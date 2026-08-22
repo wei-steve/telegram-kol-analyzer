@@ -63,8 +63,6 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 )
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
-from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
-from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
 from telegram_kol_research.runtime_agent_production_audit import (
     project_bounded_production_audit,
     run_bounded_production_audit_command,
@@ -158,9 +156,6 @@ from telegram_kol_research.protection_snapshot import build_position_protection_
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
 from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
-from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
-from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
-from telegram_kol_research.recovery_live_submit import submit_recovery_order_live
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
 from telegram_kol_research.recovery_runner import run_recovery_dry_run
@@ -231,19 +226,13 @@ from telegram_kol_research.trading_settings import (
     trading_settings_from_payload,
 )
 from telegram_kol_research.worker_command_jobs import (
-    ShadowWorkerCommandAdmission,
     WorkerCommandIdempotencyConflict,
-    begin_shadow_worker_command,
     enqueue_worker_command,
     get_worker_command,
-    settle_worker_command_failed,
-    settle_worker_command_succeeded,
 )
 from telegram_kol_research.worker_command_executor import (
-    SYNC_EFFECTS_RECONCILE_ONLY,
     WorkerCommandDependencies,
     require_worker_command_mode_transition_safe,
-    run_sync_command_blocking,
     supervise_worker_command_mode,
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
@@ -3998,13 +3987,6 @@ WORKER_COMMAND_WAIT_SECONDS = 30.0
 WORKER_COMMAND_POLL_SECONDS = 0.05
 
 
-@dataclass(frozen=True, slots=True)
-class _WebWorkerCommandContext:
-    mode: str
-    shadow: ShadowWorkerCommandAdmission | None = None
-    terminal_result: Any | None = None
-
-
 async def wait_for_worker_command_terminal(
     session_factory,
     *,
@@ -4060,81 +4042,34 @@ def _render_worker_command_terminal(snapshot):
     raise RuntimeError(f"non-terminal worker command status: {snapshot.status}")
 
 
-async def _resolve_sync_probe_request(
-    app: FastAPI,
-    http_request: Request,
-) -> dict[str, Any]:
-    probe_value = http_request.headers.get("X-Worker-Command-Probe")
-    if probe_value is None:
-        return {}
-    if probe_value != "reconcile-only" or await http_request.body():
-        raise HTTPException(
-            status_code=400,
-            detail={"code": "worker_command_probe_invalid"},
-        )
-    settings = await asyncio.to_thread(
-        load_trading_settings,
-        app.state.session_factory,
-    )
-    if settings.worker_command_mode != "shadow" or system_operator_bot_enabled(
-        app.state.notification_bot_config
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail={"code": "worker_command_probe_unavailable"},
-        )
-    return {"effects_policy": SYNC_EFFECTS_RECONCILE_ONLY}
-
-
 async def _prepare_web_worker_command(
     app: FastAPI,
     *,
     command_type: str,
     request: dict[str, Any],
     idempotency_key: str | None,
-) -> _WebWorkerCommandContext:
+) -> Any:
     settings = await asyncio.to_thread(load_trading_settings, app.state.session_factory)
     mode = settings.worker_command_mode
-    if mode == "inline":
-        return _WebWorkerCommandContext(mode=mode)
+    if mode != "queue":
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "worker_command_mode_invalid"},
+        )
     try:
-        if mode == "shadow":
-            admission = await asyncio.to_thread(
-                begin_shadow_worker_command,
-                app.state.session_factory,
-                command_type=command_type,
-                request=request,
-                idempotency_key=idempotency_key,
-                started_at=app.state.now_provider(),
-            )
-            if admission.owner_claim is not None:
-                return _WebWorkerCommandContext(mode=mode, shadow=admission)
-            terminal = await wait_for_worker_command_terminal(
-                app.state.session_factory,
-                command_id=admission.snapshot.command_id,
-            )
-            return _WebWorkerCommandContext(
-                mode=mode,
-                shadow=admission,
-                terminal_result=_render_worker_command_terminal(terminal),
-            )
-        if mode == "queue":
-            snapshot = await asyncio.to_thread(
-                enqueue_worker_command,
-                app.state.session_factory,
-                command_type=command_type,
-                request=request,
-                idempotency_key=idempotency_key,
-                created_at=app.state.now_provider(),
-            )
-            terminal = await wait_for_worker_command_terminal(
-                app.state.session_factory,
-                command_id=snapshot.command_id,
-            )
-            return _WebWorkerCommandContext(
-                mode=mode,
-                terminal_result=_render_worker_command_terminal(terminal),
-            )
+        snapshot = await asyncio.to_thread(
+            enqueue_worker_command,
+            app.state.session_factory,
+            command_type=command_type,
+            request=request,
+            idempotency_key=idempotency_key,
+            created_at=app.state.now_provider(),
+        )
+        terminal = await wait_for_worker_command_terminal(
+            app.state.session_factory,
+            command_id=snapshot.command_id,
+        )
+        return _render_worker_command_terminal(terminal)
     except WorkerCommandIdempotencyConflict as exc:
         raise HTTPException(
             status_code=409,
@@ -4151,72 +4086,6 @@ async def _prepare_web_worker_command(
             status_code=503,
             detail={"code": "worker_command_enqueue_failed"},
         ) from exc
-    raise HTTPException(
-        status_code=503,
-        detail={"code": "worker_command_mode_invalid"},
-    )
-
-
-async def _settle_shadow_success(
-    app: FastAPI,
-    context: _WebWorkerCommandContext,
-    result: Any,
-) -> None:
-    if context.mode != "shadow" or context.shadow is None:
-        return
-    claim = context.shadow.owner_claim
-    if claim is None:
-        return
-    settled = await asyncio.to_thread(
-        settle_worker_command_succeeded,
-        app.state.session_factory,
-        claim=claim,
-        result=result,
-        http_status=200,
-        completed_at=app.state.now_provider(),
-    )
-    if not settled:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "worker_command_settlement_failed",
-                "command_id": claim.command_id,
-            },
-        )
-
-
-async def _settle_shadow_failure(
-    app: FastAPI,
-    context: _WebWorkerCommandContext,
-    *,
-    error: BaseException,
-    response_error: HTTPException,
-) -> None:
-    if context.mode != "shadow" or context.shadow is None:
-        return
-    claim = context.shadow.owner_claim
-    if claim is None:
-        return
-    detail = response_error.detail
-    result = {"detail": detail}
-    settled = await asyncio.to_thread(
-        settle_worker_command_failed,
-        app.state.session_factory,
-        claim=claim,
-        result=result,
-        http_status=response_error.status_code,
-        error_code=type(error).__name__,
-        error_summary=str(error),
-        completed_at=app.state.now_provider(),
-    )
-    if not settled:
-        raise HTTPException(
-            status_code=503,
-            detail={
-                "code": "worker_command_settlement_failed",
-                "command_id": claim.command_id,
-            },
-        )
 
 
 def create_web_app(
@@ -7143,85 +7012,17 @@ def create_web_app(
 
     @app.post("/api/execution/sync-deepcoin")
     async def sync_deepcoin_execution_state(http_request: Request):
-        command_request = await _resolve_sync_probe_request(app, http_request)
-        command_context = await _prepare_web_worker_command(
+        if http_request.headers.get("X-Worker-Command-Probe") is not None:
+            raise HTTPException(
+                status_code=400,
+                detail={"code": "worker_command_probe_removed"},
+            )
+        return await _prepare_web_worker_command(
             app,
             command_type="sync_deepcoin_execution",
-            request=command_request,
+            request={},
             idempotency_key=http_request.headers.get("Idempotency-Key"),
         )
-        if command_context.terminal_result is not None:
-            return command_context.terminal_result
-        try:
-            if command_request:
-                response_body = await asyncio.to_thread(
-                    run_sync_command_blocking,
-                    app.state.worker_command_dependencies,
-                    effects_policy=SYNC_EFFECTS_RECONCILE_ONLY,
-                )
-            else:
-                client = app.state.deepcoin_client_factory()
-                reconcile_result = (
-                    reconcile_deepcoin_execution_bindings(
-                        app.state.session_factory,
-                        client=client,
-                        recovered_at=app.state.now_provider(),
-                        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-                    )
-                    if hasattr(client, "list_open_orders")
-                    else None
-                )
-                result = sync_manual_closed_deepcoin_positions(
-                    app.state.session_factory,
-                    client=client,
-                    synced_at=app.state.now_provider(),
-                )
-                if isinstance(
-                    app.state.notification_bot_config,
-                    SystemOperatorBotConfig,
-                ):
-                    await deliver_pending_position_attribution_incidents(
-                        app.state.session_factory,
-                        config=app.state.notification_bot_config,
-                        delivered_at=app.state.now_provider(),
-                    )
-                    await deliver_pending_position_protection_incidents(
-                        app.state.session_factory,
-                        config=app.state.notification_bot_config,
-                        delivered_at=app.state.now_provider(),
-                    )
-                if isinstance(
-                    app.state.system_operator_bot_config,
-                    SystemOperatorBotConfig,
-                ):
-                    await deliver_terminal_entry_cleanup_notifications(
-                        app.state.session_factory,
-                        config=app.state.system_operator_bot_config,
-                        delivered_at=app.state.now_provider(),
-                    )
-                response_body = {
-                    "checked": result.checked,
-                    "manually_closed": result.manually_closed,
-                    "skipped_without_pos_id": result.skipped_without_pos_id,
-                    "reconciled_active": reconcile_result.active if reconcile_result else 0,
-                    "reconciled_open": reconcile_result.open if reconcile_result else 0,
-                    "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
-                }
-        except DeepcoinClientError as exc:
-            response_error = HTTPException(status_code=502, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except Exception as exc:
-            logger.exception("Deepcoin execution sync failed")
-            response_error = HTTPException(status_code=500, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        await _settle_shadow_success(app, command_context, response_body)
-        return response_body
 
     @app.post("/api/execution/close-bound-position")
     async def close_bound_position(
@@ -7234,53 +7035,12 @@ def create_web_app(
         pos_id = str(data.get("pos_id") or "").strip()
         if not pos_id:
             raise HTTPException(status_code=400, detail="pos_id is required")
-        command_context = await _prepare_web_worker_command(
+        return await _prepare_web_worker_command(
             app,
             command_type="close_bound_position",
             request={"pos_id": pos_id},
             idempotency_key=http_request.headers.get("Idempotency-Key"),
         )
-        if command_context.terminal_result is not None:
-            return command_context.terminal_result
-        try:
-            result = close_bound_position_market(
-                app.state.session_factory,
-                pos_id=pos_id,
-                deepcoin_client=app.state.deepcoin_client_factory(),
-                executed_at=app.state.now_provider(),
-            )
-            if isinstance(
-                app.state.system_operator_bot_config,
-                SystemOperatorBotConfig,
-            ):
-                await deliver_terminal_entry_cleanup_notifications(
-                    app.state.session_factory,
-                    config=app.state.system_operator_bot_config,
-                    delivered_at=app.state.now_provider(),
-                )
-        except DeepcoinExecutionActionError as exc:
-            response_error = HTTPException(status_code=409, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except DeepcoinClientError as exc:
-            response_error = HTTPException(status_code=502, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except Exception as exc:
-            logger.exception("bound Deepcoin position close failed")
-            response_error = HTTPException(
-                status_code=500, detail="bound position close failed"
-            )
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        await _settle_shadow_success(app, command_context, result)
-        return result
 
     @app.post("/api/execution/bind-live-position")
     async def bind_live_position(payload: dict[str, Any]):
@@ -8413,46 +8173,12 @@ def create_web_app(
             "symbol": str(payload["symbol"]),
             "side": str(payload["side"]),
         }
-        command_context = await _prepare_web_worker_command(
+        return await _prepare_web_worker_command(
             app,
             command_type="recovery_live_submit",
             request=command_request,
             idempotency_key=http_request.headers.get("Idempotency-Key"),
         )
-        if command_context.terminal_result is not None:
-            return command_context.terminal_result
-        try:
-            deepcoin_client = app.state.deepcoin_client_factory()
-            result = submit_recovery_order_live(
-                app.state.session_factory,
-                chat_id=command_request["chat_id"],
-                message_id=command_request["message_id"],
-                symbol=command_request["symbol"],
-                side=command_request["side"],
-                deepcoin_client=deepcoin_client,
-                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-                submitted_at=app.state.now_provider(),
-            )
-        except RecoveryLiveSubmitError as exc:
-            response_error = HTTPException(status_code=409, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except DeepcoinClientError as exc:
-            response_error = HTTPException(status_code=502, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except ValueError as exc:
-            response_error = HTTPException(status_code=422, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        await _settle_shadow_success(app, command_context, result)
-        return result
 
     @app.get("/api/trade-signals")
     def trade_signals(limit: int = 50):
@@ -8486,36 +8212,12 @@ def create_web_app(
 
     @app.post("/api/trade-signals/process-next")
     async def trade_signals_process_next(http_request: Request):
-        command_context = await _prepare_web_worker_command(
+        return await _prepare_web_worker_command(
             app,
             command_type="process_next_trade_signal",
             request={},
             idempotency_key=http_request.headers.get("Idempotency-Key"),
         )
-        if command_context.terminal_result is not None:
-            return command_context.terminal_result
-        try:
-            result = process_next_trade_signal_live(
-                app.state.session_factory,
-                deepcoin_client_factory=app.state.deepcoin_client_factory,
-                contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-                processed_at=app.state.now_provider(),
-            )
-            response_body = {"processed": result is not None, "result": result}
-        except RecoveryLiveSubmitError as exc:
-            response_error = HTTPException(status_code=409, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        except DeepcoinClientError as exc:
-            response_error = HTTPException(status_code=502, detail=str(exc))
-            await _settle_shadow_failure(
-                app, command_context, error=exc, response_error=response_error
-            )
-            raise response_error from exc
-        await _settle_shadow_success(app, command_context, response_body)
-        return response_body
 
     @app.get("/api/events")
     def events():

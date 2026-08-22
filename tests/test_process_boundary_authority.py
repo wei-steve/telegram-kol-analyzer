@@ -25,22 +25,6 @@ DYNAMIC_AUTHORITY_CALLS = {
     "app.state.authoritative_processor",
     "app.state.auto_trade_executor",
 }
-KNOWN_BLOCKING_WEB_ROUTE_AUTHORITY = {
-    "/api/execution/sync-deepcoin": (
-        "runs position-authority reconciliation in the Web process"
-    ),
-    "/api/execution/close-bound-position": (
-        "submits a position close from the Web process"
-    ),
-    "/api/recovery-live-submit": (
-        "submits a recovery order from the Web process"
-    ),
-    "/api/trade-signals/process-next": (
-        "processes a queued trade signal from the Web process"
-    ),
-}
-
-
 @dataclass(frozen=True)
 class FunctionRecord:
     key: str
@@ -194,22 +178,6 @@ def _authority_paths() -> dict[str, list[str]]:
 
 
 @pytest.mark.architecture
-def test_known_web_route_authority_blockers_stay_explicit():
-    violations = _authority_paths()
-    assert set(violations) == set(KNOWN_BLOCKING_WEB_ROUTE_AUTHORITY), (
-        "The Phase 6 Task 1 Web authority blocker inventory drifted. Review "
-        f"every changed path before updating it: {violations}"
-    )
-
-
-@pytest.mark.architecture
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "Phase 6 Task 1 is blocked until every known Web route mutation is "
-        "moved behind a worker-owned job"
-    ),
-)
 def test_web_routes_do_not_reach_exchange_mutation_authority():
     violations = _authority_paths()
     assert violations == {}, (
