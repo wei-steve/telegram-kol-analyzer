@@ -12,6 +12,7 @@ from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision, RuntimeIncident
 from telegram_kol_research.recognition_decisions import claim_next_semantic_review
+from telegram_kol_research.trading_settings import save_trading_settings
 import telegram_kol_research.semantic_disagreement_review as review_module
 from telegram_kol_research.semantic_disagreement_review import (
     SemanticReviewDecision,
@@ -47,6 +48,7 @@ def _review_payload(*, action_type="none", critical=False):
 
 def _setup(tmp_path, *, text="BTC short", automation_status="submitted"):
     factory = create_session_factory(tmp_path / "research.db")
+    save_trading_settings(factory, {"semantic_review_enabled": True})
     mimo = {
         "recognition_result": "非策略",
         "strategy": {},
@@ -723,6 +725,103 @@ def test_worker_does_not_duplicate_claimed_notification(tmp_path):
         now=NOW + timedelta(minutes=1),
     ))
     assert notified == [raw_id]
+
+
+def test_disabled_loop_skips_provider_config_claims_and_review_work(
+    tmp_path,
+    monkeypatch,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    calls = []
+
+    def forbidden_config(*args, **kwargs):
+        calls.append("config")
+        raise AssertionError("provider config must remain unloaded")
+
+    async def forbidden_once(*args, **kwargs):
+        calls.append("once")
+        raise AssertionError("review work must remain unclaimed")
+
+    async def stop_after_idle_sleep(seconds):
+        calls.append(("sleep", seconds))
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(review_module, "load_ai_recognition_config", forbidden_config)
+    monkeypatch.setattr(review_module, "run_semantic_review_once", forbidden_once)
+    monkeypatch.setattr(review_module.asyncio, "sleep", stop_after_idle_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(
+            run_semantic_review_loop(
+                session_factory=factory,
+                config_path=tmp_path / "ai.yaml",
+                notifier=None,
+                poll_interval_seconds=0.25,
+            )
+        )
+
+    assert calls == [("sleep", 0.25)]
+
+
+def test_worker_disables_claimed_row_before_provider_call(tmp_path, monkeypatch):
+    factory, raw_id, _ = _setup(tmp_path)
+    real_claim = review_module.claim_next_semantic_review
+    reviewer_calls = []
+
+    def claim_then_disable(*args, **kwargs):
+        claim = real_claim(*args, **kwargs)
+        save_trading_settings(factory, {"semantic_review_enabled": False})
+        return claim
+
+    monkeypatch.setattr(review_module, "claim_next_semantic_review", claim_then_disable)
+
+    assert asyncio.run(
+        run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=None,
+            reviewer=lambda *args, **kwargs: reviewer_calls.append(True),
+            now=NOW,
+        )
+    ) is True
+
+    assert reviewer_calls == []
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.raw_message_id == raw_id
+        assert row.comparison_status == "completed"
+        assert row.agreement_status == "review_disabled"
+        assert row.comparison_claim_token is None
+
+
+def test_disabling_during_in_flight_review_suppresses_critical_notification(tmp_path):
+    factory, raw_id, mimo = _setup(tmp_path, text="全部出局")
+    notified = []
+
+    def reviewer(*args, **kwargs):
+        save_trading_settings(factory, {"semantic_review_enabled": False})
+        return _run(
+            raw_id,
+            mimo,
+            _review_payload(action_type="exit_full", critical=True),
+        )
+
+    assert asyncio.run(
+        run_semantic_review_once(
+            factory,
+            config=AiRecognitionConfig(),
+            notifier=lambda **kwargs: notified.append(kwargs),
+            reviewer=reviewer,
+            now=NOW,
+        )
+    ) is True
+
+    assert notified == []
+    with factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "completed"
+        assert row.disagreement_severity == "critical"
+        assert row.notification_status is None
 
 
 def test_loop_reloads_config_and_survives_one_item_failure(tmp_path, monkeypatch):

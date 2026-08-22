@@ -48,6 +48,7 @@ from telegram_kol_research.recognition_decisions import (
     claim_critical_notification,
     claim_next_semantic_review,
     complete_semantic_review,
+    disable_claimed_semantic_review,
     fail_semantic_review,
 )
 from telegram_kol_research.runtime_incident_adapters import (
@@ -58,9 +59,14 @@ from telegram_kol_research.runtime_incident_adapters import (
 from telegram_kol_research.recognition_experiments import (
     _extract_chat_content,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 
 logger = logging.getLogger(__name__)
+
+
+def _semantic_review_enabled(session_factory: sessionmaker) -> bool:
+    return load_trading_settings(session_factory).semantic_review_enabled
 
 
 ACTION_TYPES = frozenset(
@@ -604,6 +610,18 @@ async def run_semantic_review_once(
     if claim is None:
         return False
 
+    review_enabled = await asyncio.to_thread(
+        _semantic_review_enabled, session_factory
+    )
+    if not review_enabled:
+        await asyncio.to_thread(
+            disable_claimed_semantic_review,
+            session_factory,
+            raw_message_id=claim.raw_message_id,
+            claim_token=claim.token,
+        )
+        return True
+
     try:
         run = await asyncio.to_thread(
             reviewer,
@@ -630,6 +648,11 @@ async def run_semantic_review_once(
             compared_at=now,
         )
         if not completed or run.decision.severity != "critical" or notifier is None:
+            return True
+        review_enabled = await asyncio.to_thread(
+            _semantic_review_enabled, session_factory
+        )
+        if not review_enabled:
             return True
         claimed_notification = await asyncio.to_thread(
             claim_critical_notification,
@@ -736,14 +759,22 @@ async def run_semantic_review_loop(
 
     while True:
         try:
-            config = await asyncio.to_thread(load_ai_recognition_config, config_path)
-            processed = await run_semantic_review_once(
-                session_factory,
-                config=config,
-                notifier=notifier,
-                now=utc_now(),
-                max_attempts=max_attempts,
+            review_enabled = await asyncio.to_thread(
+                _semantic_review_enabled, session_factory
             )
+            if review_enabled:
+                config = await asyncio.to_thread(
+                    load_ai_recognition_config, config_path
+                )
+                processed = await run_semantic_review_once(
+                    session_factory,
+                    config=config,
+                    notifier=notifier,
+                    now=utc_now(),
+                    max_attempts=max_attempts,
+                )
+            else:
+                processed = False
         except asyncio.CancelledError:
             raise
         except Exception:

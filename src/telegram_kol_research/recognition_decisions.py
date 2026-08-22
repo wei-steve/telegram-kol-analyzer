@@ -500,6 +500,35 @@ def fail_semantic_review(
         return result.rowcount == 1
 
 
+def disable_claimed_semantic_review(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    claim_token: str,
+) -> bool:
+    """Terminalize one owned review after the runtime policy is disabled."""
+
+    with session_factory() as session:
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                RecognitionDecision.comparison_status == "running",
+                RecognitionDecision.comparison_claim_token == claim_token,
+            )
+            .values(
+                agreement_status="review_disabled",
+                comparison_status="completed",
+                comparison_next_attempt_at=None,
+                comparison_started_at=None,
+                comparison_claim_token=None,
+                updated_at=utc_now(),
+            )
+        )
+        session.commit()
+        return result.rowcount == 1
+
+
 def claim_critical_notification(
     session_factory: sessionmaker,
     *,

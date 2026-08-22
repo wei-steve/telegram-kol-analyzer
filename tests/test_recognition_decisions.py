@@ -4,6 +4,8 @@ from datetime import datetime, timedelta
 
 import pytest
 
+import telegram_kol_research.recognition_decisions as decision_module
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision
 from telegram_kol_research.recognition_decisions import (
@@ -195,6 +197,30 @@ def test_disabled_semantic_review_finalizes_as_compatible_terminal_state(tmp_pat
         now=datetime(2026, 7, 13, 12, 0),
         stale_before=datetime(2026, 7, 13, 11, 55),
     ) is None
+
+
+def test_disable_claimed_semantic_review_requires_exact_claim_token(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    _save_and_finalize(session_factory, _record(raw_id))
+    claim = _claim(session_factory)
+
+    assert decision_module.disable_claimed_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token="wrong-token",
+    ) is False
+    assert decision_module.disable_claimed_semantic_review(
+        session_factory,
+        raw_message_id=raw_id,
+        claim_token=claim.token,
+    ) is True
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == "completed"
+        assert row.agreement_status == "review_disabled"
+        assert row.comparison_claim_token is None
 
 
 def test_terminal_authoritative_failure_preserves_notification_metadata(tmp_path):
