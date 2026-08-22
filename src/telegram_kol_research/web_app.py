@@ -293,6 +293,8 @@ from telegram_kol_research.telegram_session_lock import (
 
 
 REFRESH_TIMEOUT_SECONDS = 180
+INGEST_REFRESH_RESPONSE_MAX_BYTES = 64 * 1024
+DEFAULT_INGEST_REFRESH_URL = "http://127.0.0.1:8001/api/refresh"
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 RUNTIME_ROLES = frozenset({"all", "ingest", "worker", "web"})
@@ -308,6 +310,54 @@ def resolve_runtime_role(value: str) -> str:
 
 def runtime_role_owns_telegram_session(value: str) -> bool:
     return resolve_runtime_role(value) in {"all", "ingest"}
+
+
+def resolve_ingest_refresh_url(value: str) -> str:
+    url = httpx.URL(str(value or "").strip())
+    if (
+        url.scheme != "http"
+        or url.host not in {"127.0.0.1", "localhost", "::1"}
+        or url.path != "/api/refresh"
+        or url.query
+        or url.fragment
+        or url.username
+        or url.password
+    ):
+        raise ValueError("ingest refresh URL must be localhost /api/refresh over HTTP")
+    return str(url)
+
+
+async def request_ingest_refresh_once(url: str, *, timeout_seconds: float):
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        return await client.post(url)
+
+
+async def proxy_ingest_refresh_once(*, requester, url: str) -> Response:
+    try:
+        response = await requester(url, timeout_seconds=REFRESH_TIMEOUT_SECONDS)
+    except httpx.HTTPError as exc:
+        logger.warning("ingest refresh RPC outcome unknown: %s", type(exc).__name__)
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ingest_refresh_unavailable", "outcome": "unknown"},
+        ) from exc
+    if len(response.content) > INGEST_REFRESH_RESPONSE_MAX_BYTES:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ingest_refresh_invalid_response", "outcome": "unknown"},
+        )
+    try:
+        response.json()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "ingest_refresh_invalid_response", "outcome": "unknown"},
+        ) from exc
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type="application/json",
+    )
 
 
 async def _run_monitor_capture_writer(writer: Callable[[], int]) -> int:
@@ -4103,6 +4153,8 @@ async def _prepare_web_worker_command(
 def create_web_app(
     database_path: str | Path,
     runtime_role: str = "all",
+    ingest_refresh_url: str = DEFAULT_INGEST_REFRESH_URL,
+    ingest_refresh_requester=None,
     media_root: str | Path | None = None,
     live_target_titles: set[str] | None = None,
     live_listener_runner=None,
@@ -4161,6 +4213,7 @@ def create_web_app(
     """Create the minimal FastAPI app used by the web command."""
 
     resolved_runtime_role = resolve_runtime_role(runtime_role)
+    resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
     resolved_database_path = Path(database_path)
     log_directory = resolved_database_path.parent / "logs"
     configure_application_logging(log_directory)
@@ -4658,6 +4711,10 @@ def create_web_app(
     app = FastAPI(title="Telegram KOL Research Web", lifespan=lifespan)
     app.state.database_path = Path(database_path)
     app.state.runtime_role = resolved_runtime_role
+    app.state.ingest_refresh_url = resolved_ingest_refresh_url
+    app.state.ingest_refresh_requester = (
+        ingest_refresh_requester or request_ingest_refresh_once
+    )
     app.state.runtime_agent_production_audit_runner = (
         runtime_agent_production_audit_runner
         or (
@@ -7950,6 +8007,16 @@ def create_web_app(
 
     @app.post("/api/refresh")
     async def refresh():
+        if app.state.runtime_role == "web":
+            return await proxy_ingest_refresh_once(
+                requester=app.state.ingest_refresh_requester,
+                url=app.state.ingest_refresh_url,
+            )
+        if app.state.runtime_role == "worker":
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "refresh_not_owned_by_runtime_role"},
+            )
         shared_client = app.state.telegram_client is not None
         session_lock = None
         session_lock_entered = False

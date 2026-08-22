@@ -300,6 +300,7 @@ from telegram_kol_research.tpsl_ledger_backfill import (
     build_tpsl_ledger_backfill_plan,
 )
 from telegram_kol_research.web_app import (
+    DEFAULT_INGEST_REFRESH_URL,
     create_web_app,
     resolve_runtime_role,
     runtime_role_owns_telegram_session,
@@ -5604,6 +5605,11 @@ def web(
         "--runtime-role",
         envvar="TELEGRAM_KOL_RUNTIME_ROLE",
     ),
+    ingest_refresh_url: str = typer.Option(
+        DEFAULT_INGEST_REFRESH_URL,
+        "--ingest-refresh-url",
+        envvar="TELEGRAM_KOL_INGEST_REFRESH_URL",
+    ),
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
     deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
@@ -5703,6 +5709,7 @@ def web(
     app_instance = create_web_app(
         database_path=database_path,
         runtime_role=runtime_role,
+        ingest_refresh_url=ingest_refresh_url,
         live_target_titles=live_target_titles,
         telegram_client=telegram_client,
         live_listener_status_reason=live_listener_status_reason,

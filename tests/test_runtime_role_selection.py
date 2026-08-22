@@ -1,7 +1,21 @@
 from __future__ import annotations
 
+import asyncio
+import json
+
+import httpx
 import pytest
+from fastapi import HTTPException
 from typer.testing import CliRunner
+
+
+def _refresh_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/refresh"
+        and "POST" in getattr(route, "methods", set())
+    )
 
 
 @pytest.mark.parametrize("role", ["all", "ingest", "worker", "web"])
@@ -171,3 +185,174 @@ def test_ingest_cli_role_acquires_session_before_creating_client(
     assert captured["runtime_role"] == "ingest"
     assert captured["telegram_client"] is client
     assert calls == ["auth", "reap", "lock", "lock_enter", "client", "lock_exit"]
+
+
+def test_web_role_proxies_refresh_once_and_preserves_success_body(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    calls = []
+
+    async def requester(url, *, timeout_seconds):
+        calls.append((url, timeout_seconds))
+        return httpx.Response(200, json={"checked": 7, "reconciled": 3})
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        ingest_refresh_url="http://127.0.0.1:8001/api/refresh",
+        ingest_refresh_requester=requester,
+    )
+
+    response = asyncio.run(_refresh_endpoint(app)())
+
+    assert response.status_code == 200
+    assert json.loads(response.body) == {"checked": 7, "reconciled": 3}
+    assert calls == [("http://127.0.0.1:8001/api/refresh", 180)]
+
+
+def test_web_role_preserves_ingest_refresh_error_status_and_json(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    async def requester(url, *, timeout_seconds):
+        return httpx.Response(
+            409,
+            json={"detail": {"code": "telegram_session_busy", "owner_pid": 42}},
+        )
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        ingest_refresh_requester=requester,
+    )
+
+    response = asyncio.run(_refresh_endpoint(app)())
+
+    assert response.status_code == 409
+    assert json.loads(response.body) == {
+        "detail": {"code": "telegram_session_busy", "owner_pid": 42}
+    }
+
+
+def test_web_role_does_not_retry_an_unknown_ingest_refresh_failure(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    attempts = 0
+
+    async def requester(url, *, timeout_seconds):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ReadTimeout("lost ingest response")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        ingest_refresh_requester=requester,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_refresh_endpoint(app)())
+
+    assert attempts == 1
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {
+        "code": "ingest_refresh_unavailable",
+        "outcome": "unknown",
+    }
+
+
+def test_worker_role_rejects_refresh_without_calling_ingest(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    async def requester(url, *, timeout_seconds):
+        raise AssertionError("worker must not proxy Telegram refresh")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="worker",
+        ingest_refresh_requester=requester,
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(_refresh_endpoint(app)())
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == {"code": "refresh_not_owned_by_runtime_role"}
+
+
+def test_ingest_refresh_rpc_url_must_be_localhost(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    with pytest.raises(ValueError, match="localhost"):
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            runtime_role="web",
+            ingest_refresh_url="https://example.com/api/refresh",
+        )
+
+
+def test_web_cli_passes_the_configured_ingest_refresh_url(tmp_path, monkeypatch):
+    from telegram_kol_research import cli
+
+    config_path = tmp_path / "groups.yaml"
+    config_path.write_text("groups: []\n", encoding="utf-8")
+    captured = {}
+    monkeypatch.setattr(
+        cli,
+        "create_web_app",
+        lambda **kwargs: captured.update(kwargs) or object(),
+    )
+    monkeypatch.setattr(
+        cli,
+        "_build_web_server",
+        lambda app_instance, host, port: type(
+            "Server", (), {"run": lambda self: None}
+        )(),
+    )
+
+    result = CliRunner().invoke(
+        cli.app,
+        [
+            "web",
+            "--runtime-role",
+            "web",
+            "--ingest-refresh-url",
+            "http://localhost:8124/api/refresh",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--config-path",
+            str(config_path),
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["ingest_refresh_url"] == "http://localhost:8124/api/refresh"
+
+
+def test_ingest_role_executes_the_existing_local_refresh_path(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    calls = []
+
+    class Client:
+        async def connect(self):
+            calls.append("connect")
+
+    async def local_reconcile(**kwargs):
+        calls.append("reconcile")
+        return {"checked": 2, "reconciled": 1}
+
+    async def requester(url, *, timeout_seconds):
+        raise AssertionError("ingest must execute locally, not proxy")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="ingest",
+        telegram_client=Client(),
+        ingest_refresh_requester=requester,
+    )
+    app.state.reconcile_once_runner = local_reconcile
+
+    result = asyncio.run(_refresh_endpoint(app)())
+
+    assert result == {"checked": 2, "reconciled": 1}
+    assert calls == ["connect", "reconcile"]
