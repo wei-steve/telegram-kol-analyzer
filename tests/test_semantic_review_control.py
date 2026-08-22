@@ -1,5 +1,5 @@
 import importlib.util
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -285,6 +285,35 @@ def test_apply_refuses_plan_from_another_database(tmp_path):
             expected_plan_sha=plan.plan_sha,
             applied_at=NOW + timedelta(minutes=1),
         )
+
+
+def test_repeated_apply_fingerprint_survives_sqlite_utc_timestamp_reload(tmp_path):
+    session_factory = create_session_factory(tmp_path / "utc-reload.db")
+    raw_id = _seed_decision(
+        session_factory, message_id=1, comparison_status="failed"
+    )
+    plan = control.build_semantic_review_disable_plan(session_factory, cutoff=NOW)
+
+    first = control.apply_semantic_review_disable_plan(
+        session_factory,
+        plan,
+        expected_plan_sha=plan.plan_sha,
+        applied_at=datetime(2026, 8, 22, 18, 0, tzinfo=UTC),
+    )
+    with session_factory() as session:
+        reloaded = session.query(RecognitionDecision).filter_by(
+            raw_message_id=raw_id
+        ).one()
+        assert reloaded.updated_at.tzinfo is None
+    repeated = control.apply_semantic_review_disable_plan(
+        session_factory,
+        plan,
+        expected_plan_sha=plan.plan_sha,
+        applied_at=datetime(2026, 8, 22, 18, 1, tzinfo=UTC),
+    )
+
+    assert repeated.changed_count == 0
+    assert repeated.post_apply_sha == first.post_apply_sha
 
 
 def test_apply_detects_drift_and_rolls_back_all_targets(tmp_path):
