@@ -14,11 +14,11 @@ deploy_branch: codex/deepcoin-auto-trading-v1   # matches the updater default; n
 integration_branch: codex/phase0-deploy-integration  # merged onto origin/deploy_branch (302c1ae); push this to deploy_branch
 local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v1 is 118 commits diverged from origin and is checked out in /private/tmp/tg-risk-routing.wmF2Vj. Do not use it. origin/codex/deepcoin-auto-trading-v1 is authoritative.
 design_version: 1
-current_phase: 6a
-phase_name: durable-worker-command-boundary
-phase_status: in_progress          # planned | claimed | in_progress | completed
-claimed_by: null
-current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-6a-durable-worker-command-boundary.md
+current_phase: 6r
+phase_name: semantic-review-control
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: 01a02822-4cb1-7891-9808-7175deb8ab14
+current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-6r-semantic-review-control.md
 last_completed_phase: 5   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5
 last_completed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
 phase_6a_planning_claim_commit: 7f266f43844b15648f6d013121f1efe3271a137d
@@ -38,6 +38,9 @@ phase_6a_runtime_modes: "message_lock_mode=global, message_pipeline_mode=queue, 
 phase_6a_worker_state_at_stop: "worker total=0, claimed=0, executing=0, uncertain=0; deployment-window journal grep found SQLITE_BUSY/database-is-locked/worker-command anomaly count 0. No shadow command sample exists because the mandatory real sync was not safe to invoke."
 phase_6a_rollback_status: "Rollback preconditions are currently satisfied (claimed=0, executing=0). Safe operational rollback is the settings API switch shadow -> inline at exact Candidate A; no code rollback is required for the current migration-compatible candidate. The exact Candidate A SHA remains the future Candidate B rollback target. Schema is retained during operational rollback; physical removal was rehearsal-only and is not authorized on production."
 phase_6a_outstanding: "Resolve or explicitly authorize handling of the pre-existing pending notification outboxes, then obtain one safe real sync shadow parity sample without manufacturing an exchange write. Re-run the quiet gate, prove shadow parity/no duplicate, cut to queue, run fake-adapter crash rehearsal and one zero-inflight production restart, then complete Candidate B authority hardening, its focused/final full suite, exact gated deploy, and L2 30-minute/5-message observation."
+phase_6a_pause_status: "USER-AUTHORIZED PAUSE 2026-08-22: preserve exact deployed Candidate A f257a93121ba1d547955f0b4dd5a270dd347904d, worker_command_mode=shadow, and the Task 12 real-sync parity blocker. Do not advance, modify, roll back, or reinterpret Phase 6A while Phase 6R is current. After Phase 6R completes, restore this exact Phase 6A checkpoint; the 2463/331 pending-notification gate remains independent and unresolved."
+phase_6r_authorization: "USER-APPROVED 2026-08-22: insert a prerequisite semantic-review-control phase, initially documentation-only. Preserve MiMo authority and all recognition, context resolution, strategy, position ownership, automation, and exchange-write semantics. Control only semantic_disagreement_review; do not disable other DeepSeek consumers. Add a runtime switch defaulting off, project disabled reviews as an explicit review_disabled state backed by compatibility terminal comparison_status=completed, and design a guarded L3 terminalization of historical pending/failed reviews."
+phase_6r_planning_scope: "This claim authorizes only the design document, self-contained implementation plan, status bookkeeping, and their commits. No production/test code, database, runtime setting, provider configuration, key rotation, push, deployment, restart, notification-outbox handling, Telegram message, or exchange operation is authorized."
 phase_6a_planning_status: "PLANNED ONLY. The owner approved the durable SQLite worker-command design and the complete TDD/L3 implementation plan. No production code, database, setting, GitHub branch, server, systemd unit, or exchange state was changed. A future implementation turn must run the full exclusive preflight, claim Phase 6A, and execute only its current phase file."
 phase_6a_scope: "Move exactly four Web authority routes behind worker_command_jobs: /api/execution/sync-deepcoin, /api/execution/close-bound-position, /api/recovery-live-submit, and /api/trade-signals/process-next. Preserve existing HTTP success/error contracts and all recognition, strategy, position ownership, execution, and exchange-write semantics. Keep message_lock_mode=global, message_pipeline_mode=queue, and the monolith topology until Phase 6 resumes."
 phase_6a_verification_requirement: "L3 schema/bootstrap and physical rollback rehearsal on production database copies, plus focused concurrency/recovery/uncertain/idempotency tests, one full suite per final production candidate, compatibility shadow/queue evidence, a hardened no-Web-authority candidate, gated deployment, one lifecycle restart, L2 30-minute/5-message observation, direct exchange history for observed write-capable commands, and an exact Candidate A rollback SHA. Missing or incomplete evidence fails closed."
