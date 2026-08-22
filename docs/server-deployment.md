@@ -279,10 +279,19 @@ journalctl -u telegram-kol-monitor.service -n 50 --no-pager
 ```
 
 Verify the main service remains active and the expected HEAD and live gates
-remain unchanged. A later reviewed deployment may rerun the installer to
-advance the frozen HEAD, but valid HEAD drift is treated as deployment context
-rather than a standalone production-safety failure. To roll back the monitor
-without touching trading:
+remain unchanged. After installation, later exact-SHA deployments through
+`deploy/telegram-kol-update` synchronize the frozen HEAD transactionally. The
+updater records the timer's enabled/active state, stops it and waits for the
+monitor oneshots to become inactive, validates the regular root-owned `0600`
+environment file, and atomically normalizes the pin to the rollback commit
+before application checkout mutation. It advances the pin to the candidate
+only after exact-SHA checkout, package installation, service start, and HTTP
+health succeed, then restores the prior timer state last. Rollback makes the
+pin follow the actual rollback HEAD before timer restoration. A missing monitor
+is compatible with the existing deployment flow, while a partial, symlinked,
+wrong-mode, wrong-owner, or malformed installation fails closed. Valid HEAD
+drift remains deployment context rather than a standalone reason code. To roll
+back the monitor without touching trading:
 
 ```bash
 sudo systemctl disable --now telegram-kol-monitor.timer

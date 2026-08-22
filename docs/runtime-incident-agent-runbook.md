@@ -469,6 +469,19 @@ performs no source scan and no database write. Never use an empty POST as a
 health probe: every accepted capture POST intentionally runs the bounded
 durable-source scan after processing its monitor projection.
 
+Composite checks obtain current position sizes from the authenticated GET
+endpoint `/api/runtime-incidents/live-position-sizes` using the same dedicated
+monitor token. The route accepts only direct loopback requests and returns only
+`schema_version`, `complete`, `captured_at`, and at most 100
+`pos_id`/`size_text` rows. The response is bounded below 32 KiB. The main
+service performs one read-only Deepcoin position request; it does not write the
+production database or a cache file, and the monitor never receives exchange
+credentials. Provider or validation failure returns `complete=false` with an
+empty position list. The monitor rejects incomplete, stale, duplicate,
+oversized, negative, non-finite, or malformed projections and does not fall
+back to the UI-owned position cache. This endpoint is a read-only evidence
+source; the capture POST must not be used as its health probe.
+
 Failure of this loopback writer is fail-open for monitoring: the independent
 monitor result and operator alert remain authoritative, while the missing
 runtime-incident append is logged without sensitive detail. Roll back by
@@ -484,6 +497,19 @@ deployment, keep the timer stopped, update policy, restart and verify the main
 service, and enable the timer last. The timer is `Persistent=true` and may run
 an immediate catch-up when enabled; enabling it before the main restart can
 create a real transient `monitor_adapter_failure` and operator alert.
+
+Managed exact-SHA deployments now transact the monitor pin automatically. If
+the monitor installation is complete, `deploy/telegram-kol-update` records the
+timer's enabled/active state, stops the timer, waits for both monitor oneshots
+to be inactive, and validates the regular root-owned `0600` environment file.
+It atomically normalizes the expected-HEAD line to the actual rollback commit
+before checkout mutation. Only after the candidate checkout, package, service,
+and HTTP-health gates succeed does it atomically advance the pin to the exact
+candidate SHA and restore the previous timer state last. Rollback synchronizes
+the pin to the actual rollback HEAD before restoring the timer. A completely
+absent monitor leaves deployment behavior unchanged; a partial or malformed
+installation fails closed before application checkout mutation. HEAD mismatch
+remains deployment context and does not add a monitor reason code.
 
 Task 8R.3 adds an independently supervised scanner with these scanner-only
 settings:
