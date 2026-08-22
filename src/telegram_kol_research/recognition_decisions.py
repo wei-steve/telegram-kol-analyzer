@@ -642,3 +642,54 @@ def update_recognition_execution_outcome(
             row.notification_error = notification_error
         row.updated_at = utc_now()
         session.commit()
+
+
+def claim_authoritative_failure_notification(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    automation_status: str,
+    automation_reason: str | None,
+) -> bool:
+    """Atomically reserve one authoritative-failure notification delivery."""
+
+    with session_factory() as session:
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        row = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one_or_none()
+        )
+        if row is None:
+            session.rollback()
+            raise LookupError(
+                f"Recognition decision not found for raw message {raw_message_id}"
+            )
+        observed_status = row.notification_status
+        if observed_status not in {None, "failed"}:
+            session.rollback()
+            return False
+        expected_status = (
+            RecognitionDecision.notification_status.is_(None)
+            if observed_status is None
+            else RecognitionDecision.notification_status == observed_status
+        )
+        result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == raw_message_id,
+                expected_status,
+            )
+            .values(
+                automation_status=automation_status,
+                automation_reason=automation_reason,
+                notification_status="scheduled",
+                notification_error=None,
+                updated_at=utc_now(),
+            )
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+        return True

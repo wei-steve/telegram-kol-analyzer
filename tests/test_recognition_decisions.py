@@ -257,6 +257,49 @@ def test_terminal_authoritative_failure_preserves_notification_metadata(tmp_path
     assert failed.notification_status == "sent"
 
 
+def test_authoritative_failure_notification_claim_is_once_only(tmp_path):
+    session_factory = create_session_factory(tmp_path / "notification-claim.db")
+    raw_id = _raw_message(session_factory)
+    save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload={},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[],
+            prompt_versions={"mimo": {}},
+        ),
+    )
+
+    first = decision_module.claim_authoritative_failure_notification(
+        session_factory,
+        raw_message_id=raw_id,
+        automation_status="skipped",
+        automation_reason="mimo_authoritative_failed",
+    )
+    second = decision_module.claim_authoritative_failure_notification(
+        session_factory,
+        raw_message_id=raw_id,
+        automation_status="skipped",
+        automation_reason="mimo_authoritative_failed",
+    )
+
+    assert first is True
+    assert second is False
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+    assert row.notification_status == "scheduled"
+    assert row.notification_error is None
+    assert row.automation_status == "skipped"
+    assert row.automation_reason == "mimo_authoritative_failed"
+
+
 def test_completed_authoritative_decision_is_terminal_for_semantic_claims(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)

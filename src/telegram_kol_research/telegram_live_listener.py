@@ -43,10 +43,11 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
     capture_runtime_incident_best_effort,
 )
-from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    claim_authoritative_failure_notification,
     save_terminal_authoritative_decision,
+    update_recognition_execution_outcome,
 )
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
@@ -573,14 +574,18 @@ def _schedule_authoritative_notification(
     sender,
     config,
     payload: dict[str, Any],
-) -> asyncio.Task[None]:
-    update_recognition_execution_outcome(
+) -> asyncio.Task[None] | None:
+    automation_status = str(
+        payload.get("automation", {}).get("status") or "unknown"
+    )
+    automation_reason = payload.get("automation", {}).get("reason")
+    if not claim_authoritative_failure_notification(
         session_factory,
         raw_message_id=raw_message_id,
-        automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
-        automation_reason=payload.get("automation", {}).get("reason"),
-        notification_status="scheduled",
-    )
+        automation_status=automation_status,
+        automation_reason=automation_reason,
+    ):
+        return None
 
     async def send_in_background() -> None:
         try:
@@ -591,8 +596,8 @@ def _schedule_authoritative_notification(
                 update_recognition_execution_outcome,
                 session_factory,
                 raw_message_id=raw_message_id,
-                automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
-                automation_reason=payload.get("automation", {}).get("reason"),
+                automation_status=automation_status,
+                automation_reason=automation_reason,
                 notification_status="failed",
                 notification_error=type(exc).__name__,
             )
@@ -610,8 +615,8 @@ def _schedule_authoritative_notification(
                 update_recognition_execution_outcome,
                 session_factory,
                 raw_message_id=raw_message_id,
-                automation_status=str(payload.get("automation", {}).get("status") or "unknown"),
-                automation_reason=payload.get("automation", {}).get("reason"),
+                automation_status=automation_status,
+                automation_reason=automation_reason,
                 notification_status="sent",
             )
 

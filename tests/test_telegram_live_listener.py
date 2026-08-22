@@ -9,10 +9,15 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     MessageInstructionItem,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
     TradeSignal,
 )
 from telegram_kol_research.message_recognition import MessageRecognitionResult
+from telegram_kol_research.recognition_decisions import (
+    RecognitionDecisionRecord,
+    save_terminal_authoritative_decision,
+)
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_live_listener import (
     _schedule_authoritative_notification,
@@ -42,6 +47,10 @@ def test_authoritative_notification_failure_captures_independent_incident(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         lambda *args, **kwargs: outcome_updates.append(kwargs),
     )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.claim_authoritative_failure_notification",
+        lambda *args, **kwargs: True,
+    )
 
     async def scenario():
         async def failing_sender(**kwargs):
@@ -63,6 +72,141 @@ def test_authoritative_notification_failure_captures_independent_incident(
     assert captures[0]["source_record_id"] == "raw_message_41"
     assert captures[0]["error_type"] == "TimeoutError"
     assert outcome_updates[-1]["notification_error"] == "TimeoutError"
+
+
+def test_authoritative_notification_is_once_only_after_sent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "notification-once.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=123, message_id=41, text="BTC short")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload={},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[],
+            prompt_versions={"mimo": {}},
+        ),
+    )
+    deliveries = []
+
+    async def scenario():
+        async def sender(**kwargs):
+            deliveries.append(kwargs)
+
+        first = _schedule_authoritative_notification(
+            session_factory=session_factory,
+            raw_message_id=raw_id,
+            sender=sender,
+            config=object(),
+            payload={
+                "automation": {
+                    "status": "skipped",
+                    "reason": "mimo_authoritative_failed",
+                }
+            },
+        )
+        assert first is not None
+        await first
+        second = _schedule_authoritative_notification(
+            session_factory=session_factory,
+            raw_message_id=raw_id,
+            sender=sender,
+            config=object(),
+            payload={
+                "automation": {
+                    "status": "skipped",
+                    "reason": "mimo_authoritative_failed",
+                }
+            },
+        )
+        assert second is None
+
+    asyncio.run(scenario())
+
+    assert len(deliveries) == 1
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+    assert row.notification_status == "sent"
+
+
+def test_authoritative_notification_can_retry_after_send_failure(tmp_path):
+    session_factory = create_session_factory(tmp_path / "notification-retry.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=123, message_id=42, text="BTC short")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload={},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[],
+            prompt_versions={"mimo": {}},
+        ),
+    )
+    attempts = 0
+
+    async def scenario():
+        nonlocal attempts
+
+        async def sender(**_kwargs):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise TimeoutError("temporary delivery failure")
+
+        payload = {
+            "automation": {
+                "status": "skipped",
+                "reason": "mimo_authoritative_failed",
+            }
+        }
+        first = _schedule_authoritative_notification(
+            session_factory=session_factory,
+            raw_message_id=raw_id,
+            sender=sender,
+            config=object(),
+            payload=payload,
+        )
+        assert first is not None
+        await first
+        with session_factory() as session:
+            assert session.query(RecognitionDecision).one().notification_status == "failed"
+        second = _schedule_authoritative_notification(
+            session_factory=session_factory,
+            raw_message_id=raw_id,
+            sender=sender,
+            config=object(),
+            payload=payload,
+        )
+        assert second is not None
+        await second
+
+    asyncio.run(scenario())
+
+    assert attempts == 2
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+    assert row.notification_status == "sent"
+    assert row.notification_error is None
 
 
 class _FakeMessage:
@@ -556,6 +700,10 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         lambda *args, **kwargs: None,
     )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.claim_authoritative_failure_notification",
+        lambda *args, **kwargs: True,
+    )
 
     def authoritative_processor(raw_message_id):
         return SimpleNamespace(
@@ -744,6 +892,7 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
+    notification_claims: list[dict] = []
 
     def authoritative_processor(raw_message_id):
         return SimpleNamespace(
@@ -777,6 +926,10 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         record_audit,
     )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.claim_authoritative_failure_notification",
+        lambda *args, **kwargs: notification_claims.append(kwargs) or True,
+    )
 
     text = "移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情"
     async def scenario():
@@ -804,10 +957,9 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     assert len(sent) == 1
     assert sent[0]["payload"]["agreement_status"] == "authoritative_failed"
     assert sent[0]["payload"]["text"] == text
-    assert [row["notification_status"] for row in audit] == [
-        "scheduled",
-        "sent",
-    ]
+    assert len(notification_claims) == 1
+    assert notification_claims[0]["automation_reason"] == "mimo_authoritative_failed"
+    assert [row["notification_status"] for row in audit] == ["sent"]
 
 
 def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
@@ -821,6 +973,10 @@ def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
     monkeypatch.setattr(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.claim_authoritative_failure_notification",
+        lambda *args, **kwargs: True,
     )
 
     def authoritative_processor(raw_message_id):
