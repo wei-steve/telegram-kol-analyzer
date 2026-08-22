@@ -295,7 +295,19 @@ from telegram_kol_research.telegram_session_lock import (
 REFRESH_TIMEOUT_SECONDS = 180
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
+RUNTIME_ROLES = frozenset({"all", "ingest", "worker", "web"})
 logger = logging.getLogger(__name__)
+
+
+def resolve_runtime_role(value: str) -> str:
+    role = str(value or "").strip().lower()
+    if role not in RUNTIME_ROLES:
+        raise ValueError(f"unsupported runtime role: {value}")
+    return role
+
+
+def runtime_role_owns_telegram_session(value: str) -> bool:
+    return resolve_runtime_role(value) in {"all", "ingest"}
 
 
 async def _run_monitor_capture_writer(writer: Callable[[], int]) -> int:
@@ -4090,6 +4102,7 @@ async def _prepare_web_worker_command(
 
 def create_web_app(
     database_path: str | Path,
+    runtime_role: str = "all",
     media_root: str | Path | None = None,
     live_target_titles: set[str] | None = None,
     live_listener_runner=None,
@@ -4147,6 +4160,7 @@ def create_web_app(
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
+    resolved_runtime_role = resolve_runtime_role(runtime_role)
     resolved_database_path = Path(database_path)
     log_directory = resolved_database_path.parent / "logs"
     configure_application_logging(log_directory)
@@ -4643,6 +4657,7 @@ def create_web_app(
 
     app = FastAPI(title="Telegram KOL Research Web", lifespan=lifespan)
     app.state.database_path = Path(database_path)
+    app.state.runtime_role = resolved_runtime_role
     app.state.runtime_agent_production_audit_runner = (
         runtime_agent_production_audit_runner
         or (

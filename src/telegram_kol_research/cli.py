@@ -299,7 +299,11 @@ from telegram_kol_research.tpsl_ledger_backfill import (
     apply_tpsl_ledger_backfill_plan,
     build_tpsl_ledger_backfill_plan,
 )
-from telegram_kol_research.web_app import create_web_app
+from telegram_kol_research.web_app import (
+    create_web_app,
+    resolve_runtime_role,
+    runtime_role_owns_telegram_session,
+)
 
 app = typer.Typer(help="Telegram KOL win-rate research CLI.")
 deepcoin_contract_specs_app = typer.Typer(
@@ -5595,6 +5599,11 @@ def review(
 def web(
     host: str = "127.0.0.1",
     port: int = 8000,
+    runtime_role: str = typer.Option(
+        "all",
+        "--runtime-role",
+        envvar="TELEGRAM_KOL_RUNTIME_ROLE",
+    ),
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
     deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
@@ -5609,6 +5618,11 @@ def web(
     ),
 ) -> None:
     """Run the local web workbench."""
+
+    try:
+        runtime_role = resolve_runtime_role(runtime_role)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc), param_hint="--runtime-role") from exc
 
     try:
         import uvicorn
@@ -5655,34 +5669,40 @@ def web(
     live_listener_status_reason = None
     telegram_session_lock = None
     telegram_session_lock_entered = False
-    try:
-        auth_config = load_telegram_auth_config()
-        reap_stopped_session_lock_owner(
-            auth_config.session_path,
-            current_command="telegram-kol-research web",
-        )
-        telegram_session_lock = acquire_telegram_session_lock(auth_config.session_path)
-        telegram_session_lock.__enter__()
-        telegram_session_lock_entered = True
-        telegram_client = create_telegram_client(auth_config)
-    except TelegramSessionLockError as exc:
-        live_listener_status_reason = str(exc)
-        typer.echo(
-            f"Telegram live listener disabled: {exc}",
-            err=False,
-        )
-    except (ValueError, RuntimeError) as exc:
-        if telegram_session_lock_entered and telegram_session_lock is not None:
-            telegram_session_lock.__exit__(None, None, None)
-            telegram_session_lock_entered = False
-        live_listener_status_reason = "缺少 Telegram API 凭据或 Telethon 运行依赖"
-        typer.echo(
-            f"Telegram live listener disabled: {exc}",
-            err=False,
+    if runtime_role_owns_telegram_session(runtime_role):
+        try:
+            auth_config = load_telegram_auth_config()
+            reap_stopped_session_lock_owner(
+                auth_config.session_path,
+                current_command="telegram-kol-research web",
+            )
+            telegram_session_lock = acquire_telegram_session_lock(auth_config.session_path)
+            telegram_session_lock.__enter__()
+            telegram_session_lock_entered = True
+            telegram_client = create_telegram_client(auth_config)
+        except TelegramSessionLockError as exc:
+            live_listener_status_reason = str(exc)
+            typer.echo(
+                f"Telegram live listener disabled: {exc}",
+                err=False,
+            )
+        except (ValueError, RuntimeError) as exc:
+            if telegram_session_lock_entered and telegram_session_lock is not None:
+                telegram_session_lock.__exit__(None, None, None)
+                telegram_session_lock_entered = False
+            live_listener_status_reason = "缺少 Telegram API 凭据或 Telethon 运行依赖"
+            typer.echo(
+                f"Telegram live listener disabled: {exc}",
+                err=False,
+            )
+    else:
+        live_listener_status_reason = (
+            f"Telegram live listener is owned by the ingest runtime role, not {runtime_role}"
         )
 
     app_instance = create_web_app(
         database_path=database_path,
+        runtime_role=runtime_role,
         live_target_titles=live_target_titles,
         telegram_client=telegram_client,
         live_listener_status_reason=live_listener_status_reason,

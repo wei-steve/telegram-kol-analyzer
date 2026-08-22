@@ -81,7 +81,7 @@ groups:
 
     captured = {}
 
-    def fake_create_web_app(*, database_path, live_target_titles, media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
+    def fake_create_web_app(*, database_path, live_target_titles, runtime_role="all", media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
         captured["database_path"] = Path(database_path)
         captured["live_target_titles"] = set(live_target_titles)
         captured["telegram_client"] = telegram_client
@@ -366,7 +366,7 @@ groups:
     )
     captured = {}
 
-    def fake_create_web_app(*, database_path, live_target_titles, media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
+    def fake_create_web_app(*, database_path, live_target_titles, runtime_role="all", media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
         captured["telegram_client"] = telegram_client
         captured["live_listener_status_reason"] = live_listener_status_reason
         return object()
@@ -430,7 +430,7 @@ groups:
     )
     calls = []
 
-    def fake_create_web_app(*, database_path, live_target_titles, media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
+    def fake_create_web_app(*, database_path, live_target_titles, runtime_role="all", media_root=None, live_listener_runner=None, telegram_client=None, live_listener_status_reason=None, group_labels_by_title=None, now_provider=None, reconcile_runner=None, reconcile_interval_seconds=300, group_config=None, group_config_path=None, deepcoin_contract_spec_provider=None):
         return object()
 
     monkeypatch.setattr("telegram_kol_research.cli.create_web_app", fake_create_web_app, raising=False)
