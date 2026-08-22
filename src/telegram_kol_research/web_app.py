@@ -298,6 +298,29 @@ DEFAULT_INGEST_REFRESH_URL = "http://127.0.0.1:8001/api/refresh"
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 RUNTIME_ROLES = frozenset({"all", "ingest", "worker", "web"})
+RUNTIME_ROLE_SINGLETON_TASKS = {
+    "ingest": frozenset({"live_listener", "reconcile"}),
+    "worker": frozenset(
+        {
+            "authoritative_gap_recovery_loop",
+            "break_even_convergence_worker",
+            "contract_spec_refresh",
+            "deepcoin_reconcile",
+            "lifecycle_monitor",
+            "message_operation_supervisor",
+            "message_processing_worker",
+            "runtime_incident_notification",
+            "semantic_review",
+            "source_message_deletion_worker",
+            "strategy_management_notification",
+            "strategy_management_worker",
+            "system_operator_bot_command",
+            "telegram_bot_command",
+            "worker_command_worker",
+        }
+    ),
+    "web": frozenset({"position_snapshot_startup"}),
+}
 logger = logging.getLogger(__name__)
 
 
@@ -310,6 +333,22 @@ def resolve_runtime_role(value: str) -> str:
 
 def runtime_role_owns_telegram_session(value: str) -> bool:
     return resolve_runtime_role(value) in {"all", "ingest"}
+
+
+def runtime_role_singleton_tasks(value: str) -> set[str]:
+    role = resolve_runtime_role(value)
+    if role == "all":
+        return set().union(*RUNTIME_ROLE_SINGLETON_TASKS.values())
+    return set(RUNTIME_ROLE_SINGLETON_TASKS[role])
+
+
+def runtime_role_starts_singleton_task(value: str, task_name: str) -> bool:
+    return task_name in runtime_role_singleton_tasks(value)
+
+
+def runtime_role_starts_process_monitor(value: str, task_name: str) -> bool:
+    resolve_runtime_role(value)
+    return task_name == "loop_lag_monitor"
 
 
 def resolve_ingest_refresh_url(value: str) -> str:
@@ -4231,6 +4270,10 @@ def create_web_app(
                     _log_background_task_result("loop_lag_monitor_task")
                 )
             if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "contract_spec_refresh"
+                )
+                and
                 app.state.contract_spec_refresh_orchestrator is not None
                 and app.state.contract_spec_refresh_task is None
             ):
@@ -4241,6 +4284,10 @@ def create_web_app(
                     _log_background_task_result("contract_spec_refresh_task")
                 )
             if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "message_operation_supervisor"
+                )
+                and
                 app.state.message_operation_supervisor_config.enabled
                 and app.state.message_operation_supervisor_config.shadow_only
                 and app.state.message_operation_supervisor_policy_status == "valid"
@@ -4255,39 +4302,56 @@ def create_web_app(
                         "message_operation_supervisor_task"
                     )
                 )
-            if app.state.semantic_review_task is None:
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "semantic_review"
+                )
+                and app.state.semantic_review_task is None
+            ):
                 app.state.semantic_review_task = asyncio.create_task(
                     _supervise_semantic_review_runner(app)
                 )
                 app.state.semantic_review_task.add_done_callback(
                     _log_background_task_result("semantic_review_task")
                 )
-            # ── lifecycle monitor (no dependency on Telegram client) ──
-            app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
-            expiry_review_notifier = None
-            if isinstance(app.state.system_operator_bot_config, SystemOperatorBotConfig):
-                async def expiry_review_notifier(payload):
-                    group_labels = _group_label_by_chat_id(app.state.group_config)
-                    payload = dict(payload)
-                    payload["chat_title"] = group_labels.get(int(payload.get("chat_id") or 0))
-                    await send_pending_entry_expiry_review(
-                        config=app.state.system_operator_bot_config,
-                        payload=payload,
-                    )
-            app.state.lifecycle_monitor = LifecycleMonitor(
-                session_factory=app.state.session_factory,
-                broker=app.state.live_update_broker,
-                config=LifecycleMonitorConfig(),
-                http_client=app.state.lifecycle_monitor_http,
-                now_provider=app.state.now_provider,
-                expiry_review_notifier=expiry_review_notifier,
-                context_resolution_scheduler=app.state.context_resolution_scheduler,
-                context_resolution_worker=app.state.context_resolution_worker,
-            )
-            app.state.lifecycle_monitor_task = asyncio.create_task(
-                app.state.lifecycle_monitor.run_loop()
-            )
-            if app.state.authoritative_gap_recovery_loop_task is None:
+            if runtime_role_starts_singleton_task(
+                app.state.runtime_role, "lifecycle_monitor"
+            ):
+                # ── lifecycle monitor (no dependency on Telegram client) ──
+                app.state.lifecycle_monitor_http = httpx.AsyncClient(timeout=10.0)
+                expiry_review_notifier = None
+                if isinstance(
+                    app.state.system_operator_bot_config, SystemOperatorBotConfig
+                ):
+                    async def expiry_review_notifier(payload):
+                        group_labels = _group_label_by_chat_id(app.state.group_config)
+                        payload = dict(payload)
+                        payload["chat_title"] = group_labels.get(
+                            int(payload.get("chat_id") or 0)
+                        )
+                        await send_pending_entry_expiry_review(
+                            config=app.state.system_operator_bot_config,
+                            payload=payload,
+                        )
+                app.state.lifecycle_monitor = LifecycleMonitor(
+                    session_factory=app.state.session_factory,
+                    broker=app.state.live_update_broker,
+                    config=LifecycleMonitorConfig(),
+                    http_client=app.state.lifecycle_monitor_http,
+                    now_provider=app.state.now_provider,
+                    expiry_review_notifier=expiry_review_notifier,
+                    context_resolution_scheduler=app.state.context_resolution_scheduler,
+                    context_resolution_worker=app.state.context_resolution_worker,
+                )
+                app.state.lifecycle_monitor_task = asyncio.create_task(
+                    app.state.lifecycle_monitor.run_loop()
+                )
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "authoritative_gap_recovery_loop"
+                )
+                and app.state.authoritative_gap_recovery_loop_task is None
+            ):
                 app.state.authoritative_gap_recovery_loop_task = asyncio.create_task(
                     app.state.authoritative_gap_recovery_runner(
                         session_factory=app.state.session_factory,
@@ -4313,73 +4377,90 @@ def create_web_app(
                         "authoritative_gap_recovery_loop_task"
                     )
                 )
-            app.state.deepcoin_reconcile_task = asyncio.create_task(
-                _run_reconcile_after_startup_delay(
-                    runner=app.state.deepcoin_reconcile_runner,
-                    startup_delay_seconds=app.state.deepcoin_reconcile_startup_delay_seconds,
-                    session_factory=app.state.session_factory,
-                    deepcoin_client_factory=app.state.deepcoin_client_factory,
-                    interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
-                    now_provider=app.state.now_provider,
-                    system_operator_bot_config=app.state.notification_bot_config,
-                    terminal_entry_cleanup_bot_config=(
-                        app.state.system_operator_bot_config
-                    ),
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            if runtime_role_starts_singleton_task(
+                app.state.runtime_role, "deepcoin_reconcile"
+            ):
+                app.state.deepcoin_reconcile_task = asyncio.create_task(
+                    _run_reconcile_after_startup_delay(
+                        runner=app.state.deepcoin_reconcile_runner,
+                        startup_delay_seconds=app.state.deepcoin_reconcile_startup_delay_seconds,
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
+                        now_provider=app.state.now_provider,
+                        system_operator_bot_config=app.state.notification_bot_config,
+                        terminal_entry_cleanup_bot_config=(
+                            app.state.system_operator_bot_config
+                        ),
+                        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    )
                 )
-            )
-            app.state.strategy_management_worker_task = asyncio.create_task(
-                _run_reconcile_after_startup_delay(
-                    runner=app.state.strategy_management_worker_runner,
-                    startup_delay_seconds=app.state.strategy_management_worker_startup_delay_seconds,
-                    session_factory=app.state.session_factory,
-                    deepcoin_client_factory=app.state.deepcoin_client_factory,
-                    interval_seconds=app.state.strategy_management_worker_interval_seconds,
-                    max_batches=app.state.strategy_management_worker_max_batches,
-                    now_provider=app.state.now_provider,
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+            if runtime_role_starts_singleton_task(
+                app.state.runtime_role, "strategy_management_worker"
+            ):
+                app.state.strategy_management_worker_task = asyncio.create_task(
+                    _run_reconcile_after_startup_delay(
+                        runner=app.state.strategy_management_worker_runner,
+                        startup_delay_seconds=app.state.strategy_management_worker_startup_delay_seconds,
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        interval_seconds=app.state.strategy_management_worker_interval_seconds,
+                        max_batches=app.state.strategy_management_worker_max_batches,
+                        now_provider=app.state.now_provider,
+                        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    )
                 )
-            )
-            app.state.strategy_management_worker_task.add_done_callback(
-                _log_background_task_result("strategy_management_worker_task")
-            )
-            app.state.break_even_convergence_worker_task = asyncio.create_task(
-                _run_reconcile_after_startup_delay(
-                    runner=app.state.break_even_convergence_worker_runner,
-                    startup_delay_seconds=(
-                        app.state.break_even_convergence_worker_startup_delay_seconds
-                    ),
-                    session_factory=app.state.session_factory,
-                    deepcoin_client_factory=app.state.deepcoin_client_factory,
-                    interval_seconds=(
-                        app.state.break_even_convergence_worker_interval_seconds
-                    ),
-                    now_provider=app.state.now_provider,
+                app.state.strategy_management_worker_task.add_done_callback(
+                    _log_background_task_result("strategy_management_worker_task")
                 )
-            )
-            app.state.break_even_convergence_worker_task.add_done_callback(
-                _log_background_task_result(
-                    "break_even_convergence_worker_task"
+            if runtime_role_starts_singleton_task(
+                app.state.runtime_role, "break_even_convergence_worker"
+            ):
+                app.state.break_even_convergence_worker_task = asyncio.create_task(
+                    _run_reconcile_after_startup_delay(
+                        runner=app.state.break_even_convergence_worker_runner,
+                        startup_delay_seconds=(
+                            app.state.break_even_convergence_worker_startup_delay_seconds
+                        ),
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        interval_seconds=(
+                            app.state.break_even_convergence_worker_interval_seconds
+                        ),
+                        now_provider=app.state.now_provider,
+                    )
                 )
-            )
-            app.state.source_message_deletion_worker_task = asyncio.create_task(
-                app.state.source_message_deletion_worker_runner(
-                    session_factory=app.state.session_factory,
-                    deepcoin_client_factory=app.state.deepcoin_client_factory,
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
-                    interval_seconds=(
-                        app.state.source_message_deletion_worker_interval_seconds
-                    ),
-                    max_jobs=app.state.source_message_deletion_worker_max_jobs,
-                    now_provider=app.state.now_provider,
+                app.state.break_even_convergence_worker_task.add_done_callback(
+                    _log_background_task_result(
+                        "break_even_convergence_worker_task"
+                    )
                 )
-            )
-            app.state.source_message_deletion_worker_task.add_done_callback(
-                _log_background_task_result(
-                    "source_message_deletion_worker_task"
+            if runtime_role_starts_singleton_task(
+                app.state.runtime_role, "source_message_deletion_worker"
+            ):
+                app.state.source_message_deletion_worker_task = asyncio.create_task(
+                    app.state.source_message_deletion_worker_runner(
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                        interval_seconds=(
+                            app.state.source_message_deletion_worker_interval_seconds
+                        ),
+                        max_jobs=app.state.source_message_deletion_worker_max_jobs,
+                        now_provider=app.state.now_provider,
+                    )
                 )
-            )
-            if isinstance(app.state.strategy_alert_config, StrategyAlertConfig):
+                app.state.source_message_deletion_worker_task.add_done_callback(
+                    _log_background_task_result(
+                        "source_message_deletion_worker_task"
+                    )
+                )
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "telegram_bot_command"
+                )
+                and isinstance(app.state.strategy_alert_config, StrategyAlertConfig)
+            ):
                 app.state.telegram_bot_command_task = asyncio.create_task(
                     run_telegram_bot_command_loop(
                         config=app.state.strategy_alert_config,
@@ -4387,7 +4468,14 @@ def create_web_app(
                         group_config=app.state.group_config,
                     )
                 )
-            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "strategy_management_notification"
+                )
+                and isinstance(
+                    app.state.notification_bot_config, SystemOperatorBotConfig
+                )
+            ):
                 app.state.strategy_management_notification_task = asyncio.create_task(
                     run_strategy_management_notification_loop(
                         session_factory=app.state.session_factory,
@@ -4403,10 +4491,13 @@ def create_web_app(
                 SystemOperatorBotConfig,
             ):
                 if (
-                    app.state.runtime_incident_config
-                    .telegram_notifications_enabled
-                    or app.state.runtime_incident_config
-                    .message_operation_stage1_enabled
+                    runtime_role_starts_singleton_task(
+                        app.state.runtime_role, "runtime_incident_notification"
+                    )
+                    and (
+                        app.state.runtime_incident_config.telegram_notifications_enabled
+                        or app.state.runtime_incident_config.message_operation_stage1_enabled
+                    )
                 ):
                     app.state.runtime_incident_notification_task = (
                         asyncio.create_task(
@@ -4422,18 +4513,28 @@ def create_web_app(
                             "runtime_incident_notification_task"
                         )
                     )
-                app.state.system_operator_bot_command_task = asyncio.create_task(
-                    run_system_operator_bot_command_loop(
-                        config=app.state.system_operator_bot_config,
-                        session_factory=app.state.session_factory,
-                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                if runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "system_operator_bot_command"
+                ):
+                    app.state.system_operator_bot_command_task = asyncio.create_task(
+                        run_system_operator_bot_command_loop(
+                            config=app.state.system_operator_bot_config,
+                            session_factory=app.state.session_factory,
+                            deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        )
                     )
-                )
-                app.state.system_operator_bot_command_task.add_done_callback(
-                    _log_background_task_result("system_operator_bot_command_task")
-                )
+                    app.state.system_operator_bot_command_task.add_done_callback(
+                        _log_background_task_result(
+                            "system_operator_bot_command_task"
+                        )
+                    )
             await ensure_message_processing_worker_mode()
-            if app.state.worker_command_worker_task is None:
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "worker_command_worker"
+                )
+                and app.state.worker_command_worker_task is None
+            ):
                 app.state.worker_command_worker_task = asyncio.create_task(
                     app.state.worker_command_worker_runner(
                         session_factory=app.state.session_factory,
@@ -4447,7 +4548,13 @@ def create_web_app(
                     _log_background_task_result("worker_command_worker_task")
                 )
             if (
-                app.state.live_target_titles
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "live_listener"
+                )
+                and runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "reconcile"
+                )
+                and app.state.live_target_titles
                 and app.state.telegram_client is not None
                 and app.state.live_listener_task is None
             ):
@@ -4492,7 +4599,10 @@ def create_web_app(
                     )
                 )
             if (
-                app.state.live_position_snapshot_store.read() is None
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "position_snapshot_startup"
+                )
+                and app.state.live_position_snapshot_store.read() is None
                 and app.state.position_snapshot_startup_task is None
             ):
                 app.state.position_snapshot_startup_task = asyncio.create_task(
@@ -4976,6 +5086,9 @@ def create_web_app(
     )
     app.state.authoritative_gap_recovery_loop_task = None
     app.state.deepcoin_reconcile_task = None
+    app.state.lifecycle_monitor = None
+    app.state.lifecycle_monitor_http = None
+    app.state.lifecycle_monitor_task = None
     app.state.telegram_bot_command_task = None
     app.state.system_operator_bot_command_task = None
     app.state.strategy_management_notification_task = None
@@ -5015,6 +5128,10 @@ def create_web_app(
         return response
 
     async def ensure_message_processing_worker_mode() -> None:
+        if not runtime_role_starts_singleton_task(
+            app.state.runtime_role, "message_processing_worker"
+        ):
+            return
         mode = load_trading_settings(
             app.state.session_factory
         ).message_pipeline_mode
@@ -5092,6 +5209,15 @@ def create_web_app(
         )
 
     async def ensure_live_tasks_match_targets() -> None:
+        if not (
+            runtime_role_starts_singleton_task(
+                app.state.runtime_role, "live_listener"
+            )
+            and runtime_role_starts_singleton_task(
+                app.state.runtime_role, "reconcile"
+            )
+        ):
+            return
         if not app.state.live_target_titles:
             for task_name in ("live_listener_task", "reconcile_task"):
                 task = getattr(app.state, task_name)

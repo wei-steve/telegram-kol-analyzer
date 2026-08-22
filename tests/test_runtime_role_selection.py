@@ -6,6 +6,7 @@ import json
 import httpx
 import pytest
 from fastapi import HTTPException
+from fastapi.testclient import TestClient
 from typer.testing import CliRunner
 
 
@@ -54,6 +55,107 @@ def test_create_web_app_defaults_to_the_existing_all_role(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
 
     assert app.state.runtime_role == "all"
+
+
+def test_split_runtime_roles_partition_the_existing_singleton_task_set():
+    from telegram_kol_research import web_app
+
+    selector = getattr(web_app, "runtime_role_singleton_tasks", None)
+    assert selector is not None, "runtime task partition is not implemented"
+
+    all_tasks = selector("all")
+    split_tasks = {
+        role: selector(role)
+        for role in ("ingest", "worker", "web")
+    }
+
+    assert all(split_tasks[role] < all_tasks for role in split_tasks)
+    assert set.union(*split_tasks.values()) == all_tasks
+    assert split_tasks["ingest"].isdisjoint(split_tasks["worker"])
+    assert split_tasks["ingest"].isdisjoint(split_tasks["web"])
+    assert split_tasks["worker"].isdisjoint(split_tasks["web"])
+
+
+def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
+    from telegram_kol_research import web_app
+
+    selector = getattr(web_app, "runtime_role_singleton_tasks", None)
+    assert selector is not None, "runtime task partition is not implemented"
+
+    assert selector("ingest") == {"live_listener", "reconcile"}
+    assert selector("web") == {"position_snapshot_startup"}
+    assert selector("worker") == {
+        "authoritative_gap_recovery_loop",
+        "break_even_convergence_worker",
+        "contract_spec_refresh",
+        "deepcoin_reconcile",
+        "lifecycle_monitor",
+        "message_operation_supervisor",
+        "message_processing_worker",
+        "runtime_incident_notification",
+        "semantic_review",
+        "source_message_deletion_worker",
+        "strategy_management_notification",
+        "strategy_management_worker",
+        "system_operator_bot_command",
+        "telegram_bot_command",
+        "worker_command_worker",
+    }
+
+
+@pytest.mark.parametrize("role", ["all", "ingest", "worker", "web"])
+def test_loop_lag_monitor_is_process_local_instrumentation(role):
+    from telegram_kol_research import web_app
+
+    predicate = getattr(web_app, "runtime_role_starts_process_monitor", None)
+    assert predicate is not None, "process-local monitor selection is not implemented"
+    assert predicate(role, "loop_lag_monitor") is True
+
+
+@pytest.mark.parametrize("role", ["ingest", "web"])
+def test_non_worker_lifespans_do_not_start_worker_singletons(role, tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}.db",
+        runtime_role=role,
+    )
+
+    with TestClient(app):
+        assert app.state.lifecycle_monitor_task is None
+        assert app.state.authoritative_gap_recovery_loop_task is None
+        assert app.state.deepcoin_reconcile_task is None
+        assert app.state.strategy_management_worker_task is None
+        assert app.state.break_even_convergence_worker_task is None
+        assert app.state.source_message_deletion_worker_task is None
+        assert app.state.worker_command_worker_task is None
+        assert app.state.semantic_review_task is None
+
+
+@pytest.mark.parametrize("role", ["ingest", "worker"])
+def test_non_web_lifespans_do_not_start_web_singletons(role, tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}.db",
+        runtime_role=role,
+    )
+
+    with TestClient(app):
+        assert app.state.position_snapshot_startup_task is None
+
+
+@pytest.mark.parametrize("role", ["all", "ingest", "worker", "web"])
+def test_every_runtime_lifespan_starts_its_process_local_loop_monitor(role, tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}.db",
+        runtime_role=role,
+    )
+
+    with TestClient(app):
+        assert app.state.loop_lag_monitor_task is not None
 
 
 @pytest.mark.parametrize("role", ["web", "worker"])
