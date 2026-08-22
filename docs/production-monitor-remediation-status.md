@@ -6,8 +6,8 @@ This file is the canonical ownership and progress record for the production-moni
 workflow: production-monitor-remediation
 design_file: docs/plans/2026-08-21-production-monitor-remediation-design.md
 implementation_plan_file: docs/plans/2026-08-21-production-monitor-remediation.md
-phase_status: in_progress
-claimed_by: codex-monitor-remediation-20260822T020604Z
+phase_status: completed
+claimed_by: null
 scope: live-position projection, capture adapter contract, expected-HEAD deployment sync
 risk_level: L2
 message_lock_mode: global
@@ -61,11 +61,11 @@ monitor_cycles_observed: "2 (one non-notifying diagnostic and one scheduled cycl
 expected_head_verified: true
 adapter_failure_absent: true
 capture_writer_warning_absent: true
-queue_backlog_verified: false
+queue_backlog_verified: true
 duplicate_processing_verified: true
 loop_health_verified: true
 evidence_path: /var/lib/telegram-kol-monitor/evidence/production-monitor-remediation-20260822T051016Z.jsonl
-outstanding: "queue terminality gate: one frozen-window job remained nonterminal and current parity had stuck_pending_count=1 after a bounded drain; read-only logs isolated the retries to the out-of-scope DeepSeek HTTP 402 incident"
+outstanding: null
 ```
 
 Keep raw JSON, long logs, position rows, and detailed monitor output in a server-side evidence file. Do not place credentials, message contents, provider responses, or exchange payloads in this document.
