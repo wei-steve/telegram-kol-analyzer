@@ -128,6 +128,103 @@ class MessageProcessingJob(Base):
     )
 
 
+class WorkerCommandJob(Base):
+    """Durable worker-owned command crossing the Web exchange boundary."""
+
+    __tablename__ = "worker_command_jobs"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('pending', 'claimed', 'executing', 'succeeded', "
+            "'failed', 'uncertain')",
+            name="ck_worker_command_jobs_status",
+        ),
+        CheckConstraint(
+            "command_type IN ('sync_deepcoin_execution', "
+            "'close_bound_position', 'recovery_live_submit', "
+            "'process_next_trade_signal')",
+            name="ck_worker_command_jobs_command_type",
+        ),
+        CheckConstraint(
+            "attempt_count >= 0",
+            name="ck_worker_command_jobs_attempt_count",
+        ),
+        CheckConstraint(
+            "result_schema_version >= 1",
+            name="ck_worker_command_jobs_result_schema_version",
+        ),
+        CheckConstraint(
+            "http_status IS NULL OR (http_status >= 100 AND http_status <= 599)",
+            name="ck_worker_command_jobs_http_status",
+        ),
+        Index(
+            "uq_worker_command_jobs_command_id",
+            "command_id",
+            unique=True,
+        ),
+        Index(
+            "uq_worker_command_jobs_type_idempotency",
+            "command_type",
+            "idempotency_key",
+            unique=True,
+        ),
+        Index(
+            "ix_worker_command_jobs_claim_scan",
+            "status",
+            "lease_expires_at",
+            "created_at",
+        ),
+        Index(
+            "ix_worker_command_jobs_request_fingerprint",
+            "request_fingerprint",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    command_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default=lambda: str(uuid4())
+    )
+    command_type: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_json: Mapped[str] = mapped_column(Text, nullable=False)
+    request_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
+    idempotency_key: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="pending",
+        server_default=sql_text("'pending'"),
+    )
+    claim_token: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    claimed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    lease_expires_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    attempt_count: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=sql_text("'0'"),
+    )
+    side_effect_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    result_schema_version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        server_default=sql_text("'1'"),
+    )
+    http_status: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_code: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    error_summary: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    uncertain_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    reconciled_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+
+
 class TelegramSourceMessageEvent(Base):
     """Immutable evidence that Telegram reported a source-message event."""
 

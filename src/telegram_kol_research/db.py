@@ -26,6 +26,31 @@ MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL = (
     "uq_message_processing_jobs_raw_message_id "
     "ON message_processing_jobs (raw_message_id)"
 )
+WORKER_COMMAND_JOB_COMMAND_ID_INDEX_NAME = "uq_worker_command_jobs_command_id"
+WORKER_COMMAND_JOB_COMMAND_ID_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS uq_worker_command_jobs_command_id "
+    "ON worker_command_jobs (command_id)"
+)
+WORKER_COMMAND_JOB_IDEMPOTENCY_INDEX_NAME = (
+    "uq_worker_command_jobs_type_idempotency"
+)
+WORKER_COMMAND_JOB_IDEMPOTENCY_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "uq_worker_command_jobs_type_idempotency "
+    "ON worker_command_jobs (command_type, idempotency_key)"
+)
+WORKER_COMMAND_JOB_CLAIM_SCAN_INDEX_NAME = "ix_worker_command_jobs_claim_scan"
+WORKER_COMMAND_JOB_CLAIM_SCAN_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS ix_worker_command_jobs_claim_scan "
+    "ON worker_command_jobs (status, lease_expires_at, created_at)"
+)
+WORKER_COMMAND_JOB_FINGERPRINT_INDEX_NAME = (
+    "ix_worker_command_jobs_request_fingerprint"
+)
+WORKER_COMMAND_JOB_FINGERPRINT_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS ix_worker_command_jobs_request_fingerprint "
+    "ON worker_command_jobs (request_fingerprint)"
+)
 MANAGEMENT_BATCH_IDEMPOTENCY_INDEX_NAME = (
     "uq_strategy_management_batches_idempotency"
 )
@@ -489,6 +514,18 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
     MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_NAME: (
         MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL
+    ),
+    WORKER_COMMAND_JOB_COMMAND_ID_INDEX_NAME: (
+        WORKER_COMMAND_JOB_COMMAND_ID_INDEX_SQL
+    ),
+    WORKER_COMMAND_JOB_IDEMPOTENCY_INDEX_NAME: (
+        WORKER_COMMAND_JOB_IDEMPOTENCY_INDEX_SQL
+    ),
+    WORKER_COMMAND_JOB_CLAIM_SCAN_INDEX_NAME: (
+        WORKER_COMMAND_JOB_CLAIM_SCAN_INDEX_SQL
+    ),
+    WORKER_COMMAND_JOB_FINGERPRINT_INDEX_NAME: (
+        WORKER_COMMAND_JOB_FINGERPRINT_INDEX_SQL
     ),
     "ix_message_evidence_versions_mimo_recognition_run_id": (
         "CREATE INDEX IF NOT EXISTS "
