@@ -57,6 +57,7 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import MessageEvidenceVersion
 from telegram_kol_research.models import MessageProcessingJob
+from telegram_kol_research.models import WorkerCommandJob
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionTakeProfitOrder
@@ -6948,6 +6949,428 @@ def test_worker_command_route_error_contract_is_frozen(
 
     assert response.status_code == expected_status
     assert response.json() == {"detail": expected_detail}
+
+
+def test_worker_command_shadow_sync_records_terminal_parity_before_return(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def fake_sync(session_factory, *, client, synced_at):
+        calls.append((session_factory, client, synced_at))
+        return SimpleNamespace(
+            checked=7, manually_closed=2, skipped_without_pos_id=1
+        )
+
+    client = object()
+    monkeypatch.setattr(web_app_module, "sync_manual_closed_deepcoin_positions", fake_sync)
+    app = create_web_app(
+        database_path=tmp_path / "shadow-sync.db",
+        deepcoin_client_factory=lambda: client,
+        now_provider=lambda: datetime(2026, 8, 22, 10, 0),
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "shadow"})
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "checked": 7,
+        "manually_closed": 2,
+        "skipped_without_pos_id": 1,
+        "reconciled_active": 0,
+        "reconciled_open": 0,
+        "reconciled_stale": 0,
+    }
+    assert len(calls) == 1
+    with app.state.session_factory() as session:
+        job = session.query(WorkerCommandJob).one()
+    assert job.command_type == "sync_deepcoin_execution"
+    assert json.loads(job.request_json) == {}
+    assert job.status == "succeeded"
+    assert job.http_status == 200
+    assert json.loads(job.result_json) == response.json()
+    assert job.side_effect_started_at is not None
+    assert job.claim_token is None
+
+
+def test_worker_command_shadow_close_records_same_known_failure_once(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def fake_close(*_args, **_kwargs):
+        calls.append(True)
+        raise web_app_module.DeepcoinExecutionActionError("position conflict")
+
+    monkeypatch.setattr(web_app_module, "close_bound_position_market", fake_close)
+    app = create_web_app(
+        database_path=tmp_path / "shadow-close.db",
+        deepcoin_client_factory=object,
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "shadow"})
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position", json={"pos_id": "position-7"}
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {"detail": "position conflict"}
+    assert calls == [True]
+    with app.state.session_factory() as session:
+        job = session.query(WorkerCommandJob).one()
+    assert job.status == "failed"
+    assert job.http_status == 409
+    assert job.error_code == "DeepcoinExecutionActionError"
+    assert json.loads(job.result_json) == response.json()
+
+
+@pytest.mark.parametrize(
+    ("command_type", "path", "payload", "target", "domain_result", "http_result"),
+    [
+        (
+            "recovery_live_submit",
+            "/api/recovery-live-submit",
+            {"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
+            "submit_recovery_order_live",
+            {"submitted": True, "order_count": 2},
+            {"submitted": True, "order_count": 2},
+        ),
+        (
+            "process_next_trade_signal",
+            "/api/trade-signals/process-next",
+            None,
+            "process_next_trade_signal_live",
+            {"signal_id": 42},
+            {"processed": True, "result": {"signal_id": 42}},
+        ),
+    ],
+)
+def test_worker_command_shadow_records_recovery_and_process_next_parity(
+    tmp_path,
+    monkeypatch,
+    command_type,
+    path,
+    payload,
+    target,
+    domain_result,
+    http_result,
+):
+    calls = []
+
+    def fake_domain(*_args, **_kwargs):
+        calls.append(True)
+        return domain_result
+
+    monkeypatch.setattr(web_app_module, target, fake_domain)
+    app = create_web_app(
+        database_path=tmp_path / f"shadow-{command_type}.db",
+        deepcoin_client_factory=object,
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "shadow"})
+    client = TestClient(app)
+
+    response = client.post(path, json=payload) if payload is not None else client.post(path)
+
+    assert response.status_code == 200
+    assert response.json() == http_result
+    assert calls == [True]
+    with app.state.session_factory() as session:
+        job = session.query(WorkerCommandJob).one()
+    assert job.command_type == command_type
+    assert job.status == "succeeded"
+    assert json.loads(job.result_json) == http_result
+
+
+def test_worker_command_shadow_enqueue_failure_precedes_exchange_authority(
+    tmp_path, monkeypatch
+):
+    domain_calls = []
+
+    def fail_enqueue(*_args, **_kwargs):
+        raise RuntimeError("durable enqueue unavailable")
+
+    monkeypatch.setattr(
+        web_app_module,
+        "begin_shadow_worker_command",
+        fail_enqueue,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *_args, **_kwargs: domain_calls.append(True),
+    )
+    app = create_web_app(
+        database_path=tmp_path / "shadow-enqueue-failure.db",
+        deepcoin_client_factory=object,
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "shadow"})
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/execution/sync-deepcoin"
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"]["code"] == "worker_command_enqueue_failed"
+    assert domain_calls == []
+
+
+@pytest.mark.parametrize(
+    ("command_type", "path", "payload", "terminal_body"),
+    [
+        (
+            "sync_deepcoin_execution",
+            "/api/execution/sync-deepcoin",
+            None,
+            {
+                "checked": 7,
+                "manually_closed": 2,
+                "skipped_without_pos_id": 1,
+                "reconciled_active": 3,
+                "reconciled_open": 4,
+                "reconciled_stale": 5,
+            },
+        ),
+        (
+            "close_bound_position",
+            "/api/execution/close-bound-position",
+            {"pos_id": "position-7"},
+            {"submitted": True, "pos_id": "position-7"},
+        ),
+        (
+            "recovery_live_submit",
+            "/api/recovery-live-submit",
+            {"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
+            {"submitted": True, "order_count": 2},
+        ),
+        (
+            "process_next_trade_signal",
+            "/api/trade-signals/process-next",
+            None,
+            {"processed": True, "result": {"signal_id": 42}},
+        ),
+    ],
+)
+def test_worker_command_queue_routes_enqueue_wait_and_never_call_web_authority(
+    tmp_path,
+    monkeypatch,
+    command_type,
+    path,
+    payload,
+    terminal_body,
+):
+    enqueues = []
+
+    def fake_enqueue(session_factory, **kwargs):
+        enqueues.append((session_factory, kwargs))
+        return SimpleNamespace(command_id="command-7")
+
+    async def fake_wait(session_factory, **kwargs):
+        assert kwargs["command_id"] == "command-7"
+        return SimpleNamespace(
+            command_id="command-7",
+            status="succeeded",
+            http_status=200,
+            result=terminal_body,
+            error_code=None,
+            error_summary=None,
+        )
+
+    monkeypatch.setattr(web_app_module, "enqueue_worker_command", fake_enqueue, raising=False)
+    monkeypatch.setattr(
+        web_app_module,
+        "wait_for_worker_command_terminal",
+        fake_wait,
+        raising=False,
+    )
+    for target in (
+        "sync_manual_closed_deepcoin_positions",
+        "close_bound_position_market",
+        "submit_recovery_order_live",
+        "process_next_trade_signal_live",
+    ):
+        monkeypatch.setattr(
+            web_app_module,
+            target,
+            lambda *_args, _target=target, **_kwargs: pytest.fail(
+                f"Web authority called: {_target}"
+            ),
+        )
+    app = create_web_app(
+        database_path=tmp_path / f"queue-{command_type}.db",
+        deepcoin_client_factory=lambda: pytest.fail("Web client factory called"),
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
+    client = TestClient(app)
+    headers = {"Idempotency-Key": "action-7"}
+
+    response = (
+        client.post(path, json=payload, headers=headers)
+        if payload is not None
+        else client.post(path, headers=headers)
+    )
+
+    assert response.status_code == 200
+    assert response.json() == terminal_body
+    assert len(enqueues) == 1
+    assert enqueues[0][1]["command_type"] == command_type
+    assert enqueues[0][1]["idempotency_key"] == "action-7"
+
+
+def test_worker_command_wait_polls_off_thread_without_blocking_heartbeat(
+    tmp_path, monkeypatch
+):
+    polls = []
+
+    def slow_lookup(_session_factory, *, command_id):
+        time.sleep(0.03)
+        polls.append(command_id)
+        return SimpleNamespace(status="succeeded")
+
+    monkeypatch.setattr(web_app_module, "get_worker_command", slow_lookup)
+
+    async def scenario():
+        beats = 0
+
+        async def heartbeat():
+            nonlocal beats
+            while beats < 5:
+                beats += 1
+                await asyncio.sleep(0.003)
+
+        terminal, _ = await asyncio.gather(
+            web_app_module.wait_for_worker_command_terminal(
+                object(), command_id="command-7", timeout_seconds=0.2
+            ),
+            heartbeat(),
+        )
+        return terminal, beats
+
+    terminal, beats = asyncio.run(scenario())
+
+    assert terminal.status == "succeeded"
+    assert polls == ["command-7"]
+    assert beats == 5
+
+
+def test_worker_command_wait_timeout_keeps_live_command_id(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        web_app_module,
+        "get_worker_command",
+        lambda *_args, **_kwargs: SimpleNamespace(status="pending"),
+    )
+
+    with pytest.raises(web_app_module.HTTPException) as exc_info:
+        asyncio.run(
+            web_app_module.wait_for_worker_command_terminal(
+                object(),
+                command_id="command-live",
+                timeout_seconds=0.005,
+                poll_seconds=0.001,
+            )
+        )
+
+    assert exc_info.value.status_code == 504
+    assert exc_info.value.detail == {
+        "code": "worker_command_timeout",
+        "command_id": "command-live",
+    }
+
+
+@pytest.mark.parametrize(
+    ("status", "http_status", "result", "expected_status", "expected_detail"),
+    [
+        ("failed", 409, {"detail": "position conflict"}, 409, "position conflict"),
+        (
+            "uncertain",
+            None,
+            None,
+            503,
+            {"code": "worker_command_uncertain", "command_id": "command-7"},
+        ),
+    ],
+)
+def test_worker_command_queue_renders_terminal_error_contract(
+    tmp_path,
+    monkeypatch,
+    status,
+    http_status,
+    result,
+    expected_status,
+    expected_detail,
+):
+    monkeypatch.setattr(
+        web_app_module,
+        "enqueue_worker_command",
+        lambda *_args, **_kwargs: SimpleNamespace(command_id="command-7"),
+    )
+
+    async def fake_wait(*_args, **_kwargs):
+        return SimpleNamespace(
+            command_id="command-7",
+            status=status,
+            http_status=http_status,
+            result=result,
+            error_summary="worker failed",
+        )
+
+    monkeypatch.setattr(web_app_module, "wait_for_worker_command_terminal", fake_wait)
+    app = create_web_app(tmp_path / f"terminal-{status}.db")
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position", json={"pos_id": "position-7"}
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+
+
+def test_worker_command_queue_validates_before_enqueue(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        web_app_module,
+        "enqueue_worker_command",
+        lambda *_args, **_kwargs: pytest.fail("invalid request was enqueued"),
+    )
+    app = create_web_app(tmp_path / "validate-before-enqueue.db")
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position", json={"pos_id": "position-7", "x": 1}
+    )
+
+    assert response.status_code == 400
+    assert response.json() == {"detail": "only pos_id is accepted"}
+
+
+def test_worker_command_queue_idempotency_conflict_is_bounded(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.worker_command_jobs import (
+        WorkerCommandIdempotencyConflict,
+    )
+
+    def conflict(*_args, **_kwargs):
+        raise WorkerCommandIdempotencyConflict(command_id="original-command")
+
+    monkeypatch.setattr(web_app_module, "enqueue_worker_command", conflict)
+    app = create_web_app(tmp_path / "idempotency-conflict.db")
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position",
+        json={"pos_id": "position-7"},
+        headers={"Idempotency-Key": "action-7"},
+    )
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "code": "worker_command_idempotency_conflict",
+            "command_id": "original-command",
+        }
+    }
 
 
 def test_runtime_agent_exchange_snapshot_endpoint_is_bounded_and_redacted(

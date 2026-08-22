@@ -136,6 +136,75 @@ def test_keyless_requests_create_independent_commands(tmp_path):
     assert first.command_id != second.command_id
 
 
+def test_begin_shadow_command_commits_executing_before_authority(tmp_path):
+    from telegram_kol_research.worker_command_jobs import begin_shadow_worker_command
+
+    session_factory = create_session_factory(tmp_path / "shadow-begin.db")
+
+    admission = begin_shadow_worker_command(
+        session_factory,
+        command_type="close_bound_position",
+        request={"pos_id": "position-7"},
+        idempotency_key="action-7",
+        started_at=NOW,
+    )
+
+    assert admission.owner_claim is not None
+    assert admission.snapshot.status == "executing"
+    assert admission.owner_claim.command_id == admission.snapshot.command_id
+    with session_factory() as session:
+        row = session.query(WorkerCommandJob).one()
+    assert row.status == "executing"
+    assert row.side_effect_started_at == NOW.replace(tzinfo=None)
+    assert row.claim_token == admission.owner_claim.claim_token
+
+
+def test_begin_shadow_same_key_reattaches_without_second_owner(tmp_path):
+    from telegram_kol_research.worker_command_jobs import begin_shadow_worker_command
+
+    session_factory = create_session_factory(tmp_path / "shadow-reattach.db")
+    first = begin_shadow_worker_command(
+        session_factory,
+        command_type="recovery_live_submit",
+        request={"chat_id": 1, "message_id": 2, "symbol": "BTC", "side": "long"},
+        idempotency_key="action-7",
+        started_at=NOW,
+    )
+    replay = begin_shadow_worker_command(
+        session_factory,
+        command_type="recovery_live_submit",
+        request={"side": "long", "symbol": "BTC", "message_id": 2, "chat_id": 1},
+        idempotency_key="action-7",
+        started_at=NOW,
+    )
+
+    assert replay.snapshot.command_id == first.snapshot.command_id
+    assert replay.owner_claim is None
+    with session_factory() as session:
+        assert session.query(WorkerCommandJob).count() == 1
+
+
+def test_shadow_executing_command_is_never_claimed_by_queue_worker(tmp_path):
+    from telegram_kol_research.worker_command_jobs import (
+        begin_shadow_worker_command,
+        claim_worker_commands,
+    )
+
+    session_factory = create_session_factory(tmp_path / "shadow-not-claimable.db")
+    begin_shadow_worker_command(
+        session_factory,
+        command_type="sync_deepcoin_execution",
+        request={},
+        started_at=NOW,
+    )
+
+    assert claim_worker_commands(
+        session_factory,
+        claimed_at=NOW,
+        lease_for=timedelta(seconds=30),
+    ) == []
+
+
 @pytest.mark.parametrize(
     "request_payload",
     [

@@ -93,6 +93,86 @@ class WorkerCommandClaim:
     lease_expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class ShadowWorkerCommandAdmission:
+    snapshot: WorkerCommandSnapshot
+    owner_claim: WorkerCommandClaim | None
+
+
+def begin_shadow_worker_command(
+    session_factory,
+    *,
+    command_type: str,
+    request: dict[str, Any],
+    idempotency_key: str | None = None,
+    started_at: datetime | None = None,
+    lease_for: timedelta = timedelta(minutes=5),
+) -> ShadowWorkerCommandAdmission:
+    """Durably cross the shadow execution boundary before Web authority runs."""
+
+    canonical_json, fingerprint = canonical_worker_command_request(
+        command_type=command_type,
+        request=request,
+    )
+    normalized_key = _validated_idempotency_key(idempotency_key)
+    execution_time = _naive_utc(started_at or utc_now())
+    lease_expires_at = execution_time + timedelta(
+        seconds=max(1.0, float(lease_for.total_seconds()))
+    )
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        if normalized_key is not None:
+            existing = (
+                session.query(WorkerCommandJob)
+                .filter(
+                    WorkerCommandJob.command_type == command_type,
+                    WorkerCommandJob.idempotency_key == normalized_key,
+                )
+                .one_or_none()
+            )
+            if existing is not None:
+                if existing.request_fingerprint != fingerprint:
+                    command_id = str(existing.command_id)
+                    session.rollback()
+                    raise WorkerCommandIdempotencyConflict(command_id=command_id)
+                snapshot = _snapshot(existing)
+                session.commit()
+                return ShadowWorkerCommandAdmission(snapshot, None)
+
+        token = uuid4().hex
+        row = WorkerCommandJob(
+            command_id=uuid4().hex,
+            command_type=command_type,
+            request_json=canonical_json,
+            request_fingerprint=fingerprint,
+            idempotency_key=normalized_key,
+            status="executing",
+            claim_token=token,
+            claimed_at=execution_time,
+            lease_expires_at=lease_expires_at,
+            attempt_count=1,
+            side_effect_started_at=execution_time,
+            result_schema_version=RESULT_SCHEMA_VERSION,
+            created_at=execution_time,
+        )
+        session.add(row)
+        session.flush()
+        snapshot = _snapshot(row)
+        claim = WorkerCommandClaim(
+            job_id=int(row.id),
+            command_id=str(row.command_id),
+            command_type=command_type,
+            request=json.loads(canonical_json),
+            request_fingerprint=fingerprint,
+            attempt_count=1,
+            claim_token=token,
+            claimed_at=execution_time,
+            lease_expires_at=lease_expires_at,
+        )
+        session.commit()
+        return ShadowWorkerCommandAdmission(snapshot, claim)
+
+
 def enqueue_worker_command(
     session_factory,
     *,
