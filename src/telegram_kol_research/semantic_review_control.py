@@ -225,6 +225,9 @@ def apply_semantic_review_disable_plan(
     with session_factory() as session:
         try:
             session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+            database_identity = str(session.get_bind().url.database or "")
+            if database_identity != plan.database_identity:
+                raise SemanticReviewControlError("semantic review database drift detected")
             if _semantic_review_enabled_in_session(session):
                 raise SemanticReviewControlError("semantic review is enabled")
             running_count = (
@@ -238,7 +241,39 @@ def apply_semantic_review_disable_plan(
             cutoff = datetime.fromisoformat(plan.cutoff)
             current_targets = _current_targets(session, cutoff)
             if current_targets != plan.targets:
-                raise SemanticReviewControlError("semantic review target drift detected")
+                if current_targets:
+                    raise SemanticReviewControlError(
+                        "semantic review target drift detected"
+                    )
+                planned_ids = [target.raw_message_id for target in plan.targets]
+                applied_rows = (
+                    session.query(RecognitionDecision)
+                    .filter(RecognitionDecision.raw_message_id.in_(planned_ids))
+                    .order_by(RecognitionDecision.raw_message_id)
+                    .all()
+                    if planned_ids
+                    else []
+                )
+                if [row.raw_message_id for row in applied_rows] != planned_ids or any(
+                    row.comparison_status != "completed"
+                    or row.agreement_status != "review_disabled"
+                    or row.comparison_next_attempt_at is not None
+                    or row.comparison_started_at is not None
+                    or row.comparison_claim_token is not None
+                    for row in applied_rows
+                ):
+                    raise SemanticReviewControlError(
+                        "semantic review target drift detected"
+                    )
+                post_targets = tuple(_target_from_row(row) for row in applied_rows)
+                post_apply_sha = _fingerprint(
+                    [asdict(target) for target in post_targets]
+                )
+                session.commit()
+                return SemanticReviewApplyResult(
+                    changed_count=0,
+                    post_apply_sha=post_apply_sha,
+                )
 
             rows_by_raw_id = {
                 row.raw_message_id: row

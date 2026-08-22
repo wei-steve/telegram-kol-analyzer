@@ -261,6 +261,30 @@ def test_apply_preserves_audit_fields_and_fresh_plan_is_empty(tmp_path):
         cutoff=applied_at + timedelta(seconds=1),
     )
     assert fresh.targets == ()
+    repeated = control.apply_semantic_review_disable_plan(
+        session_factory,
+        plan,
+        expected_plan_sha=plan.plan_sha,
+        applied_at=applied_at + timedelta(minutes=1),
+    )
+    assert repeated.changed_count == 0
+    assert repeated.post_apply_sha == result.post_apply_sha
+
+
+def test_apply_refuses_plan_from_another_database(tmp_path):
+    first_factory = create_session_factory(tmp_path / "first.db")
+    second_factory = create_session_factory(tmp_path / "second.db")
+    _seed_decision(first_factory, message_id=1, comparison_status="pending")
+    _seed_decision(second_factory, message_id=1, comparison_status="pending")
+    plan = control.build_semantic_review_disable_plan(first_factory, cutoff=NOW)
+
+    with pytest.raises(control.SemanticReviewControlError, match="database"):
+        control.apply_semantic_review_disable_plan(
+            second_factory,
+            plan,
+            expected_plan_sha=plan.plan_sha,
+            applied_at=NOW + timedelta(minutes=1),
+        )
 
 
 def test_apply_detects_drift_and_rolls_back_all_targets(tmp_path):
