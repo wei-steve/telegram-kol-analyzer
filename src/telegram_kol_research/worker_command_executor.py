@@ -365,7 +365,7 @@ async def _execute_sync(
 ) -> WorkerCommandExecutionResult:
     effects_policy = _parse_sync_effects_policy(request)
     body = await asyncio.to_thread(
-        _run_sync_blocking,
+        run_sync_command_blocking,
         dependencies,
         effects_policy=effects_policy,
     )
@@ -395,7 +395,7 @@ async def _execute_sync(
     return WorkerCommandExecutionResult(http_status=200, body=body)
 
 
-def _run_sync_blocking(
+def run_sync_command_blocking(
     dependencies: WorkerCommandDependencies,
     *,
     effects_policy: str = SYNC_EFFECTS_FULL,

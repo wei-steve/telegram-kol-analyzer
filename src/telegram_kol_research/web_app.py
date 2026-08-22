@@ -240,8 +240,10 @@ from telegram_kol_research.worker_command_jobs import (
     settle_worker_command_succeeded,
 )
 from telegram_kol_research.worker_command_executor import (
+    SYNC_EFFECTS_RECONCILE_ONLY,
     WorkerCommandDependencies,
     require_worker_command_mode_transition_safe,
+    run_sync_command_blocking,
     supervise_worker_command_mode,
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
@@ -4058,6 +4060,32 @@ def _render_worker_command_terminal(snapshot):
     raise RuntimeError(f"non-terminal worker command status: {snapshot.status}")
 
 
+async def _resolve_sync_probe_request(
+    app: FastAPI,
+    http_request: Request,
+) -> dict[str, Any]:
+    probe_value = http_request.headers.get("X-Worker-Command-Probe")
+    if probe_value is None:
+        return {}
+    if probe_value != "reconcile-only" or await http_request.body():
+        raise HTTPException(
+            status_code=400,
+            detail={"code": "worker_command_probe_invalid"},
+        )
+    settings = await asyncio.to_thread(
+        load_trading_settings,
+        app.state.session_factory,
+    )
+    if settings.worker_command_mode != "shadow" or system_operator_bot_enabled(
+        app.state.notification_bot_config
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail={"code": "worker_command_probe_unavailable"},
+        )
+    return {"effects_policy": SYNC_EFFECTS_RECONCILE_ONLY}
+
+
 async def _prepare_web_worker_command(
     app: FastAPI,
     *,
@@ -7115,51 +7143,70 @@ def create_web_app(
 
     @app.post("/api/execution/sync-deepcoin")
     async def sync_deepcoin_execution_state(http_request: Request):
+        command_request = await _resolve_sync_probe_request(app, http_request)
         command_context = await _prepare_web_worker_command(
             app,
             command_type="sync_deepcoin_execution",
-            request={},
+            request=command_request,
             idempotency_key=http_request.headers.get("Idempotency-Key"),
         )
         if command_context.terminal_result is not None:
             return command_context.terminal_result
         try:
-            client = app.state.deepcoin_client_factory()
-            reconcile_result = (
-                reconcile_deepcoin_execution_bindings(
+            if command_request:
+                response_body = await asyncio.to_thread(
+                    run_sync_command_blocking,
+                    app.state.worker_command_dependencies,
+                    effects_policy=SYNC_EFFECTS_RECONCILE_ONLY,
+                )
+            else:
+                client = app.state.deepcoin_client_factory()
+                reconcile_result = (
+                    reconcile_deepcoin_execution_bindings(
+                        app.state.session_factory,
+                        client=client,
+                        recovered_at=app.state.now_provider(),
+                        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    )
+                    if hasattr(client, "list_open_orders")
+                    else None
+                )
+                result = sync_manual_closed_deepcoin_positions(
                     app.state.session_factory,
                     client=client,
-                    recovered_at=app.state.now_provider(),
-                    contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                    synced_at=app.state.now_provider(),
                 )
-                if hasattr(client, "list_open_orders")
-                else None
-            )
-            result = sync_manual_closed_deepcoin_positions(
-                app.state.session_factory,
-                client=client,
-                synced_at=app.state.now_provider(),
-            )
-            if isinstance(app.state.notification_bot_config, SystemOperatorBotConfig):
-                await deliver_pending_position_attribution_incidents(
-                    app.state.session_factory,
-                    config=app.state.notification_bot_config,
-                    delivered_at=app.state.now_provider(),
-                )
-                await deliver_pending_position_protection_incidents(
-                    app.state.session_factory,
-                    config=app.state.notification_bot_config,
-                    delivered_at=app.state.now_provider(),
-                )
-            if isinstance(
-                app.state.system_operator_bot_config,
-                SystemOperatorBotConfig,
-            ):
-                await deliver_terminal_entry_cleanup_notifications(
-                    app.state.session_factory,
-                    config=app.state.system_operator_bot_config,
-                    delivered_at=app.state.now_provider(),
-                )
+                if isinstance(
+                    app.state.notification_bot_config,
+                    SystemOperatorBotConfig,
+                ):
+                    await deliver_pending_position_attribution_incidents(
+                        app.state.session_factory,
+                        config=app.state.notification_bot_config,
+                        delivered_at=app.state.now_provider(),
+                    )
+                    await deliver_pending_position_protection_incidents(
+                        app.state.session_factory,
+                        config=app.state.notification_bot_config,
+                        delivered_at=app.state.now_provider(),
+                    )
+                if isinstance(
+                    app.state.system_operator_bot_config,
+                    SystemOperatorBotConfig,
+                ):
+                    await deliver_terminal_entry_cleanup_notifications(
+                        app.state.session_factory,
+                        config=app.state.system_operator_bot_config,
+                        delivered_at=app.state.now_provider(),
+                    )
+                response_body = {
+                    "checked": result.checked,
+                    "manually_closed": result.manually_closed,
+                    "skipped_without_pos_id": result.skipped_without_pos_id,
+                    "reconciled_active": reconcile_result.active if reconcile_result else 0,
+                    "reconciled_open": reconcile_result.open if reconcile_result else 0,
+                    "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
+                }
         except DeepcoinClientError as exc:
             response_error = HTTPException(status_code=502, detail=str(exc))
             await _settle_shadow_failure(
@@ -7173,14 +7220,6 @@ def create_web_app(
                 app, command_context, error=exc, response_error=response_error
             )
             raise response_error from exc
-        response_body = {
-            "checked": result.checked,
-            "manually_closed": result.manually_closed,
-            "skipped_without_pos_id": result.skipped_without_pos_id,
-            "reconciled_active": reconcile_result.active if reconcile_result else 0,
-            "reconciled_open": reconcile_result.open if reconcile_result else 0,
-            "reconciled_stale": reconcile_result.stale if reconcile_result else 0,
-        }
         await _settle_shadow_success(app, command_context, response_body)
         return response_body
 

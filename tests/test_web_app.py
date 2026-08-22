@@ -7039,6 +7039,131 @@ def test_worker_command_shadow_sync_records_terminal_parity_before_return(
     assert job.claim_token is None
 
 
+def test_worker_command_shadow_sync_probe_records_reconcile_only_parity(
+    tmp_path, monkeypatch
+):
+    calls = []
+    expected = {
+        "checked": 7,
+        "manually_closed": 2,
+        "skipped_without_pos_id": 1,
+        "reconciled_active": 3,
+        "reconciled_open": 4,
+        "reconciled_stale": 5,
+    }
+
+    def safe_sync(dependencies, *, effects_policy):
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            on_event_loop = False
+        else:
+            on_event_loop = True
+        calls.append((dependencies, effects_policy, on_event_loop))
+        return expected
+
+    def reject_full_sync(*_args, **_kwargs):
+        raise AssertionError("full sync must be unreachable for the probe")
+
+    monkeypatch.setattr(
+        web_app_module,
+        "run_sync_command_blocking",
+        safe_sync,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        reject_full_sync,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "shadow-sync-probe.db",
+        deepcoin_client_factory=object,
+        now_provider=lambda: datetime(2026, 8, 22, 10, 0),
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "shadow"})
+
+    response = TestClient(app, raise_server_exceptions=False).post(
+        "/api/execution/sync-deepcoin",
+        headers={
+            "X-Worker-Command-Probe": "reconcile-only",
+            "Idempotency-Key": "phase6a-safe-sync-probe-1",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert calls == [
+        (app.state.worker_command_dependencies, "reconcile_only", False),
+    ]
+    with app.state.session_factory() as session:
+        job = session.query(WorkerCommandJob).one()
+    assert job.command_type == "sync_deepcoin_execution"
+    assert json.loads(job.request_json) == {"effects_policy": "reconcile_only"}
+    assert job.status == "succeeded"
+    assert job.http_status == 200
+    assert json.loads(job.result_json) == expected
+    assert job.side_effect_started_at is not None
+    assert job.claim_token is None
+
+
+@pytest.mark.parametrize(
+    ("mode", "probe_value", "notification_enabled", "json_payload", "expected_status"),
+    [
+        ("shadow", "unknown", False, None, 400),
+        ("inline", "reconcile-only", False, None, 409),
+        ("queue", "reconcile-only", False, None, 409),
+        ("shadow", "reconcile-only", True, None, 409),
+        ("shadow", "reconcile-only", False, {}, 400),
+    ],
+)
+def test_worker_command_sync_probe_refuses_before_enqueue_or_exchange_access(
+    tmp_path,
+    monkeypatch,
+    mode,
+    probe_value,
+    notification_enabled,
+    json_payload,
+    expected_status,
+):
+    domain_calls = []
+
+    monkeypatch.setattr(
+        web_app_module,
+        "sync_manual_closed_deepcoin_positions",
+        lambda *_args, **_kwargs: domain_calls.append("full"),
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "run_sync_command_blocking",
+        lambda *_args, **_kwargs: domain_calls.append("probe"),
+        raising=False,
+    )
+    app = create_web_app(
+        database_path=tmp_path / f"sync-probe-refusal-{mode}.db",
+        deepcoin_client_factory=lambda: domain_calls.append("client") or object(),
+    )
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": mode})
+    if notification_enabled:
+        app.state.notification_bot_config = SystemOperatorBotConfig(
+            bot_token="token",
+            chat_id="notification-chat",
+        )
+    client = TestClient(app, raise_server_exceptions=False)
+    request_kwargs = {
+        "headers": {"X-Worker-Command-Probe": probe_value},
+    }
+    if json_payload is not None:
+        request_kwargs["json"] = json_payload
+
+    response = client.post("/api/execution/sync-deepcoin", **request_kwargs)
+
+    assert response.status_code == expected_status
+    assert domain_calls == []
+    with app.state.session_factory() as session:
+        assert session.query(WorkerCommandJob).count() == 0
+
+
 def test_worker_command_shadow_close_records_same_known_failure_once(
     tmp_path, monkeypatch
 ):
