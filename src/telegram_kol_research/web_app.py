@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import asdict, dataclass
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
@@ -3535,6 +3536,72 @@ def _position_size_label(position: dict[str, Any]) -> str | None:
     return f"{size} contracts {inst_id}".strip()
 
 
+def _monitor_live_position_timestamp(captured_at: datetime) -> str:
+    if not isinstance(captured_at, datetime) or captured_at.tzinfo is None:
+        raise ValueError("monitor capture timestamp must be timezone-aware")
+    return captured_at.astimezone(UTC).isoformat()
+
+
+def _incomplete_monitor_live_position_sizes(
+    captured_at: datetime,
+) -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "complete": False,
+        "captured_at": _monitor_live_position_timestamp(captured_at),
+        "positions": [],
+    }
+
+
+def _project_monitor_live_position_sizes(
+    rows: object,
+    *,
+    captured_at: datetime,
+    limit: int,
+) -> dict[str, Any]:
+    if not isinstance(rows, list) or len(rows) > limit:
+        raise ValueError("invalid monitor live-position rows")
+    positions: list[dict[str, str]] = []
+    seen_position_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            raise ValueError("invalid monitor live-position row")
+        raw_position_id = row.get("posId", row.get("pos_id", row.get("id")))
+        if not isinstance(raw_position_id, str):
+            raise ValueError("invalid monitor live-position identity")
+        position_id = raw_position_id.strip()
+        if not position_id or position_id in seen_position_ids:
+            raise ValueError("invalid monitor live-position identity")
+        raw_size = row.get("pos", row.get("size"))
+        if not isinstance(raw_size, str):
+            raise ValueError("invalid monitor live-position size")
+        size_source = raw_size.strip()
+        if not size_source or len(size_source) > 128:
+            raise ValueError("invalid monitor live-position size")
+        try:
+            size = Decimal(size_source)
+        except InvalidOperation as exc:
+            raise ValueError("invalid monitor live-position size") from exc
+        if not size.is_finite() or size < 0 or abs(size.adjusted()) > 64:
+            raise ValueError("invalid monitor live-position size")
+        size_text = "0" if size == 0 else format(size.normalize(), "f")
+        seen_position_ids.add(position_id)
+        positions.append({"pos_id": position_id, "size_text": size_text})
+    projection = {
+        "schema_version": 1,
+        "complete": True,
+        "captured_at": _monitor_live_position_timestamp(captured_at),
+        "positions": positions,
+    }
+    if len(
+        json.dumps(projection, ensure_ascii=False, separators=(",", ":")).encode(
+            "utf-8"
+        )
+    ) >= 32 * 1024:
+        raise ValueError("monitor live-position projection is oversized")
+    return projection
+
+
 def _extract_session_lock_owner_pid(reason: str | None) -> int | None:
     if not reason or "already in use" not in reason:
         return None
@@ -5186,6 +5253,31 @@ def create_web_app(
     def api_runtime_incidents_monitor_capture_health(request: Request):
         require_monitor_capture_auth(request)
         return {"available": True, "schema_version": 1}
+
+    @app.get("/api/runtime-incidents/live-position-sizes")
+    def api_runtime_incidents_live_position_sizes(request: Request):
+        require_monitor_capture_auth(request)
+        captured_at = app.state.now_provider()
+        client = None
+        try:
+            client = app.state.deepcoin_client_factory()
+            rows = client.list_positions()
+            projection = _project_monitor_live_position_sizes(
+                rows,
+                captured_at=captured_at,
+                limit=100,
+            )
+        except Exception:
+            logger.warning("Monitor live-position projection is unavailable")
+            projection = _incomplete_monitor_live_position_sizes(captured_at)
+        finally:
+            close_client = getattr(client, "close", None)
+            if callable(close_client):
+                try:
+                    close_client()
+                except Exception:
+                    logger.warning("Monitor live-position client cleanup failed")
+        return projection
 
     @app.get("/api/runtime-incidents/message-operation-coverage")
     def api_runtime_incidents_message_operation_coverage(request: Request):

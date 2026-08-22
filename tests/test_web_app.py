@@ -6920,6 +6920,209 @@ def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def test_monitor_live_position_sizes_requires_loopback_and_dedicated_token(
+    tmp_path,
+):
+    token = "m" * 43
+    factory_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_client_factory=lambda: factory_calls.append("called"),
+    )
+    path = "/api/runtime-incidents/live-position-sizes"
+
+    remote = TestClient(app, client=("198.51.100.8", 50000)).get(
+        path,
+        headers={"x-monitor-capture-token": token},
+    )
+    proxied = TestClient(app, client=("127.0.0.1", 50000)).get(
+        path,
+        headers={
+            "x-monitor-capture-token": token,
+            "x-forwarded-for": "198.51.100.8",
+        },
+    )
+    missing = TestClient(app, client=("127.0.0.1", 50000)).get(path)
+    incorrect = TestClient(app, client=("127.0.0.1", 50000)).get(
+        path,
+        headers={"x-monitor-capture-token": "x" * 43},
+    )
+
+    assert {
+        remote.status_code,
+        proxied.status_code,
+        missing.status_code,
+        incorrect.status_code,
+    } == {404}
+    assert factory_calls == []
+
+
+def test_monitor_live_position_sizes_returns_closed_normalized_projection(
+    tmp_path,
+):
+    token = "m" * 43
+    closed = []
+
+    class Client:
+        def list_positions(self):
+            return [
+                {"posId": "position-1", "pos": "0.2500", "instId": "secret"},
+                {"posId": "position-2", "pos": "1.0", "markPx": "secret"},
+            ]
+
+        def close(self):
+            closed.append("closed")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_client_factory=Client,
+        now_provider=lambda: datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/live-position-sizes",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "complete": True,
+        "captured_at": "2026-08-22T01:00:00+00:00",
+        "positions": [
+            {"pos_id": "position-1", "size_text": "0.25"},
+            {"pos_id": "position-2", "size_text": "1"},
+        ],
+    }
+    assert closed == ["closed"]
+    assert "secret" not in response.text
+
+
+def test_monitor_live_position_sizes_hides_provider_failure_and_closes_client(
+    tmp_path,
+):
+    token = "m" * 43
+    closed = []
+
+    class Client:
+        def list_positions(self):
+            raise RuntimeError("provider-secret-position")
+
+        def close(self):
+            closed.append("closed")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_client_factory=Client,
+        now_provider=lambda: datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/live-position-sizes",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "complete": False,
+        "captured_at": "2026-08-22T01:00:00+00:00",
+        "positions": [],
+    }
+    assert closed == ["closed"]
+    assert "provider-secret-position" not in response.text
+
+
+@pytest.mark.parametrize(
+    "positions",
+    [
+        [
+            {"posId": "position-1", "pos": "1"},
+            {"posId": "position-1", "pos": "2"},
+        ],
+        [{"posId": "", "pos": "1"}],
+        [{"pos": "1"}],
+        [{"posId": "position-1", "pos": "-1"}],
+        [{"posId": "position-1", "pos": "NaN"}],
+        [{"posId": "position-1", "pos": "Infinity"}],
+        [{"posId": "position-1", "pos": True}],
+        [{"posId": "position-1", "pos": "not-a-decimal"}],
+        [
+            {"posId": f"position-{index}", "pos": "1"}
+            for index in range(101)
+        ],
+    ],
+)
+def test_monitor_live_position_sizes_fails_closed_for_invalid_provider_rows(
+    tmp_path, positions
+):
+    token = "m" * 43
+
+    class Client:
+        def list_positions(self):
+            return positions
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_client_factory=Client,
+        now_provider=lambda: datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/live-position-sizes",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "complete": False,
+        "captured_at": "2026-08-22T01:00:00+00:00",
+        "positions": [],
+    }
+
+
+def test_monitor_live_position_sizes_hides_cleanup_failure(tmp_path):
+    token = "m" * 43
+
+    class Client:
+        def list_positions(self):
+            return [{"posId": "position-1", "pos": "1"}]
+
+        def close(self):
+            raise RuntimeError("cleanup-secret-position")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_client_factory=Client,
+        now_provider=lambda: datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/live-position-sizes",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["complete"] is True
+    assert "cleanup-secret-position" not in response.text
+
+
 def test_message_operation_coverage_health_is_loopback_authenticated_and_read_only(
     tmp_path,
 ):
