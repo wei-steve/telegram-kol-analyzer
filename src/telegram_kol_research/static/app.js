@@ -34,16 +34,17 @@ const EXCHANGE_POSITION_TAB_LABELS = {
   'position-history': '历史仓位',
 };
 
+let strategyRecordRequestId = 0;
+let strategyRecordHasPendingChanges = false;
+let lastSuccessfulStrategyRecordAt = null;
+let lastSuccessfulStrategyRecordSelection = null;
+
 function createWorkerCommandIdempotencyKey() {
   if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
     return crypto.randomUUID();
   }
   return `worker-command-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`.slice(0, 128);
 }
-let strategyRecordRequestId = 0;
-let strategyRecordHasPendingChanges = false;
-let lastSuccessfulStrategyRecordAt = null;
-let lastSuccessfulStrategyRecordSelection = null;
 
 const workbenchLoadState = {
   strategies: { key: null, promise: null },
