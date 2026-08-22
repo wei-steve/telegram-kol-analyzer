@@ -33,6 +33,13 @@ const EXCHANGE_POSITION_TAB_LABELS = {
   'order-history': '历史委托',
   'position-history': '历史仓位',
 };
+
+function createWorkerCommandIdempotencyKey() {
+  if (globalThis.crypto && typeof globalThis.crypto.randomUUID === 'function') {
+    return crypto.randomUUID();
+  }
+  return `worker-command-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`.slice(0, 128);
+}
 let strategyRecordRequestId = 0;
 let strategyRecordHasPendingChanges = false;
 let lastSuccessfulStrategyRecordAt = null;
@@ -755,7 +762,11 @@ function bindDetailPanelControls() {
       if (chatId) {
         setRecoveryStatus('正在扫描...');
         try {
-          await fetch('/api/execution/sync-deepcoin', { method: 'POST' });
+          const idempotencyKey = createWorkerCommandIdempotencyKey();
+          await fetch('/api/execution/sync-deepcoin', {
+            method: 'POST',
+            headers: { 'Idempotency-Key': idempotencyKey },
+          });
         } catch {
           // Keep the strategy panel refresh usable even when exchange sync is unavailable.
         }
@@ -839,12 +850,13 @@ function bindDetailPanelControls() {
       if (!window.confirm(`确认实盘提交 ${symbol} ${side} 策略？`)) {
         return;
       }
+      const idempotencyKey = createWorkerCommandIdempotencyKey();
       button.disabled = true;
       if (status) { status.textContent = '实盘提交中...'; status.classList.remove('is-error', 'is-ready'); }
       try {
         const response = await fetch('/api/recovery-live-submit', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
           body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side }),
         });
         const result = await response.json();
@@ -4540,6 +4552,7 @@ function bindBoundPositionCloseButtons() {
       if (!confirmed) {
         return;
       }
+      const idempotencyKey = createWorkerCommandIdempotencyKey();
       setMutationBusy(button, true);
       if (status) {
         status.textContent = '正在提交市价全平...';
@@ -4548,7 +4561,7 @@ function bindBoundPositionCloseButtons() {
       try {
         const response = await fetch('/api/execution/close-bound-position', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey },
           body: JSON.stringify({ pos_id: posId }),
         });
         const payload = await response.json().catch(() => ({}));
@@ -4626,7 +4639,11 @@ function bindDeepcoinPositionSync() {
       status.classList.remove('is-error');
     }
     try {
-      const response = await fetch('/api/execution/sync-deepcoin', { method: 'POST' });
+      const idempotencyKey = createWorkerCommandIdempotencyKey();
+      const response = await fetch('/api/execution/sync-deepcoin', {
+        method: 'POST',
+        headers: { 'Idempotency-Key': idempotencyKey },
+      });
       const payload = await response.json().catch(() => ({}));
       if (!response.ok) {
         throw new Error(payload.detail || 'sync failed');

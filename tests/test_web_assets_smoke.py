@@ -1,6 +1,7 @@
 import shutil
 import subprocess
 import textwrap
+import re
 
 import pytest
 from fastapi.testclient import TestClient
@@ -1264,7 +1265,8 @@ def test_app_js_strategy_refresh_syncs_deepcoin_before_reloading_panels(tmp_path
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "await fetch('/api/execution/sync-deepcoin', { method: 'POST' });" in response.text
+    assert "await fetch('/api/execution/sync-deepcoin', {" in response.text
+    assert "headers: { 'Idempotency-Key': idempotencyKey }" in response.text
     assert "await refreshStrategyPanels(chatId);" in response.text
 
 
@@ -2017,12 +2019,38 @@ def test_worker_command_first_party_route_contract_is_explicit(tmp_path):
 
     javascript = client.get("/static/app.js").text
 
-    assert "fetch('/api/execution/sync-deepcoin', { method: 'POST' })" in javascript
+    assert "fetch('/api/execution/sync-deepcoin'," in javascript
     assert "fetch('/api/execution/close-bound-position', {" in javascript
     assert "body: JSON.stringify({ pos_id: posId })" in javascript
     assert "fetch('/api/recovery-live-submit', {" in javascript
     assert "body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side })" in javascript
     assert "/api/trade-signals/process-next" not in javascript
+
+
+def test_worker_command_live_actions_send_stable_bounded_idempotency_keys(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    javascript = client.get("/static/app.js").text
+
+    assert "function createWorkerCommandIdempotencyKey()" in javascript
+    assert "crypto.randomUUID()" in javascript
+    assert "const idempotencyKey = createWorkerCommandIdempotencyKey();" in javascript
+    assert javascript.count("'Idempotency-Key': idempotencyKey") >= 4
+    assert "headers: { 'Content-Type': 'application/json', 'Idempotency-Key': idempotencyKey }" in javascript
+    assert "worker-command-${Date.now().toString(36)}-" in javascript
+
+
+def test_worker_command_dry_run_gate_has_no_live_idempotency_key(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    javascript = client.get("/static/app.js").text
+    gate_blocks = re.findall(
+        r"fetch\('/api/recovery-live-submit-gate',[\s\S]*?\n\s*}\);",
+        javascript,
+    )
+
+    assert gate_blocks
+    assert all("Idempotency-Key" not in block for block in gate_blocks)
 
 
 def test_live_action_confirmation_clears_stale_return_value_before_opening(tmp_path):
