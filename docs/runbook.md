@@ -124,6 +124,56 @@ Start the local browser UI:
 PYTHONPATH=src python -m telegram_kol_research.cli web --host 127.0.0.1 --port 8000
 ```
 
+## Phase 6 process-separation operations
+
+The normal production topology remains `telegram-kol.service` until the Phase 6
+cutover gate explicitly changes it. Installing the three unit files is not a
+cutover: after installation, prove the monolith is active and all split units
+are disabled and inactive.
+
+At cutover, first satisfy the Phase 6 safe-window, SQLite, Telegram-session,
+exchange-authority, and updater gates. Then stop and disable the monolith. Start
+and enable the split topology in this order so intake resumes last:
+
+```bash
+systemctl stop telegram-kol.service
+systemctl disable telegram-kol.service
+systemctl enable telegram-kol-worker.service telegram-kol-web.service \
+  telegram-kol-ingest.service
+systemctl start telegram-kol-worker.service
+systemctl start telegram-kol-web.service
+systemctl start telegram-kol-ingest.service
+```
+
+Fail closed if either topology is partly active, if any split unit is missing,
+or if worker/Web can reach the Telethon session. The required post-cutover
+checks are:
+
+- all three split units active and the monolith disabled/inactive;
+- only ingest holds the Telegram session lock;
+- a natural message is persisted/enqueued by ingest and processed once by
+  worker; management and all exchange writes originate only from worker;
+- the workbench and SSE operate through Web, including bounded refresh proxying;
+- each unit's loop-lag monitor is healthy, with no backlog growth, duplicate
+  processing, `SQLITE_BUSY`, or unexplained exchange history.
+
+Rollback requires no code change. Quiesce intake first, stop all split units,
+then enable and start the monolith:
+
+```bash
+systemctl stop telegram-kol-ingest.service
+systemctl stop telegram-kol-worker.service telegram-kol-web.service
+systemctl disable telegram-kol-ingest.service telegram-kol-worker.service \
+  telegram-kol-web.service
+systemctl enable telegram-kol.service
+systemctl start telegram-kol.service
+```
+
+After rollback, prove only `telegram-kol.service` is active, the Telegram lock
+has one owner, queue progress resumes, and no duplicate or unknown exchange
+write occurred. Do not delete the split units or role environment files during
+rollback; they are retained as reviewed recovery material.
+
 ## Exact backup-stop repair
 
 Second stops are conditional market-close orders bound to one split-position

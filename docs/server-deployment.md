@@ -41,6 +41,78 @@ systemctl restart telegram-kol.service
 
 Nginx proxies public port `80` to the local app on `127.0.0.1:8000`.
 
+### Three-process runtime topology
+
+Phase 6 keeps the existing `telegram-kol.service` as the default and rollback
+topology. The replacement topology is three loopback-only services:
+
+| Unit | Port | Runtime role | Exclusive authority |
+|---|---:|---|---|
+| `telegram-kol-ingest.service` | 8001 | `ingest` | Telethon session, intake, persistence, enqueue, reconcile |
+| `telegram-kol-worker.service` | 8002 | `worker` | durable workers and every Deepcoin mutation |
+| `telegram-kol-web.service` | 8000 | `web` | HTTP/SSE/workbench and read-only projections |
+
+The unit files are installed from `deploy/systemd/`, but installation and
+enablement are separate gates. Installing them must leave all three disabled
+while `telegram-kol.service` remains active. Nginx continues to target port
+8000; the Web process forwards `POST /api/refresh` once to the ingest process at
+`http://127.0.0.1:8001/api/refresh` and fails closed if the bounded response is
+unavailable or invalid.
+
+Create three non-login users and one shared database group before installing
+the units. The database directory and existing SQLite database, WAL, SHM, and
+journal files must remain group writable; new files use the units' `UMask=0007`.
+
+```bash
+groupadd --system telegram-kol-runtime
+useradd --system --no-create-home --shell /usr/sbin/nologin \
+  --gid telegram-kol-runtime telegram-kol-ingest
+useradd --system --no-create-home --shell /usr/sbin/nologin \
+  --gid telegram-kol-runtime telegram-kol-worker
+useradd --system --no-create-home --shell /usr/sbin/nologin \
+  --gid telegram-kol-runtime telegram-kol-web
+chgrp -R telegram-kol-runtime /opt/telegram-kol-analyzer/data
+chmod 0770 /opt/telegram-kol-analyzer/data
+find /opt/telegram-kol-analyzer/data -type d -exec chmod 0770 {} +
+find /opt/telegram-kol-analyzer/data -type f -exec chmod 0660 {} +
+```
+
+Provision three root-controlled environment files with mode `0640`, group each
+file only to its matching service user, and copy only the variables required by
+that role. Never copy the combined checkout secret files wholesale. In
+particular:
+
+- ingest receives the Telegram API ID/hash/session path and only the bot
+  credentials needed for intake/reconcile diagnostics; it receives no
+  `DEEPCOIN_API_*` variables;
+- worker receives the Deepcoin write credentials, worker notification/model
+  settings, and no Telegram API ID/hash/session path;
+- web receives no Telegram session values and either a separately permissioned
+  read-only Deepcoin key or no Deepcoin credentials.
+
+Every split unit blocks fallback reads of `.env` and the checkout's secret env
+files. Worker and Web additionally block the Telegram session plus its journal,
+WAL, and SHM files. Install without enabling:
+
+```bash
+install -o root -g root -m 0644 deploy/systemd/telegram-kol-ingest.service \
+  /etc/systemd/system/telegram-kol-ingest.service
+install -o root -g root -m 0644 deploy/systemd/telegram-kol-worker.service \
+  /etc/systemd/system/telegram-kol-worker.service
+install -o root -g root -m 0644 deploy/systemd/telegram-kol-web.service \
+  /etc/systemd/system/telegram-kol-web.service
+systemctl daemon-reload
+systemctl disable telegram-kol-ingest.service telegram-kol-worker.service \
+  telegram-kol-web.service
+systemctl is-active telegram-kol.service
+systemctl is-enabled telegram-kol-ingest.service telegram-kol-worker.service \
+  telegram-kol-web.service
+```
+
+Do not start a split unit while the monolith is active. The cutover and rollback
+orders are defined in the runbook and are executed only after the updater has
+proved both topologies while the monolith still owns production.
+
 ## Deepcoin contract-spec runtime configuration
 
 The Web process must use one explicit cache path and TTL consistently:

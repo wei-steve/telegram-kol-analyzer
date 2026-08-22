@@ -1,0 +1,53 @@
+[Unit]
+Description=Telegram KOL ingest runtime
+After=network-online.target telegram-kol-worker.service telegram-kol-web.service
+Wants=network-online.target
+ConditionPathExists=/etc/telegram-kol-ingest.env
+
+[Service]
+Type=simple
+User=telegram-kol-ingest
+Group=telegram-kol-runtime
+UMask=0007
+WorkingDirectory=/opt/telegram-kol-analyzer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/telegram-kol-ingest.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research web --runtime-role ingest --host 127.0.0.1 --port 8001 --database-path data/research.db --config-path config/groups.yaml --deepcoin-contract-specs-path config/deepcoin_contract_specs.yaml
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/opt/telegram-kol-analyzer/data
+InaccessiblePaths=-/opt/telegram-kol-analyzer/.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/telegram.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/llm.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+
+[Install]
+WantedBy=multi-user.target

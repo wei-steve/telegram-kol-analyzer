@@ -1,0 +1,57 @@
+[Unit]
+Description=Telegram KOL worker runtime
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/telegram-kol-worker.env
+
+[Service]
+Type=simple
+User=telegram-kol-worker
+Group=telegram-kol-runtime
+UMask=0007
+WorkingDirectory=/opt/telegram-kol-analyzer
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=/etc/telegram-kol-worker.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research web --runtime-role worker --host 127.0.0.1 --port 8002 --database-path data/research.db --config-path config/groups.yaml --deepcoin-contract-specs-path config/deepcoin_contract_specs.yaml
+Restart=on-failure
+RestartSec=5
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/opt/telegram-kol-analyzer/data
+InaccessiblePaths=-/opt/telegram-kol-analyzer/.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/telegram.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/llm.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-journal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-wal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-shm
+
+[Install]
+WantedBy=multi-user.target

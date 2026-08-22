@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from pathlib import Path
 
 import httpx
 import pytest
@@ -156,6 +157,80 @@ def test_every_runtime_lifespan_starts_its_process_local_loop_monitor(role, tmp_
 
     with TestClient(app):
         assert app.state.loop_lag_monitor_task is not None
+
+
+def _runtime_unit_text(role: str) -> str:
+    repository_root = Path(__file__).resolve().parents[1]
+    return (
+        repository_root / "deploy" / "systemd" / f"telegram-kol-{role}.service"
+    ).read_text(encoding="utf-8")
+
+
+@pytest.mark.parametrize(
+    ("role", "port"),
+    [("ingest", 8001), ("worker", 8002), ("web", 8000)],
+)
+def test_split_runtime_units_select_one_role_and_one_loopback_port(role, port):
+    unit = _runtime_unit_text(role)
+
+    assert f"User=telegram-kol-{role}" in unit
+    assert "Group=telegram-kol-runtime" in unit
+    assert f"EnvironmentFile=/etc/telegram-kol-{role}.env" in unit
+    assert f"--runtime-role {role}" in unit
+    assert f"--host 127.0.0.1 --port {port}" in unit
+    assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in unit
+
+
+@pytest.mark.parametrize("role", ["ingest", "worker", "web"])
+def test_split_runtime_units_preserve_the_proven_hardening_baseline(role):
+    unit = _runtime_unit_text(role)
+
+    for directive in (
+        "AmbientCapabilities=",
+        "CapabilityBoundingSet=",
+        "LockPersonality=true",
+        "MemoryDenyWriteExecute=true",
+        "NoNewPrivileges=true",
+        "PrivateDevices=true",
+        "PrivateMounts=true",
+        "PrivateTmp=true",
+        "ProtectSystem=strict",
+        "RestrictNamespaces=true",
+        "RestrictSUIDSGID=true",
+        "SystemCallFilter=@system-service",
+        "SystemCallFilter=~@mount @privileged",
+        "ReadOnlyPaths=/opt/telegram-kol-analyzer",
+    ):
+        assert directive in unit
+
+
+@pytest.mark.parametrize("role", ["worker", "web"])
+def test_only_ingest_unit_can_reach_telegram_session_files(role):
+    unit = _runtime_unit_text(role)
+
+    for suffix in ("", "-journal", "-wal", "-shm"):
+        assert (
+            "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session"
+            f"{suffix}"
+        ) in unit
+
+    assert "telegram.session" not in _runtime_unit_text("ingest")
+
+
+@pytest.mark.parametrize("role", ["ingest", "worker", "web"])
+def test_split_units_cannot_fall_back_to_shared_checkout_secret_files(role):
+    unit = _runtime_unit_text(role)
+
+    for secret_path in (
+        ".env",
+        "config/telegram.env",
+        "config/system_operator_bot.env",
+        "config/llm.env",
+        "config/runtime_incident_agent.env",
+    ):
+        assert (
+            f"InaccessiblePaths=-/opt/telegram-kol-analyzer/{secret_path}" in unit
+        )
 
 
 @pytest.mark.parametrize("role", ["web", "worker"])
