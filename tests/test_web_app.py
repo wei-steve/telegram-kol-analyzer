@@ -6567,6 +6567,367 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path):
     assert "tpTriggerPx" not in fake_client.trigger_payloads[0]
 
 
+def test_worker_command_sync_route_contract_freezes_result_arguments_and_notifications(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 8, 22, 7, 0)
+    client = object()
+    calls = []
+
+    def fake_sync(session_factory, *, client, synced_at):
+        calls.append(("sync", session_factory, client, synced_at))
+        return SimpleNamespace(
+            checked=7,
+            manually_closed=2,
+            skipped_without_pos_id=3,
+        )
+
+    async def fake_attribution(
+        session_factory, *, config, delivered_at, **_kwargs
+    ):
+        calls.append(("attribution", session_factory, config.chat_id, delivered_at))
+        return 1
+
+    async def fake_protection(
+        session_factory, *, config, delivered_at, **_kwargs
+    ):
+        calls.append(("protection", session_factory, config.chat_id, delivered_at))
+        return 1
+
+    async def fake_cleanup(session_factory, *, config, delivered_at, **_kwargs):
+        calls.append(("cleanup", session_factory, config.chat_id, delivered_at))
+        return 1
+
+    monkeypatch.setattr(web_app_module, "sync_manual_closed_deepcoin_positions", fake_sync)
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_pending_position_attribution_incidents",
+        fake_attribution,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_pending_position_protection_incidents",
+        fake_protection,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_terminal_entry_cleanup_notifications",
+        fake_cleanup,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: client,
+        now_provider=lambda: now,
+    )
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="token", chat_id="notification-chat"
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="token", chat_id="operator-chat"
+    )
+
+    response = TestClient(app).post("/api/execution/sync-deepcoin")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "checked": 7,
+        "manually_closed": 2,
+        "skipped_without_pos_id": 3,
+        "reconciled_active": 0,
+        "reconciled_open": 0,
+        "reconciled_stale": 0,
+    }
+    assert [call[0] for call in calls] == [
+        "sync",
+        "attribution",
+        "protection",
+        "cleanup",
+    ]
+    assert calls[0][1:] == (app.state.session_factory, client, now)
+    assert calls[1][1:] == (
+        app.state.session_factory,
+        "notification-chat",
+        now,
+    )
+    assert calls[2][1:] == (
+        app.state.session_factory,
+        "notification-chat",
+        now,
+    )
+    assert calls[3][1:] == (app.state.session_factory, "operator-chat", now)
+
+
+def test_worker_command_close_route_contract_freezes_payload_result_and_order(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 8, 22, 7, 1)
+    client = object()
+    calls = []
+    expected = {"submitted": True, "pos_id": "position-7", "order_id": "close-9"}
+
+    def fake_close(
+        session_factory, *, pos_id, deepcoin_client, executed_at
+    ):
+        calls.append(
+            ("close", session_factory, pos_id, deepcoin_client, executed_at)
+        )
+        return expected
+
+    async def fake_cleanup(session_factory, *, config, delivered_at, **_kwargs):
+        calls.append(("cleanup", session_factory, config.chat_id, delivered_at))
+        return 1
+
+    monkeypatch.setattr(web_app_module, "close_bound_position_market", fake_close)
+    monkeypatch.setattr(
+        web_app_module,
+        "deliver_terminal_entry_cleanup_notifications",
+        fake_cleanup,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: client,
+        now_provider=lambda: now,
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="token", chat_id="operator-chat"
+    )
+
+    response = TestClient(app).post(
+        "/api/execution/close-bound-position", json={"pos_id": " position-7 "}
+    )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert calls == [
+        ("close", app.state.session_factory, "position-7", client, now),
+        ("cleanup", app.state.session_factory, "operator-chat", now),
+    ]
+
+
+def test_worker_command_recovery_route_contract_freezes_arguments_and_result(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 8, 22, 7, 2)
+    client = object()
+    calls = []
+    expected = {"submitted": True, "order_count": 2, "signal_id": 41}
+
+    def fake_submit(session_factory, **kwargs):
+        calls.append((session_factory, kwargs))
+        return expected
+
+    monkeypatch.setattr(web_app_module, "submit_recovery_order_live", fake_submit)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: client,
+        now_provider=lambda: now,
+    )
+
+    response = TestClient(app).post(
+        "/api/recovery-live-submit",
+        json={"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert calls == [
+        (
+            app.state.session_factory,
+            {
+                "chat_id": 100,
+                "message_id": 55,
+                "symbol": "BTC",
+                "side": "long",
+                "deepcoin_client": client,
+                "contract_spec_provider": app.state.deepcoin_contract_spec_provider,
+                "submitted_at": now,
+            },
+        )
+    ]
+
+
+def test_worker_command_process_next_route_contract_freezes_arguments_and_result(
+    tmp_path, monkeypatch
+):
+    now = datetime(2026, 8, 22, 7, 3)
+    client_factory = object()
+    calls = []
+    expected = {"signal_id": 42, "submitted": True}
+
+    def fake_process(session_factory, **kwargs):
+        calls.append((session_factory, kwargs))
+        return expected
+
+    monkeypatch.setattr(web_app_module, "process_next_trade_signal_live", fake_process)
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: None,
+        now_provider=lambda: now,
+    )
+    app.state.deepcoin_client_factory = client_factory
+
+    response = TestClient(app).post("/api/trade-signals/process-next")
+
+    assert response.status_code == 200
+    assert response.json() == {"processed": True, "result": expected}
+    assert calls == [
+        (
+            app.state.session_factory,
+            {
+                "deepcoin_client_factory": client_factory,
+                "contract_spec_provider": app.state.deepcoin_contract_spec_provider,
+                "processed_at": now,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("path", "payload", "expected_status", "expected_detail"),
+    [
+        (
+            "/api/execution/close-bound-position",
+            {"pos_id": "", "extra": "forbidden"},
+            400,
+            "only pos_id is accepted",
+        ),
+        (
+            "/api/execution/close-bound-position",
+            {"pos_id": ""},
+            400,
+            "pos_id is required",
+        ),
+        (
+            "/api/recovery-live-submit",
+            {"chat_id": 100, "message_id": 55, "symbol": "", "side": "long"},
+            422,
+            "missing required fields: symbol",
+        ),
+    ],
+)
+def test_worker_command_route_validation_contract_precedes_exchange_factory(
+    tmp_path, path, payload, expected_status, expected_detail
+):
+    factory_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        deepcoin_client_factory=lambda: factory_calls.append(True),
+    )
+
+    response = TestClient(app).post(path, json=payload)
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+    assert factory_calls == []
+
+
+@pytest.mark.parametrize(
+    ("target", "path", "payload", "error", "expected_status", "expected_detail"),
+    [
+        (
+            "sync_manual_closed_deepcoin_positions",
+            "/api/execution/sync-deepcoin",
+            None,
+            web_app_module.DeepcoinClientError("sync unavailable"),
+            502,
+            "sync unavailable",
+        ),
+        (
+            "sync_manual_closed_deepcoin_positions",
+            "/api/execution/sync-deepcoin",
+            None,
+            RuntimeError("sync internal"),
+            500,
+            "sync internal",
+        ),
+        (
+            "close_bound_position_market",
+            "/api/execution/close-bound-position",
+            {"pos_id": "position-7"},
+            web_app_module.DeepcoinExecutionActionError("position conflict"),
+            409,
+            "position conflict",
+        ),
+        (
+            "close_bound_position_market",
+            "/api/execution/close-bound-position",
+            {"pos_id": "position-7"},
+            web_app_module.DeepcoinClientError("close unavailable"),
+            502,
+            "close unavailable",
+        ),
+        (
+            "close_bound_position_market",
+            "/api/execution/close-bound-position",
+            {"pos_id": "position-7"},
+            RuntimeError("must stay hidden"),
+            500,
+            "bound position close failed",
+        ),
+        (
+            "submit_recovery_order_live",
+            "/api/recovery-live-submit",
+            {"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
+            web_app_module.RecoveryLiveSubmitError("recovery conflict"),
+            409,
+            "recovery conflict",
+        ),
+        (
+            "submit_recovery_order_live",
+            "/api/recovery-live-submit",
+            {"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
+            ValueError("invalid recovery"),
+            422,
+            "invalid recovery",
+        ),
+        (
+            "process_next_trade_signal_live",
+            "/api/trade-signals/process-next",
+            None,
+            web_app_module.RecoveryLiveSubmitError("signal conflict"),
+            409,
+            "signal conflict",
+        ),
+        (
+            "process_next_trade_signal_live",
+            "/api/trade-signals/process-next",
+            None,
+            web_app_module.DeepcoinClientError("signal unavailable"),
+            502,
+            "signal unavailable",
+        ),
+    ],
+)
+def test_worker_command_route_error_contract_is_frozen(
+    tmp_path,
+    monkeypatch,
+    target,
+    path,
+    payload,
+    error,
+    expected_status,
+    expected_detail,
+):
+    def raise_error(*_args, **_kwargs):
+        raise error
+
+    monkeypatch.setattr(web_app_module, target, raise_error)
+    app = create_web_app(
+        database_path=tmp_path / f"{target}.db",
+        deepcoin_client_factory=object,
+    )
+    client = TestClient(app, raise_server_exceptions=False)
+
+    response = (
+        client.post(path, json=payload)
+        if payload is not None
+        else client.post(path)
+    )
+
+    assert response.status_code == expected_status
+    assert response.json() == {"detail": expected_detail}
+
+
 def test_runtime_agent_exchange_snapshot_endpoint_is_bounded_and_redacted(
     tmp_path,
 ):

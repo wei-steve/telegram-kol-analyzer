@@ -2012,6 +2012,19 @@ def test_bound_position_close_app_js_binds_confirmed_exact_market_close(tmp_path
     assert "bindBoundPositionCloseButtons();" in response.text
 
 
+def test_worker_command_first_party_route_contract_is_explicit(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+
+    javascript = client.get("/static/app.js").text
+
+    assert "fetch('/api/execution/sync-deepcoin', { method: 'POST' })" in javascript
+    assert "fetch('/api/execution/close-bound-position', {" in javascript
+    assert "body: JSON.stringify({ pos_id: posId })" in javascript
+    assert "fetch('/api/recovery-live-submit', {" in javascript
+    assert "body: JSON.stringify({ chat_id: chatId, message_id: messageId, symbol, side })" in javascript
+    assert "/api/trade-signals/process-next" not in javascript
+
+
 def test_live_action_confirmation_clears_stale_return_value_before_opening(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
