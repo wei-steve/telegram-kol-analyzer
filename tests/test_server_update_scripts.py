@@ -110,6 +110,30 @@ def test_server_updater_runs_two_active_checks_before_checkout_and_install():
     )
 
 
+def test_server_updater_transactions_monitor_expected_head_and_timer_state():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    monitor_stop = script.index("stop_monitor_for_deployment")
+    application_stop = script.index("\nstop_writer_service\n", monitor_stop)
+    previous_pin = script.index(
+        'sync_monitor_expected_head "$previous_commit"', monitor_stop
+    )
+    checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
+    health = script.index("if ! verify_http_health", checkout)
+    candidate_pin = script.index(
+        'sync_monitor_expected_head "$EXPECTED_COMMIT"', health
+    )
+    restore = script.index("restore_monitor_timer_state", candidate_pin)
+
+    assert monitor_stop < previous_pin < application_stop < checkout
+    assert checkout < health < candidate_pin < restore
+    assert 'MONITOR_TIMER="telegram-kol-monitor.timer"' in script
+    assert 'MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"' in script
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" in script
+    assert "git reset" not in script
+    assert "git push" not in script
+
+
 def test_server_updater_detects_schema_changes_only_by_git_paths():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 

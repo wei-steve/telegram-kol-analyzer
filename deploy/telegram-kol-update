@@ -10,6 +10,21 @@ STOP_TIMEOUT_SECONDS="${STOP_TIMEOUT_SECONDS:-30}"
 UPDATER_PATH="${UPDATER_PATH:-/usr/local/bin/telegram-kol-update}"
 LOCK_PATH="${LOCK_PATH:-/run/telegram-kol-update.lock}"
 STAGE_PARENT="${STAGE_PARENT:-/run}"
+monitor_env_override="${MONITOR_ENV_FILE:-}"
+MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"
+MONITOR_TIMER="telegram-kol-monitor.timer"
+MONITOR_ONESHOT_UNITS=(
+  "telegram-kol-monitor.service"
+  "telegram-kol-monitor-diagnostic.service"
+)
+if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
+  if [ "$APP_DIR" = "/opt/telegram-kol-analyzer" ] || [ -z "$monitor_env_override" ]; then
+    echo "Updater test-mode path override is invalid." >&2
+    exit 4
+  fi
+  MONITOR_ENV_FILE="$monitor_env_override"
+fi
+unset monitor_env_override
 
 if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "EXPECTED_COMMIT must be a full 40-character hexadecimal commit." >&2
@@ -49,6 +64,12 @@ stop_attempted=0
 checkout_mutated=0
 updater_installed=0
 deployment_finalized=0
+monitor_managed=0
+monitor_state_captured=0
+monitor_restore_needed=0
+monitor_pin_normalized=0
+monitor_timer_was_enabled=0
+monitor_timer_was_active=0
 if ! previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"; then
   echo "Could not read the production rollback commit." >&2
   exit 4
@@ -65,6 +86,153 @@ wait_for_unit_inactive() {
     remaining=$((remaining - 1))
     sleep 0.25
   done
+}
+
+validate_monitor_env_file() {
+  local metadata owner_uid mode extra_metadata expected_uid head_count head_line head_value
+  if [ ! -f "$MONITOR_ENV_FILE" ] || [ -L "$MONITOR_ENV_FILE" ]; then
+    return 1
+  fi
+  metadata="$(stat -c '%u %a' -- "$MONITOR_ENV_FILE")" || return 1
+  read -r owner_uid mode extra_metadata <<<"$metadata"
+  if [ -n "${extra_metadata:-}" ]; then return 1; fi
+  expected_uid=0
+  if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
+    expected_uid="$(id -u)"
+  fi
+  if [ "$owner_uid" != "$expected_uid" ] || [ "$mode" != "600" ]; then
+    return 1
+  fi
+  head_count="$(grep -c '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$MONITOR_ENV_FILE" || true)"
+  if [ "$head_count" != "1" ]; then return 1; fi
+  head_line="$(grep '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$MONITOR_ENV_FILE")" || return 1
+  head_value="${head_line#TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=}"
+  [[ "$head_value" =~ ^[0-9a-fA-F]{40}$ ]]
+}
+
+classify_monitor_installation() {
+  local unit_present=0 env_present=0
+  if systemctl cat "$MONITOR_TIMER" >/dev/null 2>&1; then
+    unit_present=1
+  fi
+  if [ -e "$MONITOR_ENV_FILE" ] || [ -L "$MONITOR_ENV_FILE" ]; then
+    env_present=1
+  fi
+  if [ "$unit_present" -eq 0 ] && [ "$env_present" -eq 0 ]; then
+    monitor_managed=0
+    return 0
+  fi
+  if [ "$unit_present" -ne 1 ] || [ "$env_present" -ne 1 ]; then
+    return 1
+  fi
+  if ! validate_monitor_env_file; then return 1; fi
+  monitor_managed=1
+}
+
+record_monitor_timer_state() {
+  local enabled_state active_state enabled_status active_status
+  set +e
+  enabled_state="$(systemctl is-enabled "$MONITOR_TIMER" 2>/dev/null)"
+  enabled_status=$?
+  active_state="$(systemctl is-active "$MONITOR_TIMER" 2>/dev/null)"
+  active_status=$?
+  set -e
+  case "$enabled_state:$enabled_status" in
+    enabled:0) monitor_timer_was_enabled=1 ;;
+    disabled:1) monitor_timer_was_enabled=0 ;;
+    *) return 1 ;;
+  esac
+  case "$active_state:$active_status" in
+    active:0) monitor_timer_was_active=1 ;;
+    inactive:3) monitor_timer_was_active=0 ;;
+    *) return 1 ;;
+  esac
+  monitor_state_captured=1
+  monitor_restore_needed=1
+}
+
+wait_for_monitor_oneshots_inactive() {
+  local remaining=$((STOP_TIMEOUT_SECONDS * 4)) unit state all_inactive
+  while true; do
+    all_inactive=1
+    for unit in "${MONITOR_ONESHOT_UNITS[@]}"; do
+      state="$(systemctl show "$unit" --property=ActiveState --value)" || return 1
+      case "$state" in
+        inactive|failed) ;;
+        *) all_inactive=0 ;;
+      esac
+    done
+    if [ "$all_inactive" -eq 1 ]; then return 0; fi
+    if [ "$remaining" -le 0 ]; then return 1; fi
+    remaining=$((remaining - 1))
+    sleep 0.25
+  done
+}
+
+stop_monitor_for_deployment() {
+  local timer_state
+  if ! systemctl stop "$MONITOR_TIMER"; then return 1; fi
+  timer_state="$(systemctl show "$MONITOR_TIMER" --property=ActiveState --value)" || return 1
+  case "$timer_state" in
+    inactive|failed) ;;
+    *) return 1 ;;
+  esac
+  wait_for_monitor_oneshots_inactive
+}
+
+sync_monitor_expected_head() {
+  local target_commit="$1" candidate=""
+  if [[ ! "$target_commit" =~ ^[0-9a-f]{40}$ ]]; then return 1; fi
+  if ! validate_monitor_env_file; then return 1; fi
+  candidate="$(mktemp "${MONITOR_ENV_FILE}.candidate.XXXXXX")" || return 1
+  if ! awk -v expected="$target_commit" '
+    BEGIN { count = 0 }
+    /^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=/ {
+      print "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" expected
+      count += 1
+      next
+    }
+    { print }
+    END { if (count != 1) exit 4 }
+  ' "$MONITOR_ENV_FILE" >"$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! chmod 0600 "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if [ "${UPDATER_TEST_MODE:-0}" != "1" ] && ! chown root:root "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! mv -f -- "$candidate" "$MONITOR_ENV_FILE"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! validate_monitor_env_file; then return 1; fi
+  grep -Fxq "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$target_commit" "$MONITOR_ENV_FILE"
+}
+
+restore_monitor_timer_state() {
+  local timer_state
+  if [ "$monitor_timer_was_enabled" -eq 1 ]; then
+    systemctl enable "$MONITOR_TIMER" || return 1
+  else
+    systemctl disable "$MONITOR_TIMER" || return 1
+  fi
+  if [ "$monitor_timer_was_active" -eq 1 ]; then
+    systemctl start "$MONITOR_TIMER" || return 1
+    timer_state="$(systemctl show "$MONITOR_TIMER" --property=ActiveState --value)" || return 1
+    [ "$timer_state" = "active" ] || return 1
+  else
+    timer_state="$(systemctl show "$MONITOR_TIMER" --property=ActiveState --value)" || return 1
+    case "$timer_state" in
+      inactive|failed) ;;
+      *) return 1 ;;
+    esac
+  fi
+  monitor_restore_needed=0
 }
 
 cleanup_schema_dry_run() {
@@ -134,10 +302,20 @@ cleanup() {
     if [ "$rollback_ok" -eq 1 ]; then
       systemctl is-active --quiet telegram-kol.service || rollback_ok=0
     fi
-    if [ "$rollback_ok" -ne 1 ]; then
-      echo "ROLLBACK FAILED; telegram-kol.service may remain stopped." >&2
-      exit 4
+  fi
+
+  if [ "$monitor_managed" -eq 1 ] && [ "$monitor_restore_needed" -eq 1 ]; then
+    if [ "$rollback_ok" -eq 1 ] && [ "$monitor_pin_normalized" -eq 1 ]; then
+      sync_monitor_expected_head "$previous_commit" || rollback_ok=0
     fi
+    if [ "$rollback_ok" -eq 1 ] && [ "$monitor_state_captured" -eq 1 ]; then
+      restore_monitor_timer_state || rollback_ok=0
+    fi
+  fi
+
+  if [ "$rollback_ok" -ne 1 ]; then
+    echo "ROLLBACK FAILED; telegram-kol.service may remain stopped. Monitor state may also be incomplete." >&2
+    exit 4
   fi
 
   if [ -n "$stage_dir" ] && [ -d "$stage_dir" ]; then
@@ -315,6 +493,26 @@ if [ "$schema_changed" -eq 1 ]; then
   fi
 fi
 
+if ! classify_monitor_installation; then
+  echo "Monitor installation is partial or invalid." >&2
+  exit 4
+fi
+if [ "$monitor_managed" -eq 1 ]; then
+  if ! record_monitor_timer_state; then
+    echo "Could not record the monitor timer state." >&2
+    exit 4
+  fi
+  if ! stop_monitor_for_deployment; then
+    echo "Could not stop the monitor timer and oneshots." >&2
+    exit 4
+  fi
+  if ! sync_monitor_expected_head "$previous_commit"; then
+    echo "Could not normalize the monitor expected HEAD." >&2
+    exit 4
+  fi
+  monitor_pin_normalized=1
+fi
+
 run_active_write_check() {
   local output status
   set +e
@@ -436,6 +634,16 @@ stage_registered=0
 if ! cleanup_schema_dry_run; then
   echo "Could not remove the disposable schema copy." >&2
   exit 4
+fi
+if [ "$monitor_managed" -eq 1 ]; then
+  if ! sync_monitor_expected_head "$EXPECTED_COMMIT"; then
+    echo "Could not advance the monitor expected HEAD." >&2
+    exit 4
+  fi
+  if ! restore_monitor_timer_state; then
+    echo "Could not restore the monitor timer state." >&2
+    exit 4
+  fi
 fi
 deployment_finalized=1
 stop_attempted=0

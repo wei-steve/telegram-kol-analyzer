@@ -37,8 +37,18 @@ def updater_harness(tmp_path: Path):
     durable_updater.write_text("old updater\n", encoding="utf-8")
     durable_updater.chmod(0o755)
     log = tmp_path / "events.log"
+    monitor_env = tmp_path / "telegram-kol-monitor.env"
+    monitor_env.write_text(
+        "MONITOR_SECRET=must-not-be-printed\n"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
+        "MONITOR_SETTING=preserve-this-line\n",
+        encoding="utf-8",
+    )
+    monitor_env.chmod(0o600)
     (state / "head").write_text(f"{PREVIOUS}\n", encoding="utf-8")
     (state / "branch").write_text(f"{PREVIOUS}\n", encoding="utf-8")
+    (state / "monitor_timer_enabled").touch()
+    (state / "monitor_timer_active").touch()
 
     _write_executable(
         fake_bin / "git",
@@ -135,8 +145,34 @@ esac
         r'''#!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
+  cat)
+    [ "${HARNESS_MONITOR_INSTALLED:-1}" = "1" ] || exit 1
+    printf 'monitor-unit\n'
+    ;;
+  is-enabled)
+    printf 'monitor-timer-enabled-check\n' >>"$HARNESS_LOG"
+    if [ -f "$HARNESS_STATE/monitor_timer_enabled" ]; then
+      printf 'enabled\n'
+    else
+      printf 'disabled\n'
+      exit 1
+    fi
+    ;;
   show)
-    if [ -f "$HARNESS_STATE/rollback_pending" ]; then
+    log_plain_state=1
+    if [ "${2:-}" = "telegram-kol-monitor.timer" ]; then
+      if [ -f "$HARNESS_STATE/monitor_timer_active" ]; then
+        unit_state=active
+      else
+        unit_state=inactive
+      fi
+      printf 'monitor-timer-%s\n' "$unit_state" >>"$HARNESS_LOG"
+      log_plain_state=0
+    elif [ "${2:-}" = "telegram-kol-monitor.service" ] || [ "${2:-}" = "telegram-kol-monitor-diagnostic.service" ]; then
+      unit_state="${HARNESS_MONITOR_ONESHOT_STATE:-inactive}"
+      printf 'monitor-oneshot-%s\n' "$unit_state" >>"$HARNESS_LOG"
+      log_plain_state=0
+    elif [ -f "$HARNESS_STATE/rollback_pending" ]; then
       if [ "${HARNESS_ROLLBACK_STOP_MODE:-normal}" = "stuck" ]; then
         unit_state=deactivating
       elif [ ! -f "$HARNESS_STATE/rollback_deactivating_seen" ]; then
@@ -163,10 +199,20 @@ case "${1:-}" in
     else
       unit_state=active
     fi
-    printf '%s\n' "$unit_state" >>"$HARNESS_LOG"
+    [ "$log_plain_state" -ne 1 ] || printf '%s\n' "$unit_state" >>"$HARNESS_LOG"
     printf '%s\n' "$unit_state"
     ;;
   is-active)
+    if [ "${2:-}" = "telegram-kol-monitor.timer" ]; then
+      printf 'monitor-timer-active-check\n' >>"$HARNESS_LOG"
+      if [ -f "$HARNESS_STATE/monitor_timer_active" ]; then
+        printf 'active\n'
+      else
+        printf 'inactive\n'
+        exit 3
+      fi
+      exit 0
+    fi
     head_value="$(cat "$HARNESS_STATE/head")"
     if [ -f "$HARNESS_STATE/candidate_started" ]; then
       printf 'is-active\n' >>"$HARNESS_LOG"
@@ -182,6 +228,12 @@ case "${1:-}" in
     [ ! -f "$HARNESS_STATE/rollback_pending" ]
     ;;
   stop)
+    if [ "${2:-}" = "telegram-kol-monitor.timer" ]; then
+      printf 'monitor-timer-stop\n' >>"$HARNESS_LOG"
+      [ "${HARNESS_MONITOR_TIMER_STOP_FAIL:-0}" != "1" ] || exit 1
+      rm -f "$HARNESS_STATE/monitor_timer_active"
+      exit 0
+    fi
     printf 'stop\n' >>"$HARNESS_LOG"
     if [ ! -f "$HARNESS_STATE/first_stop" ]; then
       touch "$HARNESS_STATE/first_stop"
@@ -202,6 +254,12 @@ case "${1:-}" in
     fi
     ;;
   start)
+    if [ "${2:-}" = "telegram-kol-monitor.timer" ]; then
+      printf 'monitor-timer-start\n' >>"$HARNESS_LOG"
+      [ "${HARNESS_MONITOR_TIMER_START_FAIL:-0}" != "1" ] || exit 1
+      touch "$HARNESS_STATE/monitor_timer_active"
+      exit 0
+    fi
     head_value="$(cat "$HARNESS_STATE/head")"
     if [ "$head_value" = "$HARNESS_CANDIDATE" ]; then
       printf 'start\n' >>"$HARNESS_LOG"
@@ -215,6 +273,16 @@ case "${1:-}" in
       rm -f "$HARNESS_STATE/candidate_started"
     fi
     rm -f "$HARNESS_STATE/stopped" "$HARNESS_STATE/pending_stop" "$HARNESS_STATE/rollback_pending"
+    ;;
+  enable)
+    printf 'monitor-timer-enable\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_TIMER_ENABLE_FAIL:-0}" != "1" ] || exit 1
+    touch "$HARNESS_STATE/monitor_timer_enabled"
+    ;;
+  disable)
+    printf 'monitor-timer-disable\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_TIMER_DISABLE_FAIL:-0}" != "1" ] || exit 1
+    rm -f "$HARNESS_STATE/monitor_timer_enabled"
     ;;
 esac
 ''',
@@ -300,6 +368,21 @@ chmod 0755 "$target"
         fake_bin / "mv",
         r'''#!/usr/bin/env bash
 set -euo pipefail
+target="${@: -1}"
+if [ "$target" = "$MONITOR_ENV_FILE" ]; then
+  source="${@: -2:1}"
+  if grep -q "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$HARNESS_PREVIOUS" "$source"; then
+    printf 'monitor-pin-previous\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_PIN_PREVIOUS_FAIL:-0}" != "1" ] || exit 1
+  elif grep -q "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$HARNESS_CANDIDATE" "$source"; then
+    printf 'monitor-pin-candidate\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_PIN_CANDIDATE_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'monitor-pin-unknown\n' >>"$HARNESS_LOG"
+    exit 1
+  fi
+  exec /bin/mv "$@"
+fi
 printf 'durable-updater-move\n' >>"$HARNESS_LOG"
 [ "${HARNESS_DURABLE_MOVE_FAIL:-0}" != "1" ] || exit 1
 if [ "${HARNESS_DURABLE_MOVE_FAIL_AFTER:-0}" = "1" ]; then
@@ -307,6 +390,13 @@ if [ "${HARNESS_DURABLE_MOVE_FAIL_AFTER:-0}" = "1" ]; then
   exit 1
 fi
 exec /bin/mv "$@"
+''',
+    )
+    _write_executable(
+        fake_bin / "stat",
+        r'''#!/usr/bin/env bash
+set -euo pipefail
+printf '%s %s\n' "${HARNESS_MONITOR_UID:-$(id -u)}" "${HARNESS_MONITOR_MODE:-600}"
 ''',
     )
     _write_executable(
@@ -350,6 +440,45 @@ exec /bin/rm "$@"
 
     def run(**overrides: str) -> subprocess.CompletedProcess[str]:
         log.write_text("", encoding="utf-8")
+        installation = overrides.pop("HARNESS_MONITOR_INSTALLATION", "complete")
+        prior_enabled = overrides.pop("HARNESS_MONITOR_PRIOR_ENABLED", "1")
+        prior_active = overrides.pop("HARNESS_MONITOR_PRIOR_ACTIVE", "1")
+        for marker, enabled in (
+            (state / "monitor_timer_enabled", prior_enabled),
+            (state / "monitor_timer_active", prior_active),
+        ):
+            if enabled == "1":
+                marker.touch()
+            elif marker.exists():
+                marker.unlink()
+        if monitor_env.is_symlink() or monitor_env.exists():
+            monitor_env.unlink()
+        if installation in {"complete", "env_only", "malformed", "symlink"}:
+            monitor_env.write_text(
+                "MONITOR_SECRET=must-not-be-printed\n"
+                f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
+                "MONITOR_SETTING=preserve-this-line\n",
+                encoding="utf-8",
+            )
+            monitor_env.chmod(0o600)
+        if installation == "malformed":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8")
+                + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}\n",
+                encoding="utf-8",
+            )
+        if installation == "symlink":
+            target = tmp_path / "monitor-env-target"
+            target.write_text(
+                f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n",
+                encoding="utf-8",
+            )
+            monitor_env.unlink()
+            monitor_env.symlink_to(target)
+        overrides.setdefault(
+            "HARNESS_MONITOR_INSTALLED",
+            "0" if installation in {"absent", "env_only"} else "1",
+        )
         environment = os.environ.copy()
         environment.update(
             {
@@ -359,6 +488,8 @@ exec /bin/rm "$@"
                 "LOCK_PATH": str(tmp_path / "update.lock"),
                 "STAGE_PARENT": str(tmp_path),
                 "UPDATER_PATH": str(durable_updater),
+                "UPDATER_TEST_MODE": "1",
+                "MONITOR_ENV_FILE": str(monitor_env),
                 "EXPECTED_COMMIT": CANDIDATE,
                 "BRANCH": "codex/test",
                 "STOP_TIMEOUT_SECONDS": "1",
@@ -444,6 +575,166 @@ def test_success_uses_candidate_source_and_exactly_two_checks(
     assert result.returncode == 0, result.stderr
     assert "wrong-pythonpath" not in _events(log)
     assert (state / "active_check_count").read_text().strip() == "2"
+
+
+def test_monitor_pin_transaction_wraps_successful_cutover(updater_harness) -> None:
+    run, log, state = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+
+    result = run()
+
+    assert result.returncode == 0, result.stderr
+    events = _events(log)
+    assert events.index("monitor-timer-stop") < events.index("stop")
+    assert events.index("monitor-pin-previous") < events.index("checkout")
+    assert events.index("http-health") < events.index("monitor-pin-candidate")
+    assert events.index("monitor-pin-candidate") < events.index(
+        "monitor-timer-enable"
+    )
+    assert events.index("monitor-timer-enable") < events.index(
+        "monitor-timer-start"
+    )
+    assert monitor_env.read_text(encoding="utf-8") == (
+        "MONITOR_SECRET=must-not-be-printed\n"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={CANDIDATE}\n"
+        "MONITOR_SETTING=preserve-this-line\n"
+    )
+    assert (state / "monitor_timer_enabled").exists()
+    assert (state / "monitor_timer_active").exists()
+
+
+def test_absent_monitor_preserves_existing_updater_behavior(updater_harness) -> None:
+    run, log, state = updater_harness
+
+    result = run(HARNESS_MONITOR_INSTALLATION="absent")
+
+    assert result.returncode == 0, result.stderr
+    assert (state / "head").read_text().strip() == CANDIDATE
+    assert not any(event.startswith("monitor-") for event in _events(log))
+
+
+def test_monitor_restores_prior_disabled_inactive_timer_state(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(
+        HARNESS_MONITOR_PRIOR_ENABLED="0",
+        HARNESS_MONITOR_PRIOR_ACTIVE="0",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = _events(log)
+    assert "monitor-timer-disable" in events
+    assert "monitor-timer-start" not in events
+    assert not (state / "monitor_timer_enabled").exists()
+    assert not (state / "monitor_timer_active").exists()
+
+
+@pytest.mark.parametrize(
+    ("installation", "overrides"),
+    (
+        ("malformed", {}),
+        ("symlink", {}),
+        ("env_only", {}),
+        ("timer_only", {}),
+        ("complete", {"HARNESS_MONITOR_MODE": "640"}),
+        ("complete", {"HARNESS_MONITOR_UID": "99999"}),
+    ),
+)
+def test_invalid_partial_monitor_installation_fails_before_checkout_mutation(
+    updater_harness,
+    installation: str,
+    overrides: dict[str, str],
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_MONITOR_INSTALLATION=installation, **overrides)
+
+    assert result.returncode == 4
+    events = _events(log)
+    assert "stop" not in events
+    assert "checkout" not in events
+    assert "must-not-be-printed" not in result.stdout + result.stderr
+
+
+def test_monitor_timer_stop_failure_never_reaches_application_stop(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(HARNESS_MONITOR_TIMER_STOP_FAIL="1")
+
+    assert result.returncode == 4
+    assert "stop" not in _events(log)
+    assert "checkout" not in _events(log)
+    assert (state / "monitor_timer_active").exists()
+
+
+def test_monitor_predeploy_pin_failure_restores_timer_without_checkout(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(HARNESS_MONITOR_PIN_PREVIOUS_FAIL="1")
+
+    assert result.returncode == 4
+    events = _events(log)
+    assert "monitor-timer-stop" in events
+    assert "checkout" not in events
+    assert "stop" not in events
+    assert "monitor-timer-start" in events
+    assert (state / "monitor_timer_active").exists()
+
+
+@pytest.mark.parametrize(
+    "fault",
+    (
+        "HARNESS_CHECKOUT_FAIL",
+        "HARNESS_PIP_FAIL",
+        "HARNESS_CANDIDATE_START_FAIL",
+        "HARNESS_HTTP_FAIL",
+        "HARNESS_MONITOR_PIN_CANDIDATE_FAIL",
+    ),
+)
+def test_post_normalization_failure_rolls_back_pin_and_timer(
+    updater_harness, fault: str
+) -> None:
+    run, log, state = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+
+    result = run(**{fault: "1"})
+
+    assert result.returncode == 4
+    assert (state / "head").read_text().strip() == PREVIOUS
+    assert (
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}"
+        in monitor_env.read_text(encoding="utf-8")
+    )
+    assert (state / "monitor_timer_enabled").exists()
+    assert (state / "monitor_timer_active").exists()
+    events = _events(log)
+    assert events.index("monitor-pin-previous") < events.index("checkout")
+    assert events.index("rollback-is-active") < len(events) - 1 - events[
+        ::-1
+    ].index("monitor-timer-start")
+
+
+def test_monitor_timer_restore_failure_rolls_back_application_and_pin(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+
+    result = run(HARNESS_MONITOR_TIMER_START_FAIL="1")
+
+    assert result.returncode == 4
+    assert (state / "head").read_text().strip() == PREVIOUS
+    assert (
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}"
+        in monitor_env.read_text(encoding="utf-8")
+    )
+    assert "must-not-be-printed" not in result.stdout + result.stderr
 
 
 def test_updater_has_no_retired_gate_mechanism_or_event(updater_harness) -> None:
