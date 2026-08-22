@@ -18,6 +18,57 @@ MONITOR_ONESHOT_UNITS=(
   "telegram-kol-monitor-diagnostic.service"
   "telegram-kol-monitor-test-notification.service"
 )
+MONOLITH_UNITS=("telegram-kol.service")
+SPLIT_UNITS=(
+  "telegram-kol-ingest.service"
+  "telegram-kol-worker.service"
+  "telegram-kol-web.service"
+)
+SPLIT_STOP_UNITS=(
+  "telegram-kol-ingest.service"
+  "telegram-kol-web.service"
+  "telegram-kol-worker.service"
+)
+SPLIT_START_UNITS=(
+  "telegram-kol-worker.service"
+  "telegram-kol-web.service"
+  "telegram-kol-ingest.service"
+)
+managed_topology=""
+managed_stop_units=()
+managed_start_units=()
+
+resolve_managed_topology() {
+  local monolith_active=0 split_installed=0 split_active=0 unit
+  if systemctl is-active --quiet "${MONOLITH_UNITS[0]}"; then
+    monolith_active=1
+  fi
+  for unit in "${SPLIT_UNITS[@]}"; do
+    if systemctl cat "$unit" >/dev/null 2>&1; then
+      split_installed=$((split_installed + 1))
+    fi
+    if systemctl is-active --quiet "$unit"; then
+      split_active=$((split_active + 1))
+    fi
+  done
+
+  if [ "$monolith_active" -eq 1 ] && [ "$split_active" -eq 0 ]; then
+    managed_topology="monolith"
+    managed_stop_units=("${MONOLITH_UNITS[@]}")
+    managed_start_units=("${MONOLITH_UNITS[@]}")
+    return 0
+  fi
+  if [ "$monolith_active" -eq 0 ] \
+    && [ "$split_installed" -eq "${#SPLIT_UNITS[@]}" ] \
+    && [ "$split_active" -eq "${#SPLIT_UNITS[@]}" ]; then
+    managed_topology="split"
+    managed_stop_units=("${SPLIT_STOP_UNITS[@]}")
+    managed_start_units=("${SPLIT_START_UNITS[@]}")
+    return 0
+  fi
+  echo "Ambiguous or incomplete runtime topology; refusing managed deployment." >&2
+  return 1
+}
 if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
   if [ "$APP_DIR" = "/opt/telegram-kol-analyzer" ] || [ -z "$monitor_env_override" ]; then
     echo "Updater test-mode path override is invalid." >&2
@@ -44,8 +95,7 @@ if [ ! -d "$APP_DIR/.git" ] || [ ! -f "$DATABASE_PATH" ] || [ ! -x "$APP_DIR/.ve
   echo "Production checkout, database, or Python environment is unavailable." >&2
   exit 4
 fi
-if ! systemctl is-active --quiet telegram-kol.service; then
-  echo "Exchange-writer service must be active before a managed deployment." >&2
+if ! resolve_managed_topology; then
   exit 4
 fi
 
@@ -77,9 +127,9 @@ if ! previous_commit="$(git -C "$APP_DIR" rev-parse HEAD)"; then
 fi
 
 wait_for_unit_inactive() {
-  local remaining=$((STOP_TIMEOUT_SECONDS * 4)) state
+  local unit="$1" remaining=$((STOP_TIMEOUT_SECONDS * 4)) state
   while true; do
-    state="$(systemctl show telegram-kol.service --property=ActiveState --value)" || return 1
+    state="$(systemctl show "$unit" --property=ActiveState --value)" || return 1
     case "$state" in
       inactive|failed) return 0 ;;
     esac
@@ -271,15 +321,21 @@ restore_updater() {
 }
 
 cleanup() {
-  local status=$? rollback_ok=1 inactive_status branch_commit
+  local status=$? rollback_ok=1 inactive_status branch_commit unit
   trap - EXIT INT TERM
 
   if [ "$stop_attempted" -eq 1 ] && [ "$deployment_finalized" -ne 1 ]; then
     if [ "$checkout_mutated" -eq 1 ]; then
       set +e
-      timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
-      wait_for_unit_inactive
-      inactive_status=$?
+      inactive_status=0
+      for unit in "${managed_stop_units[@]}"; do
+        timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop "$unit"
+        if [ "$?" -ne 0 ]; then inactive_status=1; fi
+      done
+      for unit in "${managed_stop_units[@]}"; do
+        wait_for_unit_inactive "$unit"
+        if [ "$?" -ne 0 ]; then inactive_status=1; fi
+      done
       set -e
       if [ "$inactive_status" -ne 0 ]; then rollback_ok=0; fi
       if [ "$rollback_ok" -eq 1 ]; then
@@ -306,10 +362,14 @@ cleanup() {
     fi
     if [ "$rollback_ok" -eq 1 ]; then restore_updater || rollback_ok=0; fi
     if [ "$rollback_ok" -eq 1 ]; then
-      systemctl start telegram-kol.service || rollback_ok=0
+      for unit in "${managed_start_units[@]}"; do
+        systemctl start "$unit" || rollback_ok=0
+      done
     fi
     if [ "$rollback_ok" -eq 1 ]; then
-      systemctl is-active --quiet telegram-kol.service || rollback_ok=0
+      for unit in "${managed_start_units[@]}"; do
+        systemctl is-active --quiet "$unit" || rollback_ok=0
+      done
     fi
   fi
 
@@ -323,7 +383,7 @@ cleanup() {
   fi
 
   if [ "$rollback_ok" -ne 1 ]; then
-    echo "ROLLBACK FAILED; telegram-kol.service may remain stopped. Monitor state may also be incomplete." >&2
+    echo "ROLLBACK FAILED; managed runtime units may remain stopped. Monitor state may also be incomplete." >&2
     exit 4
   fi
 
@@ -548,20 +608,40 @@ run_active_write_check() {
 }
 
 stop_writer_service() {
-  local stop_status
+  local stop_status=0 unit
   stop_attempted=1
   set +e
-  timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop telegram-kol.service
-  stop_status=$?
+  for unit in "${managed_stop_units[@]}"; do
+    timeout --foreground "${STOP_TIMEOUT_SECONDS}s" systemctl stop "$unit"
+    if [ "$?" -ne 0 ]; then stop_status=1; fi
+  done
   set -e
   if [ "$stop_status" -ne 0 ]; then
     echo "Exchange-writer service stop command failed." >&2
     exit 4
   fi
-  if ! wait_for_unit_inactive; then
-    echo "Exchange-writer service did not reach an inactive state within the timeout." >&2
-    exit 4
-  fi
+  for unit in "${managed_stop_units[@]}"; do
+    if ! wait_for_unit_inactive "$unit"; then
+      echo "Managed runtime unit did not reach an inactive state within the timeout: $unit" >&2
+      exit 4
+    fi
+  done
+}
+
+start_managed_services() {
+  local unit
+  for unit in "${managed_start_units[@]}"; do
+    if ! systemctl start "$unit"; then
+      echo "Candidate runtime unit start failed: $unit" >&2
+      return 1
+    fi
+  done
+  for unit in "${managed_start_units[@]}"; do
+    if ! systemctl is-active --quiet "$unit"; then
+      echo "Candidate runtime unit did not become active: $unit" >&2
+      return 1
+    fi
+  done
 }
 
 verify_http_health() {
@@ -599,12 +679,7 @@ if ! env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e
   echo "Candidate package installation failed." >&2
   exit 4
 fi
-if ! systemctl start telegram-kol.service; then
-  echo "Candidate service start failed." >&2
-  exit 4
-fi
-if ! systemctl is-active --quiet telegram-kol.service; then
-  echo "Candidate service did not become active." >&2
+if ! start_managed_services; then
   exit 4
 fi
 if ! verify_http_health; then

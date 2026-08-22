@@ -146,6 +146,11 @@ esac
 set -euo pipefail
 case "${1:-}" in
   cat)
+    case "${2:-}" in
+      telegram-kol-ingest.service|telegram-kol-worker.service|telegram-kol-web.service)
+        [ "${HARNESS_RUNTIME_TOPOLOGY:-monolith}" != "monolith" ] || exit 1
+        ;;
+    esac
     [ "${HARNESS_MONITOR_INSTALLED:-1}" = "1" ] || exit 1
     printf 'monitor-unit\n'
     ;;
@@ -213,6 +218,20 @@ case "${1:-}" in
       fi
       exit 0
     fi
+    case "${@: -1}" in
+      telegram-kol.service)
+        case "${HARNESS_RUNTIME_TOPOLOGY:-monolith}" in
+          split|partial) exit 3 ;;
+        esac
+        ;;
+      telegram-kol-ingest.service|telegram-kol-worker.service|telegram-kol-web.service)
+        [ "${HARNESS_RUNTIME_TOPOLOGY:-monolith}" != "monolith" ] || exit 3
+        if [ "${HARNESS_RUNTIME_TOPOLOGY:-monolith}" = "partial" ] \
+          && [ "${@: -1}" != "telegram-kol-worker.service" ]; then
+          exit 3
+        fi
+        ;;
+    esac
     head_value="$(cat "$HARNESS_STATE/head")"
     if [ -f "$HARNESS_STATE/candidate_started" ]; then
       printf 'is-active\n' >>"$HARNESS_LOG"
@@ -234,6 +253,7 @@ case "${1:-}" in
       rm -f "$HARNESS_STATE/monitor_timer_active"
       exit 0
     fi
+    printf 'stop-unit:%s\n' "${2:-}" >>"$HARNESS_LOG"
     printf 'stop\n' >>"$HARNESS_LOG"
     if [ ! -f "$HARNESS_STATE/first_stop" ]; then
       touch "$HARNESS_STATE/first_stop"
@@ -260,6 +280,7 @@ case "${1:-}" in
       touch "$HARNESS_STATE/monitor_timer_active"
       exit 0
     fi
+    printf 'start-unit:%s\n' "${2:-}" >>"$HARNESS_LOG"
     head_value="$(cat "$HARNESS_STATE/head")"
     if [ "$head_value" = "$HARNESS_CANDIDATE" ]; then
       printf 'start\n' >>"$HARNESS_LOG"
@@ -582,6 +603,39 @@ def test_success_has_exact_short_authorization_order(updater_harness) -> None:
         "durable-updater-move",
         "worktree-remove",
     ]
+
+
+def test_split_topology_uses_ordered_three_unit_stop_and_start(updater_harness):
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_RUNTIME_TOPOLOGY="split")
+
+    assert result.returncode == 0, result.stderr
+    events = _events(log)
+    assert [event for event in events if event.startswith("stop-unit:")] == [
+        "stop-unit:telegram-kol-ingest.service",
+        "stop-unit:telegram-kol-web.service",
+        "stop-unit:telegram-kol-worker.service",
+    ]
+    assert [event for event in events if event.startswith("start-unit:")] == [
+        "start-unit:telegram-kol-worker.service",
+        "start-unit:telegram-kol-web.service",
+        "start-unit:telegram-kol-ingest.service",
+    ]
+
+
+@pytest.mark.parametrize("topology", ["both", "partial"])
+def test_ambiguous_or_partial_topology_fails_before_deployment(
+    updater_harness, topology: str
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_RUNTIME_TOPOLOGY=topology)
+
+    assert result.returncode == 4
+    assert "Ambiguous or incomplete runtime topology" in result.stderr
+    assert "fetch" not in _events(log)
+    assert not any(event.startswith("stop-unit:") for event in _events(log))
 
 
 def test_success_uses_candidate_source_and_exactly_two_checks(

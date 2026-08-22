@@ -85,7 +85,7 @@ def test_server_updater_runs_two_active_checks_before_checkout_and_install():
     second_check = script.index("\nrun_active_write_check\n", first_check + 1)
     checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
     install = script.rindex(' -m pip install -e "$APP_DIR"')
-    start = script.rindex("systemctl start telegram-kol.service")
+    start = script.rindex("\nif ! start_managed_services; then")
     health = script.index("if ! verify_http_health", start)
     updater_install = script.rindex(
         'install -o root -g root -m 0755 "$stage_dir/deploy/telegram-kol-update"'
@@ -99,7 +99,7 @@ def test_server_updater_runs_two_active_checks_before_checkout_and_install():
     assert script.index("checkout_mutated=1") < script.rindex(
         ' -m pip install -e "$APP_DIR"'
     )
-    assert "ROLLBACK FAILED; telegram-kol.service may remain stopped." in script
+    assert "ROLLBACK FAILED; managed runtime units may remain stopped." in script
     assert 'if [ "$rollback_ok" -eq 1 ]; then' in script
     assert "git pull" not in script
     assert "schema_changed" in script
@@ -108,6 +108,58 @@ def test_server_updater_runs_two_active_checks_before_checkout_and_install():
     assert script.rindex("updater_installed=1") < script.index(
         'mv -f -- "$updater_candidate" "$UPDATER_PATH"'
     )
+
+
+def test_server_updater_resolves_exactly_one_complete_runtime_topology():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert "resolve_managed_topology()" in script
+    assert 'MONOLITH_UNITS=("telegram-kol.service")' in script
+    assert "SPLIT_UNITS=(" in script
+    for unit in (
+        "telegram-kol-ingest.service",
+        "telegram-kol-worker.service",
+        "telegram-kol-web.service",
+    ):
+        assert f'"{unit}"' in script
+    assert "Ambiguous or incomplete runtime topology" in script
+    assert script.index("resolve_managed_topology") < script.index(
+        "exec 9>\"$LOCK_PATH\""
+    )
+
+
+def test_split_topology_stop_start_and_rollback_orders_are_explicit():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert re.search(
+        r'SPLIT_STOP_UNITS=\(\s*"telegram-kol-ingest\.service"\s*'
+        r'"telegram-kol-web\.service"\s*"telegram-kol-worker\.service"\s*\)',
+        script,
+    )
+    assert re.search(
+        r'SPLIT_START_UNITS=\(\s*"telegram-kol-worker\.service"\s*'
+        r'"telegram-kol-web\.service"\s*"telegram-kol-ingest\.service"\s*\)',
+        script,
+    )
+    assert 'for unit in "${managed_stop_units[@]}"' in script
+    assert 'for unit in "${managed_start_units[@]}"' in script
+    assert script.count('for unit in "${managed_start_units[@]}"') >= 2
+
+
+def test_workstation_bootstraps_require_the_dual_topology_updater_contract():
+    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'UPDATER_TOPOLOGY_CONTRACT="dual-v1"' in shell
+    assert "UPDATER_TOPOLOGY_CONTRACT" in bootstrap
+    assert "resolve_managed_topology()" in bootstrap
+    assert '$topologyContract = "dual-v1"' in powershell
+    assert "resolve_managed_topology()" in powershell
 
 
 def test_server_updater_transactions_monitor_expected_head_and_timer_state():
