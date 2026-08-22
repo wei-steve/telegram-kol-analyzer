@@ -7373,6 +7373,61 @@ def test_worker_command_queue_idempotency_conflict_is_bounded(
     }
 
 
+def test_worker_command_monolith_lifespan_owns_one_consumer_task(tmp_path):
+    starts = []
+    stopped = []
+
+    async def fake_worker_command_runner(**kwargs):
+        starts.append(kwargs)
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.append(True)
+
+    app = create_web_app(
+        tmp_path / "worker-command-lifespan.db",
+        worker_command_worker_runner=fake_worker_command_runner,
+    )
+
+    with TestClient(app):
+        for _ in range(100):
+            if starts:
+                break
+            time.sleep(0.001)
+        assert len(starts) == 1
+        assert app.state.worker_command_worker_task is not None
+
+    assert stopped == [True]
+    assert app.state.worker_command_worker_task is None
+
+
+def test_worker_command_mode_api_refuses_rollback_with_executing_job(tmp_path):
+    app = create_web_app(tmp_path / "worker-mode-guard.db")
+    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
+    with app.state.session_factory() as session:
+        session.add(
+            WorkerCommandJob(
+                command_id="executing-command",
+                command_type="sync_deepcoin_execution",
+                request_json="{}",
+                request_fingerprint="f" * 64,
+                status="executing",
+                attempt_count=1,
+                side_effect_started_at=datetime(2026, 8, 22, 12, 0),
+                result_schema_version=1,
+                created_at=datetime(2026, 8, 22, 12, 0),
+            )
+        )
+        session.commit()
+
+    response = TestClient(app).post(
+        "/api/trading-settings", json={"worker_command_mode": "inline"}
+    )
+
+    assert response.status_code == 422
+    assert "claimed=0 executing=1" in response.json()["detail"]
+
+
 def test_runtime_agent_exchange_snapshot_endpoint_is_bounded_and_redacted(
     tmp_path,
 ):

@@ -239,6 +239,11 @@ from telegram_kol_research.worker_command_jobs import (
     settle_worker_command_failed,
     settle_worker_command_succeeded,
 )
+from telegram_kol_research.worker_command_executor import (
+    WorkerCommandDependencies,
+    require_worker_command_mode_transition_safe,
+    supervise_worker_command_mode,
+)
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
     build_redacted_exchange_state,
@@ -4227,6 +4232,8 @@ def create_web_app(
     source_message_deletion_worker_max_jobs: int = 10,
     message_processing_worker_runner=None,
     message_processing_worker_interval_seconds: float = 0.5,
+    worker_command_worker_runner=None,
+    worker_command_worker_interval_seconds: float = 0.25,
     runtime_agent_production_audit_runner=None,
     runtime_agent_telegram_evidence_runner=None,
     runtime_incident_config: RuntimeIncidentConfig | None = None,
@@ -4462,6 +4469,19 @@ def create_web_app(
                     _log_background_task_result("system_operator_bot_command_task")
                 )
             await ensure_message_processing_worker_mode()
+            if app.state.worker_command_worker_task is None:
+                app.state.worker_command_worker_task = asyncio.create_task(
+                    app.state.worker_command_worker_runner(
+                        session_factory=app.state.session_factory,
+                        dependencies=app.state.worker_command_dependencies,
+                        interval_seconds=(
+                            app.state.worker_command_worker_interval_seconds
+                        ),
+                    )
+                )
+                app.state.worker_command_worker_task.add_done_callback(
+                    _log_background_task_result("worker_command_worker_task")
+                )
             if (
                 app.state.live_target_titles
                 and app.state.telegram_client is not None
@@ -4614,6 +4634,16 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.message_processing_worker_task = None
+            worker_command_worker_task = app.state.worker_command_worker_task
+            if worker_command_worker_task is not None:
+                worker_command_worker_task.cancel()
+                try:
+                    await worker_command_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.worker_command_worker_task = None
             management_worker_task = app.state.strategy_management_worker_task
             if management_worker_task is not None:
                 management_worker_task.cancel()
@@ -4911,6 +4941,21 @@ def create_web_app(
         0.01, float(message_processing_worker_interval_seconds)
     )
     app.state.message_processing_worker_task = None
+    app.state.worker_command_worker_runner = (
+        worker_command_worker_runner or supervise_worker_command_mode
+    )
+    app.state.worker_command_worker_interval_seconds = max(
+        0.01, float(worker_command_worker_interval_seconds)
+    )
+    app.state.worker_command_worker_task = None
+    app.state.worker_command_dependencies = WorkerCommandDependencies(
+        session_factory=app.state.session_factory,
+        deepcoin_client_factory=app.state.deepcoin_client_factory,
+        contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+        now_provider=app.state.now_provider,
+        notification_bot_config=app.state.notification_bot_config,
+        system_operator_bot_config=app.state.system_operator_bot_config,
+    )
     app.state.break_even_convergence_worker_runner = (
         break_even_convergence_worker_runner
         or run_break_even_convergence_worker_loop
@@ -7424,6 +7469,11 @@ def create_web_app(
             current = load_trading_settings(app.state.session_factory)
             candidate = trading_settings_from_payload(
                 {**current.to_dict(), **payload}
+            )
+            require_worker_command_mode_transition_safe(
+                app.state.session_factory,
+                current_mode=current.worker_command_mode,
+                candidate_mode=candidate.worker_command_mode,
             )
             mimo_contract_change = (
                 candidate.mimo_contract_mode != current.mimo_contract_mode

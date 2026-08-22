@@ -17,7 +17,7 @@ from telegram_kol_research.execution_bindings import (
     reconcile_deepcoin_execution_bindings,
     sync_manual_closed_deepcoin_positions,
 )
-from telegram_kol_research.models import utc_now
+from telegram_kol_research.models import WorkerCommandJob, utc_now
 from telegram_kol_research.recovery_live_submit import (
     RecoveryLiveSubmitError,
     process_next_trade_signal_live,
@@ -88,6 +88,16 @@ class WorkerCommandMappedError(RuntimeError):
         self.body = body
         self.error_code = error_code
         self.error_summary = error_summary
+
+
+class WorkerCommandModeTransitionError(ValueError):
+    def __init__(self, *, claimed: int, executing: int) -> None:
+        super().__init__(
+            "worker command mode transition refused: "
+            f"claimed={claimed} executing={executing}"
+        )
+        self.claimed = int(claimed)
+        self.executing = int(executing)
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +209,54 @@ async def run_worker_command_loop(
             **tick_kwargs,
         )
         await asyncio.sleep(max(0.01, float(interval_seconds)))
+
+
+def require_worker_command_mode_transition_safe(
+    session_factory,
+    *,
+    current_mode: str,
+    candidate_mode: str,
+) -> None:
+    """Refuse authority-mode changes while a command has an active owner."""
+
+    if current_mode == candidate_mode:
+        return
+    with session_factory() as session:
+        claimed = (
+            session.query(WorkerCommandJob)
+            .filter(WorkerCommandJob.status == "claimed")
+            .count()
+        )
+        executing = (
+            session.query(WorkerCommandJob)
+            .filter(WorkerCommandJob.status == "executing")
+            .count()
+        )
+    if claimed or executing:
+        raise WorkerCommandModeTransitionError(
+            claimed=int(claimed), executing=int(executing)
+        )
+
+
+async def supervise_worker_command_mode(
+    session_factory,
+    *,
+    dependencies: WorkerCommandDependencies,
+    queue_runner=run_worker_command_loop,
+    interval_seconds: float = 0.25,
+) -> None:
+    """Keep one monolith-owned supervisor responsive to runtime mode changes."""
+
+    delay = max(0.01, float(interval_seconds))
+    while True:
+        settings = await asyncio.to_thread(load_trading_settings, session_factory)
+        if settings.worker_command_mode == "queue":
+            await queue_runner(
+                session_factory,
+                dependencies=dependencies,
+                interval_seconds=delay,
+            )
+        await asyncio.sleep(delay)
 
 
 async def execute_worker_command_adapter(
