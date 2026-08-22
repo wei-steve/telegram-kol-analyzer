@@ -3047,6 +3047,7 @@ def sync_manual_closed_deepcoin_positions(
     *,
     client: DeepcoinReadOnlyClient,
     synced_at: datetime | None = None,
+    allow_exchange_mutations: bool = True,
 ) -> ManualCloseSyncResult:
     """Mark bound active positions as manual-closed when they vanish on Deepcoin."""
 
@@ -3060,17 +3061,19 @@ def sync_manual_closed_deepcoin_positions(
         if _has_nonzero_size(position)
         for pos_id in _position_identity_ids(position)
     }
-    cleanup_status_by_binding = _cleanup_terminal_lifecycle_entry_exposure(
-        session_factory,
-        client=client,
-        cleaned_at=now,
-    )
-    cleanup_status_by_binding.update(_cleanup_missing_position_deferred_entries(
-        session_factory,
-        client=client,
-        active_pos_ids={str(pos_id) for pos_id in active_pos_ids if pos_id},
-        cleaned_at=now,
-    ))
+    cleanup_status_by_binding: dict[int, str] = {}
+    if allow_exchange_mutations:
+        cleanup_status_by_binding = _cleanup_terminal_lifecycle_entry_exposure(
+            session_factory,
+            client=client,
+            cleaned_at=now,
+        )
+        cleanup_status_by_binding.update(_cleanup_missing_position_deferred_entries(
+            session_factory,
+            client=client,
+            active_pos_ids={str(pos_id) for pos_id in active_pos_ids if pos_id},
+            cleaned_at=now,
+        ))
     result = ManualCloseSyncResult()
     with session_factory() as session:
         management_reserved_pos_ids = _active_management_reserved_pos_ids(

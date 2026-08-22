@@ -6254,6 +6254,98 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
         ]
 
 
+def test_sync_manual_closed_positions_disables_exchange_mutations_explicitly(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="pos-reconcile-only",
+            status="active",
+            order_id="entry-filled,entry-pending",
+            client_order_id="client-filled,client-pending",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=1,
+        order_id="entry-filled",
+        client_order_id="client-filled",
+        pos_id="pos-reconcile-only",
+        status="active",
+        attribution_status="verified",
+    )
+    _add_entry_leg(
+        session_factory,
+        binding_id,
+        leg_index=2,
+        order_id="entry-pending",
+        client_order_id="client-pending",
+        pos_id=None,
+        status="pending",
+        attribution_status="unassigned",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=100,
+                message_id=55,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 7, 30, 1, 0),
+                entered_at=datetime(2026, 7, 30, 1, 1),
+                execution_binding_id=binding_id,
+            )
+        )
+        session.commit()
+
+    class MutationTrapClient:
+        def __init__(self):
+            self.cancel_calls = 0
+
+        def list_positions(self, *, inst_id=None):
+            return []
+
+        def cancel_trigger_order(self, _payload):
+            self.cancel_calls += 1
+            raise AssertionError("exchange cancellation must be unreachable")
+
+        def cancel_order(self, _payload):
+            self.cancel_calls += 1
+            raise AssertionError("exchange cancellation must be unreachable")
+
+    client = MutationTrapClient()
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0),
+        allow_exchange_mutations=False,
+    )
+
+    assert client.cancel_calls == 0
+    assert result.checked == 1
+    assert result.manually_closed == 0
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        lifecycle = session.query(StrategyLifecycle).one()
+        legs = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id)
+            .order_by(ExecutionOrderLeg.leg_index)
+            .all()
+        )
+        assert binding.status == "open"
+        assert binding.last_exchange_status == "entry_legs_pending_after_position_closed"
+        assert lifecycle.lifecycle_status == "entered"
+        assert [(leg.status, leg.terminal_reason) for leg in legs] == [
+            ("active", None),
+            ("pending", None),
+        ]
+
+
 def test_missing_position_history_uncertainty_does_not_skip_pending_order_cancel(
     tmp_path,
 ):
