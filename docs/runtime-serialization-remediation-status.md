@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 6a
 phase_name: durable-worker-command-boundary
-phase_status: planned          # planned | claimed | in_progress | completed
-claimed_by: null
+phase_status: claimed          # planned | claimed | in_progress | completed
+claimed_by: 01a02822-4cb1-7891-9808-7175deb8ab14
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-6a-durable-worker-command-boundary.md
 last_completed_phase: 5   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5
 last_completed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
