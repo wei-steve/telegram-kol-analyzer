@@ -6,8 +6,8 @@ This file is the canonical ownership and progress record for the production-moni
 workflow: production-monitor-remediation
 design_file: docs/plans/2026-08-21-production-monitor-remediation-design.md
 implementation_plan_file: docs/plans/2026-08-21-production-monitor-remediation.md
-phase_status: planned
-claimed_by: null
+phase_status: claimed
+claimed_by: codex-monitor-remediation-20260822T020604Z
 scope: live-position projection, capture adapter contract, expected-HEAD deployment sync
 risk_level: L2
 message_lock_mode: global
