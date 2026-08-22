@@ -22,6 +22,7 @@ current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phas
 last_completed_phase: 5   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5
 last_completed_commit: 7a54411ebb0907cd04c33fe3b474f4b5b54ecfb8
 phase_6a_planning_claim_commit: 7f266f43844b15648f6d013121f1efe3271a137d
+phase_6a_implementation_claim_commit: 86f2328b9c89fcbdb5ee57fea289ffd773cb0784
 phase_6a_design_commit: d04dc7d47cdb44fb6f36ada439c38e6c108b88c4
 phase_6a_plan_commit: e93b13b253ff0191309b478182d11d4da38d0e9c
 phase_6a_planning_status: "PLANNED ONLY. The owner approved the durable SQLite worker-command design and the complete TDD/L3 implementation plan. No production code, database, setting, GitHub branch, server, systemd unit, or exchange state was changed. A future implementation turn must run the full exclusive preflight, claim Phase 6A, and execute only its current phase file."
