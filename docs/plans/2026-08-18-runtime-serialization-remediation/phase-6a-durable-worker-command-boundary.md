@@ -710,6 +710,318 @@ global/queue/queue, and topology stays monolithic.
 
 Do not interrupt a real exchange write to manufacture uncertainty.
 
+## Task 12A: Add the owner-approved exchange-read-only shadow probe
+
+> **For Codex:** Execute this supplement with `executing-plans` and
+> `test-driven-development`. The approved design is
+> `docs/plans/2026-08-22-phase-6a-safe-sync-shadow-probe-design.md`. Do not
+> start Claude, subagents, background agents, or a parallel implementation
+> session.
+
+This task exists only because the ordinary sync route cannot satisfy the
+owner's Task 12 sample authorization while production liveness is live. The
+probe is migration-only and must be removed in Candidate B. Requests without
+the probe header keep the exact existing full sync behavior.
+
+### Task 12A.1: Make manual-close reconciliation explicitly mutation-free
+
+**Files:**
+
+- Modify first: `tests/test_execution_bindings.py`
+- Modify: `src/telegram_kol_research/execution_bindings.py`
+
+**Step 1: Write one focused failing test**
+
+Build a missing-position binding with a visible pending entry order and a fake
+client whose cancel methods record calls. Call:
+
+```python
+result = sync_manual_closed_deepcoin_positions(
+    session_factory,
+    client=client,
+    synced_at=NOW,
+    allow_exchange_mutations=False,
+)
+```
+
+Assert the client receives zero cancel/submit/amend calls, the pending leg is
+not terminalized, the binding remains fail-closed/open, and permitted local
+reconciliation fields are committed. Add a companion assertion that omitting
+the keyword retains the existing cancellation behavior and call ordering.
+
+**Step 2: Verify RED**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_execution_bindings.py \
+  -k 'manual_closed and exchange_mutations'
+```
+
+Expected RED: `sync_manual_closed_deepcoin_positions()` rejects the new
+keyword.
+
+**Step 3: Implement the minimum guard**
+
+Add a keyword-only parameter whose default preserves current behavior:
+
+```python
+def sync_manual_closed_deepcoin_positions(
+    session_factory,
+    *,
+    client,
+    synced_at=None,
+    allow_exchange_mutations: bool = True,
+):
+```
+
+Call `_cleanup_terminal_lifecycle_entry_exposure` and
+`_cleanup_missing_position_deferred_entries` only when the flag is true. Use
+an empty cleanup-status map otherwise. Do not change any other branch or the
+decorator/lock boundary.
+
+**Step 4: Verify GREEN and the existing cleanup slice**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_execution_bindings.py \
+  -k 'manual_closed or terminal_entry_cleanup'
+```
+
+**Step 5: Commit explicitly**
+
+```bash
+git add tests/test_execution_bindings.py \
+  src/telegram_kol_research/execution_bindings.py
+git diff --cached --name-only
+git commit -m "feat: isolate mutation-free manual close sync"
+```
+
+### Task 12A.2: Add a bounded reconcile-only sync policy
+
+**Files:**
+
+- Modify first: `tests/test_worker_command_executor.py`
+- Modify: `src/telegram_kol_research/worker_command_executor.py`
+
+**Step 1: RED — normal policy remains byte-for-byte compatible**
+
+Extend the current sync-adapter characterization so an empty request still
+calls, in order, the write-capable reconciler, manual-close sync with its
+default mutation policy, then the three configured notification deliverers.
+The request/result body and error mapping must stay unchanged.
+
+Run:
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_worker_command_executor.py -k 'sync_adapter and full_policy'
+```
+
+Expected RED: the adapter does not yet expose or validate an effects policy.
+
+**Step 2: GREEN — introduce strict policy parsing only**
+
+Accept exactly `{}` as `full` and
+`{"effects_policy":"reconcile_only"}` as the temporary probe request. Reject
+every other sync request before constructing a Deepcoin client. Pass the claim
+request into `_execute_sync`; keep the full branch identical.
+
+**Step 3: RED — reconcile-only cannot reach mutation or notification**
+
+Add a test client that supplies every required read method but raises
+`AssertionError` from submit/cancel/amend/close methods. Require the probe to:
+
+- call `reconcile_deepcoin_execution_bindings_read_only` rather than the full
+  reconciler;
+- call manual-close sync with `allow_exchange_mutations=False`;
+- omit the contract-spec provider;
+- call no notification deliverer;
+- return the existing six-key `200` body;
+- map incomplete read evidence through the existing bounded failure contract;
+- execute the blocking unit exactly once.
+
+Run the new test and observe the expected failure before production changes.
+
+**Step 4: GREEN — add the minimum read-only orchestration**
+
+Add a small explicit read-only client facade that forwards only:
+
+```text
+list_positions, list_open_orders, read_trigger_orders_pending,
+list_trigger_orders_pending, list_order_history, list_trade_fills,
+list_trigger_order_history, list_position_history
+```
+
+Any other attribute is unavailable. Use it only in the reconcile-only branch.
+Call the existing read-only reconciler and mutation-disabled manual-close sync.
+Do not catch a mutation attempt and retry through the full branch.
+
+**Step 5: Verify and commit**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_worker_command_executor.py -k sync
+git add tests/test_worker_command_executor.py \
+  src/telegram_kol_research/worker_command_executor.py
+git diff --cached --name-only
+git commit -m "feat: add reconcile-only sync policy"
+```
+
+### Task 12A.3: Gate the temporary real HTTP shadow probe
+
+**Files:**
+
+- Modify first: `tests/test_web_app.py`
+- Modify: `src/telegram_kol_research/web_app.py`
+
+**Step 1: RED — freeze the no-header path**
+
+Assert a normal sync request still enqueues `{}` and invokes the current full
+reconciler, manual-close sync, and enabled notification delivery in the frozen
+order. This test must pass before the route is edited and continue to pass
+afterward.
+
+**Step 2: RED — add exact probe admission tests**
+
+For `X-Worker-Command-Probe: reconcile-only`, require:
+
+- `worker_command_mode=shadow`;
+- `system_operator_bot_enabled(app.state.notification_bot_config) == false`;
+- no JSON payload;
+- shadow request JSON exactly
+  `{"effects_policy":"reconcile_only"}`;
+- the reconcile-only orchestration result settles the one shadow job with the
+  exact returned status/body fingerprint;
+- attribution, protection, and cleanup delivery calls remain zero.
+
+Require an unknown header value to return bounded `400`, and an otherwise valid
+probe in inline/queue mode or with the notification bot enabled to return
+bounded `409`. Each refusal occurs before enqueue, reconciliation, or Deepcoin
+client creation.
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_web_app.py -k 'sync_deepcoin and (probe or no_header)'
+```
+
+Expected RED: the header is currently ignored and the shadow request remains
+`{}`.
+
+**Step 3: Implement the migration-only Web branch**
+
+Parse the header before `_prepare_web_worker_command`. Load settings through
+the existing async/off-thread pattern for the gate. For an admitted probe, pass
+the internal request policy to durable admission and run the bounded
+reconcile-only orchestration. Requests without the header remain on the exact
+existing route body. Do not add a UI control or persist a new trading setting.
+
+**Step 4: Verify focused route and event-loop coverage**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_web_app.py \
+  -k 'worker_command or sync_deepcoin or lifespan'
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_worker_command_executor.py -k sync \
+  tests/test_runtime_event_loop_blocking_census.py
+```
+
+**Step 5: Commit explicitly**
+
+```bash
+git add tests/test_web_app.py src/telegram_kol_research/web_app.py
+git diff --cached --name-only
+git commit -m "feat: gate phase 6a safe sync probe"
+```
+
+### Task 12A.4: Assemble the replacement Candidate A
+
+**Step 1: Run the affected acceptance slice**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_execution_bindings.py \
+  -k 'manual_closed or terminal_entry_cleanup'
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_worker_command_executor.py \
+  tests/test_web_app.py \
+  -k 'worker_command or sync_deepcoin or close_bound_position or recovery_live_submit or trade_signal_process_next or lifespan'
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
+  tests/test_process_boundary_authority.py \
+  tests/test_runtime_event_loop_blocking_census.py
+```
+
+Expected: zero failures and the existing Candidate A authority strict-xfail
+only. Run `git diff --check`.
+
+**Step 2: Run one new final full suite**
+
+```bash
+/Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q
+```
+
+Record exact counts and runtime. If production code changes afterward, run the
+affected focused tests and exactly one new final full suite on the replacement
+candidate.
+
+**Step 3: Record and push the replacement candidate**
+
+Use explicit paths for any test-only assembly commit. Verify the actual remote
+is the local candidate's ancestor, then push fast-forward only to
+`codex/deepcoin-auto-trading-v1`. The original Candidate A remains the rollback
+target until the replacement deploy passes.
+
+### Task 12A.5: Rehearse, deploy, and collect exactly one real sample
+
+**Step 1: Production-copy rehearsal**
+
+Create a fresh online production backup and a rehearsal copy. Run the admitted
+probe orchestration against the copy with a captured/fake read-only exchange
+snapshot and mutation-trap client. Record `PRAGMA quick_check`, before/after
+counts and targeted hashes for worker jobs, bindings/legs, lifecycles, execution
+events, protection tables, and both notification outboxes. Prove no mutation
+method and no notification deliverer was called. The prior schema/physical
+rollback rehearsal remains authoritative because no schema changed.
+
+**Step 2: Pre-deploy gate and exact-SHA deploy**
+
+Require exact current production SHA, active service, global/queue/shadow,
+notification bot effectively disabled, zero active management/write state,
+zero claimed/executing worker commands, WAL, quick check, complete queue state,
+and a recoverable rollback SHA. Use only the gated updater with the exact
+replacement Candidate A SHA.
+
+**Step 3: Freeze exact old outbox state**
+
+Using SQLite URI `mode=ro` plus `query_only=1`, record a deterministic digest of
+every pre-existing attribution/protection outbox row including id, status,
+notification timestamps, error, claim/lease fields where present, and payload
+fingerprint. Record counts by state. `total_changes` must remain zero.
+
+**Step 4: Recheck and invoke once**
+
+Immediately recheck notification disabled state, zero active management/write
+state, modes, and worker inflight counts. Then invoke exactly one real
+`POST /api/execution/sync-deepcoin` with the reconcile-only probe header and a
+fresh idempotency key. Do not retry an accepted request. An incomplete response
+or evidence query gets at most one reasoned read-only evidence retry, not a
+second sync.
+
+**Step 5: Verify parity and absence of forbidden effects**
+
+Require exactly one non-claimable shadow job whose request and terminal
+status/body fingerprint match the HTTP response. Recompute the exact old-outbox
+digest and require equality. Verify no notification delivery/claim, no exchange
+submit/cancel/amend/close, no duplicate domain/execution event, no
+`SQLITE_BUSY`, and complete read-only Deepcoin order/fill/trigger/position
+history spanning the sample. Normal permitted DB reconciliation is recorded,
+not treated as drift.
+
+Any failed or incomplete gate stops in shadow, keeps Phase 6A `in_progress`,
+records evidence, and does not proceed to queue. If the sample passes, resume
+Task 12 Step 4; Candidate B must delete the probe branch and its tests while
+retaining the normal-contract characterization.
+
 ## Task 13: Remove migration-only Web authority for Candidate B
 
 **Files:**
