@@ -1847,6 +1847,7 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         "auto_trade",
         "persist_automation",
     ]
+    assert events.index("auto_trade") < events.index("persist_automation")
     assert result.assessment.agreement_status == "pending"
     assert result.assessment.deepseek_payload is None
     assert result.automation == {"status": "executed", "reason": "close_submitted"}

@@ -196,6 +196,33 @@ def test_terminal_authoritative_failure_preserves_notification_metadata(tmp_path
     assert failed.notification_status == "sent"
 
 
+def test_completed_authoritative_decision_is_terminal_for_semantic_claims(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    save_terminal_authoritative_decision(
+        session_factory,
+        RecognitionDecisionRecord(
+            raw_message_id=raw_id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status="识别失败",
+            authoritative_payload={},
+            auxiliary_model=None,
+            auxiliary_status=None,
+            auxiliary_payload=None,
+            agreement_status="authoritative_failed",
+            differences=[],
+            prompt_versions={"mimo": {}},
+        ),
+    )
+
+    assert claim_next_semantic_review(
+        session_factory,
+        now=datetime(2026, 7, 13, 12, 0),
+        stale_before=datetime(2026, 7, 13, 11, 55),
+    ) is None
+
+
 def test_comparison_completion_preserves_automation_outcome(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)

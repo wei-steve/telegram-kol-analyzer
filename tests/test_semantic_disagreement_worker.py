@@ -349,7 +349,13 @@ def test_worker_persists_sent_status_and_canonical_fingerprint(tmp_path):
     def notifier(**kwargs):
         with factory() as session:
             row = session.query(RecognitionDecision).one()
-            observed.append((row.notification_status, row.automation_status))
+            observed.append(
+                (
+                    row.comparison_status,
+                    row.notification_status,
+                    row.automation_status,
+                )
+            )
         assert kwargs["payload"]["text"] == "全部出局"
         assert kwargs["payload"]["conflict_types"] == [
             "actionability",
@@ -366,7 +372,7 @@ def test_worker_persists_sent_status_and_canonical_fingerprint(tmp_path):
 
     with factory() as session:
         row = session.query(RecognitionDecision).one()
-        assert observed == [("scheduled", "submitted")]
+        assert observed == [("completed", "scheduled", "submitted")]
         assert row.notification_status == "sent"
         assert row.notification_error is None
         assert row.notification_fingerprint == hashlib.sha256(
