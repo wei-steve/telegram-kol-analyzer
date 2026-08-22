@@ -53,19 +53,19 @@ The implementation session must append concise, non-secret facts here:
 candidate_commit: 556f53592436ab21f49281acda3448cf7037010e
 focused_tests: "final monitor and web: 350 passed in 4.61s; final updater and installer: 108 passed, 1 skipped in 85.37s"
 full_suite: "5888 passed, 1 skipped, 17 warnings in 442.65s (0:07:22)"
-deployed_commit: null
-production_window: null
-real_messages_observed: null
-chats_observed: null
-monitor_cycles_observed: null
-expected_head_verified: null
-adapter_failure_absent: null
-capture_writer_warning_absent: null
-queue_backlog_verified: null
-duplicate_processing_verified: null
-loop_health_verified: null
-evidence_path: null
-outstanding: "exact-SHA push/deploy authorization required"
+deployed_commit: 10160398630dc15472dc660fe13ca8721a19337d
+production_window: "2026-08-22T05:10:17+00:00 to 2026-08-22T05:41:36+00:00 (at least 30 continuous minutes)"
+real_messages_observed: 38
+chats_observed: 9
+monitor_cycles_observed: "2 (one non-notifying diagnostic and one scheduled cycle; both healthy)"
+expected_head_verified: true
+adapter_failure_absent: true
+capture_writer_warning_absent: true
+queue_backlog_verified: false
+duplicate_processing_verified: true
+loop_health_verified: true
+evidence_path: /var/lib/telegram-kol-monitor/evidence/production-monitor-remediation-20260822T051016Z.jsonl
+outstanding: "queue terminality gate: one frozen-window job remained nonterminal and current parity had stuck_pending_count=1 after a bounded drain; read-only logs isolated the retries to the out-of-scope DeepSeek HTTP 402 incident"
 ```
 
 Keep raw JSON, long logs, position rows, and detailed monitor output in a server-side evidence file. Do not place credentials, message contents, provider responses, or exchange payloads in this document.
