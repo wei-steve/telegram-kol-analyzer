@@ -87,6 +87,7 @@
       {% set execution_outcome = message.execution_outcome %}
       {% set decision_card = message.decision_card %}
       {% set mimo_analysis = message.mimo_analysis %}
+      {% set historical_context_analysis = message.historical_context_analysis %}
       {% set modern_mimo = mimo_analysis and mimo_analysis.format == 'v2' %}
       {% set system_acceptance = message.system_acceptance %}
       {% set low_confidence_exit_targets = message.low_confidence_exit_targets %}
@@ -319,6 +320,19 @@
               <small>引用消息：{{ '#' ~ context.reply_to_message_id if context.reply_to_message_id else '无' }} · 证据版本：{{ context.evidence_version or '-' }} · 输入：{{ context.evidence_input_kind or '-' }}</small>
               {% if context.decision %}<small>决策：{{ context.decision }} · 置信度：{{ context.confidence if context.confidence is not none else '-' }} · 支持消息：{{ context.supporting_message_ids | join(', ') if context.supporting_message_ids else '无' }} · 反对消息：{{ context.opposing_message_ids | join(', ') if context.opposing_message_ids else '无' }}</small>{% endif %}
               {% if context.unresolved_reason %}<small>待解决原因：{{ context.unresolved_reason }} · 下次触发：{{ context.next_triggers | join(', ') if context.next_triggers else '未声明' }}</small>{% endif %}
+            </section>
+          {% endif %}
+          {% if historical_context_analysis %}
+            <section class="message-context-resolution is-historical-analysis" aria-label="历史分析补齐">
+              <strong>历史分析补齐（不执行）</strong>
+              <small>状态：{{ historical_context_analysis.status }} · 分析模型：{{ historical_context_analysis.analyst_model }}</small>
+              {% if historical_context_analysis.decision %}
+                <small>决策：{{ historical_context_analysis.decision }} · 置信度：{{ historical_context_analysis.confidence if historical_context_analysis.confidence is not none else '-' }}</small>
+              {% endif %}
+              {% if historical_context_analysis.target_thread_ids %}
+                <small>目标：{% for thread_id in historical_context_analysis.target_thread_ids %}线程 #{{ thread_id }}{% if not loop.last %}；{% endif %}{% endfor %}</small>
+              {% endif %}
+              {% if historical_context_analysis.reason %}<small>原因：{{ historical_context_analysis.reason }}</small>{% endif %}
             </section>
           {% endif %}
           {% if system_acceptance or execution_outcome %}

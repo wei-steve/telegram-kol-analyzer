@@ -7,6 +7,7 @@ from sqlalchemy import event
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    ContextAnalysisBackfill,
     ContextResolutionAttempt,
     ExecutionBinding,
     MediaAsset,
@@ -216,6 +217,68 @@ def test_load_group_messages_projects_safe_context_resolution_observability(tmp_
     assert context["unresolved_reason"] == "等待入场状态"
     assert context["next_triggers"] == ["strategy_state_changed"]
     assert "request_summary_json" not in context
+
+
+def test_load_group_messages_projects_latest_context_analysis_backfill_separately(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=9, message_id=1463, text="历史补齐消息")
+        session.add(raw)
+        session.flush()
+        attempt = ContextResolutionAttempt(
+            raw_message_id=raw.id,
+            context_fingerprint="sha256:historical-source",
+            model="deepseek-v4-flash",
+            prompt_versions_json='{"context_resolution":"context-resolution-v1"}',
+            request_summary_json="{}",
+            status="exhausted",
+        )
+        session.add(attempt)
+        session.flush()
+        session.add_all(
+            [
+                ContextAnalysisBackfill(
+                    run_id="older-run",
+                    raw_message_id=raw.id,
+                    source_attempt_id=attempt.id,
+                    source_request_sha256="older-request",
+                    prompt_version="context-resolution-v1",
+                    analyst_model="codex-manual-context-v1",
+                    decision_json='{"decision":"hold","target_thread_ids":[],"confidence":0.4,"reason":"older"}',
+                    status="analysis_only_completed",
+                ),
+                ContextAnalysisBackfill(
+                    run_id="newer-run",
+                    raw_message_id=raw.id,
+                    source_attempt_id=attempt.id,
+                    source_request_sha256="newer-request",
+                    prompt_version="context-resolution-v1",
+                    analyst_model="codex-manual-context-v1",
+                    decision_json='{"decision":"manage_thread","target_thread_ids":[123],"confidence":0.91,"reason":"仅补齐历史上下文"}',
+                    status="analysis_only_completed",
+                ),
+            ]
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
+
+    assert row["historical_context_analysis"] == {
+        "status": "analysis_only_completed",
+        "non_authoritative": True,
+        "decision": "manage_thread",
+        "target_thread_ids": [123],
+        "confidence": 0.91,
+        "reason": "仅补齐历史上下文",
+        "analyst_model": "codex-manual-context-v1",
+    }
+    assert row["context_resolution"]["linked_threads"] == []
+    assert row["strategy_lifecycle_id"] is None
+    assert "instruction" not in row["historical_context_analysis"]
+    assert "lifecycle" not in row["historical_context_analysis"]
+    assert "operation" not in row["historical_context_analysis"]
 
 
 def test_load_group_messages_limits_excessive_media_assets_per_message(tmp_path):

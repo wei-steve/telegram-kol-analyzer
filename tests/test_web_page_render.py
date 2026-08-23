@@ -15,6 +15,8 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import StaticDeepcoinContractSpecProvider
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionOrderLeg
+from telegram_kol_research.models import ContextAnalysisBackfill
+from telegram_kol_research.models import ContextResolutionAttempt
 from telegram_kol_research.models import MediaAsset
 from telegram_kol_research.models import MessageRecognition
 from telegram_kol_research.models import PositionProtectionLedger
@@ -4202,6 +4204,57 @@ def test_index_page_renders_message_cards_with_hierarchy_and_media_labels(tmp_pa
     assert "/local-media/77/2.jpg" in response.text
     assert 'class="media-token"' in response.text
     assert "/local-media/77/2.mp4" not in response.text
+
+
+def test_message_detail_renders_context_analysis_backfill_as_non_executing_history(
+    tmp_path,
+):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=1463, text="历史上下文补齐")
+        session.add(raw)
+        session.flush()
+        attempt = ContextResolutionAttempt(
+            raw_message_id=raw.id,
+            context_fingerprint="sha256:web-history",
+            model="deepseek-v4-flash",
+            prompt_versions_json='{"context_resolution":"context-resolution-v1"}',
+            request_summary_json="{}",
+            status="exhausted",
+        )
+        session.add(attempt)
+        session.flush()
+        session.add(
+            ContextAnalysisBackfill(
+                run_id="web-history-run",
+                raw_message_id=raw.id,
+                source_attempt_id=attempt.id,
+                source_request_sha256="request-hash",
+                prompt_version="context-resolution-v1",
+                analyst_model="codex-manual-context-v1",
+                decision_json='{"decision":"manage_thread","target_thread_ids":[123],"confidence":0.91,"reason":"仅补齐历史上下文"}',
+                status="analysis_only_completed",
+            )
+        )
+        session.commit()
+    client = TestClient(
+        create_web_app(
+            database_path=database_path,
+            group_config=GroupConfig(
+                groups=[TargetGroupConfig(chat_title="77", chat_id=77)]
+            ),
+        )
+    )
+
+    response = client.get("/groups/77/detail/tab/messages")
+
+    assert response.status_code == 200
+    assert "历史分析补齐（不执行）" in response.text
+    assert "manage_thread" in response.text
+    assert "仅补齐历史上下文" in response.text
+    assert "线程 #123" in response.text
+    assert "data-message-strategy-record" not in response.text
 
 
 def test_message_tab_renders_bounded_adjacent_entry_assembly(tmp_path):

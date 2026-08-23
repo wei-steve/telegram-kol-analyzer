@@ -11,6 +11,7 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
+    ContextAnalysisBackfill,
     ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -679,6 +680,18 @@ def _serialize_raw_messages(
     context_attempt_by_msg_id: dict[int, ContextResolutionAttempt] = {}
     for attempt in context_attempts:
         context_attempt_by_msg_id.setdefault(attempt.raw_message_id, attempt)
+    context_backfills = (
+        session.query(ContextAnalysisBackfill)
+        .filter(ContextAnalysisBackfill.raw_message_id.in_(raw_message_ids))
+        .order_by(
+            ContextAnalysisBackfill.raw_message_id.asc(),
+            ContextAnalysisBackfill.id.desc(),
+        )
+        .all()
+    )
+    context_backfill_by_msg_id: dict[int, ContextAnalysisBackfill] = {}
+    for backfill in context_backfills:
+        context_backfill_by_msg_id.setdefault(backfill.raw_message_id, backfill)
     evidence_rows = (
         session.query(MessageEvidenceVersion)
         .filter(
@@ -924,10 +937,46 @@ def _serialize_raw_messages(
                     links=context_links_by_msg_id.get(raw_message.id, []),
                     thread_history_by_thread_id=thread_history_by_thread_id,
                 ),
+                "historical_context_analysis": _serialize_historical_context_analysis(
+                    context_backfill_by_msg_id.get(raw_message.id)
+                ),
             }
         )
 
     return rows
+
+
+def _serialize_historical_context_analysis(
+    backfill: ContextAnalysisBackfill | None,
+) -> dict[str, object] | None:
+    if backfill is None:
+        return None
+    decision = _safe_json_dict(backfill.decision_json)
+    target_thread_ids = decision.get("target_thread_ids")
+    safe_target_thread_ids = (
+        [
+            int(value)
+            for value in target_thread_ids
+            if isinstance(value, int) and not isinstance(value, bool)
+        ]
+        if isinstance(target_thread_ids, list)
+        else []
+    )
+    confidence = decision.get("confidence")
+    safe_confidence = (
+        float(confidence)
+        if isinstance(confidence, (int, float)) and not isinstance(confidence, bool)
+        else None
+    )
+    return {
+        "status": backfill.status,
+        "non_authoritative": True,
+        "decision": str(decision.get("decision") or "") or None,
+        "target_thread_ids": safe_target_thread_ids,
+        "confidence": safe_confidence,
+        "reason": str(decision.get("reason") or "") or None,
+        "analyst_model": backfill.analyst_model,
+    }
 
 
 def _serialize_mimo_analysis(
