@@ -192,10 +192,14 @@ def _load_env_file_values(
     ignore_unreadable_names: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
     values: dict[str, str] = {}
-    candidate_paths = env_file_paths or [
-        ".env",
-        "config/llm.env",
-    ]
+    candidate_paths = (
+        [
+            ".env",
+            "config/llm.env",
+        ]
+        if env_file_paths is None
+        else env_file_paths
+    )
     for raw_path in candidate_paths:
         path = os.fspath(raw_path)
         if not os.path.isfile(path):

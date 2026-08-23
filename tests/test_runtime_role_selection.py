@@ -58,6 +58,132 @@ def test_create_web_app_defaults_to_the_existing_all_role(tmp_path):
     assert app.state.runtime_role == "all"
 
 
+def test_explicit_empty_env_file_paths_disable_checkout_secret_fallbacks(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.llm_chat import load_llm_proxy_config
+    from telegram_kol_research.strategy_alerts import load_strategy_alert_config
+    from telegram_kol_research.telegram_client import load_telegram_auth_config
+
+    (tmp_path / ".env").write_text(
+        "TELEGRAM_KOL_LLM_API_KEY=checkout-secret\n"
+        "TELEGRAM_KOL_ALERT_BOT_TOKEN=checkout-alert-token\n"
+        "TELEGRAM_KOL_ALERT_CHAT_ID=checkout-chat\n"
+        "TELEGRAM_API_ID=123\n"
+        "TELEGRAM_API_HASH=checkout-hash\n",
+        encoding="utf-8",
+    )
+    monkeypatch.chdir(tmp_path)
+    isolated_environ = {"UNRELATED_SENTINEL": "1"}
+
+    llm_config = load_llm_proxy_config(
+        environ=isolated_environ,
+        env_file_paths=[],
+    )
+    alert_config = load_strategy_alert_config(
+        environ=isolated_environ,
+        env_file_paths=[],
+    )
+
+    assert llm_config.api_key == ""
+    assert alert_config.bot_token == ""
+    assert alert_config.alert_chat_id == ""
+    with pytest.raises(ValueError, match="TELEGRAM_API_ID is required"):
+        load_telegram_auth_config(
+            environ=isolated_environ,
+            env_file_paths=[],
+        )
+
+
+@pytest.mark.parametrize("role", ["ingest", "worker", "web"])
+def test_split_runtime_app_loads_secrets_from_process_environment_only(
+    role, tmp_path, monkeypatch
+):
+    from telegram_kol_research import web_app
+    from telegram_kol_research.config import (
+        MessageOperationSupervisorConfig,
+        RuntimeIncidentConfig,
+    )
+    from telegram_kol_research.llm_chat import LLMProxyConfig
+    from telegram_kol_research.strategy_alerts import StrategyAlertConfig
+    from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+
+    calls = {}
+
+    def record(name, value, **kwargs):
+        calls[name] = kwargs
+        return value
+
+    monkeypatch.setattr(
+        web_app,
+        "load_llm_proxy_config",
+        lambda **kwargs: record(
+            "llm",
+            LLMProxyConfig("http://127.0.0.1:8317", "", "model", 1.0),
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "load_strategy_alert_config",
+        lambda **kwargs: record(
+            "strategy_alert",
+            StrategyAlertConfig(
+                "http://127.0.0.1:8317", "", "model", 1.0, "", ""
+            ),
+            **kwargs,
+        ),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "load_system_operator_bot_config",
+        lambda **kwargs: record(
+            "system_bot", SystemOperatorBotConfig("", ""), **kwargs
+        ),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "load_notification_bot_config",
+        lambda **kwargs: record(
+            "notification_bot", SystemOperatorBotConfig("", ""), **kwargs
+        ),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "load_runtime_incident_config",
+        lambda **kwargs: record("runtime_incident", RuntimeIncidentConfig(), **kwargs),
+    )
+    monkeypatch.setattr(
+        web_app,
+        "load_message_operation_supervisor_config",
+        lambda **kwargs: record(
+            "message_supervisor", MessageOperationSupervisorConfig(), **kwargs
+        ),
+    )
+    deepcoin_client = object()
+    monkeypatch.setattr(
+        web_app,
+        "build_deepcoin_client_from_env",
+        lambda **kwargs: record("deepcoin", deepcoin_client, **kwargs),
+    )
+
+    app = web_app.create_web_app(
+        database_path=tmp_path / f"{role}.db",
+        runtime_role=role,
+    )
+
+    assert calls == {
+        "llm": {"env_file_paths": []},
+        "strategy_alert": {"env_file_paths": []},
+        "system_bot": {"env_file_paths": []},
+        "notification_bot": {"env_file_paths": []},
+        "runtime_incident": {"environment_only": True},
+        "message_supervisor": {"env_file_paths": []},
+    }
+    assert app.state.deepcoin_client_factory() is deepcoin_client
+    assert calls["deepcoin"] == {"env_file_paths": []}
+
+
 def test_split_runtime_roles_partition_the_existing_singleton_task_set():
     from telegram_kol_research import web_app
 
@@ -351,7 +477,23 @@ def test_ingest_cli_role_acquires_session_before_creating_client(
 
     config = TelegramAuthConfig(api_id=1, api_hash="hash", session_path=session_path)
     client = object()
-    monkeypatch.setattr(cli, "load_telegram_auth_config", lambda: calls.append("auth") or config)
+    monkeypatch.setattr(
+        cli,
+        "load_telegram_auth_config",
+        lambda **kwargs: calls.append(("auth", kwargs)) or config,
+    )
+    deepcoin_calls = []
+
+    class DeepcoinClient:
+        def list_swap_instruments(self):
+            deepcoin_calls.append("list_swap_instruments")
+            return []
+
+    monkeypatch.setattr(
+        cli,
+        "build_deepcoin_client_from_env",
+        lambda **kwargs: deepcoin_calls.append(("build", kwargs)) or DeepcoinClient(),
+    )
     monkeypatch.setattr(
         cli,
         "reap_stopped_session_lock_owner",
@@ -396,7 +538,22 @@ def test_ingest_cli_role_acquires_session_before_creating_client(
     assert result.exit_code == 0, result.output
     assert captured["runtime_role"] == "ingest"
     assert captured["telegram_client"] is client
-    assert calls == ["auth", "reap", "lock", "lock_enter", "client", "lock_exit"]
+    assert calls == [
+        ("auth", {"env_file_paths": []}),
+        "reap",
+        "lock",
+        "lock_enter",
+        "client",
+        "lock_exit",
+    ]
+    authoritative_provider = (
+        captured["deepcoin_contract_spec_provider"].authoritative_provider
+    )
+    assert authoritative_provider._instrument_loader() == []
+    assert deepcoin_calls == [
+        ("build", {"env_file_paths": []}),
+        "list_swap_instruments",
+    ]
 
 
 def test_web_role_proxies_refresh_once_and_preserves_success_body(tmp_path):

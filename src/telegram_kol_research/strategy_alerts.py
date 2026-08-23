@@ -88,16 +88,16 @@ def load_strategy_alert_config(
 ) -> StrategyAlertConfig:
     """Load alert forwarding configuration from environment variables."""
 
-    env = dict(
-        _load_env_file_values(
-            env_file_paths
-            or [
-                ".env",
-                "config/llm.env",
-                "config/telegram.env",
-            ]
-        )
+    paths = (
+        [
+            ".env",
+            "config/llm.env",
+            "config/telegram.env",
+        ]
+        if env_file_paths is None
+        else env_file_paths
     )
+    env = dict(_load_env_file_values(paths) if paths else {})
     env.update(environ or os.environ)
     llm_model = env.get("TELEGRAM_KOL_ALERT_LLM_MODEL") or env.get(
         "TELEGRAM_KOL_LLM_MODEL",

@@ -4252,6 +4252,7 @@ def create_web_app(
     """Create the minimal FastAPI app used by the web command."""
 
     resolved_runtime_role = resolve_runtime_role(runtime_role)
+    split_runtime = resolved_runtime_role != "all"
     resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
     resolved_database_path = Path(database_path)
     log_directory = resolved_database_path.parent / "logs"
@@ -4838,20 +4839,36 @@ def create_web_app(
     app.state.session_factory = create_session_factory(database_path)
     app.state.media_root = resolved_media_root.resolve()
     app.state.live_update_broker = LiveUpdateBroker()
-    app.state.llm_proxy_config = load_llm_proxy_config()
-    loaded_strategy_alert_config = load_strategy_alert_config()
+    app.state.llm_proxy_config = (
+        load_llm_proxy_config(env_file_paths=[])
+        if split_runtime
+        else load_llm_proxy_config()
+    )
+    loaded_strategy_alert_config = (
+        load_strategy_alert_config(env_file_paths=[])
+        if split_runtime
+        else load_strategy_alert_config()
+    )
     app.state.strategy_alert_config = (
         loaded_strategy_alert_config
         if strategy_alerts_enabled(loaded_strategy_alert_config)
         else None
     )
-    loaded_system_operator_bot_config = load_system_operator_bot_config()
+    loaded_system_operator_bot_config = (
+        load_system_operator_bot_config(env_file_paths=[])
+        if split_runtime
+        else load_system_operator_bot_config()
+    )
     app.state.system_operator_bot_config = (
         loaded_system_operator_bot_config
         if system_operator_bot_enabled(loaded_system_operator_bot_config)
         else None
     )
-    loaded_notification_bot_config = load_notification_bot_config()
+    loaded_notification_bot_config = (
+        load_notification_bot_config(env_file_paths=[])
+        if split_runtime
+        else load_notification_bot_config()
+    )
     app.state.notification_bot_config = (
         loaded_notification_bot_config
         if system_operator_bot_enabled(loaded_notification_bot_config)
@@ -4879,6 +4896,10 @@ def create_web_app(
         app.state.runtime_incident_config_loader = lambda: runtime_incident_config
     elif runtime_incident_config_loader is not None:
         app.state.runtime_incident_config_loader = runtime_incident_config_loader
+    elif split_runtime:
+        app.state.runtime_incident_config_loader = (
+            lambda: load_runtime_incident_config(environment_only=True)
+        )
     else:
         app.state.runtime_incident_config_loader = load_runtime_incident_config
     try:
@@ -4890,7 +4911,11 @@ def create_web_app(
     app.state.message_operation_supervisor_config = (
         message_operation_supervisor_config
         if message_operation_supervisor_config is not None
-        else load_message_operation_supervisor_config()
+        else (
+            load_message_operation_supervisor_config(env_file_paths=[])
+            if split_runtime
+            else load_message_operation_supervisor_config()
+        )
     )
     app.state.message_operation_supervisor_policy_status = (
         message_operation_supervisor_policy_status(
@@ -4953,9 +4978,14 @@ def create_web_app(
         else None
     )
     app.state.contract_spec_refresh_task = None
-    app.state.deepcoin_client_factory = (
-        deepcoin_client_factory or build_deepcoin_client_from_env
-    )
+    if deepcoin_client_factory is not None:
+        app.state.deepcoin_client_factory = deepcoin_client_factory
+    elif split_runtime:
+        app.state.deepcoin_client_factory = lambda: build_deepcoin_client_from_env(
+            env_file_paths=[]
+        )
+    else:
+        app.state.deepcoin_client_factory = build_deepcoin_client_from_env
     app.state.live_position_snapshot_store = LivePositionSnapshotStore(
         Path(live_position_snapshot_path)
         if live_position_snapshot_path is not None

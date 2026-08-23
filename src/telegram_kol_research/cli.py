@@ -5671,10 +5671,16 @@ def web(
         required=False,
     )
     settings_session_factory = create_session_factory(database_path)
+
+    def build_runtime_deepcoin_client():
+        if runtime_role == "all":
+            return build_deepcoin_client_from_env()
+        return build_deepcoin_client_from_env(env_file_paths=[])
+
     authoritative_contract_spec_provider = RefreshableDeepcoinContractSpecProvider(
         cache_path=deepcoin_contract_specs_cache_path,
         instrument_loader=lambda: (
-            build_deepcoin_client_from_env().list_swap_instruments()
+            build_runtime_deepcoin_client().list_swap_instruments()
         ),
         ttl=timedelta(hours=deepcoin_contract_specs_ttl_hours),
     )
@@ -5692,7 +5698,11 @@ def web(
     telegram_session_lock_entered = False
     if runtime_role_owns_telegram_session(runtime_role):
         try:
-            auth_config = load_telegram_auth_config()
+            auth_config = (
+                load_telegram_auth_config()
+                if runtime_role == "all"
+                else load_telegram_auth_config(env_file_paths=[])
+            )
             reap_stopped_session_lock_owner(
                 auth_config.session_path,
                 current_command="telegram-kol-research web",

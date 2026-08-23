@@ -69,10 +69,14 @@ def _load_env_file_values(
     env_file_paths: list[str | Path] | None = None,
 ) -> dict[str, str]:
     values: dict[str, str] = {}
-    candidate_paths = env_file_paths or [
-        ".env",
-        "config/telegram.env",
-    ]
+    candidate_paths = (
+        [
+            ".env",
+            "config/telegram.env",
+        ]
+        if env_file_paths is None
+        else env_file_paths
+    )
     for raw_path in candidate_paths:
         path = Path(raw_path).expanduser()
         if not path.exists() or not path.is_file():
