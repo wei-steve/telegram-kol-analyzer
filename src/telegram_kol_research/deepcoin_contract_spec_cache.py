@@ -10,6 +10,7 @@ from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
 from decimal import InvalidOperation
+import errno
 import hashlib
 import hmac
 import json
@@ -17,6 +18,8 @@ import math
 import os
 from pathlib import Path
 import re
+import subprocess
+import sys
 import tempfile
 import threading
 from types import MappingProxyType
@@ -419,7 +422,28 @@ def publish_deepcoin_contract_spec_snapshot(
             prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
         )
         temporary_path = Path(temporary_name)
-        os.fchmod(descriptor, 0o600)
+        if sys.platform.startswith("linux"):
+            remove_xattr = getattr(os, "removexattr", None)
+            if remove_xattr is None:
+                subprocess.run(
+                    [
+                        "/usr/bin/setfacl",
+                        "-b",
+                        "--",
+                        f"/proc/self/fd/{descriptor}",
+                    ],
+                    check=True,
+                    close_fds=True,
+                    pass_fds=(descriptor,),
+                    env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+                )
+            else:
+                try:
+                    remove_xattr(descriptor, "system.posix_acl_access")
+                except OSError as exc:
+                    if exc.errno != errno.ENODATA:
+                        raise
+        os.fchmod(descriptor, 0o660)
         with os.fdopen(descriptor, "wb") as temporary_file:
             temporary_file.write(serialized_payload)
             temporary_file.flush()

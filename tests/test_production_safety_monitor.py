@@ -5548,6 +5548,11 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
         "read_loopback_settings",
         lambda url: _snapshot().settings,
     )
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_runtime_role",
+        lambda _url: "all",
+    )
     assert adapters.read_service_state() == "active"
     assert adapters.read_git_head() == REVIEWED_HEAD
     assert adapters.count_journal_errors(
@@ -5617,6 +5622,93 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
             {"timeout_seconds": 180},
         ),
     ]
+
+
+def test_service_adapter_requires_every_split_role_health_endpoint(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    calls = []
+    roles = {
+        "http://127.0.0.1:8000/api/runtime/loop-health": "web",
+        "http://127.0.0.1:8001/api/runtime/loop-health": "ingest",
+        "http://127.0.0.1:8002/api/runtime/loop-health": "worker",
+    }
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_settings",
+        lambda _url: _snapshot().settings,
+    )
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_runtime_role",
+        lambda url: calls.append(url) or roles[url],
+        raising=False,
+    )
+    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
+
+    assert adapters.read_service_state() == "active"
+    assert calls == [
+        "http://127.0.0.1:8000/api/runtime/loop-health",
+        "http://127.0.0.1:8001/api/runtime/loop-health",
+        "http://127.0.0.1:8002/api/runtime/loop-health",
+    ]
+
+
+def test_service_adapter_fails_closed_when_one_split_role_is_unavailable(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_settings",
+        lambda _url: _snapshot().settings,
+    )
+
+    def read_role(url):
+        if ":8002/" in url:
+            raise RuntimeError("worker unavailable")
+        return "web" if ":8000/" in url else "ingest"
+
+    monkeypatch.setattr(monitor_module, "read_loopback_runtime_role", read_role)
+    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
+
+    with pytest.raises(RuntimeError, match="worker unavailable"):
+        adapters.read_service_state()
+
+
+def test_split_journal_adapter_queries_all_three_runtime_units(monkeypatch):
+    import telegram_kol_research.production_safety_monitor as monitor_module
+
+    commands = []
+    roles = {
+        "http://127.0.0.1:8000/api/runtime/loop-health": "web",
+        "http://127.0.0.1:8001/api/runtime/loop-health": "ingest",
+        "http://127.0.0.1:8002/api/runtime/loop-health": "worker",
+    }
+    monkeypatch.setattr(
+        monitor_module,
+        "read_loopback_runtime_role",
+        lambda url: roles[url],
+        raising=False,
+    )
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda argv, **_kwargs: commands.append(argv)
+        or SimpleNamespace(returncode=0, output=""),
+    )
+    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
+
+    assert adapters.count_journal_errors(
+        since=datetime(2026, 8, 23, 0, 0, tzinfo=UTC)
+    ) == 0
+    command = commands[0]
+    assert command.count("--unit") == 3
+    for unit in (
+        "telegram-kol-worker.service",
+        "telegram-kol-web.service",
+        "telegram-kol-ingest.service",
+    ):
+        assert unit in command
 
 
 def test_default_audit_invocation_is_bound_to_current_interpreter_with_stripped_path(

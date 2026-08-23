@@ -234,6 +234,7 @@ def test_split_cutover_refreshes_generated_contract_cache_permissions():
     )[0]
     normalized_cutover_section = " ".join(cutover_section.split())
     assert "after `telegram-kol.service` has stopped" in normalized_cutover_section
+    assert f"setfacl -b {cache_path}" in cutover_section
     assert f"chgrp telegram-kol-runtime {cache_path}" in cutover_section
     assert f"chmod 0660 {cache_path}" in cutover_section
 

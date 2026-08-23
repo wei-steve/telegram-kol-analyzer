@@ -495,6 +495,20 @@ class ProductionSafetyAdapters:
     )
     monitor_capture_token: str | None = None
     service_name: str = "telegram-kol.service"
+    split_service_names: tuple[str, ...] = (
+        "telegram-kol-worker.service",
+        "telegram-kol-web.service",
+        "telegram-kol-ingest.service",
+    )
+    web_loop_health_url: str = (
+        "http://127.0.0.1:8000/api/runtime/loop-health"
+    )
+    ingest_loop_health_url: str = (
+        "http://127.0.0.1:8001/api/runtime/loop-health"
+    )
+    worker_loop_health_url: str = (
+        "http://127.0.0.1:8002/api/runtime/loop-health"
+    )
     audit_command: tuple[str, ...] = (
         sys.executable,
         "-m",
@@ -505,7 +519,20 @@ class ProductionSafetyAdapters:
         # A successful response from the service-owned loopback endpoint proves
         # the app is serving without granting this monitor system-bus access.
         read_loopback_settings(self.settings_url)
+        self._runtime_service_names()
         return "active"
+
+    def _runtime_service_names(self) -> tuple[str, ...]:
+        web_role = read_loopback_runtime_role(self.web_loop_health_url)
+        if web_role == "all":
+            return (self.service_name,)
+        if web_role != "web":
+            raise RuntimeError("runtime_topology_invalid")
+        if read_loopback_runtime_role(self.ingest_loop_health_url) != "ingest":
+            raise RuntimeError("runtime_topology_invalid")
+        if read_loopback_runtime_role(self.worker_loop_health_url) != "worker":
+            raise RuntimeError("runtime_topology_invalid")
+        return self.split_service_names
 
     def read_git_head(self) -> str:
         safe_checkout = self.checkout_path.resolve()
@@ -553,11 +580,15 @@ class ProductionSafetyAdapters:
         }
 
     def _read_bounded_journal_lines(self, *, since: datetime) -> tuple[str, ...]:
+        journal_units = tuple(
+            item
+            for service_name in self._runtime_service_names()
+            for item in ("--unit", service_name)
+        )
         completed = _run_bounded_command(
             (
                 "journalctl",
-                "--unit",
-                self.service_name,
+                *journal_units,
                 "--priority",
                 "err",
                 "--since",
@@ -2423,6 +2454,41 @@ def read_loopback_settings(
         ),
         "entry_revision_v2_mode": payload.get("entry_revision_v2_mode"),
     }
+
+
+def read_loopback_runtime_role(
+    url: str,
+    *,
+    timeout_seconds: float = 5.0,
+) -> str:
+    """Read one process-local role marker from a bounded loopback endpoint."""
+
+    parsed = urlsplit(url)
+    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
+        raise ValueError("loop health URL must use loopback HTTP")
+    body = bytearray()
+    with httpx.stream(
+        "GET",
+        url,
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > _MAX_HTTP_OUTPUT_BYTES:
+                raise ValueError("loop health response too large")
+    payload = json.loads(
+        body,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("loop health response must be an object")
+    role = payload.get("runtime_role")
+    if role not in {"all", "ingest", "worker", "web"}:
+        raise ValueError("loop health runtime role is invalid")
+    return role
 
 
 def read_monitor_live_position_sizes(

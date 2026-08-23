@@ -5369,6 +5369,7 @@ def create_web_app(
         monitor = app.state.loop_lag_monitor
         return {
             **monitor.snapshot(),
+            "runtime_role": app.state.runtime_role,
             "now": app.state.now_provider().isoformat(),
             "uptime_seconds": monitor.uptime_seconds(),
         }

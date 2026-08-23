@@ -202,10 +202,21 @@ def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp
     regular = tmp_path / "telegram.session"
     regular.write_text("redacted-fixture", encoding="utf-8")
     regular.chmod(0o644)
+    shared_cache = tmp_path / "deepcoin_contract_specs_cache.json"
+    shared_cache.write_text("{}", encoding="utf-8")
+    shared_cache.chmod(0o600)
+    shared_runtime_calls = []
+    sanitizer.__globals__["SHARED_RUNTIME_DATA_FILES"] = frozenset(
+        {shared_cache.name}
+    )
+    sanitizer.__globals__["_set_shared_runtime_acl_fd"] = (
+        lambda fd: shared_runtime_calls.append(os.fstat(fd).st_ino)
+    )
 
     sanitizer(trusted_owner_uid=os.getuid())
     assert regular.stat().st_mode & 0o077 == 0
     assert denied_directory.stat().st_mode & 0o077 == 0
+    assert shared_runtime_calls == [shared_cache.stat().st_ino]
 
     target = tmp_path.parent / f"{tmp_path.name}-protected-target"
     try:

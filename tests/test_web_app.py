@@ -771,6 +771,7 @@ def test_loop_health_endpoint_reports_monitor_snapshot(tmp_path):
 
     assert response.status_code == 200
     payload = response.json()
+    assert payload["runtime_role"] == "all"
     assert payload["samples"] >= 2
     assert payload["max_ms"] >= 4500.0
     assert payload["stall_count"] >= 1

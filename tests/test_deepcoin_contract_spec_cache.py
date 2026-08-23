@@ -567,8 +567,49 @@ def test_cache_publish_and_load_round_trip_atomically(tmp_path):
     loaded = load_deepcoin_contract_spec_snapshot(cache_path, now=NOW)
 
     assert loaded == snapshot
-    assert cache_path.stat().st_mode & 0o777 == 0o600
+    assert cache_path.stat().st_mode & 0o777 == 0o660
     assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
+
+
+def test_cache_publish_clears_inherited_posix_acl_before_group_mode(
+    tmp_path, monkeypatch
+):
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")],
+        source_path="/deepcoin/market/instruments?instType=SWAP",
+        fetched_at=NOW,
+        ttl=TTL,
+    )
+    events = []
+    real_fchmod = os.fchmod
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.sys.platform", "linux"
+    )
+
+    def recording_run(args, **_kwargs):
+        events.append(("clear_acl", tuple(args)))
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.subprocess.run",
+        recording_run,
+    )
+
+    def recording_fchmod(fd, mode):
+        events.append(("fchmod", mode))
+        real_fchmod(fd, mode)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.deepcoin_contract_spec_cache.os.fchmod",
+        recording_fchmod,
+    )
+
+    publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    assert events[0][0] == "clear_acl"
+    assert events[0][1][:3] == ("/usr/bin/setfacl", "-b", "--")
+    assert events[1] == ("fchmod", 0o660)
 
 
 def test_cache_digest_verification_is_independent_of_json_key_and_row_order(tmp_path):

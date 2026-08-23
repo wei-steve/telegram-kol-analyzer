@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import errno
+import grp
 import os
 import pwd
 import stat
@@ -12,6 +13,12 @@ import sys
 
 
 AGENT_USER = "telegram-kol-agent"
+SHARED_RUNTIME_GROUP = "telegram-kol-runtime"
+SHARED_RUNTIME_USERS = (
+    "telegram-kol-ingest",
+    "telegram-kol-worker",
+    "telegram-kol-web",
+)
 DATABASE_PATH = "/opt/telegram-kol-analyzer/data/research.db"
 SQLITE_PATHS = (
     DATABASE_PATH,
@@ -20,6 +27,7 @@ SQLITE_PATHS = (
     f"{DATABASE_PATH}-journal",
 )
 SQLITE_NAMES = frozenset(os.path.basename(path) for path in SQLITE_PATHS)
+SHARED_RUNTIME_DATA_FILES = frozenset({"deepcoin_contract_specs_cache.json"})
 REVIEWED_READABLE_DATA_DIRECTORIES = frozenset({"logs", "media", "web_cache"})
 DENIED_DATA_DIRECTORIES = frozenset(
     {"backups", "deepcoin_field_probe", "session_backups"}
@@ -79,6 +87,35 @@ def _set_agent_acl_fd(fd: int, permission: str) -> None:
     )
 
 
+def _set_shared_runtime_acl_fd(fd: int) -> None:
+    runtime_gid = grp.getgrnam(SHARED_RUNTIME_GROUP).gr_gid
+    os.fchown(fd, 0, runtime_gid)
+    os.fchmod(fd, 0o660)
+    subprocess.run(
+        [
+            "/usr/bin/setfacl",
+            "-m",
+            f"u:{AGENT_USER}:---,g::rw-,m::rw-",
+            "--",
+            f"/proc/self/fd/{fd}",
+        ],
+        check=True,
+        close_fds=True,
+        pass_fds=(fd,),
+        env={"PATH": "/usr/bin:/bin", "LANG": "C"},
+    )
+
+
+def _trusted_shared_runtime_owner_uids(trusted_owner_uid: int) -> frozenset[int]:
+    owner_uids = {trusted_owner_uid}
+    for username in SHARED_RUNTIME_USERS:
+        try:
+            owner_uids.add(pwd.getpwnam(username).pw_uid)
+        except KeyError:
+            continue
+    return frozenset(owner_uids)
+
+
 def _verify_reviewed_directory_nofollow_at(
     directory_fd: int,
     name: str,
@@ -125,6 +162,15 @@ def _sanitize_non_database_files(*, trusted_owner_uid: int = 0) -> None:
                 continue
             try:
                 metadata = os.fstat(fd)
+                if name in SHARED_RUNTIME_DATA_FILES:
+                    if metadata.st_uid not in _trusted_shared_runtime_owner_uids(
+                        trusted_owner_uid
+                    ):
+                        raise RuntimeError(
+                            "shared runtime data has an unexpected owner"
+                        )
+                    _set_shared_runtime_acl_fd(fd)
+                    continue
                 if metadata.st_uid != trusted_owner_uid:
                     raise RuntimeError("non-database production data is not root-owned")
                 os.fchmod(fd, metadata.st_mode & ~0o077)

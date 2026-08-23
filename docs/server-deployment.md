@@ -125,13 +125,16 @@ returned zero, refresh that non-secret generated input before starting the
 worker:
 
 ```bash
+setfacl -b /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 chmod 0660 /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 ```
 
-Do not recursively reopen the data tree at this point. The split units already
-carry `UMask=0007`; this transition-only refresh prevents a file last written by
-the root monolith from failing the non-root CLI startup gate.
+Do not recursively reopen the data tree at this point. Clearing the cache's
+inherited access ACL is required because changing mode alone can leave its
+`group::---` ACL entry intact. The split units already carry `UMask=0007`; cache
+publishing also removes that inherited ACL before atomic replacement so future
+refreshes preserve shared access.
 
 Do not start a split unit while the monolith is active. The cutover and rollback
 orders are defined in the runbook and are executed only after the updater has
