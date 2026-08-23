@@ -4900,7 +4900,11 @@ def test_entry_preamble_adapter_failure_is_preserved_by_evaluator():
     assert result.details["adapter_failures"] == ("entry_preamble",)
 
 
-def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch):
+@pytest.mark.parametrize("port", [8000, 8002])
+def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(
+    monkeypatch,
+    port,
+):
     calls = []
 
     class Response:
@@ -4934,8 +4938,9 @@ def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch)
         "notification_error": None,
     }
 
+    url = f"http://127.0.0.1:{port}/api/runtime-incidents/monitor-capture"
     assert send_monitor_incident_capture(
-        "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+        url,
         token="a" * 43,
         projection=payload,
     ) == 1
@@ -4943,7 +4948,7 @@ def test_monitor_incident_capture_client_is_fixed_loopback_no_proxy(monkeypatch)
         ("init", {"timeout": 45.0, "trust_env": False}),
         (
             "post",
-            ("http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",),
+            (url,),
             {
                 "headers": {"x-monitor-capture-token": "a" * 43},
                 "json": payload,

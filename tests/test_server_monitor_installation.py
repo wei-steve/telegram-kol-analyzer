@@ -81,7 +81,7 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "--database-path /opt/telegram-kol-analyzer/data/research.db "
         "--state-path /var/lib/telegram-kol-monitor/state.json "
         "--lookback-minutes 35 "
-        "--runtime-incident-capture-url http://127.0.0.1:8000/api/runtime-incidents/monitor-capture "
+        "--runtime-incident-capture-url http://127.0.0.1:8002/api/runtime-incidents/monitor-capture "
         "--notify"
     ) in normalized
 

@@ -298,7 +298,7 @@ def send_monitor_incident_capture(
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "::1"}
-        or parsed.port != 8000
+        or parsed.port not in {8000, 8002}
         or parsed.username is not None
         or parsed.password is not None
         or parsed.query
@@ -308,8 +308,8 @@ def send_monitor_incident_capture(
         raise ValueError("monitor incident capture URL must be exact loopback HTTP")
     if not isinstance(token, str) or not 32 <= len(token) <= 128:
         raise ValueError("monitor incident capture token is invalid")
-    # The production web process has pre-existing synchronous maintenance
-    # windows that can delay loopback request dispatch for tens of seconds.
+    # The production runtime writer can have synchronous maintenance windows
+    # that delay loopback request dispatch for tens of seconds.
     # This wait affects only the isolated monitor oneshot; it never blocks the
     # listener or trading process. Keep it bounded above SQLite's 30s busy
     # timeout so a healthy writer still has a chance to answer.
