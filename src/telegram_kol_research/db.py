@@ -26,6 +26,14 @@ MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL = (
     "uq_message_processing_jobs_raw_message_id "
     "ON message_processing_jobs (raw_message_id)"
 )
+CONTEXT_ANALYSIS_BACKFILL_RUN_MESSAGE_INDEX_NAME = (
+    "uq_context_analysis_backfills_run_message"
+)
+CONTEXT_ANALYSIS_BACKFILL_RUN_MESSAGE_INDEX_SQL = (
+    "CREATE UNIQUE INDEX IF NOT EXISTS "
+    "uq_context_analysis_backfills_run_message "
+    "ON context_analysis_backfills (run_id, raw_message_id)"
+)
 WORKER_COMMAND_JOB_COMMAND_ID_INDEX_NAME = "uq_worker_command_jobs_command_id"
 WORKER_COMMAND_JOB_COMMAND_ID_INDEX_SQL = (
     "CREATE UNIQUE INDEX IF NOT EXISTS uq_worker_command_jobs_command_id "
@@ -512,6 +520,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
 }
 
 SQLITE_COMPAT_INDEXES: dict[str, str] = {
+    CONTEXT_ANALYSIS_BACKFILL_RUN_MESSAGE_INDEX_NAME: (
+        CONTEXT_ANALYSIS_BACKFILL_RUN_MESSAGE_INDEX_SQL
+    ),
     MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_NAME: (
         MESSAGE_PROCESSING_JOB_RAW_MESSAGE_UNIQUE_INDEX_SQL
     ),

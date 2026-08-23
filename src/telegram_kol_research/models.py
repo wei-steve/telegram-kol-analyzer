@@ -770,6 +770,45 @@ class ContextResolutionAttempt(Base):
     )
 
 
+class ContextAnalysisBackfill(Base):
+    __tablename__ = "context_analysis_backfills"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ("
+            "'analysis_only_completed', 'skipped_deleted', 'skipped_stale'"
+            ")",
+            name="ck_context_analysis_backfills_status",
+        ),
+        Index(
+            "uq_context_analysis_backfills_run_message",
+            "run_id",
+            "raw_message_id",
+            unique=True,
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    run_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    source_attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("context_resolution_attempts.id"), nullable=False, index=True
+    )
+    source_request_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    source_state_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(80), nullable=True
+    )
+    prompt_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    analyst_model: Mapped[str] = mapped_column(String(128), nullable=False)
+    decision_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    skip_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class StrategyRevisionBatch(Base):
     """Durable replacement of pending entry legs for one strategy thread."""
 
