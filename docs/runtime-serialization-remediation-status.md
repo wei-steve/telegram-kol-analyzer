@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 6
 phase_name: process-separation
-phase_status: in_progress              # planned | claimed | in_progress | completed
-claimed_by: null
+phase_status: claimed                  # planned | claimed | in_progress | completed
+claimed_by: 01a02fe4-c276-7143-83d9-64f3a2f23752
 current_phase_file: docs/plans/2026-08-18-runtime-serialization-remediation/phase-6-process-separation.md
 last_completed_phase: 6c   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5, 6r, 6a, 6c
 last_completed_commit: 0cd474a6918a6c36e71ccc5894d006599b095506
