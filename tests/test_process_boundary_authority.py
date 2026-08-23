@@ -12,6 +12,13 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).parents[1] / "src" / "telegram_kol_research"
 WEB_MODULE = "telegram_kol_research.web_app"
+BACKFILL_MODULE = "telegram_kol_research.context_analysis_backfill"
+BACKFILL_ENTRYPOINTS = {
+    "export_context_analysis_incidents",
+    "validate_context_analysis_manifest",
+    "apply_context_analysis_manifest",
+    "rollback_context_analysis_backfill",
+}
 DEEPCOIN_WRITE_METHODS = {
     "cancel_order",
     "cancel_position_sltp",
@@ -185,3 +192,24 @@ def test_web_routes_do_not_reach_exchange_mutation_authority():
         "Phase 6 must move these operations behind worker-owned jobs before "
         f"the process split: {violations}"
     )
+
+
+@pytest.mark.architecture
+def test_context_analysis_backfill_entrypoints_do_not_reach_exchange_authority():
+    functions, _routes, edges, sinks = _load_graph()
+    violations = {}
+    for function_name in sorted(BACKFILL_ENTRYPOINTS):
+        entrypoint = f"{BACKFILL_MODULE}.{function_name}"
+        assert entrypoint in functions
+        queue = deque([(entrypoint, [entrypoint])])
+        visited = {entrypoint}
+        while queue:
+            current, path = queue.popleft()
+            if current in sinks:
+                violations[function_name] = [*path, sinks[current]]
+                break
+            for target in sorted(edges[current]):
+                if target not in visited:
+                    visited.add(target)
+                    queue.append((target, [*path, target]))
+    assert violations == {}, f"historical backfill reached authority: {violations}"
