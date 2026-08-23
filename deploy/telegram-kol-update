@@ -555,6 +555,17 @@ PY
   fi
 }
 
+bootstrap_production_schema() {
+  env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -c '
+import sys
+
+from telegram_kol_research.db import create_session_factory
+
+factory = create_session_factory(sys.argv[1])
+factory.kw["bind"].dispose()
+' "$DATABASE_PATH"
+}
+
 if [ "$schema_changed" -eq 1 ]; then
   if ! create_schema_backup_and_dry_run; then
     echo "Schema backup or migration dry-run failed." >&2
@@ -677,6 +688,10 @@ if [ "$(git rev-parse HEAD)" != "$EXPECTED_COMMIT" ]; then
 fi
 if ! env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR"; then
   echo "Candidate package installation failed." >&2
+  exit 4
+fi
+if [ "$schema_changed" -eq 1 ] && ! bootstrap_production_schema; then
+  echo "Candidate production schema bootstrap failed." >&2
   exit 4
 fi
 if ! start_managed_services; then

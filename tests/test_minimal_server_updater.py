@@ -349,6 +349,13 @@ if [ "${1:-}" = "-m" ] && [ "${2:-}" = "pip" ]; then
   fi
   exit 0
 fi
+if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"create_session_factory"* ]]; then
+  printf 'production-schema-bootstrap\n' >>"$HARNESS_LOG"
+  [ "${3:-}" = "$DATABASE_PATH" ] || exit 65
+  [ "$(cat "$HARNESS_STATE/head")" = "$HARNESS_CANDIDATE" ] || exit 66
+  [ "${HARNESS_PRODUCTION_SCHEMA_BOOTSTRAP_FAIL:-0}" != "1" ] || exit 1
+  exit 0
+fi
 if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"monitor-pin-rewrite"* ]]; then
   printf 'monitor-pin-rewrite\n' >>"$HARNESS_LOG"
   MONITOR_REWRITE_HEAD="$5" perl -0pe '
@@ -976,6 +983,49 @@ def test_schema_paths_run_backup_migration_checks_before_first_active_check(
     assert events.index("watermark-compare") < events.index("active-check-1")
 
 
+def test_schema_candidate_bootstraps_production_once_before_split_start(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(
+        HARNESS_CHANGED_PATH="src/telegram_kol_research/models.py",
+        HARNESS_RUNTIME_TOPOLOGY="split",
+    )
+
+    assert result.returncode == 0, result.stderr
+    events = _events(log)
+    assert events.count("production-schema-bootstrap") == 1
+    assert events.index("pip-install") < events.index("production-schema-bootstrap")
+    first_start = next(
+        index
+        for index, event in enumerate(events)
+        if event.startswith("start-unit:")
+    )
+    assert events.index("production-schema-bootstrap") < first_start
+
+
+def test_production_schema_bootstrap_failure_rolls_back_before_candidate_start(
+    updater_harness,
+) -> None:
+    run, log, state = updater_harness
+
+    result = run(
+        HARNESS_CHANGED_PATH="src/telegram_kol_research/models.py",
+        HARNESS_RUNTIME_TOPOLOGY="split",
+        HARNESS_PRODUCTION_SCHEMA_BOOTSTRAP_FAIL="1",
+    )
+
+    assert result.returncode == 4
+    assert (state / "head").read_text().strip() == PREVIOUS
+    assert (state / "branch").read_text().strip() == PREVIOUS
+    events = _events(log)
+    assert events.count("production-schema-bootstrap") == 1
+    bootstrap = events.index("production-schema-bootstrap")
+    assert "start" not in events
+    assert events.index("rollback-start") > bootstrap
+
+
 @pytest.mark.parametrize(
     "changed_path",
     ("src/telegram_kol_research/web.py", "docs/server-deployment.md"),
@@ -993,6 +1043,7 @@ def test_nonschema_paths_skip_all_schema_work(
     assert "online-backup" not in events
     assert "disposable-migration" not in events
     assert "watermark-compare" not in events
+    assert "production-schema-bootstrap" not in events
 
 
 @pytest.mark.parametrize(
