@@ -16,8 +16,8 @@ local_deploy_branch_is_poisoned: true  # the LOCAL codex/deepcoin-auto-trading-v
 design_version: 1
 current_phase: 6c
 phase_name: mimo-context-resolution-authority-cutover
-phase_status: planned                  # planned | claimed | in_progress | completed
-claimed_by: null
+phase_status: claimed                  # planned | claimed | in_progress | completed
+claimed_by: 01a02b86-c2c9-7cf0-a033-0f28be68ee47
 current_phase_file: docs/plans/2026-08-22-mimo-context-resolution-authority-cutover.md
 last_completed_phase: 6a   # the sequence ran 0, 1, 1b, 1c, 1d, 1e, 2, 2f, 3, 4, 5, 6r, 6a
 last_completed_commit: 7b7d2e6f9a9e011e6fbe570ce6d9a7cdea207fc5
