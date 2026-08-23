@@ -11,6 +11,7 @@ Group=telegram-kol-runtime
 UMask=0007
 WorkingDirectory=/opt/telegram-kol-analyzer
 Environment=PYTHONUNBUFFERED=1
+Environment=TELEGRAM_KOL_RUNTIME_ROLE=web
 EnvironmentFile=/etc/telegram-kol-web.env
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research web --runtime-role web --ingest-refresh-url http://127.0.0.1:8001/api/refresh --host 127.0.0.1 --port 8000 --database-path data/research.db --config-path config/groups.yaml --deepcoin-contract-specs-path config/deepcoin_contract_specs.yaml
 Restart=on-failure

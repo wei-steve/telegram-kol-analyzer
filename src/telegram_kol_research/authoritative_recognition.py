@@ -19,6 +19,7 @@ from telegram_kol_research.context_resolution import (
     ContextResolutionDecision,
     ContextResolutionError,
 )
+from telegram_kol_research.config import MultiTargetManagementConfig
 from telegram_kol_research.contextual_message_window import (
     ContextualMessageWindow,
     build_contextual_message_window,
@@ -1214,6 +1215,8 @@ def _message_input_kind(
 def apply_authoritative_assessment(
     session_factory: sessionmaker,
     assessment: AuthoritativeAssessment,
+    *,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
 ) -> MessageRecognitionResult:
     result = apply_authoritative_mimo_payload(
         session_factory,
@@ -1231,6 +1234,7 @@ def apply_authoritative_assessment(
             )
             is True
         ),
+        multi_target_management_config=multi_target_management_config,
     )
     if result.status == "是策略":
         _ensure_entry_strategy_thread(
@@ -1392,6 +1396,7 @@ def process_authoritative_message(
     context_resolver=None,
     exchange_state_provider=None,
     reuse_current_evidence: bool = False,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
 ) -> AuthoritativeProcessingResult:
     """Gate review until MiMo application and automation persistence finish."""
 
@@ -1415,7 +1420,14 @@ def process_authoritative_message(
             raise RuntimeError(
                 "authoritative execution claim failed for stale generation"
             )
-    recognition = apply_authoritative_assessment(session_factory, assessment)
+    if multi_target_management_config is None:
+        recognition = apply_authoritative_assessment(session_factory, assessment)
+    else:
+        recognition = apply_authoritative_assessment(
+            session_factory,
+            assessment,
+            multi_target_management_config=multi_target_management_config,
+        )
     from telegram_kol_research.source_message_deletion import (
         source_execution_barrier,
     )

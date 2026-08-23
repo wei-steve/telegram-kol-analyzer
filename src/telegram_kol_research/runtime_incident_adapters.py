@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from typing import Any, Callable
@@ -70,15 +71,22 @@ def capture_runtime_incident_best_effort(
     adapter: Callable[..., Any],
     session_factory: sessionmaker,
     *,
-    config_loader: Callable[[], RuntimeIncidentConfig] = (
-        load_runtime_incident_config
-    ),
+    config_loader: Callable[[], RuntimeIncidentConfig] | None = None,
     **kwargs: Any,
 ):
     """Fail open across both configuration loading and adapter execution."""
 
     try:
-        config = config_loader()
+        if config_loader is not None:
+            config = config_loader()
+        elif os.environ.get("TELEGRAM_KOL_RUNTIME_ROLE") in {
+            "ingest",
+            "worker",
+            "web",
+        }:
+            config = load_runtime_incident_config(environment_only=True)
+        else:
+            config = load_runtime_incident_config()
         return adapter(
             session_factory,
             config=config,

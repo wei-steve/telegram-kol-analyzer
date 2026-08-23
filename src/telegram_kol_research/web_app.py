@@ -189,8 +189,10 @@ from telegram_kol_research.strategy_alerts import (
 )
 from telegram_kol_research.config import (
     MessageOperationSupervisorConfig,
+    MultiTargetManagementConfig,
     RuntimeIncidentConfig,
     load_message_operation_supervisor_config,
+    load_multi_target_management_config,
     load_runtime_incident_config,
     message_operation_supervisor_policy_status,
 )
@@ -3771,6 +3773,7 @@ def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
                 candidate_thread_ids=candidate_thread_ids,
             )
         ) if context_enabled else None,
+        multi_target_management_config=app.state.multi_target_management_config,
     )
 
 
@@ -4242,6 +4245,7 @@ def create_web_app(
     message_operation_supervisor_config: (
         MessageOperationSupervisorConfig | None
     ) = None,
+    multi_target_management_config: MultiTargetManagementConfig | None = None,
     message_operation_supervisor_runner=None,
     message_operation_supervisor_interval_seconds: float = 30.0,
     live_position_snapshot_path: str | Path | None = None,
@@ -4915,6 +4919,15 @@ def create_web_app(
             load_message_operation_supervisor_config(env_file_paths=[])
             if split_runtime
             else load_message_operation_supervisor_config()
+        )
+    )
+    app.state.multi_target_management_config = (
+        multi_target_management_config
+        if multi_target_management_config is not None
+        else (
+            load_multi_target_management_config(env_file_paths=[])
+            if split_runtime
+            else load_multi_target_management_config()
         )
     )
     app.state.message_operation_supervisor_policy_status = (

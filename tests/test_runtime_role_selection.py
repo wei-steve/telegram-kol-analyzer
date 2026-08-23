@@ -119,6 +119,7 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
     from telegram_kol_research import web_app
     from telegram_kol_research.config import (
         MessageOperationSupervisorConfig,
+        MultiTargetManagementConfig,
         RuntimeIncidentConfig,
     )
     from telegram_kol_research.llm_chat import LLMProxyConfig
@@ -177,6 +178,13 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
             "message_supervisor", MessageOperationSupervisorConfig(), **kwargs
         ),
     )
+    monkeypatch.setattr(
+        web_app,
+        "load_multi_target_management_config",
+        lambda **kwargs: record(
+            "multi_target", MultiTargetManagementConfig(), **kwargs
+        ),
+    )
     deepcoin_client = object()
     monkeypatch.setattr(
         web_app,
@@ -196,6 +204,7 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
         "notification_bot": {"env_file_paths": []},
         "runtime_incident": {"environment_only": True},
         "message_supervisor": {"env_file_paths": []},
+        "multi_target": {"env_file_paths": []},
     }
     assert app.state.deepcoin_client_factory() is deepcoin_client
     assert calls["deepcoin"] == {"env_file_paths": []}
@@ -319,6 +328,7 @@ def test_split_runtime_units_select_one_role_and_one_loopback_port(role, port):
     assert f"User=telegram-kol-{role}" in unit
     assert "Group=telegram-kol-runtime" in unit
     assert f"EnvironmentFile=/etc/telegram-kol-{role}.env" in unit
+    assert f"Environment=TELEGRAM_KOL_RUNTIME_ROLE={role}" in unit
     assert f"--runtime-role {role}" in unit
     assert f"--host 127.0.0.1 --port {port}" in unit
     assert "ReadWritePaths=/opt/telegram-kol-analyzer/data" in unit

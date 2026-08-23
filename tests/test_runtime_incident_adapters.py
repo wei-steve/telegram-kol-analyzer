@@ -911,3 +911,26 @@ def test_entire_source_adapter_boundary_fails_open(failure_site):
     assert result is None
     assert source_state == {"status": "already_committed"}
     assert len(calls) == (0 if failure_site == "config" else 1)
+
+
+def test_split_runtime_source_adapter_uses_environment_only_config(
+    monkeypatch,
+):
+    from telegram_kol_research import runtime_incident_adapters
+
+    calls = []
+    config = _enabled("management_partial_failed")
+    monkeypatch.setenv("TELEGRAM_KOL_RUNTIME_ROLE", "worker")
+    monkeypatch.setattr(
+        runtime_incident_adapters,
+        "load_runtime_incident_config",
+        lambda **kwargs: calls.append(kwargs) or config,
+    )
+
+    result = runtime_incident_adapters.capture_runtime_incident_best_effort(
+        lambda *args, config, **kwargs: config,
+        "session-factory",
+    )
+
+    assert result is config
+    assert calls == [{"environment_only": True}]
