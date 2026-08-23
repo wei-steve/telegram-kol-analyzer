@@ -220,6 +220,24 @@ def test_split_runtime_provisioning_grants_shared_group_config_read_only_access(
     assert "chmod -R" not in deployment_guide
 
 
+def test_split_cutover_refreshes_generated_contract_cache_permissions():
+    repository_root = Path(__file__).resolve().parents[1]
+    deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(
+        encoding="utf-8"
+    )
+    marker = "### Final split cutover permission refresh"
+    cache_path = "/opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json"
+
+    assert marker in deployment_guide
+    cutover_section = deployment_guide.split(marker, 1)[1].split(
+        "## Deepcoin contract-spec runtime configuration", 1
+    )[0]
+    normalized_cutover_section = " ".join(cutover_section.split())
+    assert "after `telegram-kol.service` has stopped" in normalized_cutover_section
+    assert f"chgrp telegram-kol-runtime {cache_path}" in cutover_section
+    assert f"chmod 0660 {cache_path}" in cutover_section
+
+
 @pytest.mark.parametrize("role", ["worker", "web"])
 def test_only_ingest_unit_can_reach_telegram_session_files(role):
     unit = _runtime_unit_text(role)

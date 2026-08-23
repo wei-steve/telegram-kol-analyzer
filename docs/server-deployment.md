@@ -116,6 +116,23 @@ systemctl is-enabled telegram-kol-ingest.service telegram-kol-worker.service \
   telegram-kol-web.service
 ```
 
+### Final split cutover permission refresh
+
+The monolith can regenerate its contract-spec cache with a root-only umask
+between unit installation and the maintenance window. Only after
+`telegram-kol.service` has stopped and the post-stop active-write gate has
+returned zero, refresh that non-secret generated input before starting the
+worker:
+
+```bash
+chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
+chmod 0660 /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
+```
+
+Do not recursively reopen the data tree at this point. The split units already
+carry `UMask=0007`; this transition-only refresh prevents a file last written by
+the root monolith from failing the non-root CLI startup gate.
+
 Do not start a split unit while the monolith is active. The cutover and rollback
 orders are defined in the runbook and are executed only after the updater has
 proved both topologies while the monolith still owns production.
