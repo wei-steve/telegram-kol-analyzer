@@ -13,6 +13,9 @@ from telegram_kol_research.context_analysis_backfill import (
     rollback_context_analysis_backfill,
     validate_context_analysis_manifest,
 )
+from telegram_kol_research.context_resolution_worker import (
+    build_context_state_fingerprint,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -72,28 +75,38 @@ def _prepared_manifest(tmp_path):
                 shadow=False,
             )
         )
-        session.add(
-            ContextResolutionAttempt(
-                raw_message_id=raw.id,
-                context_fingerprint="sha256:authority-source",
-                state_fingerprint="sha256:authority-state",
-                model="deepseek-v4-flash",
-                prompt_versions_json='{"context_resolution":"context-resolution-v1"}',
-                request_summary_json=_canonical_json(
-                    {
-                        "current_message": {
-                            "raw_message_id": raw.id,
-                            "chat_id": raw.chat_id,
-                            "message_id": raw.message_id,
-                            "text": raw.text,
-                        },
-                        "candidate_strategy_threads": [],
-                    }
-                ),
-                status="exhausted",
-                error_class="network_error",
-            )
+        attempt = ContextResolutionAttempt(
+            raw_message_id=raw.id,
+            context_fingerprint="sha256:authority-source",
+            state_fingerprint="sha256:authority-state",
+            model="deepseek-v4-flash",
+            prompt_versions_json='{"context_resolution":"context-resolution-v1"}',
+            request_summary_json=_canonical_json(
+                {
+                    "current_message": {
+                        "raw_message_id": raw.id,
+                        "chat_id": raw.chat_id,
+                        "message_id": raw.message_id,
+                        "text": raw.text,
+                    },
+                    "candidate_strategy_threads": [],
+                }
+            ),
+            status="exhausted",
+            error_class="network_error",
         )
+        session.add(attempt)
+        session.commit()
+        raw_message_id = raw.id
+        attempt_id = attempt.id
+    state_fingerprint = build_context_state_fingerprint(
+        session_factory,
+        raw_message_id,
+        candidate_thread_ids=set(),
+    )
+    with session_factory() as session:
+        attempt = session.get(ContextResolutionAttempt, attempt_id)
+        attempt.state_fingerprint = state_fingerprint
         session.commit()
     export_path = tmp_path / "export.json"
     manifest = export_context_analysis_incidents(

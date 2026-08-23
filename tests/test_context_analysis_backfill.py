@@ -14,9 +14,13 @@ from telegram_kol_research.context_analysis_backfill import (
     rollback_context_analysis_backfill,
     validate_context_analysis_manifest,
 )
+from telegram_kol_research.context_resolution_worker import (
+    build_context_state_fingerprint,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
+    MessageEvidenceVersion,
     MessageProcessingJob,
     RawMessage,
     StrategyThread,
@@ -116,6 +120,7 @@ def _add_attempt(
 def _build_incident_database(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
+    engine = session_factory.kw["bind"]
     expected = {}
     with session_factory() as session:
         raw_one = RawMessage(
@@ -260,6 +265,24 @@ def _build_incident_database(tmp_path):
             error_class="malformed_json",
         )
         session.commit()
+    for raw_message_id, expected_record in expected.items():
+        candidate_thread_ids = {
+            int(row["thread_id"])
+            for row in expected_record["request"]["candidate_strategy_threads"]
+        }
+        state_fingerprint = build_context_state_fingerprint(
+            session_factory,
+            raw_message_id,
+            candidate_thread_ids=candidate_thread_ids,
+        )
+        with session_factory() as session:
+            source_attempt = session.get(
+                ContextResolutionAttempt,
+                expected_record["source_attempt_id"],
+            )
+            source_attempt.state_fingerprint = state_fingerprint
+            session.commit()
+    engine.dispose()
     return database_path, expected
 
 
@@ -299,7 +322,7 @@ def _database_files(database_path):
     return {
         path.name: path.read_bytes()
         for path in (database_path, database_path.with_name(f"{database_path.name}-wal"))
-        if path.exists()
+        if path.exists() and (path == database_path or path.stat().st_size > 0)
     }
 
 
@@ -728,6 +751,43 @@ def test_apply_rejects_stale_source_evidence(tmp_path):
     _refresh_manifest_database_identity(database_path, manifest, manifest_path)
 
     with pytest.raises(ValueError, match="stale source evidence"):
+        _apply(tmp_path, database_path, manifest, manifest_path)
+
+
+@pytest.mark.parametrize("state_change", ["raw", "evidence", "thread"])
+def test_apply_rejects_current_context_state_drift_without_attempt_rewrite(
+    tmp_path, state_change
+):
+    database_path, manifest, manifest_path = _prepared_manifest(tmp_path)
+    record = manifest["records"][0]
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        if state_change == "raw":
+            raw = session.get(RawMessage, record["raw_message_id"])
+            raw.text = "current raw text changed after the failed attempt"
+        elif state_change == "evidence":
+            session.add(
+                MessageEvidenceVersion(
+                    raw_message_id=record["raw_message_id"],
+                    version=1,
+                    input_fingerprint="sha256:new-current-evidence",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    extraction_status="completed",
+                    confidence=0.9,
+                    text_evidence_json="{}",
+                    image_evidence_json="{}",
+                    normalized_evidence_json="{}",
+                )
+            )
+        else:
+            target_id = record["decision"]["target_thread_ids"][0]
+            thread = session.get(StrategyThread, target_id)
+            thread.status = "closed"
+        session.commit()
+    _refresh_manifest_database_identity(database_path, manifest, manifest_path)
+
+    with pytest.raises(ValueError, match="stale current context state"):
         _apply(tmp_path, database_path, manifest, manifest_path)
 
 

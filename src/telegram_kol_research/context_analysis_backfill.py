@@ -10,10 +10,14 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
+from sqlalchemy import create_engine
+from sqlalchemy.orm import sessionmaker
+
 from .context_resolution import (
     ContextResolutionError,
     parse_context_resolution_decision,
 )
+from .context_resolution_worker import build_context_state_fingerprint
 
 
 SCHEMA_VERSION = "context-analysis-backfill-v1"
@@ -249,6 +253,7 @@ def apply_context_analysis_manifest(
         connection.execute("BEGIN IMMEDIATE")
         if _database_identity(database) != identity:
             raise ValueError("database_identity changed before apply lock")
+        _check_current_state_fingerprints(database, manifest["records"])
         _check_runtime_gates(connection)
         for record in manifest["records"]:
             _validate_record(connection, record)
@@ -396,7 +401,46 @@ def _validate_loaded_manifest(
     with _read_only_connection(database) as connection:
         for record in records:
             _validate_record(connection, record)
+        _check_target_threads(connection, records)
+    _check_current_state_fingerprints(database, records)
     return identity, records_sha
+
+
+def _check_current_state_fingerprints(
+    database: Path, records: list[Any]
+) -> None:
+    engine = create_engine(
+        f"sqlite+pysqlite:///file:{database}?mode=ro&uri=true"
+    )
+    readonly_session_factory = sessionmaker(
+        bind=engine,
+        autoflush=False,
+        expire_on_commit=False,
+    )
+    try:
+        for record in records:
+            if (
+                not isinstance(record, Mapping)
+                or record.get("status") != "analysis_only_completed"
+            ):
+                continue
+            try:
+                current = build_context_state_fingerprint(
+                    readonly_session_factory,
+                    _strict_int(
+                        record["raw_message_id"], field="raw_message_id"
+                    ),
+                    candidate_thread_ids={
+                        _strict_int(value, field="allowed_target_thread_id")
+                        for value in record["allowed_target_thread_ids"]
+                    },
+                )
+            except LookupError as exc:
+                raise ValueError("stale current context state") from exc
+            if current != record["source_state_fingerprint"]:
+                raise ValueError("stale current context state")
+    finally:
+        engine.dispose()
 
 
 def _require_expected_apply_values(
@@ -830,16 +874,9 @@ def _read_only_connection(database: Path) -> Iterator[sqlite3.Connection]:
 
 
 def _database_identity(database: Path) -> str:
-    digest = hashlib.sha256()
-    for suffix in ("", "-wal"):
-        path = Path(f"{database}{suffix}")
-        if not path.exists():
-            continue
-        content = path.read_bytes()
-        digest.update(suffix.encode("ascii"))
-        digest.update(len(content).to_bytes(8, "big"))
-        digest.update(content)
-    return f"sha256:{digest.hexdigest()}"
+    with _read_only_connection(database) as connection:
+        serialized = connection.serialize()
+    return f"sha256:{hashlib.sha256(serialized).hexdigest()}"
 
 
 def _load_json_object(path: str | Path, *, label: str) -> dict[str, Any]:
