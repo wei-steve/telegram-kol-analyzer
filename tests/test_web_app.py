@@ -16,6 +16,7 @@ import telegram_kol_research.web_app as web_app_module
 import telegram_kol_research.worker_command_executor as worker_command_executor_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
 from telegram_kol_research.config import (
     MessageOperationSupervisorConfig,
     RuntimeIncidentConfig,
@@ -6044,6 +6045,111 @@ def test_ai_recognition_config_api_saves_model_list_and_active_selection(tmp_pat
     assert payload["image_provider"]["api_key"] == ""
     assert payload["text_provider"]["api_key_configured"] is True
     assert payload["image_provider"]["api_key_configured"] is True
+
+
+def test_model_selection_api_accepts_text_capable_context_model(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            ai_recognition_config_path=config_path,
+        )
+    )
+
+    response = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "active_text_model_id": "deepseek-v4-flash",
+            "active_image_model_id": "mimo-v2.5",
+            "context_resolution_model_id": "mimo-v2.5",
+            "ai_models": [
+                {
+                    "id": "deepseek-v4-flash",
+                    "label": "DeepSeek V4 Flash",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "deepseek-key",
+                    "model": "deepseek-v4-flash",
+                    "supports_text": True,
+                    "supports_image": False,
+                },
+                {
+                    "id": "mimo-v2.5",
+                    "label": "MiMo V2.5",
+                    "base_url": "https://api.xiaomimimo.com/v1",
+                    "api_key": "mimo-key",
+                    "model": "mimo-v2.5",
+                    "supports_text": True,
+                    "supports_image": True,
+                },
+            ],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["context_resolution_model_id"] == "mimo-v2.5"
+    assert load_ai_recognition_config(config_path).context_resolution_model_id == "mimo-v2.5"
+
+
+def test_model_selection_api_rejects_non_text_context_model(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    client = TestClient(
+        create_web_app(
+            database_path=tmp_path / "research.db",
+            ai_recognition_config_path=config_path,
+        )
+    )
+    initial = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "active_text_model_id": "deepseek-v4-flash",
+            "active_image_model_id": "mimo-v2.5",
+            "context_resolution_model_id": "mimo-v2.5",
+            "ai_models": [
+                {
+                    "id": "deepseek-v4-flash",
+                    "label": "DeepSeek V4 Flash",
+                    "base_url": "https://api.deepseek.com",
+                    "api_key": "deepseek-key",
+                    "model": "deepseek-v4-flash",
+                    "supports_text": True,
+                    "supports_image": False,
+                },
+                {
+                    "id": "glm-ocr",
+                    "label": "GLM OCR",
+                    "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                    "api_key": "glm-key",
+                    "model": "glm-ocr",
+                    "supports_text": False,
+                    "supports_image": True,
+                },
+                {
+                    "id": "mimo-v2.5",
+                    "label": "MiMo V2.5",
+                    "base_url": "https://api.xiaomimimo.com/v1",
+                    "api_key": "mimo-key",
+                    "model": "mimo-v2.5",
+                    "supports_text": True,
+                    "supports_image": True,
+                },
+            ],
+        },
+    )
+    assert initial.status_code == 200
+    before = config_path.read_bytes()
+
+    rejected = client.post(
+        "/api/ai-recognition-config",
+        json={
+            "active_text_model_id": "deepseek-v4-flash",
+            "active_image_model_id": "mimo-v2.5",
+            "context_resolution_model_id": "glm-ocr",
+            "ai_models": initial.json()["ai_models"],
+        },
+    )
+
+    assert rejected.status_code == 422
+    assert config_path.read_bytes() == before
 
 
 def test_recovery_dry_run_api_persists_decisions_with_configured_gate_provider(tmp_path):

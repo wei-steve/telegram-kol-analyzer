@@ -699,6 +699,30 @@ image_provider:
     assert "never-render-this-image-secret" not in response.text
 
 
+def test_model_selection_page_exposes_independent_context_selector(tmp_path):
+    config_path = tmp_path / "ai.yaml"
+    config_path.write_text(
+        "\n".join(
+            [
+                "active_text_model_id: deepseek-v4-flash",
+                "active_image_model_id: mimo-v2.5",
+                "context_resolution_model_id: mimo-v2.5",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=config_path,
+    )
+
+    response = TestClient(app).get("/more-panel")
+
+    assert response.status_code == 200
+    assert "data-context-resolution-model-id" in response.text
+    assert re.search(r'<option value="mimo-v2\.5" selected>', response.text)
+
+
 def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, monkeypatch):
     app = create_web_app(database_path=tmp_path / "research.db")
 
@@ -2017,6 +2041,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "data-ai-recognition-prompt" not in response.text
     assert "data-ai-recognition-config" in response.text
     assert "data-ai-model-selection" in response.text
+    assert "data-context-resolution-model-id" in response.text
     assert "data-trading-settings-form" in response.text
     assert 'data-dashboard-tab="exchange-positions"' in response.text
     assert 'data-dashboard-panel="exchange-positions"' in response.text

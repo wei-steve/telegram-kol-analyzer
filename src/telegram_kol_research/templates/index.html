@@ -218,7 +218,7 @@
       <div class="panel-heading">
         <div>
           <h2>AI模型选择</h2>
-          <p class="ai-helper-text">选择当前用于文字消息和图片消息识别的模型。</p>
+          <p class="ai-helper-text">分别选择文字识别、图片识别和上下文解析模型。</p>
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
       </div>
@@ -236,6 +236,14 @@
           <select data-active-image-model-id>
             {% for model in ai_recognition_config.ai_models if model.supports_image %}
               <option value="{{ model.id }}" {% if model.id == ai_recognition_config.active_image_model_id %}selected{% endif %}>{{ model.label }} / {{ model.model }}</option>
+            {% endfor %}
+          </select>
+        </label>
+        <label>
+          Context resolution model
+          <select data-context-resolution-model-id>
+            {% for model in ai_recognition_config.ai_models if model.supports_text %}
+              <option value="{{ model.id }}" {% if model.id == ai_recognition_config.context_resolution_model_id %}selected{% endif %}>{{ model.label }} / {{ model.model }}</option>
             {% endfor %}
           </select>
         </label>

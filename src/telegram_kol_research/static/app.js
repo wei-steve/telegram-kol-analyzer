@@ -3930,12 +3930,14 @@ function buildAiRecognitionConfigPayload() {
   const aiModels = collectAiModelConfigs();
   const activeTextModelId = value('[data-active-text-model-id]');
   const activeImageModelId = value('[data-active-image-model-id]');
+  const contextResolutionModelId = value('[data-context-resolution-model-id]');
   const activeTextModel = aiModels.find((model) => model.id === activeTextModelId) || null;
   const activeImageModel = aiModels.find((model) => model.id === activeImageModelId) || null;
   return {
     mode: 'ai_provider',
     active_text_model_id: activeTextModelId,
     active_image_model_id: activeImageModelId,
+    context_resolution_model_id: contextResolutionModelId,
     ai_models: aiModels,
     text_provider: modelConfigToProvider(activeTextModel),
     image_provider: modelConfigToProvider(activeImageModel),

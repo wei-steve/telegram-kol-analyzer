@@ -195,6 +195,8 @@ def test_app_js_collects_separate_ai_model_configs_and_active_selection(tmp_path
     assert "collectAiModelConfigs" in response.text
     assert "active_text_model_id" in response.text
     assert "active_image_model_id" in response.text
+    assert "context_resolution_model_id" in response.text
+    assert "data-context-resolution-model-id" in response.text
     assert "data-ai-model-api-key" in response.text
     assert "modelConfigToProvider(activeTextModel)" in response.text
 

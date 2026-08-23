@@ -7924,6 +7924,28 @@ def create_web_app(
     @app.post("/api/ai-recognition-config")
     def update_ai_recognition_config(payload: dict[str, Any]):
         existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        ai_models = _model_configs_from_payload(
+            payload.get("ai_models"), existing_config.ai_models
+        )
+        context_resolution_model_id = str(
+            payload.get("context_resolution_model_id")
+            or existing_config.context_resolution_model_id
+        )
+        context_resolution_model = next(
+            (
+                model
+                for model in ai_models
+                if model.id == context_resolution_model_id
+            ),
+            None,
+        )
+        if context_resolution_model is None or not context_resolution_model.supports_text:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "context_resolution_model_id must reference a text-capable model"
+                ),
+            )
         config = save_ai_recognition_config(
             app.state.ai_recognition_config_path,
             AiRecognitionConfig(
@@ -7937,17 +7959,17 @@ def create_web_app(
                 image_provider=_provider_config_from_payload(
                     payload.get("image_provider"), existing_config.image_provider
                 ),
-                ai_models=_model_configs_from_payload(
-                    payload.get("ai_models"), existing_config.ai_models
-                ),
+                ai_models=ai_models,
                 active_text_model_id=str(payload.get("active_text_model_id") or ""),
                 active_image_model_id=str(payload.get("active_image_model_id") or ""),
+                context_resolution_model_id=context_resolution_model_id,
             ),
         )
         return {
             "mode": config.mode,
             "active_text_model_id": config.active_text_model_id,
             "active_image_model_id": config.active_image_model_id,
+            "context_resolution_model_id": config.context_resolution_model_id,
             "ai_models": [_model_config_response(model) for model in config.ai_models],
             "text_provider": _provider_config_response(config.text_provider),
             "image_provider": _provider_config_response(config.image_provider),

@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 from telegram_kol_research.ai_recognition_config import (
     DEFAULT_LIFECYCLE_EVENT_PROMPT,
     DEFAULT_MIMO_DIRECT_PROMPT,
@@ -351,3 +353,43 @@ def test_save_ai_recognition_config_uses_active_model_selection(tmp_path):
     reloaded = load_ai_recognition_config(config_path)
     assert reloaded.active_text_model_id == "deepseek-v4-flash"
     assert reloaded.active_image_model_id == "mimo-v2.5"
+
+
+def test_model_selection_save_preserves_independent_context_model(tmp_path):
+    config_path = tmp_path / "ai_recognition.yaml"
+    saved = save_ai_recognition_config(
+        config_path,
+        AiRecognitionConfig(
+            mode="ai_provider",
+            active_text_model_id="deepseek-v4-flash",
+            active_image_model_id="mimo-v2.5",
+            context_resolution_model_id="mimo-v2.5",
+            ai_models=[
+                AiModelConfig(
+                    id="deepseek-v4-flash",
+                    label="DeepSeek V4 Flash",
+                    base_url="https://api.deepseek.com",
+                    api_key="deepseek-key",
+                    model="deepseek-v4-flash",
+                    supports_text=True,
+                    supports_image=False,
+                ),
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo V2.5",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    supports_image=True,
+                ),
+            ],
+        ),
+    )
+
+    save_ai_recognition_config(
+        config_path,
+        replace(saved, active_text_model_id="deepseek-v4-flash"),
+    )
+
+    assert load_ai_recognition_config(config_path).context_resolution_model_id == "mimo-v2.5"
