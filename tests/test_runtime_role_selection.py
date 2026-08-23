@@ -335,6 +335,14 @@ def test_split_monitor_routes_incident_capture_to_worker(unit_name):
     capture_path = "/api/runtime-incidents/monitor-capture"
     assert f"http://127.0.0.1:8002{capture_path}" in unit
     assert f"http://127.0.0.1:8000{capture_path}" not in unit
+    assert (
+        "--message-operation-coverage-url "
+        "http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage"
+    ) in unit
+    assert (
+        "--live-position-sizes-url "
+        "http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes"
+    ) in unit
 
 
 @pytest.mark.parametrize(

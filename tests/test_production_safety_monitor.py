@@ -219,7 +219,11 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
             "--expected-max-concurrent-positions",
             "4",
             "--runtime-incident-capture-url",
-            "http://127.0.0.1:8000/api/runtime-incidents/monitor-capture",
+            "http://127.0.0.1:8002/api/runtime-incidents/monitor-capture",
+            "--message-operation-coverage-url",
+            "http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage",
+            "--live-position-sizes-url",
+            "http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes",
         ],
     )
 
@@ -229,6 +233,12 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
     assert calls[0]["runtime_incident_capture_token"] == "m" * 43
     assert calls[0]["runtime_incident_capture_url"].endswith(
         "/api/runtime-incidents/monitor-capture"
+    )
+    assert calls[0]["adapters"].message_operation_coverage_url.endswith(
+        ":8002/api/runtime-incidents/message-operation-coverage"
+    )
+    assert calls[0]["adapters"].live_position_sizes_url.endswith(
+        ":8002/api/runtime-incidents/live-position-sizes"
     )
 
 
@@ -5020,8 +5030,10 @@ def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
     ]
 
 
+@pytest.mark.parametrize("port", [8000, 8002])
 def test_message_operation_coverage_reader_is_authenticated_bounded_and_no_proxy(
     monkeypatch,
+    port,
 ):
     calls = []
 
@@ -5045,8 +5057,12 @@ def test_message_operation_coverage_reader_is_authenticated_bounded_and_no_proxy
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setattr(monitor_module.httpx, "stream", stream)
 
+    url = (
+        f"http://127.0.0.1:{port}"
+        "/api/runtime-incidents/message-operation-coverage"
+    )
     payload = read_message_operation_coverage(
-        "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+        url,
         token="c" * 43,
     )
 
@@ -5055,7 +5071,7 @@ def test_message_operation_coverage_reader_is_authenticated_bounded_and_no_proxy
         (
             (
                 "GET",
-                "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
+                url,
             ),
             {
                 "headers": {"x-monitor-capture-token": "c" * 43},
@@ -5068,6 +5084,11 @@ def test_message_operation_coverage_reader_is_authenticated_bounded_and_no_proxy
     with pytest.raises(ValueError, match="fixed loopback"):
         read_message_operation_coverage(
             "http://example.com/api/runtime-incidents/message-operation-coverage",
+            token="c" * 43,
+        )
+    with pytest.raises(ValueError, match="fixed loopback"):
+        read_message_operation_coverage(
+            "http://127.0.0.1:9000/api/runtime-incidents/message-operation-coverage",
             token="c" * 43,
         )
     with pytest.raises(ValueError, match="token unavailable"):
@@ -5118,8 +5139,10 @@ def _monitor_live_position_payload(**overrides):
     return payload
 
 
+@pytest.mark.parametrize("port", [8000, 8002])
 def test_monitor_live_position_sizes_reader_is_strict_authenticated_and_no_proxy(
     monkeypatch,
+    port,
 ):
     calls = []
 
@@ -5143,8 +5166,9 @@ def test_monitor_live_position_sizes_reader_is_strict_authenticated_and_no_proxy
     monkeypatch.setenv("HTTP_PROXY", "http://proxy.invalid:3128")
     monkeypatch.setattr(monitor_module.httpx, "stream", stream)
 
+    url = f"http://127.0.0.1:{port}/api/runtime-incidents/live-position-sizes"
     sizes = monitor_module.read_monitor_live_position_sizes(
-        "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+        url,
         token="m" * 43,
         now=datetime(2026, 8, 22, 1, 0, tzinfo=UTC),
     )
@@ -5157,7 +5181,7 @@ def test_monitor_live_position_sizes_reader_is_strict_authenticated_and_no_proxy
         (
             (
                 "GET",
-                "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
+                url,
             ),
             {
                 "headers": {"x-monitor-capture-token": "m" * 43},

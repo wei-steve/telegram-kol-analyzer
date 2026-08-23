@@ -2506,7 +2506,7 @@ def read_monitor_live_position_sizes(
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "::1"}
-        or parsed.port != 8000
+        or parsed.port not in {8000, 8002}
         or parsed.username is not None
         or parsed.password is not None
         or parsed.path
@@ -2611,6 +2611,9 @@ def read_message_operation_coverage(
     if (
         parsed.scheme != "http"
         or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.port not in {8000, 8002}
+        or parsed.username is not None
+        or parsed.password is not None
         or parsed.path
         != "/api/runtime-incidents/message-operation-coverage"
         or parsed.query

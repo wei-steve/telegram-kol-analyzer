@@ -78,6 +78,8 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "--web-loop-health-url http://127.0.0.1:8000/api/runtime/loop-health "
         "--ingest-loop-health-url http://127.0.0.1:8001/api/runtime/loop-health "
         "--worker-loop-health-url http://127.0.0.1:8002/api/runtime/loop-health "
+        "--message-operation-coverage-url http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage "
+        "--live-position-sizes-url http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes "
         "--database-path /opt/telegram-kol-analyzer/data/research.db "
         "--state-path /var/lib/telegram-kol-monitor/state.json "
         "--lookback-minutes 35 "
