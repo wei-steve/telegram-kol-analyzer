@@ -536,10 +536,16 @@ def resolve_contextual_strategy(
         session_factory,
         int(raw_message_id),
     )
+    provider = _select_provider(ai_recognition_config)
     fingerprint_payload = {
         "raw_message_id": int(raw_message_id),
         "evidence_version_id": evidence_version_id,
         "request": request_payload,
+        "provider": {
+            "model_id": ai_recognition_config.context_resolution_model_id,
+            "model": provider.model,
+            "base_url": provider.base_url.rstrip("/"),
+        },
     }
     context_fingerprint = "sha256:" + hashlib.sha256(
         _canonical_json(fingerprint_payload).encode("utf-8")
@@ -585,7 +591,6 @@ def resolve_contextual_strategy(
             raise ContextResolutionError(
                 str(exhausted.error_class or "context_contract_invalid")
             )
-    provider = _select_provider(ai_recognition_config)
     prior_error_code: str | None = None
     for attempt_number in (1, 2):
         failure: ContextResolutionError | None = None

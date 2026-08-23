@@ -3,6 +3,7 @@ import json
 import pytest
 
 from telegram_kol_research.ai_recognition_config import (
+    AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
 )
@@ -12,7 +13,19 @@ from telegram_kol_research.context_resolution import (
     resolve_contextual_strategy,
 )
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import ContextResolutionAttempt, RawMessage
+from telegram_kol_research.context_resolution_prompt import (
+    CONTEXT_RESOLUTION_SYSTEM_PROMPT,
+    build_context_resolution_request,
+)
+from telegram_kol_research.models import (
+    ContextResolutionAttempt,
+    ExecutionEvent,
+    RawMessage,
+    RecognitionDecision,
+    SignalCandidate,
+    StrategyLifecycle,
+    TradeSignal,
+)
 
 
 def _valid_payload(**overrides):
@@ -500,3 +513,159 @@ def test_completed_context_fingerprint_is_reused_without_recalling_model(tmp_pat
     assert calls == 1
     with session_factory() as session:
         assert session.query(ContextResolutionAttempt).count() == 1
+
+
+def test_resolver_selects_configured_mimo_provider_without_changing_contract(tmp_path):
+    session_factory = create_session_factory(tmp_path / "mimo-selection.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=92, message_id=1600, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    calls = []
+    evidence = {"text": {"observed_text": "更新 BTC 多单"}}
+    context_window = {
+        "current": {"message_id": 1600},
+        "messages": [{"message_id": 1599, "text": "BTC 多单"}],
+        "reply_chain": [],
+    }
+    candidates = [{"thread_id": 12, "root_message_id": 1599}]
+    first_pass_payload = {"recognition_result": "是策略"}
+    exchange_state = {"positions": []}
+
+    def model_caller(**kwargs):
+        calls.append(kwargs)
+        return _valid_payload(supporting_message_ids=[1599, 1600])
+
+    resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(
+            text_provider=AiProviderConfig(
+                base_url="https://api.deepseek.com",
+                api_key="deepseek-secret",
+                model="deepseek-v4-flash",
+            ),
+            ai_models=[
+                AiModelConfig(
+                    id="deepseek-v4-flash",
+                    label="DeepSeek",
+                    base_url="https://api.deepseek.com",
+                    api_key="deepseek-secret",
+                    model="deepseek-v4-flash",
+                    supports_text=True,
+                ),
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo",
+                    base_url="https://api.xiaomimimo.com/v1/",
+                    api_key="mimo-secret",
+                    model="mimo-v2.5",
+                    timeout_seconds=17.5,
+                    supports_text=True,
+                ),
+            ],
+            context_resolution_model_id="mimo-v2.5",
+        ),
+        evidence=evidence,
+        context_window=context_window,
+        candidates=candidates,
+        first_pass_payload=first_pass_payload,
+        exchange_state=exchange_state,
+        model_caller=model_caller,
+    )
+
+    assert len(calls) == 1
+    provider = calls[0]["provider"]
+    assert provider.base_url == "https://api.xiaomimimo.com/v1/"
+    assert provider.api_key == "mimo-secret"
+    assert provider.model == "mimo-v2.5"
+    assert provider.timeout_seconds == 17.5
+    assert calls[0]["system_prompt"] == CONTEXT_RESOLUTION_SYSTEM_PROMPT
+    assert calls[0]["request_payload"] == build_context_resolution_request(
+        current_message={
+            "raw_message_id": raw_id,
+            "chat_id": 92,
+            "message_id": 1600,
+            "posted_at": None,
+            "text": "更新 BTC 多单",
+            "reply_to_message_id": None,
+        },
+        evidence=evidence,
+        context_window=context_window,
+        candidates=candidates,
+        exchange_state=exchange_state,
+        first_pass_payload=first_pass_payload,
+    )
+
+
+def test_mimo_provider_failure_exhausts_without_deepseek_fallback_or_operations(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "mimo-failure.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=93, message_id=1700, text="看看已有策略")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    calls = {"mimo": 0, "deepseek": 0}
+
+    def failing_caller(*, provider, **_kwargs):
+        if provider.model == "mimo-v2.5":
+            calls["mimo"] += 1
+        else:
+            calls["deepseek"] += 1
+        raise RuntimeError("provider unavailable")
+
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(
+                text_provider=AiProviderConfig(
+                    base_url="https://api.deepseek.com",
+                    api_key="deepseek-secret",
+                    model="deepseek-v4-flash",
+                ),
+                ai_models=[
+                    AiModelConfig(
+                        id="deepseek-v4-flash",
+                        label="DeepSeek",
+                        base_url="https://api.deepseek.com",
+                        api_key="deepseek-secret",
+                        model="deepseek-v4-flash",
+                    ),
+                    AiModelConfig(
+                        id="mimo-v2.5",
+                        label="MiMo",
+                        base_url="https://api.xiaomimimo.com/v1",
+                        api_key="mimo-secret",
+                        model="mimo-v2.5",
+                    ),
+                ],
+                context_resolution_model_id="mimo-v2.5",
+            ),
+            evidence={},
+            context_window={"current": {"message_id": 1700}, "messages": []},
+            candidates=[],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=failing_caller,
+        )
+
+    assert raised.value.code == "network_error"
+    assert calls == {"mimo": 2, "deepseek": 0}
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.model == "mimo-v2.5"
+        assert attempt.status == "exhausted"
+        assert attempt.error_class == "network_error"
+        assert attempt.attempts == 2
+        for model in (
+            RecognitionDecision,
+            SignalCandidate,
+            StrategyLifecycle,
+            TradeSignal,
+            ExecutionEvent,
+        ):
+            assert session.query(model).count() == 0

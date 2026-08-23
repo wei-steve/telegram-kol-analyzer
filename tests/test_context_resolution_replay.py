@@ -4,10 +4,14 @@ from pathlib import Path
 
 import pytest
 from telegram_kol_research.ai_recognition_config import (
+    AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
 )
-from telegram_kol_research.context_resolution import resolve_contextual_strategy
+from telegram_kol_research.context_resolution import (
+    ContextResolutionError,
+    resolve_contextual_strategy,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_execution_actions import (
     DeepcoinExecutionActionError,
@@ -15,6 +19,7 @@ from telegram_kol_research.deepcoin_execution_actions import (
     cancel_revision_entry_leg,
 )
 from telegram_kol_research.models import (
+    ContextResolutionAttempt,
     ExecutionBinding,
     ExecutionOrderLeg,
     MessageInstructionItem,
@@ -140,6 +145,98 @@ def test_context_resolution_disabled_mode_is_a_no_call_gate():
         calls.append("resolver")
 
     assert calls == []
+
+
+def test_exhausted_deepseek_cache_does_not_suppress_new_mimo_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "provider-cache.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=94, message_id=1800, text="继续观察")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    models = [
+        AiModelConfig(
+            id="deepseek-v4-flash",
+            label="DeepSeek",
+            base_url="https://api.deepseek.com",
+            api_key="deepseek-secret",
+            model="deepseek-v4-flash",
+        ),
+        AiModelConfig(
+            id="mimo-v2.5",
+            label="MiMo",
+            base_url="https://api.xiaomimimo.com/v1",
+            api_key="mimo-secret",
+            model="mimo-v2.5",
+        ),
+    ]
+    common = {
+        "raw_message_id": raw_id,
+        "evidence": {},
+        "context_window": {"current": {"message_id": 1800}, "messages": []},
+        "candidates": [],
+        "first_pass_payload": {},
+        "exchange_state": {},
+    }
+    deepseek_calls = 0
+
+    def failing_deepseek(**_kwargs):
+        nonlocal deepseek_calls
+        deepseek_calls += 1
+        raise RuntimeError("payment required")
+
+    with pytest.raises(ContextResolutionError) as exhausted:
+        resolve_contextual_strategy(
+            session_factory,
+            ai_recognition_config=AiRecognitionConfig(
+                ai_models=models,
+                context_resolution_model_id="deepseek-v4-flash",
+            ),
+            model_caller=failing_deepseek,
+            **common,
+        )
+    assert exhausted.value.code == "network_error"
+    assert deepseek_calls == 2
+    mimo_calls = 0
+
+    def successful_mimo(**kwargs):
+        nonlocal mimo_calls
+        mimo_calls += 1
+        assert kwargs["provider"].model == "mimo-v2.5"
+        return {
+            "decision": "hold",
+            "target_thread_ids": [],
+            "management_action": None,
+            "confidence": 0.9,
+            "supporting_message_ids": [1800],
+            "opposing_message_ids": [],
+            "conflict_types": [],
+            "risk_reducing_fanout_allowed": False,
+            "reanalysis_triggers": [],
+            "reason": "no strategy change",
+        }
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        ai_recognition_config=AiRecognitionConfig(
+            ai_models=models,
+            context_resolution_model_id="mimo-v2.5",
+        ),
+        model_caller=successful_mimo,
+        **common,
+    )
+
+    assert decision.decision == "hold"
+    assert mimo_calls == 1
+    with session_factory() as session:
+        attempts = session.query(ContextResolutionAttempt).order_by(
+            ContextResolutionAttempt.id
+        ).all()
+    assert [attempt.model for attempt in attempts] == [
+        "deepseek-v4-flash",
+        "mimo-v2.5",
+    ]
+    assert attempts[0].context_fingerprint != attempts[1].context_fingerprint
 
 
 def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
