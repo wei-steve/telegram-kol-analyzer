@@ -330,15 +330,19 @@ def test_split_runtime_units_preserve_the_proven_hardening_baseline(role):
         assert directive in unit
 
 
-def test_split_runtime_provisioning_grants_shared_group_config_read_only_access():
+def test_split_runtime_provisioning_grants_shared_configs_read_only_access():
     repository_root = Path(__file__).resolve().parents[1]
     deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(
         encoding="utf-8"
     )
-    shared_config = "/opt/telegram-kol-analyzer/config/groups.yaml"
+    shared_configs = (
+        "/opt/telegram-kol-analyzer/config/groups.yaml",
+        "/opt/telegram-kol-analyzer/config/ai_recognition.yaml",
+    )
 
-    assert f"chgrp telegram-kol-runtime {shared_config}" in deployment_guide
-    assert f"chmod 0640 {shared_config}" in deployment_guide
+    for shared_config in shared_configs:
+        assert f"chgrp telegram-kol-runtime {shared_config}" in deployment_guide
+        assert f"chmod 0640 {shared_config}" in deployment_guide
     assert (
         "chgrp -R telegram-kol-runtime /opt/telegram-kol-analyzer/config"
         not in deployment_guide
