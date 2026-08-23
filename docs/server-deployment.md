@@ -75,7 +75,14 @@ chgrp -R telegram-kol-runtime /opt/telegram-kol-analyzer/data
 chmod 0770 /opt/telegram-kol-analyzer/data
 find /opt/telegram-kol-analyzer/data -type d -exec chmod 0770 {} +
 find /opt/telegram-kol-analyzer/data -type f -exec chmod 0660 {} +
+chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/config/groups.yaml
+chmod 0640 /opt/telegram-kol-analyzer/config/groups.yaml
 ```
+
+The three roles all parse `config/groups.yaml` at startup, so that one
+non-secret routing file must be group-readable. Do not apply either command
+recursively to `config/`; checkout environment and credential files remain
+inaccessible to the split units.
 
 Provision three root-controlled environment files with mode `0640`, group each
 file only to its matching service user, and copy only the variables required by

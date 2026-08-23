@@ -204,6 +204,22 @@ def test_split_runtime_units_preserve_the_proven_hardening_baseline(role):
         assert directive in unit
 
 
+def test_split_runtime_provisioning_grants_shared_group_config_read_only_access():
+    repository_root = Path(__file__).resolve().parents[1]
+    deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(
+        encoding="utf-8"
+    )
+    shared_config = "/opt/telegram-kol-analyzer/config/groups.yaml"
+
+    assert f"chgrp telegram-kol-runtime {shared_config}" in deployment_guide
+    assert f"chmod 0640 {shared_config}" in deployment_guide
+    assert (
+        "chgrp -R telegram-kol-runtime /opt/telegram-kol-analyzer/config"
+        not in deployment_guide
+    )
+    assert "chmod -R" not in deployment_guide
+
+
 @pytest.mark.parametrize("role", ["worker", "web"])
 def test_only_ingest_unit_can_reach_telegram_session_files(role):
     unit = _runtime_unit_text(role)
