@@ -27,7 +27,16 @@ SQLITE_PATHS = (
     f"{DATABASE_PATH}-journal",
 )
 SQLITE_NAMES = frozenset(os.path.basename(path) for path in SQLITE_PATHS)
-SHARED_RUNTIME_DATA_FILES = frozenset({"deepcoin_contract_specs_cache.json"})
+SHARED_RUNTIME_DATA_FILES = frozenset(
+    {
+        "deepcoin_contract_specs_cache.json",
+        "telegram.session",
+        "telegram.session-journal",
+        "telegram.session-shm",
+        "telegram.session-wal",
+        "telegram.session.lock",
+    }
+)
 REVIEWED_READABLE_DATA_DIRECTORIES = frozenset({"logs", "media", "web_cache"})
 DENIED_DATA_DIRECTORIES = frozenset(
     {"backups", "deepcoin_field_probe", "session_backups"}

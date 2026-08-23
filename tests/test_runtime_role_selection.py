@@ -95,6 +95,23 @@ def test_explicit_empty_env_file_paths_disable_checkout_secret_fallbacks(
         )
 
 
+def test_deepcoin_client_factory_accepts_environment_only_credentials():
+    from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+
+    client = build_deepcoin_client_from_env(
+        environ={
+            "DEEPCOIN_API_KEY": "process-key",
+            "DEEPCOIN_API_SECRET": "process-secret",
+            "DEEPCOIN_API_PASSPHRASE": "process-passphrase",
+        },
+        env_file_paths=[],
+    )
+
+    assert client._credentials.api_key == "process-key"
+    assert client._credentials.api_secret == "process-secret"
+    assert client._credentials.passphrase == "process-passphrase"
+
+
 @pytest.mark.parametrize("role", ["ingest", "worker", "web"])
 def test_split_runtime_app_loads_secrets_from_process_environment_only(
     role, tmp_path, monkeypatch
@@ -367,13 +384,23 @@ def test_split_cutover_refreshes_generated_contract_cache_permissions():
     assert f"setfacl -b {cache_path}" in cutover_section
     assert f"chgrp telegram-kol-runtime {cache_path}" in cutover_section
     assert f"chmod 0660 {cache_path}" in cutover_section
+    for session_path in (
+        "/opt/telegram-kol-analyzer/data/telegram.session",
+        "/opt/telegram-kol-analyzer/data/telegram.session.lock",
+    ):
+        assert f"chgrp telegram-kol-runtime {session_path}" in cutover_section
+        assert f"chmod 0660 {session_path}" in cutover_section
+        assert (
+            "setfacl -m u:telegram-kol-agent:---,g::rw-,m::rw- "
+            f"{session_path}"
+        ) in cutover_section
 
 
 @pytest.mark.parametrize("role", ["worker", "web"])
 def test_only_ingest_unit_can_reach_telegram_session_files(role):
     unit = _runtime_unit_text(role)
 
-    for suffix in ("", "-journal", "-wal", "-shm"):
+    for suffix in ("", ".lock", "-journal", "-wal", "-shm"):
         assert (
             "InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session"
             f"{suffix}"

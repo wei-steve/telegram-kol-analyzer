@@ -49,6 +49,7 @@ InaccessiblePaths=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/llm.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/runtime_incident_agent.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session.lock
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-journal
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-wal
 InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-shm

@@ -129,16 +129,27 @@ returned zero, refresh that non-secret generated input before starting the
 worker:
 
 ```bash
+chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/telegram.session
+chmod 0660 /opt/telegram-kol-analyzer/data/telegram.session
+setfacl -m u:telegram-kol-agent:---,g::rw-,m::rw- /opt/telegram-kol-analyzer/data/telegram.session
+chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/telegram.session.lock
+chmod 0660 /opt/telegram-kol-analyzer/data/telegram.session.lock
+setfacl -m u:telegram-kol-agent:---,g::rw-,m::rw- /opt/telegram-kol-analyzer/data/telegram.session.lock
 setfacl -b /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 chmod 0660 /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
 ```
 
-Do not recursively reopen the data tree at this point. Clearing the cache's
-inherited access ACL is required because changing mode alone can leave its
-`group::---` ACL entry intact. The split units already carry `UMask=0007`; cache
-publishing also removes that inherited ACL before atomic replacement so future
-refreshes preserve shared access.
+The session database and its durable lock remain inaccessible to worker and
+Web through their systemd mount namespaces; the shared group write bit lets
+only the ingest unit take over the root-created files. Keep the Runtime Agent's
+explicit deny ACL. Do not recursively reopen the data tree at this point.
+Clearing the cache's inherited access ACL is required because changing mode
+alone can leave its `group::---` ACL entry intact. The split units already carry
+`UMask=0007`; cache publishing also removes that inherited ACL before atomic
+replacement so future refreshes preserve shared access. The Runtime Agent ACL
+helper likewise preserves shared access for the cache and Telegram session
+files if its bounded non-database sanitizer is rerun.
 
 Do not start a split unit while the monolith is active. The cutover and rollback
 orders are defined in the runbook and are executed only after the updater has

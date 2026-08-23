@@ -660,8 +660,16 @@ def build_deepcoin_auth_headers(
     }
 
 
-def build_deepcoin_client_from_env() -> DeepcoinRestClient:
-    return DeepcoinRestClient(load_deepcoin_credentials())
+def build_deepcoin_client_from_env(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | Path] | None = None,
+) -> DeepcoinRestClient:
+    return DeepcoinRestClient(
+        load_deepcoin_credentials(
+            environ=environ,
+            env_file_paths=env_file_paths,
+        )
+    )
 
 
 def _raise_for_deepcoin_business_error(payload: dict[str, Any]) -> None:
