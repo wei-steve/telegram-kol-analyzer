@@ -6,6 +6,7 @@ from PIL import Image
 
 from telegram_kol_research.telegram_client import (
     _download_media_if_present,
+    discover_dialogs,
     fetch_dialog_messages,
     is_usable_image_file,
 )
@@ -34,6 +35,41 @@ class _FakeMessage:
 class _FakeClient:
     async def iter_messages(self, chat_id, limit):
         yield _FakeMessage()
+
+
+def test_discover_dialogs_can_bound_reconcile_scan_to_archived_folder():
+    class DialogClient:
+        def __init__(self):
+            self.calls = []
+
+        async def iter_dialogs(self, **kwargs):
+            self.calls.append(kwargs)
+            yield type(
+                "Dialog",
+                (),
+                {
+                    "id": 9001,
+                    "title": "VIP BTC Room",
+                    "archived": True,
+                    "is_group": True,
+                    "is_channel": False,
+                },
+            )()
+
+    client = DialogClient()
+
+    dialogs = asyncio.run(discover_dialogs(client, archived_only=True))
+
+    assert client.calls == [{"archived": True}]
+    assert dialogs == [
+        {
+            "id": 9001,
+            "title": "VIP BTC Room",
+            "archived": True,
+            "is_group": True,
+            "is_channel": False,
+        }
+    ]
 
 
 def _write_jpeg(path: Path) -> None:

@@ -107,3 +107,30 @@ def test_finish_success_atomically_replaces_existing_file(tmp_path):
     assert persisted["version"] == second.version
     assert persisted["payload"]["positions"] == []
     assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_reader_observes_atomic_snapshot_updates_from_another_process_instance(
+    tmp_path,
+):
+    path = tmp_path / "positions.json"
+    reader = LivePositionSnapshotStore(path)
+    writer = LivePositionSnapshotStore(path)
+
+    first = writer.finish_success(
+        {"positions": [{"pos_id": "first"}]},
+        captured_at=CAPTURED_AT,
+    )
+    observed_first = reader.read()
+
+    second = writer.finish_success(
+        {"positions": [{"pos_id": "second"}]},
+        captured_at=datetime(2026, 7, 31, 8, 16, tzinfo=UTC),
+    )
+    observed_second = reader.read()
+
+    assert observed_first is not None
+    assert observed_first.version == first.version
+    assert observed_first.payload["positions"] == [{"pos_id": "first"}]
+    assert observed_second is not None
+    assert observed_second.version == second.version
+    assert observed_second.payload["positions"] == [{"pos_id": "second"}]

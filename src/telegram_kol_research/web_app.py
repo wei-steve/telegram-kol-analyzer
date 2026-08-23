@@ -311,6 +311,7 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "lifecycle_monitor",
             "message_operation_supervisor",
             "message_processing_worker",
+            "position_snapshot_startup",
             "runtime_incident_notification",
             "semantic_review",
             "source_message_deletion_worker",
@@ -321,7 +322,7 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "worker_command_worker",
         }
     ),
-    "web": frozenset({"position_snapshot_startup"}),
+    "web": frozenset(),
 }
 logger = logging.getLogger(__name__)
 
@@ -4607,11 +4608,10 @@ def create_web_app(
                 runtime_role_starts_singleton_task(
                     app.state.runtime_role, "position_snapshot_startup"
                 )
-                and app.state.live_position_snapshot_store.read() is None
                 and app.state.position_snapshot_startup_task is None
             ):
                 app.state.position_snapshot_startup_task = asyncio.create_task(
-                    asyncio.to_thread(refresh_live_position_snapshot)
+                    run_live_position_snapshot_refresh_loop()
                 )
                 app.state.position_snapshot_startup_task.add_done_callback(
                     _log_background_task_result(
@@ -4657,6 +4657,7 @@ def create_web_app(
                 app.state.position_snapshot_startup_task
             )
             if position_snapshot_startup_task is not None:
+                position_snapshot_startup_task.cancel()
                 try:
                     await position_snapshot_startup_task
                 except asyncio.CancelledError:
@@ -5951,6 +5952,11 @@ def create_web_app(
         }
 
     def build_positions_panel_context() -> dict[str, Any]:
+        if app.state.runtime_role == "web":
+            return build_initial_positions_panel_context(
+                schedule_refresh=False,
+                allow_sync_refresh=False,
+            )
         symbol_whitelist_by_chat_id = _symbol_whitelist_by_chat_id(app.state.group_config)
         pending_entry_signals = list_pending_strategies(
             app.state.session_factory,
@@ -5994,6 +6000,8 @@ def create_web_app(
 
     def refresh_live_position_snapshot():
         store = app.state.live_position_snapshot_store
+        if app.state.runtime_role == "web":
+            return store.read()
         if not store.begin_refresh():
             return store.read()
         try:
@@ -6023,6 +6031,13 @@ def create_web_app(
             logger.exception("Deepcoin live position snapshot refresh failed")
             store.finish_failure(str(exc))
             return store.read()
+
+    async def run_live_position_snapshot_refresh_loop() -> None:
+        while True:
+            await asyncio.to_thread(refresh_live_position_snapshot)
+            await asyncio.sleep(
+                max(0.01, app.state.position_snapshot_refresh_seconds)
+            )
 
     def position_snapshot_metadata(snapshot) -> dict[str, Any]:
         if snapshot is None:
@@ -6061,6 +6076,8 @@ def create_web_app(
         }
 
     def schedule_live_position_snapshot_refresh() -> bool:
+        if app.state.runtime_role == "web":
+            return False
         startup_task = app.state.position_snapshot_startup_task
         if startup_task is not None and not startup_task.done():
             return True
@@ -6182,7 +6199,12 @@ def create_web_app(
         )
         group_label_by_chat_id = _group_label_by_chat_id(app.state.group_config)
         history_pagination = None
-        if tab_name == "position-history" and browse_token:
+        if app.state.runtime_role == "web":
+            exchange_snapshot = {
+                **_empty_exchange_snapshot(),
+                "error": "unavailable",
+            }
+        elif tab_name == "position-history" and browse_token:
             try:
                 page = app.state.history_position_browse_snapshots.page(
                     token=browse_token,

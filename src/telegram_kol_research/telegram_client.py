@@ -257,11 +257,16 @@ async def ensure_telegram_login(
     return True
 
 
-async def discover_dialogs(client: Any) -> list[dict[str, Any]]:
+async def discover_dialogs(
+    client: Any,
+    *,
+    archived_only: bool = False,
+) -> list[dict[str, Any]]:
     """Enumerate dialogs and capture the fields needed for archived-group filtering."""
 
     dialogs: list[dict[str, Any]] = []
-    async for dialog in client.iter_dialogs():
+    iter_kwargs = {"archived": True} if archived_only else {}
+    async for dialog in client.iter_dialogs(**iter_kwargs):
         dialogs.append(
             {
                 "id": getattr(dialog, "id", None),

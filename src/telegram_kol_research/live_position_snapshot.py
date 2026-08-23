@@ -33,10 +33,12 @@ class LivePositionSnapshotStore:
         self._refreshing = False
         self._last_error: str | None = None
         self.last_load_error: str | None = None
+        self._loaded_file_signature: tuple[int, int, int] | None = None
         self._load()
 
     def read(self) -> LivePositionSnapshot | None:
         with self._lock:
+            self._reload_if_changed()
             if self._snapshot is None:
                 return None
             return replace(
@@ -81,6 +83,7 @@ class LivePositionSnapshotStore:
 
     def _load(self) -> None:
         if not self.path.exists():
+            self._loaded_file_signature = None
             return
         try:
             persisted = json.loads(self.path.read_text(encoding="utf-8"))
@@ -93,12 +96,27 @@ class LivePositionSnapshotStore:
                 raise ValueError("invalid live position snapshot")
         except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError) as exc:
             self.last_load_error = str(exc)
+            self._loaded_file_signature = self._file_signature()
             return
         self._snapshot = LivePositionSnapshot(
             payload=payload,
             captured_at=captured_at,
             version=version,
         )
+        self.last_load_error = None
+        self._loaded_file_signature = self._file_signature()
+
+    def _reload_if_changed(self) -> None:
+        signature = self._file_signature()
+        if signature != self._loaded_file_signature:
+            self._load()
+
+    def _file_signature(self) -> tuple[int, int, int] | None:
+        try:
+            stat = self.path.stat()
+        except FileNotFoundError:
+            return None
+        return (stat.st_ino, stat.st_mtime_ns, stat.st_size)
 
     def _persist(self, snapshot: LivePositionSnapshot) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -117,6 +135,7 @@ class LivePositionSnapshotStore:
         try:
             temporary_path.write_text(body, encoding="utf-8")
             temporary_path.replace(self.path)
+            self._loaded_file_signature = self._file_signature()
         except Exception:
             temporary_path.unlink(missing_ok=True)
             raise

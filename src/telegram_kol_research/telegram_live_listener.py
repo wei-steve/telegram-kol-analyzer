@@ -1402,7 +1402,11 @@ async def run_reconcile_once(
             session_factory,
             config=notification_bot_config,
         )
-    dialogs = await discover_dialogs_fn(client)
+    discovery_kwargs = _filter_callable_kwargs(
+        discover_dialogs_fn,
+        {"archived_only": True},
+    )
+    dialogs = await discover_dialogs_fn(client, **discovery_kwargs)
     matched_dialogs = filter_target_dialogs(dialogs, target_titles)
 
     recovered_messages = 0

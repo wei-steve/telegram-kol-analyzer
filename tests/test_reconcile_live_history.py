@@ -121,6 +121,27 @@ def test_run_reconcile_once_persists_only_messages_newer_than_checkpoint(tmp_pat
     assert checkpoint.last_message_id == 78
 
 
+def test_run_reconcile_once_bounds_dialog_discovery_to_archived_folder(tmp_path):
+    calls = []
+
+    async def discover_archived_dialogs(_client, *, archived_only=False):
+        calls.append(archived_only)
+        return []
+
+    stats = asyncio.run(
+        run_reconcile_once(
+            client=_FakeClient(),
+            session_factory=create_session_factory(tmp_path / "research.db"),
+            broker=None,
+            target_titles={"VIP BTC Room"},
+            discover_dialogs_fn=discover_archived_dialogs,
+        )
+    )
+
+    assert calls == [True]
+    assert stats["matched_dialogs"] == 0
+
+
 def test_history_reconcile_without_authority_persists_raw_only(tmp_path):
     session_factory = create_session_factory(tmp_path / "authority-required.db")
 

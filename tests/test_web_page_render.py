@@ -1078,6 +1078,29 @@ def test_positions_panel_fresh_snapshot_avoids_deepcoin_read(tmp_path):
     assert "持仓数据刚刚更新" in response.text
 
 
+def test_split_web_position_loaders_never_construct_a_deepcoin_client(tmp_path):
+    factory_calls = []
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        deepcoin_client_factory=lambda: factory_calls.append("called"),
+        live_position_snapshot_path=tmp_path / "missing-snapshot.json",
+    )
+
+    with TestClient(app) as client:
+        responses = [
+            client.get("/positions-panel?initial=positions"),
+            client.get("/positions-panel"),
+            client.get("/positions-panel/tabs/open-orders"),
+            client.get("/positions-panel/tabs/order-history"),
+            client.get("/positions-panel/tabs/position-history"),
+        ]
+
+    assert [response.status_code for response in responses] == [200] * 5
+    assert factory_calls == []
+    assert all("Deepcoin 数据暂不可用" in response.text for response in responses)
+
+
 def test_positions_view_server_renders_cached_snapshot_in_initial_document(tmp_path):
     snapshot_path = tmp_path / "web-cache" / "positions.json"
     LivePositionSnapshotStore(snapshot_path).finish_success(

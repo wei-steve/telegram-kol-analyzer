@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from pathlib import Path
 
 import httpx
@@ -236,7 +237,7 @@ def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
     assert selector is not None, "runtime task partition is not implemented"
 
     assert selector("ingest") == {"live_listener", "reconcile"}
-    assert selector("web") == {"position_snapshot_startup"}
+    assert selector("web") == set()
     assert selector("worker") == {
         "authoritative_gap_recovery_loop",
         "break_even_convergence_worker",
@@ -245,6 +246,7 @@ def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
         "lifecycle_monitor",
         "message_operation_supervisor",
         "message_processing_worker",
+        "position_snapshot_startup",
         "runtime_incident_notification",
         "semantic_review",
         "source_message_deletion_worker",
@@ -285,7 +287,7 @@ def test_non_worker_lifespans_do_not_start_worker_singletons(role, tmp_path):
         assert app.state.semantic_review_task is None
 
 
-@pytest.mark.parametrize("role", ["ingest", "worker"])
+@pytest.mark.parametrize("role", ["ingest", "web"])
 def test_non_web_lifespans_do_not_start_web_singletons(role, tmp_path):
     from telegram_kol_research.web_app import create_web_app
 
@@ -309,6 +311,32 @@ def test_every_runtime_lifespan_starts_its_process_local_loop_monitor(role, tmp_
 
     with TestClient(app):
         assert app.state.loop_lag_monitor_task is not None
+
+
+def test_worker_keeps_the_shared_live_position_cache_fresh(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    calls = []
+
+    class ReadOnlyClient:
+        def list_positions(self):
+            calls.append("positions")
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "worker.db",
+        runtime_role="worker",
+        deepcoin_client_factory=ReadOnlyClient,
+        position_snapshot_refresh_seconds=0.01,
+    )
+
+    with TestClient(app):
+        deadline = time.monotonic() + 0.25
+        while len(calls) < 2 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert len(calls) >= 2
+        assert app.state.position_snapshot_startup_task is not None
+        assert not app.state.position_snapshot_startup_task.done()
 
 
 def _runtime_unit_text(role: str) -> str:
