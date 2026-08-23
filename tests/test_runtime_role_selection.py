@@ -319,6 +319,25 @@ def _runtime_unit_text(role: str) -> str:
 
 
 @pytest.mark.parametrize(
+    "unit_name",
+    [
+        "telegram-kol-monitor.service",
+        "telegram-kol-monitor-diagnostic.service",
+        "telegram-kol-monitor-test-notification.service",
+    ],
+)
+def test_split_monitor_routes_incident_capture_to_worker(unit_name):
+    repository_root = Path(__file__).resolve().parents[1]
+    unit = (repository_root / "deploy" / "systemd" / unit_name).read_text(
+        encoding="utf-8"
+    )
+
+    capture_path = "/api/runtime-incidents/monitor-capture"
+    assert f"http://127.0.0.1:8002{capture_path}" in unit
+    assert f"http://127.0.0.1:8000{capture_path}" not in unit
+
+
+@pytest.mark.parametrize(
     ("role", "port"),
     [("ingest", 8001), ("worker", 8002), ("web", 8000)],
 )
