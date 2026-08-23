@@ -14,6 +14,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.web_queries import (
     _build_lifecycle_event_timeline,
     list_execution_strategy_overview,
+    list_holding_strategies,
     load_home_event_rows,
 )
 
@@ -215,6 +216,43 @@ def test_holding_dashboard_surfaces_critical_unprotected_position(tmp_path):
         "exposure_started_at": started.replace(tzinfo=None).isoformat(),
         "rescue_state": "not_planned",
     }]
+
+
+def test_holding_projection_closes_fallback_lookup_session_connection(tmp_path):
+    session_factory = create_session_factory(tmp_path / "holding-pool.db")
+    started = datetime(2026, 8, 23, 18, 0, tzinfo=UTC)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:10:20:BTC:long",
+            kol_id="group:10",
+            chat_id=10,
+            message_id=20,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            pos_id="pos-pool",
+            status="active",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(
+            StrategyLifecycle(
+                execution_binding_id=binding.id,
+                chat_id=10,
+                message_id=20,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=started,
+                entered_at=started,
+            )
+        )
+        session.commit()
+
+    rows = list_holding_strategies(session_factory)
+
+    assert [row["pos_id"] for row in rows] == ["pos-pool"]
+    assert session_factory.kw["bind"].pool.checkedout() == 0
 
 
 def test_entered_lifecycle_without_binding_is_labeled_as_price_touch(tmp_path):

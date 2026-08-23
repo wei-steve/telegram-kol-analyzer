@@ -3168,7 +3168,10 @@ def list_holding_strategies(
             StrategyLifecycle.id.desc(),
         ).limit(limit)
         rows = q.all()
+        return _project_holding_strategy_rows(session, rows)
 
+
+def _project_holding_strategy_rows(session, rows) -> list[dict[str, object]]:
     results: list[dict[str, object]] = []
     for lc, cand, raw_msg, binding in rows:
         row: dict[str, object] = {
