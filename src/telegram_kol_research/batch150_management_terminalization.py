@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import json
 import os
@@ -171,6 +172,16 @@ class Batch150TerminalizationPlan:
         payload = asdict(self)
         payload["action_count"] = self.action_count
         return payload
+
+
+@dataclass(frozen=True, slots=True)
+class Batch150TerminalizationMutationResult:
+    mode: str
+    status: str
+    changed_row_count: int
+    quick_check: str
+    table_counts_before: Mapping[str, int]
+    table_counts_after: Mapping[str, int]
 
 
 def build_batch150_terminalization_plan(
@@ -364,6 +375,305 @@ def render_batch150_rollback_sql(plan: Batch150TerminalizationPlan) -> str:
     lines.append("DROP TABLE _batch150_repair_cas_guard;")
     lines.append("COMMIT;")
     return "\n".join(lines) + "\n"
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Exact batch 150 historical terminalization rehearsal tool"
+    )
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    plan_parser = subparsers.add_parser("plan", help="build read-only artifacts")
+    plan_parser.add_argument("--database-path", required=True)
+    plan_parser.add_argument("--exchange-evidence", required=True)
+    plan_parser.add_argument("--repair-ts-utc", required=True)
+    plan_parser.add_argument("--code-sha", required=True)
+    plan_parser.add_argument("--plan-path", required=True)
+    plan_parser.add_argument("--rollback-sql-path", required=True)
+
+    apply_parser = subparsers.add_parser("apply", help="apply exact CAS actions")
+    _add_common_mutation_arguments(apply_parser)
+    apply_parser.add_argument("--expected-plan-fingerprint", required=True)
+    apply_parser.add_argument("--expected-repair-ts-utc", required=True)
+
+    rollback_parser = subparsers.add_parser(
+        "rollback", help="rollback exact CAS actions"
+    )
+    _add_common_mutation_arguments(rollback_parser)
+    rollback_parser.add_argument("--expected-rollback-fingerprint", required=True)
+
+    arguments = parser.parse_args(argv)
+    if arguments.command == "plan":
+        evidence = json.loads(
+            Path(arguments.exchange_evidence).expanduser().read_text(encoding="utf-8")
+        )
+        plan = build_batch150_terminalization_plan(
+            arguments.database_path,
+            exchange_evidence=evidence,
+            repair_ts=datetime.fromisoformat(arguments.repair_ts_utc),
+            code_sha=arguments.code_sha,
+        )
+        write_batch150_terminalization_plan(arguments.plan_path, plan)
+        _write_private_text(
+            arguments.rollback_sql_path, render_batch150_rollback_sql(plan)
+        )
+        _print_summary(
+            {
+                "mode": plan.mode,
+                "status": "planned",
+                "action_count": plan.action_count,
+                "plan_fingerprint": plan.plan_fingerprint,
+                "action_fingerprint": plan.action_fingerprint,
+                "rollback_fingerprint": plan.rollback_fingerprint,
+                "database_fingerprint": plan.database_fingerprint,
+                "exchange_fingerprint": plan.exchange_fingerprint,
+                "exchange_write_count": plan.exchange_write_count,
+            }
+        )
+        return 0
+
+    plan = load_batch150_terminalization_plan(arguments.plan_path)
+    if arguments.command == "apply":
+        result = apply_batch150_terminalization_plan(
+            arguments.database_path,
+            plan=plan,
+            expected_plan_fingerprint=arguments.expected_plan_fingerprint,
+            expected_action_count=arguments.expected_action_count,
+            expected_repair_ts_utc=arguments.expected_repair_ts_utc,
+            confirmation_token=arguments.confirmation_token,
+        )
+    else:
+        result = rollback_batch150_terminalization_plan(
+            arguments.database_path,
+            plan=plan,
+            expected_rollback_fingerprint=arguments.expected_rollback_fingerprint,
+            expected_action_count=arguments.expected_action_count,
+            confirmation_token=arguments.confirmation_token,
+        )
+    _print_summary(asdict(result))
+    return 0
+
+
+def _add_common_mutation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database-path", required=True)
+    parser.add_argument("--plan-path", required=True)
+    parser.add_argument("--expected-action-count", required=True, type=int)
+    parser.add_argument("--confirmation-token", required=True)
+
+
+def _print_summary(value: Mapping[str, Any]) -> None:
+    print(_canonical_json(value))
+
+
+def _write_private_text(path: str | Path, value: str) -> None:
+    resolved = Path(path).expanduser().resolve()
+    resolved.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    descriptor = os.open(resolved, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(descriptor, "w", encoding="utf-8") as stream:
+            stream.write(value)
+    except Exception:
+        try:
+            os.close(descriptor)
+        except OSError:
+            pass
+        raise
+    os.chmod(resolved, 0o600)
+
+
+def apply_batch150_terminalization_plan(
+    database_path: str | Path,
+    *,
+    plan: Batch150TerminalizationPlan,
+    expected_plan_fingerprint: str,
+    expected_action_count: int,
+    expected_repair_ts_utc: str,
+    confirmation_token: str,
+) -> Batch150TerminalizationMutationResult:
+    """Apply the exact plan using full-row compare-and-swap predicates."""
+
+    _validate_plan_integrity(plan)
+    if expected_plan_fingerprint != plan.plan_fingerprint:
+        raise Batch150TerminalizationRefused("plan_fingerprint_mismatch")
+    if expected_action_count != plan.action_count:
+        raise Batch150TerminalizationRefused("action_count_mismatch")
+    if expected_repair_ts_utc != plan.repair_ts_utc:
+        raise Batch150TerminalizationRefused("repair_timestamp_mismatch")
+    if confirmation_token != plan.confirmation_token:
+        raise Batch150TerminalizationRefused("confirmation_token_mismatch")
+    return _mutate_batch150_terminalization_plan(database_path, plan=plan, reverse=False)
+
+
+def rollback_batch150_terminalization_plan(
+    database_path: str | Path,
+    *,
+    plan: Batch150TerminalizationPlan,
+    expected_rollback_fingerprint: str,
+    expected_action_count: int,
+    confirmation_token: str,
+) -> Batch150TerminalizationMutationResult:
+    """Rollback the exact plan, refusing runtime-canonicalized or mixed rows."""
+
+    _validate_plan_integrity(plan)
+    if expected_rollback_fingerprint != plan.rollback_fingerprint:
+        raise Batch150TerminalizationRefused("rollback_fingerprint_mismatch")
+    if expected_action_count != plan.action_count:
+        raise Batch150TerminalizationRefused("action_count_mismatch")
+    if confirmation_token != plan.confirmation_token:
+        raise Batch150TerminalizationRefused("confirmation_token_mismatch")
+    return _mutate_batch150_terminalization_plan(database_path, plan=plan, reverse=True)
+
+
+def _mutate_batch150_terminalization_plan(
+    database_path: str | Path,
+    *,
+    plan: Batch150TerminalizationPlan,
+    reverse: bool,
+) -> Batch150TerminalizationMutationResult:
+    resolved = Path(database_path).expanduser().resolve()
+    if str(resolved) != plan.database_path:
+        raise Batch150TerminalizationRefused("database_path_mismatch")
+    if not resolved.is_file():
+        raise Batch150TerminalizationRefused("database_missing")
+
+    connection = sqlite3.connect(resolved)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA busy_timeout=5000")
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+        quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        if quick_check != "ok":
+            raise Batch150TerminalizationRefused("quick_check_failed")
+        counts_before = _table_counts(connection)
+        if counts_before != dict(plan.table_counts):
+            raise Batch150TerminalizationRefused("table_counts_changed")
+
+        actions = tuple(reversed(plan.actions)) if reverse else plan.actions
+        start_rows = tuple(
+            _read_action_row(connection, action, reverse=reverse)
+            for action in actions
+        )
+        expected_before = tuple(
+            dict(action.after if reverse else action.before) for action in actions
+        )
+        expected_after = tuple(
+            dict(action.before if reverse else action.after) for action in actions
+        )
+        if start_rows == expected_after:
+            _require_quiet_target_set(connection, reverse=not reverse)
+            connection.rollback()
+            return Batch150TerminalizationMutationResult(
+                mode="rollback" if reverse else "apply",
+                status="already_rolled_back" if reverse else "already_applied",
+                changed_row_count=0,
+                quick_check=quick_check,
+                table_counts_before=counts_before,
+                table_counts_after=counts_before,
+            )
+        if start_rows != expected_before:
+            raise Batch150TerminalizationRefused("database_state_mixed")
+        _require_quiet_target_set(connection, reverse=reverse)
+
+        for action in actions:
+            _cas_update_action(connection, action, reverse=reverse)
+
+        final_rows = tuple(
+            _read_action_row(connection, action, reverse=reverse)
+            for action in actions
+        )
+        if final_rows != expected_after:
+            raise Batch150TerminalizationRefused("postcondition_failed")
+        counts_after = _table_counts(connection)
+        if counts_after != counts_before:
+            raise Batch150TerminalizationRefused("table_counts_changed")
+        _require_quiet_target_set(connection, reverse=not reverse)
+        post_quick_check = str(connection.execute("PRAGMA quick_check").fetchone()[0])
+        if post_quick_check != "ok":
+            raise Batch150TerminalizationRefused("quick_check_failed")
+        connection.commit()
+        return Batch150TerminalizationMutationResult(
+            mode="rollback" if reverse else "apply",
+            status="rolled_back" if reverse else "applied",
+            changed_row_count=len(actions),
+            quick_check=post_quick_check,
+            table_counts_before=counts_before,
+            table_counts_after=counts_after,
+        )
+    except Exception:
+        connection.rollback()
+        raise
+    finally:
+        connection.close()
+
+
+def _table_counts(connection: sqlite3.Connection) -> dict[str, int]:
+    return {
+        table: int(connection.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        for table in _COUNT_TABLES
+    }
+
+
+def _require_quiet_target_set(
+    connection: sqlite3.Connection, *, reverse: bool
+) -> None:
+    recovery_ids = tuple(
+        int(row[0])
+        for row in connection.execute(
+            "SELECT id FROM strategy_management_batches "
+            "WHERE status='recovery_required' ORDER BY id"
+        )
+    )
+    expected = () if reverse else (TARGET_BATCH_ID,)
+    if recovery_ids != expected:
+        raise Batch150TerminalizationRefused("target_set_changed")
+    unsafe = connection.execute(
+        "SELECT id FROM strategy_management_batches WHERE status IN "
+        "('executing','reserved','submitted','submit_unknown','reconciling') "
+        "ORDER BY id"
+    ).fetchall()
+    if unsafe:
+        raise Batch150TerminalizationRefused("management_window_not_quiet")
+
+
+def _read_action_row(
+    connection: sqlite3.Connection,
+    action: Batch150TerminalizationAction,
+    *,
+    reverse: bool,
+) -> dict[str, Any]:
+    columns = tuple((action.after if reverse else action.before).keys())
+    cursor = connection.execute(
+        f"SELECT {','.join(columns)} FROM {action.table} WHERE id=?", (action.pk,)
+    )
+    row = cursor.fetchone()
+    if row is None or cursor.fetchone() is not None:
+        raise Batch150TerminalizationRefused("database_state_mixed")
+    return dict(row)
+
+
+def _cas_update_action(
+    connection: sqlite3.Connection,
+    action: Batch150TerminalizationAction,
+    *,
+    reverse: bool,
+) -> None:
+    before = dict(action.after if reverse else action.before)
+    after = dict(action.before if reverse else action.after)
+    changed_columns = tuple(
+        column
+        for column in before
+        if column != "id" and before[column] != after[column]
+    )
+    assignments = ",".join(f"{column}=?" for column in changed_columns)
+    predicates = " AND ".join(f"{column} IS ?" for column in before)
+    parameters = tuple(after[column] for column in changed_columns) + tuple(
+        before[column] for column in before
+    )
+    cursor = connection.execute(
+        f"UPDATE {action.table} SET {assignments} WHERE {predicates}", parameters
+    )
+    if cursor.rowcount != 1:
+        raise Batch150TerminalizationRefused("cas_rowcount_changed")
 
 
 def _build_actions(connection: sqlite3.Connection, *, repair_db_value: str):
@@ -693,6 +1003,16 @@ def _validate_owned_stop(value, *, expected_order_id: str, history, reason: str)
 
 
 def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
+    expected_actions = (
+        ("strategy_management_components", 23),
+        ("strategy_management_components", 24),
+        ("strategy_management_legs", 133),
+        ("strategy_management_batches", 150),
+        ("execution_order_legs", 553),
+        ("execution_order_legs", 554),
+        ("execution_bindings", 320),
+        ("strategy_lifecycles", 952),
+    )
     if (
         plan.schema_version != 1
         or plan.mode != "batch150_historical_terminalization"
@@ -701,6 +1021,16 @@ def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
         or plan.exchange_write_count != 0
         or plan.quick_check != "ok"
         or not _valid_sha(plan.code_sha)
+        or set(plan.table_counts) != set(_COUNT_TABLES)
+        or tuple((action.table, action.pk) for action in plan.actions)
+        != expected_actions
+        or any(
+            set(action.before) != set(action.after)
+            or action.before.get("id") != action.pk
+            or action.after.get("id") != action.pk
+            for action in plan.actions
+        )
+        or str(Path(plan.database_path).expanduser().resolve()) != plan.database_path
     ):
         raise Batch150TerminalizationRefused("plan_integrity_invalid")
     if _sha(plan.database_evidence) != plan.database_fingerprint:
@@ -811,3 +1141,7 @@ def _sql_literal(value: Any) -> str:
     if isinstance(value, (int, float)):
         return str(value)
     return "'" + str(value).replace("'", "''") + "'"
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import UTC, datetime
 
 import pytest
 
 from telegram_kol_research.batch150_management_terminalization import (
     Batch150TerminalizationRefused,
+    apply_batch150_terminalization_plan,
     build_batch150_terminalization_plan,
     load_batch150_terminalization_plan,
+    main,
     render_batch150_rollback_sql,
+    rollback_batch150_terminalization_plan,
     write_batch150_terminalization_plan,
 )
 
@@ -363,3 +368,247 @@ def test_plan_round_trip_and_rollback_sql_are_exact(tmp_path):
     assert rollback_sql.rstrip().endswith("COMMIT;")
     assert rollback_sql.count("UPDATE ") == 8
     assert plan.rollback_fingerprint in rollback_sql
+
+
+def _database_digest(path):
+    connection = sqlite3.connect(path)
+    try:
+        rows = []
+        for table in (
+            "strategy_management_components",
+            "strategy_management_legs",
+            "strategy_management_batches",
+            "execution_order_legs",
+            "execution_bindings",
+            "strategy_lifecycles",
+            "position_mutation_intents",
+            "bound_position_close_reservations",
+            "position_protection_ledger",
+            "position_take_profit_orders",
+            "execution_events",
+            "raw_messages",
+            "recognition_decisions",
+        ):
+            columns = [
+                row[1] for row in connection.execute(f"PRAGMA table_info({table})")
+            ]
+            values = connection.execute(f"SELECT * FROM {table} ORDER BY id").fetchall()
+            rows.append((table, columns, values))
+        return hashlib.sha256(
+            json.dumps(rows, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest()
+    finally:
+        connection.close()
+
+
+def _apply(database_path, plan, **overrides):
+    values = {
+        "expected_plan_fingerprint": plan.plan_fingerprint,
+        "expected_action_count": 8,
+        "expected_repair_ts_utc": plan.repair_ts_utc,
+        "confirmation_token": plan.confirmation_token,
+    }
+    values.update(overrides)
+    return apply_batch150_terminalization_plan(
+        database_path, plan=plan, **values
+    )
+
+
+def _rollback(database_path, plan, **overrides):
+    values = {
+        "expected_rollback_fingerprint": plan.rollback_fingerprint,
+        "expected_action_count": 8,
+        "confirmation_token": plan.confirmation_token,
+    }
+    values.update(overrides)
+    return rollback_batch150_terminalization_plan(
+        database_path, plan=plan, **values
+    )
+
+
+def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    original_digest = _database_digest(database_path)
+
+    applied = _apply(database_path, plan)
+    assert applied.status == "applied"
+    assert applied.changed_row_count == 8
+    assert applied.quick_check == "ok"
+    assert applied.table_counts_before == applied.table_counts_after
+
+    second = _apply(database_path, plan)
+    assert second.status == "already_applied"
+    assert second.changed_row_count == 0
+
+    rolled_back = _rollback(database_path, plan)
+    assert rolled_back.status == "rolled_back"
+    assert rolled_back.changed_row_count == 8
+    assert rolled_back.quick_check == "ok"
+    assert rolled_back.table_counts_before == rolled_back.table_counts_after
+    assert _database_digest(database_path) == original_digest
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"expected_plan_fingerprint": "0" * 64}, "plan_fingerprint_mismatch"),
+        ({"expected_action_count": 7}, "action_count_mismatch"),
+        ({"expected_repair_ts_utc": "2026-08-24T22:30:00Z"}, "repair_timestamp_mismatch"),
+        ({"confirmation_token": "wrong"}, "confirmation_token_mismatch"),
+    ],
+)
+def test_apply_refuses_wrong_exact_authorization_before_write(
+    tmp_path, overrides, reason
+):
+    database_path, plan = _build_plan(tmp_path)
+    original_digest = _database_digest(database_path)
+
+    with pytest.raises(Batch150TerminalizationRefused, match=reason):
+        _apply(database_path, plan, **overrides)
+    assert _database_digest(database_path) == original_digest
+
+
+def test_apply_refuses_database_path_or_table_count_drift(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    other_path = tmp_path / "other.db"
+    _seed_database(other_path)
+    other_digest = _database_digest(other_path)
+
+    with pytest.raises(
+        Batch150TerminalizationRefused, match="database_path_mismatch"
+    ):
+        _apply(other_path, plan)
+    assert _database_digest(other_path) == other_digest
+
+    connection = sqlite3.connect(database_path)
+    connection.execute("INSERT INTO execution_events VALUES (3713)")
+    connection.commit()
+    connection.close()
+    drift_digest = _database_digest(database_path)
+    with pytest.raises(Batch150TerminalizationRefused, match="table_counts_changed"):
+        _apply(database_path, plan)
+    assert _database_digest(database_path) == drift_digest
+
+
+def test_apply_and_rollback_refuse_mixed_row_state_without_partial_write(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE strategy_management_components SET attempt_count=99 WHERE id=23"
+    )
+    connection.commit()
+    connection.close()
+    drift_digest = _database_digest(database_path)
+
+    with pytest.raises(Batch150TerminalizationRefused, match="database_state_mixed"):
+        _apply(database_path, plan)
+    assert _database_digest(database_path) == drift_digest
+
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE strategy_management_components SET attempt_count=0 WHERE id=23"
+    )
+    connection.commit()
+    connection.close()
+    _apply(database_path, plan)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE execution_bindings SET last_exchange_status='entry_legs_terminal' "
+        "WHERE id=320"
+    )
+    connection.commit()
+    connection.close()
+    canonicalized_digest = _database_digest(database_path)
+
+    with pytest.raises(Batch150TerminalizationRefused, match="database_state_mixed"):
+        _rollback(database_path, plan)
+    assert _database_digest(database_path) == canonicalized_digest
+
+
+def test_rollback_refuses_wrong_exact_authorization(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    _apply(database_path, plan)
+    applied_digest = _database_digest(database_path)
+
+    with pytest.raises(
+        Batch150TerminalizationRefused, match="rollback_fingerprint_mismatch"
+    ):
+        _rollback(
+            database_path,
+            plan,
+            expected_rollback_fingerprint="0" * 64,
+        )
+    assert _database_digest(database_path) == applied_digest
+
+
+def test_rendered_rollback_sql_restores_exact_rows(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    original_digest = _database_digest(database_path)
+    _apply(database_path, plan)
+
+    connection = sqlite3.connect(database_path)
+    connection.executescript(render_batch150_rollback_sql(plan))
+    connection.close()
+    assert _database_digest(database_path) == original_digest
+
+
+def test_plan_integrity_rejects_tampered_action_before_mutation(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    action = plan.actions[0]
+    changed_before = dict(action.before)
+    changed_before["attempt_count"] = 99
+    tampered_action = replace(action, before=changed_before)
+    tampered_plan = replace(plan, actions=(tampered_action, *plan.actions[1:]))
+    original_digest = _database_digest(database_path)
+
+    with pytest.raises(Batch150TerminalizationRefused, match="action_fingerprint_invalid"):
+        _apply(database_path, tampered_plan)
+    assert _database_digest(database_path) == original_digest
+
+
+def test_cli_plan_apply_idempotent_and_rollback(tmp_path, capsys):
+    database_path = tmp_path / "copy.db"
+    evidence_path = tmp_path / "exchange.json"
+    plan_path = tmp_path / "plan.json"
+    rollback_sql_path = tmp_path / "rollback.sql"
+    _seed_database(database_path)
+    evidence_path.write_text(json.dumps(_complete_exchange_evidence()), encoding="utf-8")
+
+    assert main([
+        "plan",
+        "--database-path", str(database_path),
+        "--exchange-evidence", str(evidence_path),
+        "--repair-ts-utc", REPAIR_TS.isoformat(),
+        "--code-sha", "f" * 40,
+        "--plan-path", str(plan_path),
+        "--rollback-sql-path", str(rollback_sql_path),
+    ]) == 0
+    planned_output = json.loads(capsys.readouterr().out)
+    plan = load_batch150_terminalization_plan(plan_path)
+    assert planned_output["status"] == "planned"
+    assert planned_output["action_count"] == 8
+    assert rollback_sql_path.stat().st_mode & 0o777 == 0o600
+
+    apply_args = [
+        "apply",
+        "--database-path", str(database_path),
+        "--plan-path", str(plan_path),
+        "--expected-plan-fingerprint", plan.plan_fingerprint,
+        "--expected-action-count", "8",
+        "--expected-repair-ts-utc", plan.repair_ts_utc,
+        "--confirmation-token", plan.confirmation_token,
+    ]
+    assert main(apply_args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "applied"
+    assert main(apply_args) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "already_applied"
+
+    assert main([
+        "rollback",
+        "--database-path", str(database_path),
+        "--plan-path", str(plan_path),
+        "--expected-rollback-fingerprint", plan.rollback_fingerprint,
+        "--expected-action-count", "8",
+        "--confirmation-token", plan.confirmation_token,
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["status"] == "rolled_back"
