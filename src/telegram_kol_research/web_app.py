@@ -7675,6 +7675,15 @@ def create_web_app(
                     "code": "concurrency_transition_not_owned_by_runtime_role"
                 },
             )
+        payload_for_local_save = dict(payload)
+        if not explicit_concurrency_request:
+            for concurrency_key in (
+                "message_lock_mode",
+                "message_processing_max_parallel_chats",
+                "message_lock_expected_mode",
+                "message_processing_expected_max_parallel_chats",
+            ):
+                payload_for_local_save.pop(concurrency_key, None)
 
         refresh_status = None
         orchestrator = app.state.contract_spec_refresh_orchestrator
@@ -7686,7 +7695,7 @@ def create_web_app(
         try:
             current = load_trading_settings(app.state.session_factory)
             candidate = trading_settings_from_payload(
-                {**current.to_dict(), **payload}
+                {**current.to_dict(), **payload_for_local_save}
             )
             require_worker_command_mode_transition_safe(
                 app.state.session_factory,
@@ -7698,25 +7707,13 @@ def create_web_app(
                 or candidate.mimo_v2_activation_after_raw_message_id
                 != current.mimo_v2_activation_after_raw_message_id
             )
-            concurrency_change = (
-                candidate.message_lock_mode != current.message_lock_mode
-                or candidate.message_processing_max_parallel_chats
-                != current.message_processing_max_parallel_chats
-            )
-            explicit_concurrency_request = concurrency_change or any(
-                key in payload
-                for key in (
-                    "message_lock_expected_mode",
-                    "message_processing_expected_max_parallel_chats",
-                )
-            )
             if mimo_contract_change or explicit_concurrency_request:
                 async with app.state.message_lock_provider.lock_all():
                     locked_current = load_trading_settings(
                         app.state.session_factory
                     )
                     locked_candidate = trading_settings_from_payload(
-                        {**locked_current.to_dict(), **payload}
+                        {**locked_current.to_dict(), **payload_for_local_save}
                     )
                     require_worker_command_mode_transition_safe(
                         app.state.session_factory,
@@ -7732,26 +7729,26 @@ def create_web_app(
                     if locked_mimo_change:
                         _require_expected_mimo_contract_state(
                             locked_current,
-                            payload=payload,
+                            payload=payload_for_local_save,
                         )
                         _validate_mimo_contract_activation(
                             app.state.session_factory,
-                            payload=payload,
+                            payload=payload_for_local_save,
                         )
                     if explicit_concurrency_request:
                         response = transition_message_concurrency_settings(
                             app.state.session_factory,
-                            payload,
+                            payload_for_local_save,
                             updated_at=app.state.now_provider(),
                         ).to_dict()
                     else:
                         response = save_trading_settings(
                             app.state.session_factory,
-                            payload,
+                            payload_for_local_save,
                             updated_at=app.state.now_provider(),
                         ).to_dict()
             else:
-                payload_without_unchanged_mimo = dict(payload)
+                payload_without_unchanged_mimo = dict(payload_for_local_save)
                 payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
                 payload_without_unchanged_mimo.pop(
                     "mimo_v2_activation_after_raw_message_id",
@@ -7763,22 +7760,6 @@ def create_web_app(
                 )
                 payload_without_unchanged_mimo.pop(
                     "mimo_contract_expected_watermark",
-                    None,
-                )
-                # The concurrency tuple matched when this ordinary-save path
-                # was selected. Do not let stale full-form values overwrite a
-                # transition that commits before the save transaction begins.
-                payload_without_unchanged_mimo.pop("message_lock_mode", None)
-                payload_without_unchanged_mimo.pop(
-                    "message_processing_max_parallel_chats",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "message_lock_expected_mode",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "message_processing_expected_max_parallel_chats",
                     None,
                 )
                 response = save_trading_settings(
