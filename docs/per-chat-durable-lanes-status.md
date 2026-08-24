@@ -38,6 +38,7 @@ local_candidate_commit: null
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
+  - 4490ec2c2e3adad3268a155376d5ba0da6c0b045
 local_focused_verification: null
 local_full_suite_verification: null
 local_compileall_verified: false
@@ -250,3 +251,12 @@ cutover_authorized: false
   and its `6222`-test evidence were invalidated before any further production
   edit. The workstream returned to Task 10 RED-to-GREEN remediation; push and all
   production actions remain unauthorized.
+- `2026-08-24 second rebuilt-candidate review`: read-only review invalidated
+  candidate `4490ec2c2e3adad3268a155376d5ba0da6c0b045` before a final suite. It found
+  two remaining variants of the same stale full-form defect: the MiMo-only branch
+  still passed concurrency targets to an ordinary save, and a second settings
+  read could reclassify an initially unrelated Web/worker request as a concurrency
+  transition after role ownership had already been checked. The approved repair
+  boundary is to classify request intent once from the first read and carry one
+  concurrency-stripped payload through every non-explicit save path. No push or
+  production action occurred.
