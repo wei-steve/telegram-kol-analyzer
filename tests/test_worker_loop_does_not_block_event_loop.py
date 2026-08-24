@@ -14,7 +14,6 @@ stays robust on a loaded machine.
 from __future__ import annotations
 
 import asyncio
-import logging
 import threading
 import time
 from datetime import UTC, datetime
@@ -557,7 +556,6 @@ def test_system_operator_callback_cancellation_cancels_queued_management_unit_wi
 
 def test_system_operator_callback_logs_worker_failure_before_propagating_cancellation(
     monkeypatch,
-    caplog,
 ):
     class _FakeAsyncClient:
         async def __aenter__(self):
@@ -569,6 +567,7 @@ def test_system_operator_callback_logs_worker_failure_before_propagating_cancell
     update_sent = False
     processing_started = threading.Event()
     processing_release = threading.Event()
+    logged_errors = []
 
     async def _get_one_update(*_args, **_kwargs):
         nonlocal update_sent
@@ -597,6 +596,9 @@ def test_system_operator_callback_logs_worker_failure_before_propagating_cancell
         processing_release.wait(timeout=5)
         raise RuntimeError("callback drain failed")
 
+    def _record_error(message, *args, exc_info=None, **kwargs):
+        logged_errors.append((message, args, exc_info, kwargs))
+
     monkeypatch.setattr(
         bot_commands.httpx,
         "AsyncClient",
@@ -616,7 +618,7 @@ def test_system_operator_callback_logs_worker_failure_before_propagating_cancell
         "process_system_operator_callback_data",
         _failing_callback,
     )
-    caplog.set_level(logging.ERROR, logger=bot_commands.__name__)
+    monkeypatch.setattr(bot_commands.logger, "error", _record_error)
 
     async def scenario():
         task = asyncio.create_task(
@@ -641,15 +643,13 @@ def test_system_operator_callback_logs_worker_failure_before_propagating_cancell
 
     asyncio.run(scenario())
 
-    matching = [
-        record
-        for record in caplog.records
-        if record.getMessage()
-        == "System operator bot failed to process update_id=41"
-    ]
-    assert len(matching) == 1
-    assert matching[0].exc_info is not None
-    assert isinstance(matching[0].exc_info[1], RuntimeError)
+    assert len(logged_errors) == 1
+    message, args, exc_info, kwargs = logged_errors[0]
+    assert message == "System operator bot failed to process update_id=%s"
+    assert args == (41,)
+    assert kwargs == {}
+    assert exc_info is not None
+    assert isinstance(exc_info[1], RuntimeError)
 
 
 def test_operator_tick_shares_the_management_worker_thread(monkeypatch):
