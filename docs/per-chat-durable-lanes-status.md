@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-9-observability-authority
+current_task: task-10-final-candidate
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -168,3 +168,24 @@ cutover_authorized: false
   compatibility passed `220 passed in 5.09s`. Unknown proxy outcomes are not
   retried, expected-state conflicts do not write, and unrelated saves avoid
   exclusive admission.
+- `2026-08-24 task 9 RED`: the required observability/authority selection ran
+  `5` tests: `2 failed, 3 passed`. The worker response had no shared lane
+  activity object and the ingest response had no admission snapshot; the
+  existing non-worker task partition and exchange-authority guard already
+  passed.
+- `2026-08-24 task 9 GREEN`: created one process-local
+  `MessageProcessingActivity`, injected that exact instance into the worker
+  loop, and exposed role-specific in-memory snapshots: worker/all reports only
+  bounded lane counters and ingest/all reports only admission counters. No
+  endpoint response contains chat IDs or reads settings, the database, or the
+  exchange. Six new observability/process-boundary tests passed. The first
+  affected run found one event-loop census violation from the Task 6
+  `utc_now()` limit timestamp (`594 passed, 1 failed`); settings and observation
+  time are now captured together in the existing worker thread. The census plus
+  worker tests passed `24`, then the complete affected set passed
+  `595 passed, 2 existing deprecation warnings in 46.21s`. Submission review
+  strengthened the cross-process boundary assertion to prove the worker gets
+  activity only, never the ingest registry/provider; that focused slice passed
+  `3`. No schema, database data, recognition, strategy, execution, exchange
+  semantics, production setting, deployment, restart, or external traffic
+  changed.

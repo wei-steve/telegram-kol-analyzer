@@ -288,6 +288,71 @@ def test_non_worker_lifespans_do_not_start_worker_singletons(role, tmp_path):
 
 
 @pytest.mark.parametrize("role", ["ingest", "web"])
+def test_non_worker_roles_never_start_message_processing_slots(role, tmp_path):
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.web_app import create_web_app
+
+    runner_started = False
+
+    async def forbidden_message_processing_runner(**_kwargs):
+        nonlocal runner_started
+        runner_started = True
+        await asyncio.Event().wait()
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}-queue.db",
+        runtime_role=role,
+        message_processing_worker_runner=forbidden_message_processing_runner,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    with TestClient(app):
+        time.sleep(0.02)
+        assert runner_started is False
+        assert app.state.message_processing_worker_task is None
+
+
+def test_ingest_lock_registry_is_not_claimed_as_cross_process_worker_lock(
+    tmp_path,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.web_app import create_web_app
+
+    started = asyncio.Event()
+    captured_kwargs = {}
+
+    async def capture_worker_boundary(**kwargs):
+        captured_kwargs.update(kwargs)
+        started.set()
+        await asyncio.Event().wait()
+
+    worker_app = create_web_app(
+        database_path=tmp_path / "worker-observation.db",
+        runtime_role="worker",
+        message_processing_worker_runner=capture_worker_boundary,
+    )
+    save_trading_settings(
+        worker_app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    with TestClient(worker_app) as client:
+        assert started.is_set()
+        assert captured_kwargs["activity"] is (
+            worker_app.state.message_processing_activity
+        )
+        assert "message_lock_registry" not in captured_kwargs
+        assert "message_lock_provider" not in captured_kwargs
+        worker_snapshot = client.get("/api/runtime/loop-health").json()
+
+    assert "active_shared_admissions" not in worker_snapshot
+    assert "configured_max_parallel_chats" in worker_snapshot
+
+
+@pytest.mark.parametrize("role", ["ingest", "web"])
 def test_non_web_lifespans_do_not_start_web_singletons(role, tmp_path):
     from telegram_kol_research.web_app import create_web_app
 

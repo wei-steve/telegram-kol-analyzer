@@ -80,6 +80,15 @@ from telegram_kol_research.telegram_bot_commands import (
 )
 
 
+def _loop_health_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/runtime/loop-health"
+        and "GET" in getattr(route, "methods", set())
+    )
+
+
 def _install_worker_command_route_driver(monkeypatch, app):
     original_wait = web_app_module.wait_for_worker_command_terminal
 
@@ -820,6 +829,73 @@ def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
         response = client.get("/api/runtime/loop-health")
 
     assert response.status_code == 200
+
+
+def test_worker_loop_health_exposes_message_lane_activity_without_database(
+    tmp_path,
+):
+    app = create_web_app(
+        database_path=tmp_path / "worker.db",
+        runtime_role="worker",
+        now_provider=lambda: datetime(2026, 8, 24, 12, 0, tzinfo=UTC),
+    )
+    activity = app.state.message_processing_activity
+    activity.apply_limit(
+        3,
+        applied_at=datetime(2026, 8, 24, 11, 59, tzinfo=UTC),
+    )
+    activity.enter(987654321)
+    activity.enter(876543210)
+    activity.note_refill(2)
+
+    def forbidden_dependency():
+        raise AssertionError("loop health must stay in-memory")
+
+    app.state.session_factory = forbidden_dependency
+    app.state.deepcoin_client_factory = forbidden_dependency
+    try:
+        payload = asyncio.run(_loop_health_endpoint(app)())
+    finally:
+        activity.leave(987654321)
+        activity.leave(876543210)
+
+    assert payload["runtime_role"] == "worker"
+    assert payload["configured_max_parallel_chats"] == 3
+    assert payload["active_chat_lanes"] == 2
+    assert payload["peak_active_chat_lanes_since_limit_change"] == 2
+    assert payload["last_refill_claimed"] == 2
+    assert payload["total_started"] == 2
+    assert payload["limit_applied_at"] == "2026-08-24T11:59:00+00:00"
+    assert "active_shared_admissions" not in payload
+    assert "987654321" not in str(payload)
+    assert "876543210" not in str(payload)
+
+
+def test_ingest_loop_health_exposes_admission_state_without_database(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "ingest.db",
+        runtime_role="ingest",
+    )
+
+    def forbidden_dependency():
+        raise AssertionError("loop health must stay in-memory")
+
+    app.state.session_factory = forbidden_dependency
+    app.state.deepcoin_client_factory = forbidden_dependency
+
+    async def snapshot_while_admitted():
+        async with app.state.message_lock_registry.lock(303):
+            return await _loop_health_endpoint(app)()
+
+    payload = asyncio.run(snapshot_while_admitted())
+
+    assert payload["runtime_role"] == "ingest"
+    assert payload["active_shared_admissions"] == 1
+    assert payload["waiting_exclusive_admissions"] == 0
+    assert payload["exclusive_admission_active"] is False
+    assert payload["known_key_count"] == 1
+    assert "configured_max_parallel_chats" not in payload
+    assert "303" not in str(payload)
 
 
 def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(

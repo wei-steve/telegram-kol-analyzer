@@ -660,6 +660,12 @@ async def run_message_processing_worker_tick(
     return MessageProcessingWorkerResult(claimed=len(claims), **counts)
 
 
+def _load_trading_settings_with_observed_at(session_factory):
+    """Load the cap and capture its observation time on the same worker thread."""
+
+    return load_trading_settings(session_factory), utc_now()
+
+
 async def run_message_processing_worker_loop(
     session_factory,
     *,
@@ -674,12 +680,12 @@ async def run_message_processing_worker_loop(
     interval = max(0.01, float(interval_seconds))
     try:
         while True:
-            settings = await asyncio.to_thread(
-                load_trading_settings,
+            settings, observed_at = await asyncio.to_thread(
+                _load_trading_settings_with_observed_at,
                 session_factory,
             )
             cap = settings.message_processing_max_parallel_chats
-            lane_activity.apply_limit(cap, applied_at=utc_now())
+            lane_activity.apply_limit(cap, applied_at=observed_at)
 
             if settings.message_pipeline_mode != "queue":
                 if in_flight:

@@ -195,6 +195,15 @@ def test_web_routes_do_not_reach_exchange_mutation_authority():
 
 
 @pytest.mark.architecture
+def test_concurrency_settings_route_cannot_reach_exchange_mutation():
+    violations = _authority_paths()
+    assert "/api/trading-settings" not in violations, (
+        "The concurrency transition route crossed into exchange mutation "
+        f"authority: {violations.get('/api/trading-settings')}"
+    )
+
+
+@pytest.mark.architecture
 def test_context_analysis_backfill_entrypoints_do_not_reach_exchange_authority():
     functions, _routes, edges, sinks = _load_graph()
     violations = {}

@@ -70,6 +70,7 @@ from telegram_kol_research.runtime_agent_production_audit import (
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.message_lock_provider import MessageLockProvider
 from telegram_kol_research.message_processing_worker import (
+    MessageProcessingActivity,
     run_message_processing_worker_loop,
 )
 from telegram_kol_research.runtime_incident_adapters import (
@@ -5177,6 +5178,7 @@ def create_web_app(
     app.state.message_processing_worker_interval_seconds = max(
         0.01, float(message_processing_worker_interval_seconds)
     )
+    app.state.message_processing_activity = MessageProcessingActivity()
     app.state.message_processing_worker_task = None
     app.state.worker_command_worker_runner = (
         worker_command_worker_runner or supervise_worker_command_mode
@@ -5353,6 +5355,7 @@ def create_web_app(
                 }.get(int(chat_id)),
                 loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                 terminal_failure_notifier=notify_terminal_failure,
+                activity=app.state.message_processing_activity,
             )
         )
         app.state.message_processing_worker_task.add_done_callback(
@@ -5525,12 +5528,17 @@ def create_web_app(
         """
 
         monitor = app.state.loop_lag_monitor
-        return {
+        payload = {
             **monitor.snapshot(),
             "runtime_role": app.state.runtime_role,
             "now": app.state.now_provider().isoformat(),
             "uptime_seconds": monitor.uptime_seconds(),
         }
+        if app.state.runtime_role in {"all", "worker"}:
+            payload.update(app.state.message_processing_activity.snapshot())
+        if app.state.runtime_role in {"all", "ingest"}:
+            payload.update(app.state.message_lock_registry.snapshot())
+        return payload
 
     @app.get("/api/runtime/message-pipeline-parity")
     def api_runtime_message_pipeline_parity(
