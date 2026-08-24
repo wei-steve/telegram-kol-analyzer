@@ -23,8 +23,10 @@ Treat one callback as a single blocking management unit:
 4. Submit the unit to the existing process-wide, single-thread management
    executor with `run_on_management_worker()`.
 5. Await the result before sending the Telegram callback response. If Bot
-   cancellation arrives after the unit starts, finish that unit before
-   propagating cancellation.
+   cancellation wins while the unit is still queued, atomically mark it
+   cancelled so the processor can never start. If cancellation arrives after
+   the unit starts, finish that unit before propagating cancellation and log
+   any drain failure by safe update ID.
 6. During lifespan shutdown, stop every long-lived management-executor
    producer before releasing the executor.
 
@@ -48,6 +50,8 @@ introduce concurrency with management and exchange-sensitive paths.
 - Preserve callback return values and existing exception handling.
 - Preserve cancellation as the Bot task's visible result, but only after any
   already-started callback has left its database/exchange scope.
+- A callback still queued behind other management work is cancelled without
+  waiting and never constructs a client or invokes the processor.
 - Preserve the current client lifetime; client closing is outside this repair.
 - Do not alter recognition, strategy choice, attribution, execution semantics,
   settings, queue ordering, or exchange-write semantics.
@@ -62,6 +66,9 @@ introduce concurrency with management and exchange-sensitive paths.
   processing both run on the same `mgmt-worker` thread.
 - A cancellation test proves the Bot task remains alive until its admitted
   callback unit finishes.
+- A saturated-executor test proves a queued callback is cancelled without
+  later execution, and a running-error test proves drain failure is logged
+  before cancellation propagates.
 - A lifespan-order test proves the system Bot stops before management-executor
   shutdown.
 - The blocking-call census removes exactly the repaired callback entry.

@@ -423,7 +423,10 @@ def test_system_operator_callback_cancellation_waits_for_inflight_management_uni
         try:
             assert await asyncio.to_thread(processing_started.wait, 2)
             task.cancel()
-            await asyncio.sleep(0.05)
+            await asyncio.sleep(0.02)
+            assert not task.done()
+            task.cancel()
+            await asyncio.sleep(0.03)
             assert not task.done()
             assert not processing_finished.is_set()
         finally:

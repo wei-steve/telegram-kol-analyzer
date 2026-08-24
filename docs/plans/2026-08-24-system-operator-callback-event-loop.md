@@ -144,6 +144,14 @@ Record this 40-hex commit as the rebuilt production-code candidate.
 
 ### Task 4: Freeze and verify the rebuilt candidate
 
+Before freezing, independently review cancellation and lifespan shutdown. If
+review finds that a queued callback can execute after cancellation, add an
+atomic queued/started state so only started work drains; queued work must be
+cancelled without client construction or processor invocation. If started work
+fails during cancellation drain, retain `CancelledError` as the Bot result and
+log the failure by safe update ID. Cover queued cancellation, running success,
+running failure, and repeated cancellation in focused tests.
+
 **Files:** none until status evidence is recorded.
 
 **Step 1: Run focused compatibility verification**
