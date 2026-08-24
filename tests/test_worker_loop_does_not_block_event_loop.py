@@ -24,6 +24,7 @@ import pytest
 from telegram_kol_research import break_even_convergence_worker as be_worker
 from telegram_kol_research import strategy_management_worker as mgmt_worker
 from telegram_kol_research import system_operator_bot as operator_bot
+from telegram_kol_research import telegram_bot_commands as bot_commands
 from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.runtime_worker_executor import (
     shutdown_management_worker_executor,
@@ -199,6 +200,145 @@ def test_operator_maintenance_loop_leaves_the_event_loop_responsive(monkeypatch)
 
     assert beats >= MIN_HEARTBEATS
     assert worst_gap < TICK_BLOCK_SECONDS
+
+
+def test_system_operator_callback_loop_leaves_event_loop_responsive(monkeypatch):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    update_sent = False
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 1,
+                    "callback_query": {
+                        "id": "callback-1",
+                        "data": "unknown:1",
+                        "message": {"message_id": 7},
+                    },
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    monkeypatch.setattr(bot_commands.httpx, "AsyncClient", lambda **_kwargs: _FakeAsyncClient())
+    monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+    monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+    monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+    monkeypatch.setattr(bot_commands, "_message_is_from_alert_chat", lambda *_args: True)
+    monkeypatch.setattr(bot_commands, "_answer_callback_query", _noop)
+    monkeypatch.setattr(bot_commands, "process_system_operator_callback_data", _blocking_tick)
+
+    async def scenario():
+        return await _observe_loop_while(
+            lambda: asyncio.create_task(
+                bot_commands.run_system_operator_bot_command_loop(
+                    config=bot_commands.SystemOperatorBotConfig(
+                        bot_token="token", chat_id="1"
+                    ),
+                    session_factory=object(),
+                    poll_interval_seconds=0.01,
+                )
+            )
+        )
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS
+
+
+def test_system_operator_callback_builds_and_runs_on_management_thread(monkeypatch):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    threads: list[tuple[str, str]] = []
+    update_sent = False
+
+    def _build_client():
+        threads.append(("build", threading.current_thread().name))
+        return object()
+
+    def _process_callback(*_args, **_kwargs):
+        threads.append(("process", threading.current_thread().name))
+        return None
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 1,
+                    "callback_query": {
+                        "id": "callback-1",
+                        "data": "expiry_refresh:1",
+                        "message": {"message_id": 7},
+                    },
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    async def scenario():
+        callback_answered = asyncio.Event()
+
+        async def _answer(*_args, **_kwargs):
+            callback_answered.set()
+
+        monkeypatch.setattr(bot_commands.httpx, "AsyncClient", lambda **_kwargs: _FakeAsyncClient())
+        monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+        monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+        monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+        monkeypatch.setattr(bot_commands, "_message_is_from_alert_chat", lambda *_args: True)
+        monkeypatch.setattr(bot_commands, "_answer_callback_query", _answer)
+        monkeypatch.setattr(
+            bot_commands, "process_system_operator_callback_data", _process_callback
+        )
+        task = asyncio.create_task(
+            bot_commands.run_system_operator_bot_command_loop(
+                config=bot_commands.SystemOperatorBotConfig(
+                    bot_token="token", chat_id="1"
+                ),
+                session_factory=object(),
+                deepcoin_client_factory=_build_client,
+                poll_interval_seconds=0.01,
+            )
+        )
+        try:
+            await asyncio.wait_for(callback_answered.wait(), timeout=5)
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
+
+    assert [name for name, _thread in threads] == ["build", "process"]
+    assert len({thread for _name, thread in threads}) == 1
+    assert threads[0][1].startswith("mgmt-worker")
 
 
 def test_operator_tick_shares_the_management_worker_thread(monkeypatch):

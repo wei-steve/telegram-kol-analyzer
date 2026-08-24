@@ -29,8 +29,6 @@ KNOWN_BLOCKING_CALLS = frozenset(
         # Database work on the loop whenever an operator uses a bot command.
         "telegram_bot_commands.run_system_operator_bot_command_loop"
         " -> process_system_operator_command",
-        "telegram_bot_commands.run_system_operator_bot_command_loop"
-        " -> process_system_operator_callback_data",
         "telegram_bot_commands.run_telegram_bot_command_loop"
         " -> format_holding_positions_message",
         "telegram_bot_commands.run_telegram_bot_command_loop"
