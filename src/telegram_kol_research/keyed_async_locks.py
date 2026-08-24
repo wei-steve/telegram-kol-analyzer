@@ -51,6 +51,16 @@ class KeyedAsyncLockRegistry:
 
         return len(self._locks)
 
+    def snapshot(self) -> dict[str, int | bool]:
+        """Return a read-only in-memory view of current admission state."""
+
+        return {
+            "active_shared_admissions": self._active_readers,
+            "waiting_exclusive_admissions": self._waiting_writers,
+            "exclusive_admission_active": self._writer_active,
+            "known_key_count": len(self._locks),
+        }
+
     @asynccontextmanager
     async def _key_context(self, key: Hashable) -> AsyncIterator[None]:
         async with self._shared_admission():
@@ -72,44 +82,65 @@ class KeyedAsyncLockRegistry:
     async def _shared_admission(self) -> AsyncIterator[None]:
         """Admit per-key work unless a writer is active or waiting."""
 
-        async with self._admission:
-            await self._admission.wait_for(
-                lambda: not self._writer_active and self._waiting_writers == 0
-            )
-            self._active_readers += 1
+        admitted = False
         try:
+            async with self._admission:
+                await self._admission.wait_for(
+                    lambda: not self._writer_active
+                    and self._waiting_writers == 0
+                )
+                self._active_readers += 1
+                admitted = True
             yield
         finally:
-            async with self._admission:
-                self._active_readers -= 1
-                if self._active_readers == 0:
-                    self._admission.notify_all()
+            if admitted:
+                async with self._admission:
+                    if self._active_readers <= 0:
+                        raise RuntimeError("shared admission counter underflow")
+                    self._active_readers -= 1
+                    if self._active_readers == 0:
+                        self._admission.notify_all()
 
     @asynccontextmanager
     async def _exclusive_admission(self) -> AsyncIterator[None]:
         """Admit one writer after existing readers and before new readers."""
 
+        registered = False
         acquired = False
-        async with self._admission:
-            self._waiting_writers += 1
-            try:
-                await self._admission.wait_for(
-                    lambda: not self._writer_active
-                    and self._active_readers == 0
-                )
+        try:
+            async with self._admission:
+                self._waiting_writers += 1
+                registered = True
+                try:
+                    await self._admission.wait_for(
+                        lambda: not self._writer_active
+                        and self._active_readers == 0
+                    )
+                except BaseException:
+                    self._waiting_writers -= 1
+                    registered = False
+                    self._admission.notify_all()
+                    raise
+
                 self._waiting_writers -= 1
+                registered = False
                 self._writer_active = True
                 acquired = True
-            except BaseException:
-                self._waiting_writers -= 1
-                self._admission.notify_all()
-                raise
-        try:
             yield
         finally:
+            if registered:
+                async with self._admission:
+                    if self._waiting_writers <= 0:
+                        raise RuntimeError("exclusive admission counter underflow")
+                    self._waiting_writers -= 1
+                    registered = False
+                    self._admission.notify_all()
             if acquired:
                 async with self._admission:
+                    if not self._writer_active:
+                        raise RuntimeError("exclusive admission ownership lost")
                     self._writer_active = False
+                    acquired = False
                     self._admission.notify_all()
 
     async def _acquire_ref(self, key: Hashable) -> asyncio.Lock:

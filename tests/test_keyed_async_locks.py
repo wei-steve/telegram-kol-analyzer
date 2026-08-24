@@ -4,7 +4,22 @@ from __future__ import annotations
 
 import asyncio
 
+import pytest
+
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
+
+
+async def _wait_for_snapshot(
+    registry: KeyedAsyncLockRegistry, **expected: object
+) -> None:
+    for _ in range(100):
+        snapshot = registry.snapshot()
+        if all(snapshot[name] == value for name, value in expected.items()):
+            return
+        await asyncio.sleep(0)
+    raise AssertionError(
+        f"registry state did not reach {expected!r}; last state was {snapshot!r}"
+    )
 
 
 def test_two_different_keys_proceed_concurrently():
@@ -297,6 +312,239 @@ def test_waiting_lock_all_is_not_starved_by_continuous_new_keys():
     asyncio.run(scenario())
 
     assert order[:2] == ["writer:enter", "writer:exit"]
+
+
+def test_multiple_lock_all_callers_are_exclusive_without_deadlock():
+    registry = KeyedAsyncLockRegistry()
+    order: list[str] = []
+    active_writers = 0
+    peak_writers = 0
+
+    async def scenario():
+        nonlocal active_writers, peak_writers
+        reader_entered = asyncio.Event()
+        release_reader = asyncio.Event()
+        release_first_writer = asyncio.Event()
+
+        async def hold_reader():
+            async with registry.lock("chat-old"):
+                reader_entered.set()
+                await release_reader.wait()
+
+        async def writer(label: str):
+            nonlocal active_writers, peak_writers
+            async with registry.lock_all():
+                active_writers += 1
+                peak_writers = max(peak_writers, active_writers)
+                order.append(f"{label}:enter")
+                if label == "writer-1":
+                    await release_first_writer.wait()
+                order.append(f"{label}:exit")
+                active_writers -= 1
+
+        reader_task = asyncio.create_task(hold_reader())
+        await reader_entered.wait()
+        writer_tasks = [
+            asyncio.create_task(writer("writer-1")),
+            asyncio.create_task(writer("writer-2")),
+        ]
+        await _wait_for_snapshot(registry, waiting_exclusive_admissions=2)
+        release_reader.set()
+        await _wait_for_snapshot(registry, exclusive_admission_active=True)
+        assert order == ["writer-1:enter"]
+        release_first_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(reader_task, *writer_tasks), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert peak_writers == 1
+    assert order == [
+        "writer-1:enter",
+        "writer-1:exit",
+        "writer-2:enter",
+        "writer-2:exit",
+    ]
+
+
+def test_cancelled_waiting_lock_all_restores_reader_admission():
+    registry = KeyedAsyncLockRegistry()
+
+    async def scenario():
+        reader_entered = asyncio.Event()
+        release_reader = asyncio.Event()
+        future_entered = asyncio.Event()
+
+        async def hold_reader():
+            async with registry.lock("chat-old"):
+                reader_entered.set()
+                await release_reader.wait()
+
+        async def waiting_writer():
+            async with registry.lock_all():
+                raise AssertionError("cancelled writer unexpectedly entered")
+
+        async def future_reader():
+            async with registry.lock("chat-future"):
+                future_entered.set()
+
+        reader_task = asyncio.create_task(hold_reader())
+        await reader_entered.wait()
+        writer_task = asyncio.create_task(waiting_writer())
+        await _wait_for_snapshot(registry, waiting_exclusive_admissions=1)
+
+        writer_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer_task
+        await _wait_for_snapshot(registry, waiting_exclusive_admissions=0)
+
+        future_task = asyncio.create_task(future_reader())
+        await asyncio.wait_for(future_entered.wait(), timeout=5.0)
+        release_reader.set()
+        await asyncio.wait_for(
+            asyncio.gather(reader_task, future_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert registry.known_key_count() == 0
+
+
+def test_cancelled_held_lock_all_releases_exclusive_admission():
+    registry = KeyedAsyncLockRegistry()
+
+    async def scenario():
+        writer_entered = asyncio.Event()
+
+        async def hold_writer():
+            async with registry.lock_all():
+                writer_entered.set()
+                await asyncio.Event().wait()
+
+        writer_task = asyncio.create_task(hold_writer())
+        await writer_entered.wait()
+        writer_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await writer_task
+
+        await _wait_for_snapshot(registry, exclusive_admission_active=False)
+        async with registry.lock("chat-after-cancel"):
+            pass
+
+    asyncio.run(scenario())
+
+    assert registry.known_key_count() == 0
+
+
+def test_exception_inside_lock_all_releases_exclusive_admission():
+    registry = KeyedAsyncLockRegistry()
+
+    async def scenario():
+        with pytest.raises(RuntimeError, match="writer failed"):
+            async with registry.lock_all():
+                raise RuntimeError("writer failed")
+
+        await _wait_for_snapshot(registry, exclusive_admission_active=False)
+        async with registry.lock("chat-after-error"):
+            pass
+
+    asyncio.run(scenario())
+
+    assert registry.known_key_count() == 0
+
+
+def test_cancelled_key_waiter_releases_ref_and_shared_admission():
+    registry = KeyedAsyncLockRegistry()
+
+    async def scenario():
+        owner_entered = asyncio.Event()
+        release_owner = asyncio.Event()
+
+        async def owner():
+            async with registry.lock("chat-shared"):
+                owner_entered.set()
+                await release_owner.wait()
+
+        async def waiter():
+            async with registry.lock("chat-shared"):
+                raise AssertionError("cancelled key waiter unexpectedly entered")
+
+        owner_task = asyncio.create_task(owner())
+        await owner_entered.wait()
+        waiter_task = asyncio.create_task(waiter())
+        await _wait_for_snapshot(
+            registry,
+            active_shared_admissions=2,
+            known_key_count=1,
+        )
+
+        waiter_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter_task
+        await _wait_for_snapshot(
+            registry,
+            active_shared_admissions=1,
+            known_key_count=1,
+        )
+
+        release_owner.set()
+        await asyncio.wait_for(owner_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert registry.snapshot() == {
+        "active_shared_admissions": 0,
+        "waiting_exclusive_admissions": 0,
+        "exclusive_admission_active": False,
+        "known_key_count": 0,
+    }
+
+
+def test_registry_cleans_keys_after_mixed_reader_writer_cancellation():
+    registry = KeyedAsyncLockRegistry()
+
+    async def scenario():
+        owner_entered = asyncio.Event()
+        release_owner = asyncio.Event()
+
+        async def owner():
+            async with registry.lock("chat-mixed"):
+                owner_entered.set()
+                await release_owner.wait()
+
+        async def key_waiter():
+            async with registry.lock("chat-mixed"):
+                raise AssertionError("cancelled key waiter unexpectedly entered")
+
+        async def writer():
+            async with registry.lock_all():
+                raise AssertionError("cancelled writer unexpectedly entered")
+
+        owner_task = asyncio.create_task(owner())
+        await owner_entered.wait()
+        key_waiter_task = asyncio.create_task(key_waiter())
+        await _wait_for_snapshot(registry, active_shared_admissions=2)
+        writer_task = asyncio.create_task(writer())
+        await _wait_for_snapshot(registry, waiting_exclusive_admissions=1)
+
+        key_waiter_task.cancel()
+        writer_task.cancel()
+        for task in (key_waiter_task, writer_task):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+        release_owner.set()
+        await asyncio.wait_for(owner_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert registry.snapshot() == {
+        "active_shared_admissions": 0,
+        "waiting_exclusive_admissions": 0,
+        "exclusive_admission_active": False,
+        "known_key_count": 0,
+    }
 
 
 def test_registry_stays_bounded_after_locks_release():

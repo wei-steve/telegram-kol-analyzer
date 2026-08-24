@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-3-cancellation-cleanup
+current_task: task-4-provider-integration
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -120,3 +120,12 @@ cutover_authorized: false
   writer-preference shared/exclusive admission barrier. Ran
   `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -vv`; result:
   `9 passed in 0.19s`.
+- `2026-08-24 task 3 RED`: ran
+  `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -k 'cancel or exception or multiple_lock_all or mixed_reader' -vv`;
+  all 6 selected tests failed because the required admission snapshot was not
+  yet implemented.
+- `2026-08-24 task 3 GREEN`: added the pure in-memory admission snapshot and
+  exact registered/acquired cancellation bookkeeping. Ran
+  `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -vv`; result:
+  `15 passed in 0.19s`, including multiple writers, waiting/held cancellation,
+  exception release, key-waiter cancellation, and mixed cleanup.
