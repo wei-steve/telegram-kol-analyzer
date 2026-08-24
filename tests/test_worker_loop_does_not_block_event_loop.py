@@ -544,7 +544,9 @@ def test_system_operator_callback_cancellation_cancels_queued_management_unit_wi
         assert task is not None
         with pytest.raises(asyncio.CancelledError):
             await task
-        await asyncio.sleep(0.05)
+        # A sentinel submitted after the callback proves the single-worker
+        # queue has advanced beyond the callback's exact position.
+        await real_run_on_management_worker(lambda: None)
         return cancelled_without_waiting
 
     cancelled_without_waiting = asyncio.run(scenario())
