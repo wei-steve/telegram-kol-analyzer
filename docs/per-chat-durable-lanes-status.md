@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-16-cancellation-shutdown-red-green
+current_task: task-16-queued-cancellation-error-red-green
 verification_level: L2
 local_candidate_commit: null
 invalidated_local_candidate_commits:
@@ -41,6 +41,7 @@ invalidated_local_candidate_commits:
   - 4490ec2c2e3adad3268a155376d5ba0da6c0b045
   - eb9ff4c261080190e3f6d360724aec05395197ed
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
+  - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
 local_focused_verification: null
 local_full_suite_verification: null
 local_compileall_verified: false
@@ -311,3 +312,13 @@ cutover_authorized: false
   and every management-executor producer must stop before executor shutdown.
   No deployment, restart, production setting, cutover, traffic, database, or
   exchange action is authorized.
+- `2026-08-24 task 16 cancellation-shutdown review`: the first cancellation
+  repair production commit `78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284`
+  passed `400` focused tests and static checks, but was invalidated before its
+  final suite. Read-only review proved that a callback still queued behind a
+  saturated management executor would execute after Bot cancellation, and
+  that a running callback failure during cancellation drain was retrieved but
+  not logged. The next RED-to-GREEN boundary must cancel queued work without
+  executing it, drain only work that actually started, preserve final Bot
+  cancellation, and record a safe update-id exception log. Production actions
+  remain unauthorized.
