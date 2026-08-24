@@ -308,6 +308,102 @@ def test_unrelated_save_preserves_message_parallel_chat_limit_and_lock_mode(tmp_
     assert reloaded.message_processing_max_parallel_chats == 3
 
 
+def test_unrelated_settings_save_cannot_restore_stale_concurrency_tuple(
+    tmp_path,
+    monkeypatch,
+):
+    database_path = tmp_path / "stale-unrelated-save.db"
+    unrelated_factory = create_session_factory(database_path)
+    transition_factory = create_session_factory(database_path)
+    save_trading_settings(
+        unrelated_factory,
+        {
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 20,
+            "default_max_loss_usdt": 20,
+        },
+    )
+    stale_read = threading.Event()
+    release_unrelated = threading.Event()
+    transition_started = threading.Event()
+    transition_finished = threading.Event()
+    errors: list[BaseException] = []
+    real_read = trading_settings_module._settings_row_and_payload_in_session
+
+    def gated_read(session):
+        result = real_read(session)
+        if threading.current_thread().name == "unrelated-settings-writer":
+            stale_read.set()
+            if not release_unrelated.wait(timeout=3.0):
+                raise AssertionError("unrelated settings writer was not released")
+        return result
+
+    monkeypatch.setattr(
+        trading_settings_module,
+        "_settings_row_and_payload_in_session",
+        gated_read,
+    )
+
+    def unrelated_writer():
+        try:
+            save_trading_settings(
+                unrelated_factory,
+                {"default_max_loss_usdt": 25},
+            )
+        except BaseException as exc:
+            errors.append(exc)
+
+    def concurrency_writer():
+        transition_started.set()
+        try:
+            _transition_concurrency(
+                transition_factory,
+                {
+                    "message_lock_expected_mode": "global",
+                    "message_processing_expected_max_parallel_chats": 20,
+                    "message_lock_mode": "per_chat",
+                    "message_processing_max_parallel_chats": 3,
+                },
+            )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            transition_finished.set()
+
+    unrelated_thread = threading.Thread(
+        target=unrelated_writer,
+        name="unrelated-settings-writer",
+    )
+    transition_thread = threading.Thread(
+        target=concurrency_writer,
+        name="concurrency-settings-writer",
+    )
+    unrelated_thread.start()
+    try:
+        assert stale_read.wait(timeout=2.0)
+        transition_thread.start()
+        assert transition_started.wait(timeout=2.0)
+        # On the broken path, the transition can commit while the unrelated
+        # writer still holds a stale read. On the fixed path it waits for that
+        # writer's short transaction to commit first.
+        transition_finished.wait(timeout=0.25)
+    finally:
+        release_unrelated.set()
+        unrelated_thread.join(timeout=3.0)
+        if transition_thread.ident is not None:
+            transition_thread.join(timeout=3.0)
+
+    assert not unrelated_thread.is_alive()
+    assert not transition_thread.is_alive()
+    assert errors == []
+    final = load_trading_settings(transition_factory)
+    assert final.default_max_loss_usdt == 25
+    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
+        "per_chat",
+        3,
+    )
+
+
 def _transition_concurrency(session_factory, payload):
     return trading_settings_module.transition_message_concurrency_settings(
         session_factory,

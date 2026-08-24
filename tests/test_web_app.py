@@ -1846,6 +1846,85 @@ def _per_chat_three_transition_payload():
     }
 
 
+def _explicit_noop_concurrency_payload(*, expected_mode="global", expected_cap=20):
+    return {
+        "message_lock_expected_mode": expected_mode,
+        "message_processing_expected_max_parallel_chats": expected_cap,
+        "message_lock_mode": "global",
+        "message_processing_max_parallel_chats": 20,
+    }
+
+
+def test_web_role_routes_explicit_noop_concurrency_transition_to_ingest(tmp_path):
+    calls = []
+    payload = _explicit_noop_concurrency_payload(
+        expected_mode="per_chat",
+        expected_cap=3,
+    )
+
+    async def requester(url, *, payload, timeout_seconds):
+        calls.append((url, payload, timeout_seconds))
+        return httpx.Response(409, json={"detail": "stale expected state"})
+
+    app = create_web_app(
+        database_path=tmp_path / "web-explicit-noop.db",
+        runtime_role="web",
+        ingest_trading_settings_requester=requester,
+    )
+
+    response = TestClient(app).post("/api/trading-settings", json=payload)
+
+    assert response.status_code == 409
+    assert calls == [
+        (
+            "http://127.0.0.1:8001/api/trading-settings",
+            payload,
+            web_app_module.TRADING_SETTINGS_TIMEOUT_SECONDS,
+        )
+    ]
+
+
+def test_worker_role_refuses_explicit_noop_concurrency_transition(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "worker-explicit-noop.db",
+        runtime_role="worker",
+    )
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json=_explicit_noop_concurrency_payload(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "concurrency_transition_not_owned_by_runtime_role"
+    }
+
+
+def test_explicit_noop_concurrency_transition_rejects_stale_expected_state(
+    tmp_path,
+):
+    app = create_web_app(
+        database_path=tmp_path / "ingest-explicit-noop.db",
+        runtime_role="ingest",
+    )
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json=_explicit_noop_concurrency_payload(
+            expected_mode="per_chat",
+            expected_cap=3,
+        ),
+    )
+
+    assert response.status_code == 409
+    settings = web_app_module.load_trading_settings(app.state.session_factory)
+    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
+        "global",
+        20,
+    )
+
+
 def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
     tmp_path,
 ):

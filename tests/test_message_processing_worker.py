@@ -1,6 +1,7 @@
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -404,6 +405,125 @@ def test_lowered_limit_stops_new_claims_without_cancelling_inflight(tmp_path):
             )
             for gate in release.values():
                 gate.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+
+def test_lowered_limit_prevents_unclaimed_old_slots_from_exceeding_new_cap(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "lower-unclaimed-cap.db")
+    for chat_id in (1, 2):
+        _add_job(session_factory, chat_id=chat_id, message_id=1)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    activity = worker_module.MessageProcessingActivity()
+    lowered_cap_applied = asyncio.Event()
+    real_apply_limit = activity.apply_limit
+
+    def track_applied_limit(limit, *, applied_at):
+        real_apply_limit(limit, applied_at=applied_at)
+        if limit == 1:
+            lowered_cap_applied.set()
+
+    monkeypatch.setattr(activity, "apply_limit", track_applied_limit)
+    call_lock = threading.Lock()
+    old_slots_ready = threading.Event()
+    release_first_claim = threading.Event()
+    release_pending_claims = threading.Event()
+    claim_calls = 0
+    centralized_claim_seen = False
+    real_claim = worker_module.claim_message_processing_jobs
+
+    def gated_claim(*args, limit, **kwargs):
+        nonlocal claim_calls, centralized_claim_seen
+        with call_lock:
+            claim_calls += 1
+            call_number = claim_calls
+            if limit > 1:
+                centralized_claim_seen = True
+                old_slots_ready.set()
+            elif not centralized_claim_seen and claim_calls >= 3:
+                old_slots_ready.set()
+            uses_centralized_claim = centralized_claim_seen
+
+        if limit > 1:
+            assert release_first_claim.wait(timeout=3.0)
+            return []
+        if not uses_centralized_claim:
+            if call_number == 1:
+                assert release_first_claim.wait(timeout=3.0)
+                return []
+            assert release_pending_claims.wait(timeout=3.0)
+        return real_claim(*args, limit=limit, **kwargs)
+
+    monkeypatch.setattr(
+        worker_module,
+        "claim_message_processing_jobs",
+        gated_claim,
+    )
+    active = 0
+    peak = 0
+    first_started = asyncio.Event()
+    two_started = asyncio.Event()
+    release_processing = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        nonlocal active, peak
+        active += 1
+        peak = max(peak, active)
+        first_started.set()
+        if active >= 2:
+            two_started.set()
+        try:
+            await release_processing.wait()
+        finally:
+            active -= 1
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+                activity=activity,
+            )
+        )
+        try:
+            await _wait_until(old_slots_ready.is_set)
+            save_trading_settings(
+                session_factory,
+                {"message_processing_max_parallel_chats": 1},
+            )
+            release_first_claim.set()
+            await asyncio.wait_for(lowered_cap_applied.wait(), timeout=5.0)
+            release_pending_claims.set()
+            await asyncio.wait_for(first_started.wait(), timeout=5.0)
+            try:
+                await asyncio.wait_for(two_started.wait(), timeout=0.25)
+            except TimeoutError:
+                pass
+
+            snapshot = activity.snapshot()
+            assert snapshot["configured_max_parallel_chats"] == 1
+            assert snapshot["active_chat_lanes"] <= 1
+            assert peak <= 1
+        finally:
+            save_trading_settings(
+                session_factory,
+                {"message_pipeline_mode": "inline"},
+            )
+            release_first_claim.set()
+            release_pending_claims.set()
+            release_processing.set()
             await asyncio.wait_for(loop_task, timeout=5.0)
 
     asyncio.run(scenario())
