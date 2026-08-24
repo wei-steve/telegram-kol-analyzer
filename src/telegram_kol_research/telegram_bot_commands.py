@@ -30,6 +30,7 @@ from telegram_kol_research.execution_bindings import (
     binding_has_unresolved_entry_leg,
     reconcile_deepcoin_execution_bindings_read_only,
 )
+from telegram_kol_research.runtime_worker_executor import run_on_management_worker
 from telegram_kol_research.deepcoin_execution_actions import (
     cancel_pending_entry_legs,
     execute_deepcoin_management_signal,
@@ -91,6 +92,22 @@ def _log_system_operator_callback_processed(*, update_id: int, callback_data: st
     """Log callback handling without retaining untrusted callback payload data."""
     del callback_data
     logger.info("System operator bot processing callback update_id=%s", update_id)
+
+
+def _process_system_operator_callback_update(
+    session_factory: sessionmaker,
+    callback_data: str,
+    *,
+    deepcoin_client_factory=None,
+) -> str | ExpiryReviewRefreshResult | None:
+    """Build and use the callback client on one blocking worker thread."""
+
+    deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
+    return process_system_operator_callback_data(
+        session_factory,
+        callback_data,
+        deepcoin_client=deepcoin_client,
+    )
 
 
 async def run_telegram_bot_command_loop(
@@ -188,16 +205,17 @@ async def run_system_operator_bot_command_loop(
                             update_id=update_id,
                             callback_data=callback_data,
                         )
-                        deepcoin_client = (
-                            deepcoin_client_factory()
+                        callback_client_factory = (
+                            deepcoin_client_factory
                             if deepcoin_client_factory
                             and _expiry_callback_needs_deepcoin_client(callback_data)
                             else None
                         )
-                        callback_response = process_system_operator_callback_data(
+                        callback_response = await run_on_management_worker(
+                            _process_system_operator_callback_update,
                             session_factory,
                             callback_data,
-                            deepcoin_client=deepcoin_client,
+                            deepcoin_client_factory=callback_client_factory,
                         )
                         if isinstance(
                             callback_response, ExpiryReviewRefreshResult
