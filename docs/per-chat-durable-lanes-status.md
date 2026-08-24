@@ -30,9 +30,9 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: planned
-claimed_by: null
-current_task: task-1-implementation-claim
+workstream_status: claimed
+claimed_by: codex-per-chat-20260823-root-68b9e88
+current_task: task-2-keyed-admission-barrier
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -104,3 +104,11 @@ cutover_authorized: false
   ingest-owned atomic transition, pure in-memory observability, and two-level
   rollback design. Design commit:
   `1efd20cbd50be4e3c724d48874f6004fe6ad2c7c`.
+- `2026-08-24T06:23:14Z implementation claim`: session
+  `codex-per-chat-20260823-root-68b9e88` claimed the independent workstream at
+  exact baseline `68b9e88bbb9dd76227056a08376b7a94b553c5f8`. The upstream and
+  remote deploy baseline remained
+  `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`; the working tree was clean and
+  the original remediation pointer remained completed. Authorization is local
+  Tasks 1-10 only: no push, deploy, restart, production configuration, Telegram
+  traffic, database mutation, or exchange action.
