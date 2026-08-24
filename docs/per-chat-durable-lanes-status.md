@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-2-keyed-admission-barrier
+current_task: task-3-cancellation-cleanup
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -112,3 +112,11 @@ cutover_authorized: false
   the original remediation pointer remained completed. Authorization is local
   Tasks 1-10 only: no push, deploy, restart, production configuration, Telegram
   traffic, database mutation, or exchange action.
+- `2026-08-24 task 2 RED`: ran
+  `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -k 'future_key or not_starved' -vv`;
+  all 3 selected tests failed because a future key entered while snapshot
+  `lock_all()` was held or waiting.
+- `2026-08-24 task 2 GREEN`: replaced snapshot enumeration with a
+  writer-preference shared/exclusive admission barrier. Ran
+  `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -vv`; result:
+  `9 passed in 0.19s`.

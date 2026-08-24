@@ -143,39 +143,160 @@ def test_lock_all_is_deadlock_free_under_concurrent_per_key_acquisition():
     assert all_2_span[1] - all_2_span[0] == 1
 
 
-def test_lock_all_acquires_locks_in_deterministic_sorted_order():
-    acquire_order: list[int] = []
-    real_acquire = asyncio.Lock.acquire
+def test_lock_all_held_blocks_a_future_key():
+    registry = KeyedAsyncLockRegistry()
+    order: list[str] = []
 
     async def scenario():
-        registry = KeyedAsyncLockRegistry()
-        # Populate the registry directly, without releasing, so all three
-        # keys are still present when lock_all() takes its snapshot - lock()
-        # itself drops a key's entry the instant it becomes unreferenced.
-        for key in ("chat-9", "chat-2", "chat-5"):
-            await registry._acquire_ref(key)
+        writer_entered = asyncio.Event()
+        release_writer = asyncio.Event()
+        future_attempted = asyncio.Event()
+        future_entered = asyncio.Event()
 
-        expected = [
-            registry._locks[key]
-            for key in sorted(registry._locks.keys(), key=repr)
-        ]
-
-        async def tracking_acquire(self):
-            acquire_order.append(id(self))
-            return await real_acquire(self)
-
-        guard_id = id(registry._guard)
-        asyncio.Lock.acquire = tracking_acquire
-        try:
+        async def hold_all():
             async with registry.lock_all():
-                pass
-        finally:
-            asyncio.Lock.acquire = real_acquire
+                order.append("writer:enter")
+                writer_entered.set()
+                await release_writer.wait()
+                order.append("writer:exit")
 
-        per_key_order = [value for value in acquire_order if value != guard_id]
-        assert per_key_order == [id(lock) for lock in expected]
+        async def use_future_key():
+            future_attempted.set()
+            async with registry.lock("chat-future"):
+                order.append("future:enter")
+                future_entered.set()
+
+        writer_task = asyncio.create_task(hold_all())
+        await writer_entered.wait()
+        future_task = asyncio.create_task(use_future_key())
+        await future_attempted.wait()
+        await asyncio.sleep(0)
+
+        assert not future_entered.is_set()
+        release_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(writer_task, future_task), timeout=5.0
+        )
 
     asyncio.run(scenario())
+
+    assert order == ["writer:enter", "writer:exit", "future:enter"]
+
+
+def test_waiting_lock_all_blocks_a_future_key_until_old_readers_drain():
+    registry = KeyedAsyncLockRegistry()
+    order: list[str] = []
+
+    async def scenario():
+        reader_entered = asyncio.Event()
+        release_reader = asyncio.Event()
+        writer_attempted = asyncio.Event()
+        writer_entered = asyncio.Event()
+        release_writer = asyncio.Event()
+        future_attempted = asyncio.Event()
+        future_entered = asyncio.Event()
+
+        async def hold_old_reader():
+            async with registry.lock("chat-old"):
+                reader_entered.set()
+                await release_reader.wait()
+                order.append("reader:exit")
+
+        async def hold_all():
+            writer_attempted.set()
+            async with registry.lock_all():
+                order.append("writer:enter")
+                writer_entered.set()
+                await release_writer.wait()
+                order.append("writer:exit")
+
+        async def use_future_key():
+            future_attempted.set()
+            async with registry.lock("chat-future"):
+                order.append("future:enter")
+                future_entered.set()
+
+        reader_task = asyncio.create_task(hold_old_reader())
+        await reader_entered.wait()
+        writer_task = asyncio.create_task(hold_all())
+        await writer_attempted.wait()
+        await asyncio.sleep(0)
+        future_task = asyncio.create_task(use_future_key())
+        await future_attempted.wait()
+        await asyncio.sleep(0)
+
+        assert not writer_entered.is_set()
+        assert not future_entered.is_set()
+
+        release_reader.set()
+        await writer_entered.wait()
+        assert not future_entered.is_set()
+        release_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(reader_task, writer_task, future_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert order == ["reader:exit", "writer:enter", "writer:exit", "future:enter"]
+
+
+def test_waiting_lock_all_is_not_starved_by_continuous_new_keys():
+    registry = KeyedAsyncLockRegistry()
+    order: list[str] = []
+
+    async def scenario():
+        reader_entered = asyncio.Event()
+        release_reader = asyncio.Event()
+        writer_attempted = asyncio.Event()
+        writer_entered = asyncio.Event()
+        release_writer = asyncio.Event()
+        future_attempted = [asyncio.Event() for _ in range(12)]
+        future_entered = [asyncio.Event() for _ in range(12)]
+
+        async def hold_old_reader():
+            async with registry.lock("chat-old"):
+                reader_entered.set()
+                await release_reader.wait()
+
+        async def hold_all():
+            writer_attempted.set()
+            async with registry.lock_all():
+                order.append("writer:enter")
+                writer_entered.set()
+                await release_writer.wait()
+                order.append("writer:exit")
+
+        async def use_new_key(index: int):
+            future_attempted[index].set()
+            async with registry.lock(f"chat-new-{index}"):
+                order.append(f"future-{index}:enter")
+                future_entered[index].set()
+
+        reader_task = asyncio.create_task(hold_old_reader())
+        await reader_entered.wait()
+        writer_task = asyncio.create_task(hold_all())
+        await writer_attempted.wait()
+        await asyncio.sleep(0)
+
+        future_tasks = [
+            asyncio.create_task(use_new_key(index)) for index in range(12)
+        ]
+        await asyncio.gather(*(event.wait() for event in future_attempted))
+        await asyncio.sleep(0)
+
+        assert not any(event.is_set() for event in future_entered)
+        release_reader.set()
+        await writer_entered.wait()
+        assert not any(event.is_set() for event in future_entered)
+        release_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(reader_task, writer_task, *future_tasks), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert order[:2] == ["writer:enter", "writer:exit"]
 
 
 def test_registry_stays_bounded_after_locks_release():

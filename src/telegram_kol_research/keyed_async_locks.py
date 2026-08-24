@@ -1,4 +1,4 @@
-"""A per-key asyncio lock registry, for serializing work within a key only.
+"""Per-key asyncio locks with writer-preference cross-key admission.
 
 The message-processing chain used to hold one process-wide ``asyncio.Lock``
 across every chat, so a slow message in one chat delayed every other chat.
@@ -6,9 +6,10 @@ Ordering only ever needed to be preserved *within* a chat. This registry
 creates one lock per key on first use, so unrelated keys can proceed
 concurrently while same-key work stays serialized, in arrival order.
 
-Locks are dropped once nothing references them and they are unlocked, so a
-process with a large or unbounded key space (chat ids arriving over a long
-uptime) does not accumulate locks forever.
+``lock_all()`` is an admission barrier rather than a snapshot of known keys:
+once a cross-key caller announces intent, new per-key callers wait until it has
+entered and exited. Locks are dropped once nothing references them and they are
+unlocked, so an unbounded key space does not accumulate locks forever.
 """
 
 from __future__ import annotations
@@ -25,6 +26,10 @@ class KeyedAsyncLockRegistry:
         self._locks: dict[Hashable, asyncio.Lock] = {}
         self._refcounts: dict[Hashable, int] = {}
         self._guard = asyncio.Lock()
+        self._admission = asyncio.Condition()
+        self._active_readers = 0
+        self._waiting_writers = 0
+        self._writer_active = False
 
     def lock(self, key: Hashable) -> AbstractAsyncContextManager[None]:
         """Return an async context manager serializing work under ``key``.
@@ -37,14 +42,7 @@ class KeyedAsyncLockRegistry:
         return self._key_context(key)
 
     def lock_all(self) -> AbstractAsyncContextManager[None]:
-        """Return an async context manager acquiring every known key's lock.
-
-        For the rare cross-chat operation. Locks are acquired in a
-        deterministic sorted order, which is what makes this deadlock-free
-        against a concurrent ``lock_all()`` call: any two callers request
-        locks in the same relative order, so no cycle of "A waits for B's
-        lock while B waits for A's lock" can form.
-        """
+        """Return an exclusive context blocking every per-key admission."""
 
         return self._all_context()
 
@@ -55,12 +53,64 @@ class KeyedAsyncLockRegistry:
 
     @asynccontextmanager
     async def _key_context(self, key: Hashable) -> AsyncIterator[None]:
+        async with self._shared_admission():
+            async with self._key_only_context(key):
+                yield
+
+    @asynccontextmanager
+    async def _key_only_context(self, key: Hashable) -> AsyncIterator[None]:
+        """Hold only ``key``; callers must already hold shared admission."""
+
         per_key_lock = await self._acquire_ref(key)
         try:
             async with per_key_lock:
                 yield
         finally:
             await self._release_ref(key)
+
+    @asynccontextmanager
+    async def _shared_admission(self) -> AsyncIterator[None]:
+        """Admit per-key work unless a writer is active or waiting."""
+
+        async with self._admission:
+            await self._admission.wait_for(
+                lambda: not self._writer_active and self._waiting_writers == 0
+            )
+            self._active_readers += 1
+        try:
+            yield
+        finally:
+            async with self._admission:
+                self._active_readers -= 1
+                if self._active_readers == 0:
+                    self._admission.notify_all()
+
+    @asynccontextmanager
+    async def _exclusive_admission(self) -> AsyncIterator[None]:
+        """Admit one writer after existing readers and before new readers."""
+
+        acquired = False
+        async with self._admission:
+            self._waiting_writers += 1
+            try:
+                await self._admission.wait_for(
+                    lambda: not self._writer_active
+                    and self._active_readers == 0
+                )
+                self._waiting_writers -= 1
+                self._writer_active = True
+                acquired = True
+            except BaseException:
+                self._waiting_writers -= 1
+                self._admission.notify_all()
+                raise
+        try:
+            yield
+        finally:
+            if acquired:
+                async with self._admission:
+                    self._writer_active = False
+                    self._admission.notify_all()
 
     async def _acquire_ref(self, key: Hashable) -> asyncio.Lock:
         async with self._guard:
@@ -84,15 +134,5 @@ class KeyedAsyncLockRegistry:
 
     @asynccontextmanager
     async def _all_context(self) -> AsyncIterator[None]:
-        async with self._guard:
-            ordered_keys = sorted(self._locks.keys(), key=repr)
-            ordered_locks = [self._locks[key] for key in ordered_keys]
-        acquired: list[asyncio.Lock] = []
-        try:
-            for per_key_lock in ordered_locks:
-                await per_key_lock.acquire()
-                acquired.append(per_key_lock)
+        async with self._exclusive_admission():
             yield
-        finally:
-            for per_key_lock in reversed(acquired):
-                per_key_lock.release()
