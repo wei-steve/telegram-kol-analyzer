@@ -34,7 +34,7 @@ workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
 current_task: task-17-review-push
 verification_level: L2
-local_candidate_commit: e03622749c32ebb214af56cd118984268e72af56
+local_candidate_commit: 4d6950ad9919a9fb71f8f54a73c45d85912b9272
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -42,8 +42,9 @@ invalidated_local_candidate_commits:
   - eb9ff4c261080190e3f6d360724aec05395197ed
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
-local_focused_verification: "402 passed, 2 warnings in 39.77s; final callback state slice 5 passed"
-local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 492.58s"
+  - e03622749c32ebb214af56cd118984268e72af56
+local_focused_verification: "composite slice 33 passed; complete strategy-management executor 190 passed; authority/backfill boundary 9 passed"
+local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 475.29s"
 local_compileall_verified: true
 local_diff_check_verified: true
 production_lock_mode_at_planning: global
@@ -345,3 +346,24 @@ cutover_authorized: false
   The workstream is `local_complete`. No push, deployment, restart, production
   setting, cutover, manufactured traffic, database mutation, or exchange
   action occurred or is authorized.
+- `2026-08-24 task 12 deployment blocker and rebuilt candidate`: the dormant
+  deployment of exact remote candidate
+  `a832ffb08972a3b74309c468274105b7014790fb` stopped at the predeploy gate
+  because management batch `150` was `recovery_required`; production remained
+  exact `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb` at `global + 20` with no
+  deployment, restart, cutover, database write, or exchange write. Read-only
+  evidence proved its first component exhausted three attempts before creating
+  any cancel/reduce/protection intent. The production client exposes
+  `list_trigger_order_history()`, while both composite snapshot call sites and
+  their shared test double used the nonexistent plural spelling. RED changed
+  only the fake to the production interface and reproduced
+  `recovery_required`; GREEN changed both read-only snapshot call sites. The
+  composite slice passed `33`, the complete management executor file passed
+  `190`, and authority/backfill boundary tests passed `9`. Independent read-only
+  review found no Critical or Important issue after two documentation-only
+  corrections. Frozen production-code candidate
+  `4d6950ad9919a9fb71f8f54a73c45d85912b9272` then passed the one final suite:
+  `6231 passed, 1 skipped, 32 warnings in 475.29s`. Batch `150` remains untouched
+  and needs fresh complete exchange evidence plus a separately authorized exact
+  recovery operation; the rebuilt candidate is local only and has no push or
+  deployment authorization.
