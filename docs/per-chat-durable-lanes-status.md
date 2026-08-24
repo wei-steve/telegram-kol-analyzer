@@ -30,9 +30,9 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
+workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-11-review-push
+current_task: task-16-system-operator-callback-event-loop-red-green
 verification_level: L2
 local_candidate_commit: eb9ff4c261080190e3f6d360724aec05395197ed
 invalidated_local_candidate_commits:
@@ -275,3 +275,12 @@ cutover_authorized: false
   `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`. Task 11 review/push, deployment,
   restart, production configuration, database mutation, Telegram traffic,
   exchange action, and cutover remain unstarted and separately unauthorized.
+- `2026-08-24 task 16 repair claim`: production deployment of integration HEAD
+  `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb` remained compatible at
+  `global + 20`, but the Task 13 freeze gate stopped before cutover after two
+  real worker event-loop stalls (`worst_stall_ms=3972.537`). The captured stack
+  showed `run_system_operator_bot_command_loop()` calling synchronous expiry
+  refresh reconciliation on the asyncio thread. The owner authorized local
+  RED-to-GREEN repair and candidate rebuild only. Push, deployment, restart,
+  production settings, cutover, manufactured traffic, database mutation, and
+  exchange writes remain unauthorized.
