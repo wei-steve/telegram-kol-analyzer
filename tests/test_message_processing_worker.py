@@ -3,13 +3,16 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import telegram_kol_research.message_processing_worker as worker_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MessageProcessingJob, RawMessage
 from telegram_kol_research.message_processing_worker import (
     claim_message_processing_jobs,
     process_message_job,
+    run_message_processing_worker_loop,
     run_message_processing_worker_tick,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
@@ -95,6 +98,428 @@ def _add_job(session_factory, *, chat_id, message_id, posted_at=NOW):
         )
         session.commit()
         return raw.id
+
+
+async def _wait_until(predicate, *, turns: int = 500):
+    for _ in range(turns):
+        if predicate():
+            return
+        await asyncio.sleep(0)
+    raise AssertionError("condition was not reached")
+
+
+def _claimed_job_count(session_factory) -> int:
+    with session_factory() as session:
+        return (
+            session.query(MessageProcessingJob)
+            .filter(MessageProcessingJob.status == "claimed")
+            .count()
+        )
+
+
+def test_worker_activity_snapshot_tracks_three_active_chat_lanes():
+    activity = worker_module.MessageProcessingActivity()
+
+    activity.apply_limit(3, applied_at=NOW)
+    for chat_id in (1, 2, 3):
+        activity.enter(chat_id)
+    activity.note_refill(3)
+
+    snapshot = activity.snapshot()
+    assert snapshot == {
+        "configured_max_parallel_chats": 3,
+        "active_chat_lanes": 3,
+        "peak_active_chat_lanes_since_limit_change": 3,
+        "last_refill_claimed": 3,
+        "total_started": 3,
+        "limit_applied_at": NOW.isoformat(),
+    }
+    assert "chat_ids" not in snapshot
+
+    for chat_id in (1, 2, 3):
+        activity.leave(chat_id)
+    assert activity.snapshot()["active_chat_lanes"] == 0
+
+
+def test_worker_loop_never_exceeds_three_active_chat_lanes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "three-lanes.db")
+    raw_to_chat = {
+        _add_job(session_factory, chat_id=chat_id, message_id=1): chat_id
+        for chat_id in range(1, 7)
+    }
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    active = 0
+    peak = 0
+    three_started = asyncio.Event()
+    release_all = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        nonlocal active, peak
+        assert raw_message_id in raw_to_chat
+        active += 1
+        peak = max(peak, active)
+        if active >= 3:
+            three_started.set()
+        try:
+            await release_all.wait()
+        finally:
+            active -= 1
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(three_started.wait(), timeout=5.0)
+            await _wait_until(lambda: _claimed_job_count(session_factory) >= 3)
+            assert _claimed_job_count(session_factory) == 3
+            assert peak == 3
+        finally:
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            release_all.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert peak == 3
+
+
+def test_slow_lane_does_not_prevent_two_free_slots_from_refilling(tmp_path):
+    session_factory = create_session_factory(tmp_path / "slow-lane-refill.db")
+    raw_to_chat = {
+        _add_job(session_factory, chat_id=chat_id, message_id=1): chat_id
+        for chat_id in range(1, 6)
+    }
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    started: list[int] = []
+    active = 0
+    peak = 0
+    slow_started = asyncio.Event()
+    initial_three_started = asyncio.Event()
+    later_started = asyncio.Event()
+    release_slow = asyncio.Event()
+    release_initial_fast = asyncio.Event()
+    release_later = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        nonlocal active, peak
+        chat_id = raw_to_chat[raw_message_id]
+        started.append(chat_id)
+        active += 1
+        peak = max(peak, active)
+        if chat_id == 1:
+            slow_started.set()
+        if {1, 2, 3}.issubset(started):
+            initial_three_started.set()
+        if 4 in started and 5 in started:
+            later_started.set()
+        try:
+            if chat_id == 1:
+                await release_slow.wait()
+            elif chat_id in {2, 3}:
+                await release_initial_fast.wait()
+            else:
+                await release_later.wait()
+        finally:
+            active -= 1
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(slow_started.wait(), timeout=5.0)
+            await asyncio.wait_for(initial_three_started.wait(), timeout=5.0)
+            await _wait_until(lambda: _claimed_job_count(session_factory) >= 3)
+            assert _claimed_job_count(session_factory) == 3
+            assert peak == 3
+            release_initial_fast.set()
+            await asyncio.wait_for(later_started.wait(), timeout=5.0)
+            assert not release_slow.is_set()
+            assert peak == 3
+        finally:
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            release_slow.set()
+            release_initial_fast.set()
+            release_later.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert set(started) == {1, 2, 3, 4, 5}
+    assert peak == 3
+
+
+def test_worker_loop_reloads_parallel_limit_before_each_refill(tmp_path):
+    session_factory = create_session_factory(tmp_path / "reload-cap.db")
+    raw_to_chat = {
+        _add_job(session_factory, chat_id=chat_id, message_id=1): chat_id
+        for chat_id in range(1, 4)
+    }
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 1,
+        },
+    )
+    started: list[int] = []
+    first_started = asyncio.Event()
+    all_started = asyncio.Event()
+    release_all = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        chat_id = raw_to_chat[raw_message_id]
+        started.append(chat_id)
+        if chat_id == 1:
+            first_started.set()
+        if len(started) == 3:
+            all_started.set()
+        await release_all.wait()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=5.0)
+            await _wait_until(lambda: _claimed_job_count(session_factory) >= 1)
+            assert _claimed_job_count(session_factory) == 1
+            assert started == [1]
+            save_trading_settings(
+                session_factory,
+                {"message_processing_max_parallel_chats": 3},
+            )
+            await asyncio.wait_for(all_started.wait(), timeout=5.0)
+        finally:
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            release_all.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert started == [1, 2, 3]
+
+
+def test_lowered_limit_stops_new_claims_without_cancelling_inflight(tmp_path):
+    session_factory = create_session_factory(tmp_path / "lower-cap.db")
+    raw_to_chat = {
+        _add_job(session_factory, chat_id=chat_id, message_id=1): chat_id
+        for chat_id in range(1, 6)
+    }
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    started: list[int] = []
+    release = {chat_id: asyncio.Event() for chat_id in range(1, 6)}
+    first_three_started = asyncio.Event()
+    next_started = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        chat_id = raw_to_chat[raw_message_id]
+        started.append(chat_id)
+        if len(started) == 3:
+            first_three_started.set()
+        if chat_id in {4, 5}:
+            next_started.set()
+        await release[chat_id].wait()
+
+    def first_three_settled() -> bool:
+        with session_factory() as session:
+            statuses = {
+                int(job.chat_id): job.status
+                for job in session.query(MessageProcessingJob).all()
+            }
+        return statuses.get(2) == "succeeded" and statuses.get(3) == "succeeded"
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(first_three_started.wait(), timeout=5.0)
+            await _wait_until(lambda: _claimed_job_count(session_factory) >= 3)
+            assert _claimed_job_count(session_factory) == 3
+            assert set(started) == {1, 2, 3}
+            save_trading_settings(
+                session_factory,
+                {"message_processing_max_parallel_chats": 1},
+            )
+            release[2].set()
+            release[3].set()
+            await _wait_until(first_three_settled)
+            await asyncio.sleep(0)
+            assert not next_started.is_set()
+
+            release[1].set()
+            await asyncio.wait_for(next_started.wait(), timeout=5.0)
+            assert len([chat for chat in started if chat in {4, 5}]) == 1
+        finally:
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            for gate in release.values():
+                gate.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+
+def test_live_claim_blocks_later_same_chat_job_while_other_chats_progress(tmp_path):
+    session_factory = create_session_factory(tmp_path / "live-claim-order.db")
+    first = _add_job(session_factory, chat_id=1, message_id=1)
+    second = _add_job(session_factory, chat_id=1, message_id=2)
+    other = _add_job(session_factory, chat_id=2, message_id=1)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    started: list[int] = []
+    first_started = asyncio.Event()
+    other_finished = asyncio.Event()
+    second_started = asyncio.Event()
+    release_first = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        started.append(raw_message_id)
+        if raw_message_id == first:
+            first_started.set()
+            await release_first.wait()
+        elif raw_message_id == other:
+            other_finished.set()
+        elif raw_message_id == second:
+            second_started.set()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(first_started.wait(), timeout=5.0)
+            await asyncio.wait_for(other_finished.wait(), timeout=5.0)
+            await asyncio.sleep(0)
+            assert not second_started.is_set()
+            release_first.set()
+            await asyncio.wait_for(second_started.wait(), timeout=5.0)
+        finally:
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            release_first.set()
+            await asyncio.wait_for(loop_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+    assert started == [first, other, second]
+
+
+def test_retry_not_due_blocks_later_same_chat_job_while_other_chats_progress(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "retry-lane-order.db")
+    first = _add_job(session_factory, chat_id=1, message_id=1)
+    second = _add_job(session_factory, chat_id=1, message_id=2)
+    other = _add_job(session_factory, chat_id=2, message_id=1)
+    with session_factory() as session:
+        first_job = (
+            session.query(MessageProcessingJob)
+            .filter(MessageProcessingJob.raw_message_id == first)
+            .one()
+        )
+        first_job.next_attempt_at = (NOW + timedelta(minutes=1)).replace(
+            tzinfo=None
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    processed: list[int] = []
+    other_finished = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        processed.append(raw_message_id)
+        if raw_message_id == other:
+            other_finished.set()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await asyncio.wait_for(other_finished.wait(), timeout=5.0)
+            save_trading_settings(
+                session_factory, {"message_pipeline_mode": "inline"}
+            )
+            await asyncio.wait_for(loop_task, timeout=5.0)
+        finally:
+            if not loop_task.done():
+                loop_task.cancel()
+                await asyncio.gather(loop_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+
+    assert processed == [other]
+    assert first not in processed
+    assert second not in processed
 
 
 def test_claim_is_atomic_and_only_claims_one_ordered_job_per_chat(tmp_path):

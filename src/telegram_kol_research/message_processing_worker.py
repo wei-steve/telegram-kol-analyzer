@@ -51,6 +51,69 @@ class MessageProcessingWorkerResult:
     expired: int = 0
 
 
+class MessageProcessingActivity:
+    """Event-loop-owned counters for bounded durable chat lanes."""
+
+    def __init__(self) -> None:
+        self._configured_limit: int | None = None
+        self._active_by_chat: dict[int, int] = {}
+        self._active = 0
+        self._peak_since_limit_change = 0
+        self._last_refill_claimed = 0
+        self._total_started = 0
+        self._limit_applied_at: datetime | None = None
+
+    def apply_limit(self, limit: int, *, applied_at: datetime) -> None:
+        normalized = int(limit)
+        if normalized == self._configured_limit:
+            return
+        self._configured_limit = normalized
+        self._peak_since_limit_change = self._active
+        self._limit_applied_at = applied_at
+
+    def enter(self, chat_id: int) -> None:
+        normalized_chat_id = int(chat_id)
+        self._active_by_chat[normalized_chat_id] = (
+            self._active_by_chat.get(normalized_chat_id, 0) + 1
+        )
+        self._active += 1
+        self._total_started += 1
+        self._peak_since_limit_change = max(
+            self._peak_since_limit_change,
+            self._active,
+        )
+
+    def leave(self, chat_id: int) -> None:
+        normalized_chat_id = int(chat_id)
+        chat_count = self._active_by_chat.get(normalized_chat_id, 0)
+        if chat_count <= 0 or self._active <= 0:
+            raise RuntimeError("message processing activity counter underflow")
+        if chat_count == 1:
+            del self._active_by_chat[normalized_chat_id]
+        else:
+            self._active_by_chat[normalized_chat_id] = chat_count - 1
+        self._active -= 1
+
+    def note_refill(self, claimed: int) -> None:
+        self._last_refill_claimed = max(0, int(claimed))
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "configured_max_parallel_chats": self._configured_limit,
+            "active_chat_lanes": self._active,
+            "peak_active_chat_lanes_since_limit_change": (
+                self._peak_since_limit_change
+            ),
+            "last_refill_claimed": self._last_refill_claimed,
+            "total_started": self._total_started,
+            "limit_applied_at": (
+                self._limit_applied_at.isoformat()
+                if self._limit_applied_at is not None
+                else None
+            ),
+        }
+
+
 class AuthoritativeProcessingFailed(RuntimeError):
     """A returned authoritative failure that the durable queue must retry."""
 
@@ -452,6 +515,7 @@ async def run_message_processing_worker_tick(
     chat_title_provider: Callable[[int], str | None] | None = None,
     loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
     terminal_failure_notifier: Callable[..., Any] | None = None,
+    activity: MessageProcessingActivity | None = None,
 ) -> MessageProcessingWorkerResult:
     """Claim one ordered job per chat and process chat lanes concurrently."""
 
@@ -465,7 +529,7 @@ async def run_message_processing_worker_tick(
     )
     counts = {"succeeded": 0, "retried": 0, "failed": 0, "expired": 0}
 
-    async def run_claim(claim: MessageProcessingClaim) -> None:
+    async def _run_claim_body(claim: MessageProcessingClaim) -> None:
         try:
             expiry = await asyncio.to_thread(
                 _classify_claim_expiry,
@@ -582,6 +646,15 @@ async def run_message_processing_worker_tick(
         if settled:
             counts["succeeded"] += 1
 
+    async def run_claim(claim: MessageProcessingClaim) -> None:
+        if activity is not None:
+            activity.enter(claim.chat_id)
+        try:
+            await _run_claim_body(claim)
+        finally:
+            if activity is not None:
+                activity.leave(claim.chat_id)
+
     if claims:
         await asyncio.gather(*(run_claim(claim) for claim in claims))
     return MessageProcessingWorkerResult(claimed=len(claims), **counts)
@@ -591,19 +664,57 @@ async def run_message_processing_worker_loop(
     session_factory,
     *,
     interval_seconds: float = 0.5,
+    activity: MessageProcessingActivity | None = None,
     **tick_kwargs,
 ) -> None:
     """Consume queue jobs only while the dynamic pipeline mode is ``queue``."""
 
-    while True:
-        settings = await asyncio.to_thread(load_trading_settings, session_factory)
-        if settings.message_pipeline_mode != "queue":
-            return
-        await run_message_processing_worker_tick(
-            session_factory,
-            **tick_kwargs,
-        )
-        await asyncio.sleep(max(0.01, float(interval_seconds)))
+    lane_activity = activity or MessageProcessingActivity()
+    in_flight: set[asyncio.Task[MessageProcessingWorkerResult]] = set()
+    interval = max(0.01, float(interval_seconds))
+    try:
+        while True:
+            settings = await asyncio.to_thread(
+                load_trading_settings,
+                session_factory,
+            )
+            cap = settings.message_processing_max_parallel_chats
+            lane_activity.apply_limit(cap, applied_at=utc_now())
+
+            if settings.message_pipeline_mode != "queue":
+                if in_flight:
+                    await asyncio.gather(*in_flight)
+                return
+
+            while len(in_flight) < cap:
+                in_flight.add(
+                    asyncio.create_task(
+                        run_message_processing_worker_tick(
+                            session_factory,
+                            limit=1,
+                            activity=lane_activity,
+                            **tick_kwargs,
+                        )
+                    )
+                )
+
+            done, pending = await asyncio.wait(
+                in_flight,
+                timeout=interval,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            in_flight = set(pending)
+            claimed = 0
+            for task in done:
+                claimed += task.result().claimed
+            lane_activity.note_refill(claimed)
+            if done and claimed == 0:
+                await asyncio.sleep(interval)
+    finally:
+        for task in in_flight:
+            task.cancel()
+        if in_flight:
+            await asyncio.gather(*in_flight, return_exceptions=True)
 
 
 def _classify_claim_expiry(

@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-6-work-conserving-worker
+current_task: task-7-restart-cancellation
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -143,3 +143,11 @@ cutover_authorized: false
   bounds 1-20 for `message_processing_max_parallel_chats`, including storage
   preservation across unrelated saves. Full trading-settings result:
   `198 passed in 2.71s`.
+- `2026-08-24 task 6 RED`: after replacing scheduler-sensitive start-order
+  assertions with durable claimed-count evidence, the selected lane slice was
+  `5 failed, 2 passed`: the old loop claimed 5-6 jobs at cap 3 and 3 jobs at
+  cap 1; same-chat live/retry authority tests already passed.
+- `2026-08-24 task 6 GREEN`: added pure in-memory lane activity and refactored
+  the loop to dynamic, work-conserving, single-claim slot tasks. The focused
+  lane slice passed `7 passed in 0.99s`; worker, pipeline-exclusivity, and
+  shadow-enqueue compatibility passed `46 passed in 3.59s`.
