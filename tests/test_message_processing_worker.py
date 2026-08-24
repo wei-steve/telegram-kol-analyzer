@@ -3,6 +3,8 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
+import pytest
+
 import telegram_kol_research.message_processing_worker as worker_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import MessageProcessingJob, RawMessage
@@ -520,6 +522,211 @@ def test_retry_not_due_blocks_later_same_chat_job_while_other_chats_progress(
     assert processed == [other]
     assert first not in processed
     assert second not in processed
+
+
+def test_cancelled_loop_leaves_claim_for_stale_recovery(tmp_path):
+    session_factory = create_session_factory(tmp_path / "cancelled-loop.db")
+    raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 1,
+        },
+    )
+    processor_started = asyncio.Event()
+    processor_cancelled = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        assert raw_message_id == raw_id
+        processor_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            processor_cancelled.set()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        await asyncio.wait_for(processor_started.wait(), timeout=5.0)
+        with session_factory() as session:
+            claimed = session.query(MessageProcessingJob).one()
+            original_token = claimed.claim_token
+            assert claimed.status == "claimed"
+            assert original_token
+            assert claimed.attempt_count == 0
+
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+        assert processor_cancelled.is_set()
+
+        with session_factory() as session:
+            claimed = session.query(MessageProcessingJob).one()
+            assert claimed.status == "claimed"
+            assert claimed.claim_token == original_token
+            assert claimed.attempt_count == 0
+
+    asyncio.run(scenario())
+
+
+def test_cancelled_first_job_keeps_second_same_chat_blocked(tmp_path):
+    session_factory = create_session_factory(tmp_path / "cancelled-same-chat.db")
+    first = _add_job(session_factory, chat_id=1, message_id=1)
+    second = _add_job(session_factory, chat_id=1, message_id=2)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 1,
+        },
+    )
+    first_started = asyncio.Event()
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        assert raw_message_id == first
+        first_started.set()
+        await asyncio.Event().wait()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=5.0)
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+
+    asyncio.run(scenario())
+
+    assert claim_message_processing_jobs(
+        session_factory,
+        claimed_at=NOW + timedelta(seconds=1),
+        limit=1,
+    ) == []
+    with session_factory() as session:
+        jobs = (
+            session.query(MessageProcessingJob)
+            .order_by(MessageProcessingJob.raw_message_id.asc())
+            .all()
+        )
+    assert [job.raw_message_id for job in jobs] == [first, second]
+    assert [job.status for job in jobs] == ["claimed", "pending"]
+    assert jobs[0].claim_token
+    assert jobs[1].claim_token is None
+    assert [job.attempt_count for job in jobs] == [0, 0]
+
+
+def test_stale_recovery_processes_first_once_then_releases_second(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-recovery-order.db")
+    first = _add_job(session_factory, chat_id=1, message_id=1)
+    second = _add_job(session_factory, chat_id=1, message_id=2)
+    initial_claim = claim_message_processing_jobs(
+        session_factory,
+        claimed_at=NOW,
+        stale_after=timedelta(minutes=5),
+        limit=1,
+    )
+    assert [claim.raw_message_id for claim in initial_claim] == [first]
+    original_token = initial_claim[0].claim_token
+    processed: list[int] = []
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        processed.append(raw_message_id)
+
+    reclaimed = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW + timedelta(minutes=6),
+            stale_after=timedelta(minutes=5),
+            limit=1,
+            job_processor=processor,
+        )
+    )
+    released = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW + timedelta(minutes=6, seconds=1),
+            stale_after=timedelta(minutes=5),
+            limit=1,
+            job_processor=processor,
+        )
+    )
+
+    assert reclaimed.claimed == 1
+    assert reclaimed.succeeded == 1
+    assert released.claimed == 1
+    assert released.succeeded == 1
+    assert processed == [first, second]
+    with session_factory() as session:
+        jobs = (
+            session.query(MessageProcessingJob)
+            .order_by(MessageProcessingJob.raw_message_id.asc())
+            .all()
+        )
+    assert [job.status for job in jobs] == ["succeeded", "succeeded"]
+    assert [job.claim_token for job in jobs] == [None, None]
+    assert [job.attempt_count for job in jobs] == [0, 0]
+    assert original_token not in {job.claim_token for job in jobs}
+
+
+def test_second_worker_cannot_duplicate_a_live_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "second-worker.db")
+    raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    first_invocations: list[int] = []
+    second_invocations: list[int] = []
+
+    async def first_processor(_session_factory, *, raw_message_id, **_kwargs):
+        first_invocations.append(raw_message_id)
+        first_started.set()
+        await release_first.wait()
+
+    async def second_processor(_session_factory, *, raw_message_id, **_kwargs):
+        second_invocations.append(raw_message_id)
+
+    async def scenario():
+        first_task = asyncio.create_task(
+            run_message_processing_worker_tick(
+                session_factory,
+                now=NOW,
+                limit=1,
+                job_processor=first_processor,
+            )
+        )
+        await asyncio.wait_for(first_started.wait(), timeout=5.0)
+        second_result = await run_message_processing_worker_tick(
+            session_factory,
+            now=NOW + timedelta(seconds=1),
+            limit=1,
+            job_processor=second_processor,
+        )
+        assert second_result.claimed == 0
+        release_first.set()
+        first_result = await asyncio.wait_for(first_task, timeout=5.0)
+        assert first_result.succeeded == 1
+
+    asyncio.run(scenario())
+
+    assert first_invocations == [raw_id]
+    assert second_invocations == []
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+    assert job.status == "succeeded"
+    assert job.attempt_count == 0
+    assert job.claim_token is None
 
 
 def test_claim_is_atomic_and_only_claims_one_ordered_job_per_chat(tmp_path):

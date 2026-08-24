@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-7-restart-cancellation
+current_task: task-8-atomic-settings-transition
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -151,3 +151,10 @@ cutover_authorized: false
   the loop to dynamic, work-conserving, single-claim slot tasks. The focused
   lane slice passed `7 passed in 0.99s`; worker, pipeline-exclusivity, and
   shadow-enqueue compatibility passed `46 passed in 3.59s`.
+- `2026-08-24 task 7 proof`: the Task 6 cancellation-finally implementation
+  already satisfied the new restart/recovery assertions, so no additional
+  production edit was required. The selected cancellation/stale/second-worker
+  slice passed `3 passed in 0.41s`; the full worker file passed
+  `21 passed in 1.88s`. Cancelled async slots retain their exact claim token
+  and attempt count for stale-lease recovery, while later same-chat work stays
+  blocked and a second worker cannot duplicate a live claim.
