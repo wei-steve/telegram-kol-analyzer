@@ -60,6 +60,220 @@ async def _fake_fetch_no_messages(client, dialog, limit, media_root="data/media"
     return []
 
 
+async def _event_set_after_turns(event: asyncio.Event, *, turns: int = 100) -> bool:
+    for _ in range(turns):
+        if event.is_set():
+            return True
+        await asyncio.sleep(0)
+    return event.is_set()
+
+
+def test_provider_lock_all_waits_for_global_operation_and_blocks_new_global_work(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    registry = KeyedAsyncLockRegistry()
+    provider = MessageLockProvider(
+        session_factory=session_factory,
+        global_lock=asyncio.Lock(),
+        registry=registry,
+    )
+
+    async def scenario():
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        writer_attempted = asyncio.Event()
+        writer_entered = asyncio.Event()
+        release_writer = asyncio.Event()
+        future_attempted = asyncio.Event()
+        future_entered = asyncio.Event()
+
+        async def first_global_operation():
+            async with provider(101):
+                first_entered.set()
+                await release_first.wait()
+
+        async def cross_chat_operation():
+            writer_attempted.set()
+            async with provider.lock_all():
+                writer_entered.set()
+                await release_writer.wait()
+
+        async def future_global_operation():
+            future_attempted.set()
+            async with provider(202):
+                future_entered.set()
+
+        save_trading_settings(session_factory, {"message_lock_mode": "global"})
+        first_task = asyncio.create_task(first_global_operation())
+        await first_entered.wait()
+
+        save_trading_settings(session_factory, {"message_lock_mode": "per_chat"})
+        writer_task = asyncio.create_task(cross_chat_operation())
+        await writer_attempted.wait()
+        await asyncio.sleep(0)
+        assert not writer_entered.is_set()
+
+        save_trading_settings(session_factory, {"message_lock_mode": "global"})
+        future_task = asyncio.create_task(future_global_operation())
+        await future_attempted.wait()
+        await asyncio.sleep(0)
+        assert not future_entered.is_set()
+
+        release_first.set()
+        await writer_entered.wait()
+        assert not future_entered.is_set()
+        release_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_task, writer_task, future_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+
+def test_provider_lock_all_waits_for_per_chat_operations_and_blocks_new_chat(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    provider = _make_provider(session_factory, mode="per_chat")
+    order: list[str] = []
+
+    async def scenario():
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        writer_attempted = asyncio.Event()
+        writer_entered = asyncio.Event()
+        release_writer = asyncio.Event()
+        future_attempted = asyncio.Event()
+        future_entered = asyncio.Event()
+
+        async def first_chat():
+            async with provider(101):
+                first_entered.set()
+                await release_first.wait()
+                order.append("first:exit")
+
+        async def cross_chat_operation():
+            writer_attempted.set()
+            async with provider.lock_all():
+                order.append("writer:enter")
+                writer_entered.set()
+                await release_writer.wait()
+                order.append("writer:exit")
+
+        async def future_chat():
+            future_attempted.set()
+            async with provider(202):
+                order.append("future:enter")
+                future_entered.set()
+
+        first_task = asyncio.create_task(first_chat())
+        await first_entered.wait()
+        writer_task = asyncio.create_task(cross_chat_operation())
+        await writer_attempted.wait()
+        await asyncio.sleep(0)
+        future_task = asyncio.create_task(future_chat())
+        await future_attempted.wait()
+        await asyncio.sleep(0)
+
+        assert not writer_entered.is_set()
+        assert not future_entered.is_set()
+        release_first.set()
+        await writer_entered.wait()
+        assert not future_entered.is_set()
+        release_writer.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_task, writer_task, future_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert order == ["first:exit", "writer:enter", "writer:exit", "future:enter"]
+
+
+def test_provider_resolves_mode_only_after_shared_admission(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    registry = KeyedAsyncLockRegistry()
+    global_lock = asyncio.Lock()
+    provider = MessageLockProvider(
+        session_factory=session_factory,
+        global_lock=global_lock,
+        registry=registry,
+    )
+
+    async def scenario():
+        attempted = asyncio.Event()
+        entered = asyncio.Event()
+
+        async def precreated_caller(context):
+            attempted.set()
+            async with context:
+                entered.set()
+
+        save_trading_settings(session_factory, {"message_lock_mode": "global"})
+        await global_lock.acquire()
+        caller_task = None
+        try:
+            async with registry._exclusive_admission():
+                context = provider(101)
+                caller_task = asyncio.create_task(precreated_caller(context))
+                await attempted.wait()
+                await asyncio.sleep(0)
+                assert not entered.is_set()
+                save_trading_settings(
+                    session_factory, {"message_lock_mode": "per_chat"}
+                )
+
+            assert await _event_set_after_turns(entered)
+        finally:
+            global_lock.release()
+            if caller_task is not None:
+                await asyncio.wait_for(caller_task, timeout=5.0)
+
+    asyncio.run(scenario())
+
+
+def test_global_rollback_serializes_two_different_chats_again(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    provider = _make_provider(session_factory, mode="per_chat")
+    order: list[str] = []
+
+    async def scenario():
+        save_trading_settings(session_factory, {"message_lock_mode": "global"})
+        first_entered = asyncio.Event()
+        release_first = asyncio.Event()
+        second_attempted = asyncio.Event()
+        second_entered = asyncio.Event()
+
+        async def first_chat():
+            async with provider(101):
+                order.append("first:enter")
+                first_entered.set()
+                await release_first.wait()
+                order.append("first:exit")
+
+        async def second_chat():
+            second_attempted.set()
+            async with provider(202):
+                order.append("second:enter")
+                second_entered.set()
+
+        first_task = asyncio.create_task(first_chat())
+        await first_entered.wait()
+        second_task = asyncio.create_task(second_chat())
+        await second_attempted.wait()
+        await asyncio.sleep(0)
+        assert not second_entered.is_set()
+        release_first.set()
+        await asyncio.wait_for(
+            asyncio.gather(first_task, second_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert order == ["first:enter", "first:exit", "second:enter"]
+
+
 def test_per_chat_mode_a_slow_chat_does_not_delay_another_chat(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "research.db")
     provider = _make_provider(session_factory, mode="per_chat")

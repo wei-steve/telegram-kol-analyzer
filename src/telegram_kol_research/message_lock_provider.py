@@ -19,8 +19,8 @@ rollback path Phase 2 depends on.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Hashable
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncIterator, Hashable
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Literal
 
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
@@ -54,16 +54,28 @@ class MessageLockProvider:
         every other, identical to the pre-Phase-2 behavior.
         """
 
-        if self.mode() == "per_chat":
-            return self._registry.lock(chat_id)
-        return self._global_lock
+        return self._operation_context(chat_id)
 
     def lock_all(self) -> AbstractAsyncContextManager[None]:
         """Return the lock for a cross-chat operation (refresh, mode switch)."""
 
-        if self.mode() == "per_chat":
-            return self._registry.lock_all()
-        return self._global_lock
+        return self._all_context()
+
+    @asynccontextmanager
+    async def _operation_context(self, chat_id: Hashable) -> AsyncIterator[None]:
+        async with self._registry._shared_admission():
+            if self.mode() == "per_chat":
+                async with self._registry._key_only_context(chat_id):
+                    yield
+            else:
+                async with self._global_lock:
+                    yield
+
+    @asynccontextmanager
+    async def _all_context(self) -> AsyncIterator[None]:
+        async with self._registry._exclusive_admission():
+            async with self._global_lock:
+                yield
 
 
 def resolve_message_lock_mode(

@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-4-provider-integration
+current_task: task-5-parallel-chat-setting
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -129,3 +129,10 @@ cutover_authorized: false
   `$PROJECT_PYTHON -m pytest tests/test_keyed_async_locks.py -vv`; result:
   `15 passed in 0.19s`, including multiple writers, waiting/held cancellation,
   exception release, key-waiter cancellation, and mixed cleanup.
+- `2026-08-24 task 4 RED`: ran the provider/rollback/mode-resolution slice;
+  `2 failed, 2 passed`. The failures proved global work bypassed registry
+  admission and a pre-created caller resolved `message_lock_mode` too early.
+- `2026-08-24 task 4 GREEN`: provider operations now enter shared admission
+  before resolving mode, while `lock_all()` always enters exclusive admission
+  before the legacy global lock. Ran the registry, listener, reconcile, and
+  position-authority compatibility slices; result: `49 passed in 2.61s`.
