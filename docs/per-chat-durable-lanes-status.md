@@ -30,15 +30,16 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
+workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-11-review-push
+current_task: task-10-final-candidate
 verification_level: L2
-local_candidate_commit: c8f778201c123f0bbadddc06e718945307adf40b
-local_focused_verification: "589 passed, 2 warnings in 46.62s"
-local_full_suite_verification: "6215 passed, 1 skipped, 32 warnings in 524.52s"
-local_compileall_verified: true
-local_diff_check_verified: true
+local_candidate_commit: null
+invalidated_local_candidate_commit: c8f778201c123f0bbadddc06e718945307adf40b
+local_focused_verification: null
+local_full_suite_verification: null
+local_compileall_verified: false
+local_diff_check_verified: false
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -212,3 +213,12 @@ cutover_authorized: false
   is now `local_complete`; Task 11 independent review, push, deployment
   authorization, and every production/cutover action remain unstarted and
   require their own gates.
+- `2026-08-24 independent review`: the local Task 10 candidate was invalidated
+  before further production edits. Read-only review at integration HEAD
+  `4d53b83960d08598796308d1b244e468f5c57110` found three reproducible Important
+  defects: explicit no-op expected-state requests bypassed concurrency-transition
+  admission and role routing; an unrelated settings save could restore a stale
+  concurrency tuple; and scheduler slots created under an old cap could claim
+  after a lower cap was applied. The owner approved RED-to-GREEN remediation and
+  rebuilding Task 10 under design A. Push, deployment, restart, production
+  configuration, database mutation, and exchange action remain unauthorized.
