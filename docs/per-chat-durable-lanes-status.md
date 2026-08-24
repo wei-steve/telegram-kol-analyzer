@@ -30,16 +30,18 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
+workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-11-review-push
+current_task: task-10-final-candidate
 verification_level: L2
-local_candidate_commit: c0e2471ed76b6d73bceb3be3d88304e57e44088d
-invalidated_local_candidate_commit: c8f778201c123f0bbadddc06e718945307adf40b
-local_focused_verification: "541 passed, 2 warnings in 36.65s"
-local_full_suite_verification: "6222 passed, 1 skipped, 32 warnings in 503.19s"
-local_compileall_verified: true
-local_diff_check_verified: true
+local_candidate_commit: null
+invalidated_local_candidate_commits:
+  - c8f778201c123f0bbadddc06e718945307adf40b
+  - c0e2471ed76b6d73bceb3be3d88304e57e44088d
+local_focused_verification: null
+local_full_suite_verification: null
+local_compileall_verified: false
+local_diff_check_verified: false
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -239,3 +241,12 @@ cutover_authorized: false
   production configuration, database mutation, Telegram traffic, or exchange
   action occurred; Task 11 review/push and all production/cutover gates remain
   separately unauthorized.
+- `2026-08-24 rebuilt-candidate review`: read-only re-review confirmed the
+  original three findings were closed, then found one new Important interleaving:
+  a normal complete settings payload carrying an initially unchanged concurrency
+  tuple could restore that stale tuple if cutover committed after the endpoint's
+  second comparison but before `save_trading_settings()` acquired its write
+  transaction. Candidate `c0e2471ed76b6d73bceb3be3d88304e57e44088d`
+  and its `6222`-test evidence were invalidated before any further production
+  edit. The workstream returned to Task 10 RED-to-GREEN remediation; push and all
+  production actions remain unauthorized.
