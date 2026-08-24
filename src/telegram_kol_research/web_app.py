@@ -7655,13 +7655,20 @@ def create_web_app(
             or candidate.message_processing_max_parallel_chats
             != current.message_processing_max_parallel_chats
         )
-        if concurrency_change and app.state.runtime_role == "web":
+        explicit_concurrency_request = concurrency_change or any(
+            key in payload
+            for key in (
+                "message_lock_expected_mode",
+                "message_processing_expected_max_parallel_chats",
+            )
+        )
+        if explicit_concurrency_request and app.state.runtime_role == "web":
             return await proxy_ingest_trading_settings_once(
                 requester=app.state.ingest_trading_settings_requester,
                 url=app.state.ingest_trading_settings_url,
                 payload=payload,
             )
-        if concurrency_change and app.state.runtime_role == "worker":
+        if explicit_concurrency_request and app.state.runtime_role == "worker":
             raise HTTPException(
                 status_code=503,
                 detail={
@@ -7696,7 +7703,14 @@ def create_web_app(
                 or candidate.message_processing_max_parallel_chats
                 != current.message_processing_max_parallel_chats
             )
-            if mimo_contract_change or concurrency_change:
+            explicit_concurrency_request = concurrency_change or any(
+                key in payload
+                for key in (
+                    "message_lock_expected_mode",
+                    "message_processing_expected_max_parallel_chats",
+                )
+            )
+            if mimo_contract_change or explicit_concurrency_request:
                 async with app.state.message_lock_provider.lock_all():
                     locked_current = load_trading_settings(
                         app.state.session_factory
@@ -7724,7 +7738,7 @@ def create_web_app(
                             app.state.session_factory,
                             payload=payload,
                         )
-                    if concurrency_change:
+                    if explicit_concurrency_request:
                         response = transition_message_concurrency_settings(
                             app.state.session_factory,
                             payload,

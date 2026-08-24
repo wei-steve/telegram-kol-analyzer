@@ -516,17 +516,21 @@ async def run_message_processing_worker_tick(
     loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
     terminal_failure_notifier: Callable[..., Any] | None = None,
     activity: MessageProcessingActivity | None = None,
+    _preclaimed_jobs: list[MessageProcessingClaim] | None = None,
 ) -> MessageProcessingWorkerResult:
     """Claim one ordered job per chat and process chat lanes concurrently."""
 
     tick_time = now or utc_now()
-    claims = await asyncio.to_thread(
-        claim_message_processing_jobs,
-        session_factory,
-        claimed_at=tick_time,
-        stale_after=stale_after,
-        limit=limit,
-    )
+    if _preclaimed_jobs is None:
+        claims = await asyncio.to_thread(
+            claim_message_processing_jobs,
+            session_factory,
+            claimed_at=tick_time,
+            stale_after=stale_after,
+            limit=limit,
+        )
+    else:
+        claims = list(_preclaimed_jobs)
     counts = {"succeeded": 0, "retried": 0, "failed": 0, "expired": 0}
 
     async def _run_claim_body(claim: MessageProcessingClaim) -> None:
@@ -692,17 +696,36 @@ async def run_message_processing_worker_loop(
                     await asyncio.gather(*in_flight)
                 return
 
-            while len(in_flight) < cap:
+            available = max(0, cap - len(in_flight))
+            claims: list[MessageProcessingClaim] = []
+            if available:
+                claims = await asyncio.to_thread(
+                    claim_message_processing_jobs,
+                    session_factory,
+                    claimed_at=tick_kwargs.get("now") or observed_at,
+                    stale_after=tick_kwargs.get(
+                        "stale_after",
+                        DEFAULT_CLAIM_STALE_AFTER,
+                    ),
+                    limit=available,
+                )
+                lane_activity.note_refill(len(claims))
+
+            for claim in claims:
                 in_flight.add(
                     asyncio.create_task(
                         run_message_processing_worker_tick(
                             session_factory,
-                            limit=1,
                             activity=lane_activity,
+                            _preclaimed_jobs=[claim],
                             **tick_kwargs,
                         )
                     )
                 )
+
+            if not in_flight:
+                await asyncio.sleep(interval)
+                continue
 
             done, pending = await asyncio.wait(
                 in_flight,
@@ -710,12 +733,8 @@ async def run_message_processing_worker_loop(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             in_flight = set(pending)
-            claimed = 0
             for task in done:
-                claimed += task.result().claimed
-            lane_activity.note_refill(claimed)
-            if done and claimed == 0:
-                await asyncio.sleep(interval)
+                task.result()
     finally:
         for task in in_flight:
             task.cancel()

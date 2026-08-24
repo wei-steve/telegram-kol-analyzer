@@ -289,6 +289,7 @@ def save_trading_settings(
     """Validate and persist global trading settings."""
 
     with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
         row, persisted_payload = _settings_row_and_payload_in_session(session)
         merged_payload = {**persisted_payload, **payload}
         settings = trading_settings_from_payload(merged_payload)
@@ -333,6 +334,15 @@ def transition_message_concurrency_settings(
             if not required.issubset(payload):
                 raise ValueError(
                     "global to per_chat requires both target and expected fields"
+                )
+
+        for expected_key, target_key in (
+            (expected_mode_key, target_mode_key),
+            (expected_cap_key, target_cap_key),
+        ):
+            if expected_key in payload and target_key not in payload:
+                raise ValueError(
+                    f"{expected_key} requires the matching target field {target_key}"
                 )
 
         candidate_payload = dict(payload)

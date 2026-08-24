@@ -557,6 +557,32 @@ def test_global_to_per_chat_requires_both_target_and_expected_fields(tmp_path):
         ) == ("global", 20)
 
 
+@pytest.mark.parametrize(
+    ("expected_field", "expected_value", "target_field"),
+    [
+        ("message_lock_expected_mode", "global", "message_lock_mode"),
+        (
+            "message_processing_expected_max_parallel_chats",
+            20,
+            "message_processing_max_parallel_chats",
+        ),
+    ],
+)
+def test_expected_concurrency_field_requires_matching_target(
+    tmp_path,
+    expected_field,
+    expected_value,
+    target_field,
+):
+    session_factory = create_session_factory(tmp_path / f"unpaired-{target_field}.db")
+
+    with pytest.raises(ValueError, match="requires the matching target field"):
+        _transition_concurrency(
+            session_factory,
+            {expected_field: expected_value},
+        )
+
+
 def test_global_rollback_can_keep_cap_three(tmp_path):
     session_factory = create_session_factory(tmp_path / "rollback-keep-cap.db")
     save_trading_settings(
