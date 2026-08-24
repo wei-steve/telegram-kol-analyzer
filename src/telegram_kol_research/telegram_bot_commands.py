@@ -110,6 +110,40 @@ def _process_system_operator_callback_update(
     )
 
 
+async def _run_system_operator_callback_update(
+    session_factory: sessionmaker,
+    callback_data: str,
+    *,
+    deepcoin_client_factory=None,
+) -> str | ExpiryReviewRefreshResult | None:
+    """Finish an admitted callback unit before propagating Bot cancellation."""
+
+    processing_task = asyncio.create_task(
+        run_on_management_worker(
+            _process_system_operator_callback_update,
+            session_factory,
+            callback_data,
+            deepcoin_client_factory=deepcoin_client_factory,
+        )
+    )
+    try:
+        return await asyncio.shield(processing_task)
+    except asyncio.CancelledError:
+        # ThreadPoolExecutor cannot stop an already-running call. Keep the Bot
+        # task alive until that callback has left its database/exchange scope,
+        # then preserve cancellation as the externally visible result.
+        while not processing_task.done():
+            try:
+                await asyncio.shield(processing_task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if processing_task.done() and not processing_task.cancelled():
+            processing_task.exception()
+        raise
+
+
 async def run_telegram_bot_command_loop(
     *,
     config: StrategyAlertConfig,
@@ -211,8 +245,7 @@ async def run_system_operator_bot_command_loop(
                             and _expiry_callback_needs_deepcoin_client(callback_data)
                             else None
                         )
-                        callback_response = await run_on_management_worker(
-                            _process_system_operator_callback_update,
+                        callback_response = await _run_system_operator_callback_update(
                             session_factory,
                             callback_data,
                             deepcoin_client_factory=callback_client_factory,

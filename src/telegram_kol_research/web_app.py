@@ -4856,11 +4856,6 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.break_even_convergence_worker_task = None
-            # Both worker loops submit their blocking ticks here, so the
-            # executor is released only after both tasks are cancelled. The
-            # shutdown never waits: a tick already in flight finishes on its
-            # own thread, exactly as it did when it ran on the event loop.
-            shutdown_management_worker_executor(wait=False)
             source_deletion_worker_task = (
                 app.state.source_message_deletion_worker_task
             )
@@ -4922,6 +4917,12 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.runtime_incident_notification_task = None
+            # All long-lived producers that submit to the shared management
+            # executor are stopped before it is released. Bot callbacks wait
+            # for an already-started unit to finish, so wait=False remains
+            # bounded here and no producer can recreate the executor during
+            # the rest of lifespan shutdown.
+            shutdown_management_worker_executor(wait=False)
             reconcile_task = app.state.reconcile_task
             if reconcile_task is not None:
                 reconcile_task.cancel()
