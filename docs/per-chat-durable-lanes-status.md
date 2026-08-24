@@ -30,19 +30,19 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: claimed
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-10-final-candidate
+current_task: task-11-review-push
 verification_level: L2
-local_candidate_commit: null
+local_candidate_commit: eb9ff4c261080190e3f6d360724aec05395197ed
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
   - 4490ec2c2e3adad3268a155376d5ba0da6c0b045
-local_focused_verification: null
-local_full_suite_verification: null
-local_compileall_verified: false
-local_diff_check_verified: false
+local_focused_verification: "544 passed, 2 warnings in 36.01s"
+local_full_suite_verification: "6225 passed, 1 skipped, 32 warnings in 466.23s"
+local_compileall_verified: true
+local_diff_check_verified: true
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -260,3 +260,18 @@ cutover_authorized: false
   boundary is to classify request intent once from the first read and carry one
   concurrency-stripped payload through every non-explicit save path. No push or
   production action occurred.
+- `2026-08-24 final rebuilt Task 10 candidate`: two deterministic RED tests
+  proved the remaining MiMo-only stale full-form overwrite and Web second-read
+  misclassification (`2 failed`), then stable first-read intent plus one shared
+  concurrency-stripped local-save payload made all `11` critical Web paths GREEN.
+  The complete affected set passed `544 passed, 2 warnings in 36.01s`; compileall
+  and `git diff --check` passed. An independent read-only endpoint-level review
+  found no Critical, Important, or Minor issues: `36/36` non-explicit role/timing
+  interleavings, `10/10` explicit role/transition paths, and `16` focused
+  regressions passed. Frozen production candidate
+  `eb9ff4c261080190e3f6d360724aec05395197ed` then ran its one final complete
+  suite exactly once: `6225 passed, 1 skipped, 32 warnings in 466.23s`.
+  The workstream is `local_complete`; the remote deploy branch remains at
+  `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`. Task 11 review/push, deployment,
+  restart, production configuration, database mutation, Telegram traffic,
+  exchange action, and cutover remain unstarted and separately unauthorized.
