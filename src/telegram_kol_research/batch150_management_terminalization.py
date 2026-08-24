@@ -130,6 +130,12 @@ _COUNT_TABLES = (
     "recognition_decisions",
 )
 
+_CAS_POLICY = {
+    "execution_order_legs:553": {
+        "ignored_before_fields": ("updated_at",),
+    }
+}
+
 
 class Batch150TerminalizationRefused(RuntimeError):
     """Raised before commit whenever exact L3 evidence or CAS state differs."""
@@ -153,6 +159,7 @@ class Batch150TerminalizationPlan:
     repair_ts_utc: str
     quick_check: str
     table_counts: Mapping[str, int]
+    cas_policy: Mapping[str, Mapping[str, tuple[str, ...]]]
     database_evidence: Mapping[str, Any]
     exchange_evidence: Mapping[str, Any]
     database_fingerprint: str
@@ -247,11 +254,16 @@ def build_batch150_terminalization_plan(
     exchange_fingerprint = _sha(normalized_exchange)
     action_fingerprint = _sha([_action_payload(value) for value in actions])
     rollback_fingerprint = _sha(
-        [_reverse_action_payload(value) for value in reversed(actions)]
+        {
+            "actions": [
+                _reverse_action_payload(value) for value in reversed(actions)
+            ],
+            "cas_policy": _CAS_POLICY,
+        }
     )
     repair_ts_utc = repair_ts.isoformat(timespec="seconds")
     plan_material = {
-        "schema_version": 1,
+        "schema_version": 2,
         "mode": "batch150_historical_terminalization",
         "database_path": str(resolved),
         "target_batch_id": TARGET_BATCH_ID,
@@ -259,6 +271,7 @@ def build_batch150_terminalization_plan(
         "repair_ts_utc": repair_ts_utc,
         "quick_check": quick_check,
         "table_counts": table_counts,
+        "cas_policy": _CAS_POLICY,
         "database_fingerprint": database_fingerprint,
         "exchange_fingerprint": exchange_fingerprint,
         "action_fingerprint": action_fingerprint,
@@ -274,7 +287,7 @@ def build_batch150_terminalization_plan(
         }
     )
     plan = Batch150TerminalizationPlan(
-        schema_version=1,
+        schema_version=2,
         mode="batch150_historical_terminalization",
         database_path=str(resolved),
         target_batch_id=TARGET_BATCH_ID,
@@ -282,6 +295,7 @@ def build_batch150_terminalization_plan(
         repair_ts_utc=repair_ts_utc,
         quick_check=quick_check,
         table_counts=table_counts,
+        cas_policy=_CAS_POLICY,
         database_evidence=database_evidence,
         exchange_evidence=normalized_exchange,
         database_fingerprint=database_fingerprint,
@@ -327,9 +341,16 @@ def load_batch150_terminalization_plan(
     ):
         raise Batch150TerminalizationRefused("plan_json_invalid")
     raw_actions = payload.get("actions")
-    if not isinstance(raw_actions, list):
+    raw_cas_policy = payload.get("cas_policy")
+    if not isinstance(raw_actions, list) or not isinstance(raw_cas_policy, dict):
         raise Batch150TerminalizationRefused("plan_json_invalid")
     try:
+        payload["cas_policy"] = {
+            key: {
+                "ignored_before_fields": tuple(value["ignored_before_fields"]),
+            }
+            for key, value in raw_cas_policy.items()
+        }
         payload["actions"] = tuple(
             Batch150TerminalizationAction(
                 table=item["table"],
@@ -350,8 +371,10 @@ def render_batch150_rollback_sql(plan: Batch150TerminalizationPlan) -> str:
     _validate_plan_integrity(plan)
     lines = [
         "BEGIN IMMEDIATE;",
+        f"-- plan_fingerprint: {plan.plan_fingerprint}",
         f"-- rollback_fingerprint: {plan.rollback_fingerprint}",
         f"-- exact_action_count: {plan.action_count}",
+        "-- ignored_before_field: execution_order_legs:553 updated_at",
         "CREATE TEMP TABLE _batch150_repair_cas_guard "
         "(value INTEGER CHECK(value=1));",
     ]
@@ -366,8 +389,11 @@ def render_batch150_rollback_sql(plan: Batch150TerminalizationPlan) -> str:
         assignments = ", ".join(
             f"{column}={_sql_literal(after[column])}" for column in changed_columns
         )
+        ignored_fields = _ignored_before_fields(plan, action)
         predicates = " AND ".join(
-            f"{column} IS {_sql_literal(value)}" for column, value in before.items()
+            f"{column} IS {_sql_literal(value)}"
+            for column, value in before.items()
+            if column not in ignored_fields
         )
         lines.append(f"UPDATE {action.table} SET {assignments} WHERE {predicates};")
         lines.append("INSERT INTO _batch150_repair_cas_guard VALUES(changes());")
@@ -422,6 +448,7 @@ def main(argv: list[str] | None = None) -> int:
                 "mode": plan.mode,
                 "status": "planned",
                 "action_count": plan.action_count,
+                "cas_policy": plan.cas_policy,
                 "plan_fingerprint": plan.plan_fingerprint,
                 "action_fingerprint": plan.action_fingerprint,
                 "rollback_fingerprint": plan.rollback_fingerprint,
@@ -559,7 +586,7 @@ def _mutate_batch150_terminalization_plan(
         expected_after = tuple(
             dict(action.before if reverse else action.after) for action in actions
         )
-        if start_rows == expected_after:
+        if _rows_equal_under_policy(plan, actions, start_rows, expected_after):
             _require_quiet_target_set(connection, reverse=not reverse)
             connection.rollback()
             return Batch150TerminalizationMutationResult(
@@ -570,12 +597,12 @@ def _mutate_batch150_terminalization_plan(
                 table_counts_before=counts_before,
                 table_counts_after=counts_before,
             )
-        if start_rows != expected_before:
+        if not _rows_equal_under_policy(plan, actions, start_rows, expected_before):
             raise Batch150TerminalizationRefused("database_state_mixed")
         _require_quiet_target_set(connection, reverse=reverse)
 
         for action in actions:
-            _cas_update_action(connection, action, reverse=reverse)
+            _cas_update_action(connection, plan, action, reverse=reverse)
 
         final_rows = tuple(
             _read_action_row(connection, action, reverse=reverse)
@@ -653,6 +680,7 @@ def _read_action_row(
 
 def _cas_update_action(
     connection: sqlite3.Connection,
+    plan: Batch150TerminalizationPlan,
     action: Batch150TerminalizationAction,
     *,
     reverse: bool,
@@ -665,15 +693,50 @@ def _cas_update_action(
         if column != "id" and before[column] != after[column]
     )
     assignments = ",".join(f"{column}=?" for column in changed_columns)
-    predicates = " AND ".join(f"{column} IS ?" for column in before)
+    ignored_fields = _ignored_before_fields(plan, action)
+    predicate_columns = tuple(
+        column for column in before if column not in ignored_fields
+    )
+    predicates = " AND ".join(f"{column} IS ?" for column in predicate_columns)
     parameters = tuple(after[column] for column in changed_columns) + tuple(
-        before[column] for column in before
+        before[column] for column in predicate_columns
     )
     cursor = connection.execute(
         f"UPDATE {action.table} SET {assignments} WHERE {predicates}", parameters
     )
     if cursor.rowcount != 1:
         raise Batch150TerminalizationRefused("cas_rowcount_changed")
+
+
+def _ignored_before_fields(
+    plan: Batch150TerminalizationPlan,
+    action: Batch150TerminalizationAction,
+) -> frozenset[str]:
+    action_policy = plan.cas_policy.get(f"{action.table}:{action.pk}", {})
+    return frozenset(action_policy.get("ignored_before_fields", ()))
+
+
+def _rows_equal_under_policy(
+    plan: Batch150TerminalizationPlan,
+    actions: tuple[Batch150TerminalizationAction, ...],
+    actual_rows: tuple[Mapping[str, Any], ...],
+    expected_rows: tuple[Mapping[str, Any], ...],
+) -> bool:
+    return all(
+        {
+            key: value
+            for key, value in actual.items()
+            if key not in _ignored_before_fields(plan, action)
+        }
+        == {
+            key: value
+            for key, value in expected.items()
+            if key not in _ignored_before_fields(plan, action)
+        }
+        for action, actual, expected in zip(
+            actions, actual_rows, expected_rows, strict=True
+        )
+    )
 
 
 def _build_actions(connection: sqlite3.Connection, *, repair_db_value: str):
@@ -1014,7 +1077,7 @@ def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
         ("strategy_lifecycles", 952),
     )
     if (
-        plan.schema_version != 1
+        plan.schema_version != 2
         or plan.mode != "batch150_historical_terminalization"
         or plan.target_batch_id != TARGET_BATCH_ID
         or plan.action_count != EXPECTED_ACTION_COUNT
@@ -1022,6 +1085,7 @@ def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
         or plan.quick_check != "ok"
         or not _valid_sha(plan.code_sha)
         or set(plan.table_counts) != set(_COUNT_TABLES)
+        or _canonical_json(plan.cas_policy) != _canonical_json(_CAS_POLICY)
         or tuple((action.table, action.pk) for action in plan.actions)
         != expected_actions
         or any(
@@ -1040,7 +1104,15 @@ def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
     if _sha([_action_payload(value) for value in plan.actions]) != plan.action_fingerprint:
         raise Batch150TerminalizationRefused("action_fingerprint_invalid")
     if (
-        _sha([_reverse_action_payload(value) for value in reversed(plan.actions)])
+        _sha(
+            {
+                "actions": [
+                    _reverse_action_payload(value)
+                    for value in reversed(plan.actions)
+                ],
+                "cas_policy": plan.cas_policy,
+            }
+        )
         != plan.rollback_fingerprint
     ):
         raise Batch150TerminalizationRefused("rollback_fingerprint_invalid")
@@ -1053,6 +1125,7 @@ def _validate_plan_integrity(plan: Batch150TerminalizationPlan) -> None:
         "repair_ts_utc": plan.repair_ts_utc,
         "quick_check": plan.quick_check,
         "table_counts": dict(plan.table_counts),
+        "cas_policy": plan.cas_policy,
         "database_fingerprint": plan.database_fingerprint,
         "exchange_fingerprint": plan.exchange_fingerprint,
         "action_fingerprint": plan.action_fingerprint,

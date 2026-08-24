@@ -448,6 +448,129 @@ def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
     assert _database_digest(database_path) == original_digest
 
 
+def test_apply_tolerates_only_leg_553_updated_at_drift(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE execution_order_legs SET updated_at='runtime-refresh-before-apply' "
+        "WHERE id=553"
+    )
+    connection.commit()
+    connection.close()
+
+    result = _apply(database_path, plan)
+
+    assert result.status == "applied"
+    assert result.changed_row_count == 8
+    connection = sqlite3.connect(database_path)
+    row = connection.execute(
+        "SELECT * FROM execution_order_legs WHERE id=553"
+    ).fetchone()
+    columns = [
+        value[1]
+        for value in connection.execute("PRAGMA table_info(execution_order_legs)")
+    ]
+    connection.close()
+    action = next(value for value in plan.actions if value.pk == 553)
+    assert dict(zip(columns, row, strict=True)) == dict(action.after)
+
+
+def test_reapply_and_rollback_tolerate_leg_553_updated_at_drift(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    original_digest = _database_digest(database_path)
+    _apply(database_path, plan)
+
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE execution_order_legs SET updated_at='runtime-refresh-after-apply' "
+        "WHERE id=553"
+    )
+    connection.commit()
+    connection.close()
+    second = _apply(database_path, plan)
+    assert second.status == "already_applied"
+    assert second.changed_row_count == 0
+
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE execution_order_legs SET updated_at='runtime-refresh-before-rollback' "
+        "WHERE id=553"
+    )
+    connection.commit()
+    connection.close()
+    rolled_back = _rollback(database_path, plan)
+    assert rolled_back.status == "rolled_back"
+    assert rolled_back.changed_row_count == 8
+    assert _database_digest(database_path) == original_digest
+
+
+@pytest.mark.parametrize(
+    ("table", "pk", "column", "value"),
+    [
+        ("execution_order_legs", 553, "status", "cancelled"),
+        ("execution_order_legs", 553, "last_verified_at", "drift"),
+        ("execution_order_legs", 554, "updated_at", "drift"),
+        ("execution_bindings", 320, "updated_at", "drift"),
+    ],
+)
+def test_apply_refuses_every_nonapproved_drift(
+    tmp_path, table, pk, column, value
+):
+    database_path, plan = _build_plan(tmp_path)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        f"UPDATE {table} SET {column}=? WHERE id=?", (value, pk)
+    )
+    connection.commit()
+    connection.close()
+    drift_digest = _database_digest(database_path)
+
+    with pytest.raises(Batch150TerminalizationRefused, match="database_state_mixed"):
+        _apply(database_path, plan)
+    assert _database_digest(database_path) == drift_digest
+
+
+def test_plan_fingerprints_the_single_volatile_cas_coordinate(tmp_path):
+    _database_path, plan = _build_plan(tmp_path)
+
+    assert plan.schema_version == 2
+    assert plan.cas_policy == {
+        "execution_order_legs:553": {
+            "ignored_before_fields": ("updated_at",),
+        }
+    }
+
+    tampered = replace(plan, cas_policy={})
+    with pytest.raises(Batch150TerminalizationRefused, match="plan_integrity_invalid"):
+        _apply(_database_path, tampered)
+
+
+def test_rollback_fingerprint_and_sql_bind_the_cas_policy(tmp_path):
+    _database_path, plan = _build_plan(tmp_path)
+    legacy_actions_only = [
+        {
+            "table": action.table,
+            "pk": action.pk,
+            "before": dict(action.after),
+            "after": dict(action.before),
+        }
+        for action in reversed(plan.actions)
+    ]
+    legacy_fingerprint = hashlib.sha256(
+        json.dumps(
+            legacy_actions_only,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+    assert plan.rollback_fingerprint != legacy_fingerprint
+    rollback_sql = render_batch150_rollback_sql(plan)
+    assert plan.plan_fingerprint in rollback_sql
+    assert "execution_order_legs:553 updated_at" in rollback_sql
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [
@@ -549,6 +672,23 @@ def test_rendered_rollback_sql_restores_exact_rows(tmp_path):
     connection = sqlite3.connect(database_path)
     connection.executescript(render_batch150_rollback_sql(plan))
     connection.close()
+    assert _database_digest(database_path) == original_digest
+
+
+def test_rendered_rollback_sql_tolerates_only_leg_553_updated_at_drift(tmp_path):
+    database_path, plan = _build_plan(tmp_path)
+    original_digest = _database_digest(database_path)
+    _apply(database_path, plan)
+    connection = sqlite3.connect(database_path)
+    connection.execute(
+        "UPDATE execution_order_legs SET updated_at='runtime-refresh-before-sql' "
+        "WHERE id=553"
+    )
+    connection.commit()
+
+    connection.executescript(render_batch150_rollback_sql(plan))
+    connection.close()
+
     assert _database_digest(database_path) == original_digest
 
 
