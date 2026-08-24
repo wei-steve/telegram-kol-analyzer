@@ -1101,6 +1101,54 @@ def test_lifespan_shutdown_releases_the_management_worker_executor(tmp_path):
     runtime_worker_executor.shutdown_management_worker_executor(wait=True)
 
 
+def test_lifespan_stops_system_bot_before_management_executor_shutdown(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+    from telegram_kol_research import runtime_worker_executor
+
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+    started = threading.Event()
+    shutdown_order = []
+    real_shutdown = web_module.shutdown_management_worker_executor
+
+    async def fake_system_operator_loop(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            shutdown_order.append("system_bot_stopped")
+
+    def recording_shutdown(*, wait):
+        shutdown_order.append("executor_shutdown")
+        real_shutdown(wait=wait)
+
+    monkeypatch.setattr(
+        web_module,
+        "run_system_operator_bot_command_loop",
+        fake_system_operator_loop,
+    )
+    monkeypatch.setattr(
+        web_module,
+        "shutdown_management_worker_executor",
+        recording_shutdown,
+    )
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+
+    assert shutdown_order.index("system_bot_stopped") < shutdown_order.index(
+        "executor_shutdown"
+    )
+    runtime_worker_executor.shutdown_management_worker_executor(wait=True)
+
+
 def test_lifespan_shutdown_does_not_hang_while_a_tick_is_in_flight(tmp_path):
     from telegram_kol_research import runtime_worker_executor
 
