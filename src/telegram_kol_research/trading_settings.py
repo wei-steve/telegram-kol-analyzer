@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Literal
 
+from sqlalchemy import text
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
@@ -203,25 +204,80 @@ class TradingSettings:
         )
 
 
-def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
-    """Load global trading settings, returning safe defaults when absent."""
+class TradingSettingsConcurrencyConflict(ValueError):
+    """The persisted concurrency tuple no longer matches the caller's view."""
 
-    with session_factory() as session:
-        row = (
-            session.query(TradingSetting)
-            .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
-            .one_or_none()
-        )
-        if row is None:
-            return TradingSettings()
-        try:
-            payload = json.loads(row.value_json)
-        except json.JSONDecodeError:
-            return TradingSettings()
+
+def _settings_row_and_payload_in_session(session):
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
+        .one_or_none()
+    )
+    if row is None:
+        return None, {}
+    try:
+        payload = json.loads(row.value_json)
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return row, payload
+
+
+def _load_trading_settings_in_session(session) -> TradingSettings:
+    _row, payload = _settings_row_and_payload_in_session(session)
     try:
         return trading_settings_from_payload(payload)
     except ValueError:
         return TradingSettings()
+
+
+def _persist_trading_settings_in_session(
+    session,
+    settings: TradingSettings,
+    *,
+    updated_at: datetime,
+    row=None,
+    persisted_payload: dict[str, Any] | None = None,
+) -> None:
+    if row is None or persisted_payload is None:
+        row, persisted_payload = _settings_row_and_payload_in_session(session)
+    prior_revision_mode = str(
+        persisted_payload.get("entry_revision_v2_mode") or "disabled"
+    )
+    stored_payload = settings.to_dict()
+    if "entry_preamble_live_chat_ids" in persisted_payload:
+        stored_payload["entry_preamble_live_chat_ids"] = persisted_payload[
+            "entry_preamble_live_chat_ids"
+        ]
+    value_json = json.dumps(stored_payload, ensure_ascii=False, sort_keys=True)
+    if row is None:
+        row = TradingSetting(key=TRADING_SETTINGS_KEY, value_json=value_json)
+        session.add(row)
+    else:
+        row.value_json = value_json
+    row.updated_at = updated_at
+    if settings.entry_revision_v2_mode != prior_revision_mode:
+        activation = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == ENTRY_REVISION_ACTIVATION_KEY)
+            .one_or_none()
+        )
+        if activation is None:
+            activation = TradingSetting(key=ENTRY_REVISION_ACTIVATION_KEY)
+            session.add(activation)
+        activation.value_json = json.dumps(
+            {"mode": settings.entry_revision_v2_mode}, sort_keys=True
+        )
+        activation.updated_at = updated_at
+
+
+def load_trading_settings(session_factory: sessionmaker) -> TradingSettings:
+    """Load global trading settings, returning safe defaults when absent."""
+
+    with session_factory() as session:
+        return _load_trading_settings_in_session(session)
 
 
 def save_trading_settings(
@@ -233,51 +289,93 @@ def save_trading_settings(
     """Validate and persist global trading settings."""
 
     with session_factory() as session:
-        row = (
-            session.query(TradingSetting)
-            .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
-            .one_or_none()
-        )
-        persisted_payload: dict[str, Any] = {}
-        if row is not None:
-            try:
-                parsed_persisted = json.loads(row.value_json)
-            except json.JSONDecodeError:
-                parsed_persisted = {}
-            if isinstance(parsed_persisted, dict):
-                persisted_payload = parsed_persisted
+        row, persisted_payload = _settings_row_and_payload_in_session(session)
         merged_payload = {**persisted_payload, **payload}
         settings = trading_settings_from_payload(merged_payload)
-        prior_revision_mode = str(
-            persisted_payload.get("entry_revision_v2_mode") or "disabled"
+        _persist_trading_settings_in_session(
+            session,
+            settings,
+            updated_at=updated_at or datetime.now(UTC),
+            row=row,
+            persisted_payload=persisted_payload,
         )
-        stored_payload = settings.to_dict()
-        if "entry_preamble_live_chat_ids" in persisted_payload:
-            stored_payload["entry_preamble_live_chat_ids"] = persisted_payload[
-                "entry_preamble_live_chat_ids"
-            ]
-        value_json = json.dumps(stored_payload, ensure_ascii=False, sort_keys=True)
-        if row is None:
-            row = TradingSetting(key=TRADING_SETTINGS_KEY, value_json=value_json)
-            session.add(row)
-        else:
-            row.value_json = value_json
-        row.updated_at = updated_at or datetime.now(UTC)
-        if settings.entry_revision_v2_mode != prior_revision_mode:
-            activation = (
-                session.query(TradingSetting)
-                .filter(TradingSetting.key == ENTRY_REVISION_ACTIVATION_KEY)
-                .one_or_none()
-            )
-            if activation is None:
-                activation = TradingSetting(key=ENTRY_REVISION_ACTIVATION_KEY)
-                session.add(activation)
-            activation.value_json = json.dumps(
-                {"mode": settings.entry_revision_v2_mode}, sort_keys=True
-            )
-            activation.updated_at = updated_at or datetime.now(UTC)
         session.commit()
     return settings
+
+
+def transition_message_concurrency_settings(
+    session_factory: sessionmaker,
+    payload: dict[str, Any],
+    *,
+    updated_at: datetime | None = None,
+) -> TradingSettings:
+    """Atomically compare and replace the message concurrency tuple."""
+
+    expected_mode_key = "message_lock_expected_mode"
+    expected_cap_key = "message_processing_expected_max_parallel_chats"
+    target_mode_key = "message_lock_mode"
+    target_cap_key = "message_processing_max_parallel_chats"
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        row, persisted_payload = _settings_row_and_payload_in_session(session)
+        current = trading_settings_from_payload(persisted_payload)
+
+        if (
+            current.message_lock_mode == "global"
+            and payload.get(target_mode_key) == "per_chat"
+        ):
+            required = {
+                expected_mode_key,
+                expected_cap_key,
+                target_mode_key,
+                target_cap_key,
+            }
+            if not required.issubset(payload):
+                raise ValueError(
+                    "global to per_chat requires both target and expected fields"
+                )
+
+        candidate_payload = dict(payload)
+        candidate_payload.pop(expected_mode_key, None)
+        candidate_payload.pop(expected_cap_key, None)
+        candidate = trading_settings_from_payload(
+            {**current.to_dict(), **candidate_payload}
+        )
+        if target_mode_key in payload:
+            if expected_mode_key not in payload:
+                raise ValueError(
+                    "message lock changes require the expected message lock mode"
+                )
+            expected_mode = _message_lock_mode(payload[expected_mode_key])
+            if expected_mode != current.message_lock_mode:
+                raise TradingSettingsConcurrencyConflict(
+                    "expected message lock mode does not match persisted settings"
+                )
+        if target_cap_key in payload:
+            if expected_cap_key not in payload:
+                raise ValueError(
+                    "parallel chat limit changes require the expected parallel chat limit"
+                )
+            expected_cap = _bounded_int_setting(
+                payload[expected_cap_key],
+                field_name=expected_cap_key,
+                minimum=1,
+                maximum=20,
+            )
+            if expected_cap != current.message_processing_max_parallel_chats:
+                raise TradingSettingsConcurrencyConflict(
+                    "expected parallel chat limit does not match persisted settings"
+                )
+
+        _persist_trading_settings_in_session(
+            session,
+            candidate,
+            updated_at=updated_at or datetime.now(UTC),
+            row=row,
+            persisted_payload=persisted_payload,
+        )
+        session.commit()
+    return candidate
 
 
 def apply_trading_settings_to_group_config(

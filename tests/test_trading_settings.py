@@ -1,9 +1,11 @@
 from decimal import Decimal
 from datetime import UTC, datetime, timedelta
 import json
+import threading
 
 import pytest
 
+import telegram_kol_research.trading_settings as trading_settings_module
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.group_config import TrackedSenderConfig
@@ -304,6 +306,209 @@ def test_unrelated_save_preserves_message_parallel_chat_limit_and_lock_mode(tmp_
     reloaded = load_trading_settings(session_factory)
     assert reloaded.message_lock_mode == "per_chat"
     assert reloaded.message_processing_max_parallel_chats == 3
+
+
+def _transition_concurrency(session_factory, payload):
+    return trading_settings_module.transition_message_concurrency_settings(
+        session_factory,
+        payload,
+        updated_at=datetime(2026, 8, 24, 0, 0, tzinfo=UTC),
+    )
+
+
+def test_concurrency_transition_writes_mode_and_cap_in_one_transaction(tmp_path):
+    database_path = tmp_path / "atomic-concurrency.db"
+    writer_factory = create_session_factory(database_path)
+    reader_factory = create_session_factory(database_path)
+    save_trading_settings(
+        writer_factory,
+        {
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 20,
+        },
+    )
+    observed: list[tuple[str, int]] = []
+    ready = threading.Event()
+    stop = threading.Event()
+
+    def reader():
+        while not stop.is_set():
+            settings = load_trading_settings(reader_factory)
+            observed.append(
+                (
+                    settings.message_lock_mode,
+                    settings.message_processing_max_parallel_chats,
+                )
+            )
+            ready.set()
+
+    thread = threading.Thread(target=reader)
+    thread.start()
+    assert ready.wait(timeout=2.0)
+    try:
+        expected_mode = "global"
+        expected_cap = 20
+        for _ in range(10):
+            target_mode = "per_chat" if expected_mode == "global" else "global"
+            target_cap = 3 if expected_cap == 20 else 20
+            _transition_concurrency(
+                writer_factory,
+                {
+                    "message_lock_expected_mode": expected_mode,
+                    "message_processing_expected_max_parallel_chats": expected_cap,
+                    "message_lock_mode": target_mode,
+                    "message_processing_max_parallel_chats": target_cap,
+                },
+            )
+            expected_mode = target_mode
+            expected_cap = target_cap
+    finally:
+        stop.set()
+        thread.join(timeout=2.0)
+
+    assert not thread.is_alive()
+    assert observed
+    assert set(observed) <= {("global", 20), ("per_chat", 3)}
+    final = load_trading_settings(reader_factory)
+    assert (
+        final.message_lock_mode,
+        final.message_processing_max_parallel_chats,
+    ) == ("global", 20)
+
+
+def test_concurrency_transition_rejects_expected_mode_mismatch_without_write(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "expected-mode.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 20,
+        },
+    )
+
+    with pytest.raises(ValueError, match="expected message lock mode"):
+        _transition_concurrency(
+            session_factory,
+            {
+                "message_lock_expected_mode": "per_chat",
+                "message_processing_expected_max_parallel_chats": 20,
+                "message_lock_mode": "per_chat",
+                "message_processing_max_parallel_chats": 3,
+            },
+        )
+
+    settings = load_trading_settings(session_factory)
+    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
+        "global",
+        20,
+    )
+
+
+def test_concurrency_transition_rejects_expected_cap_mismatch_without_write(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "expected-cap.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 20,
+        },
+    )
+
+    with pytest.raises(ValueError, match="expected parallel chat limit"):
+        _transition_concurrency(
+            session_factory,
+            {
+                "message_lock_expected_mode": "global",
+                "message_processing_expected_max_parallel_chats": 3,
+                "message_lock_mode": "per_chat",
+                "message_processing_max_parallel_chats": 3,
+            },
+        )
+
+    settings = load_trading_settings(session_factory)
+    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
+        "global",
+        20,
+    )
+
+
+def test_global_to_per_chat_requires_both_target_and_expected_fields(tmp_path):
+    session_factory = create_session_factory(tmp_path / "required-transition.db")
+    complete = {
+        "message_lock_expected_mode": "global",
+        "message_processing_expected_max_parallel_chats": 20,
+        "message_lock_mode": "per_chat",
+        "message_processing_max_parallel_chats": 3,
+    }
+
+    for missing in (
+        "message_processing_max_parallel_chats",
+        "message_lock_expected_mode",
+        "message_processing_expected_max_parallel_chats",
+    ):
+        payload = dict(complete)
+        payload.pop(missing)
+        with pytest.raises(ValueError, match="global to per_chat"):
+            _transition_concurrency(session_factory, payload)
+        settings = load_trading_settings(session_factory)
+        assert (
+            settings.message_lock_mode,
+            settings.message_processing_max_parallel_chats,
+        ) == ("global", 20)
+
+
+def test_global_rollback_can_keep_cap_three(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollback-keep-cap.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "per_chat",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+
+    saved = _transition_concurrency(
+        session_factory,
+        {
+            "message_lock_expected_mode": "per_chat",
+            "message_lock_mode": "global",
+        },
+    )
+
+    assert (saved.message_lock_mode, saved.message_processing_max_parallel_chats) == (
+        "global",
+        3,
+    )
+
+
+def test_fail_closed_rollback_can_set_global_and_cap_one_atomically(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollback-cap-one.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "per_chat",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+
+    saved = _transition_concurrency(
+        session_factory,
+        {
+            "message_lock_expected_mode": "per_chat",
+            "message_processing_expected_max_parallel_chats": 3,
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 1,
+        },
+    )
+
+    assert (saved.message_lock_mode, saved.message_processing_max_parallel_chats) == (
+        "global",
+        1,
+    )
 
 
 def test_authoritative_gap_recovery_max_age_minutes_defaults_and_round_trips(tmp_path):

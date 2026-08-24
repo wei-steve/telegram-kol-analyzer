@@ -223,8 +223,10 @@ from telegram_kol_research.runtime_agent_telegram_evidence import (
 from telegram_kol_research.time_utils import DEFAULT_LOCAL_TIMEZONE
 from telegram_kol_research.trading_settings import (
     SymbolEntryThresholds,
+    TradingSettingsConcurrencyConflict,
     load_trading_settings,
     save_trading_settings,
+    transition_message_concurrency_settings,
     trading_settings_from_payload,
 )
 from telegram_kol_research.worker_command_jobs import (
@@ -297,6 +299,12 @@ from telegram_kol_research.telegram_session_lock import (
 REFRESH_TIMEOUT_SECONDS = 180
 INGEST_REFRESH_RESPONSE_MAX_BYTES = 64 * 1024
 DEFAULT_INGEST_REFRESH_URL = "http://127.0.0.1:8001/api/refresh"
+TRADING_SETTINGS_TIMEOUT_SECONDS = 10
+INGEST_TRADING_SETTINGS_RESPONSE_MAX_BYTES = 64 * 1024
+INGEST_TRADING_SETTINGS_REQUEST_MAX_BYTES = 64 * 1024
+DEFAULT_INGEST_TRADING_SETTINGS_URL = (
+    "http://127.0.0.1:8001/api/trading-settings"
+)
 MESSAGE_PAGE_SIZE = 20
 SESSION_LOCK_OWNER_PID_PATTERN = re.compile(r"owner pid=(\d+)")
 RUNTIME_ROLES = frozenset({"all", "ingest", "worker", "web"})
@@ -369,9 +377,38 @@ def resolve_ingest_refresh_url(value: str) -> str:
     return str(url)
 
 
+def resolve_ingest_trading_settings_url(value: str) -> str:
+    url = httpx.URL(str(value or "").strip())
+    if (
+        url.scheme != "http"
+        or url.host not in {"127.0.0.1", "localhost", "::1"}
+        or url.port != 8001
+        or url.path != "/api/trading-settings"
+        or url.query
+        or url.fragment
+        or url.username
+        or url.password
+    ):
+        raise ValueError(
+            "ingest trading settings URL must be localhost:8001 "
+            "/api/trading-settings over HTTP"
+        )
+    return str(url)
+
+
 async def request_ingest_refresh_once(url: str, *, timeout_seconds: float):
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         return await client.post(url)
+
+
+async def request_ingest_trading_settings_once(
+    url: str,
+    *,
+    payload: dict[str, Any],
+    timeout_seconds: float,
+):
+    async with httpx.AsyncClient(timeout=timeout_seconds) as client:
+        return await client.post(url, json=payload)
 
 
 async def proxy_ingest_refresh_once(*, requester, url: str) -> Response:
@@ -395,6 +432,73 @@ async def proxy_ingest_refresh_once(*, requester, url: str) -> Response:
             status_code=503,
             detail={"code": "ingest_refresh_invalid_response", "outcome": "unknown"},
         ) from exc
+    return Response(
+        content=response.content,
+        status_code=response.status_code,
+        media_type="application/json",
+    )
+
+
+async def proxy_ingest_trading_settings_once(
+    *,
+    requester,
+    url: str,
+    payload: dict[str, Any],
+) -> Response:
+    encoded_payload = json.dumps(
+        payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    if len(encoded_payload) > INGEST_TRADING_SETTINGS_REQUEST_MAX_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail={"code": "ingest_trading_settings_request_too_large"},
+        )
+    try:
+        response = await requester(
+            url,
+            payload=payload,
+            timeout_seconds=TRADING_SETTINGS_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "ingest trading settings RPC outcome unknown: %s",
+            type(exc).__name__,
+        )
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ingest_trading_settings_unavailable",
+                "outcome": "unknown",
+            },
+        ) from exc
+    if len(response.content) > INGEST_TRADING_SETTINGS_RESPONSE_MAX_BYTES:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ingest_trading_settings_invalid_response",
+                "outcome": "unknown",
+            },
+        )
+    try:
+        decoded = response.json()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ingest_trading_settings_invalid_response",
+                "outcome": "unknown",
+            },
+        ) from exc
+    if not isinstance(decoded, dict):
+        raise HTTPException(
+            status_code=503,
+            detail={
+                "code": "ingest_trading_settings_invalid_response",
+                "outcome": "unknown",
+            },
+        )
     return Response(
         content=response.content,
         status_code=response.status_code,
@@ -4198,6 +4302,8 @@ def create_web_app(
     runtime_role: str = "all",
     ingest_refresh_url: str = DEFAULT_INGEST_REFRESH_URL,
     ingest_refresh_requester=None,
+    ingest_trading_settings_url: str = DEFAULT_INGEST_TRADING_SETTINGS_URL,
+    ingest_trading_settings_requester=None,
     media_root: str | Path | None = None,
     live_target_titles: set[str] | None = None,
     live_listener_runner=None,
@@ -4259,6 +4365,9 @@ def create_web_app(
     resolved_runtime_role = resolve_runtime_role(runtime_role)
     split_runtime = resolved_runtime_role != "all"
     resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
+    resolved_ingest_trading_settings_url = resolve_ingest_trading_settings_url(
+        ingest_trading_settings_url
+    )
     resolved_database_path = Path(database_path)
     log_directory = resolved_database_path.parent / "logs"
     configure_application_logging(log_directory)
@@ -4830,6 +4939,11 @@ def create_web_app(
     app.state.ingest_refresh_url = resolved_ingest_refresh_url
     app.state.ingest_refresh_requester = (
         ingest_refresh_requester or request_ingest_refresh_once
+    )
+    app.state.ingest_trading_settings_url = resolved_ingest_trading_settings_url
+    app.state.ingest_trading_settings_requester = (
+        ingest_trading_settings_requester
+        or request_ingest_trading_settings_once
     )
     app.state.runtime_agent_production_audit_runner = (
         runtime_agent_production_audit_runner
@@ -7521,6 +7635,32 @@ def create_web_app(
 
     @app.post("/api/trading-settings")
     async def update_trading_settings(payload: dict[str, Any]):
+        try:
+            current = load_trading_settings(app.state.session_factory)
+            candidate = trading_settings_from_payload(
+                {**current.to_dict(), **payload}
+            )
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        concurrency_change = (
+            candidate.message_lock_mode != current.message_lock_mode
+            or candidate.message_processing_max_parallel_chats
+            != current.message_processing_max_parallel_chats
+        )
+        if concurrency_change and app.state.runtime_role == "web":
+            return await proxy_ingest_trading_settings_once(
+                requester=app.state.ingest_trading_settings_requester,
+                url=app.state.ingest_trading_settings_url,
+                payload=payload,
+            )
+        if concurrency_change and app.state.runtime_role == "worker":
+            raise HTTPException(
+                status_code=503,
+                detail={
+                    "code": "concurrency_transition_not_owned_by_runtime_role"
+                },
+            )
+
         refresh_status = None
         orchestrator = app.state.contract_spec_refresh_orchestrator
         if orchestrator is not None:
@@ -7543,24 +7683,51 @@ def create_web_app(
                 or candidate.mimo_v2_activation_after_raw_message_id
                 != current.mimo_v2_activation_after_raw_message_id
             )
-            if mimo_contract_change:
+            concurrency_change = (
+                candidate.message_lock_mode != current.message_lock_mode
+                or candidate.message_processing_max_parallel_chats
+                != current.message_processing_max_parallel_chats
+            )
+            if mimo_contract_change or concurrency_change:
                 async with app.state.message_lock_provider.lock_all():
                     locked_current = load_trading_settings(
                         app.state.session_factory
                     )
-                    _require_expected_mimo_contract_state(
-                        locked_current,
-                        payload=payload,
+                    locked_candidate = trading_settings_from_payload(
+                        {**locked_current.to_dict(), **payload}
                     )
-                    _validate_mimo_contract_activation(
+                    require_worker_command_mode_transition_safe(
                         app.state.session_factory,
-                        payload=payload,
+                        current_mode=locked_current.worker_command_mode,
+                        candidate_mode=locked_candidate.worker_command_mode,
                     )
-                    response = save_trading_settings(
-                        app.state.session_factory,
-                        payload,
-                        updated_at=app.state.now_provider(),
-                    ).to_dict()
+                    locked_mimo_change = (
+                        locked_candidate.mimo_contract_mode
+                        != locked_current.mimo_contract_mode
+                        or locked_candidate.mimo_v2_activation_after_raw_message_id
+                        != locked_current.mimo_v2_activation_after_raw_message_id
+                    )
+                    if locked_mimo_change:
+                        _require_expected_mimo_contract_state(
+                            locked_current,
+                            payload=payload,
+                        )
+                        _validate_mimo_contract_activation(
+                            app.state.session_factory,
+                            payload=payload,
+                        )
+                    if concurrency_change:
+                        response = transition_message_concurrency_settings(
+                            app.state.session_factory,
+                            payload,
+                            updated_at=app.state.now_provider(),
+                        ).to_dict()
+                    else:
+                        response = save_trading_settings(
+                            app.state.session_factory,
+                            payload,
+                            updated_at=app.state.now_provider(),
+                        ).to_dict()
             else:
                 payload_without_unchanged_mimo = dict(payload)
                 payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
@@ -7576,11 +7743,21 @@ def create_web_app(
                     "mimo_contract_expected_watermark",
                     None,
                 )
+                payload_without_unchanged_mimo.pop(
+                    "message_lock_expected_mode",
+                    None,
+                )
+                payload_without_unchanged_mimo.pop(
+                    "message_processing_expected_max_parallel_chats",
+                    None,
+                )
                 response = save_trading_settings(
                     app.state.session_factory,
                     payload_without_unchanged_mimo,
                     updated_at=app.state.now_provider(),
                 ).to_dict()
+        except TradingSettingsConcurrencyConflict as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         await ensure_message_processing_worker_mode()

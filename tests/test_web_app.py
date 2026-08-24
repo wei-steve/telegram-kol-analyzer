@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 from datetime import timedelta
 from types import SimpleNamespace
 
+import httpx
 from fastapi.testclient import TestClient
 import pytest
 
@@ -1749,6 +1750,209 @@ def test_unrelated_trading_settings_save_does_not_take_telegram_operation_lock(
 
     assert response.status_code == 200
     assert observed == [False]
+
+
+def _trading_settings_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/trading-settings"
+        and "POST" in getattr(route, "methods", set())
+    )
+
+
+def _per_chat_three_transition_payload():
+    return {
+        "message_lock_expected_mode": "global",
+        "message_processing_expected_max_parallel_chats": 20,
+        "message_lock_mode": "per_chat",
+        "message_processing_max_parallel_chats": 3,
+    }
+
+
+def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
+    tmp_path,
+):
+    calls = []
+
+    async def requester(url, *, payload, timeout_seconds):
+        calls.append(
+            {
+                "url": url,
+                "payload": payload,
+                "timeout_seconds": timeout_seconds,
+            }
+        )
+        return httpx.Response(
+            200,
+            json={
+                "message_lock_mode": "per_chat",
+                "message_processing_max_parallel_chats": 3,
+            },
+        )
+
+    app = create_web_app(
+        database_path=tmp_path / "web-proxy.db",
+        runtime_role="web",
+        ingest_trading_settings_requester=requester,
+    )
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json=_per_chat_three_transition_payload(),
+    )
+
+    assert response.status_code == 200
+    assert response.json()["message_lock_mode"] == "per_chat"
+    assert response.json()["message_processing_max_parallel_chats"] == 3
+    assert calls == [
+        {
+            "url": "http://127.0.0.1:8001/api/trading-settings",
+            "payload": _per_chat_three_transition_payload(),
+            "timeout_seconds": web_app_module.TRADING_SETTINGS_TIMEOUT_SECONDS,
+        }
+    ]
+    local = web_app_module.load_trading_settings(app.state.session_factory)
+    assert (local.message_lock_mode, local.message_processing_max_parallel_chats) == (
+        "global",
+        20,
+    )
+
+
+def test_ingest_role_holds_exclusive_message_admission_during_transition(
+    tmp_path,
+):
+    app = create_web_app(
+        database_path=tmp_path / "ingest-transition.db",
+        runtime_role="ingest",
+    )
+    endpoint = _trading_settings_endpoint(app)
+    old_entered = asyncio.Event()
+    release_old = asyncio.Event()
+    future_attempted = asyncio.Event()
+    future_entered = asyncio.Event()
+    future_tuple = []
+
+    async def old_operation():
+        async with app.state.message_lock_provider(101):
+            old_entered.set()
+            await release_old.wait()
+
+    async def future_operation():
+        future_attempted.set()
+        async with app.state.message_lock_provider(202):
+            settings = web_app_module.load_trading_settings(
+                app.state.session_factory
+            )
+            future_tuple.append(
+                (
+                    settings.message_lock_mode,
+                    settings.message_processing_max_parallel_chats,
+                )
+            )
+            future_entered.set()
+
+    async def wait_for_writer():
+        for _ in range(200):
+            if app.state.message_lock_registry.snapshot()[
+                "waiting_exclusive_admissions"
+            ] == 1:
+                return
+            await asyncio.sleep(0)
+        raise AssertionError("settings transition never requested exclusive admission")
+
+    async def scenario():
+        old_task = asyncio.create_task(old_operation())
+        await old_entered.wait()
+        transition_task = asyncio.create_task(
+            endpoint(_per_chat_three_transition_payload())
+        )
+        await wait_for_writer()
+        future_task = asyncio.create_task(future_operation())
+        await future_attempted.wait()
+        await asyncio.sleep(0)
+        assert not future_entered.is_set()
+
+        release_old.set()
+        response = await asyncio.wait_for(transition_task, timeout=5.0)
+        assert response["message_lock_mode"] == "per_chat"
+        assert response["message_processing_max_parallel_chats"] == 3
+        await asyncio.wait_for(
+            asyncio.gather(old_task, future_task), timeout=5.0
+        )
+
+    asyncio.run(scenario())
+
+    assert future_tuple == [("per_chat", 3)]
+
+
+def test_worker_role_refuses_direct_concurrency_transition(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "worker-refusal.db",
+        runtime_role="worker",
+    )
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json=_per_chat_three_transition_payload(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "concurrency_transition_not_owned_by_runtime_role"
+    }
+    settings = web_app_module.load_trading_settings(app.state.session_factory)
+    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
+        "global",
+        20,
+    )
+
+
+def test_transition_unknown_outcome_does_not_blindly_retry(tmp_path):
+    calls = []
+
+    async def requester(url, *, payload, timeout_seconds):
+        calls.append((url, payload, timeout_seconds))
+        raise httpx.ReadTimeout("response lost after possible commit")
+
+    app = create_web_app(
+        database_path=tmp_path / "unknown-outcome.db",
+        runtime_role="web",
+        ingest_trading_settings_requester=requester,
+    )
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json=_per_chat_three_transition_payload(),
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == {
+        "code": "ingest_trading_settings_unavailable",
+        "outcome": "unknown",
+    }
+    assert len(calls) == 1
+
+
+def test_unrelated_settings_save_does_not_take_exclusive_admission(
+    tmp_path,
+    monkeypatch,
+):
+    app = create_web_app(database_path=tmp_path / "unrelated-admission.db")
+    real_lock_all = app.state.message_lock_provider.lock_all
+    calls = []
+
+    def tracking_lock_all():
+        calls.append("exclusive")
+        return real_lock_all()
+
+    monkeypatch.setattr(app.state.message_lock_provider, "lock_all", tracking_lock_all)
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json={"default_max_loss_usdt": 25},
+    )
+
+    assert response.status_code == 200
+    assert calls == []
 
 
 @pytest.mark.parametrize("mode", ["shadow", "v2", "live"])

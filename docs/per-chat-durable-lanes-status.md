@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-8-atomic-settings-transition
+current_task: task-9-observability-authority
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -158,3 +158,13 @@ cutover_authorized: false
   `21 passed in 1.88s`. Cancelled async slots retain their exact claim token
   and attempt count for stale-lease recovery, while later same-chat work stays
   blocked and a second worker cannot duplicate a live claim.
+- `2026-08-24 task 8 RED`: the selected transaction/role slice failed all 6
+  tests because the atomic helper, Web-to-ingest requester, ingest exclusive
+  admission, and worker refusal were absent.
+- `2026-08-24 task 8 GREEN`: added a `BEGIN IMMEDIATE` expected-state tuple
+  transition and bounded localhost:8001 settings proxy. All 11 new transaction
+  and role contracts passed; settings/Web selection passed
+  `241 passed, 219 deselected in 7.19s`, and full settings/listener/pipeline
+  compatibility passed `220 passed in 5.09s`. Unknown proxy outcomes are not
+  retried, expected-state conflicts do not write, and unrelated saves avoid
+  exclusive admission.
