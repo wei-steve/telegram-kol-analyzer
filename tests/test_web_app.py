@@ -1925,6 +1925,56 @@ def test_explicit_noop_concurrency_transition_rejects_stale_expected_state(
     )
 
 
+def test_unrelated_full_settings_payload_cannot_reverse_concurrent_transition(
+    tmp_path,
+    monkeypatch,
+):
+    app = create_web_app(
+        database_path=tmp_path / "full-payload-interleaving.db",
+        runtime_role="ingest",
+    )
+    real_save = web_app_module.save_trading_settings
+    interleavings = []
+
+    def save_after_concurrent_transition(session_factory, payload, **kwargs):
+        if not interleavings:
+            web_app_module.transition_message_concurrency_settings(
+                session_factory,
+                {
+                    "message_lock_expected_mode": "global",
+                    "message_processing_expected_max_parallel_chats": 20,
+                    "message_lock_mode": "per_chat",
+                    "message_processing_max_parallel_chats": 3,
+                },
+            )
+            interleavings.append("cutover_committed")
+        return real_save(session_factory, payload, **kwargs)
+
+    monkeypatch.setattr(
+        web_app_module,
+        "save_trading_settings",
+        save_after_concurrent_transition,
+    )
+
+    response = TestClient(app).post(
+        "/api/trading-settings",
+        json={
+            "default_max_loss_usdt": 25,
+            "message_lock_mode": "global",
+            "message_processing_max_parallel_chats": 20,
+        },
+    )
+
+    assert response.status_code == 200
+    assert interleavings == ["cutover_committed"]
+    final = web_app_module.load_trading_settings(app.state.session_factory)
+    assert final.default_max_loss_usdt == 25
+    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
+        "per_chat",
+        3,
+    )
+
+
 def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
     tmp_path,
 ):
