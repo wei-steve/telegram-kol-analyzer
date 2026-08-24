@@ -363,7 +363,12 @@ cutover_authorized: false
   review found no Critical or Important issue after two documentation-only
   corrections. Frozen production-code candidate
   `4d6950ad9919a9fb71f8f54a73c45d85912b9272` then passed the one final suite:
-  `6231 passed, 1 skipped, 32 warnings in 475.29s`. Batch `150` remains untouched
-  and needs fresh complete exchange evidence plus a separately authorized exact
-  recovery operation; the rebuilt candidate is local only and has no push or
-  deployment authorization.
+  `6231 passed, 1 skipped, 32 warnings in 475.29s`. One corrected, bounded
+  read-only exchange snapshot then completed all six reads: the target posId was
+  absent from live positions, had one exact position-history row, and none of
+  its four owned protection order IDs remained pending; the binding's verified
+  sibling leg remains active in the database. Batch `150` is therefore eligible
+  only for an exact historical-target terminalization that preserves the active
+  sibling, binding, and lifecycle. It remains untouched until a separately
+  authorized production data repair; the rebuilt candidate is local only and
+  has no push or deployment authorization.
