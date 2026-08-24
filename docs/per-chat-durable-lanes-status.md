@@ -30,20 +30,21 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
+workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-17-review-push
+current_task: task-16-cancellation-shutdown-red-green
 verification_level: L2
-local_candidate_commit: de0ae43498dc5b330f3e61c70eb8ebb27d50b269
+local_candidate_commit: null
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
   - 4490ec2c2e3adad3268a155376d5ba0da6c0b045
   - eb9ff4c261080190e3f6d360724aec05395197ed
-local_focused_verification: "398 passed, 2 warnings in 39.93s"
-local_full_suite_verification: "6227 passed, 1 skipped, 32 warnings in 514.56s"
-local_compileall_verified: true
-local_diff_check_verified: true
+  - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
+local_focused_verification: null
+local_full_suite_verification: null
+local_compileall_verified: false
+local_diff_check_verified: false
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -300,3 +301,13 @@ cutover_authorized: false
   deployment, restart, production setting, cutover, manufactured Telegram
   traffic, database mutation, or exchange action occurred; all production
   actions remain separately unauthorized.
+- `2026-08-24 task 16 rebuilt-candidate review`: independent read-only review
+  invalidated candidate `de0ae43498dc5b330f3e61c70eb8ebb27d50b269` and its
+  `6227`-test evidence before any push or production action. Cancelling the Bot
+  task cancelled only the asyncio proxy while the already-started management
+  callback continued, and lifespan shut down the management executor before
+  stopping the newly added Bot producer. The approved repair remains local
+  RED-to-GREEN work: cancellation must wait for the in-flight callback unit,
+  and every management-executor producer must stop before executor shutdown.
+  No deployment, restart, production setting, cutover, traffic, database, or
+  exchange action is authorized.
