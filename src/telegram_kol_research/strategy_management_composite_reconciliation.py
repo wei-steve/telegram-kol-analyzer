@@ -250,7 +250,7 @@ def _complete_snapshot(client, instrument_id):
     return {
         "positions": read("list_positions"),
         "pending": read("list_trigger_orders_pending"),
-        "history": [*read("list_trigger_orders_history"), *read("list_order_history")],
+        "history": [*read("list_trigger_order_history"), *read("list_order_history")],
         "fills": read("list_trade_fills"),
     }
 

@@ -4,7 +4,7 @@
 
 **Goal:** Make composite management preflight use the real Deepcoin trigger-history interface and prevent future test-double drift.
 
-**Architecture:** Keep `DeepcoinTradingClientProtocol.list_trigger_order_history()` as the single canonical interface. Change the executor snapshot call and its test double to that name, with one production-shaped regression test proving the snapshot reaches planning instead of failing on a missing method.
+**Architecture:** Keep `DeepcoinTradingClientProtocol.list_trigger_order_history()` as the single canonical interface. Change the executor and restart reconciler snapshot calls plus their shared test double to that name, with production-shaped regression coverage proving snapshots reach planning or reconciliation instead of failing on a missing method.
 
 **Tech Stack:** Python, pytest, SQLAlchemy test database, Deepcoin client protocol
 
@@ -23,9 +23,11 @@
 
 **Files:**
 - Modify: `src/telegram_kol_research/strategy_management_composite_executor.py`
+- Modify: `src/telegram_kol_research/strategy_management_composite_reconciliation.py`
 - Test: `tests/test_strategy_management_executor.py`
 
-1. Replace the plural trigger-history call with `list_trigger_order_history()`.
+1. Replace both plural trigger-history calls with `list_trigger_order_history()`.
 2. Re-run the RED test and verify GREEN.
 3. Run the focused composite-management test slice and verify no regression.
-4. Review the explicit diff and commit only the two code paths plus these plan files.
+4. Review the explicit diff and commit only the two production code paths, the
+   shared regression test file, and these plan files.

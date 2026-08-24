@@ -5808,7 +5808,7 @@ class _CompositeConsumptionClient:
     def list_trigger_orders_pending(self, *, inst_id):
         return list(self.pending)
 
-    def list_trigger_orders_history(self, *, inst_id):
+    def list_trigger_order_history(self, *, inst_id):
         return list(self.history)
 
     def list_order_history(self, *, inst_id):
