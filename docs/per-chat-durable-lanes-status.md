@@ -30,11 +30,11 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: in_progress
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-16-queued-cancellation-error-red-green
+current_task: task-17-review-push
 verification_level: L2
-local_candidate_commit: null
+local_candidate_commit: e03622749c32ebb214af56cd118984268e72af56
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -42,10 +42,10 @@ invalidated_local_candidate_commits:
   - eb9ff4c261080190e3f6d360724aec05395197ed
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
-local_focused_verification: null
-local_full_suite_verification: null
-local_compileall_verified: false
-local_diff_check_verified: false
+local_focused_verification: "402 passed, 2 warnings in 39.77s; final callback state slice 5 passed"
+local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 492.58s"
+local_compileall_verified: true
+local_diff_check_verified: true
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -322,3 +322,26 @@ cutover_authorized: false
   executing it, drain only work that actually started, preserve final Bot
   cancellation, and record a safe update-id exception log. Production actions
   remain unauthorized.
+- `2026-08-24 final task 16 callback candidate`: deterministic RED proved both
+  remaining review findings (`2 failed`): a callback queued behind a saturated
+  management worker did not cancel promptly and later executed, while a
+  running callback failure during cancellation produced no captured audit log.
+  GREEN added one lock-linearized queued/started unit: queued cancellation wins
+  without client construction or processor invocation; started work drains;
+  running failure logs exactly one safe update ID with `exc_info`; repeated
+  cancellation still ends as `CancelledError`. The five callback state tests
+  passed, and a sentinel now proves the executor advanced past the cancelled
+  queue position without timing assumptions. Final affected Bot/census/Web
+  verification passed `402 passed, 2 warnings in 39.77s`; `git diff --check`
+  and compileall passed. Independent read-only review found no Critical or
+  Important issues, ran 2,000 queued/start races with zero cases where cancel
+  won and the processor started, and returned Ready. The first complete suite
+  reached `6230 passed, 1 skipped` but failed one test-only `caplog` assertion:
+  the error and traceback were visibly emitted, while prior global logger state
+  prevented capture. Replacing only that test fixture with a direct logger-call
+  assertion passed the complete callback file (`18 passed`). Production code
+  remained frozen at `e03622749c32ebb214af56cd118984268e72af56`; the final
+  complete suite then passed `6231 passed, 1 skipped, 32 warnings in 492.58s`.
+  The workstream is `local_complete`. No push, deployment, restart, production
+  setting, cutover, manufactured traffic, database mutation, or exchange
+  action occurred or is authorized.
