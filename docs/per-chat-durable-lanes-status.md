@@ -30,16 +30,16 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: claimed
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-10-final-candidate
+current_task: task-11-review-push
 verification_level: L2
-local_candidate_commit: null
+local_candidate_commit: c0e2471ed76b6d73bceb3be3d88304e57e44088d
 invalidated_local_candidate_commit: c8f778201c123f0bbadddc06e718945307adf40b
-local_focused_verification: null
-local_full_suite_verification: null
-local_compileall_verified: false
-local_diff_check_verified: false
+local_focused_verification: "541 passed, 2 warnings in 36.65s"
+local_full_suite_verification: "6222 passed, 1 skipped, 32 warnings in 503.19s"
+local_compileall_verified: true
+local_diff_check_verified: true
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -222,3 +222,20 @@ cutover_authorized: false
   after a lower cap was applied. The owner approved RED-to-GREEN remediation and
   rebuilding Task 10 under design A. Push, deployment, restart, production
   configuration, database mutation, and exchange action remain unauthorized.
+- `2026-08-24 task 10 rebuilt candidate`: all three independent-review findings
+  were repaired under RED-to-GREEN TDD. The new tests first proved `3` explicit
+  no-op role/admission failures, `1` stale settings overwrite, and `1` lowered-cap
+  oversubscription; paired expected fields without targets also failed `2`
+  validation cases. The final implementation routes every explicit expected-state
+  concurrency request through the owning role and exclusive admission, serializes
+  all settings read-merge-write transactions with `BEGIN IMMEDIATE`, and performs
+  scheduler-owned claim/refill only up to the current available capacity. The
+  affected compatibility set passed `541 passed, 2 warnings in 36.65s`.
+  `git diff --check` and compileall passed. Production candidate
+  `c0e2471ed76b6d73bceb3be3d88304e57e44088d` then ran the one authorized final
+  complete suite exactly once: `6222 passed, 1 skipped, 32 warnings in 503.19s`.
+  The remote deploy branch remained exactly
+  `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`. No push, deployment, restart,
+  production configuration, database mutation, Telegram traffic, or exchange
+  action occurred; Task 11 review/push and all production/cutover gates remain
+  separately unauthorized.
