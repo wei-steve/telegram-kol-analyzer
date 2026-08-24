@@ -7765,6 +7765,14 @@ def create_web_app(
                     "mimo_contract_expected_watermark",
                     None,
                 )
+                # The concurrency tuple matched when this ordinary-save path
+                # was selected. Do not let stale full-form values overwrite a
+                # transition that commits before the save transaction begins.
+                payload_without_unchanged_mimo.pop("message_lock_mode", None)
+                payload_without_unchanged_mimo.pop(
+                    "message_processing_max_parallel_chats",
+                    None,
+                )
                 payload_without_unchanged_mimo.pop(
                     "message_lock_expected_mode",
                     None,
