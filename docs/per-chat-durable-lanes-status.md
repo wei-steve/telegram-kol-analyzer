@@ -47,10 +47,10 @@ local_focused_verification: "composite slice 33 passed; complete strategy-manage
 local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 475.29s"
 local_compileall_verified: true
 local_diff_check_verified: true
-batch150_terminalization_tool_commit: 13ad300e42cd7fc436b6ebb6aafeacac15df3317
-batch150_rehearsal_status: passed_copy_only
-batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-terminalization-rehearsal-20260824T221044Z/rehearsal-summary.json
-batch150_production_apply_plan_status: invalidated_by_natural_updated_at_drift
+batch150_terminalization_tool_commit: 868bbf378d77960a05dd199b3c1df6b6cb78621b
+batch150_rehearsal_status: passed_copy_only_volatile_cas
+batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/rehearsal-summary.json
+batch150_production_apply_plan_status: not_built_not_authorized
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -414,3 +414,47 @@ cutover_authorized: false
   writes remain unauthorized; the next step requires an explicit choice between
   quiescing the relevant writer and approving a narrowly revised volatile-field
   CAS design.
+- `2026-08-24 batch 150 controlled volatile-CAS rebuild`: owner approved the
+  narrow design that treats only
+  `execution_order_legs.id=553.updated_at` as volatile in starting-state
+  classification and CAS predicates. It remains in before/after evidence, is
+  still written by apply/rollback, and is checked exactly by the transactional
+  postcondition. Design and execution-plan commits are
+  `c402b124bc957b9bacc9e794d1223b846172c9fe` and
+  `f67d71c5ab6d2e73e48d039c3fdf4464362189d2`. RED reproduced four exact
+  failures while 33 prior/counterexample tests passed. GREEN plus the review
+  correction binds the single CAS policy into schema-v2 plan and rollback
+  fingerprints and the rendered SQL; the new file passed 38 tests and the
+  final affected compatibility set passed `88 passed in 3.53s`, with compile,
+  CLI, and diff checks clean. Exact tool commit
+  `868bbf378d77960a05dd199b3c1df6b6cb78621b`, tool SHA-256
+  `a8be99433fcc8ceebcfd002cddedcc7d38e144145abafe5d027e8b5ceec15d86`.
+  Fresh immutable online backup
+  `/Users/steven/.codex/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/research-online-backup.db`
+  has SHA-256 `073e8a138a2b5ccab9447c90aeae506a6b465ddc9dddea36a5c4f5f0a0afc28a`,
+  mode `0600`, and `quick_check=ok`; its independent SQLite rehearsal copy
+  initially had SHA-256
+  `7ea91b93f86210ec8ccf999cd0df2b8be3266991a96ed9590d6cf9f438c6df3d`.
+  Complete fresh GET-only Deepcoin evidence again proved both exact full-close
+  histories, parent-trigger to unique-child to sibling-posId lineage, both
+  owned stops, and empty related live/open/pending sets with zero exchange
+  writes. Private evidence root:
+  `/opt/telegram-kol-analyzer/data/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/`.
+  The schema-v2 plan contains exactly
+  `execution_order_legs:553 -> ignored_before_fields=[updated_at]`; plan/action/
+  rollback fingerprints are respectively
+  `0ef630e968e8eb8e7aa22d2b85a68e0a3983bb3cbb00e8eaef4bda1597c63c01`,
+  `8a1fdebcce8287479f0d006d279c59bad3318cd77a8ceac2e7a56d6cd040a0a6`,
+  and `fe12e9702b9544e646d94c718f516a867ca454c9b44f3d2d3cd40ffca21ede32`.
+  Three copy-only leg-553 timestamp drifts passed `applied/8`,
+  `already_applied/0`, and `rolled_back/8`, restoring the exact complete before
+  rows. A separate `leg553.last_verified_at` drift refused with
+  `database_state_mixed`, zero repair writes, and exact cleanup. Production
+  remained exact `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb`, split services active,
+  monolith inactive, `global + 20`, and target rows equal the backup under the
+  one-field policy. One natural claimed job appeared at the first stop snapshot
+  and cleared on the single allowed read-only retry; final unsafe management and
+  claimed jobs were zero, source `query_only=1` / `total_changes=0` /
+  `quick_check=ok`, and production/exchange writes were zero. No production
+  apply plan was built. Push, deployment, restart, cutover, replay, settings
+  mutation, production DB apply, and exchange writes remain unauthorized.
