@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -110,25 +111,69 @@ def _process_system_operator_callback_update(
     )
 
 
+class _SystemOperatorCallbackUnit:
+    """Atomically distinguish queued cancellation from in-flight work."""
+
+    def __init__(
+        self,
+        session_factory: sessionmaker,
+        callback_data: str,
+        *,
+        deepcoin_client_factory=None,
+    ) -> None:
+        self._session_factory = session_factory
+        self._callback_data = callback_data
+        self._deepcoin_client_factory = deepcoin_client_factory
+        self._state_lock = threading.Lock()
+        self._cancelled_before_start = False
+        self._started = False
+
+    def cancel_if_queued(self) -> bool:
+        with self._state_lock:
+            if self._started:
+                return False
+            self._cancelled_before_start = True
+            return True
+
+    def __call__(self) -> str | ExpiryReviewRefreshResult | None:
+        with self._state_lock:
+            if self._cancelled_before_start:
+                return None
+            self._started = True
+        return _process_system_operator_callback_update(
+            self._session_factory,
+            self._callback_data,
+            deepcoin_client_factory=self._deepcoin_client_factory,
+        )
+
+
 async def _run_system_operator_callback_update(
     session_factory: sessionmaker,
     callback_data: str,
     *,
+    update_id: int,
     deepcoin_client_factory=None,
 ) -> str | ExpiryReviewRefreshResult | None:
     """Finish an admitted callback unit before propagating Bot cancellation."""
 
+    callback_unit = _SystemOperatorCallbackUnit(
+        session_factory,
+        callback_data,
+        deepcoin_client_factory=deepcoin_client_factory,
+    )
     processing_task = asyncio.create_task(
-        run_on_management_worker(
-            _process_system_operator_callback_update,
-            session_factory,
-            callback_data,
-            deepcoin_client_factory=deepcoin_client_factory,
-        )
+        run_on_management_worker(callback_unit)
     )
     try:
         return await asyncio.shield(processing_task)
     except asyncio.CancelledError:
+        if callback_unit.cancel_if_queued():
+            processing_task.cancel()
+            try:
+                await processing_task
+            except asyncio.CancelledError:
+                pass
+            raise
         # ThreadPoolExecutor cannot stop an already-running call. Keep the Bot
         # task alive until that callback has left its database/exchange scope,
         # then preserve cancellation as the externally visible result.
@@ -140,7 +185,17 @@ async def _run_system_operator_callback_update(
             except Exception:
                 break
         if processing_task.done() and not processing_task.cancelled():
-            processing_task.exception()
+            processing_error = processing_task.exception()
+            if processing_error is not None:
+                logger.error(
+                    "System operator bot failed to process update_id=%s",
+                    update_id,
+                    exc_info=(
+                        type(processing_error),
+                        processing_error,
+                        processing_error.__traceback__,
+                    ),
+                )
         raise
 
 
@@ -248,6 +303,7 @@ async def run_system_operator_bot_command_loop(
                         callback_response = await _run_system_operator_callback_update(
                             session_factory,
                             callback_data,
+                            update_id=update_id,
                             deepcoin_client_factory=callback_client_factory,
                         )
                         if isinstance(
