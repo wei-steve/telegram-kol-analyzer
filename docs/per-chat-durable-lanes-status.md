@@ -47,6 +47,10 @@ local_focused_verification: "composite slice 33 passed; complete strategy-manage
 local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 475.29s"
 local_compileall_verified: true
 local_diff_check_verified: true
+batch150_terminalization_tool_commit: 13ad300e42cd7fc436b6ebb6aafeacac15df3317
+batch150_rehearsal_status: passed_copy_only
+batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-terminalization-rehearsal-20260824T221044Z/rehearsal-summary.json
+batch150_production_apply_plan_status: invalidated_by_natural_updated_at_drift
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -374,3 +378,39 @@ cutover_authorized: false
   derives one compare-and-set terminalization plus rollback from that evidence.
   The batch remains untouched; the rebuilt candidate is local only and has no
   push or deployment authorization.
+- `2026-08-24 batch 150 exact L3 copy rehearsal`: owner-authorized work proved
+  the previously unknown sibling history with one bounded, complete read-only
+  Deepcoin snapshot. Target posId `1001124956792734` and sibling posId
+  `1001124961572300` each had one exact full-close history row; parent trigger
+  `1001124956792983` mapped to the unique filled child regular order and sibling
+  posId, both owned stops had the exact close timestamp, and the current related
+  position/open/pending sets were empty. Tool commit
+  `13ad300e42cd7fc436b6ebb6aafeacac15df3317` passed its RED-to-GREEN tests and
+  the focused compatibility set (`79 passed`), compile, CLI, diff check, and
+  self-review. The server had space for only one 713 MB copy, so the verified
+  immutable online backup was retained privately at
+  `/Users/steven/.codex/evidence/batch150-terminalization-rehearsal-20260824T221044Z/research-online-backup.db`
+  (SHA-256 `3a1d34bc4613f4753e5885d84b051a09cf2b0b6b3a25eafe33ab9297a160cfda`,
+  mode `0600`, `quick_check=ok`) and an independent SQLite-backup copy was
+  transferred to the private server evidence root
+  `/opt/telegram-kol-analyzer/data/evidence/batch150-terminalization-rehearsal-20260824T221044Z/`.
+  Copy-only execution passed `applied/8`, identical reapply
+  `already_applied/0`, and `rolled_back/8`; every quick check was `ok`, the
+  exact after rows matched, and the restored logical digest equalled the before
+  digest `8265f9e80575eb2f1f4822fd38f35440b917c462a74058055667a066660b20c3`.
+  Rehearsal plan/action/rollback fingerprints were respectively
+  `271567c4572fa095f3e9ea6b9b2e92101848407951da8e40a9c355927f9ab4c6`,
+  `48d8788f5563bcda95e74cbe2b16179bef171da8d2781af674d18997eeee73b8`,
+  and `1f594d5102fd9e60e7fa65017f3dd648983aac6324362f36e7b416609704f1f0`.
+  Production remained exact `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb`,
+  split services active, monolith inactive, `global + 20`, batch set `[150]`,
+  no unsafe management, no claimed job, no unconfirmed binding-320 intent,
+  and `query_only=1` / `total_changes=0` / `quick_check=ok`; production and
+  exchange write counts were zero. A read-only production-path plan was also
+  generated, but execution leg `553.updated_at` was naturally refreshed before
+  handoff, invalidating its full-row CAS immediately. It is retained only as
+  evidence and is not an executable authorization candidate. Production apply,
+  push, deployment, restart, cutover, replay, settings mutation, and exchange
+  writes remain unauthorized; the next step requires an explicit choice between
+  quiescing the relevant writer and approving a narrowly revised volatile-field
+  CAS design.
