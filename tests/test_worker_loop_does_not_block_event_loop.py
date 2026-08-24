@@ -14,6 +14,7 @@ stays robust on a loaded machine.
 from __future__ import annotations
 
 import asyncio
+import logging
 import threading
 import time
 from datetime import UTC, datetime
@@ -433,6 +434,217 @@ def test_system_operator_callback_cancellation_waits_for_inflight_management_uni
         assert processing_finished.is_set()
 
     asyncio.run(scenario())
+
+
+def test_system_operator_callback_cancellation_cancels_queued_management_unit_without_waiting(
+    monkeypatch,
+):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    update_sent = False
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+    callback_submitted = threading.Event()
+    callback_started = threading.Event()
+    real_run_on_management_worker = bot_commands.run_on_management_worker
+
+    def _block_management_worker():
+        blocker_started.set()
+        blocker_release.wait(timeout=5)
+
+    async def _record_callback_submission(*args, **kwargs):
+        callback_submitted.set()
+        return await real_run_on_management_worker(*args, **kwargs)
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 1,
+                    "callback_query": {
+                        "id": "callback-1",
+                        "data": "unknown:1",
+                        "message": {"message_id": 7},
+                    },
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    def _callback(*_args, **_kwargs):
+        callback_started.set()
+        return None
+
+    monkeypatch.setattr(
+        bot_commands.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(),
+    )
+    monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+    monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+    monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+    monkeypatch.setattr(
+        bot_commands,
+        "_message_is_from_alert_chat",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(bot_commands, "_answer_callback_query", _noop)
+    monkeypatch.setattr(
+        bot_commands,
+        "process_system_operator_callback_data",
+        _callback,
+    )
+    monkeypatch.setattr(
+        bot_commands,
+        "run_on_management_worker",
+        _record_callback_submission,
+    )
+
+    async def scenario():
+        blocker_task = asyncio.create_task(
+            real_run_on_management_worker(_block_management_worker)
+        )
+        task = None
+        try:
+            assert await asyncio.to_thread(blocker_started.wait, 2)
+            task = asyncio.create_task(
+                bot_commands.run_system_operator_bot_command_loop(
+                    config=bot_commands.SystemOperatorBotConfig(
+                        bot_token="token",
+                        chat_id="1",
+                    ),
+                    session_factory=object(),
+                    poll_interval_seconds=0.01,
+                )
+            )
+            assert await asyncio.to_thread(callback_submitted.wait, 2)
+            assert not callback_started.is_set()
+            task.cancel()
+            await asyncio.sleep(0.05)
+            cancelled_without_waiting = task.done()
+        finally:
+            blocker_release.set()
+            await blocker_task
+
+        assert task is not None
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.05)
+        return cancelled_without_waiting
+
+    cancelled_without_waiting = asyncio.run(scenario())
+
+    assert cancelled_without_waiting is True
+    assert not callback_started.is_set()
+
+
+def test_system_operator_callback_logs_worker_failure_before_propagating_cancellation(
+    monkeypatch,
+    caplog,
+):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    update_sent = False
+    processing_started = threading.Event()
+    processing_release = threading.Event()
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 41,
+                    "callback_query": {
+                        "id": "callback-41",
+                        "data": "unknown:41",
+                        "message": {"message_id": 7},
+                    },
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    def _failing_callback(*_args, **_kwargs):
+        processing_started.set()
+        processing_release.wait(timeout=5)
+        raise RuntimeError("callback drain failed")
+
+    monkeypatch.setattr(
+        bot_commands.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(),
+    )
+    monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+    monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+    monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+    monkeypatch.setattr(
+        bot_commands,
+        "_message_is_from_alert_chat",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(bot_commands, "_answer_callback_query", _noop)
+    monkeypatch.setattr(
+        bot_commands,
+        "process_system_operator_callback_data",
+        _failing_callback,
+    )
+    caplog.set_level(logging.ERROR, logger=bot_commands.__name__)
+
+    async def scenario():
+        task = asyncio.create_task(
+            bot_commands.run_system_operator_bot_command_loop(
+                config=bot_commands.SystemOperatorBotConfig(
+                    bot_token="token",
+                    chat_id="1",
+                ),
+                session_factory=object(),
+                poll_interval_seconds=0.01,
+            )
+        )
+        try:
+            assert await asyncio.to_thread(processing_started.wait, 2)
+            task.cancel()
+            await asyncio.sleep(0.05)
+            assert not task.done()
+        finally:
+            processing_release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    asyncio.run(scenario())
+
+    matching = [
+        record
+        for record in caplog.records
+        if record.getMessage()
+        == "System operator bot failed to process update_id=41"
+    ]
+    assert len(matching) == 1
+    assert matching[0].exc_info is not None
+    assert isinstance(matching[0].exc_info[1], RuntimeError)
 
 
 def test_operator_tick_shares_the_management_worker_thread(monkeypatch):
