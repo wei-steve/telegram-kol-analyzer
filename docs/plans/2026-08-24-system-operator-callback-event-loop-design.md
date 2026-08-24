@@ -22,10 +22,14 @@ Treat one callback as a single blocking management unit:
 3. Run `process_system_operator_callback_data()` in the same unit.
 4. Submit the unit to the existing process-wide, single-thread management
    executor with `run_on_management_worker()`.
-5. Await the result before sending the Telegram callback response.
+5. Await the result before sending the Telegram callback response. If Bot
+   cancellation arrives after the unit starts, finish that unit before
+   propagating cancellation.
+6. During lifespan shutdown, stop every long-lived management-executor
+   producer before releasing the executor.
 
-The single-thread executor preserves the current mutual exclusion between
-strategy management, reconciliation, operator maintenance, and callback work.
+The single-thread executor adds callback work to the existing mutual-exclusion
+domain shared by strategy management, reconciliation, and operator maintenance.
 It also keeps Deepcoin client construction and use on one worker thread. The
 default asyncio executor is deliberately not used because it is shared and can
 introduce concurrency with management and exchange-sensitive paths.
@@ -42,6 +46,8 @@ introduce concurrency with management and exchange-sensitive paths.
 - Preserve callback ordering: the Bot still processes one update at a time and
   waits for processing before answering Telegram.
 - Preserve callback return values and existing exception handling.
+- Preserve cancellation as the Bot task's visible result, but only after any
+  already-started callback has left its database/exchange scope.
 - Preserve the current client lifetime; client closing is outside this repair.
 - Do not alter recognition, strategy choice, attribution, execution semantics,
   settings, queue ordering, or exchange-write semantics.
@@ -54,6 +60,10 @@ introduce concurrency with management and exchange-sensitive paths.
   and proves the Bot loop no longer starves a heartbeat coroutine.
 - A thread-identity test proves Deepcoin client construction and callback
   processing both run on the same `mgmt-worker` thread.
+- A cancellation test proves the Bot task remains alive until its admitted
+  callback unit finishes.
+- A lifespan-order test proves the system Bot stops before management-executor
+  shutdown.
 - The blocking-call census removes exactly the repaired callback entry.
 - Focused Bot, executor, census, and Web lifecycle tests must pass.
 - Because production code changes, the rebuilt candidate receives one final
