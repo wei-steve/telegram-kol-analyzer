@@ -30,10 +30,15 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: claimed
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-10-final-candidate
+current_task: task-11-review-push
 verification_level: L2
+local_candidate_commit: c8f778201c123f0bbadddc06e718945307adf40b
+local_focused_verification: "589 passed, 2 warnings in 46.62s"
+local_full_suite_verification: "6215 passed, 1 skipped, 32 warnings in 524.52s"
+local_compileall_verified: true
+local_diff_check_verified: true
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
 target_parallel_chat_limit: 3
@@ -189,3 +194,21 @@ cutover_authorized: false
   `3`. No schema, database data, recognition, strategy, execution, exchange
   semantics, production setting, deployment, restart, or external traffic
   changed.
+- `2026-08-24 task 10 local candidate`: exact production-code candidate
+  `c8f778201c123f0bbadddc06e718945307adf40b` passed the final local gate.
+  The diff from implementation claim `0f40b7d` contains only the planned lock
+  registry/provider, durable worker, trading-settings, Web wiring, tests, and
+  this independent status document; it contains no schema, migration, model,
+  recognition, strategy, execution, or original remediation pointer file.
+  `git diff --check` passed and
+  `$PROJECT_PYTHON -m compileall -q src/telegram_kol_research tests` exited zero
+  in `0.68s`. The exact Task 9 focused command passed
+  `589 passed, 2 warnings in 46.62s` (`48.24s` wall clock). The one authorized
+  complete suite ran exactly once after the last production-code edit and
+  passed `6215 passed, 1 skipped, 32 warnings in 524.52s` (`535.65s` wall
+  clock). The warnings are existing deprecation warnings. Schema and production
+  data are unchanged; recognition, strategy, position ownership, execution,
+  exchange-write, and trading-decision semantics are unchanged. The workstream
+  is now `local_complete`; Task 11 independent review, push, deployment
+  authorization, and every production/cutover action remain unstarted and
+  require their own gates.
