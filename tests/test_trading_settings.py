@@ -251,6 +251,61 @@ def test_message_lock_mode_fails_closed(value):
         trading_settings_from_payload({"message_lock_mode": value})
 
 
+def test_message_parallel_chat_limit_defaults_to_compatibility_twenty(tmp_path):
+    session_factory = create_session_factory(tmp_path / "parallel-chat-default.db")
+
+    settings = load_trading_settings(session_factory)
+
+    assert settings.message_processing_max_parallel_chats == 20
+
+
+def test_message_parallel_chat_limit_round_trips(tmp_path):
+    session_factory = create_session_factory(tmp_path / "parallel-chat-roundtrip.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {"message_processing_max_parallel_chats": 3},
+    )
+
+    assert saved.message_processing_max_parallel_chats == 3
+    assert (
+        load_trading_settings(session_factory).message_processing_max_parallel_chats
+        == 3
+    )
+
+
+@pytest.mark.parametrize(
+    "value", [True, False, 0, -1, 21, 1.0, "3", None, [], {}]
+)
+def test_message_parallel_chat_limit_rejects_invalid_values(value):
+    with pytest.raises(ValueError, match="message_processing_max_parallel_chats"):
+        trading_settings_from_payload(
+            {"message_processing_max_parallel_chats": value}
+        )
+
+
+def test_unrelated_save_preserves_message_parallel_chat_limit_and_lock_mode(tmp_path):
+    session_factory = create_session_factory(tmp_path / "parallel-chat-preserve.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "message_lock_mode": "per_chat",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+
+    saved = save_trading_settings(
+        session_factory,
+        {"semantic_review_enabled": False},
+    )
+
+    assert saved.message_lock_mode == "per_chat"
+    assert saved.message_processing_max_parallel_chats == 3
+    reloaded = load_trading_settings(session_factory)
+    assert reloaded.message_lock_mode == "per_chat"
+    assert reloaded.message_processing_max_parallel_chats == 3
+
+
 def test_authoritative_gap_recovery_max_age_minutes_defaults_and_round_trips(tmp_path):
     session_factory = create_session_factory(tmp_path / "gap-recovery-window.db")
 

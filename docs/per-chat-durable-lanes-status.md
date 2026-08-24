@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: claimed
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-5-parallel-chat-setting
+current_task: task-6-work-conserving-worker
 verification_level: L2
 production_lock_mode_at_planning: global
 compatibility_parallel_chat_limit: 20
@@ -136,3 +136,10 @@ cutover_authorized: false
   before resolving mode, while `lock_all()` always enters exclusive admission
   before the legacy global lock. Ran the registry, listener, reconcile, and
   position-authority compatibility slices; result: `49 passed in 2.61s`.
+- `2026-08-24 task 5 RED`: ran the parallel-chat settings slice; all 13
+  selected tests failed because the field was absent and invalid values were
+  ignored.
+- `2026-08-24 task 5 GREEN`: added compatibility default 20 and exact-integer
+  bounds 1-20 for `message_processing_max_parallel_chats`, including storage
+  preservation across unrelated saves. Full trading-settings result:
+  `198 passed in 2.71s`.

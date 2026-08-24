@@ -87,6 +87,7 @@ class TradingSettings:
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_lock_mode: Literal["global", "per_chat"] = "global"
+    message_processing_max_parallel_chats: int = 20
     message_pipeline_mode: Literal["inline", "shadow", "queue"] = "inline"
     worker_command_mode: Literal["inline", "shadow", "queue"] = "inline"
     semantic_review_enabled: bool = False
@@ -403,6 +404,15 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     message_lock_mode = _message_lock_mode(
         raw.get("message_lock_mode", defaults.message_lock_mode)
     )
+    message_processing_max_parallel_chats = _bounded_int_setting(
+        raw.get(
+            "message_processing_max_parallel_chats",
+            defaults.message_processing_max_parallel_chats,
+        ),
+        field_name="message_processing_max_parallel_chats",
+        minimum=1,
+        maximum=20,
+    )
     message_pipeline_mode = _message_pipeline_mode(
         raw.get("message_pipeline_mode", defaults.message_pipeline_mode)
     )
@@ -455,6 +465,9 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             mimo_v2_activation_after_raw_message_id
         ),
         message_lock_mode=message_lock_mode,
+        message_processing_max_parallel_chats=(
+            message_processing_max_parallel_chats
+        ),
         message_pipeline_mode=message_pipeline_mode,
         worker_command_mode=worker_command_mode,
         semantic_review_enabled=_boolean_setting(
@@ -670,6 +683,20 @@ def _boolean_setting(
 def _nonnegative_int_setting(value: Any, *, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{field_name} must be a nonnegative integer")
+    return value
+
+
+def _bounded_int_setting(
+    value: Any,
+    *,
+    field_name: str,
+    minimum: int,
+    maximum: int,
+) -> int:
+    if type(value) is not int or not minimum <= value <= maximum:
+        raise ValueError(
+            f"{field_name} must be an integer from {minimum} to {maximum}"
+        )
     return value
 
 
