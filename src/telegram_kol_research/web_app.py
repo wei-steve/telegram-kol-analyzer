@@ -760,32 +760,10 @@ async def _stop_semantic_review_task(app: FastAPI) -> None:
     app.state.semantic_review_task = None
 
 
-async def _disconnect_shared_telegram_client(app: FastAPI) -> None:
-    client = app.state.telegram_client
-    disconnect = getattr(client, "disconnect", None)
-    if not callable(disconnect):
-        return
-    disconnect_task = asyncio.ensure_future(maybe_await(disconnect()))
-    done, _pending = await asyncio.wait(
-        {disconnect_task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
-    )
-    if disconnect_task not in done:
-        disconnect_task.cancel()
-        logger.warning("Telegram client disconnect exceeded shutdown timeout")
-        return
-    try:
-        disconnect_task.result()
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        logger.exception("Telegram client disconnect failed during shutdown")
-
-
 async def _stop_live_listener_task(app: FastAPI) -> None:
     task = app.state.live_listener_task
     if task is None:
         return
-    await _disconnect_shared_telegram_client(app)
     task.cancel()
     done, _pending = await asyncio.wait(
         {task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
