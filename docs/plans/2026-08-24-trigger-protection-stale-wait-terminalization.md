@@ -160,17 +160,21 @@ Seed one active BTC saved intent. Make BTC pending/history reads succeed and onl
 
 Assert the BTC intent keeps its original state, retry count, next attempt, disposition, reason, evidence, and `updated_at`; no `protection_adoption_refused` audit is created for the BTC leg; `result.protection_snapshot_unavailable == 0` for the unrelated BTC exposure.
 
-Add two GREEN-preserving controls:
+Add GREEN-preserving controls for both protection sources:
 
-- `trigger_history:BTC-USDT-SWAP` still schedules `wait / snapshot_incomplete`;
-- generic `trigger_history` still schedules `wait / snapshot_incomplete`.
+- target-scoped `trigger_history` and `pending_trigger_orders` still schedule
+  `wait / snapshot_incomplete`;
+- generic `trigger_history` and `pending_trigger_orders` remain account-wide;
+- a public read-only reconcile with persisted BTC and ETH bindings must retain
+  an ETH-only history failure as `trigger_history:ETH-USDT-SWAP`.
 
 **Step 3: Run RED**
 
 ```bash
 PYTHONPATH=src /Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
-  tests/test_execution_bindings.py::test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent \
-  tests/test_execution_bindings.py::test_reconcile_target_or_generic_history_error_still_waits
+  tests/test_execution_bindings.py::test_reconcile_unrelated_instrument_error_does_not_rewrite_intent \
+  tests/test_execution_bindings.py::test_read_only_reconcile_scopes_real_multi_instrument_history_failure \
+  tests/test_execution_bindings.py::test_reconcile_target_or_generic_protection_error_still_waits
 ```
 
 Expected: unrelated-instrument case fails because the BTC intent is rewritten with the ETH source; relevant controls pass.
@@ -228,8 +232,9 @@ Scope `_trigger_protection_exposure_count()` to the same relevant-error rule so 
 
 ```bash
 PYTHONPATH=src /Users/steven/Documents/telegram获取消息/.venv/bin/python -m pytest -q \
-  tests/test_execution_bindings.py::test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent \
-  tests/test_execution_bindings.py::test_reconcile_target_or_generic_history_error_still_waits \
+  tests/test_execution_bindings.py::test_reconcile_unrelated_instrument_error_does_not_rewrite_intent \
+  tests/test_execution_bindings.py::test_read_only_reconcile_scopes_real_multi_instrument_history_failure \
+  tests/test_execution_bindings.py::test_reconcile_target_or_generic_protection_error_still_waits \
   tests/test_execution_bindings.py::test_reconcile_saved_intent_records_unavailable_snapshot_and_retries \
   tests/test_execution_bindings.py::test_reconcile_saved_intent_outage_does_not_exhaust_retry_budget \
   tests/test_execution_bindings.py::test_reconcile_protection_adoption_counts_unavailable_pending_snapshot

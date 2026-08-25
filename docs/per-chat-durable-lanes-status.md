@@ -32,7 +32,7 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-19-independent-review
+current_task: task-20-awaiting-owner-direction
 verification_level: L2
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
@@ -43,7 +43,7 @@ invalidated_local_candidate_commits:
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
   - e03622749c32ebb214af56cd118984268e72af56
-local_focused_verification: "stale-wait RED 1 failed/8 passed; terminalization GREEN 12 passed; instrument-fanout RED 1 failed/2 passed; scoped-error GREEN 6 passed; complete execution-bindings 151 passed; adjacent compatibility 108 passed with 3 warnings"
+local_focused_verification: "stale-wait RED 1 failed/8 passed; terminalization GREEN 12 passed; instrument-fanout RED 1 failed/2 passed; scoped-error GREEN 6 passed; review hardening mutation REDs 1 failed each; review-focused 21 passed; complete execution-bindings 157 passed; adjacent compatibility 108 passed with 3 warnings"
 local_full_suite_verification: "6281 passed, 1 skipped, 32 warnings in 467.33s"
 local_compileall_verified: true
 local_diff_check_verified: true
@@ -52,6 +52,8 @@ trigger_protection_rehearsal_status: passed_copy_only_exact_three_rows
 trigger_protection_rehearsal_evidence: /Users/steven/.codex/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/rehearsal-summary.json
 trigger_protection_backup_sha256: de4926231f0c608028abd74ea9575b4448109ef307f0122477714baccfd27fe3
 trigger_protection_production_apply_plan_status: not_built_not_authorized
+trigger_protection_review_test_commit: 1992312cebfbf2496545aa582ff0786d372d4a1b
+trigger_protection_independent_review_status: passed_no_critical_or_important
 batch150_terminalization_tool_commit: 868bbf378d77960a05dd199b3c1df6b6cb78621b
 batch150_rehearsal_status: passed_copy_only_volatile_cas
 batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/rehearsal-summary.json
@@ -499,3 +501,23 @@ cutover_authorized: false
   manufactured or natural Telegram observation, and exchange writes remain
   unauthorized. The next task is independent read-only review of the frozen
   candidate.
+- `2026-08-25 trigger-protection independent review`: the first independent
+  read-only review found no production implementation defect, zero Critical,
+  two Important regression-test gaps, and one Minor counterexample gap. Test-only
+  commit `1992312cebfbf2496545aa582ff0786d372d4a1b` now runs the terminal positive
+  twice behind an unrelated ETH error barrier, exercises the public read-only
+  loader with persisted BTC and ETH bindings and an ETH-only history failure,
+  compares every intent column for all counterexamples, adds `failed` and
+  `adopted` states, and covers scoped/generic/unrelated `trigger_history` and
+  `pending_trigger_orders`. Removing the pre-barrier helper call produced the
+  expected RED (`1 failed`); degrading the scoped loader error to generic also
+  produced the expected RED (`1 failed`). Restored-code focused verification
+  passed `21`, and the complete `tests/test_execution_bindings.py` passed `157`
+  in `11.14s`; diff and compile checks passed. No production code changed, so
+  the final complete-suite evidence remains attached to exact production-code
+  candidate `130de7bbaff5abe28c912f60a554fe39be451ecd` and was not rerun. Independent
+  re-review returned Ready `Yes`, zero Critical, zero Important, and only the
+  now-corrected stale test names in this implementation plan as a Minor finding.
+  Work remains local and unpushed. Production apply, push, deployment, restart,
+  cutover, Telegram traffic, and exchange writes remain unauthorized; the next
+  action requires explicit owner direction.
