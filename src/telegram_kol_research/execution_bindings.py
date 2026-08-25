@@ -814,7 +814,9 @@ def _apply_reconcile_snapshot(
 
         if snapshot.errors:
             result.protection_snapshot_unavailable = _trigger_protection_exposure_count(
-                session, legs=legs
+                session,
+                legs=legs,
+                errors=snapshot.errors,
             )
             _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
                 session, legs=legs, snapshot=snapshot, recovered_at=recovered_at, result=result
@@ -1542,6 +1544,9 @@ def _adopt_verified_trigger_entry_protection(
 
 
 _TRIGGER_PROTECTION_RETRY_LIMIT = 5
+_TRIGGER_PROTECTION_SNAPSHOT_SOURCES = frozenset(
+    {"pending_trigger_orders", "trigger_history"}
+)
 
 
 def _trigger_protection_leg_instrument_id(
@@ -1630,6 +1635,25 @@ def _resolve_exact_terminal_stale_wait_trigger_protection_intents(
     return resolved
 
 
+def _trigger_protection_snapshot_errors_for_instrument(
+    errors: dict[str, str],
+    *,
+    instrument_id: str | None,
+) -> list[str]:
+    normalized_instrument = str(instrument_id or "").strip().upper()
+    relevant: list[str] = []
+    for key in sorted(errors):
+        source, separator, scoped_instrument = key.partition(":")
+        if source not in _TRIGGER_PROTECTION_SNAPSHOT_SOURCES:
+            continue
+        if not separator or (
+            normalized_instrument
+            and scoped_instrument.strip().upper() == normalized_instrument
+        ):
+            relevant.append(key)
+    return relevant
+
+
 def _record_trigger_assignment_shadow_plan(
     session, *, global_plan, contexts_by_leg, observed_at
 ) -> None:
@@ -1684,10 +1708,10 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
     from telegram_kol_research.entry_protection_ledger_repair import EntryProtectionLedgerRepairRefusal
     from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
 
-    sources = sorted(key for key in snapshot.errors if key == "pending_trigger_orders"
-                     or key.startswith("pending_trigger_orders:") or key == "trigger_history"
-                     or key.startswith("trigger_history:"))
-    if not sources:
+    if not any(
+        key.partition(":")[0] in _TRIGGER_PROTECTION_SNAPSHOT_SOURCES
+        for key in snapshot.errors
+    ):
         return
     legs_by_id = {int(leg.id): leg for leg in legs}
     intents = session.query(TriggerProtectionIntent).filter(
@@ -1699,6 +1723,16 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
         if leg is None or not _trigger_intent_due(intent, recovered_at):
             continue
         if not (str(leg.pos_id or "").strip() and str(leg.attribution_status or "") == "verified"):
+            continue
+        binding = session.get(ExecutionBinding, int(leg.execution_binding_id))
+        sources = _trigger_protection_snapshot_errors_for_instrument(
+            snapshot.errors,
+            instrument_id=_trigger_protection_leg_instrument_id(
+                leg,
+                binding=binding,
+            ),
+        )
+        if not sources:
             continue
         _record_protection_adoption_refusal(session, leg=leg, refusal=EntryProtectionLedgerRepairRefusal(
             event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
@@ -2112,7 +2146,10 @@ def _bounded_protection_refusal_evidence(refusal: Any) -> dict[str, Any]:
 
 
 def _trigger_protection_exposure_count(
-    session, *, legs: list[ExecutionOrderLeg]
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+    errors: dict[str, str],
 ) -> int:
     return sum(
         1
@@ -2122,6 +2159,18 @@ def _trigger_protection_exposure_count(
         and str(leg.order_kind or "") == "trigger_limit"
         and str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
         and _request_has_combined_trigger_protection(leg.request_json)
+        and bool(
+            _trigger_protection_snapshot_errors_for_instrument(
+                errors,
+                instrument_id=_trigger_protection_leg_instrument_id(
+                    leg,
+                    binding=session.get(
+                        ExecutionBinding,
+                        int(leg.execution_binding_id),
+                    ),
+                ),
+            )
+        )
     )
 
 
