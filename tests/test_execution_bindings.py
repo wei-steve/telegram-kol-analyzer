@@ -179,6 +179,119 @@ def _add_entry_leg(
     )
 
 
+def test_unchanged_leg_refresh_does_not_regress_newer_terminalization(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="entry-order",
+            client_order_id="entry-client",
+            pos_id="position-1",
+            status="active",
+        ),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="entry-order",
+        client_order_id="entry-client",
+        pos_id="position-1",
+        status="filled",
+        attribution_status="verified",
+    )
+    original_time = datetime(2026, 8, 25, 11, 4, 0)
+    stale_recovered_at = datetime(2026, 8, 25, 11, 5, 30, 288171)
+    terminalized_at = datetime(2026, 8, 25, 11, 5, 31)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.updated_at = original_time
+        session.commit()
+
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        order_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "ordId": "entry-order",
+                "clOrdId": "entry-client",
+                "state": "filled",
+            }
+        ]
+    )
+    with session_factory() as stale_worker_session:
+        stale_leg = stale_worker_session.get(ExecutionOrderLeg, leg_id)
+        execution_bindings_module._refresh_exact_entry_leg_states(
+            [stale_leg],
+            snapshot=snapshot,
+            recovered_at=stale_recovered_at,
+        )
+        with sqlite3.connect(database_path) as terminalizer:
+            terminalizer.execute(
+                "UPDATE execution_order_legs SET "
+                "status='closed', terminal_reason=?, updated_at=? WHERE id=?",
+                (
+                    "historical_exchange_position_closed",
+                    terminalized_at.isoformat(sep=" ", timespec="microseconds"),
+                    leg_id,
+                ),
+            )
+            terminalizer.commit()
+        stale_worker_session.commit()
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+
+    assert leg.status == "closed"
+    assert leg.terminal_reason == "historical_exchange_position_closed"
+    assert leg.updated_at == terminalized_at
+
+
+def test_changed_leg_refresh_updates_terminal_state_and_timestamp(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            order_id="entry-order",
+            client_order_id="entry-client",
+            status="open",
+        ),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        order_id="entry-order",
+        client_order_id="entry-client",
+        status="open",
+    )
+    recovered_at = datetime(2026, 8, 25, 12, 0)
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        order_history=[
+            {
+                "instId": "BTC-USDT-SWAP",
+                "ordId": "entry-order",
+                "clOrdId": "entry-client",
+                "state": "cancelled",
+            }
+        ]
+    )
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        execution_bindings_module._refresh_exact_entry_leg_states(
+            [leg],
+            snapshot=snapshot,
+            recovered_at=recovered_at,
+        )
+        session.commit()
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+
+    assert leg.status == "manually_cancelled"
+    assert leg.terminal_reason == "manually_cancelled"
+    assert leg.updated_at == recovered_at
+
+
 def test_entry_binding_evidence_requires_exact_order_and_client_ids(tmp_path):
     session_factory = create_session_factory(tmp_path / "entry-evidence.db")
     strategy_instance_id = "deepcoin:100:55:BTC:long"

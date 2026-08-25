@@ -2302,6 +2302,29 @@ def _ensure_legacy_entry_legs(
     session.flush()
 
 
+_PRESERVE_TERMINAL_REASON = object()
+
+
+def _set_entry_leg_exchange_state(
+    leg: ExecutionOrderLeg,
+    *,
+    status: str,
+    updated_at: datetime,
+    terminal_reason: Any = _PRESERVE_TERMINAL_REASON,
+) -> None:
+    status_changed = leg.status != status
+    reason_changed = (
+        terminal_reason is not _PRESERVE_TERMINAL_REASON
+        and leg.terminal_reason != terminal_reason
+    )
+    if not status_changed and not reason_changed:
+        return
+    leg.status = status
+    if terminal_reason is not _PRESERVE_TERMINAL_REASON:
+        leg.terminal_reason = terminal_reason
+    leg.updated_at = updated_at
+
+
 def _refresh_exact_entry_leg_states(
     legs: list[ExecutionOrderLeg],
     *,
@@ -2322,27 +2345,42 @@ def _refresh_exact_entry_leg_states(
                 for position in snapshot.positions
             )
         ):
-            leg.status = "active"
-            leg.terminal_reason = None
-            leg.updated_at = recovered_at
+            _set_entry_leg_exchange_state(
+                leg,
+                status="active",
+                terminal_reason=None,
+                updated_at=recovered_at,
+            )
             continue
         pending = next((row for row in pending_rows if _exchange_row_matches_leg(row, leg)), None)
         if pending is not None:
-            leg.status = "pending"
-            leg.updated_at = recovered_at
+            _set_entry_leg_exchange_state(
+                leg,
+                status="pending",
+                updated_at=recovered_at,
+            )
             continue
         history = next((row for row in history_rows if _exchange_row_matches_leg(row, leg)), None)
         if history is None:
             if str(leg.status or "").lower() in {"open", "submitted"}:
-                leg.status = "unknown"
-                leg.updated_at = recovered_at
+                _set_entry_leg_exchange_state(
+                    leg,
+                    status="unknown",
+                    updated_at=recovered_at,
+                )
             continue
         state = classify_leg_exchange_state(history)
         if state != "unknown":
-            leg.status = state
-            if state in TERMINAL_ENTRY_LEG_STATES:
-                leg.terminal_reason = state
-            leg.updated_at = recovered_at
+            _set_entry_leg_exchange_state(
+                leg,
+                status=state,
+                terminal_reason=(
+                    state
+                    if state in TERMINAL_ENTRY_LEG_STATES
+                    else _PRESERVE_TERMINAL_REASON
+                ),
+                updated_at=recovered_at,
+            )
 
 
 def _exchange_row_matches_leg(row: dict[str, Any], leg: ExecutionOrderLeg) -> bool:
