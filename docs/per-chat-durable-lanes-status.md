@@ -30,13 +30,22 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: in_progress
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-21-telethon-shutdown-red
+current_task: task-21-shutdown-safety-push-awaiting-authorization
 verification_level: L2
 shutdown_safety_design: docs/plans/2026-08-24-telegram-shutdown-safety-design.md
 shutdown_safety_design_commit: f38bc6f9215b532e82542f1e7d7519ba03c21426
 shutdown_safety_plan: docs/plans/2026-08-24-telegram-shutdown-safety.md
+shutdown_safety_production_code_candidate: 1fa0d83f9b2c0470c8c7bd234e234b5e19a8ce95
+shutdown_safety_review_hardened_candidate: 66e8b51b2688dfbee83f11ed594868eec9c1844e
+shutdown_safety_focused_verification: "411 passed, 2 warnings in 37.14s"
+shutdown_safety_full_suite_verification: "6295 passed, 1 skipped, 32 warnings in 478.10s"
+shutdown_safety_independent_review_status: passed_no_critical_or_important_minor_tests_added
+shutdown_safety_push_authorized: false
+shutdown_safety_deployment_authorized: false
+shutdown_safety_restart_authorized: false
+shutdown_safety_credential_rotation_authorized: false
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
@@ -124,6 +133,32 @@ cutover_authorized: false
 
 ## History
 
+- `2026-08-25 task 21 local candidate`: completed the authorized local
+  RED-to-GREEN repair. The Telethon lifecycle RED failed with two disconnects
+  instead of one; GREEN and its bounded-timeout neighbor passed `2`. The raw-log
+  RED exposed a fake authenticated Bot token before handler emission; the full
+  logging file passed `5` after the formatter fix. Bot polling REDs failed
+  because no shared recovery helper existed; GREEN proved 502 retry and 401
+  fail-fast, then review hardening covered 429, ConnectError, ReadTimeout, and
+  cancellation propagation. The failed-task lifespan RED re-raised a synthetic
+  authenticated 502; GREEN consumed it, cleared app state, preserved executor
+  shutdown order, and the event-loop regression file passed `18`. One combined
+  test run exposed only a closed pytest capture handler in the new test; the
+  test was isolated without production-code changes, after which the final
+  focused set passed `411` with `2` existing deprecation warnings in `37.14s`.
+  Compileall and diff checks passed. Independent read-only review of the
+  production range returned Ready Yes, zero Critical, zero Important, and one
+  Minor test-coverage finding; the added review tests passed `6`. Frozen
+  production-code candidate
+  `1fa0d83f9b2c0470c8c7bd234e234b5e19a8ce95` then passed the one final complete
+  suite at review-hardened test candidate
+  `66e8b51b2688dfbee83f11ed594868eec9c1844e`: `6295 passed, 1 skipped, 32
+  warnings in 478.10s` (`488.53s` command wall time). No schema, recognition,
+  durable-queue, callback, management, position, execution, settings,
+  concurrency, or exchange-write semantics changed. The candidate remains
+  local. Push, credential rotation, deployment, restart, production
+  data/settings mutation, Telegram traffic, cutover, and exchange writes remain
+  unauthorized.
 - `2026-08-25 task 21 design`: owner approved design A. The committed design
   makes the live-listener task the single Telethon disconnect owner, retries
   only transient Bot polling failures, consumes already-failed Bot tasks during
