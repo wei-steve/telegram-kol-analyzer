@@ -30,11 +30,11 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: in_progress
+workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-18-trigger-protection-stale-wait-repair
+current_task: task-19-independent-review
 verification_level: L2
-local_candidate_commit: 4d6950ad9919a9fb71f8f54a73c45d85912b9272
+local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -43,10 +43,15 @@ invalidated_local_candidate_commits:
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
   - e03622749c32ebb214af56cd118984268e72af56
-local_focused_verification: "composite slice 33 passed; complete strategy-management executor 190 passed; authority/backfill boundary 9 passed"
-local_full_suite_verification: "6231 passed, 1 skipped, 32 warnings in 475.29s"
+local_focused_verification: "stale-wait RED 1 failed/8 passed; terminalization GREEN 12 passed; instrument-fanout RED 1 failed/2 passed; scoped-error GREEN 6 passed; complete execution-bindings 151 passed; adjacent compatibility 108 passed with 3 warnings"
+local_full_suite_verification: "6281 passed, 1 skipped, 32 warnings in 467.33s"
 local_compileall_verified: true
 local_diff_check_verified: true
+trigger_protection_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
+trigger_protection_rehearsal_status: passed_copy_only_exact_three_rows
+trigger_protection_rehearsal_evidence: /Users/steven/.codex/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/rehearsal-summary.json
+trigger_protection_backup_sha256: de4926231f0c608028abd74ea9575b4448109ef307f0122477714baccfd27fe3
+trigger_protection_production_apply_plan_status: not_built_not_authorized
 batch150_terminalization_tool_commit: 868bbf378d77960a05dd199b3c1df6b6cb78621b
 batch150_rehearsal_status: passed_copy_only_volatile_cas
 batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/rehearsal-summary.json
@@ -458,3 +463,39 @@ cutover_authorized: false
   `quick_check=ok`, and production/exchange writes were zero. No production
   apply plan was built. Push, deployment, restart, cutover, replay, settings
   mutation, production DB apply, and exchange writes remain unauthorized.
+- `2026-08-25 trigger-protection stale-wait local candidate`: exact
+  production-code candidate
+  `130de7bbaff5abe28c912f60a554fe39be451ecd` resolves only verified terminal
+  trigger-protection intents in `retrying / wait / snapshot_incomplete` whose
+  binding, execution leg, parent trigger order, nonempty `pos_id`, attribution,
+  and instrument all match exactly. It also scopes pending-trigger/history
+  snapshot errors to the owning instrument while retaining generic errors as
+  account-wide fail-closed evidence. The terminalization RED witnessed the
+  positive case remain stale (`1 failed, 8 passed`); GREEN passed `12`. The
+  unrelated-instrument RED witnessed the BTC intent rewritten by an ETH error
+  (`1 failed, 2 passed`); scoped-error GREEN passed `6`. The complete
+  `tests/test_execution_bindings.py` passed `151`; adjacent protection/liveness
+  compatibility passed `108` with `3` warnings; diff and compile checks passed.
+  The one final complete suite passed `6281`, skipped `1`, with `32` warnings in
+  `467.33s`; no production code changed afterward. A fresh immutable online
+  production backup at
+  `/Users/steven/.codex/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/research-online-backup.db`
+  is mode `0600`, size `716435456`, SHA-256
+  `de4926231f0c608028abd74ea9575b4448109ef307f0122477714baccfd27fe3`,
+  with `quick_check=ok` and zero foreign-key violations. Invoking the shared
+  helper on the independent copy matched exactly intents `138`, `141`, and
+  `147`, changed `3` rows, changed `0` on identical reapply, preserved every
+  other business row and all critical counts, and restored the exact starting
+  rows and complete logical digest
+  `3e8b3a39c520ae0d3466facae9975dd2dc11cb02f982337ff23f1e24dc23cc49`.
+  Evidence manifest:
+  `/Users/steven/.codex/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/rehearsal-summary.json`.
+  Production remained exact
+  `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb`; the three production intents
+  remained `retrying / wait / snapshot_incomplete`, unsafe management,
+  claimed/executing worker commands, and claimed message jobs were zero, and
+  the read-only postcheck had `query_only=1` / `total_changes=0`. No production
+  apply plan was built. Production apply, push, deployment, restart, cutover,
+  manufactured or natural Telegram observation, and exchange writes remain
+  unauthorized. The next task is independent read-only review of the frozen
+  candidate.
