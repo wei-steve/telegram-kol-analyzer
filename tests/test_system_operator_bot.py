@@ -163,6 +163,91 @@ def test_bot_poll_rejects_auth_error_without_retry(monkeypatch):
     assert calls == 1
 
 
+@pytest.mark.parametrize(
+    "failure_kind",
+    ["rate_limit", "connect_error", "read_timeout"],
+)
+def test_bot_poll_retries_each_recoverable_failure_kind(
+    failure_kind,
+    monkeypatch,
+):
+    token = "123456789:recoverable-poll-sentinel"
+    request = httpx.Request(
+        "GET",
+        f"https://api.telegram.org/bot{token}/getUpdates",
+    )
+    if failure_kind == "rate_limit":
+        error = _telegram_status_error(status_code=429, token=token)
+    elif failure_kind == "connect_error":
+        error = httpx.ConnectError("offline", request=request)
+    else:
+        error = httpx.ReadTimeout("timed out", request=request)
+    calls = 0
+
+    async def fake_get_updates(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return []
+
+    monkeypatch.setattr(bot_commands_module, "_get_updates", fake_get_updates)
+    monkeypatch.setattr(bot_commands_module.logger, "disabled", True)
+
+    result = asyncio.run(
+        bot_commands_module._get_updates_with_retry(
+            object(),
+            "https://api.telegram.org/bot[hidden]",
+            offset=9,
+            poll_interval_seconds=0,
+            bot_label="System operator bot",
+        )
+    )
+
+    assert result == []
+    assert calls == 2
+
+
+def test_bot_poll_retry_wait_propagates_cancellation_without_another_attempt(
+    monkeypatch,
+):
+    error = _telegram_status_error(
+        status_code=502,
+        token="123456789:cancelled-poll-sentinel",
+    )
+    attempted = asyncio.Event()
+    calls = 0
+
+    async def fake_get_updates(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        attempted.set()
+        raise error
+
+    monkeypatch.setattr(bot_commands_module, "_get_updates", fake_get_updates)
+    monkeypatch.setattr(bot_commands_module.logger, "disabled", True)
+
+    async def scenario():
+        task = asyncio.create_task(
+            bot_commands_module._get_updates_with_retry(
+                object(),
+                "https://api.telegram.org/bot[hidden]",
+                offset=11,
+                poll_interval_seconds=60,
+                bot_label="System operator bot",
+            )
+        )
+        await asyncio.wait_for(attempted.wait(), timeout=1.0)
+        await asyncio.sleep(0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(scenario())
+
+    assert calls == 1
+
+
 def test_operator_maintenance_tick_runs_bounded_entry_reconciler(monkeypatch):
     calls = []
     expected = SimpleNamespace(released=1, expired=0, incidents=0, skipped=0)
