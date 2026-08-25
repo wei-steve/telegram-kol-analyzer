@@ -18,6 +18,14 @@ TELEGRAM_BOT_URL_PATTERN = re.compile(
 )
 
 
+class TelegramCredentialRedactingFormatter(logging.Formatter):
+    """Redact Telegram Bot credentials from rendered log records."""
+
+    def format(self, record: logging.LogRecord) -> str:
+        rendered = super().format(record)
+        return TELEGRAM_BOT_URL_PATTERN.sub(r"\1[REDACTED]", rendered)
+
+
 def configure_application_logging(log_directory: Path) -> Path:
     """Configure the package logger to write a rotating UTF-8 application log."""
     log_directory.mkdir(parents=True, exist_ok=True)
@@ -46,7 +54,7 @@ def configure_application_logging(log_directory: Path) -> Path:
         logger.removeHandler(handler)
         handler.close()
 
-    formatter = logging.Formatter(LOG_FORMAT)
+    formatter = TelegramCredentialRedactingFormatter(LOG_FORMAT)
     file_handler = RotatingFileHandler(
         log_path, maxBytes=10 * 1024 * 1024, backupCount=10, encoding="utf-8"
     )

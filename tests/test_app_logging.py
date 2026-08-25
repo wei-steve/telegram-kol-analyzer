@@ -1,6 +1,8 @@
 from pathlib import Path
 import logging
 
+import httpx
+
 from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
@@ -93,3 +95,30 @@ def test_read_log_page_redacts_telegram_bot_token_from_http_error_traceback(
     message = page["items"][0]["message"]
     assert token not in message
     assert "https://api.telegram.org/bot[REDACTED]/getUpdates" in message
+
+
+def test_application_handlers_redact_bot_token_before_emission(
+    tmp_path: Path,
+    capsys,
+):
+    token = "123456789:raw-handler-sentinel"
+    url = f"https://api.telegram.org/bot{token}/getUpdates"
+    request = httpx.Request("GET", url)
+    response = httpx.Response(502, request=request)
+    path = configure_application_logging(tmp_path)
+    logger = logging.getLogger("telegram_kol_research.bot_test")
+
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError:
+        logger.exception("Bot poll failed")
+
+    for handler in logging.getLogger("telegram_kol_research").handlers:
+        handler.flush()
+    raw_file = path.read_text(encoding="utf-8")
+    raw_stderr = capsys.readouterr().err
+
+    assert token not in raw_file
+    assert token not in raw_stderr
+    assert "https://api.telegram.org/bot[REDACTED]/getUpdates" in raw_file
+    assert "https://api.telegram.org/bot[REDACTED]/getUpdates" in raw_stderr
