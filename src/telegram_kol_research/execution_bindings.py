@@ -794,6 +794,12 @@ def _apply_reconcile_snapshot(
             leg.status = "manually_closed"
             leg.terminal_reason = "manual_lifecycle_terminal"
             leg.updated_at = recovered_at
+        _resolve_exact_terminal_stale_wait_trigger_protection_intents(
+            session,
+            legs=legs,
+            bindings_by_id=bindings_by_id,
+            resolved_at=recovered_at,
+        )
         reserved_pos_ids = {
             str(pos_id)
             for (pos_id,) in (
@@ -1536,6 +1542,92 @@ def _adopt_verified_trigger_entry_protection(
 
 
 _TRIGGER_PROTECTION_RETRY_LIMIT = 5
+
+
+def _trigger_protection_leg_instrument_id(
+    leg: ExecutionOrderLeg,
+    *,
+    binding: ExecutionBinding | None,
+) -> str | None:
+    request = _safe_json_object(leg.request_json)
+    instrument_id = str(request.get("instId") or "").strip().upper()
+    if instrument_id:
+        return instrument_id
+    if binding is None:
+        return None
+    return _binding_instrument_id(binding)
+
+
+def _resolve_exact_terminal_stale_wait_trigger_protection_intents(
+    session,
+    *,
+    legs: list[ExecutionOrderLeg],
+    bindings_by_id: dict[int, ExecutionBinding],
+    resolved_at: datetime,
+) -> int:
+    """Resolve only verified terminal legs stranded by snapshot wait."""
+
+    from telegram_kol_research.trigger_protection_intents import (
+        transition_trigger_protection_intent,
+    )
+
+    legs_by_id = {int(leg.id): leg for leg in legs}
+    intents = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.venue == "deepcoin")
+        .filter(TriggerProtectionIntent.recovery_state == "retrying")
+        .filter(TriggerProtectionIntent.recovery_disposition == "wait")
+        .filter(TriggerProtectionIntent.last_reason_code == "snapshot_incomplete")
+        .order_by(TriggerProtectionIntent.id.asc())
+        .all()
+    )
+    resolved = 0
+    for intent in intents:
+        leg = legs_by_id.get(int(intent.execution_order_leg_id))
+        if leg is None:
+            continue
+        binding = bindings_by_id.get(int(leg.execution_binding_id))
+        pos_id = str(leg.pos_id or "").strip()
+        if (
+            binding is None
+            or int(intent.execution_binding_id) != int(leg.execution_binding_id)
+            or str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
+            or str(leg.attribution_status or "") != "verified"
+            or not pos_id
+            or not _same_present_text(intent.parent_trigger_order_id, leg.order_id)
+        ):
+            continue
+        instrument_id = _trigger_protection_leg_instrument_id(
+            leg,
+            binding=binding,
+        )
+        if not instrument_id:
+            continue
+        intent.next_attempt_at = None
+        transition_trigger_protection_intent(
+            session,
+            intent,
+            recovery_state="resolved",
+            recovery_disposition="terminal",
+            last_reason_code="entry_leg_terminal_after_snapshot_wait",
+            last_evidence={
+                "schema_version": 1,
+                "intent_id": int(intent.id),
+                "binding_id": int(intent.execution_binding_id),
+                "execution_order_leg_id": int(leg.id),
+                "instrument_id": instrument_id,
+                "pos_id": pos_id,
+                "leg_status": str(leg.status).lower(),
+                "terminal_reason": (
+                    str(leg.terminal_reason) if leg.terminal_reason else None
+                ),
+                "previous_reason_code": "snapshot_incomplete",
+            },
+        )
+        intent.updated_at = resolved_at
+        session.flush()
+        resolved += 1
+    return resolved
 
 
 def _record_trigger_assignment_shadow_plan(
