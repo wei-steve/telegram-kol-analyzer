@@ -2069,6 +2069,111 @@ def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_pat
     assert json.loads(audit.evidence_json)["reason"] == "trigger_protection_snapshot_unavailable"
 
 
+def _make_active_btc_saved_intent(session_factory):
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        intent = session.query(TriggerProtectionIntent).one()
+        request = json.loads(leg.request_json)
+        request["instId"] = "BTC-USDT-SWAP"
+        binding.symbol = "BTC"
+        binding.side = "short"
+        binding.status = "active"
+        leg.request_json = json.dumps(request)
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.terminal_reason = None
+        leg.attribution_status = "verified"
+        intent.recovery_state = "pending"
+        intent.recovery_disposition = None
+        intent.last_reason_code = None
+        intent.last_evidence_json = None
+        intent.retry_attempts = 0
+        intent.next_attempt_at = None
+        intent.updated_at = datetime(2026, 8, 25, 1, 0)
+        session.commit()
+        return int(intent.id)
+
+
+def test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "instrument-isolation.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    intent_id = _make_active_btc_saved_intent(session_factory)
+
+    with session_factory() as session:
+        before_intent = session.get(TriggerProtectionIntent, intent_id)
+        assert before_intent is not None
+        before = (
+            before_intent.recovery_state,
+            before_intent.retry_attempts,
+            before_intent.next_attempt_at,
+            before_intent.recovery_disposition,
+            before_intent.last_reason_code,
+            before_intent.last_evidence_json,
+            before_intent.updated_at,
+        )
+
+    result = execution_bindings_module._apply_reconcile_snapshot(
+        session_factory,
+        snapshot=execution_bindings_module._ReconcileSnapshot(
+            errors={"trigger_history:ETH-USDT-SWAP": "unavailable"}
+        ),
+        recovered_at=datetime(2026, 8, 25, 1, 8),
+    )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        after = (
+            intent.recovery_state,
+            intent.retry_attempts,
+            intent.next_attempt_at,
+            intent.recovery_disposition,
+            intent.last_reason_code,
+            intent.last_evidence_json,
+            intent.updated_at,
+        )
+        audits = session.query(PositionAttributionAudit).filter(
+            PositionAttributionAudit.event_type == "protection_adoption_refused"
+        ).all()
+    assert after == before
+    assert audits == []
+    assert result.protection_snapshot_unavailable == 0
+
+
+@pytest.mark.parametrize(
+    "error_key",
+    ["trigger_history:BTC-USDT-SWAP", "trigger_history"],
+)
+def test_reconcile_target_or_generic_history_error_still_waits(tmp_path, error_key):
+    session_factory = create_session_factory(tmp_path / "relevant-history-error.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    intent_id = _make_active_btc_saved_intent(session_factory)
+
+    result = execution_bindings_module._apply_reconcile_snapshot(
+        session_factory,
+        snapshot=execution_bindings_module._ReconcileSnapshot(
+            errors={error_key: "unavailable"}
+        ),
+        recovered_at=datetime(2026, 8, 25, 1, 8),
+    )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        assert intent.recovery_state == "retrying"
+        assert intent.recovery_disposition == "wait"
+        assert intent.last_reason_code == "snapshot_incomplete"
+        assert json.loads(intent.last_evidence_json) == {
+            "snapshot_sources": [error_key]
+        }
+    assert result.protection_snapshot_unavailable == 1
+
+
 def test_reconcile_saved_intent_outage_does_not_exhaust_retry_budget(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
