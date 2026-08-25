@@ -30,9 +30,9 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: deployed_followup_required
+workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-21-shutdown-safety-followup-awaiting-authorization
+current_task: task-21-shutdown-safety-design
 verification_level: L2
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
@@ -121,6 +121,15 @@ cutover_authorized: false
 
 ## History
 
+- `2026-08-25T05:18:01Z task 21 claim`: the existing exclusive owner resumed
+  the shutdown-safety follow-up after the owner approved design A. The clean
+  working HEAD and latest status commit both equalled
+  `f8646997580283f21465d5e451fbed1853054d08`; the remote deploy branch remained
+  exact deployed commit `cdfe1b73c40d34d92bf613e5bcf0c81bf1fc0007`, with no Git
+  locks. Authorization is limited to local design, RED-to-GREEN repair, tests,
+  review, and candidate rebuild. Push, deployment, restart, production data or
+  settings mutation, credential rotation, cutover, Telegram traffic, and
+  exchange writes remain unauthorized.
 - `2026-08-23 planning`: read-only investigation at source baseline
   `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`; clean HEAD/upstream/remote and
   unclaimed completed original remediation were verified. Existing focused
