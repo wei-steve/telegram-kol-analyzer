@@ -30,9 +30,9 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
+workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-17-review-push
+current_task: task-18-trigger-protection-stale-wait-repair
 verification_level: L2
 local_candidate_commit: 4d6950ad9919a9fb71f8f54a73c45d85912b9272
 invalidated_local_candidate_commits:
