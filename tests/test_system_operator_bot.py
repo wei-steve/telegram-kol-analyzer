@@ -1,6 +1,8 @@
 import asyncio
 import hashlib
+import io
 import json
+import logging
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -93,7 +95,6 @@ def _telegram_status_error(*, status_code: int, token: str) -> httpx.HTTPStatusE
 
 def test_bot_poll_retries_server_error_without_logging_authenticated_url(
     monkeypatch,
-    caplog,
 ):
     token = "123456789:poll-retry-sentinel"
     error = _telegram_status_error(status_code=502, token=token)
@@ -107,22 +108,30 @@ def test_bot_poll_retries_server_error_without_logging_authenticated_url(
         return [{"update_id": 7}]
 
     monkeypatch.setattr(bot_commands_module, "_get_updates", fake_get_updates)
+    monkeypatch.setattr(bot_commands_module.logger, "propagate", False)
+    log_output = io.StringIO()
+    log_handler = logging.StreamHandler(log_output)
+    bot_commands_module.logger.addHandler(log_handler)
 
-    result = asyncio.run(
-        bot_commands_module._get_updates_with_retry(
-            object(),
-            "https://api.telegram.org/bot[hidden]",
-            offset=0,
-            poll_interval_seconds=0,
-            bot_label="System operator bot",
+    try:
+        result = asyncio.run(
+            bot_commands_module._get_updates_with_retry(
+                object(),
+                "https://api.telegram.org/bot[hidden]",
+                offset=0,
+                poll_interval_seconds=0,
+                bot_label="System operator bot",
+            )
         )
-    )
+    finally:
+        bot_commands_module.logger.removeHandler(log_handler)
+        log_handler.close()
 
     assert result == [{"update_id": 7}]
     assert calls == 2
-    assert token not in caplog.text
-    assert "api.telegram.org/bot" not in caplog.text
-    assert "status_code=502" in caplog.text
+    assert token not in log_output.getvalue()
+    assert "api.telegram.org/bot" not in log_output.getvalue()
+    assert "status_code=502" in log_output.getvalue()
 
 
 def test_bot_poll_rejects_auth_error_without_retry(monkeypatch):
