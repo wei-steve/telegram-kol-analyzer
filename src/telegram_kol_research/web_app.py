@@ -760,25 +760,32 @@ async def _stop_semantic_review_task(app: FastAPI) -> None:
     app.state.semantic_review_task = None
 
 
-async def _stop_bot_command_task(app: FastAPI, task_name: str) -> None:
-    task = getattr(app.state, task_name)
-    if task is None:
+async def _disconnect_shared_telegram_client(app: FastAPI) -> None:
+    client = app.state.telegram_client
+    disconnect = getattr(client, "disconnect", None)
+    if not callable(disconnect):
         return
-    task.cancel()
+    disconnect_task = asyncio.ensure_future(maybe_await(disconnect()))
+    done, _pending = await asyncio.wait(
+        {disconnect_task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
+    )
+    if disconnect_task not in done:
+        disconnect_task.cancel()
+        logger.warning("Telegram client disconnect exceeded shutdown timeout")
+        return
     try:
-        await task
+        disconnect_task.result()
     except asyncio.CancelledError:
         pass
     except Exception:
-        # The task's done callback is the single redacted failure report.
-        pass
-    setattr(app.state, task_name, None)
+        logger.exception("Telegram client disconnect failed during shutdown")
 
 
 async def _stop_live_listener_task(app: FastAPI) -> None:
     task = app.state.live_listener_task
     if task is None:
         return
+    await _disconnect_shared_telegram_client(app)
     task.cancel()
     done, _pending = await asyncio.wait(
         {task}, timeout=_TELEGRAM_SHUTDOWN_TIMEOUT_SECONDS
@@ -4577,9 +4584,6 @@ def create_web_app(
                         group_config=app.state.group_config,
                     )
                 )
-                app.state.telegram_bot_command_task.add_done_callback(
-                    _log_background_task_result("telegram_bot_command_task")
-                )
             if (
                 runtime_role_starts_singleton_task(
                     app.state.runtime_role, "strategy_management_notification"
@@ -4875,8 +4879,22 @@ def create_web_app(
                     pass
                 app.state.deepcoin_reconcile_task = None
             await _stop_live_listener_task(app)
-            await _stop_bot_command_task(app, "telegram_bot_command_task")
-            await _stop_bot_command_task(app, "system_operator_bot_command_task")
+            bot_command_task = app.state.telegram_bot_command_task
+            if bot_command_task is not None:
+                bot_command_task.cancel()
+                try:
+                    await bot_command_task
+                except asyncio.CancelledError:
+                    pass
+                app.state.telegram_bot_command_task = None
+            system_bot_command_task = app.state.system_operator_bot_command_task
+            if system_bot_command_task is not None:
+                system_bot_command_task.cancel()
+                try:
+                    await system_bot_command_task
+                except asyncio.CancelledError:
+                    pass
+                app.state.system_operator_bot_command_task = None
             management_notification_task = app.state.strategy_management_notification_task
             if management_notification_task is not None:
                 management_notification_task.cancel()

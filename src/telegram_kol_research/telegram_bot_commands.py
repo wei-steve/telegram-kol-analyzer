@@ -215,13 +215,12 @@ async def run_telegram_bot_command_loop(
         await _set_bot_commands(client, base_url)
         offset = await _latest_update_offset(client, base_url)
         while True:
-            updates = await _get_updates_with_retry(
-                client,
-                base_url,
-                offset=offset,
-                poll_interval_seconds=poll_interval_seconds,
-                bot_label="Telegram bot",
-            )
+            try:
+                updates = await _get_updates(client, base_url, offset=offset)
+            except httpx.TimeoutException:
+                logger.warning("Telegram bot getUpdates timed out; continuing")
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             for update in updates:
                 update_id = int(update.get("update_id") or 0)
                 offset = max(offset, update_id + 1)
@@ -273,13 +272,12 @@ async def run_system_operator_bot_command_loop(
         offset = await _latest_update_offset(client, base_url)
         logger.info("System operator bot command loop started chat_id=%s offset=%s", chat_id, offset)
         while True:
-            updates = await _get_updates_with_retry(
-                client,
-                base_url,
-                offset=offset,
-                poll_interval_seconds=poll_interval_seconds,
-                bot_label="System operator bot",
-            )
+            try:
+                updates = await _get_updates(client, base_url, offset=offset)
+            except httpx.TimeoutException:
+                logger.warning("System operator bot getUpdates timed out; continuing")
+                await asyncio.sleep(poll_interval_seconds)
+                continue
             if updates:
                 logger.info("System operator bot received %d update(s)", len(updates))
             for update in updates:
@@ -1098,40 +1096,6 @@ async def _get_updates(client: httpx.AsyncClient, base_url: str, *, offset: int)
     )
     response.raise_for_status()
     return list(response.json().get("result") or [])
-
-
-async def _get_updates_with_retry(
-    client: httpx.AsyncClient,
-    base_url: str,
-    *,
-    offset: int,
-    poll_interval_seconds: float,
-    bot_label: str,
-) -> list[dict[str, Any]]:
-    while True:
-        try:
-            return await _get_updates(client, base_url, offset=offset)
-        except httpx.HTTPError as exc:
-            status_code = (
-                exc.response.status_code
-                if isinstance(exc, httpx.HTTPStatusError)
-                else None
-            )
-            retryable = (
-                isinstance(exc, httpx.RequestError)
-                or status_code == 429
-                or status_code is not None
-                and 500 <= status_code < 600
-            )
-            if not retryable:
-                raise
-            logger.warning(
-                "%s getUpdates failed transiently; error_type=%s status_code=%s",
-                bot_label,
-                type(exc).__name__,
-                status_code if status_code is not None else "none",
-            )
-            await asyncio.sleep(poll_interval_seconds)
 
 
 async def _send_message(

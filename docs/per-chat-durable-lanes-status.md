@@ -32,20 +32,8 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: local_complete
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-21-shutdown-safety-push-awaiting-authorization
+current_task: task-20-awaiting-owner-direction
 verification_level: L2
-shutdown_safety_design: docs/plans/2026-08-24-telegram-shutdown-safety-design.md
-shutdown_safety_design_commit: f38bc6f9215b532e82542f1e7d7519ba03c21426
-shutdown_safety_plan: docs/plans/2026-08-24-telegram-shutdown-safety.md
-shutdown_safety_production_code_candidate: 1fa0d83f9b2c0470c8c7bd234e234b5e19a8ce95
-shutdown_safety_review_hardened_candidate: 66e8b51b2688dfbee83f11ed594868eec9c1844e
-shutdown_safety_focused_verification: "411 passed, 2 warnings in 37.14s"
-shutdown_safety_full_suite_verification: "6295 passed, 1 skipped, 32 warnings in 478.10s"
-shutdown_safety_independent_review_status: passed_no_critical_or_important_minor_tests_added
-shutdown_safety_push_authorized: false
-shutdown_safety_deployment_authorized: false
-shutdown_safety_restart_authorized: false
-shutdown_safety_credential_rotation_authorized: false
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
@@ -63,14 +51,9 @@ trigger_protection_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 trigger_protection_rehearsal_status: passed_copy_only_exact_three_rows
 trigger_protection_rehearsal_evidence: /Users/steven/.codex/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/rehearsal-summary.json
 trigger_protection_backup_sha256: de4926231f0c608028abd74ea9575b4448109ef307f0122477714baccfd27fe3
-trigger_protection_production_apply_plan_status: not_built_terminalized_by_normal_reconciliation
+trigger_protection_production_apply_plan_status: not_built_not_authorized
 trigger_protection_review_test_commit: 1992312cebfbf2496545aa582ff0786d372d4a1b
 trigger_protection_independent_review_status: passed_no_critical_or_important
-trigger_protection_deployed_commit: cdfe1b73c40d34d92bf613e5bcf0c81bf1fc0007
-trigger_protection_previous_production_commit: 76e4c9486ff18d5ab1ea71eeb65f31f08072afbb
-trigger_protection_production_status: passed_with_recorded_preexisting_shutdown_anomalies
-trigger_protection_production_evidence: /opt/telegram-kol-analyzer/data/evidence/trigger-protection-deploy-cdfe1b7-20260825T045048Z/final-stability.json
-trigger_protection_production_backup_sha256: aed34d9e8d24dc4ebdf0708658a8210787a357a263db8de6f6cede8778648c60
 batch150_terminalization_tool_commit: 868bbf378d77960a05dd199b3c1df6b6cb78621b
 batch150_rehearsal_status: passed_copy_only_volatile_cas
 batch150_rehearsal_evidence: /opt/telegram-kol-analyzer/data/evidence/batch150-volatile-cas-rehearsal-20260824T224153Z/rehearsal-summary.json
@@ -82,7 +65,7 @@ fail_closed_parallel_chat_limit: 1
 schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
-deployment_authorized: true
+deployment_authorized: false
 cutover_authorized: false
 ```
 
@@ -133,49 +116,6 @@ cutover_authorized: false
 
 ## History
 
-- `2026-08-25 task 21 local candidate`: completed the authorized local
-  RED-to-GREEN repair. The Telethon lifecycle RED failed with two disconnects
-  instead of one; GREEN and its bounded-timeout neighbor passed `2`. The raw-log
-  RED exposed a fake authenticated Bot token before handler emission; the full
-  logging file passed `5` after the formatter fix. Bot polling REDs failed
-  because no shared recovery helper existed; GREEN proved 502 retry and 401
-  fail-fast, then review hardening covered 429, ConnectError, ReadTimeout, and
-  cancellation propagation. The failed-task lifespan RED re-raised a synthetic
-  authenticated 502; GREEN consumed it, cleared app state, preserved executor
-  shutdown order, and the event-loop regression file passed `18`. One combined
-  test run exposed only a closed pytest capture handler in the new test; the
-  test was isolated without production-code changes, after which the final
-  focused set passed `411` with `2` existing deprecation warnings in `37.14s`.
-  Compileall and diff checks passed. Independent read-only review of the
-  production range returned Ready Yes, zero Critical, zero Important, and one
-  Minor test-coverage finding; the added review tests passed `6`. Frozen
-  production-code candidate
-  `1fa0d83f9b2c0470c8c7bd234e234b5e19a8ce95` then passed the one final complete
-  suite at review-hardened test candidate
-  `66e8b51b2688dfbee83f11ed594868eec9c1844e`: `6295 passed, 1 skipped, 32
-  warnings in 478.10s` (`488.53s` command wall time). No schema, recognition,
-  durable-queue, callback, management, position, execution, settings,
-  concurrency, or exchange-write semantics changed. The candidate remains
-  local. Push, credential rotation, deployment, restart, production
-  data/settings mutation, Telegram traffic, cutover, and exchange writes remain
-  unauthorized.
-- `2026-08-25 task 21 design`: owner approved design A. The committed design
-  makes the live-listener task the single Telethon disconnect owner, retries
-  only transient Bot polling failures, consumes already-failed Bot tasks during
-  lifespan shutdown, and redacts authenticated Bot URLs before handler
-  emission. The implementation plan preserves RED-to-GREEN checkpoints and one
-  final complete suite. No production code, push, deployment, restart,
-  credential, production-data/settings, Telegram, cutover, or exchange action
-  occurred. Design commit: `f38bc6f9215b532e82542f1e7d7519ba03c21426`.
-- `2026-08-25T05:18:01Z task 21 claim`: the existing exclusive owner resumed
-  the shutdown-safety follow-up after the owner approved design A. The clean
-  working HEAD and latest status commit both equalled
-  `f8646997580283f21465d5e451fbed1853054d08`; the remote deploy branch remained
-  exact deployed commit `cdfe1b73c40d34d92bf613e5bcf0c81bf1fc0007`, with no Git
-  locks. Authorization is limited to local design, RED-to-GREEN repair, tests,
-  review, and candidate rebuild. Push, deployment, restart, production data or
-  settings mutation, credential rotation, cutover, Telegram traffic, and
-  exchange writes remain unauthorized.
 - `2026-08-23 planning`: read-only investigation at source baseline
   `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`; clean HEAD/upstream/remote and
   unclaimed completed original remediation were verified. Existing focused
@@ -581,37 +521,3 @@ cutover_authorized: false
   Work remains local and unpushed. Production apply, push, deployment, restart,
   cutover, Telegram traffic, and exchange writes remain unauthorized; the next
   action requires explicit owner direction.
-- `2026-08-25 trigger-protection exact deployment`: owner authorized exact
-  integration SHA `cdfe1b73c40d34d92bf613e5bcf0c81bf1fc0007`. The deploy branch advanced by
-  non-force fast-forward from `a832ffb08972a3b74309c468274105b7014790fb`, and
-  the gated updater advanced production from
-  `76e4c9486ff18d5ab1ea71eeb65f31f08072afbb`; updater exit was `0`. Fresh
-  predeploy gates proved exact remote SHA, tracked worktree clean, split services
-  active/enabled with monolith inactive/disabled, `global + 20 / queue / queue`,
-  semantic review off, active-write/unsafe-management/active-worker/claimed-job
-  counts zero, source `quick_check=ok`, and exact predicate IDs `[138, 141, 147]`.
-  The private online backup
-  `/opt/telegram-kol-analyzer/data/evidence/trigger-protection-deploy-cdfe1b7-20260825T045048Z/research-before.db`
-  is `0600`, size `719441920`, SHA-256
-  `aed34d9e8d24dc4ebdf0708658a8210787a357a263db8de6f6cede8778648c60`,
-  with `quick_check=ok` and zero foreign-key violations. Normal candidate
-  reconciliation changed exactly the six permitted state/evidence fields on
-  each target intent, preserving retry attempts and all immutable identities;
-  the resolved set was exactly `[138, 141, 147]`. Every critical table count,
-  including `execution_events`, had delta zero. Final `quick_check=ok`, foreign
-  keys zero, active-write zero, settings unchanged, and all new split PIDs were
-  active with Result `success`; the three target rows remained byte-for-byte
-  stable at the delayed read with common `updated_at=2026-08-25 04:52:34.691080`.
-  No exchange write, cutover, settings mutation, manufactured traffic, or extra
-  restart occurred. Evidence root:
-  `/opt/telegram-kol-analyzer/data/evidence/trigger-protection-deploy-cdfe1b7-20260825T045048Z/`.
-  The required restart exposed two old-process shutdown anomalies before the
-  candidate PIDs started: ingest Telethon keepalive attempted session persistence
-  during cancellation, and worker Bot polling received a transient Telegram 502
-  whose old lifespan re-raised an authenticated request exception. The latter
-  demonstrates an authenticated-URL redaction risk. Self-created evidence was
-  immediately redacted; system journal and credentials were not mutated. New
-  candidate PIDs had zero matching runtime markers. Code rollback was not
-  triggered. Separate authorization is required for RED-to-GREEN graceful
-  shutdown/log-redaction repair, credential rotation, any follow-up push, or
-  another restart/deployment.
