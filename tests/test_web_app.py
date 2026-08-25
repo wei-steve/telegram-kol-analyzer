@@ -639,6 +639,53 @@ def test_runtime_incident_notification_worker_stays_dormant_when_disabled(
         assert app.state.system_operator_bot_command_task is not None
 
 
+def test_lifespan_consumes_failed_system_bot_task_without_authenticated_url(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.web_app as web_module
+
+    token = "123456789:failed-task-sentinel"
+    failed = asyncio.Event()
+
+    async def failing_system_operator_loop(**_kwargs):
+        request = httpx.Request(
+            "GET",
+            f"https://api.telegram.org/bot{token}/getUpdates",
+        )
+        response = httpx.Response(502, request=request)
+        failed.set()
+        response.raise_for_status()
+
+    monkeypatch.setattr(
+        web_module,
+        "run_system_operator_bot_command_loop",
+        failing_system_operator_loop,
+    )
+    app = create_web_app(database_path=tmp_path / "research.db")
+    app.state.strategy_alert_config = None
+    app.state.notification_bot_config = None
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+
+    async def scenario():
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(failed.wait(), timeout=1.0)
+            await asyncio.sleep(0)
+            assert app.state.system_operator_bot_command_task.done()
+
+    asyncio.run(scenario())
+
+    assert app.state.system_operator_bot_command_task is None
+    raw_log = (tmp_path / "logs" / "telegram-kol.log").read_text(
+        encoding="utf-8"
+    )
+    assert token not in raw_log
+    assert "https://api.telegram.org/bot[REDACTED]/getUpdates" in raw_log
+
+
 def test_message_operation_stage1_starts_dispatcher_without_legacy_notifications(
     tmp_path,
     monkeypatch,
