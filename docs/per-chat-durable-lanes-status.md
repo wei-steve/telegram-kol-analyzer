@@ -32,8 +32,11 @@ remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
 workstream_status: in_progress
 claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-21-shutdown-safety-design
+current_task: task-21-telethon-shutdown-red
 verification_level: L2
+shutdown_safety_design: docs/plans/2026-08-24-telegram-shutdown-safety-design.md
+shutdown_safety_design_commit: f38bc6f9215b532e82542f1e7d7519ba03c21426
+shutdown_safety_plan: docs/plans/2026-08-24-telegram-shutdown-safety.md
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
@@ -121,6 +124,14 @@ cutover_authorized: false
 
 ## History
 
+- `2026-08-25 task 21 design`: owner approved design A. The committed design
+  makes the live-listener task the single Telethon disconnect owner, retries
+  only transient Bot polling failures, consumes already-failed Bot tasks during
+  lifespan shutdown, and redacts authenticated Bot URLs before handler
+  emission. The implementation plan preserves RED-to-GREEN checkpoints and one
+  final complete suite. No production code, push, deployment, restart,
+  credential, production-data/settings, Telegram, cutover, or exchange action
+  occurred. Design commit: `f38bc6f9215b532e82542f1e7d7519ba03c21426`.
 - `2026-08-25T05:18:01Z task 21 claim`: the existing exclusive owner resumed
   the shutdown-safety follow-up after the owner approved design A. The clean
   working HEAD and latest status commit both equalled
