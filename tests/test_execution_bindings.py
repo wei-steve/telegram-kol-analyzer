@@ -1946,7 +1946,9 @@ def test_reconcile_resolves_exact_terminal_stale_wait_intent(tmp_path):
 
     execution_bindings_module._apply_reconcile_snapshot(
         session_factory,
-        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        snapshot=execution_bindings_module._ReconcileSnapshot(
+            errors={"trigger_history:ETH-USDT-SWAP": "unavailable"}
+        ),
         recovered_at=datetime(2026, 8, 25, 1, 8),
     )
 
@@ -1976,7 +1978,9 @@ def test_reconcile_resolves_exact_terminal_stale_wait_intent(tmp_path):
 
     execution_bindings_module._apply_reconcile_snapshot(
         session_factory,
-        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        snapshot=execution_bindings_module._ReconcileSnapshot(
+            errors={"trigger_history:ETH-USDT-SWAP": "unavailable"}
+        ),
         recovered_at=datetime(2026, 8, 25, 1, 9),
     )
 
@@ -1991,6 +1995,8 @@ def test_reconcile_resolves_exact_terminal_stale_wait_intent(tmp_path):
     ("changed_field", "changed_value"),
     [
         ("recovery_state", "pending"),
+        ("recovery_state", "failed"),
+        ("recovery_state", "adopted"),
         ("recovery_disposition", "retry"),
         ("last_reason_code", "candidate_not_yet_observable"),
         ("leg_status", "active"),
@@ -2027,18 +2033,26 @@ def test_reconcile_terminal_stale_wait_predicate_is_exact(
         else:
             setattr(intent, changed_field, changed_value)
         session.commit()
+        before = tuple(
+            getattr(intent, column.name)
+            for column in TriggerProtectionIntent.__table__.columns
+        )
     execution_bindings_module._apply_reconcile_snapshot(
         session_factory,
-        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        snapshot=execution_bindings_module._ReconcileSnapshot(
+            errors={"trigger_history:ETH-USDT-SWAP": "unavailable"}
+        ),
         recovered_at=datetime(2026, 8, 25, 1, 8),
     )
 
     with session_factory() as session:
         intent = session.get(TriggerProtectionIntent, intent_id)
         assert intent is not None
-        assert intent.recovery_state != "resolved"
-        assert intent.recovery_disposition != "terminal"
-        assert intent.last_reason_code != "entry_leg_terminal_after_snapshot_wait"
+        after = tuple(
+            getattr(intent, column.name)
+            for column in TriggerProtectionIntent.__table__.columns
+        )
+    assert after == before
 
 
 def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_path):
@@ -2095,8 +2109,15 @@ def _make_active_btc_saved_intent(session_factory):
         return int(intent.id)
 
 
-def test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent(
-    tmp_path,
+@pytest.mark.parametrize(
+    "error_key",
+    [
+        "trigger_history:ETH-USDT-SWAP",
+        "pending_trigger_orders:ETH-USDT-SWAP",
+    ],
+)
+def test_reconcile_unrelated_instrument_error_does_not_rewrite_intent(
+    tmp_path, error_key,
 ):
     session_factory = create_session_factory(tmp_path / "instrument-isolation.db")
     _seed_trigger_protection_adoption(session_factory)
@@ -2119,7 +2140,7 @@ def test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent(
     result = execution_bindings_module._apply_reconcile_snapshot(
         session_factory,
         snapshot=execution_bindings_module._ReconcileSnapshot(
-            errors={"trigger_history:ETH-USDT-SWAP": "unavailable"}
+            errors={error_key: "unavailable"}
         ),
         recovered_at=datetime(2026, 8, 25, 1, 8),
     )
@@ -2144,11 +2165,134 @@ def test_reconcile_unrelated_instrument_history_error_does_not_rewrite_intent(
     assert result.protection_snapshot_unavailable == 0
 
 
+def test_read_only_reconcile_scopes_real_multi_instrument_history_failure(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "public-instrument-isolation.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    intent_id = _make_active_btc_saved_intent(session_factory)
+    eth_binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            message_id=56,
+            symbol="ETH",
+            side="short",
+            order_id="eth-entry",
+            client_order_id="eth-client",
+            status="active",
+        ),
+    )
+    _add_entry_leg(
+        session_factory,
+        eth_binding_id,
+        order_id="eth-entry",
+        client_order_id="eth-client",
+        status="active",
+        request={"instId": "ETH-USDT-SWAP", "posSide": "short", "sz": "1"},
+    )
+
+    with session_factory() as session:
+        before_intent = session.get(TriggerProtectionIntent, intent_id)
+        assert before_intent is not None
+        before = tuple(
+            getattr(before_intent, column.name)
+            for column in TriggerProtectionIntent.__table__.columns
+        )
+        btc_leg_id = int(before_intent.execution_order_leg_id)
+
+    class MultiInstrumentClient:
+        def __init__(self):
+            self.pending_calls = []
+            self.history_calls = []
+
+        def list_positions(self):
+            return []
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.pending_calls.append(inst_id)
+            return []
+
+        def list_order_history(self, *, inst_id):
+            return []
+
+        def list_trade_fills(self, *, inst_id):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id):
+            self.history_calls.append(inst_id)
+            if inst_id == "ETH-USDT-SWAP":
+                raise RuntimeError("ETH history unavailable")
+            return []
+
+    client = MultiInstrumentClient()
+    captured = {}
+    original_apply = execution_bindings_module._apply_reconcile_snapshot
+
+    def capture_apply(*args, **kwargs):
+        captured["errors"] = dict(kwargs["snapshot"].errors)
+        result = original_apply(*args, **kwargs)
+        captured["result"] = result
+        return result
+
+    monkeypatch.setattr(
+        execution_bindings_module,
+        "_apply_reconcile_snapshot",
+        capture_apply,
+    )
+
+    with pytest.raises(
+        execution_bindings_module.DeepcoinReconciliationSnapshotUnavailable
+    ):
+        execution_bindings_module.reconcile_deepcoin_execution_bindings_read_only(
+            session_factory,
+            client=client,
+            recovered_at=datetime(2026, 8, 25, 1, 8),
+        )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        after = tuple(
+            getattr(intent, column.name)
+            for column in TriggerProtectionIntent.__table__.columns
+        )
+        btc_leg = session.get(ExecutionOrderLeg, btc_leg_id)
+        assert btc_leg is not None
+        refusal_audits = session.query(PositionAttributionAudit).filter(
+            PositionAttributionAudit.execution_order_leg_id == btc_leg_id,
+            PositionAttributionAudit.event_type == "protection_adoption_refused",
+        ).all()
+        barrier_audit = session.query(PositionAttributionAudit).filter(
+            PositionAttributionAudit.execution_order_leg_id == btc_leg_id,
+            PositionAttributionAudit.event_type == "evidence_unavailable",
+        ).one()
+
+    assert after == before
+    assert captured["errors"] == {
+        "trigger_history:ETH-USDT-SWAP": "ETH history unavailable"
+    }
+    assert captured["result"].protection_snapshot_unavailable == 0
+    assert client.pending_calls == ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    assert client.history_calls == ["BTC-USDT-SWAP", "ETH-USDT-SWAP"]
+    assert refusal_audits == []
+    assert barrier_audit.new_state == "evidence_unavailable"
+    assert btc_leg.attribution_status == "evidence_unavailable"
+
+
 @pytest.mark.parametrize(
     "error_key",
-    ["trigger_history:BTC-USDT-SWAP", "trigger_history"],
+    [
+        "trigger_history:BTC-USDT-SWAP",
+        "trigger_history",
+        "pending_trigger_orders:BTC-USDT-SWAP",
+        "pending_trigger_orders",
+    ],
 )
-def test_reconcile_target_or_generic_history_error_still_waits(tmp_path, error_key):
+def test_reconcile_target_or_generic_protection_error_still_waits(tmp_path, error_key):
     session_factory = create_session_factory(tmp_path / "relevant-history-error.db")
     _seed_trigger_protection_adoption(session_factory)
     _save_trigger_protection_intent(session_factory)
