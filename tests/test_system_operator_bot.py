@@ -78,6 +78,82 @@ from telegram_kol_research.system_operator_bot import (
 NOW = datetime(2026, 7, 15, 12, 0, tzinfo=UTC)
 
 
+def _telegram_status_error(*, status_code: int, token: str) -> httpx.HTTPStatusError:
+    request = httpx.Request(
+        "GET",
+        f"https://api.telegram.org/bot{token}/getUpdates",
+    )
+    response = httpx.Response(status_code, request=request)
+    try:
+        response.raise_for_status()
+    except httpx.HTTPStatusError as exc:
+        return exc
+    raise AssertionError("expected an HTTP status error")
+
+
+def test_bot_poll_retries_server_error_without_logging_authenticated_url(
+    monkeypatch,
+    caplog,
+):
+    token = "123456789:poll-retry-sentinel"
+    error = _telegram_status_error(status_code=502, token=token)
+    calls = 0
+
+    async def fake_get_updates(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise error
+        return [{"update_id": 7}]
+
+    monkeypatch.setattr(bot_commands_module, "_get_updates", fake_get_updates)
+
+    result = asyncio.run(
+        bot_commands_module._get_updates_with_retry(
+            object(),
+            "https://api.telegram.org/bot[hidden]",
+            offset=0,
+            poll_interval_seconds=0,
+            bot_label="System operator bot",
+        )
+    )
+
+    assert result == [{"update_id": 7}]
+    assert calls == 2
+    assert token not in caplog.text
+    assert "api.telegram.org/bot" not in caplog.text
+    assert "status_code=502" in caplog.text
+
+
+def test_bot_poll_rejects_auth_error_without_retry(monkeypatch):
+    error = _telegram_status_error(
+        status_code=401,
+        token="123456789:poll-auth-sentinel",
+    )
+    calls = 0
+
+    async def fake_get_updates(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        raise error
+
+    monkeypatch.setattr(bot_commands_module, "_get_updates", fake_get_updates)
+
+    async def scenario():
+        with pytest.raises(httpx.HTTPStatusError) as exc_info:
+            await bot_commands_module._get_updates_with_retry(
+                object(),
+                "https://api.telegram.org/bot[hidden]",
+                offset=0,
+                poll_interval_seconds=0,
+                bot_label="System operator bot",
+            )
+        return exc_info.value
+
+    assert asyncio.run(scenario()) is error
+    assert calls == 1
+
+
 def test_operator_maintenance_tick_runs_bounded_entry_reconciler(monkeypatch):
     calls = []
     expected = SimpleNamespace(released=1, expired=0, incidents=0, skipped=0)
