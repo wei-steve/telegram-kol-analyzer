@@ -1906,6 +1906,141 @@ def test_reconcile_saved_intent_adopts_history_only_proven_candidate(tmp_path):
     assert intent.adopted_order_id == "tpsl-history"
 
 
+def _make_exact_terminal_stale_wait_intent(session_factory):
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        intent = session.query(TriggerProtectionIntent).one()
+        request = json.loads(leg.request_json)
+        request["instId"] = "BTC-USDT-SWAP"
+        binding.symbol = "BTC"
+        binding.side = "short"
+        binding.status = "closed"
+        leg.request_json = json.dumps(request)
+        leg.pos_id = "pos-1"
+        leg.status = "manually_closed"
+        leg.terminal_reason = "manual_position_missing"
+        leg.attribution_status = "verified"
+        intent.recovery_state = "retrying"
+        intent.recovery_disposition = "wait"
+        intent.last_reason_code = "snapshot_incomplete"
+        intent.last_evidence_json = json.dumps(
+            {"snapshot_sources": ["trigger_history:ETH-USDT-SWAP"]},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        intent.retry_attempts = 2
+        intent.next_attempt_at = datetime(2026, 8, 24, 23, 41)
+        intent.updated_at = datetime(2026, 8, 24, 23, 31)
+        session.commit()
+        return int(binding.id), int(leg.id), int(intent.id)
+
+
+def test_reconcile_resolves_exact_terminal_stale_wait_intent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "terminal-stale-wait.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    binding_id, leg_id, intent_id = _make_exact_terminal_stale_wait_intent(
+        session_factory
+    )
+
+    execution_bindings_module._apply_reconcile_snapshot(
+        session_factory,
+        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        recovered_at=datetime(2026, 8, 25, 1, 8),
+    )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        first_updated_at = intent.updated_at
+        assert intent.recovery_state == "resolved"
+        assert intent.recovery_disposition == "terminal"
+        assert intent.last_reason_code == "entry_leg_terminal_after_snapshot_wait"
+        assert intent.next_attempt_at is None
+        assert intent.retry_attempts == 2
+        assert intent.parent_trigger_order_id == "entry-1"
+        assert intent.adopted_order_id is None
+        assert json.loads(intent.last_evidence_json) == {
+            "binding_id": binding_id,
+            "execution_order_leg_id": leg_id,
+            "instrument_id": "BTC-USDT-SWAP",
+            "intent_id": intent_id,
+            "leg_status": "manually_closed",
+            "pos_id": "pos-1",
+            "previous_reason_code": "snapshot_incomplete",
+            "schema_version": 1,
+            "terminal_reason": "manual_position_missing",
+        }
+        assert session.query(PositionAttributionAudit).count() == 0
+
+    execution_bindings_module._apply_reconcile_snapshot(
+        session_factory,
+        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        recovered_at=datetime(2026, 8, 25, 1, 9),
+    )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        assert intent.updated_at == first_updated_at
+        assert session.query(PositionAttributionAudit).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("changed_field", "changed_value"),
+    [
+        ("recovery_state", "pending"),
+        ("recovery_disposition", "retry"),
+        ("last_reason_code", "candidate_not_yet_observable"),
+        ("leg_status", "active"),
+        ("attribution_status", "unassigned"),
+        ("pos_id", None),
+        ("parent_trigger_order_id", "other-parent"),
+        ("execution_binding_id", "other-binding"),
+    ],
+)
+def test_reconcile_terminal_stale_wait_predicate_is_exact(
+    tmp_path, changed_field, changed_value
+):
+    session_factory = create_session_factory(tmp_path / f"counterexample-{changed_field}.db")
+    _seed_trigger_protection_adoption(session_factory)
+    _save_trigger_protection_intent(session_factory)
+    _, _, intent_id = _make_exact_terminal_stale_wait_intent(session_factory)
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        leg = session.get(ExecutionOrderLeg, intent.execution_order_leg_id)
+        assert leg is not None
+        if changed_field == "leg_status":
+            leg.status = changed_value
+        elif changed_field == "attribution_status":
+            leg.attribution_status = changed_value
+        elif changed_field == "pos_id":
+            leg.pos_id = changed_value
+        elif changed_field == "execution_binding_id":
+            other_binding_id = upsert_execution_binding(
+                session_factory,
+                _binding(message_id=56, order_id="other-order", client_order_id="other-client"),
+            )
+            intent.execution_binding_id = other_binding_id
+        else:
+            setattr(intent, changed_field, changed_value)
+        session.commit()
+    execution_bindings_module._apply_reconcile_snapshot(
+        session_factory,
+        snapshot=execution_bindings_module._ReconcileSnapshot(),
+        recovered_at=datetime(2026, 8, 25, 1, 8),
+    )
+
+    with session_factory() as session:
+        intent = session.get(TriggerProtectionIntent, intent_id)
+        assert intent is not None
+        assert intent.recovery_state != "resolved"
+        assert intent.recovery_disposition != "terminal"
+        assert intent.last_reason_code != "entry_leg_terminal_after_snapshot_wait"
+
+
 def test_reconcile_saved_intent_records_unavailable_snapshot_and_retries(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_protection_adoption(session_factory)
