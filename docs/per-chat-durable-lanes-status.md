@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-precutover-gates-failed-awaiting-owner
+claimed_by: codex-per-chat-phase7-blocker-repair-20260826-root
+claim_base_sha: 61a5e9cfab14d4c3150c7ef7c2390ff4ec07874f
+current_task: phase-7-precutover-blocker-diagnosis-and-local-repair
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,9 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: precutover_gate_failed_incomplete
+phase_7_status: in_progress
 phase_7_authorization: consumed_safe_retry_stopped_before_cutover
+phase_7_blocker_remediation_authorization: owner_directed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_production_sha: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
 phase_7_before_tuple: global_1_queue
 phase_7_cutover_tuple: per_chat_3_queue
@@ -212,6 +213,20 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 blocker-remediation claim`: session
+  `codex-per-chat-phase7-blocker-repair-20260826-root` claimed the failed
+  pre-cutover Web loop-stall and pending-job blockers at exact clean canonical
+  base `61a5e9cfab14d4c3150c7ef7c2390ff4ec07874f`. Local upstream, the local
+  remote-tracking deploy ref, the live remote deploy branch, and production
+  HEAD remained exactly
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a`; production remained
+  `global + 1 + queue`. Authorization is limited to read-only production root-
+  cause evidence, minimal RED-to-GREEN local code/tests if a defect is proven,
+  canonical status updates, and explicit-path local commits. Push, deployment,
+  restart, cutover, rollback, production settings/schema/data changes, worker
+  commands, replay, manufactured traffic, Telegram business messages, test
+  trades, and exchange writes remain unauthorized.
 
 - `2026-08-26 Phase 7 safe-retry pre-cutover stop`: the claimed retry repeated
   the immediate local identity check successfully at local canonical claim
