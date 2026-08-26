@@ -195,12 +195,14 @@ def create_telegram_client(
     kwargs.update(env_settings)
     if connect_settings:
         kwargs.update(connect_settings)
-    return TelegramClient(
+    client = TelegramClient(
         str(auth_config.session_path),
         auth_config.api_id,
         auth_config.api_hash,
         **kwargs,
     )
+    client.session.save_entities = False
+    return client
 
 
 async def maybe_await(value: Any) -> Any:
