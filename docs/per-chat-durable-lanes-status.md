@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-awaiting-claim
+claimed_by: codex-per-chat-opt-phase7-20260826-root
+claim_base_sha: 8c2159286309d9380622d0a3770c3d46592d11d7
+current_task: phase-7-cutover-acceptance-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,6 +96,8 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
+phase_7_status: in_progress
+phase_7_authorization: exact_atomic_cutover_two_level_rollback_and_two_hour_read_only_acceptance_only
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -133,7 +135,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -182,6 +184,43 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 cutover-and-acceptance claim`: session
+  `codex-per-chat-opt-phase7-20260826-root` exclusively claimed only Phase 7 at
+  exact clean local canonical base
+  `8c2159286309d9380622d0a3770c3d46592d11d7`. Phase 6 is completed and its
+  deployed commit, local upstream, local remote-tracking deploy ref, live remote
+  deploy branch, and production HEAD all resolve exactly to
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a`. The Phase 6 raw evidence remains
+  present and matches canonical SHA-256
+  `7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023`.
+  Canonical ownership was unclaimed, the local worktree was clean and exclusive,
+  and no Git or deployment lock or updater process was active.
+
+  The production preclaim gate found exactly one active/running ingest, worker,
+  and Web authority at the deployed checkout, distinct PIDs, an inactive
+  monolith, and only ingest holding the Telegram session. The complete tuple was
+  exactly `global + 20 + queue`, semantic review was disabled, active exchange
+  writes, active management, pending/claimed message jobs, and pending/claimed/
+  executing worker commands were all zero. The worker had zero active lanes;
+  SQLite was `wal`, `quick_check=ok`, `query_only=1`, `total_changes=0`, and had
+  zero foreign-key violations. All three runtime roles reported zero loop stalls
+  and the journals reported zero new SQLite locks, session conflicts,
+  DeepSeek/402 errors, or authority drift. The worker-owned bounded read-only
+  exchange baseline was complete with fingerprint
+  `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`,
+  zero positions, and zero open orders.
+
+  Authorization is limited to one exact ingest-owned expected-state transition
+  from `global + 20 + queue` to `per_chat + 3 + queue`, the approved atomic
+  rollback to `global + 3 + queue` for lock/admission/ingest anomalies or
+  `global + 1 + queue` for scheduler/duplicate/SQLite/execution/concurrency
+  anomalies, one uninterrupted two-hour natural-traffic acceptance window,
+  read-only production evidence, local canonical status updates, and local
+  explicit-path commits. No push, deployment, restart, production code/schema/
+  migration/data edit, worker command, replay, manufactured traffic, Telegram
+  business or operator/system Bot message, test trade, or observer-triggered
+  exchange write is authorized.
 
 - `2026-08-26 Phase 6 compatible deployment completion`: exact candidate
   `8cccfbb1683894459368cec4ca64a0cf626a1e9a` was pushed without force and
