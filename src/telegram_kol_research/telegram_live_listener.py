@@ -1358,6 +1358,68 @@ async def recover_missing_authoritative_decisions(
     return result
 
 
+def _load_reconcile_pipeline_mode(session_factory) -> str:
+    repair_history_checkpoints(session_factory)
+    return load_trading_settings(session_factory).message_pipeline_mode
+
+
+def _load_history_checkpoint_projection(session_factory) -> dict[int, int]:
+    from telegram_kol_research.models import SyncCheckpoint
+
+    with session_factory() as session:
+        checkpoints = (
+            session.query(SyncCheckpoint)
+            .filter(SyncCheckpoint.sync_kind == "history")
+            .all()
+        )
+        return {
+            checkpoint.chat_id: int(checkpoint.last_message_id or 0)
+            for checkpoint in checkpoints
+        }
+
+
+def _load_orphan_media_message_ids(
+    session_factory,
+    *,
+    dialog_id: int,
+    replay_floor: int,
+    media_root: str | Path,
+) -> set[int]:
+    with session_factory() as session:
+        media_rows = (
+            session.query(RawMessage.message_id, MediaAsset.local_path)
+            .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
+            .filter(
+                RawMessage.chat_id == dialog_id,
+                RawMessage.message_id > replay_floor,
+            )
+            .all()
+        )
+    resolved_media_root = Path(media_root)
+    return {
+        int(row.message_id)
+        for row in media_rows
+        if not _is_usable_downloaded_media_path(
+            row.local_path,
+            media_root=resolved_media_root,
+        )
+    }
+
+
+def _persist_history_reconcile_records(
+    session_factory,
+    *,
+    records,
+    broker,
+) -> dict[str, Any]:
+    return persist_normalized_messages(
+        session_factory,
+        records,
+        sync_kind="history",
+        broker=broker,
+    )
+
+
 async def run_reconcile_once(
     *,
     client: Any,
@@ -1395,8 +1457,10 @@ async def run_reconcile_once(
     lock instead, exactly as it did before this parameter existed.
     """
 
-    repair_history_checkpoints(session_factory)
-    pipeline_mode = load_trading_settings(session_factory).message_pipeline_mode
+    pipeline_mode = await asyncio.to_thread(
+        _load_reconcile_pipeline_mode,
+        session_factory,
+    )
     if system_operator_bot_enabled(notification_bot_config):
         await deliver_pending_message_instruction_summaries(
             session_factory,
@@ -1435,19 +1499,10 @@ async def run_reconcile_once(
         recovered_messages = recovery_result["recovered_messages"]
         expired_recovery_messages = recovery_result["expired_recovery_messages"]
 
-    history_checkpoints: dict[int, int] = {}
-    with session_factory() as session:
-        from telegram_kol_research.models import SyncCheckpoint
-
-        checkpoints = (
-            session.query(SyncCheckpoint)
-            .filter(SyncCheckpoint.sync_kind == "history")
-            .all()
-        )
-        history_checkpoints = {
-            checkpoint.chat_id: int(checkpoint.last_message_id or 0)
-            for checkpoint in checkpoints
-        }
+    history_checkpoints = await asyncio.to_thread(
+        _load_history_checkpoint_projection,
+        session_factory,
+    )
 
     inserted_messages = 0
     inserted_candidates = 0
@@ -1466,25 +1521,13 @@ async def run_reconcile_once(
 
         # ── Also re-fetch messages whose media download failed earlier ──
         dialog_id = int(dialog.get("id") or 0)
-        with session_factory() as session:
-            media_rows = (
-                session.query(RawMessage.message_id, MediaAsset.local_path)
-                .join(MediaAsset, MediaAsset.raw_message_id == RawMessage.id)
-                .filter(
-                    RawMessage.chat_id == dialog_id,
-                    RawMessage.message_id > replay_floor,
-                )
-                .all()
-            )
-        resolved_media_root = Path(media_root)
-        orphan_msg_ids = {
-            row.message_id
-            for row in media_rows
-            if not _is_usable_downloaded_media_path(
-                row.local_path,
-                media_root=resolved_media_root,
-            )
-        }
+        orphan_msg_ids = await asyncio.to_thread(
+            _load_orphan_media_message_ids,
+            session_factory,
+            dialog_id=dialog_id,
+            replay_floor=replay_floor,
+            media_root=media_root,
+        )
         fetch_kwargs = _filter_callable_kwargs(
             fetch_dialog_messages_fn,
             {
@@ -1510,10 +1553,10 @@ async def run_reconcile_once(
         if not records:
             continue
 
-        stats = persist_normalized_messages(
+        stats = await asyncio.to_thread(
+            _persist_history_reconcile_records,
             session_factory,
-            records,
-            sync_kind="history",
+            records=records,
             broker=broker,
         )
         inserted_messages += stats["inserted_messages"]
