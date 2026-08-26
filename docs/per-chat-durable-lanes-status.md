@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-rolled-back-awaiting-ingest-stall-remediation-authorization
+claimed_by: codex-per-chat-phase7-ingest-stall-remediation-20260826T1755Z-root
+claim_base_sha: 54dca4b57ee7da80b6566d42b048153d6467eb05
+current_task: phase-7-ingest-stall-remediation-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -98,6 +98,8 @@ phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
 phase_7_authorization: consumed_owner_authorized_new_safe_retry_global_1_to_per_chat_3
+phase_7_ingest_stall_remediation_authorization: owner_authorized_local_red_green_root_cause_minimal_fix_tests_status_and_commits_only
+phase_7_ingest_stall_remediation_status: in_progress
 phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
 phase_7_observer_design_commit: c1edfb14b00730fc72eec225a93313f7e5ea67dd
 phase_7_observer_plan_commit: 753c401c37e81a7620a02843c091fe5ade1727f9
@@ -252,6 +254,25 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 ingest-stall remediation claim`: session
+  `codex-per-chat-phase7-ingest-stall-remediation-20260826T1755Z-root`
+  exclusively claimed the owner-authorized local RED-to-GREEN investigation at
+  exact clean canonical base
+  `54dca4b57ee7da80b6566d42b048153d6467eb05`. The local upstream, local
+  remote-tracking deploy ref, and live remote deploy branch all remained exact
+  `7a60aa2ebe060dd90211c0fafb430044ce4ed30d`; the current integration branch
+  was only two local canonical commits ahead. No Git lock, active Git mutator,
+  or same-branch worktree owner was present.
+
+  Authorization is limited to directly related ingest runtime and loop-health
+  attribution source/tests, one minimal implementation plan, test-first root-
+  cause reproduction, the smallest proven local production-code fix, focused
+  verification, one final complete suite, canonical status updates, and
+  explicit-path local commits. Push, deployment, restart, Phase 7 cutover or
+  rollback, production configuration/schema/data changes, Telegram traffic,
+  replay, worker commands, test trades, and every exchange write remain
+  prohibited.
 
 - `2026-08-26 Phase 7 versioned-observer safe-retry claim`: session
   `codex-per-chat-phase7-safe-retry-20260826T1652Z-root` exclusively claimed one
