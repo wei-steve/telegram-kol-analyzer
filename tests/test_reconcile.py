@@ -8,6 +8,7 @@ import pytest
 
 from telegram_kol_research import telegram_live_listener as live_listener
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.reconcile import build_reconcile_window
 
 
@@ -129,6 +130,48 @@ def test_reconcile_database_write_drains_before_cancellation(monkeypatch, tmp_pa
         persistence_release.set()
 
     assert persistence_finished.is_set()
+
+
+def test_reconcile_broker_publish_is_safe_with_an_active_loop_subscriber(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    broker = LiveUpdateBroker()
+
+    async def one_dialog(_client, **_kwargs):
+        return [{"id": 9001, "title": "VIP BTC Room", "archived": True}]
+
+    async def one_message(_client, _dialog, **_kwargs):
+        return [
+            {
+                "chat_id": 9001,
+                "message_id": 1,
+                "sender_id": 501,
+                "sender_name": "VIP BTC Room",
+                "text": "fresh message",
+                "posted_at": "2026-04-10T08:45:00+00:00",
+                "media": None,
+            }
+        ]
+
+    async def scenario() -> str:
+        stream = broker.stream()
+        assert await anext(stream) == ": keep-alive\n\n"
+        try:
+            await live_listener.run_reconcile_once(
+                client=object(),
+                session_factory=session_factory,
+                broker=broker,
+                target_titles={"VIP BTC Room"},
+                discover_dialogs_fn=one_dialog,
+                fetch_dialog_messages_fn=one_message,
+            )
+            return await asyncio.wait_for(anext(stream), timeout=1.0)
+        finally:
+            await stream.aclose()
+
+    payload = asyncio.run(scenario())
+
+    assert '"chat_id": 9001' in payload
+    assert '"message_id": 1' in payload
 
 
 def test_non_queue_reconcile_database_projection_leaves_loop_responsive(

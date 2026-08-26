@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import threading
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,8 +29,12 @@ class LiveUpdateBroker:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
                 pass
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
         for queue in list(self._subscribers):
-            if self._loop and self._loop is not asyncio.get_event_loop():
+            if self._loop and self._loop is not current_loop:
                 # Called from a background thread — schedule on the event loop
                 self._loop.call_soon_threadsafe(queue.put_nowait, payload)
             else:
@@ -65,8 +68,12 @@ class LiveUpdateBroker:
                 self._loop = asyncio.get_running_loop()
             except RuntimeError:
                 pass
+        try:
+            current_loop = asyncio.get_running_loop()
+        except RuntimeError:
+            current_loop = None
         for queue in list(self._subscribers):
-            if self._loop and self._loop is not asyncio.get_event_loop():
+            if self._loop and self._loop is not current_loop:
                 self._loop.call_soon_threadsafe(queue.put_nowait, formatted)
             else:
                 try:
@@ -76,6 +83,7 @@ class LiveUpdateBroker:
         return event
 
     async def stream(self):
+        self._loop = asyncio.get_running_loop()
         queue: asyncio.Queue[str | None] = asyncio.Queue()
         self._subscribers.append(queue)
         try:
