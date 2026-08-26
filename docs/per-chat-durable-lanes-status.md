@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-6-awaiting-claim
+claimed_by: codex-per-chat-opt-phase6-20260826-root
+claim_base_sha: 4b2f004a226ac97c622331632e473ad3d1100ba0
+current_task: phase-6-compatible-deployment-in-progress
 current_phase: phase_6_compatible_deployment
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-6-compatible-deployment.md
 last_completed_phase: phase_5_trigger_intents_read_only_gate
@@ -80,7 +80,7 @@ phase_5_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-int
 phase_5_evidence_sha256: 0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344
 phase_5_identity_investigation_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-checkout-diff-read-only.txt
 phase_5_identity_investigation_evidence_sha256: de07b8b638a9699000131ab48819a8804db4c7a7f656a43dba467a89be16463f
-phase_6_authorization: not_started_requires_new_claim
+phase_6_authorization: exact_candidate_non_force_push_compatible_deployment_and_l2_read_only_verification_only
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -117,7 +117,7 @@ fail_closed_parallel_chat_limit: 1
 schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
-deployment_authorized: false
+deployment_authorized: true
 cutover_authorized: false
 ```
 
@@ -167,6 +167,24 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 6 compatible-deployment claim`: session
+  `codex-per-chat-opt-phase6-20260826-root` claimed only compatible deployment
+  and L2 verification at exact clean local canonical base
+  `4b2f004a226ac97c622331632e473ad3d1100ba0`. Phase 5 is completed; frozen
+  production-code candidate `e37146eaea03befac6457fa224e9dad0cd6c7166`
+  remains unchanged, is an ancestor, and only this canonical status changed
+  afterward. Local upstream, local remote-tracking deploy ref, and live remote
+  deploy branch all resolved to
+  `d66afadda5e34db80851a0dae5986b622521ab3f`; the worktree was clean and
+  exclusive, and no Git lock was present. Authorization is limited to one
+  explicit-path claim commit, a verified exact 40-hex Phase 6 candidate,
+  non-force push, the existing compatible deployment workflow, one necessary
+  restart in a proven safe window, and Phase 6 L2 read-only/no-op/conflict
+  evidence. Production must remain exactly `global + 20 + queue`. Cutover,
+  `per_chat + 3`, schema or production-data changes, manufactured traffic,
+  replay, test trades, exchange writes, Telegram business messages, and
+  operator/system Bot messages are forbidden.
 
 - `2026-08-26 Phase 5 completion after identity-check root-cause correction`:
   the earlier `deployed_dirty_count=15` stop was caused by a measurement-
