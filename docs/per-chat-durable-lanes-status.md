@@ -33,7 +33,7 @@ approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
 claimed_by: unclaimed
 claim_base_sha: null
-current_task: phase-7-blocker-fix-awaiting-push-deploy-restart-authorization
+current_task: phase-7-safe-retry-awaiting-owner-authorization
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,16 +96,29 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: local_blocker_fix_complete_awaiting_deployment
+phase_7_status: blocker_fix_deployed_verified_awaiting_safe_retry
 phase_7_authorization: consumed_safe_retry_stopped_before_cutover
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
+phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
+phase_7_blocker_fix_deployed_commit: 7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9
+phase_7_blocker_fix_deployment_status: passed_exact_sha_split_runtime_restart_and_l1_observation
+phase_7_blocker_fix_deployment_focused_verification: 13_passed_then_13_passed_260_deselected_6_warnings
+phase_7_blocker_fix_observation_start: 2026-08-26T08:22:01.604993+00:00
+phase_7_blocker_fix_observation_end: 2026-08-26T08:37:18.191347+00:00
+phase_7_blocker_fix_observation_stop_reason: fifteen_minutes
+phase_7_blocker_fix_observation_samples: 177
+phase_7_blocker_fix_observation_natural_message_count: 1
+phase_7_blocker_fix_observation_distinct_chat_count: 1
+phase_7_blocker_fix_observation_peak_active_chat_lanes: 1
+phase_7_blocker_fix_deployment_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-fix-deploy-20260826T081637Z/deploy-evidence.log
+phase_7_blocker_fix_deployment_evidence_sha256: ee0aa0b41929c2892439e70387965b9e6e1c31bd64f44f70eb7701d0418d4716
 phase_7_blocker_red_verification: one_failed_expected_stale_stack_was_not_discarded
 phase_7_blocker_focused_verification: 286_passed_2_warnings_then_21_passed
 phase_7_blocker_full_suite_verification: 6304_passed_1_skipped_32_warnings_in_526_53_seconds
 phase_7_blocker_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-diagnosis-20260826T075147Z/diagnosis-evidence.log
 phase_7_blocker_evidence_sha256: 4dd3ad9cf3e91aed66ebd6b3d9b7660979d623379bf51ca9615b0f28b7bef0dc
-phase_7_production_sha: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
+phase_7_production_sha: 7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9
 phase_7_before_tuple: global_1_queue
 phase_7_cutover_tuple: per_chat_3_queue
 phase_7_final_tuple: global_1_queue
@@ -116,7 +129,7 @@ phase_7_failure_reason: safe_retry_pre_cutover_web_loop_health_reported_stall_co
 phase_7_acceptance_window_status: not_started_safe_retry_stopped_before_cutover
 phase_7_retry_convergence_status: not_started_cutover_not_submitted
 phase_7_retry_convergence_samples: []
-phase_7_retry_remaining_gate_blockers: exact_fix_not_pushed_deployed_or_restarted_and_new_retry_not_authorized
+phase_7_retry_remaining_gate_blockers: new_safe_retry_not_authorized
 phase_7_window_start: null
 phase_7_window_end: null
 phase_7_natural_message_count: 0
@@ -126,7 +139,7 @@ phase_7_ordering_status: not_observed_window_not_started
 phase_7_backlog_status: queue_pending_0_claimed_0_five_historical_shadow_pending_excluded_by_worker_contract
 phase_7_duplicate_status: not_observed_window_not_started
 phase_7_sqlite_status: poststop_wal_quick_check_ok_query_only_1_total_changes_0
-phase_7_loop_status: one_real_historical_web_stall_selector_stack_invalidated_by_capture_race_local_attribution_fix_complete_not_deployed
+phase_7_loop_status: attribution_fix_deployed_and_verified_zero_stalls_across_all_roles_during_l1_observation
 phase_7_session_status: poststop_ingest_only_one_holder
 phase_7_exchange_status: not_queried_retry_stopped_before_exchange_baseline
 phase_7_previous_attempt_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log
@@ -219,6 +232,56 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 blocker-fix exact deployment completion`: the owner
+  separately authorized exact deployment commit
+  `7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9`, one updater-required split-runtime
+  restart, focused server verification, and an L1 observation. The clean local
+  HEAD, canonical status commit, upstream, remote-tracking deploy ref, and live
+  remote deploy branch all matched that exact SHA before deployment. Production
+  was clean at prior commit `8cccfbb1683894459368cec4ca64a0cf626a1e9a`,
+  exactly one ingest, worker, and Web authority were active, the monolith was
+  inactive, only ingest held the Telegram session, the complete tuple remained
+  `global + 1 + queue`, semantic review was disabled, and active exchange writes,
+  active management, and active worker commands were zero. One natural non-shadow
+  message job was initially claimed; a bounded read-only quiet gate observed it
+  naturally clear on the first sample before the updater ran.
+
+  The existing verified bootstrap updater fetched and verified the exact remote
+  commit and updater hash, passed its topology, clean-checkout, and active-write
+  gates, fast-forwarded production once, and completed one necessary managed
+  stop/start cycle. Production HEAD, branch ref, remote-tracking ref, and monitor
+  expected-HEAD pin then all matched the authorized SHA. New ingest, worker, and
+  Web PIDs `404790`, `404786`, and `404788` remained stable through observation;
+  the three roles stayed active/running, the monolith stayed inactive, and only
+  ingest held the session. The database and API remained `global + 1 + queue`,
+  semantic review stayed disabled, and the worker applied cap `1` at
+  `2026-08-26T08:18:25.030388+00:00`.
+
+  Exact deployed source inspection found the check-in generation and recovered-
+  stack discard path. The focused stall-attribution test passed `13`; the focused
+  runtime/Web loop-health slice passed `13` with `260` deselected and six existing
+  warnings. The continuous L1 window ran from
+  `2026-08-26T08:22:01.604993+00:00` through
+  `2026-08-26T08:37:18.191347+00:00`, sampled `177` times, and ended on the fixed
+  fifteen-minute criterion because only one natural message from one chat arrived.
+  That job succeeded, final non-shadow pending and claimed counts were zero, and
+  worker peak active lanes was `1`. There were zero incomplete-query retries,
+  duplicate new jobs, loop stalls, SQLite locks, Telegram session conflicts,
+  DeepSeek/402 events, authority drift, active exchange writes, active management,
+  or active worker commands. Final SQLite evidence was `wal`, `query_only=1`,
+  `quick_check=ok`, `total_changes=0`, with zero foreign-key violations. The five
+  historical `shadow=1` pending rows were explicitly excluded by the worker queue
+  contract.
+
+  Raw evidence is retained at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-fix-deploy-20260826T081637Z/deploy-evidence.log`,
+  SHA-256
+  `ee0aa0b41929c2892439e70387965b9e6e1c31bd64f44f70eb7701d0418d4716`.
+  No cutover, rollback, settings/schema/data change, replay, worker command,
+  manufactured Telegram traffic, test trade, exchange write, code/test edit, or
+  post-deployment push occurred. Phase 7 remains incomplete and requires a new,
+  separately authorized safe retry; Phase 8 remains forbidden.
 
 - `2026-08-26 Phase 7 blocker-remediation local completion`: production
   read-only diagnosis proved that the five apparent pending jobs were all
