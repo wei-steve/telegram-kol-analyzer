@@ -204,6 +204,10 @@ def acceptance_snapshot(
     return observer.AcceptanceObservation(**values)
 
 
+def loop_stall_event(role, attribution):
+    return observer.LoopStallEvidence(role=role, attribution=attribution)
+
+
 def test_pending_same_chat_successor_does_not_fail_acceptance():
     tracker = acceptance_tracker()
 
@@ -301,7 +305,6 @@ def test_acceptance_finalize_passes_complete_minimums():
         ({"orphan_job_count": 1}, "orphan_job_identity"),
         ({"stuck_job_count": 1}, "stuck_message_job"),
         ({"sqlite_lock_count": 1}, "sqlite_lock"),
-        ({"loop_stall_count": 1}, "event_loop_stall"),
         ({"session_conflict_count": 1}, "telegram_session_conflict"),
         ({"deepseek_402_count": 1}, "deepseek_402"),
         ({"execution_anomaly_count": 1}, "execution_anomaly"),
@@ -324,6 +327,113 @@ def test_ingest_anomaly_uses_global_cap_three_rollback():
     assert result.rollback_target == observer.ExpectedRuntimeState(
         "global", 3, "queue", "queue"
     )
+
+
+@pytest.mark.parametrize("role", ["ingest", "worker"])
+def test_ingest_and_worker_business_stalls_fail_closed_by_role(role):
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(
+            loop_stall_count=1,
+            loop_stall_events=(
+                loop_stall_event(role, "captured_business_blocker"),
+            ),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == f"{role}_event_loop_stall_captured_business_blocker"
+    assert result.rollback_target == observer.ExpectedRuntimeState(
+        "global", 1, "queue", "queue"
+    )
+
+
+def test_web_business_blocker_fails_closed_with_explicit_attribution():
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(
+            loop_stall_count=1,
+            loop_stall_events=(
+                loop_stall_event("web", "captured_business_blocker"),
+            ),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == "web_event_loop_stall_captured_business_blocker"
+
+
+@pytest.mark.parametrize(
+    ("attribution", "reason"),
+    [
+        (
+            "loop_lag_confirmed_but_stack_unattributed",
+            "web_event_loop_stall_loop_lag_confirmed_but_stack_unattributed",
+        ),
+        (
+            "idle_or_post_recovery_selector_capture",
+            "web_event_loop_stall_idle_or_post_recovery_selector_capture",
+        ),
+    ],
+)
+def test_web_unattributed_stall_fails_closed_without_scheduler_blame(
+    attribution,
+    reason,
+):
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(
+            loop_stall_count=1,
+            loop_stall_events=(loop_stall_event("web", attribution),),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == reason
+    assert "scheduler" not in result.reason
+    assert "worker" not in result.reason
+    assert result.rollback_target == observer.ExpectedRuntimeState(
+        "global", 1, "queue", "queue"
+    )
+
+
+def test_loop_stall_count_without_role_attribution_fails_closed_as_incomplete():
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(loop_stall_count=1)
+    )
+
+    assert result.failed is True
+    assert result.reason == "loop_stall_evidence_incomplete"
+
+
+def test_loop_stall_event_without_matching_count_fails_closed_as_incomplete():
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(
+            loop_stall_count=0,
+            loop_stall_events=(
+                loop_stall_event("web", "captured_business_blocker"),
+            ),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == "loop_stall_evidence_incomplete"
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        ("unknown", "captured_business_blocker"),
+        ("web", "guessed_business_function"),
+    ],
+)
+def test_invalid_loop_stall_role_or_attribution_fails_closed(event):
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(
+            loop_stall_count=1,
+            loop_stall_events=(loop_stall_event(*event),),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == "loop_stall_evidence_invalid"
 
 
 def test_tuple_drift_fails_acceptance():
@@ -494,6 +604,28 @@ def test_database_collector_fails_metrics_closed_for_identity_anomalies(tmp_path
     assert result.duplicate_job_count == 1
     assert result.missing_job_count == 1
     assert result.orphan_job_count == 1
+
+
+def test_guard_counter_reader_preserves_loop_stall_role_and_attribution(tmp_path):
+    path = tmp_path / "guards.json"
+    payload = {
+        field: 0 for field in observer.GUARD_COUNTER_FIELDS
+    }
+    payload["loop_stall_count"] = 1
+    payload["loop_stall_events"] = [
+        {
+            "role": "web",
+            "attribution": "idle_or_post_recovery_selector_capture",
+        }
+    ]
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    result = observer._read_guard_counters(path)
+
+    assert result["loop_stall_count"] == 1
+    assert result["loop_stall_events"] == (
+        loop_stall_event("web", "idle_or_post_recovery_selector_capture"),
+    )
 
 
 def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):

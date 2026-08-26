@@ -21,6 +21,9 @@ DEFAULT_STALL_LOG_INTERVAL_SECONDS = 60.0
 DEFAULT_WATCHDOG_POLL_SECONDS = 0.25
 DEFAULT_MAX_CAPTURES = 5
 DEFAULT_MAX_STACK_FRAMES = 25
+CAPTURED_BUSINESS_BLOCKER = "captured_business_blocker"
+LOOP_LAG_UNATTRIBUTED = "loop_lag_confirmed_but_stack_unattributed"
+IDLE_SELECTOR_CAPTURE = "idle_or_post_recovery_selector_capture"
 
 
 @dataclass(frozen=True)
@@ -38,6 +41,7 @@ class StallCapture:
     at: str
     blocked_ms: float
     stack: tuple[str, ...]
+    attribution: str
     reason: str | None = None
 
     def as_dict(self) -> dict[str, Any]:
@@ -45,10 +49,27 @@ class StallCapture:
             "at": self.at,
             "blocked_ms": round(self.blocked_ms, 3),
             "stack": list(self.stack),
+            "attribution": self.attribution,
         }
         if self.reason is not None:
             payload["reason"] = self.reason
         return payload
+
+
+def _classify_stall_stack(
+    stack: tuple[str, ...],
+    reason: str | None,
+) -> str:
+    if reason is not None or not stack:
+        return LOOP_LAG_UNATTRIBUTED
+    terminal_frame = stack[-1].lower()
+    if "selectors.py" in terminal_frame and (
+        " in select" in terminal_frame
+        or "_selector.poll(" in terminal_frame
+        or "_selector.select(" in terminal_frame
+    ):
+        return IDLE_SELECTOR_CAPTURE
+    return CAPTURED_BUSINESS_BLOCKER
 
 
 class LoopStallAttributor:
@@ -152,13 +173,15 @@ class LoopStallAttributor:
                 at=self._now_provider().isoformat(),
                 blocked_ms=blocked_seconds * 1000.0,
                 stack=stack,
+                attribution=_classify_stall_stack(stack, reason),
                 reason=reason,
             )
             self._captures.append(capture)
             self._capture_count += 1
         logger.warning(
-            "event loop stall stack after %.1f ms%s:\n%s",
+            "event loop stall stack after %.1f ms [%s]%s:\n%s",
             capture.blocked_ms,
+            capture.attribution,
             "" if reason is None else f" ({reason})",
             "\n".join(capture.stack) or "<no frames>",
         )

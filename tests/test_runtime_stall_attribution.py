@@ -42,6 +42,18 @@ def synthetic_ingest_blocking_call():
     return sys._getframe()
 
 
+_selector_namespace: dict[str, object] = {}
+exec(
+    compile(
+        "import sys\ndef select():\n    return sys._getframe()\n",
+        "/usr/lib/python3.12/selectors.py",
+        "exec",
+    ),
+    _selector_namespace,
+)
+synthetic_selector_poll = _selector_namespace["select"]
+
+
 def _attributor(clock, *, frames=None, **kwargs):
     return LoopStallAttributor(
         stall_threshold_ms=kwargs.pop("stall_threshold_ms", 3000.0),
@@ -94,7 +106,33 @@ def test_capture_once_the_gap_crosses_the_threshold():
     assert capture.blocked_ms == 3100.0
     assert capture.at == NOW.isoformat()
     assert capture.stack
+    assert capture.attribution == "captured_business_blocker"
     assert any("test_runtime_stall_attribution.py" in line for line in capture.stack)
+
+
+def test_delayed_watchdog_selector_capture_is_not_a_business_blocker():
+    """The watchdog may first run after the blocked callback has recovered.
+
+    Advancing the stale check-in clock represents the confirmed loop lag.  The
+    sampled frame is already back in selector.poll, as happens when GIL or OS
+    scheduling delays the watchdog until the business callback has returned.
+    """
+
+    clock = FakeClock()
+    attributor = _attributor(
+        clock,
+        frames={LOOP_THREAD_ID: synthetic_selector_poll()},
+    )
+    attributor.attach_loop_thread(LOOP_THREAD_ID)
+    clock.advance(5.0)
+
+    capture = attributor.poll_once()
+
+    assert capture is not None
+    assert capture.blocked_ms == 5000.0
+    assert capture.stack
+    assert capture.attribution == "idle_or_post_recovery_selector_capture"
+    assert capture.attribution != "captured_business_blocker"
 
 
 def test_only_one_capture_per_stall_episode():
@@ -141,6 +179,7 @@ def test_a_missing_loop_thread_is_recorded_as_a_reason_not_an_exception():
 
     assert capture is not None
     assert capture.stack == ()
+    assert capture.attribution == "loop_lag_confirmed_but_stack_unattributed"
     assert "not present in sys._current_frames" in (capture.reason or "")
 
 
@@ -260,7 +299,7 @@ def test_captures_are_bounded_and_exposed_in_the_snapshot():
     assert snapshot["stall_captures"] == 5
     assert len(snapshot["recent_stall_stacks"]) == 3
     entry = snapshot["recent_stall_stacks"][0]
-    assert set(entry) >= {"at", "blocked_ms", "stack"}
+    assert set(entry) >= {"at", "blocked_ms", "stack", "attribution"}
 
 
 def test_stack_depth_is_bounded():

@@ -19,6 +19,14 @@ from urllib import request as urllib_request
 NONTERMINAL_STATUSES = frozenset({"pending", "claimed"})
 EXIT_ACCEPTANCE_FAILED = 2
 EXIT_OBSERVER_INCOMPLETE = 3
+LOOP_STALL_ROLES = frozenset({"ingest", "worker", "web"})
+LOOP_STALL_ATTRIBUTIONS = frozenset(
+    {
+        "captured_business_blocker",
+        "loop_lag_confirmed_but_stack_unattributed",
+        "idle_or_post_recovery_selector_capture",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,12 @@ class RuntimeObservation:
 
 
 @dataclass(frozen=True)
+class LoopStallEvidence:
+    role: str
+    attribution: str
+
+
+@dataclass(frozen=True)
 class ConvergenceResult:
     passed: bool
     failed: bool
@@ -98,6 +112,7 @@ class AcceptanceObservation:
     deepseek_402_count: int
     ingest_anomaly_count: int
     execution_anomaly_count: int
+    loop_stall_events: tuple[LoopStallEvidence, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -529,13 +544,16 @@ class AcceptanceTracker:
         if same_chat.violations:
             return self._fail(same_chat.violations[0].code)
 
+        loop_stall_failure = self._loop_stall_failure(sample)
+        if loop_stall_failure is not None:
+            return self._fail(loop_stall_failure)
+
         anomaly_fields = (
             (sample.duplicate_job_count, "duplicate_job_identity"),
             (sample.missing_job_count, "missing_job_identity"),
             (sample.orphan_job_count, "orphan_job_identity"),
             (sample.stuck_job_count, "stuck_message_job"),
             (sample.sqlite_lock_count, "sqlite_lock"),
-            (sample.loop_stall_count, "event_loop_stall"),
             (sample.session_conflict_count, "telegram_session_conflict"),
             (sample.deepseek_402_count, "deepseek_402"),
             (sample.ingest_anomaly_count, "ingest_anomaly"),
@@ -613,6 +631,21 @@ class AcceptanceTracker:
             <= self.expected_state.max_parallel_chats
         ):
             return "worker_lane_bounds_invalid"
+        return None
+
+    def _loop_stall_failure(
+        self,
+        sample: AcceptanceObservation,
+    ) -> str | None:
+        if sample.loop_stall_count != len(sample.loop_stall_events):
+            return "loop_stall_evidence_incomplete"
+        for event in sample.loop_stall_events:
+            if (
+                event.role not in LOOP_STALL_ROLES
+                or event.attribution not in LOOP_STALL_ATTRIBUTIONS
+            ):
+                return "loop_stall_evidence_invalid"
+            return f"{event.role}_event_loop_stall_{event.attribution}"
         return None
 
     def _fail(self, reason: str) -> AcceptanceResult:
@@ -747,6 +780,8 @@ def run_acceptance_samples(
             distinct_chat_count=sample.distinct_chat_count,
             pending_count=sample.pending_count,
             claimed_count=sample.claimed_count,
+            loop_stall_count=sample.loop_stall_count,
+            loop_stall_events=[asdict(row) for row in sample.loop_stall_events],
         )
         result = tracker.observe(sample)
         if result.reason == "observer_incomplete_retry":
@@ -986,12 +1021,29 @@ GUARD_COUNTER_FIELDS = (
 )
 
 
-def _read_guard_counters(path: Path) -> dict[str, int]:
+def _read_guard_counters(path: Path) -> dict[str, object]:
     with Path(path).open(encoding="utf-8") as handle:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError("guard counters payload is not an object")
-    return {field: int(payload[field]) for field in GUARD_COUNTER_FIELDS}
+    counters: dict[str, object] = {
+        field: int(payload[field]) for field in GUARD_COUNTER_FIELDS
+    }
+    raw_events = payload.get("loop_stall_events", [])
+    if not isinstance(raw_events, list):
+        raise ValueError("loop_stall_events is not a list")
+    events: list[LoopStallEvidence] = []
+    for row in raw_events:
+        if not isinstance(row, dict):
+            raise ValueError("loop_stall_events row is not an object")
+        events.append(
+            LoopStallEvidence(
+                role=str(row["role"]),
+                attribution=str(row["attribution"]),
+            )
+        )
+    counters["loop_stall_events"] = tuple(events)
+    return counters
 
 
 def _acceptance_samples(
@@ -1003,7 +1055,7 @@ def _acceptance_samples(
         database, runtime = _collect_runtime_with_retry(
             args, elapsed_seconds=elapsed
         )
-        guards: dict[str, int] | None = None
+        guards: dict[str, object] | None = None
         if database is not None and runtime.complete:
             for _attempt in range(2):
                 try:
@@ -1031,14 +1083,19 @@ def _acceptance_samples(
                 orphan_job_count=0,
             )
             guards = {field: 0 for field in GUARD_COUNTER_FIELDS}
+            guards["loop_stall_events"] = ()
         elif (
             database.query_only != 1
             or database.total_changes != 0
             or database.journal_mode.lower() != "wal"
         ):
-            guards["sqlite_lock_count"] += 1
+            guards["sqlite_lock_count"] = (
+                int(guards["sqlite_lock_count"]) + 1
+            )
         if database.semantic_review_enabled:
-            guards["ingest_anomaly_count"] += 1
+            guards["ingest_anomaly_count"] = (
+                int(guards["ingest_anomaly_count"]) + 1
+            )
         yield AcceptanceObservation(
             runtime=runtime,
             jobs=database.jobs,
