@@ -1055,3 +1055,57 @@ def test_scheduler_batch_blocking_leaves_the_event_loop_responsive():
 
     assert beats >= MIN_HEARTBEATS
     assert worst_gap < TICK_BLOCK_SECONDS
+
+
+def test_pending_expiry_review_database_work_leaves_event_loop_responsive(
+    monkeypatch,
+    tmp_path,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.lifecycle_monitor import LifecycleMonitor
+    from telegram_kol_research.live_updates import LiveUpdateBroker
+    from telegram_kol_research.models import StrategyLifecycle
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=88,
+                message_id=3888,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=NOW,
+            )
+        )
+        session.commit()
+
+    async def notifier(_payload):
+        return None
+
+    def blocking_pending_leg_context(_session, _row):
+        time.sleep(TICK_BLOCK_SECONDS)
+        return {}
+
+    monkeypatch.setattr(
+        LifecycleMonitor,
+        "_entered_lifecycle_pending_entry_leg_context",
+        staticmethod(blocking_pending_leg_context),
+    )
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        expiry_review_notifier=notifier,
+    )
+
+    async def scenario():
+        return await _observe_loop_while(
+            lambda: asyncio.create_task(
+                monitor._request_pending_expiry_reviews(NOW)
+            )
+        )
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS

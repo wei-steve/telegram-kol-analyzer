@@ -681,6 +681,24 @@ class LifecycleMonitor:
     async def _request_pending_expiry_reviews(self, now: datetime) -> None:
         if self._expiry_review_notifier is None:
             return
+        review_payloads = await run_on_management_worker(
+            self._prepare_pending_expiry_reviews,
+            now,
+        )
+
+        for payload in review_payloads:
+            try:
+                await self._expiry_review_notifier(payload)
+            except Exception:
+                logger.exception(
+                    "Pending-entry expiry review notifier failed lifecycle_id=%s",
+                    payload.get("lifecycle_id"),
+                )
+
+    def _prepare_pending_expiry_reviews(
+        self,
+        now: datetime,
+    ) -> list[dict[str, Any]]:
         review_payloads: list[dict[str, Any]] = []
         state_changed = False
         with self._session_factory() as session:
@@ -763,15 +781,7 @@ class LifecycleMonitor:
                 )
             if state_changed:
                 session.commit()
-
-        for payload in review_payloads:
-            try:
-                await self._expiry_review_notifier(payload)
-            except Exception:
-                logger.exception(
-                    "Pending-entry expiry review notifier failed lifecycle_id=%s",
-                    payload.get("lifecycle_id"),
-                )
+        return review_payloads
 
     @staticmethod
     def _claim_expiry_review(

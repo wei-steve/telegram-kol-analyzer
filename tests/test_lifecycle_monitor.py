@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from datetime import UTC, datetime
 
 from telegram_kol_research.db import create_session_factory
@@ -1028,6 +1029,82 @@ def test_lifecycle_monitor_does_not_consume_review_without_notifier(tmp_path):
     assert lifecycle.management_action is None
     assert lifecycle.expiry_review_notified_at is None
     assert lifecycle.expiry_review_next_at is None
+
+
+def test_pending_expiry_review_queues_behind_existing_management_work(
+    monkeypatch,
+    tmp_path,
+):
+    from telegram_kol_research.runtime_worker_executor import (
+        run_on_management_worker,
+        shutdown_management_worker_executor,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            StrategyLifecycle(
+                chat_id=88,
+                message_id=3893,
+                symbol="BTC",
+                side="long",
+                lifecycle_status="entered",
+                signal_at=datetime(2026, 6, 30, 0, 0, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+    expiry_review_started = threading.Event()
+
+    def blocking_management_unit():
+        blocker_started.set()
+        assert blocker_release.wait(5.0)
+
+    def observe_pending_leg_context(_session, _row):
+        expiry_review_started.set()
+        return {}
+
+    async def notifier(_payload):
+        return None
+
+    monkeypatch.setattr(
+        LifecycleMonitor,
+        "_entered_lifecycle_pending_entry_leg_context",
+        staticmethod(observe_pending_leg_context),
+    )
+    monitor = LifecycleMonitor(
+        session_factory,
+        LiveUpdateBroker(),
+        expiry_review_notifier=notifier,
+    )
+
+    async def scenario() -> bool:
+        blocker_task = asyncio.create_task(
+            run_on_management_worker(blocking_management_unit)
+        )
+        assert await asyncio.to_thread(blocker_started.wait, 5.0)
+        review_task = asyncio.create_task(
+            monitor._request_pending_expiry_reviews(
+                datetime(2026, 6, 30, 3, 1, tzinfo=UTC)
+            )
+        )
+        await asyncio.sleep(0.05)
+        started_before_release = expiry_review_started.is_set()
+        blocker_release.set()
+        await blocker_task
+        await review_task
+        return started_before_release
+
+    shutdown_management_worker_executor(wait=True)
+    try:
+        started_before_release = asyncio.run(scenario())
+    finally:
+        blocker_release.set()
+        shutdown_management_worker_executor(wait=True)
+
+    assert not started_before_release
 
 
 def test_lifecycle_monitor_stale_review_claim_cannot_overwrite_terminal_decision(
