@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-rolled-back-observer-false-positive-awaiting-owner
+claimed_by: codex-per-chat-phase7-observer-fix-20260826-root
+claim_base_sha: 8e4b3a8ed8720495067dbb8d8e03ab15cc232a96
+current_task: phase-7-acceptance-observer-fix-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -98,6 +98,7 @@ phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
 phase_7_authorization: consumed_owner_authorized_single_safe_retry_global_1_to_per_chat_3
+phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
 phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
@@ -236,6 +237,19 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 acceptance-observer fix claim`: session
+  `codex-per-chat-phase7-observer-fix-20260826-root` exclusively claimed the
+  owner-authorized local observer remediation at exact clean canonical base
+  `8e4b3a8ed8720495067dbb8d8e03ab15cc232a96`. The accepted design boundary is
+  a versioned read-only observer whose state machine distinguishes a later
+  same-chat pending enqueue from an actual claimed overlap and whose rollback
+  convergence check is independent of failed acceptance invariants. The scope
+  permits local design and implementation plans, RED-to-GREEN observer code and
+  focused tests, canonical status updates, and explicit-path local commits. It
+  does not authorize production access or mutation, push, deployment, restart,
+  cutover, rollback, schema/data changes, replay, worker commands, manufactured
+  Telegram traffic, test trades, or exchange writes.
 
 - `2026-08-26 Phase 7 post-fix safe-retry rollback`: all preflight gates passed
   against exact production SHA
