@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-rolled-back-awaiting-owner
+claimed_by: codex-per-chat-opt-phase7-retry-20260826-root
+claim_base_sha: 05609b79a385ebfb1e43a8a520826335e7017eb7
+current_task: phase-7-safe-retry-cutover-acceptance
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,8 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: rolled_back_incomplete
-phase_7_authorization: consumed_single_atomic_cutover_and_required_level_two_rollback_no_recutover
+phase_7_status: in_progress
+phase_7_authorization: owner_authorized_single_safe_retry_from_global_1_to_per_chat_3_convergence_gate_acceptance_and_required_rollback
 phase_7_production_sha: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
 phase_7_before_tuple: global_20_queue
 phase_7_cutover_tuple: per_chat_3_queue
@@ -158,7 +158,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -207,6 +207,44 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 safe-retry claim`: session
+  `codex-per-chat-opt-phase7-retry-20260826-root` exclusively claimed only the
+  owner-authorized Phase 7 retry at exact clean local canonical base
+  `05609b79a385ebfb1e43a8a520826335e7017eb7`. Local upstream, the local
+  remote-tracking deploy ref, the live remote deploy branch, and production
+  HEAD all resolved exactly to
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a`. The previous Phase 7 evidence
+  remained present with canonical SHA-256
+  `ad3d14aa04805a7187d5ca289e5a63ff9b681c269e9453b2137ace346bff127b`.
+  The worktree was clean with no Git lock or active Git mutation; other
+  long-lived application processes holding this directory as cwd had no open
+  repository files or Git child process.
+
+  The production preclaim gate found exactly one active/running ingest,
+  worker, and Web authority with distinct PIDs, an inactive monolith, and only
+  ingest holding the Telegram session. Database and ingest API both reported
+  exactly `global + 1 + queue`; worker in-memory health reported cap `1`, zero
+  active lanes, peak `0`, and zero stalls. Semantic review was disabled.
+  Active exchange writes, active management, pending/claimed message jobs, and
+  pending/claimed/executing worker commands were all zero. SQLite was `wal`,
+  `query_only=1`, `quick_check=ok`, `total_changes=0`, with zero foreign-key
+  violations. The current service journals had zero SQLite locks, loop stalls,
+  session conflicts, DeepSeek/402 errors, or authority drift. The worker-owned
+  bounded read-only exchange baseline was complete at fingerprint
+  `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`,
+  with zero positions and zero open orders.
+
+  This retry authorization explicitly supersedes only the Phase 7 plan's old
+  `global + 20 + queue` retry baseline. It permits one exact ingest-owned
+  expected-state transition from `global + 1 + queue` to
+  `per_chat + 3 + queue`, one non-stitchable five-second worker convergence
+  gate, the approved rollback, one complete two-hour natural-traffic
+  acceptance window after convergence, read-only production evidence, and
+  local canonical status updates with explicit-path commits. It does not
+  authorize production-code or test changes, push, deployment, restart,
+  schema/data changes, worker commands, replay, manufactured traffic, Telegram
+  business or operator/system Bot messages, test trades, or exchange writes.
 
 - `2026-08-26 Phase 7 immediate scheduler-gate rollback`: all final cutover
   gates passed again against exact production SHA
