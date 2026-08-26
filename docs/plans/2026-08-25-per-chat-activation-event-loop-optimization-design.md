@@ -32,10 +32,13 @@ schema, executor framework, or second status system.
 - The existing per-chat workstream is locally complete but not cut over. Its
   approved production target is `per_chat + 3`, with `global + 3` and
   `global + 1` rollback levels.
-- Management batch `150` and trigger-protection intents `138`, `141`, and `147`
-  remain separate production-data prerequisites. Copy rehearsals exist, but no
-  fresh production apply plan or production mutation is authorized by this
-  design.
+- A fresh read-only production check found management batch `150` already
+  `resolved/historical_position_fully_closed`, with active management count
+  zero. Trigger-protection intents `138`, `141`, and `147` are already
+  `resolved/terminal` with reason
+  `entry_leg_terminal_after_snapshot_wait`. `PRAGMA quick_check` returned
+  `ok`. The older status header that still describes these rows as pending is
+  stale and must not be used to justify another write.
 
 All production, Git, database, service, and exchange facts are time-sensitive
 and must be freshly verified by the phase that uses them.
@@ -153,41 +156,34 @@ Required tests cover a large same-chat backlog, no overtaking, live and stale
 claims, other-chat progress, two-worker competition, limit enforcement, and
 restart recovery.
 
-## L3 Production-Data Prerequisites
+## Read-Only Production-State Prerequisites
 
 ### Management batch 150
 
-Use fresh production database and GET-only Deepcoin evidence. Create a fresh
-online backup, run `quick_check`, check foreign keys and bounded critical-table
-counts, and generate a new schema-v2 CAS plan.
+Freshly verify that batch `150` remains terminal with reason
+`historical_position_fully_closed`, its related management/component/leg/binding
+state is internally consistent, active management count remains zero, and
+`PRAGMA quick_check` is `ok`. This phase is read-only: no backup, CAS plan,
+database apply, rollback rehearsal, exchange write, deployment, restart,
+replay, or Telegram message.
 
-Only `execution_order_legs.id=553.updated_at` may be ignored in the starting
-state comparison. It remains present in before/after evidence, is written by
-apply/rollback, and is checked by the transactional postcondition. Freeze the
-plan, action, and rollback fingerprints before asking for separate production
-apply authorization.
-
-An authorized apply may change only the reviewed eight rows. Any other CAS
-mismatch stops with zero repair writes. Verify terminal management, component,
-leg, and binding state and `active management=0`. No exchange write, deployment,
-restart, replay, or Telegram message is permitted.
+If any required field has regressed or the query is incomplete, stop. Record
+the discrepancy and design a separate L3 repair only after new owner approval;
+do not repair it inside this workstream.
 
 ### Trigger-protection intents
 
-In a separate session, freshly bind intents `138`, `141`, and `147` through
-binding, execution leg, parent trigger, unique child regular order, nonempty
-`posId`, instrument, and current Deepcoin history. Create a new backup and an
-exact full-row CAS plan for only those three rows. Freeze its apply and rollback
-fingerprints before asking for a second production authorization.
+In a separate session, freshly verify that intents `138`, `141`, and `147`
+remain `resolved/terminal` with reason
+`entry_leg_terminal_after_snapshot_wait`, retain their expected execution-leg
+identity, and that `PRAGMA quick_check` is `ok`. Use only local database reads;
+Deepcoin history is not needed to prove that the already-terminal rows have not
+regressed.
 
-An authorized apply may change exactly those three rows. Identical reapply must
-change zero rows, every counterexample row and critical count must remain
-unchanged, and no exchange write is allowed.
-
-Approval of this design authorizes neither L3 apply. Approval of one L3 plan
-does not authorize the other. If either phase discovers a production-code or
-tool defect, it stops and returns to candidate construction rather than fixing
-code inside a production-data session.
+This phase performs no database apply, rollback rehearsal, exchange call,
+deployment, restart, replay, or Telegram message. Any regression or incomplete
+query stops the workstream and requires a separately designed and authorized L3
+repair.
 
 ## Atomic Cutover
 
@@ -245,10 +241,10 @@ automatic waiver is allowed.
 2. Bounded claim selection: local RED-to-GREEN code only.
 3. Candidate integration and review: focused verification, one final full
    suite, independent review, and frozen exact SHA.
-4. Batch 150 L3: fresh plan, separate authorization, apply/verify or zero-write
-   stop.
-5. Trigger-protection L3: fresh plan, separate authorization, apply/verify or
-   zero-write stop.
+4. Batch 150 read-only gate: verify the already-terminal production state or
+   stop without repair.
+5. Trigger-protection read-only gate: verify the three already-terminal intents
+   or stop without repair.
 6. Compatible deployment: reviewed exact-SHA push/deploy while retaining
    `global + 20`; prove no-op transition and conflict behavior; no cutover.
 7. Cutover and acceptance: `per_chat + 3`, continuous observation, success or
