@@ -31,19 +31,30 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase1-20260825-root
+claimed_by: unclaimed
 claim_base_sha: d88ecc99c1e7b95f253bfabe32e87fe2dc5391bc
-current_task: phase-1-task-1-claim
-current_phase: phase_1_event_loop_db_offload
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-1-event-loop-db-offload.md
-phase_1_status: in_progress
+current_task: phase-2-awaiting-claim
+current_phase: phase_2_bounded_claim_selection
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-2-bounded-claim-selection.md
+last_completed_phase: phase_1_event_loop_db_offload
+phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
+phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
+phase_1_invalidated_review_candidate: 0dc08425693b16a8c903d66b974380d86ff56b02
+phase_1_commits:
+  - bc52549e7ebf244eacd189efadc7ac7d57395d4f
+  - 70107ad84cf133b5d1ee798a6532cf8fde2995c7
+  - 1e403b3b7e8e371340c63874143b365979643aba
+  - 0dc08425693b16a8c903d66b974380d86ff56b02
+  - 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
+phase_1_independent_review_status: ready_zero_findings_after_red_green_hardening
+phase_2_authorization: not_started_requires_new_claim
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
   - push_deploy_restart_or_production_action_required
 verification_level: L2
-local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
+local_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -52,8 +63,8 @@ invalidated_local_candidate_commits:
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
   - e03622749c32ebb214af56cd118984268e72af56
-local_focused_verification: "stale-wait RED 1 failed/8 passed; terminalization GREEN 12 passed; instrument-fanout RED 1 failed/2 passed; scoped-error GREEN 6 passed; review hardening mutation REDs 1 failed each; review-focused 21 passed; complete execution-bindings 157 passed; adjacent compatibility 108 passed with 3 warnings"
-local_full_suite_verification: "6281 passed, 1 skipped, 32 warnings in 467.33s"
+local_focused_verification: "Phase 1 final focused set: 90 passed in 15.04s"
+local_full_suite_verification: "not run in Phase 1 by plan; deferred to Phase 3"
 local_compileall_verified: true
 local_diff_check_verified: true
 trigger_protection_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
@@ -124,6 +135,34 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 1 local completion`: exact local candidate
+  `3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd` moves only the approved reconcile,
+  lifecycle-expiry, and Bot database slices off their asyncio loops. Reconcile
+  setup RED was
+  `.venv/bin/python -m pytest tests/test_reconcile.py -k offloads_blocking_database_setup -vv`
+  (`1 failed`, `0` heartbeats); GREEN plus the reconcile files passed `21`.
+  Lifecycle heartbeat and mgmt-worker ordering REDs each failed as intended;
+  GREEN plus lifecycle/worker files passed `45`. Bot heartbeat RED failed all
+  three target paths, queued/started command cancellation RED failed `2`, and
+  the narrowed census RED reported exactly the three target calls; GREEN plus
+  the complete Phase 1 focused set initially passed `87`.
+- `2026-08-25 Phase 1 review hardening`: independent review invalidated
+  `0dc08425693b16a8c903d66b974380d86ff56b02` with three Important findings:
+  cancellation could outlive newly offloaded reconcile/lifecycle work, and the
+  tested non-queue reconcile projections remained on the loop. New RED ran
+  `.venv/bin/python -m pytest tests/test_reconcile.py -k 'database_write_drains or non_queue_reconcile_database_projection' -vv`
+  (`2 failed`) and the lifecycle cancellation slice (`1 failed`). GREEN adds
+  queued-cancel/started-drain boundaries, drains expiry notifications before
+  propagating a started cancellation, and offloads raw-message/candidate/trade-
+  idea projections. The final focused command over Bot, worker executor,
+  census, lifecycle, and reconcile files passed `90` in `15.04s`.
+  `git diff --check` and compileall of every touched module/test passed.
+  Independent re-review found zero Critical, Important, or Minor issues and
+  returned Ready. No full suite was run because Phase 1 explicitly defers it to
+  Phase 3. No push, deployment, restart, production setting/data, Telegram
+  traffic, or exchange action occurred. Phase 2 is unclaimed and requires a new
+  user turn.
 
 - `2026-08-25 Phase 1 claim`: session
   `codex-per-chat-opt-phase1-20260825-root` claimed only the event-loop database
