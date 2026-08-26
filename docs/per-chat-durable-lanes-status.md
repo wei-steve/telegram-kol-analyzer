@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-blocker-repair-20260826-root
-claim_base_sha: 61a5e9cfab14d4c3150c7ef7c2390ff4ec07874f
-current_task: phase-7-precutover-blocker-diagnosis-and-local-repair
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-blocker-fix-awaiting-push-deploy-restart-authorization
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,9 +96,15 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: in_progress
+phase_7_status: local_blocker_fix_complete_awaiting_deployment
 phase_7_authorization: consumed_safe_retry_stopped_before_cutover
-phase_7_blocker_remediation_authorization: owner_directed_local_diagnosis_code_tests_status_and_commits_only
+phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
+phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
+phase_7_blocker_red_verification: one_failed_expected_stale_stack_was_not_discarded
+phase_7_blocker_focused_verification: 286_passed_2_warnings_then_21_passed
+phase_7_blocker_full_suite_verification: 6304_passed_1_skipped_32_warnings_in_526_53_seconds
+phase_7_blocker_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-diagnosis-20260826T075147Z/diagnosis-evidence.log
+phase_7_blocker_evidence_sha256: 4dd3ad9cf3e91aed66ebd6b3d9b7660979d623379bf51ca9615b0f28b7bef0dc
 phase_7_production_sha: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
 phase_7_before_tuple: global_1_queue
 phase_7_cutover_tuple: per_chat_3_queue
@@ -110,17 +116,17 @@ phase_7_failure_reason: safe_retry_pre_cutover_web_loop_health_reported_stall_co
 phase_7_acceptance_window_status: not_started_safe_retry_stopped_before_cutover
 phase_7_retry_convergence_status: not_started_cutover_not_submitted
 phase_7_retry_convergence_samples: []
-phase_7_retry_remaining_gate_blockers: web_loop_stall_and_5_pending_jobs_not_drained_in_bounded_30_seconds
+phase_7_retry_remaining_gate_blockers: exact_fix_not_pushed_deployed_or_restarted_and_new_retry_not_authorized
 phase_7_window_start: null
 phase_7_window_end: null
 phase_7_natural_message_count: 0
 phase_7_distinct_chat_count: 0
 phase_7_peak_active_chat_lanes: null
 phase_7_ordering_status: not_observed_window_not_started
-phase_7_backlog_status: poststop_5_pending_0_claimed_not_drained_in_bounded_30_seconds
+phase_7_backlog_status: queue_pending_0_claimed_0_five_historical_shadow_pending_excluded_by_worker_contract
 phase_7_duplicate_status: not_observed_window_not_started
 phase_7_sqlite_status: poststop_wal_quick_check_ok_query_only_1_total_changes_0
-phase_7_loop_status: failed_pre_cutover_web_stall_count_1_worst_stall_ms_5653_293
+phase_7_loop_status: one_real_historical_web_stall_selector_stack_invalidated_by_capture_race_local_attribution_fix_complete_not_deployed
 phase_7_session_status: poststop_ingest_only_one_holder
 phase_7_exchange_status: not_queried_retry_stopped_before_exchange_baseline
 phase_7_previous_attempt_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log
@@ -213,6 +219,46 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 blocker-remediation local completion`: production
+  read-only diagnosis proved that the five apparent pending jobs were all
+  historical `shadow=1` reconcile rows from 2026-08-20. The queue worker claim
+  contract filters `shadow=0`; current queue pending and claimed counts were
+  both zero. Therefore the prior unqualified pending count was a diagnostic
+  scope error, not a worker scheduling or backlog defect, and it is not a
+  remaining Phase 7 gate blocker.
+
+  The Web loop stall was a real single event at
+  `2026-08-26T07:30:33.765410+00:00`, with
+  `worst_stall_ms=5653.293`. It did not reproduce: a bounded localhost
+  positions-panel read completed in `0.060974` seconds and Web `stall_count`
+  remained `1`; the journal contained exactly one stall warning since the
+  event. The old `selector.poll()` stack is not authoritative attribution.
+  `LoopStallAttributor.poll_once()` marked the episode under its lock but
+  released that lock before reading the loop frame, allowing the loop to check
+  in and advance before the watchdog formatted the stack. The observed warning
+  and stack-log ordering matched this recovery race.
+
+  RED-to-GREEN remediation added a check-in generation and discards a sampled
+  stack with an explicit `event loop recovered before stack capture` reason if
+  the loop recovered during capture. The focused regression first failed
+  because the recovered stack remained populated, then passed after the
+  minimal fix. Related loop-health and Web tests passed `286` with two existing
+  warnings; the final focused set passed `21`; the one final complete suite on
+  exact code candidate `a9545a1b16c5132b789c805d03680d203a9a0440` passed
+  `6304`, skipped `1`, and emitted `32` existing warnings in `526.53s`.
+  Production diagnosis evidence is retained at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-diagnosis-20260826T075147Z/diagnosis-evidence.log`,
+  SHA-256
+  `4dd3ad9cf3e91aed66ebd6b3d9b7660979d623379bf51ca9615b0f28b7bef0dc`.
+
+  This local repair is not pushed or deployed. Production remains exact commit
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a` at
+  `global + 1 + queue`; no service was restarted and no Phase 7 cutover was
+  attempted. A push, exact-SHA deployment/restart with its own verification,
+  and a separately authorized Phase 7 retry remain required. No production
+  setting/schema/data change, worker command, replay, manufactured traffic,
+  Telegram business message, test trade, or exchange write occurred.
 
 - `2026-08-26 Phase 7 blocker-remediation claim`: session
   `codex-per-chat-phase7-blocker-repair-20260826-root` claimed the failed
