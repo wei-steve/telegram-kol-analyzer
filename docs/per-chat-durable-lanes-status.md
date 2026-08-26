@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-web-loop-stall-attribution-awaiting-owner-authorization
+claimed_by: codex-per-chat-phase7-web-stall-attribution-20260826-root
+claim_base_sha: dde02f3c9a33f3d8437dcdcad6af11331b96157c
+current_task: phase-7-web-loop-stall-attribution-local-red-green-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -97,6 +97,7 @@ phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snaps
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
+phase_7_web_stall_attribution_authorization: owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_latest_safe_retry_authorization: consumed_owner_authorized_exact_56bebd36_canonical_95a88371_production_claim_single_cutover_convergence_two_hour_acceptance_and_l2_rollback
 phase_7_latest_safe_retry_claim_commit: 741c17187bba8c9e6130cb9d067c823145682f0c
 phase_7_latest_safe_retry_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
@@ -331,6 +332,16 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 Web event-loop stall attribution claim`: session
+  `codex-per-chat-phase7-web-stall-attribution-20260826-root` exclusively
+  claimed the owner-authorized local RED-to-GREEN remediation at exact clean
+  canonical base `dde02f3c9a33f3d8437dcdcad6af11331b96157c`. Scope is limited
+  to directly related runtime-loop health and Phase 7 observer code/tests,
+  canonical status updates, focused tests, one final complete suite, and
+  explicit-path local commits. It does not authorize push, deployment, restart,
+  cutover, rollback, production configuration/data access or mutation,
+  Telegram traffic, replay, worker commands, test trades, or exchange writes.
 
 - `2026-08-26 Phase 7 Telethon entity-cache deployment verification`: after
   the owner confirmed the explicitly proposed next step, exact clean commit
