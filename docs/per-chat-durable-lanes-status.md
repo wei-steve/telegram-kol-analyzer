@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase2-20260825-root
+claimed_by: unclaimed
 claim_base_sha: e49c8f3abc8e90c71da88b80bab3999fc0a3bd1d
-current_task: phase-2-bounded-claim-selection
-current_phase: phase_2_bounded_claim_selection
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-2-bounded-claim-selection.md
-last_completed_phase: phase_1_event_loop_db_offload
+current_task: phase-3-awaiting-claim
+current_phase: phase_3_final_candidate_review
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-3-final-candidate-review.md
+last_completed_phase: phase_2_bounded_claim_selection
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -50,12 +50,19 @@ phase_1_commits:
 phase_1_independent_review_status: ready_zero_findings_after_red_green_hardening
 phase_2_authorization: local_code_tests_status_and_commits_only
 phase_2_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
+phase_2_status: local_complete
+phase_2_candidate_commit: 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
+phase_2_commits:
+  - 396bcb4606fe079a1a12e601bfa1a1f9c4db7f0b
+  - 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
+phase_2_independent_review_status: pending_phase_3
+phase_3_authorization: not_started_requires_new_claim
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
   - push_deploy_restart_or_production_action_required
 verification_level: L2
-local_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
+local_candidate_commit: 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -64,8 +71,8 @@ invalidated_local_candidate_commits:
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
   - e03622749c32ebb214af56cd118984268e72af56
-local_focused_verification: "Phase 1 final focused set: 90 passed in 15.04s"
-local_full_suite_verification: "not run in Phase 1 by plan; deferred to Phase 3"
+local_focused_verification: "Phase 2 final focused set: 69 passed"
+local_full_suite_verification: "not run in Phase 2 by plan; required in Phase 3"
 local_compileall_verified: true
 local_diff_check_verified: true
 trigger_protection_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
@@ -136,6 +143,34 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 2 local completion`: exact local candidate
+  `592c0e9d6537c5e2f58c15cd495b6767a32b3da4` replaces only the unbounded
+  durable-job candidate read inside the existing `BEGIN IMMEDIATE` claim
+  transaction. One window CTE identifies the lowest nonterminal, non-shadow
+  `raw_message_id` per chat, filters only due pending or stale claimed owners,
+  orders by chat and raw-message ID, and applies `LIMIT :claim_limit` before
+  Python receives rows. Existing conditional updates, claim tokens, attempt
+  counts, timestamps, reasons, and the single commit boundary are unchanged.
+  RED ran
+  `.venv/bin/python -m pytest tests/test_message_processing_worker.py -k 'candidate_fetch_is_bounded or does_not_use_unbounded' -vv`
+  and failed both selected tests: the bounded CTE was absent and the old
+  `MessageProcessingJob.query.all()` path was reached. Initial GREEN passed
+  both. The first complete worker-file run then exposed the exact-due datetime
+  boundary (`1 failed, 23 passed`): untyped text parameters omitted ORM
+  microseconds. That existing retry test remained RED until typed SQLAlchemy
+  `DateTime` binds restored identical SQLite comparison format. Final worker
+  verification passed `24`; shadow enqueue passed `21`; settings-cap passed
+  `17`; process-role plus event-loop census passed `7` (`69` total). A
+  representative temporary database with `48` jobs completed
+  `EXPLAIN QUERY PLAN`, used the existing chat-id index, and selected exactly
+  `3` rows at limit `3`. `git diff --check` and compileall of the touched
+  source/test modules passed. No index, schema, migration, model, fallback
+  query, pool/executor change, recognition/strategy/execution/exchange semantic
+  change, full suite, push, deployment, restart, production query,
+  configuration/data mutation, Telegram traffic, or exchange action occurred.
+  Phase 2 is locally complete; Phase 3 final candidate review is unclaimed and
+  requires a new user turn.
 
 - `2026-08-25 Phase 2 claim`: session
   `codex-per-chat-opt-phase2-20260825-root` claimed only bounded durable-job
