@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-ingest-stall-remediation-20260826T1755Z-root
-claim_base_sha: 54dca4b57ee7da80b6566d42b048153d6467eb05
-current_task: phase-7-ingest-stall-remediation-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-ingest-stall-attribution-fix-awaiting-owner-push-authorization
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -98,8 +98,14 @@ phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
 phase_7_authorization: consumed_owner_authorized_new_safe_retry_global_1_to_per_chat_3
-phase_7_ingest_stall_remediation_authorization: owner_authorized_local_red_green_root_cause_minimal_fix_tests_status_and_commits_only
-phase_7_ingest_stall_remediation_status: in_progress
+phase_7_ingest_stall_remediation_authorization: consumed_owner_authorized_local_red_green_root_cause_minimal_fix_tests_status_and_commits_only
+phase_7_ingest_stall_remediation_status: local_complete_attribution_race_fixed_under_test_underlying_blocking_function_still_unknown
+phase_7_ingest_stall_remediation_claim_commit: c633a9aff92c86a5c767a936d987b8675ce5fed0
+phase_7_ingest_stall_remediation_plan_commit: 9a952b05b3da2679eb1cdf036cd38b621e47dd3b
+phase_7_ingest_stall_remediation_candidate_commit: 37907849223a3e4b52086f3d162109fb8e7c5c3b
+phase_7_ingest_stall_remediation_red_verification: one_failed_checkin_completed_before_frame_snapshot_and_stack_was_discarded
+phase_7_ingest_stall_remediation_green_verification: one_passed_then_28_passed_259_deselected
+phase_7_ingest_stall_remediation_full_suite_verification: 6342_passed_1_skipped_32_warnings_in_476_95_seconds
 phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
 phase_7_observer_design_commit: c1edfb14b00730fc72eec225a93313f7e5ea67dd
 phase_7_observer_plan_commit: 753c401c37e81a7620a02843c091fe5ade1727f9
@@ -149,7 +155,7 @@ phase_7_retry_convergence_samples:
   - "sample_2_elapsed_0.332932_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_3_elapsed_0.613592_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.893838_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: exact_ingest_stall_blocking_function_attribution_then_separately_authorized_red_green_fix_deploy_and_new_safe_retry
+phase_7_retry_remaining_gate_blockers: separately_authorized_push_exact_candidate_deploy_restart_and_global_1_production_stall_capture_then_underlying_function_fix_and_new_safe_retry
 phase_7_window_start: 2026-08-26T16:59:28.134926+00:00
 phase_7_window_end: 2026-08-26T17:33:44.352048+00:00
 phase_7_natural_message_count: 1
@@ -272,6 +278,43 @@ cutover_authorized: false
   explicit-path local commits. Push, deployment, restart, Phase 7 cutover or
   rollback, production configuration/schema/data changes, Telegram traffic,
   replay, worker commands, test trades, and every exchange write remain
+  prohibited.
+
+  Backward tracing confirmed a watchdog attribution race introduced by the
+  earlier stale-stack safeguard: `poll_once()` claimed a stall and recorded the
+  check-in generation under `_lock`, released that lock, and only then read the
+  loop thread frame. A recovering loop could therefore complete
+  `note_checkin()` in that gap and force the otherwise useful pre-recovery frame
+  to be discarded. A no-file-write concurrent reproduction produced the exact
+  production evidence shape: check-in completed before frame snapshot,
+  `stack_size=0`, and `event loop recovered before stack capture`.
+
+  The deterministic RED test
+  `test_concurrent_recovery_cannot_erase_pre_recovery_blocking_function` first
+  failed because the check-in completed before the paused frame provider was
+  released and the synthetic ingest blocking frame was erased. Minimal GREEN
+  replaces the attributor state lock with `threading.RLock` and keeps stall
+  ownership, frame freezing, generation comparison, and capture append in one
+  linearized critical section. Logging remains outside the lock. The existing
+  same-thread provider test still proves that a recovery which truly happens
+  before a frame is returned is discarded rather than misattributed.
+
+  Exact candidate `37907849223a3e4b52086f3d162109fb8e7c5c3b` passed the RED
+  target after repair, then the focused attribution/loop-health/Web slice passed
+  `28` with `259` deselected in `1.21s`. `git diff --check` and compileall of
+  both touched files passed. The one final complete suite on that frozen
+  production-code candidate passed `6342`, skipped `1`, and emitted `32`
+  existing warnings in `476.95s`. Claim commit is
+  `c633a9aff92c86a5c767a936d987b8675ce5fed0`; implementation-plan commit is
+  `9a952b05b3da2679eb1cdf036cd38b621e47dd3b`.
+
+  This local candidate closes the recovery/frame attribution race only. It does
+  not identify or claim to remove the production ingest function that caused
+  the original `4473.963` ms stall. A separate exact-SHA non-force push and a
+  separately authorized deployment/restart while production remains
+  `global + 1 + queue` are required before a subsequent natural stall can
+  produce authoritative function-level evidence. Phase 7 remains rolled back
+  and incomplete; no new cutover authorization exists and Phase 8 remains
   prohibited.
 
 - `2026-08-26 Phase 7 versioned-observer safe-retry claim`: session
