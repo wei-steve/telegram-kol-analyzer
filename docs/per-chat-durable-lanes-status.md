@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: d88ecc99c1e7b95f253bfabe32e87fe2dc5391bc
-current_task: phase-2-awaiting-claim
+claimed_by: codex-per-chat-opt-phase2-20260825-root
+claim_base_sha: e49c8f3abc8e90c71da88b80bab3999fc0a3bd1d
+current_task: phase-2-bounded-claim-selection
 current_phase: phase_2_bounded_claim_selection
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-2-bounded-claim-selection.md
 last_completed_phase: phase_1_event_loop_db_offload
@@ -48,7 +48,8 @@ phase_1_commits:
   - 0dc08425693b16a8c903d66b974380d86ff56b02
   - 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
 phase_1_independent_review_status: ready_zero_findings_after_red_green_hardening
-phase_2_authorization: not_started_requires_new_claim
+phase_2_authorization: local_code_tests_status_and_commits_only
+phase_2_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -135,6 +136,19 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 2 claim`: session
+  `codex-per-chat-opt-phase2-20260825-root` claimed only bounded durable-job
+  candidate selection at exact clean local base
+  `e49c8f3abc8e90c71da88b80bab3999fc0a3bd1d`. The owner explicitly authorized
+  Phase 2 to use exact upstream and remote deploy baseline
+  `d66afadda5e34db80851a0dae5986b622521ab3f`; both resolved to that SHA and no
+  Git lock was present. Authorization is limited to Phase 2 local code, tests,
+  status updates, and local commits. Push, deployment, restart, production
+  queries, configuration/data mutation, Telegram traffic, and exchange actions
+  are forbidden. Any schema, index, migration, model, fallback query,
+  recognition, strategy, execution, exchange-write, pool-size, or executor-
+  count change is a stop condition.
 
 - `2026-08-25 Phase 1 local completion`: exact local candidate
   `3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd` moves only the approved reconcile,
