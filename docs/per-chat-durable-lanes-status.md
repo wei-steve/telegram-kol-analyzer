@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-safe-retry-awaiting-owner-authorization
+claimed_by: codex-per-chat-phase7-safe-retry-20260826T084816Z-root
+claim_base_sha: 568fb78710ab0fb3e4b27c5589377854111353d8
+current_task: phase-7-safe-retry-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,8 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: blocker_fix_deployed_verified_awaiting_safe_retry
-phase_7_authorization: consumed_safe_retry_stopped_before_cutover
+phase_7_status: in_progress
+phase_7_authorization: owner_authorized_single_safe_retry_global_1_to_per_chat_3
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
 phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
@@ -183,7 +183,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -232,6 +232,29 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 post-fix safe-retry claim`: session
+  `codex-per-chat-phase7-safe-retry-20260826T084816Z-root` exclusively claimed
+  one owner-authorized Phase 7 retry at exact clean canonical base
+  `568fb78710ab0fb3e4b27c5589377854111353d8`. Local upstream, the local
+  remote-tracking deploy ref, the live remote deploy branch, and production
+  HEAD all resolved exactly to deployed fix commit
+  `7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9`. Production tracked status was
+  clean with no Git, updater, or deployment mutation; exactly one active/running
+  ingest, worker, and Web authority had distinct PIDs, the monolith was inactive,
+  and only ingest held the Telegram session. The API tuple was exactly
+  `global + 1 + queue`, semantic review was disabled, all three roles reported
+  zero stalls, and worker memory reported cap `1`.
+
+  Authorization is limited to fresh complete read-only gates, one exact
+  ingest-owned transition from `global + 1 + queue` to `per_chat + 3 + queue`,
+  the non-stitchable five-second convergence gate, one complete continuous
+  two-hour natural-traffic acceptance window after convergence, the approved
+  atomic rollback, worker-owned read-only exchange baseline/end parity, raw
+  evidence, canonical status updates, and explicit-path local commits. Code or
+  test changes, push, deployment, restart, schema/data changes, replay, worker
+  commands, manufactured Telegram traffic, test trades, and exchange writes
+  remain unauthorized.
 
 - `2026-08-26 Phase 7 blocker-fix exact deployment completion`: the owner
   separately authorized exact deployment commit
