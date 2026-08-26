@@ -149,7 +149,7 @@ phase_7_exchange_status: complete_worker_owned_baseline_end_identical_zero_posit
 phase_7_previous_attempt_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log
 phase_7_previous_attempt_evidence_sha256: ad3d14aa04805a7187d5ca289e5a63ff9b681c269e9453b2137ace346bff127b
 phase_7_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-postfix-safe-retry-20260826T085214Z/phase7-retry-evidence.log
-phase_7_evidence_sha256: 8a05037c5f4c180314ab6e741ac3566b5bcdf008bf460b95fecd596ced7f0a57
+phase_7_evidence_sha256: 566892624f51c82dcdb961a3577888915780f029d73a2a5d3e8445ae567ce1cf
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -288,7 +288,7 @@ cutover_authorized: false
   exchange end snapshot was identical to baseline. Raw evidence is retained at
   `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-postfix-safe-retry-20260826T085214Z/phase7-retry-evidence.log`,
   SHA-256
-  `8a05037c5f4c180314ab6e741ac3566b5bcdf008bf460b95fecd596ced7f0a57`.
+  `566892624f51c82dcdb961a3577888915780f029d73a2a5d3e8445ae567ce1cf`.
   Phase 7 remains rolled back and incomplete; Phase 8 is forbidden. A corrected
   acceptance observer and a new explicit safe-retry authorization are required.
   No code/test edit, push, deployment, restart, schema/data mutation, replay,
