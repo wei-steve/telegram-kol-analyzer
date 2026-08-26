@@ -159,6 +159,31 @@ def test_a_failing_frame_provider_is_recorded_as_a_reason():
     assert "frame provider failed" in (capture.reason or "")
 
 
+def test_recovery_before_stack_snapshot_is_reported_instead_of_misattributed():
+    clock = FakeClock()
+    attributor = None
+
+    def recover_then_return_frames():
+        assert attributor is not None
+        attributor.note_checkin()
+        return {LOOP_THREAD_ID: _a_frame()}
+
+    attributor = LoopStallAttributor(
+        stall_threshold_ms=3000.0,
+        monotonic=clock,
+        now_provider=lambda: NOW,
+        frame_provider=recover_then_return_frames,
+    )
+    attributor.attach_loop_thread(LOOP_THREAD_ID)
+    clock.advance(5.0)
+
+    capture = attributor.poll_once()
+
+    assert capture is not None
+    assert capture.stack == ()
+    assert "recovered before stack capture" in (capture.reason or "")
+
+
 def test_captures_are_bounded_and_exposed_in_the_snapshot():
     clock = FakeClock()
     attributor = _attributor(clock, capture_interval_seconds=0.0, max_captures=3)

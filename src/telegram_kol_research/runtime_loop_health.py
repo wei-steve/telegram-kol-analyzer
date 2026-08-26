@@ -88,6 +88,7 @@ class LoopStallAttributor:
         self._captures: deque[StallCapture] = deque(maxlen=self.max_captures)
         self._loop_thread_id: int | None = None
         self._last_checkin: float | None = None
+        self._checkin_generation = 0
         self._captured_this_episode = False
         self._last_capture_monotonic: float | None = None
         self._capture_count = 0
@@ -100,6 +101,7 @@ class LoopStallAttributor:
         with self._lock:
             self._loop_thread_id = int(thread_id)
             self._last_checkin = self._monotonic()
+            self._checkin_generation += 1
             self._captured_this_episode = False
 
     def note_checkin(self) -> None:
@@ -107,6 +109,7 @@ class LoopStallAttributor:
 
         with self._lock:
             self._last_checkin = self._monotonic()
+            self._checkin_generation += 1
             self._captured_this_episode = False
 
     def poll_once(self) -> StallCapture | None:
@@ -134,8 +137,19 @@ class LoopStallAttributor:
                 return None
             self._captured_this_episode = True
             self._last_capture_monotonic = now
+            checkin_generation = self._checkin_generation
 
         stack, reason = self._format_loop_stack(thread_id)
+        with self._lock:
+            recovered_before_capture = (
+                self._checkin_generation != checkin_generation
+            )
+        if recovered_before_capture:
+            stack = ()
+            reason = (
+                "event loop recovered before stack capture; "
+                "sampled stack discarded"
+            )
         capture = StallCapture(
             at=self._now_provider().isoformat(),
             blocked_ms=blocked_seconds * 1000.0,
