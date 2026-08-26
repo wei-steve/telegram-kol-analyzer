@@ -70,6 +70,34 @@ class ConvergenceResult:
     reason: str | None
 
 
+@dataclass(frozen=True)
+class AcceptanceObservation:
+    runtime: RuntimeObservation
+    jobs: tuple[JobObservation, ...]
+    raw_message_count: int
+    distinct_chat_count: int
+    pending_count: int
+    claimed_count: int
+    duplicate_job_count: int
+    missing_job_count: int
+    orphan_job_count: int
+    stuck_job_count: int
+    sqlite_lock_count: int
+    loop_stall_count: int
+    session_conflict_count: int
+    deepseek_402_count: int
+    ingest_anomaly_count: int
+    execution_anomaly_count: int
+
+
+@dataclass(frozen=True)
+class AcceptanceResult:
+    passed: bool
+    failed: bool
+    reason: str | None
+    rollback_target: ExpectedRuntimeState | None
+
+
 def evaluate_same_chat_jobs(jobs: list[JobObservation]) -> SameChatEvaluation:
     by_chat: dict[int, list[JobObservation]] = defaultdict(list)
     for row in jobs:
@@ -202,3 +230,148 @@ class RollbackConvergenceTracker(ConvergenceTracker):
             deadline_seconds=deadline_seconds,
             previous_limit_applied_at=None,
         )
+
+
+class AcceptanceTracker:
+    def __init__(
+        self,
+        *,
+        expected_state: ExpectedRuntimeState,
+        expected_pids: AuthorityPids,
+    ) -> None:
+        self.expected_state = expected_state
+        self.expected_pids = expected_pids
+        self.raw_message_count = 0
+        self.distinct_chat_count = 0
+        self.peak_lanes = 0
+        self.max_backlog = 0
+        self.cross_chat_progress = False
+        self._pending_count = 0
+        self._claimed_count = 0
+        self._incomplete_attempts = 0
+        self._failure: AcceptanceResult | None = None
+
+    def observe(self, sample: AcceptanceObservation) -> AcceptanceResult:
+        if self._failure is not None:
+            return self._failure
+        if not sample.runtime.complete:
+            self._incomplete_attempts += 1
+            if self._incomplete_attempts == 1:
+                return AcceptanceResult(
+                    passed=False,
+                    failed=False,
+                    reason="observer_incomplete_retry",
+                    rollback_target=None,
+                )
+            return self._fail("observer_incomplete")
+        self._incomplete_attempts = 0
+
+        runtime_failure = self._runtime_failure(sample.runtime)
+        if runtime_failure is not None:
+            return self._fail(runtime_failure)
+
+        same_chat = evaluate_same_chat_jobs(list(sample.jobs))
+        if same_chat.violations:
+            return self._fail(same_chat.violations[0].code)
+
+        anomaly_fields = (
+            (sample.duplicate_job_count, "duplicate_job_identity"),
+            (sample.missing_job_count, "missing_job_identity"),
+            (sample.orphan_job_count, "orphan_job_identity"),
+            (sample.stuck_job_count, "stuck_message_job"),
+            (sample.sqlite_lock_count, "sqlite_lock"),
+            (sample.loop_stall_count, "event_loop_stall"),
+            (sample.session_conflict_count, "telegram_session_conflict"),
+            (sample.deepseek_402_count, "deepseek_402"),
+            (sample.ingest_anomaly_count, "ingest_anomaly"),
+            (sample.execution_anomaly_count, "execution_anomaly"),
+        )
+        for count, reason in anomaly_fields:
+            if count:
+                return self._fail(reason)
+
+        self.raw_message_count = max(
+            self.raw_message_count, sample.raw_message_count
+        )
+        self.distinct_chat_count = max(
+            self.distinct_chat_count, sample.distinct_chat_count
+        )
+        self.peak_lanes = max(
+            self.peak_lanes, int(sample.runtime.peak_lanes or 0)
+        )
+        self._pending_count = sample.pending_count
+        self._claimed_count = sample.claimed_count
+        self.max_backlog = max(
+            self.max_backlog, sample.pending_count + sample.claimed_count
+        )
+        claimed_chat_count = len(same_chat.claimed_chat_ids)
+        if (
+            claimed_chat_count >= 2
+            and sample.runtime.active_lanes is not None
+            and sample.runtime.active_lanes >= claimed_chat_count
+        ):
+            self.cross_chat_progress = True
+        return AcceptanceResult(
+            passed=False,
+            failed=False,
+            reason=None,
+            rollback_target=None,
+        )
+
+    def finalize(self) -> AcceptanceResult:
+        if self._failure is not None:
+            return self._failure
+        if (
+            self.raw_message_count < 5
+            or self.distinct_chat_count < 2
+            or not 2 <= self.peak_lanes <= 3
+            or not self.cross_chat_progress
+            or self._pending_count != 0
+            or self._claimed_count != 0
+        ):
+            return self._fail("acceptance_minimum_not_met")
+        return AcceptanceResult(
+            passed=True,
+            failed=False,
+            reason=None,
+            rollback_target=None,
+        )
+
+    def _runtime_failure(self, sample: RuntimeObservation) -> str | None:
+        if (
+            sample.database_state != self.expected_state
+            or sample.api_state != self.expected_state
+        ):
+            return "runtime_state_drift"
+        if sample.pids != self.expected_pids:
+            return "authority_pid_drift"
+        if sample.worker_role != "worker":
+            return "authority_role_drift"
+        if sample.worker_cap != self.expected_state.max_parallel_chats:
+            return "worker_cap_drift"
+        if (
+            sample.active_lanes is None
+            or sample.peak_lanes is None
+            or not 0
+            <= sample.active_lanes
+            <= sample.peak_lanes
+            <= self.expected_state.max_parallel_chats
+        ):
+            return "worker_lane_bounds_invalid"
+        return None
+
+    def _fail(self, reason: str) -> AcceptanceResult:
+        cap = 3 if reason in {
+            "lock_anomaly",
+            "admission_anomaly",
+            "ingest_anomaly",
+        } else 1
+        self._failure = AcceptanceResult(
+            passed=False,
+            failed=True,
+            reason=reason,
+            rollback_target=ExpectedRuntimeState(
+                "global", cap, "queue", "queue"
+            ),
+        )
+        return self._failure

@@ -3,6 +3,8 @@ import importlib.util
 from pathlib import Path
 import sys
 
+import pytest
+
 
 SCRIPT_PATH = (
     Path(__file__).resolve().parents[1]
@@ -148,3 +150,217 @@ def test_rollback_confirmation_ignores_prior_acceptance_failure():
     )
 
     assert result.passed is True
+
+
+def acceptance_tracker():
+    return observer.AcceptanceTracker(
+        expected_state=observer.ExpectedRuntimeState(
+            "per_chat", 3, "queue", "queue"
+        ),
+        expected_pids=observer.AuthorityPids(101, 102, 103),
+    )
+
+
+def acceptance_snapshot(
+    *,
+    jobs=None,
+    raw_count=1,
+    chat_count=1,
+    active_lanes=0,
+    peak_lanes=0,
+    pending_count=0,
+    claimed_count=0,
+    complete=True,
+    runtime_sample=None,
+    **overrides,
+):
+    values = {
+        "runtime": runtime_sample
+        or runtime(
+            active_lanes=active_lanes,
+            peak_lanes=peak_lanes,
+            complete=complete,
+        ),
+        "jobs": tuple(jobs or ()),
+        "raw_message_count": raw_count,
+        "distinct_chat_count": chat_count,
+        "pending_count": pending_count,
+        "claimed_count": claimed_count,
+        "duplicate_job_count": 0,
+        "missing_job_count": 0,
+        "orphan_job_count": 0,
+        "stuck_job_count": 0,
+        "sqlite_lock_count": 0,
+        "loop_stall_count": 0,
+        "session_conflict_count": 0,
+        "deepseek_402_count": 0,
+        "ingest_anomaly_count": 0,
+        "execution_anomaly_count": 0,
+    }
+    values.update(overrides)
+    return observer.AcceptanceObservation(**values)
+
+
+def test_pending_same_chat_successor_does_not_fail_acceptance():
+    tracker = acceptance_tracker()
+
+    result = tracker.observe(
+        acceptance_snapshot(
+            jobs=[job(1, 10, 7, "claimed"), job(2, 11, 7, "pending")],
+            active_lanes=1,
+            peak_lanes=1,
+            pending_count=1,
+            claimed_count=1,
+        )
+    )
+
+    assert result.failed is False
+
+
+def test_same_chat_double_claim_fails_with_scheduler_l2_rollback():
+    tracker = acceptance_tracker()
+
+    result = tracker.observe(
+        acceptance_snapshot(
+            jobs=[job(1, 10, 7, "claimed"), job(2, 11, 7, "claimed")],
+            active_lanes=2,
+            peak_lanes=2,
+            claimed_count=2,
+        )
+    )
+
+    assert result.reason == "same_chat_multiple_claims"
+    assert result.rollback_target == observer.ExpectedRuntimeState(
+        "global", 1, "queue", "queue"
+    )
+
+
+def test_two_claimed_chats_establish_cross_chat_progress():
+    tracker = acceptance_tracker()
+
+    result = tracker.observe(
+        acceptance_snapshot(
+            jobs=[job(1, 10, 7, "claimed"), job(2, 11, 8, "claimed")],
+            active_lanes=2,
+            peak_lanes=2,
+            claimed_count=2,
+            chat_count=2,
+        )
+    )
+
+    assert result.failed is False
+    assert tracker.cross_chat_progress is True
+
+
+def test_acceptance_finalize_never_waives_traffic_or_peak():
+    tracker = acceptance_tracker()
+    tracker.observe(
+        acceptance_snapshot(raw_count=3, chat_count=2, peak_lanes=1)
+    )
+
+    result = tracker.finalize()
+
+    assert result.failed is True
+    assert result.reason == "acceptance_minimum_not_met"
+
+
+def test_acceptance_finalize_passes_complete_minimums():
+    tracker = acceptance_tracker()
+    tracker.observe(
+        acceptance_snapshot(
+            jobs=[job(1, 10, 7, "claimed"), job(2, 11, 8, "claimed")],
+            raw_count=5,
+            chat_count=2,
+            active_lanes=2,
+            peak_lanes=2,
+            claimed_count=2,
+        )
+    )
+    tracker.observe(
+        acceptance_snapshot(
+            raw_count=5,
+            chat_count=2,
+            active_lanes=0,
+            peak_lanes=2,
+        )
+    )
+
+    result = tracker.finalize()
+
+    assert result.passed is True
+
+
+@pytest.mark.parametrize(
+    ("overrides", "reason"),
+    [
+        ({"duplicate_job_count": 1}, "duplicate_job_identity"),
+        ({"missing_job_count": 1}, "missing_job_identity"),
+        ({"orphan_job_count": 1}, "orphan_job_identity"),
+        ({"stuck_job_count": 1}, "stuck_message_job"),
+        ({"sqlite_lock_count": 1}, "sqlite_lock"),
+        ({"loop_stall_count": 1}, "event_loop_stall"),
+        ({"session_conflict_count": 1}, "telegram_session_conflict"),
+        ({"deepseek_402_count": 1}, "deepseek_402"),
+        ({"execution_anomaly_count": 1}, "execution_anomaly"),
+    ],
+)
+def test_acceptance_fails_closed_on_pipeline_anomaly(overrides, reason):
+    result = acceptance_tracker().observe(acceptance_snapshot(**overrides))
+
+    assert result.failed is True
+    assert result.reason == reason
+    assert result.rollback_target.max_parallel_chats == 1
+
+
+def test_ingest_anomaly_uses_global_cap_three_rollback():
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(ingest_anomaly_count=1)
+    )
+
+    assert result.reason == "ingest_anomaly"
+    assert result.rollback_target == observer.ExpectedRuntimeState(
+        "global", 3, "queue", "queue"
+    )
+
+
+def test_tuple_drift_fails_acceptance():
+    drifted = runtime(lock_mode="global", cap=3)
+
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(runtime_sample=drifted)
+    )
+
+    assert result.reason == "runtime_state_drift"
+
+
+def test_pid_drift_fails_acceptance():
+    drifted = runtime(pids=observer.AuthorityPids(101, 999, 103))
+
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(runtime_sample=drifted)
+    )
+
+    assert result.reason == "authority_pid_drift"
+
+
+def test_peak_above_three_fails_acceptance():
+    excessive = runtime(cap=3, active_lanes=3, peak_lanes=4)
+
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(runtime_sample=excessive)
+    )
+
+    assert result.reason == "worker_lane_bounds_invalid"
+
+
+def test_second_incomplete_acceptance_sample_fails_closed():
+    tracker = acceptance_tracker()
+    incomplete = acceptance_snapshot(complete=False)
+
+    first = tracker.observe(incomplete)
+    second = tracker.observe(incomplete)
+
+    assert first.failed is False
+    assert first.reason == "observer_incomplete_retry"
+    assert second.failed is True
+    assert second.reason == "observer_incomplete"
