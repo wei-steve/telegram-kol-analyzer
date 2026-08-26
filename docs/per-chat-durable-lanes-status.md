@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase6-20260826-root
-claim_base_sha: 4b2f004a226ac97c622331632e473ad3d1100ba0
-current_task: phase-6-compatible-deployment-in-progress
-current_phase: phase_6_compatible_deployment
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-6-compatible-deployment.md
-last_completed_phase: phase_5_trigger_intents_read_only_gate
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-awaiting-claim
+current_phase: phase_7_cutover_acceptance
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
+last_completed_phase: phase_6_compatible_deployment
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -80,7 +80,22 @@ phase_5_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-int
 phase_5_evidence_sha256: 0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344
 phase_5_identity_investigation_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-checkout-diff-read-only.txt
 phase_5_identity_investigation_evidence_sha256: de07b8b638a9699000131ab48819a8804db4c7a7f656a43dba467a89be16463f
-phase_6_authorization: exact_candidate_non_force_push_compatible_deployment_and_l2_read_only_verification_only
+phase_6_status: completed
+phase_6_authorization: completed_exact_candidate_non_force_push_compatible_deployment_and_l2_read_only_verification_only
+phase_6_candidate_commit: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
+phase_6_deployed_commit: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
+phase_6_window_start: 2026-08-26T06:06:06.946178+00:00
+phase_6_window_end: 2026-08-26T06:36:07.108192+00:00
+phase_6_natural_message_count: 8
+phase_6_distinct_chat_count: 4
+phase_6_peak_active_chat_lanes: 2
+phase_6_focused_verification: "111 passed; 28 passed, 179 deselected; 5 passed, 260 deselected"
+phase_6_noop_expected_state_status: passed_http_200_unchanged_global_20_queue
+phase_6_stale_expected_state_status: passed_http_409_no_row_change
+phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orphan_stuck_duplicates
+phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
+phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
+phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -117,7 +132,7 @@ fail_closed_parallel_chat_limit: 1
 schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
-deployment_authorized: true
+deployment_authorized: false
 cutover_authorized: false
 ```
 
@@ -167,6 +182,48 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 6 compatible deployment completion`: exact candidate
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a` was pushed without force and
+  deployed once through the existing verified updater bootstrap. The local
+  machine had no executable PowerShell runtime, so the `.ps1` wrapper itself
+  could not start; no server action occurred on that failed attempt. The same
+  wrapper bootstrap was then executed directly: it fetched the exact branch,
+  verified `FETCH_HEAD`, extracted the candidate's updater, matched SHA-256
+  `b24132a3204bebee29679530a19cc5c3e680f724b0200195d869865ed7adcb70`,
+  verified the dual split-runtime contract, and invoked that updater. Production
+  reached the exact candidate with one necessary restart; ingest, worker, and
+  Web remained the only active authorities, the monolith stayed inactive, the
+  monitor pin/timer were healthy, and all three service PIDs then remained
+  unchanged through observation.
+
+  Server focused verification passed `111`, then the settings expected-state
+  slice passed `28` with `179` deselected, and the Web role/expected-state slice
+  passed `5` with `260` deselected. The ingest-owned exact no-op
+  `global + 20 -> global + 20` returned HTTP `200` with no tuple change; the
+  deliberately stale expected cap `19` request returned HTTP `409` and left the
+  complete settings row unchanged. No `per_chat` or cap `3` request was sent.
+  The continuous L2 window ran from `2026-08-26T06:06:06.946178+00:00` through
+  `2026-08-26T06:36:07.108192+00:00`, sampled `360` times, and observed `8`
+  natural messages across `4` chats. All `8` queue jobs succeeded; ending
+  pending and claimed counts were zero; peak active lanes were `2`; missing,
+  orphan, stuck, duplicate job, duplicate recognition-decision, and duplicate
+  execution-contract counts were zero. All runtime roles retained zero new
+  loop stalls, SQLite locks, session conflicts, DeepSeek/402 errors, or
+  authority drift. Opening and ending SQLite checks were `quick_check=ok`,
+  `query_only=1`, and `total_changes=0` for each read-only snapshot. Two
+  worker-owned bounded exchange reads were complete and had the identical
+  fingerprint, with zero positions and zero open orders; no exchange write
+  occurred. Production remained exactly `global + 20 + queue`, and semantic
+  review remained disabled.
+
+  Raw evidence is retained at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log`,
+  SHA-256
+  `7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023`.
+  Phase 6 is complete and the exclusive claim is released. The pointer advances
+  only to Phase 7 awaiting claim; Phase 7 was not read, claimed, executed, or
+  pushed, and cutover remains unauthorized.
 
 - `2026-08-26 Phase 6 compatible-deployment claim`: session
   `codex-per-chat-opt-phase6-20260826-root` claimed only compatible deployment
