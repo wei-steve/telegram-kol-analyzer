@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-5-stopped-production-identity-mismatch
+claimed_by: codex-per-chat-opt-phase5-identity-20260826-root
+claim_base_sha: 20457cfb947b6c210b643191ffdccbb411169b27
+current_task: phase-5-production-identity-read-only-investigation
 current_phase: phase_5_trigger_intents_read_only_gate
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-5-trigger-intents-read-only-gate.md
 last_completed_phase: phase_4_batch150_read_only_gate
@@ -71,8 +71,8 @@ phase_4_status: completed
 phase_4_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_4_evidence_path: /Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt
 phase_4_evidence_sha256: 4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd
-phase_5_status: stopped_fail_closed_production_identity_mismatch
-phase_5_authorization: consumed_read_only_capture_requires_new_claim_after_production_identity_resolution
+phase_5_status: claimed_production_identity_read_only_investigation
+phase_5_authorization: production_checkout_read_only_diff_classification_local_evidence_status_and_local_commits_only
 phase_5_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_5_production_dirty_count: 15
 phase_5_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-read-only-gate.txt
@@ -163,6 +163,21 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 5 production-identity investigation claim`: session
+  `codex-per-chat-opt-phase5-identity-20260826-root` resumed only the unresolved
+  `deployed_dirty_count=15` classification at exact clean local canonical base
+  `20457cfb947b6c210b643191ffdccbb411169b27`. The local upstream, local remote-
+  tracking deploy ref, and live remote deploy branch still resolved to
+  `d66afadda5e34db80851a0dae5986b622521ab3f`; the worktree was clean and no Git
+  lock was present. Authorization is limited to one bounded read-only listing
+  and classification of the production checkout differences, comparison with
+  exact deployed Git content where needed, local-only evidence, canonical
+  status updates, and local commits. No production/server/database write or
+  repair, backup, CAS plan, push, deployment, restart, configuration or data
+  change, replay, Telegram traffic or business/operator/system Bot message,
+  Deepcoin call, exchange action, Phase 6 read, claim, or execution is
+  authorized.
 
 - `2026-08-26 Phase 5 fail-closed stop`: the bounded read-only capture ran from
   `2026-08-26T05:40:02Z` through `2026-08-26T05:40:25Z`. The deployed HEAD and
