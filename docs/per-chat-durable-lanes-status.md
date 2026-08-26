@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase7-20260826-root
-claim_base_sha: 8c2159286309d9380622d0a3770c3d46592d11d7
-current_task: phase-7-cutover-acceptance-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-rolled-back-awaiting-owner
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,31 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: in_progress
-phase_7_authorization: exact_atomic_cutover_two_level_rollback_and_two_hour_read_only_acceptance_only
+phase_7_status: rolled_back_incomplete
+phase_7_authorization: consumed_single_atomic_cutover_and_required_level_two_rollback_no_recutover
+phase_7_production_sha: 8cccfbb1683894459368cec4ca64a0cf626a1e9a
+phase_7_before_tuple: global_20_queue
+phase_7_cutover_tuple: per_chat_3_queue
+phase_7_final_tuple: global_1_queue
+phase_7_cutover_http_status: 200
+phase_7_rollback_occurred: true
+phase_7_rollback_http_status: 200
+phase_7_failure_reason: postcutover_worker_runtime_remained_configured_max_parallel_chats_20_after_db_and_api_confirmed_per_chat_3_queue
+phase_7_acceptance_window_status: not_started_immediate_postcutover_scheduler_concurrency_gate_failed
+phase_7_window_start: null
+phase_7_window_end: null
+phase_7_natural_message_count: 0
+phase_7_distinct_chat_count: 0
+phase_7_peak_active_chat_lanes: null
+phase_7_ordering_status: not_observed_window_not_started
+phase_7_backlog_status: pre_and_postrollback_zero_window_not_started
+phase_7_duplicate_status: pre_and_postrollback_zero_window_not_started
+phase_7_sqlite_status: pre_and_postrollback_wal_quick_check_ok_query_only_1_total_changes_0
+phase_7_loop_status: pre_and_postrollback_zero_stalls
+phase_7_session_status: ingest_only_one_holder_confirmed_after_rollback
+phase_7_exchange_status: complete_baseline_and_end_identical_zero_positions_zero_open_orders
+phase_7_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log
+phase_7_evidence_sha256: ad3d14aa04805a7187d5ca289e5a63ff9b681c269e9453b2137ace346bff127b
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -135,7 +158,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: true
+cutover_authorized: false
 ```
 
 ## Fixed Boundaries
@@ -184,6 +207,49 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 immediate scheduler-gate rollback`: all final cutover
+  gates passed again against exact production SHA
+  `8cccfbb1683894459368cec4ca64a0cf626a1e9a`. The ingest-owned expected-state
+  request atomically changed `global + 20 + queue` to
+  `per_chat + 3 + queue` once and returned HTTP `200`; both the database and
+  ingest API confirmed the desired complete tuple. No service was restarted.
+  The immediate worker runtime-health confirmation still reported
+  `configured_max_parallel_chats=20`, `active_chat_lanes=0`, the prior
+  `peak_active_chat_lanes_since_limit_change=2`, and the prior
+  `limit_applied_at`, rather than the newly configured cap `3`. This failed the
+  post-cutover scheduler/concurrency gate before the two-hour acceptance window
+  began.
+
+  Per the approved level-two rollback, the session read the exact current tuple
+  and issued one atomic transition from `per_chat + 3 + queue` to
+  `global + 1 + queue`. The rollback returned HTTP `200`; database and API
+  confirmation was complete. Final worker runtime health then converged to cap
+  `1`, zero active lanes, a reset peak of `0`, and a new limit-applied timestamp.
+  Ingest, worker, and Web retained their original distinct PIDs and remained the
+  only active/running split authorities; the monolith remained inactive and
+  only ingest held the Telegram session. Final SQLite evidence was `wal`,
+  `quick_check=ok`, `query_only=1`, `total_changes=0`, with zero foreign-key
+  violations. Active exchange writes, active management, pending/claimed
+  message jobs, and pending/claimed/executing worker commands were zero. Final
+  journals and runtime health had zero SQLite locks, loop stalls, session
+  conflicts, DeepSeek/402 errors, or authority drift. Complete worker-owned
+  read-only exchange baseline and end snapshots were identical at fingerprint
+  `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`,
+  with zero positions and zero open orders.
+
+  The uninterrupted two-hour acceptance window was not started; therefore its
+  natural-message count is `0`, distinct-chat count is `0`, and Phase 7 peak,
+  ordering, cross-chat progress, and convergence acceptance are not claimed.
+  The workstream remains incomplete and `in_progress`, ownership is released,
+  cutover authorization is consumed, and no automatic re-cutover is permitted.
+  Raw evidence is retained at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log`,
+  SHA-256
+  `ad3d14aa04805a7187d5ca289e5a63ff9b681c269e9453b2137ace346bff127b`.
+  No push, deployment, restart, manufactured traffic, replay, worker command,
+  Telegram business or operator/system Bot message, test trade, production
+  code/schema/migration/data edit, or observer-triggered exchange write occurred.
 
 - `2026-08-26 Phase 7 cutover-and-acceptance claim`: session
   `codex-per-chat-opt-phase7-20260826-root` exclusively claimed only Phase 7 at
