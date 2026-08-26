@@ -18,22 +18,12 @@ SOURCE_ROOT = Path(__file__).resolve().parents[1] / "src" / "telegram_kol_resear
 # longer the empty set it reached under the narrow rule. Emptiness there was
 # false assurance: the call causing every production stall was invisible to it.
 #
-# Four of these are REAL blocking calls that were never seen before. They take a
-# session_factory and query the database on the event loop. They are event
-# driven — they run only when someone sends a bot command — so they do not
-# produce the metronomic stalls Phase 1c attributed to the reconcile loop, and
-# Phase 1d does not fix them. They have no owning phase yet.
+# The three Bot database calls formerly listed here are owned by the per-chat
+# activation event-loop optimization and now run off the event loop. The
+# remaining entries are reviewed pure helpers retained because this static
+# matcher cannot prove purity.
 KNOWN_BLOCKING_CALLS = frozenset(
     {
-        # ── real blocking calls, unowned, discovered by the Phase 1d widening ──
-        # Database work on the loop whenever an operator uses a bot command.
-        "telegram_bot_commands.run_system_operator_bot_command_loop"
-        " -> process_system_operator_command",
-        "telegram_bot_commands.run_telegram_bot_command_loop"
-        " -> format_holding_positions_message",
-        "telegram_bot_commands.run_telegram_bot_command_loop"
-        " -> format_pending_positions_message",
-
         # ── pure helpers: no I/O, microseconds, safe on the loop ──
         # Kept because the matcher cannot prove purity statically. Reviewed by
         # hand in Phase 1d; none touches a session, a client, or the network.

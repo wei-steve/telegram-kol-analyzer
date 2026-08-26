@@ -1109,3 +1109,168 @@ def test_pending_expiry_review_database_work_leaves_event_loop_responsive(
 
     assert beats >= MIN_HEARTBEATS
     assert worst_gap < TICK_BLOCK_SECONDS
+
+
+@pytest.mark.parametrize(
+    ("command_text", "formatter_name"),
+    [
+        ("/positions", "format_holding_positions_message"),
+        ("/pending", "format_pending_positions_message"),
+    ],
+)
+def test_operator_position_commands_leave_event_loop_responsive(
+    monkeypatch,
+    command_text,
+    formatter_name,
+):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    update_sent = False
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 1,
+                    "message": {"chat": {"id": "1"}, "text": command_text},
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    def blocking_formatter(*_args, **_kwargs):
+        time.sleep(TICK_BLOCK_SECONDS)
+        return "ok"
+
+    monkeypatch.setattr(
+        bot_commands.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(),
+    )
+    monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+    monkeypatch.setattr(bot_commands, "_set_bot_commands", _noop)
+    monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+    monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+    monkeypatch.setattr(
+        bot_commands,
+        "_message_is_from_alert_chat",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(bot_commands, "_send_message", _noop)
+    monkeypatch.setattr(bot_commands, formatter_name, blocking_formatter)
+
+    async def scenario():
+        return await _observe_loop_while(
+            lambda: asyncio.create_task(
+                bot_commands.run_telegram_bot_command_loop(
+                    config=SimpleNamespace(
+                        bot_token="token",
+                        alert_chat_id="1",
+                        timeout_seconds=1.0,
+                    ),
+                    session_factory=object(),
+                    group_config=object(),
+                    poll_interval_seconds=0.01,
+                )
+            )
+        )
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS
+
+
+def test_system_operator_text_command_leaves_event_loop_responsive(monkeypatch):
+    class _FakeAsyncClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+    update_sent = False
+    threads: list[tuple[str, str]] = []
+
+    async def _get_one_update(*_args, **_kwargs):
+        nonlocal update_sent
+        if not update_sent:
+            update_sent = True
+            return [
+                {
+                    "update_id": 7,
+                    "message": {
+                        "chat": {"id": "1"},
+                        "text": "/expiry_expire_cancel 1",
+                    },
+                }
+            ]
+        await asyncio.sleep(3600)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _zero(*_args, **_kwargs):
+        return 0
+
+    def build_client():
+        threads.append(("build", threading.current_thread().name))
+        return object()
+
+    def blocking_command(*_args, **_kwargs):
+        threads.append(("process", threading.current_thread().name))
+        time.sleep(TICK_BLOCK_SECONDS)
+        return None
+
+    monkeypatch.setattr(
+        bot_commands.httpx,
+        "AsyncClient",
+        lambda **_kwargs: _FakeAsyncClient(),
+    )
+    monkeypatch.setattr(bot_commands, "_delete_webhook", _noop)
+    monkeypatch.setattr(bot_commands, "_latest_update_offset", _zero)
+    monkeypatch.setattr(bot_commands, "_get_updates", _get_one_update)
+    monkeypatch.setattr(
+        bot_commands,
+        "_message_is_from_alert_chat",
+        lambda *_args: True,
+    )
+    monkeypatch.setattr(
+        bot_commands,
+        "process_system_operator_command",
+        blocking_command,
+    )
+
+    async def scenario():
+        return await _observe_loop_while(
+            lambda: asyncio.create_task(
+                bot_commands.run_system_operator_bot_command_loop(
+                    config=bot_commands.SystemOperatorBotConfig(
+                        bot_token="token",
+                        chat_id="1",
+                    ),
+                    session_factory=object(),
+                    deepcoin_client_factory=build_client,
+                    poll_interval_seconds=0.01,
+                )
+            )
+        )
+
+    beats, worst_gap = asyncio.run(scenario())
+
+    assert beats >= MIN_HEARTBEATS
+    assert worst_gap < TICK_BLOCK_SECONDS
+    assert [label for label, _thread in threads] == ["build", "process"]
+    assert all(thread.startswith("mgmt-worker") for _label, thread in threads)

@@ -111,19 +111,19 @@ def _process_system_operator_callback_update(
     )
 
 
-class _SystemOperatorCallbackUnit:
+class _CancellableManagementUnit:
     """Atomically distinguish queued cancellation from in-flight work."""
 
     def __init__(
         self,
-        session_factory: sessionmaker,
-        callback_data: str,
-        *,
-        deepcoin_client_factory=None,
+        operation,
+        /,
+        *args,
+        **kwargs,
     ) -> None:
-        self._session_factory = session_factory
-        self._callback_data = callback_data
-        self._deepcoin_client_factory = deepcoin_client_factory
+        self._operation = operation
+        self._args = args
+        self._kwargs = kwargs
         self._state_lock = threading.Lock()
         self._cancelled_before_start = False
         self._started = False
@@ -135,39 +135,26 @@ class _SystemOperatorCallbackUnit:
             self._cancelled_before_start = True
             return True
 
-    def __call__(self) -> str | ExpiryReviewRefreshResult | None:
+    def __call__(self):
         with self._state_lock:
             if self._cancelled_before_start:
                 return None
             self._started = True
-        return _process_system_operator_callback_update(
-            self._session_factory,
-            self._callback_data,
-            deepcoin_client_factory=self._deepcoin_client_factory,
-        )
+        return self._operation(*self._args, **self._kwargs)
 
 
-async def _run_system_operator_callback_update(
-    session_factory: sessionmaker,
-    callback_data: str,
+async def _run_cancellable_management_unit(
+    management_unit: _CancellableManagementUnit,
     *,
     update_id: int,
-    deepcoin_client_factory=None,
-) -> str | ExpiryReviewRefreshResult | None:
-    """Finish an admitted callback unit before propagating Bot cancellation."""
-
-    callback_unit = _SystemOperatorCallbackUnit(
-        session_factory,
-        callback_data,
-        deepcoin_client_factory=deepcoin_client_factory,
-    )
+):
     processing_task = asyncio.create_task(
-        run_on_management_worker(callback_unit)
+        run_on_management_worker(management_unit)
     )
     try:
         return await asyncio.shield(processing_task)
     except asyncio.CancelledError:
-        if callback_unit.cancel_if_queued():
+        if management_unit.cancel_if_queued():
             processing_task.cancel()
             try:
                 await processing_task
@@ -175,8 +162,8 @@ async def _run_system_operator_callback_update(
                 pass
             raise
         # ThreadPoolExecutor cannot stop an already-running call. Keep the Bot
-        # task alive until that callback has left its database/exchange scope,
-        # then preserve cancellation as the externally visible result.
+        # task alive until that unit has left its database/exchange scope, then
+        # preserve cancellation as the externally visible result.
         while not processing_task.done():
             try:
                 await asyncio.shield(processing_task)
@@ -197,6 +184,60 @@ async def _run_system_operator_callback_update(
                     ),
                 )
         raise
+
+
+async def _run_system_operator_callback_update(
+    session_factory: sessionmaker,
+    callback_data: str,
+    *,
+    update_id: int,
+    deepcoin_client_factory=None,
+) -> str | ExpiryReviewRefreshResult | None:
+    """Finish an admitted callback unit before propagating Bot cancellation."""
+
+    callback_unit = _CancellableManagementUnit(
+        _process_system_operator_callback_update,
+        session_factory,
+        callback_data,
+        deepcoin_client_factory=deepcoin_client_factory,
+    )
+    return await _run_cancellable_management_unit(
+        callback_unit,
+        update_id=update_id,
+    )
+
+
+def _process_system_operator_command_update(
+    session_factory: sessionmaker,
+    text: str,
+    *,
+    deepcoin_client_factory=None,
+) -> str | None:
+    deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
+    return process_system_operator_command(
+        session_factory,
+        text,
+        deepcoin_client=deepcoin_client,
+    )
+
+
+async def _run_system_operator_command_update(
+    session_factory: sessionmaker,
+    text: str,
+    *,
+    update_id: int,
+    deepcoin_client_factory=None,
+) -> str | None:
+    command_unit = _CancellableManagementUnit(
+        _process_system_operator_command_update,
+        session_factory,
+        text,
+        deepcoin_client_factory=deepcoin_client_factory,
+    )
+    return await _run_cancellable_management_unit(
+        command_unit,
+        update_id=update_id,
+    )
 
 
 async def run_telegram_bot_command_loop(
@@ -229,14 +270,16 @@ async def run_telegram_bot_command_loop(
                     continue
                 text = str(message.get("text") or "").strip()
                 if _is_positions_command(text):
-                    response_text = format_holding_positions_message(
+                    response_text = await asyncio.to_thread(
+                        format_holding_positions_message,
                         session_factory=session_factory,
                         group_config=group_config,
                     )
                     for chunk in split_telegram_message(response_text):
                         await _send_message(client, base_url, chat_id=chat_id, text=chunk)
                 elif _is_pending_command(text):
-                    response_text = format_pending_positions_message(
+                    response_text = await asyncio.to_thread(
+                        format_pending_positions_message,
                         session_factory=session_factory,
                         group_config=group_config,
                     )
@@ -345,15 +388,16 @@ async def run_system_operator_bot_command_loop(
                     if not _message_is_from_alert_chat(message, chat_id):
                         continue
                     text = str(message.get("text") or "").strip()
-                    deepcoin_client = (
-                        deepcoin_client_factory()
+                    command_client_factory = (
+                        deepcoin_client_factory
                         if deepcoin_client_factory and _command_name(text) == EXPIRY_EXPIRE_CANCEL_COMMAND
                         else None
                     )
-                    response_text = process_system_operator_command(
+                    response_text = await _run_system_operator_command_update(
                         session_factory,
                         text,
-                        deepcoin_client=deepcoin_client,
+                        update_id=update_id,
+                        deepcoin_client_factory=command_client_factory,
                     )
                     if response_text:
                         await _send_message(client, base_url, chat_id=chat_id, text=response_text)

@@ -1,5 +1,10 @@
+import asyncio
+import threading
 from datetime import UTC, datetime
 
+import pytest
+
+from telegram_kol_research import telegram_bot_commands as bot_commands
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
@@ -185,3 +190,119 @@ def test_split_telegram_message_keeps_chunks_under_limit():
 
     assert len(chunks) > 1
     assert all(len(chunk) <= 30 for chunk in chunks)
+
+
+def test_system_operator_text_command_queued_cancellation_prevents_execution(
+    monkeypatch,
+):
+    from telegram_kol_research.runtime_worker_executor import (
+        run_on_management_worker,
+        shutdown_management_worker_executor,
+    )
+
+    runner = getattr(bot_commands, "_run_system_operator_command_update", None)
+    assert runner is not None
+
+    blocker_started = threading.Event()
+    blocker_release = threading.Event()
+    command_started = threading.Event()
+    client_built = threading.Event()
+
+    def blocker():
+        blocker_started.set()
+        assert blocker_release.wait(5.0)
+
+    def build_client():
+        client_built.set()
+        return object()
+
+    def process_command(*_args, **_kwargs):
+        command_started.set()
+        return None
+
+    monkeypatch.setattr(
+        bot_commands,
+        "process_system_operator_command",
+        process_command,
+    )
+
+    async def scenario():
+        blocker_task = asyncio.create_task(run_on_management_worker(blocker))
+        assert await asyncio.to_thread(blocker_started.wait, 5.0)
+        command_task = asyncio.create_task(
+            runner(
+                object(),
+                "/expiry_expire_cancel 1",
+                update_id=9,
+                deepcoin_client_factory=build_client,
+            )
+        )
+        await asyncio.sleep(0.05)
+        command_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(command_task, timeout=0.5)
+        blocker_release.set()
+        await blocker_task
+        await run_on_management_worker(lambda: None)
+
+    shutdown_management_worker_executor(wait=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        blocker_release.set()
+        shutdown_management_worker_executor(wait=True)
+
+    assert not client_built.is_set()
+    assert not command_started.is_set()
+
+
+def test_system_operator_text_command_started_work_drains_before_cancellation(
+    monkeypatch,
+):
+    from telegram_kol_research.runtime_worker_executor import (
+        shutdown_management_worker_executor,
+    )
+
+    runner = getattr(bot_commands, "_run_system_operator_command_update", None)
+    assert runner is not None
+
+    command_started = threading.Event()
+    command_release = threading.Event()
+    command_finished = threading.Event()
+
+    def process_command(*_args, **_kwargs):
+        command_started.set()
+        assert command_release.wait(5.0)
+        command_finished.set()
+        return None
+
+    monkeypatch.setattr(
+        bot_commands,
+        "process_system_operator_command",
+        process_command,
+    )
+
+    async def scenario():
+        command_task = asyncio.create_task(
+            runner(
+                object(),
+                "/expiry_continue 1",
+                update_id=10,
+            )
+        )
+        assert await asyncio.to_thread(command_started.wait, 5.0)
+        command_task.cancel()
+        await asyncio.sleep(0.05)
+        assert not command_task.done()
+        command_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await command_task
+
+    shutdown_management_worker_executor(wait=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        command_release.set()
+        shutdown_management_worker_executor(wait=True)
+
+    assert command_finished.is_set()
