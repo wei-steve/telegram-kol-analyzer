@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-observer-fix-20260826-root
-claim_base_sha: 8e4b3a8ed8720495067dbb8d8e03ab15cc232a96
-current_task: phase-7-acceptance-observer-fix-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-observer-fixed-awaiting-push-and-safe-retry-authorization
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -99,6 +99,19 @@ phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891
 phase_7_status: rolled_back_incomplete
 phase_7_authorization: consumed_owner_authorized_single_safe_retry_global_1_to_per_chat_3
 phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
+phase_7_observer_design_commit: c1edfb14b00730fc72eec225a93313f7e5ea67dd
+phase_7_observer_plan_commit: 753c401c37e81a7620a02843c091fe5ade1727f9
+phase_7_observer_claim_commit: d0a99946e8c4db2760db34c174d06c4544ff0821
+phase_7_observer_candidate_commits:
+  - 9fd5db290ced735786227f6ebc462979525a5753
+  - 96a8d78e17ba45613580eedf5cbedee21fbd319f
+  - 5212d96899f75fb07dbe6ad5944530b355c8c421
+  - d2c1ee6c4b42948694836c112a6691183474a466
+  - 513334ac5dbefb8942f2a823636a0307f9838902
+phase_7_observer_red_verification: "RED confirmed missing contracts or entrypoints before each implementation batch; collector RED was 4 failed and 27 passed; CLI RED was 6 failed and 31 passed"
+phase_7_observer_green_verification: "37 passed in focused observer suite; 6 passed in existing durable ordering regression slice; compileall and diff check passed"
+phase_7_observer_source_boundary: "SQLite file URI mode=ro plus query_only=ON; HTTP collection uses urlopen GET only; JSONL writes only to stdout; no Request method override, POST, subprocess, service control, worker action, evidence-file output, rollback execution, Telegram send, replay, or exchange-write path"
+phase_7_observer_status: local_complete_not_pushed_not_deployed_not_run_against_production
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
 phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
