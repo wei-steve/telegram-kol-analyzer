@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase5-identity-20260826-root
-claim_base_sha: 20457cfb947b6c210b643191ffdccbb411169b27
-current_task: phase-5-production-identity-read-only-investigation
-current_phase: phase_5_trigger_intents_read_only_gate
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-5-trigger-intents-read-only-gate.md
-last_completed_phase: phase_4_batch150_read_only_gate
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-6-awaiting-claim
+current_phase: phase_6_compatible_deployment
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-6-compatible-deployment.md
+last_completed_phase: phase_5_trigger_intents_read_only_gate
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -71,12 +71,16 @@ phase_4_status: completed
 phase_4_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_4_evidence_path: /Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt
 phase_4_evidence_sha256: 4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd
-phase_5_status: claimed_production_identity_read_only_investigation
-phase_5_authorization: production_checkout_read_only_diff_classification_local_evidence_status_and_local_commits_only
+phase_5_status: completed
+phase_5_authorization: completed_production_read_only_checks_local_evidence_status_and_local_commits_only
 phase_5_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
-phase_5_production_dirty_count: 15
+phase_5_production_tracked_dirty_count: 0
+phase_5_production_untracked_historical_backup_count: 15
 phase_5_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-read-only-gate.txt
 phase_5_evidence_sha256: 0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344
+phase_5_identity_investigation_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-checkout-diff-read-only.txt
+phase_5_identity_investigation_evidence_sha256: de07b8b638a9699000131ab48819a8804db4c7a7f656a43dba467a89be16463f
+phase_6_authorization: not_started_requires_new_claim
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -163,6 +167,44 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 5 completion after identity-check root-cause correction`:
+  the earlier `deployed_dirty_count=15` stop was caused by a measurement-
+  definition mismatch, not production code or managed-configuration drift.
+  Phase 4 explicitly ran `git status --porcelain --untracked-files=no` and
+  reported zero tracked changes. Phase 5 had changed the command to
+  `--untracked-files=all`; a bounded read-only classification proved all 15
+  entries are historical untracked configuration backup files dated from June
+  through August 9. There were exactly zero tracked name-status or numstat
+  differences against deployed HEAD
+  `d66afadda5e34db80851a0dae5986b622521ab3f`, and the same 15 untracked paths
+  were stable at the beginning and end of the classification capture. No file
+  content was emitted; only paths, file metadata, and hashes were retained in
+  local evidence. Therefore the production identity requirement is satisfied
+  under the same tracked-worktree definition used by Phase 4, without deleting,
+  moving, ignoring, or modifying any server file.
+
+  The original Phase 5 database capture remains authoritative and complete:
+  intents `138`, `141`, and `147` existed exactly once each and were stable as
+  `resolved / terminal / entry_leg_terminal_after_snapshot_wait`; exact
+  persisted binding/leg identities `301/522`, `306/528`, and `310/536` resolved
+  to verified terminal legs with matching non-empty persisted `pos_id`, status,
+  terminal reason, and intent evidence. Opening and closing `quick_check` were
+  `ok`, `query_only=1`, and the SQLite connection reported `total_changes=0`.
+  Phase 5 raw evidence remains only on the local machine at
+  `/Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-read-only-gate.txt`,
+  SHA-256
+  `0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344`;
+  identity root-cause evidence is
+  `/Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-checkout-diff-read-only.txt`,
+  SHA-256
+  `de07b8b638a9699000131ab48819a8804db4c7a7f656a43dba467a89be16463f`.
+  No server evidence file or directory, server/database write or repair,
+  backup, CAS plan, historical attribution reconstruction, Deepcoin or exchange
+  call, push, deployment, restart, configuration or data change, replay,
+  Telegram business message, or operator/system Bot message occurred. Phase 5
+  is complete; the pointer advances only to Phase 6 awaiting claim. Phase 6 was
+  not read, claimed, or executed.
 
 - `2026-08-26 Phase 5 production-identity investigation claim`: session
   `codex-per-chat-opt-phase5-identity-20260826-root` resumed only the unresolved
