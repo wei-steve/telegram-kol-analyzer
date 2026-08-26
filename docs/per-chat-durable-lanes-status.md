@@ -33,7 +33,7 @@ approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
 claimed_by: unclaimed
 claim_base_sha: null
-current_task: phase-7-ingest-stall-attribution-fix-awaiting-owner-push-authorization
+current_task: phase-7-ingest-stall-attribution-deployed-awaiting-natural-stall-evidence
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -99,13 +99,24 @@ phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891
 phase_7_status: rolled_back_incomplete
 phase_7_authorization: consumed_owner_authorized_new_safe_retry_global_1_to_per_chat_3
 phase_7_ingest_stall_remediation_authorization: consumed_owner_authorized_local_red_green_root_cause_minimal_fix_tests_status_and_commits_only
-phase_7_ingest_stall_remediation_status: local_complete_attribution_race_fixed_under_test_underlying_blocking_function_still_unknown
+phase_7_ingest_stall_remediation_status: deployed_verified_attribution_race_fixed_under_test_underlying_blocking_function_still_unknown
 phase_7_ingest_stall_remediation_claim_commit: c633a9aff92c86a5c767a936d987b8675ce5fed0
 phase_7_ingest_stall_remediation_plan_commit: 9a952b05b3da2679eb1cdf036cd38b621e47dd3b
 phase_7_ingest_stall_remediation_candidate_commit: 37907849223a3e4b52086f3d162109fb8e7c5c3b
 phase_7_ingest_stall_remediation_red_verification: one_failed_checkin_completed_before_frame_snapshot_and_stack_was_discarded
 phase_7_ingest_stall_remediation_green_verification: one_passed_then_28_passed_259_deselected
 phase_7_ingest_stall_remediation_full_suite_verification: 6342_passed_1_skipped_32_warnings_in_476_95_seconds
+phase_7_ingest_stall_deployment_authorization: consumed_owner_continue_next_exact_fc8baaad_one_split_restart_global_1_l1_only
+phase_7_ingest_stall_deployed_commit: fc8baaad2e677fe0536c0c7211e2ae9d0cc915d4
+phase_7_ingest_stall_server_focused_verification: 28_passed_259_deselected_7_warnings_in_6_74_seconds
+phase_7_ingest_stall_observation_start: 2026-08-26T18:29:57.989132+00:00
+phase_7_ingest_stall_observation_end: 2026-08-26T18:45:24.951535+00:00
+phase_7_ingest_stall_observation_stop_reason: fifteen_minute_deadline
+phase_7_ingest_stall_observation_samples: 180
+phase_7_ingest_stall_observation_natural_message_count: 0
+phase_7_ingest_stall_observation_stall_count: 0
+phase_7_ingest_stall_deployment_evidence_path: /opt/telegram-kol-analyzer/data/evidence/phase7-ingest-stall-attribution-deploy-20260826T182957Z/observation-evidence.jsonl
+phase_7_ingest_stall_deployment_evidence_sha256: 1c9cdd16d3561b0b0db10be4758bada5dd1fdfc8c4e7927593f7022d868be807
 phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
 phase_7_observer_design_commit: c1edfb14b00730fc72eec225a93313f7e5ea67dd
 phase_7_observer_plan_commit: 753c401c37e81a7620a02843c091fe5ade1727f9
@@ -155,7 +166,7 @@ phase_7_retry_convergence_samples:
   - "sample_2_elapsed_0.332932_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_3_elapsed_0.613592_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.893838_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: separately_authorized_push_exact_candidate_deploy_restart_and_global_1_production_stall_capture_then_underlying_function_fix_and_new_safe_retry
+phase_7_retry_remaining_gate_blockers: natural_global_1_stall_with_function_level_capture_then_if_required_red_green_underlying_fix_and_separately_authorized_new_safe_retry
 phase_7_window_start: 2026-08-26T16:59:28.134926+00:00
 phase_7_window_end: 2026-08-26T17:33:44.352048+00:00
 phase_7_natural_message_count: 1
@@ -260,6 +271,55 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 ingest-stall attribution deployment verification`:
+  after the owner replied `continue next step` to the explicitly bounded next
+  action, exact canonical and implementation head
+  `fc8baaad2e677fe0536c0c7211e2ae9d0cc915d4` was non-force pushed and then
+  deployed through the repository updater. The authorization covered only this
+  exact SHA, the updater-required single split-runtime stop/start cycle, and an
+  L1 read-only natural-traffic observation while the tuple remained
+  `global + 1 + queue`; it did not authorize Phase 7 cutover, rollback,
+  production settings/data changes, replay, worker commands, manufactured
+  Telegram traffic, test trades, or exchange writes.
+
+  Pre-deploy local HEAD, canonical last commit, upstream, remote-tracking ref,
+  and live remote all matched the exact candidate and the local tree was clean.
+  Production was clean at
+  `7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9`, with exactly one ingest, worker,
+  and Web process, inactive monolith, ingest as the only Telegram-session
+  holder, all three APIs at `global + 1 + queue`, semantic review disabled, and
+  active exchange writes at zero. The query-only SQLite retry completed with
+  WAL, `quick_check=ok`, `total_changes=0`, zero non-shadow pending/claimed
+  jobs, zero active management, zero claimed/executing worker commands, and
+  five historical shadow-pending jobs explicitly excluded.
+
+  The updater completed successfully and production reached exact clean SHA
+  `fc8baaad2e677fe0536c0c7211e2ae9d0cc915d4`. It started worker, Web, and
+  ingest PIDs `1667524`, `1667526`, and `1667529`; all retained zero systemd
+  restarts, monolith remained inactive, and only ingest PID `1667529` held the
+  Telegram session. Post-deploy server verification passed `28` focused tests
+  with `259` deselected and seven warnings in `6.74s`.
+
+  The uninterrupted L1 observation started at
+  `2026-08-26T18:29:57.989132+00:00`, sampled every five seconds until the
+  fixed fifteen-minute deadline, and recorded `180` complete samples. No
+  natural message arrived and no new stall occurred. Every sample preserved
+  the exact PID/role/authority and `global + 1 + queue` tuple. Final SQLite was
+  WAL, query-only, `quick_check=ok`, and `total_changes=0`; non-shadow queue,
+  active management, active worker commands, service journals, and active
+  exchange writes remained clear. Evidence is stored at
+  `/opt/telegram-kol-analyzer/data/evidence/phase7-ingest-stall-attribution-deploy-20260826T182957Z/observation-evidence.jsonl`
+  with SHA-256
+  `1c9cdd16d3561b0b0db10be4758bada5dd1fdfc8c4e7927593f7022d868be807`.
+
+  This proves the attribution-race candidate is deployed and stable under the
+  bounded zero-traffic window. It does not identify the original blocking
+  function or prove that the underlying ingest stall disappeared. Phase 7
+  remains rolled back and incomplete; the next safe evidence step is to wait
+  for a natural stall while remaining at `global + 1 + queue`, then use its
+  frozen function-level stack to decide whether another RED-to-GREEN code fix
+  is required. No new safe-retry or Phase 8 authorization exists.
 
 - `2026-08-26 Phase 7 ingest-stall remediation claim`: session
   `codex-per-chat-phase7-ingest-stall-remediation-20260826T1755Z-root`
