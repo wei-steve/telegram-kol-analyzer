@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase5-20260826-root
-claim_base_sha: 858cd91d68f24436830012bcbe11bc830bc6a414
-current_task: phase-5-production-read-only-gate
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-5-stopped-production-identity-mismatch
 current_phase: phase_5_trigger_intents_read_only_gate
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-5-trigger-intents-read-only-gate.md
 last_completed_phase: phase_4_batch150_read_only_gate
@@ -71,8 +71,12 @@ phase_4_status: completed
 phase_4_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_4_evidence_path: /Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt
 phase_4_evidence_sha256: 4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd
-phase_5_status: claimed
-phase_5_authorization: production_read_only_identity_sqlite_exact_intents_persisted_execution_leg_checks_local_evidence_status_and_local_commits_only
+phase_5_status: stopped_fail_closed_production_identity_mismatch
+phase_5_authorization: consumed_read_only_capture_requires_new_claim_after_production_identity_resolution
+phase_5_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
+phase_5_production_dirty_count: 15
+phase_5_evidence_path: /Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-read-only-gate.txt
+phase_5_evidence_sha256: 0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -159,6 +163,37 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 5 fail-closed stop`: the bounded read-only capture ran from
+  `2026-08-26T05:40:02Z` through `2026-08-26T05:40:25Z`. The deployed HEAD and
+  branch remained `d66afadda5e34db80851a0dae5986b622521ab3f` and
+  `codex/deepcoin-auto-trading-v1`; split ingest, worker, and Web services were
+  active/running from `/opt/telegram-kol-analyzer`, the monolith was
+  inactive/dead, and all named service commands resolved `data/research.db`
+  from that root. The database identity remained device `64257`, inode
+  `75526029`. SQLite reported `query_only=1`, `total_changes=0`, and
+  `quick_check=ok` at both required checkpoints. Intents `138`, `141`, and
+  `147` existed exactly once each and remained byte-for-byte stable as
+  `resolved / terminal / entry_leg_terminal_after_snapshot_wait`. Their exact
+  audited persisted identities remained respectively binding/leg `301/522`,
+  `306/528`, and `310/536`; every foreign-key leg resolved, every binding ID
+  matched, each leg was verified with a non-empty persisted `pos_id` and a
+  terminal status, and each intent's persisted terminal evidence exactly
+  matched the leg ID, binding ID, `pos_id`, status, and terminal reason. No
+  symbol, side, time, tag, or `clOrdId` inference was used. The target result
+  was complete and stable, but the production checkout reported
+  `deployed_dirty_count=15`, whereas the Phase 4 identity checkpoint recorded
+  zero. Because the checkout can no longer be described as an exact clean
+  deployed SHA, Phase 5 stopped fail closed without a retry, path inspection,
+  repair, or Phase 6 advancement. The raw capture exists only on the local
+  machine at
+  `/Users/steven/.codex/evidence/per-chat-phase5-trigger-intents-read-only-20260826T054000Z/production-read-only-gate.txt`,
+  SHA-256
+  `0d9a31aced419dce9ebfc35d3a90e5368bd30127d0849e502e8c9ef4d738f344`.
+  No server evidence file or directory, production database or server write,
+  repair, backup, CAS plan, historical attribution reconstruction, Deepcoin or
+  exchange call, push, deployment, restart, configuration or data change,
+  replay, Telegram business message, or operator/system Bot message occurred.
 
 - `2026-08-26 Phase 5 claim`: session
   `codex-per-chat-opt-phase5-20260826-root` claimed only the bounded trigger-
