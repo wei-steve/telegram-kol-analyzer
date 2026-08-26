@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from functools import wraps
@@ -1363,6 +1364,68 @@ def _load_reconcile_pipeline_mode(session_factory) -> str:
     return load_trading_settings(session_factory).message_pipeline_mode
 
 
+class _CancellableReconcileDatabaseUnit:
+    def __init__(self, operation, /, *args, **kwargs) -> None:
+        self._operation = operation
+        self._args = args
+        self._kwargs = kwargs
+        self._state_lock = threading.Lock()
+        self._cancelled_before_start = False
+        self._started = False
+
+    def cancel_if_queued(self) -> bool:
+        with self._state_lock:
+            if self._started:
+                return False
+            self._cancelled_before_start = True
+            return True
+
+    def __call__(self):
+        with self._state_lock:
+            if self._cancelled_before_start:
+                return None
+            self._started = True
+        return self._operation(*self._args, **self._kwargs)
+
+
+async def _run_reconcile_database_slice(operation, /, *args, **kwargs):
+    database_unit = _CancellableReconcileDatabaseUnit(
+        operation,
+        *args,
+        **kwargs,
+    )
+    processing_task = asyncio.create_task(asyncio.to_thread(database_unit))
+    try:
+        return await asyncio.shield(processing_task)
+    except asyncio.CancelledError:
+        if database_unit.cancel_if_queued():
+            processing_task.cancel()
+            try:
+                await processing_task
+            except asyncio.CancelledError:
+                pass
+            raise
+        while not processing_task.done():
+            try:
+                await asyncio.shield(processing_task)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if processing_task.done() and not processing_task.cancelled():
+            processing_error = processing_task.exception()
+            if processing_error is not None:
+                logger.error(
+                    "Reconcile database slice failed during cancellation",
+                    exc_info=(
+                        type(processing_error),
+                        processing_error,
+                        processing_error.__traceback__,
+                    ),
+                )
+        raise
+
+
 def _load_history_checkpoint_projection(session_factory) -> dict[int, int]:
     from telegram_kol_research.models import SyncCheckpoint
 
@@ -1420,6 +1483,29 @@ def _persist_history_reconcile_records(
     )
 
 
+def _load_authoritative_reconcile_projection(
+    session_factory,
+    *,
+    inserted_keys: list[tuple[int, int]],
+) -> tuple[list[RawMessage], int]:
+    with session_factory() as session:
+        raw_messages = (
+            session.query(RawMessage)
+            .filter(
+                tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
+            )
+            .all()
+            if inserted_keys
+            else []
+        )
+        return raw_messages, session.query(SignalCandidate).count()
+
+
+def _count_signal_candidates(session_factory) -> int:
+    with session_factory() as session:
+        return int(session.query(SignalCandidate).count())
+
+
 async def run_reconcile_once(
     *,
     client: Any,
@@ -1457,7 +1543,7 @@ async def run_reconcile_once(
     lock instead, exactly as it did before this parameter existed.
     """
 
-    pipeline_mode = await asyncio.to_thread(
+    pipeline_mode = await _run_reconcile_database_slice(
         _load_reconcile_pipeline_mode,
         session_factory,
     )
@@ -1499,7 +1585,7 @@ async def run_reconcile_once(
         recovered_messages = recovery_result["recovered_messages"]
         expired_recovery_messages = recovery_result["expired_recovery_messages"]
 
-    history_checkpoints = await asyncio.to_thread(
+    history_checkpoints = await _run_reconcile_database_slice(
         _load_history_checkpoint_projection,
         session_factory,
     )
@@ -1521,7 +1607,7 @@ async def run_reconcile_once(
 
         # ── Also re-fetch messages whose media download failed earlier ──
         dialog_id = int(dialog.get("id") or 0)
-        orphan_msg_ids = await asyncio.to_thread(
+        orphan_msg_ids = await _run_reconcile_database_slice(
             _load_orphan_media_message_ids,
             session_factory,
             dialog_id=dialog_id,
@@ -1553,7 +1639,7 @@ async def run_reconcile_once(
         if not records:
             continue
 
-        stats = await asyncio.to_thread(
+        stats = await _run_reconcile_database_slice(
             _persist_history_reconcile_records,
             session_factory,
             records=records,
@@ -1572,17 +1658,13 @@ async def run_reconcile_once(
         inserted_records = filter_records_by_inserted_message_keys(records, stats)
         recognition_by_key: dict[tuple[int, int], Any] = {}
         if authoritative_processor is not None and pipeline_mode != "queue":
-            with session_factory() as session:
-                raw_messages = (
-                    session.query(RawMessage)
-                    .filter(
-                        tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
-                    )
-                    .all()
-                    if inserted_keys
-                    else []
+            raw_messages, candidate_count_before = (
+                await _run_reconcile_database_slice(
+                    _load_authoritative_reconcile_projection,
+                    session_factory,
+                    inserted_keys=inserted_keys,
                 )
-                candidate_count_before = session.query(SignalCandidate).count()
+            )
             async def _process_dialog_raw_message(raw_message) -> None:
                 processing_result = await asyncio.to_thread(
                     authoritative_processor,
@@ -1622,12 +1704,14 @@ async def run_reconcile_once(
                             await _process_dialog_raw_message(raw_message)
                     else:
                         await _process_dialog_raw_message(raw_message)
-                with session_factory() as session:
-                    inserted_candidates += max(
-                        0,
-                        session.query(SignalCandidate).count()
-                        - candidate_count_before,
-                    )
+                candidate_count_after = await _run_reconcile_database_slice(
+                    _count_signal_candidates,
+                    session_factory,
+                )
+                inserted_candidates += max(
+                    0,
+                    candidate_count_after - candidate_count_before,
+                )
             except BaseException as exc:
                 await _try_mark_shadow_processing_jobs_terminal(
                     session_factory,
@@ -1645,7 +1729,10 @@ async def run_reconcile_once(
             )
         try:
             if authoritative_processor is not None and pipeline_mode != "queue":
-                trade_stats = persist_trade_ideas_from_candidates(session_factory)
+                trade_stats = await _run_reconcile_database_slice(
+                    persist_trade_ideas_from_candidates,
+                    session_factory,
+                )
                 inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
             dialog_title = str(dialog.get("title") or "")
             if (

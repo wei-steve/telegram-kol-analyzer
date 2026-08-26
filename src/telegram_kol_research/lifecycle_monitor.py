@@ -16,6 +16,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
@@ -264,6 +265,30 @@ def _run_context_resolution_scheduler_batch(scheduler, events) -> None:
 
     for event in events:
         scheduler(**event)
+
+
+class _CancellableExpiryReviewUnit:
+    def __init__(self, operation, /, *args, **kwargs) -> None:
+        self._operation = operation
+        self._args = args
+        self._kwargs = kwargs
+        self._state_lock = threading.Lock()
+        self._cancelled_before_start = False
+        self._started = False
+
+    def cancel_if_queued(self) -> bool:
+        with self._state_lock:
+            if self._started:
+                return False
+            self._cancelled_before_start = True
+            return True
+
+    def __call__(self):
+        with self._state_lock:
+            if self._cancelled_before_start:
+                return []
+            self._started = True
+        return self._operation(*self._args, **self._kwargs)
 
 
 class LifecycleMonitor:
@@ -681,10 +706,77 @@ class LifecycleMonitor:
     async def _request_pending_expiry_reviews(self, now: datetime) -> None:
         if self._expiry_review_notifier is None:
             return
-        review_payloads = await run_on_management_worker(
+        prepare_unit = _CancellableExpiryReviewUnit(
             self._prepare_pending_expiry_reviews,
             now,
         )
+        prepare_task = asyncio.create_task(
+            run_on_management_worker(prepare_unit)
+        )
+        cancelled_during_prepare = False
+        try:
+            review_payloads = await asyncio.shield(prepare_task)
+        except asyncio.CancelledError:
+            if prepare_unit.cancel_if_queued():
+                prepare_task.cancel()
+                try:
+                    await prepare_task
+                except asyncio.CancelledError:
+                    pass
+                raise
+            cancelled_during_prepare = True
+            while not prepare_task.done():
+                try:
+                    await asyncio.shield(prepare_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if prepare_task.done() and not prepare_task.cancelled():
+                prepare_error = prepare_task.exception()
+                if prepare_error is not None:
+                    logger.error(
+                        "Pending-entry expiry review failed during cancellation",
+                        exc_info=(
+                            type(prepare_error),
+                            prepare_error,
+                            prepare_error.__traceback__,
+                        ),
+                    )
+            if prepare_task.cancelled() or prepare_task.exception() is not None:
+                raise
+            review_payloads = prepare_task.result()
+
+        if cancelled_during_prepare:
+            notification_task = asyncio.create_task(
+                self._deliver_expiry_review_notifications(review_payloads)
+            )
+            while not notification_task.done():
+                try:
+                    await asyncio.shield(notification_task)
+                except asyncio.CancelledError:
+                    continue
+                except Exception:
+                    break
+            if notification_task.done() and not notification_task.cancelled():
+                notification_error = notification_task.exception()
+                if notification_error is not None:
+                    logger.error(
+                        "Pending-entry expiry review notification drain failed",
+                        exc_info=(
+                            type(notification_error),
+                            notification_error,
+                            notification_error.__traceback__,
+                        ),
+                    )
+            raise asyncio.CancelledError
+
+        await self._deliver_expiry_review_notifications(review_payloads)
+
+    async def _deliver_expiry_review_notifications(
+        self,
+        review_payloads: list[dict[str, Any]],
+    ) -> None:
 
         for payload in review_payloads:
             try:

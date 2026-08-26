@@ -2,6 +2,8 @@ import asyncio
 import threading
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.lifecycle_monitor import (
     LifecycleMonitor,
@@ -1105,6 +1107,66 @@ def test_pending_expiry_review_queues_behind_existing_management_work(
         shutdown_management_worker_executor(wait=True)
 
     assert not started_before_release
+
+
+def test_pending_expiry_review_cancellation_drains_claim_and_notification(
+    monkeypatch,
+    tmp_path,
+):
+    from telegram_kol_research.runtime_worker_executor import (
+        shutdown_management_worker_executor,
+    )
+
+    prepare_started = threading.Event()
+    prepare_release = threading.Event()
+    prepare_finished = threading.Event()
+    notified = threading.Event()
+
+    async def notifier(payload):
+        assert payload["lifecycle_id"] == 42
+        notified.set()
+
+    monitor = LifecycleMonitor(
+        create_session_factory(tmp_path / "research.db"),
+        LiveUpdateBroker(),
+        expiry_review_notifier=notifier,
+    )
+
+    def blocking_prepare(_now):
+        prepare_started.set()
+        assert prepare_release.wait(5.0)
+        prepare_finished.set()
+        return [{"lifecycle_id": 42}]
+
+    monkeypatch.setattr(
+        monitor,
+        "_prepare_pending_expiry_reviews",
+        blocking_prepare,
+    )
+
+    async def scenario():
+        review_task = asyncio.create_task(
+            monitor._request_pending_expiry_reviews(
+                datetime(2026, 6, 30, 3, 1, tzinfo=UTC)
+            )
+        )
+        assert await asyncio.to_thread(prepare_started.wait, 5.0)
+        review_task.cancel()
+        await asyncio.sleep(0.05)
+        assert not review_task.done()
+        prepare_release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await review_task
+
+    shutdown_management_worker_executor(wait=True)
+    try:
+        asyncio.run(scenario())
+    finally:
+        prepare_release.set()
+        shutdown_management_worker_executor(wait=True)
+
+    assert prepare_finished.is_set()
+    assert notified.is_set()
 
 
 def test_lifecycle_monitor_stale_review_claim_cannot_overwrite_terminal_decision(
