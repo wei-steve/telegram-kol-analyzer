@@ -6,6 +6,11 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import datetime
+import json
+from pathlib import Path
+import sqlite3
+from typing import Callable
+from urllib import request as urllib_request
 
 
 NONTERMINAL_STATUSES = frozenset({"pending", "claimed"})
@@ -98,6 +103,23 @@ class AcceptanceResult:
     rollback_target: ExpectedRuntimeState | None
 
 
+@dataclass(frozen=True)
+class DatabaseObservation:
+    state: ExpectedRuntimeState
+    semantic_review_enabled: bool
+    query_only: int
+    journal_mode: str
+    total_changes: int
+    jobs: tuple[JobObservation, ...]
+    raw_message_count: int
+    distinct_chat_count: int
+    pending_count: int
+    claimed_count: int
+    duplicate_job_count: int
+    missing_job_count: int
+    orphan_job_count: int
+
+
 def evaluate_same_chat_jobs(jobs: list[JobObservation]) -> SameChatEvaluation:
     by_chat: dict[int, list[JobObservation]] = defaultdict(list)
     for row in jobs:
@@ -137,6 +159,234 @@ def evaluate_same_chat_jobs(jobs: list[JobObservation]) -> SameChatEvaluation:
 def _parse_iso_timestamp(value: str) -> datetime:
     normalized = value[:-1] + "+00:00" if value.endswith("Z") else value
     return datetime.fromisoformat(normalized)
+
+
+def _parse_database_timestamp(value: str | None) -> datetime | None:
+    if value is None:
+        return None
+    return datetime.fromisoformat(value.replace(" ", "T"))
+
+
+def open_read_only_database(path: Path) -> sqlite3.Connection:
+    resolved = Path(path).resolve()
+    connection = sqlite3.connect(f"file:{resolved}?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    return connection
+
+
+def collect_database_observation(
+    path: Path,
+    *,
+    baseline_raw_message_id: int,
+    baseline_job_id: int,
+) -> DatabaseObservation:
+    connection = open_read_only_database(path)
+    try:
+        connection.execute("BEGIN")
+        settings_row = connection.execute(
+            "SELECT value_json FROM trading_settings WHERE key = 'global'"
+        ).fetchone()
+        if settings_row is None:
+            raise ValueError("global trading settings row is missing")
+        settings = json.loads(settings_row["value_json"])
+        state = ExpectedRuntimeState(
+            lock_mode=str(settings["message_lock_mode"]),
+            max_parallel_chats=int(
+                settings["message_processing_max_parallel_chats"]
+            ),
+            pipeline_mode=str(settings["message_pipeline_mode"]),
+            worker_command_mode=str(settings["worker_command_mode"]),
+        )
+        rows = connection.execute(
+            """
+            SELECT id, raw_message_id, chat_id, status, completed_at
+            FROM message_processing_jobs
+            WHERE id > ? AND shadow = 0
+            ORDER BY id
+            """,
+            (baseline_job_id,),
+        ).fetchall()
+        jobs = tuple(
+            JobObservation(
+                job_id=int(row["id"]),
+                raw_message_id=int(row["raw_message_id"]),
+                chat_id=int(row["chat_id"]),
+                status=str(row["status"]),
+                completed_at=_parse_database_timestamp(row["completed_at"]),
+            )
+            for row in rows
+        )
+        raw_message_count = int(
+            connection.execute(
+                "SELECT COUNT(*) FROM raw_messages WHERE id > ?",
+                (baseline_raw_message_id,),
+            ).fetchone()[0]
+        )
+        distinct_chat_count = int(
+            connection.execute(
+                "SELECT COUNT(DISTINCT chat_id) FROM raw_messages WHERE id > ?",
+                (baseline_raw_message_id,),
+            ).fetchone()[0]
+        )
+        duplicate_job_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM (
+                    SELECT raw_message_id
+                    FROM message_processing_jobs
+                    WHERE id > ? AND shadow = 0
+                    GROUP BY raw_message_id
+                    HAVING COUNT(*) > 1
+                )
+                """,
+                (baseline_job_id,),
+            ).fetchone()[0]
+        )
+        missing_job_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM raw_messages AS raw
+                WHERE raw.id > ?
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM message_processing_jobs AS job
+                      WHERE job.raw_message_id = raw.id
+                        AND job.id > ?
+                        AND job.shadow = 0
+                  )
+                """,
+                (baseline_raw_message_id, baseline_job_id),
+            ).fetchone()[0]
+        )
+        orphan_job_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM message_processing_jobs AS job
+                LEFT JOIN raw_messages AS raw ON raw.id = job.raw_message_id
+                WHERE job.id > ? AND job.shadow = 0 AND raw.id IS NULL
+                """,
+                (baseline_job_id,),
+            ).fetchone()[0]
+        )
+        query_only = int(connection.execute("PRAGMA query_only").fetchone()[0])
+        journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
+        pending_count = sum(row.status == "pending" for row in jobs)
+        claimed_count = sum(row.status == "claimed" for row in jobs)
+        total_changes = int(connection.total_changes)
+        connection.rollback()
+        return DatabaseObservation(
+            state=state,
+            semantic_review_enabled=bool(
+                settings.get("semantic_review_enabled", False)
+            ),
+            query_only=query_only,
+            journal_mode=journal_mode,
+            total_changes=total_changes,
+            jobs=jobs,
+            raw_message_count=raw_message_count,
+            distinct_chat_count=distinct_chat_count,
+            pending_count=pending_count,
+            claimed_count=claimed_count,
+            duplicate_job_count=duplicate_job_count,
+            missing_job_count=missing_job_count,
+            orphan_job_count=orphan_job_count,
+        )
+    finally:
+        connection.close()
+
+
+def read_json_url(url: str, *, timeout_seconds: float) -> dict[str, object]:
+    with urllib_request.urlopen(url, timeout=timeout_seconds) as response:
+        payload = json.load(response)
+    if not isinstance(payload, dict):
+        raise ValueError("HTTP observation payload is not an object")
+    return payload
+
+
+def _state_from_settings(payload: dict[str, object]) -> ExpectedRuntimeState:
+    return ExpectedRuntimeState(
+        lock_mode=str(payload["message_lock_mode"]),
+        max_parallel_chats=int(payload["message_processing_max_parallel_chats"]),
+        pipeline_mode=str(payload["message_pipeline_mode"]),
+        worker_command_mode=str(payload["worker_command_mode"]),
+    )
+
+
+def _pid_is_alive(pid: int) -> bool:
+    return Path(f"/proc/{int(pid)}").exists()
+
+
+def collect_runtime_observation(
+    database: DatabaseObservation,
+    *,
+    elapsed_seconds: float,
+    expected_pids: AuthorityPids,
+    ingest_base_url: str,
+    worker_base_url: str,
+    web_base_url: str,
+    timeout_seconds: float,
+    json_reader: Callable[..., dict[str, object]] = read_json_url,
+    pid_is_alive: Callable[[int], bool] = _pid_is_alive,
+) -> RuntimeObservation:
+    bases = {
+        "ingest": ingest_base_url.rstrip("/"),
+        "worker": worker_base_url.rstrip("/"),
+        "web": web_base_url.rstrip("/"),
+    }
+    settings = {
+        role: json_reader(
+            f"{base}/api/trading-settings", timeout_seconds=timeout_seconds
+        )
+        for role, base in bases.items()
+    }
+    health = {
+        role: json_reader(
+            f"{base}/api/runtime/loop-health", timeout_seconds=timeout_seconds
+        )
+        for role, base in bases.items()
+    }
+    api_states = {role: _state_from_settings(row) for role, row in settings.items()}
+    api_state = api_states["worker"]
+    roles_match = all(
+        str(health[role].get("runtime_role")) == role for role in bases
+    )
+    settings_match = all(row == api_state for row in api_states.values())
+    pids_alive = all(
+        pid_is_alive(pid)
+        for pid in (expected_pids.ingest, expected_pids.worker, expected_pids.web)
+    )
+    worker = health["worker"]
+    worker_cap = worker.get("configured_max_parallel_chats")
+    active_lanes = worker.get("active_chat_lanes")
+    peak_lanes = worker.get("peak_active_chat_lanes_since_limit_change")
+    limit_applied_at = worker.get("limit_applied_at")
+    complete = (
+        settings_match
+        and roles_match
+        and pids_alive
+        and worker_cap is not None
+        and active_lanes is not None
+        and peak_lanes is not None
+        and limit_applied_at is not None
+    )
+    return RuntimeObservation(
+        elapsed_seconds=float(elapsed_seconds),
+        complete=complete,
+        database_state=database.state,
+        api_state=api_state if settings_match else None,
+        pids=expected_pids if pids_alive else None,
+        worker_role=str(worker.get("runtime_role")),
+        worker_cap=int(worker_cap) if worker_cap is not None else None,
+        active_lanes=int(active_lanes) if active_lanes is not None else None,
+        peak_lanes=int(peak_lanes) if peak_lanes is not None else None,
+        limit_applied_at=(
+            str(limit_applied_at) if limit_applied_at is not None else None
+        ),
+    )
 
 
 class ConvergenceTracker:

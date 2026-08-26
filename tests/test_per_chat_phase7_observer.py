@@ -1,6 +1,8 @@
 from datetime import UTC, datetime
 import importlib.util
+import json
 from pathlib import Path
+import sqlite3
 import sys
 
 import pytest
@@ -364,3 +366,186 @@ def test_second_incomplete_acceptance_sample_fails_closed():
     assert first.reason == "observer_incomplete_retry"
     assert second.failed is True
     assert second.reason == "observer_incomplete"
+
+
+def create_observer_database(path):
+    connection = sqlite3.connect(path)
+    connection.executescript(
+        """
+        CREATE TABLE trading_settings (
+            id INTEGER PRIMARY KEY,
+            key TEXT NOT NULL UNIQUE,
+            value_json TEXT NOT NULL,
+            updated_at TEXT
+        );
+        CREATE TABLE raw_messages (
+            id INTEGER PRIMARY KEY,
+            chat_id INTEGER NOT NULL
+        );
+        CREATE TABLE message_processing_jobs (
+            id INTEGER PRIMARY KEY,
+            raw_message_id INTEGER NOT NULL,
+            chat_id INTEGER NOT NULL,
+            status TEXT NOT NULL,
+            completed_at TEXT,
+            shadow INTEGER NOT NULL DEFAULT 0
+        );
+        """
+    )
+    settings = {
+        "message_lock_mode": "per_chat",
+        "message_processing_max_parallel_chats": 3,
+        "message_pipeline_mode": "queue",
+        "worker_command_mode": "queue",
+        "semantic_review_enabled": False,
+    }
+    connection.execute(
+        "INSERT INTO trading_settings (key, value_json) VALUES ('global', ?)",
+        (json.dumps(settings),),
+    )
+    connection.executemany(
+        "INSERT INTO raw_messages (id, chat_id) VALUES (?, ?)",
+        [(100, 1), (101, 7), (102, 8)],
+    )
+    connection.executemany(
+        """
+        INSERT INTO message_processing_jobs
+            (id, raw_message_id, chat_id, status, completed_at, shadow)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        [
+            (10, 100, 1, "succeeded", "2026-08-26 08:00:00", 0),
+            (11, 101, 7, "claimed", None, 0),
+            (12, 102, 8, "pending", None, 0),
+            (13, 102, 8, "pending", None, 1),
+        ],
+    )
+    connection.commit()
+    connection.close()
+
+
+def test_database_connection_is_read_only_and_query_only(tmp_path):
+    path = tmp_path / "observer.db"
+    create_observer_database(path)
+
+    connection = observer.open_read_only_database(path)
+
+    assert connection.execute("PRAGMA query_only").fetchone()[0] == 1
+    with pytest.raises(sqlite3.OperationalError):
+        connection.execute("CREATE TABLE forbidden_write (id INTEGER)")
+    connection.close()
+
+
+def test_database_collector_reads_nonshadow_jobs_and_tuple(tmp_path):
+    path = tmp_path / "observer.db"
+    create_observer_database(path)
+
+    result = observer.collect_database_observation(
+        path,
+        baseline_raw_message_id=100,
+        baseline_job_id=10,
+    )
+
+    assert result.state == observer.ExpectedRuntimeState(
+        "per_chat", 3, "queue", "queue"
+    )
+    assert result.query_only == 1
+    assert result.total_changes == 0
+    assert [row.job_id for row in result.jobs] == [11, 12]
+    assert result.raw_message_count == 2
+    assert result.distinct_chat_count == 2
+    assert result.pending_count == 1
+    assert result.claimed_count == 1
+    assert result.duplicate_job_count == 0
+    assert result.missing_job_count == 0
+    assert result.orphan_job_count == 0
+    assert result.semantic_review_enabled is False
+
+
+def test_database_collector_fails_metrics_closed_for_identity_anomalies(tmp_path):
+    path = tmp_path / "observer.db"
+    create_observer_database(path)
+    connection = sqlite3.connect(path)
+    connection.execute("INSERT INTO raw_messages (id, chat_id) VALUES (103, 9)")
+    connection.execute(
+        """
+        INSERT INTO message_processing_jobs
+            (id, raw_message_id, chat_id, status, shadow)
+        VALUES (14, 101, 7, 'succeeded', 0)
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO message_processing_jobs
+            (id, raw_message_id, chat_id, status, shadow)
+        VALUES (15, 999, 10, 'succeeded', 0)
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    result = observer.collect_database_observation(
+        path,
+        baseline_raw_message_id=100,
+        baseline_job_id=10,
+    )
+
+    assert result.duplicate_job_count == 1
+    assert result.missing_job_count == 1
+    assert result.orphan_job_count == 1
+
+
+def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):
+    path = tmp_path / "observer.db"
+    create_observer_database(path)
+    database = observer.collect_database_observation(
+        path,
+        baseline_raw_message_id=100,
+        baseline_job_id=10,
+    )
+    requested = []
+
+    def fake_reader(url, *, timeout_seconds):
+        requested.append((url, timeout_seconds))
+        if url.endswith("/api/trading-settings"):
+            return {
+                "message_lock_mode": "per_chat",
+                "message_processing_max_parallel_chats": 3,
+                "message_pipeline_mode": "queue",
+                "worker_command_mode": "queue",
+            }
+        role = {"http://ingest": "ingest", "http://worker": "worker", "http://web": "web"}[
+            url.removesuffix("/api/runtime/loop-health")
+        ]
+        payload = {"runtime_role": role, "stall_count": 0}
+        if role == "worker":
+            payload.update(
+                {
+                    "configured_max_parallel_chats": 3,
+                    "active_chat_lanes": 1,
+                    "peak_active_chat_lanes_since_limit_change": 2,
+                    "limit_applied_at": NEW_LIMIT_APPLIED_AT,
+                }
+            )
+        return payload
+
+    result = observer.collect_runtime_observation(
+        database,
+        elapsed_seconds=0.5,
+        expected_pids=observer.AuthorityPids(101, 102, 103),
+        ingest_base_url="http://ingest",
+        worker_base_url="http://worker",
+        web_base_url="http://web",
+        timeout_seconds=1.0,
+        json_reader=fake_reader,
+        pid_is_alive=lambda _pid: True,
+    )
+
+    assert result.complete is True
+    assert result.api_state == database.state
+    assert result.worker_role == "worker"
+    assert result.worker_cap == 3
+    assert result.active_lanes == 1
+    assert result.peak_lanes == 2
+    assert result.pids == observer.AuthorityPids(101, 102, 103)
+    assert len(requested) == 6
