@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-web-stall-attribution-20260826-root
-claim_base_sha: dde02f3c9a33f3d8437dcdcad6af11331b96157c
-current_task: phase-7-web-loop-stall-attribution-local-red-green-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-web-loop-stall-attribution-local-complete-awaiting-separate-push-deploy-and-safe-retry-authorizations
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -97,7 +97,15 @@ phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snaps
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
-phase_7_web_stall_attribution_authorization: owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
+phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
+phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
+phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
+phase_7_web_stall_attribution_red_verification: "10 failed and 48 passed for missing runtime attribution and observer role contracts; 4 focused failures for structured guard parsing, validation, and snapshot serialization"
+phase_7_web_stall_attribution_focused_verification: "69 passed in 0.29 seconds"
+phase_7_web_stall_attribution_full_suite_verification: "6354 passed, 1 skipped, 32 warnings in 506.87 seconds"
+phase_7_web_stall_attribution_compileall_verified: true
+phase_7_web_stall_attribution_contract: "runtime captures classify captured_business_blocker, loop_lag_confirmed_but_stack_unattributed, or idle_or_post_recovery_selector_capture; Phase 7 observer requires matching role-attributed events and fails closed with role-specific reasons without labeling Web-only selector captures as scheduler or worker defects"
+phase_7_web_stall_attribution_source_boundary: "local runtime-loop health and read-only Phase 7 observer code/tests only; no push, deploy, restart, cutover, rollback, production configuration or data change, Telegram traffic, replay, worker command, test trade, or exchange write"
 phase_7_latest_safe_retry_authorization: consumed_owner_authorized_exact_56bebd36_canonical_95a88371_production_claim_single_cutover_convergence_two_hour_acceptance_and_l2_rollback
 phase_7_latest_safe_retry_claim_commit: 741c17187bba8c9e6130cb9d067c823145682f0c
 phase_7_latest_safe_retry_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
@@ -225,7 +233,7 @@ phase_7_retry_convergence_samples:
   - "sample_3_elapsed_0.543429_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.827980_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_5_elapsed_1.038383_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: owner_authorization_for_local_red_green_web_loop_attribution_and_acceptance_semantics_then_separate_push_deploy_and_safe_retry_authorizations
+phase_7_retry_remaining_gate_blockers: separate_owner_authorizations_for_exact_candidate_push_deploy_and_later_safe_retry
 phase_7_window_start: 2026-08-26T21:49:44.392235+00:00
 phase_7_window_end: 2026-08-26T22:27:32.081458+00:00
 phase_7_natural_message_count: 2
@@ -332,6 +340,28 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 Web event-loop stall attribution local completion`:
+  exact candidate `159264a1cd16b557efe01cf0792e209c36aeff37`
+  completed the owner-authorized local RED-to-GREEN repair. A deterministic
+  delayed-watchdog test reproduced a confirmed five-second loop lag whose
+  sampled terminal frame was already back in `selectors.py:select`; the capture
+  is now classified `idle_or_post_recovery_selector_capture`, never a concrete
+  business blocker. Empty or failed stack samples are
+  `loop_lag_confirmed_but_stack_unattributed`; only non-selector terminal stacks
+  are `captured_business_blocker`.
+
+  The Phase 7 observer now requires each loop-stall delta to have a matching
+  `ingest`, `worker`, or `web` role and one of those three attributions. Count
+  mismatch or an invalid role/category fails closed. Ingest/worker stalls, Web
+  business blockers, Web unattributed lag, and Web post-recovery selector
+  captures all fail acceptance with distinct reasons; the latter two never
+  claim a per-chat scheduler/worker defect. RED was `10 failed, 48 passed`, with
+  an additional `4 failed` structured-input/serialization slice. GREEN was `69
+  passed in 0.29s`; compileall passed; the one final complete suite was `6354
+  passed, 1 skipped, 32 warnings in 506.87s`. No production or external action
+  was performed. The claim is released; push, deployment, and any later safe
+  retry each require separate owner authorization.
 
 - `2026-08-26 Phase 7 Web event-loop stall attribution claim`: session
   `codex-per-chat-phase7-web-stall-attribution-20260826-root` exclusively
