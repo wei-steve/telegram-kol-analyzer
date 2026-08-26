@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: e49c8f3abc8e90c71da88b80bab3999fc0a3bd1d
-current_task: phase-3-awaiting-claim
+claimed_by: codex-per-chat-opt-phase3-20260825-root
+claim_base_sha: 9e1d41400996881107ef15accff772173da4c280
+current_task: phase-3-final-candidate-review
 current_phase: phase_3_final_candidate_review
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-3-final-candidate-review.md
 last_completed_phase: phase_2_bounded_claim_selection
@@ -56,7 +56,8 @@ phase_2_commits:
   - 396bcb4606fe079a1a12e601bfa1a1f9c4db7f0b
   - 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
 phase_2_independent_review_status: pending_phase_3
-phase_3_authorization: not_started_requires_new_claim
+phase_3_authorization: local_code_tests_status_and_commits_only
+phase_3_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -143,6 +144,21 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 3 claim`: session
+  `codex-per-chat-opt-phase3-20260825-root` claimed only final local candidate
+  review and freeze at exact clean local base
+  `9e1d41400996881107ef15accff772173da4c280`. Phase 1 candidate
+  `3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd`, Phase 2 candidate
+  `592c0e9d6537c5e2f58c15cd495b6767a32b3da4`, and approved design
+  `9707109dfd1f0815dec6edbc8809fa3fb89a00a0` are ancestors. Upstream and the
+  remote deploy branch both resolved to the authorized Phase 3 gate baseline
+  `d66afadda5e34db80851a0dae5986b622521ab3f`; no Git lock was present.
+  Authorization is limited to Phase 3 local review, RED-to-GREEN repairs,
+  tests, status updates, and local commits. Push, deployment, restart,
+  production reads/writes, settings changes, Telegram traffic, and exchange
+  calls are forbidden. Any trading-semantic, schema, migration, index, service,
+  executor, queue, actor, or authority change is a stop condition.
 
 - `2026-08-25 Phase 2 local completion`: exact local candidate
   `592c0e9d6537c5e2f58c15cd495b6767a32b3da4` replaces only the unbounded
