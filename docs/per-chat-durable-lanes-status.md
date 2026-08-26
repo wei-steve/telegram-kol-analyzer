@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase3-20260825-root
-claim_base_sha: 9e1d41400996881107ef15accff772173da4c280
-current_task: phase-3-final-candidate-review
-current_phase: phase_3_final_candidate_review
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-3-final-candidate-review.md
-last_completed_phase: phase_2_bounded_claim_selection
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-4-awaiting-claim
+current_phase: phase_4_batch150_read_only_gate
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-4-batch150-read-only-gate.md
+last_completed_phase: phase_3_final_candidate_review
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -55,15 +55,23 @@ phase_2_candidate_commit: 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
 phase_2_commits:
   - 396bcb4606fe079a1a12e601bfa1a1f9c4db7f0b
   - 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
-phase_2_independent_review_status: pending_phase_3
+phase_2_independent_review_status: ready_zero_findings_after_phase_3_review
 phase_3_authorization: local_code_tests_status_and_commits_only
 phase_3_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
+phase_3_status: local_complete
+phase_3_candidate_commit: e37146eaea03befac6457fa224e9dad0cd6c7166
+phase_3_invalidated_review_candidate: 77d570ee2187c7e7bbbaf53b6a55f1d0efb135de
+phase_3_commits:
+  - 77d570ee2187c7e7bbbaf53b6a55f1d0efb135de
+  - e37146eaea03befac6457fa224e9dad0cd6c7166
+phase_3_independent_review_status: ready_zero_findings_after_red_green_repair
+phase_4_authorization: not_started_requires_new_claim
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
   - push_deploy_restart_or_production_action_required
 verification_level: L2
-local_candidate_commit: 592c0e9d6537c5e2f58c15cd495b6767a32b3da4
+local_candidate_commit: e37146eaea03befac6457fa224e9dad0cd6c7166
 invalidated_local_candidate_commits:
   - c8f778201c123f0bbadddc06e718945307adf40b
   - c0e2471ed76b6d73bceb3be3d88304e57e44088d
@@ -72,8 +80,8 @@ invalidated_local_candidate_commits:
   - de0ae43498dc5b330f3e61c70eb8ebb27d50b269
   - 78cc24dae7e2bf3b341c4f5ecdf28b9cf5de0284
   - e03622749c32ebb214af56cd118984268e72af56
-local_focused_verification: "Phase 2 final focused set: 69 passed"
-local_full_suite_verification: "not run in Phase 2 by plan; required in Phase 3"
+local_focused_verification: "Phase 3 final consolidated focused set: 705 passed, 2 warnings in 57.33s"
+local_full_suite_verification: "Phase 3 final candidate: 6303 passed, 1 skipped, 32 warnings in 506.37s"
 local_compileall_verified: true
 local_diff_check_verified: true
 trigger_protection_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
@@ -144,6 +152,30 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 3 local completion`: exact production candidate
+  `e37146eaea03befac6457fa224e9dad0cd6c7166` was reviewed over diff boundary
+  `d88ecc99c1e7b95f253bfabe32e87fe2dc5391bc..e37146eaea03befac6457fa224e9dad0cd6c7166`.
+  The initial consolidated focused run passed `700` tests, but independent
+  review invalidated candidate
+  `77d570ee2187c7e7bbbaf53b6a55f1d0efb135de` and its `6302 passed, 1 skipped`
+  full-suite result: reconcile persistence now runs in a worker thread, while
+  an active `LiveUpdateBroker` subscriber caused `publish_message()` to call
+  `asyncio.get_event_loop()` from that thread after the database commit.
+  The new RED test failed with the expected Python 3.12 `RuntimeError`; the
+  minimal GREEN repair captures the subscriber's running loop and uses safe
+  running-loop detection before thread-safe queue scheduling. The affected
+  slice passed `50` tests, the final consolidated focused set passed `705`
+  tests with `2` existing warnings in `57.33s`, `git diff --check` and full
+  compileall passed, and the one valid complete suite after the last production
+  edit passed `6303`, skipped `1`, and reported `32` existing deprecation
+  warnings in `506.37s`. Same-session independent read-only re-review found
+  zero Critical, Important, or Minor findings. The final diff adds no schema,
+  migration, index, service, executor, queue, actor, recognition, strategy,
+  execution, exchange-authority, configuration, or data change. No push,
+  deployment, restart, production read/write, settings mutation, Telegram
+  traffic, or exchange action occurred. Phase 3 is locally complete and frozen;
+  Phase 4 is unclaimed and requires a new user turn and exclusive claim.
 
 - `2026-08-25 Phase 3 claim`: session
   `codex-per-chat-opt-phase3-20260825-root` claimed only final local candidate
