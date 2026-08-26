@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-web-loop-stall-attribution-local-complete-awaiting-separate-push-deploy-and-safe-retry-authorizations
+claimed_by: codex-per-chat-phase7-web-stall-deploy-l1-20260826-root
+claim_base_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
+current_task: phase-7-web-loop-stall-attribution-exact-deployment-and-l1-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -106,6 +106,7 @@ phase_7_web_stall_attribution_full_suite_verification: "6354 passed, 1 skipped, 
 phase_7_web_stall_attribution_compileall_verified: true
 phase_7_web_stall_attribution_contract: "runtime captures classify captured_business_blocker, loop_lag_confirmed_but_stack_unattributed, or idle_or_post_recovery_selector_capture; Phase 7 observer requires matching role-attributed events and fails closed with role-specific reasons without labeling Web-only selector captures as scheduler or worker defects"
 phase_7_web_stall_attribution_source_boundary: "local runtime-loop health and read-only Phase 7 observer code/tests only; no push, deploy, restart, cutover, rollback, production configuration or data change, Telegram traffic, replay, worker command, test trade, or exchange write"
+phase_7_web_stall_attribution_deployment_authorization: owner_authorized_exact_0a6a9a18_helper_managed_monitor_sync_one_split_stop_start_and_l1_only
 phase_7_latest_safe_retry_authorization: consumed_owner_authorized_exact_56bebd36_canonical_95a88371_production_claim_single_cutover_convergence_two_hour_acceptance_and_l2_rollback
 phase_7_latest_safe_retry_claim_commit: 741c17187bba8c9e6130cb9d067c823145682f0c
 phase_7_latest_safe_retry_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
@@ -290,7 +291,7 @@ fail_closed_parallel_chat_limit: 1
 schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
-deployment_authorized: false
+deployment_authorized: true
 cutover_authorized: false
 ```
 
@@ -340,6 +341,17 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 Web stall attribution deployment/L1 claim`: session
+  `codex-per-chat-phase7-web-stall-deploy-l1-20260826-root` exclusively claimed
+  the exact-SHA production deployment and L1 verification at clean canonical
+  base `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. Authorization permits
+  read-only production preflight, the governed helper's monitor pause/restore
+  and expected-HEAD synchronization, one managed split-runtime stop/start,
+  candidate package/updater installation, and L1 observation for 15 continuous
+  minutes or five natural messages. It does not authorize cutover, trading
+  settings or database mutation, replay, worker commands, manufactured Telegram
+  traffic, test trades, or exchange writes.
 
 - `2026-08-26 Phase 7 Web event-loop stall attribution local completion`:
   exact candidate `159264a1cd16b557efe01cf0792e209c36aeff37`
