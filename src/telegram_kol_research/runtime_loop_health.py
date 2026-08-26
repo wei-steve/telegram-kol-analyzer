@@ -84,7 +84,7 @@ class LoopStallAttributor:
         self._monotonic = monotonic or time.perf_counter
         self._now_provider = now_provider or (lambda: datetime.now(UTC))
         self._frame_provider = frame_provider or sys._current_frames
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self._captures: deque[StallCapture] = deque(maxlen=self.max_captures)
         self._loop_thread_id: int | None = None
         self._last_checkin: float | None = None
@@ -138,25 +138,22 @@ class LoopStallAttributor:
             self._captured_this_episode = True
             self._last_capture_monotonic = now
             checkin_generation = self._checkin_generation
-
-        stack, reason = self._format_loop_stack(thread_id)
-        with self._lock:
+            stack, reason = self._format_loop_stack(thread_id)
             recovered_before_capture = (
                 self._checkin_generation != checkin_generation
             )
-        if recovered_before_capture:
-            stack = ()
-            reason = (
-                "event loop recovered before stack capture; "
-                "sampled stack discarded"
+            if recovered_before_capture:
+                stack = ()
+                reason = (
+                    "event loop recovered before stack capture; "
+                    "sampled stack discarded"
+                )
+            capture = StallCapture(
+                at=self._now_provider().isoformat(),
+                blocked_ms=blocked_seconds * 1000.0,
+                stack=stack,
+                reason=reason,
             )
-        capture = StallCapture(
-            at=self._now_provider().isoformat(),
-            blocked_ms=blocked_seconds * 1000.0,
-            stack=stack,
-            reason=reason,
-        )
-        with self._lock:
             self._captures.append(capture)
             self._capture_count += 1
         logger.warning(

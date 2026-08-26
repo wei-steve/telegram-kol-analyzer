@@ -36,6 +36,12 @@ def _a_frame():
     return sys._getframe()
 
 
+def synthetic_ingest_blocking_call():
+    """Marker frame representing the ingest call the watchdog must retain."""
+
+    return sys._getframe()
+
+
 def _attributor(clock, *, frames=None, **kwargs):
     return LoopStallAttributor(
         stall_threshold_ms=kwargs.pop("stall_threshold_ms", 3000.0),
@@ -182,6 +188,61 @@ def test_recovery_before_stack_snapshot_is_reported_instead_of_misattributed():
     assert capture is not None
     assert capture.stack == ()
     assert "recovered before stack capture" in (capture.reason or "")
+
+
+def test_concurrent_recovery_cannot_erase_pre_recovery_blocking_function():
+    clock = FakeClock()
+    capture_started = threading.Event()
+    release_capture = threading.Event()
+    checkin_attempted = threading.Event()
+    checkin_completed = threading.Event()
+    captures = []
+
+    def paused_frame_provider():
+        capture_started.set()
+        assert release_capture.wait(5.0)
+        return {LOOP_THREAD_ID: synthetic_ingest_blocking_call()}
+
+    attributor = LoopStallAttributor(
+        stall_threshold_ms=3000.0,
+        monotonic=clock,
+        now_provider=lambda: NOW,
+        frame_provider=paused_frame_provider,
+    )
+    attributor.attach_loop_thread(LOOP_THREAD_ID)
+    clock.advance(5.0)
+
+    capture_thread = threading.Thread(
+        target=lambda: captures.append(attributor.poll_once())
+    )
+
+    def recover_loop() -> None:
+        checkin_attempted.set()
+        attributor.note_checkin()
+        checkin_completed.set()
+
+    checkin_thread = threading.Thread(target=recover_loop)
+    capture_thread.start()
+    try:
+        assert capture_started.wait(5.0)
+        checkin_thread.start()
+        assert checkin_attempted.wait(5.0)
+        checkin_finished_before_frame_snapshot = checkin_completed.wait(0.1)
+    finally:
+        release_capture.set()
+        capture_thread.join(timeout=5.0)
+        if checkin_thread.ident is not None:
+            checkin_thread.join(timeout=5.0)
+
+    assert not capture_thread.is_alive()
+    assert not checkin_thread.is_alive()
+    assert checkin_finished_before_frame_snapshot is False
+    assert checkin_completed.is_set()
+    assert len(captures) == 1
+    capture = captures[0]
+    assert capture is not None
+    assert capture.reason is None
+    assert any("synthetic_ingest_blocking_call" in line for line in capture.stack)
 
 
 def test_captures_are_bounded_and_exposed_in_the_snapshot():
