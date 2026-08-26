@@ -33,7 +33,7 @@ approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
 claimed_by: unclaimed
 claim_base_sha: null
-current_task: phase-7-telethon-entity-cache-candidate-awaiting-owner-push-authorization
+current_task: phase-7-telethon-entity-cache-deployed-awaiting-natural-message-evidence
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -107,7 +107,7 @@ phase_7_ingest_stall_remediation_red_verification: one_failed_checkin_completed_
 phase_7_ingest_stall_remediation_green_verification: one_passed_then_28_passed_259_deselected
 phase_7_ingest_stall_remediation_full_suite_verification: 6342_passed_1_skipped_32_warnings_in_476_95_seconds
 phase_7_telethon_entity_cache_authorization: owner_authorized_scheme_a_local_design_plan_red_green_tests_status_and_commits_only
-phase_7_telethon_entity_cache_status: local_candidate_complete_awaiting_owner_push_authorization
+phase_7_telethon_entity_cache_status: deployed_verified_zero_traffic_l1_awaiting_natural_message_evidence
 phase_7_telethon_entity_cache_claim_commit: 9dd0706afed1e51bbaba6d751b92d6f72ba2d8fa
 phase_7_telethon_entity_cache_design_commit: c32d3b64bb09890be2b14cd899d853f7fe37243d
 phase_7_telethon_entity_cache_plan_commit: e5fdc5b5e512941a6f381e9a7a7870c4751a57c9
@@ -119,6 +119,20 @@ phase_7_telethon_entity_cache_focused_verification: 76_passed_in_4_04_seconds
 phase_7_telethon_entity_cache_full_suite_verification: 6344_passed_1_skipped_32_warnings_in_533_71_seconds
 phase_7_telethon_entity_cache_source_boundary: one_factory_assignment_disables_optional_entity_cache_writes_while_retaining_sqlite_auth_dc_and_update_state_persistence
 phase_7_telethon_entity_cache_production_boundary: no_push_no_deploy_no_restart_no_cutover_no_telegram_or_exchange_calls
+phase_7_telethon_entity_cache_deployment_authorization: consumed_owner_confirmed_exact_sha_deploy_one_updater_restart_and_bounded_natural_traffic_verification
+phase_7_telethon_entity_cache_deployed_commit: 95a883715881b4fd393fbf5e745693cc78e066df
+phase_7_telethon_entity_cache_server_focused_verification: 76_passed_22_warnings_in_28_01_seconds
+phase_7_telethon_entity_cache_observation_start: 2026-08-26T20:21:41.444900+00:00
+phase_7_telethon_entity_cache_observation_end: 2026-08-26T20:36:41.557076+00:00
+phase_7_telethon_entity_cache_observation_stop_reason: fixed_fifteen_minute_deadline
+phase_7_telethon_entity_cache_observation_samples: 181
+phase_7_telethon_entity_cache_observation_natural_message_count: 0
+phase_7_telethon_entity_cache_observation_distinct_chat_count: 0
+phase_7_telethon_entity_cache_observation_stall_counts: ingest_0_worker_0_web_0
+phase_7_telethon_entity_cache_observation_status: passed_stability_only_zero_traffic_does_not_prove_natural_message_path
+phase_7_telethon_entity_cache_deployment_evidence_path: /opt/telegram-kol-analyzer/data/evidence/phase7-telethon-entity-cache-deploy-20260826T202141Z/observation-evidence.jsonl
+phase_7_telethon_entity_cache_deployment_evidence_sha256: 7df2a84808235c833320af4538c76069a1f6f9f5505d9f669bb6abe4b949fd7a
+phase_7_ingest_stall_watcher_status: active_read_only_baseline_updated_to_95a883715881b4fd393fbf5e745693cc78e066df
 phase_7_ingest_stall_deployment_authorization: consumed_owner_continue_next_exact_fc8baaad_one_split_restart_global_1_l1_only
 phase_7_ingest_stall_deployed_commit: fc8baaad2e677fe0536c0c7211e2ae9d0cc915d4
 phase_7_ingest_stall_server_focused_verification: 28_passed_259_deselected_7_warnings_in_6_74_seconds
@@ -179,7 +193,7 @@ phase_7_retry_convergence_samples:
   - "sample_2_elapsed_0.332932_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_3_elapsed_0.613592_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.893838_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: exact_candidate_push_then_separately_authorized_deploy_and_post_deploy_natural_stall_verification_then_separate_safe_retry_authorization
+phase_7_retry_remaining_gate_blockers: natural_message_evidence_under_deployed_entity_cache_fix_then_separate_safe_retry_authorization
 phase_7_window_start: 2026-08-26T16:59:28.134926+00:00
 phase_7_window_end: 2026-08-26T17:33:44.352048+00:00
 phase_7_natural_message_count: 1
@@ -284,6 +298,40 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 Telethon entity-cache deployment verification`: after
+  the owner confirmed the explicitly proposed next step, exact clean commit
+  `95a883715881b4fd393fbf5e745693cc78e066df` was deployed through the repository
+  updater with its single required split-runtime stop/start cycle. Pre-deploy
+  production was exact clean commit
+  `fc8baaad2e677fe0536c0c7211e2ae9d0cc915d4`, with one ingest, worker, and Web
+  authority, inactive monolith, ingest-only Telegram session ownership,
+  `global + 1 + queue`, semantic review disabled, zero claimed non-shadow jobs,
+  and SQLite WAL `quick_check=ok` under `query_only=1`.
+
+  Post-deploy production was exact clean commit
+  `95a883715881b4fd393fbf5e745693cc78e066df`. Worker, Web, and ingest PIDs were
+  `1898355`, `1898357`, and `1898359`, each with `NRestarts=0`; only ingest held
+  the Telegram session. Server focused verification passed `76` tests with 22
+  warnings in 28.01 seconds. The fixed L1 window ran from
+  `2026-08-26T20:21:41.444900+00:00` to
+  `2026-08-26T20:36:41.557076+00:00`, producing 181 complete five-second
+  samples. All samples preserved the tuple, authorities, PIDs, zero backlog,
+  and zero ingest/worker/Web stalls. No natural message arrived, so this proves
+  deployment stability but not the real Telegram message path. Final SQLite
+  remained WAL with `quick_check=ok`, no relevant stall/SQLite-lock journal
+  line appeared, and the deployed factory contained
+  `client.session.save_entities = False`.
+
+  Evidence is
+  `/opt/telegram-kol-analyzer/data/evidence/phase7-telethon-entity-cache-deploy-20260826T202141Z/observation-evidence.jsonl`
+  with SHA-256
+  `7df2a84808235c833320af4538c76069a1f6f9f5505d9f669bb6abe4b949fd7a`.
+  The read-only stall watcher now targets this exact deployed SHA. No Phase 7
+  cutover, rollback, production setting/data change, replay, worker command,
+  manufactured Telegram traffic, test trade, or exchange call occurred. Phase
+  7 remains rolled back and incomplete; a new safe retry still requires
+  natural-message evidence and separate owner authorization.
 
 - `2026-08-26 Phase 7 ingest-stall attribution deployment verification`:
   after the owner replied `continue next step` to the explicitly bounded next
