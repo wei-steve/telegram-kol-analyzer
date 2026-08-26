@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-5-awaiting-claim
+claimed_by: codex-per-chat-opt-phase5-20260826-root
+claim_base_sha: 858cd91d68f24436830012bcbe11bc830bc6a414
+current_task: phase-5-production-read-only-gate
 current_phase: phase_5_trigger_intents_read_only_gate
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-5-trigger-intents-read-only-gate.md
 last_completed_phase: phase_4_batch150_read_only_gate
@@ -71,7 +71,8 @@ phase_4_status: completed
 phase_4_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
 phase_4_evidence_path: /Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt
 phase_4_evidence_sha256: 4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd
-phase_5_authorization: not_started_requires_new_claim
+phase_5_status: claimed
+phase_5_authorization: production_read_only_identity_sqlite_exact_intents_persisted_execution_leg_checks_local_evidence_status_and_local_commits_only
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -158,6 +159,27 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 5 claim`: session
+  `codex-per-chat-opt-phase5-20260826-root` claimed only the bounded trigger-
+  protection intent `138`, `141`, and `147` production read-only gate at exact
+  clean local base `858cd91d68f24436830012bcbe11bc830bc6a414`. Phase 4 is
+  completed, the frozen local candidate
+  `e37146eaea03befac6457fa224e9dad0cd6c7166` is unchanged, and the status
+  pointer names only the Phase 5 plan. The local upstream, local remote-tracking
+  deploy ref, and live remote deploy branch all resolved to
+  `d66afadda5e34db80851a0dae5986b622521ab3f`; the worktree was clean and no Git
+  lock was present. Authorization is limited to production read-only identity,
+  `PRAGMA query_only=ON`, opening and closing `quick_check`, the three exact
+  intent rows, their persisted execution-leg references and exact terminal leg
+  identities, local-only raw evidence and hashing, canonical status updates,
+  and local commits. Production or server writes, repairs, backups, CAS plans,
+  historical attribution reconstruction, Deepcoin or exchange calls, push,
+  deployment, restart, configuration or data changes, replay, manufactured
+  Telegram traffic, Telegram business messages, and operator/system Bot
+  messages are forbidden. Any incomplete query, missing or changed row, broken
+  persisted leg reference, identity ambiguity, or state change is an immediate
+  fail-closed stop condition without retry polling or repair.
 
 - `2026-08-26 Phase 4 completion`: the bounded production read-only gate ran
   from `2026-08-26T05:27:07Z` through `2026-08-26T05:27:20Z` against exact
