@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
-from sqlalchemy import or_, text
+from sqlalchemy import DateTime, bindparam, or_, text
 
 from telegram_kol_research.models import RawMessage, utc_now
 from telegram_kol_research.models import MessageProcessingJob
@@ -333,36 +333,65 @@ def claim_message_processing_jobs(
         # SQLite is the production store. BEGIN IMMEDIATE makes selection plus
         # conditional updates one short cross-process claim transaction.
         session.execute(text("BEGIN IMMEDIATE"))
-        rows = (
-            session.query(MessageProcessingJob)
-            .filter(
-                MessageProcessingJob.status.in_(("pending", "claimed")),
-                MessageProcessingJob.shadow.is_(False),
-            )
-            .order_by(
-                MessageProcessingJob.chat_id.asc(),
-                MessageProcessingJob.raw_message_id.asc(),
-            )
-            .all()
-        )
-        selected_chats: set[int] = set()
+        rows = session.execute(
+            text(
+                """
+                WITH lane_owners AS (
+                    SELECT
+                        id,
+                        raw_message_id,
+                        chat_id,
+                        status,
+                        attempt_count,
+                        claimed_at,
+                        next_attempt_at,
+                        last_reason,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY chat_id
+                            ORDER BY raw_message_id ASC
+                        ) AS lane_position
+                    FROM message_processing_jobs
+                    WHERE status IN ('pending', 'claimed')
+                      AND shadow = 0
+                )
+                SELECT
+                    id,
+                    raw_message_id,
+                    chat_id,
+                    status,
+                    attempt_count,
+                    last_reason
+                FROM lane_owners
+                WHERE lane_position = 1
+                  AND (
+                      (
+                          status = 'pending'
+                          AND (
+                              next_attempt_at IS NULL
+                              OR next_attempt_at <= :claim_time
+                          )
+                      )
+                      OR (
+                          status = 'claimed'
+                          AND claimed_at IS NOT NULL
+                          AND claimed_at <= :stale_before
+                      )
+                  )
+                ORDER BY chat_id ASC, raw_message_id ASC
+                LIMIT :claim_limit
+                """
+            ).bindparams(
+                bindparam("claim_time", type_=DateTime()),
+                bindparam("stale_before", type_=DateTime()),
+            ),
+            {
+                "claim_time": claim_time,
+                "stale_before": stale_before,
+                "claim_limit": claim_limit,
+            },
+        ).all()
         for row in rows:
             chat_id = int(row.chat_id)
-            if chat_id in selected_chats:
-                continue
-            # The oldest non-terminal row owns the lane even when its retry is
-            # not due or its lease is still live. Later rows cannot overtake it.
-            if row.status == "pending":
-                if (
-                    row.next_attempt_at is not None
-                    and row.next_attempt_at > claim_time
-                ):
-                    selected_chats.add(chat_id)
-                    continue
-            elif row.claimed_at is None or row.claimed_at > stale_before:
-                selected_chats.add(chat_id)
-                continue
-
             token = uuid4().hex
             conditions = [
                 MessageProcessingJob.id == int(row.id),
@@ -403,7 +432,6 @@ def claim_message_processing_jobs(
                     synchronize_session=False,
                 )
             )
-            selected_chats.add(chat_id)
             if updated == 1:
                 claims.append(
                     MessageProcessingClaim(
@@ -415,8 +443,6 @@ def claim_message_processing_jobs(
                         source_reason=row.last_reason,
                     )
                 )
-                if len(claims) >= claim_limit:
-                    break
         session.commit()
     return claims
 

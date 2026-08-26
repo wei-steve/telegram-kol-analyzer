@@ -5,6 +5,7 @@ import threading
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.orm import Query
 
 import telegram_kol_research.message_processing_worker as worker_module
 from telegram_kol_research.db import create_session_factory
@@ -870,6 +871,88 @@ def test_claim_is_atomic_and_only_claims_one_ordered_job_per_chat(tmp_path):
     claimed_ids = [claim.raw_message_id for result in results for claim in result]
     assert sorted(claimed_ids) == sorted([first, other_chat])
     assert len(claimed_ids) == len(set(claimed_ids))
+
+
+def test_claim_candidate_fetch_is_bounded_by_limit_with_large_backlog(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "bounded-claim-fetch.db")
+    oldest_same_chat = _add_job(session_factory, chat_id=1, message_id=1)
+    for message_id in range(2, 102):
+        _add_job(session_factory, chat_id=1, message_id=message_id)
+    oldest_other_chats = [
+        _add_job(session_factory, chat_id=chat_id, message_id=1)
+        for chat_id in range(2, 14)
+    ]
+
+    candidate_row_counts: list[int] = []
+    original_execute = session_factory.class_.execute
+
+    class RecordingResult:
+        def __init__(self, result):
+            self._result = result
+
+        def all(self):
+            rows = self._result.all()
+            candidate_row_counts.append(len(rows))
+            return rows
+
+    def recording_execute(session, statement, params=None, **kwargs):
+        result = original_execute(session, statement, params=params, **kwargs)
+        normalized_sql = " ".join(str(statement).lower().split())
+        if (
+            normalized_sql.startswith("with ")
+            and "message_processing_jobs" in normalized_sql
+            and "claim_limit" in normalized_sql
+        ):
+            return RecordingResult(result)
+        return result
+
+    monkeypatch.setattr(session_factory.class_, "execute", recording_execute)
+
+    claims = claim_message_processing_jobs(
+        session_factory,
+        claimed_at=NOW,
+        limit=3,
+    )
+
+    assert candidate_row_counts == [3]
+    assert [claim.raw_message_id for claim in claims] == [
+        oldest_same_chat,
+        *oldest_other_chats[:2],
+    ]
+
+
+def test_claim_selection_does_not_use_unbounded_message_job_query_all(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "no-unbounded-all.db")
+    for chat_id in range(1, 6):
+        _add_job(session_factory, chat_id=chat_id, message_id=1)
+
+    original_all = Query.all
+
+    def reject_message_job_all(query):
+        if any(
+            description.get("entity") is MessageProcessingJob
+            for description in query.column_descriptions
+        ):
+            raise AssertionError(
+                "claim selection must not load the unbounded job query"
+            )
+        return original_all(query)
+
+    monkeypatch.setattr(Query, "all", reject_message_job_all)
+
+    claims = claim_message_processing_jobs(
+        session_factory,
+        claimed_at=NOW,
+        limit=2,
+    )
+
+    assert len(claims) == 2
 
 
 def test_stale_claim_is_reclaimed_and_completed(tmp_path):
