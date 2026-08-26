@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-opt-phase4-20260826-root
-claim_base_sha: d6768b681ece8ed43aeced19c95da35afcfeb952
-current_task: phase-4-batch150-read-only-gate-claimed
-current_phase: phase_4_batch150_read_only_gate
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-4-batch150-read-only-gate.md
-last_completed_phase: phase_3_final_candidate_review
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-5-awaiting-claim
+current_phase: phase_5_trigger_intents_read_only_gate
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-5-trigger-intents-read-only-gate.md
+last_completed_phase: phase_4_batch150_read_only_gate
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -67,7 +67,11 @@ phase_3_commits:
 phase_3_independent_review_status: ready_zero_findings_after_red_green_repair
 phase_4_authorization: production_read_only_checks_local_evidence_status_and_local_commits_only
 phase_4_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
-phase_4_status: claimed
+phase_4_status: completed
+phase_4_production_sha: d66afadda5e34db80851a0dae5986b622521ab3f
+phase_4_evidence_path: /Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt
+phase_4_evidence_sha256: 4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd
+phase_5_authorization: not_started_requires_new_claim
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -154,6 +158,34 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 4 completion`: the bounded production read-only gate ran
+  from `2026-08-26T05:27:07Z` through `2026-08-26T05:27:20Z` against exact
+  clean deployed SHA `d66afadda5e34db80851a0dae5986b622521ab3f`. The ingest, worker,
+  and Web services were loaded and active/running from
+  `/opt/telegram-kol-analyzer`; the monolith was inactive/dead. Every service
+  resolved `data/research.db` from that same working directory, whose exact
+  read-only identity was device `64257`, inode `75526029`. SQLite reported
+  `query_only=1`, `total_changes=0`, and `quick_check=ok` at both checkpoints.
+  Batch `150` existed exactly once and remained byte-for-byte stable across its
+  selected gate fields as `resolved / historical_position_fully_closed`.
+  Its one management leg was `failed`; components `23` and `24` were
+  `safely_skipped / historical_position_fully_closed`, while exhausted
+  component `22` retained its historical `operator_required /
+  take_profit_cancel_retry_exhausted` evidence under the terminal batch. Both
+  execution legs were `closed / historical_exchange_position_closed`; binding
+  `320` was `closed`, had null `pos_id`, and reported terminal marker
+  `entry_legs_terminal`. The established active-management count was exactly
+  zero, so none of these rows retained active management authority. Per the
+  owner's prohibition on production writes, no server evidence directory was
+  created; the exact raw output was saved only on the local machine at
+  `/Users/steven/.codex/evidence/per-chat-phase4-batch150-read-only-20260826T052707Z/production-read-only-gate.txt`,
+  SHA-256
+  `4fb2a8e57f74e2f44f8bb2e29827f84c9a909480c48e0fc7800b49e116c399dd`.
+  No production write or repair, backup, CAS plan, push, deployment, restart,
+  configuration or data change, Telegram business or operator/system Bot
+  message, replay, Deepcoin call, or exchange action occurred. Phase 4 is
+  complete; Phase 5 is unclaimed and requires a new user turn.
 
 - `2026-08-26 Phase 4 claim`: session
   `codex-per-chat-opt-phase4-20260826-root` claimed only the bounded batch `150`
