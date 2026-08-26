@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-observer-fixed-awaiting-push-and-safe-retry-authorization
+claimed_by: codex-per-chat-phase7-safe-retry-20260826T1652Z-root
+claim_base_sha: 7a60aa2ebe060dd90211c0fafb430044ce4ed30d
+current_task: phase-7-safe-retry-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,8 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: rolled_back_incomplete
-phase_7_authorization: consumed_owner_authorized_single_safe_retry_global_1_to_per_chat_3
+phase_7_status: in_progress
+phase_7_authorization: owner_authorized_new_safe_retry_global_1_to_per_chat_3
 phase_7_observer_fix_authorization: owner_authorized_local_design_plan_code_tests_status_and_commits_only
 phase_7_observer_design_commit: c1edfb14b00730fc72eec225a93313f7e5ea67dd
 phase_7_observer_plan_commit: 753c401c37e81a7620a02843c091fe5ade1727f9
@@ -111,7 +111,7 @@ phase_7_observer_candidate_commits:
 phase_7_observer_red_verification: "RED confirmed missing contracts or entrypoints before each implementation batch; collector RED was 4 failed and 27 passed; CLI RED was 6 failed and 31 passed"
 phase_7_observer_green_verification: "37 passed in focused observer suite; 6 passed in existing durable ordering regression slice; compileall and diff check passed"
 phase_7_observer_source_boundary: "SQLite file URI mode=ro plus query_only=ON; HTTP collection uses urlopen GET only; JSONL writes only to stdout; no Request method override, POST, subprocess, service control, worker action, evidence-file output, rollback execution, Telegram send, replay, or exchange-write path"
-phase_7_observer_status: local_complete_not_pushed_not_deployed_not_run_against_production
+phase_7_observer_status: pushed_exact_7a60aa2_stream_only_not_deployed
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
 phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
@@ -201,7 +201,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -250,6 +250,40 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 versioned-observer safe-retry claim`: session
+  `codex-per-chat-phase7-safe-retry-20260826T1652Z-root` exclusively claimed one
+  owner-authorized retry at exact clean canonical base
+  `7a60aa2ebe060dd90211c0fafb430044ce4ed30d`. Local upstream, local remote-
+  tracking, and the live remote deploy branch matched that exact SHA. Production
+  remained clean at deployed runtime SHA
+  `7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9`; the remote-only delta contains
+  only the versioned observer, its tests, plans, and canonical status, with no
+  deployed production-source change.
+
+  The complete read-only preclaim snapshot found exactly one active/running
+  ingest, worker, and Web authority, an inactive monolith, and ingest as the
+  only Telegram-session holder. Database and all three APIs were exactly
+  `global + 1 + queue + queue`; worker memory was cap `1` with zero active
+  lanes. The non-shadow pending/claimed queue, active worker commands, active
+  management, and active exchange-write count were all zero. SQLite was WAL,
+  `query_only=1`, `quick_check=ok`, `total_changes=0`, with no foreign-key
+  violations. The worker-owned exchange snapshot was complete with zero
+  positions, zero open orders, and fingerprint
+  `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`.
+
+  Cumulative loop-stall baselines are ingest/Web/worker `1/1/0`; the last two
+  events were approximately four and six hours before claim, and the current
+  rolling one-hour health windows were quiet. They are retained as immutable
+  baselines rather than cleared or treated as zero. Any increment during the
+  final gate, convergence, or acceptance is a failure. Authorization permits
+  one exact `global + 1` to `per_chat + 3` expected-state transition, the fixed
+  five-second convergence gate, one continuous two-hour natural-traffic
+  acceptance window, the approved necessary rollback, read-only production and
+  exchange evidence, and canonical status updates with explicit-path local
+  commits. Code/test changes, another push, deployment, restart, schema/data
+  changes, replay, worker commands, manufactured traffic, test trades, and
+  exchange writes remain prohibited.
 
 - `2026-08-26 Phase 7 acceptance-observer fix claim`: session
   `codex-per-chat-phase7-observer-fix-20260826-root` exclusively claimed the
