@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-safe-retry-20260826T084816Z-root
-claim_base_sha: 568fb78710ab0fb3e4b27c5589377854111353d8
-current_task: phase-7-safe-retry-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-rolled-back-observer-false-positive-awaiting-owner
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -96,8 +96,8 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: in_progress
-phase_7_authorization: owner_authorized_single_safe_retry_global_1_to_per_chat_3
+phase_7_status: rolled_back_incomplete
+phase_7_authorization: consumed_owner_authorized_single_safe_retry_global_1_to_per_chat_3
 phase_7_blocker_remediation_authorization: completed_local_diagnosis_code_tests_status_and_commits_only
 phase_7_blocker_fix_commit: a9545a1b16c5132b789c805d03680d203a9a0440
 phase_7_blocker_fix_deployment_authorization: consumed_exact_sha_deploy_one_restart_l1_verification
@@ -122,30 +122,34 @@ phase_7_production_sha: 7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9
 phase_7_before_tuple: global_1_queue
 phase_7_cutover_tuple: per_chat_3_queue
 phase_7_final_tuple: global_1_queue
-phase_7_cutover_http_status: null
-phase_7_rollback_occurred: false
-phase_7_rollback_http_status: null
-phase_7_failure_reason: safe_retry_pre_cutover_web_loop_health_reported_stall_count_1_last_stall_2026_08_26T07_30_33_765410Z_worst_stall_ms_5653_293
-phase_7_acceptance_window_status: not_started_safe_retry_stopped_before_cutover
-phase_7_retry_convergence_status: not_started_cutover_not_submitted
-phase_7_retry_convergence_samples: []
-phase_7_retry_remaining_gate_blockers: new_safe_retry_not_authorized
-phase_7_window_start: null
-phase_7_window_end: null
-phase_7_natural_message_count: 0
-phase_7_distinct_chat_count: 0
-phase_7_peak_active_chat_lanes: null
-phase_7_ordering_status: not_observed_window_not_started
-phase_7_backlog_status: queue_pending_0_claimed_0_five_historical_shadow_pending_excluded_by_worker_contract
-phase_7_duplicate_status: not_observed_window_not_started
-phase_7_sqlite_status: poststop_wal_quick_check_ok_query_only_1_total_changes_0
-phase_7_loop_status: attribution_fix_deployed_and_verified_zero_stalls_across_all_roles_during_l1_observation
-phase_7_session_status: poststop_ingest_only_one_holder
-phase_7_exchange_status: not_queried_retry_stopped_before_exchange_baseline
+phase_7_cutover_http_status: 200
+phase_7_rollback_occurred: true
+phase_7_rollback_http_status: 200
+phase_7_failure_reason: acceptance_observer_false_positive_counted_pending_same_chat_enqueue_as_processing_overlap
+phase_7_acceptance_window_status: failed_closed_at_2565_seconds_then_rolled_back_no_window_stitching
+phase_7_retry_convergence_status: passed_three_consecutive_samples_by_sample_4_in_0_914874_seconds
+phase_7_retry_convergence_samples:
+  - "sample_1_elapsed_0.111743_db_api_per_chat_3_worker_cap_1_old_limit"
+  - "sample_2_elapsed_0.353987_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
+  - "sample_3_elapsed_0.671958_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
+  - "sample_4_elapsed_0.914874_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
+phase_7_retry_remaining_gate_blockers: corrected_acceptance_observer_and_new_owner_safe_retry_authorization
+phase_7_window_start: 2026-08-26T08:59:52.921506+00:00
+phase_7_window_end: 2026-08-26T09:42:38.140941+00:00
+phase_7_natural_message_count: 3
+phase_7_distinct_chat_count: 2
+phase_7_peak_active_chat_lanes: 1
+phase_7_ordering_status: production_lane_order_preserved_but_acceptance_observer_false_positive_for_pending_same_chat_enqueue
+phase_7_backlog_status: max_2_final_pending_0_claimed_0_five_historical_shadow_pending_excluded
+phase_7_duplicate_status: zero_missing_orphan_stuck_duplicate_job_decision_or_contract_before_failure
+phase_7_sqlite_status: final_wal_quick_check_ok_query_only_1_total_changes_0_foreign_keys_0
+phase_7_loop_status: zero_stalls_all_roles_during_retry_and_final_gate
+phase_7_session_status: final_ingest_only_one_holder_pid_404790
+phase_7_exchange_status: complete_worker_owned_baseline_end_identical_zero_positions_zero_open_orders
 phase_7_previous_attempt_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-cutover-acceptance-20260826T065802Z/phase7-evidence.log
 phase_7_previous_attempt_evidence_sha256: ad3d14aa04805a7187d5ca289e5a63ff9b681c269e9453b2137ace346bff127b
-phase_7_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-safe-retry-20260826T073652Z/phase7-retry-evidence.log
-phase_7_evidence_sha256: d47e070667fa20e78faad02ffdd2f5c0aae7f5983c2bdcbbf2a680a25cd00031
+phase_7_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-postfix-safe-retry-20260826T085214Z/phase7-retry-evidence.log
+phase_7_evidence_sha256: 8a05037c5f4c180314ab6e741ac3566b5bcdf008bf460b95fecd596ced7f0a57
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -183,7 +187,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: true
+cutover_authorized: false
 ```
 
 ## Fixed Boundaries
@@ -232,6 +236,64 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 post-fix safe-retry rollback`: all preflight gates passed
+  against exact production SHA
+  `7ca03ac2839420b9d4b22ab13f16a52ebcbc0ef9`. The worker-owned exchange
+  baseline was complete with zero positions, zero open orders, and fingerprint
+  `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`.
+  One ingest-owned expected-state request changed `global + 1 + queue` to
+  `per_chat + 3 + queue` and returned HTTP `200` at
+  `2026-08-26T08:55:47.828639+00:00`. Database and API persistence were
+  immediate. Worker sample 1 still reported cap `1`; samples 2, 3, and 4
+  reported cap `3`, zero active lanes, peak `0`, and new
+  `limit_applied_at=2026-08-26T08:55:48.021057+00:00`. The third consecutive
+  convergence sample completed after `0.914874` seconds. No convergence time
+  was counted toward acceptance.
+
+  The independent acceptance window began at
+  `2026-08-26T08:59:52.921506+00:00`. At
+  `2026-08-26T09:42:38.140941+00:00`, after `2565` seconds, the observer
+  reported `same_chat_violations`; the window then contained three natural
+  messages from two chats, peak active lanes `1`, and maximum backlog `2`.
+  The approved scheduler/concurrency rollback immediately issued one atomic
+  `per_chat + 3 + queue` to `global + 1 + queue` transition and received HTTP
+  `200`. The observer labelled rollback confirmation incomplete because its
+  confirmation samples reused the already-failed same-chat invariant. A fresh
+  independent read proved the rollback itself had converged: database and all
+  three APIs were `global + 1 + queue`, worker memory was cap `1`, active `0`,
+  peak `1`, with new
+  `limit_applied_at=2026-08-26T09:42:38.433385+00:00`. There was no second
+  cutover and no restart.
+
+  Read-only diagnosis classified the acceptance failure as an observer false
+  positive, not a production scheduler violation. While the earlier job from
+  chat `-1002805019371` was claimed, the next job from that chat remained
+  `pending`; every runtime sample reported active and peak lanes at most `1`.
+  The earlier recognition decision updated at
+  `2026-08-26T09:42:37.798151+00:00`, before the later job's recorded terminal
+  tick at `2026-08-26T09:42:37.882049+00:00`. Deployed claim SQL selects only
+  the oldest pending-or-claimed lane owner per chat. It is valid for a later
+  same-chat message to enqueue while the prior lane is active; the observer
+  incorrectly treated that pending enqueue as processing overlap. The worker
+  also writes a tick-start value to job `completed_at`, so that column is not a
+  standalone wall-clock processing-end boundary for an external overlap query.
+
+  The final queue had zero non-shadow pending or claimed jobs. Exactly one
+  ingest, worker, and Web authority retained PIDs `404790`, `404786`, and
+  `404788`; monolith remained inactive and only ingest held the Telegram
+  session. All roles reported zero stalls. SQLite was `wal`, `query_only=1`,
+  `quick_check=ok`, `total_changes=0`, with zero foreign-key violations;
+  active management and worker commands were zero. The complete worker-owned
+  exchange end snapshot was identical to baseline. Raw evidence is retained at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-postfix-safe-retry-20260826T085214Z/phase7-retry-evidence.log`,
+  SHA-256
+  `8a05037c5f4c180314ab6e741ac3566b5bcdf008bf460b95fecd596ced7f0a57`.
+  Phase 7 remains rolled back and incomplete; Phase 8 is forbidden. A corrected
+  acceptance observer and a new explicit safe-retry authorization are required.
+  No code/test edit, push, deployment, restart, schema/data mutation, replay,
+  worker command, manufactured Telegram traffic, test trade, or exchange write
+  occurred.
 
 - `2026-08-26 Phase 7 post-fix safe-retry claim`: session
   `codex-per-chat-phase7-safe-retry-20260826T084816Z-root` exclusively claimed
