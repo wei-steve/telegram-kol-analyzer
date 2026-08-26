@@ -21,18 +21,27 @@ condition, not permission to pull, reset, stash, clean, merge, or repair.
 
 ```yaml
 project: per-chat-durable-lanes
-design_doc: docs/plans/2026-08-23-per-chat-durable-lanes-design.md
-implementation_plan: docs/plans/2026-08-23-per-chat-durable-lanes.md
+design_doc: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization-design.md
+implementation_plan: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization.md
 canonical_status: docs/per-chat-durable-lanes-status.md
 original_remediation_status: docs/runtime-serialization-remediation-status.md
 deploy_branch: codex/deepcoin-auto-trading-v1
 integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
-approved_design_commit: 1efd20cbd50be4e3c724d48874f6004fe6ad2c7c
-workstream_status: local_complete
-claimed_by: codex-per-chat-20260823-root-68b9e88
-current_task: task-20-awaiting-owner-direction
+approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
+workstream_status: in_progress
+claimed_by: codex-per-chat-opt-phase1-20260825-root
+claim_base_sha: d88ecc99c1e7b95f253bfabe32e87fe2dc5391bc
+current_task: phase-1-task-1-claim
+current_phase: phase_1_event_loop_db_offload
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-1-event-loop-db-offload.md
+phase_1_status: in_progress
+phase_1_authorization: local_code_and_tests_only
+phase_1_stop_conditions:
+  - recognition_strategy_execution_or_exchange_semantics_change_required
+  - schema_or_production_data_change_required
+  - push_deploy_restart_or_production_action_required
 verification_level: L2
 local_candidate_commit: 130de7bbaff5abe28c912f60a554fe39be451ecd
 invalidated_local_candidate_commits:
@@ -115,6 +124,17 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-25 Phase 1 claim`: session
+  `codex-per-chat-opt-phase1-20260825-root` claimed only the event-loop database
+  offload phase at exact clean local base
+  `d88ecc99c1e7b95f253bfabe32e87fe2dc5391bc`. Approved design correction
+  `9707109dfd1f0815dec6edbc8809fa3fb89a00a0` is an ancestor. Authorization is
+  limited to Phase 1 local code, tests, status updates, and local commits. Push,
+  deployment, restart, production configuration/data, Telegram traffic, and
+  exchange actions are forbidden. Any required recognition, strategy,
+  execution, position-ownership, exchange-write, schema, pool-size, or executor-
+  count change is a stop condition.
 
 - `2026-08-23 planning`: read-only investigation at source baseline
   `bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7`; clean HEAD/upstream/remote and
