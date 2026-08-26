@@ -1,5 +1,6 @@
 from datetime import UTC, datetime
 import importlib.util
+import io
 import json
 from pathlib import Path
 import sqlite3
@@ -549,3 +550,150 @@ def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):
     assert result.peak_lanes == 2
     assert result.pids == observer.AuthorityPids(101, 102, 103)
     assert len(requested) == 6
+
+
+def parse_jsonl(output):
+    return [json.loads(line) for line in output.getvalue().splitlines()]
+
+
+def test_convergence_orchestration_exits_zero_after_three_samples():
+    output = io.StringIO()
+
+    exit_code = observer.run_convergence_samples(
+        [runtime(elapsed=0.25), runtime(elapsed=0.50), runtime(elapsed=0.75)],
+        convergence_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-26T10:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert exit_code == 0
+    assert [row["kind"] for row in rows] == [
+        "sample",
+        "sample",
+        "sample",
+        "convergence_passed",
+    ]
+    assert rows[-1]["consecutive"] == 3
+
+
+def test_acceptance_orchestration_reports_failure_without_rollback_write():
+    output = io.StringIO()
+    failing = acceptance_snapshot(
+        jobs=[job(1, 10, 7, "claimed"), job(2, 11, 7, "claimed")],
+        active_lanes=2,
+        peak_lanes=2,
+        claimed_count=2,
+    )
+
+    exit_code = observer.run_acceptance_samples(
+        [failing],
+        acceptance_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-26T10:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert exit_code == observer.EXIT_ACCEPTANCE_FAILED
+    assert rows[-1]["kind"] == "acceptance_failed"
+    assert rows[-1]["reason"] == "same_chat_multiple_claims"
+    assert rows[-1]["rollback_target"] == {
+        "lock_mode": "global",
+        "max_parallel_chats": 1,
+        "pipeline_mode": "queue",
+        "worker_command_mode": "queue",
+    }
+    assert not hasattr(observer, "perform_rollback")
+
+
+def test_rollback_orchestration_is_independent_after_acceptance_failure():
+    failed_tracker = acceptance_tracker()
+    failed_tracker.observe(
+        acceptance_snapshot(duplicate_job_count=1)
+    )
+    output = io.StringIO()
+    rollback_tracker = observer.RollbackConvergenceTracker(
+        target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
+        expected_pids=observer.AuthorityPids(101, 102, 103),
+        required_consecutive=1,
+    )
+
+    exit_code = observer.run_rollback_samples(
+        [runtime(lock_mode="global", cap=1, new_limit=False)],
+        rollback_tracker,
+        output=output,
+        now_provider=lambda: "2026-08-26T10:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert exit_code == 0
+    assert rows[-1]["kind"] == "rollback_converged"
+
+
+def test_second_incomplete_cli_sample_is_observer_incomplete():
+    output = io.StringIO()
+
+    exit_code = observer.run_acceptance_samples(
+        [acceptance_snapshot(complete=False), acceptance_snapshot(complete=False)],
+        acceptance_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-26T10:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert exit_code == observer.EXIT_OBSERVER_INCOMPLETE
+    assert rows[-1]["kind"] == "observer_incomplete"
+    assert rows[-1]["reason"] == "observer_incomplete"
+
+
+def test_every_orchestration_line_has_kind_and_observed_at():
+    output = io.StringIO()
+
+    observer.run_convergence_samples(
+        [runtime(elapsed=5.001)],
+        convergence_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-26T10:00:00Z",
+    )
+
+    assert all(
+        {"kind", "observed_at"} <= row.keys() for row in parse_jsonl(output)
+    )
+
+
+def test_cli_has_only_fixed_read_only_observation_inputs():
+    parser = observer.build_parser()
+    help_text = parser.format_help()
+    subcommands = parser._subparsers._group_actions[0].choices
+    all_help = help_text + "\n".join(
+        command.format_help() for command in subcommands.values()
+    )
+
+    assert set(subcommands) == {
+        "convergence",
+        "acceptance",
+        "rollback-convergence",
+    }
+    for forbidden in (
+        "http-method",
+        "sql",
+        "shell",
+        "command",
+        "evidence-output",
+        "post",
+        "restart",
+    ):
+        assert forbidden not in all_help.lower()
+    for required in (
+        "--database",
+        "--ingest-url",
+        "--worker-url",
+        "--web-url",
+        "--baseline-raw-message-id",
+        "--baseline-job-id",
+        "--ingest-pid",
+        "--worker-pid",
+        "--web-pid",
+        "--poll-interval",
+    ):
+        assert required in all_help

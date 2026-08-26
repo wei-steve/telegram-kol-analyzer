@@ -3,17 +3,22 @@
 
 from __future__ import annotations
 
+import argparse
 from collections import defaultdict
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime
 import json
 from pathlib import Path
 import sqlite3
-from typing import Callable
+import sys
+import time
+from typing import Callable, Iterable, TextIO
 from urllib import request as urllib_request
 
 
 NONTERMINAL_STATUSES = frozenset({"pending", "claimed"})
+EXIT_ACCEPTANCE_FAILED = 2
+EXIT_OBSERVER_INCOMPLETE = 3
 
 
 @dataclass(frozen=True)
@@ -625,3 +630,456 @@ class AcceptanceTracker:
             ),
         )
         return self._failure
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat().replace("+00:00", "Z")
+
+
+def _emit_jsonl(
+    output: TextIO,
+    kind: str,
+    *,
+    now_provider: Callable[[], str],
+    **fields: object,
+) -> None:
+    payload = {"kind": kind, "observed_at": now_provider(), **fields}
+    output.write(json.dumps(payload, sort_keys=True, separators=(",", ":")))
+    output.write("\n")
+    output.flush()
+
+
+def _runtime_sample_fields(sample: RuntimeObservation) -> dict[str, object]:
+    return {
+        "elapsed_seconds": sample.elapsed_seconds,
+        "complete": sample.complete,
+        "database_state": (
+            asdict(sample.database_state) if sample.database_state else None
+        ),
+        "api_state": asdict(sample.api_state) if sample.api_state else None,
+        "pids": asdict(sample.pids) if sample.pids else None,
+        "worker_role": sample.worker_role,
+        "worker_cap": sample.worker_cap,
+        "active_lanes": sample.active_lanes,
+        "peak_lanes": sample.peak_lanes,
+        "limit_applied_at": sample.limit_applied_at,
+    }
+
+
+def run_convergence_samples(
+    samples: Iterable[RuntimeObservation],
+    tracker: ConvergenceTracker,
+    *,
+    output: TextIO = sys.stdout,
+    now_provider: Callable[[], str] = _utc_now,
+) -> int:
+    incomplete_count = 0
+    for sample in samples:
+        _emit_jsonl(
+            output,
+            "sample",
+            now_provider=now_provider,
+            mode="convergence",
+            **_runtime_sample_fields(sample),
+        )
+        if not sample.complete:
+            incomplete_count += 1
+            if incomplete_count >= 2:
+                _emit_jsonl(
+                    output,
+                    "observer_incomplete",
+                    now_provider=now_provider,
+                    reason="observer_incomplete",
+                )
+                return EXIT_OBSERVER_INCOMPLETE
+        else:
+            incomplete_count = 0
+        result = tracker.observe(sample)
+        if result.passed:
+            _emit_jsonl(
+                output,
+                "convergence_passed",
+                now_provider=now_provider,
+                consecutive=result.consecutive,
+            )
+            return 0
+        if result.failed:
+            _emit_jsonl(
+                output,
+                "convergence_failed",
+                now_provider=now_provider,
+                reason=result.reason,
+                consecutive=result.consecutive,
+            )
+            return EXIT_ACCEPTANCE_FAILED
+    _emit_jsonl(
+        output,
+        "observer_incomplete",
+        now_provider=now_provider,
+        reason="sample_stream_ended",
+    )
+    return EXIT_OBSERVER_INCOMPLETE
+
+
+def _rollback_fields(
+    target: ExpectedRuntimeState | None,
+) -> dict[str, object] | None:
+    return asdict(target) if target is not None else None
+
+
+def run_acceptance_samples(
+    samples: Iterable[AcceptanceObservation],
+    tracker: AcceptanceTracker,
+    *,
+    output: TextIO = sys.stdout,
+    now_provider: Callable[[], str] = _utc_now,
+) -> int:
+    observed_any = False
+    for sample in samples:
+        observed_any = True
+        _emit_jsonl(
+            output,
+            "sample",
+            now_provider=now_provider,
+            mode="acceptance",
+            **_runtime_sample_fields(sample.runtime),
+            raw_message_count=sample.raw_message_count,
+            distinct_chat_count=sample.distinct_chat_count,
+            pending_count=sample.pending_count,
+            claimed_count=sample.claimed_count,
+        )
+        result = tracker.observe(sample)
+        if result.reason == "observer_incomplete_retry":
+            continue
+        if result.failed:
+            kind = (
+                "observer_incomplete"
+                if result.reason == "observer_incomplete"
+                else "acceptance_failed"
+            )
+            _emit_jsonl(
+                output,
+                kind,
+                now_provider=now_provider,
+                reason=result.reason,
+                rollback_target=_rollback_fields(result.rollback_target),
+            )
+            return (
+                EXIT_OBSERVER_INCOMPLETE
+                if kind == "observer_incomplete"
+                else EXIT_ACCEPTANCE_FAILED
+            )
+    if not observed_any:
+        _emit_jsonl(
+            output,
+            "observer_incomplete",
+            now_provider=now_provider,
+            reason="sample_stream_ended",
+        )
+        return EXIT_OBSERVER_INCOMPLETE
+    result = tracker.finalize()
+    kind = "acceptance_summary" if result.passed else "acceptance_failed"
+    _emit_jsonl(
+        output,
+        kind,
+        now_provider=now_provider,
+        passed=result.passed,
+        reason=result.reason,
+        rollback_target=_rollback_fields(result.rollback_target),
+        raw_message_count=tracker.raw_message_count,
+        distinct_chat_count=tracker.distinct_chat_count,
+        peak_lanes=tracker.peak_lanes,
+        max_backlog=tracker.max_backlog,
+        cross_chat_progress=tracker.cross_chat_progress,
+    )
+    return 0 if result.passed else EXIT_ACCEPTANCE_FAILED
+
+
+def run_rollback_samples(
+    samples: Iterable[RuntimeObservation],
+    tracker: RollbackConvergenceTracker,
+    *,
+    output: TextIO = sys.stdout,
+    now_provider: Callable[[], str] = _utc_now,
+) -> int:
+    incomplete_count = 0
+    for sample in samples:
+        _emit_jsonl(
+            output,
+            "sample",
+            now_provider=now_provider,
+            mode="rollback-convergence",
+            **_runtime_sample_fields(sample),
+        )
+        if not sample.complete:
+            incomplete_count += 1
+            if incomplete_count >= 2:
+                _emit_jsonl(
+                    output,
+                    "observer_incomplete",
+                    now_provider=now_provider,
+                    reason="observer_incomplete",
+                )
+                return EXIT_OBSERVER_INCOMPLETE
+        else:
+            incomplete_count = 0
+        result = tracker.observe(sample)
+        if result.passed:
+            _emit_jsonl(
+                output,
+                "rollback_converged",
+                now_provider=now_provider,
+                consecutive=result.consecutive,
+            )
+            return 0
+        if result.failed:
+            _emit_jsonl(
+                output,
+                "rollback_convergence_failed",
+                now_provider=now_provider,
+                reason=result.reason,
+                consecutive=result.consecutive,
+            )
+            return EXIT_ACCEPTANCE_FAILED
+    _emit_jsonl(
+        output,
+        "observer_incomplete",
+        now_provider=now_provider,
+        reason="sample_stream_ended",
+    )
+    return EXIT_OBSERVER_INCOMPLETE
+
+
+def _add_common_observation_arguments(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--database", type=Path, required=True)
+    parser.add_argument("--ingest-url", required=True)
+    parser.add_argument("--worker-url", required=True)
+    parser.add_argument("--web-url", required=True)
+    parser.add_argument("--baseline-raw-message-id", type=int, required=True)
+    parser.add_argument("--baseline-job-id", type=int, required=True)
+    parser.add_argument("--ingest-pid", type=int, required=True)
+    parser.add_argument("--worker-pid", type=int, required=True)
+    parser.add_argument("--web-pid", type=int, required=True)
+    parser.add_argument("--poll-interval", type=float, default=0.25)
+    parser.add_argument("--http-timeout", type=float, default=1.0)
+    parser.add_argument(
+        "--target-lock-mode", choices=("global", "per_chat"), required=True
+    )
+    parser.add_argument("--target-cap", type=int, required=True)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Read-only Phase 7 state observer; JSONL is written to stdout."
+    )
+    subparsers = parser.add_subparsers(dest="mode", required=True)
+
+    convergence = subparsers.add_parser("convergence")
+    _add_common_observation_arguments(convergence)
+    convergence.add_argument("--deadline", type=float, default=5.0)
+    convergence.add_argument("--required-consecutive", type=int, default=3)
+    convergence.add_argument("--previous-limit-applied-at", required=True)
+
+    acceptance = subparsers.add_parser("acceptance")
+    _add_common_observation_arguments(acceptance)
+    acceptance.add_argument("--window", type=float, default=7200.0)
+    acceptance.add_argument(
+        "--guard-counters-file",
+        type=Path,
+        required=True,
+        help="Read-only JSON snapshot containing all external anomaly deltas.",
+    )
+
+    rollback = subparsers.add_parser("rollback-convergence")
+    _add_common_observation_arguments(rollback)
+    rollback.add_argument("--deadline", type=float, default=5.0)
+    rollback.add_argument("--required-consecutive", type=int, default=3)
+    return parser
+
+
+def _expected_pids_from_args(args: argparse.Namespace) -> AuthorityPids:
+    return AuthorityPids(args.ingest_pid, args.worker_pid, args.web_pid)
+
+
+def _target_from_args(args: argparse.Namespace) -> ExpectedRuntimeState:
+    return ExpectedRuntimeState(
+        args.target_lock_mode,
+        args.target_cap,
+        "queue",
+        "queue",
+    )
+
+
+def _incomplete_runtime(elapsed_seconds: float) -> RuntimeObservation:
+    return RuntimeObservation(
+        elapsed_seconds=elapsed_seconds,
+        complete=False,
+        database_state=None,
+        api_state=None,
+        pids=None,
+        worker_role=None,
+        worker_cap=None,
+        active_lanes=None,
+        peak_lanes=None,
+        limit_applied_at=None,
+    )
+
+
+KNOWN_INCOMPLETE_ERRORS = (
+    OSError,
+    ValueError,
+    KeyError,
+    sqlite3.Error,
+)
+
+
+def _collect_runtime_with_retry(
+    args: argparse.Namespace,
+    *,
+    elapsed_seconds: float,
+) -> tuple[DatabaseObservation | None, RuntimeObservation]:
+    for _attempt in range(2):
+        try:
+            database = collect_database_observation(
+                args.database,
+                baseline_raw_message_id=args.baseline_raw_message_id,
+                baseline_job_id=args.baseline_job_id,
+            )
+            runtime = collect_runtime_observation(
+                database,
+                elapsed_seconds=elapsed_seconds,
+                expected_pids=_expected_pids_from_args(args),
+                ingest_base_url=args.ingest_url,
+                worker_base_url=args.worker_url,
+                web_base_url=args.web_url,
+                timeout_seconds=args.http_timeout,
+            )
+            return database, runtime
+        except KNOWN_INCOMPLETE_ERRORS:
+            continue
+    return None, _incomplete_runtime(elapsed_seconds)
+
+
+def _runtime_samples(args: argparse.Namespace) -> Iterable[RuntimeObservation]:
+    started = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - started
+        _database, runtime = _collect_runtime_with_retry(
+            args, elapsed_seconds=elapsed
+        )
+        elapsed = time.monotonic() - started
+        runtime = replace(runtime, elapsed_seconds=elapsed)
+        yield runtime
+        if elapsed > args.deadline:
+            return
+        time.sleep(args.poll_interval)
+
+
+GUARD_COUNTER_FIELDS = (
+    "stuck_job_count",
+    "sqlite_lock_count",
+    "loop_stall_count",
+    "session_conflict_count",
+    "deepseek_402_count",
+    "ingest_anomaly_count",
+    "execution_anomaly_count",
+)
+
+
+def _read_guard_counters(path: Path) -> dict[str, int]:
+    with Path(path).open(encoding="utf-8") as handle:
+        payload = json.load(handle)
+    if not isinstance(payload, dict):
+        raise ValueError("guard counters payload is not an object")
+    return {field: int(payload[field]) for field in GUARD_COUNTER_FIELDS}
+
+
+def _acceptance_samples(
+    args: argparse.Namespace,
+) -> Iterable[AcceptanceObservation]:
+    started = time.monotonic()
+    while True:
+        elapsed = time.monotonic() - started
+        database, runtime = _collect_runtime_with_retry(
+            args, elapsed_seconds=elapsed
+        )
+        guards: dict[str, int] | None = None
+        if database is not None and runtime.complete:
+            for _attempt in range(2):
+                try:
+                    guards = _read_guard_counters(args.guard_counters_file)
+                    break
+                except KNOWN_INCOMPLETE_ERRORS:
+                    continue
+        elapsed = time.monotonic() - started
+        runtime = replace(runtime, elapsed_seconds=elapsed)
+        if database is None or guards is None:
+            runtime = _incomplete_runtime(elapsed)
+            database = DatabaseObservation(
+                state=_target_from_args(args),
+                semantic_review_enabled=False,
+                query_only=0,
+                journal_mode="unknown",
+                total_changes=0,
+                jobs=(),
+                raw_message_count=0,
+                distinct_chat_count=0,
+                pending_count=0,
+                claimed_count=0,
+                duplicate_job_count=0,
+                missing_job_count=0,
+                orphan_job_count=0,
+            )
+            guards = {field: 0 for field in GUARD_COUNTER_FIELDS}
+        elif (
+            database.query_only != 1
+            or database.total_changes != 0
+            or database.journal_mode.lower() != "wal"
+        ):
+            guards["sqlite_lock_count"] += 1
+        if database.semantic_review_enabled:
+            guards["ingest_anomaly_count"] += 1
+        yield AcceptanceObservation(
+            runtime=runtime,
+            jobs=database.jobs,
+            raw_message_count=database.raw_message_count,
+            distinct_chat_count=database.distinct_chat_count,
+            pending_count=database.pending_count,
+            claimed_count=database.claimed_count,
+            duplicate_job_count=database.duplicate_job_count,
+            missing_job_count=database.missing_job_count,
+            orphan_job_count=database.orphan_job_count,
+            **guards,
+        )
+        if elapsed >= args.window:
+            return
+        time.sleep(args.poll_interval)
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = build_parser().parse_args(argv)
+    target = _target_from_args(args)
+    pids = _expected_pids_from_args(args)
+    if args.mode == "convergence":
+        tracker = ConvergenceTracker(
+            target=target,
+            expected_pids=pids,
+            required_consecutive=args.required_consecutive,
+            deadline_seconds=args.deadline,
+            previous_limit_applied_at=args.previous_limit_applied_at,
+        )
+        return run_convergence_samples(_runtime_samples(args), tracker)
+    if args.mode == "acceptance":
+        tracker = AcceptanceTracker(expected_state=target, expected_pids=pids)
+        return run_acceptance_samples(_acceptance_samples(args), tracker)
+    tracker = RollbackConvergenceTracker(
+        target=target,
+        expected_pids=pids,
+        required_consecutive=args.required_consecutive,
+        deadline_seconds=args.deadline,
+    )
+    return run_rollback_samples(_runtime_samples(args), tracker)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
