@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-4-awaiting-claim
+claimed_by: codex-per-chat-opt-phase4-20260826-root
+claim_base_sha: d6768b681ece8ed43aeced19c95da35afcfeb952
+current_task: phase-4-batch150-read-only-gate-claimed
 current_phase: phase_4_batch150_read_only_gate
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-4-batch150-read-only-gate.md
 last_completed_phase: phase_3_final_candidate_review
@@ -65,7 +65,9 @@ phase_3_commits:
   - 77d570ee2187c7e7bbbaf53b6a55f1d0efb135de
   - e37146eaea03befac6457fa224e9dad0cd6c7166
 phase_3_independent_review_status: ready_zero_findings_after_red_green_repair
-phase_4_authorization: not_started_requires_new_claim
+phase_4_authorization: production_read_only_checks_local_evidence_status_and_local_commits_only
+phase_4_remote_gate_baseline: d66afadda5e34db80851a0dae5986b622521ab3f
+phase_4_status: claimed
 phase_1_stop_conditions:
   - recognition_strategy_execution_or_exchange_semantics_change_required
   - schema_or_production_data_change_required
@@ -152,6 +154,23 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 4 claim`: session
+  `codex-per-chat-opt-phase4-20260826-root` claimed only the bounded batch `150`
+  production read-only gate at exact clean local base
+  `d6768b681ece8ed43aeced19c95da35afcfeb952`. Phase 3 frozen candidate
+  `e37146eaea03befac6457fa224e9dad0cd6c7166` and approved design
+  `9707109dfd1f0815dec6edbc8809fa3fb89a00a0` are ancestors. The local upstream,
+  local remote-tracking deploy ref, and live remote deploy branch all resolved
+  to `d66afadda5e34db80851a0dae5986b622521ab3f`; the status pointer named only
+  the Phase 4 plan, the worktree was clean and exclusive, and no Git lock was
+  present. Authorization is limited to the Phase 4 plan's bounded production
+  read-only service, deployed-SHA, database-identity, and SQLite checks; local
+  evidence; status updates; and local commits. Production writes or repairs,
+  push, deployment, restart, configuration or data changes, Telegram business
+  messages, operator/system Bot messages, replay, backup or CAS-plan creation,
+  and exchange calls are forbidden. Any incomplete or mismatched result is an
+  immediate stop condition.
 
 - `2026-08-25 Phase 3 local completion`: exact production candidate
   `e37146eaea03befac6457fa224e9dad0cd6c7166` was reviewed over diff boundary
