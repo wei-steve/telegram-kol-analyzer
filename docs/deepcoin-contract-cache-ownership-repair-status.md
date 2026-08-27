@@ -6,9 +6,9 @@ design_status: approved
 current_phase: candidate_integration
 phase_state: planned
 claimed_by: null
-candidate_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
+candidate_sha: a61c2617430a44ab629bfa0de581aca1172a2b6e
 candidate_content_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
-handoff_sha: null
+handoff_sha: a61c2617430a44ab629bfa0de581aca1172a2b6e
 pushed_sha: d2a9c4c615a3fc25af5842f6209b3a080e763e5c
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
@@ -68,6 +68,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - During this Task 12 findings repair, no push, deployment, SSH, restart,
   production/settings/database mutation, Telegram send/replay, manufactured
   traffic or Deepcoin write was performed.
+- `a61c2617430a44ab629bfa0de581aca1172a2b6e` is the evidence-bearing Task 12
+  findings handoff commit. The following status-only commit records that SHA;
+  any future exact-SHA action must use its read-only `git rev-parse HEAD`
+  result as the final local integration target, avoiding self-reference.
 - Phase 2 non-force push completed and the remote
   `codex/deepcoin-auto-trading-v1` ref was independently verified at exact SHA
   `d2a9c4c615a3fc25af5842f6209b3a080e763e5c`.
