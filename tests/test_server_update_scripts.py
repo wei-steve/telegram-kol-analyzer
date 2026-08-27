@@ -192,6 +192,16 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "task12_gate: failed_closed" in status
     assert "task12_health_classification: legacy_capability_absent" in status
     assert "task12_time_sensitive_pending_trigger_count: 7" in status
+    assert "pending_entry_cancel_candidate_status: local_complete_unpushed" in status
+    assert (
+        "pending_entry_cancel_candidate_sha: "
+        "b5d189ac" in status
+    )
+    assert "pending_entry_cancel_production_executed: false" in status
+    assert "pending_entry_cancel_live_order_count: 7" in status
+    assert "auto_trade_frozen: false" in status
+    assert "freeze_raw_message_id: null" in status
+    assert "restore_raw_message_id: null" in status
     assert "recognized migratable legacy drift" in status
     assert "bounded 100-row history coverage" in status
     assert "seven unprotected pending trigger entries" in status
