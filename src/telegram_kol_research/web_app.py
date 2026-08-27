@@ -10,10 +10,12 @@ from pathlib import Path
 from typing import Any, Callable
 import asyncio
 import concurrent.futures
+import grp
 import hashlib
 import hmac
 import json
 import logging
+import pwd
 import re
 import secrets
 import threading
@@ -60,6 +62,9 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_contract_spec_cache import (
     DeepcoinContractSpecRefreshOrchestrator,
+)
+from telegram_kol_research.contract_cache_permissions import (
+    inspect_contract_cache_permissions,
 )
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
@@ -3767,6 +3772,72 @@ def _incomplete_monitor_live_position_sizes(
     }
 
 
+def _unavailable_contract_spec_health() -> dict[str, Any]:
+    return {
+        "schema_version": 1,
+        "state": "unavailable",
+        "fetched_at": None,
+        "expires_at": None,
+        "last_success_at": None,
+        "last_refresh_succeeded": False,
+        "error_category": "unknown",
+        "ownership_contract_satisfied": False,
+    }
+
+
+def _project_contract_spec_health(app: FastAPI) -> dict[str, Any]:
+    orchestrator = app.state.contract_spec_refresh_orchestrator
+    provider = _refreshable_contract_spec_provider(
+        app.state.deepcoin_contract_spec_provider
+    )
+    if orchestrator is None or provider is None:
+        raise ValueError("contract spec health unavailable")
+    status = orchestrator.status()
+    state = status.get("state")
+    fetched_at = status.get("fetched_at")
+    expires_at = status.get("expires_at")
+    last_success_at = status.get("last_success_at")
+    last_refresh_succeeded = status.get("last_refresh_succeeded")
+    error_category = status.get("error_category")
+    if state not in {"fresh", "stale", "unavailable"}:
+        raise ValueError("invalid contract spec health state")
+    if not all(
+        value is None or isinstance(value, str)
+        for value in (fetched_at, expires_at, last_success_at)
+    ):
+        raise ValueError("invalid contract spec health time")
+    if not isinstance(last_refresh_succeeded, bool):
+        raise ValueError("invalid contract spec refresh state")
+    if error_category not in {
+        None,
+        "refresh_timeout",
+        "permission_denied",
+        "validation_failed",
+        "transport_failed",
+        "unknown",
+    }:
+        raise ValueError("invalid contract spec error category")
+    cache_path = getattr(provider, "cache_path", None)
+    if not isinstance(cache_path, Path):
+        raise ValueError("contract spec cache path unavailable")
+    permission_status = inspect_contract_cache_permissions(
+        cache_path,
+        worker_uid=pwd.getpwnam("telegram-kol-worker").pw_uid,
+        runtime_gid=grp.getgrnam("telegram-kol-runtime").gr_gid,
+        agent_user="telegram-kol-agent",
+    )
+    return {
+        "schema_version": 1,
+        "state": state,
+        "fetched_at": fetched_at,
+        "expires_at": expires_at,
+        "last_success_at": last_success_at,
+        "last_refresh_succeeded": last_refresh_succeeded,
+        "error_category": error_category,
+        "ownership_contract_satisfied": permission_status.contract_satisfied,
+    }
+
+
 def _project_monitor_live_position_sizes(
     rows: object,
     *,
@@ -5769,6 +5840,17 @@ def create_web_app(
     def api_runtime_incidents_monitor_capture_health(request: Request):
         require_monitor_capture_auth(request)
         return {"available": True, "schema_version": 1}
+
+    @app.get("/api/runtime-incidents/contract-spec-health")
+    def api_runtime_incidents_contract_spec_health(request: Request):
+        if app.state.runtime_role != "worker":
+            raise HTTPException(status_code=404, detail="not found")
+        require_monitor_capture_auth(request)
+        try:
+            return _project_contract_spec_health(app)
+        except Exception:
+            logger.warning("Monitor contract-spec projection is unavailable")
+            return _unavailable_contract_spec_health()
 
     @app.get("/api/runtime-incidents/live-position-sizes")
     def api_runtime_incidents_live_position_sizes(request: Request):

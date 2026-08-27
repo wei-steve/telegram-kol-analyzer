@@ -8181,6 +8181,148 @@ def test_monitor_incident_writer_health_probe_is_persistence_free(tmp_path):
         assert session.query(RuntimeIncident).count() == 0
 
 
+def _contract_health_provider(tmp_path):
+    fetched_at = datetime(2026, 8, 27, 0, 0, tzinfo=UTC)
+    return SimpleNamespace(
+        ttl=timedelta(hours=12),
+        cache_path=tmp_path / "deepcoin_contract_specs_cache.json",
+        snapshot=SimpleNamespace(
+            fetched_at=fetched_at,
+            expires_at=fetched_at + timedelta(hours=12),
+        ),
+        metadata=SimpleNamespace(
+            last_success_at=fetched_at,
+            expires_at=fetched_at + timedelta(hours=12),
+            last_error=None,
+        ),
+        refresh=lambda: True,
+    )
+
+
+def test_contract_spec_health_is_worker_only_and_uses_monitor_auth(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    path = "/api/runtime-incidents/contract-spec-health"
+    ownership_calls = []
+    monkeypatch.setattr(
+        web_app_module,
+        "inspect_contract_cache_permissions",
+        lambda cache_path, **kwargs: ownership_calls.append((cache_path, kwargs))
+        or SimpleNamespace(contract_satisfied=True),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "pwd",
+        SimpleNamespace(getpwnam=lambda _name: SimpleNamespace(pw_uid=501)),
+        raising=False,
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "grp",
+        SimpleNamespace(getgrnam=lambda _name: SimpleNamespace(gr_gid=502)),
+        raising=False,
+    )
+
+    for role in ("all", "ingest", "web"):
+        hidden_app = create_web_app(
+            database_path=tmp_path / f"{role}.db",
+            runtime_role=role,
+            runtime_incident_config=RuntimeIncidentConfig(
+                monitor_capture_token=token,
+            ),
+            deepcoin_contract_spec_provider=_contract_health_provider(tmp_path),
+            now_provider=lambda: datetime(2026, 8, 27, 1, 0, tzinfo=UTC),
+        )
+        hidden = TestClient(hidden_app, client=("127.0.0.1", 50000)).get(
+            path,
+            headers={"x-monitor-capture-token": token},
+        )
+        assert hidden.status_code == 404
+
+    app = create_web_app(
+        database_path=tmp_path / "worker.db",
+        runtime_role="worker",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_contract_spec_provider=_contract_health_provider(tmp_path),
+        now_provider=lambda: datetime(2026, 8, 27, 1, 0, tzinfo=UTC),
+    )
+    remote = TestClient(app, client=("198.51.100.8", 50000)).get(
+        path,
+        headers={"x-monitor-capture-token": token},
+    )
+    missing = TestClient(app, client=("127.0.0.1", 50000)).get(path)
+    accepted = TestClient(app, client=("127.0.0.1", 50000)).get(
+        path,
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert remote.status_code == missing.status_code == 404
+    assert accepted.status_code == 200
+    assert accepted.json() == {
+        "schema_version": 1,
+        "state": "fresh",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "expires_at": "2026-08-27T12:00:00Z",
+        "last_success_at": "2026-08-27T00:00:00Z",
+        "last_refresh_succeeded": True,
+        "error_category": None,
+        "ownership_contract_satisfied": True,
+    }
+    assert ownership_calls == [
+        (
+            tmp_path / "deepcoin_contract_specs_cache.json",
+            {
+                "worker_uid": 501,
+                "runtime_gid": 502,
+                "agent_user": "telegram-kol-agent",
+            },
+        )
+    ]
+
+
+def test_contract_spec_health_fails_closed_without_leaking_errors(
+    tmp_path, monkeypatch
+):
+    token = "m" * 43
+    app = create_web_app(
+        database_path=tmp_path / "worker.db",
+        runtime_role="worker",
+        runtime_incident_config=RuntimeIncidentConfig(
+            monitor_capture_token=token,
+        ),
+        deepcoin_contract_spec_provider=_contract_health_provider(tmp_path),
+    )
+    monkeypatch.setattr(
+        app.state.contract_spec_refresh_orchestrator,
+        "status",
+        lambda: (_ for _ in ()).throw(
+            RuntimeError("secret path credential signed response")
+        ),
+    )
+
+    response = TestClient(app, client=("127.0.0.1", 50000)).get(
+        "/api/runtime-incidents/contract-spec-health",
+        headers={"x-monitor-capture-token": token},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "schema_version": 1,
+        "state": "unavailable",
+        "fetched_at": None,
+        "expires_at": None,
+        "last_success_at": None,
+        "last_refresh_succeeded": False,
+        "error_category": "unknown",
+        "ownership_contract_satisfied": False,
+    }
+    assert "secret" not in response.text
+
+
 def test_monitor_live_position_sizes_requires_loopback_and_dedicated_token(
     tmp_path,
 ):

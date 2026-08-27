@@ -93,6 +93,7 @@ class DeepcoinContractSpecRefreshOrchestrator:
             thread_name_prefix="deepcoin-contract-spec-refresh",
         )
         self._closed = False
+        self._last_refresh_succeeded: bool | None = None
         half_ttl_seconds = ttl.total_seconds() / 2
         self.interval_seconds = max(
             float(minimum_interval_seconds),
@@ -181,14 +182,25 @@ class DeepcoinContractSpecRefreshOrchestrator:
             state = "stale"
         else:
             state = "fresh"
+        raw_error = (
+            error_override
+            if error_override is not None
+            else getattr(metadata, "last_error", None)
+        )
+        if refresh_succeeded is not None:
+            self._last_refresh_succeeded = refresh_succeeded
+        last_refresh_succeeded = self._last_refresh_succeeded
+        if last_refresh_succeeded is None:
+            last_refresh_succeeded = state == "fresh" and raw_error is None
         return {
             "state": state,
             "refresh_succeeded": refresh_succeeded,
+            "fetched_at": self._format_datetime(snapshot_fetched_at),
             "last_success_at": self._format_datetime(last_success_at),
             "expires_at": self._format_datetime(expires_at),
-            "last_error": error_override
-            if error_override is not None
-            else getattr(metadata, "last_error", None),
+            "last_refresh_succeeded": last_refresh_succeeded,
+            "error_category": _contract_spec_refresh_error_category(raw_error),
+            "last_error": raw_error,
         }
 
     def _now(self) -> datetime:
@@ -210,6 +222,33 @@ class DeepcoinContractSpecRefreshOrchestrator:
         if not isinstance(value, datetime):
             return None
         return cls._utc(value).isoformat().replace("+00:00", "Z")
+
+
+def _contract_spec_refresh_error_category(error: object) -> str | None:
+    if error is None:
+        return None
+    normalized = str(error).strip().lower()
+    if "timeout" in normalized:
+        return "refresh_timeout"
+    if "permission" in normalized:
+        return "permission_denied"
+    if any(
+        marker in normalized
+        for marker in ("valueerror", "validation", "digest", "json", "schema")
+    ):
+        return "validation_failed"
+    if any(
+        marker in normalized
+        for marker in (
+            "connection",
+            "transport",
+            "network",
+            "http",
+            "clienterror",
+        )
+    ):
+        return "transport_failed"
+    return "unknown"
 
 
 @dataclass(frozen=True)

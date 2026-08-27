@@ -116,6 +116,8 @@ def test_refresh_orchestrator_reports_timeout_without_blocking_event_loop():
     assert result["state"] == "unavailable"
     assert result["refresh_succeeded"] is False
     assert result["last_error"] == "refresh_timeout"
+    assert result["last_refresh_succeeded"] is False
+    assert result["error_category"] == "refresh_timeout"
     assert second_result["last_error"] == "refresh_timeout"
 
 
@@ -147,6 +149,50 @@ def test_refresh_orchestrator_never_reports_fresh_with_incoherent_metadata():
     )
 
     assert orchestrator.status()["state"] == "unavailable"
+
+
+def test_refresh_orchestrator_projects_bounded_fresh_health_after_failed_refresh():
+    class Provider:
+        ttl = timedelta(hours=24)
+        snapshot = type(
+            "Snapshot",
+            (),
+            {"fetched_at": NOW, "expires_at": NOW + timedelta(hours=24)},
+        )()
+        metadata = type(
+            "Metadata",
+            (),
+            {
+                "last_success_at": NOW,
+                "expires_at": NOW + timedelta(hours=24),
+                "last_error": None,
+            },
+        )()
+
+        def refresh(self):
+            raise PermissionError("secret absolute path and response body")
+
+    orchestrator = DeepcoinContractSpecRefreshOrchestrator(
+        Provider(),
+        refresh_timeout_seconds=1,
+        now_provider=lambda: NOW,
+    )
+
+    import asyncio
+
+    status = asyncio.run(orchestrator.refresh_once())
+
+    assert status == {
+        "state": "fresh",
+        "refresh_succeeded": False,
+        "fetched_at": "2026-08-08T12:00:00Z",
+        "last_success_at": "2026-08-08T12:00:00Z",
+        "expires_at": "2026-08-09T12:00:00Z",
+        "last_refresh_succeeded": False,
+        "error_category": "permission_denied",
+        "last_error": "refresh_failed:PermissionError",
+    }
+    assert "secret" not in repr(status)
 
 
 def test_validate_builds_immutable_complete_snapshot_with_exact_specs():
