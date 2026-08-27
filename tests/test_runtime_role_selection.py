@@ -436,6 +436,10 @@ def test_split_monitor_routes_incident_capture_to_worker(unit_name):
         "--live-position-sizes-url "
         "http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes"
     ) in unit
+    assert (
+        "--contract-spec-health-url "
+        "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health"
+    ) in unit
 
 
 @pytest.mark.parametrize(

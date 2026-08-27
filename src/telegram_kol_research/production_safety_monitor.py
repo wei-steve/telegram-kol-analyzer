@@ -78,7 +78,7 @@ logger = logging.getLogger(__name__)
 
 _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
-_SAFE_TIMESTAMP = re.compile(r"[0-9T:+.-]{1,40}\Z")
+_SAFE_TIMESTAMP = re.compile(r"[0-9TZ:+.-]{1,40}\Z")
 _SHA256_FINGERPRINT = re.compile(r"[0-9a-f]{64}\Z")
 _MAX_RECONCILIATION_JSON_BYTES = 1_000_000
 _TERMINAL_PREBINDING_ERROR_TYPE = "RecoveryLiveSubmitError"
@@ -165,6 +165,7 @@ MONITOR_ADAPTER_NAMES = frozenset(
         "audit",
         "composite",
         "coverage",
+        "contract_specs",
         "entry_preamble",
     }
 )
@@ -242,6 +243,10 @@ _FIXED_REASON_CODES = frozenset(
         "message_operation_supervisor_policy_invalid",
         "message_operation_coverage_incomplete",
         "instruction_execution_contradiction",
+        "contract_spec_unavailable",
+        "contract_spec_ownership_drift",
+        "contract_spec_sync_refusal_detected",
+        "contract_spec_refresh_warning",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -367,6 +372,10 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
     ),
     "audit_incomplete": ("audit_complete",),
     "adapter_failure": ("adapter_failures",),
+    "contract_spec_unavailable": ("contract_spec_state",),
+    "contract_spec_ownership_drift": ("ownership_contract_satisfied",),
+    "contract_spec_sync_refusal_detected": ("contract_spec_sync_refusal_count",),
+    "contract_spec_refresh_warning": ("contract_spec_error_category",),
     "malformed_snapshot": (),
     "state_invalid": (),
     "completed_batch_missing_component_evidence": ("composite_invariant_codes",),
@@ -429,6 +438,8 @@ class MonitorSnapshot:
     adapter_failures: Sequence[str] = ()
     state_invalid: bool = False
     message_operation_coverage: Mapping[str, Any] | None = None
+    contract_spec_health: Mapping[str, Any] | None = None
+    contract_spec_sync_refusal_count: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -492,6 +503,9 @@ class ProductionSafetyAdapters:
     )
     live_position_sizes_url: str = (
         "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes"
+    )
+    contract_spec_health_url: str = (
+        "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health"
     )
     monitor_capture_token: str | None = None
     service_name: str = "telegram-kol.service"
@@ -558,6 +572,18 @@ class ProductionSafetyAdapters:
         return read_message_operation_coverage(
             self.message_operation_coverage_url,
             token=self.monitor_capture_token,
+        )
+
+    def read_contract_spec_health(self) -> Mapping[str, Any]:
+        return read_contract_spec_health(
+            self.contract_spec_health_url,
+            token=self.monitor_capture_token,
+        )
+
+    def count_contract_spec_sync_refusals(self, *, since: datetime) -> int:
+        return read_contract_spec_sync_refusal_count(
+            self.database_path,
+            since=since,
         )
 
     def count_journal_errors(self, *, since: datetime) -> int:
@@ -2449,6 +2475,7 @@ def read_loopback_settings(
         "management_execution_mode": payload.get("management_execution_mode"),
         "max_concurrent_positions": payload.get("max_concurrent_positions"),
         "entry_preamble_mode": payload.get("entry_preamble_mode"),
+        "deepcoin_contract_specs_mode": payload.get("deepcoin_contract_specs_mode"),
         "entry_message_assembly_v2_mode": payload.get(
             "entry_message_assembly_v2_mode"
         ),
@@ -2647,6 +2674,146 @@ def read_message_operation_coverage(
     return payload
 
 
+_CONTRACT_SPEC_HEALTH_FIELDS = frozenset(
+    {
+        "schema_version",
+        "state",
+        "fetched_at",
+        "expires_at",
+        "last_success_at",
+        "last_refresh_succeeded",
+        "error_category",
+        "ownership_contract_satisfied",
+    }
+)
+_CONTRACT_SPEC_STATES = frozenset({"fresh", "stale", "unavailable"})
+_CONTRACT_SPEC_ERROR_CATEGORIES = frozenset(
+    {
+        "refresh_timeout",
+        "permission_denied",
+        "validation_failed",
+        "transport_failed",
+        "unknown",
+    }
+)
+
+
+def _validate_contract_spec_health(value: object) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping) or set(value) != _CONTRACT_SPEC_HEALTH_FIELDS:
+        raise ValueError("contract spec health schema is invalid")
+    if value.get("schema_version") != 1:
+        raise ValueError("contract spec health schema is invalid")
+    state = value.get("state")
+    if state not in _CONTRACT_SPEC_STATES:
+        raise ValueError("contract spec health state is invalid")
+    timestamps = (
+        value.get("fetched_at"),
+        value.get("expires_at"),
+        value.get("last_success_at"),
+    )
+    for timestamp in timestamps:
+        if timestamp is None:
+            continue
+        if not isinstance(timestamp, str) or not _SAFE_TIMESTAMP.fullmatch(timestamp):
+            raise ValueError("contract spec health timestamp is invalid")
+        parsed = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+        _require_aware_datetime(parsed)
+    if state in {"fresh", "stale"} and any(value is None for value in timestamps):
+        raise ValueError("contract spec health timestamp is incomplete")
+    if type(value.get("last_refresh_succeeded")) is not bool:
+        raise ValueError("contract spec refresh state is invalid")
+    error_category = value.get("error_category")
+    if error_category is not None and error_category not in _CONTRACT_SPEC_ERROR_CATEGORIES:
+        raise ValueError("contract spec error category is invalid")
+    if type(value.get("ownership_contract_satisfied")) is not bool:
+        raise ValueError("contract spec ownership state is invalid")
+    return value
+
+
+def read_contract_spec_health(
+    url: str,
+    *,
+    token: str | None,
+    timeout_seconds: float = 30.0,
+) -> Mapping[str, Any]:
+    """Read the exact worker-owned contract-spec health projection."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname != "127.0.0.1"
+        or parsed.port != 8002
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path != "/api/runtime-incidents/contract-spec-health"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise ValueError("contract spec health URL must use the exact loopback endpoint")
+    if not isinstance(token, str) or not re.fullmatch(
+        r"[A-Za-z0-9_-]{32,128}", token
+    ):
+        raise ValueError("contract spec health token unavailable")
+    body = bytearray()
+    with httpx.stream(
+        "GET",
+        url,
+        headers={"x-monitor-capture-token": token},
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > 8_192:
+                raise ValueError("contract spec health response too large")
+    payload = json.loads(
+        body,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    return _validate_contract_spec_health(payload)
+
+
+def read_contract_spec_sync_refusal_count(
+    database_path: str | Path,
+    *,
+    since: datetime,
+) -> int:
+    """Count new terminal sync refusals through a read-only SQLite handle."""
+
+    since_utc = _require_aware_datetime(since).astimezone(UTC).replace(tzinfo=None)
+    uri = Path(database_path).resolve().as_uri() + "?mode=ro"
+    try:
+        with sqlite3.connect(uri, uri=True) as connection:
+            connection.execute("PRAGMA query_only = ON")
+            columns = {
+                str(row[1])
+                for row in connection.execute(
+                    "PRAGMA table_info(instruction_execution_contracts)"
+                ).fetchall()
+            }
+            if not {"reason_code", "terminal_at"}.issubset(columns):
+                raise RuntimeError("contract spec refusal query unavailable")
+            row = connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM instruction_execution_contracts
+                WHERE reason_code = 'contract_spec_sync_unavailable'
+                  AND terminal_at >= ?
+                """,
+                (since_utc.isoformat(sep=" "),),
+            ).fetchone()
+    except (OSError, sqlite3.Error):
+        raise RuntimeError("contract spec refusal query unavailable") from None
+    if row is None or len(row) != 1:
+        raise RuntimeError("contract spec refusal query unavailable")
+    count = _safe_count(row[0])
+    if count is None:
+        raise RuntimeError("contract spec refusal query unavailable")
+    return count
+
+
 def run_production_safety_monitor(
     *,
     expectations: MonitorExpectations,
@@ -2760,6 +2927,21 @@ def run_production_safety_monitor(
         if callable(coverage_reader)
         else None
     )
+    contract_spec_health = None
+    contract_spec_sync_refusal_count = None
+    contract_health_reader = getattr(adapters, "read_contract_spec_health", None)
+    contract_refusal_reader = getattr(
+        adapters, "count_contract_spec_sync_refusals", None
+    )
+    if callable(contract_health_reader) and callable(contract_refusal_reader):
+        try:
+            contract_spec_health = contract_health_reader()
+            contract_spec_sync_refusal_count = contract_refusal_reader(since=since)
+        except Exception:
+            if "contract_specs" not in failures:
+                failures.append("contract_specs")
+            contract_spec_health = None
+            contract_spec_sync_refusal_count = None
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
@@ -2790,6 +2972,8 @@ def run_production_safety_monitor(
             adapter_failures=tuple(failures),
             state_invalid=state_integrity_alert_pending,
             message_operation_coverage=message_operation_coverage,
+            contract_spec_health=contract_spec_health,
+            contract_spec_sync_refusal_count=contract_spec_sync_refusal_count,
         ),
         expectations,
         checked_at=checked_at,
@@ -3712,6 +3896,17 @@ def evaluate_monitor_snapshot(
             reasons=reasons,
             details=details,
         )
+    if (
+        snapshot.contract_spec_health is not None
+        or snapshot.contract_spec_sync_refusal_count is not None
+    ):
+        _evaluate_contract_specs(
+            snapshot.contract_spec_health,
+            refusal_count=snapshot.contract_spec_sync_refusal_count,
+            settings=snapshot.settings,
+            reasons=reasons,
+            details=details,
+        )
 
     reason_codes = tuple(sorted(reasons))
     return MonitorResult(
@@ -3719,6 +3914,52 @@ def evaluate_monitor_snapshot(
         reason_codes=reason_codes,
         details=details,
     )
+
+
+def _evaluate_contract_specs(
+    health: object,
+    *,
+    refusal_count: object,
+    settings: object,
+    reasons: set[str],
+    details: dict[str, Any],
+) -> None:
+    try:
+        validated = _validate_contract_spec_health(health)
+    except (TypeError, ValueError):
+        reasons.add("malformed_snapshot")
+        return
+    count = _safe_count(refusal_count)
+    if count is None or not isinstance(settings, Mapping):
+        reasons.add("malformed_snapshot")
+        return
+    auto_trade_enabled = settings.get("auto_trade_enabled")
+    mode = settings.get("deepcoin_contract_specs_mode")
+    if type(auto_trade_enabled) is not bool or mode not in {"live", "shadow", "static"}:
+        reasons.add("malformed_snapshot")
+        return
+
+    state = validated["state"]
+    ownership_satisfied = validated["ownership_contract_satisfied"]
+    last_refresh_succeeded = validated["last_refresh_succeeded"]
+    restore_ready = state == "fresh" and ownership_satisfied and count == 0
+    if not auto_trade_enabled:
+        details["restore_ready"] = restore_ready
+        return
+    if mode != "live":
+        return
+    if state != "fresh":
+        reasons.add("contract_spec_unavailable")
+        details["contract_spec_state"] = state
+    if not ownership_satisfied:
+        reasons.add("contract_spec_ownership_drift")
+        details["ownership_contract_satisfied"] = False
+    if count:
+        reasons.add("contract_spec_sync_refusal_detected")
+        details["contract_spec_sync_refusal_count"] = count
+    if state == "fresh" and not last_refresh_succeeded:
+        reasons.add("contract_spec_refresh_warning")
+        details["contract_spec_error_category"] = validated["error_category"]
 
 
 _MESSAGE_OPERATION_COVERAGE_COUNT_FIELDS = frozenset(
@@ -4462,6 +4703,26 @@ _ALERT_RULES: Mapping[str, tuple[str, str, str]] = {
         "消息操作覆盖检查不完整",
         "端到端覆盖投影被截断、格式错误或计数不一致。",
     ),
+    "contract_spec_unavailable": (
+        "critical",
+        "Deepcoin 合约规格缓存不可用",
+        "自动交易开启时合约规格快照不是 fresh。",
+    ),
+    "contract_spec_ownership_drift": (
+        "critical",
+        "Deepcoin 合约规格缓存所有权漂移",
+        "worker 无法证明具备安全原子发布所需的缓存所有权。",
+    ),
+    "contract_spec_sync_refusal_detected": (
+        "critical",
+        "出现新的合约规格同步拒绝",
+        "恢复水位之后出现了新的合约规格不可用终态。",
+    ),
+    "contract_spec_refresh_warning": (
+        "review",
+        "Deepcoin 合约规格刷新失败",
+        "当前 fresh 快照仍有效，但最近一次后台刷新没有成功。",
+    ),
     "instruction_execution_contradiction": (
         "critical",
         "交易指令执行状态存在矛盾",
@@ -4483,6 +4744,9 @@ _ALERT_REASON_PRIORITY = (
     "message_operation_supervisor_stale",
     "message_operation_supervisor_policy_invalid",
     "message_operation_coverage_incomplete",
+    "contract_spec_unavailable",
+    "contract_spec_ownership_drift",
+    "contract_spec_sync_refusal_detected",
     "duplicate_manual_close",
     "service_inactive",
     "auto_trade_enabled_drift",
@@ -4495,6 +4759,7 @@ _ALERT_REASON_PRIORITY = (
     "malformed_snapshot",
     "audit_abnormal",
     "journal_errors",
+    "contract_spec_refresh_warning",
     "state_invalid",
 )
 
@@ -4679,6 +4944,10 @@ def _safe_detail_value(key: str, value: object) -> str | None:
         "entry_revision_v2_mode", "expected_entry_revision_v2_mode",
     }:
         return _safe_entry_preamble_mode(value) or "invalid"
+    if key == "contract_spec_state":
+        return value if value in _CONTRACT_SPEC_STATES else "invalid"
+    if key == "contract_spec_error_category":
+        return value if value in _CONTRACT_SPEC_ERROR_CATEGORIES else "invalid"
     if type(value) is bool:
         return "true" if value else "false"
     if _safe_count(value) is not None:

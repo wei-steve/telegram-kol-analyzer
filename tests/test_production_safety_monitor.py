@@ -38,6 +38,8 @@ from telegram_kol_research.production_safety_monitor import load_monitor_state
 from telegram_kol_research.production_safety_monitor import read_abnormal_execution_events
 from telegram_kol_research.production_safety_monitor import read_loopback_settings
 from telegram_kol_research.production_safety_monitor import read_message_operation_coverage
+from telegram_kol_research.production_safety_monitor import read_contract_spec_health
+from telegram_kol_research.production_safety_monitor import read_contract_spec_sync_refusal_count
 from telegram_kol_research.production_safety_monitor import read_composite_management_invariants
 from telegram_kol_research.production_safety_monitor import read_entry_preamble_invariants
 from telegram_kol_research.production_safety_monitor import read_adjacent_entry_invariants
@@ -224,6 +226,8 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
             "http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage",
             "--live-position-sizes-url",
             "http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes",
+            "--contract-spec-health-url",
+            "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health",
         ],
     )
 
@@ -240,6 +244,9 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
     assert calls[0]["adapters"].live_position_sizes_url.endswith(
         ":8002/api/runtime-incidents/live-position-sizes"
     )
+    assert calls[0]["adapters"].contract_spec_health_url.endswith(
+        ":8002/api/runtime-incidents/contract-spec-health"
+    )
 
 
 def _snapshot(**overrides):
@@ -251,6 +258,7 @@ def _snapshot(**overrides):
             "management_execution_mode": "live",
             "max_concurrent_positions": 4,
             "entry_preamble_mode": "live",
+            "deepcoin_contract_specs_mode": "live",
         },
         "journal_error_count": 0,
         "abnormal_events": (),
@@ -292,6 +300,102 @@ def _healthy_message_operation_coverage(**overrides):
     }
     values.update(overrides)
     return values
+
+
+def _healthy_contract_spec_health(**overrides):
+    values = {
+        "schema_version": 1,
+        "state": "fresh",
+        "fetched_at": "2026-08-27T00:00:00Z",
+        "expires_at": "2026-08-27T12:00:00Z",
+        "last_success_at": "2026-08-27T00:00:00Z",
+        "last_refresh_succeeded": True,
+        "error_category": None,
+        "ownership_contract_satisfied": True,
+    }
+    values.update(overrides)
+    return values
+
+
+@pytest.mark.parametrize(
+    ("health_overrides", "refusal_count", "expected_reason"),
+    [
+        ({"state": "stale"}, 0, "contract_spec_unavailable"),
+        (
+            {"ownership_contract_satisfied": False},
+            0,
+            "contract_spec_ownership_drift",
+        ),
+        ({}, 1, "contract_spec_sync_refusal_detected"),
+        (
+            {
+                "last_refresh_succeeded": False,
+                "error_category": "transport_failed",
+            },
+            0,
+            "contract_spec_refresh_warning",
+        ),
+    ],
+)
+def test_live_auto_trade_contract_spec_health_is_fail_closed(
+    health_overrides, refusal_count, expected_reason
+):
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            contract_spec_health=_healthy_contract_spec_health(**health_overrides),
+            contract_spec_sync_refusal_count=refusal_count,
+        ),
+        EXPECTATIONS,
+    )
+
+    assert expected_reason in result.reason_codes
+
+
+def test_frozen_auto_trade_reports_restore_not_ready_without_trade_incident():
+    settings = dict(_snapshot().settings)
+    settings["auto_trade_enabled"] = False
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            settings=settings,
+            contract_spec_health=_healthy_contract_spec_health(
+                state="stale",
+                ownership_contract_satisfied=False,
+                last_refresh_succeeded=False,
+                error_category="permission_denied",
+            ),
+            contract_spec_sync_refusal_count=2,
+        ),
+        MonitorExpectations(
+            head=REVIEWED_HEAD,
+            auto_trade_enabled=False,
+            management_execution_mode="live",
+            max_concurrent_positions=4,
+            entry_preamble_mode="live",
+        ),
+    )
+
+    assert result.reason_codes == ()
+    assert result.healthy is True
+    assert result.details["restore_ready"] is False
+
+
+@pytest.mark.parametrize("mode", ["static", "shadow"])
+def test_non_live_contract_spec_mode_does_not_block_current_trading(mode):
+    settings = dict(_snapshot().settings)
+    settings["deepcoin_contract_specs_mode"] = mode
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            settings=settings,
+            contract_spec_health=_healthy_contract_spec_health(
+                state="unavailable",
+                ownership_contract_satisfied=False,
+            ),
+            contract_spec_sync_refusal_count=3,
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.reason_codes == ()
 
 
 def test_monitor_surfaces_bounded_instruction_execution_contradiction_in_chinese():
@@ -3310,6 +3414,32 @@ class _RecordingAdapters:
         return self.audit
 
 
+def test_contract_spec_sources_share_since_and_fail_closed_as_one_adapter(tmp_path):
+    class ContractSpecAdapters(_RecordingAdapters):
+        def read_contract_spec_health(self):
+            self.calls.append("contract-health")
+            return _healthy_contract_spec_health()
+
+        def count_contract_spec_sync_refusals(self, *, since):
+            self.calls.append(("contract-refusals", since))
+            raise RuntimeError("incomplete external query with secret detail")
+
+    adapters = ContractSpecAdapters()
+    checked_at = datetime(2026, 8, 27, 2, 0, tzinfo=UTC)
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=adapters,
+        now=checked_at,
+        notify=False,
+    )
+
+    assert outcome.result.reason_codes == ("adapter_failure",)
+    assert outcome.result.details["adapter_failures"] == ("contract_specs",)
+    assert "contract-health" in adapters.calls
+    assert ("contract-refusals", checked_at - timedelta(minutes=35)) in adapters.calls
+
+
 def test_authoritative_processor_required_journal_signal_is_critical(tmp_path):
     class AuthorityMissingAdapters(_RecordingAdapters):
         def read_journal_summary(self, *, since):
@@ -4891,6 +5021,7 @@ def test_monitor_incident_capture_projection_accepts_every_monitor_adapter():
             "composite",
             "coverage",
             "entry_preamble",
+            "contract_specs",
         ),
         notification_status="suppressed",
         monitor_error=None,
@@ -4908,6 +5039,15 @@ def test_entry_preamble_adapter_failure_is_preserved_by_evaluator():
 
     assert result.reason_codes == ("adapter_failure",)
     assert result.details["adapter_failures"] == ("entry_preamble",)
+
+
+def test_contract_spec_adapter_failure_is_preserved_by_evaluator():
+    result = evaluate_monitor_snapshot(
+        _snapshot(adapter_failures=("contract_specs",)), EXPECTATIONS
+    )
+
+    assert result.reason_codes == ("adapter_failure",)
+    assert result.details["adapter_failures"] == ("contract_specs",)
 
 
 @pytest.mark.parametrize("port", [8000, 8002])
@@ -5122,6 +5262,121 @@ def test_message_operation_coverage_reader_rejects_oversized_response(monkeypatc
         read_message_operation_coverage(
             "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
             token="c" * 43,
+        )
+
+
+def test_contract_spec_health_reader_is_exact_authenticated_and_closed(monkeypatch):
+    calls = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield json.dumps(_healthy_contract_spec_health()).encode("utf-8")
+
+    def stream(*args, **kwargs):
+        calls.append((args, kwargs))
+        return Response()
+
+    monkeypatch.setattr(monitor_module.httpx, "stream", stream)
+    url = "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health"
+
+    assert read_contract_spec_health(url, token="c" * 43) == (
+        _healthy_contract_spec_health()
+    )
+    assert calls == [
+        (
+            ("GET", url),
+            {
+                "headers": {"x-monitor-capture-token": "c" * 43},
+                "timeout": 30.0,
+                "trust_env": False,
+            },
+        )
+    ]
+    for invalid_url in (
+        "http://127.0.0.1:8000/api/runtime-incidents/contract-spec-health",
+        "http://localhost:8002/api/runtime-incidents/contract-spec-health",
+        "https://127.0.0.1:8002/api/runtime-incidents/contract-spec-health",
+        "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health?q=1",
+    ):
+        with pytest.raises(ValueError, match="exact loopback"):
+            read_contract_spec_health(invalid_url, token="c" * 43)
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"schema_version":1,"schema_version":1}',
+        json.dumps(
+            {**_healthy_contract_spec_health(), "raw_specs": "secret"}
+        ).encode(),
+        json.dumps(
+            _healthy_contract_spec_health(last_refresh_succeeded="false")
+        ).encode(),
+    ],
+)
+def test_contract_spec_health_reader_rejects_non_closed_payload(monkeypatch, body):
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_bytes(self):
+            yield body
+
+    monkeypatch.setattr(
+        monitor_module.httpx,
+        "stream",
+        lambda *args, **kwargs: Response(),
+    )
+
+    with pytest.raises((TypeError, ValueError, json.JSONDecodeError)):
+        read_contract_spec_health(
+            "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health",
+            token="c" * 43,
+        )
+
+
+def test_contract_spec_refusal_count_uses_read_only_since_watermark(tmp_path):
+    database = tmp_path / "refusals.db"
+    with sqlite3.connect(database) as connection:
+        connection.execute(
+            "CREATE TABLE instruction_execution_contracts "
+            "(reason_code TEXT, terminal_at TEXT)"
+        )
+        connection.executemany(
+            "INSERT INTO instruction_execution_contracts VALUES (?, ?)",
+            [
+                ("contract_spec_sync_unavailable", "2026-08-27 00:00:00"),
+                ("contract_spec_sync_unavailable", "2026-08-26 23:59:59"),
+                ("other", "2026-08-27 01:00:00"),
+            ],
+        )
+
+    assert read_contract_spec_sync_refusal_count(
+        database,
+        since=datetime(2026, 8, 27, 0, 0, tzinfo=UTC),
+    ) == 1
+
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE instruction_execution_contracts")
+    with pytest.raises(RuntimeError, match="unavailable"):
+        read_contract_spec_sync_refusal_count(
+            database,
+            since=datetime(2026, 8, 27, 0, 0, tzinfo=UTC),
         )
 
 

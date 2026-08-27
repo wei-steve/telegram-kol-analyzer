@@ -8024,6 +8024,7 @@ def test_monitor_incident_writer_accepts_every_monitor_adapter(
                 "audit",
                 "composite",
                 "coverage",
+                "contract_specs",
                 "entry_preamble",
             ],
             "notification_error": None,
@@ -8041,6 +8042,7 @@ def test_monitor_incident_writer_accepts_every_monitor_adapter(
         "audit",
         "composite",
         "coverage",
+        "contract_specs",
         "entry_preamble",
     )
 

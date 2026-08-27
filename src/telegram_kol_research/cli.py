@@ -2625,6 +2625,10 @@ def monitor_production_safety(
         "http://127.0.0.1:8000/api/runtime-incidents/live-position-sizes",
         "--live-position-sizes-url",
     ),
+    contract_spec_health_url: str = typer.Option(
+        "http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health",
+        "--contract-spec-health-url",
+    ),
     lookback_minutes: int = typer.Option(35, "--lookback-minutes", min=1, max=120),
     notify: bool = typer.Option(False, "--notify"),
     force_full_audit: bool = typer.Option(False, "--force-full-audit"),
@@ -2701,6 +2705,7 @@ def monitor_production_safety(
             worker_loop_health_url=worker_loop_health_url,
             message_operation_coverage_url=message_operation_coverage_url,
             live_position_sizes_url=live_position_sizes_url,
+            contract_spec_health_url=contract_spec_health_url,
             monitor_capture_token=runtime_config.monitor_capture_token,
         ),
         now=datetime.now(UTC),
