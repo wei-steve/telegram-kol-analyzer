@@ -32,7 +32,7 @@ def _stub_agent_acl(monkeypatch, *, permission: str = "---") -> list[str]:
 
     monkeypatch.setattr(
         contract_cache_permissions,
-        "_set_agent_acl_fd",
+        "set_contract_cache_agent_deny_acl_fd",
         record_write,
     )
     return writes
@@ -212,6 +212,50 @@ def test_inspect_is_read_only(tmp_path, monkeypatch):
     assert after.st_gid == before.st_gid
     assert after.st_mode == before.st_mode
     assert after.st_mtime_ns == before.st_mtime_ns
+
+
+@pytest.mark.parametrize("operation", ["inspect", "converge"])
+def test_directory_entry_replacement_during_acl_read_fails_closed(
+    operation, tmp_path, monkeypatch
+):
+    from telegram_kol_research import contract_cache_permissions
+
+    path = tmp_path / "deepcoin_contract_specs_cache.json"
+    path.write_text("original", encoding="utf-8")
+    path.chmod(0o660)
+    original_inode = path.stat().st_ino
+    monkeypatch.setattr(
+        contract_cache_permissions,
+        "set_contract_cache_agent_deny_acl_fd",
+        lambda _fd, *, agent_user: None,
+    )
+    swapped = False
+
+    def swap_during_acl_read(_fd, *, agent_user):
+        nonlocal swapped
+        if not swapped:
+            replacement = tmp_path / "replacement.json"
+            replacement.write_text("replacement", encoding="utf-8")
+            replacement.chmod(0o600)
+            os.replace(replacement, path)
+            swapped = True
+        return "---"
+
+    monkeypatch.setattr(
+        contract_cache_permissions,
+        "_read_agent_acl_fd",
+        swap_during_acl_read,
+    )
+
+    action = _inspect if operation == "inspect" else _converge
+    with pytest.raises(ContractCachePermissionError) as caught:
+        action(path)
+
+    current = path.stat()
+    assert caught.value.category == "verification_failed"
+    assert current.st_ino != original_inode
+    assert stat.S_IMODE(current.st_mode) == 0o600
+    assert path.read_text(encoding="utf-8") == "replacement"
 
 
 def _replace_as_nobody(parent: Path, target: Path, temporary_name: str) -> int:

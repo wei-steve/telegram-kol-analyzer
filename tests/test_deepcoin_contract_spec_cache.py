@@ -617,9 +617,11 @@ def test_cache_publish_and_load_round_trip_atomically(tmp_path):
     assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
 
 
-def test_cache_publish_clears_inherited_posix_acl_before_group_mode(
+def test_cache_publish_clears_inherited_acl_then_restores_agent_deny(
     tmp_path, monkeypatch
 ):
+    from telegram_kol_research import contract_cache_permissions
+
     cache_path = tmp_path / "deepcoin_contract_specs.json"
     snapshot = validate_deepcoin_instrument_snapshot(
         [_row("BTC-USDT-SWAP")],
@@ -651,11 +653,30 @@ def test_cache_publish_clears_inherited_posix_acl_before_group_mode(
         recording_fchmod,
     )
 
+    def recording_agent_deny(fd, *, agent_user):
+        metadata = os.fstat(fd)
+        events.append(
+            (
+                "agent_deny",
+                agent_user,
+                stat.S_ISREG(metadata.st_mode),
+                stat.S_IMODE(metadata.st_mode),
+            )
+        )
+
+    monkeypatch.setattr(
+        contract_cache_permissions,
+        "set_contract_cache_agent_deny_acl_fd",
+        recording_agent_deny,
+        raising=False,
+    )
+
     publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
 
     assert events[0][0] == "clear_acl"
     assert events[0][1][:3] == ("/usr/bin/setfacl", "-b", "--")
     assert events[1] == ("fchmod", 0o660)
+    assert events[2] == ("agent_deny", "telegram-kol-agent", True, 0o660)
 
 
 def test_cache_digest_verification_is_independent_of_json_key_and_row_order(tmp_path):

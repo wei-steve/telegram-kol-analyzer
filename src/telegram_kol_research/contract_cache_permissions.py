@@ -110,7 +110,9 @@ def _read_agent_acl_fd(fd: int, *, agent_user: str) -> str | None:
     return matches[0] if matches else None
 
 
-def _set_agent_acl_fd(fd: int, *, agent_user: str) -> None:
+def set_contract_cache_agent_deny_acl_fd(fd: int, *, agent_user: str) -> None:
+    """Apply the fixed cache ACL through an already validated descriptor."""
+
     _run_acl_command(
         [
             "/usr/bin/setfacl",
@@ -135,16 +137,29 @@ def _validate_metadata(metadata: os.stat_result, *, worker_uid: int) -> None:
 def _status_from_fd(
     fd: int,
     *,
+    directory_fd: int,
+    name: str,
     worker_uid: int,
     runtime_gid: int,
     agent_user: str,
 ) -> ContractCachePermissionStatus:
+    initial_metadata = os.fstat(fd)
+    _validate_metadata(initial_metadata, worker_uid=worker_uid)
+    acl_satisfied = _read_agent_acl_fd(fd, agent_user=agent_user) == "---"
     metadata = os.fstat(fd)
+    try:
+        current_metadata = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    except OSError:
+        _raise("verification_failed")
+    if (
+        metadata.st_dev != current_metadata.st_dev
+        or metadata.st_ino != current_metadata.st_ino
+    ):
+        _raise("verification_failed")
     _validate_metadata(metadata, worker_uid=worker_uid)
     owner_satisfied = metadata.st_uid == worker_uid
     group_satisfied = metadata.st_gid == runtime_gid
     mode_satisfied = stat.S_IMODE(metadata.st_mode) == 0o660
-    acl_satisfied = _read_agent_acl_fd(fd, agent_user=agent_user) == "---"
     contract_satisfied = all(
         (owner_satisfied, group_satisfied, mode_satisfied, acl_satisfied)
     )
@@ -191,6 +206,8 @@ def inspect_contract_cache_permissions(
         try:
             return _status_from_fd(
                 fd,
+                directory_fd=directory_fd,
+                name=path.name,
                 worker_uid=worker_uid,
                 runtime_gid=runtime_gid,
                 agent_user=agent_user,
@@ -222,7 +239,7 @@ def converge_contract_cache_permissions(
             try:
                 os.fchown(fd, worker_uid, runtime_gid)
                 os.fchmod(fd, 0o660)
-                _set_agent_acl_fd(fd, agent_user=agent_user)
+                set_contract_cache_agent_deny_acl_fd(fd, agent_user=agent_user)
             except ContractCachePermissionError:
                 raise
             except OSError as exc:
@@ -231,6 +248,8 @@ def converge_contract_cache_permissions(
                 _raise("verification_failed")
             status = _status_from_fd(
                 fd,
+                directory_fd=directory_fd,
+                name=path.name,
                 worker_uid=worker_uid,
                 runtime_gid=runtime_gid,
                 agent_user=agent_user,

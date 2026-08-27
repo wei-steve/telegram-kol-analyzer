@@ -26,6 +26,7 @@ from types import MappingProxyType
 from typing import Any
 from typing import Mapping
 
+from telegram_kol_research import contract_cache_permissions
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 
 
@@ -483,6 +484,11 @@ def publish_deepcoin_contract_spec_snapshot(
                     if exc.errno != errno.ENODATA:
                         raise
         os.fchmod(descriptor, 0o660)
+        if sys.platform.startswith("linux"):
+            contract_cache_permissions.set_contract_cache_agent_deny_acl_fd(
+                descriptor,
+                agent_user="telegram-kol-agent",
+            )
         with os.fdopen(descriptor, "wb") as temporary_file:
             temporary_file.write(serialized_payload)
             temporary_file.flush()
