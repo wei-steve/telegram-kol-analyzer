@@ -30,12 +30,12 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
-workstream_status: claimed
-claimed_by: codex-per-chat-phase8-scope-20260826-root
+workstream_status: in_progress
+claimed_by: null
 claim_base_sha: ce2febd11b137bf66fad8db201b366381cbb5817
-current_task: phase-8-authoritative-scope-definition
-current_phase: phase_8_scope_definition
-current_phase_file: null
+current_task: phase-8-awaiting-owner-scope-decision
+current_phase: phase_8_scope_awaiting_owner_decision
+current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-8-scope-definition.md
 last_completed_phase: phase_7_cutover_acceptance
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
@@ -166,6 +166,13 @@ phase_7_r7_final_guard_status: identity_unsettled_stuck_loop_session_pid_sqlite_
 phase_7_r7_combined_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-missing-grace-r7-20260827T052358Z/combined-acceptance.json
 phase_7_r7_combined_evidence_sha256: 38cc690f9e31a0f94976c8851170618a38a9e21ed35bc280aeed94d5c7a02b5a
 phase_8_eligibility: eligible_requires_separate_phase_8_claim_and_scope
+phase_8_scope_status: design_and_executable_plan_complete_awaiting_one_owner_decision
+phase_8_scope_claim_commit: af839f65a67ef4f9bff9fcf17e5142ce6b39c65e
+phase_8_scope_plan_commit: ea4ec63ccb250047925ae76d5d7cb958ff4e5163
+phase_8_current_risk_level: l0_documentation_only
+phase_8_monitoring_impact: none_in_scope_definition
+phase_8_gate_impact: none_phase_7_acceptance_preserved
+phase_8_implementation_authorization: not_granted_until_owner_selects_scope
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -448,6 +455,26 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 8 scope definition and plan complete`: self-contained phase
+  file
+  `docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-8-scope-definition.md`
+  was committed at `ea4ec63ccb250047925ae76d5d7cb958ff4e5163` after
+  `git diff --check` and explicit-path cached-path verification passed. The
+  authoritative seven-session plan ends at Phase 7, while the total plan says
+  successful acceptance transitions directly to terminal `completed`/`done`.
+  Canonical eligibility alone does not uniquely choose between L0 terminal
+  closeout, a new monitoring-hardening deliverable, or another owner-specified
+  goal. The phase file records those bounded alternatives, recommends terminal
+  closeout, and asks exactly one owner scope question. Current monitoring impact
+  and gate impact are both none: production remains accepted at
+  `per_chat + 3 + queue`, and Phase 7 evidence is preserved without rerun or
+  waiver. No production code or test changed, so RED, GREEN, focused pytest,
+  independent code review, and the complete suite were not applicable and were
+  not run. No push, deployment, restart, cutover, rollback, production access
+  or mutation, replay, worker command, manufactured traffic, test trade, or
+  exchange write occurred. The claim is released pending the single owner
+  decision recorded in the phase file.
 
 - `2026-08-26 Phase 8 scope-definition claim`: session
   `codex-per-chat-phase8-scope-20260826-root` exclusively claimed Phase 8 at
