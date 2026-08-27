@@ -35,6 +35,10 @@ from telegram_kol_research.entry_revision_risk import (
 from telegram_kol_research.entry_revision_planner import (
     plan_post_submit_entry_fragment_revisions,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    acquire_entry_revision_exchange_authority,
+    release_entry_revision_exchange_authority,
+)
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
@@ -431,8 +435,69 @@ def _scale_replacement_legs(
     return scaled
 
 
-@serialized_position_authority_mutation
 def execute_entry_revision(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    deepcoin_client,
+    risk_reduction_executor=None,
+    contract_value: object = None,
+    quantity_step: object = "0.000001",
+    min_quantity: object | None = None,
+    executed_at: datetime | None = None,
+) -> EntryRevisionExecutionResult:
+    """Run one live revision under durable and single-process authority."""
+
+    now = executed_at or datetime.now(UTC)
+    rollout_mode = load_trading_settings(session_factory).entry_revision_v2_mode
+    if rollout_mode == "disabled":
+        return EntryRevisionExecutionResult("disabled", int(batch_id))
+    if rollout_mode == "shadow":
+        return EntryRevisionExecutionResult("shadow_planned", int(batch_id))
+    authority = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="entry_revision_worker",
+        owner_id=f"batch:{int(batch_id)}",
+        acquired_at=now,
+        require_cancel_quiescence=False,
+    )
+    if not authority.acquired:
+        return EntryRevisionExecutionResult(
+            "in_progress",
+            int(batch_id),
+            authority.reason_code or "entry_revision_exchange_authority_unavailable",
+        )
+    try:
+        result = _execute_entry_revision_with_position_authority(
+            session_factory,
+            batch_id=batch_id,
+            deepcoin_client=deepcoin_client,
+            risk_reduction_executor=risk_reduction_executor,
+            contract_value=contract_value,
+            quantity_step=quantity_step,
+            min_quantity=min_quantity,
+            executed_at=now,
+        )
+    except BaseException:
+        raise
+    released = release_entry_revision_exchange_authority(
+        session_factory,
+        token=str(authority.token),
+        owner_kind="entry_revision_worker",
+        released_at=now,
+    )
+    if not released.released:
+        return EntryRevisionExecutionResult(
+            "recovery_required",
+            int(batch_id),
+            released.reason_code
+            or "entry_revision_exchange_authority_release_failed",
+        )
+    return result
+
+
+@serialized_position_authority_mutation
+def _execute_entry_revision_with_position_authority(
     session_factory: sessionmaker,
     *,
     batch_id: int,
@@ -446,11 +511,6 @@ def execute_entry_revision(
     """Cancel exact old legs, prove terminal state, then submit exact replacements."""
 
     now = executed_at or datetime.now(UTC)
-    rollout_mode = load_trading_settings(session_factory).entry_revision_v2_mode
-    if rollout_mode == "disabled":
-        return EntryRevisionExecutionResult("disabled", int(batch_id))
-    if rollout_mode == "shadow":
-        return EntryRevisionExecutionResult("shadow_planned", int(batch_id))
     claim_token = uuid.uuid4().hex
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, int(batch_id))

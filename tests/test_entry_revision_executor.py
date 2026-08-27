@@ -15,6 +15,7 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
     StrategyRevisionBatch,
     StrategyRevisionLeg,
+    TradingSetting,
 )
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
 from telegram_kol_research.trading_settings import save_trading_settings
@@ -370,6 +371,180 @@ def test_entry_revision_worker_advances_durable_live_batch(tmp_path):
     )
 
     assert result == {"status": "completed", "batch_ids": [batch_id]}
+
+
+def test_cancellation_authority_blocks_revision_before_batch_claim(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "authority-busy.db")
+    batch_id = _planned_batch(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "entry_revision_v2_mode": "disabled",
+        },
+        updated_at=NOW,
+    )
+    cancellation = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="reviewed_pending_entry_cancel",
+        owner_id="order:reviewed-1",
+        acquired_at=NOW,
+        require_cancel_quiescence=True,
+    )
+    assert cancellation.acquired is True
+    save_trading_settings(
+        session_factory,
+        {"entry_revision_v2_mode": "live"},
+        updated_at=NOW + timedelta(seconds=1),
+    )
+    client = FakeRevisionClient()
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        executed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert result.status == "in_progress"
+    assert result.reason_code == "entry_revision_exchange_authority_busy"
+    assert client.events == []
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        assert batch.status == "planned"
+        assert batch.advance_claim_token is None
+
+
+def test_live_revision_owns_authority_during_exchange_and_releases_on_return(
+    tmp_path,
+):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "authority-owned.db")
+    batch_id = _planned_batch(session_factory)
+
+    class AuthorityInspectingClient(FakeRevisionClient):
+        def cancel_trigger_order(self, payload):
+            with session_factory() as session:
+                row = (
+                    session.query(TradingSetting)
+                    .filter(
+                        TradingSetting.key
+                        == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+                    )
+                    .one()
+                )
+                document = json.loads(row.value_json)
+            assert document["state"] == "held"
+            assert document["owner_kind"] == "entry_revision_worker"
+            assert document["owner_id"] == f"batch:{batch_id}"
+            return super().cancel_trigger_order(payload)
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=AuthorityInspectingClient(),
+        executed_at=NOW,
+    )
+
+    assert result.status == "succeeded"
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        assert json.loads(row.value_json)["state"] == "idle"
+
+
+def test_unhandled_revision_exception_retains_exchange_authority(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "authority-retained.db")
+    batch_id = _planned_batch(session_factory)
+
+    class ExplodingReadClient(FakeRevisionClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            raise RuntimeError("unexpected read failure")
+
+    try:
+        execute_entry_revision(
+            session_factory,
+            batch_id=batch_id,
+            deepcoin_client=ExplodingReadClient(),
+            executed_at=NOW,
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "unexpected read failure"
+    else:
+        raise AssertionError("revision exception must escape")
+
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        document = json.loads(row.value_json)
+    assert document["state"] == "held"
+    assert document["owner_kind"] == "entry_revision_worker"
+    assert document["owner_id"] == f"batch:{batch_id}"
+
+
+def test_disabled_and_shadow_revision_do_not_acquire_exchange_authority(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    for mode in ("disabled", "shadow"):
+        session_factory = create_session_factory(tmp_path / f"{mode}.db")
+        batch_id = _planned_batch(
+            session_factory,
+            mode="live" if mode == "disabled" else "shadow",
+        )
+        if mode == "disabled":
+            save_trading_settings(
+                session_factory,
+                {"entry_revision_v2_mode": "disabled"},
+                updated_at=NOW + timedelta(seconds=1),
+            )
+
+        result = execute_entry_revision(
+            session_factory,
+            batch_id=batch_id,
+            deepcoin_client=FakeRevisionClient(),
+            executed_at=NOW,
+        )
+
+        assert result.status == (
+            "disabled" if mode == "disabled" else "shadow_planned"
+        )
+        with session_factory() as session:
+            assert (
+                session.query(TradingSetting)
+                .filter(
+                    TradingSetting.key
+                    == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+                )
+                .one_or_none()
+                is None
+            )
 
 
 def test_live_activation_does_not_replay_older_pending_fragments(tmp_path):
