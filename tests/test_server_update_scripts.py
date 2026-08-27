@@ -94,7 +94,6 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     deployment = (ROOT / "docs/server-deployment.md").read_text(encoding="utf-8")
     runbook = CACHE_REPAIR_RUNBOOK.read_text(encoding="utf-8")
     implementation = CACHE_REPAIR_PLAN.read_text(encoding="utf-8")
-    status = CACHE_REPAIR_STATUS.read_text(encoding="utf-8")
     combined = deployment + "\n" + runbook + "\n" + implementation
 
     for required in (
@@ -149,14 +148,22 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     assert "失败只因 owner 漂移" not in task12
     assert "已知的 15 条历史" not in runbook
     assert "历史 15 条拒绝" not in implementation[task12_start:]
-    assert "task12_refusal_baseline_count: 16" in status
-    assert "task12_observed_max_raw_message_id: 13530" in status
-    assert "task12_gate: failed_closed" in status
     restore_section = runbook.index("## 4. 单独恢复")
     enabled_updater = runbook.index("EXPECTED_AUTO_TRADE_STATE=enabled", restore_section)
     restore_watermark = runbook.index("restore_raw_message_id", restore_section)
     enable_setting = runbook.index("然后重新 GET 当前完整 settings", restore_section)
     assert enabled_updater < restore_watermark < enable_setting
+
+
+def test_contract_cache_status_records_version_aware_task12_handoff():
+    status = CACHE_REPAIR_STATUS.read_text(encoding="utf-8")
+
+    assert "task12_refusal_baseline_count: 16" in status
+    assert "task12_observed_max_raw_message_id: 13530" in status
+    assert "task12_gate: failed_closed" in status
+    assert "recognized migratable legacy drift" in status
+    assert "bounded 100-row history coverage" in status
+    assert "health HTTP error remains unresolved" in status
 
 
 def test_server_updater_runs_two_active_checks_before_checkout_and_install():
