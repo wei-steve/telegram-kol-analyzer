@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-web-stall-deploy-l1-20260826-root
-claim_base_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
-current_task: phase-7-web-loop-stall-attribution-exact-deployment-and-l1-in-progress
+claimed_by: unclaimed
+claim_base_sha: null
+current_task: phase-7-web-loop-stall-attribution-deployed-l1-stability-only-awaiting-separate-safe-retry-authorization
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -105,8 +105,25 @@ phase_7_web_stall_attribution_focused_verification: "69 passed in 0.29 seconds"
 phase_7_web_stall_attribution_full_suite_verification: "6354 passed, 1 skipped, 32 warnings in 506.87 seconds"
 phase_7_web_stall_attribution_compileall_verified: true
 phase_7_web_stall_attribution_contract: "runtime captures classify captured_business_blocker, loop_lag_confirmed_but_stack_unattributed, or idle_or_post_recovery_selector_capture; Phase 7 observer requires matching role-attributed events and fails closed with role-specific reasons without labeling Web-only selector captures as scheduler or worker defects"
-phase_7_web_stall_attribution_source_boundary: "local runtime-loop health and read-only Phase 7 observer code/tests only; no push, deploy, restart, cutover, rollback, production configuration or data change, Telegram traffic, replay, worker command, test trade, or exchange write"
-phase_7_web_stall_attribution_deployment_authorization: owner_authorized_exact_0a6a9a18_helper_managed_monitor_sync_one_split_stop_start_and_l1_only
+phase_7_web_stall_attribution_source_boundary: "exact candidate deployment, governed monitor and expected-HEAD synchronization, one managed split-runtime stop/start, candidate package installation, read-only gates, focused tests, and L1 observation only; no cutover, trading configuration or database mutation, replay, worker command, manufactured Telegram traffic, test trade, or exchange write"
+phase_7_web_stall_attribution_deployment_authorization: consumed_owner_authorized_exact_0a6a9a18_helper_managed_monitor_sync_one_split_stop_start_and_l1_only
+phase_7_web_stall_attribution_deployment_claim_commit: ca3a01da74b4c3f27de342e98c5e5d4738e14609
+phase_7_web_stall_attribution_deployed_commit: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
+phase_7_web_stall_attribution_deployment_status: passed_exact_sha_helper_managed_split_restart_and_l1_stability_only_zero_traffic
+phase_7_web_stall_attribution_preflight_status: passed_tracked_clean_global_1_active_write_0_management_0_nonshadow_jobs_0_worker_commands_0_revision_claims_0_quick_check_ok_unique_ingest_session
+phase_7_web_stall_attribution_server_focused_verification: "69 passed in 1.10 seconds"
+phase_7_web_stall_attribution_restart_pids: "ingest 2350033, worker 2350028, web 2350030, all NRestarts 0"
+phase_7_web_stall_attribution_l1_start: 2026-08-26T23:59:21.458186+00:00
+phase_7_web_stall_attribution_l1_end: 2026-08-27T00:14:26.032042+00:00
+phase_7_web_stall_attribution_l1_elapsed_seconds: 904.574
+phase_7_web_stall_attribution_l1_samples: 179
+phase_7_web_stall_attribution_l1_natural_message_count: 0
+phase_7_web_stall_attribution_l1_distinct_chat_count: 0
+phase_7_web_stall_attribution_l1_stall_counts: ingest_0_worker_0_web_0
+phase_7_web_stall_attribution_l1_pipeline_status: zero_new_nonshadow_pending_claimed_missing_duplicate_orphan_failed
+phase_7_web_stall_attribution_l1_status: passed_stability_only_zero_traffic_natural_message_path_unproven
+phase_7_web_stall_attribution_l1_evidence_path: /opt/telegram-kol-analyzer/data/evidence/phase7-web-stall-deploy-20260826T235921Z/l1-observation.jsonl
+phase_7_web_stall_attribution_l1_evidence_sha256: efd3598372ac978656e05e55da33b0bfdbf476ed9c3a4c18f82cdf838bee809f
 phase_7_latest_safe_retry_authorization: consumed_owner_authorized_exact_56bebd36_canonical_95a88371_production_claim_single_cutover_convergence_two_hour_acceptance_and_l2_rollback
 phase_7_latest_safe_retry_claim_commit: 741c17187bba8c9e6130cb9d067c823145682f0c
 phase_7_latest_safe_retry_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
@@ -218,7 +235,7 @@ phase_7_blocker_focused_verification: 286_passed_2_warnings_then_21_passed
 phase_7_blocker_full_suite_verification: 6304_passed_1_skipped_32_warnings_in_526_53_seconds
 phase_7_blocker_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-blocker-diagnosis-20260826T075147Z/diagnosis-evidence.log
 phase_7_blocker_evidence_sha256: 4dd3ad9cf3e91aed66ebd6b3d9b7660979d623379bf51ca9615b0f28b7bef0dc
-phase_7_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
+phase_7_production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
 phase_7_before_tuple: global_1_queue
 phase_7_cutover_tuple: per_chat_3_queue
 phase_7_final_tuple: global_1_queue
@@ -234,7 +251,7 @@ phase_7_retry_convergence_samples:
   - "sample_3_elapsed_0.543429_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.827980_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_5_elapsed_1.038383_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: separate_owner_authorizations_for_exact_candidate_push_deploy_and_later_safe_retry
+phase_7_retry_remaining_gate_blockers: separate_owner_authorization_for_later_safe_retry
 phase_7_window_start: 2026-08-26T21:49:44.392235+00:00
 phase_7_window_end: 2026-08-26T22:27:32.081458+00:00
 phase_7_natural_message_count: 2
@@ -291,7 +308,7 @@ fail_closed_parallel_chat_limit: 1
 schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
-deployment_authorized: true
+deployment_authorized: false
 cutover_authorized: false
 ```
 
@@ -341,6 +358,33 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 Web stall attribution exact deployment and L1`:
+  production preflight passed at clean tracked checkout
+  `95a883715881b4fd393fbf5e745693cc78e066df`, remote tip exact candidate
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`, tuple `global_1_queue`,
+  zero active writes, management operations, non-shadow jobs, worker commands,
+  or claimed revision batches, SQLite `quick_check=ok`, and one unique ingest
+  Telegram-session holder. The governed helper fast-forwarded production to the
+  exact candidate, synchronized expected HEAD, installed the candidate package,
+  performed one managed split-runtime stop/start, and restored the monitor.
+  Post-restart focused verification was `69 passed in 1.10s`; ingest, worker,
+  and Web remained active with stable PIDs and zero restarts.
+
+  L1 ran continuously from `2026-08-26T23:59:21.458186+00:00` through
+  `2026-08-27T00:14:26.032042+00:00` for `904.574s` and `179` samples. It
+  passed the fifteen-minute stability branch with zero new ingest, worker, or
+  Web stalls and zero new non-shadow pending, claimed, missing, duplicate,
+  orphan, or failed work. No natural Telegram message arrived, so this is
+  explicitly a stability-only pass and does not prove the natural-message path.
+  Evidence is
+  `/opt/telegram-kol-analyzer/data/evidence/phase7-web-stall-deploy-20260826T235921Z/l1-observation.jsonl`
+  with SHA-256
+  `efd3598372ac978656e05e55da33b0bfdbf476ed9c3a4c18f82cdf838bee809f`.
+  No cutover, trading configuration or database mutation, replay, worker
+  command, manufactured traffic, test trade, or exchange write occurred. The
+  deployment authorization is consumed and the claim is released; a later safe
+  retry remains separately owner-authorized work.
 
 - `2026-08-26 Phase 7 Web stall attribution deployment/L1 claim`: session
   `codex-per-chat-phase7-web-stall-deploy-l1-20260826-root` exclusively claimed
