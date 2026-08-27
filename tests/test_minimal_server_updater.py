@@ -36,6 +36,12 @@ def updater_harness(tmp_path: Path):
     durable_updater = tmp_path / "durable-updater"
     durable_updater.write_text("old updater\n", encoding="utf-8")
     durable_updater.chmod(0o755)
+    worker_helper = tmp_path / "telegram-kol-worker-prepare-contract-cache"
+    worker_unit = tmp_path / "telegram-kol-worker.service"
+    worker_helper.write_text("old helper\n", encoding="utf-8")
+    worker_helper.chmod(0o755)
+    worker_unit.write_text("old unit\n", encoding="utf-8")
+    worker_unit.chmod(0o644)
     log = tmp_path / "events.log"
     monitor_env = tmp_path / "telegram-kol-monitor.env"
     monitor_env.write_text(
@@ -86,8 +92,11 @@ case "${1:-}" in
     if [ "${2:-}" = "add" ]; then
       printf 'worktree-add\n' >>"$HARNESS_LOG"
       [ "${HARNESS_WORKTREE_FAIL:-0}" != "1" ] || exit 1
-      mkdir -p "${4}/deploy" "${4}/src/telegram_kol_research"
+      mkdir -p "${4}/deploy/systemd" "${4}/src/telegram_kol_research"
       printf 'candidate updater\n' >"${4}/deploy/telegram-kol-update"
+      printf 'candidate helper\n' >"${4}/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
+      chmod 0755 "${4}/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
+      printf 'candidate unit\n' >"${4}/deploy/systemd/telegram-kol-worker.service"
       touch "$HARNESS_STATE/worktree_registered"
     else
       printf 'worktree-remove\n' >>"$HARNESS_LOG"
@@ -145,6 +154,17 @@ esac
         r'''#!/usr/bin/env bash
 set -euo pipefail
 case "${1:-}" in
+  daemon-reload)
+    printf 'daemon-reload\n' >>"$HARNESS_LOG"
+    count_file="$HARNESS_STATE/daemon_reload_count"
+    count=0
+    [ ! -f "$count_file" ] || count="$(cat "$count_file")"
+    count=$((count + 1))
+    printf '%s\n' "$count" >"$count_file"
+    if [ "${HARNESS_DAEMON_RELOAD_FAIL:-0}" = "1" ] && [ "$count" -eq 1 ]; then
+      exit 1
+    fi
+    ;;
   cat)
     case "${2:-}" in
       telegram-kol-ingest.service|telegram-kol-worker.service|telegram-kol-web.service)
@@ -388,7 +408,21 @@ if [ "${1:-}" = "-d" ] || [[ " $* " = *" -d "* ]]; then exec /usr/bin/install "$
 count=$#
 eval "source=\${$((count - 1))}"
 eval "target=\${$count}"
-if [[ "$target" = *.candidate.* ]]; then
+if [ "$target" = "$WORKER_CACHE_HELPER_PATH" ]; then
+  if [[ "$source" = *telegram-kol-stage.*/deploy/systemd/* ]]; then
+    printf 'worker-helper-install\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_WORKER_HELPER_INSTALL_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'worker-helper-restore\n' >>"$HARNESS_LOG"
+  fi
+elif [ "$target" = "$WORKER_UNIT_PATH" ]; then
+  if [[ "$source" = *telegram-kol-stage.*/deploy/systemd/* ]]; then
+    printf 'worker-unit-install\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_WORKER_UNIT_INSTALL_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'worker-unit-restore\n' >>"$HARNESS_LOG"
+  fi
+elif [[ "$target" = *.candidate.* ]]; then
   printf 'durable-updater-install\n' >>"$HARNESS_LOG"
   [ "${HARNESS_DURABLE_INSTALL_FAIL:-0}" != "1" ] || exit 1
 else
@@ -535,6 +569,8 @@ exec /bin/rm "$@"
                 "LOCK_PATH": str(tmp_path / "update.lock"),
                 "STAGE_PARENT": str(tmp_path),
                 "UPDATER_PATH": str(durable_updater),
+                "WORKER_CACHE_HELPER_PATH": str(worker_helper),
+                "WORKER_UNIT_PATH": str(worker_unit),
                 "UPDATER_TEST_MODE": "1",
                 "MONITOR_ENV_FILE": str(monitor_env),
                 "EXPECTED_COMMIT": CANDIDATE,
@@ -547,6 +583,9 @@ exec /bin/rm "$@"
             }
         )
         environment.update(overrides)
+        if environment.pop("HARNESS_ARTIFACTS_EXIST", "1") == "0":
+            worker_helper.unlink(missing_ok=True)
+            worker_unit.unlink(missing_ok=True)
         return subprocess.run(
             ["bash", str(ROOT / "deploy/telegram-kol-update")],
             text=True,
@@ -629,6 +668,78 @@ def test_split_topology_uses_ordered_three_unit_stop_and_start(updater_harness):
         "start-unit:telegram-kol-web.service",
         "start-unit:telegram-kol-ingest.service",
     ]
+
+
+def test_split_installs_worker_cache_artifacts_before_worker_start(updater_harness):
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_RUNTIME_TOPOLOGY="split")
+
+    assert result.returncode == 0, result.stderr
+    events = _events(log)
+    assert events.index("pip-install") < events.index("worker-helper-install")
+    assert events.index("worker-helper-install") < events.index("worker-unit-install")
+    assert events.index("worker-unit-install") < events.index("daemon-reload")
+    assert events.index("daemon-reload") < events.index(
+        "start-unit:telegram-kol-worker.service"
+    )
+    assert (log.parent / "telegram-kol-worker-prepare-contract-cache").read_text() == (
+        "candidate helper\n"
+    )
+    assert (log.parent / "telegram-kol-worker.service").read_text() == (
+        "candidate unit\n"
+    )
+
+
+def test_monolith_does_not_install_worker_cache_artifacts(updater_harness):
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_RUNTIME_TOPOLOGY="monolith")
+
+    assert result.returncode == 0, result.stderr
+    assert not any("worker-helper" in event for event in _events(log))
+    assert not any("worker-unit" in event for event in _events(log))
+    assert "daemon-reload" not in _events(log)
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"HARNESS_WORKER_UNIT_INSTALL_FAIL": "1"},
+        {"HARNESS_DAEMON_RELOAD_FAIL": "1"},
+        {"HARNESS_CANDIDATE_START_FAIL": "1"},
+    ],
+)
+def test_split_artifact_failures_restore_previous_helper_and_unit(
+    updater_harness, failure: dict[str, str]
+):
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_RUNTIME_TOPOLOGY="split", **failure)
+
+    assert result.returncode == 4
+    assert (log.parent / "telegram-kol-worker-prepare-contract-cache").read_text() == (
+        "old helper\n"
+    )
+    assert (log.parent / "telegram-kol-worker.service").read_text() == "old unit\n"
+    events = _events(log)
+    assert "worker-helper-restore" in events
+    assert "worker-unit-restore" in events
+    assert events.index("worker-helper-restore") < events.index("rollback-start")
+
+
+def test_split_rollback_removes_only_new_artifact_targets(updater_harness):
+    run, log, _ = updater_harness
+
+    result = run(
+        HARNESS_RUNTIME_TOPOLOGY="split",
+        HARNESS_ARTIFACTS_EXIST="0",
+        HARNESS_CANDIDATE_START_FAIL="1",
+    )
+
+    assert result.returncode == 4
+    assert not (log.parent / "telegram-kol-worker-prepare-contract-cache").exists()
+    assert not (log.parent / "telegram-kol-worker.service").exists()
 
 
 @pytest.mark.parametrize("topology", ["both", "partial"])

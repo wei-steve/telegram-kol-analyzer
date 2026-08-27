@@ -11,7 +11,11 @@ UPDATER_PATH="${UPDATER_PATH:-/usr/local/bin/telegram-kol-update}"
 LOCK_PATH="${LOCK_PATH:-/run/telegram-kol-update.lock}"
 STAGE_PARENT="${STAGE_PARENT:-/run}"
 monitor_env_override="${MONITOR_ENV_FILE:-}"
+worker_cache_helper_override="${WORKER_CACHE_HELPER_PATH:-}"
+worker_unit_override="${WORKER_UNIT_PATH:-}"
 MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"
+WORKER_CACHE_HELPER_PATH=/usr/local/libexec/telegram-kol-worker-prepare-contract-cache
+WORKER_UNIT_PATH=/etc/systemd/system/telegram-kol-worker.service
 MONITOR_TIMER="telegram-kol-monitor.timer"
 MONITOR_ONESHOT_UNITS=(
   "telegram-kol-monitor.service"
@@ -70,13 +74,18 @@ resolve_managed_topology() {
   return 1
 }
 if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
-  if [ "$APP_DIR" = "/opt/telegram-kol-analyzer" ] || [ -z "$monitor_env_override" ]; then
+  if [ "$APP_DIR" = "/opt/telegram-kol-analyzer" ] \
+    || [ -z "$monitor_env_override" ] \
+    || [ -z "$worker_cache_helper_override" ] \
+    || [ -z "$worker_unit_override" ]; then
     echo "Updater test-mode path override is invalid." >&2
     exit 4
   fi
   MONITOR_ENV_FILE="$monitor_env_override"
+  WORKER_CACHE_HELPER_PATH="$worker_cache_helper_override"
+  WORKER_UNIT_PATH="$worker_unit_override"
 fi
-unset monitor_env_override
+unset monitor_env_override worker_cache_helper_override worker_unit_override
 
 if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "EXPECTED_COMMIT must be a full 40-character hexadecimal commit." >&2
@@ -111,6 +120,12 @@ schema_backup=""
 schema_dry_run=""
 updater_backup=""
 updater_candidate=""
+worker_cache_helper_backup=""
+worker_unit_backup=""
+worker_cache_helper_existed=0
+worker_unit_existed=0
+worker_cache_artifacts_touched=0
+worker_cache_artifacts_installed=0
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0
@@ -320,6 +335,72 @@ restore_updater() {
   fi
 }
 
+install_root_artifact() {
+  local mode="$1" source="$2" target="$3"
+  if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
+    install -m "$mode" "$source" "$target"
+  else
+    install -o root -g root -m "$mode" "$source" "$target"
+  fi
+}
+
+backup_worker_cache_artifacts() {
+  if [ -e "$WORKER_CACHE_HELPER_PATH" ] || [ -L "$WORKER_CACHE_HELPER_PATH" ]; then
+    if [ ! -f "$WORKER_CACHE_HELPER_PATH" ] || [ -L "$WORKER_CACHE_HELPER_PATH" ]; then
+      return 1
+    fi
+    worker_cache_helper_backup="$(mktemp "$STAGE_PARENT/telegram-kol-worker-helper-backup.XXXXXX")" || return 1
+    chmod 0600 "$worker_cache_helper_backup" || return 1
+    cp -p -- "$WORKER_CACHE_HELPER_PATH" "$worker_cache_helper_backup" || return 1
+    worker_cache_helper_existed=1
+  fi
+  if [ -e "$WORKER_UNIT_PATH" ] || [ -L "$WORKER_UNIT_PATH" ]; then
+    if [ ! -f "$WORKER_UNIT_PATH" ] || [ -L "$WORKER_UNIT_PATH" ]; then
+      return 1
+    fi
+    worker_unit_backup="$(mktemp "$STAGE_PARENT/telegram-kol-worker-unit-backup.XXXXXX")" || return 1
+    chmod 0600 "$worker_unit_backup" || return 1
+    cp -p -- "$WORKER_UNIT_PATH" "$worker_unit_backup" || return 1
+    worker_unit_existed=1
+  fi
+}
+
+install_worker_cache_artifacts() {
+  local helper_source="$stage_dir/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
+  local unit_source="$stage_dir/deploy/systemd/telegram-kol-worker.service"
+  if [ ! -f "$helper_source" ] || [ -L "$helper_source" ] || [ ! -x "$helper_source" ] \
+    || [ ! -f "$unit_source" ] || [ -L "$unit_source" ]; then
+    return 1
+  fi
+  backup_worker_cache_artifacts || return 1
+  worker_cache_artifacts_touched=1
+  install_root_artifact 0755 "$helper_source" "$WORKER_CACHE_HELPER_PATH" || return 1
+  install_root_artifact 0644 "$unit_source" "$WORKER_UNIT_PATH" || return 1
+  systemctl daemon-reload || return 1
+  worker_cache_artifacts_installed=1
+}
+
+restore_worker_cache_artifacts() {
+  local restore_status=0
+  if [ "$worker_cache_artifacts_touched" -ne 1 ]; then return 0; fi
+  if [ "$worker_cache_helper_existed" -eq 1 ]; then
+    install_root_artifact 0755 "$worker_cache_helper_backup" "$WORKER_CACHE_HELPER_PATH" || restore_status=1
+  else
+    rm -f -- "$WORKER_CACHE_HELPER_PATH" || restore_status=1
+  fi
+  if [ "$worker_unit_existed" -eq 1 ]; then
+    install_root_artifact 0644 "$worker_unit_backup" "$WORKER_UNIT_PATH" || restore_status=1
+  else
+    rm -f -- "$WORKER_UNIT_PATH" || restore_status=1
+  fi
+  systemctl daemon-reload || restore_status=1
+  if [ "$restore_status" -eq 0 ]; then
+    worker_cache_artifacts_touched=0
+    worker_cache_artifacts_installed=0
+  fi
+  return "$restore_status"
+}
+
 cleanup() {
   local status=$? rollback_ok=1 inactive_status branch_commit unit
   trap - EXIT INT TERM
@@ -360,6 +441,7 @@ cleanup() {
         env "PYTHONPATH=$APP_DIR/src" "$APP_DIR/.venv/bin/python" -m pip install -e "$APP_DIR" >/dev/null 2>&1 || rollback_ok=0
       fi
     fi
+    if [ "$rollback_ok" -eq 1 ]; then restore_worker_cache_artifacts || rollback_ok=0; fi
     if [ "$rollback_ok" -eq 1 ]; then restore_updater || rollback_ok=0; fi
     if [ "$rollback_ok" -eq 1 ]; then
       for unit in "${managed_start_units[@]}"; do
@@ -398,6 +480,8 @@ cleanup() {
   cleanup_schema_dry_run || true
   [ -z "$updater_candidate" ] || rm -f -- "$updater_candidate" || true
   [ -z "$updater_backup" ] || rm -f -- "$updater_backup" || true
+  [ -z "$worker_cache_helper_backup" ] || rm -f -- "$worker_cache_helper_backup" || true
+  [ -z "$worker_unit_backup" ] || rm -f -- "$worker_unit_backup" || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -694,6 +778,12 @@ if [ "$schema_changed" -eq 1 ] && ! bootstrap_production_schema; then
   echo "Candidate production schema bootstrap failed." >&2
   exit 4
 fi
+if [ "$managed_topology" = "split" ]; then
+  if ! install_worker_cache_artifacts; then
+    echo "Candidate worker cache artifact installation failed." >&2
+    exit 4
+  fi
+fi
 if ! start_managed_services; then
   exit 4
 fi
@@ -748,8 +838,18 @@ deployment_finalized=1
 stop_attempted=0
 checkout_mutated=0
 updater_installed=0
+worker_cache_artifacts_touched=0
+worker_cache_artifacts_installed=0
 trap - EXIT INT TERM
 if [ -n "$updater_backup" ]; then
   rm -f -- "$updater_backup" || true
 fi
 updater_backup=""
+if [ -n "$worker_cache_helper_backup" ]; then
+  rm -f -- "$worker_cache_helper_backup" || true
+fi
+if [ -n "$worker_unit_backup" ]; then
+  rm -f -- "$worker_unit_backup" || true
+fi
+worker_cache_helper_backup=""
+worker_unit_backup=""

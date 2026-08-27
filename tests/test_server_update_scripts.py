@@ -162,6 +162,44 @@ def test_workstation_bootstraps_require_the_dual_topology_updater_contract():
     assert "resolve_managed_topology()" in powershell
 
 
+def test_workstation_bootstraps_require_worker_cache_artifact_transaction():
+    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'UPDATER_CACHE_ARTIFACT_CONTRACT="worker-cache-v1"' in shell
+    assert "UPDATER_CACHE_ARTIFACT_CONTRACT" in bootstrap
+    assert "install_worker_cache_artifacts" in bootstrap
+    assert "telegram-kol-worker-prepare-contract-cache" in bootstrap
+    assert '$cacheArtifactContract = "worker-cache-v1"' in powershell
+    assert "install_worker_cache_artifacts" in powershell
+
+
+def test_server_updater_transactions_worker_cache_helper_and_unit():
+    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert (
+        "WORKER_CACHE_HELPER_PATH=/usr/local/libexec/"
+        "telegram-kol-worker-prepare-contract-cache"
+    ) in script
+    assert (
+        "WORKER_UNIT_PATH=/etc/systemd/system/telegram-kol-worker.service" in script
+    )
+    assert "install_worker_cache_artifacts()" in script
+    assert "restore_worker_cache_artifacts()" in script
+    assert "worker_cache_artifacts_installed=1" in script
+    assert 'if [ "$managed_topology" = "split" ]; then' in script
+    assert 'systemctl daemon-reload' in script
+    pip_install = script.rindex(' -m pip install -e "$APP_DIR"')
+    artifact_install = script.index("install_worker_cache_artifacts", pip_install)
+    worker_start = script.index("\nif ! start_managed_services; then", artifact_install)
+    assert pip_install < artifact_install < worker_start
+
+
 def test_server_updater_transactions_monitor_expected_head_and_timer_state():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 

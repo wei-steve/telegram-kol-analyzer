@@ -521,6 +521,16 @@ def test_worker_contract_cache_prepare_helper_has_a_fixed_narrow_target():
     assert "inspect_contract_cache_permissions(" in helper
     assert "os.geteuid() != 0" in helper
 
+    worker_unit = (
+        repository_root / "deploy" / "systemd" / "telegram-kol-worker.service"
+    ).read_text(encoding="utf-8")
+    exec_start_pre = (
+        "ExecStartPre=+/usr/local/libexec/"
+        "telegram-kol-worker-prepare-contract-cache"
+    )
+    assert worker_unit.count(exec_start_pre) == 1
+    assert worker_unit.index(exec_start_pre) < worker_unit.index("ExecStart=")
+
 
 def test_runtime_agent_sanitizer_preserves_worker_owned_cache_classification():
     repository_root = Path(__file__).resolve().parents[1]
