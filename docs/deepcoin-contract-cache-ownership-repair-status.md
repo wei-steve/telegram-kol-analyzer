@@ -226,9 +226,12 @@ phase completes or pauses, record both verified evidence and outstanding work.
   exact-SHA push requires separate authorization; the remote candidate remains
   `a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6` and production remains unchanged.
 - Rerun Task 12 under separate production-read-only authorization. Capture the
-  exact contract-spec health HTTP status: only a verified previous production
-  SHA plus closed legacy monitor env plus HTTP 404 may be classified as
-  `legacy_capability_absent`; authentication failures, timeout, malformed
+  exact contract-spec health HTTP status. HTTP 404 alone is insufficient. A
+  `legacy_capability_absent` classification additionally requires the verified
+  previous production SHA, closed legacy monitor env, the same token succeeding
+  against authenticated monitor-capture health on the exact worker port,
+  loop-health proof of `runtime_role=worker`, and exact previous SHA route absence
+  for the contract-spec endpoint. Authentication ambiguity, timeout, malformed
   schema and every non-404 HTTP error remain blockers. Reconfirm current-account
   Deepcoin snapshots and unique active-row ownership.
 - Explicit freeze, exact-SHA deployment, Linux/root helper verification,

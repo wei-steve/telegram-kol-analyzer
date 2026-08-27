@@ -24,10 +24,12 @@ Load the main implementation plan and canonical status alongside the existing
 runbook. Add assertions requiring all of these exact policy concepts:
 
 - `recognized migratable legacy drift` / `已识别可迁移旧版漂移`;
-- root owner plus absent Agent deny ACL is the complete allowed legacy set;
+- root is the only allowed legacy owner, and Agent deny ACL may be satisfied or absent;
 - unknown owner/type/link/group/mode/ACL errors remain fail-closed;
-- HTTP 404 may be `legacy_capability_absent` only for the verified previous SHA
-  and closed legacy monitor env;
+- HTTP 404 alone is insufficient; `legacy_capability_absent` also requires the
+  verified previous SHA, closed legacy monitor env, the same token succeeding on
+  authenticated monitor-capture health at the exact worker port,
+  worker runtime role proof, and exact previous SHA route absence for the contract-spec endpoint;
 - 401/403, timeout, malformed schema and non-404 HTTP errors remain blockers;
 - a valid 100-row history window is bounded coverage rather than a cache
   migration blocker;
