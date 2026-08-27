@@ -28,7 +28,7 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - Initial gates passed at `bad13a7b56c833919536dfb7f028725201fc22cc` on
   `codex/phase0-deploy-integration` in the authoritative workspace.
 - The implementation plan was validated and committed separately as
-  `da56a7edfc62e7818ce89e2a296f32bedca9eea0`.
+  `da56a7ede4965f42af173c6e5c98d1f5e4e9b2d6`.
 
 ## Outstanding
 
