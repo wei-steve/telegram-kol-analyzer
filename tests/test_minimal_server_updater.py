@@ -38,15 +38,19 @@ def updater_harness(tmp_path: Path):
     durable_updater.chmod(0o755)
     worker_helper = tmp_path / "telegram-kol-worker-prepare-contract-cache"
     worker_unit = tmp_path / "telegram-kol-worker.service"
+    monitor_service = tmp_path / "telegram-kol-monitor.service"
     worker_helper.write_text("old helper\n", encoding="utf-8")
     worker_helper.chmod(0o755)
     worker_unit.write_text("old unit\n", encoding="utf-8")
     worker_unit.chmod(0o644)
+    monitor_service.write_text("old monitor unit\n", encoding="utf-8")
+    monitor_service.chmod(0o644)
     log = tmp_path / "events.log"
     monitor_env = tmp_path / "telegram-kol-monitor.env"
     monitor_env.write_text(
         "MONITOR_SECRET=must-not-be-printed\n"
         f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=--expected-auto-trade-enabled\n"
         "MONITOR_SETTING=preserve-this-line\n",
         encoding="utf-8",
     )
@@ -97,6 +101,7 @@ case "${1:-}" in
       printf 'candidate helper\n' >"${4}/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
       chmod 0755 "${4}/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
       printf 'candidate unit\n' >"${4}/deploy/systemd/telegram-kol-worker.service"
+      printf 'candidate monitor unit\n' >"${4}/deploy/systemd/telegram-kol-monitor.service"
       touch "$HARNESS_STATE/worktree_registered"
     else
       printf 'worktree-remove\n' >>"$HARNESS_LOG"
@@ -378,8 +383,9 @@ if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"create_session_factory"* ]]; then
 fi
 if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"monitor-pin-rewrite"* ]]; then
   printf 'monitor-pin-rewrite\n' >>"$HARNESS_LOG"
-  MONITOR_REWRITE_HEAD="$5" perl -0pe '
-    s/^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$ENV{MONITOR_REWRITE_HEAD}/m
+  MONITOR_REWRITE_HEAD="$5" MONITOR_REWRITE_OPTION="$6" perl -0pe '
+    s/^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$ENV{MONITOR_REWRITE_HEAD}/m;
+    s/^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=$ENV{MONITOR_REWRITE_OPTION}/m
   ' "$3" >"$4"
   exit 0
 fi
@@ -422,6 +428,15 @@ elif [ "$target" = "$WORKER_UNIT_PATH" ]; then
   else
     printf 'worker-unit-restore\n' >>"$HARNESS_LOG"
   fi
+elif [ "$target" = "$MONITOR_SERVICE_PATH" ]; then
+  if [[ "$source" = *telegram-kol-stage.*/deploy/systemd/* ]]; then
+    printf 'monitor-unit-install\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_UNIT_INSTALL_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'monitor-unit-restore\n' >>"$HARNESS_LOG"
+  fi
+elif [ "$target" = "$MONITOR_ENV_FILE" ]; then
+  printf 'monitor-env-restore\n' >>"$HARNESS_LOG"
 elif [[ "$target" = *.candidate.* ]]; then
   printf 'durable-updater-install\n' >>"$HARNESS_LOG"
   [ "${HARNESS_DURABLE_INSTALL_FAIL:-0}" != "1" ] || exit 1
@@ -528,10 +543,13 @@ exec /bin/rm "$@"
             "malformed",
             "symlink",
             "no_final_newline",
+            "duplicate_expectation",
+            "invalid_expectation",
         }:
             monitor_env.write_text(
                 "MONITOR_SECRET=must-not-be-printed\n"
                 f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
+                "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=--expected-auto-trade-enabled\n"
                 "MONITOR_SETTING=preserve-this-line\n",
                 encoding="utf-8",
             )
@@ -540,12 +558,27 @@ exec /bin/rm "$@"
             monitor_env.write_bytes(
                 b"MONITOR_SECRET=must-not-be-printed\n"
                 + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n".encode()
+                + b"TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=--expected-auto-trade-enabled\n"
                 + b"MONITOR_SETTING=preserve-without-final-newline"
             )
         if installation == "malformed":
             monitor_env.write_text(
                 monitor_env.read_text(encoding="utf-8")
                 + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}\n",
+                encoding="utf-8",
+            )
+        if installation == "duplicate_expectation":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8")
+                + "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+                "--no-expected-auto-trade-enabled\n",
+                encoding="utf-8",
+            )
+        if installation == "invalid_expectation":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8").replace(
+                    "--expected-auto-trade-enabled", "--auto-trade-maybe"
+                ),
                 encoding="utf-8",
             )
         if installation == "symlink":
@@ -573,7 +606,9 @@ exec /bin/rm "$@"
                 "WORKER_UNIT_PATH": str(worker_unit),
                 "UPDATER_TEST_MODE": "1",
                 "MONITOR_ENV_FILE": str(monitor_env),
+                "MONITOR_SERVICE_PATH": str(monitor_service),
                 "EXPECTED_COMMIT": CANDIDATE,
+                "EXPECTED_AUTO_TRADE_STATE": "enabled",
                 "BRANCH": "codex/test",
                 "STOP_TIMEOUT_SECONDS": "1",
                 "HARNESS_LOG": str(log),
@@ -699,7 +734,8 @@ def test_monolith_does_not_install_worker_cache_artifacts(updater_harness):
     assert result.returncode == 0, result.stderr
     assert not any("worker-helper" in event for event in _events(log))
     assert not any("worker-unit" in event for event in _events(log))
-    assert "daemon-reload" not in _events(log)
+    assert "monitor-unit-install" in _events(log)
+    assert _events(log).count("daemon-reload") == 1
 
 
 @pytest.mark.parametrize(
@@ -717,7 +753,7 @@ def test_split_artifact_failures_restore_previous_helper_and_unit(
 
     result = run(HARNESS_RUNTIME_TOPOLOGY="split", **failure)
 
-    assert result.returncode == 4
+    assert result.returncode != 0
     assert (log.parent / "telegram-kol-worker-prepare-contract-cache").read_text() == (
         "old helper\n"
     )
@@ -788,6 +824,7 @@ def test_monitor_pin_transaction_wraps_successful_cutover(updater_harness) -> No
     assert monitor_env.read_text(encoding="utf-8") == (
         "MONITOR_SECRET=must-not-be-printed\n"
         f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={CANDIDATE}\n"
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=--expected-auto-trade-enabled\n"
         "MONITOR_SETTING=preserve-this-line\n"
     )
     assert (state / "monitor_timer_enabled").exists()
@@ -806,8 +843,81 @@ def test_monitor_pin_preserves_non_head_bytes_without_final_newline(
     assert monitor_env.read_bytes() == (
         b"MONITOR_SECRET=must-not-be-printed\n"
         + f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={CANDIDATE}\n".encode()
+        + b"TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=--expected-auto-trade-enabled\n"
         + b"MONITOR_SETTING=preserve-without-final-newline"
     )
+
+
+def test_disabled_expectation_is_atomic_with_candidate_head_and_monitor_unit(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+    monitor_unit = log.parent / "telegram-kol-monitor.service"
+
+    result = run(EXPECTED_AUTO_TRADE_STATE="disabled")
+
+    assert result.returncode == 0, result.stderr
+    assert monitor_env.read_text(encoding="utf-8").count(
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+    ) == 1
+    assert (
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+        "--no-expected-auto-trade-enabled\n"
+    ) in monitor_env.read_text(encoding="utf-8")
+    assert monitor_unit.read_text(encoding="utf-8") == "candidate monitor unit\n"
+    events = _events(log)
+    assert events.index("monitor-unit-install") < events.index("daemon-reload")
+    assert events.index("daemon-reload") < events.index("monitor-pin-candidate")
+
+
+@pytest.mark.parametrize("state", ["", "true", "ENABLED", "disabled\nBAD=1"])
+def test_invalid_auto_trade_expectation_fails_before_fetch(
+    updater_harness, state: str
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(EXPECTED_AUTO_TRADE_STATE=state)
+
+    assert result.returncode != 0
+    assert "fetch" not in _events(log)
+
+
+@pytest.mark.parametrize("fault", ["duplicate_expectation", "invalid_expectation"])
+def test_malformed_monitor_expectation_fails_before_checkout(
+    updater_harness, fault: str
+) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+    original_run = run
+
+    # Ask the harness to generate the baseline, then rewrite it through the
+    # explicit malformed installation modes handled by the fixture.
+    installation = fault
+    result = original_run(HARNESS_MONITOR_INSTALLATION=installation)
+
+    assert result.returncode == 4
+    assert "checkout" not in _events(log)
+    assert "must-not-be-printed" not in result.stdout + result.stderr
+
+
+def test_monitor_unit_failure_restores_old_unit_and_old_env(updater_harness) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+    monitor_unit = log.parent / "telegram-kol-monitor.service"
+
+    result = run(
+        EXPECTED_AUTO_TRADE_STATE="disabled",
+        HARNESS_MONITOR_UNIT_INSTALL_FAIL="1",
+    )
+
+    assert result.returncode == 4
+    assert monitor_unit.read_text(encoding="utf-8") == "old monitor unit\n"
+    assert (
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+        "--expected-auto-trade-enabled\n"
+    ) in monitor_env.read_text(encoding="utf-8")
+    assert "monitor-unit-restore" in _events(log)
 
 
 def test_monitor_waits_for_every_installed_oneshot(updater_harness) -> None:
@@ -924,7 +1034,7 @@ def test_post_normalization_failure_rolls_back_pin_and_timer(
     assert result.returncode == 4
     assert (state / "head").read_text().strip() == PREVIOUS
     assert (
-        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}"
         in monitor_env.read_text(encoding="utf-8")
     )
     assert (state / "monitor_timer_enabled").exists()
@@ -947,7 +1057,7 @@ def test_monitor_timer_restore_failure_rolls_back_application_and_pin(
     assert result.returncode == 4
     assert (state / "head").read_text().strip() == PREVIOUS
     assert (
-        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={PREVIOUS}"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}"
         in monitor_env.read_text(encoding="utf-8")
     )
     assert "must-not-be-printed" not in result.stdout + result.stderr

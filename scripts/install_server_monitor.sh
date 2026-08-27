@@ -7,6 +7,8 @@ if [[ "$(id -u)" -ne 0 ]]; then
 fi
 
 enable_timer=false
+expected_auto_trade_state=""
+expected_auto_trade_option=""
 expected_entry_preamble_mode=""
 expected_entry_message_assembly_v2_mode=""
 expected_entry_revision_v2_mode=""
@@ -24,6 +26,14 @@ while [[ "$#" -gt 0 ]]; do
       expected_entry_preamble_mode="$2"
       shift 2
       ;;
+    --expected-auto-trade-state)
+      if [[ "$#" -lt 2 || ! "$2" =~ ^(enabled|disabled)$ ]]; then
+        echo "--expected-auto-trade-state requires enabled or disabled." >&2
+        exit 2
+      fi
+      expected_auto_trade_state="$2"
+      shift 2
+      ;;
     --expected-entry-message-assembly-v2-mode)
       [[ "$#" -ge 2 && "$2" =~ ^(disabled|shadow|live)$ ]] || exit 2
       expected_entry_message_assembly_v2_mode="$2"
@@ -35,11 +45,20 @@ while [[ "$#" -gt 0 ]]; do
       shift 2
       ;;
     *)
-      echo "Usage: $0 [--enable] [--expected-entry-preamble-mode disabled|shadow|live]" >&2
+      echo "Usage: $0 [--enable] --expected-auto-trade-state enabled|disabled [--expected-entry-preamble-mode disabled|shadow|live]" >&2
       exit 2
       ;;
   esac
 done
+if [[ -z "$expected_auto_trade_state" ]]; then
+  echo "--expected-auto-trade-state is required." >&2
+  exit 2
+fi
+case "$expected_auto_trade_state" in
+  enabled) expected_auto_trade_option="--expected-auto-trade-enabled" ;;
+  disabled) expected_auto_trade_option="--no-expected-auto-trade-enabled" ;;
+  *) exit 2 ;;
+esac
 if [[ -z "$expected_entry_preamble_mode" ]]; then
   echo "--expected-entry-preamble-mode is required." >&2
   exit 2
@@ -292,6 +311,7 @@ trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE=%s\n' "$expected_entry_revision_v2_mode" >> "$env_source"

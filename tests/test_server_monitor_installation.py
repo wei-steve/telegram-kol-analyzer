@@ -67,7 +67,7 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
         "monitor-production-safety "
         "--expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} "
-        "--expected-auto-trade-enabled "
+        "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION} "
         "--expected-management-mode live "
         "--expected-entry-preamble-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE} "
         "--expected-entry-message-assembly-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE} "
@@ -300,10 +300,16 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE" in installer
     assert "--expected-entry-preamble-mode" in installer
+    assert '--expected-auto-trade-state)' in installer
+    assert 'expected_auto_trade_state=""' in installer
+    assert '"--expected-auto-trade-state is required."' in installer
+    assert 'enabled) expected_auto_trade_option="--expected-auto-trade-enabled"' in installer
+    assert 'disabled) expected_auto_trade_option="--no-expected-auto-trade-enabled"' in installer
     assert 'expected_entry_preamble_mode=""' in installer
     assert 'echo "--expected-entry-preamble-mode is required."' in installer
     assert "disabled|shadow|live" in installer
@@ -325,6 +331,7 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE=%s\\n' "$expected_entry_revision_v2_mode" >> "$env_source"

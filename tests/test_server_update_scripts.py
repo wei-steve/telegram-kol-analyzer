@@ -32,14 +32,18 @@ def test_embedded_python_helpers_are_syntax_valid():
         compile(helper, "deploy/telegram-kol-update", "exec")
 
 
-def test_workstation_helpers_require_only_branch_and_exact_commit():
+def test_workstation_helpers_require_exact_commit_and_auto_trade_expectation():
     shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
 
     assert 'EXPECTED_COMMIT="${EXPECTED_COMMIT:?' in shell
+    assert 'EXPECTED_AUTO_TRADE_STATE="${EXPECTED_AUTO_TRADE_STATE:?' in shell
+    assert '[[ "$EXPECTED_AUTO_TRADE_STATE" =~ ^(enabled|disabled)$ ]]' in shell
     assert "bootstrap_server_updater.sh" in shell
     assert "[Parameter(Mandatory = $true)]" in powershell
     assert "$ExpectedCommit" in powershell
+    assert '[ValidateSet("enabled", "disabled")]' in powershell
+    assert "$ExpectedAutoTradeState" in powershell
     assert "$ChangeClass" not in powershell
     assert "$LASTEXITCODE -ne 0" in powershell
     assert "Get-FileHash -Algorithm SHA256" in powershell
@@ -179,6 +183,24 @@ def test_workstation_bootstraps_require_worker_cache_artifact_transaction():
     assert "install_worker_cache_artifacts" in powershell
 
 
+def test_workstation_bootstraps_require_monitor_expectation_transaction():
+    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    assert 'UPDATER_MONITOR_EXPECTATION_CONTRACT="monitor-expectation-v1"' in shell
+    assert "UPDATER_MONITOR_EXPECTATION_CONTRACT" in bootstrap
+    assert "sync_monitor_expectations" in bootstrap
+    assert "install_monitor_service_artifact" in bootstrap
+    assert '$monitorExpectationContract = "monitor-expectation-v1"' in powershell
+    assert "sync_monitor_expectations" in powershell
+    assert "install_monitor_service_artifact" in powershell
+
+
 def test_server_updater_transactions_worker_cache_helper_and_unit():
     script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
@@ -206,12 +228,12 @@ def test_server_updater_transactions_monitor_expected_head_and_timer_state():
     monitor_stop = script.index("stop_monitor_for_deployment")
     application_stop = script.index("\nstop_writer_service\n", monitor_stop)
     previous_pin = script.index(
-        'sync_monitor_expected_head "$previous_commit"', monitor_stop
+        'sync_monitor_expectations "$previous_commit"', monitor_stop
     )
     checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
     health = script.index("if ! verify_http_health", checkout)
     candidate_pin = script.index(
-        'sync_monitor_expected_head "$EXPECTED_COMMIT"', health
+        'sync_monitor_expectations "$EXPECTED_COMMIT"', health
     )
     restore = script.index("restore_monitor_timer_state", candidate_pin)
 
@@ -221,6 +243,13 @@ def test_server_updater_transactions_monitor_expected_head_and_timer_state():
     assert '"telegram-kol-monitor-test-notification.service"' in script
     assert 'MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"' in script
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" in script
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=" in script
+    assert 'EXPECTED_AUTO_TRADE_STATE="${EXPECTED_AUTO_TRADE_STATE:?' in script
+    assert '^(enabled|disabled)$' in script
+    assert "install_monitor_service_artifact()" in script
+    assert "restore_monitor_artifacts()" in script
+    assert "MONITOR_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor.service" in script
+    assert "auto_trade" not in script.lower().replace("expected_auto_trade", "")
     assert "git reset" not in script
     assert "git push" not in script
 
