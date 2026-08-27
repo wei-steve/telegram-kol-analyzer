@@ -1,0 +1,60 @@
+#!/usr/bin/python3
+"""Converge the one production Deepcoin contract cache ownership contract."""
+
+from __future__ import annotations
+
+import json
+import os
+import grp
+import pwd
+import sys
+from dataclasses import asdict
+from pathlib import Path
+
+from telegram_kol_research.contract_cache_permissions import (
+    ContractCachePermissionError,
+    converge_contract_cache_permissions,
+    inspect_contract_cache_permissions,
+)
+
+
+CACHE_PATH = Path("/opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json")
+WORKER_USER = "telegram-kol-worker"
+RUNTIME_GROUP = "telegram-kol-runtime"
+AGENT_USER = "telegram-kol-agent"
+
+
+def main(arguments: list[str]) -> int:
+    if os.geteuid() != 0:
+        print('{"error_category":"permission_denied"}')
+        return 1
+    if arguments not in ([], ["--check"]):
+        print('{"error_category":"unsupported_arguments"}')
+        return 2
+    try:
+        worker_uid = pwd.getpwnam(WORKER_USER).pw_uid
+        runtime_gid = grp.getgrnam(RUNTIME_GROUP).gr_gid
+        if arguments == ["--check"]:
+            status = inspect_contract_cache_permissions(
+                CACHE_PATH,
+                worker_uid=worker_uid,
+                runtime_gid=runtime_gid,
+                agent_user=AGENT_USER,
+            )
+        else:
+            status = converge_contract_cache_permissions(
+                CACHE_PATH,
+                worker_uid=worker_uid,
+                runtime_gid=runtime_gid,
+                agent_user=AGENT_USER,
+            )
+    except (KeyError, ContractCachePermissionError) as exc:
+        category = getattr(exc, "category", "identity_unavailable")
+        print(json.dumps({"error_category": category}, separators=(",", ":")))
+        return 1
+    print(json.dumps(asdict(status), sort_keys=True, separators=(",", ":")))
+    return 0 if status.contract_satisfied else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))

@@ -4,6 +4,7 @@ import os
 import stat
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,15 +19,21 @@ def _stub_agent_acl(monkeypatch, *, permission: str = "---") -> list[str]:
     from telegram_kol_research import contract_cache_permissions
 
     writes: list[str] = []
+    current_permission = {"value": permission}
     monkeypatch.setattr(
         contract_cache_permissions,
         "_read_agent_acl_fd",
-        lambda _fd, *, agent_user: permission,
+        lambda _fd, *, agent_user: current_permission["value"],
     )
+
+    def record_write(_fd, *, agent_user):
+        writes.append(agent_user)
+        current_permission["value"] = "---"
+
     monkeypatch.setattr(
         contract_cache_permissions,
         "_set_agent_acl_fd",
-        lambda _fd, *, agent_user: writes.append(agent_user),
+        record_write,
     )
     return writes
 
@@ -83,22 +90,39 @@ def test_worker_owned_regular_file_converges_to_exact_contract(tmp_path, monkeyp
     assert acl_writes == ["telegram-kol-agent"]
 
 
-@pytest.mark.skipif(os.geteuid() != 0, reason="requires root-owned fixture")
 def test_root_owned_regular_file_can_migrate_to_worker(tmp_path, monkeypatch):
+    from telegram_kol_research import contract_cache_permissions
+
     _stub_agent_acl(monkeypatch)
     path = tmp_path / "deepcoin_contract_specs_cache.json"
     path.write_text("{}", encoding="utf-8")
+    real_fstat = os.fstat
+    first_inspection = {"pending": True}
+
+    def report_root_owner_once(fd):
+        metadata = real_fstat(fd)
+        if first_inspection["pending"]:
+            first_inspection["pending"] = False
+            return SimpleNamespace(
+                st_mode=metadata.st_mode,
+                st_nlink=metadata.st_nlink,
+                st_uid=0,
+                st_gid=metadata.st_gid,
+            )
+        return metadata
+
+    monkeypatch.setattr(contract_cache_permissions.os, "fstat", report_root_owner_once)
 
     status = converge_contract_cache_permissions(
         path,
-        worker_uid=65534,
-        runtime_gid=65534,
+        worker_uid=os.getuid(),
+        runtime_gid=os.getgid(),
         agent_user="telegram-kol-agent",
     )
 
     assert status.contract_satisfied is True
-    assert path.stat().st_uid == 65534
-    assert path.stat().st_gid == 65534
+    assert path.stat().st_uid == os.getuid()
+    assert path.stat().st_gid == os.getgid()
 
 
 def test_unknown_owner_is_rejected_without_changing_inode(tmp_path, monkeypatch):

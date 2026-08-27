@@ -497,6 +497,31 @@ def test_split_runtime_provisioning_grants_shared_configs_read_only_access():
     assert "chmod -R" not in deployment_guide
 
 
+def test_worker_contract_cache_prepare_helper_has_a_fixed_narrow_target():
+    repository_root = Path(__file__).resolve().parents[1]
+    helper_path = (
+        repository_root
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-worker-prepare-contract-cache"
+    )
+
+    helper = helper_path.read_text(encoding="utf-8")
+
+    assert helper.startswith("#!/usr/bin/python3\n")
+    assert (
+        'CACHE_PATH = Path("/opt/telegram-kol-analyzer/data/'
+        'deepcoin_contract_specs_cache.json")'
+    ) in helper
+    assert 'WORKER_USER = "telegram-kol-worker"' in helper
+    assert 'RUNTIME_GROUP = "telegram-kol-runtime"' in helper
+    assert 'AGENT_USER = "telegram-kol-agent"' in helper
+    assert 'if arguments == ["--check"]:' in helper
+    assert "converge_contract_cache_permissions(" in helper
+    assert "inspect_contract_cache_permissions(" in helper
+    assert "os.geteuid() != 0" in helper
+
+
 def test_split_cutover_refreshes_generated_contract_cache_permissions():
     repository_root = Path(__file__).resolve().parents[1]
     deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(
