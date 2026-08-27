@@ -3,17 +3,21 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: candidate_integration
-phase_state: planned
-claimed_by: null
+current_phase: production_preflight
+phase_state: in_progress
+claimed_by: task12-production-preflight-2026-08-27
 candidate_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
 candidate_content_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
 handoff_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
+pushed_sha: d2a9c4c615a3fc25af5842f6209b3a080e763e5c
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
-production_sha: null
+production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
+task12_gate: failed_closed
+task12_observed_max_raw_message_id: 13522
+task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
 historical_replay_allowed: false
 ```
 
@@ -25,6 +29,46 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- Phase 2 non-force push completed and the remote
+  `codex/deepcoin-auto-trading-v1` ref was independently verified at exact SHA
+  `d2a9c4c615a3fc25af5842f6209b3a080e763e5c`.
+- Task 12 production preflight ran under explicit read-only authority. Production
+  remained clean on branch `codex/deepcoin-auto-trading-v1` at
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; monolith was inactive, the ingest,
+  worker and Web services were active, and the monitor timer was active. The
+  Telegram session lock owner matched the ingest PID.
+- SQLite evidence was complete through `query_only=1`, WAL mode and
+  `PRAGMA quick_check=ok`. Active exchange writes, pending/claimed non-shadow
+  queue jobs, active management batches, active worker commands and revision
+  claims were all zero. Recent queue parity had zero missing, orphan and stuck
+  jobs. The observed preflight maximum raw message ID was 13522.
+- The bounded account snapshot completed with zero positions and zero pending
+  regular orders. Pending trigger/TPSL reads completed for the configured
+  BTC/ETH/SOL set with counts 4/3/0. Full history acceptance did not pass:
+  BTC position history failed twice and multiple history/fill reads returned
+  exactly the 100-row boundary, so completeness remains unknown.
+- The historical `contract_spec_sync_unavailable` terminal set is now 15 rather
+  than the previously recorded 14. All 15 remain `verified_refusal` with
+  `attempted_exchange_write=0`; the newest is raw message 13491. Four older
+  instruction execution contracts remain pending/deferred with zero attempted
+  exchange writes and require a separate read-only explanation before retrying
+  Task 12.
+- The candidate `--check` against the real cache was read-only. Type, link,
+  group and mode passed; owner and Agent ACL failed. The production monitor env
+  still pins the production HEAD but lacks the candidate auto-trade expectation
+  field, so the current candidate updater cannot pass its monitor-env preflight.
+- The shipped Linux/root pytest case failed because the root-only pytest
+  ancestors were mode `0700`, preventing the dropped worker identity from
+  traversing to the inner sticky directory. A corrected direct kernel proof in
+  a separate traversable isolated directory passed: replacement failed while
+  root-owned, permission convergence produced worker/runtime `0660`, and the
+  worker identity then replaced the target successfully. The real cache was not
+  modified.
+- Raw JSON, exact exchange rows and long logs are retained only in the
+  root-owned `0700` directory with `0600` evidence file at
+  `/run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl`. Task 12 stopped fail-closed;
+  no freeze, deployment, restart, settings/database mutation, replay, Telegram
+  send or Deepcoin write was performed.
 - Task 11 findings were repaired locally from exact clean base
   `49b8f40c9af0f38344724c84f39a7e065e5beabd`. The repair plan/claim commit is
   `f6e99937`; descriptor/current-entry binding and ACL persistence are in
@@ -49,8 +93,9 @@ phase completes or pauses, record both verified evidence and outstanding work.
   2 skipped, 32 warnings in 631.09s. No production code changed after this run.
 - Bash syntax checks, Python compilation, and `git diff --check` passed. A
   read-only follow-up review found no remaining P0-P2 findings.
-- No push, deployment, SSH, restart, production/database/settings write,
-  Telegram replay, manufactured traffic, or Deepcoin write was performed.
+- During the local repair session, no push, deployment, SSH, restart,
+  production/database/settings write, Telegram replay, manufactured traffic or
+  Deepcoin write was performed.
 - `2ab3e92458abcda65f4a5c46b11616eb820742ec` is the evidence-bearing repaired
   handoff commit. The following status-only commit records that SHA; any future
   exact-SHA action must use its read-only `git rev-parse HEAD` result as the
@@ -96,12 +141,18 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- Linux/root sticky-directory integration test before production deployment.
-- Any push or further Phase 2 integration action remains separately authorized.
-- Production server preflight must still prove the exact checkout/topology,
-  clean tracked tree, safe window, complete zero active-write evidence, healthy
-  queues/listener/reconciliation/protection, and complete Deepcoin read-only
-  attribution/history.
+- Repair and re-review the candidate's legacy monitor-env upgrade path before
+  Task 13; the production env does not yet contain the required governed
+  auto-trade expectation line. Any new candidate requires a new exact-SHA push.
+- Make the Linux/root pytest test provide traversable ancestors to the dropped
+  worker identity, then rerun the exact shipped test; the direct kernel behavior
+  is proven but the prescribed automated acceptance remains red.
+- Explain the four old zero-write nonterminal execution contracts and update the
+  historical terminal refusal baseline from 14 to 15 without replay or data
+  mutation.
+- Rerun Task 12 under new authorization after the candidate is repaired.
+  Deepcoin history completeness exhausted its single allowed retry in this
+  session and remains unknown; no Task 13 authorization is currently eligible.
 - Explicit freeze, exact-SHA deployment, Linux/root helper verification,
   worker refresh/health checks, bounded observation, and future-signal-only
   restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
