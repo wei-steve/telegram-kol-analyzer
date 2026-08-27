@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import shutil
 import stat
 import sys
+import tempfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -281,27 +283,32 @@ def _replace_as_nobody(parent: Path, target: Path, temporary_name: str) -> int:
     sys.platform != "linux" or os.geteuid() != 0,
     reason="requires Linux root for real cross-UID sticky-directory semantics",
 )
-def test_linux_sticky_directory_replace_requires_target_ownership(
-    tmp_path, monkeypatch
-):
+def test_linux_sticky_directory_replace_requires_target_ownership(monkeypatch):
     _stub_agent_acl(monkeypatch)
-    parent = tmp_path / "sticky"
-    parent.mkdir(mode=0o777)
-    parent.chmod(0o1777)
-    target = parent / "deepcoin_contract_specs_cache.json"
-    target.write_text("root-owned", encoding="utf-8")
-    os.chown(target, 0, 0)
-
-    assert _replace_as_nobody(parent, target, "before.tmp") == 10
-    (parent / "before.tmp").unlink(missing_ok=True)
-
-    status = converge_contract_cache_permissions(
-        target,
-        worker_uid=65534,
-        runtime_gid=65534,
-        agent_user="telegram-kol-agent",
+    test_root = Path(
+        tempfile.mkdtemp(prefix="contract-cache-sticky-", dir="/tmp")
     )
+    try:
+        test_root.chmod(0o755)
+        parent = test_root / "sticky"
+        parent.mkdir(mode=0o777)
+        parent.chmod(0o1777)
+        target = parent / "deepcoin_contract_specs_cache.json"
+        target.write_text("root-owned", encoding="utf-8")
+        os.chown(target, 0, 0)
 
-    assert status.contract_satisfied is True
-    assert _replace_as_nobody(parent, target, "after.tmp") == 0
-    assert target.read_text(encoding="utf-8") == "replacement"
+        assert _replace_as_nobody(parent, target, "before.tmp") == 10
+        (parent / "before.tmp").unlink(missing_ok=True)
+
+        status = converge_contract_cache_permissions(
+            target,
+            worker_uid=65534,
+            runtime_gid=65534,
+            agent_user="telegram-kol-agent",
+        )
+
+        assert status.contract_satisfied is True
+        assert _replace_as_nobody(parent, target, "after.tmp") == 0
+        assert target.read_text(encoding="utf-8") == "replacement"
+    finally:
+        shutil.rmtree(test_root)
