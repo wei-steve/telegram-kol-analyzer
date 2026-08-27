@@ -196,6 +196,27 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "terminal set is now 15" not in current
     assert "still require a production-read-only\n  explanation" not in current
     assert "owner and Agent ACL failed" not in current
+    outstanding = status[status.index("## Outstanding") :]
+    for required in (
+        "same token",
+        "exact worker port",
+        "runtime_role=worker",
+        "exact previous SHA route absence",
+        "HTTP 404 alone is insufficient",
+    ):
+        assert required in outstanding
+
+
+def test_version_aware_implementation_plan_uses_closed_legacy_requirements():
+    plan = CACHE_REPAIR_VERSION_AWARE_PLAN.read_text(encoding="utf-8")
+    requirements = plan[plan.index("Add assertions requiring") : plan.index("Also assert")]
+
+    assert "Agent deny ACL may be satisfied or absent" in requirements
+    assert "same token" in requirements
+    assert "exact worker port" in requirements
+    assert "worker runtime role" in requirements
+    assert "exact previous SHA route absence" in requirements
+    assert "HTTP 404 alone is insufficient" in requirements
 
 
 def test_version_aware_gate_documents_have_single_terminal_newline():
