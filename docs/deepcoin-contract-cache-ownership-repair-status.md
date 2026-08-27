@@ -23,7 +23,7 @@ task12_observed_max_raw_message_id: 13534
 task12_refusal_baseline_count: 16
 task12_time_sensitive_pending_trigger_count: 7
 pending_entry_cancel_candidate_status: local_complete_unpushed
-pending_entry_cancel_candidate_sha: b5d189ac
+pending_entry_cancel_candidate_sha: d39fefa46f0c01b500059d9da77bbe0aa973f1df
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -40,23 +40,25 @@ phase completes or pauses, record both verified evidence and outstanding work.
 ## Verified
 
 - The exact seven-entry cancellation helper is locally RED-to-GREEN complete at
-  code candidate `b5d189ac`. It is dry-run by default, opens only an existing
-  database, selects exactly one reviewed order per apply, requires fresh plan
-  and action fingerprints plus a globally single-use confirmation token, never
-  retries an unknown write, verifies exact cancelled history/no fill/no new
-  position or regular order/unchanged siblings, and terminalizes only the exact
-  dependent local rows in one transaction after complete confirmation.
+  code candidate `d39fefa46f0c01b500059d9da77bbe0aa973f1df`. It is dry-run
+  by default, opens only an existing database, selects exactly one reviewed
+  order per apply, requires fresh plan and action fingerprints plus a globally
+  single-use confirmation token, never retries an unknown write, verifies exact
+  cancelled history/no fill/no new position or regular order/unchanged siblings,
+  and terminalizes only the exact dependent local rows in one transaction after
+  complete confirmation.
 - The helper stores only closed-schema request/result evidence and bounded reason
   codes. Transport and response failures were tested without exception or raw
-  response leakage. Focused and adjacent verification passed 208 tests; the
-  final repository suite passed 6451 tests with 2 skipped and 32 warnings in
-  685.41 seconds. `compileall` and `git diff --check` also passed.
-- Candidate `b5d189ac` is local and unpushed. No SSH, freeze, deployment,
-  restart, production/database/Deepcoin write, historical replay, or production
-  Telegram action occurred during implementation. The live count of seven is
-  retained from the latest separately authorized read-only Task 12 snapshot; it
-  was not refreshed in this local-only turn and the seven orders remain
-  untouched by this candidate.
+  response leakage. Focused and adjacent verification passed 236 tests; the
+  final repository suite passed 6458 tests with 2 skipped and 32 warnings in
+  679.07 seconds. `compileall` and `git diff --check` also passed. Independent
+  code review found no remaining Critical or Important findings.
+- Candidate `d39fefa46f0c01b500059d9da77bbe0aa973f1df` is local and
+  unpushed. No SSH, freeze, deployment, restart, production/database/Deepcoin
+  write, historical replay, or production Telegram action occurred during
+  implementation. The live count of seven is retained from the latest separately
+  authorized read-only Task 12 snapshot; it was not refreshed in this local-only
+  turn and the seven orders remain untouched by this candidate.
 - The version-aware gate candidate was non-force pushed and the remote
   `codex/deepcoin-auto-trading-v1` ref was independently verified at exact SHA
   `c3730ef6ea9406f490b44fab97847b556f946fb8` before the latest Task 12 rerun.

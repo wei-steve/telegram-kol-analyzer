@@ -195,7 +195,7 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "pending_entry_cancel_candidate_status: local_complete_unpushed" in status
     assert (
         "pending_entry_cancel_candidate_sha: "
-        "b5d189ac" in status
+        "d39fefa46f0c01b500059d9da77bbe0aa973f1df" in status
     )
     assert "pending_entry_cancel_production_executed: false" in status
     assert "pending_entry_cancel_live_order_count: 7" in status
