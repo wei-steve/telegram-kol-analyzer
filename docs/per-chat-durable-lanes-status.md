@@ -31,12 +31,12 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: codex-per-chat-phase7-low-perturbation-observer-20260826-root
+claimed_by: null
 claim_base_sha: b24e8935ef5a548eb898110a40e62e98dce88e00
-current_task: phase-7-r6-web-parity-isolation-design-plan-red-green-and-final-safe-retry
-current_phase: phase_7_cutover_acceptance
-current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
-last_completed_phase: phase_6_compatible_deployment
+current_task: phase-8-eligible-not-started
+current_phase: phase_8_eligible_not_started
+current_phase_file: null
+last_completed_phase: phase_7_cutover_acceptance
 phase_1_status: local_complete
 phase_1_authorization: local_code_and_tests_only
 phase_1_candidate_commit: 3d5e05aeb4d439654ee9ed24b5bfa3158d0354bd
@@ -96,7 +96,7 @@ phase_6_pipeline_parity_status: passed_8_raw_8_succeeded_jobs_zero_missing_orpha
 phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snapshots_identical
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
-phase_7_status: rolled_back_incomplete
+phase_7_status: complete
 phase_7_low_perturbation_observer_authorization: owner_approved_design_local_red_green_full_suite_read_only_observer_install_fresh_two_hour_safe_retry_and_atomic_rollback
 phase_7_low_perturbation_observer_status: local_complete_ready_for_read_only_install_and_fresh_safe_retry
 phase_7_low_perturbation_observer_claim_commit: 86ad3007192b7a26102317890f6f809b37e732e2
@@ -145,7 +145,7 @@ phase_7_r6_initial_status: per_chat_3_queue_converged_three_samples_zero_identit
 phase_7_r6_failure_at: 2026-08-27T05:05:18.575438Z
 phase_7_r6_failure_reason: acceptance_tool_sampled_fresh_raw_220ms_before_queue_job_creation_and_misclassified_it_as_permanent_missing_identity
 phase_7_r6_rollback_status: confirmed_global_1_queue_three_consecutive_samples
-phase_7_r7_status: production_acceptance_in_progress
+phase_7_r7_status: accepted_by_owner_authorized_risk_adaptive_combined_evidence
 phase_7_r7_candidate_commit: cc2e2d680c05a4c6f26a6bae283fd3326f6a0541
 phase_7_r7_observer_sha256: 715c558f7d6a4c9e13eb3ecc33958c96bc2f16d09a0d63098c1af168128a8531
 phase_7_r7_controller_sha256: 150a7f6bdb83ef655996c960e81c8463c2541a90c05224d78a94e95156e0bd64
@@ -158,6 +158,14 @@ phase_7_r7_cutover_at: 2026-08-27T05:24:51.596867+00:00
 phase_7_r7_window_start: 2026-08-27T05:24:53.787272Z
 phase_7_r7_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-missing-grace-r7-20260827T052358Z
 phase_7_r7_initial_status: per_chat_3_queue_converged_three_samples_zero_identity_unsettled_stuck_guard_or_exchange_anomaly
+phase_7_r7_acceptance_status: passed_combined_r5_cross_chat_and_r7_l2_stability_evidence
+phase_7_r7_final_tuple: per_chat_3_queue
+phase_7_r7_final_runtime_status: ingest_worker_web_active_original_pids_nrestarts_0
+phase_7_r7_final_queue_status: pending_0_claimed_0
+phase_7_r7_final_guard_status: identity_unsettled_stuck_loop_session_pid_sqlite_execution_and_exchange_all_passed
+phase_7_r7_combined_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-missing-grace-r7-20260827T052358Z/combined-acceptance.json
+phase_7_r7_combined_evidence_sha256: 38cc690f9e31a0f94976c8851170618a38a9e21ed35bc280aeed94d5c7a02b5a
+phase_8_eligibility: eligible_requires_separate_phase_8_claim_and_scope
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -440,6 +448,29 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-27 Phase 7 risk-adaptive acceptance complete`: the owner explicitly
+  authorized evidence-based completion without mechanically extending an
+  already sufficient window. Combined evidence uses the same exact production
+  runtime SHA `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`: R5 supplied
+  `2460.236s`, seven natural messages from three chats, maximum two simultaneous
+  claimed chats and worker peak two; its only failure was the separately proven
+  acceptance Web-parity self-perturbation. R7 supplied `2135.593s`, three
+  further natural messages from three chats, `418` external guard samples and
+  zero observer/guard anomaly samples after both acceptance-tool repairs. Final
+  read-only checks passed for exact clean runtime HEAD, all three
+  `per_chat + 3 + queue` tuples, drained queue, same-chat ordering, cross-chat
+  progress, identity/unsettled/stuck/duplicate evidence, unchanged role stall
+  counts, original PIDs with `NRestarts=0`, unique ingest session, SQLite
+  query-only/WAL/quick-check, zero management/command/revision/active-write,
+  and two identical complete exchange snapshots with zero positions and zero
+  open orders. The acceptance-only cgroup was stopped without rollback or a
+  business-service restart; all three services remain active on their original
+  PIDs. Combined evidence SHA-256 is
+  `38cc690f9e31a0f94976c8851170618a38a9e21ed35bc280aeed94d5c7a02b5a` at
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-missing-grace-r7-20260827T052358Z/combined-acceptance.json`.
+  Phase 7 is complete, the claim is released, and Phase 8 is eligible but not
+  started.
 
 - `2026-08-27 Phase 7 R6 rollback and R7 repair`: R6 correctly converged and
   kept every external guard at zero, but the first natural raw row was sampled
