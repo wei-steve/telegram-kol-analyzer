@@ -4,11 +4,11 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: candidate_integration
-phase_state: claimed
-claimed_by: task-11-findings-local-red-green-2026-08-27
-candidate_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
-candidate_content_sha: 14819b309f27025d183f4bd27b8210ac74996e92
-handoff_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
+phase_state: planned
+claimed_by: null
+candidate_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
+candidate_content_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
+handoff_sha: null
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 production_sha: null
 auto_trade_frozen: false
@@ -25,6 +25,32 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- Task 11 findings were repaired locally from exact clean base
+  `49b8f40c9af0f38344724c84f39a7e065e5beabd`. The repair plan/claim commit is
+  `f6e99937`; descriptor/current-entry binding and ACL persistence are in
+  `34bd6289`; the remaining monitor/updater/runbook and descriptor-cleanup
+  repairs are in candidate content commit
+  `a6ac63cb57d633831196414f7a55bb1bd0f321f2`.
+- Publication now restores the explicit `telegram-kol-agent:---` deny ACL on
+  every Linux candidate inode, binds descriptor inspection to the current
+  directory entry, and closes the pre-`fdopen` descriptor on ACL/setup failure.
+  Unknown owner/group and replaced entries remain fail-closed.
+- Main, diagnostic, and test-notification monitor units all consume the governed
+  auto-trade expectation. The updater backs up, installs, and restores all three
+  fixed unit paths with the monitor env in one rollback boundary; monitor output
+  continues excluding secret values.
+- `freeze_raw_message_id` is audit-only. A distinct
+  `restore_raw_message_id = MAX(raw_messages.id)` is recorded after the enabled
+  updater succeeds and immediately before settings recovery. All messages at or
+  below it, including updater-window arrivals, remain terminal with zero replay
+  and zero backfill.
+- Final focused candidate: 915 passed, 2 skipped, 2 warnings in 157.04s.
+- The only completed final full suite for this repaired candidate: 6428 passed,
+  2 skipped, 32 warnings in 631.09s. No production code changed after this run.
+- Bash syntax checks, Python compilation, and `git diff --check` passed. A
+  read-only follow-up review found no remaining P0-P2 findings.
+- No push, deployment, SSH, restart, production/database/settings write,
+  Telegram replay, manufactured traffic, or Deepcoin write was performed.
 - Task 11 exact-SHA review rejected the prior candidate before push. The
   owner-authorized local RED→GREEN repair is claimed at exact clean base
   `49b8f40c9af0f38344724c84f39a7e065e5beabd`; push, SSH, deployment, restart,
@@ -63,12 +89,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- Close the four Task 11 findings locally: post-publish Agent deny ACL,
-  descriptor/current-directory-entry binding, governed frozen expectations for
-  all monitor oneshots, and the separate restore watermark boundary.
 - Linux/root sticky-directory integration test before production deployment.
-- Phase 2 exact-SHA review/integration and any push remain separately
-  authorized.
+- Any push or further Phase 2 integration action remains separately authorized.
 - Production server preflight must still prove the exact checkout/topology,
   clean tracked tree, safe window, complete zero active-write evidence, healthy
   queues/listener/reconciliation/protection, and complete Deepcoin read-only
