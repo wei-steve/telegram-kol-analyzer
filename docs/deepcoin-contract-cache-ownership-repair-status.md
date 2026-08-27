@@ -3,14 +3,15 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: production_preflight
-phase_state: in_progress
-claimed_by: task12-production-preflight-2026-08-27
-candidate_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
-candidate_content_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
-handoff_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
+current_phase: task12_findings_local_red_green
+phase_state: claimed
+claimed_by: task12-findings-local-red-green-2026-08-27
+candidate_sha: null
+candidate_content_sha: null
+handoff_sha: null
 pushed_sha: d2a9c4c615a3fc25af5842f6209b3a080e763e5c
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
+task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
 auto_trade_frozen: false
 freeze_raw_message_id: null
