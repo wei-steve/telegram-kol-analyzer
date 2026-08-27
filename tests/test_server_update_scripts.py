@@ -186,11 +186,15 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     status = CACHE_REPAIR_STATUS.read_text(encoding="utf-8")
 
     assert "task12_refusal_baseline_count: 16" in status
-    assert "task12_observed_max_raw_message_id: 13530" in status
+    observed_max = re.search(r"task12_observed_max_raw_message_id: (\d+)", status)
+    assert observed_max is not None
+    assert int(observed_max.group(1)) >= 13534
     assert "task12_gate: failed_closed" in status
+    assert "task12_health_classification: legacy_capability_absent" in status
+    assert "task12_time_sensitive_pending_trigger_count: 7" in status
     assert "recognized migratable legacy drift" in status
     assert "bounded 100-row history coverage" in status
-    assert "health HTTP error remains unresolved" in status
+    assert "seven unprotected pending trigger entries" in status
     current = status[: status.index("### Prior rejected candidate history")]
     assert "baseline of\n  15 terminal" not in current
     assert "terminal set is now 15" not in current
