@@ -6,9 +6,9 @@ design_status: approved
 current_phase: candidate_integration
 phase_state: planned
 claimed_by: null
-candidate_sha: 14819b309f27025d183f4bd27b8210ac74996e92
+candidate_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
 candidate_content_sha: 14819b309f27025d183f4bd27b8210ac74996e92
-handoff_sha: null
+handoff_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
 production_sha: null
 auto_trade_frozen: false
 freeze_raw_message_id: null
@@ -51,6 +51,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
   the existing Linux/systemd sandbox probe.
 - `git diff --check` passed and the pre-handoff worktree was clean at candidate
   content SHA `14819b309f27025d183f4bd27b8210ac74996e92`.
+- `314f7c19628b8c49c15519fb3af405e704e718a4` is the evidence-bearing handoff
+  commit. The following status-only commit records that SHA; the receiving
+  phase must use its read-only `git rev-parse HEAD` result as the exact final
+  integration target, avoiding an impossible self-referential status hash.
 
 ## Outstanding
 
