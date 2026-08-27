@@ -9,14 +9,34 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from telegram_kol_research.execution_events import (
+    ExecutionEventRecord,
+    record_execution_event,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    InstructionExecutionContract,
+    PositionMutationIntent,
+    PositionBackupStopOrder,
     PositionProtectionLeg,
+    StrategyManagementBatch,
+    StrategyManagementComponent,
+    StrategyRevisionBatch,
     StrategyLifecycle,
+    TradeSignal,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
+    WorkerCommandJob,
+)
+from telegram_kol_research.position_mutation_intents import (
+    reserve_position_mutation_intent,
+    transition_position_mutation_intent,
+)
+from telegram_kol_research.repair_confirmation import (
+    consume_repair_confirmation_token,
+    require_repair_confirmation_token_unused,
 )
 
 
@@ -273,6 +293,17 @@ def build_reviewed_pending_entry_cancel_plan(
     conflicts: list[dict[str, str]] = []
     completed: list[str] = []
     with session_factory() as session:
+        if _active_exchange_authority_present(session):
+            return _plan(
+                created_at,
+                (),
+                (
+                    {
+                        "order_id": "*",
+                        "reason": "active_exchange_authority_present",
+                    },
+                ),
+            )
         for target in reviewed:
             snapshot = snapshots.get(target.instrument_id, {})
             pending_rows = [
@@ -311,6 +342,22 @@ def build_reviewed_pending_entry_cancel_plan(
                 intent_rows=intent_rows,
             ):
                 conflicts.append(_conflict(target, "local_ownership_mismatch"))
+                continue
+
+            earlier_cancel = (
+                session.query(PositionMutationIntent)
+                .filter(
+                    PositionMutationIntent.operation
+                    == "cancel_reviewed_pending_entry",
+                    PositionMutationIntent.order_id == target.order_id,
+                    PositionMutationIntent.status != "confirmed",
+                )
+                .first()
+            )
+            if earlier_cancel is not None:
+                conflicts.append(
+                    _conflict(target, "prior_cancel_outcome_unknown")
+                )
                 continue
 
             if not pending_rows:
@@ -374,9 +421,675 @@ def build_reviewed_pending_entry_cancel_plan(
 
     return _plan(
         created_at,
-        actions,
+        () if conflicts else actions,
         conflicts,
         completed_order_ids=completed,
+    )
+
+
+def _active_exchange_authority_present(session) -> bool:
+    checks = (
+        session.query(ExecutionOrderLeg.id).filter(
+            ExecutionOrderLeg.status.in_({"submitting", "cancel_submitting"})
+        ),
+        session.query(PositionBackupStopOrder.id).filter(
+            PositionBackupStopOrder.status == "submitting"
+        ),
+        session.query(InstructionExecutionContract.id).filter(
+            InstructionExecutionContract.state == "submitting"
+        ),
+        session.query(StrategyManagementComponent.id).filter(
+            StrategyManagementComponent.status.in_(
+                {"submitting", "cancel_submitting"}
+            )
+        ),
+        session.query(StrategyManagementBatch.id).filter(
+            StrategyManagementBatch.status == "executing"
+        ),
+        session.query(StrategyRevisionBatch.id).filter(
+            StrategyRevisionBatch.status == "submitting_replacements"
+        ),
+        session.query(TriggerProtectionIntent.id).filter(
+            TriggerProtectionIntent.recovery_state.in_(
+                {"submitting", "cancel_submitting"}
+            )
+        ),
+        session.query(PositionMutationIntent.id).filter(
+            PositionMutationIntent.status == "submitting"
+        ),
+        session.query(TradeSignal.id).filter(
+            TradeSignal.status.in_(
+                {"processing", "submitting", "cancel_submitting"}
+            )
+        ),
+        session.query(WorkerCommandJob.id).filter(
+            WorkerCommandJob.status.in_({"pending", "claimed", "executing"})
+        ),
+    )
+    return any(query.first() is not None for query in checks)
+
+
+def apply_reviewed_pending_entry_cancel_plan(
+    session_factory,
+    plan: ReviewedPendingEntryCancelPlan,
+    *,
+    deepcoin_client,
+    targets: Iterable[ReviewedPendingEntryTarget],
+    order_id: str,
+    action_id: str,
+    expected_fingerprint: str,
+    confirmation_token: str,
+    now: datetime | None = None,
+) -> ReviewedPendingEntryCancelResult:
+    """Cancel one exact reviewed entry, without ever retrying the write."""
+
+    if expected_fingerprint != plan.fingerprint:
+        raise ValueError("plan fingerprint mismatch")
+    if plan.conflicts:
+        raise ValueError("plan has conflicts")
+    selected = [
+        action
+        for action in plan.actions
+        if action.order_id == str(order_id)
+        and action.action_id == str(action_id)
+    ]
+    if len(selected) != 1:
+        raise ValueError("exactly one reviewed cancellation action is required")
+    require_repair_confirmation_token_unused(
+        session_factory,
+        confirmation_token=confirmation_token,
+    )
+
+    reviewed = tuple(targets)
+    fresh = build_reviewed_pending_entry_cancel_plan(
+        session_factory,
+        deepcoin_client=deepcoin_client,
+        targets=reviewed,
+        now=now,
+    )
+    if fresh.fingerprint != expected_fingerprint:
+        raise ValueError("plan fingerprint changed")
+    current = [
+        action
+        for action in fresh.actions
+        if action.order_id == str(order_id)
+        and action.action_id == str(action_id)
+    ]
+    if len(current) != 1:
+        raise ValueError("reviewed cancellation action changed")
+    action = current[0]
+    observed_at = now or datetime.now(UTC)
+    request = {"instId": action.instrument_id, "ordId": action.order_id}
+    authority_fingerprint = _fingerprint(
+        {
+            "action_id": action.action_id,
+            "plan_fingerprint": fresh.fingerprint,
+            "exchange_row_fingerprint": action.exchange_row_fingerprint,
+            "request_json_fingerprint": action.request_json_fingerprint,
+        }
+    )
+    intent = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key=(
+            f"reviewed-pending-entry-cancel:{action.order_id}:{action.action_id}"
+        ),
+        operation="cancel_reviewed_pending_entry",
+        strategy_instance_id=action.strategy_instance_id,
+        execution_binding_id=action.execution_binding_id,
+        execution_order_leg_id=action.execution_order_leg_id,
+        pos_id=f"pending-entry:{action.order_id}",
+        order_id=action.order_id,
+        authority_fingerprint=authority_fingerprint,
+        request_fingerprint=_fingerprint(request),
+        request=request,
+        reserved_at=observed_at,
+        venue="deepcoin",
+    )
+    intent_id = int(intent.id)
+    if intent.status != "reserved":
+        return ReviewedPendingEntryCancelResult(
+            status=f"intent_{intent.status}",
+            order_id=action.order_id,
+            reason_code=str(intent.status),
+        )
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="cancel_reviewed_pending_entry",
+        action_id=action.action_id,
+        pos_id=f"pending-entry:{action.order_id}",
+        consumed_at=observed_at,
+    )
+    if not _single_pending_cancel_write_gate(
+        session_factory,
+        action=action,
+        mutation_intent_id=intent_id,
+    ):
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"reserved"},
+            new_status="blocked",
+            transitioned_at=observed_at,
+            error={"reason": "exact_pending_cancel_write_gate_blocked"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="blocked",
+            reason="exact_pending_cancel_write_gate_blocked",
+            request=request,
+            response={"submitted": False},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="blocked",
+            order_id=action.order_id,
+            reason_code="exact_pending_cancel_write_gate_blocked",
+        )
+    if not transition_position_mutation_intent(
+        session_factory,
+        intent_id,
+        expected_statuses={"reserved"},
+        new_status="submitting",
+        transitioned_at=observed_at,
+    ):
+        return ReviewedPendingEntryCancelResult(
+            status="intent_changed",
+            order_id=action.order_id,
+            reason_code="mutation_intent_changed",
+        )
+
+    try:
+        response = deepcoin_client.cancel_trigger_order(request)
+    except Exception:
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"submitting"},
+            new_status="recovery_required",
+            transitioned_at=observed_at,
+            error={"reason": "cancel_outcome_unknown"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="unknown",
+            reason="cancel_outcome_unknown",
+            request=request,
+            response={"outcome": "unknown"},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="cancel_outcome_unknown",
+            order_id=action.order_id,
+            reason_code="cancel_outcome_unknown",
+        )
+
+    if not _confirmed_cancel_response(response, order_id=action.order_id):
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"submitting"},
+            new_status="recovery_required",
+            transitioned_at=observed_at,
+            response={"confirmed": False},
+            error={"reason": "cancel_response_unconfirmed"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="unknown",
+            reason="cancel_response_unconfirmed",
+            request=request,
+            response={"confirmed": False},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="cancel_outcome_unknown",
+            order_id=action.order_id,
+            reason_code="cancel_response_unconfirmed",
+        )
+
+    transition_position_mutation_intent(
+        session_factory,
+        intent_id,
+        expected_statuses={"submitting"},
+        new_status="submitted",
+        transitioned_at=observed_at,
+        response={"code": "0", "order_id": action.order_id},
+    )
+
+    try:
+        snapshots = _read_exchange_snapshots(
+            deepcoin_client,
+            instruments=tuple(
+                sorted(
+                    {
+                        *_GOVERNED_INSTRUMENTS,
+                        *(target.instrument_id for target in reviewed),
+                    }
+                )
+            ),
+        )
+    except Exception:
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"submitted"},
+            new_status="recovery_required",
+            transitioned_at=observed_at,
+            error={"reason": "cancel_readback_unavailable"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="unknown",
+            reason="cancel_readback_unavailable",
+            request=request,
+            response={"code": "0", "order_id": action.order_id},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="cancel_outcome_unknown",
+            order_id=action.order_id,
+            reason_code="cancel_readback_unavailable",
+        )
+
+    if not _post_cancel_exchange_state_matches(
+        snapshots,
+        plan=fresh,
+        selected=action,
+    ):
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"submitted"},
+            new_status="recovery_required",
+            transitioned_at=observed_at,
+            response={"code": "0", "order_id": action.order_id},
+            error={"reason": "post_cancel_state_changed"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="confirmed_readback_changed",
+            reason="post_cancel_state_changed",
+            request=request,
+            response={"code": "0", "order_id": action.order_id},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="cancel_confirmed_readback_changed",
+            order_id=action.order_id,
+            reason_code="post_cancel_state_changed",
+        )
+
+    if not _terminalize_confirmed_cancel(
+        session_factory,
+        action,
+        mutation_intent_id=intent_id,
+        plan_fingerprint=fresh.fingerprint,
+        request=request,
+        now=observed_at,
+    ):
+        transition_position_mutation_intent(
+            session_factory,
+            intent_id,
+            expected_statuses={"submitted"},
+            new_status="recovery_required",
+            transitioned_at=observed_at,
+            response={"code": "0", "order_id": action.order_id},
+            error={"reason": "confirmed_cancel_database_state_changed"},
+        )
+        _record_cancel_event(
+            session_factory,
+            action,
+            status="confirmed_audit_state_changed",
+            reason="confirmed_cancel_database_state_changed",
+            request=request,
+            response={"code": "0", "order_id": action.order_id},
+            now=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="cancelled_audit_state_changed",
+            order_id=action.order_id,
+            reason_code="confirmed_cancel_database_state_changed",
+        )
+
+    return ReviewedPendingEntryCancelResult(
+        status="cancelled",
+        order_id=action.order_id,
+    )
+
+
+def _single_pending_cancel_write_gate(
+    session_factory,
+    *,
+    action: ReviewedPendingEntryCancelAction,
+    mutation_intent_id: int,
+) -> bool:
+    """Last-moment database gate allowing only this one reserved cancel."""
+
+    with session_factory() as session:
+        intent = session.get(PositionMutationIntent, mutation_intent_id)
+        leg = session.get(ExecutionOrderLeg, action.execution_order_leg_id)
+        competing = (
+            session.query(PositionMutationIntent.id)
+            .filter(
+                PositionMutationIntent.operation
+                == "cancel_reviewed_pending_entry",
+                PositionMutationIntent.status.in_(
+                    {"reserved", "submitting", "submitted", "recovery_required"}
+                ),
+                PositionMutationIntent.id != mutation_intent_id,
+            )
+            .first()
+        )
+        return bool(
+            intent is not None
+            and intent.status == "reserved"
+            and intent.order_id == action.order_id
+            and intent.execution_binding_id == action.execution_binding_id
+            and intent.execution_order_leg_id == action.execution_order_leg_id
+            and leg is not None
+            and leg.execution_binding_id == action.execution_binding_id
+            and leg.order_id == action.order_id
+            and str(leg.status or "").lower() in _PENDING_LEG_STATES
+            and competing is None
+            and not _active_exchange_authority_present(session)
+        )
+
+
+def _read_exchange_snapshots(deepcoin_client, *, instruments: Iterable[str]):
+    return {
+        instrument_id: {
+            "positions": tuple(
+                row
+                for row in deepcoin_client.list_positions(inst_id=instrument_id)
+                if isinstance(row, dict)
+            ),
+            "regular": tuple(
+                row
+                for row in deepcoin_client.list_open_orders(inst_id=instrument_id)
+                if isinstance(row, dict)
+            ),
+            "pending": tuple(
+                row
+                for row in deepcoin_client.list_trigger_orders_pending(
+                    inst_id=instrument_id
+                )
+                if isinstance(row, dict)
+            ),
+            "history": tuple(
+                row
+                for row in deepcoin_client.list_trigger_order_history(
+                    inst_id=instrument_id
+                )
+                if isinstance(row, dict)
+            ),
+            "fills": tuple(
+                row
+                for row in deepcoin_client.list_trade_fills(inst_id=instrument_id)
+                if isinstance(row, dict)
+            ),
+        }
+        for instrument_id in instruments
+    }
+
+
+def _post_cancel_exchange_state_matches(
+    snapshots,
+    *,
+    plan: ReviewedPendingEntryCancelPlan,
+    selected: ReviewedPendingEntryCancelAction,
+) -> bool:
+    if any(
+        snapshot[collection]
+        for snapshot in snapshots.values()
+        for collection in ("positions", "regular")
+    ):
+        return False
+    all_pending = [
+        row
+        for snapshot in snapshots.values()
+        for row in snapshot["pending"]
+    ]
+    if any(not _order_id(row) for row in all_pending):
+        return False
+    if any(_order_id(row) == selected.order_id for row in all_pending):
+        return False
+
+    expected = {
+        action.order_id: action.exchange_row_fingerprint
+        for action in plan.actions
+        if action.order_id != selected.order_id
+    }
+    observed: dict[str, str] = {}
+    for row in all_pending:
+        order_id = _order_id(row)
+        if order_id in observed:
+            return False
+        observed[order_id] = _fingerprint(row)
+    if observed != expected:
+        return False
+
+    selected_snapshot = snapshots.get(selected.instrument_id)
+    if not selected_snapshot:
+        return False
+    history_rows = [
+        row
+        for row in selected_snapshot["history"]
+        if _matches_order(row, selected.order_id)
+    ]
+    if not _history_has_cancelled_state(history_rows):
+        return False
+    if _history_has_filled_state(history_rows):
+        return False
+    reviewed_ids = {action.order_id for action in plan.actions}
+    return not any(
+        _order_id(row) in reviewed_ids
+        for snapshot in snapshots.values()
+        for row in snapshot["fills"]
+    )
+
+
+def _terminalize_confirmed_cancel(
+    session_factory,
+    action: ReviewedPendingEntryCancelAction,
+    *,
+    mutation_intent_id: int,
+    plan_fingerprint: str,
+    request: dict[str, str],
+    now: datetime,
+) -> bool:
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, action.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, action.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, action.lifecycle_id)
+        intents = (
+            session.query(TriggerProtectionIntent)
+            .filter(
+                TriggerProtectionIntent.venue == "deepcoin",
+                TriggerProtectionIntent.execution_order_leg_id
+                == action.execution_order_leg_id,
+            )
+            .all()
+        )
+        protection = (
+            session.query(PositionProtectionLeg)
+            .filter(
+                PositionProtectionLeg.venue == "deepcoin",
+                PositionProtectionLeg.execution_order_leg_id
+                == action.execution_order_leg_id,
+            )
+            .all()
+        )
+        convergence = (
+            session.query(TriggerTakeProfitConvergence)
+            .filter(
+                TriggerTakeProfitConvergence.venue == "deepcoin",
+                TriggerTakeProfitConvergence.execution_order_leg_id
+                == action.execution_order_leg_id,
+            )
+            .all()
+        )
+        mutation_intent = session.get(
+            PositionMutationIntent,
+            mutation_intent_id,
+        )
+        existing_events = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "cancel_reviewed_pending_entry",
+                ExecutionEvent.order_id == action.order_id,
+            )
+            .all()
+        )
+        if not (
+            leg is not None
+            and binding is not None
+            and lifecycle is not None
+            and int(leg.execution_binding_id) == action.execution_binding_id
+            and str(leg.order_id or "") == action.order_id
+            and str(leg.status or "").lower() in _PENDING_LEG_STATES
+            and str(lifecycle.lifecycle_status or "") == "pending_entry"
+            and int(lifecycle.execution_binding_id or 0)
+            == action.execution_binding_id
+            and len(intents) == 1
+            and str(intents[0].recovery_state or "") in {"pending", "retrying"}
+            and len(protection) == 2
+            and {str(row.role or "") for row in protection}
+            == {"primary_stop", "backup_stop"}
+            and all(
+                str(row.status or "") in {"planned", "waiting_fill"}
+                for row in protection
+            )
+            and len(convergence) == 1
+            and str(convergence[0].status or "")
+            in {"waiting_backup_stop", "waiting_position", "ready"}
+            and not existing_events
+            and mutation_intent is not None
+            and mutation_intent.status == "submitted"
+            and mutation_intent.order_id == action.order_id
+            and mutation_intent.execution_order_leg_id
+            == action.execution_order_leg_id
+        ):
+            session.rollback()
+            return False
+
+        leg.status = "cancelled"
+        leg.terminal_reason = "operator_cancelled_unfilled_entry_leg"
+        leg.last_verified_at = now
+        leg.updated_at = now
+        intent = intents[0]
+        intent.recovery_state = "resolved"
+        intent.recovery_disposition = "terminal"
+        intent.last_reason_code = "parent_trigger_cancelled_before_entry"
+        intent.next_attempt_at = None
+        intent.updated_at = now
+        for row in protection:
+            row.status = "cancelled"
+            row.updated_at = now
+        convergence_row = convergence[0]
+        convergence_row.status = "completed"
+        convergence_row.reason_code = "parent_trigger_cancelled_before_entry"
+        convergence_row.completed_at = now
+        convergence_row.updated_at = now
+        mutation_intent.status = "confirmed"
+        mutation_intent.response_json = json.dumps(
+            {"code": "0", "order_id": action.order_id},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        mutation_intent.confirmed_at = now
+        mutation_intent.updated_at = now
+
+        entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id
+                == action.execution_binding_id,
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .all()
+        )
+        binding_complete = all(
+            (
+                row.id == leg.id
+                or str(row.status or "").lower() in _TERMINAL_LEG_STATES
+            )
+            for row in entry_legs
+        )
+        if binding_complete:
+            binding.status = "cancelled"
+            binding.last_exchange_status = "reviewed_pending_entries_cancelled"
+            binding.updated_at = now
+            lifecycle.lifecycle_status = "expired"
+            lifecycle.exit_reason = "expired"
+            lifecycle.exited_at = now
+            lifecycle.management_action = "reviewed_pending_entries_cancelled"
+            lifecycle.management_note = (
+                "All reviewed unfilled pending entry legs were confirmed cancelled."
+            )
+            lifecycle.expiry_review_next_at = None
+            lifecycle.updated_at = now
+
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action="cancel_reviewed_pending_entry",
+                status="confirmed",
+                execution_binding_id=action.execution_binding_id,
+                strategy_instance_id=action.strategy_instance_id,
+                venue="deepcoin",
+                symbol=action.instrument_id.split("-")[0],
+                side="long",
+                order_id=action.order_id,
+                reason="reviewed_stale_pending_entry_cancelled",
+                before={
+                    "plan_fingerprint": plan_fingerprint,
+                    "action_id": action.action_id,
+                    "exchange_row_fingerprint": action.exchange_row_fingerprint,
+                },
+                after={"pending": False, "terminalized": True},
+                request=request,
+                response={"code": "0", "order_id": action.order_id},
+                created_at=now,
+            ),
+            session=session,
+        )
+        session.commit()
+        return True
+
+
+def _record_cancel_event(
+    session_factory,
+    action: ReviewedPendingEntryCancelAction,
+    *,
+    status: str,
+    reason: str,
+    request: dict[str, str],
+    response: dict[str, Any],
+    now: datetime,
+) -> None:
+    record_execution_event(
+        session_factory,
+        ExecutionEventRecord(
+            action="cancel_reviewed_pending_entry",
+            status=status,
+            execution_binding_id=action.execution_binding_id,
+            strategy_instance_id=action.strategy_instance_id,
+            venue="deepcoin",
+            symbol=action.instrument_id.split("-")[0],
+            side="long",
+            order_id=action.order_id,
+            reason=reason,
+            request=request,
+            response=response,
+            created_at=now,
+        ),
     )
 
 
@@ -493,17 +1206,85 @@ def _completed_state_matches(
         )
         .all()
     )
+    intents = (
+        session.query(TriggerProtectionIntent)
+        .filter(
+            TriggerProtectionIntent.venue == "deepcoin",
+            TriggerProtectionIntent.execution_order_leg_id
+            == target.execution_order_leg_id,
+        )
+        .all()
+    )
+    protection = (
+        session.query(PositionProtectionLeg)
+        .filter(
+            PositionProtectionLeg.venue == "deepcoin",
+            PositionProtectionLeg.execution_order_leg_id
+            == target.execution_order_leg_id,
+        )
+        .all()
+    )
+    convergence = (
+        session.query(TriggerTakeProfitConvergence)
+        .filter(
+            TriggerTakeProfitConvergence.venue == "deepcoin",
+            TriggerTakeProfitConvergence.execution_order_leg_id
+            == target.execution_order_leg_id,
+        )
+        .all()
+    )
+    mutation_intents = (
+        session.query(PositionMutationIntent)
+        .filter(
+            PositionMutationIntent.operation
+            == "cancel_reviewed_pending_entry",
+            PositionMutationIntent.order_id == target.order_id,
+            PositionMutationIntent.status == "confirmed",
+        )
+        .all()
+    )
+    sibling_entry_legs = (
+        session.query(ExecutionOrderLeg)
+        .filter(
+            ExecutionOrderLeg.execution_binding_id
+            == target.execution_binding_id,
+            ExecutionOrderLeg.purpose == "entry",
+            ExecutionOrderLeg.id != target.execution_order_leg_id,
+        )
+        .all()
+    )
+    binding_should_be_terminal = all(
+        str(row.status or "").lower() in _TERMINAL_LEG_STATES
+        for row in sibling_entry_legs
+    )
     return bool(
         not fill_rows
         and _history_has_cancelled_state(history_rows)
         and str(leg.status or "").lower() in _TERMINAL_LEG_STATES
         and len(events) == 1
+        and len(mutation_intents) == 1
+        and len(intents) == 1
+        and intents[0].recovery_state == "resolved"
+        and intents[0].recovery_disposition == "terminal"
+        and intents[0].last_reason_code
+        == "parent_trigger_cancelled_before_entry"
+        and len(protection) == 2
+        and all(row.status == "cancelled" for row in protection)
+        and len(convergence) == 1
+        and convergence[0].status == "completed"
+        and convergence[0].reason_code
+        == "parent_trigger_cancelled_before_entry"
         and (
-            str(binding.status or "").lower() in {"open", "active", "cancelled"}
-        )
-        and (
-            str(lifecycle.lifecycle_status or "")
-            in {"pending_entry", "expired", "cancelled", "exited"}
+            (
+                binding_should_be_terminal
+                and str(binding.status or "").lower() == "cancelled"
+                and str(lifecycle.lifecycle_status or "") == "expired"
+            )
+            or (
+                not binding_should_be_terminal
+                and str(binding.status or "").lower() in {"open", "active"}
+                and str(lifecycle.lifecycle_status or "") == "pending_entry"
+            )
         )
     )
 
@@ -552,6 +1333,32 @@ def _request_matches(
             target.embedded_stop_price,
         )
     )
+
+
+def _confirmed_cancel_response(response: Any, *, order_id: str) -> bool:
+    if not isinstance(response, dict):
+        return False
+    codes = [response[key] for key in ("code", "sCode") if key in response]
+    return bool(
+        codes
+        and all(str(code) in {"0", "0.0"} for code in codes)
+        and _response_contains_order_id(response.get("data"), order_id)
+    )
+
+
+def _response_contains_order_id(value: Any, order_id: str) -> bool:
+    if isinstance(value, str):
+        return value == order_id
+    if isinstance(value, dict):
+        return any(
+            str(value.get(key) or "") == order_id
+            for key in ("ordId", "orderId", "order_id", "id")
+        )
+    if isinstance(value, list):
+        return any(
+            _response_contains_order_id(item, order_id) for item in value
+        )
+    return False
 
 
 def _history_has_filled_state(rows: Iterable[dict[str, Any]]) -> bool:
