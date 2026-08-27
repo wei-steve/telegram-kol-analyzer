@@ -22,8 +22,10 @@ task12_health_classification: legacy_capability_absent
 task12_observed_max_raw_message_id: 13534
 task12_refusal_baseline_count: 16
 task12_time_sensitive_pending_trigger_count: 7
-pending_entry_cancel_candidate_status: local_complete_unpushed
-pending_entry_cancel_candidate_sha: d39fefa46f0c01b500059d9da77bbe0aa973f1df
+pending_entry_cancel_candidate_status: revision_gate_fix_local_complete_unpushed
+pending_entry_cancel_candidate_sha: 1b561ebc95292d45080c0a014e71d848cc86466f
+pending_entry_cancel_pushed_base_sha: 91bb257e2a1c808c25a54149a7c71c392c0952e4
+pending_entry_cancel_revision_gate_plan_sha: 1eb6b0c70f7e2dd648258fcce779c522a0095504
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -39,6 +41,28 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- The production read-only dry-run of pushed base
+  `91bb257e2a1c808c25a54149a7c71c392c0952e4` failed closed before producing
+  actions because its revision gate treated three old, unclaimed
+  `recovery_required` batches as live authority. A separate read-only diagnostic
+  confirmed all seven reviewed orders still appeared exactly once with unchanged
+  economics, local ownership, pending state and request fingerprints; BTC/ETH/SOL
+  counts were 4/3/0 with zero positions, regular orders, fills or unreviewed
+  pending triggers.
+- The approved gate-fix design and implementation plan are commit
+  `1eb6b0c70f7e2dd648258fcce779c522a0095504`; the production-code candidate is
+  `1b561ebc95292d45080c0a014e71d848cc86466f`. The planner now permits only a
+  terminal, claim-free, ambiguous-child-free revision batch. It still blocks
+  every non-terminal batch, any claim token/timestamp residue,
+  `cancel_submitting`/`submit_unknown` revision legs, and
+  `submit_reserved`/`submitted` replacements, including after recovery clears
+  the parent claim.
+- TDD captured the original false block, the claimed-before-child race and the
+  no-claim unknown-outcome child states. The final reviewed-cancellation file
+  passed 31 tests, the adjacent six-file group passed 204 tests, and the final
+  repository suite passed 6467 tests with 2 skipped and 32 warnings in 694.98
+  seconds. Independent review found no remaining Critical or Important findings;
+  its sole Minor test-isolation finding was fixed before the final suite.
 - The exact seven-entry cancellation helper is locally RED-to-GREEN complete at
   code candidate `d39fefa46f0c01b500059d9da77bbe0aa973f1df`. It is dry-run
   by default, opens only an existing database, selects exactly one reviewed
@@ -263,11 +287,14 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- The reviewed cancellation tool has not been pushed, deployed, or executed in
-  production. Any fresh production read-only plan, candidate push/deployment,
-  and each individual Deepcoin cancellation require their own explicit
-  authorization. An unknown result must stop the sequence and must not be
-  retried; the remaining exact orders must be freshly replanned one at a time.
+- The gate-fixed reviewed cancellation candidate
+  `1b561ebc95292d45080c0a014e71d848cc86466f` has not been pushed, deployed, or
+  executed in production. Its prior base was pushed at
+  `91bb257e2a1c808c25a54149a7c71c392c0952e4`. Any fresh production read-only
+  plan, candidate push/deployment, and each individual Deepcoin cancellation
+  require their own explicit authorization. An unknown result must stop the
+  sequence and must not be retried; the remaining exact orders must be freshly
+  replanned one at a time.
 - Production remains unchanged at
   `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; automatic entry remains enabled.
   Do not enter Task 13 while any of the seven unprotected pending trigger entries

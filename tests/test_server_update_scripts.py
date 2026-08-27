@@ -192,10 +192,17 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "task12_gate: failed_closed" in status
     assert "task12_health_classification: legacy_capability_absent" in status
     assert "task12_time_sensitive_pending_trigger_count: 7" in status
-    assert "pending_entry_cancel_candidate_status: local_complete_unpushed" in status
+    assert (
+        "pending_entry_cancel_candidate_status: "
+        "revision_gate_fix_local_complete_unpushed" in status
+    )
     assert (
         "pending_entry_cancel_candidate_sha: "
-        "d39fefa46f0c01b500059d9da77bbe0aa973f1df" in status
+        "1b561ebc95292d45080c0a014e71d848cc86466f" in status
+    )
+    assert (
+        "pending_entry_cancel_pushed_base_sha: "
+        "91bb257e2a1c808c25a54149a7c71c392c0952e4" in status
     )
     assert "pending_entry_cancel_production_executed: false" in status
     assert "pending_entry_cancel_live_order_count: 7" in status
