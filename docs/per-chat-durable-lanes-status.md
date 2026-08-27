@@ -125,7 +125,7 @@ phase_7_r5_rollback_status: confirmed_global_1_queue_three_consecutive_samples
 phase_7_r5_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-low-perturbation-r5-20260827T023922Z
 phase_7_r5_evidence_manifest_sha256: cef991f533ee0ac8069a735cf02a7eebc4f2640280facf317862b4a977687b2f
 phase_7_r6_authorization: owner_authorized_fix_acceptance_tool_remove_continuous_web_parity_red_green_full_suite_read_only_install_and_complete_phase_7_one_go
-phase_7_r6_status: local_candidate_complete_ready_for_production_preflight
+phase_7_r6_status: production_acceptance_in_progress
 phase_7_r6_design_commit: cdea2640ba0ef22a0f5e9e9644fd8e32d94a074b
 phase_7_r6_plan_commit: 42d8cddd8dedb0f9b57de1e60bcb850b7e9a8b7f
 phase_7_r6_candidate_commit: dee0a2e9d1875b50927ab4add9a50fe6c9934e0c
@@ -136,6 +136,12 @@ phase_7_r6_focused_verification: "78 passed, 18 deselected in observer, runtime-
 phase_7_r6_full_suite_verification: "6372 passed, 1 skipped, 32 warnings in 563.20 seconds"
 phase_7_r6_review_status: ready_yes_zero_critical_zero_important_after_four_fail_closed_repairs
 phase_7_r6_contract: "continuous Web message-pipeline parity HTTP is absent; SQLite RO owns identity and 300-second pending-stuck evidence; quiet safety and traffic-minimum baselines are separate and both initial snapshots retain fail-closed evidence; lightweight current-state guards run every 5 seconds, journal evidence every 30 seconds, and role loop-health at most every 30 seconds; initial unknown, runtime anomaly, signal, child cleanup failure, or acceptance failure rolls back independently"
+phase_7_r6_production_runtime_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
+phase_7_r6_preflight_status: passed_exact_sha_tracked_clean_global_1_zero_queue_management_commands_revision_claim_active_write_complete_stable_exchange_unique_ingest_session_roles_pids_sqlite_and_candidate_hash
+phase_7_r6_cutover_at: 2026-08-27T05:04:07.143275+00:00
+phase_7_r6_window_start: 2026-08-27T05:04:11.139934Z
+phase_7_r6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-web-parity-isolation-r6-20260827T050229Z
+phase_7_r6_initial_status: per_chat_3_queue_converged_three_samples_zero_identity_stuck_guard_or_exchange_anomaly
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -418,6 +424,20 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-27 Phase 7 R6 production window started`: production preflight
+  passed at exact clean runtime SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f` with safe
+  `global + 1 + queue`, stable original PIDs, unique ingest session, zero
+  pending/claimed queue, management, worker command, revision claim and active
+  exchange write, SQLite `query_only=1` / WAL / `quick_check=ok`, and two
+  identical complete worker-owned exchange snapshots with zero positions and
+  zero open orders. The exact frozen observer/controller hashes matched. The
+  controller cut over once at `2026-08-27T05:04:07.143275Z`; three convergence
+  samples passed and the uninterrupted natural-message window began at
+  `2026-08-27T05:04:11.139934Z`. Initial identity, stuck, guard and exchange
+  evidence is zero. Evidence directory is
+  `/opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-web-parity-isolation-r6-20260827T050229Z`.
 
 - `2026-08-27 Phase 7 R6 local candidate`: commits
   `cdea2640ba0ef22a0f5e9e9644fd8e32d94a074b` and
