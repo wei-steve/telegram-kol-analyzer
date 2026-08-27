@@ -3,11 +3,10 @@
 ## Decision
 
 Treat `succeeded`, `blocked`, `failed`, and `recovery_required` as terminal
-revision batch states, but allow a terminal batch only when it has no claim
-evidence and no ambiguous child write. Every non-terminal batch, any non-null
-claim token or claim timestamp, a revision leg in `cancel_submitting` or
-`submit_unknown`, and a replacement in `submit_reserved` or `submitted` blocks
-the reviewed pending-entry cancellation planner.
+revision batch states. Every non-terminal batch and any non-null claim token or
+claim timestamp remain global blockers. An ambiguous child in a terminal,
+claim-free batch blocks only when its parent binding, execution leg, or order
+identity overlaps the fixed reviewed target set.
 
 ## Why
 
@@ -18,13 +17,20 @@ candidate instead counted every such batch as active, so a safe read-only
 dry-run could never reach the seven reviewed targets. Unlike a deployment
 restart gate, however, this cancellation gate must also preserve the
 unknown-outcome no-retry boundary: executor recovery clears the parent claim
-but can intentionally leave an ambiguous child state behind.
+but can intentionally leave an ambiguous child state behind. Production also
+contains three old `submit_unknown` children for one order outside the fixed
+seven and outside all reviewed bindings. That terminal history cannot be
+confirmed or rewritten, but it has no authority to retry or mutate a reviewed
+order and must not permanently block this closed-target operator tool.
 
 ## Safety boundaries
 
 - Do not rewrite or terminalize historical revision rows.
 - Block any claim evidence, including a half-present token or timestamp.
-- Block ambiguous child writes even after the parent claim is cleared.
+- Block ambiguous child writes after the parent claim is cleared whenever their
+  binding, execution leg, or order identity overlaps a reviewed target.
+- Ignore only terminal, claim-free ambiguous children that are disjoint from
+  every reviewed binding, execution leg, and order ID.
 - Continue to block every non-terminal batch, including
   `submitting_replacements`, even without a child row.
 - Continue to fail closed for active queue, order, management, mutation,
@@ -34,9 +40,9 @@ but can intentionally leave an ambiguous child state behind.
 
 ## Verification
 
-Use TDD to prove that an unclaimed, child-clean `recovery_required` batch does
-not block an otherwise clean plan; non-terminal and claimed batches do block;
-and ambiguous cancellation/replacement children block even without a parent
-claim. Run the reviewed-cancellation tests, adjacent active-write tests, the
-relevant cancellation/entry/protection group, and one final full suite on the
-completed production-code candidate.
+Use TDD to prove that terminal, claim-free ambiguous cancellation/replacement
+children on an unrelated binding do not block; the same child states on a
+reviewed binding, execution leg, or order do block; and non-terminal or claimed
+batches remain global blockers. Run the reviewed-cancellation tests, adjacent
+active-write tests, the relevant cancellation/entry/protection group, and one
+final full suite on the completed production-code candidate.

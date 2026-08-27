@@ -2,9 +2,9 @@
 
 > **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
-**Goal:** Stop terminal, unclaimed `recovery_required` revision batches from falsely blocking the reviewed pending-entry cancellation dry-run while retaining every real revision write-authority gate.
+**Goal:** Stop terminal, claim-free ambiguous revision children outside the fixed reviewed bindings/orders from falsely blocking the reviewed pending-entry cancellation dry-run while retaining every active or target-related authority gate.
 
-**Architecture:** Separate clean terminal batch state from live or ambiguous authority. Block all non-terminal batches, any parent claim evidence, and ambiguous child cancellation/replacement states even after recovery has cleared the parent claim.
+**Architecture:** Keep non-terminal revision batches and parent claim evidence as global blockers. Pass the fixed reviewed targets into the authority gate and scope terminal ambiguous child queries by parent binding, execution leg, or order identity so unrelated history cannot authorize or block a reviewed cancellation.
 
 **Tech Stack:** Python 3.12, SQLAlchemy, pytest, existing Deepcoin cancellation planner and deployment active-write gate.
 
@@ -101,3 +101,44 @@ Resolve all Critical and Important findings before committing.
 
 Stage only the two plan documents, the reviewed cancellation module, and its
 test file. Verify the staged path list before committing. Do not push.
+
+### Task 4: Scope terminal ambiguous children to the reviewed target set
+
+**Files:**
+- Modify: `src/telegram_kol_research/reviewed_pending_entry_cancel.py`
+- Modify: `tests/test_reviewed_pending_entry_cancel.py`
+
+**Step 1: Write RED tests**
+
+Seed a terminal, claim-free `recovery_required` batch on a binding, execution
+leg and order outside the reviewed set. Cover both a `submit_unknown` revision
+leg and a `submit_reserved` replacement. Assert that the otherwise clean plan
+still returns all reviewed actions. Retain the existing tests proving the same
+states on the reviewed binding/leg/order fail closed.
+
+**Step 2: Run RED**
+
+```bash
+.venv/bin/python -m pytest -q tests/test_reviewed_pending_entry_cancel.py \
+  -k "unrelated_terminal_ambiguous"
+```
+
+Expected: FAIL with `active_exchange_authority_present` under the current
+global ambiguous-child queries.
+
+**Step 3: Implement the minimal target-aware gate**
+
+Pass the reviewed target tuple into `_active_exchange_authority_present` from
+both planning and the last-moment apply gate. Leave global non-terminal batch
+and claim queries unchanged. Join ambiguous children to their parent batch and
+match only reviewed binding IDs, execution-leg IDs, or order IDs.
+
+**Step 4: Run GREEN and regression**
+
+Run the two new tests, the target-related ambiguity tests, the complete reviewed
+cancellation file, the adjacent six-file group, and one final full suite.
+
+**Step 5: Review and commit explicit paths**
+
+Resolve all Critical and Important review findings. Stage only the design,
+plan, production module, tests and canonical status; do not push.
