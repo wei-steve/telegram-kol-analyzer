@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-web-loop-stall-attribution-deployed-l1-stability-only-awaiting-separate-safe-retry-authorization
+claimed_by: codex-per-chat-phase7-final-safe-retry-20260826-root
+claim_base_sha: 3c2e84a47375e671ab28df4944c81c202bfc5a63
+current_task: phase-7-final-safe-retry-cutover-and-l2-in-progress
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -124,6 +124,8 @@ phase_7_web_stall_attribution_l1_pipeline_status: zero_new_nonshadow_pending_cla
 phase_7_web_stall_attribution_l1_status: passed_stability_only_zero_traffic_natural_message_path_unproven
 phase_7_web_stall_attribution_l1_evidence_path: /opt/telegram-kol-analyzer/data/evidence/phase7-web-stall-deploy-20260826T235921Z/l1-observation.jsonl
 phase_7_web_stall_attribution_l1_evidence_sha256: efd3598372ac978656e05e55da33b0bfdbf476ed9c3a4c18f82cdf838bee809f
+phase_7_final_safe_retry_authorization: owner_authorized_current_production_0a6a9a18_global_1_to_per_chat_3_two_hour_l2_and_atomic_global_1_rollback
+phase_7_final_safe_retry_status: claimed_preflight_pending
 phase_7_latest_safe_retry_authorization: consumed_owner_authorized_exact_56bebd36_canonical_95a88371_production_claim_single_cutover_convergence_two_hour_acceptance_and_l2_rollback
 phase_7_latest_safe_retry_claim_commit: 741c17187bba8c9e6130cb9d067c823145682f0c
 phase_7_latest_safe_retry_production_sha: 95a883715881b4fd393fbf5e745693cc78e066df
@@ -251,7 +253,7 @@ phase_7_retry_convergence_samples:
   - "sample_3_elapsed_0.543429_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_4_elapsed_0.827980_db_api_per_chat_3_worker_cap_3_new_limit_peak_0"
   - "sample_5_elapsed_1.038383_db_api_per_chat_3_worker_cap_3_new_limit_peak_0_third_consecutive_success"
-phase_7_retry_remaining_gate_blockers: separate_owner_authorization_for_later_safe_retry
+phase_7_retry_remaining_gate_blockers: production_preflight_and_two_hour_acceptance
 phase_7_window_start: 2026-08-26T21:49:44.392235+00:00
 phase_7_window_end: 2026-08-26T22:27:32.081458+00:00
 phase_7_natural_message_count: 2
@@ -309,7 +311,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -358,6 +360,21 @@ cutover_authorized: false
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 7 final safe-retry claim`: session
+  `codex-per-chat-phase7-final-safe-retry-20260826-root` exclusively claimed the
+  owner-authorized next step at exact clean canonical and remote status base
+  `3c2e84a47375e671ab28df4944c81c202bfc5a63`, with production expected to remain
+  on exact deployed code `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f` and rollback
+  tuple `global + 1 + queue`. Scope permits read-only preflight, one atomic
+  expected-state transition to `per_chat + 3 + queue`, the tested convergence
+  gate, one uninterrupted two-hour L2 natural-traffic acceptance window, and
+  atomic rollback to `global + 1 + queue` on any acceptance failure. Recoverable
+  command, measurement, and query defects may be corrected in place; real active
+  writes or time-sensitive strategy activity, unknown evidence after one
+  reasoned retry, or an unprovable rollback remain fail-closed conditions. No
+  deployment, restart, database edit, replay, worker command, manufactured
+  Telegram traffic, test trade, or exchange write is authorized.
 
 - `2026-08-26 Phase 7 Web stall attribution exact deployment and L1`:
   production preflight passed at clean tracked checkout
