@@ -22,6 +22,7 @@ from telegram_kol_research.models import (
     StrategyRevisionBatch,
     StrategyRevisionLeg,
     StrategyThread,
+    TradingSetting,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
 )
@@ -1025,6 +1026,263 @@ def _apply_one(
         confirmation_token=confirmation_token,
         now=NOW,
     )
+
+
+def _authority_document(session_factory):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        return json.loads(row.value_json)
+
+
+@pytest.mark.parametrize(
+    ("settings", "reason_code"),
+    (
+        (
+            {"auto_trade_enabled": True, "entry_revision_v2_mode": "disabled"},
+            "pending_entry_cancel_auto_trade_not_frozen",
+        ),
+        (
+            {"auto_trade_enabled": False, "entry_revision_v2_mode": "shadow"},
+            "pending_entry_cancel_revision_not_disabled",
+        ),
+        (
+            {"auto_trade_enabled": False, "entry_revision_v2_mode": "live"},
+            "pending_entry_cancel_revision_not_disabled",
+        ),
+    ),
+)
+def test_apply_quiescence_requires_frozen_settings(
+    tmp_path,
+    settings,
+    reason_code,
+):
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    save_trading_settings(session_factory, settings, updated_at=NOW)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "blocked"
+    assert result.reason_code == reason_code
+    assert client.cancel_payloads == []
+    with session_factory() as session:
+        assert session.query(RepairConfirmationToken).count() == 0
+        assert session.query(PositionMutationIntent).count() == 0
+
+
+def test_worker_exchange_authority_blocks_cancel_before_confirmation(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    worker = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="entry_revision_worker",
+        owner_id="batch:91",
+        acquired_at=NOW,
+        require_cancel_quiescence=False,
+    )
+    assert worker.acquired is True
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "blocked"
+    assert result.reason_code == "entry_revision_exchange_authority_busy"
+    assert client.cancel_payloads == []
+    assert _authority_document(session_factory)["token"] == worker.token
+    with session_factory() as session:
+        assert session.query(RepairConfirmationToken).count() == 0
+        assert session.query(PositionMutationIntent).count() == 0
+
+
+def test_cancel_holds_authority_during_exchange_and_releases_on_success(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+
+    class AuthorityInspectingClient(_Client):
+        worker_attempt = None
+
+        def cancel_trigger_order(self, payload):
+            document = _authority_document(session_factory)
+            assert document["state"] == "held"
+            assert document["owner_kind"] == "reviewed_pending_entry_cancel"
+            assert document["owner_id"] == "order:reviewed-1"
+            self.worker_attempt = acquire_entry_revision_exchange_authority(
+                session_factory,
+                owner_kind="entry_revision_worker",
+                owner_id="batch:92",
+                acquired_at=NOW,
+                require_cancel_quiescence=False,
+            )
+            return super().cancel_trigger_order(payload)
+
+    client = AuthorityInspectingClient()
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "cancelled"
+    assert client.worker_attempt.acquired is False
+    assert (
+        client.worker_attempt.reason_code
+        == "entry_revision_exchange_authority_busy"
+    )
+    assert _authority_document(session_factory)["state"] == "idle"
+
+
+def test_cancel_unknown_retains_authority_and_blocks_new_writer(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    client.cancel_exception = RuntimeError("unknown")
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "cancel_outcome_unknown"
+    document = _authority_document(session_factory)
+    assert document["state"] == "held"
+    assert document["owner_kind"] == "reviewed_pending_entry_cancel"
+    worker = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="entry_revision_worker",
+        owner_id="batch:93",
+        acquired_at=NOW,
+        require_cancel_quiescence=False,
+    )
+    assert worker.acquired is False
+    assert worker.reason_code == "entry_revision_exchange_authority_busy"
+
+
+@pytest.mark.parametrize(
+    "failure_mode",
+    ("unconfirmed_response", "changed_readback", "terminalization_drift"),
+)
+def test_post_write_incomplete_outcome_retains_exchange_authority(
+    tmp_path,
+    failure_mode,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    if failure_mode == "unconfirmed_response":
+        client.cancel_response = {
+            "code": "0",
+            "data": [{"ordId": "different-order", "sCode": "0"}],
+        }
+    elif failure_mode == "changed_readback":
+        client.mutate_sibling_after_cancel = True
+    else:
+        def mutate_local_identity():
+            with session_factory() as session:
+                session.get(ExecutionOrderLeg, leg_ids[0]).purpose = "exit"
+                session.commit()
+
+        client.after_cancel_callback = mutate_local_identity
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status != "cancelled"
+    document = _authority_document(session_factory)
+    assert document["state"] == "held"
+    assert document["owner_kind"] == "reviewed_pending_entry_cancel"
+
+
+def test_under_authority_plan_drift_releases_before_write(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+
+    class ThirdPlanDriftClient(_Client):
+        eth_pending_reads = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            if inst_id == "ETH-USDT-SWAP":
+                self.eth_pending_reads += 1
+                if self.eth_pending_reads == 3:
+                    self.pending[0]["sz"] = "99"
+            return super().list_trigger_orders_pending(inst_id=inst_id)
+
+    client = ThirdPlanDriftClient()
+    plan = _build_plan(session_factory, client, targets)
+
+    with pytest.raises(ValueError, match="plan fingerprint changed"):
+        _apply_one(session_factory, client, targets, plan)
+
+    assert client.cancel_payloads == []
+    assert _authority_document(session_factory)["state"] == "idle"
+
+
+@pytest.mark.parametrize("failure_point", ("write_gate", "intent_transition"))
+def test_prewrite_refusal_releases_exchange_authority(
+    tmp_path,
+    monkeypatch,
+    failure_point,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    if failure_point == "write_gate":
+        monkeypatch.setattr(
+            cancel_module,
+            "_single_pending_cancel_write_gate",
+            lambda *_args, **_kwargs: False,
+        )
+    else:
+        original_transition = cancel_module.transition_position_mutation_intent
+
+        def fail_submitting_transition(*args, **kwargs):
+            if kwargs.get("new_status") == "submitting":
+                return False
+            return original_transition(*args, **kwargs)
+
+        monkeypatch.setattr(
+            cancel_module,
+            "transition_position_mutation_intent",
+            fail_submitting_transition,
+        )
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status in {"blocked", "intent_changed"}
+    assert client.cancel_payloads == []
+    assert _authority_document(session_factory)["state"] == "idle"
 
 
 def test_apply_cancels_exactly_one_and_terminalizes_only_selected_leg(tmp_path):
