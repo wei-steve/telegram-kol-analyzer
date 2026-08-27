@@ -3,11 +3,11 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: local_red_green
-phase_state: in_progress
-claimed_by: 01a0422b-212f-7561-8f27-aa433f0b094c
-candidate_sha: null
-candidate_content_sha: null
+current_phase: candidate_integration
+phase_state: planned
+claimed_by: null
+candidate_sha: 14819b309f27025d183f4bd27b8210ac74996e92
+candidate_content_sha: 14819b309f27025d183f4bd27b8210ac74996e92
 handoff_sha: null
 production_sha: null
 auto_trade_frozen: false
@@ -42,11 +42,26 @@ phase completes or pauses, record both verified evidence and outstanding work.
   689 passed, 1 skipped.
 - Task 8 governed frozen monitor expectations and monitor unit/env rollback in
   `c22c17ca`; focused result: 133 passed, 1 skipped. Shell syntax checks passed.
+- Task 9 added the controlled deployment/recovery runbook in `14819b30`;
+  documentation/static result: 79 passed.
+- Final focused candidate: 910 passed, 2 skipped, 2 warnings in 146.63s.
+- The one and only final full suite: 6423 passed, 2 skipped, 32 warnings in
+  558.75s. No production code changed after this run.
+- The two macOS skips were the new Linux/root sticky-directory kernel test and
+  the existing Linux/systemd sandbox probe.
+- `git diff --check` passed and the pre-handoff worktree was clean at candidate
+  content SHA `14819b309f27025d183f4bd27b8210ac74996e92`.
 
 ## Outstanding
 
-- Task 9 documentation checks and Task 10 final focused/full-suite candidate.
 - Linux/root sticky-directory integration test before production deployment.
-- Server preflight, exact-SHA review/integration, explicit freeze, deployment,
-  refresh/permission verification, observation, and future-signal-only restore
-  remain separately authorized phases. No production action has been taken.
+- Phase 2 exact-SHA review/integration and any push remain separately
+  authorized.
+- Production server preflight must still prove the exact checkout/topology,
+  clean tracked tree, safe window, complete zero active-write evidence, healthy
+  queues/listener/reconciliation/protection, and complete Deepcoin read-only
+  attribution/history.
+- Explicit freeze, exact-SHA deployment, Linux/root helper verification,
+  worker refresh/health checks, bounded observation, and future-signal-only
+  restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
+  restart, production write, Telegram replay, or Deepcoin write was performed.
