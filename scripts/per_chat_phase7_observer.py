@@ -30,6 +30,7 @@ LOOP_STALL_ATTRIBUTIONS = frozenset(
 MIN_DATABASE_POLL_INTERVAL_SECONDS = 0.5
 MIN_RUNTIME_POLL_INTERVAL_SECONDS = 10.0
 STUCK_PENDING_SECONDS = 300
+MISSING_JOB_GRACE_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -130,6 +131,8 @@ class AcceptanceObservation:
     retry_exhausted: bool = False
     traffic_jobs: tuple[JobObservation, ...] | None = None
     traffic_window_started_at: str | None = None
+    unsettled_missing_job_count: int = 0
+    unsettled_missing_raw_ids: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -158,6 +161,8 @@ class DatabaseObservation:
     stuck_job_count: int
     raw_messages: tuple[tuple[int, int], ...] = ()
     snapshot_started_at: str | None = None
+    unsettled_missing_job_count: int = 0
+    unsettled_missing_raw_ids: tuple[int, ...] = ()
 
 
 def evaluate_same_chat_jobs(jobs: list[JobObservation]) -> SameChatEvaluation:
@@ -288,6 +293,10 @@ def collect_database_observation(
                 SELECT COUNT(*)
                 FROM raw_messages AS raw
                 WHERE raw.id > ?
+                  AND (
+                      datetime(raw.created_at) IS NULL
+                      OR datetime(raw.created_at) <= datetime('now', ?)
+                  )
                   AND NOT EXISTS (
                       SELECT 1
                       FROM message_processing_jobs AS job
@@ -296,9 +305,38 @@ def collect_database_observation(
                         AND job.shadow = 0
                   )
                 """,
-                (baseline_raw_message_id, baseline_job_id),
+                (
+                    baseline_raw_message_id,
+                    f"-{MISSING_JOB_GRACE_SECONDS} seconds",
+                    baseline_job_id,
+                ),
             ).fetchone()[0]
         )
+        unsettled_missing_raw_ids = tuple(
+            int(row[0])
+            for row in connection.execute(
+                """
+                SELECT raw.id
+                FROM raw_messages AS raw
+                WHERE raw.id > ?
+                  AND datetime(raw.created_at) IS NOT NULL
+                  AND datetime(raw.created_at) > datetime('now', ?)
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM message_processing_jobs AS job
+                      WHERE job.raw_message_id = raw.id
+                        AND job.id > ?
+                        AND job.shadow = 0
+                  )
+                """,
+                (
+                    baseline_raw_message_id,
+                    f"-{MISSING_JOB_GRACE_SECONDS} seconds",
+                    baseline_job_id,
+                ),
+            ).fetchall()
+        )
+        unsettled_missing_job_count = len(unsettled_missing_raw_ids)
         orphan_job_count = int(
             connection.execute(
                 """
@@ -351,6 +389,8 @@ def collect_database_observation(
             stuck_job_count=stuck_job_count,
             raw_messages=raw_messages,
             snapshot_started_at=snapshot_started_at,
+            unsettled_missing_job_count=unsettled_missing_job_count,
+            unsettled_missing_raw_ids=unsettled_missing_raw_ids,
         )
     finally:
         connection.close()
@@ -892,6 +932,7 @@ def run_acceptance_samples(
             claimed_count=sample.claimed_count,
             duplicate_job_count=sample.duplicate_job_count,
             missing_job_count=sample.missing_job_count,
+            unsettled_missing_job_count=sample.unsettled_missing_job_count,
             orphan_job_count=sample.orphan_job_count,
             stuck_job_count=sample.stuck_job_count,
             traffic_window_started_at=sample.traffic_window_started_at,
@@ -1278,6 +1319,8 @@ def _empty_database_observation(args: argparse.Namespace) -> DatabaseObservation
         orphan_job_count=0,
         stuck_job_count=0,
         raw_messages=(),
+        unsettled_missing_job_count=0,
+        unsettled_missing_raw_ids=(),
     )
 
 
@@ -1300,6 +1343,10 @@ def _acceptance_samples(
     traffic_window_started_at: str | None = None
     traffic_baseline_raw_id: int | None = None
     traffic_baseline_job_id: int | None = None
+    traffic_ceiling_raw_id: int | None = None
+    traffic_ceiling_job_id: int | None = None
+    drain_unsettled_raw_ids: frozenset[int] | None = None
+    window_end_runtime_collected = False
     next_runtime_elapsed = 0.0
     last_complete_runtime: RuntimeObservation | None = None
     database_poll_interval = _database_poll_interval(
@@ -1315,7 +1362,10 @@ def _acceptance_samples(
         runtime_due = (
             last_complete_runtime is None
             or elapsed >= next_runtime_elapsed
-            or elapsed >= args.window
+            or (
+                elapsed >= args.window
+                and not window_end_runtime_collected
+            )
         )
         if database is not None and runtime_due:
             runtime = runtime_collector(
@@ -1404,6 +1454,16 @@ def _acceptance_samples(
                             safety_database.missing_job_count,
                             traffic_database.missing_job_count,
                         ),
+                        unsettled_missing_job_count=max(
+                            safety_database.unsettled_missing_job_count,
+                            traffic_database.unsettled_missing_job_count,
+                        ),
+                        unsettled_missing_raw_ids=tuple(
+                            sorted(
+                                set(safety_database.unsettled_missing_raw_ids)
+                                | set(traffic_database.unsettled_missing_raw_ids)
+                            )
+                        ),
                         orphan_job_count=max(
                             safety_database.orphan_job_count,
                             traffic_database.orphan_job_count,
@@ -1429,10 +1489,13 @@ def _acceptance_samples(
             elapsed = 0.0
         else:
             elapsed = monotonic() - started
+        if runtime_fresh and elapsed >= args.window:
+            window_end_runtime_collected = True
         if (
             elapsed >= args.window
             and database is not None
             and not runtime_fresh
+            and not window_end_runtime_collected
         ):
             runtime = runtime_collector(
                 args,
@@ -1442,6 +1505,7 @@ def _acceptance_samples(
             runtime_fresh = True
             if runtime.complete:
                 last_complete_runtime = runtime
+                window_end_runtime_collected = True
             else:
                 retry_exhausted = True
         runtime = replace(runtime, elapsed_seconds=elapsed)
@@ -1464,18 +1528,65 @@ def _acceptance_samples(
         guards["stuck_job_count"] = (
             int(guards["stuck_job_count"]) + database.stuck_job_count
         )
+        if elapsed >= args.window and traffic_ceiling_raw_id is None:
+            traffic_ceiling_raw_id = max(
+                (row[0] for row in database.raw_messages),
+                default=traffic_baseline_raw_id or int(args.baseline_raw_message_id),
+            )
+            traffic_ceiling_job_id = max(
+                (row.job_id for row in database.jobs),
+                default=traffic_baseline_job_id or int(args.baseline_job_id),
+            )
+            drain_unsettled_raw_ids = frozenset(
+                raw_id
+                for raw_id in database.unsettled_missing_raw_ids
+                if raw_id <= traffic_ceiling_raw_id
+            )
         traffic_raw_messages = tuple(
             row
             for row in database.raw_messages
             if traffic_baseline_raw_id is not None
             and row[0] > traffic_baseline_raw_id
+            and (
+                traffic_ceiling_raw_id is None
+                or row[0] <= traffic_ceiling_raw_id
+            )
         )
         traffic_jobs = tuple(
             row
             for row in database.jobs
             if traffic_baseline_job_id is not None
             and row.job_id > traffic_baseline_job_id
+            and (
+                traffic_ceiling_job_id is None
+                or row.job_id <= traffic_ceiling_job_id
+            )
         )
+        scoped_unsettled_raw_ids = (
+            frozenset(database.unsettled_missing_raw_ids)
+            if drain_unsettled_raw_ids is None
+            else drain_unsettled_raw_ids
+            & frozenset(database.unsettled_missing_raw_ids)
+        )
+        should_return = elapsed >= args.window and not scoped_unsettled_raw_ids
+        if should_return and not runtime_fresh and database is not None:
+            runtime = runtime_collector(
+                args,
+                database,
+                elapsed_seconds=elapsed,
+            )
+            runtime_fresh = True
+            if runtime.complete:
+                last_complete_runtime = runtime
+            else:
+                retry_exhausted = True
+            runtime = replace(runtime, elapsed_seconds=elapsed)
+        missing_job_count = database.missing_job_count
+        if (
+            elapsed >= args.window + MISSING_JOB_GRACE_SECONDS
+            and scoped_unsettled_raw_ids
+        ):
+            missing_job_count += len(scoped_unsettled_raw_ids)
         yield AcceptanceObservation(
             runtime=runtime,
             jobs=database.jobs,
@@ -1484,15 +1595,18 @@ def _acceptance_samples(
             pending_count=database.pending_count,
             claimed_count=database.claimed_count,
             duplicate_job_count=database.duplicate_job_count,
-            missing_job_count=database.missing_job_count,
+            missing_job_count=missing_job_count,
             orphan_job_count=database.orphan_job_count,
             runtime_fresh=runtime_fresh,
             retry_exhausted=retry_exhausted,
             traffic_jobs=traffic_jobs,
             traffic_window_started_at=traffic_window_started_at,
+            unsettled_missing_job_count=len(scoped_unsettled_raw_ids),
             **guards,
         )
-        if elapsed >= args.window:
+        if should_return:
+            return
+        if elapsed >= args.window + MISSING_JOB_GRACE_SECONDS:
             return
         sleeper(database_poll_interval)
 

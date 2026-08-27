@@ -233,7 +233,8 @@ def acceptance_snapshot(
 
 
 def database_snapshot(
-    *, jobs=(), raw_messages=(), raw_count=0, chat_count=0, stuck_count=0
+    *, jobs=(), raw_messages=(), raw_count=0, chat_count=0, stuck_count=0,
+    unsettled_missing_ids=(),
 ):
     claimed_count = sum(row.status == "claimed" for row in jobs)
     pending_count = sum(row.status == "pending" for row in jobs)
@@ -253,6 +254,8 @@ def database_snapshot(
         orphan_job_count=0,
         stuck_job_count=stuck_count,
         raw_messages=tuple(raw_messages),
+        unsettled_missing_job_count=len(unsettled_missing_ids),
+        unsettled_missing_raw_ids=tuple(unsettled_missing_ids),
     )
 
 
@@ -605,7 +608,8 @@ def create_observer_database(path):
         );
         CREATE TABLE raw_messages (
             id INTEGER PRIMARY KEY,
-            chat_id INTEGER NOT NULL
+            chat_id INTEGER NOT NULL,
+            created_at TEXT NOT NULL DEFAULT '2000-01-01 00:00:00'
         );
         CREATE TABLE message_processing_jobs (
             id INTEGER PRIMARY KEY,
@@ -746,6 +750,18 @@ def test_database_collector_fails_metrics_closed_for_identity_anomalies(tmp_path
     connection = sqlite3.connect(path)
     connection.execute("INSERT INTO raw_messages (id, chat_id) VALUES (103, 9)")
     connection.execute(
+        "INSERT INTO raw_messages (id, chat_id, created_at) "
+        "VALUES (104, 10, datetime('now'))"
+    )
+    connection.execute(
+        "INSERT INTO raw_messages (id, chat_id, created_at) "
+        "VALUES (105, 11, datetime('now', '-30 seconds'))"
+    )
+    connection.execute(
+        "INSERT INTO raw_messages (id, chat_id, created_at) "
+        "VALUES (106, 12, 'not-a-timestamp')"
+    )
+    connection.execute(
         """
         INSERT INTO message_processing_jobs
             (id, raw_message_id, chat_id, status, shadow)
@@ -769,7 +785,7 @@ def test_database_collector_fails_metrics_closed_for_identity_anomalies(tmp_path
     )
 
     assert result.duplicate_job_count == 1
-    assert result.missing_job_count == 1
+    assert result.missing_job_count == 3
     assert result.orphan_job_count == 1
 
 
@@ -1042,6 +1058,109 @@ def test_initial_safety_anomaly_survives_clean_traffic_baseline_snapshot():
     assert sample.execution_anomaly_count > 0
     assert result.failed is True
     assert result.reason == "execution_anomaly"
+
+
+def test_post_window_missing_grace_drains_until_job_appears():
+    clock = FakeMonotonicClock()
+    unresolved = database_snapshot(
+        raw_messages=((101, 7),), unsettled_missing_ids=(101,)
+    )
+    resolved = database_snapshot(raw_messages=((101, 7),))
+    snapshots = iter((unresolved, unresolved, resolved))
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(window=0.0),
+            database_collector=lambda _args: next(snapshots),
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert len(samples) == 2
+    assert samples[0].unsettled_missing_job_count == 1
+    assert samples[0].missing_job_count == 0
+    assert samples[1].unsettled_missing_job_count == 0
+
+
+def test_post_window_missing_grace_fails_closed_at_bounded_deadline():
+    clock = FakeMonotonicClock()
+    unresolved = database_snapshot(
+        raw_messages=((101, 7),), unsettled_missing_ids=(101,)
+    )
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(window=0.0),
+            database_collector=lambda _args: unresolved,
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert samples[-1].runtime.elapsed_seconds == pytest.approx(30.0)
+    assert samples[-1].missing_job_count == 1
+
+
+def test_post_window_drain_ignores_newer_unsettled_raw_cohort():
+    clock = FakeMonotonicClock()
+    clean = database_snapshot()
+    boundary = database_snapshot(
+        raw_messages=((101, 7),), unsettled_missing_ids=(101,)
+    )
+    post_window_only = database_snapshot(
+        raw_messages=((101, 7), (102, 8)), unsettled_missing_ids=(102,)
+    )
+    snapshots = iter((clean, clean, boundary, post_window_only))
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(window=1.0),
+            database_collector=lambda _args: next(snapshots),
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert samples[-1].runtime.elapsed_seconds == pytest.approx(2.0)
+    assert samples[-1].missing_job_count == 0
+
+
+def test_post_window_drain_runtime_http_budget_remains_split_cadence():
+    clock = FakeMonotonicClock()
+    unresolved = database_snapshot(
+        raw_messages=((101, 7),), unsettled_missing_ids=(101,)
+    )
+    runtime_calls = []
+
+    def collect_runtime(_args, _database, *, elapsed_seconds):
+        runtime_calls.append(elapsed_seconds)
+        return runtime(elapsed=elapsed_seconds)
+
+    list(
+        observer._acceptance_samples(
+            acceptance_args(window=1.0),
+            database_collector=lambda _args: unresolved,
+            runtime_collector=collect_runtime,
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert len(runtime_calls) <= 4
 
 
 def test_database_stuck_evidence_cannot_be_masked_by_zero_external_guard():
