@@ -125,7 +125,7 @@ phase_7_r5_rollback_status: confirmed_global_1_queue_three_consecutive_samples
 phase_7_r5_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-low-perturbation-r5-20260827T023922Z
 phase_7_r5_evidence_manifest_sha256: cef991f533ee0ac8069a735cf02a7eebc4f2640280facf317862b4a977687b2f
 phase_7_r6_authorization: owner_authorized_fix_acceptance_tool_remove_continuous_web_parity_red_green_full_suite_read_only_install_and_complete_phase_7_one_go
-phase_7_r6_status: production_acceptance_in_progress
+phase_7_r6_status: rolled_back_after_fresh_raw_missing_job_grace_false_positive
 phase_7_r6_design_commit: cdea2640ba0ef22a0f5e9e9644fd8e32d94a074b
 phase_7_r6_plan_commit: 42d8cddd8dedb0f9b57de1e60bcb850b7e9a8b7f
 phase_7_r6_candidate_commit: dee0a2e9d1875b50927ab4add9a50fe6c9934e0c
@@ -142,6 +142,17 @@ phase_7_r6_cutover_at: 2026-08-27T05:04:07.143275+00:00
 phase_7_r6_window_start: 2026-08-27T05:04:11.139934Z
 phase_7_r6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-web-parity-isolation-r6-20260827T050229Z
 phase_7_r6_initial_status: per_chat_3_queue_converged_three_samples_zero_identity_stuck_guard_or_exchange_anomaly
+phase_7_r6_failure_at: 2026-08-27T05:05:18.575438Z
+phase_7_r6_failure_reason: acceptance_tool_sampled_fresh_raw_220ms_before_queue_job_creation_and_misclassified_it_as_permanent_missing_identity
+phase_7_r6_rollback_status: confirmed_global_1_queue_three_consecutive_samples
+phase_7_r7_status: local_candidate_complete_ready_for_production_preflight
+phase_7_r7_candidate_commit: cc2e2d680c05a4c6f26a6bae283fd3326f6a0541
+phase_7_r7_observer_sha256: 715c558f7d6a4c9e13eb3ecc33958c96bc2f16d09a0d63098c1af168128a8531
+phase_7_r7_controller_sha256: 150a7f6bdb83ef655996c960e81c8463c2541a90c05224d78a94e95156e0bd64
+phase_7_r7_contract: "fresh unmatched raw rows receive a 30-second debounce but never a final waiver; the two-hour boundary freezes the unresolved raw cohort and traffic ceilings, performs at most a 30-second bounded drain, ignores newer post-window rows for forced aging, fails permanent unresolved rows closed, keeps 30-second runtime HTTP cadence during drain, and forces one fresh runtime sample at the boundary and before early successful return"
+phase_7_r7_focused_verification: "82 passed, 18 deselected in observer, runtime-loop-health, and durable worker ordering slice"
+phase_7_r7_full_suite_verification: "6376 passed, 1 skipped, 32 warnings in 583.86 seconds"
+phase_7_r7_review_status: ready_yes_zero_critical_zero_important
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -424,6 +435,25 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-27 Phase 7 R6 rollback and R7 repair`: R6 correctly converged and
+  kept every external guard at zero, but the first natural raw row was sampled
+  `220ms` before its non-shadow queue job was created. The observer treated
+  this normal enqueue gap as permanent `missing_job_identity`, failed closed,
+  and confirmed `global + 1 + queue` rollback with three samples. Read-only
+  evidence later showed raw `13416` at `05:05:18.338045Z`, job `1655`
+  enqueued at `05:05:18.558115Z`, and successful completion at
+  `05:05:18.821472Z`; this was an acceptance-tool defect, not a scheduler or
+  worker defect. R7 candidate
+  `cc2e2d680c05a4c6f26a6bae283fd3326f6a0541` adds a 30-second debounce with a
+  bounded post-window drain, freezes the boundary cohort and traffic ceilings,
+  never waives permanent missing parity, preserves split runtime HTTP cadence,
+  and forces fresh boundary/final role evidence. RED reproduced the transient
+  missing false positive, final-waiver gap, post-window cohort contamination,
+  and high-frequency drain HTTP; focused verification passed `82` with `18`
+  deselected, the final suite passed `6376` with `1` skipped and `32` existing
+  warnings in `583.86s`, and independent review returned zero Critical and
+  zero Important findings.
 
 - `2026-08-27 Phase 7 R6 production window started`: production preflight
   passed at exact clean runtime SHA
