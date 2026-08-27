@@ -4,11 +4,12 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: candidate_integration
-phase_state: planned
-claimed_by: null
+phase_state: claimed
+claimed_by: task-11-findings-local-red-green-2026-08-27
 candidate_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
 candidate_content_sha: 14819b309f27025d183f4bd27b8210ac74996e92
 handoff_sha: 314f7c19628b8c49c15519fb3af405e704e718a4
+review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 production_sha: null
 auto_trade_frozen: false
 freeze_raw_message_id: null
@@ -24,6 +25,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- Task 11 exact-SHA review rejected the prior candidate before push. The
+  owner-authorized local RED→GREEN repair is claimed at exact clean base
+  `49b8f40c9af0f38344724c84f39a7e065e5beabd`; push, SSH, deployment, restart,
+  production writes, and trading writes remain unauthorized.
 - The approved design and implementation plan were read in full.
 - Initial gates passed at `bad13a7b56c833919536dfb7f028725201fc22cc` on
   `codex/phase0-deploy-integration` in the authoritative workspace.
@@ -58,6 +63,9 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
+- Close the four Task 11 findings locally: post-publish Agent deny ACL,
+  descriptor/current-directory-entry binding, governed frozen expectations for
+  all monitor oneshots, and the separate restore watermark boundary.
 - Linux/root sticky-directory integration test before production deployment.
 - Phase 2 exact-SHA review/integration and any push remain separately
   authorized.
