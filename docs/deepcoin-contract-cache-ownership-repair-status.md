@@ -22,10 +22,11 @@ task12_health_classification: legacy_capability_absent
 task12_observed_max_raw_message_id: 13534
 task12_refusal_baseline_count: 16
 task12_time_sensitive_pending_trigger_count: 7
-pending_entry_cancel_candidate_status: revision_gate_fix_local_complete_unpushed
-pending_entry_cancel_candidate_sha: 1b561ebc95292d45080c0a014e71d848cc86466f
+pending_entry_cancel_candidate_status: revision_ambiguity_scope_fix_local_complete_unpushed
+pending_entry_cancel_candidate_sha: afe5f50e6123182b34f5dc821521febc0120b851
 pending_entry_cancel_pushed_base_sha: 91bb257e2a1c808c25a54149a7c71c392c0952e4
-pending_entry_cancel_revision_gate_plan_sha: 1eb6b0c70f7e2dd648258fcce779c522a0095504
+pending_entry_cancel_revision_gate_plan_sha: 7a17c3a0818c9f674fc5afb6bafb163bc48639b1
+pending_entry_cancel_revision_scope_fix_base_sha: be97f3233838e6e0867529cf04cd4e380d9c9625
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -41,6 +42,29 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- The historical-unrelated revision ambiguity scope repair started from exact
+  clean SHA `be97f3233838e6e0867529cf04cd4e380d9c9625` on branch
+  `codex/phase0-deploy-integration`. The approved design and implementation-plan
+  update is `7a17c3a0818c9f674fc5afb6bafb163bc48639b1`; the production-code and test
+  candidate is `afe5f50e6123182b34f5dc821521febc0120b851`.
+- The active-authority gate still treats every non-terminal revision batch and
+  any parent claim residue as global authority. Terminal, claim-free ambiguous
+  children are ignored only when their parent binding, target lifecycle,
+  execution leg and order are all unrelated to the fixed reviewed target set.
+  Any target-related `cancel_submitting`/`submit_unknown` revision leg or
+  `submit_reserved`/`submitted` replacement remains fail-closed. Missing parent
+  rows and an empty reviewed target set also fail closed.
+- RED first reproduced four unrelated terminal-child false blocks. Additional
+  RED tests exposed replacement order-only overlap, orphan ambiguous children
+  and the empty-target boundary. GREEN passed the complete reviewed-cancellation
+  file at 39 tests and the adjacent six-file group at 213 tests. The one final
+  repository suite passed 6475 tests with 2 skipped and 32 warnings in 626.28
+  seconds. Independent review found no Critical, Important or Minor finding in
+  the authorized scope.
+- This local turn performed no push, deployment, SSH, freeze, restart,
+  production/database/Deepcoin write, historical replay or Telegram send. The
+  existing cross-process authority-check-to-exchange-write TOCTOU was neither
+  widened nor claimed solved by this query-scope repair.
 - The production read-only dry-run of pushed base
   `91bb257e2a1c808c25a54149a7c71c392c0952e4` failed closed before producing
   actions because its revision gate treated three old, unclaimed
@@ -287,14 +311,19 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- The gate-fixed reviewed cancellation candidate
-  `1b561ebc95292d45080c0a014e71d848cc86466f` has not been pushed, deployed, or
+- The scoped gate-fixed reviewed cancellation candidate
+  `afe5f50e6123182b34f5dc821521febc0120b851` has not been pushed, deployed, or
   executed in production. Its prior base was pushed at
   `91bb257e2a1c808c25a54149a7c71c392c0952e4`. Any fresh production read-only
   plan, candidate push/deployment, and each individual Deepcoin cancellation
   require their own explicit authorization. An unknown result must stop the
   sequence and must not be retried; the remaining exact orders must be freshly
   replanned one at a time.
+- This scoped gate repair does not serialize the separate worker process with a
+  CLI apply between its last database authority check and the exchange request.
+  A future production apply therefore still requires a separately approved
+  quiescence protocol or a cross-process authority protocol honored by every
+  writer; neither is authorized or implemented here.
 - Production remains unchanged at
   `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; automatic entry remains enabled.
   Do not enter Task 13 while any of the seven unprotected pending trigger entries
