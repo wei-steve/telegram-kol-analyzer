@@ -399,7 +399,11 @@ if [ "${1:-}" = "-c" ] && [[ "${2:-}" = *"monitor-pin-rewrite"* ]]; then
   printf 'monitor-pin-rewrite\n' >>"$HARNESS_LOG"
   MONITOR_REWRITE_HEAD="$5" MONITOR_REWRITE_OPTION="$6" perl -0pe '
     s/^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=$ENV{MONITOR_REWRITE_HEAD}/m;
-    s/^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=$ENV{MONITOR_REWRITE_OPTION}/m
+    if (/^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=/m) {
+      s/^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=[^\r\n]*/TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=$ENV{MONITOR_REWRITE_OPTION}/m;
+    } else {
+      s/^(TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*)/$1\nTELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=$ENV{MONITOR_REWRITE_OPTION}/m;
+    }
   ' "$3" >"$4"
   exit 0
 fi
@@ -568,6 +572,7 @@ exec /bin/rm "$@"
         if installation in {
             "complete",
             "env_only",
+            "legacy_missing_expectation",
             "malformed",
             "symlink",
             "no_final_newline",
@@ -582,6 +587,15 @@ exec /bin/rm "$@"
                 encoding="utf-8",
             )
             monitor_env.chmod(0o600)
+        if installation == "legacy_missing_expectation":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8").replace(
+                    "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+                    "--expected-auto-trade-enabled\n",
+                    "",
+                ),
+                encoding="utf-8",
+            )
         if installation == "no_final_newline":
             monitor_env.write_bytes(
                 b"MONITOR_SECRET=must-not-be-printed\n"
@@ -861,6 +875,60 @@ def test_monitor_pin_transaction_wraps_successful_cutover(updater_harness) -> No
     )
     assert (state / "monitor_timer_enabled").exists()
     assert (state / "monitor_timer_active").exists()
+
+
+@pytest.mark.parametrize(
+    ("state", "expected_option"),
+    [
+        ("enabled", "--expected-auto-trade-enabled"),
+        ("disabled", "--no-expected-auto-trade-enabled"),
+    ],
+)
+def test_legacy_monitor_env_adds_missing_governed_expectation(
+    updater_harness, state: str, expected_option: str
+) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+
+    result = run(
+        HARNESS_MONITOR_INSTALLATION="legacy_missing_expectation",
+        EXPECTED_AUTO_TRADE_STATE=state,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert "checkout" in _events(log)
+    assert monitor_env.read_text(encoding="utf-8") == (
+        "MONITOR_SECRET=must-not-be-printed\n"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={CANDIDATE}\n"
+        "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
+        f"{expected_option}\n"
+        "MONITOR_SETTING=preserve-this-line\n"
+    )
+    assert "must-not-be-printed" not in result.stdout + result.stderr
+
+
+def test_legacy_monitor_env_is_restored_byte_for_byte_after_failure(
+    updater_harness,
+) -> None:
+    run, log, _ = updater_harness
+    monitor_env = log.parent / "telegram-kol-monitor.env"
+    original = (
+        "MONITOR_SECRET=must-not-be-printed\n"
+        f"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD={OTHER}\n"
+        "MONITOR_SETTING=preserve-this-line\n"
+    ).encode()
+
+    result = run(
+        HARNESS_MONITOR_INSTALLATION="legacy_missing_expectation",
+        EXPECTED_AUTO_TRADE_STATE="disabled",
+        HARNESS_HTTP_FAIL="1",
+    )
+
+    assert result.returncode == 4
+    assert "monitor-pin-previous" in _events(log)
+    assert "checkout" in _events(log)
+    assert monitor_env.read_bytes() == original
+    assert "must-not-be-printed" not in result.stdout + result.stderr
 
 
 def test_monitor_pin_preserves_non_head_bytes_without_final_newline(

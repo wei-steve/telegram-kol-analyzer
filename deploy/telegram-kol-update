@@ -187,12 +187,13 @@ wait_for_unit_inactive() {
   done
 }
 
-validate_monitor_env_file() {
+validate_monitor_env_path() {
+  local path="$1" source_schema="${2:-strict}"
   local metadata owner_uid mode extra_metadata expected_uid head_count head_line head_value option_count option_line option_value
-  if [ ! -f "$MONITOR_ENV_FILE" ] || [ -L "$MONITOR_ENV_FILE" ]; then
+  if [ ! -f "$path" ] || [ -L "$path" ]; then
     return 1
   fi
-  metadata="$(stat -c '%u %a' -- "$MONITOR_ENV_FILE")" || return 1
+  metadata="$(stat -c '%u %a' -- "$path")" || return 1
   read -r owner_uid mode extra_metadata <<<"$metadata"
   if [ -n "${extra_metadata:-}" ]; then return 1; fi
   expected_uid=0
@@ -202,19 +203,26 @@ validate_monitor_env_file() {
   if [ "$owner_uid" != "$expected_uid" ] || [ "$mode" != "600" ]; then
     return 1
   fi
-  head_count="$(grep -c '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$MONITOR_ENV_FILE" || true)"
+  head_count="$(grep -c '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$path" || true)"
   if [ "$head_count" != "1" ]; then return 1; fi
-  head_line="$(grep '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$MONITOR_ENV_FILE")" || return 1
+  head_line="$(grep '^TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=' "$path")" || return 1
   head_value="${head_line#TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=}"
   if [[ ! "$head_value" =~ ^[0-9a-fA-F]{40}$ ]]; then return 1; fi
-  option_count="$(grep -c '^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=' "$MONITOR_ENV_FILE" || true)"
+  option_count="$(grep -c '^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=' "$path" || true)"
+  if [ "$option_count" = "0" ] && [ "$source_schema" = "legacy-source" ]; then
+    return 0
+  fi
   if [ "$option_count" != "1" ]; then return 1; fi
-  option_line="$(grep '^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=' "$MONITOR_ENV_FILE")" || return 1
+  option_line="$(grep '^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=' "$path")" || return 1
   option_value="${option_line#TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=}"
   case "$option_value" in
     --expected-auto-trade-enabled|--no-expected-auto-trade-enabled) ;;
     *) return 1 ;;
   esac
+}
+
+validate_monitor_env_file() {
+  validate_monitor_env_path "$MONITOR_ENV_FILE" "${1:-strict}"
 }
 
 classify_monitor_installation() {
@@ -232,7 +240,7 @@ classify_monitor_installation() {
   if [ "$unit_present" -ne 1 ] || [ "$env_present" -ne 1 ]; then
     return 1
   fi
-  if ! validate_monitor_env_file; then return 1; fi
+  if ! validate_monitor_env_file legacy-source; then return 1; fi
   monitor_managed=1
 }
 
@@ -290,7 +298,7 @@ stop_monitor_for_deployment() {
 sync_monitor_expectations() {
   local target_commit="$1" candidate=""
   if [[ ! "$target_commit" =~ ^[0-9a-f]{40}$ ]]; then return 1; fi
-  if ! validate_monitor_env_file; then return 1; fi
+  if ! validate_monitor_env_file legacy-source; then return 1; fi
   candidate="$(mktemp "${MONITOR_ENV_FILE}.candidate.XXXXXX")" || return 1
   if ! "$APP_DIR/.venv/bin/python" -c '# monitor-pin-rewrite
 import re
@@ -305,7 +313,9 @@ head_pattern = re.compile(
 option_pattern = re.compile(
     br"(?m)^TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=[^\r\n]*"
 )
-if len(head_pattern.findall(source)) != 1 or len(option_pattern.findall(source)) != 1:
+head_matches = head_pattern.findall(source)
+option_matches = option_pattern.findall(source)
+if len(head_matches) != 1 or len(option_matches) > 1:
     raise SystemExit(4)
 head_replacement = (
     b"TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" + target_commit.encode("ascii")
@@ -315,7 +325,22 @@ option_replacement = (
     + expected_auto_trade_option.encode("ascii")
 )
 rewritten = head_pattern.sub(lambda _: head_replacement, source, count=1)
-rewritten = option_pattern.sub(lambda _: option_replacement, rewritten, count=1)
+if option_matches:
+    rewritten = option_pattern.sub(lambda _: option_replacement, rewritten, count=1)
+else:
+    head_line_pattern = re.compile(
+        br"(?m)^(TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=[^\r\n]*)(\r\n|\n|\r|$)"
+    )
+
+    def insert_option(match):
+        line_ending = match.group(2)
+        if not line_ending:
+            return match.group(1) + b"\n" + option_replacement
+        return match.group(1) + line_ending + option_replacement + line_ending
+
+    rewritten, insertion_count = head_line_pattern.subn(insert_option, rewritten, count=1)
+    if insertion_count != 1:
+        raise SystemExit(4)
 Path(candidate_path).write_bytes(rewritten)
 ' "$MONITOR_ENV_FILE" "$candidate" "$target_commit" "$EXPECTED_AUTO_TRADE_OPTION"; then
     rm -f -- "$candidate"
@@ -326,6 +351,10 @@ Path(candidate_path).write_bytes(rewritten)
     return 1
   fi
   if [ "${UPDATER_TEST_MODE:-0}" != "1" ] && ! chown root:root "$candidate"; then
+    rm -f -- "$candidate"
+    return 1
+  fi
+  if ! validate_monitor_env_path "$candidate"; then
     rm -f -- "$candidate"
     return 1
   fi
@@ -395,7 +424,7 @@ install_root_artifact() {
 }
 
 backup_monitor_artifacts() {
-  if ! validate_monitor_env_file; then return 1; fi
+  if ! validate_monitor_env_file legacy-source; then return 1; fi
   monitor_env_backup="$(mktemp "$STAGE_PARENT/telegram-kol-monitor-env-backup.XXXXXX")" || return 1
   chmod 0600 "$monitor_env_backup" || return 1
   cp -p -- "$MONITOR_ENV_FILE" "$monitor_env_backup" || return 1
