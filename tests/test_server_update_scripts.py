@@ -9,6 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 CACHE_REPAIR_RUNBOOK = (
     ROOT / "docs" / "runbooks" / "deepcoin-contract-cache-ownership-repair.md"
 )
+CACHE_REPAIR_PLAN = (
+    ROOT / "docs" / "plans" / "2026-08-27-deepcoin-contract-cache-ownership-repair.md"
+)
+CACHE_REPAIR_STATUS = (
+    ROOT / "docs" / "deepcoin-contract-cache-ownership-repair-status.md"
+)
 
 
 def test_update_scripts_are_syntax_valid():
@@ -87,7 +93,9 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
 def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     deployment = (ROOT / "docs/server-deployment.md").read_text(encoding="utf-8")
     runbook = CACHE_REPAIR_RUNBOOK.read_text(encoding="utf-8")
-    combined = deployment + "\n" + runbook
+    implementation = CACHE_REPAIR_PLAN.read_text(encoding="utf-8")
+    status = CACHE_REPAIR_STATUS.read_text(encoding="utf-8")
+    combined = deployment + "\n" + runbook + "\n" + implementation
 
     for required in (
         "telegram-kol-worker:telegram-kol-runtime",
@@ -120,11 +128,30 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     assert "telegram-kol.service stopped" in runbook
     assert "active_write_count=0" in runbook
     assert "记录冻结后的首个自然到达 `raw_message_id` 作为 future-only 水位" not in runbook
-    assert "已知的 15 条历史 `contract_spec_sync_unavailable` 拒绝" in runbook
-    assert "15 条均保持 `verified_refusal`" in runbook
+    for required in (
+        "已识别可迁移旧版漂移",
+        "root owner 与缺失的 Agent deny ACL",
+        "unknown owner/type/link/group/mode/ACL",
+        "`legacy_capability_absent`",
+        "HTTP 404",
+        "401/403",
+        "有界历史覆盖",
+        "100-row",
+        "完整候选合同",
+        "冻结时动态记录",
+    ):
+        assert required in combined
     assert "`attempted_exchange_write=0`" in runbook
     assert "4 条旧的 zero-write 非终态执行合同" in runbook
-    assert "已知的 14 条历史 `contract_spec_sync_unavailable` 拒绝" not in runbook
+    task12_start = implementation.index("### Task 12: 冻结前只读门禁")
+    task13_start = implementation.index("### Task 13: 冻结、部署并保持关闭")
+    task12 = implementation[task12_start:task13_start]
+    assert "失败只因 owner 漂移" not in task12
+    assert "已知的 15 条历史" not in runbook
+    assert "历史 15 条拒绝" not in implementation[task12_start:]
+    assert "task12_refusal_baseline_count: 16" in status
+    assert "task12_observed_max_raw_message_id: 13530" in status
+    assert "task12_gate: failed_closed" in status
     restore_section = runbook.index("## 4. 单独恢复")
     enabled_updater = runbook.index("EXPECTED_AUTO_TRADE_STATE=enabled", restore_section)
     restore_watermark = runbook.index("restore_raw_message_id", restore_section)
