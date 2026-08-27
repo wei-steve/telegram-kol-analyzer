@@ -152,10 +152,90 @@ tests that cover durable same-chat ownership. Because the new tool is dormant
 and does not alter production imports, no deployment, restart, production
 observation, or full production suite is required for this local remediation.
 
+## Low-Perturbation Addendum
+
+The first production use of the observer showed that coupling every durable-
+queue sample to six role HTTP requests and their access-log writes can perturb
+the event loops being measured. This addendum supersedes only the sampling and
+cross-chat clauses above; the read-only boundary and every fail-closed safety
+contract remain unchanged.
+
+### Split cadence
+
+The acceptance mode uses two independent monotonic schedules:
+
+- a durable SQLite schedule, normally once per second, reads settings and job
+  state through the existing `mode=ro` / `query_only` connection;
+- a runtime HTTP schedule, normally once per 30 seconds and always at window
+  start and end, reads settings and the ingest, worker, and Web health endpoints.
+
+SQLite samples never trigger an HTTP request. Runtime samples cache the last
+complete authority, role, cap, lane, and cumulative health state for diagnostic
+output, but cached state cannot turn an incomplete due runtime read into a
+healthy sample. Each due database or runtime read gets at most one bounded
+retry; the second incomplete result fails closed immediately.
+
+The convergence and rollback modes retain their bounded sub-second combined
+sampling because each normally lasts about one second and directly proves an
+expected-state transition. Their short request burst is outside the continuous
+acceptance window and is not evidence of natural runtime health.
+
+### Cross-chat attribution
+
+The durable queue remains the concurrency authority. A complete SQLite snapshot
+with `claimed` jobs from at least two distinct chats proves simultaneous durable
+cross-chat ownership without an accompanying high-frequency HTTP read. The
+worker's cumulative peak must independently reach at least the same lower bound
+in a complete runtime sample from the same acceptance window. Neither signal is
+sufficient by itself, and the worker peak must remain at most three.
+
+Same-chat overlap and oldest-nonterminal ordering continue to be evaluated only
+from one consistent SQLite snapshot. Cached runtime data is never used to infer
+job order, and a pending successor is still valid backlog.
+
+### Stall and acceptance contract
+
+Role stall counters and attributed events are cumulative. A new event therefore
+remains observable at the next low-frequency runtime sample even if its callback
+has already recovered. Acceptance fails closed for any new ingest or worker
+stall, any Web `captured_business_blocker`, authority or tuple drift, invalid
+role evidence, or a second incomplete query.
+
+A Web-only `loop_lag_confirmed_but_stack_unattributed` or
+`idle_or_post_recovery_selector_capture` is recorded as Web evidence and cannot
+be relabeled as a per-chat scheduler or worker defect. It may still fail the Web
+health contract when the configured Phase 7 policy says so; the reason code and
+rollback class must identify Web, never a fabricated business blocker.
+
+The two-hour clock, five-natural-message minimum, two-chat attempt, ordering,
+cross-chat, queue-drain, duplicate, authority, SQLite, session, and exchange
+parity gates remain mandatory. The lower HTTP rate is a measurement correction,
+not an acceptance waiver.
+
+### Rejected cadence alternatives
+
+Simply increasing the old single poll interval was rejected because it would
+still couple database and HTTP work and could miss short simultaneous claims.
+Ignoring selector-only captures was rejected because ingest and worker stalls
+must remain fail closed even when the stack cannot be attributed to a business
+function.
+
+### Addendum verification
+
+RED-to-GREEN tests must prove the database and runtime call budget, cross-chat
+proof across the two independent signals, persistence of cumulative stall
+deltas, and immediate failure after the one allowed retry. The approved final
+candidate also receives the Phase 7 focused slice and one complete local suite
+before the standalone observer is copied into a server evidence directory.
+The observer does not enter the production checkout and no runtime deployment or
+restart is required.
+
 ## Authorization Boundary
 
-This design authorizes only local design and implementation documents, observer
-code, focused tests, canonical status updates, and explicit-path local commits.
-Push, deployment, restart, production access or mutation, cutover, rollback,
-schema/data changes, replay, worker commands, manufactured Telegram traffic,
-test trades, and exchange writes remain separately prohibited.
+The original design authorization covered only local artifacts. The owner has
+now additionally authorized non-force push of the reviewed observer candidate,
+read-only installation outside the production checkout, a fresh Phase 7
+`global + 1` to `per_chat + 3` safe retry, and the already-tested atomic
+rollback. Production runtime deployment, restart, schema or business-data
+changes, replay, worker commands, manufactured Telegram traffic, test trades,
+and exchange writes remain prohibited.
