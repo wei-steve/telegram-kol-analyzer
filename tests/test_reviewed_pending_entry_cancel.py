@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    EntryRevisionReplacement,
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
@@ -18,6 +19,9 @@ from telegram_kol_research.models import (
     RepairConfirmationToken,
     RawMessage,
     StrategyLifecycle,
+    StrategyRevisionBatch,
+    StrategyRevisionLeg,
+    StrategyThread,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
 )
@@ -485,6 +489,207 @@ def test_plan_blocks_cancel_submitting_mutation_authority(tmp_path):
                 status="cancel_submitting",
                 request_json="{}",
                 reserved_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def _seed_revision_batch(
+    session_factory,
+    *,
+    binding_id: int,
+    lifecycle_id: int,
+    status: str,
+    claim_token: str | None = None,
+    claim_timestamp_present: bool = False,
+) -> int:
+    with session_factory() as session:
+        raw = RawMessage(chat_id=303, message_id=404, text="old revision")
+        thread = StrategyThread(
+            chat_id=303,
+            root_message_id=404,
+            symbol="BTC",
+            side="long",
+            status="active",
+        )
+        session.add_all([raw, thread])
+        session.flush()
+        session.add(
+            StrategyRevisionBatch(
+                idempotency_fingerprint=_fingerprint(
+                    {"status": status, "raw_message_id": raw.id}
+                ),
+                raw_message_id=raw.id,
+                strategy_thread_id=thread.id,
+                target_lifecycle_id=lifecycle_id,
+                execution_binding_id=binding_id,
+                revision_kind="replacement",
+                status=status,
+                replacement_json="{}",
+                reason_code=(
+                    "revision_cancel_outcome_unknown"
+                    if status == "recovery_required"
+                    else None
+                ),
+                advance_claim_token=claim_token,
+                advance_claimed_at=(
+                    NOW if claim_timestamp_present else None
+                ),
+                planned_at=NOW,
+            )
+        )
+        session.commit()
+        return int(
+            session.query(StrategyRevisionBatch.id)
+            .filter_by(raw_message_id=raw.id)
+            .one()[0]
+        )
+
+
+def test_plan_allows_recovery_required_revision_batch_without_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="recovery_required",
+    )
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert len(plan.actions) == 2
+    assert plan.conflicts == ()
+
+
+def test_plan_blocks_submitting_replacements_revision_batch(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="submitting_replacements",
+    )
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("claim_token", "claim_timestamp_present"),
+    (("revision-claim", False), (None, True), ("revision-claim", True)),
+)
+def test_plan_blocks_revision_batch_with_claim_evidence(
+    tmp_path,
+    claim_token,
+    claim_timestamp_present,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="recovery_required",
+        claim_token=claim_token,
+        claim_timestamp_present=claim_timestamp_present,
+    )
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+@pytest.mark.parametrize("child_status", ("cancel_submitting", "submit_unknown"))
+def test_plan_blocks_recovery_required_revision_with_ambiguous_cancel_child(
+    tmp_path,
+    child_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="recovery_required",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyRevisionLeg(
+                revision_batch_id=batch_id,
+                execution_order_leg_id=leg_ids[0],
+                action="cancel_pending",
+                prior_status="pending",
+                status=child_status,
+                order_id="reviewed-1",
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+@pytest.mark.parametrize("child_status", ("submit_reserved", "submitted"))
+def test_plan_blocks_recovery_required_revision_with_ambiguous_replacement(
+    tmp_path,
+    child_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="recovery_required",
+    )
+    with session_factory() as session:
+        session.add(
+            EntryRevisionReplacement(
+                revision_batch_id=batch_id,
+                execution_order_leg_id=leg_ids[0],
+                leg_index=0,
+                desired_json="{}",
+                status=child_status,
             )
         )
         session.commit()

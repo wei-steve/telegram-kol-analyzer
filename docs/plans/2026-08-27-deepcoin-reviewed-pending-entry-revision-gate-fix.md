@@ -4,7 +4,7 @@
 
 **Goal:** Stop terminal, unclaimed `recovery_required` revision batches from falsely blocking the reviewed pending-entry cancellation dry-run while retaining every real revision write-authority gate.
 
-**Architecture:** Reuse the exact batch write-boundary state already enforced by `deployment_active_write_check.py`: `submitting_replacements`. Keep the existing claimed revision-leg and replacement queries unchanged so an in-flight child write remains fail-closed.
+**Architecture:** Separate clean terminal batch state from live or ambiguous authority. Block all non-terminal batches, any parent claim evidence, and ambiguous child cancellation/replacement states even after recovery has cleared the parent claim.
 
 **Tech Stack:** Python 3.12, SQLAlchemy, pytest, existing Deepcoin cancellation planner and deployment active-write gate.
 
@@ -32,25 +32,36 @@ Run:
 Expected: FAIL because the current broad batch query returns
 `active_exchange_authority_present`.
 
-**Step 3: Add the active-boundary companion test**
+**Step 3: Add active and ambiguous-boundary companion tests**
 
 Seed the same batch with status `submitting_replacements`. Assert zero actions
-and the global `active_exchange_authority_present` conflict.
+and the global `active_exchange_authority_present` conflict. Also cover a
+claimed `cancelling_old_entries` batch, half-present claim evidence,
+`cancel_submitting`/`submit_unknown` revision legs, and
+`submit_reserved`/`submitted` replacements without a parent claim.
 
 ### Task 2: Implement the minimal gate correction
 
 **Files:**
 - Modify: `src/telegram_kol_research/reviewed_pending_entry_cancel.py`
 
-**Step 1: Replace only the broad revision batch predicate**
+**Step 1: Distinguish terminal-clean state from live or ambiguous authority**
 
-Change the batch query from every status outside `succeeded`/`blocked` to:
+Allow only terminal batch states, then add independent fail-closed queries for
+claim evidence and ambiguous children:
 
 ```python
-StrategyRevisionBatch.status == "submitting_replacements"
+StrategyRevisionBatch.status.not_in(
+    {"succeeded", "blocked", "failed", "recovery_required"}
+)
+StrategyRevisionBatch.advance_claim_token.is_not(None)
+StrategyRevisionBatch.advance_claimed_at.is_not(None)
+StrategyRevisionLeg.status.in_({"cancel_submitting", "submit_unknown"})
+EntryRevisionReplacement.status.in_({"submit_reserved", "submitted"})
 ```
 
-Do not alter the claimed revision-leg or replacement queries.
+The child queries must not depend on a surviving parent claim because recovery
+clears that claim after an unknown exchange outcome.
 
 **Step 2: Run GREEN**
 

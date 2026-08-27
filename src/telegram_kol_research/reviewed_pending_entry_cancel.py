@@ -58,6 +58,9 @@ _CANCELLED_HISTORY_STATES = frozenset(
 _FILLED_HISTORY_STATES = frozenset(
     {"filled", "partially_filled", "partially-filled", "partial_filled"}
 )
+_TERMINAL_REVISION_BATCH_STATES = frozenset(
+    {"succeeded", "blocked", "failed", "recovery_required"}
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -456,28 +459,21 @@ def _active_exchange_authority_present(session) -> bool:
             )
         ),
         session.query(StrategyRevisionBatch.id).filter(
-            StrategyRevisionBatch.status.not_in({"succeeded", "blocked"})
+            StrategyRevisionBatch.status.not_in(_TERMINAL_REVISION_BATCH_STATES)
         ),
-        session.query(StrategyRevisionLeg.id)
-        .join(
-            StrategyRevisionBatch,
-            StrategyRevisionBatch.id == StrategyRevisionLeg.revision_batch_id,
-        )
-        .filter(
-            StrategyRevisionLeg.status == "cancel_submitting",
-            StrategyRevisionBatch.advance_claim_token.is_not(None),
-            StrategyRevisionBatch.advance_claimed_at.is_not(None),
+        session.query(StrategyRevisionBatch.id).filter(
+            (StrategyRevisionBatch.advance_claim_token.is_not(None))
+            | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
         ),
-        session.query(EntryRevisionReplacement.id)
-        .join(
-            StrategyRevisionBatch,
-            StrategyRevisionBatch.id
-            == EntryRevisionReplacement.revision_batch_id,
-        )
-        .filter(
-            EntryRevisionReplacement.status == "submit_reserved",
-            StrategyRevisionBatch.advance_claim_token.is_not(None),
-            StrategyRevisionBatch.advance_claimed_at.is_not(None),
+        session.query(StrategyRevisionLeg.id).filter(
+            StrategyRevisionLeg.status.in_(
+                {"cancel_submitting", "submit_unknown"}
+            ),
+        ),
+        session.query(EntryRevisionReplacement.id).filter(
+            EntryRevisionReplacement.status.in_(
+                {"submit_reserved", "submitted"}
+            ),
         ),
         session.query(TriggerProtectionIntent.id).filter(
             TriggerProtectionIntent.recovery_state.in_(
