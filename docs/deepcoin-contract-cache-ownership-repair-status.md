@@ -6,9 +6,9 @@ design_status: approved
 current_phase: candidate_integration
 phase_state: planned
 claimed_by: null
-candidate_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
+candidate_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
 candidate_content_sha: a6ac63cb57d633831196414f7a55bb1bd0f321f2
-handoff_sha: null
+handoff_sha: 2ab3e92458abcda65f4a5c46b11616eb820742ec
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 production_sha: null
 auto_trade_frozen: false
@@ -51,6 +51,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
   read-only follow-up review found no remaining P0-P2 findings.
 - No push, deployment, SSH, restart, production/database/settings write,
   Telegram replay, manufactured traffic, or Deepcoin write was performed.
+- `2ab3e92458abcda65f4a5c46b11616eb820742ec` is the evidence-bearing repaired
+  handoff commit. The following status-only commit records that SHA; any future
+  exact-SHA action must use its read-only `git rev-parse HEAD` result as the
+  final local integration target, avoiding an impossible self-reference.
 - Task 11 exact-SHA review rejected the prior candidate before push. The
   owner-authorized local RED→GREEN repair is claimed at exact clean base
   `49b8f40c9af0f38344724c84f39a7e065e5beabd`; push, SSH, deployment, restart,
