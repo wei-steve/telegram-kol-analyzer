@@ -33,7 +33,7 @@ approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
 claimed_by: codex-per-chat-phase7-low-perturbation-observer-20260826-root
 claim_base_sha: b24e8935ef5a548eb898110a40e62e98dce88e00
-current_task: phase-7-low-perturbation-observer-design-plan-red-green-and-fresh-two-hour-safe-retry
+current_task: phase-7-r6-web-parity-isolation-design-plan-red-green-and-final-safe-retry
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -111,6 +111,21 @@ phase_7_low_perturbation_observer_compileall_verified: true
 phase_7_low_perturbation_observer_review_status: ready_yes_zero_critical_zero_important_after_two_review_repairs
 phase_7_low_perturbation_observer_contract: "acceptance samples read-only SQLite each second and role HTTP at start, end, and no more often than 30 seconds; CLI rejects database intervals below 0.5 seconds and runtime intervals below 10 seconds; each due query retries once then fails closed; durable simultaneous claims plus cumulative worker peak prove cross-chat progress; cumulative role stalls retain exact attribution"
 phase_7_low_perturbation_observer_source_boundary: "standalone standard-library observer only, SQLite mode=ro query_only, HTTP GET, stdout JSONL; no production runtime import, POST, rollback, service control, worker command, Telegram send, replay, or exchange-write path"
+phase_7_r5_status: rolled_back_incomplete_after_2460_seconds_web_idle_or_post_recovery_selector_capture
+phase_7_r5_window_start: 2026-08-27T02:40:36.912712+00:00
+phase_7_r5_failure_at: 2026-08-27T03:21:38.297587+00:00
+phase_7_r5_elapsed_seconds: 2460.236
+phase_7_r5_natural_message_count: 7
+phase_7_r5_distinct_chat_count: 3
+phase_7_r5_peak_active_chat_lanes: 2
+phase_7_r5_max_claimed_count: 2
+phase_7_r5_failure_reason: web_event_loop_stall_idle_or_post_recovery_selector_capture_7369_438ms_guard_web_message_pipeline_parity_completed_same_log_instant
+phase_7_r5_root_cause_status: strong_evidence_continuous_web_parity_guard_self_perturbed_web_loop_no_per_chat_scheduler_or_worker_defect_attributed
+phase_7_r5_rollback_status: confirmed_global_1_queue_three_consecutive_samples
+phase_7_r5_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-low-perturbation-r5-20260827T023922Z
+phase_7_r5_evidence_manifest_sha256: cef991f533ee0ac8069a735cf02a7eebc4f2640280facf317862b4a977687b2f
+phase_7_r6_authorization: owner_authorized_fix_acceptance_tool_remove_continuous_web_parity_red_green_full_suite_read_only_install_and_complete_phase_7_one_go
+phase_7_r6_status: design_in_progress
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -394,6 +409,20 @@ cutover_authorized: true
 
 ## History
 
+- `2026-08-26 Phase 7 R5 rollback and R6 approval`: R5 observed `2443`
+  acceptance samples over `2460.236s`, seven natural messages from three chats,
+  maximum two simultaneous claims, and worker peak two. All non-loop guards
+  remained zero. At `2026-08-27T03:21:34Z` the external guard's synchronous Web
+  parity request completed in the same log instant as a `7369.438ms` Web loop
+  lag; the watchdog correctly classified its selector-only capture as
+  `idle_or_post_recovery_selector_capture`, not a business blocker or per-chat
+  defect. Acceptance failed closed and atomically restored `global + 1`, with
+  three convergence samples. Evidence manifest SHA-256 is
+  `cef991f533ee0ac8069a735cf02a7eebc4f2640280facf317862b4a977687b2f`.
+  The owner then authorized R6 to remove continuous Web parity observation,
+  replace it with SQLite read-only evidence, retain all fail-closed contracts,
+  and continue through the final Phase 7 window without another routine
+  approval pause.
 - `2026-08-26 Phase 7 low-perturbation observer claim`: session
   `codex-per-chat-phase7-low-perturbation-observer-20260826-root` exclusively
   claimed the approved observer redesign at canonical commit

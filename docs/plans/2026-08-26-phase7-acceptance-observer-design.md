@@ -230,6 +230,41 @@ before the standalone observer is copied into a server evidence directory.
 The observer does not enter the production checkout and no runtime deployment or
 restart is required.
 
+## R6 Web-Parity Isolation Addendum
+
+R5 proved that cadence separation alone is insufficient when the external guard
+still invokes the synchronous Web
+`/api/runtime/message-pipeline-parity` projection. At
+`2026-08-27T03:21:34Z` that request completed in the same log instant as a
+`7369.438ms` Web loop lag and a post-recovery selector capture. The durable
+worker path had already processed seven natural messages from three chats with
+peak two, while queue, SQLite, session, management, execution, and exchange
+guards remained clean. The failure is therefore attributed to the acceptance
+measurement path, not to a proven per-chat scheduler or worker defect.
+
+R6 removes every continuous call to the Web parity endpoint. The checked-in
+observer's existing read-only SQLite snapshot remains authoritative for raw/job
+identity, missing/orphan jobs, duplicates, ordering, claimed-chat concurrency,
+and queue counts. It additionally computes stuck pending jobs directly in the
+same `mode=ro`, `query_only=ON` transaction from `enqueued_at` and the fixed
+300-second Phase 7 threshold. The external guard retains only read-only checks
+that are not already present in the observer: active exchange writes,
+management/revision/worker-command state, duplicate decisions, service/session
+authority, and journal anomalies. None of those checks may call a production
+Web diagnostic endpoint.
+
+Role HTTP remains limited to the lightweight settings and loop-health reads at
+window start, end, and every 30 seconds. A new role-attributed stall still fails
+closed exactly as before. R6 changes only where parity evidence is collected;
+it does not waive Web health, traffic, ordering, cross-chat, two-hour, exchange,
+or rollback requirements.
+
+The operational controller candidate must pass a source-boundary check proving
+that `message-pipeline-parity` is absent before installation. RED-to-GREEN tests
+must prove pending age is derived from SQLite, a 300-second pending row fails as
+stuck, younger and terminal rows do not, and an external zero guard cannot mask
+the database result.
+
 ## Authorization Boundary
 
 The original design authorization covered only local artifacts. The owner has
