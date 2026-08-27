@@ -57,9 +57,11 @@ curl -fsS http://127.0.0.1:8000/api/trading-settings \
   | jq -e '.auto_trade_enabled == false'
 ```
 
-记录冻结后的首个自然到达 `raw_message_id` 作为 future-only 水位。已知的 14 条
-历史 `contract_spec_sync_unavailable` 拒绝永不重放、永不补单，也不因修复缓存
-而自动执行。不得发送测试 Telegram 消息。
+冻结读回成功后，以 `MAX(raw_messages.id)` 记录
+`freeze_raw_message_id`。它只标记冻结窗口的审计起点，不是恢复后的执行水位：
+冻结期间到达但因 `auto_trade_enabled=false` 而终止的消息同样不得在恢复时重放。
+已知的 14 条历史 `contract_spec_sync_unavailable` 拒绝永不重放、永不补单，也不因
+修复缓存而自动执行。不得发送测试 Telegram 消息。
 
 失败后的安全终态：若写入结果或读回不完整，禁止部署并人工核对；不得猜测当前
 设置。只要已确认 false，就保持冻结，不进行自动恢复。
@@ -113,9 +115,15 @@ BRANCH=codex/deepcoin-auto-trading-v1 \
 ./scripts/server_git_update.sh
 ```
 
+updater 成功后、紧邻 settings 恢复写入前，重新查询 `MAX(raw_messages.id)`，把
+结果记录为 `restore_raw_message_id`。只有之后自然到达、满足
+`raw_messages.id > restore_raw_message_id` 的新消息才可进入现有权威识别和执行链；
+所有 `raw_messages.id <= restore_raw_message_id` 的消息（包括冻结前、冻结期间以及
+updater 执行间隙到达的消息）都保持历史终态，禁止回扫、重放或补单。
+
 然后重新 GET 当前完整 settings，只把 `auto_trade_enabled` 改为 `true`，POST 后
-立即读回。不得修改水位，不得回扫或重放冻结前消息；只允许冻结后水位之后自然
-到达的未来新信号进入现有权威识别和执行链。
+立即读回。不得修改 `restore_raw_message_id`，也不得把
+`freeze_raw_message_id` 误用为恢复水位。
 
 失败后的安全终态：保持 `auto_trade_enabled=false` 和 monitor disabled expectation，
 不重试交易、不补单；记录 evidence path 并等待新的恢复授权。

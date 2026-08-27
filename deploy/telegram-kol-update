@@ -15,10 +15,14 @@ monitor_env_override="${MONITOR_ENV_FILE:-}"
 worker_cache_helper_override="${WORKER_CACHE_HELPER_PATH:-}"
 worker_unit_override="${WORKER_UNIT_PATH:-}"
 monitor_service_override="${MONITOR_SERVICE_PATH:-}"
+monitor_diagnostic_service_override="${MONITOR_DIAGNOSTIC_SERVICE_PATH:-}"
+monitor_test_notification_service_override="${MONITOR_TEST_NOTIFICATION_SERVICE_PATH:-}"
 MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"
 WORKER_CACHE_HELPER_PATH=/usr/local/libexec/telegram-kol-worker-prepare-contract-cache
 WORKER_UNIT_PATH=/etc/systemd/system/telegram-kol-worker.service
 MONITOR_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor.service
+MONITOR_DIAGNOSTIC_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor-diagnostic.service
+MONITOR_TEST_NOTIFICATION_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor-test-notification.service
 MONITOR_TIMER="telegram-kol-monitor.timer"
 MONITOR_ONESHOT_UNITS=(
   "telegram-kol-monitor.service"
@@ -81,7 +85,9 @@ if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
     || [ -z "$monitor_env_override" ] \
     || [ -z "$worker_cache_helper_override" ] \
     || [ -z "$worker_unit_override" ] \
-    || [ -z "$monitor_service_override" ]; then
+    || [ -z "$monitor_service_override" ] \
+    || [ -z "$monitor_diagnostic_service_override" ] \
+    || [ -z "$monitor_test_notification_service_override" ]; then
     echo "Updater test-mode path override is invalid." >&2
     exit 4
   fi
@@ -89,8 +95,11 @@ if [ "${UPDATER_TEST_MODE:-0}" = "1" ]; then
   WORKER_CACHE_HELPER_PATH="$worker_cache_helper_override"
   WORKER_UNIT_PATH="$worker_unit_override"
   MONITOR_SERVICE_PATH="$monitor_service_override"
+  MONITOR_DIAGNOSTIC_SERVICE_PATH="$monitor_diagnostic_service_override"
+  MONITOR_TEST_NOTIFICATION_SERVICE_PATH="$monitor_test_notification_service_override"
 fi
-unset monitor_env_override worker_cache_helper_override worker_unit_override monitor_service_override
+unset monitor_env_override worker_cache_helper_override worker_unit_override monitor_service_override \
+  monitor_diagnostic_service_override monitor_test_notification_service_override
 
 if [[ ! "$EXPECTED_COMMIT" =~ ^[0-9a-fA-F]{40}$ ]]; then
   echo "EXPECTED_COMMIT must be a full 40-character hexadecimal commit." >&2
@@ -145,7 +154,11 @@ worker_cache_artifacts_touched=0
 worker_cache_artifacts_installed=0
 monitor_env_backup=""
 monitor_service_backup=""
+monitor_diagnostic_service_backup=""
+monitor_test_notification_service_backup=""
 monitor_service_existed=0
+monitor_diagnostic_service_existed=0
+monitor_test_notification_service_existed=0
 monitor_artifacts_touched=0
 stop_attempted=0
 checkout_mutated=0
@@ -395,13 +408,39 @@ backup_monitor_artifacts() {
     cp -p -- "$MONITOR_SERVICE_PATH" "$monitor_service_backup" || return 1
     monitor_service_existed=1
   fi
+  if [ -e "$MONITOR_DIAGNOSTIC_SERVICE_PATH" ] || [ -L "$MONITOR_DIAGNOSTIC_SERVICE_PATH" ]; then
+    if [ ! -f "$MONITOR_DIAGNOSTIC_SERVICE_PATH" ] || [ -L "$MONITOR_DIAGNOSTIC_SERVICE_PATH" ]; then
+      return 1
+    fi
+    monitor_diagnostic_service_backup="$(mktemp "$STAGE_PARENT/telegram-kol-monitor-diagnostic-unit-backup.XXXXXX")" || return 1
+    chmod 0600 "$monitor_diagnostic_service_backup" || return 1
+    cp -p -- "$MONITOR_DIAGNOSTIC_SERVICE_PATH" "$monitor_diagnostic_service_backup" || return 1
+    monitor_diagnostic_service_existed=1
+  fi
+  if [ -e "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" ] || [ -L "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" ]; then
+    if [ ! -f "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" ] || [ -L "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" ]; then
+      return 1
+    fi
+    monitor_test_notification_service_backup="$(mktemp "$STAGE_PARENT/telegram-kol-monitor-test-notification-unit-backup.XXXXXX")" || return 1
+    chmod 0600 "$monitor_test_notification_service_backup" || return 1
+    cp -p -- "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" "$monitor_test_notification_service_backup" || return 1
+    monitor_test_notification_service_existed=1
+  fi
 }
 
 install_monitor_service_artifact() {
   local unit_source="$stage_dir/deploy/systemd/telegram-kol-monitor.service"
-  if [ ! -f "$unit_source" ] || [ -L "$unit_source" ]; then return 1; fi
+  local diagnostic_unit_source="$stage_dir/deploy/systemd/telegram-kol-monitor-diagnostic.service"
+  local test_notification_unit_source="$stage_dir/deploy/systemd/telegram-kol-monitor-test-notification.service"
+  if [ ! -f "$unit_source" ] || [ -L "$unit_source" ] \
+    || [ ! -f "$diagnostic_unit_source" ] || [ -L "$diagnostic_unit_source" ] \
+    || [ ! -f "$test_notification_unit_source" ] || [ -L "$test_notification_unit_source" ]; then
+    return 1
+  fi
   monitor_artifacts_touched=1
   install_root_artifact 0644 "$unit_source" "$MONITOR_SERVICE_PATH" || return 1
+  install_root_artifact 0644 "$diagnostic_unit_source" "$MONITOR_DIAGNOSTIC_SERVICE_PATH" || return 1
+  install_root_artifact 0644 "$test_notification_unit_source" "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" || return 1
   systemctl daemon-reload || return 1
 }
 
@@ -417,6 +456,16 @@ restore_monitor_artifacts() {
     install_root_artifact 0644 "$monitor_service_backup" "$MONITOR_SERVICE_PATH" || restore_status=1
   else
     rm -f -- "$MONITOR_SERVICE_PATH" || restore_status=1
+  fi
+  if [ "$monitor_diagnostic_service_existed" -eq 1 ]; then
+    install_root_artifact 0644 "$monitor_diagnostic_service_backup" "$MONITOR_DIAGNOSTIC_SERVICE_PATH" || restore_status=1
+  else
+    rm -f -- "$MONITOR_DIAGNOSTIC_SERVICE_PATH" || restore_status=1
+  fi
+  if [ "$monitor_test_notification_service_existed" -eq 1 ]; then
+    install_root_artifact 0644 "$monitor_test_notification_service_backup" "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" || restore_status=1
+  else
+    rm -f -- "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" || restore_status=1
   fi
   systemctl daemon-reload || restore_status=1
   if [ "$restore_status" -eq 0 ]; then
@@ -566,6 +615,8 @@ cleanup() {
   [ -z "$worker_unit_backup" ] || rm -f -- "$worker_unit_backup" || true
   [ -z "$monitor_env_backup" ] || rm -f -- "$monitor_env_backup" || true
   [ -z "$monitor_service_backup" ] || rm -f -- "$monitor_service_backup" || true
+  [ -z "$monitor_diagnostic_service_backup" ] || rm -f -- "$monitor_diagnostic_service_backup" || true
+  [ -z "$monitor_test_notification_service_backup" ] || rm -f -- "$monitor_test_notification_service_backup" || true
   exit "$status"
 }
 trap cleanup EXIT
@@ -954,5 +1005,13 @@ fi
 if [ -n "$monitor_service_backup" ]; then
   rm -f -- "$monitor_service_backup" || true
 fi
+if [ -n "$monitor_diagnostic_service_backup" ]; then
+  rm -f -- "$monitor_diagnostic_service_backup" || true
+fi
+if [ -n "$monitor_test_notification_service_backup" ]; then
+  rm -f -- "$monitor_test_notification_service_backup" || true
+fi
 monitor_env_backup=""
 monitor_service_backup=""
+monitor_diagnostic_service_backup=""
+monitor_test_notification_service_backup=""

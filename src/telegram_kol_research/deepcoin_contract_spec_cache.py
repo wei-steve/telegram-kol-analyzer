@@ -456,6 +456,7 @@ def publish_deepcoin_contract_spec_snapshot(
     serialized_payload = _serialize_snapshot_payload(snapshot)
     path = Path(cache_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor: int | None = None
     temporary_path: Path | None = None
     try:
         descriptor, temporary_name = tempfile.mkstemp(
@@ -489,7 +490,9 @@ def publish_deepcoin_contract_spec_snapshot(
                 descriptor,
                 agent_user="telegram-kol-agent",
             )
-        with os.fdopen(descriptor, "wb") as temporary_file:
+        temporary_file = os.fdopen(descriptor, "wb")
+        descriptor = None
+        with temporary_file:
             temporary_file.write(serialized_payload)
             temporary_file.flush()
             os.fsync(temporary_file.fileno())
@@ -501,6 +504,8 @@ def publish_deepcoin_contract_spec_snapshot(
         temporary_path = None
         _fsync_directory(path.parent)
     finally:
+        if descriptor is not None:
+            os.close(descriptor)
         if temporary_path is not None:
             try:
                 temporary_path.unlink()

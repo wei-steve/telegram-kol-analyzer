@@ -5,6 +5,7 @@ from datetime import datetime
 from datetime import timedelta
 from datetime import timezone
 from decimal import Decimal
+import errno
 import json
 import os
 import stat
@@ -677,6 +678,52 @@ def test_cache_publish_clears_inherited_acl_then_restores_agent_deny(
     assert events[0][1][:3] == ("/usr/bin/setfacl", "-b", "--")
     assert events[1] == ("fchmod", 0o660)
     assert events[2] == ("agent_deny", "telegram-kol-agent", True, 0o660)
+
+
+def test_cache_publish_closes_descriptor_when_agent_deny_acl_fails(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import contract_cache_permissions
+    from telegram_kol_research import deepcoin_contract_spec_cache
+
+    cache_path = tmp_path / "deepcoin_contract_specs.json"
+    snapshot = validate_deepcoin_instrument_snapshot(
+        [_row("BTC-USDT-SWAP")], fetched_at=NOW, ttl=TTL
+    )
+    descriptors: list[int] = []
+    real_mkstemp = deepcoin_contract_spec_cache.tempfile.mkstemp
+
+    def recording_mkstemp(*args, **kwargs):
+        descriptor, temporary_name = real_mkstemp(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor, temporary_name
+
+    monkeypatch.setattr(deepcoin_contract_spec_cache.tempfile, "mkstemp", recording_mkstemp)
+    monkeypatch.setattr(deepcoin_contract_spec_cache.sys, "platform", "linux")
+    monkeypatch.setattr(deepcoin_contract_spec_cache.subprocess, "run", lambda *_a, **_k: None)
+
+    def fail_agent_deny(_descriptor, *, agent_user):
+        assert agent_user == "telegram-kol-agent"
+        raise RuntimeError("acl failed")
+
+    monkeypatch.setattr(
+        contract_cache_permissions,
+        "set_contract_cache_agent_deny_acl_fd",
+        fail_agent_deny,
+    )
+
+    with pytest.raises(RuntimeError, match="acl failed"):
+        publish_deepcoin_contract_spec_snapshot(cache_path, snapshot, now=NOW)
+
+    assert len(descriptors) == 1
+    try:
+        os.fstat(descriptors[0])
+    except OSError as exc:
+        assert exc.errno == errno.EBADF
+    else:
+        os.close(descriptors[0])
+        pytest.fail("temporary cache descriptor remained open")
+    assert list(tmp_path.glob(f".{cache_path.name}.*.tmp")) == []
 
 
 def test_cache_digest_verification_is_independent_of_json_key_and_row_order(tmp_path):

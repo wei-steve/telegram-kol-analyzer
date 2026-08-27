@@ -103,6 +103,10 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
         "永不重放",
         "代码回滚不自动恢复交易设置",
         "server evidence file",
+        "freeze_raw_message_id",
+        "restore_raw_message_id",
+        "MAX(raw_messages.id)",
+        "raw_messages.id > restore_raw_message_id",
     ):
         assert required in combined
     assert "递归 `chown`" in combined
@@ -116,6 +120,12 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
         assert heading in runbook
     assert "telegram-kol.service stopped" in runbook
     assert "active_write_count=0" in runbook
+    assert "记录冻结后的首个自然到达 `raw_message_id` 作为 future-only 水位" not in runbook
+    restore_section = runbook.index("## 4. 单独恢复")
+    enabled_updater = runbook.index("EXPECTED_AUTO_TRADE_STATE=enabled", restore_section)
+    restore_watermark = runbook.index("restore_raw_message_id", restore_section)
+    enable_setting = runbook.index("然后重新 GET 当前完整 settings", restore_section)
+    assert enabled_updater < restore_watermark < enable_setting
 
 
 def test_server_updater_runs_two_active_checks_before_checkout_and_install():
@@ -286,6 +296,16 @@ def test_server_updater_transactions_monitor_expected_head_and_timer_state():
     assert "install_monitor_service_artifact()" in script
     assert "restore_monitor_artifacts()" in script
     assert "MONITOR_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor.service" in script
+    assert (
+        "MONITOR_DIAGNOSTIC_SERVICE_PATH=/etc/systemd/system/"
+        "telegram-kol-monitor-diagnostic.service"
+    ) in script
+    assert (
+        "MONITOR_TEST_NOTIFICATION_SERVICE_PATH=/etc/systemd/system/"
+        "telegram-kol-monitor-test-notification.service"
+    ) in script
+    assert "telegram-kol-monitor-diagnostic.service" in script
+    assert "telegram-kol-monitor-test-notification.service" in script
     assert "auto_trade" not in script.lower().replace("expected_auto_trade", "")
     assert "git reset" not in script
     assert "git push" not in script

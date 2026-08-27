@@ -39,12 +39,24 @@ def updater_harness(tmp_path: Path):
     worker_helper = tmp_path / "telegram-kol-worker-prepare-contract-cache"
     worker_unit = tmp_path / "telegram-kol-worker.service"
     monitor_service = tmp_path / "telegram-kol-monitor.service"
+    monitor_diagnostic_service = tmp_path / "telegram-kol-monitor-diagnostic.service"
+    monitor_test_notification_service = (
+        tmp_path / "telegram-kol-monitor-test-notification.service"
+    )
     worker_helper.write_text("old helper\n", encoding="utf-8")
     worker_helper.chmod(0o755)
     worker_unit.write_text("old unit\n", encoding="utf-8")
     worker_unit.chmod(0o644)
     monitor_service.write_text("old monitor unit\n", encoding="utf-8")
     monitor_service.chmod(0o644)
+    monitor_diagnostic_service.write_text(
+        "old diagnostic monitor unit\n", encoding="utf-8"
+    )
+    monitor_diagnostic_service.chmod(0o644)
+    monitor_test_notification_service.write_text(
+        "old test-notification monitor unit\n", encoding="utf-8"
+    )
+    monitor_test_notification_service.chmod(0o644)
     log = tmp_path / "events.log"
     monitor_env = tmp_path / "telegram-kol-monitor.env"
     monitor_env.write_text(
@@ -102,6 +114,8 @@ case "${1:-}" in
       chmod 0755 "${4}/deploy/systemd/telegram-kol-worker-prepare-contract-cache"
       printf 'candidate unit\n' >"${4}/deploy/systemd/telegram-kol-worker.service"
       printf 'candidate monitor unit\n' >"${4}/deploy/systemd/telegram-kol-monitor.service"
+      printf 'candidate diagnostic monitor unit\n' >"${4}/deploy/systemd/telegram-kol-monitor-diagnostic.service"
+      printf 'candidate test-notification monitor unit\n' >"${4}/deploy/systemd/telegram-kol-monitor-test-notification.service"
       touch "$HARNESS_STATE/worktree_registered"
     else
       printf 'worktree-remove\n' >>"$HARNESS_LOG"
@@ -435,6 +449,20 @@ elif [ "$target" = "$MONITOR_SERVICE_PATH" ]; then
   else
     printf 'monitor-unit-restore\n' >>"$HARNESS_LOG"
   fi
+elif [ "$target" = "$MONITOR_DIAGNOSTIC_SERVICE_PATH" ]; then
+  if [[ "$source" = *telegram-kol-stage.*/deploy/systemd/* ]]; then
+    printf 'monitor-diagnostic-unit-install\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_DIAGNOSTIC_UNIT_INSTALL_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'monitor-diagnostic-unit-restore\n' >>"$HARNESS_LOG"
+  fi
+elif [ "$target" = "$MONITOR_TEST_NOTIFICATION_SERVICE_PATH" ]; then
+  if [[ "$source" = *telegram-kol-stage.*/deploy/systemd/* ]]; then
+    printf 'monitor-test-notification-unit-install\n' >>"$HARNESS_LOG"
+    [ "${HARNESS_MONITOR_TEST_NOTIFICATION_UNIT_INSTALL_FAIL:-0}" != "1" ] || exit 1
+  else
+    printf 'monitor-test-notification-unit-restore\n' >>"$HARNESS_LOG"
+  fi
 elif [ "$target" = "$MONITOR_ENV_FILE" ]; then
   printf 'monitor-env-restore\n' >>"$HARNESS_LOG"
 elif [[ "$target" = *.candidate.* ]]; then
@@ -607,6 +635,10 @@ exec /bin/rm "$@"
                 "UPDATER_TEST_MODE": "1",
                 "MONITOR_ENV_FILE": str(monitor_env),
                 "MONITOR_SERVICE_PATH": str(monitor_service),
+                "MONITOR_DIAGNOSTIC_SERVICE_PATH": str(monitor_diagnostic_service),
+                "MONITOR_TEST_NOTIFICATION_SERVICE_PATH": str(
+                    monitor_test_notification_service
+                ),
                 "EXPECTED_COMMIT": CANDIDATE,
                 "EXPECTED_AUTO_TRADE_STATE": "enabled",
                 "BRANCH": "codex/test",
@@ -848,12 +880,16 @@ def test_monitor_pin_preserves_non_head_bytes_without_final_newline(
     )
 
 
-def test_disabled_expectation_is_atomic_with_candidate_head_and_monitor_unit(
+def test_disabled_expectation_is_atomic_with_candidate_head_and_all_monitor_units(
     updater_harness,
 ) -> None:
     run, log, _ = updater_harness
     monitor_env = log.parent / "telegram-kol-monitor.env"
     monitor_unit = log.parent / "telegram-kol-monitor.service"
+    diagnostic_unit = log.parent / "telegram-kol-monitor-diagnostic.service"
+    test_notification_unit = (
+        log.parent / "telegram-kol-monitor-test-notification.service"
+    )
 
     result = run(EXPECTED_AUTO_TRADE_STATE="disabled")
 
@@ -866,8 +902,20 @@ def test_disabled_expectation_is_atomic_with_candidate_head_and_monitor_unit(
         "--no-expected-auto-trade-enabled\n"
     ) in monitor_env.read_text(encoding="utf-8")
     assert monitor_unit.read_text(encoding="utf-8") == "candidate monitor unit\n"
+    assert diagnostic_unit.read_text(encoding="utf-8") == (
+        "candidate diagnostic monitor unit\n"
+    )
+    assert test_notification_unit.read_text(encoding="utf-8") == (
+        "candidate test-notification monitor unit\n"
+    )
     events = _events(log)
     assert events.index("monitor-unit-install") < events.index("daemon-reload")
+    assert events.index("monitor-diagnostic-unit-install") < events.index(
+        "daemon-reload"
+    )
+    assert events.index("monitor-test-notification-unit-install") < events.index(
+        "daemon-reload"
+    )
     assert events.index("daemon-reload") < events.index("monitor-pin-candidate")
 
 
@@ -901,23 +949,45 @@ def test_malformed_monitor_expectation_fails_before_checkout(
     assert "must-not-be-printed" not in result.stdout + result.stderr
 
 
-def test_monitor_unit_failure_restores_old_unit_and_old_env(updater_harness) -> None:
+@pytest.mark.parametrize(
+    "failure",
+    [
+        {"HARNESS_MONITOR_UNIT_INSTALL_FAIL": "1"},
+        {"HARNESS_MONITOR_DIAGNOSTIC_UNIT_INSTALL_FAIL": "1"},
+        {"HARNESS_MONITOR_TEST_NOTIFICATION_UNIT_INSTALL_FAIL": "1"},
+    ],
+)
+def test_monitor_unit_failure_restores_all_old_units_and_old_env(
+    updater_harness, failure: dict[str, str]
+) -> None:
     run, log, _ = updater_harness
     monitor_env = log.parent / "telegram-kol-monitor.env"
     monitor_unit = log.parent / "telegram-kol-monitor.service"
+    diagnostic_unit = log.parent / "telegram-kol-monitor-diagnostic.service"
+    test_notification_unit = (
+        log.parent / "telegram-kol-monitor-test-notification.service"
+    )
 
     result = run(
         EXPECTED_AUTO_TRADE_STATE="disabled",
-        HARNESS_MONITOR_UNIT_INSTALL_FAIL="1",
+        **failure,
     )
 
     assert result.returncode == 4
     assert monitor_unit.read_text(encoding="utf-8") == "old monitor unit\n"
+    assert diagnostic_unit.read_text(encoding="utf-8") == (
+        "old diagnostic monitor unit\n"
+    )
+    assert test_notification_unit.read_text(encoding="utf-8") == (
+        "old test-notification monitor unit\n"
+    )
     assert (
         "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
         "--expected-auto-trade-enabled\n"
     ) in monitor_env.read_text(encoding="utf-8")
     assert "monitor-unit-restore" in _events(log)
+    assert "monitor-diagnostic-unit-restore" in _events(log)
+    assert "monitor-test-notification-unit-restore" in _events(log)
 
 
 def test_monitor_waits_for_every_installed_oneshot(updater_harness) -> None:

@@ -115,6 +115,10 @@ def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once(
     assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in test_directives
     assert "[Install]" not in test_directives
     assert "--notify --test-notification" in " ".join(test_service.split())
+    assert "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION}" in test_service
+    assert " --expected-auto-trade-enabled " not in " ".join(
+        test_service.split()
+    )
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" not in test_service
     ignored_prefixes = ("Description=", "ExecStart=")
     expected_sandbox = {
@@ -143,6 +147,8 @@ def test_diagnostic_unit_forces_full_audit_without_notification_in_same_sandbox(
     normalized = " ".join(diagnostic.split())
     assert "--force-full-audit" in normalized
     assert "--notify" not in normalized
+    assert "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION}" in diagnostic
+    assert " --expected-auto-trade-enabled " not in normalized
     ignored_prefixes = ("Description=", "ExecStart=")
     assert {
         line
