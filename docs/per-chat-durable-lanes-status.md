@@ -30,11 +30,11 @@ integration_branch: codex/phase0-deploy-integration
 source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
-workstream_status: in_progress
-claimed_by: null
-claim_base_sha: b24e8935ef5a548eb898110a40e62e98dce88e00
-current_task: phase-8-eligible-not-started
-current_phase: phase_8_eligible_not_started
+workstream_status: claimed
+claimed_by: codex-per-chat-phase8-scope-20260826-root
+claim_base_sha: ce2febd11b137bf66fad8db201b366381cbb5817
+current_task: phase-8-authoritative-scope-definition
+current_phase: phase_8_scope_definition
 current_phase_file: null
 last_completed_phase: phase_7_cutover_acceptance
 phase_1_status: local_complete
@@ -448,6 +448,22 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-26 Phase 8 scope-definition claim`: session
+  `codex-per-chat-phase8-scope-20260826-root` exclusively claimed Phase 8 at
+  exact clean canonical, upstream, remote-tracking, and live remote base
+  `ce2febd11b137bf66fad8db201b366381cbb5817`, with no Git lock present.
+  Authorization is limited to resolving Phase 8's target from the canonical
+  status and the two governing plans, creating one self-contained Phase 8
+  design/implementation phase file, updating this canonical pointer, and
+  committing those local documentation changes with explicit-path staging.
+  The governing activation plan defines only Phases 1 through 7, and the total
+  durable-lanes plan says successful acceptance proceeds directly to terminal
+  `completed`/`done`; therefore production code, tests, push, deployment,
+  restart, cutover, rollback, production configuration/database access or
+  mutation, replay, worker commands, manufactured Telegram traffic, test
+  trades, and exchange writes remain outside this claim unless the Phase 8
+  target is uniquely established by the authorized sources.
 
 - `2026-08-27 Phase 7 risk-adaptive acceptance complete`: the owner explicitly
   authorized evidence-based completion without mechanically extending an
