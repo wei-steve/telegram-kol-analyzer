@@ -46,8 +46,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - The isolated Linux/root sticky test passed against candidate code in a unique
   `/tmp` directory. Candidate `--check` against the real cache was read-only and
   found one recognized migratable legacy drift: type, link, runtime group and
-  mode passed, while worker owner and the Agent deny ACL were both absent from
-  the final candidate contract. No cache metadata or content was changed.
+  mode passed, while the real cache lacked the worker owner and Agent deny ACL
+  required by the final candidate contract. No cache metadata or content changed.
 - The refusal baseline is now 16 exact terminal
   `contract_spec_sync_unavailable` rows. Every row is `verified_refusal` with
   `attempted_exchange_write=0`; the newest is raw message 13529. This is an
@@ -96,11 +96,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
   mount and isolated tmpfs: 1 passed in 0.04s. It retained the real fork,
   UID/GID drop, root-owned replacement refusal, permission convergence and
   worker-owned replacement success; no real cache path was used.
-- Prospective runbook and acceptance language now use the observed baseline of
-  15 terminal `verified_refusal` rows with `attempted_exchange_write=0`, zero
-  replay and zero backfill. The four old zero-write pending/deferred contracts
-  were not reclassified locally and still require a production-read-only
-  explanation before Task 12 can pass.
+- The earlier Task 12 repair used the then-observed count of 15 terminal
+  zero-write refusals and left four old contracts for production explanation.
+  That evidence is superseded by the current 16-row baseline and the completed
+  read-only explanation above; replay and backfill remain forbidden.
 - Final affected focused set: 920 passed, 2 skipped, 2 warnings in 169.17s.
   Bash syntax, Python compilation and `git diff --check` passed. The only valid
   final full suite after the last production-code edit: 6433 passed, 2 skipped,
@@ -130,16 +129,15 @@ phase completes or pauses, record both verified evidence and outstanding work.
   BTC/ETH/SOL set with counts 4/3/0. Full history acceptance did not pass:
   BTC position history failed twice and multiple history/fill reads returned
   exactly the 100-row boundary, so completeness remains unknown.
-- The historical `contract_spec_sync_unavailable` terminal set is now 15 rather
-  than the previously recorded 14. All 15 remain `verified_refusal` with
-  `attempted_exchange_write=0`; the newest is raw message 13491. Four older
-  instruction execution contracts remain pending/deferred with zero attempted
-  exchange writes and require a separate read-only explanation before retrying
-  Task 12.
+- The prior production preflight observed 15 terminal zero-write refusals, with
+  newest raw message 13491, and identified four contracts needing explanation.
+  The current evidence above supersedes those counts and completes that
+  explanation without mutation.
 - The prior candidate `--check` against the real cache was read-only. Type, link,
-  group and mode passed; owner and Agent ACL failed. The production monitor env
-  still pins the production HEAD but lacked the candidate auto-trade expectation
-  field, so that prior candidate updater could not pass its monitor-env preflight.
+  group and mode passed; the real cache did not satisfy the worker-owner or
+  Agent-deny checks. The production monitor env still pins the production HEAD
+  but lacked the candidate auto-trade expectation field, so that prior candidate
+  updater could not pass its monitor-env preflight.
 - The shipped Linux/root pytest case failed because the root-only pytest
   ancestors were mode `0700`, preventing the dropped worker identity from
   traversing to the inner sticky directory. A corrected direct kernel proof in

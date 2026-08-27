@@ -83,19 +83,22 @@ Document the two allowed pre-deploy results:
 
 1. the complete candidate owner/ACL contract already passes; or
 2. the fixed target is a root-owned regular single-link file with the correct
-   runtime group and `0660`, and worker owner plus an absent Agent deny ACL are
-   the complete recognized migratable legacy drift.
+   runtime group and `0660`; the Agent deny ACL may already be satisfied or be
+   absent. Absence is the only migratable ACL drift.
 
 Explicitly retain fail-closed behavior for every other owner, target type, link,
 group, mode, ACL, parent, or directory-entry result.
 
 **Step 2: Add the health capability split**
 
-Before deployment, accept a missing endpoint only as HTTP 404
-`legacy_capability_absent` when the previous production SHA and closed legacy
-monitor env are verified. Block 401/403, timeout, non-404 HTTP failure and bad
-schema. After deployment and before restore, require authenticated HTTP 200 and
-the exact candidate schema.
+Before deployment, HTTP 404 alone is insufficient. Classify
+`legacy_capability_absent` only when the previous production SHA and closed
+legacy monitor env are verified, the same token succeeds on the exact worker
+port's authenticated monitor-capture health endpoint, loop health proves worker
+role, and the exact previous SHA route inventory proves the contract-spec route
+does not exist. Block authentication ambiguity, 401/403, timeout, non-404 HTTP
+failure and bad schema. After deployment and before restore, require
+authenticated HTTP 200 and the exact candidate schema.
 
 **Step 3: Narrow the Deepcoin historical boundary**
 
@@ -201,4 +204,3 @@ Report the new local HEAD and focused test result. Explicitly state that no push
 SSH, freeze, deployment, restart, production/settings/database write, exchange
 write, replay, or test Telegram message was performed, and that Task 12 remains
 fail-closed until a separately authorized production-read-only rerun.
-

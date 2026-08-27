@@ -43,9 +43,11 @@ contract or the one recognized legacy cache state:
 - the explicit Agent deny ACL is either already satisfied or absent;
 - no other ACL, type, link, directory-entry binding, or metadata error exists.
 
-The missing worker owner and absent Agent deny ACL form one closed migratable
-set because the candidate helper changes both through the validated descriptor
-and the updater installs that helper within its tested rollback boundary.
+The root owner is the required legacy owner drift. An already satisfied Agent
+deny ACL is preserved; an absent Agent deny ACL is the only migratable ACL drift.
+The candidate helper changes the owner and, when needed, adds the ACL through the
+validated descriptor, while the updater installs that helper within its tested
+rollback boundary.
 Unknown owners, unexpected groups or modes, symlinks, hardlinks, directories,
 FIFOs, entry replacement, unreadable ACLs, duplicate ACLs, and any unclassified
 error still stop Task 12.
@@ -60,10 +62,16 @@ Before deployment, the production health endpoint is classified by capability:
 
 - a present endpoint must return HTTP 200 and the exact validated schema;
 - an HTTP 404 may be recorded as `legacy_capability_absent` only when production
-  is still on the verified previous SHA and the recognized legacy monitor-env
-  schema passes its closed validation;
+  is still on the verified previous SHA, the recognized legacy monitor-env
+  schema passes its closed validation, the same token succeeds against the exact
+  worker port's authenticated monitor-capture health endpoint, loop health proves
+  the worker runtime role, and the exact previous SHA's route inventory proves
+  that the contract-spec route does not exist;
 - authentication failures, timeouts, non-404 HTTP errors, malformed responses,
   or an endpoint that exists with an invalid schema remain blockers.
+
+HTTP 404 alone is never absence proof because authentication and runtime-role
+refusals are intentionally indistinguishable from route absence.
 
 After deployment, `legacy_capability_absent` is forbidden. The candidate worker
 health endpoint must return HTTP 200 with the exact schema before any automatic
@@ -120,4 +128,3 @@ GREEN changes will update the implementation plan, runbook, canonical status,
 and their static acceptance tests to encode the closed legacy classification and
 strict post-deploy contract. Existing updater, descriptor/ACL, monitor redaction,
 rollback, unknown-owner, and no-replay tests remain unchanged and must stay green.
-

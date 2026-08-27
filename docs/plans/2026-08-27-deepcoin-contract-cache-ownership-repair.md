@@ -807,13 +807,19 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 - 当前设置原值与 `MAX(raw_messages.id)`；
 - Linux/root 临时目录 sticky 集成测试通过；
 - helper `--check` 必须通过完整候选合同，或只报告已识别可迁移旧版漂移：固定
-  regular single-link 目标的 group/mode 正确，且 root owner 与缺失的 Agent deny ACL
-  是全部差异。unknown owner/type/link/group/mode/ACL、父目录或 entry-binding 异常
-  仍 fail-closed；
+  regular single-link 目标的 group/mode 正确、owner 为 root，且
+  Agent deny ACL 已满足或缺失；root owner 与缺失的 Agent deny ACL 是已观测子状态，不要求为了
+  迁移先删除一个已正确存在的 deny ACL。unknown owner/type/link/group/mode/ACL、
+  父目录或 entry-binding 异常仍 fail-closed；
 - contract-spec health 已存在时必须 HTTP 200 且 schema 完整。只有生产仍为已核验
-  previous SHA、closed legacy monitor env 通过且端点返回 HTTP 404 时，才可记为
-  `legacy_capability_absent`；401/403、timeout、非 404 HTTP 错误和 malformed schema
-  均阻断。
+  previous SHA、closed legacy monitor env 通过、同一 token 请求精确 worker 端口的
+  `/api/runtime-incidents/monitor-capture-health` 返回 200、loop health 明确
+  `runtime_role=worker`，且 exact previous SHA 的 route 清单证明 contract-spec route
+  不存在时，contract-spec health 的 HTTP 404 才可记为
+  `legacy_capability_absent`。HTTP 404 单独不构成旧版能力缺失证明；401/403、
+  timeout、非 404 HTTP 错误和 malformed schema 均阻断；
+- schema-valid 100-row history/fills 只作为有界覆盖；除非 active row 需要窗口外证据，
+  否则不阻断本缓存迁移，但不得宣称完整账户历史。
 
 任一外部查询不完整只允许一次有理由的重试；仍不完整则停止并保持生产未修改。
 版本感知只允许候选 updater 已覆盖且可回滚的已知旧版差异，不豁免不可迁移门禁。

@@ -37,15 +37,20 @@ active row 均能唯一归因。schema-valid 但达到 100-row 上限的 history
 有界历史覆盖；除非 active row 需要窗口外证据，否则不作为缓存迁移 blocker。
 
 旧生产只允许一个已识别可迁移旧版漂移：缓存是固定 regular single-link 目标、
-group/mode 正确，root owner 与缺失的 Agent deny ACL 是全部差异。候选 updater 的
-固定 helper 负责在冻结部署事务内同时收敛这两项。任何
+group/mode 正确、owner 为 root，且 Agent deny ACL 已满足或缺失。root owner 与
+缺失的 Agent deny ACL 是已观测子状态；已经正确存在的 deny ACL 不需要先被移除。
+候选 updater 的固定 helper 负责在冻结部署事务内收敛 owner 并补齐缺失 ACL。任何
 unknown owner/type/link/group/mode/ACL、父目录或 directory-entry binding 异常仍
 fail-closed。
 
 若旧生产已有 contract-spec health endpoint，它必须返回 HTTP 200 和完整 schema。
-只有 production SHA 已核验为 previous SHA、closed legacy monitor env 通过且端点
-明确返回 HTTP 404 时，才能记录 `legacy_capability_absent`。401/403、timeout、
-非 404 HTTP 错误或 malformed schema 都是 blocker。最近新增的
+HTTP 404 单独不构成旧版能力缺失证明。只有 production SHA 已核验为 previous SHA、
+closed legacy monitor env 通过、同一 token 请求精确 worker 端口的
+`/api/runtime-incidents/monitor-capture-health` 返回 200、loop health 明确
+`runtime_role=worker`，且 exact previous SHA 的 route 清单证明 contract-spec route
+不存在时，contract-spec health 的 HTTP 404 才能记录
+`legacy_capability_absent`。401/403、timeout、非 404 HTTP 错误或 malformed schema
+都是 blocker。最近新增的
 `contract_spec_sync_unavailable` exact set 也必须完整。此处禁止制造 Telegram
 流量、历史信号 replay、补单或调用 Deepcoin 写接口。
 
