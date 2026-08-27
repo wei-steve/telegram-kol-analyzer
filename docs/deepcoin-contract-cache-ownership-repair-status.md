@@ -3,11 +3,11 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: task12_findings_local_red_green
-phase_state: claimed
-claimed_by: task12-findings-local-red-green-2026-08-27
-candidate_sha: null
-candidate_content_sha: null
+current_phase: candidate_integration
+phase_state: planned
+claimed_by: null
+candidate_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
+candidate_content_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
 handoff_sha: null
 pushed_sha: d2a9c4c615a3fc25af5842f6209b3a080e763e5c
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
@@ -30,6 +30,44 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- Task 12 findings were repaired locally from exact clean base
+  `eb3dc0d0868d8131f003c869842bddba07aa5c29`. The claim commit is `f2ca84f9`,
+  the approved narrow design/plan commit is `ca912d4f`, the legacy monitor-env
+  upgrade repair is `f621164f`, the isolated Linux/root test repair is
+  `b4cbef50`, the historical boundary update is `19891a47`, and the review P1
+  repair is `9a0b883515de1af4e3785383bd059e62d8ea4bff`.
+- A known legacy monitor env is accepted only when its metadata and unique
+  expected-HEAD contract pass and the governed auto-trade line is absent. The
+  updater backs up the original bytes, inserts the requested fixed option into
+  a `0600` candidate, strictly validates it before atomic installation, and
+  restores the byte-identical legacy env on later failure. Current-schema
+  normalization remains idempotent; duplicate and invalid values fail closed;
+  secret values are preserved without being printed.
+- Read-only review found and repaired one P1 in the first local candidate:
+  systemd `EnvironmentFile` whitespace/continuation semantics could hide a
+  second managed key from line-anchored matching. The final updater accepts only
+  the installer's closed, single-line assignment grammar and rejects leading
+  whitespace, control characters, quotes, backslash continuations and other
+  noncanonical lines before checkout. The focused re-review found no remaining
+  P0-P2 findings.
+- The shipped Linux/root sticky pytest now creates a unique traversable ancestor
+  under `/tmp` instead of pytest's root-only temporary tree. The exact test
+  passed as root in a local Linux container with no network, a read-only source
+  mount and isolated tmpfs: 1 passed in 0.04s. It retained the real fork,
+  UID/GID drop, root-owned replacement refusal, permission convergence and
+  worker-owned replacement success; no real cache path was used.
+- Prospective runbook and acceptance language now use the observed baseline of
+  15 terminal `verified_refusal` rows with `attempted_exchange_write=0`, zero
+  replay and zero backfill. The four old zero-write pending/deferred contracts
+  were not reclassified locally and still require a production-read-only
+  explanation before Task 12 can pass.
+- Final affected focused set: 920 passed, 2 skipped, 2 warnings in 169.17s.
+  Bash syntax, Python compilation and `git diff --check` passed. The only valid
+  final full suite after the last production-code edit: 6433 passed, 2 skipped,
+  32 warnings in 546.36s. No production code changed after that run.
+- During this Task 12 findings repair, no push, deployment, SSH, restart,
+  production/settings/database mutation, Telegram send/replay, manufactured
+  traffic or Deepcoin write was performed.
 - Phase 2 non-force push completed and the remote
   `codex/deepcoin-auto-trading-v1` ref was independently verified at exact SHA
   `d2a9c4c615a3fc25af5842f6209b3a080e763e5c`.
@@ -54,10 +92,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
   instruction execution contracts remain pending/deferred with zero attempted
   exchange writes and require a separate read-only explanation before retrying
   Task 12.
-- The candidate `--check` against the real cache was read-only. Type, link,
+- The prior candidate `--check` against the real cache was read-only. Type, link,
   group and mode passed; owner and Agent ACL failed. The production monitor env
-  still pins the production HEAD but lacks the candidate auto-trade expectation
-  field, so the current candidate updater cannot pass its monitor-env preflight.
+  still pins the production HEAD but lacked the candidate auto-trade expectation
+  field, so that prior candidate updater could not pass its monitor-env preflight.
 - The shipped Linux/root pytest case failed because the root-only pytest
   ancestors were mode `0700`, preventing the dropped worker identity from
   traversing to the inner sticky directory. A corrected direct kernel proof in
@@ -142,18 +180,14 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- Repair and re-review the candidate's legacy monitor-env upgrade path before
-  Task 13; the production env does not yet contain the required governed
-  auto-trade expectation line. Any new candidate requires a new exact-SHA push.
-- Make the Linux/root pytest test provide traversable ancestors to the dropped
-  worker identity, then rerun the exact shipped test; the direct kernel behavior
-  is proven but the prescribed automated acceptance remains red.
-- Explain the four old zero-write nonterminal execution contracts and update the
-  historical terminal refusal baseline from 14 to 15 without replay or data
-  mutation.
-- Rerun Task 12 under new authorization after the candidate is repaired.
-  Deepcoin history completeness exhausted its single allowed retry in this
-  session and remains unknown; no Task 13 authorization is currently eligible.
+- The repaired candidate requires a separately authorized non-force exact-SHA
+  push and remote-SHA verification. The remote integration branch remains at
+  `d2a9c4c615a3fc25af5842f6209b3a080e763e5c`; production remains unchanged.
+- Rerun Task 12 under new production-read-only authorization after integration.
+  Explain the four old zero-write pending/deferred execution contracts without
+  mutation. Deepcoin history completeness exhausted its single allowed retry in
+  the prior session and remains unknown; no Task 13 authorization is currently
+  eligible.
 - Explicit freeze, exact-SHA deployment, Linux/root helper verification,
   worker refresh/health checks, bounded observation, and future-signal-only
   restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
