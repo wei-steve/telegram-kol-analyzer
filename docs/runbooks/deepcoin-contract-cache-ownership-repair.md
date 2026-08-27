@@ -60,8 +60,11 @@ curl -fsS http://127.0.0.1:8000/api/trading-settings \
 冻结读回成功后，以 `MAX(raw_messages.id)` 记录
 `freeze_raw_message_id`。它只标记冻结窗口的审计起点，不是恢复后的执行水位：
 冻结期间到达但因 `auto_trade_enabled=false` 而终止的消息同样不得在恢复时重放。
-已知的 14 条历史 `contract_spec_sync_unavailable` 拒绝永不重放、永不补单，也不因
-修复缓存而自动执行。不得发送测试 Telegram 消息。
+已知的 15 条历史 `contract_spec_sync_unavailable` 拒绝永不重放、永不补单，也不因
+修复缓存而自动执行；15 条均保持 `verified_refusal` 且
+`attempted_exchange_write=0`。另外 4 条旧的 zero-write 非终态执行合同必须在重跑
+Task 12 前仅用生产只读证据解释；本地文档不得猜测、重分类或修改它们。
+不得发送测试 Telegram 消息。
 
 失败后的安全终态：若写入结果或读回不完整，禁止部署并人工核对；不得猜测当前
 设置。只要已确认 false，就保持冻结，不进行自动恢复。

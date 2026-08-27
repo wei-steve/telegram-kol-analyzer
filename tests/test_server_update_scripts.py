@@ -99,7 +99,6 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
         "telegram-kol-worker-prepare-contract-cache",
         "EXPECTED_AUTO_TRADE_STATE=disabled",
         "EXPECTED_AUTO_TRADE_STATE=enabled",
-        "14",
         "永不重放",
         "代码回滚不自动恢复交易设置",
         "server evidence file",
@@ -121,6 +120,11 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     assert "telegram-kol.service stopped" in runbook
     assert "active_write_count=0" in runbook
     assert "记录冻结后的首个自然到达 `raw_message_id` 作为 future-only 水位" not in runbook
+    assert "已知的 15 条历史 `contract_spec_sync_unavailable` 拒绝" in runbook
+    assert "15 条均保持 `verified_refusal`" in runbook
+    assert "`attempted_exchange_write=0`" in runbook
+    assert "4 条旧的 zero-write 非终态执行合同" in runbook
+    assert "已知的 14 条历史 `contract_spec_sync_unavailable` 拒绝" not in runbook
     restore_section = runbook.index("## 4. 单独恢复")
     enabled_updater = runbook.index("EXPECTED_AUTO_TRADE_STATE=enabled", restore_section)
     restore_watermark = runbook.index("restore_raw_message_id", restore_section)

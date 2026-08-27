@@ -19,7 +19,8 @@
   `runtime-serialization` worktree。
 - 禁止 `git add -A`；每次提交都显式列出路径并先检查
   `git diff --cached --name-only`。
-- 已有 14 条 `contract_spec_sync_unavailable` 拒绝保持终态，任何阶段都不重放、不补单。
+- Task 12 已观测到 15 条 `contract_spec_sync_unavailable` 拒绝；它们保持
+  `verified_refusal` 且 `attempted_exchange_write=0`，任何阶段都不重放、不补单。
 - 运行时发布协议
   `mkstemp -> fsync -> strict reload -> os.replace -> directory fsync`
   不改动。
@@ -662,7 +663,7 @@ git commit -m "fix: govern monitor expectations during trade freeze"
 - monolith 停止且 active-write 为 0 后才迁移；
 - 冻结前/部署后/恢复前门禁；
 - `EXPECTED_AUTO_TRADE_STATE=disabled` 与恢复时 `enabled`；
-- 14 条历史拒绝永不重放；
+- 15 条历史拒绝永不重放；
 - 代码回滚不自动恢复交易设置；
 - 原始 JSON、交易所明细和长日志只写 server evidence 文件。
 
@@ -850,7 +851,7 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 - 冻结水位后同步拒绝数为 0；
 - Deepcoin 仓位/委托/trigger/TPSL 与冻结基线可解释；
 - active-write/queue/management/command/revision claim 为 0；
-- 历史 14 条拒绝仍为 terminal verified refusal 且
+- 历史 15 条拒绝仍为 terminal verified refusal 且
   `attempted_exchange_write=0`。
 
 ### Task 16: 只恢复未来新信号
@@ -880,5 +881,5 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 3. live + auto trade 时 stale/unavailable/owner drift/new refusal 会被 monitor 捕获；
 4. freeze 时同一异常只降低 `restore_ready`，不误报为交易开启状态事故；
 5. 未来新信号恢复正常规格检查；
-6. 历史 14 条拒绝保持原终态，零重放、零补单；
+6. 历史 15 条拒绝保持原终态，零重放、零补单；
 7. 没有改变 symbol、TTL、下单计算、识别权威、队列权威或 exchange-write 归属语义。
