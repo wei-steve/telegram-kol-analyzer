@@ -557,6 +557,57 @@ def _seed_revision_batch(
         )
 
 
+def _seed_unrelated_revision_owner(session_factory):
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:historical-revision",
+            chat_id=303,
+            message_id=404,
+            symbol="BTC",
+            side="long",
+            venue="deepcoin",
+            status="open",
+            strategy_instance_id="deepcoin:303:404:BTC:long",
+            margin_mode="cross",
+            position_mode="split",
+            last_exchange_status="entry_order_pending",
+        )
+        session.add(binding)
+        session.flush()
+        lifecycle = StrategyLifecycle(
+            chat_id=303,
+            message_id=404,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="pending_entry",
+            signal_at=NOW,
+            entry_range_low=61000,
+            entry_range_high=62000,
+            stop_loss=60000,
+            take_profit="63000",
+            filled_tp_index=-1,
+            execution_binding_id=binding.id,
+        )
+        session.add(lifecycle)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="historical-unrelated-order",
+            client_order_id="historical-unrelated-client",
+            venue="deepcoin",
+            attribution_status="unassigned",
+            status="pending",
+            request_json="{}",
+        )
+        session.add(leg)
+        session.commit()
+        return int(binding.id), int(lifecycle.id), int(leg.id)
+
+
 def test_plan_allows_recovery_required_revision_batch_without_claim(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id, lifecycle_id, leg_ids = _seed(session_factory)
@@ -703,6 +754,189 @@ def test_plan_blocks_recovery_required_revision_with_ambiguous_replacement(
     assert plan.actions == ()
     assert plan.conflicts == (
         {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+@pytest.mark.parametrize("child_status", ("cancel_submitting", "submit_unknown"))
+def test_plan_allows_unrelated_terminal_ambiguous_cancel_child(
+    tmp_path,
+    child_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    old_binding_id, old_lifecycle_id, old_leg_id = (
+        _seed_unrelated_revision_owner(session_factory)
+    )
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=old_binding_id,
+        lifecycle_id=old_lifecycle_id,
+        status="recovery_required",
+    )
+    with session_factory() as session:
+        session.add(
+            StrategyRevisionLeg(
+                revision_batch_id=batch_id,
+                execution_order_leg_id=old_leg_id,
+                action="cancel_pending",
+                prior_status="pending",
+                status=child_status,
+                order_id="historical-unrelated-order",
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert len(plan.actions) == 2
+    assert plan.conflicts == ()
+
+
+@pytest.mark.parametrize("child_status", ("submit_reserved", "submitted"))
+def test_plan_allows_unrelated_terminal_ambiguous_replacement(
+    tmp_path,
+    child_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    old_binding_id, old_lifecycle_id, old_leg_id = (
+        _seed_unrelated_revision_owner(session_factory)
+    )
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=old_binding_id,
+        lifecycle_id=old_lifecycle_id,
+        status="recovery_required",
+    )
+    with session_factory() as session:
+        session.add(
+            EntryRevisionReplacement(
+                revision_batch_id=batch_id,
+                execution_order_leg_id=old_leg_id,
+                leg_index=0,
+                desired_json="{}",
+                status=child_status,
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert len(plan.actions) == 2
+    assert plan.conflicts == ()
+
+
+def test_plan_blocks_terminal_ambiguous_replacement_with_reviewed_order_only(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    old_binding_id, old_lifecycle_id, old_leg_id = (
+        _seed_unrelated_revision_owner(session_factory)
+    )
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=old_binding_id,
+        lifecycle_id=old_lifecycle_id,
+        status="recovery_required",
+    )
+    with session_factory() as session:
+        session.add(
+            EntryRevisionReplacement(
+                revision_batch_id=batch_id,
+                execution_order_leg_id=old_leg_id,
+                leg_index=0,
+                desired_json="{}",
+                status="submitted",
+                order_id="reviewed-1",
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def test_plan_blocks_orphan_ambiguous_revision_child(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    with session_factory() as session:
+        session.add(
+            StrategyRevisionLeg(
+                revision_batch_id=999_999,
+                execution_order_leg_id=leg_ids[0],
+                action="cancel_pending",
+                prior_status="pending",
+                status="submit_unknown",
+                order_id="reviewed-1",
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def test_plan_blocks_orphan_ambiguous_replacement(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    with session_factory() as session:
+        session.add(
+            EntryRevisionReplacement(
+                revision_batch_id=999_999,
+                execution_order_leg_id=leg_ids[0],
+                leg_index=0,
+                desired_json="{}",
+                status="submitted",
+                order_id="reviewed-1",
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def test_plan_rejects_empty_reviewed_target_set(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    plan = _build_plan(session_factory, _Client(), ())
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "empty_reviewed_target_set"},
     )
 
 

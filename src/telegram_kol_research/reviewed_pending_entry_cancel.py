@@ -201,6 +201,12 @@ def build_reviewed_pending_entry_cancel_plan(
 
     created_at = now or datetime.now(UTC)
     reviewed = tuple(targets)
+    if not reviewed:
+        return _plan(
+            created_at,
+            (),
+            ({"order_id": "*", "reason": "empty_reviewed_target_set"},),
+        )
     order_ids = {target.order_id for target in reviewed}
     if len(order_ids) != len(reviewed):
         return _plan(
@@ -299,7 +305,7 @@ def build_reviewed_pending_entry_cancel_plan(
     conflicts: list[dict[str, str]] = []
     completed: list[str] = []
     with session_factory() as session:
-        if _active_exchange_authority_present(session):
+        if _active_exchange_authority_present(session, targets=reviewed):
             return _plan(
                 created_at,
                 (),
@@ -433,7 +439,16 @@ def build_reviewed_pending_entry_cancel_plan(
     )
 
 
-def _active_exchange_authority_present(session) -> bool:
+def _active_exchange_authority_present(
+    session,
+    *,
+    targets: Iterable[ReviewedPendingEntryTarget],
+) -> bool:
+    reviewed = tuple(targets)
+    binding_ids = {target.execution_binding_id for target in reviewed}
+    lifecycle_ids = {target.lifecycle_id for target in reviewed}
+    leg_ids = {target.execution_order_leg_id for target in reviewed}
+    order_ids = {target.order_id for target in reviewed}
     checks = (
         session.query(MessageProcessingJob.id).filter(
             MessageProcessingJob.shadow.is_(False),
@@ -465,14 +480,39 @@ def _active_exchange_authority_present(session) -> bool:
             (StrategyRevisionBatch.advance_claim_token.is_not(None))
             | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
         ),
-        session.query(StrategyRevisionLeg.id).filter(
+        session.query(StrategyRevisionLeg.id)
+        .outerjoin(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id == StrategyRevisionLeg.revision_batch_id,
+        )
+        .filter(
             StrategyRevisionLeg.status.in_(
                 {"cancel_submitting", "submit_unknown"}
             ),
+            (
+                StrategyRevisionBatch.id.is_(None)
+                | StrategyRevisionBatch.execution_binding_id.in_(binding_ids)
+                | StrategyRevisionBatch.target_lifecycle_id.in_(lifecycle_ids)
+                | StrategyRevisionLeg.execution_order_leg_id.in_(leg_ids)
+                | StrategyRevisionLeg.order_id.in_(order_ids)
+            ),
         ),
-        session.query(EntryRevisionReplacement.id).filter(
+        session.query(EntryRevisionReplacement.id)
+        .outerjoin(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id
+            == EntryRevisionReplacement.revision_batch_id,
+        )
+        .filter(
             EntryRevisionReplacement.status.in_(
                 {"submit_reserved", "submitted"}
+            ),
+            (
+                StrategyRevisionBatch.id.is_(None)
+                | StrategyRevisionBatch.execution_binding_id.in_(binding_ids)
+                | StrategyRevisionBatch.target_lifecycle_id.in_(lifecycle_ids)
+                | EntryRevisionReplacement.execution_order_leg_id.in_(leg_ids)
+                | EntryRevisionReplacement.order_id.in_(order_ids)
             ),
         ),
         session.query(TriggerProtectionIntent.id).filter(
@@ -591,6 +631,7 @@ def apply_reviewed_pending_entry_cancel_plan(
     if not _single_pending_cancel_write_gate(
         session_factory,
         action=action,
+        targets=reviewed,
         mutation_intent_id=intent_id,
     ):
         transition_position_mutation_intent(
@@ -795,6 +836,7 @@ def _single_pending_cancel_write_gate(
     session_factory,
     *,
     action: ReviewedPendingEntryCancelAction,
+    targets: Iterable[ReviewedPendingEntryTarget],
     mutation_intent_id: int,
 ) -> bool:
     """Last-moment database gate allowing only this one reserved cancel."""
@@ -825,7 +867,10 @@ def _single_pending_cancel_write_gate(
             and leg.order_id == action.order_id
             and str(leg.status or "").lower() in _PENDING_LEG_STATES
             and competing is None
-            and not _active_exchange_authority_present(session)
+            and not _active_exchange_authority_present(
+                session,
+                targets=targets,
+            )
         )
 
 
