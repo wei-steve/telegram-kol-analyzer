@@ -27,6 +27,8 @@ LOOP_STALL_ATTRIBUTIONS = frozenset(
         "idle_or_post_recovery_selector_capture",
     }
 )
+MIN_DATABASE_POLL_INTERVAL_SECONDS = 0.5
+MIN_RUNTIME_POLL_INTERVAL_SECONDS = 10.0
 
 
 @dataclass(frozen=True)
@@ -67,6 +69,14 @@ class AuthorityPids:
 
 
 @dataclass(frozen=True)
+class RoleLoopHealth:
+    role: str
+    stall_count: int
+    stall_captures: int
+    recent_attributions: tuple[str, ...]
+
+
+@dataclass(frozen=True)
 class RuntimeObservation:
     elapsed_seconds: float
     complete: bool
@@ -78,6 +88,8 @@ class RuntimeObservation:
     active_lanes: int | None
     peak_lanes: int | None
     limit_applied_at: str | None
+    loop_health: tuple[RoleLoopHealth, ...] = ()
+    role_evidence_valid: bool = True
 
 
 @dataclass(frozen=True)
@@ -113,6 +125,8 @@ class AcceptanceObservation:
     ingest_anomaly_count: int
     execution_anomaly_count: int
     loop_stall_events: tuple[LoopStallEvidence, ...] = ()
+    runtime_fresh: bool = True
+    retry_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -380,15 +394,30 @@ def collect_runtime_observation(
         for pid in (expected_pids.ingest, expected_pids.worker, expected_pids.web)
     )
     worker = health["worker"]
+    loop_health: list[RoleLoopHealth] = []
+    for role in ("ingest", "worker", "web"):
+        raw_stacks = health[role]["recent_stall_stacks"]
+        if not isinstance(raw_stacks, list):
+            raise ValueError(f"{role} recent_stall_stacks is not a list")
+        attributions: list[str] = []
+        for row in raw_stacks:
+            if not isinstance(row, dict):
+                raise ValueError(f"{role} recent_stall_stacks row is invalid")
+            attributions.append(str(row["attribution"]))
+        loop_health.append(
+            RoleLoopHealth(
+                role=role,
+                stall_count=int(health[role]["stall_count"]),
+                stall_captures=int(health[role]["stall_captures"]),
+                recent_attributions=tuple(attributions),
+            )
+        )
     worker_cap = worker.get("configured_max_parallel_chats")
     active_lanes = worker.get("active_chat_lanes")
     peak_lanes = worker.get("peak_active_chat_lanes_since_limit_change")
     limit_applied_at = worker.get("limit_applied_at")
     complete = (
-        settings_match
-        and roles_match
-        and pids_alive
-        and worker_cap is not None
+        worker_cap is not None
         and active_lanes is not None
         and peak_lanes is not None
         and limit_applied_at is not None
@@ -406,6 +435,8 @@ def collect_runtime_observation(
         limit_applied_at=(
             str(limit_applied_at) if limit_applied_at is not None else None
         ),
+        loop_health=tuple(loop_health),
+        role_evidence_valid=roles_match,
     )
 
 
@@ -461,7 +492,11 @@ class ConvergenceTracker:
     def _matches_target(self, sample: RuntimeObservation) -> bool:
         if sample.database_state != self.target or sample.api_state != self.target:
             return False
-        if sample.pids != self.expected_pids or sample.worker_role != "worker":
+        if (
+            sample.pids != self.expected_pids
+            or not sample.role_evidence_valid
+            or sample.worker_role != "worker"
+        ):
             return False
         if sample.worker_cap != self.target.max_parallel_chats:
             return False
@@ -516,14 +551,18 @@ class AcceptanceTracker:
         self.peak_lanes = 0
         self.max_backlog = 0
         self.cross_chat_progress = False
+        self.max_simultaneous_claimed_chats = 0
         self._pending_count = 0
         self._claimed_count = 0
         self._incomplete_attempts = 0
         self._failure: AcceptanceResult | None = None
+        self._last_loop_health: dict[str, RoleLoopHealth] | None = None
 
     def observe(self, sample: AcceptanceObservation) -> AcceptanceResult:
         if self._failure is not None:
             return self._failure
+        if sample.retry_exhausted:
+            return self._fail("observer_incomplete")
         if not sample.runtime.complete:
             self._incomplete_attempts += 1
             if self._incomplete_attempts == 1:
@@ -539,6 +578,10 @@ class AcceptanceTracker:
         runtime_failure = self._runtime_failure(sample.runtime)
         if runtime_failure is not None:
             return self._fail(runtime_failure)
+
+        runtime_stall_failure = self._runtime_loop_stall_failure(sample)
+        if runtime_stall_failure is not None:
+            return self._fail(runtime_stall_failure)
 
         same_chat = evaluate_same_chat_jobs(list(sample.jobs))
         if same_chat.violations:
@@ -578,10 +621,15 @@ class AcceptanceTracker:
             self.max_backlog, sample.pending_count + sample.claimed_count
         )
         claimed_chat_count = len(same_chat.claimed_chat_ids)
+        self.max_simultaneous_claimed_chats = max(
+            self.max_simultaneous_claimed_chats,
+            claimed_chat_count,
+        )
         if (
-            claimed_chat_count >= 2
-            and sample.runtime.active_lanes is not None
-            and sample.runtime.active_lanes >= claimed_chat_count
+            self.max_simultaneous_claimed_chats >= 2
+            and sample.runtime.peak_lanes is not None
+            and sample.runtime.peak_lanes
+            >= self.max_simultaneous_claimed_chats
         ):
             self.cross_chat_progress = True
         return AcceptanceResult(
@@ -618,7 +666,7 @@ class AcceptanceTracker:
             return "runtime_state_drift"
         if sample.pids != self.expected_pids:
             return "authority_pid_drift"
-        if sample.worker_role != "worker":
+        if not sample.role_evidence_valid or sample.worker_role != "worker":
             return "authority_role_drift"
         if sample.worker_cap != self.expected_state.max_parallel_chats:
             return "worker_cap_drift"
@@ -646,6 +694,41 @@ class AcceptanceTracker:
             ):
                 return "loop_stall_evidence_invalid"
             return f"{event.role}_event_loop_stall_{event.attribution}"
+        return None
+
+    def _runtime_loop_stall_failure(
+        self,
+        sample: AcceptanceObservation,
+    ) -> str | None:
+        if not sample.runtime_fresh or not sample.runtime.loop_health:
+            return None
+        current = {row.role: row for row in sample.runtime.loop_health}
+        if set(current) != LOOP_STALL_ROLES:
+            return "loop_stall_evidence_invalid"
+        if self._last_loop_health is None:
+            self._last_loop_health = current
+            return None
+
+        previous = self._last_loop_health
+        self._last_loop_health = current
+        for role in ("ingest", "worker", "web"):
+            old = previous[role]
+            new = current[role]
+            stall_delta = new.stall_count - old.stall_count
+            capture_delta = new.stall_captures - old.stall_captures
+            if stall_delta < 0 or capture_delta < 0:
+                return "loop_stall_evidence_invalid"
+            if stall_delta != capture_delta:
+                return "loop_stall_evidence_incomplete"
+            if capture_delta == 0:
+                continue
+            if capture_delta > len(new.recent_attributions):
+                return "loop_stall_evidence_incomplete"
+            attributions = new.recent_attributions[-capture_delta:]
+            for attribution in attributions:
+                if attribution not in LOOP_STALL_ATTRIBUTIONS:
+                    return "loop_stall_evidence_invalid"
+                return f"{role}_event_loop_stall_{attribution}"
         return None
 
     def _fail(self, reason: str) -> AcceptanceResult:
@@ -696,6 +779,7 @@ def _runtime_sample_fields(sample: RuntimeObservation) -> dict[str, object]:
         "active_lanes": sample.active_lanes,
         "peak_lanes": sample.peak_lanes,
         "limit_applied_at": sample.limit_applied_at,
+        "loop_health": [asdict(row) for row in sample.loop_health],
     }
 
 
@@ -782,6 +866,8 @@ def run_acceptance_samples(
             claimed_count=sample.claimed_count,
             loop_stall_count=sample.loop_stall_count,
             loop_stall_events=[asdict(row) for row in sample.loop_stall_events],
+            runtime_fresh=sample.runtime_fresh,
+            retry_exhausted=sample.retry_exhausted,
         )
         result = tracker.observe(sample)
         if result.reason == "observer_incomplete_retry":
@@ -903,6 +989,36 @@ def _add_common_observation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--target-cap", type=int, required=True)
 
 
+def _interval_at_least(
+    value: str | float,
+    *,
+    minimum: float,
+    label: str,
+) -> float:
+    parsed = float(value)
+    if parsed < minimum:
+        raise argparse.ArgumentTypeError(
+            f"{label} must be at least {minimum:g} seconds"
+        )
+    return parsed
+
+
+def _database_poll_interval(value: str | float) -> float:
+    return _interval_at_least(
+        value,
+        minimum=MIN_DATABASE_POLL_INTERVAL_SECONDS,
+        label="database poll interval",
+    )
+
+
+def _runtime_poll_interval(value: str | float) -> float:
+    return _interval_at_least(
+        value,
+        minimum=MIN_RUNTIME_POLL_INTERVAL_SECONDS,
+        label="runtime poll interval",
+    )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Read-only Phase 7 state observer; JSONL is written to stdout."
@@ -918,6 +1034,16 @@ def build_parser() -> argparse.ArgumentParser:
     acceptance = subparsers.add_parser("acceptance")
     _add_common_observation_arguments(acceptance)
     acceptance.add_argument("--window", type=float, default=7200.0)
+    acceptance.add_argument(
+        "--database-poll-interval",
+        type=_database_poll_interval,
+        default=1.0,
+    )
+    acceptance.add_argument(
+        "--runtime-poll-interval",
+        type=_runtime_poll_interval,
+        default=30.0,
+    )
     acceptance.add_argument(
         "--guard-counters-file",
         type=Path,
@@ -957,6 +1083,8 @@ def _incomplete_runtime(elapsed_seconds: float) -> RuntimeObservation:
         active_lanes=None,
         peak_lanes=None,
         limit_applied_at=None,
+        loop_health=(),
+        role_evidence_valid=False,
     )
 
 
@@ -993,6 +1121,48 @@ def _collect_runtime_with_retry(
         except KNOWN_INCOMPLETE_ERRORS:
             continue
     return None, _incomplete_runtime(elapsed_seconds)
+
+
+def _collect_database_with_retry(
+    args: argparse.Namespace,
+    *,
+    collector: Callable[..., DatabaseObservation] = collect_database_observation,
+) -> DatabaseObservation | None:
+    for _attempt in range(2):
+        try:
+            return collector(
+                args.database,
+                baseline_raw_message_id=args.baseline_raw_message_id,
+                baseline_job_id=args.baseline_job_id,
+            )
+        except KNOWN_INCOMPLETE_ERRORS:
+            continue
+    return None
+
+
+def _collect_runtime_only_with_retry(
+    args: argparse.Namespace,
+    database: DatabaseObservation,
+    *,
+    elapsed_seconds: float,
+    collector: Callable[..., RuntimeObservation] = collect_runtime_observation,
+) -> RuntimeObservation:
+    for _attempt in range(2):
+        try:
+            runtime = collector(
+                database,
+                elapsed_seconds=elapsed_seconds,
+                expected_pids=_expected_pids_from_args(args),
+                ingest_base_url=args.ingest_url,
+                worker_base_url=args.worker_url,
+                web_base_url=args.web_url,
+                timeout_seconds=args.http_timeout,
+            )
+            if runtime.complete:
+                return runtime
+        except KNOWN_INCOMPLETE_ERRORS:
+            continue
+    return _incomplete_runtime(elapsed_seconds)
 
 
 def _runtime_samples(args: argparse.Namespace) -> Iterable[RuntimeObservation]:
@@ -1046,42 +1216,121 @@ def _read_guard_counters(path: Path) -> dict[str, object]:
     return counters
 
 
+def _read_guard_counters_with_retry(
+    path: Path,
+    *,
+    reader: Callable[[Path], dict[str, object]] = _read_guard_counters,
+) -> dict[str, object] | None:
+    for _attempt in range(2):
+        try:
+            return reader(path)
+        except KNOWN_INCOMPLETE_ERRORS:
+            continue
+    return None
+
+
+def _empty_database_observation(args: argparse.Namespace) -> DatabaseObservation:
+    return DatabaseObservation(
+        state=_target_from_args(args),
+        semantic_review_enabled=False,
+        query_only=0,
+        journal_mode="unknown",
+        total_changes=0,
+        jobs=(),
+        raw_message_count=0,
+        distinct_chat_count=0,
+        pending_count=0,
+        claimed_count=0,
+        duplicate_job_count=0,
+        missing_job_count=0,
+        orphan_job_count=0,
+    )
+
+
 def _acceptance_samples(
     args: argparse.Namespace,
+    *,
+    database_collector: Callable[
+        [argparse.Namespace], DatabaseObservation | None
+    ] = _collect_database_with_retry,
+    runtime_collector: Callable[..., RuntimeObservation] = (
+        _collect_runtime_only_with_retry
+    ),
+    guard_reader: Callable[[Path], dict[str, object] | None] = (
+        _read_guard_counters_with_retry
+    ),
+    monotonic: Callable[[], float] = time.monotonic,
+    sleeper: Callable[[float], None] = time.sleep,
 ) -> Iterable[AcceptanceObservation]:
-    started = time.monotonic()
+    started: float | None = None
+    next_runtime_elapsed = 0.0
+    last_complete_runtime: RuntimeObservation | None = None
+    database_poll_interval = _database_poll_interval(
+        args.database_poll_interval
+    )
+    runtime_poll_interval = _runtime_poll_interval(args.runtime_poll_interval)
     while True:
-        elapsed = time.monotonic() - started
-        database, runtime = _collect_runtime_with_retry(
-            args, elapsed_seconds=elapsed
+        elapsed = 0.0 if started is None else monotonic() - started
+        database = database_collector(args)
+        elapsed = 0.0 if started is None else monotonic() - started
+        runtime_fresh = False
+        retry_exhausted = database is None
+        runtime_due = (
+            last_complete_runtime is None
+            or elapsed >= next_runtime_elapsed
+            or elapsed >= args.window
         )
+        if database is not None and runtime_due:
+            runtime = runtime_collector(
+                args,
+                database,
+                elapsed_seconds=elapsed,
+            )
+            runtime_fresh = True
+            while next_runtime_elapsed <= elapsed:
+                next_runtime_elapsed += runtime_poll_interval
+            if runtime.complete:
+                last_complete_runtime = runtime
+            else:
+                retry_exhausted = True
+        elif database is not None and last_complete_runtime is not None:
+            runtime = replace(
+                last_complete_runtime,
+                elapsed_seconds=elapsed,
+                database_state=database.state,
+                loop_health=(),
+            )
+        else:
+            runtime = _incomplete_runtime(elapsed)
+
         guards: dict[str, object] | None = None
         if database is not None and runtime.complete:
-            for _attempt in range(2):
-                try:
-                    guards = _read_guard_counters(args.guard_counters_file)
-                    break
-                except KNOWN_INCOMPLETE_ERRORS:
-                    continue
-        elapsed = time.monotonic() - started
+            guards = guard_reader(args.guard_counters_file)
+            if guards is None:
+                retry_exhausted = True
+        if started is None:
+            started = monotonic()
+            elapsed = 0.0
+        else:
+            elapsed = monotonic() - started
+        if (
+            elapsed >= args.window
+            and database is not None
+            and not runtime_fresh
+        ):
+            runtime = runtime_collector(
+                args,
+                database,
+                elapsed_seconds=elapsed,
+            )
+            runtime_fresh = True
+            if runtime.complete:
+                last_complete_runtime = runtime
+            else:
+                retry_exhausted = True
         runtime = replace(runtime, elapsed_seconds=elapsed)
         if database is None or guards is None:
-            runtime = _incomplete_runtime(elapsed)
-            database = DatabaseObservation(
-                state=_target_from_args(args),
-                semantic_review_enabled=False,
-                query_only=0,
-                journal_mode="unknown",
-                total_changes=0,
-                jobs=(),
-                raw_message_count=0,
-                distinct_chat_count=0,
-                pending_count=0,
-                claimed_count=0,
-                duplicate_job_count=0,
-                missing_job_count=0,
-                orphan_job_count=0,
-            )
+            database = database or _empty_database_observation(args)
             guards = {field: 0 for field in GUARD_COUNTER_FIELDS}
             guards["loop_stall_events"] = ()
         elif (
@@ -1106,11 +1355,13 @@ def _acceptance_samples(
             duplicate_job_count=database.duplicate_job_count,
             missing_job_count=database.missing_job_count,
             orphan_job_count=database.orphan_job_count,
+            runtime_fresh=runtime_fresh,
+            retry_exhausted=retry_exhausted,
             **guards,
         )
         if elapsed >= args.window:
             return
-        time.sleep(args.poll_interval)
+        sleeper(database_poll_interval)
 
 
 def main(argv: list[str] | None = None) -> int:

@@ -1,10 +1,12 @@
 from datetime import UTC, datetime
+import argparse
 import importlib.util
 import io
 import json
 from pathlib import Path
 import sqlite3
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -141,6 +143,15 @@ def test_cutover_deadline_is_fixed_and_cannot_be_extended():
     assert tracker.deadline_seconds == 5.0
 
 
+def test_cutover_rejects_invalid_role_evidence():
+    sample = observer.replace(runtime(), role_evidence_valid=False)
+
+    result = convergence_tracker().observe(sample)
+
+    assert result.passed is False
+    assert result.reason == "target_not_converged"
+
+
 def test_rollback_confirmation_ignores_prior_acceptance_failure():
     rollback = observer.RollbackConvergenceTracker(
         target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
@@ -153,6 +164,23 @@ def test_rollback_confirmation_ignores_prior_acceptance_failure():
     )
 
     assert result.passed is True
+
+
+def test_rollback_rejects_invalid_role_evidence():
+    rollback = observer.RollbackConvergenceTracker(
+        target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
+        expected_pids=observer.AuthorityPids(101, 102, 103),
+        required_consecutive=1,
+    )
+    sample = observer.replace(
+        runtime(lock_mode="global", cap=1, new_limit=False),
+        role_evidence_valid=False,
+    )
+
+    result = rollback.observe(sample)
+
+    assert result.passed is False
+    assert result.reason == "target_not_converged"
 
 
 def acceptance_tracker():
@@ -202,6 +230,26 @@ def acceptance_snapshot(
     }
     values.update(overrides)
     return observer.AcceptanceObservation(**values)
+
+
+def database_snapshot(*, jobs=(), raw_count=0, chat_count=0):
+    claimed_count = sum(row.status == "claimed" for row in jobs)
+    pending_count = sum(row.status == "pending" for row in jobs)
+    return observer.DatabaseObservation(
+        state=observer.ExpectedRuntimeState("per_chat", 3, "queue", "queue"),
+        semantic_review_enabled=False,
+        query_only=1,
+        journal_mode="wal",
+        total_changes=0,
+        jobs=tuple(jobs),
+        raw_message_count=raw_count,
+        distinct_chat_count=chat_count,
+        pending_count=pending_count,
+        claimed_count=claimed_count,
+        duplicate_job_count=0,
+        missing_job_count=0,
+        orphan_job_count=0,
+    )
 
 
 def loop_stall_event(role, attribution):
@@ -256,6 +304,33 @@ def test_two_claimed_chats_establish_cross_chat_progress():
     )
 
     assert result.failed is False
+    assert tracker.cross_chat_progress is True
+
+
+def test_cross_chat_progress_combines_durable_claims_with_later_worker_peak():
+    tracker = acceptance_tracker()
+
+    first = tracker.observe(
+        acceptance_snapshot(
+            jobs=[job(1, 10, 7, "claimed"), job(2, 11, 8, "claimed")],
+            active_lanes=0,
+            peak_lanes=0,
+            claimed_count=2,
+            chat_count=2,
+        )
+    )
+    second = tracker.observe(
+        acceptance_snapshot(
+            jobs=[],
+            active_lanes=0,
+            peak_lanes=2,
+            claimed_count=0,
+            chat_count=2,
+        )
+    )
+
+    assert first.failed is False
+    assert second.failed is False
     assert tracker.cross_chat_progress is True
 
 
@@ -342,6 +417,30 @@ def test_ingest_and_worker_business_stalls_fail_closed_by_role(role):
 
     assert result.failed is True
     assert result.reason == f"{role}_event_loop_stall_captured_business_blocker"
+    assert result.rollback_target == observer.ExpectedRuntimeState(
+        "global", 1, "queue", "queue"
+    )
+
+
+def test_sparse_runtime_sample_preserves_unattributed_worker_stall_failure():
+    tracker = acceptance_tracker()
+    tracker.observe(acceptance_snapshot(loop_stall_count=0))
+
+    result = tracker.observe(
+        acceptance_snapshot(
+            loop_stall_count=1,
+            loop_stall_events=(
+                loop_stall_event(
+                    "worker", "idle_or_post_recovery_selector_capture"
+                ),
+            ),
+        )
+    )
+
+    assert result.failed is True
+    assert result.reason == (
+        "worker_event_loop_stall_idle_or_post_recovery_selector_capture"
+    )
     assert result.rollback_target == observer.ExpectedRuntimeState(
         "global", 1, "queue", "queue"
     )
@@ -454,6 +553,17 @@ def test_pid_drift_fails_acceptance():
     )
 
     assert result.reason == "authority_pid_drift"
+
+
+def test_complete_role_evidence_drift_is_not_collapsed_to_unknown():
+    drifted = observer.replace(runtime(), role_evidence_valid=False)
+
+    result = acceptance_tracker().observe(
+        acceptance_snapshot(runtime_sample=drifted)
+    )
+
+    assert drifted.complete is True
+    assert result.reason == "authority_role_drift"
 
 
 def test_peak_above_three_fails_acceptance():
@@ -651,6 +761,12 @@ def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):
             url.removesuffix("/api/runtime/loop-health")
         ]
         payload = {"runtime_role": role, "stall_count": 0}
+        payload.update(
+            {
+                "stall_captures": 0,
+                "recent_stall_stacks": [],
+            }
+        )
         if role == "worker":
             payload.update(
                 {
@@ -681,7 +797,254 @@ def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):
     assert result.active_lanes == 1
     assert result.peak_lanes == 2
     assert result.pids == observer.AuthorityPids(101, 102, 103)
+    assert [row.role for row in result.loop_health] == [
+        "ingest",
+        "worker",
+        "web",
+    ]
     assert len(requested) == 6
+
+
+def test_sparse_runtime_health_delta_fails_closed_with_role_attribution():
+    tracker = acceptance_tracker()
+    baseline = tuple(
+        observer.RoleLoopHealth(role, 0, 0, ())
+        for role in ("ingest", "worker", "web")
+    )
+    tracker.observe(
+        acceptance_snapshot(runtime_sample=replace_runtime_health(baseline))
+    )
+    changed = (
+        observer.RoleLoopHealth("ingest", 0, 0, ()),
+        observer.RoleLoopHealth(
+            "worker",
+            1,
+            1,
+            ("idle_or_post_recovery_selector_capture",),
+        ),
+        observer.RoleLoopHealth("web", 0, 0, ()),
+    )
+
+    result = tracker.observe(
+        acceptance_snapshot(runtime_sample=replace_runtime_health(changed))
+    )
+
+    assert result.failed is True
+    assert result.reason == (
+        "worker_event_loop_stall_idle_or_post_recovery_selector_capture"
+    )
+
+
+def replace_runtime_health(loop_health):
+    return observer.replace(runtime(), loop_health=loop_health)
+
+
+class FakeMonotonicClock:
+    def __init__(self):
+        self.value = 0.0
+
+    def monotonic(self):
+        return self.value
+
+    def sleep(self, seconds):
+        self.value += seconds
+
+
+def acceptance_args(
+    *,
+    window=60.0,
+    database_poll_interval=1.0,
+    runtime_poll_interval=30.0,
+):
+    return SimpleNamespace(
+        window=window,
+        database_poll_interval=database_poll_interval,
+        runtime_poll_interval=runtime_poll_interval,
+        guard_counters_file=Path("unused-guards.json"),
+        target_lock_mode="per_chat",
+        target_cap=3,
+        ingest_pid=101,
+        worker_pid=102,
+        web_pid=103,
+        ingest_url="http://ingest",
+        worker_url="http://worker",
+        web_url="http://web",
+        http_timeout=1.0,
+    )
+
+
+def zero_guard_counters(_path):
+    result = {field: 0 for field in observer.GUARD_COUNTER_FIELDS}
+    result["loop_stall_events"] = ()
+    return result
+
+
+def test_acceptance_split_cadence_limits_runtime_http_collection():
+    clock = FakeMonotonicClock()
+    database = database_snapshot()
+    runtime_calls = []
+
+    def collect_runtime(_args, _database, *, elapsed_seconds):
+        runtime_calls.append(elapsed_seconds)
+        return runtime(elapsed=elapsed_seconds)
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(),
+            database_collector=lambda _args: database,
+            runtime_collector=collect_runtime,
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert len(samples) == 61
+    assert runtime_calls == [0.0, 30.0, 60.0]
+    assert [sample.runtime_fresh for sample in samples].count(True) == 3
+
+
+def test_due_runtime_failure_is_not_masked_by_cached_complete_sample():
+    clock = FakeMonotonicClock()
+    database = database_snapshot()
+    runtime_calls = []
+
+    def collect_runtime(_args, _database, *, elapsed_seconds):
+        runtime_calls.append(elapsed_seconds)
+        if len(runtime_calls) == 1:
+            return runtime(elapsed=elapsed_seconds)
+        return observer._incomplete_runtime(elapsed_seconds)
+
+    samples = observer._acceptance_samples(
+        acceptance_args(window=30.0),
+        database_collector=lambda _args: database,
+        runtime_collector=collect_runtime,
+        guard_reader=zero_guard_counters,
+        monotonic=clock.monotonic,
+        sleeper=clock.sleep,
+    )
+    output = io.StringIO()
+
+    exit_code = observer.run_acceptance_samples(
+        samples,
+        acceptance_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-27T03:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert runtime_calls == [0.0, 30.0]
+    assert exit_code == observer.EXIT_OBSERVER_INCOMPLETE
+    assert rows[-1]["kind"] == "observer_incomplete"
+    assert rows[-1]["reason"] == "observer_incomplete"
+
+
+def test_database_read_crossing_window_forces_fresh_final_runtime_sample():
+    clock = FakeMonotonicClock()
+    database = database_snapshot()
+    database_calls = 0
+    runtime_calls = []
+
+    def collect_database(_args):
+        nonlocal database_calls
+        database_calls += 1
+        if database_calls == 3:
+            clock.value += 10.1
+        return database
+
+    def collect_runtime(_args, _database, *, elapsed_seconds):
+        runtime_calls.append(elapsed_seconds)
+        return runtime(elapsed=elapsed_seconds)
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(window=30.0, database_poll_interval=10.0),
+            database_collector=collect_database,
+            runtime_collector=collect_runtime,
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert samples[-1].runtime_fresh is True
+    assert samples[-1].runtime.elapsed_seconds == pytest.approx(30.1)
+    assert runtime_calls == [0.0, pytest.approx(30.1)]
+
+
+def test_acceptance_clock_starts_after_initial_health_baseline():
+    clock = FakeMonotonicClock()
+    database = database_snapshot()
+
+    def collect_database(_args):
+        clock.value += 0.4
+        return database
+
+    def collect_runtime(_args, _database, *, elapsed_seconds):
+        clock.value += 0.6
+        return runtime(elapsed=elapsed_seconds)
+
+    def collect_guards(_path):
+        clock.value += 0.2
+        return zero_guard_counters(_path)
+
+    first = next(
+        observer._acceptance_samples(
+            acceptance_args(window=30.0),
+            database_collector=collect_database,
+            runtime_collector=collect_runtime,
+            guard_reader=collect_guards,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert clock.value == pytest.approx(1.2)
+    assert first.runtime_fresh is True
+    assert first.runtime.elapsed_seconds == 0.0
+
+
+def test_runtime_due_collection_retries_once_then_returns_incomplete():
+    calls = []
+
+    def failing_collector(*_args, **_kwargs):
+        calls.append("attempt")
+        raise OSError("temporary HTTP failure")
+
+    result = observer._collect_runtime_only_with_retry(
+        acceptance_args(),
+        database_snapshot(),
+        elapsed_seconds=30.0,
+        collector=failing_collector,
+    )
+
+    assert calls == ["attempt", "attempt"]
+    assert result.complete is False
+
+
+def test_runtime_due_collection_retries_incomplete_return_once():
+    calls = []
+
+    def incomplete_collector(*_args, **_kwargs):
+        calls.append("attempt")
+        return observer._incomplete_runtime(30.0)
+
+    result = observer._collect_runtime_only_with_retry(
+        acceptance_args(),
+        database_snapshot(),
+        elapsed_seconds=30.0,
+        collector=incomplete_collector,
+    )
+
+    assert calls == ["attempt", "attempt"]
+    assert result.complete is False
+
+
+def test_acceptance_cli_rejects_high_perturbation_intervals():
+    with pytest.raises(argparse.ArgumentTypeError):
+        observer._database_poll_interval("0.49")
+    with pytest.raises(argparse.ArgumentTypeError):
+        observer._runtime_poll_interval("9.99")
 
 
 def parse_jsonl(output):
