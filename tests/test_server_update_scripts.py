@@ -15,6 +15,18 @@ CACHE_REPAIR_PLAN = (
 CACHE_REPAIR_STATUS = (
     ROOT / "docs" / "deepcoin-contract-cache-ownership-repair-status.md"
 )
+CACHE_REPAIR_VERSION_AWARE_DESIGN = (
+    ROOT
+    / "docs"
+    / "plans"
+    / "2026-08-27-deepcoin-contract-cache-task12-version-aware-gates-design.md"
+)
+CACHE_REPAIR_VERSION_AWARE_PLAN = (
+    ROOT
+    / "docs"
+    / "plans"
+    / "2026-08-27-deepcoin-contract-cache-task12-version-aware-gates.md"
+)
 
 
 def test_update_scripts_are_syntax_valid():
@@ -145,9 +157,24 @@ def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
     task12_start = implementation.index("### Task 12: 冻结前只读门禁")
     task13_start = implementation.index("### Task 13: 冻结、部署并保持关闭")
     task12 = implementation[task12_start:task13_start]
+    preflight_start = runbook.index("## 1. 只读 preflight")
+    freeze_start = runbook.index("## 2. 冻结写入")
+    preflight = runbook[preflight_start:freeze_start]
     assert "失败只因 owner 漂移" not in task12
     assert "已知的 15 条历史" not in runbook
     assert "历史 15 条拒绝" not in implementation[task12_start:]
+    for required in (
+        "HTTP 404 单独不构成",
+        "/api/runtime-incidents/monitor-capture-health",
+        "同一 token",
+        "runtime_role=worker",
+        "exact previous SHA 的 route",
+        "Agent deny ACL 已满足或缺失",
+        "除非 active row 需要窗口外证据",
+    ):
+        assert required in preflight
+        assert required in task12
+    assert "unknown owner/type/link/group/mode/ACL" in preflight
     restore_section = runbook.index("## 4. 单独恢复")
     enabled_updater = runbook.index("EXPECTED_AUTO_TRADE_STATE=enabled", restore_section)
     restore_watermark = runbook.index("restore_raw_message_id", restore_section)
@@ -164,6 +191,19 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "recognized migratable legacy drift" in status
     assert "bounded 100-row history coverage" in status
     assert "health HTTP error remains unresolved" in status
+    current = status[: status.index("### Prior rejected candidate history")]
+    assert "baseline of\n  15 terminal" not in current
+    assert "terminal set is now 15" not in current
+    assert "still require a production-read-only\n  explanation" not in current
+    assert "owner and Agent ACL failed" not in current
+
+
+def test_version_aware_gate_documents_have_single_terminal_newline():
+    for path in (
+        CACHE_REPAIR_VERSION_AWARE_DESIGN,
+        CACHE_REPAIR_VERSION_AWARE_PLAN,
+    ):
+        assert not path.read_text(encoding="utf-8").endswith("\n\n")
 
 
 def test_server_updater_runs_two_active_checks_before_checkout_and_install():
