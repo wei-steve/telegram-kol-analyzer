@@ -98,7 +98,19 @@ phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
 phase_7_low_perturbation_observer_authorization: owner_approved_design_local_red_green_full_suite_read_only_observer_install_fresh_two_hour_safe_retry_and_atomic_rollback
-phase_7_low_perturbation_observer_status: claimed_design_in_progress
+phase_7_low_perturbation_observer_status: local_complete_ready_for_read_only_install_and_fresh_safe_retry
+phase_7_low_perturbation_observer_claim_commit: 86ad3007192b7a26102317890f6f809b37e732e2
+phase_7_low_perturbation_observer_design_commit: 3913c54d74b82fddfeb05da99062b32a673ff910
+phase_7_low_perturbation_observer_plan_commit: 0cd02cff01adc4d38a0e491fd72eb5eebc2f4858
+phase_7_low_perturbation_observer_candidate_commit: 86f67429c8c6c4926dbdf353c1f4948683e8ac34
+phase_7_low_perturbation_observer_red_verification: "initial cadence and independent-evidence RED 4 failed 1 passed; review-hardening RED 3 failed 1 passed; convergence-role RED 2 failed"
+phase_7_low_perturbation_observer_green_verification: "59 passed in observer module"
+phase_7_low_perturbation_observer_focused_verification: "75 passed, 16 deselected in observer, runtime-loop-health, and durable worker ordering slice"
+phase_7_low_perturbation_observer_full_suite_verification: "6367 passed, 1 skipped, 32 warnings in 482.61 seconds"
+phase_7_low_perturbation_observer_compileall_verified: true
+phase_7_low_perturbation_observer_review_status: ready_yes_zero_critical_zero_important_after_two_review_repairs
+phase_7_low_perturbation_observer_contract: "acceptance samples read-only SQLite each second and role HTTP at start, end, and no more often than 30 seconds; CLI rejects database intervals below 0.5 seconds and runtime intervals below 10 seconds; each due query retries once then fails closed; durable simultaneous claims plus cumulative worker peak prove cross-chat progress; cumulative role stalls retain exact attribution"
+phase_7_low_perturbation_observer_source_boundary: "standalone standard-library observer only, SQLite mode=ro query_only, HTTP GET, stdout JSONL; no production runtime import, POST, rollback, service control, worker command, Telegram send, replay, or exchange-write path"
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -393,6 +405,21 @@ cutover_authorized: true
   runtime deployment, restart, manufactured Telegram traffic, replay, worker
   commands, trading configuration or database mutation, test trades, and
   exchange writes remain unauthorized.
+- `2026-08-26 Phase 7 low-perturbation observer local candidate`: design and
+  plan commits `3913c54d74b82fddfeb05da99062b32a673ff910` and
+  `0cd02cff01adc4d38a0e491fd72eb5eebc2f4858` split the continuous acceptance
+  schedule into one-second read-only SQLite samples and 30-second role HTTP
+  samples, with fresh HTTP at the start and end. RED first proved four missing
+  cadence/evidence contracts, then three review hardening gaps, then two
+  convergence role-evidence gaps. Exact candidate
+  `86f67429c8c6c4926dbdf353c1f4948683e8ac34` passed `59` observer tests,
+  the consolidated directly related slice passed `75` with `16` deselected,
+  compileall and diff checks passed, and the one final complete suite passed
+  `6367`, skipped `1`, with `32` warnings in `482.61s`. Independent review
+  returned Ready Yes with zero Critical and zero Important after the end-sample,
+  retry, baseline-clock, safe-interval, and convergence-role repairs. The
+  candidate remains a standalone read-only evidence tool and has not been
+  copied to production or used for a new cutover yet.
 - `2026-08-26 Phase 7 final safe-retry failed closed and rolled back`: exact
   production code `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f` passed the full
   read-only gate at `global + 1 + queue`. A transient claimed job was handled by
