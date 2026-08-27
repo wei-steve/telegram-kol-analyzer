@@ -125,7 +125,17 @@ phase_7_r5_rollback_status: confirmed_global_1_queue_three_consecutive_samples
 phase_7_r5_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase7-low-perturbation-r5-20260827T023922Z
 phase_7_r5_evidence_manifest_sha256: cef991f533ee0ac8069a735cf02a7eebc4f2640280facf317862b4a977687b2f
 phase_7_r6_authorization: owner_authorized_fix_acceptance_tool_remove_continuous_web_parity_red_green_full_suite_read_only_install_and_complete_phase_7_one_go
-phase_7_r6_status: design_in_progress
+phase_7_r6_status: local_candidate_complete_ready_for_production_preflight
+phase_7_r6_design_commit: cdea2640ba0ef22a0f5e9e9644fd8e32d94a074b
+phase_7_r6_plan_commit: 42d8cddd8dedb0f9b57de1e60bcb850b7e9a8b7f
+phase_7_r6_candidate_commit: dee0a2e9d1875b50927ab4add9a50fe6c9934e0c
+phase_7_r6_observer_sha256: 2c34a1ec4c9894f4ba03b36898931d1d86e84a15b0b1e305013ffe0309141521
+phase_7_r6_controller_sha256: 5d26ed14fb7e5978b26ccf2da3d885d92b5a8884052969b64271522a59dd0864
+phase_7_r6_red_verification: "SQLite stuck attribution and guard merge 2 failed; explicit JSONL evidence 1 failed; traffic-window race 1 failed; transient initial safety anomaly retention 1 failed"
+phase_7_r6_focused_verification: "78 passed, 18 deselected in observer, runtime-loop-health, and durable worker ordering slice"
+phase_7_r6_full_suite_verification: "6372 passed, 1 skipped, 32 warnings in 563.20 seconds"
+phase_7_r6_review_status: ready_yes_zero_critical_zero_important_after_four_fail_closed_repairs
+phase_7_r6_contract: "continuous Web message-pipeline parity HTTP is absent; SQLite RO owns identity and 300-second pending-stuck evidence; quiet safety and traffic-minimum baselines are separate and both initial snapshots retain fail-closed evidence; lightweight current-state guards run every 5 seconds, journal evidence every 30 seconds, and role loop-health at most every 30 seconds; initial unknown, runtime anomaly, signal, child cleanup failure, or acceptance failure rolls back independently"
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -408,6 +418,29 @@ cutover_authorized: true
   incomplete without an automatic waiver.
 
 ## History
+
+- `2026-08-27 Phase 7 R6 local candidate`: commits
+  `cdea2640ba0ef22a0f5e9e9644fd8e32d94a074b` and
+  `42d8cddd8dedb0f9b57de1e60bcb850b7e9a8b7f` froze the Web-parity isolation
+  design and plan; candidate `dee0a2e9d1875b50927ab4add9a50fe6c9934e0c`
+  removes continuous synchronous Web
+  parity HTTP from acceptance. SQLite read-only sampling now owns identity and
+  pending-stuck evidence, including ISO-offset timestamps and fail-closed
+  null/invalid pending timestamps. Separate quiet safety and traffic-minimum
+  baselines prevent cutover-gap traffic from satisfying the five-message/two-
+  chat minimum while preserving transient safety violations. The controller
+  starts fail-closed guards before the observer, retains 5-second current-state
+  coverage and 30-second journal coverage, counts PID drift, and always reaps
+  the observer and guard before rollback completes. Focused verification passed
+  `78` tests with `18` deselected; the one final suite passed `6372`, skipped
+  `1`, and emitted `32` existing warnings in `563.20s`. Independent final
+  review returned Ready `Yes` with zero Critical and zero Important findings.
+  Observer SHA-256 is
+  `2c34a1ec4c9894f4ba03b36898931d1d86e84a15b0b1e305013ffe0309141521`;
+  controller SHA-256 is
+  `5d26ed14fb7e5978b26ccf2da3d885d92b5a8884052969b64271522a59dd0864`.
+  Production remains at the safe `global + 1 + queue` tuple pending R6
+  preflight.
 
 - `2026-08-26 Phase 7 R5 rollback and R6 approval`: R5 observed `2443`
   acceptance samples over `2460.236s`, seven natural messages from three chats,
