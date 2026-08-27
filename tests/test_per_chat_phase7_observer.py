@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import argparse
 import importlib.util
 import io
@@ -232,7 +232,9 @@ def acceptance_snapshot(
     return observer.AcceptanceObservation(**values)
 
 
-def database_snapshot(*, jobs=(), raw_count=0, chat_count=0):
+def database_snapshot(
+    *, jobs=(), raw_messages=(), raw_count=0, chat_count=0, stuck_count=0
+):
     claimed_count = sum(row.status == "claimed" for row in jobs)
     pending_count = sum(row.status == "pending" for row in jobs)
     return observer.DatabaseObservation(
@@ -249,6 +251,8 @@ def database_snapshot(*, jobs=(), raw_count=0, chat_count=0):
         duplicate_job_count=0,
         missing_job_count=0,
         orphan_job_count=0,
+        stuck_job_count=stuck_count,
+        raw_messages=tuple(raw_messages),
     )
 
 
@@ -608,6 +612,7 @@ def create_observer_database(path):
             raw_message_id INTEGER NOT NULL,
             chat_id INTEGER NOT NULL,
             status TEXT NOT NULL,
+            enqueued_at TEXT,
             completed_at TEXT,
             shadow INTEGER NOT NULL DEFAULT 0
         );
@@ -681,6 +686,58 @@ def test_database_collector_reads_nonshadow_jobs_and_tuple(tmp_path):
     assert result.missing_job_count == 0
     assert result.orphan_job_count == 0
     assert result.semantic_review_enabled is False
+
+
+def test_database_collector_counts_sqlite_stuck_pending_only(tmp_path):
+    path = tmp_path / "observer.db"
+    create_observer_database(path)
+    connection = sqlite3.connect(path)
+    connection.executemany(
+        "INSERT INTO raw_messages (id, chat_id) VALUES (?, ?)",
+        [
+            (99, 6),
+            (103, 9),
+            (104, 10),
+            (105, 11),
+            (106, 12),
+            (107, 13),
+            (108, 14),
+        ],
+    )
+    old_iso = (datetime.now(UTC) - timedelta(minutes=10)).isoformat()
+    connection.executemany(
+        """
+        INSERT INTO message_processing_jobs
+            (id, raw_message_id, chat_id, status, enqueued_at, shadow)
+        VALUES (?, ?, ?, ?, ?, 0)
+        """,
+        [
+            (9, 99, 6, "pending", "2000-01-01 00:00:00"),
+            (14, 103, 9, "pending", old_iso),
+            (15, 104, 10, "pending", "2999-01-01 00:00:00"),
+            (16, 105, 11, "succeeded", "2000-01-01 00:00:00"),
+            (17, 106, 12, "pending", None),
+            (18, 107, 13, "pending", "not-a-timestamp"),
+            (19, 108, 14, "failed", None),
+        ],
+    )
+    connection.execute(
+        """
+        UPDATE message_processing_jobs
+        SET enqueued_at = datetime('now', '-300 seconds')
+        WHERE id = 12
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    result = observer.collect_database_observation(
+        path,
+        baseline_raw_message_id=100,
+        baseline_job_id=10,
+    )
+
+    assert result.stuck_job_count == 4
 
 
 def test_database_collector_fails_metrics_closed_for_identity_anomalies(tmp_path):
@@ -870,6 +927,8 @@ def acceptance_args(
         worker_url="http://worker",
         web_url="http://web",
         http_timeout=1.0,
+        baseline_raw_message_id=0,
+        baseline_job_id=0,
     )
 
 
@@ -902,6 +961,110 @@ def test_acceptance_split_cadence_limits_runtime_http_collection():
     assert len(samples) == 61
     assert runtime_calls == [0.0, 30.0, 60.0]
     assert [sample.runtime_fresh for sample in samples].count(True) == 3
+
+
+def test_acceptance_traffic_baseline_excludes_pre_window_gap_messages():
+    clock = FakeMonotonicClock()
+    gap_job = job(11, 101, 7, "succeeded")
+    runtime_collection_race_job = job(12, 102, 8, "succeeded")
+    window_job = job(13, 103, 9, "succeeded")
+    snapshots = iter(
+        (
+            database_snapshot(
+                jobs=(gap_job,), raw_messages=((101, 7),), raw_count=1,
+                chat_count=1,
+            ),
+            database_snapshot(
+                jobs=(gap_job, runtime_collection_race_job),
+                raw_messages=((101, 7), (102, 8)), raw_count=2,
+                chat_count=2,
+            ),
+            database_snapshot(
+                jobs=(gap_job, runtime_collection_race_job, window_job),
+                raw_messages=((101, 7), (102, 8), (103, 9)), raw_count=3,
+                chat_count=3,
+            ),
+        )
+    )
+
+    samples = list(
+        observer._acceptance_samples(
+            acceptance_args(window=1.0),
+            database_collector=lambda _args: next(snapshots),
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds, peak_lanes=2)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    assert samples[0].raw_message_count == 0
+    assert samples[0].distinct_chat_count == 0
+    assert samples[0].traffic_jobs == ()
+    assert samples[0].jobs == (gap_job, runtime_collection_race_job)
+    assert samples[1].raw_message_count == 1
+    assert samples[1].distinct_chat_count == 1
+    assert samples[1].traffic_jobs == (window_job,)
+    assert samples[0].traffic_window_started_at == (
+        samples[1].traffic_window_started_at
+    )
+
+
+def test_initial_safety_anomaly_survives_clean_traffic_baseline_snapshot():
+    clock = FakeMonotonicClock()
+    first_claim = job(11, 101, 7, "claimed")
+    second_claim = job(12, 102, 7, "claimed")
+    clean_first = job(11, 101, 7, "succeeded")
+    clean_second = job(12, 102, 7, "succeeded")
+    snapshots = iter(
+        (
+            database_snapshot(jobs=(first_claim, second_claim)),
+            database_snapshot(jobs=(clean_first, clean_second)),
+        )
+    )
+
+    sample = next(
+        observer._acceptance_samples(
+            acceptance_args(window=0.0),
+            database_collector=lambda _args: next(snapshots),
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+    result = acceptance_tracker().observe(sample)
+
+    assert sample.execution_anomaly_count > 0
+    assert result.failed is True
+    assert result.reason == "execution_anomaly"
+
+
+def test_database_stuck_evidence_cannot_be_masked_by_zero_external_guard():
+    clock = FakeMonotonicClock()
+    database = database_snapshot(stuck_count=1)
+    sample = next(
+        observer._acceptance_samples(
+            acceptance_args(window=0.0),
+            database_collector=lambda _args: database,
+            runtime_collector=lambda _args, _database, *, elapsed_seconds: (
+                runtime(elapsed=elapsed_seconds)
+            ),
+            guard_reader=zero_guard_counters,
+            monotonic=clock.monotonic,
+            sleeper=clock.sleep,
+        )
+    )
+
+    result = acceptance_tracker().observe(sample)
+
+    assert sample.stuck_job_count == 1
+    assert result.failed is True
+    assert result.reason == "stuck_message_job"
 
 
 def test_due_runtime_failure_is_not_masked_by_cached_complete_sample():
@@ -972,7 +1135,7 @@ def test_database_read_crossing_window_forces_fresh_final_runtime_sample():
     assert runtime_calls == [0.0, pytest.approx(30.1)]
 
 
-def test_acceptance_clock_starts_after_initial_health_baseline():
+def test_acceptance_clock_starts_after_initial_health_and_traffic_baselines():
     clock = FakeMonotonicClock()
     database = database_snapshot()
 
@@ -999,7 +1162,7 @@ def test_acceptance_clock_starts_after_initial_health_baseline():
         )
     )
 
-    assert clock.value == pytest.approx(1.2)
+    assert clock.value == pytest.approx(1.6)
     assert first.runtime_fresh is True
     assert first.runtime.elapsed_seconds == 0.0
 
@@ -1099,6 +1262,30 @@ def test_acceptance_orchestration_reports_failure_without_rollback_write():
         "worker_command_mode": "queue",
     }
     assert not hasattr(observer, "perform_rollback")
+
+
+def test_acceptance_jsonl_emits_explicit_database_parity_evidence():
+    output = io.StringIO()
+    sample = acceptance_snapshot(
+        duplicate_job_count=0,
+        missing_job_count=0,
+        orphan_job_count=0,
+        stuck_job_count=0,
+    )
+
+    observer.run_acceptance_samples(
+        [sample],
+        acceptance_tracker(),
+        output=output,
+        now_provider=lambda: "2026-08-27T05:00:00Z",
+    )
+
+    rows = parse_jsonl(output)
+    assert rows[0]["duplicate_job_count"] == 0
+    assert rows[0]["missing_job_count"] == 0
+    assert rows[0]["orphan_job_count"] == 0
+    assert rows[0]["stuck_job_count"] == 0
+    assert rows[-1]["max_simultaneous_claimed_chats"] == 0
 
 
 def test_rollback_orchestration_is_independent_after_acceptance_failure():

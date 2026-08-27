@@ -29,6 +29,7 @@ LOOP_STALL_ATTRIBUTIONS = frozenset(
 )
 MIN_DATABASE_POLL_INTERVAL_SECONDS = 0.5
 MIN_RUNTIME_POLL_INTERVAL_SECONDS = 10.0
+STUCK_PENDING_SECONDS = 300
 
 
 @dataclass(frozen=True)
@@ -127,6 +128,8 @@ class AcceptanceObservation:
     loop_stall_events: tuple[LoopStallEvidence, ...] = ()
     runtime_fresh: bool = True
     retry_exhausted: bool = False
+    traffic_jobs: tuple[JobObservation, ...] | None = None
+    traffic_window_started_at: str | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +155,9 @@ class DatabaseObservation:
     duplicate_job_count: int
     missing_job_count: int
     orphan_job_count: int
+    stuck_job_count: int
+    raw_messages: tuple[tuple[int, int], ...] = ()
+    snapshot_started_at: str | None = None
 
 
 def evaluate_same_chat_jobs(jobs: list[JobObservation]) -> SameChatEvaluation:
@@ -215,6 +221,7 @@ def collect_database_observation(
     baseline_raw_message_id: int,
     baseline_job_id: int,
 ) -> DatabaseObservation:
+    snapshot_started_at = datetime.now(UTC).isoformat().replace("+00:00", "Z")
     connection = open_read_only_database(path)
     try:
         connection.execute("BEGIN")
@@ -251,18 +258,15 @@ def collect_database_observation(
             )
             for row in rows
         )
-        raw_message_count = int(
-            connection.execute(
-                "SELECT COUNT(*) FROM raw_messages WHERE id > ?",
+        raw_messages = tuple(
+            (int(row[0]), int(row[1]))
+            for row in connection.execute(
+                "SELECT id, chat_id FROM raw_messages WHERE id > ? ORDER BY id",
                 (baseline_raw_message_id,),
-            ).fetchone()[0]
+            ).fetchall()
         )
-        distinct_chat_count = int(
-            connection.execute(
-                "SELECT COUNT(DISTINCT chat_id) FROM raw_messages WHERE id > ?",
-                (baseline_raw_message_id,),
-            ).fetchone()[0]
-        )
+        raw_message_count = len(raw_messages)
+        distinct_chat_count = len({row[1] for row in raw_messages})
         duplicate_job_count = int(
             connection.execute(
                 """
@@ -306,6 +310,22 @@ def collect_database_observation(
                 (baseline_job_id,),
             ).fetchone()[0]
         )
+        stuck_job_count = int(
+            connection.execute(
+                """
+                SELECT COUNT(*)
+                FROM message_processing_jobs
+                WHERE id > ?
+                  AND shadow = 0
+                  AND status = 'pending'
+                  AND (
+                      datetime(enqueued_at) IS NULL
+                      OR datetime(enqueued_at) <= datetime('now', ?)
+                  )
+                """,
+                (baseline_job_id, f"-{STUCK_PENDING_SECONDS} seconds"),
+            ).fetchone()[0]
+        )
         query_only = int(connection.execute("PRAGMA query_only").fetchone()[0])
         journal_mode = str(connection.execute("PRAGMA journal_mode").fetchone()[0])
         pending_count = sum(row.status == "pending" for row in jobs)
@@ -328,6 +348,9 @@ def collect_database_observation(
             duplicate_job_count=duplicate_job_count,
             missing_job_count=missing_job_count,
             orphan_job_count=orphan_job_count,
+            stuck_job_count=stuck_job_count,
+            raw_messages=raw_messages,
+            snapshot_started_at=snapshot_started_at,
         )
     finally:
         connection.close()
@@ -620,7 +643,10 @@ class AcceptanceTracker:
         self.max_backlog = max(
             self.max_backlog, sample.pending_count + sample.claimed_count
         )
-        claimed_chat_count = len(same_chat.claimed_chat_ids)
+        traffic_same_chat = evaluate_same_chat_jobs(
+            list(sample.jobs if sample.traffic_jobs is None else sample.traffic_jobs)
+        )
+        claimed_chat_count = len(traffic_same_chat.claimed_chat_ids)
         self.max_simultaneous_claimed_chats = max(
             self.max_simultaneous_claimed_chats,
             claimed_chat_count,
@@ -864,6 +890,11 @@ def run_acceptance_samples(
             distinct_chat_count=sample.distinct_chat_count,
             pending_count=sample.pending_count,
             claimed_count=sample.claimed_count,
+            duplicate_job_count=sample.duplicate_job_count,
+            missing_job_count=sample.missing_job_count,
+            orphan_job_count=sample.orphan_job_count,
+            stuck_job_count=sample.stuck_job_count,
+            traffic_window_started_at=sample.traffic_window_started_at,
             loop_stall_count=sample.loop_stall_count,
             loop_stall_events=[asdict(row) for row in sample.loop_stall_events],
             runtime_fresh=sample.runtime_fresh,
@@ -910,6 +941,7 @@ def run_acceptance_samples(
         raw_message_count=tracker.raw_message_count,
         distinct_chat_count=tracker.distinct_chat_count,
         peak_lanes=tracker.peak_lanes,
+        max_simultaneous_claimed_chats=tracker.max_simultaneous_claimed_chats,
         max_backlog=tracker.max_backlog,
         cross_chat_progress=tracker.cross_chat_progress,
     )
@@ -1244,6 +1276,8 @@ def _empty_database_observation(args: argparse.Namespace) -> DatabaseObservation
         duplicate_job_count=0,
         missing_job_count=0,
         orphan_job_count=0,
+        stuck_job_count=0,
+        raw_messages=(),
     )
 
 
@@ -1263,6 +1297,9 @@ def _acceptance_samples(
     sleeper: Callable[[float], None] = time.sleep,
 ) -> Iterable[AcceptanceObservation]:
     started: float | None = None
+    traffic_window_started_at: str | None = None
+    traffic_baseline_raw_id: int | None = None
+    traffic_baseline_job_id: int | None = None
     next_runtime_elapsed = 0.0
     last_complete_runtime: RuntimeObservation | None = None
     database_poll_interval = _database_poll_interval(
@@ -1309,6 +1346,85 @@ def _acceptance_samples(
             if guards is None:
                 retry_exhausted = True
         if started is None:
+            if database is not None and runtime.complete and guards is not None:
+                traffic_database = database_collector(args)
+                if traffic_database is None:
+                    retry_exhausted = True
+                else:
+                    safety_database = database
+                    initial_violations = evaluate_same_chat_jobs(
+                        list(safety_database.jobs)
+                    ).violations
+                    guards["execution_anomaly_count"] = (
+                        int(guards["execution_anomaly_count"])
+                        + len(initial_violations)
+                    )
+                    target = _target_from_args(args)
+                    safety_state = (
+                        safety_database.state
+                        if safety_database.state != target
+                        else traffic_database.state
+                    )
+                    database = replace(
+                        traffic_database,
+                        state=safety_state,
+                        semantic_review_enabled=(
+                            safety_database.semantic_review_enabled
+                            or traffic_database.semantic_review_enabled
+                        ),
+                        query_only=(
+                            1
+                            if safety_database.query_only == 1
+                            and traffic_database.query_only == 1
+                            else 0
+                        ),
+                        journal_mode=(
+                            "wal"
+                            if safety_database.journal_mode.lower() == "wal"
+                            and traffic_database.journal_mode.lower() == "wal"
+                            else "unsafe"
+                        ),
+                        total_changes=max(
+                            safety_database.total_changes,
+                            traffic_database.total_changes,
+                        ),
+                        pending_count=max(
+                            safety_database.pending_count,
+                            traffic_database.pending_count,
+                        ),
+                        claimed_count=max(
+                            safety_database.claimed_count,
+                            traffic_database.claimed_count,
+                        ),
+                        duplicate_job_count=max(
+                            safety_database.duplicate_job_count,
+                            traffic_database.duplicate_job_count,
+                        ),
+                        missing_job_count=max(
+                            safety_database.missing_job_count,
+                            traffic_database.missing_job_count,
+                        ),
+                        orphan_job_count=max(
+                            safety_database.orphan_job_count,
+                            traffic_database.orphan_job_count,
+                        ),
+                        stuck_job_count=max(
+                            safety_database.stuck_job_count,
+                            traffic_database.stuck_job_count,
+                        ),
+                    )
+                    runtime = replace(runtime, database_state=safety_state)
+                    traffic_baseline_raw_id = max(
+                        (row[0] for row in database.raw_messages),
+                        default=int(args.baseline_raw_message_id),
+                    )
+                    traffic_baseline_job_id = max(
+                        (row.job_id for row in database.jobs),
+                        default=int(args.baseline_job_id),
+                    )
+                    traffic_window_started_at = (
+                        database.snapshot_started_at or _utc_now()
+                    )
             started = monotonic()
             elapsed = 0.0
         else:
@@ -1345,11 +1461,26 @@ def _acceptance_samples(
             guards["ingest_anomaly_count"] = (
                 int(guards["ingest_anomaly_count"]) + 1
             )
+        guards["stuck_job_count"] = (
+            int(guards["stuck_job_count"]) + database.stuck_job_count
+        )
+        traffic_raw_messages = tuple(
+            row
+            for row in database.raw_messages
+            if traffic_baseline_raw_id is not None
+            and row[0] > traffic_baseline_raw_id
+        )
+        traffic_jobs = tuple(
+            row
+            for row in database.jobs
+            if traffic_baseline_job_id is not None
+            and row.job_id > traffic_baseline_job_id
+        )
         yield AcceptanceObservation(
             runtime=runtime,
             jobs=database.jobs,
-            raw_message_count=database.raw_message_count,
-            distinct_chat_count=database.distinct_chat_count,
+            raw_message_count=len(traffic_raw_messages),
+            distinct_chat_count=len({row[1] for row in traffic_raw_messages}),
             pending_count=database.pending_count,
             claimed_count=database.claimed_count,
             duplicate_job_count=database.duplicate_job_count,
@@ -1357,6 +1488,8 @@ def _acceptance_samples(
             orphan_job_count=database.orphan_job_count,
             runtime_fresh=runtime_fresh,
             retry_exhausted=retry_exhausted,
+            traffic_jobs=traffic_jobs,
+            traffic_window_started_at=traffic_window_started_at,
             **guards,
         )
         if elapsed >= args.window:
