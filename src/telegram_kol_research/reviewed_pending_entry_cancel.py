@@ -17,13 +17,16 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    EntryRevisionReplacement,
     InstructionExecutionContract,
+    MessageProcessingJob,
     PositionMutationIntent,
     PositionBackupStopOrder,
     PositionProtectionLeg,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyRevisionBatch,
+    StrategyRevisionLeg,
     StrategyLifecycle,
     TradeSignal,
     TriggerProtectionIntent,
@@ -50,7 +53,7 @@ _TERMINAL_LEG_STATES = frozenset(
     {"cancelled", "canceled", "expired", "rejected"}
 )
 _CANCELLED_HISTORY_STATES = frozenset(
-    {"cancelled", "canceled", "cancel", "expired", "rejected"}
+    {"cancelled", "canceled", "cancel", "expired"}
 )
 _FILLED_HISTORY_STATES = frozenset(
     {"filled", "partially_filled", "partially-filled", "partial_filled"}
@@ -429,6 +432,10 @@ def build_reviewed_pending_entry_cancel_plan(
 
 def _active_exchange_authority_present(session) -> bool:
     checks = (
+        session.query(MessageProcessingJob.id).filter(
+            MessageProcessingJob.shadow.is_(False),
+            MessageProcessingJob.status == "claimed",
+        ),
         session.query(ExecutionOrderLeg.id).filter(
             ExecutionOrderLeg.status.in_({"submitting", "cancel_submitting"})
         ),
@@ -444,10 +451,33 @@ def _active_exchange_authority_present(session) -> bool:
             )
         ),
         session.query(StrategyManagementBatch.id).filter(
-            StrategyManagementBatch.status == "executing"
+            StrategyManagementBatch.status.not_in(
+                {"succeeded", "blocked", "resolved"}
+            )
         ),
         session.query(StrategyRevisionBatch.id).filter(
-            StrategyRevisionBatch.status == "submitting_replacements"
+            StrategyRevisionBatch.status.not_in({"succeeded", "blocked"})
+        ),
+        session.query(StrategyRevisionLeg.id)
+        .join(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id == StrategyRevisionLeg.revision_batch_id,
+        )
+        .filter(
+            StrategyRevisionLeg.status == "cancel_submitting",
+            StrategyRevisionBatch.advance_claim_token.is_not(None),
+            StrategyRevisionBatch.advance_claimed_at.is_not(None),
+        ),
+        session.query(EntryRevisionReplacement.id)
+        .join(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id
+            == EntryRevisionReplacement.revision_batch_id,
+        )
+        .filter(
+            EntryRevisionReplacement.status == "submit_reserved",
+            StrategyRevisionBatch.advance_claim_token.is_not(None),
+            StrategyRevisionBatch.advance_claimed_at.is_not(None),
         ),
         session.query(TriggerProtectionIntent.id).filter(
             TriggerProtectionIntent.recovery_state.in_(
@@ -455,7 +485,9 @@ def _active_exchange_authority_present(session) -> bool:
             )
         ),
         session.query(PositionMutationIntent.id).filter(
-            PositionMutationIntent.status == "submitting"
+            PositionMutationIntent.status.in_(
+                {"submitting", "cancel_submitting"}
+            )
         ),
         session.query(TradeSignal.id).filter(
             TradeSignal.status.in_(
@@ -946,34 +978,91 @@ def _terminalize_confirmed_cancel(
             )
             .all()
         )
+        target = ReviewedPendingEntryTarget(
+            order_id=action.order_id,
+            instrument_id=action.instrument_id,
+            lifecycle_id=action.lifecycle_id,
+            execution_binding_id=action.execution_binding_id,
+            execution_order_leg_id=action.execution_order_leg_id,
+            trigger_price=action.trigger_price,
+            size=action.size,
+            embedded_stop_price=action.embedded_stop_price,
+            request_fingerprint=action.request_fingerprint,
+        )
+        stored_request = _json_object(leg.request_json if leg is not None else None)
+        expected_authority_fingerprint = _fingerprint(
+            {
+                "action_id": action.action_id,
+                "plan_fingerprint": plan_fingerprint,
+                "exchange_row_fingerprint": action.exchange_row_fingerprint,
+                "request_json_fingerprint": action.request_json_fingerprint,
+            }
+        )
         if not (
-            leg is not None
-            and binding is not None
-            and lifecycle is not None
-            and int(leg.execution_binding_id) == action.execution_binding_id
-            and str(leg.order_id or "") == action.order_id
-            and str(leg.status or "").lower() in _PENDING_LEG_STATES
-            and str(lifecycle.lifecycle_status or "") == "pending_entry"
-            and int(lifecycle.execution_binding_id or 0)
-            == action.execution_binding_id
+            _local_identity_matches(
+                target,
+                leg=leg,
+                binding=binding,
+                lifecycle=lifecycle,
+                intent_rows=intents,
+            )
+            and _local_pending_state_matches(
+                session,
+                target=target,
+                leg=leg,
+                lifecycle=lifecycle,
+                intent=intents[0],
+            )
+            and str(binding.status or "").lower() in {"open", "active"}
+            and str(binding.strategy_instance_id or "")
+            == action.strategy_instance_id
+            and str(leg.strategy_instance_id or "")
+            == action.strategy_instance_id
+            and str(lifecycle.symbol or "").upper()
+            == action.instrument_id.removesuffix("-USDT-SWAP")
+            and str(lifecycle.side or "").lower() == "long"
+            and _request_matches(stored_request, target)
+            and _fingerprint(stored_request)
+            == action.request_json_fingerprint
             and len(intents) == 1
-            and str(intents[0].recovery_state or "") in {"pending", "retrying"}
             and len(protection) == 2
             and {str(row.role or "") for row in protection}
             == {"primary_stop", "backup_stop"}
             and all(
-                str(row.status or "") in {"planned", "waiting_fill"}
+                row.execution_binding_id == action.execution_binding_id
+                and row.parent_entry_order_id == action.order_id
+                and str(row.status or "") in {"planned", "waiting_fill"}
                 for row in protection
             )
             and len(convergence) == 1
+            and convergence[0].execution_binding_id
+            == action.execution_binding_id
             and str(convergence[0].status or "")
             in {"waiting_backup_stop", "waiting_position", "ready"}
             and not existing_events
             and mutation_intent is not None
             and mutation_intent.status == "submitted"
+            and mutation_intent.venue == "deepcoin"
+            and mutation_intent.operation
+            == "cancel_reviewed_pending_entry"
+            and mutation_intent.strategy_instance_id
+            == action.strategy_instance_id
+            and mutation_intent.execution_binding_id
+            == action.execution_binding_id
             and mutation_intent.order_id == action.order_id
             and mutation_intent.execution_order_leg_id
             == action.execution_order_leg_id
+            and mutation_intent.pos_id
+            == f"pending-entry:{action.order_id}"
+            and mutation_intent.request_fingerprint == _fingerprint(request)
+            and _json_object(mutation_intent.request_json) == request
+            and _json_object(mutation_intent.response_json)
+            == {"code": "0", "order_id": action.order_id}
+            and mutation_intent.error_json in (None, "")
+            and mutation_intent.submitted_at is not None
+            and mutation_intent.confirmed_at is None
+            and mutation_intent.authority_fingerprint
+            == expected_authority_fingerprint
         ):
             session.rollback()
             return False
@@ -1257,20 +1346,117 @@ def _completed_state_matches(
         str(row.status or "").lower() in _TERMINAL_LEG_STATES
         for row in sibling_entry_legs
     )
+    event = events[0] if len(events) == 1 else None
+    mutation = mutation_intents[0] if len(mutation_intents) == 1 else None
+    stored_request = _json_object(leg.request_json)
+    cancel_request = {
+        "instId": target.instrument_id,
+        "ordId": target.order_id,
+    }
+    event_before = _json_object(event.before_json if event is not None else None)
+    event_after = _json_object(event.after_json if event is not None else None)
+    exchange_row_fingerprint = str(
+        event_before.get("exchange_row_fingerprint") or ""
+    )
+    plan_fingerprint = str(event_before.get("plan_fingerprint") or "")
+    action_base = {
+        "order_id": target.order_id,
+        "instrument_id": target.instrument_id,
+        "lifecycle_id": target.lifecycle_id,
+        "execution_binding_id": target.execution_binding_id,
+        "execution_order_leg_id": target.execution_order_leg_id,
+        "strategy_instance_id": str(leg.strategy_instance_id or ""),
+        "trigger_price": target.trigger_price,
+        "size": target.size,
+        "embedded_stop_price": target.embedded_stop_price,
+        "request_fingerprint": target.request_fingerprint,
+        "request_json_fingerprint": _fingerprint(stored_request),
+        "exchange_row_fingerprint": exchange_row_fingerprint,
+    }
+    expected_action_id = _fingerprint(action_base)
+    expected_authority_fingerprint = _fingerprint(
+        {
+            "action_id": expected_action_id,
+            "plan_fingerprint": plan_fingerprint,
+            "exchange_row_fingerprint": exchange_row_fingerprint,
+            "request_json_fingerprint": _fingerprint(stored_request),
+        }
+    )
+    exact_durable_evidence = bool(
+        event is not None
+        and mutation is not None
+        and _is_sha256(plan_fingerprint)
+        and _is_sha256(exchange_row_fingerprint)
+        and event_before
+        == {
+            "plan_fingerprint": plan_fingerprint,
+            "action_id": expected_action_id,
+            "exchange_row_fingerprint": exchange_row_fingerprint,
+        }
+        and event_after == {"pending": False, "terminalized": True}
+        and _json_object(event.request_json) == cancel_request
+        and _json_object(event.response_json)
+        == {"code": "0", "order_id": target.order_id}
+        and event.execution_binding_id == target.execution_binding_id
+        and event.strategy_instance_id == str(leg.strategy_instance_id or "")
+        and event.venue == "deepcoin"
+        and event.symbol == target.instrument_id.split("-")[0]
+        and event.side == "long"
+        and event.reason == "reviewed_stale_pending_entry_cancelled"
+        and mutation.idempotency_key
+        == (
+            f"reviewed-pending-entry-cancel:{target.order_id}:"
+            f"{expected_action_id}"
+        )
+        and mutation.strategy_instance_id
+        == str(leg.strategy_instance_id or "")
+        and mutation.venue == "deepcoin"
+        and mutation.execution_binding_id == target.execution_binding_id
+        and mutation.execution_order_leg_id
+        == target.execution_order_leg_id
+        and mutation.pos_id == f"pending-entry:{target.order_id}"
+        and mutation.request_fingerprint == _fingerprint(cancel_request)
+        and _json_object(mutation.request_json) == cancel_request
+        and _json_object(mutation.response_json)
+        == {"code": "0", "order_id": target.order_id}
+        and mutation.error_json in (None, "")
+        and mutation.submitted_at is not None
+        and mutation.confirmed_at is not None
+        and mutation.authority_fingerprint
+        == expected_authority_fingerprint
+    )
     return bool(
         not fill_rows
         and _history_has_cancelled_state(history_rows)
         and str(leg.status or "").lower() in _TERMINAL_LEG_STATES
+        and leg.terminal_reason == "operator_cancelled_unfilled_entry_leg"
+        and str(leg.venue or "").lower() == "deepcoin"
+        and leg.purpose == "entry"
+        and leg.pos_id in (None, "")
+        and _request_matches(stored_request, target)
+        and _fingerprint(stored_request) == target.request_fingerprint
         and len(events) == 1
         and len(mutation_intents) == 1
+        and exact_durable_evidence
         and len(intents) == 1
+        and intents[0].execution_binding_id == target.execution_binding_id
+        and intents[0].parent_trigger_order_id == target.order_id
         and intents[0].recovery_state == "resolved"
         and intents[0].recovery_disposition == "terminal"
         and intents[0].last_reason_code
         == "parent_trigger_cancelled_before_entry"
         and len(protection) == 2
-        and all(row.status == "cancelled" for row in protection)
+        and {row.role for row in protection}
+        == {"primary_stop", "backup_stop"}
+        and all(
+            row.status == "cancelled"
+            and row.execution_binding_id == target.execution_binding_id
+            and row.parent_entry_order_id == target.order_id
+            for row in protection
+        )
         and len(convergence) == 1
+        and convergence[0].execution_binding_id
+        == target.execution_binding_id
         and convergence[0].status == "completed"
         and convergence[0].reason_code
         == "parent_trigger_cancelled_before_entry"
@@ -1278,7 +1464,12 @@ def _completed_state_matches(
             (
                 binding_should_be_terminal
                 and str(binding.status or "").lower() == "cancelled"
+                and binding.last_exchange_status
+                == "reviewed_pending_entries_cancelled"
                 and str(lifecycle.lifecycle_status or "") == "expired"
+                and lifecycle.exit_reason == "expired"
+                and lifecycle.management_action
+                == "reviewed_pending_entries_cancelled"
             )
             or (
                 not binding_should_be_terminal
@@ -1405,6 +1596,13 @@ def _numbers_equal(left: Any, right: Any) -> bool:
         return Decimal(str(left)) == Decimal(str(right))
     except (InvalidOperation, TypeError, ValueError):
         return False
+
+
+def _is_sha256(value: Any) -> bool:
+    text = str(value or "")
+    return len(text) == 64 and all(
+        character in "0123456789abcdef" for character in text
+    )
 
 
 def _conflict(

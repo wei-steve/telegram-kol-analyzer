@@ -12,9 +12,11 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
+    MessageProcessingJob,
     PositionMutationIntent,
     PositionProtectionLeg,
     RepairConfirmationToken,
+    RawMessage,
     StrategyLifecycle,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
@@ -74,6 +76,7 @@ class _Client:
         self.cancel_exception: Exception | None = None
         self.cancel_response: object | None = None
         self.mutate_sibling_after_cancel = False
+        self.after_cancel_callback = None
 
     def list_positions(self, *, inst_id=None):
         return [row for row in self.positions if not inst_id or row.get("instId") == inst_id]
@@ -106,6 +109,8 @@ class _Client:
         )
         if self.mutate_sibling_after_cancel and self.pending:
             self.pending[0]["sz"] = "99"
+        if self.after_cancel_callback is not None:
+            self.after_cancel_callback()
         return (
             self.cancel_response
             if self.cancel_response is not None
@@ -421,6 +426,73 @@ def test_plan_blocks_all_actions_when_exchange_write_authority_is_active(
         deepcoin_client=client,
         targets=_targets(binding_id, lifecycle_id, leg_ids),
         now=NOW,
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def test_plan_blocks_claimed_non_shadow_message_job_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=999, message_id=888, text="new signal")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=raw.id,
+                chat_id=999,
+                status="claimed",
+                claim_token=None,
+                claimed_at=None,
+                shadow=False,
+                enqueued_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
+    )
+
+    assert plan.actions == ()
+    assert plan.conflicts == (
+        {"order_id": "*", "reason": "active_exchange_authority_present"},
+    )
+
+
+def test_plan_blocks_cancel_submitting_mutation_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    with session_factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key="other-cancel-submitting",
+                venue="deepcoin",
+                operation="cancel_other_order",
+                strategy_instance_id="other-strategy",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg_ids[0],
+                pos_id="other-position",
+                order_id="other-order",
+                authority_fingerprint="a" * 64,
+                request_fingerprint="b" * 64,
+                status="cancel_submitting",
+                request_json="{}",
+                reserved_at=NOW,
+            )
+        )
+        session.commit()
+
+    plan = _build_plan(
+        session_factory,
+        _Client(),
+        _targets(binding_id, lifecycle_id, leg_ids),
     )
 
     assert plan.actions == ()
@@ -796,6 +868,113 @@ def test_confirmed_cancel_with_changed_sibling_fails_closed(tmp_path):
         assert event.reason == "post_cancel_state_changed"
 
 
+def test_rejected_history_is_not_confirmed_as_cancelled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+
+    def replace_history_with_rejection():
+        client.trigger_history[-1]["state"] = "rejected"
+
+    client.after_cancel_callback = replace_history_with_rejection
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "cancel_confirmed_readback_changed"
+    assert result.reason_code == "post_cancel_state_changed"
+    assert len(client.cancel_payloads) == 1
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, leg_ids[0]).status == "pending"
+
+
+def test_terminalization_rechecks_full_local_identity_after_exchange_write(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+
+    def mutate_local_identity():
+        with session_factory() as session:
+            leg = session.get(ExecutionOrderLeg, leg_ids[0])
+            leg.purpose = "exit"
+            leg.venue = "other"
+            session.commit()
+
+    client.after_cancel_callback = mutate_local_identity
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "cancelled_audit_state_changed"
+    assert result.reason_code == "confirmed_cancel_database_state_changed"
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_ids[0])
+        assert leg.status == "pending"
+        assert leg.terminal_reason is None
+        mutation = session.query(PositionMutationIntent).one()
+        assert mutation.status == "recovery_required"
+
+
+def test_terminalization_rejects_changed_mutation_intent_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+
+    def mutate_intent_evidence():
+        with session_factory() as session:
+            mutation = session.query(PositionMutationIntent).one()
+            mutation.venue = "other"
+            mutation.error_json = '{"reason":"corrupt"}'
+            session.commit()
+
+    client.after_cancel_callback = mutate_intent_evidence
+    plan = _build_plan(session_factory, client, targets)
+
+    result = _apply_one(session_factory, client, targets, plan)
+
+    assert result.status == "cancelled_audit_state_changed"
+    assert result.reason_code == "confirmed_cancel_database_state_changed"
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, leg_ids[0]).status == "pending"
+        mutation = session.query(PositionMutationIntent).one()
+        assert mutation.status == "recovery_required"
+
+
+def test_completed_plan_rejects_tampered_durable_cancellation_evidence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    assert _apply_one(session_factory, client, targets, plan).status == "cancelled"
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_ids[0])
+        leg.terminal_reason = "wrong_reason"
+        event = session.query(ExecutionEvent).one()
+        event.before_json = "{}"
+        event.response_json = "{}"
+        mutation = session.query(PositionMutationIntent).one()
+        mutation.venue = "other"
+        mutation.error_json = '{"reason":"corrupt"}'
+        mutation.confirmed_at = None
+        mutation.response_json = "{}"
+        session.commit()
+
+    repeated = _build_plan(session_factory, client, targets)
+
+    assert repeated.actions == ()
+    assert repeated.completed_order_ids == ()
+    assert repeated.conflicts == (
+        {"order_id": "reviewed-1", "reason": "reviewed_order_not_pending"},
+    )
+
+
 def test_cli_defaults_to_closed_schema_dry_run_without_write(
     tmp_path, monkeypatch
 ):
@@ -880,6 +1059,51 @@ def test_cli_apply_requires_all_exact_single_order_guards(tmp_path, monkeypatch)
     assert "--action-id" in result.output
     assert "--expected-fingerprint" in result.output
     assert "--confirmation-token" in result.output
+    assert client.cancel_payloads == []
+
+
+def test_cli_conflict_dry_run_exits_nonzero(tmp_path, monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    client.positions.append(
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "unexpected-position",
+            "posSide": "long",
+            "pos": "1",
+        }
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "REVIEWED_PENDING_ENTRY_TARGETS",
+        targets,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: client,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda _path: session_factory,
+    )
+
+    result = CliRunner().invoke(
+        cli_module.app,
+        [
+            "cancel-reviewed-pending-entries",
+            "--database-path",
+            str(tmp_path / "research.db"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert '"reason": "live_position_present"' in result.output
     assert client.cancel_payloads == []
 
 

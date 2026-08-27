@@ -4994,6 +4994,8 @@ def cancel_reviewed_pending_entries(
             default=str,
         )
     )
+    if plan.conflicts:
+        raise typer.Exit(code=2)
     if not apply:
         return
     clean_order_id = str(order_id or "").strip()
@@ -5006,10 +5008,6 @@ def cancel_reviewed_pending_entries(
         raise typer.BadParameter(
             "--apply requires --order-id, --action-id, "
             "--expected-fingerprint, and --confirmation-token"
-        )
-    if plan.conflicts:
-        raise typer.BadParameter(
-            "reviewed target set has unresolved cancellation conflicts"
         )
     result = apply_reviewed_pending_entry_cancel_plan(
         session_factory,
