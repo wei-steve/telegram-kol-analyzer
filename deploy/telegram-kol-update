@@ -187,12 +187,28 @@ wait_for_unit_inactive() {
   done
 }
 
+validate_monitor_env_closed_syntax() {
+  local path="$1" line
+  if LC_ALL=C grep -q '[[:cntrl:]]' "$path"; then
+    return 1
+  fi
+  while IFS= read -r line || [ -n "$line" ]; do
+    if [[ ! "$line" =~ ^[A-Z_][A-Z0-9_]*=.*$ ]]; then
+      return 1
+    fi
+    if [[ "$line" == *\\* || "$line" == *\"* || "$line" == *"'"* ]]; then
+      return 1
+    fi
+  done < "$path"
+}
+
 validate_monitor_env_path() {
   local path="$1" source_schema="${2:-strict}"
   local metadata owner_uid mode extra_metadata expected_uid head_count head_line head_value option_count option_line option_value
   if [ ! -f "$path" ] || [ -L "$path" ]; then
     return 1
   fi
+  if ! validate_monitor_env_closed_syntax "$path"; then return 1; fi
   metadata="$(stat -c '%u %a' -- "$path")" || return 1
   read -r owner_uid mode extra_metadata <<<"$metadata"
   if [ -n "${extra_metadata:-}" ]; then return 1; fi

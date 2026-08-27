@@ -573,6 +573,8 @@ exec /bin/rm "$@"
             "complete",
             "env_only",
             "legacy_missing_expectation",
+            "legacy_indented_expectation",
+            "continued_managed_assignment",
             "malformed",
             "symlink",
             "no_final_newline",
@@ -593,6 +595,22 @@ exec /bin/rm "$@"
                     "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION="
                     "--expected-auto-trade-enabled\n",
                     "",
+                ),
+                encoding="utf-8",
+            )
+        if installation == "legacy_indented_expectation":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8").replace(
+                    "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=",
+                    " TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=",
+                ),
+                encoding="utf-8",
+            )
+        if installation == "continued_managed_assignment":
+            monitor_env.write_text(
+                monitor_env.read_text(encoding="utf-8").replace(
+                    "MONITOR_SECRET=must-not-be-printed\n",
+                    "MONITOR_SECRET=must-not-be-printed\\\n",
                 ),
                 encoding="utf-8",
             )
@@ -928,6 +946,22 @@ def test_legacy_monitor_env_is_restored_byte_for_byte_after_failure(
     assert "monitor-pin-previous" in _events(log)
     assert "checkout" in _events(log)
     assert monitor_env.read_bytes() == original
+    assert "must-not-be-printed" not in result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "installation",
+    ["legacy_indented_expectation", "continued_managed_assignment"],
+)
+def test_systemd_environmentfile_ambiguity_fails_before_checkout(
+    updater_harness, installation: str
+) -> None:
+    run, log, _ = updater_harness
+
+    result = run(HARNESS_MONITOR_INSTALLATION=installation)
+
+    assert result.returncode == 4
+    assert "checkout" not in _events(log)
     assert "must-not-be-printed" not in result.stdout + result.stderr
 
 
