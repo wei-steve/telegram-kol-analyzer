@@ -135,21 +135,23 @@ setfacl -m u:telegram-kol-agent:---,g::rw-,m::rw- /opt/telegram-kol-analyzer/dat
 chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/telegram.session.lock
 chmod 0660 /opt/telegram-kol-analyzer/data/telegram.session.lock
 setfacl -m u:telegram-kol-agent:---,g::rw-,m::rw- /opt/telegram-kol-analyzer/data/telegram.session.lock
-setfacl -b /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
-chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
-chmod 0660 /opt/telegram-kol-analyzer/data/deepcoin_contract_specs_cache.json
+/usr/local/libexec/telegram-kol-worker-prepare-contract-cache
+/usr/local/libexec/telegram-kol-worker-prepare-contract-cache --check
 ```
 
 The session database and its durable lock remain inaccessible to worker and
 Web through their systemd mount namespaces; the shared group write bit lets
 only the ingest unit take over the root-created files. Keep the Runtime Agent's
 explicit deny ACL. Do not recursively reopen the data tree at this point.
-Clearing the cache's inherited access ACL is required because changing mode
-alone can leave its `group::---` ACL entry intact. The split units already carry
-`UMask=0007`; cache publishing also removes that inherited ACL before atomic
-replacement so future refreshes preserve shared access. The Runtime Agent ACL
-helper likewise preserves shared access for the cache and Telegram session
-files if its bounded non-database sanitizer is rerun.
+The cache is a worker-owned generated artifact with the exact contract
+`telegram-kol-worker:telegram-kol-runtime`, mode `0660`, a regular file with
+`st_nlink == 1`, and explicit Agent denial `u:telegram-kol-agent:---`. The data
+directory may be sticky 1777 (mode `1777`); its group write permission controls directory
+entries but cannot substitute for the target file owner. Use only the fixed
+root helper above. Do not apply recursive `chown`, recursive `chmod`, or a
+general ACL rewrite to the data directory. Missing remains missing; the worker
+creates it. An existing cache is converged through descriptor-safe checks and
+the same `--check` path proves the final owner/group/mode/ACL/type/link contract.
 
 Do not start a split unit while the monolith is active. The cutover and rollback
 orders are defined in the runbook and are executed only after the updater has
@@ -251,6 +253,7 @@ macOS / Linux:
 
 ```bash
 EXPECTED_COMMIT="$(git rev-parse HEAD)" \
+EXPECTED_AUTO_TRADE_STATE=enabled \
 BRANCH=codex/deepcoin-auto-trading-v1 \
 ./scripts/server_git_update.sh
 ```
@@ -261,7 +264,8 @@ Windows:
 $commit = git rev-parse HEAD
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
   -Branch codex/deepcoin-auto-trading-v1 `
-  -ExpectedCommit $commit
+  -ExpectedCommit $commit `
+  -ExpectedAutoTradeState enabled
 ```
 
 The server updater then:
@@ -322,6 +326,7 @@ The equivalent server-side command is:
 
 ```bash
 EXPECTED_COMMIT='<full-reviewed-commit>' \
+EXPECTED_AUTO_TRADE_STATE=enabled \
 BRANCH=codex/deepcoin-auto-trading-v1 \
 /usr/local/bin/telegram-kol-update
 ```
@@ -368,8 +373,13 @@ pass, run the helper from the fixed production Git root:
 ```bash
 cd /opt/telegram-kol-analyzer
 approved_entry_preamble_mode=disabled # replace with the currently approved value
+approved_entry_message_assembly_v2_mode=disabled
+approved_entry_revision_v2_mode=disabled
 sudo ./scripts/install_server_monitor.sh \
-  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
+  --expected-auto-trade-state enabled \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode" \
+  --expected-entry-message-assembly-v2-mode "$approved_entry_message_assembly_v2_mode" \
+  --expected-entry-revision-v2-mode "$approved_entry_revision_v2_mode"
 if systemctl is-enabled --quiet telegram-kol-monitor.timer || \
    systemctl is-active --quiet telegram-kol-monitor.timer; then
   exit 1
@@ -386,7 +396,10 @@ the timer, follow the diagnostic and single notification-test instructions in
 
 ```bash
 sudo ./scripts/install_server_monitor.sh --enable \
-  --expected-entry-preamble-mode "$approved_entry_preamble_mode"
+  --expected-auto-trade-state enabled \
+  --expected-entry-preamble-mode "$approved_entry_preamble_mode" \
+  --expected-entry-message-assembly-v2-mode "$approved_entry_message_assembly_v2_mode" \
+  --expected-entry-revision-v2-mode "$approved_entry_revision_v2_mode"
 systemctl is-active telegram-kol-monitor.timer
 systemctl list-timers telegram-kol-monitor.timer --no-pager
 journalctl -u telegram-kol-monitor.service -n 50 --no-pager
@@ -394,14 +407,16 @@ journalctl -u telegram-kol-monitor.service -n 50 --no-pager
 
 Verify the main service remains active and the expected HEAD and live gates
 remain unchanged. After installation, later exact-SHA deployments through
-`deploy/telegram-kol-update` synchronize the frozen HEAD transactionally. The
+`deploy/telegram-kol-update` synchronize the frozen HEAD and the explicitly
+requested `EXPECTED_AUTO_TRADE_STATE=enabled|disabled` transactionally. The
 updater records the timer's enabled/active state, stops it and waits for the
 monitor oneshots to become inactive, validates the regular root-owned `0600`
 environment file, and atomically normalizes the pin to the rollback commit
 before application checkout mutation. It advances the pin to the candidate
 only after exact-SHA checkout, package installation, service start, and HTTP
-health succeed, then restores the prior timer state last. Rollback makes the
-pin follow the actual rollback HEAD before timer restoration. A missing monitor
+health succeed, then restores the prior timer state last. Rollback restores the
+old monitor unit and env before timer restoration. It never edits the
+`auto_trade` setting: code rollback does not automatically resume trading. A missing monitor
 is compatible with the existing deployment flow, while a partial, symlinked,
 wrong-mode, wrong-owner, or malformed installation fails closed. Valid HEAD
 drift remains deployment context rather than a standalone reason code. To roll

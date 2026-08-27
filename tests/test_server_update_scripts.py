@@ -6,6 +6,9 @@ import subprocess
 
 
 ROOT = Path(__file__).resolve().parents[1]
+CACHE_REPAIR_RUNBOOK = (
+    ROOT / "docs" / "runbooks" / "deepcoin-contract-cache-ownership-repair.md"
+)
 
 
 def test_update_scripts_are_syntax_valid():
@@ -79,6 +82,40 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
     assert "./scripts/server_git_update.sh" in deployment
     assert "server_git_update.ps1" in deployment
     assert "./scripts/server_git_update.sh" in handoff
+
+
+def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
+    deployment = (ROOT / "docs/server-deployment.md").read_text(encoding="utf-8")
+    runbook = CACHE_REPAIR_RUNBOOK.read_text(encoding="utf-8")
+    combined = deployment + "\n" + runbook
+
+    for required in (
+        "telegram-kol-worker:telegram-kol-runtime",
+        "0660",
+        "u:telegram-kol-agent:---",
+        "regular file",
+        "st_nlink == 1",
+        "sticky 1777",
+        "telegram-kol-worker-prepare-contract-cache",
+        "EXPECTED_AUTO_TRADE_STATE=disabled",
+        "EXPECTED_AUTO_TRADE_STATE=enabled",
+        "14",
+        "永不重放",
+        "代码回滚不自动恢复交易设置",
+        "server evidence file",
+    ):
+        assert required in combined
+    assert "递归 `chown`" in combined
+    assert "递归 `chmod`" in combined
+    for heading in (
+        "只读 preflight",
+        "冻结写入",
+        "exact-SHA 部署与权限/刷新验证",
+        "单独恢复",
+    ):
+        assert heading in runbook
+    assert "telegram-kol.service stopped" in runbook
+    assert "active_write_count=0" in runbook
 
 
 def test_server_updater_runs_two_active_checks_before_checkout_and_install():
