@@ -6,10 +6,10 @@ design_status: approved
 current_phase: candidate_integration
 phase_state: planned
 claimed_by: null
-candidate_sha: a61c2617430a44ab629bfa0de581aca1172a2b6e
+candidate_sha: a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6
 candidate_content_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
-handoff_sha: a61c2617430a44ab629bfa0de581aca1172a2b6e
-pushed_sha: d2a9c4c615a3fc25af5842f6209b3a080e763e5c
+handoff_sha: a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6
+pushed_sha: a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -17,8 +17,11 @@ auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
 task12_gate: failed_closed
-task12_observed_max_raw_message_id: 13522
+task12_gate_policy: version_aware_local
+task12_observed_max_raw_message_id: 13530
+task12_refusal_baseline_count: 16
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
+task12_latest_evidence_location: codex_task_transcript
 historical_replay_allowed: false
 ```
 
@@ -30,6 +33,43 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- A second explicitly authorized Task 12 production-read-only preflight used
+  candidate `a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6`. The local and remote
+  candidate refs matched exactly. Production remained at
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; its tracked tree was clean and
+  its 15 untracked files were classified as historical configuration backups.
+- Split ingest/worker/Web remained active with zero restarts, monolith remained
+  inactive, and the Telegram session plus lock were owned only by ingest.
+  SQLite was WAL, query-only and `quick_check=ok`; active exchange writes,
+  non-shadow claims, active management, worker commands and revision claims
+  were all zero. The observed maximum raw message ID was 13530.
+- The isolated Linux/root sticky test passed against candidate code in a unique
+  `/tmp` directory. Candidate `--check` against the real cache was read-only and
+  found one recognized migratable legacy drift: type, link, runtime group and
+  mode passed, while worker owner and the Agent deny ACL were both absent from
+  the final candidate contract. No cache metadata or content was changed.
+- The refusal baseline is now 16 exact terminal
+  `contract_spec_sync_unavailable` rows. Every row is `verified_refusal` with
+  `attempted_exchange_write=0`; the newest is raw message 13529. This is an
+  observed baseline only: historical replay, backfill and resubmission remain
+  forbidden.
+- The four old zero-write nonterminal contracts are now explained without
+  mutation. Contracts 119 and 169 never entered submission and have no trade
+  signal, binding or order leg. Contracts 148 and 151 are legacy shadow mirrors:
+  their items terminalized through visibility-retry expiry while the shadow
+  contracts remained deferred. All four have zero attempted exchange writes.
+- Current Deepcoin account queries completed with zero positions, zero pending
+  regular orders and pending BTC/ETH/SOL trigger counts of 4/3/0. Multiple
+  schema-valid history and fills reads reached the venue's fixed boundary; this
+  is bounded 100-row history coverage, not proof of complete account history.
+- The contract-spec health probe remained incomplete after its one reasoned
+  authenticated retry; the health HTTP error remains unresolved because the
+  exact status was not captured. It must be classified on the next read-only
+  Task 12 run rather than guessed to be HTTP 404 or healthy.
+- The approved version-aware gate design is commit `8ff0f692`; its implementation
+  plan is `ac0c7399`. The local gate contract now separates immutable pre-deploy
+  checks, recognized legacy migration, and strict post-deploy acceptance without
+  changing runtime code, updater rollback, monitor redaction or trading authority.
 - Task 12 findings were repaired locally from exact clean base
   `eb3dc0d0868d8131f003c869842bddba07aa5c29`. The claim commit is `f2ca84f9`,
   the approved narrow design/plan commit is `ca912d4f`, the legacy monitor-env
@@ -184,14 +224,15 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- The repaired candidate requires a separately authorized non-force exact-SHA
-  push and remote-SHA verification. The remote integration branch remains at
-  `d2a9c4c615a3fc25af5842f6209b3a080e763e5c`; production remains unchanged.
-- Rerun Task 12 under new production-read-only authorization after integration.
-  Explain the four old zero-write pending/deferred execution contracts without
-  mutation. Deepcoin history completeness exhausted its single allowed retry in
-  the prior session and remains unknown; no Task 13 authorization is currently
-  eligible.
+- The version-aware Task 12 policy is local-only and is not yet pushed. A new
+  exact-SHA push requires separate authorization; the remote candidate remains
+  `a2bc1b4a42e7f9aeceadb2d1e5eb9006d707f3e6` and production remains unchanged.
+- Rerun Task 12 under separate production-read-only authorization. Capture the
+  exact contract-spec health HTTP status: only a verified previous production
+  SHA plus closed legacy monitor env plus HTTP 404 may be classified as
+  `legacy_capability_absent`; authentication failures, timeout, malformed
+  schema and every non-404 HTTP error remain blockers. Reconfirm current-account
+  Deepcoin snapshots and unique active-row ownership.
 - Explicit freeze, exact-SHA deployment, Linux/root helper verification,
   worker refresh/health checks, bounded observation, and future-signal-only
   restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
