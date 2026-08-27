@@ -31,9 +31,9 @@ source_baseline: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 remote_baseline_at_planning: bd862d74fdf4a3c9a792f2440ed301d9c5a1fba7
 approved_design_commit: 9707109dfd1f0815dec6edbc8809fa3fb89a00a0
 workstream_status: in_progress
-claimed_by: unclaimed
-claim_base_sha: null
-current_task: phase-7-low-perturbation-observer-design-approval-required
+claimed_by: codex-per-chat-phase7-low-perturbation-observer-20260826-root
+claim_base_sha: b24e8935ef5a548eb898110a40e62e98dce88e00
+current_task: phase-7-low-perturbation-observer-design-plan-red-green-and-fresh-two-hour-safe-retry
 current_phase: phase_7_cutover_acceptance
 current_phase_file: docs/plans/2026-08-25-per-chat-activation-event-loop-optimization/phase-7-cutover-acceptance.md
 last_completed_phase: phase_6_compatible_deployment
@@ -97,6 +97,8 @@ phase_6_exchange_parity_status: passed_two_complete_worker_owned_read_only_snaps
 phase_6_evidence_path: /opt/telegram-kol-analyzer/data/evidence/per-chat-phase6-compatible-deploy-20260826T055717Z/phase6-evidence.log
 phase_6_evidence_sha256: 7ed5d4baa4086f80586c4a27042f6158ac9a664c627b38d0040f891b79b36023
 phase_7_status: rolled_back_incomplete
+phase_7_low_perturbation_observer_authorization: owner_approved_design_local_red_green_full_suite_read_only_observer_install_fresh_two_hour_safe_retry_and_atomic_rollback
+phase_7_low_perturbation_observer_status: claimed_design_in_progress
 phase_7_web_stall_attribution_authorization: completed_owner_authorized_local_red_green_minimal_fix_tests_status_and_commits_only
 phase_7_web_stall_attribution_claim_commit: 400f28cb81fcd6dd199c3a644ae4531506f93167
 phase_7_web_stall_attribution_candidate_commit: 159264a1cd16b557efe01cf0792e209c36aeff37
@@ -330,7 +332,7 @@ schema_change_planned: false
 production_data_mutation_planned: false
 exchange_write_semantics_change_planned: false
 deployment_authorized: false
-cutover_authorized: false
+cutover_authorized: true
 ```
 
 ## Fixed Boundaries
@@ -380,6 +382,17 @@ cutover_authorized: false
 
 ## History
 
+- `2026-08-26 Phase 7 low-perturbation observer claim`: session
+  `codex-per-chat-phase7-low-perturbation-observer-20260826-root` exclusively
+  claimed the approved observer redesign at canonical commit
+  `b24e8935ef5a548eb898110a40e62e98dce88e00`. The owner approved the split-
+  cadence read-only design, local RED-to-GREEN implementation, one final full
+  suite, installation of the standalone observer candidate outside the
+  production runtime checkout, and one fresh two-hour `global + 1` to
+  `per_chat + 3` safe retry with the existing atomic rollback. Production
+  runtime deployment, restart, manufactured Telegram traffic, replay, worker
+  commands, trading configuration or database mutation, test trades, and
+  exchange writes remain unauthorized.
 - `2026-08-26 Phase 7 final safe-retry failed closed and rolled back`: exact
   production code `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f` passed the full
   read-only gate at `global + 1 + queue`. A transient claimed job was handled by
