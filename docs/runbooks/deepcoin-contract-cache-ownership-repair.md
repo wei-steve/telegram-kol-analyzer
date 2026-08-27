@@ -32,9 +32,22 @@ curl -fsS http://127.0.0.1:8000/api/trading-settings
 只读门禁必须共同证明：权威 checkout/branch/候选 exact SHA 正确、tracked tree
 干净、只有一个完整 runtime topology、无时间敏感策略操作、所有 active-write
 查询完整且为 `active_write_count=0`、队列/claim/recovery/监听/对账无异常、
-Deepcoin 只读订单和持仓历史能完成唯一归因。合约规格健康投影和最近新增的
-`contract_spec_sync_unavailable` 数也必须完整。此处禁止制造 Telegram 流量、
-历史信号 replay、补单或调用 Deepcoin 写接口。
+Deepcoin 当前 position、pending regular order 与 pending trigger/TPSL 查询完整，
+active row 均能唯一归因。schema-valid 但达到 100-row 上限的 history/fills 只记为
+有界历史覆盖；除非 active row 需要窗口外证据，否则不作为缓存迁移 blocker。
+
+旧生产只允许一个已识别可迁移旧版漂移：缓存是固定 regular single-link 目标、
+group/mode 正确，root owner 与缺失的 Agent deny ACL 是全部差异。候选 updater 的
+固定 helper 负责在冻结部署事务内同时收敛这两项。任何
+unknown owner/type/link/group/mode/ACL、父目录或 directory-entry binding 异常仍
+fail-closed。
+
+若旧生产已有 contract-spec health endpoint，它必须返回 HTTP 200 和完整 schema。
+只有 production SHA 已核验为 previous SHA、closed legacy monitor env 通过且端点
+明确返回 HTTP 404 时，才能记录 `legacy_capability_absent`。401/403、timeout、
+非 404 HTTP 错误或 malformed schema 都是 blocker。最近新增的
+`contract_spec_sync_unavailable` exact set 也必须完整。此处禁止制造 Telegram
+流量、历史信号 replay、补单或调用 Deepcoin 写接口。
 
 失败后的安全终态：代码和设置均未改变，`auto_trade` 保持原值，阶段保持
 `in_progress`，记录缺失证据后停止。
@@ -60,9 +73,9 @@ curl -fsS http://127.0.0.1:8000/api/trading-settings \
 冻结读回成功后，以 `MAX(raw_messages.id)` 记录
 `freeze_raw_message_id`。它只标记冻结窗口的审计起点，不是恢复后的执行水位：
 冻结期间到达但因 `auto_trade_enabled=false` 而终止的消息同样不得在恢复时重放。
-已知的 15 条历史 `contract_spec_sync_unavailable` 拒绝永不重放、永不补单，也不因
-修复缓存而自动执行；15 条均保持 `verified_refusal` 且
-`attempted_exchange_write=0`。另外 4 条旧的 zero-write 非终态执行合同必须在重跑
+冻结时动态记录全部历史 `contract_spec_sync_unavailable` exact set；每条必须保持
+`verified_refusal` 且 `attempted_exchange_write=0`。该集合永不重放、永不补单，也
+不因修复缓存而自动执行。另外 4 条旧的 zero-write 非终态执行合同必须在重跑
 Task 12 前仅用生产只读证据解释；本地文档不得猜测、重分类或修改它们。
 不得发送测试 Telegram 消息。
 
@@ -100,6 +113,10 @@ updater 必须保持 monitor timer/oneshot 的原状态，原子更新 expected 
 新消息没有产生 exchange write。Deepcoin 验证仅允许只读订单/持仓历史；禁止
 place/cancel/modify。
 
+部署后不再接受 `legacy_capability_absent` 或任何已识别可迁移旧版漂移：helper
+`--check` 必须满足完整候选合同，authenticated contract-spec health 必须返回
+HTTP 200 和 exact schema，然后才可进入冻结观察。
+
 失败后的安全终态：runtime 按 updater 的已测回滚路径恢复；monitor old unit/env
 恢复；timer 回到原状态；交易仍冻结。权限、刷新或外部查询 unknown 时不得启动
 恢复段。
@@ -108,8 +125,9 @@ place/cancel/modify。
 
 授权要求：独立的恢复自动交易批准。必须重新执行全部只读 preflight，并确认
 缓存 fresh、worker ownership/ACL 合同通过、零新增同步拒绝、无 backlog/duplicate/
-recovery、自然 future-only 流量验收通过且 Deepcoin 只读历史完整。恢复部署/监控
-期望必须显式使用：
+recovery、自然 future-only 流量验收通过，且 Deepcoin 当前账户快照完整、active row
+唯一归因。100-row 有界历史覆盖不冒充完整账户历史；任何 active row 需要窗口外
+证据时仍 fail-closed。恢复部署/监控期望必须显式使用：
 
 ```bash
 EXPECTED_COMMIT='<deployed-40-char-sha>' \

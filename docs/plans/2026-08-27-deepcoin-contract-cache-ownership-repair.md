@@ -19,8 +19,9 @@
   `runtime-serialization` worktree。
 - 禁止 `git add -A`；每次提交都显式列出路径并先检查
   `git diff --cached --name-only`。
-- Task 12 已观测到 15 条 `contract_spec_sync_unavailable` 拒绝；它们保持
-  `verified_refusal` 且 `attempted_exchange_write=0`，任何阶段都不重放、不补单。
+- Task 12 在每次冻结前动态记录 `contract_spec_sync_unavailable` 的 exact set；
+  集合内每条都必须保持 `verified_refusal` 且
+  `attempted_exchange_write=0`，任何阶段都不重放、不补单。
 - 运行时发布协议
   `mkstemp -> fsync -> strict reload -> os.replace -> directory fsync`
   不改动。
@@ -663,7 +664,7 @@ git commit -m "fix: govern monitor expectations during trade freeze"
 - monolith 停止且 active-write 为 0 后才迁移；
 - 冻结前/部署后/恢复前门禁；
 - `EXPECTED_AUTO_TRADE_STATE=disabled` 与恢复时 `enabled`；
-- 15 条历史拒绝永不重放；
+- 冻结时动态记录的历史拒绝 exact set 永不重放；
 - 代码回滚不自动恢复交易设置；
 - 原始 JSON、交易所明细和长日志只写 server evidence 文件。
 
@@ -800,12 +801,22 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 - Telegram session 仅 ingest 持有；
 - SQLite `PRAGMA quick_check=ok`、WAL 状态；
 - active exchange write、claimed job、active management、worker command、revision claim 全为 0；
-- Deepcoin position、regular order、trigger/TPSL 与历史查询全部完整；
+- Deepcoin 当前 position、pending regular order、pending trigger/TPSL 查询完整，
+  且所有 active row 可唯一归因；schema-valid 的 100-row history/fills 上限只记为
+  有界历史覆盖，除非 active row 需要窗口外证据，否则不作为缓存迁移 blocker；
 - 当前设置原值与 `MAX(raw_messages.id)`；
 - Linux/root 临时目录 sticky 集成测试通过；
-- helper `--check` 对当前 root-owned 缓存预期失败，失败只因 owner 漂移。
+- helper `--check` 必须通过完整候选合同，或只报告已识别可迁移旧版漂移：固定
+  regular single-link 目标的 group/mode 正确，且 root owner 与缺失的 Agent deny ACL
+  是全部差异。unknown owner/type/link/group/mode/ACL、父目录或 entry-binding 异常
+  仍 fail-closed；
+- contract-spec health 已存在时必须 HTTP 200 且 schema 完整。只有生产仍为已核验
+  previous SHA、closed legacy monitor env 通过且端点返回 HTTP 404 时，才可记为
+  `legacy_capability_absent`；401/403、timeout、非 404 HTTP 错误和 malformed schema
+  均阻断。
 
 任一外部查询不完整只允许一次有理由的重试；仍不完整则停止并保持生产未修改。
+版本感知只允许候选 updater 已覆盖且可回滚的已知旧版差异，不豁免不可迁移门禁。
 
 ### Task 13: 冻结、部署并保持关闭
 
@@ -813,7 +824,8 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 
 1. 停止 monitor timer，等待全部 monitor oneshot inactive，但不 disable；
 2. 将全局 `auto_trade_enabled` 写为 false，立即读回验证；
-3. 记录冻结 `raw_message_id` 水位，等待所有在途执行归零；
+3. 记录冻结 `raw_message_id` 水位和 terminal zero-write refusal exact set，等待所有
+   在途执行归零；
 4. 用批准的 exact SHA 和
    `EXPECTED_AUTO_TRADE_STATE=disabled` 调用现有 workstation helper；
 5. updater 在 worker 启动前安装 helper/unit，`ExecStartPre` 收敛缓存 owner；
@@ -828,6 +840,8 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 验证：
 
 - helper `--check` exit 0；目标 regular、nlink 1、worker/runtime、`0660`、Agent deny；
+- 旧版 `legacy_capability_absent` 不再允许：authenticated contract-spec health 必须
+  HTTP 200、schema 完整并满足完整候选合同；
 - worker 后台 refresh 成功，缓存 fresh、TTL/摘要/严格规格边界成立；
 - Deepcoin 产品查询完整且与缓存摘要输入一致；
 - parent 仍 `1777`，session/DB/backup 权限未漂移；
@@ -851,8 +865,8 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 - 冻结水位后同步拒绝数为 0；
 - Deepcoin 仓位/委托/trigger/TPSL 与冻结基线可解释；
 - active-write/queue/management/command/revision claim 为 0；
-- 历史 15 条拒绝仍为 terminal verified refusal 且
-  `attempted_exchange_write=0`。
+- 冻结时动态记录的 refusal exact set 仍全部为 terminal verified refusal 且
+  `attempted_exchange_write=0`，集合内没有 replay、backfill 或 resubmit。
 
 ### Task 16: 只恢复未来新信号
 
@@ -881,5 +895,5 @@ Expected: 远端精确为批准的 40 位 SHA；禁止 force push。生产状态
 3. live + auto trade 时 stale/unavailable/owner drift/new refusal 会被 monitor 捕获；
 4. freeze 时同一异常只降低 `restore_ready`，不误报为交易开启状态事故；
 5. 未来新信号恢复正常规格检查；
-6. 历史 15 条拒绝保持原终态，零重放、零补单；
+6. 冻结时动态记录的历史拒绝 exact set 保持原终态，零重放、零补单；
 7. 没有改变 symbol、TTL、下单计算、识别权威、队列权威或 exchange-write 归属语义。
