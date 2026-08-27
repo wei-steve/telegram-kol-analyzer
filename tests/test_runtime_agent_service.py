@@ -181,7 +181,9 @@ def test_runtime_agent_sanitizer_never_follows_agent_bait_symlink(tmp_path):
     assert target.stat().st_mode == original_mode
 
 
-def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp_path):
+def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(
+    tmp_path, monkeypatch
+):
     helper_path = (
         Path(__file__).parents[1]
         / "deploy"
@@ -212,8 +214,22 @@ def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp
     shared_cache.write_text("{}", encoding="utf-8")
     shared_cache.chmod(0o600)
     shared_runtime_calls = []
+    worker_owned_calls = []
     sanitizer.__globals__["_set_shared_runtime_acl_fd"] = (
         lambda fd: shared_runtime_calls.append(os.fstat(fd).st_ino)
+    )
+    sanitizer.__globals__["converge_contract_cache_permissions"] = (
+        lambda path, **kwargs: worker_owned_calls.append((Path(path).name, kwargs))
+    )
+    monkeypatch.setattr(
+        sanitizer.__globals__["pwd"],
+        "getpwnam",
+        lambda _name: type("Account", (), {"pw_uid": os.getuid()})(),
+    )
+    monkeypatch.setattr(
+        sanitizer.__globals__["grp"],
+        "getgrnam",
+        lambda _name: type("Group", (), {"gr_gid": os.getgid()})(),
     )
 
     sanitizer(trusted_owner_uid=os.getuid())
@@ -222,8 +238,17 @@ def test_runtime_agent_sanitizer_handles_reviewed_directory_and_rejects_bait(tmp
     assert set(shared_runtime_calls) == {
         regular.stat().st_ino,
         session_lock.stat().st_ino,
-        shared_cache.stat().st_ino,
     }
+    assert worker_owned_calls == [
+        (
+            "deepcoin_contract_specs_cache.json",
+            {
+                "worker_uid": os.getuid(),
+                "runtime_gid": os.getgid(),
+                "agent_user": "telegram-kol-agent",
+            },
+        )
+    ]
 
     target = tmp_path.parent / f"{tmp_path.name}-protected-target"
     try:

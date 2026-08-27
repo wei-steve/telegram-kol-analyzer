@@ -522,6 +522,31 @@ def test_worker_contract_cache_prepare_helper_has_a_fixed_narrow_target():
     assert "os.geteuid() != 0" in helper
 
 
+def test_runtime_agent_sanitizer_preserves_worker_owned_cache_classification():
+    repository_root = Path(__file__).resolve().parents[1]
+    helper = (
+        repository_root
+        / "deploy"
+        / "systemd"
+        / "telegram-kol-runtime-agent-prepare-db-acl"
+    ).read_text(encoding="utf-8")
+    installer = (
+        repository_root / "scripts" / "install_runtime_agent_sidecar.sh"
+    ).read_text(encoding="utf-8")
+
+    assert "WORKER_OWNED_RUNTIME_FILES" in helper
+    assert 'frozenset({"deepcoin_contract_specs_cache.json"})' in helper
+    assert "ROOT_SHARED_RUNTIME_FILES" in helper
+    assert "SHARED_RUNTIME_DATA_FILES" not in helper
+    assert "converge_contract_cache_permissions(" in helper
+    assert "worker_uid = pwd.getpwnam(WORKER_USER).pw_uid" in helper
+    assert "name in WORKER_OWNED_RUNTIME_FILES" in helper
+    assert "name in ROOT_SHARED_RUNTIME_FILES" in helper
+    assert 'WORKER_USER="telegram-kol-worker"' in installer
+    assert 'RUNTIME_GROUP="telegram-kol-runtime"' in installer
+    assert "getfacl" in installer
+
+
 def test_split_cutover_refreshes_generated_contract_cache_permissions():
     repository_root = Path(__file__).resolve().parents[1]
     deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(

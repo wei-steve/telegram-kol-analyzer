@@ -26,6 +26,8 @@ PREPARE_HELPER_TARGET="/usr/local/libexec/telegram-kol-runtime-agent-prepare-db-
 ENV_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"
 AGENT_USER="telegram-kol-agent"
 AGENT_GROUP="telegram-kol-agent"
+WORKER_USER="telegram-kol-worker"
+RUNTIME_GROUP="telegram-kol-runtime"
 DATA_DIRECTORY="$PRODUCTION_ROOT/data"
 DATABASE_PATH="$DATA_DIRECTORY/research.db"
 MONITOR_STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
@@ -54,8 +56,13 @@ if [[ "$(stat -c %u "$ENV_FILE")" != "0" || "$(stat -c %a "$ENV_FILE")" != "600"
   echo "Runtime incident environment file must be root-owned mode 0600." >&2
   exit 1
 fi
-if [[ ! -x /usr/bin/setfacl ]]; then
-  echo "/usr/bin/setfacl is required for least-privilege database access." >&2
+if [[ ! -x /usr/bin/setfacl || ! -x /usr/bin/getfacl ]]; then
+  echo "/usr/bin/setfacl and /usr/bin/getfacl are required for least-privilege data access." >&2
+  exit 1
+fi
+if ! id "$WORKER_USER" >/dev/null 2>&1 \
+  || ! getent group "$RUNTIME_GROUP" >/dev/null; then
+  echo "Split-runtime worker identity or runtime group is unavailable." >&2
   exit 1
 fi
 if [[ ! -d "$DATA_DIRECTORY" || ! -f "$DATABASE_PATH" ]]; then

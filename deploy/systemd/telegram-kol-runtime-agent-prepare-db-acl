@@ -10,9 +10,15 @@ import pwd
 import stat
 import subprocess
 import sys
+from pathlib import Path
+
+from telegram_kol_research.contract_cache_permissions import (
+    converge_contract_cache_permissions,
+)
 
 
 AGENT_USER = "telegram-kol-agent"
+WORKER_USER = "telegram-kol-worker"
 SHARED_RUNTIME_GROUP = "telegram-kol-runtime"
 SHARED_RUNTIME_USERS = (
     "telegram-kol-ingest",
@@ -27,9 +33,9 @@ SQLITE_PATHS = (
     f"{DATABASE_PATH}-journal",
 )
 SQLITE_NAMES = frozenset(os.path.basename(path) for path in SQLITE_PATHS)
-SHARED_RUNTIME_DATA_FILES = frozenset(
+WORKER_OWNED_RUNTIME_FILES = frozenset({"deepcoin_contract_specs_cache.json"})
+ROOT_SHARED_RUNTIME_FILES = frozenset(
     {
-        "deepcoin_contract_specs_cache.json",
         "telegram.session",
         "telegram.session-journal",
         "telegram.session-shm",
@@ -165,13 +171,23 @@ def _sanitize_non_database_files(*, trusted_owner_uid: int = 0) -> None:
                     deny_agent=name in DENIED_DATA_DIRECTORIES,
                 )
                 continue
+            if name in WORKER_OWNED_RUNTIME_FILES:
+                worker_uid = pwd.getpwnam(WORKER_USER).pw_uid
+                runtime_gid = grp.getgrnam(SHARED_RUNTIME_GROUP).gr_gid
+                converge_contract_cache_permissions(
+                    Path(os.path.dirname(DATABASE_PATH)) / name,
+                    worker_uid=worker_uid,
+                    runtime_gid=runtime_gid,
+                    agent_user=AGENT_USER,
+                )
+                continue
             try:
                 fd = _open_regular_nofollow_at(directory_fd, name)
             except FileNotFoundError:
                 continue
             try:
                 metadata = os.fstat(fd)
-                if name in SHARED_RUNTIME_DATA_FILES:
+                if name in ROOT_SHARED_RUNTIME_FILES:
                     if metadata.st_uid not in _trusted_shared_runtime_owner_uids(
                         trusted_owner_uid
                     ):
