@@ -484,7 +484,7 @@ def execute_entry_revision(
         acquired_at=now,
         require_cancel_quiescence=False,
     )
-    if not authority.acquired:
+    if not authority.acquired or authority.generation is None:
         return EntryRevisionExecutionResult(
             "in_progress",
             int(batch_id),
@@ -514,6 +514,7 @@ def execute_entry_revision(
         session_factory,
         token=str(authority.token),
         owner_kind="entry_revision_worker",
+        expected_generation=authority.generation,
         released_at=now,
     )
     if not released.released:

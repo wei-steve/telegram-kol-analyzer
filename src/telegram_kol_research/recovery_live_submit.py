@@ -939,21 +939,28 @@ def process_trade_signal_live(
     submission_progress = EntrySubmissionProgress()
     execution_boundary_at = now
     entry_authority_token: str | None = None
+    entry_authority_generation: int | None = None
     try:
         if trade_signal.action == "open_position":
+            authority_acquired_at = datetime.now(UTC)
             authority = acquire_entry_revision_exchange_authority(
                 session_factory,
                 owner_kind="new_entry_worker",
                 owner_id=f"signal:{int(trade_signal.id)}",
-                acquired_at=now,
+                acquired_at=authority_acquired_at,
                 require_cancel_quiescence=False,
             )
-            if not authority.acquired or authority.token is None:
+            if (
+                not authority.acquired
+                or authority.token is None
+                or authority.generation is None
+            ):
                 raise RecoveryLiveSubmitError(
                     authority.reason_code
                     or "entry_revision_exchange_authority_unavailable"
                 )
             entry_authority_token = str(authority.token)
+            entry_authority_generation = authority.generation
             verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
                 session_factory,
                 trade_signal=trade_signal,
@@ -1019,12 +1026,14 @@ def process_trade_signal_live(
         )
         if (
             entry_authority_token is not None
+            and entry_authority_generation is not None
             and submission_progress.attempted_writes == 0
         ):
             _release_new_entry_authority_or_raise(
                 session_factory,
                 authority_token=entry_authority_token,
-                released_at=execution_boundary_at,
+                authority_generation=entry_authority_generation,
+                released_at=datetime.now(UTC),
             )
         if failure is not exc:
             raise failure from exc
@@ -1045,11 +1054,15 @@ def process_trade_signal_live(
         error=None,
         projected_at=execution_boundary_at,
     )
-    if entry_authority_token is not None:
+    if (
+        entry_authority_token is not None
+        and entry_authority_generation is not None
+    ):
         _release_new_entry_authority_or_raise(
             session_factory,
             authority_token=entry_authority_token,
-            released_at=execution_boundary_at,
+            authority_generation=entry_authority_generation,
+            released_at=datetime.now(UTC),
         )
     return result
 
@@ -1058,12 +1071,14 @@ def _release_new_entry_authority_or_raise(
     session_factory: sessionmaker,
     *,
     authority_token: str,
+    authority_generation: int,
     released_at: datetime,
 ) -> None:
     released = release_entry_revision_exchange_authority(
         session_factory,
         token=authority_token,
         owner_kind="new_entry_worker",
+        expected_generation=authority_generation,
         released_at=released_at,
     )
     if released.released:

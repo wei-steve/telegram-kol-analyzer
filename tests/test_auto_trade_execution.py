@@ -17,6 +17,9 @@ from telegram_kol_research.deepcoin_client import DeepcoinCredentials
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord, ExecutionOrderLegRecord, upsert_execution_binding, upsert_execution_order_leg
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLookup
 from telegram_kol_research.group_config import GroupConfig
@@ -28,6 +31,22 @@ from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
+
+
+_BASE_CREATE_SESSION_FACTORY = create_session_factory
+
+
+def create_session_factory(*args, **kwargs):
+    session_factory = _BASE_CREATE_SESSION_FACTORY(*args, **kwargs)
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
+    )
+    if not result.seeded and result.reason_code != (
+        "entry_revision_exchange_authority_already_exists"
+    ):
+        raise AssertionError(result.reason_code)
+    return session_factory
 
 
 class _StaticContractSpecProvider:

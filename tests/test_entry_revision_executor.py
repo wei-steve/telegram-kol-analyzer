@@ -2,6 +2,9 @@ import json
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.entry_revision_planner import plan_entry_revision
 from telegram_kol_research.models import (
     EntryRevisionReplacement,
@@ -22,6 +25,20 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 8, 13, tzinfo=UTC)
+_BASE_CREATE_SESSION_FACTORY = create_session_factory
+
+
+def create_session_factory(*args, **kwargs):
+    session_factory = _BASE_CREATE_SESSION_FACTORY(*args, **kwargs)
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=NOW,
+    )
+    if not result.seeded and result.reason_code != (
+        "entry_revision_exchange_authority_already_exists"
+    ):
+        raise AssertionError(result.reason_code)
+    return session_factory
 
 
 def test_native_tpsl_without_pos_id_uses_frozen_ledger_order_identity():
@@ -445,7 +462,7 @@ def test_live_revision_owns_authority_during_exchange_and_releases_on_return(
                 document = json.loads(row.value_json)
             assert document["state"] == "held"
             assert document["owner_kind"] == "entry_revision_worker"
-            assert document["owner_id"] == f"batch:{batch_id}"
+            assert document["action_id"] == f"batch:{batch_id}"
             return super().cancel_trigger_order(payload)
 
     result = execute_entry_revision(
@@ -503,7 +520,7 @@ def test_unhandled_revision_exception_retains_exchange_authority(tmp_path):
         document = json.loads(row.value_json)
     assert document["state"] == "held"
     assert document["owner_kind"] == "entry_revision_worker"
-    assert document["owner_id"] == f"batch:{batch_id}"
+    assert document["action_id"] == f"batch:{batch_id}"
 
 
 def test_disabled_and_shadow_revision_do_not_acquire_exchange_authority(tmp_path):
@@ -536,15 +553,15 @@ def test_disabled_and_shadow_revision_do_not_acquire_exchange_authority(tmp_path
             "disabled" if mode == "disabled" else "shadow_planned"
         )
         with session_factory() as session:
-            assert (
+            row = (
                 session.query(TradingSetting)
                 .filter(
                     TradingSetting.key
                     == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
                 )
-                .one_or_none()
-                is None
+                .one()
             )
+            assert json.loads(row.value_json)["state"] == "idle"
 
 
 def test_live_activation_does_not_replay_older_pending_fragments(tmp_path):

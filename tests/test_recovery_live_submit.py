@@ -18,6 +18,7 @@ from telegram_kol_research.entry_strategy_assembly import (
 from telegram_kol_research.entry_revision_exchange_authority import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
     acquire_entry_revision_exchange_authority,
+    seed_entry_revision_exchange_authority,
 )
 from telegram_kol_research.models import (
     EntryStrategyAssembly,
@@ -63,6 +64,22 @@ from telegram_kol_research.trade_signals import enqueue_trade_signal
 from telegram_kol_research.trade_signals import canonical_management_batch_id
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
+
+
+_BASE_CREATE_SESSION_FACTORY = create_session_factory
+
+
+def create_session_factory(*args, **kwargs):
+    session_factory = _BASE_CREATE_SESSION_FACTORY(*args, **kwargs)
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
+    )
+    if not result.seeded and result.reason_code != (
+        "entry_revision_exchange_authority_already_exists"
+    ):
+        raise AssertionError(result.reason_code)
+    return session_factory
 
 
 class _StaticContractSpecProvider:
@@ -1770,7 +1787,7 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
     authority = _stored_entry_exchange_authority(session_factory)
     assert authority["state"] == "held"
     assert authority["owner_kind"] == "new_entry_worker"
-    assert authority["owner_id"] == f"signal:{signal.id}"
+    assert authority["action_id"] == f"signal:{signal.id}"
 
     with pytest.raises(
         RecoveryLiveSubmitError,

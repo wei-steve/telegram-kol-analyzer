@@ -135,7 +135,7 @@ def execute_strategy_revision(
         acquired_at=now,
         require_cancel_quiescence=False,
     )
-    if not authority.acquired:
+    if not authority.acquired or authority.generation is None:
         return {
             "status": "in_progress",
             "reason": (
@@ -159,6 +159,7 @@ def execute_strategy_revision(
         return _release_legacy_revision_authority(
             session_factory,
             authority_token=str(authority.token),
+            authority_generation=authority.generation,
             result=result,
             released_at=now,
         )
@@ -202,6 +203,7 @@ def execute_strategy_revision(
     return _release_legacy_revision_authority(
         session_factory,
         authority_token=str(authority.token),
+        authority_generation=authority.generation,
         result=result,
         released_at=now,
     )
@@ -235,6 +237,7 @@ def _release_legacy_revision_authority(
     session_factory: sessionmaker,
     *,
     authority_token: str,
+    authority_generation: int,
     result: dict[str, Any],
     released_at: datetime,
 ) -> dict[str, Any]:
@@ -242,6 +245,7 @@ def _release_legacy_revision_authority(
         session_factory,
         token=authority_token,
         owner_kind="entry_revision_worker",
+        expected_generation=authority_generation,
         released_at=released_at,
     )
     if released.released:
