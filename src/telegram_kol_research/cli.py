@@ -115,6 +115,7 @@ from telegram_kol_research.legacy_runtime_drain_bridge import (
     build_legacy_runtime_drain_evidence,
     fence_legacy_runtime_revisions,
     freeze_legacy_runtime_drain_bridge,
+    handoff_legacy_runtime_drain_bridge,
     mark_legacy_runtime_bridge_drained,
     read_local_legacy_worker_identity,
     release_legacy_runtime_bridge_for_deploy,
@@ -5096,6 +5097,9 @@ def bridge_reviewed_pending_entries(
     expected_production_sha: str = typer.Option(
         ..., "--expected-production-sha"
     ),
+    expected_candidate_sha: str | None = typer.Option(
+        None, "--expected-candidate-sha"
+    ),
     service_name: str = typer.Option(
         "telegram-kol.service", "--service-name"
     ),
@@ -5117,13 +5121,26 @@ def bridge_reviewed_pending_entries(
         "plan",
         "freeze",
         "fence",
+        "handoff",
         "rollback",
         "mark-drained",
         "release-for-deploy",
     }
     if action not in allowed_actions:
         raise typer.BadParameter("unknown bridge action")
-    if action != "plan":
+    if action == "handoff":
+        missing = []
+        if not expected_candidate_sha:
+            missing.append("--expected-candidate-sha")
+        if not bridge_token:
+            missing.append("--bridge-token")
+        if not confirmation_token:
+            missing.append("--confirmation-token")
+        if missing:
+            raise typer.BadParameter(
+                f"{action} requires " + ", ".join(missing)
+            )
+    elif action != "plan":
         missing = []
         if not expected_fingerprint:
             missing.append("--expected-fingerprint")
@@ -5137,6 +5154,33 @@ def bridge_reviewed_pending_entries(
             raise typer.BadParameter(
                 f"{action} requires " + ", ".join(missing)
             )
+
+    if action == "handoff":
+        observed_at = datetime.now(UTC)
+        candidate_identity = read_local_legacy_worker_identity(
+            checkout_path=checkout_path,
+            expected_production_sha=str(expected_candidate_sha),
+            service_name=service_name,
+        )
+        session_factory = create_existing_session_factory(database_path)
+        result = handoff_legacy_runtime_drain_bridge(
+            session_factory,
+            bridge_token=str(bridge_token),
+            candidate_runtime_identity=candidate_identity,
+            expected_candidate_sha=str(expected_candidate_sha),
+            confirmation_token=str(confirmation_token),
+            handed_off_at=observed_at,
+        )
+        typer.echo(
+            json.dumps(
+                _legacy_bridge_cli_result(result),
+                ensure_ascii=True,
+                sort_keys=True,
+            )
+        )
+        if result.status != "handed_off":
+            raise typer.Exit(code=2)
+        return
 
     observed_at = datetime.now(UTC)
     identity = read_local_legacy_worker_identity(

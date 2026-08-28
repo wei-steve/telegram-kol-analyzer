@@ -19,6 +19,8 @@ from telegram_kol_research.legacy_runtime_drain_bridge import (
     complete_legacy_runtime_bridge_cancellation,
     fence_legacy_runtime_revisions,
     freeze_legacy_runtime_drain_bridge,
+    handoff_legacy_runtime_drain_bridge,
+    legacy_runtime_bridge_revision_gate_state,
     mark_legacy_runtime_bridge_unknown,
     mark_legacy_runtime_bridge_drained,
     read_local_legacy_worker_identity,
@@ -49,6 +51,7 @@ from telegram_kol_research.trading_settings import (
 
 NOW = datetime(2026, 8, 27, 22, 0, tzinfo=UTC)
 OLD_SHA = "0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f"
+CANDIDATE_SHA = "5024a59e97b4328acba101f9bc138d7bf3d47530"
 REVIEWED_IDS = (
     "1001124718697641",
     "1001124718698413",
@@ -65,6 +68,16 @@ def _identity(**overrides):
         "production_sha": OLD_SHA,
         "worker_pid": 2350028,
         "worker_start_ticks": 987654,
+    }
+    values.update(overrides)
+    return LegacyRuntimeIdentity(**values)
+
+
+def _candidate_identity(**overrides):
+    values = {
+        "production_sha": CANDIDATE_SHA,
+        "worker_pid": 2351029,
+        "worker_start_ticks": 987777,
     }
     values.update(overrides)
     return LegacyRuntimeIdentity(**values)
@@ -716,6 +729,208 @@ def _stored_bridge(session_factory):
             .one()
         )
         return json.loads(row.value_json)
+
+
+def _handoff_bridge(session_factory):
+    bridge_token = _fenced_bridge(session_factory)
+    result = handoff_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        candidate_runtime_identity=_candidate_identity(),
+        expected_candidate_sha=CANDIDATE_SHA,
+        confirmation_token="bridge-handoff-token",
+        handed_off_at=NOW + timedelta(seconds=1),
+    )
+    assert result.status == "handed_off"
+    return bridge_token
+
+
+def test_exact_candidate_handoff_retains_entry_freeze_and_live_management(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "handoff.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "trigger_protection_stop_rescue_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+        updated_at=NOW,
+    )
+
+    bridge_token = _handoff_bridge(session_factory)
+
+    stored = _stored_bridge(session_factory)
+    assert stored["state"] == "handed_off"
+    assert stored["bridge_token"] == bridge_token
+    assert stored["production_sha"] == OLD_SHA
+    assert stored["worker_pid"] == _identity().worker_pid
+    assert stored["worker_start_ticks"] == _identity().worker_start_ticks
+    assert stored["authority_production_sha"] == CANDIDATE_SHA
+    assert stored["authority_worker_pid"] == _candidate_identity().worker_pid
+    assert (
+        stored["authority_worker_start_ticks"]
+        == _candidate_identity().worker_start_ticks
+    )
+    settings = load_trading_settings(session_factory)
+    assert settings.auto_trade_enabled is False
+    assert settings.legacy_entry_submission_frozen is True
+    assert settings.entry_submission_enabled is False
+    assert settings.live_management_execution_enabled is True
+    assert settings.effective_composite_management_v2_mode == "live"
+    assert settings.effective_trigger_protection_stop_rescue_mode == "live"
+    assert settings.effective_position_management_liveness_v2_mode == "live"
+
+
+def test_candidate_handoff_requires_exact_distinct_sha(tmp_path):
+    session_factory = create_session_factory(tmp_path / "handoff-sha.db")
+    bridge_token = _fenced_bridge(session_factory)
+
+    wrong_sha = handoff_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        candidate_runtime_identity=_candidate_identity(),
+        expected_candidate_sha="f" * 40,
+        confirmation_token="wrong-candidate-sha-token",
+        handed_off_at=NOW + timedelta(seconds=1),
+    )
+    same_as_legacy = handoff_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        candidate_runtime_identity=_identity(),
+        expected_candidate_sha=OLD_SHA,
+        confirmation_token="same-candidate-sha-token",
+        handed_off_at=NOW + timedelta(seconds=1),
+    )
+
+    assert wrong_sha.status == "blocked"
+    assert wrong_sha.reason_code == "legacy_bridge_candidate_sha_drift"
+    assert same_as_legacy.status == "blocked"
+    assert same_as_legacy.reason_code == "legacy_bridge_candidate_not_distinct"
+    assert _stored_bridge(session_factory)["state"] == "fenced"
+
+
+def test_handoff_binds_cancellation_to_candidate_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "handoff-owner.db")
+    bridge_token = _handoff_bridge(session_factory)
+
+    old_worker = begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW + timedelta(seconds=2),
+    )
+    candidate = begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_candidate_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW + timedelta(seconds=2),
+    )
+    completed = complete_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_candidate_identity(),
+        order_id=REVIEWED_IDS[0],
+        completed_at=NOW + timedelta(seconds=3),
+    )
+
+    assert old_worker.status == "blocked"
+    assert old_worker.reason_code == "legacy_bridge_production_sha_drift"
+    assert candidate.status == "cancelling"
+    assert completed.status == "handed_off"
+    assert _stored_bridge(session_factory)["state"] == "handed_off"
+
+
+def test_handoff_revision_gate_binds_to_candidate_identity(tmp_path):
+    session_factory = create_session_factory(tmp_path / "handoff-gate.db")
+    _handoff_bridge(session_factory)
+
+    with session_factory() as session:
+        old_worker = legacy_runtime_bridge_revision_gate_state(
+            session,
+            runtime_identity=_identity(),
+            reviewed_order_ids=REVIEWED_IDS,
+        )
+        candidate = legacy_runtime_bridge_revision_gate_state(
+            session,
+            runtime_identity=_candidate_identity(),
+            reviewed_order_ids=REVIEWED_IDS,
+        )
+
+    assert old_worker == "blocked"
+    assert candidate == "fenced"
+
+
+def test_handoff_prewrite_rollback_restores_all_settings_and_sentinels(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "handoff-rollback.db")
+    bridge_token = _handoff_bridge(session_factory)
+
+    rolled_back = rollback_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_candidate_identity(),
+        confirmation_token="handoff-rollback-token",
+        rolled_back_at=NOW + timedelta(seconds=2),
+    )
+
+    assert rolled_back.status == "rolled_back"
+    settings = load_trading_settings(session_factory)
+    assert settings.auto_trade_enabled is True
+    assert settings.legacy_entry_submission_frozen is False
+    assert settings.entry_revision_v2_mode == "live"
+    with session_factory() as session:
+        assert (
+            session.query(StrategyRevisionBatch)
+            .filter(
+                (StrategyRevisionBatch.advance_claim_token.is_not(None))
+                | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+            )
+            .count()
+            == 0
+        )
+        assert (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+            .one_or_none()
+            is None
+        )
+
+
+def test_handoff_refuses_any_prior_reviewed_write_boundary(tmp_path):
+    session_factory = create_session_factory(tmp_path / "handoff-write.db")
+    bridge_token = _fenced_bridge(session_factory)
+    assert begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW,
+    ).status == "cancelling"
+    assert complete_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        completed_at=NOW,
+    ).status == "fenced"
+
+    result = handoff_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        candidate_runtime_identity=_candidate_identity(),
+        expected_candidate_sha=CANDIDATE_SHA,
+        confirmation_token="late-handoff-token",
+        handed_off_at=NOW + timedelta(seconds=1),
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_handoff_write_boundary_reached"
 
 
 def test_one_bridge_cancellation_records_only_exact_completed_order(tmp_path):

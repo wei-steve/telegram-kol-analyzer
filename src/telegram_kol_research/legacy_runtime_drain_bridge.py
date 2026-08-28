@@ -46,11 +46,12 @@ from telegram_kol_research.trading_settings import (
 
 
 LEGACY_RUNTIME_DRAIN_BRIDGE_KEY = "legacy_runtime_drain_bridge"
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 _STATES = frozenset(
     {
         "frozen",
         "fenced",
+        "handed_off",
         "cancelling",
         "unknown_locked",
         "drained",
@@ -66,9 +67,14 @@ _DOCUMENT_KEYS = frozenset(
         "production_sha",
         "worker_pid",
         "worker_start_ticks",
+        "authority_production_sha",
+        "authority_worker_pid",
+        "authority_worker_start_ticks",
+        "handoff_at",
         "frozen_at",
         "freeze_raw_message_id",
         "original_auto_trade_enabled",
+        "original_legacy_entry_submission_frozen",
         "original_entry_revision_v2_mode",
         "reason_code",
         "reviewed_order_ids",
@@ -207,11 +213,11 @@ def _build_plan_in_session(
         state = str(document["state"])
         fenced_batch_ids = tuple(document["fenced_batch_ids"])
         completed_order_ids = tuple(document["completed_order_ids"])
-        if document["production_sha"] != expected_sha:
+        if document["authority_production_sha"] != expected_sha:
             conflicts.append({"reason": "legacy_bridge_production_sha_drift"})
         if (
-            document["worker_pid"] != runtime_identity.worker_pid
-            or document["worker_start_ticks"]
+            document["authority_worker_pid"] != runtime_identity.worker_pid
+            or document["authority_worker_start_ticks"]
             != runtime_identity.worker_start_ticks
         ):
             conflicts.append({"reason": "legacy_bridge_worker_identity_drift"})
@@ -389,8 +395,12 @@ def freeze_legacy_runtime_drain_bridge(
                 "freeze_raw_message_id": watermark,
                 "frozen_at": observed_at.isoformat(),
                 "original_auto_trade_enabled": settings.auto_trade_enabled,
+                "original_legacy_entry_submission_frozen": (
+                    settings.legacy_entry_submission_frozen
+                ),
                 "original_entry_revision_v2_mode": settings.entry_revision_v2_mode,
                 "production_sha": runtime_identity.production_sha,
+                "authority_production_sha": runtime_identity.production_sha,
                 "reason_code": None,
                 "reviewed_order_ids": list(reviewed),
                 "schema_version": _SCHEMA_VERSION,
@@ -398,6 +408,11 @@ def freeze_legacy_runtime_drain_bridge(
                 "updated_at": observed_at.isoformat(),
                 "worker_pid": runtime_identity.worker_pid,
                 "worker_start_ticks": runtime_identity.worker_start_ticks,
+                "authority_worker_pid": runtime_identity.worker_pid,
+                "authority_worker_start_ticks": (
+                    runtime_identity.worker_start_ticks
+                ),
+                "handoff_at": None,
                 "write_boundary_reached": False,
             }
             session.add(
@@ -545,7 +560,7 @@ def rollback_legacy_runtime_drain_bridge(
                 session,
                 bridge_token=clean_token,
                 runtime_identity=runtime_identity,
-                allowed_states={"frozen", "fenced"},
+                allowed_states={"frozen", "fenced", "handed_off"},
             )
             if error is not None:
                 session.rollback()
@@ -554,7 +569,7 @@ def rollback_legacy_runtime_drain_bridge(
                 session.rollback()
                 return _result("blocked", "legacy_bridge_rollback_forbidden")
             error = _frozen_settings_reason(session)
-            if error is None and document["state"] == "fenced":
+            if error is None and document["state"] in {"fenced", "handed_off"}:
                 error = _revision_sentinel_reason(session, document=document)
             if error is None:
                 error = _bridge_unknown_mutation_reason(
@@ -595,6 +610,9 @@ def rollback_legacy_runtime_drain_bridge(
                         "auto_trade_enabled": document[
                             "original_auto_trade_enabled"
                         ],
+                        "legacy_entry_submission_frozen": document[
+                            "original_legacy_entry_submission_frozen"
+                        ],
                         "entry_revision_v2_mode": document[
                             "original_entry_revision_v2_mode"
                         ],
@@ -627,6 +645,117 @@ def rollback_legacy_runtime_drain_bridge(
         return _result("blocked", "legacy_bridge_database_unavailable")
 
 
+def handoff_legacy_runtime_drain_bridge(
+    session_factory,
+    *,
+    bridge_token: str,
+    candidate_runtime_identity: LegacyRuntimeIdentity,
+    expected_candidate_sha: str,
+    confirmation_token: str,
+    handed_off_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Transfer a zero-write fenced bridge to one exact candidate worker."""
+
+    clean_token = _bridge_token(bridge_token)
+    expected_sha = _sha(
+        expected_candidate_sha,
+        field_name="expected_candidate_sha",
+    )
+    clean_confirmation = _confirmation_token(confirmation_token)
+    observed_at = _aware_utc(handed_off_at, field_name="handed_off_at")
+    if candidate_runtime_identity.production_sha != expected_sha:
+        return _result("blocked", "legacy_bridge_candidate_sha_drift")
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row = (
+                session.query(TradingSetting)
+                .filter(
+                    TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY
+                )
+                .one_or_none()
+            )
+            document = None if row is None else _bridge_document(row.value_json)
+            if row is None or document is None:
+                session.rollback()
+                return _result("blocked", "legacy_bridge_state_invalid")
+            if document["state"] != "fenced":
+                session.rollback()
+                return _result("blocked", "legacy_bridge_state_mismatch")
+            if document["bridge_token"] != clean_token:
+                session.rollback()
+                return _result("blocked", "legacy_bridge_owner_mismatch")
+            if expected_sha == document["production_sha"]:
+                session.rollback()
+                return _result(
+                    "blocked", "legacy_bridge_candidate_not_distinct"
+                )
+            if (
+                document["authority_production_sha"]
+                != document["production_sha"]
+                or document["authority_worker_pid"] != document["worker_pid"]
+                or document["authority_worker_start_ticks"]
+                != document["worker_start_ticks"]
+                or document["handoff_at"] is not None
+            ):
+                session.rollback()
+                return _result("blocked", "legacy_bridge_state_invalid")
+            if (
+                document["write_boundary_reached"]
+                or document["completed_order_ids"]
+            ):
+                session.rollback()
+                return _result(
+                    "blocked",
+                    "legacy_bridge_handoff_write_boundary_reached",
+                )
+            error = _frozen_settings_reason(session)
+            if error is None:
+                error = _revision_sentinel_reason(
+                    session,
+                    document=document,
+                )
+            if error is None:
+                error = _bridge_unknown_mutation_reason(
+                    session,
+                    reviewed_order_ids=tuple(document["reviewed_order_ids"]),
+                )
+            if error is None:
+                error = _inner_authority_reason(session)
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            document["state"] = "handed_off"
+            document["authority_production_sha"] = expected_sha
+            document["authority_worker_pid"] = (
+                candidate_runtime_identity.worker_pid
+            )
+            document["authority_worker_start_ticks"] = (
+                candidate_runtime_identity.worker_start_ticks
+            )
+            document["handoff_at"] = observed_at.isoformat()
+            document["updated_at"] = observed_at.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = observed_at
+            _consume_confirmation_in_session(
+                session,
+                confirmation_token=clean_confirmation,
+                action_kind="handoff_legacy_runtime_drain_bridge",
+                action_id=clean_token,
+                pos_id=f"legacy-bridge:{clean_token}",
+                consumed_at=observed_at,
+            )
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(
+                status="handed_off",
+                bridge_token=clean_token,
+            )
+    except IntegrityError:
+        return _result("blocked", "legacy_bridge_confirmation_used")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
 def begin_legacy_runtime_bridge_cancellation(
     session_factory,
     *,
@@ -647,7 +776,7 @@ def begin_legacy_runtime_bridge_cancellation(
                 session,
                 bridge_token=clean_token,
                 runtime_identity=runtime_identity,
-                allowed_states={"fenced"},
+                allowed_states={"fenced", "handed_off"},
             )
             if error is None:
                 error = _bridge_cancellation_invariant_reason(
@@ -707,7 +836,9 @@ def complete_legacy_runtime_bridge_cancellation(
                 session.rollback()
                 return _result("blocked", "legacy_bridge_order_already_completed")
             completed.add(clean_order_id)
-            document["state"] = "fenced"
+            document["state"] = (
+                "handed_off" if document["handoff_at"] is not None else "fenced"
+            )
             document["active_order_id"] = None
             document["completed_order_ids"] = sorted(completed)
             document["reason_code"] = None
@@ -715,7 +846,7 @@ def complete_legacy_runtime_bridge_cancellation(
             row.value_json = _canonical_json(document)
             row.updated_at = observed_at
             session.commit()
-            return LegacyRuntimeDrainBridgeResult(status="fenced")
+            return LegacyRuntimeDrainBridgeResult(status=document["state"])
     except SQLAlchemyError:
         return _result("blocked", "legacy_bridge_database_unavailable")
 
@@ -869,7 +1000,7 @@ def mark_legacy_runtime_bridge_drained(
                 session,
                 bridge_token=clean_token,
                 runtime_identity=runtime_identity,
-                allowed_states={"fenced"},
+                allowed_states={"fenced", "handed_off"},
             )
             if error is None and tuple(document["reviewed_order_ids"]) != tuple(
                 evidence.reviewed_order_ids
@@ -1116,10 +1247,11 @@ def legacy_runtime_bridge_revision_gate_state(
     except ValueError:
         return "blocked"
     if (
-        document["state"] not in {"fenced", "drained"}
-        or document["production_sha"] != runtime_identity.production_sha
-        or document["worker_pid"] != runtime_identity.worker_pid
-        or document["worker_start_ticks"]
+        document["state"] not in {"fenced", "handed_off", "drained"}
+        or document["authority_production_sha"]
+        != runtime_identity.production_sha
+        or document["authority_worker_pid"] != runtime_identity.worker_pid
+        or document["authority_worker_start_ticks"]
         != runtime_identity.worker_start_ticks
         or tuple(document["reviewed_order_ids"]) != reviewed
         or _frozen_settings_reason(session) is not None
@@ -1146,7 +1278,7 @@ def validate_legacy_runtime_bridge_cancellation_ready(
                 session,
                 bridge_token=clean_token,
                 runtime_identity=runtime_identity,
-                allowed_states={"fenced"},
+                allowed_states={"fenced", "handed_off"},
             )
             if error is None:
                 error = _bridge_cancellation_invariant_reason(
@@ -1180,6 +1312,10 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         production_sha = _sha(
             value.get("production_sha"), field_name="production_sha"
         )
+        authority_production_sha = _sha(
+            value.get("authority_production_sha"),
+            field_name="authority_production_sha",
+        )
         frozen_at = _aware_utc_text(value.get("frozen_at"))
         updated_at = _aware_utc_text(value.get("updated_at"))
         reviewed = _reviewed_order_ids(value.get("reviewed_order_ids", ()))
@@ -1191,17 +1327,25 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         return None
     worker_pid = value.get("worker_pid")
     worker_start_ticks = value.get("worker_start_ticks")
+    authority_worker_pid = value.get("authority_worker_pid")
+    authority_worker_start_ticks = value.get(
+        "authority_worker_start_ticks"
+    )
     watermark = value.get("freeze_raw_message_id")
     if any(
         isinstance(item, bool) or not isinstance(item, int) or item < minimum
         for item, minimum in (
             (worker_pid, 1),
             (worker_start_ticks, 1),
+            (authority_worker_pid, 1),
+            (authority_worker_start_ticks, 1),
             (watermark, 0),
         )
     ):
         return None
     if type(value.get("original_auto_trade_enabled")) is not bool:
+        return None
+    if type(value.get("original_legacy_entry_submission_frozen")) is not bool:
         return None
     if value.get("original_entry_revision_v2_mode") not in {
         "disabled",
@@ -1236,6 +1380,22 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         active_order_id is not None or reason_code is not None
     ):
         return None
+    handoff_at = value.get("handoff_at")
+    authority_is_legacy = (
+        authority_production_sha == production_sha
+        and authority_worker_pid == worker_pid
+        and authority_worker_start_ticks == worker_start_ticks
+    )
+    if handoff_at is None:
+        if not authority_is_legacy or value["state"] == "handed_off":
+            return None
+    else:
+        try:
+            handoff_at = _aware_utc_text(handoff_at).isoformat()
+        except ValueError:
+            return None
+        if authority_is_legacy or value["state"] in {"frozen", "fenced"}:
+            return None
     drained_at = value.get("drained_at")
     drain_fingerprint = value.get("drain_evidence_fingerprint")
     if value["state"] in {"drained", "released_for_deploy"}:
@@ -1254,7 +1414,9 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
     return {
         **value,
         "production_sha": production_sha,
+        "authority_production_sha": authority_production_sha,
         "frozen_at": frozen_at.isoformat(),
+        "handoff_at": handoff_at,
         "updated_at": updated_at.isoformat(),
         "reviewed_order_ids": list(reviewed),
         "fenced_batch_ids": list(fenced),
@@ -1283,11 +1445,15 @@ def _owned_bridge_in_session(
         return row, document, "legacy_bridge_state_mismatch"
     if document["bridge_token"] != bridge_token:
         return row, document, "legacy_bridge_owner_mismatch"
-    if document["production_sha"] != runtime_identity.production_sha:
+    if (
+        document["authority_production_sha"]
+        != runtime_identity.production_sha
+    ):
         return row, document, "legacy_bridge_production_sha_drift"
     if (
-        document["worker_pid"] != runtime_identity.worker_pid
-        or document["worker_start_ticks"] != runtime_identity.worker_start_ticks
+        document["authority_worker_pid"] != runtime_identity.worker_pid
+        or document["authority_worker_start_ticks"]
+        != runtime_identity.worker_start_ticks
     ):
         return row, document, "legacy_bridge_worker_identity_drift"
     return row, document, None
@@ -1301,6 +1467,8 @@ def _frozen_settings_reason(session) -> str | None:
         return "legacy_bridge_settings_invalid"
     if settings.auto_trade_enabled is not False:
         return "legacy_bridge_auto_trade_not_frozen"
+    if settings.legacy_entry_submission_frozen is not True:
+        return "legacy_bridge_entry_submission_not_frozen"
     if settings.entry_revision_v2_mode != "disabled":
         return "legacy_bridge_revision_not_disabled"
     if settings.message_pipeline_mode != "queue":

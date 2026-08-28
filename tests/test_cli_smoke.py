@@ -322,6 +322,127 @@ def test_bridge_mutations_require_confirmation_before_runtime_or_database_access
     assert touched == []
 
 
+def test_bridge_handoff_requires_candidate_contract_before_any_access(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    touched = []
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: touched.append("identity"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda *_args, **_kwargs: touched.append("database"),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            "--action",
+            "handoff",
+            "--database-path",
+            str(tmp_path / "missing.db"),
+            "--checkout-path",
+            str(tmp_path),
+            "--expected-production-sha",
+            "0" * 40,
+            "--bridge-token",
+            "bridge-token",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "expected-candidate-sha" in result.output
+    assert "confirmation-token" in result.output
+    assert touched == []
+
+
+def test_bridge_handoff_cli_reads_exact_candidate_and_redacts_tokens(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    candidate_sha = "5" * 40
+    candidate = LegacyRuntimeIdentity(
+        production_sha=candidate_sha,
+        worker_pid=303,
+        worker_start_ticks=404,
+    )
+    calls = []
+
+    def read_identity(**kwargs):
+        calls.append(("identity", kwargs))
+        return candidate
+
+    def handoff(session_factory, **kwargs):
+        calls.append(("handoff", session_factory, kwargs))
+        return LegacyRuntimeDrainBridgeResult(status="handed_off")
+
+    session_factory = object()
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        read_identity,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda *_args, **_kwargs: session_factory,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "handoff_legacy_runtime_drain_bridge",
+        handoff,
+        raising=False,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            "--action",
+            "handoff",
+            "--database-path",
+            str(tmp_path / "bridge.db"),
+            "--checkout-path",
+            str(tmp_path),
+            "--expected-production-sha",
+            "0" * 40,
+            "--expected-candidate-sha",
+            candidate_sha,
+            "--bridge-token",
+            "secret-bridge-token",
+            "--confirmation-token",
+            "secret-confirmation-token",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.output) == {
+        "reason_code": None,
+        "status": "handed_off",
+    }
+    assert "secret-bridge-token" not in result.output
+    assert "secret-confirmation-token" not in result.output
+    assert calls[0][0] == "identity"
+    assert calls[0][1]["expected_production_sha"] == candidate_sha
+    assert calls[1][0] == "handoff"
+    assert calls[1][1] is session_factory
+    assert calls[1][2]["candidate_runtime_identity"] == candidate
+    assert calls[1][2]["expected_candidate_sha"] == candidate_sha
+
+
 def test_bridge_freeze_cli_uses_fresh_fingerprint_and_redacts_tokens(
     tmp_path,
     monkeypatch,
