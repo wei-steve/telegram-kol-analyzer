@@ -8,8 +8,19 @@ from telegram_kol_research.legacy_runtime_drain_bridge import (
     LEGACY_RUNTIME_DRAIN_BRIDGE_KEY,
     LegacyRuntimeIdentity,
     build_legacy_runtime_drain_bridge_plan,
+    fence_legacy_runtime_revisions,
+    freeze_legacy_runtime_drain_bridge,
+    rollback_legacy_runtime_drain_bridge,
 )
-from telegram_kol_research.models import TradingSetting
+from telegram_kol_research.models import (
+    MessageProcessingJob,
+    RawMessage,
+    TradingSetting,
+)
+from telegram_kol_research.trading_settings import (
+    load_trading_settings,
+    save_trading_settings,
+)
 
 
 NOW = datetime(2026, 8, 27, 22, 0, tzinfo=UTC)
@@ -158,4 +169,235 @@ def test_expected_sha_and_reviewed_set_are_strict(tmp_path):
             expected_production_sha=OLD_SHA,
             reviewed_order_ids=(*REVIEWED_IDS[:-1], REVIEWED_IDS[0]),
             planned_at=NOW,
+        )
+
+
+def _absent_plan(session_factory):
+    return build_legacy_runtime_drain_bridge_plan(
+        session_factory,
+        runtime_identity=_identity(),
+        expected_production_sha=OLD_SHA,
+        reviewed_order_ids=REVIEWED_IDS,
+        planned_at=NOW,
+    )
+
+
+def test_freeze_atomically_records_settings_and_watermark(tmp_path):
+    session_factory = create_session_factory(tmp_path / "freeze.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(chat_id=1, message_id=1, text="one"),
+                RawMessage(chat_id=1, message_id=2, text="two"),
+            ]
+        )
+        session.commit()
+    plan = _absent_plan(session_factory)
+
+    result = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="freeze-token-one",
+        frozen_at=NOW,
+    )
+
+    assert result.status == "frozen"
+    assert result.bridge_token
+    settings = load_trading_settings(session_factory)
+    assert settings.auto_trade_enabled is False
+    assert settings.entry_revision_v2_mode == "disabled"
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+            .one()
+        )
+        stored = json.loads(row.value_json)
+    assert stored["state"] == "frozen"
+    assert stored["freeze_raw_message_id"] == 2
+    assert stored["original_auto_trade_enabled"] is True
+    assert stored["original_entry_revision_v2_mode"] == "live"
+    assert stored["fenced_batch_ids"] == []
+
+
+def test_freeze_rechecks_plan_snapshot_inside_write_transaction(tmp_path):
+    session_factory = create_session_factory(tmp_path / "stale-plan.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"entry_revision_v2_mode": "shadow"},
+        updated_at=NOW,
+    )
+
+    result = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="freeze-stale-plan-token",
+        frozen_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_plan_mismatch"
+    settings = load_trading_settings(session_factory)
+    assert settings.auto_trade_enabled is True
+    assert settings.entry_revision_v2_mode == "shadow"
+    with session_factory() as session:
+        assert (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+            .one_or_none()
+            is None
+        )
+
+
+def test_prefreeze_claimed_message_job_blocks_fence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "claimed-job.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=1, text="claimed")
+        session.add(raw)
+        session.flush()
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=raw.id,
+                chat_id=1,
+                status="claimed",
+                shadow=False,
+                claim_token="old-worker",
+                claimed_at=NOW,
+            )
+        )
+        session.commit()
+    plan = _absent_plan(session_factory)
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="freeze-token-two",
+        frozen_at=NOW,
+    )
+
+    result = fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        fenced_at=NOW,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_prefreeze_jobs_active"
+
+
+def test_fence_succeeds_after_prefreeze_job_is_terminal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "fence.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="freeze-token-three",
+        frozen_at=NOW,
+    )
+
+    fenced = fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        fenced_at=NOW,
+    )
+
+    assert fenced.status == "fenced"
+    assert fenced.reason_code is None
+
+
+def test_exact_prewrite_rollback_restores_settings(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollback.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="freeze-token-four",
+        frozen_at=NOW,
+    )
+    fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        fenced_at=NOW,
+    )
+
+    rolled_back = rollback_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        rolled_back_at=NOW,
+    )
+
+    assert rolled_back.status == "rolled_back"
+    settings = load_trading_settings(session_factory)
+    assert settings.auto_trade_enabled is True
+    assert settings.entry_revision_v2_mode == "live"
+    with session_factory() as session:
+        assert (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+            .one_or_none()
+            is None
         )
