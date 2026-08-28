@@ -17,6 +17,14 @@ from telegram_kol_research.entry_revision_exchange_authority import (
     acquire_entry_revision_exchange_authority,
     release_entry_revision_exchange_authority,
 )
+from telegram_kol_research.legacy_runtime_drain_bridge import (
+    LegacyRuntimeIdentity,
+    begin_legacy_runtime_bridge_cancellation,
+    complete_legacy_runtime_bridge_cancellation,
+    legacy_runtime_bridge_revision_gate_state,
+    mark_legacy_runtime_bridge_unknown,
+    validate_legacy_runtime_bridge_cancellation_ready,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -199,6 +207,7 @@ def build_reviewed_pending_entry_cancel_plan(
     *,
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
+    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelPlan:
     """Build a fresh, read-only plan for the closed reviewed target set."""
@@ -309,7 +318,11 @@ def build_reviewed_pending_entry_cancel_plan(
     conflicts: list[dict[str, str]] = []
     completed: list[str] = []
     with session_factory() as session:
-        if _active_exchange_authority_present(session, targets=reviewed):
+        if _active_exchange_authority_present(
+            session,
+            targets=reviewed,
+            legacy_runtime_identity=legacy_runtime_identity,
+        ):
             return _plan(
                 created_at,
                 (),
@@ -447,13 +460,21 @@ def _active_exchange_authority_present(
     session,
     *,
     targets: Iterable[ReviewedPendingEntryTarget],
+    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
 ) -> bool:
     reviewed = tuple(targets)
     binding_ids = {target.execution_binding_id for target in reviewed}
     lifecycle_ids = {target.lifecycle_id for target in reviewed}
     leg_ids = {target.execution_order_leg_id for target in reviewed}
     order_ids = {target.order_id for target in reviewed}
-    checks = (
+    bridge_gate = legacy_runtime_bridge_revision_gate_state(
+        session,
+        runtime_identity=legacy_runtime_identity,
+        reviewed_order_ids=tuple(target.order_id for target in reviewed),
+    )
+    if bridge_gate == "blocked":
+        return True
+    checks = [
         session.query(MessageProcessingJob.id).filter(
             MessageProcessingJob.shadow.is_(False),
             MessageProcessingJob.status == "claimed",
@@ -476,13 +497,6 @@ def _active_exchange_authority_present(
             StrategyManagementBatch.status.not_in(
                 {"succeeded", "blocked", "resolved"}
             )
-        ),
-        session.query(StrategyRevisionBatch.id).filter(
-            StrategyRevisionBatch.status.not_in(_TERMINAL_REVISION_BATCH_STATES)
-        ),
-        session.query(StrategyRevisionBatch.id).filter(
-            (StrategyRevisionBatch.advance_claim_token.is_not(None))
-            | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
         ),
         session.query(StrategyRevisionLeg.id)
         .outerjoin(
@@ -537,7 +551,21 @@ def _active_exchange_authority_present(
         session.query(WorkerCommandJob.id).filter(
             WorkerCommandJob.status.in_({"pending", "claimed", "executing"})
         ),
-    )
+    ]
+    if bridge_gate != "fenced":
+        checks.extend(
+            (
+                session.query(StrategyRevisionBatch.id).filter(
+                    StrategyRevisionBatch.status.not_in(
+                        _TERMINAL_REVISION_BATCH_STATES
+                    )
+                ),
+                session.query(StrategyRevisionBatch.id).filter(
+                    (StrategyRevisionBatch.advance_claim_token.is_not(None))
+                    | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+                ),
+            )
+        )
     return any(query.first() is not None for query in checks)
 
 
@@ -551,6 +579,8 @@ def apply_reviewed_pending_entry_cancel_plan(
     action_id: str,
     expected_fingerprint: str,
     confirmation_token: str,
+    legacy_bridge_token: str | None = None,
+    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelResult:
     """Cancel one exact reviewed entry, without ever retrying the write."""
@@ -567,6 +597,28 @@ def apply_reviewed_pending_entry_cancel_plan(
     ]
     if len(selected) != 1:
         raise ValueError("exactly one reviewed cancellation action is required")
+    bridge_enabled = (
+        legacy_bridge_token is not None or legacy_runtime_identity is not None
+    )
+    if bridge_enabled and (
+        legacy_bridge_token is None or legacy_runtime_identity is None
+    ):
+        raise ValueError("legacy bridge token and runtime identity are required")
+    if bridge_enabled:
+        bridge_ready = validate_legacy_runtime_bridge_cancellation_ready(
+            session_factory,
+            bridge_token=str(legacy_bridge_token),
+            runtime_identity=legacy_runtime_identity,
+            order_id=str(order_id),
+        )
+        if bridge_ready.status != "ready":
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=str(order_id),
+                reason_code=(
+                    bridge_ready.reason_code or "legacy_bridge_not_ready"
+                ),
+            )
     require_repair_confirmation_token_unused(
         session_factory,
         confirmation_token=confirmation_token,
@@ -577,6 +629,7 @@ def apply_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
+        legacy_runtime_identity=legacy_runtime_identity,
         now=now,
     )
     if fresh.fingerprint != expected_fingerprint:
@@ -613,6 +666,7 @@ def apply_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
+        legacy_runtime_identity=legacy_runtime_identity,
         now=now,
     )
     if under_authority.fingerprint != expected_fingerprint:
@@ -694,6 +748,7 @@ def apply_reviewed_pending_entry_cancel_plan(
         action=action,
         targets=reviewed,
         mutation_intent_id=intent_id,
+        legacy_runtime_identity=legacy_runtime_identity,
     ):
         transition_position_mutation_intent(
             session_factory,
@@ -742,6 +797,38 @@ def apply_reviewed_pending_entry_cancel_plan(
             reason_code=release_failure or "mutation_intent_changed",
         )
 
+    if bridge_enabled:
+        bridge_started = begin_legacy_runtime_bridge_cancellation(
+            session_factory,
+            bridge_token=str(legacy_bridge_token),
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            started_at=observed_at,
+        )
+        if bridge_started.status != "cancelling":
+            transition_position_mutation_intent(
+                session_factory,
+                intent_id,
+                expected_statuses={"submitting"},
+                new_status="blocked",
+                transitioned_at=observed_at,
+                error={"reason": "legacy_bridge_write_gate_blocked"},
+            )
+            release_failure = _release_pending_cancel_authority_before_write(
+                session_factory,
+                authority_token=authority_token,
+                released_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=action.order_id,
+                reason_code=(
+                    release_failure
+                    or bridge_started.reason_code
+                    or "legacy_bridge_write_gate_blocked"
+                ),
+            )
+
     try:
         response = deepcoin_client.cancel_trigger_order(request)
     except Exception:
@@ -761,6 +848,15 @@ def apply_reviewed_pending_entry_cancel_plan(
             request=request,
             response={"outcome": "unknown"},
             now=observed_at,
+        )
+        _mark_bridge_unknown_after_write(
+            session_factory,
+            enabled=bridge_enabled,
+            bridge_token=legacy_bridge_token,
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            reason_code="cancel_outcome_unknown",
+            observed_at=observed_at,
         )
         return ReviewedPendingEntryCancelResult(
             status="cancel_outcome_unknown",
@@ -786,6 +882,15 @@ def apply_reviewed_pending_entry_cancel_plan(
             request=request,
             response={"confirmed": False},
             now=observed_at,
+        )
+        _mark_bridge_unknown_after_write(
+            session_factory,
+            enabled=bridge_enabled,
+            bridge_token=legacy_bridge_token,
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            reason_code="cancel_response_unconfirmed",
+            observed_at=observed_at,
         )
         return ReviewedPendingEntryCancelResult(
             status="cancel_outcome_unknown",
@@ -832,6 +937,15 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
         )
+        _mark_bridge_unknown_after_write(
+            session_factory,
+            enabled=bridge_enabled,
+            bridge_token=legacy_bridge_token,
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            reason_code="cancel_readback_unavailable",
+            observed_at=observed_at,
+        )
         return ReviewedPendingEntryCancelResult(
             status="cancel_outcome_unknown",
             order_id=action.order_id,
@@ -860,6 +974,15 @@ def apply_reviewed_pending_entry_cancel_plan(
             request=request,
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
+        )
+        _mark_bridge_unknown_after_write(
+            session_factory,
+            enabled=bridge_enabled,
+            bridge_token=legacy_bridge_token,
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            reason_code="post_cancel_state_changed",
+            observed_at=observed_at,
         )
         return ReviewedPendingEntryCancelResult(
             status="cancel_confirmed_readback_changed",
@@ -893,11 +1016,47 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
         )
+        _mark_bridge_unknown_after_write(
+            session_factory,
+            enabled=bridge_enabled,
+            bridge_token=legacy_bridge_token,
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            reason_code="confirmed_cancel_database_state_changed",
+            observed_at=observed_at,
+        )
         return ReviewedPendingEntryCancelResult(
             status="cancelled_audit_state_changed",
             order_id=action.order_id,
             reason_code="confirmed_cancel_database_state_changed",
         )
+
+    if bridge_enabled:
+        bridge_completed = complete_legacy_runtime_bridge_cancellation(
+            session_factory,
+            bridge_token=str(legacy_bridge_token),
+            runtime_identity=legacy_runtime_identity,
+            order_id=action.order_id,
+            completed_at=observed_at,
+        )
+        if bridge_completed.status != "fenced":
+            _mark_bridge_unknown_after_write(
+                session_factory,
+                enabled=True,
+                bridge_token=legacy_bridge_token,
+                runtime_identity=legacy_runtime_identity,
+                order_id=action.order_id,
+                reason_code="bridge_completion_unconfirmed",
+                observed_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="cancelled_authority_retained",
+                order_id=action.order_id,
+                reason_code=(
+                    bridge_completed.reason_code
+                    or "legacy_bridge_completion_unconfirmed"
+                ),
+            )
 
     released = release_entry_revision_exchange_authority(
         session_factory,
@@ -940,12 +1099,35 @@ def _release_pending_cancel_authority_before_write(
     )
 
 
+def _mark_bridge_unknown_after_write(
+    session_factory,
+    *,
+    enabled: bool,
+    bridge_token: str | None,
+    runtime_identity: LegacyRuntimeIdentity | None,
+    order_id: str,
+    reason_code: str,
+    observed_at: datetime,
+) -> None:
+    if not enabled:
+        return
+    mark_legacy_runtime_bridge_unknown(
+        session_factory,
+        bridge_token=str(bridge_token),
+        runtime_identity=runtime_identity,
+        order_id=order_id,
+        reason_code=reason_code,
+        observed_at=observed_at,
+    )
+
+
 def _single_pending_cancel_write_gate(
     session_factory,
     *,
     action: ReviewedPendingEntryCancelAction,
     targets: Iterable[ReviewedPendingEntryTarget],
     mutation_intent_id: int,
+    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
 ) -> bool:
     """Last-moment database gate allowing only this one reserved cancel."""
 
@@ -978,6 +1160,7 @@ def _single_pending_cancel_write_gate(
             and not _active_exchange_authority_present(
                 session,
                 targets=targets,
+                legacy_runtime_identity=legacy_runtime_identity,
             )
         )
 

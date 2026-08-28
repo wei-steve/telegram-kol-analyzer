@@ -26,6 +26,7 @@ from telegram_kol_research.models import (
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 27, 15, 0, tzinfo=UTC)
@@ -609,6 +610,86 @@ def _seed_unrelated_revision_owner(session_factory):
         return int(binding.id), int(lifecycle.id), int(leg.id)
 
 
+def test_exact_legacy_bridge_sentinel_is_the_only_revision_claim_exemption(
+    tmp_path,
+):
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeIdentity,
+        build_legacy_runtime_drain_bridge_plan,
+        fence_legacy_runtime_revisions,
+        freeze_legacy_runtime_drain_bridge,
+    )
+    from telegram_kol_research.reviewed_pending_entry_cancel import (
+        REVIEWED_PENDING_ENTRY_TARGETS,
+        _active_exchange_authority_present,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bridge-gate.db")
+    binding_id, lifecycle_id, _leg_ids = _seed(session_factory)
+    batch_id = _seed_revision_batch(
+        session_factory,
+        binding_id=binding_id,
+        lifecycle_id=lifecycle_id,
+        status="planned",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=51,
+        worker_start_ticks=73,
+    )
+    reviewed_ids = tuple(
+        target.order_id for target in REVIEWED_PENDING_ENTRY_TARGETS
+    )
+    bridge_plan = build_legacy_runtime_drain_bridge_plan(
+        session_factory,
+        runtime_identity=identity,
+        expected_production_sha=identity.production_sha,
+        reviewed_order_ids=reviewed_ids,
+        planned_at=NOW,
+    )
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=bridge_plan,
+        runtime_identity=identity,
+        reviewed_order_ids=reviewed_ids,
+        expected_fingerprint=bridge_plan.fingerprint,
+        confirmation_token="reviewed-bridge-freeze-token",
+        frozen_at=NOW,
+    )
+    fenced = fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=identity,
+        fenced_at=NOW,
+    )
+    assert fenced.status == "fenced"
+
+    with session_factory() as session:
+        assert not _active_exchange_authority_present(
+            session,
+            targets=REVIEWED_PENDING_ENTRY_TARGETS,
+            legacy_runtime_identity=identity,
+        )
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        batch.advance_claimed_at = NOW
+        session.commit()
+    with session_factory() as session:
+        assert _active_exchange_authority_present(
+            session,
+            targets=REVIEWED_PENDING_ENTRY_TARGETS,
+            legacy_runtime_identity=identity,
+        )
+
+
 def test_plan_allows_recovery_required_revision_batch_without_claim(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id, lifecycle_id, leg_ids = _seed(session_factory)
@@ -1009,6 +1090,7 @@ def _apply_one(
     *,
     order_id="reviewed-1",
     confirmation_token="cancel-token-one",
+    **apply_kwargs,
 ):
     from telegram_kol_research.reviewed_pending_entry_cancel import (
         apply_reviewed_pending_entry_cancel_plan,
@@ -1025,6 +1107,7 @@ def _apply_one(
         expected_fingerprint=plan.fingerprint,
         confirmation_token=confirmation_token,
         now=NOW,
+        **apply_kwargs,
     )
 
 
@@ -1424,6 +1507,149 @@ def test_apply_cancels_exactly_one_and_terminalizes_only_selected_leg(tmp_path):
     post_plan = _build_plan(session_factory, client, targets)
     assert post_plan.completed_order_ids == ("reviewed-1",)
     assert [action.order_id for action in post_plan.actions] == ["reviewed-2"]
+
+
+def test_bridge_hooks_wrap_the_exact_single_order_exchange_boundary(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bridge-apply.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    events = []
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=55,
+        worker_start_ticks=89,
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "validate_legacy_runtime_bridge_cancellation_ready",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="ready"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "begin_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: (
+            events.append(("begin", _kwargs["order_id"]))
+            or LegacyRuntimeDrainBridgeResult(status="cancelling")
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "complete_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: (
+            events.append(("complete", _kwargs["order_id"]))
+            or LegacyRuntimeDrainBridgeResult(status="fenced")
+        ),
+    )
+    client.after_cancel_callback = lambda: events.append(
+        ("exchange", "reviewed-1")
+    )
+
+    result = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+    )
+
+    assert result.status == "cancelled"
+    assert events == [
+        ("begin", "reviewed-1"),
+        ("exchange", "reviewed-1"),
+        ("complete", "reviewed-1"),
+    ]
+
+
+def test_bridge_unknown_hook_precedes_any_future_retry(tmp_path, monkeypatch):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bridge-unknown-apply.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=55,
+        worker_start_ticks=89,
+    )
+    ready = True
+    unknown_orders = []
+
+    def validate(*_args, **_kwargs):
+        return LegacyRuntimeDrainBridgeResult(
+            status="ready" if ready else "blocked",
+            reason_code=None if ready else "legacy_bridge_state_mismatch",
+        )
+
+    monkeypatch.setattr(
+        cancel_module,
+        "validate_legacy_runtime_bridge_cancellation_ready",
+        validate,
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "begin_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="cancelling"
+        ),
+    )
+
+    def mark_unknown(*_args, **kwargs):
+        nonlocal ready
+        ready = False
+        unknown_orders.append(kwargs["order_id"])
+        return LegacyRuntimeDrainBridgeResult(status="unknown_locked")
+
+    monkeypatch.setattr(
+        cancel_module,
+        "mark_legacy_runtime_bridge_unknown",
+        mark_unknown,
+    )
+    client.cancel_exception = RuntimeError("transport unknown")
+
+    first = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+    )
+    cancel_count = len(client.cancel_payloads)
+    second = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        confirmation_token="unused-second-token",
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+    )
+
+    assert first.status == "cancel_outcome_unknown"
+    assert unknown_orders == ["reviewed-1"]
+    assert second.status == "blocked"
+    assert second.reason_code == "legacy_bridge_state_mismatch"
+    assert len(client.cancel_payloads) == cancel_count == 1
 
 
 def test_last_cancel_terminalizes_binding_and_lifecycle(tmp_path):

@@ -43,6 +43,7 @@ _DOCUMENT_KEYS = frozenset(
     {
         "schema_version",
         "state",
+        "active_order_id",
         "bridge_token",
         "production_sha",
         "worker_pid",
@@ -51,6 +52,7 @@ _DOCUMENT_KEYS = frozenset(
         "freeze_raw_message_id",
         "original_auto_trade_enabled",
         "original_entry_revision_v2_mode",
+        "reason_code",
         "reviewed_order_ids",
         "fenced_batch_ids",
         "completed_order_ids",
@@ -64,6 +66,7 @@ _TERMINAL_REVISION_BATCH_STATES = frozenset(
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ORDER_ID = re.compile(r"[0-9]{1,64}")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}")
+_REASON_CODE = re.compile(r"[a-z0-9_]{1,64}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +311,7 @@ def freeze_legacy_runtime_drain_bridge(
                 persisted_payload=persisted_payload,
             )
             document = {
+                "active_order_id": None,
                 "bridge_token": bridge_token,
                 "completed_order_ids": [],
                 "fenced_batch_ids": [],
@@ -316,6 +320,7 @@ def freeze_legacy_runtime_drain_bridge(
                 "original_auto_trade_enabled": settings.auto_trade_enabled,
                 "original_entry_revision_v2_mode": settings.entry_revision_v2_mode,
                 "production_sha": runtime_identity.production_sha,
+                "reason_code": None,
                 "reviewed_order_ids": list(reviewed),
                 "schema_version": _SCHEMA_VERSION,
                 "state": "frozen",
@@ -509,6 +514,210 @@ def rollback_legacy_runtime_drain_bridge(
         return _result("blocked", "legacy_bridge_database_unavailable")
 
 
+def begin_legacy_runtime_bridge_cancellation(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    order_id: str,
+    started_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Cross the write boundary for one exact reviewed order."""
+
+    clean_token = _bridge_token(bridge_token)
+    clean_order_id = _order_id(order_id)
+    observed_at = _aware_utc(started_at, field_name="started_at")
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"fenced"},
+            )
+            if error is None:
+                error = _bridge_cancellation_invariant_reason(
+                    session,
+                    document=document,
+                    order_id=clean_order_id,
+                )
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            document["state"] = "cancelling"
+            document["active_order_id"] = clean_order_id
+            document["reason_code"] = None
+            document["write_boundary_reached"] = True
+            document["updated_at"] = observed_at.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = observed_at
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(status="cancelling")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
+def complete_legacy_runtime_bridge_cancellation(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    order_id: str,
+    completed_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Record one fully terminalized cancellation and retain the outer fence."""
+
+    clean_token = _bridge_token(bridge_token)
+    clean_order_id = _order_id(order_id)
+    observed_at = _aware_utc(completed_at, field_name="completed_at")
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"cancelling"},
+            )
+            if error is None and document["active_order_id"] != clean_order_id:
+                error = "legacy_bridge_active_order_mismatch"
+            if error is None:
+                error = _frozen_settings_reason(session)
+            if error is None:
+                error = _revision_sentinel_reason(session, document=document)
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            completed = set(document["completed_order_ids"])
+            if clean_order_id in completed:
+                session.rollback()
+                return _result("blocked", "legacy_bridge_order_already_completed")
+            completed.add(clean_order_id)
+            document["state"] = "fenced"
+            document["active_order_id"] = None
+            document["completed_order_ids"] = sorted(completed)
+            document["reason_code"] = None
+            document["updated_at"] = observed_at.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = observed_at
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(status="fenced")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
+def mark_legacy_runtime_bridge_unknown(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    order_id: str,
+    reason_code: str,
+    observed_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Permanently lock the bridge after a potentially submitted write."""
+
+    clean_token = _bridge_token(bridge_token)
+    clean_order_id = _order_id(order_id)
+    clean_reason = _reason_code(reason_code)
+    timestamp = _aware_utc(observed_at, field_name="observed_at")
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"cancelling", "unknown_locked"},
+            )
+            if error is None and document["active_order_id"] != clean_order_id:
+                error = "legacy_bridge_active_order_mismatch"
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            if document["state"] == "unknown_locked":
+                session.rollback()
+                return LegacyRuntimeDrainBridgeResult(status="unknown_locked")
+            document["state"] = "unknown_locked"
+            document["reason_code"] = clean_reason
+            document["updated_at"] = timestamp.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = timestamp
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(status="unknown_locked")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
+def legacy_runtime_bridge_revision_gate_state(
+    session,
+    *,
+    runtime_identity: LegacyRuntimeIdentity | None,
+    reviewed_order_ids: Iterable[str],
+) -> str:
+    """Classify the optional bridge for the cancellation authority gate."""
+
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+        .one_or_none()
+    )
+    if row is None:
+        return "absent"
+    document = _bridge_document(row.value_json)
+    if document is None or runtime_identity is None:
+        return "blocked"
+    try:
+        reviewed = _reviewed_order_ids(reviewed_order_ids)
+    except ValueError:
+        return "blocked"
+    if (
+        document["state"] != "fenced"
+        or document["production_sha"] != runtime_identity.production_sha
+        or document["worker_pid"] != runtime_identity.worker_pid
+        or document["worker_start_ticks"]
+        != runtime_identity.worker_start_ticks
+        or tuple(document["reviewed_order_ids"]) != reviewed
+        or _frozen_settings_reason(session) is not None
+        or _revision_sentinel_reason(session, document=document) is not None
+    ):
+        return "blocked"
+    return "fenced"
+
+
+def validate_legacy_runtime_bridge_cancellation_ready(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    order_id: str,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Read-only precheck used before any exchange-backed replanning."""
+
+    clean_token = _bridge_token(bridge_token)
+    clean_order_id = _order_id(order_id)
+    try:
+        with session_factory() as session:
+            _row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"fenced"},
+            )
+            if error is None:
+                error = _bridge_cancellation_invariant_reason(
+                    session,
+                    document=document,
+                    order_id=clean_order_id,
+                )
+            if error is not None:
+                return _result("blocked", error)
+            return LegacyRuntimeDrainBridgeResult(status="ready")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
 def _bridge_document(raw: Any) -> dict[str, Any] | None:
     try:
         value = json.loads(str(raw))
@@ -558,6 +767,31 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
     }:
         return None
     if type(value.get("write_boundary_reached")) is not bool:
+        return None
+    active_order_id = value.get("active_order_id")
+    reason_code = value.get("reason_code")
+    if active_order_id is not None and (
+        not isinstance(active_order_id, str)
+        or not _ORDER_ID.fullmatch(active_order_id)
+        or active_order_id not in reviewed
+    ):
+        return None
+    if reason_code is not None and (
+        not isinstance(reason_code, str)
+        or not _REASON_CODE.fullmatch(reason_code)
+    ):
+        return None
+    if value["state"] == "cancelling" and (
+        active_order_id is None or reason_code is not None
+    ):
+        return None
+    if value["state"] == "unknown_locked" and (
+        active_order_id is None or reason_code is None
+    ):
+        return None
+    if value["state"] not in {"cancelling", "unknown_locked"} and (
+        active_order_id is not None or reason_code is not None
+    ):
         return None
     return {
         **value,
@@ -614,6 +848,67 @@ def _frozen_settings_reason(session) -> str | None:
     return None
 
 
+def _bridge_cancellation_invariant_reason(
+    session,
+    *,
+    document: dict[str, Any],
+    order_id: str,
+) -> str | None:
+    if order_id not in document["reviewed_order_ids"]:
+        return "legacy_bridge_order_not_reviewed"
+    if order_id in document["completed_order_ids"]:
+        return "legacy_bridge_order_already_completed"
+    settings_reason = _frozen_settings_reason(session)
+    if settings_reason is not None:
+        return settings_reason
+    return _revision_sentinel_reason(session, document=document)
+
+
+def _revision_sentinel_reason(
+    session,
+    *,
+    document: dict[str, Any],
+) -> str | None:
+    active_ids = tuple(
+        int(batch_id)
+        for (batch_id,) in session.query(StrategyRevisionBatch.id)
+        .filter(
+            StrategyRevisionBatch.status.not_in(_TERMINAL_REVISION_BATCH_STATES)
+        )
+        .order_by(StrategyRevisionBatch.id.asc())
+        .all()
+    )
+    fenced_ids = tuple(document["fenced_batch_ids"])
+    if active_ids != fenced_ids:
+        return "legacy_bridge_active_revision_set_drift"
+    claimed_ids = tuple(
+        int(batch_id)
+        for (batch_id,) in session.query(StrategyRevisionBatch.id)
+        .filter(
+            (StrategyRevisionBatch.advance_claim_token.is_not(None))
+            | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+        )
+        .order_by(StrategyRevisionBatch.id.asc())
+        .all()
+    )
+    if claimed_ids != fenced_ids:
+        return "legacy_bridge_revision_claim_set_drift"
+    if not fenced_ids:
+        return None
+    batches = (
+        session.query(StrategyRevisionBatch)
+        .filter(StrategyRevisionBatch.id.in_(fenced_ids))
+        .all()
+    )
+    if len(batches) != len(fenced_ids) or any(
+        batch.advance_claim_token != document["bridge_token"]
+        or batch.advance_claimed_at is not None
+        for batch in batches
+    ):
+        return "legacy_bridge_sentinel_drift"
+    return None
+
+
 def _consume_confirmation_in_session(
     session,
     *,
@@ -645,6 +940,20 @@ def _bridge_token(value: Any) -> str:
     clean = str(value or "")
     if not _TOKEN.fullmatch(clean):
         raise ValueError("bridge_token is invalid")
+    return clean
+
+
+def _order_id(value: Any) -> str:
+    clean = str(value or "")
+    if not _ORDER_ID.fullmatch(clean):
+        raise ValueError("order_id is invalid")
+    return clean
+
+
+def _reason_code(value: Any) -> str:
+    clean = str(value or "")
+    if not _REASON_CODE.fullmatch(clean):
+        raise ValueError("reason_code is invalid")
     return clean
 
 

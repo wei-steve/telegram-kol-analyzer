@@ -7,9 +7,12 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.legacy_runtime_drain_bridge import (
     LEGACY_RUNTIME_DRAIN_BRIDGE_KEY,
     LegacyRuntimeIdentity,
+    begin_legacy_runtime_bridge_cancellation,
     build_legacy_runtime_drain_bridge_plan,
+    complete_legacy_runtime_bridge_cancellation,
     fence_legacy_runtime_revisions,
     freeze_legacy_runtime_drain_bridge,
+    mark_legacy_runtime_bridge_unknown,
     rollback_legacy_runtime_drain_bridge,
 )
 from telegram_kol_research.models import (
@@ -401,3 +404,109 @@ def test_exact_prewrite_rollback_restores_settings(tmp_path):
             .one_or_none()
             is None
         )
+
+
+def _fenced_bridge(session_factory):
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="bridge-cancel-freeze-token",
+        frozen_at=NOW,
+    )
+    fenced = fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        fenced_at=NOW,
+    )
+    assert fenced.status == "fenced"
+    return str(frozen.bridge_token)
+
+
+def _stored_bridge(session_factory):
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == LEGACY_RUNTIME_DRAIN_BRIDGE_KEY)
+            .one()
+        )
+        return json.loads(row.value_json)
+
+
+def test_one_bridge_cancellation_records_only_exact_completed_order(tmp_path):
+    session_factory = create_session_factory(tmp_path / "bridge-cancel.db")
+    bridge_token = _fenced_bridge(session_factory)
+
+    started = begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW,
+    )
+    during = _stored_bridge(session_factory)
+    completed = complete_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        completed_at=NOW,
+    )
+    after = _stored_bridge(session_factory)
+
+    assert started.status == "cancelling"
+    assert during["state"] == "cancelling"
+    assert during["active_order_id"] == REVIEWED_IDS[0]
+    assert during["write_boundary_reached"] is True
+    assert completed.status == "fenced"
+    assert after["state"] == "fenced"
+    assert after["active_order_id"] is None
+    assert after["completed_order_ids"] == [REVIEWED_IDS[0]]
+
+
+def test_unknown_bridge_cancellation_is_permanently_non_retryable(tmp_path):
+    session_factory = create_session_factory(tmp_path / "bridge-unknown.db")
+    bridge_token = _fenced_bridge(session_factory)
+    begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW,
+    )
+
+    unknown = mark_legacy_runtime_bridge_unknown(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        reason_code="cancel_outcome_unknown",
+        observed_at=NOW,
+    )
+    retry = begin_legacy_runtime_bridge_cancellation(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+        started_at=NOW,
+    )
+    stored = _stored_bridge(session_factory)
+
+    assert unknown.status == "unknown_locked"
+    assert retry.status == "blocked"
+    assert retry.reason_code == "legacy_bridge_state_mismatch"
+    assert stored["state"] == "unknown_locked"
+    assert stored["active_order_id"] == REVIEWED_IDS[0]
