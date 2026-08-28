@@ -99,6 +99,14 @@ _SHA = re.compile(r"[0-9a-f]{40}")
 _ORDER_ID = re.compile(r"[0-9]{1,64}")
 _TOKEN = re.compile(r"[A-Za-z0-9_-]{1,64}")
 _REASON_CODE = re.compile(r"[a-z0-9_]{1,64}")
+_PREWRITE_REFUSAL_REASONS = frozenset(
+    {
+        "exact_pending_cancel_write_gate_blocked",
+        "legacy_bridge_worker_identity_unavailable",
+        "legacy_bridge_worker_identity_drift",
+        "legacy_bridge_write_gate_blocked",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1649,8 +1657,8 @@ def _bridge_unknown_mutation_reason(
         .filter(StrategyLifecycle.execution_binding_id.in_(binding_ids))
         .all()
     }
-    unknown_cancel = (
-        session.query(PositionMutationIntent.id)
+    possible_cancel_rows = (
+        session.query(PositionMutationIntent)
         .filter(
             PositionMutationIntent.operation
             == "cancel_reviewed_pending_entry",
@@ -1661,9 +1669,12 @@ def _bridge_unknown_mutation_reason(
                 | (PositionMutationIntent.order_id == "")
             ),
         )
-        .first()
+        .all()
     )
-    if unknown_cancel is not None:
+    if any(
+        not is_valid_reviewed_pending_entry_prewrite_refusal(row)
+        for row in possible_cancel_rows
+    ):
         return "legacy_bridge_unknown_mutation_present"
 
     unknown_revision_leg = (
@@ -1713,6 +1724,59 @@ def _bridge_unknown_mutation_reason(
     if unknown_replacement is not None:
         return "legacy_bridge_unknown_mutation_present"
     return None
+
+
+def is_valid_reviewed_pending_entry_prewrite_refusal(
+    row: PositionMutationIntent,
+) -> bool:
+    """Accept only exact durable proof that no reviewed cancel was submitted."""
+
+    if (
+        not isinstance(row, PositionMutationIntent)
+        or row.venue != "deepcoin"
+        or row.operation != "cancel_reviewed_pending_entry"
+        or row.status != "prewrite_refused"
+        or row.submitted_at is not None
+        or row.confirmed_at is not None
+        or not isinstance(row.order_id, str)
+        or not 1 <= len(row.order_id) <= 64
+        or row.pos_id != f"pending-entry:{row.order_id}"
+        or not _is_sha256(row.authority_fingerprint)
+        or not _is_sha256(row.request_fingerprint)
+    ):
+        return False
+    prefix = f"reviewed-pending-entry-cancel:{row.order_id}:"
+    if not row.idempotency_key.startswith(prefix) or not _is_sha256(
+        row.idempotency_key[len(prefix) :]
+    ):
+        return False
+    request = _strict_json_object(row.request_json)
+    response = _strict_json_object(row.response_json)
+    error = _strict_json_object(row.error_json)
+    if (
+        request is None
+        or set(request) != {"instId", "ordId"}
+        or request.get("ordId") != row.order_id
+        or not isinstance(request.get("instId"), str)
+        or not 1 <= len(request["instId"]) <= 64
+        or row.request_fingerprint != _payload_fingerprint(request)
+        or response != {"submitted": False}
+        or error is None
+        or set(error) != {"reason"}
+        or error.get("reason") not in _PREWRITE_REFUSAL_REASONS
+    ):
+        return False
+    return True
+
+
+def _strict_json_object(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str) or len(value) > 4096:
+        return None
+    try:
+        parsed = json.loads(value)
+    except (TypeError, ValueError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
 
 
 def _local_drain_reason(session, *, document: dict[str, Any]) -> str | None:

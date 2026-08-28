@@ -1367,6 +1367,78 @@ def test_prewrite_refusal_releases_exchange_authority(
     assert result.status in {"blocked", "intent_changed"}
     assert client.cancel_payloads == []
     assert _authority_document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        if failure_point == "write_gate":
+            assert intent.status == "prewrite_refused"
+            assert json.loads(intent.response_json) == {"submitted": False}
+            assert json.loads(intent.error_json) == {
+                "reason": "exact_pending_cancel_write_gate_blocked"
+            }
+            assert intent.submitted_at is None
+            assert intent.confirmed_at is None
+        else:
+            assert intent.status == "reserved"
+    fresh = _build_plan(session_factory, client, targets)
+    if failure_point == "write_gate":
+        assert {action.order_id for action in fresh.actions} == {
+            "reviewed-1",
+            "reviewed-2",
+        }
+        assert fresh.conflicts == ()
+    else:
+        assert fresh.actions == ()
+        assert fresh.conflicts == (
+            {
+                "order_id": "reviewed-1",
+                "reason": "prior_cancel_outcome_unknown",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        ("status", "recovery_required"),
+        ("response_json", '{"submitted":true}'),
+        ("response_json", '{"submitted":false,"extra":true}'),
+        ("error_json", '{"reason":"cancel_outcome_unknown"}'),
+        ("submitted_at", NOW),
+    ),
+)
+def test_malformed_prewrite_refusal_remains_unknown(
+    tmp_path,
+    monkeypatch,
+    mutation,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+
+    session_factory = create_session_factory(tmp_path / "malformed-refusal.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    monkeypatch.setattr(
+        cancel_module,
+        "_single_pending_cancel_write_gate",
+        lambda *_args, **_kwargs: False,
+    )
+    result = _apply_one(session_factory, client, targets, plan)
+    assert result.status == "blocked"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        setattr(intent, mutation[0], mutation[1])
+        session.commit()
+
+    fresh = _build_plan(session_factory, client, targets)
+
+    assert fresh.actions == ()
+    assert fresh.conflicts == (
+        {
+            "order_id": "reviewed-1",
+            "reason": "prior_cancel_outcome_unknown",
+        },
+    )
 
 
 @pytest.mark.parametrize(
@@ -1711,6 +1783,78 @@ def test_bridge_apply_rechecks_live_worker_identity_before_exchange_write(
     assert result.reason_code == "legacy_bridge_worker_identity_drift"
     assert client.cancel_payloads == []
     assert _authority_document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "prewrite_refused"
+        assert json.loads(intent.response_json) == {"submitted": False}
+        assert json.loads(intent.error_json) == {
+            "reason": "legacy_bridge_worker_identity_drift"
+        }
+    fresh = _build_plan(session_factory, client, targets)
+    assert len(fresh.actions) == 2
+    assert fresh.conflicts == ()
+
+
+def test_bridge_begin_refusal_is_retryable_prewrite_evidence(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bridge-refused.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=55,
+        worker_start_ticks=89,
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "validate_legacy_runtime_bridge_cancellation_ready",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="ready"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "begin_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="blocked",
+            reason_code="legacy_bridge_sentinel_drift",
+        ),
+    )
+
+    result = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: identity,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_sentinel_drift"
+    assert client.cancel_payloads == []
+    assert _authority_document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "prewrite_refused"
+        assert json.loads(intent.response_json) == {"submitted": False}
+        assert json.loads(intent.error_json) == {
+            "reason": "legacy_bridge_write_gate_blocked"
+        }
+    fresh = _build_plan(session_factory, client, targets)
+    assert len(fresh.actions) == 2
+    assert fresh.conflicts == ()
 
 
 def test_bridge_apply_locks_unknown_when_worker_drifts_after_exchange_write(

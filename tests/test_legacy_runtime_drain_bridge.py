@@ -63,6 +63,17 @@ REVIEWED_IDS = (
 )
 
 
+def _fingerprint(value):
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
 def _identity(**overrides):
     values = {
         "production_sha": OLD_SHA,
@@ -687,6 +698,98 @@ def test_rollback_refuses_unknown_reviewed_cancel(tmp_path):
 
     assert result.status == "blocked"
     assert result.reason_code == "legacy_bridge_unknown_mutation_present"
+    assert _stored_bridge(session_factory)["state"] == "fenced"
+
+
+def test_rollback_ignores_only_structurally_valid_prewrite_refusal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollback-refused.db")
+    bridge_token = _fenced_bridge(session_factory)
+    order_id = REVIEWED_IDS[0]
+    request = {"instId": "BTC-USDT-SWAP", "ordId": order_id}
+    with session_factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key=(
+                    f"reviewed-pending-entry-cancel:{order_id}:" + "a" * 64
+                ),
+                venue="deepcoin",
+                operation="cancel_reviewed_pending_entry",
+                strategy_instance_id="deepcoin:reviewed",
+                execution_binding_id=9001,
+                execution_order_leg_id=9002,
+                pos_id=f"pending-entry:{order_id}",
+                order_id=order_id,
+                authority_fingerprint="b" * 64,
+                request_fingerprint=_fingerprint(request),
+                status="prewrite_refused",
+                request_json=json.dumps(request, sort_keys=True),
+                response_json=json.dumps({"submitted": False}, sort_keys=True),
+                error_json=json.dumps(
+                    {"reason": "legacy_bridge_write_gate_blocked"},
+                    sort_keys=True,
+                ),
+                reserved_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    rolled_back = rollback_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        confirmation_token="valid-refusal-rollback-token",
+        rolled_back_at=NOW,
+    )
+
+    assert rolled_back.status == "rolled_back"
+
+
+def test_rollback_blocks_malformed_prewrite_refusal(tmp_path):
+    session_factory = create_session_factory(tmp_path / "rollback-malformed.db")
+    bridge_token = _fenced_bridge(session_factory)
+    order_id = REVIEWED_IDS[0]
+    request = {"instId": "BTC-USDT-SWAP", "ordId": order_id}
+    with session_factory() as session:
+        session.add(
+            PositionMutationIntent(
+                idempotency_key=(
+                    f"reviewed-pending-entry-cancel:{order_id}:" + "a" * 64
+                ),
+                venue="deepcoin",
+                operation="cancel_reviewed_pending_entry",
+                strategy_instance_id="deepcoin:reviewed",
+                execution_binding_id=9001,
+                execution_order_leg_id=9002,
+                pos_id=f"pending-entry:{order_id}",
+                order_id=order_id,
+                authority_fingerprint="b" * 64,
+                request_fingerprint=_fingerprint(request),
+                status="prewrite_refused",
+                request_json=json.dumps(request, sort_keys=True),
+                response_json=json.dumps({"submitted": True}, sort_keys=True),
+                error_json=json.dumps(
+                    {"reason": "legacy_bridge_write_gate_blocked"},
+                    sort_keys=True,
+                ),
+                reserved_at=NOW,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    rolled_back = rollback_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        confirmation_token="malformed-refusal-rollback-token",
+        rolled_back_at=NOW,
+    )
+
+    assert rolled_back.status == "blocked"
+    assert rolled_back.reason_code == "legacy_bridge_unknown_mutation_present"
     assert _stored_bridge(session_factory)["state"] == "fenced"
 
 

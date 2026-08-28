@@ -21,6 +21,7 @@ from telegram_kol_research.legacy_runtime_drain_bridge import (
     LegacyRuntimeIdentity,
     begin_legacy_runtime_bridge_cancellation,
     complete_legacy_runtime_bridge_cancellation,
+    is_valid_reviewed_pending_entry_prewrite_refusal,
     legacy_runtime_bridge_revision_gate_state,
     mark_legacy_runtime_bridge_unknown,
     validate_legacy_runtime_bridge_cancellation_ready,
@@ -373,7 +374,7 @@ def build_reviewed_pending_entry_cancel_plan(
                 conflicts.append(_conflict(target, "local_ownership_mismatch"))
                 continue
 
-            earlier_cancel = (
+            earlier_cancels = (
                 session.query(PositionMutationIntent)
                 .filter(
                     PositionMutationIntent.operation
@@ -381,9 +382,12 @@ def build_reviewed_pending_entry_cancel_plan(
                     PositionMutationIntent.order_id == target.order_id,
                     PositionMutationIntent.status != "confirmed",
                 )
-                .first()
+                .all()
             )
-            if earlier_cancel is not None:
+            if any(
+                not is_valid_reviewed_pending_entry_prewrite_refusal(row)
+                for row in earlier_cancels
+            ):
                 conflicts.append(
                     _conflict(target, "prior_cancel_outcome_unknown")
                 )
@@ -768,13 +772,12 @@ def apply_reviewed_pending_entry_cancel_plan(
         mutation_intent_id=intent_id,
         legacy_runtime_identity=legacy_runtime_identity,
     ):
-        transition_position_mutation_intent(
+        _record_pending_cancel_prewrite_refusal(
             session_factory,
-            intent_id,
+            intent_id=intent_id,
             expected_statuses={"reserved"},
-            new_status="blocked",
-            transitioned_at=observed_at,
-            error={"reason": "exact_pending_cancel_write_gate_blocked"},
+            reason_code="exact_pending_cancel_write_gate_blocked",
+            refused_at=observed_at,
         )
         _record_cancel_event(
             session_factory,
@@ -818,13 +821,17 @@ def apply_reviewed_pending_entry_cancel_plan(
     if bridge_enabled:
         live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
         if live_identity != legacy_runtime_identity:
-            transition_position_mutation_intent(
+            identity_reason = (
+                "legacy_bridge_worker_identity_unavailable"
+                if live_identity is None
+                else "legacy_bridge_worker_identity_drift"
+            )
+            _record_pending_cancel_prewrite_refusal(
                 session_factory,
-                intent_id,
+                intent_id=intent_id,
                 expected_statuses={"submitting"},
-                new_status="blocked",
-                transitioned_at=observed_at,
-                error={"reason": "legacy_bridge_worker_identity_drift"},
+                reason_code=identity_reason,
+                refused_at=observed_at,
             )
             release_failure = _release_pending_cancel_authority_before_write(
                 session_factory,
@@ -837,9 +844,7 @@ def apply_reviewed_pending_entry_cancel_plan(
                 reason_code=(
                     release_failure
                     or (
-                        "legacy_bridge_worker_identity_unavailable"
-                        if live_identity is None
-                        else "legacy_bridge_worker_identity_drift"
+                        identity_reason
                     )
                 ),
             )
@@ -851,13 +856,12 @@ def apply_reviewed_pending_entry_cancel_plan(
             started_at=observed_at,
         )
         if bridge_started.status != "cancelling":
-            transition_position_mutation_intent(
+            _record_pending_cancel_prewrite_refusal(
                 session_factory,
-                intent_id,
+                intent_id=intent_id,
                 expected_statuses={"submitting"},
-                new_status="blocked",
-                transitioned_at=observed_at,
-                error={"reason": "legacy_bridge_write_gate_blocked"},
+                reason_code="legacy_bridge_write_gate_blocked",
+                refused_at=observed_at,
             )
             release_failure = _release_pending_cancel_authority_before_write(
                 session_factory,
@@ -1132,7 +1136,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             order_id=action.order_id,
             completed_at=observed_at,
         )
-        if bridge_completed.status != "fenced":
+        if bridge_completed.status not in {"fenced", "handed_off"}:
             _mark_bridge_unknown_after_write(
                 session_factory,
                 enabled=True,
@@ -1189,6 +1193,25 @@ def _release_pending_cancel_authority_before_write(
     return (
         released.reason_code
         or "entry_revision_exchange_authority_release_failed"
+    )
+
+
+def _record_pending_cancel_prewrite_refusal(
+    session_factory,
+    *,
+    intent_id: int,
+    expected_statuses: set[str],
+    reason_code: str,
+    refused_at: datetime,
+) -> bool:
+    return transition_position_mutation_intent(
+        session_factory,
+        intent_id,
+        expected_statuses=expected_statuses,
+        new_status="prewrite_refused",
+        transitioned_at=refused_at,
+        response={"submitted": False},
+        error={"reason": reason_code},
     )
 
 

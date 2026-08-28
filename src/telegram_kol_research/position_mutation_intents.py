@@ -21,6 +21,7 @@ POSITION_MUTATION_INTENT_STATUSES = frozenset(
         "rejected",
         "recovery_required",
         "blocked",
+        "prewrite_refused",
     }
 )
 
