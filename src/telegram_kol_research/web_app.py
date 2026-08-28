@@ -15,6 +15,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import pwd
 import re
 import secrets
@@ -68,6 +69,9 @@ from telegram_kol_research.contract_cache_permissions import (
 )
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.runtime_agent_production_audit import (
     project_bounded_production_audit,
     run_bounded_production_audit_command,
@@ -83,6 +87,11 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
 )
 from telegram_kol_research.runtime_loop_health import LoopLagMonitor
+from telegram_kol_research.runtime_deployment_identity import (
+    RuntimeAuthorityStatus,
+    build_runtime_deployment_identity,
+    read_self_process_start_ticks,
+)
 from telegram_kol_research.runtime_worker_executor import (
     run_on_management_worker,
     shutdown_management_worker_executor,
@@ -241,6 +250,7 @@ from telegram_kol_research.worker_command_jobs import (
     get_worker_command,
 )
 from telegram_kol_research.worker_command_executor import (
+    ENTRY_SUBMISSION_COMMAND_TYPES,
     WorkerCommandDependencies,
     require_worker_command_mode_transition_safe,
     supervise_worker_command_mode,
@@ -366,6 +376,39 @@ def runtime_role_starts_singleton_task(value: str, task_name: str) -> bool:
 def runtime_role_starts_process_monitor(value: str, task_name: str) -> bool:
     resolve_runtime_role(value)
     return task_name == "loop_lag_monitor"
+
+
+def build_runtime_deployment_identity_for_app(app: FastAPI) -> dict[str, Any]:
+    """Project process-local loaded-code and authority evidence without I/O."""
+
+    observed_now = app.state.now_provider()
+    return build_runtime_deployment_identity(
+        runtime_role=app.state.runtime_role,
+        module_path=Path(__file__),
+        expected_commit=os.environ.get("TELEGRAM_KOL_RELEASE_COMMIT", ""),
+        expected_manifest_sha256=os.environ.get(
+            "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256", ""
+        ),
+        tasks={
+            "strategy_management_worker": app.state.strategy_management_worker_task,
+            "break_even_convergence_worker": app.state.break_even_convergence_worker_task,
+            "deepcoin_reconcile": app.state.deepcoin_reconcile_task,
+            "lifecycle_monitor": app.state.lifecycle_monitor_task,
+            "message_processing_worker": app.state.message_processing_worker_task,
+            "worker_command_worker": app.state.worker_command_worker_task,
+            "live_listener": app.state.live_listener_task,
+            "reconcile": app.state.reconcile_task,
+        },
+        authority_snapshot=app.state.runtime_authority_status.snapshot(
+            now=observed_now
+        ),
+        authority_evidence=app.state.runtime_authority_status.evidence(
+            now=observed_now
+        ),
+        process_start_ticks=app.state.process_start_ticks,
+        entry_admission_frozen=app.state.deployment_entry_frozen,
+        now=observed_now,
+    )
 
 
 def resolve_ingest_refresh_url(value: str) -> str:
@@ -4016,6 +4059,15 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
     settings = load_trading_settings(app.state.session_factory)
     if not settings.context_resolution_enabled or not settings.live_management_execution_enabled:
         if settings.entry_revision_v2_mode != "disabled":
+            if app.state.deployment_entry_frozen:
+                return {
+                    "status": "completed",
+                    "context_resolution": {"status": "disabled"},
+                    "entry_revision": {
+                        "status": "deployment_entry_frozen",
+                        "batch_ids": [],
+                    },
+                }
             revision_result = run_entry_revision_worker_once(
                 app.state.session_factory,
                 deepcoin_client=app.state.deepcoin_client_factory(),
@@ -4096,6 +4148,15 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
     )
     if settings.entry_revision_v2_mode == "disabled":
         return context_result
+    if app.state.deployment_entry_frozen:
+        return {
+            "status": "completed",
+            "context_resolution": context_result,
+            "entry_revision": {
+                "status": "deployment_entry_frozen",
+                "batch_ids": [],
+            },
+        }
     revision_result = run_entry_revision_worker_once(
         app.state.session_factory,
         deepcoin_client=app.state.deepcoin_client_factory(),
@@ -4330,6 +4391,14 @@ async def _prepare_web_worker_command(
     request: dict[str, Any],
     idempotency_key: str | None,
 ) -> Any:
+    if (
+        app.state.deployment_entry_frozen
+        and command_type in ENTRY_SUBMISSION_COMMAND_TYPES
+    ):
+        raise HTTPException(
+            status_code=503,
+            detail={"code": "deployment_entry_frozen"},
+        )
     settings = await asyncio.to_thread(load_trading_settings, app.state.session_factory)
     mode = settings.worker_command_mode
     if mode != "queue":
@@ -4435,6 +4504,7 @@ def create_web_app(
     """Create the minimal FastAPI app used by the web command."""
 
     resolved_runtime_role = resolve_runtime_role(runtime_role)
+    deployment_entry_frozen = deployment_entry_admission_frozen()
     split_runtime = resolved_runtime_role != "all"
     resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
     resolved_ingest_trading_settings_url = resolve_ingest_trading_settings_url(
@@ -4580,6 +4650,12 @@ def create_web_app(
                             app.state.system_operator_bot_config
                         ),
                         contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                        authority_observer=(
+                            app.state.runtime_authority_status.record_reconcile_cycle
+                        ),
+                        authority_failure_observer=(
+                            app.state.runtime_authority_status.record_reconcile_failure
+                        ),
                     )
                 )
             if runtime_role_starts_singleton_task(
@@ -4595,6 +4671,12 @@ def create_web_app(
                         max_batches=app.state.strategy_management_worker_max_batches,
                         now_provider=app.state.now_provider,
                         contract_spec_provider=app.state.deepcoin_contract_spec_provider,
+                        authority_observer=(
+                            app.state.runtime_authority_status.record_management_cycle
+                        ),
+                        authority_failure_observer=(
+                            app.state.runtime_authority_status.record_management_failure
+                        ),
                     )
                 )
                 app.state.strategy_management_worker_task.add_done_callback(
@@ -4615,6 +4697,12 @@ def create_web_app(
                             app.state.break_even_convergence_worker_interval_seconds
                         ),
                         now_provider=app.state.now_provider,
+                        authority_observer=(
+                            app.state.runtime_authority_status.record_break_even_cycle
+                        ),
+                        authority_failure_observer=(
+                            app.state.runtime_authority_status.record_break_even_failure
+                        ),
                     )
                 )
                 app.state.break_even_convergence_worker_task.add_done_callback(
@@ -5266,6 +5354,7 @@ def create_web_app(
         now_provider=app.state.now_provider,
         notification_bot_config=app.state.notification_bot_config,
         system_operator_bot_config=app.state.system_operator_bot_config,
+        entry_admission_frozen=deployment_entry_frozen,
     )
     app.state.break_even_convergence_worker_runner = (
         break_even_convergence_worker_runner
@@ -5329,6 +5418,9 @@ def create_web_app(
     app.state.position_snapshot_refresh_task = None
     app.state.loop_lag_monitor = LoopLagMonitor(now_provider=app.state.now_provider)
     app.state.loop_lag_monitor_task = None
+    app.state.runtime_authority_status = RuntimeAuthorityStatus()
+    app.state.deployment_entry_frozen = deployment_entry_frozen
+    app.state.process_start_ticks = read_self_process_start_ticks()
     app.state.web_event_loop = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client
@@ -5363,6 +5455,8 @@ def create_web_app(
         if not runtime_role_starts_singleton_task(
             app.state.runtime_role, "message_processing_worker"
         ):
+            return
+        if app.state.deployment_entry_frozen:
             return
         mode = load_trading_settings(
             app.state.session_factory
@@ -5611,6 +5705,12 @@ def create_web_app(
         if app.state.runtime_role in {"all", "ingest"}:
             payload.update(app.state.message_lock_registry.snapshot())
         return payload
+
+    @app.get("/api/runtime/deployment-identity")
+    async def api_runtime_deployment_identity():
+        """Return redacted process-local loaded-artifact and authority proof."""
+
+        return build_runtime_deployment_identity_for_app(app)
 
     @app.get("/api/runtime/message-pipeline-parity")
     def api_runtime_message_pipeline_parity(
@@ -8823,6 +8923,8 @@ async def run_deepcoin_execution_reconcile_loop(
     system_operator_bot_config: SystemOperatorBotConfig | None = None,
     terminal_entry_cleanup_bot_config: SystemOperatorBotConfig | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
+    authority_observer=None,
+    authority_failure_observer=None,
 ) -> None:
     while True:
         try:
@@ -8861,12 +8963,26 @@ async def run_deepcoin_execution_reconcile_loop(
                     config=terminal_entry_cleanup_bot_config,
                     delivered_at=synced_at,
                 )
+            if authority_observer is not None:
+                authority_observer(observed_at=synced_at)
         except asyncio.CancelledError:
             raise
         except DeepcoinClientError as exc:
             logger.warning("Deepcoin execution reconcile skipped: %s", exc)
+            if authority_failure_observer is not None:
+                authority_failure_observer(
+                    observed_at=(
+                        now_provider() if now_provider is not None else datetime.now(UTC)
+                    )
+                )
         except Exception:
             logger.exception("Deepcoin execution reconcile failed")
+            if authority_failure_observer is not None:
+                authority_failure_observer(
+                    observed_at=(
+                        now_provider() if now_provider is not None else datetime.now(UTC)
+                    )
+                )
         await asyncio.sleep(interval_seconds)
 
 

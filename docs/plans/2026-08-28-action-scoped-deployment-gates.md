@@ -164,6 +164,42 @@ Rollback ends at the last verified immutable release. It never silently re-enabl
 
 Do not begin this task without a separate review of the immutable-release layout and rollback behavior.
 
+Implemented locally after the immutable-layout review. The implementation uses
+a separate Python activator and an explicit updater dispatcher so the legacy
+checkout-mutating path is not mixed into immutable activation. Component
+drop-ins load the exact read-only release while preserving the existing data
+working directory and trusted virtual environment. Runtime proof binds imported
+module path and manifest digest to systemd `MainPID` plus `/proc` start ticks;
+worker scope also directly observes the running management, protection, close,
+TPSL, and rescue tasks. Authorization is fresh, plan-bound, and single-use.
+
+Any worker/ingest authority activation now restarts `web`, `ingest`, and
+`worker` as one bounded maintenance group and installs the same root-owned
+entry freeze on all three. Partial authority activation is rejected. The
+freeze blocks only new entry admission: message consumption is dormant, Web
+rejects entry commands, the durable command lane skips its two entry-submission
+types, and both recovery submission and entry-revision replacement recheck the
+freeze at their final write boundaries. Close/sync plus protection, management,
+TPSL, close, and rescue remain separate directly proven capabilities.
+Candidate success and immutable rollback both stay entry-frozen; entry
+resumption is a future independently authorized `trading` action with a bounded
+maintenance watermark and no automatic backlog replay. Subsequent Web-only
+activation preserves a pre-existing freeze and cannot perform a true-to-false
+transition.
+
+The implementation intentionally accepts a bounded maintenance interruption.
+It performs pre-stop and post-stop active-write checks for worker authority,
+then either proves the candidate or returns only to the separately validated
+immutable rollback release. Ingest-only scope is rejected because it cannot
+close the worker-authority TOCTOU. L3 schema/data activation remains explicitly
+unavailable until its backup/integrity executor exists. The first production
+immutable switch also remains blocked until a separately authorized migration
+deployment has installed the loaded-artifact endpoint; legacy checkout HEAD is
+never treated as runtime identity. Worker/ingest activation also fails closed
+if the canonical durable entry-authority row is absent or malformed; creating
+that row is a separately reviewed and authorized production database write,
+not an activator side effect.
+
 ## Batch 4 — Workstation helpers and legacy removal
 
 ### Task 7: Split workstation entry points

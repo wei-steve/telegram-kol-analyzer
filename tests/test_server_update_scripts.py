@@ -43,6 +43,10 @@ def test_update_scripts_are_syntax_valid():
         check=True,
     )
     subprocess.run(
+        ["bash", "-n", str(ROOT / "deploy/telegram-kol-activate")],
+        check=True,
+    )
+    subprocess.run(
         [
             "python3",
             "-m",
@@ -51,6 +55,56 @@ def test_update_scripts_are_syntax_valid():
         ],
         check=True,
     )
+
+
+def test_updater_dispatches_activate_before_legacy_universal_inputs():
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    dispatch = updater.index('case "$DEPLOYMENT_ACTION" in')
+    activator_exec = updater.index('exec "$ACTIVATOR_PATH"', dispatch)
+    legacy_expected_commit = updater.index('EXPECTED_COMMIT="${EXPECTED_COMMIT:?')
+    assert dispatch < activator_exec < legacy_expected_commit
+    assert 'DEPLOYMENT_ACTION="${DEPLOYMENT_ACTION:-legacy}"' in updater
+    assert "DEPLOYMENT_ACTION must be activate or legacy" in updater
+
+
+def test_legacy_and_scoped_paths_share_one_deployment_control_lock():
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+    activator = (
+        ROOT / "src/telegram_kol_research/scoped_release_activation.py"
+    ).read_text(encoding="utf-8")
+
+    assert 'LOCK_PATH="${LOCK_PATH:-/run/telegram-kol-update.lock}"' in updater
+    assert 'Path("/run/telegram-kol-update.lock")' in activator
+    assert "/run/telegram-kol-activate.lock" not in activator
+
+
+def test_scoped_activator_has_no_settings_telegram_or_exchange_write_path():
+    script = (ROOT / "deploy/telegram-kol-activate").read_text(encoding="utf-8")
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+    implementation = (
+        ROOT / "src/telegram_kol_research/scoped_release_activation.py"
+    ).read_text(encoding="utf-8")
+    combined = script + implementation
+
+    for forbidden in (
+        "save_trading_settings",
+        "api.deepcoin.com",
+        "DC-ACCESS-",
+        "send_message",
+        "replay",
+        "bulk_cancel",
+    ):
+        assert forbidden not in combined
+    assert "deployment_activation_quiescence_check" in implementation
+    assert "runtime-deployment-identity-v1" in implementation
+    assert "rollback_complete" in implementation
+    assert 'export PYTHONPATH="$ACTIVATOR_ROOT/src"' in script
+    assert 'ACTIVATOR_PYTHON=/opt/telegram-kol-analyzer/.venv/bin/python' in script
+    assert 'exec "$ACTIVATOR_PYTHON"' in script
+    assert 'ACTIVATOR_PATH="/opt/telegram-kol-releases/$ROLLBACK_COMMIT/' in updater
+    assert 'ACTIVATOR_PATH="${ACTIVATOR_PATH:-' not in updater
+    assert "run_monitor_diagnostic" not in implementation
 
 
 def test_stage_only_command_has_no_live_runtime_or_trading_dependencies():
@@ -96,6 +150,26 @@ def test_stage_only_policy_documents_inputs_outputs_and_non_authority():
         "does not authorize activation",
         "does not inspect the production database",
         "does not control any service",
+    ):
+        assert required in policy
+
+
+def test_scoped_activation_policy_documents_identity_rollback_and_blockers():
+    policy = (ROOT / "docs/deployment-action-gates.md").read_text(encoding="utf-8")
+
+    for required in (
+        "## Scoped immutable activation command",
+        "`ACTIVATION_AUTHORIZATION`",
+        "systemd `MainPID`",
+        "`/proc` start ticks",
+        "management,",
+        "protection, close, TPSL, and rescue",
+        "explicit short interruption",
+        "separately validated `ROLLBACK_COMMIT`",
+        "checkout HEAD is not accepted as a substitute",
+        "Schema or production-data mutation is refused",
+        "does not change settings",
+        "replay messages",
     ):
         assert required in policy
 

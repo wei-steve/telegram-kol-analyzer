@@ -236,6 +236,7 @@ def claim_worker_commands(
     claimed_at: datetime | None = None,
     lease_for: timedelta = timedelta(seconds=30),
     limit: int = 20,
+    allowed_command_types: frozenset[str] | None = None,
 ) -> list[WorkerCommandClaim]:
     """Atomically claim oldest pending or expired pre-execution commands."""
 
@@ -245,23 +246,29 @@ def claim_worker_commands(
     claim_limit = max(0, int(limit))
     if claim_limit == 0:
         return []
+    if allowed_command_types is not None and not allowed_command_types:
+        return []
 
     claims: list[WorkerCommandClaim] = []
     with session_factory() as session:
         session.execute(text("BEGIN IMMEDIATE"))
-        rows = (
-            session.query(WorkerCommandJob)
-            .filter(
-                or_(
-                    WorkerCommandJob.status == "pending",
-                    and_(
-                        WorkerCommandJob.status == "claimed",
-                        WorkerCommandJob.side_effect_started_at.is_(None),
-                        WorkerCommandJob.lease_expires_at.is_not(None),
-                        WorkerCommandJob.lease_expires_at <= claim_time,
-                    ),
-                )
+        query = session.query(WorkerCommandJob).filter(
+            or_(
+                WorkerCommandJob.status == "pending",
+                and_(
+                    WorkerCommandJob.status == "claimed",
+                    WorkerCommandJob.side_effect_started_at.is_(None),
+                    WorkerCommandJob.lease_expires_at.is_not(None),
+                    WorkerCommandJob.lease_expires_at <= claim_time,
+                ),
             )
+        )
+        if allowed_command_types is not None:
+            query = query.filter(
+                WorkerCommandJob.command_type.in_(sorted(allowed_command_types))
+            )
+        rows = (
+            query
             .order_by(WorkerCommandJob.created_at.asc(), WorkerCommandJob.id.asc())
             .limit(claim_limit)
             .all()

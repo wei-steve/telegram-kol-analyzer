@@ -39,6 +39,9 @@ from telegram_kol_research.entry_revision_exchange_authority import (
     acquire_entry_revision_exchange_authority,
     release_entry_revision_exchange_authority,
 )
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
@@ -463,6 +466,12 @@ def execute_entry_revision(
     """Run one live revision under durable and single-process authority."""
 
     now = executed_at or datetime.now(UTC)
+    if deployment_entry_admission_frozen():
+        return EntryRevisionExecutionResult(
+            "in_progress",
+            int(batch_id),
+            "deployment_entry_frozen",
+        )
     rollout_mode = load_trading_settings(session_factory).entry_revision_v2_mode
     if rollout_mode == "disabled":
         return EntryRevisionExecutionResult("disabled", int(batch_id))
@@ -1288,6 +1297,12 @@ def _execute_entry_revision_with_position_authority(
                     reason="entry_revision_replacement_restart_requires_reconciliation",
                     now=now,
                 )
+            if deployment_entry_admission_frozen():
+                return EntryRevisionExecutionResult(
+                    "in_progress",
+                    int(batch_id),
+                    "deployment_entry_frozen",
+                )
             desired = json.loads(row.desired_json)
             payload, is_trigger = _replacement_payload(
                 replacement=replacement, binding=binding, desired=desired
@@ -1500,6 +1515,8 @@ def run_entry_revision_worker_once(
 ) -> dict[str, Any]:
     """Advance a bounded set of durable live revisions from the runtime worker."""
 
+    if deployment_entry_admission_frozen():
+        return {"status": "deployment_entry_frozen", "batch_ids": []}
     settings = load_trading_settings(session_factory)
     if settings.entry_revision_v2_mode == "disabled":
         return {"status": settings.entry_revision_v2_mode, "batch_ids": []}

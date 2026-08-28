@@ -45,6 +45,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_WORKER_COMMAND_LEASE = timedelta(minutes=5)
 SYNC_EFFECTS_FULL = "full"
 SYNC_EFFECTS_RECONCILE_ONLY = "reconcile_only"
+ENTRY_SUBMISSION_COMMAND_TYPES = frozenset(
+    {"recovery_live_submit", "process_next_trade_signal"}
+)
+ENTRY_FROZEN_ALLOWED_COMMAND_TYPES = frozenset(
+    {"sync_deepcoin_execution", "close_bound_position"}
+)
 _SYNC_READ_METHODS = frozenset(
     {
         "list_positions",
@@ -79,6 +85,7 @@ class WorkerCommandDependencies:
     cleanup_notification_deliverer: IncidentDeliverer = (
         deliver_terminal_entry_cleanup_notifications
     )
+    entry_admission_frozen: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,6 +169,11 @@ async def run_worker_command_tick(
         claimed_at=tick_time,
         lease_for=lease_for,
         limit=limit,
+        allowed_command_types=(
+            ENTRY_FROZEN_ALLOWED_COMMAND_TYPES
+            if dependencies.entry_admission_frozen
+            else None
+        ),
     )
     succeeded = 0
     failed = 0

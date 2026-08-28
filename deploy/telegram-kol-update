@@ -1,6 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+DEPLOYMENT_ACTION="${DEPLOYMENT_ACTION:-legacy}"
+case "$DEPLOYMENT_ACTION" in
+  activate)
+    if [[ ! "${ROLLBACK_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+      echo "ROLLBACK_COMMIT must identify the reviewed immutable control release." >&2
+      exit 4
+    fi
+    ACTIVATOR_PATH="/opt/telegram-kol-releases/$ROLLBACK_COMMIT/deploy/telegram-kol-activate"
+    if [ ! -x "$ACTIVATOR_PATH" ]; then
+      echo "Scoped activator is unavailable." >&2
+      exit 4
+    fi
+    exec "$ACTIVATOR_PATH"
+    ;;
+  legacy) ;;
+  *)
+    echo "DEPLOYMENT_ACTION must be activate or legacy." >&2
+    exit 4
+    ;;
+esac
+
 APP_DIR="${APP_DIR:-/opt/telegram-kol-analyzer}"
 BRANCH="${BRANCH:-codex/deepcoin-auto-trading-v1}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:?set EXPECTED_COMMIT to the reviewed 40-character commit}"

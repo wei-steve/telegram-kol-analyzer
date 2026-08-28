@@ -19,6 +19,9 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinTradingClientProtocol,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_margin_mode as _deepcoin_margin_mode,
     normalize_deepcoin_position_mode as _deepcoin_position_mode,
@@ -1692,6 +1695,8 @@ def recreate_trigger_entry_tpsl(
     )
     if not after:
         raise DeepcoinExecutionActionError("missing_new_tpsl_price")
+    if deployment_entry_admission_frozen():
+        raise DeepcoinExecutionActionError("deployment_entry_frozen")
 
     cancel_payload = {"instId": inst_id, "ordId": old_order_id}
     cancel_response = deepcoin_client.cancel_trigger_order(cancel_payload)

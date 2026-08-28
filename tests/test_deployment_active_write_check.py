@@ -50,6 +50,7 @@ def _create_authority_database(path: Path) -> Path:
             );
             CREATE TABLE position_mutation_intents (id INTEGER, status TEXT);
             CREATE TABLE trade_signals (id INTEGER, status TEXT);
+            CREATE TABLE worker_command_jobs (id INTEGER, status TEXT);
             """
         )
     return path
@@ -79,6 +80,7 @@ def test_empty_authority_tables_have_zero_active_writes(tmp_path: Path) -> None:
         ("trade_signals", "status", "processing"),
         ("trade_signals", "status", "submitting"),
         ("trade_signals", "status", "cancel_submitting"),
+        ("worker_command_jobs", "status", "executing"),
     ),
 )
 def test_direct_active_state_counts_one(
@@ -160,6 +162,7 @@ def test_claim_aware_child_requires_complete_nonempty_parent_claim(
         ("trigger_protection_intents", "recovery_state", "recovery_required"),
         ("position_mutation_intents", "status", "completed"),
         ("trade_signals", "status", "invented_future_state"),
+        ("worker_command_jobs", "status", "claimed"),
     ),
 )
 def test_historical_and_unfamiliar_states_are_ignored(

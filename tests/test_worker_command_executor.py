@@ -643,6 +643,56 @@ def test_worker_tick_commits_executing_before_adapter_and_settles_once(tmp_path)
         assert row.result_json == '{"checked":1}'
 
 
+def test_entry_freeze_skips_entry_commands_but_executes_close_command(tmp_path):
+    import telegram_kol_research.worker_command_executor as executor
+    from telegram_kol_research.trading_settings import save_trading_settings
+    from telegram_kol_research.worker_command_jobs import enqueue_worker_command
+
+    session_factory = create_session_factory(tmp_path / "entry-freeze.db")
+    save_trading_settings(session_factory, {"worker_command_mode": "queue"})
+    entry = enqueue_worker_command(
+        session_factory,
+        command_type="process_next_trade_signal",
+        request={},
+        created_at=NOW,
+    )
+    close = enqueue_worker_command(
+        session_factory,
+        command_type="close_bound_position",
+        request={"pos_id": "position-7"},
+        created_at=NOW + timedelta(seconds=1),
+    )
+    calls = []
+
+    async def adapter(claim, *, dependencies):
+        calls.append(claim.command_type)
+        return executor.WorkerCommandExecutionResult(http_status=200, body={})
+
+    result = asyncio.run(
+        executor.run_worker_command_tick(
+            session_factory,
+            dependencies=executor.WorkerCommandDependencies(
+                session_factory=session_factory,
+                deepcoin_client_factory=object,
+                contract_spec_provider="contract-provider",
+                now_provider=lambda: NOW,
+                entry_admission_frozen=True,
+            ),
+            now=NOW + timedelta(seconds=2),
+            adapter=adapter,
+        )
+    )
+
+    assert result == executor.WorkerCommandWorkerResult(claimed=1, succeeded=1)
+    assert calls == ["close_bound_position"]
+    with session_factory() as session:
+        rows = {
+            row.command_id: row.status
+            for row in session.query(WorkerCommandJob).order_by(WorkerCommandJob.id)
+        }
+    assert rows == {entry.command_id: "pending", close.command_id: "succeeded"}
+
+
 def test_worker_tick_settles_mapped_error_and_never_retries_it(tmp_path):
     import telegram_kol_research.worker_command_executor as executor
     from telegram_kol_research.trading_settings import save_trading_settings

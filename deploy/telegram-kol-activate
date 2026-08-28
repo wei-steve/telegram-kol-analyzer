@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ACTIVATOR_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+if [[ "$ACTIVATOR_ROOT" == /opt/telegram-kol-releases/* ]]; then
+  ACTIVATOR_PYTHON=/opt/telegram-kol-analyzer/.venv/bin/python
+else
+  ACTIVATOR_PYTHON="$ACTIVATOR_ROOT/.venv/bin/python"
+fi
+export PYTHONPATH="$ACTIVATOR_ROOT/src"
+exec "$ACTIVATOR_PYTHON" -m telegram_kol_research.scoped_release_activation

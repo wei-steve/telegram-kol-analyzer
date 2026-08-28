@@ -80,6 +80,11 @@ _COUNT_QUERIES = (
     FROM trade_signals
     WHERE status IN ('processing', 'submitting', 'cancel_submitting')
     """,
+    """
+    SELECT COUNT(*)
+    FROM worker_command_jobs
+    WHERE status = 'executing'
+    """,
 )
 
 
@@ -100,14 +105,7 @@ def count_active_exchange_writes(database_path: str | Path) -> int:
             raise ActiveWriteCheckError("active_write_check_failed")
         connection.execute("BEGIN")
 
-        for query in _COUNT_QUERIES:
-            row = connection.execute(query).fetchone()
-            if row is None or len(row) != 1:
-                raise ActiveWriteCheckError("active_write_check_failed")
-            count = row[0]
-            if isinstance(count, bool) or not isinstance(count, int) or count < 0:
-                raise ActiveWriteCheckError("active_write_check_failed")
-            total = min(_MAX_ACTIVE_WRITE_COUNT, total + count)
+        total = count_active_exchange_writes_in_connection(connection)
     except Exception:
         failed = True
     finally:
@@ -123,6 +121,21 @@ def count_active_exchange_writes(database_path: str | Path) -> int:
 
     if failed or cleanup_failed:
         raise ActiveWriteCheckError("active_write_check_failed") from None
+    return total
+
+
+def count_active_exchange_writes_in_connection(
+    connection: sqlite3.Connection,
+) -> int:
+    total = 0
+    for query in _COUNT_QUERIES:
+        row = connection.execute(query).fetchone()
+        if row is None or len(row) != 1:
+            raise ActiveWriteCheckError("active_write_check_failed")
+        count = row[0]
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise ActiveWriteCheckError("active_write_check_failed")
+        total = min(_MAX_ACTIVE_WRITE_COUNT, total + count)
     return total
 
 

@@ -339,21 +339,32 @@ async def run_break_even_convergence_worker_loop(
     deepcoin_client_factory: Callable[[], Any],
     interval_seconds: float = 2.0,
     now_provider: Callable[[], datetime] | None = None,
+    authority_observer=None,
+    authority_failure_observer=None,
 ) -> None:
     """Run bounded ticks until the owning application cancels the task."""
 
     while True:
         try:
+            observed_at = (
+                now_provider() if now_provider is not None else datetime.now(UTC)
+            )
             await run_on_management_worker(
                 run_break_even_convergence_worker_tick,
                 session_factory,
                 deepcoin_client_factory=deepcoin_client_factory,
-                processed_at=(
-                    now_provider() if now_provider is not None else datetime.now(UTC)
-                ),
+                processed_at=observed_at,
             )
+            if authority_observer is not None:
+                authority_observer(observed_at=observed_at)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("automatic break-even worker tick failed")
+            if authority_failure_observer is not None:
+                authority_failure_observer(
+                    observed_at=(
+                        now_provider() if now_provider is not None else datetime.now(UTC)
+                    )
+                )
         await asyncio.sleep(max(0.01, float(interval_seconds)))

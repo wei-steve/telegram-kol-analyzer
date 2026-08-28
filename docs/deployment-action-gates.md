@@ -13,12 +13,17 @@ The existing conservative updater remains authoritative for production activatio
 | `local` | correct workspace; risk-scoped tests | SSH, service control, production settings/DB, Telegram, exchange writes | no production authorization |
 | `push` | clean tree; reviewed diff; exact commit; fast-forward history | stage, activation, restart, production settings/DB, Telegram, exchange writes | push only |
 | `stage` | exact commit; immutable inactive artifact; non-secret receipt | active checkout mutation, service control, production settings/DB, Telegram, exchange writes | server staging only |
-| `activate` | verified stage receipt; explicit activation approval; exact loaded-artifact identity; affected-service scope; rollback; scoped health | undeclared services, trading enablement, exchange writes, historical/frozen-message replay, bulk order actions | activation/restart only |
+| `activate` | verified stage receipt; explicit activation approval; exact loaded-artifact identity; affected-service scope; rollback; scoped health | undeclared services, new-entry admission, activator-originated exchange writes, historical/frozen-message replay, bulk order actions | activation/restart only |
 | `trading` | explicit trading approval; fresh runtime/exchange evidence; one canonical target; no unknown; fresh single-use confirmation; full local terminalization | bulk actions, historical/frozen-message replay, automatic retry after unknown | exactly one trading action |
 
 Stage must not inspect live runtime or database state. This remains true for an L3 worker candidate: risk changes what later activation must prove, not whether inert candidate files may be prepared.
 
 Trading enablement is never implied by activation. Enabling entry, performing a close/TPSL/rescue action, or writing to Deepcoin is a distinct `trading` action.
+
+An activation does not disable already-authorized protection, management,
+close, TPSL, or rescue merely to make deployment easier. Those capabilities
+must be proven from fresh successful worker cycles and live task ownership. The
+activator itself neither grants nor invokes them.
 
 ## Risk levels describe the change, not the action
 
@@ -111,6 +116,115 @@ The published directory is named by the exact commit and contains source files p
 All published directories are mode `0555`; regular files are `0444` or `0555` according to their executable bit. Publication is same-filesystem and no-replace. Re-running the same commit with the same action manifest validates and returns the existing receipt. Any content, metadata, branch, or action-manifest mismatch fails closed and is not repaired automatically.
 
 Successful staging does not authorize activation. It does not inspect the production database, does not control any service, does not change settings, does not send Telegram messages, and does not access an exchange. A separate future `activate` command must independently verify the receipt and obtain activation authorization.
+
+## Scoped immutable activation command
+
+`deploy/telegram-kol-activate` is the separate activation entry point. It
+accepts `EXPECTED_COMMIT`, `ROLLBACK_COMMIT`, `ACTION_MANIFEST`,
+`ACTIVATION_AUTHORIZATION`, `ACTIVATION_AUTHORIZATION_CONSUMED`,
+`RELEASE_ROOT`, `SERVICE_DROPIN_ROOT`, and `DATABASE_PATH`. The activation
+manifest must describe the same risk, components, restart, schema/data,
+exchange-semantics, and authority impact as the staged manifest; only its
+action changes from `stage` to `activate`.
+
+The authorization is a root-owned mode-`0400` canonical JSON document bound to
+the candidate commit, ordered component scope, activation-plan digest, a
+64-hex nonce, and an at-most-15-minute issue/expiry window. Activation validates
+it only after validating both candidate and rollback releases and fresh runtime
+evidence. It then consumes the token once with a same-directory no-replace hard
+link plus unlink before controlling a service. Failure after consumption never
+restores the token.
+
+Runtime services load code with a component-specific systemd drop-in whose
+`PYTHONPATH` names the exact immutable release. Success requires the loopback
+runtime endpoint to prove all of the following at once:
+
+- the imported module resides under that release's `src` directory;
+- the immutable manifest bytes match the expected manifest digest and commit;
+- the endpoint PID/start ticks equal systemd `MainPID` and `/proc` start ticks;
+- each declared restarted runtime has a new PID/start-ticks identity;
+- for worker authority, exactly the worker directly reports live management,
+  protection, close, TPSL, and rescue task authority.
+
+The activation control program is imported from the separately verified
+immutable rollback release, not from the mutable active checkout. Candidate
+and rollback may differ in application source, tests, documentation, and
+activation control code, but their runtime configuration, dependency metadata,
+and installed systemd unit inputs must match for this Batch 3 activator. A
+change in that runtime-support scope fails before authorization is consumed.
+
+Web-only activation does not query the database or trading authority. Worker
+activation performs a read-only active-write check both before and after the
+old worker is stopped. Any worker or ingest authority activation must declare
+and restart `web`, `ingest`, and `worker` together. This is necessary because
+all three can admit entry work through HTTP, live message processing, or the
+durable worker. Partial authority scope is rejected before release or
+authorization handling.
+The maintenance interval starts when the first declared service is stopped and
+ends only after the new identities and authority have passed. This is an
+explicit short interruption, not a zero-interruption claim.
+
+Every authority-cutover candidate and rollback drop-in sets the same root-owned
+`TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1` on `web`, `ingest`, and `worker`.
+While it is set, the message-processing consumer never starts, Web rejects new
+entry-command admission, and the durable worker-command consumer skips only
+`recovery_live_submit` and `process_next_trade_signal`. The recovery submission
+gate and entry-revision replacement boundary independently recheck the same
+process environment immediately before an entry exchange write; pending entry
+revision work is not claimed. Pending-entry cancel/recreate management is
+blocked before its cancel so it cannot strand an order halfway through a
+maintenance switch. Close and sync commands, together with independently
+proven protection, management, TPSL, and rescue authority, remain available.
+Runtime success requires all three runtime endpoints to prove this entry freeze
+and the absence of a message consumer; a settings or API write cannot clear it.
+
+Activation deliberately leaves all runtime entry paths frozen after success and
+rollback. Removing that drop-in is a later, separately authorized `trading`
+action. Before removal, that action must establish a fresh bounded watermark
+and terminalize or explicitly review work accumulated during the maintenance
+window; it must never automatically replay frozen-period messages or queued
+entry commands.
+
+A later Web-only or monitor-adjacent activation preserves any freeze reported
+by the affected runtime before restart. No `activate` action is allowed to
+transition entry freeze from true to false; only the future `trading` thaw
+action may do so.
+
+Monitor activation stops only its timer and oneshot units. Every monitor
+oneshot receives the immutable `PYTHONPATH` plus a self-identity `ExecStartPre`;
+the activator separately runs only the same read-only loaded-artifact
+self-identity module from the candidate release. It does not execute the normal,
+diagnostic, or notification monitor command because those paths can update
+monitor state or capture an incident. If the timer was active before the switch,
+it is restored only after the identity probe passes.
+
+Any failure after service control rewrites the same scoped drop-ins to the
+separately validated `ROLLBACK_COMMIT`, starts only the declared services, and
+proves the rollback identities, authority, and runtime-wide entry freeze. It does not change settings,
+enable trading, replay messages, invoke a Telegram send, or call Deepcoin.
+Unknown evidence fails closed and is not converted to zero.
+
+Three deliberate activation blockers remain:
+
+1. A legacy checkout-loaded runtime cannot pass the immutable loaded-artifact
+   endpoint. Before the first immutable switch, the observability endpoint must
+   itself reach production through a separately reviewed and authorized
+   migration deployment; checkout HEAD is not accepted as a substitute.
+2. Schema or production-data mutation is refused until a separate L3 executor
+   can create and verify the scoped backup, `PRAGMA quick_check`, bounded counts,
+   and database rollback boundary. The activator does not accept a bypass or an
+   operator assertion in place of those checks.
+3. Worker/ingest activation requires exactly one durable
+   `entry_revision_exchange_authority` document in the canonical idle shape.
+   A production database that predates this authority row fails closed. Seeding
+   or repairing it is a separate production database write with its own review,
+   backup, and authorization; activation never creates it.
+
+The legacy updater currently exposes this path only when
+`DEPLOYMENT_ACTION=activate`; its default remains the compatibility path until
+the workstation commands are split and the legacy path is removed in Batch 4.
+No local implementation or successful test authorizes installation, SSH,
+activation, restart, or any production write.
 
 ## Removal sequence
 

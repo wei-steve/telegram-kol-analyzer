@@ -22,6 +22,9 @@ from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
@@ -287,6 +290,8 @@ def _entry_source_exchange_write_gate(
     chat_id = int(source.get("chat_id") or trade_signal.chat_id)
     message_id = int(source.get("message_id") or trade_signal.message_id)
     with source_message_execution_authority(session_factory):
+        if deployment_entry_admission_frozen():
+            raise RecoveryLiveSubmitError("deployment_entry_frozen")
         barrier = source_identity_execution_barrier(
             session_factory,
             chat_id=chat_id,
@@ -294,6 +299,8 @@ def _entry_source_exchange_write_gate(
         )
         if barrier.status != "allow":
             raise RecoveryLiveSubmitError(str(barrier.reason or "source_execution_blocked"))
+        if deployment_entry_admission_frozen():
+            raise RecoveryLiveSubmitError("deployment_entry_frozen")
         yield
 
 

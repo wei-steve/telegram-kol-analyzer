@@ -1,0 +1,753 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
+
+import pytest
+
+from telegram_kol_research.scoped_release_activation import (
+    ActivationError,
+    ActivationPaths,
+    action_plan_sha256,
+    activate_release,
+)
+from telegram_kol_research.deployment_action_plan import parse_manifest
+
+
+CANDIDATE = "2" * 40
+ROLLBACK = "1" * 40
+OTHER = "3" * 40
+
+
+def _canonical(payload: dict) -> bytes:
+    return (
+        json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
+        + "\n"
+    ).encode()
+
+
+def _content_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(root.rglob("*"), key=lambda item: item.relative_to(root).as_posix()):
+        relative = path.relative_to(root).as_posix()
+        metadata = path.lstat()
+        if path.is_dir() or relative in {
+            ".telegram-kol-release.json",
+            ".telegram-kol-stage-receipt.json",
+        }:
+            continue
+        encoded = relative.encode()
+        digest.update(len(encoded).to_bytes(8, "big"))
+        digest.update(encoded)
+        digest.update(b"x" if metadata.st_mode & 0o111 else b"-")
+        digest.update(metadata.st_size.to_bytes(8, "big"))
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+def _write_release(
+    root: Path,
+    commit: str,
+    *,
+    component: str = "web",
+    components: list[str] | None = None,
+    extra_files: dict[str, str] | None = None,
+) -> Path:
+    release = root / commit
+    source = release / "src/telegram_kol_research"
+    source.mkdir(parents=True)
+    (source / "__init__.py").write_text(f"COMMIT = {commit!r}\n", encoding="utf-8")
+    for relative, content in (extra_files or {}).items():
+        destination = release / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text(content, encoding="utf-8")
+    declared_components = components or [component]
+    action_manifest = {
+        "action": "stage",
+        "authority_changed": bool(
+            set(declared_components) & {"ingest", "worker"}
+        ),
+        "components": declared_components,
+        "exchange_write_semantics_changed": False,
+        "production_data_mutation": False,
+        "requires_restart": True,
+        "risk_level": "L2",
+        "schema_changed": False,
+    }
+    content_sha = _content_digest(release)
+    stage_plan_sha = action_plan_sha256(parse_manifest(action_manifest))
+    manifest = {
+        "action_manifest": action_manifest,
+        "action_plan_sha256": stage_plan_sha,
+        "branch": "codex/test",
+        "commit": commit,
+        "content_sha256": content_sha,
+        "contract": "immutable-release-v1",
+        "schema_version": 1,
+        "tree": "b" * 40,
+    }
+    manifest_bytes = _canonical(manifest)
+    receipt = {
+        "action_plan_sha256": stage_plan_sha,
+        "branch": "codex/test",
+        "commit": commit,
+        "content_sha256": content_sha,
+        "contract": "immutable-release-v1",
+        "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+        "release_name": commit,
+        "schema_version": 1,
+        "status": "staged",
+        "tree": "b" * 40,
+    }
+    (release / ".telegram-kol-release.json").write_bytes(manifest_bytes)
+    (release / ".telegram-kol-stage-receipt.json").write_bytes(_canonical(receipt))
+    for path in sorted(release.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        path.chmod(0o555 if path.is_dir() else 0o444)
+    release.chmod(0o555)
+    return release
+
+
+class FakeRuntime:
+    def __init__(self, *, current_commit: str, authority_ok: bool = True):
+        self.current_commit_by_role = {
+            role: current_commit for role in ("web", "ingest", "worker")
+        }
+        self.authority_ok = authority_ok
+        self.events: list[str] = []
+        self.active_write_results = [0, 0]
+        self.manifest_by_commit: dict[str, str] = {}
+        self.start_ticks_by_role = {
+            "web": 9000,
+            "ingest": 9001,
+            "worker": 9002,
+        }
+        self.entry_frozen_by_role = {
+            role: False for role in ("web", "ingest", "worker")
+        }
+
+    def active_write_count(self, database_path: Path) -> int:
+        self.events.append("active-write")
+        return self.active_write_results.pop(0)
+
+    def runtime_identity(self, role: str) -> dict:
+        current_commit = self.current_commit_by_role[role]
+        self.events.append(f"identity:{role}:{current_commit}")
+        capabilities = {
+            "global_exchange_authority": role == "worker" and self.authority_ok,
+            "management": role == "worker" and self.authority_ok,
+            "protection": role == "worker" and self.authority_ok,
+            "close": role == "worker" and self.authority_ok,
+            "tpsl": role == "worker" and self.authority_ok,
+            "rescue": role == "worker" and self.authority_ok,
+        }
+        return {
+            "contract": "runtime-deployment-identity-v1",
+            "loaded_artifact_verified": True,
+            "manifest_sha256": self.manifest_by_commit[current_commit],
+            "pid": 100 + {"web": 0, "ingest": 1, "worker": 2}[role],
+            "process_start_ticks": self.start_ticks_by_role[role],
+            "systemd_main_pid": 100 + {"web": 0, "ingest": 1, "worker": 2}[role],
+            "systemd_start_ticks": self.start_ticks_by_role[role],
+            "release_commit": current_commit,
+            "runtime_role": role,
+            "observed_at": datetime.now(UTC).isoformat(),
+            "health": {
+                "event_loop": True,
+                "ingest_live_listener": role == "ingest",
+                "ingest_reconcile": role == "ingest",
+                "worker_command": role == "worker",
+                "message_processing": (
+                    role == "worker" and not self.entry_frozen_by_role[role]
+                ),
+            },
+            "entry_admission_frozen": self.entry_frozen_by_role[role],
+            "authority_evidence": {
+                "max_age_seconds": 90.0,
+                "management_cycle": {
+                    "age_seconds": 0.0,
+                    "effective_management_enabled": self.authority_ok,
+                    "effective_rescue_enabled": self.authority_ok,
+                    "fresh": self.authority_ok,
+                    "successful": self.authority_ok,
+                },
+                "break_even_cycle": {
+                    "age_seconds": 0.0,
+                    "fresh": self.authority_ok,
+                    "successful": self.authority_ok,
+                },
+                "reconcile_cycle": {
+                    "age_seconds": 0.0,
+                    "fresh": self.authority_ok,
+                    "successful": self.authority_ok,
+                },
+            },
+            "capabilities": capabilities,
+        }
+
+    def stop_unit(self, unit: str) -> None:
+        self.events.append(f"stop:{unit}")
+
+    def start_unit(self, unit: str) -> None:
+        self.events.append(f"start:{unit}")
+        role = unit.removeprefix("telegram-kol-").removesuffix(".service")
+        if role not in self.current_commit_by_role:
+            return
+        self.start_ticks_by_role[role] += 10
+        dropin = Path(self.dropin_root) / f"{unit}.d/10-telegram-kol-release.conf"
+        text = dropin.read_text(encoding="utf-8")
+        self.entry_frozen_by_role[role] = (
+            'Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"' in text
+        )
+        for commit in (CANDIDATE, ROLLBACK):
+            if commit in text:
+                self.current_commit_by_role[role] = commit
+
+    def daemon_reload(self) -> None:
+        self.events.append("daemon-reload")
+
+    def monitor_timer_active(self) -> bool:
+        return False
+
+    def verify_monitor_release(self, release) -> None:
+        self.events.append(f"monitor-identity:{release.commit}")
+
+
+@pytest.fixture
+def activation_harness(tmp_path: Path):
+    release_root = tmp_path / "releases"
+    release_root.mkdir()
+    _write_release(release_root, ROLLBACK)
+    _write_release(release_root, CANDIDATE)
+    manifest_path = tmp_path / "activate.json"
+    manifest = {
+        "action": "activate",
+        "risk_level": "L2",
+        "components": ["web"],
+        "requires_restart": True,
+        "schema_changed": False,
+        "production_data_mutation": False,
+        "exchange_write_semantics_changed": False,
+        "authority_changed": False,
+    }
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    authorization = tmp_path / "authorization.json"
+    parsed = parse_manifest(manifest)
+    now = datetime.now(UTC)
+    authorization.write_bytes(
+        _canonical(
+            {
+                "contract": "scoped-activation-authorization-v1",
+                "schema_version": 1,
+                "commit": CANDIDATE,
+                "components": ["web"],
+                "action_plan_sha256": action_plan_sha256(parsed),
+                "nonce": "c" * 64,
+                "issued_at": (now - timedelta(seconds=1)).isoformat(),
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+            }
+        )
+    )
+    authorization.chmod(0o400)
+    paths = ActivationPaths(
+        release_root=release_root,
+        action_manifest=manifest_path,
+        authorization=authorization,
+        authorization_consumed=tmp_path / "authorization.used.json",
+        dropin_root=tmp_path / "systemd",
+        database_path=tmp_path / "research.db",
+    )
+    paths.database_path.write_bytes(b"not-used-for-web")
+    runtime = FakeRuntime(current_commit=ROLLBACK)
+    runtime.dropin_root = paths.dropin_root
+    runtime.manifest_by_commit = {
+        commit: json.loads(
+            (release_root / commit / ".telegram-kol-stage-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )["manifest_sha256"]
+        for commit in (ROLLBACK, CANDIDATE)
+    }
+    return paths, runtime, manifest
+
+
+def test_web_activation_consumes_verified_receipt_and_restarts_only_web(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+    )
+
+    assert result["status"] == "activated"
+    assert result["components"] == ["web"]
+    assert not paths.authorization.exists()
+    assert paths.authorization_consumed.exists()
+    assert "active-write" not in runtime.events
+    assert [event for event in runtime.events if event.startswith(("stop:", "start:"))] == [
+        "stop:telegram-kol-web.service",
+        "start:telegram-kol-web.service",
+    ]
+
+
+def test_web_only_activation_preserves_existing_entry_freeze(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    runtime.entry_frozen_by_role["web"] = True
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+    )
+
+    assert result["status"] == "activated"
+    assert runtime.entry_frozen_by_role["web"] is True
+    dropin = (
+        paths.dropin_root
+        / "telegram-kol-web.service.d/10-telegram-kol-release.conf"
+    ).read_text(encoding="utf-8")
+    assert 'Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"' in dropin
+
+
+def test_corrupt_release_fails_before_authorization_or_service_control(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    candidate_file = paths.release_root / CANDIDATE / "src/telegram_kol_research/__init__.py"
+    candidate_file.chmod(0o644)
+    candidate_file.write_text("corrupt\n", encoding="utf-8")
+    candidate_file.chmod(0o444)
+
+    with pytest.raises(ActivationError, match="release validation failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []
+
+
+def test_non_source_revision_change_is_rejected_before_authorization(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    candidate = paths.release_root / CANDIDATE
+    candidate.chmod(0o755)
+    for child in candidate.rglob("*"):
+        child.chmod(0o755 if child.is_dir() else 0o644)
+    for child in sorted(candidate.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            child.rmdir()
+    candidate.rmdir()
+    _write_release(
+        paths.release_root,
+        CANDIDATE,
+        extra_files={"config/groups.yaml": "changed: true\n"},
+    )
+
+    with pytest.raises(ActivationError, match="release scope validation failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []
+
+
+def test_test_only_revision_change_is_outside_runtime_support_scope(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    candidate = paths.release_root / CANDIDATE
+    candidate.chmod(0o755)
+    for child in candidate.rglob("*"):
+        child.chmod(0o755 if child.is_dir() else 0o644)
+    for child in sorted(candidate.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+        if child.is_file():
+            child.unlink()
+        elif child.is_dir():
+            child.rmdir()
+    candidate.rmdir()
+    _write_release(
+        paths.release_root,
+        CANDIDATE,
+        extra_files={"tests/test_candidate_only.py": "def test_candidate(): pass\n"},
+    )
+    runtime.manifest_by_commit[CANDIDATE] = json.loads(
+        (candidate / ".telegram-kol-stage-receipt.json").read_text(encoding="utf-8")
+    )["manifest_sha256"]
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+    )
+
+    assert result["status"] == "activated"
+
+
+def test_systemd_pid_start_identity_mismatch_fails_before_authorization(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    original_identity = runtime.runtime_identity
+
+    def mismatched_identity(role: str) -> dict:
+        payload = original_identity(role)
+        payload["systemd_start_ticks"] += 1
+        return payload
+
+    runtime.runtime_identity = mismatched_identity
+
+    with pytest.raises(ActivationError, match="runtime identity proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_stale_runtime_identity_fails_closed_without_retrying_service_control(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    original_identity = runtime.runtime_identity
+
+    def stale_identity(role: str) -> dict:
+        payload = original_identity(role)
+        payload["observed_at"] = (datetime.now(UTC) - timedelta(minutes=1)).isoformat()
+        return payload
+
+    runtime.runtime_identity = stale_identity
+
+    with pytest.raises(ActivationError, match="runtime identity proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_noncanonical_authorization_fails_before_service_control(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    payload = json.loads(paths.authorization.read_text(encoding="utf-8"))
+    paths.authorization.chmod(0o600)
+    paths.authorization.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    paths.authorization.chmod(0o400)
+
+    with pytest.raises(ActivationError, match="authorization is invalid"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def _configure_worker_harness(paths, runtime, manifest) -> None:
+    for commit in (ROLLBACK, CANDIDATE):
+        release = paths.release_root / commit
+        release.chmod(0o755)
+        for child in release.rglob("*"):
+            child.chmod(0o755 if child.is_dir() else 0o644)
+        for child in sorted(release.rglob("*"), key=lambda item: len(item.parts), reverse=True):
+            if child.is_file():
+                child.unlink()
+            elif child.is_dir():
+                child.rmdir()
+        release.rmdir()
+        _write_release(
+            paths.release_root,
+            commit,
+            components=["web", "ingest", "worker"],
+        )
+    manifest.update(
+        {"components": ["web", "ingest", "worker"], "authority_changed": True}
+    )
+    paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+    authorization = json.loads(paths.authorization.read_text(encoding="utf-8"))
+    authorization["components"] = ["web", "ingest", "worker"]
+    authorization["action_plan_sha256"] = action_plan_sha256(parse_manifest(manifest))
+    paths.authorization.chmod(0o600)
+    paths.authorization.write_bytes(_canonical(authorization))
+    paths.authorization.chmod(0o400)
+    runtime.manifest_by_commit = {
+        commit: json.loads(
+            (paths.release_root / commit / ".telegram-kol-stage-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )["manifest_sha256"]
+        for commit in (ROLLBACK, CANDIDATE)
+    }
+
+
+def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+    )
+
+    assert result["status"] == "activated"
+    assert runtime.current_commit_by_role == {
+        "web": CANDIDATE,
+        "ingest": CANDIDATE,
+        "worker": CANDIDATE,
+    }
+    assert runtime.events.count("active-write") == 2
+    assert all(runtime.entry_frozen_by_role.values())
+    for role in ("web", "ingest", "worker"):
+        dropin = (
+            paths.dropin_root
+            / f"telegram-kol-{role}.service.d/10-telegram-kol-release.conf"
+        ).read_text(encoding="utf-8")
+        assert (
+            'Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"'
+            in dropin
+        )
+    assert [event for event in runtime.events if event.startswith(("stop:", "start:"))] == [
+        "stop:telegram-kol-ingest.service",
+        "stop:telegram-kol-web.service",
+        "stop:telegram-kol-worker.service",
+        "start:telegram-kol-worker.service",
+        "start:telegram-kol-web.service",
+        "start:telegram-kol-ingest.service",
+    ]
+
+
+def test_partial_worker_authority_activation_is_rejected(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    manifest["components"] = ["worker"]
+    paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ActivationError, match="web, ingest, and worker"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []
+
+
+def test_worker_activation_requires_direct_authority_and_post_stop_quiescence(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.authority_ok = False
+
+    with pytest.raises(ActivationError, match="authority proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_worker_authority_requires_fresh_successful_cycle_evidence(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    original_identity = runtime.runtime_identity
+
+    def stale_authority_identity(role: str) -> dict:
+        payload = original_identity(role)
+        if role == "worker":
+            payload["authority_evidence"]["reconcile_cycle"].update(
+                {"age_seconds": 91.0, "fresh": False}
+            )
+        return payload
+
+    runtime.runtime_identity = stale_authority_identity
+
+    with pytest.raises(ActivationError, match="authority proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_post_start_identity_mismatch_rolls_back_to_verified_release(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    original_start = runtime.start_unit
+
+    def start_without_loading_candidate(unit: str) -> None:
+        original_start(unit)
+        if runtime.current_commit_by_role["web"] == CANDIDATE:
+            runtime.current_commit_by_role["web"] = "3" * 40
+            runtime.manifest_by_commit["3" * 40] = "4" * 64
+
+    runtime.start_unit = start_without_loading_candidate
+
+    with pytest.raises(ActivationError, match="rollback_complete"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert runtime.current_commit_by_role["web"] == ROLLBACK
+    assert runtime.events.count("daemon-reload") == 2
+    assert paths.authorization_consumed.exists()
+
+
+def test_worker_activation_rolls_back_when_candidate_does_not_prove_entry_freeze(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    original_identity = runtime.runtime_identity
+
+    def identity_without_freeze(role: str) -> dict:
+        payload = original_identity(role)
+        if role == "worker" and payload["release_commit"] == CANDIDATE:
+            payload["entry_admission_frozen"] = False
+        return payload
+
+    runtime.runtime_identity = identity_without_freeze
+
+    with pytest.raises(ActivationError, match="rollback_complete"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert runtime.current_commit_by_role["worker"] == ROLLBACK
+    assert runtime.entry_frozen_by_role["worker"] is True
+
+
+def test_same_pid_and_start_ticks_cannot_claim_a_restart(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    original_start = runtime.start_unit
+
+    def start_without_new_process(unit: str) -> None:
+        original_start(unit)
+        if unit == "telegram-kol-web.service" and runtime.current_commit_by_role["web"] == CANDIDATE:
+            runtime.start_ticks_by_role["web"] -= 10
+
+    runtime.start_unit = start_without_new_process
+
+    with pytest.raises(ActivationError, match="rollback_complete"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert runtime.current_commit_by_role["web"] == ROLLBACK
+
+
+def test_partial_ingest_worker_authority_scope_is_rejected(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    manifest["components"] = ["ingest", "worker"]
+    paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ActivationError, match="web, ingest, and worker"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []
+
+
+def test_schema_or_data_activation_remains_fail_closed_without_l3_executor(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    manifest.update({"risk_level": "L3", "schema_changed": True})
+    paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ActivationError, match="L3 database activation"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []

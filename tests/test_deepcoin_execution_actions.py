@@ -2915,6 +2915,62 @@ def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_on
     ]
 
 
+def test_deployment_entry_freeze_blocks_trigger_recreation_before_cancel(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
+    session_factory = create_session_factory(tmp_path / "frozen-recreate.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory,
+        order_id="trigger-old",
+        pos_id=None,
+        status="open",
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_trigger_entry_tpsl",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+            "price": "1000",
+            "triggerPrice": "1000",
+            "sz": "0.1",
+            "slTriggerPx": "1567.52",
+        }
+    ]
+
+    with pytest.raises(DeepcoinExecutionActionError, match="deployment_entry_frozen"):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.trigger_payloads == []
+
+
 def test_deleted_source_blocks_trigger_entry_recreation_before_cancel(tmp_path):
     session_factory = create_session_factory(tmp_path / "deleted-recreate.db")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})

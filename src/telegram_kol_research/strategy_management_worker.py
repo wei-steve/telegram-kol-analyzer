@@ -916,6 +916,7 @@ def _load_settings_and_run_strategy_management_tick(
     cursor: StrategyManagementWorkerCursor,
     now_provider=None,
     contract_spec_provider=None,
+    authority_observer=None,
 ) -> None:
     """Run one settings read plus one tick as a single blocking unit.
 
@@ -925,17 +926,24 @@ def _load_settings_and_run_strategy_management_tick(
     """
 
     settings = load_trading_settings(session_factory)
+    observed_at = now_provider() if now_provider is not None else datetime.now(UTC)
     run_strategy_management_worker_tick(
         session_factory,
         deepcoin_client_factory=deepcoin_client_factory,
         max_batches=max_batches,
         allow_execution=settings.live_management_execution_enabled,
         cursor=cursor,
-        processed_at=(
-            now_provider() if now_provider is not None else datetime.now(UTC)
-        ),
+        processed_at=observed_at,
         contract_spec_provider=contract_spec_provider,
     )
+    if authority_observer is not None:
+        authority_observer(
+            management_enabled=settings.live_management_execution_enabled,
+            rescue_enabled=(
+                settings.effective_trigger_protection_stop_rescue_mode == "live"
+            ),
+            observed_at=observed_at,
+        )
 
 
 async def run_strategy_management_worker_loop(
@@ -946,6 +954,8 @@ async def run_strategy_management_worker_loop(
     max_batches: int = 10,
     now_provider=None,
     contract_spec_provider=None,
+    authority_observer=None,
+    authority_failure_observer=None,
 ) -> None:
     """Run bounded ticks forever; cancellation is owned by the Web lifespan."""
 
@@ -960,11 +970,18 @@ async def run_strategy_management_worker_loop(
                 cursor=cursor,
                 now_provider=now_provider,
                 contract_spec_provider=contract_spec_provider,
+                authority_observer=authority_observer,
             )
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("strategy management worker tick failed")
+            if authority_failure_observer is not None:
+                authority_failure_observer(
+                    observed_at=(
+                        now_provider() if now_provider is not None else datetime.now(UTC)
+                    )
+                )
         await asyncio.sleep(max(0.01, float(interval_seconds)))
 
 

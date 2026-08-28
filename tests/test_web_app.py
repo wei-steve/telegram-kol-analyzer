@@ -89,6 +89,15 @@ def _loop_health_endpoint(app):
     )
 
 
+def _deployment_identity_endpoint(app):
+    return next(
+        route.endpoint
+        for route in app.routes
+        if getattr(route, "path", None) == "/api/runtime/deployment-identity"
+        and "GET" in getattr(route, "methods", set())
+    )
+
+
 def _install_worker_command_route_driver(monkeypatch, app):
     original_wait = web_app_module.wait_for_worker_command_terminal
 
@@ -831,6 +840,46 @@ def test_loop_health_endpoint_touches_neither_database_nor_exchange(tmp_path):
     assert response.status_code == 200
 
 
+def test_deployment_identity_endpoint_is_in_memory_and_redacts_paths(
+    tmp_path, monkeypatch
+):
+    app = create_web_app(database_path=tmp_path / "research.db", runtime_role="worker")
+    expected = {
+        "contract": "runtime-deployment-identity-v1",
+        "runtime_role": "worker",
+        "release_commit": "a" * 40,
+        "manifest_sha256": "b" * 64,
+        "loaded_artifact_verified": True,
+        "pid": 123,
+        "process_start_ticks": 456,
+        "observed_at": "2026-08-28T12:00:00+00:00",
+        "capabilities": {
+            "global_exchange_authority": True,
+            "management": True,
+            "protection": True,
+            "close": True,
+            "tpsl": True,
+            "rescue": True,
+        },
+    }
+    monkeypatch.setattr(
+        web_app_module,
+        "build_runtime_deployment_identity_for_app",
+        lambda _app: expected,
+    )
+
+    def failing_session_factory():
+        raise AssertionError("deployment identity must not touch the database")
+
+    with TestClient(app) as client:
+        app.state.session_factory = failing_session_factory
+        response = client.get("/api/runtime/deployment-identity")
+
+    assert response.status_code == 200
+    assert response.json() == expected
+    assert "path" not in json.dumps(response.json()).lower()
+
+
 def test_worker_loop_health_exposes_message_lane_activity_without_database(
     tmp_path,
 ):
@@ -1065,6 +1114,83 @@ def test_message_pipeline_parity_observes_authoritative_queue_jobs(tmp_path):
     assert payload["shadow_jobs"] == 0
     assert payload["missing_job_count"] == 0
     assert payload["stuck_pending_count"] == 1
+
+
+def test_deployment_entry_freeze_cannot_be_cleared_by_queue_setting(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
+    started = []
+
+    async def message_worker(**_kwargs):
+        started.append(True)
+        await asyncio.Event().wait()
+
+    app = create_web_app(
+        database_path=tmp_path / "frozen-worker.db",
+        runtime_role="worker",
+        message_processing_worker_runner=message_worker,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/trading-settings",
+            json={"message_pipeline_mode": "queue"},
+        )
+        entry_response = client.post(
+            "/api/recovery-live-submit",
+            json={
+                "chat_id": 100,
+                "message_id": 55,
+                "symbol": "BTC",
+                "side": "long",
+            },
+        )
+        identity = client.get("/api/runtime/deployment-identity").json()
+
+    assert response.status_code == 200
+    assert app.state.deployment_entry_frozen is True
+    assert started == []
+    assert entry_response.status_code == 503
+    assert entry_response.json() == {
+        "detail": {"code": "deployment_entry_frozen"}
+    }
+    assert identity["entry_admission_frozen"] is True
+    assert identity["health"]["message_processing"] is False
+
+
+def test_deployment_entry_freeze_value_is_fail_closed(tmp_path, monkeypatch):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "maybe")
+
+    with pytest.raises(ValueError, match="DEPLOYMENT_ENTRY_FROZEN"):
+        create_web_app(database_path=tmp_path / "invalid-freeze.db")
+
+
+def test_deployment_entry_freeze_blocks_context_entry_revision_before_client(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
+    app = create_web_app(
+        database_path=tmp_path / "frozen-auto-trade.db",
+        deepcoin_client_factory=lambda: pytest.fail("exchange client must stay closed"),
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"entry_revision_v2_mode": "live"},
+    )
+
+    assert web_app_module._run_context_resolution_worker_for_app(app) == {
+        "status": "completed",
+        "context_resolution": {"status": "disabled"},
+        "entry_revision": {
+            "status": "deployment_entry_frozen",
+            "batch_ids": [],
+        },
+    }
 
 
 @pytest.mark.parametrize(
