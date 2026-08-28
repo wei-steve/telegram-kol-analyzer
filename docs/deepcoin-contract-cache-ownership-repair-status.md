@@ -31,11 +31,14 @@ pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
-legacy_runtime_drain_bridge_status: local_complete_unpushed_unexecuted
+legacy_runtime_drain_bridge_status: review_findings_repaired_local_complete_unpushed_unexecuted
 legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
 legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
 legacy_runtime_drain_bridge_plan_sha: 1dd9868233670486ac8575f609e954fa221f6071
-legacy_runtime_drain_bridge_content_sha: 6e51eeed7ce23eabb691082198578421d5cc7c39
+legacy_runtime_drain_bridge_content_sha: c13f207df762a725de428ce0657064df55c53443
+legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d47530
+legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
+legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
 task12_latest_evidence_location: codex_task_transcript
@@ -355,6 +358,52 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - No push, deployment, SSH, restart, production freeze, settings/database or
   Deepcoin write, order cancellation, historical replay, manufactured traffic,
   or Telegram send occurred while building and reviewing this local bridge.
+- The independent-review findings repair started from exact clean SHA
+  `5024a59e97b4328acba101f9bc138d7bf3d47530` on branch
+  `codex/phase0-deploy-integration`. The bounded compatibility-cutover design
+  and implementation plan are
+  `4a2a2ac0793e3faddbbc69e4940e6391b6652795` and
+  `d53aadbe602f8397e29cb25216c6e131240f31fb`.
+- The P0 global-freeze defect is repaired by the durable internal
+  `legacy_entry_submission_frozen` setting. New entry and entry-revision writes
+  remain disabled while configured management, composite management, protection
+  rescue and liveness authority stay live. New-entry multi-leg submission and
+  bridge freeze now serialize through the same exact-owner SQLite authority;
+  zero-write failure releases it, while any possible-write unknown retains it.
+- Candidate handoff uses bridge schema v3 with immutable legacy identity and a
+  distinct current authority identity. It preserves the entry-only freeze and
+  exact revision sentinels, binds subsequent cancellation to the candidate, and
+  allows rollback only before any reviewed write boundary. Runtime identity is
+  hard-bound to `telegram-kol-worker.service`, exact checkout HEAD, stable
+  MainPID/start ticks, exact proc cwd and the bounded
+  `telegram-kol-research web --runtime-role worker` cmdline.
+- A reviewed zero-write refusal is retryable only when its durable intent is a
+  structurally exact `prewrite_refused` record with `submitted=false` and an
+  allowlisted reason. A fresh plan and new confirmation token re-arm that exact
+  intent under `BEGIN IMMEDIATE`; malformed, submitting, recovery-required or
+  possible-write outcomes remain unknown and non-retryable. No refusal payload
+  or CLI result exposes credentials or bridge/confirmation tokens.
+- Drain evidence is timestamped after all exchange reads and compared with a
+  separate post-identity transition time. Negative age and age over 60 seconds
+  fail closed. Revision fence and later sentinel validation share one
+  nonterminal-batch scope; unrelated terminal claim residue is ignored, while
+  active foreign claims and target-related/orphan unknown children still block.
+- RED reproduced every authorized review finding plus the later exact-intent
+  re-arm boundary. GREEN checkpoints were 383, 226, 126, 133, 118, 138 and 99
+  tests; the post-review re-arm regression passed in a 128-test affected set.
+  The final wide authority/protection regression passed 1271 tests with 3
+  existing warnings. Python compilation and exact base-to-candidate
+  `git diff --check` passed.
+- The only final repository suite after the last production-code edit passed
+  6607 tests with 2 skipped and 32 existing deprecation warnings in 750.91
+  seconds. Exact content candidate
+  `c13f207df762a725de428ce0657064df55c53443` received a final base-diff review;
+  no remaining P0-P2 finding was found in the authorized scope. No historical
+  replay path or bulk cancellation loop was added.
+- This review-findings repair performed no push, deployment, SSH, production
+  freeze, restart, settings/database/Deepcoin write, order cancellation,
+  historical replay, manufactured traffic or Telegram trading send. The seven
+  production orders and production runtime were not queried or changed.
 
 ### Prior rejected candidate history
 
@@ -396,8 +445,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- The legacy-runtime drain bridge content commit
-  `6e51eeed7ce23eabb691082198578421d5cc7c39` is local only. It has not been
+- The repaired legacy-runtime drain bridge content commit
+  `c13f207df762a725de428ce0657064df55c53443` is local only. It has not been
   pushed, installed, invoked against production, or used to cancel any of the
   seven reviewed orders. The following status-only commit records this evidence;
   any future exact-SHA review or push must resolve the then-current local HEAD
