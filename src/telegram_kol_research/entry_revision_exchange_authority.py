@@ -22,7 +22,11 @@ from telegram_kol_research.trading_settings import (
 ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY = "entry_revision_exchange_authority"
 _SCHEMA_VERSION = 1
 _OWNER_KINDS = frozenset(
-    {"entry_revision_worker", "reviewed_pending_entry_cancel"}
+    {
+        "entry_revision_worker",
+        "new_entry_worker",
+        "reviewed_pending_entry_cancel",
+    }
 )
 _HELD_KEYS = frozenset(
     {
@@ -54,7 +58,9 @@ def acquire_entry_revision_exchange_authority(
     session_factory,
     *,
     owner_kind: Literal[
-        "entry_revision_worker", "reviewed_pending_entry_cancel"
+        "entry_revision_worker",
+        "new_entry_worker",
+        "reviewed_pending_entry_cancel",
     ],
     owner_id: str,
     acquired_at: datetime,
@@ -75,6 +81,14 @@ def acquire_entry_revision_exchange_authority(
             session.execute(text("BEGIN IMMEDIATE"))
             if require_cancel_quiescence:
                 settings_reason = _cancel_quiescence_reason(session)
+                if settings_reason is not None:
+                    session.rollback()
+                    return EntryRevisionExchangeAuthorityAcquisition(
+                        acquired=False,
+                        reason_code=settings_reason,
+                    )
+            elif clean_owner_kind == "new_entry_worker":
+                settings_reason = _new_entry_quiescence_reason(session)
                 if settings_reason is not None:
                     session.rollback()
                     return EntryRevisionExchangeAuthorityAcquisition(
@@ -201,6 +215,38 @@ def release_entry_revision_exchange_authority(
 
 
 def _cancel_quiescence_reason(session) -> str | None:
+    settings, reason = _settings_in_session(
+        session,
+        invalid_reason="pending_entry_cancel_settings_invalid",
+    )
+    if reason is not None:
+        return reason
+    assert settings is not None
+    if settings.auto_trade_enabled is not False:
+        return "pending_entry_cancel_auto_trade_not_frozen"
+    if settings.entry_revision_v2_mode != "disabled":
+        return "pending_entry_cancel_revision_not_disabled"
+    return None
+
+
+def _new_entry_quiescence_reason(session) -> str | None:
+    settings, reason = _settings_in_session(
+        session,
+        invalid_reason="new_entry_worker_settings_invalid",
+    )
+    if reason is not None:
+        return reason
+    assert settings is not None
+    if settings.legacy_entry_submission_frozen:
+        return "legacy_entry_submission_frozen"
+    return None
+
+
+def _settings_in_session(
+    session,
+    *,
+    invalid_reason: str,
+) -> tuple[TradingSettings | None, str | None]:
     row = (
         session.query(TradingSetting)
         .filter(TradingSetting.key == TRADING_SETTINGS_KEY)
@@ -215,12 +261,8 @@ def _cancel_quiescence_reason(session) -> str | None:
                 raise ValueError("settings payload is not an object")
             settings = trading_settings_from_payload(payload)
         except (json.JSONDecodeError, TypeError, ValueError):
-            return "pending_entry_cancel_settings_invalid"
-    if settings.auto_trade_enabled is not False:
-        return "pending_entry_cancel_auto_trade_not_frozen"
-    if settings.entry_revision_v2_mode != "disabled":
-        return "pending_entry_cancel_revision_not_disabled"
-    return None
+            return None, invalid_reason
+    return settings, None
 
 
 def _authority_document(value_json: str) -> dict[str, object] | None:

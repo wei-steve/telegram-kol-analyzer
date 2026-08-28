@@ -27,6 +27,10 @@ from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
     canonical_entry_assembly_fingerprint,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    acquire_entry_revision_exchange_authority,
+    release_entry_revision_exchange_authority,
+)
 from telegram_kol_research.deepcoin_execution_actions import execute_deepcoin_management_signal
 from telegram_kol_research.execution_bindings import ExecutionBindingRecord
 from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
@@ -927,8 +931,22 @@ def process_trade_signal_live(
     verified_v2_assembly = False
     submission_progress = EntrySubmissionProgress()
     execution_boundary_at = now
+    entry_authority_token: str | None = None
     try:
         if trade_signal.action == "open_position":
+            authority = acquire_entry_revision_exchange_authority(
+                session_factory,
+                owner_kind="new_entry_worker",
+                owner_id=f"signal:{int(trade_signal.id)}",
+                acquired_at=now,
+                require_cancel_quiescence=False,
+            )
+            if not authority.acquired or authority.token is None:
+                raise RecoveryLiveSubmitError(
+                    authority.reason_code
+                    or "entry_revision_exchange_authority_unavailable"
+                )
+            entry_authority_token = str(authority.token)
             verified_v2_assembly = _require_synchronized_finalized_entry_assembly(
                 session_factory,
                 trade_signal=trade_signal,
@@ -971,16 +989,17 @@ def process_trade_signal_live(
         if isinstance(exc, EntrySubmissionProgressError):
             failure = exc.cause
             submission_progress = exc.progress
+        terminal_status = _entry_submission_failure_status(
+            failure,
+            progress=submission_progress,
+        )
         mark_trade_signal_failed(
             session_factory,
             signal_id=signal_id,
             error=str(failure),
             failed_at=execution_boundary_at,
             expected_status="processing",
-            terminal_status=_entry_submission_failure_status(
-                failure,
-                progress=submission_progress,
-            ),
+            terminal_status=terminal_status,
         )
         _project_instruction_entry_submission(
             session_factory,
@@ -991,6 +1010,15 @@ def process_trade_signal_live(
             error=failure,
             projected_at=execution_boundary_at,
         )
+        if (
+            entry_authority_token is not None
+            and submission_progress.attempted_writes == 0
+        ):
+            _release_new_entry_authority_or_raise(
+                session_factory,
+                authority_token=entry_authority_token,
+                released_at=execution_boundary_at,
+            )
         if failure is not exc:
             raise failure from exc
         raise
@@ -1010,7 +1038,33 @@ def process_trade_signal_live(
         error=None,
         projected_at=execution_boundary_at,
     )
+    if entry_authority_token is not None:
+        _release_new_entry_authority_or_raise(
+            session_factory,
+            authority_token=entry_authority_token,
+            released_at=execution_boundary_at,
+        )
     return result
+
+
+def _release_new_entry_authority_or_raise(
+    session_factory: sessionmaker,
+    *,
+    authority_token: str,
+    released_at: datetime,
+) -> None:
+    released = release_entry_revision_exchange_authority(
+        session_factory,
+        token=authority_token,
+        owner_kind="new_entry_worker",
+        released_at=released_at,
+    )
+    if released.released:
+        return
+    raise RecoveryLiveSubmitError(
+        released.reason_code
+        or "entry_revision_exchange_authority_release_failed"
+    )
 
 
 def _prepare_instruction_entry_submission(

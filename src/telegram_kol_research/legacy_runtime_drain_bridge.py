@@ -327,6 +327,26 @@ def freeze_legacy_runtime_drain_bridge(
             if existing is not None:
                 session.rollback()
                 return _result("blocked", "legacy_bridge_already_present")
+            authority_row = (
+                session.query(TradingSetting)
+                .filter(
+                    TradingSetting.key
+                    == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+                )
+                .one_or_none()
+            )
+            if authority_row is not None:
+                authority = _authority_document(authority_row.value_json)
+                if authority is None:
+                    session.rollback()
+                    return _result(
+                        "blocked", "legacy_bridge_entry_authority_unknown"
+                    )
+                if authority["state"] == "held":
+                    session.rollback()
+                    return _result(
+                        "blocked", "legacy_bridge_entry_authority_busy"
+                    )
             settings_row, persisted_payload = _settings_row_and_payload_in_session(
                 session
             )
@@ -348,6 +368,7 @@ def freeze_legacy_runtime_drain_bridge(
                 {
                     **settings.to_dict(),
                     "auto_trade_enabled": False,
+                    "legacy_entry_submission_frozen": True,
                     "entry_revision_v2_mode": "disabled",
                 }
             )

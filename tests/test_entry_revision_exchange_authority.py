@@ -76,6 +76,45 @@ def test_independent_process_owner_cannot_replace_held_authority(tmp_path):
     }
 
 
+def test_new_entry_worker_is_an_exact_authority_owner(tmp_path):
+    session_factory = create_session_factory(tmp_path / "new-entry-owner.db")
+
+    acquisition = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="new_entry_worker",
+        owner_id="signal:71",
+        acquired_at=NOW,
+        require_cancel_quiescence=False,
+    )
+
+    assert acquisition.acquired is True
+    assert _stored_authority(session_factory)["owner_kind"] == "new_entry_worker"
+
+
+def test_legacy_entry_freeze_blocks_new_entry_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-frozen.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "legacy_entry_submission_frozen": True,
+            "entry_revision_v2_mode": "disabled",
+        },
+        updated_at=NOW,
+    )
+
+    acquisition = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="new_entry_worker",
+        owner_id="signal:72",
+        acquired_at=NOW,
+        require_cancel_quiescence=False,
+    )
+
+    assert acquisition.acquired is False
+    assert acquisition.reason_code == "legacy_entry_submission_frozen"
+
+
 def test_exact_owner_release_allows_next_quiesced_cancellation(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     worker = acquire_entry_revision_exchange_authority(

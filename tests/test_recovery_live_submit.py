@@ -15,6 +15,10 @@ from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecLo
 from telegram_kol_research.entry_strategy_assembly import (
     finalize_adjacent_entry_assembly_draft,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    acquire_entry_revision_exchange_authority,
+)
 from telegram_kol_research.models import (
     EntryStrategyAssembly,
     ExecutionBinding,
@@ -26,6 +30,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyRevisionBatch,
     StrategyRevisionLeg,
+    TradingSetting,
 )
 from telegram_kol_research.models import SourceMessageDeletionExit, StrategyLifecycle, TradeSignal, TriggerTakeProfitConvergence
 from telegram_kol_research.models import TriggerProtectionIntent
@@ -212,6 +217,18 @@ class _RecordingAllDeepcoinCalls(_FakeDeepcoinClient):
     def list_trigger_orders_pending(self, *, inst_id):
         self.calls.append("list_trigger_orders_pending")
         return super().list_trigger_orders_pending(inst_id=inst_id)
+
+
+def _stored_entry_exchange_authority(session_factory):
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        return json.loads(row.value_json)
 
 
 class _ProtectionFailingDeepcoinClient(_FakeDeepcoinClient):
@@ -1712,6 +1729,8 @@ def test_v2_pre_submit_gate_failure_is_ordinary_failed_with_zero_exchange_calls(
         row = session.get(TradeSignal, signal.id)
         assert row.status == "failed"
         assert row.last_error == "live_submit_blocked:pre_submit_blocked"
+    authority = _stored_entry_exchange_authority(session_factory)
+    assert authority["state"] == "idle"
 
 
 def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
@@ -1748,6 +1767,10 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
         row = session.get(TradeSignal, signal.id)
         assert row.status == "unknown_exchange_outcome"
         assert row.last_error == "first leg outcome unknown"
+    authority = _stored_entry_exchange_authority(session_factory)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "new_entry_worker"
+    assert authority["owner_id"] == f"signal:{signal.id}"
 
     with pytest.raises(
         RecoveryLiveSubmitError,
@@ -2141,6 +2164,56 @@ def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path)
 
     assert result["order_count"] == 2
     assert len(client.trigger_payloads) == 2
+
+
+def test_new_entry_authority_covers_every_leg_and_releases_after_success(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "entry-authority.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    finalized = _finalize_v2_assembly_for_signal(session_factory, signal)
+    _persist_finalized_signal_evidence(session_factory, signal, finalized)
+
+    class _AuthorityProbingClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.probes = []
+
+        def trigger_order(self, order_payload):
+            self.probes.append(
+                acquire_entry_revision_exchange_authority(
+                    session_factory,
+                    owner_kind="entry_revision_worker",
+                    owner_id=f"probe:{len(self.probes) + 1}",
+                    acquired_at=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
+                    require_cancel_quiescence=False,
+                )
+            )
+            return super().trigger_order(order_payload)
+
+    client = _AuthorityProbingClient()
+    result = process_trade_signal_live(
+        session_factory,
+        signal_id=signal.id,
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result["order_count"] == 2
+    assert [probe.reason_code for probe in client.probes] == [
+        "entry_revision_exchange_authority_busy",
+        "entry_revision_exchange_authority_busy",
+    ]
+    assert _stored_entry_exchange_authority(session_factory)["state"] == "idle"
 
 
 def test_legacy_shadow_metadata_does_not_override_maximum_order_legs(tmp_path):

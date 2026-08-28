@@ -7,6 +7,9 @@ import subprocess
 import pytest
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.entry_revision_exchange_authority import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+)
 from telegram_kol_research.legacy_runtime_drain_bridge import (
     LEGACY_RUNTIME_DRAIN_BRIDGE_KEY,
     LegacyRuntimeIdentity,
@@ -324,6 +327,7 @@ def test_freeze_atomically_records_settings_and_watermark(tmp_path):
     assert result.bridge_token
     settings = load_trading_settings(session_factory)
     assert settings.auto_trade_enabled is False
+    assert settings.legacy_entry_submission_frozen is True
     assert settings.entry_revision_v2_mode == "disabled"
     with session_factory() as session:
         row = (
@@ -337,6 +341,81 @@ def test_freeze_atomically_records_settings_and_watermark(tmp_path):
     assert stored["original_auto_trade_enabled"] is True
     assert stored["original_entry_revision_v2_mode"] == "live"
     assert stored["fenced_batch_ids"] == []
+
+
+def test_active_new_entry_authority_blocks_bridge_freeze(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+
+    session_factory = create_session_factory(tmp_path / "entry-authority.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    acquisition = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="new_entry_worker",
+        owner_id="signal:73",
+        acquired_at=NOW,
+        require_cancel_quiescence=False,
+    )
+    assert acquisition.acquired is True
+
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="entry-authority-freeze-token",
+        frozen_at=NOW,
+    )
+
+    assert frozen.status == "blocked"
+    assert frozen.reason_code == "legacy_bridge_entry_authority_busy"
+
+
+def test_unknown_entry_authority_blocks_bridge_freeze(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unknown-authority.db")
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    with session_factory() as session:
+        session.add(
+            TradingSetting(
+                key=ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+                value_json="not-json",
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="unknown-authority-freeze-token",
+        frozen_at=NOW,
+    )
+
+    assert frozen.status == "blocked"
+    assert frozen.reason_code == "legacy_bridge_entry_authority_unknown"
 
 
 def test_freeze_rechecks_plan_snapshot_inside_write_transaction(tmp_path):
