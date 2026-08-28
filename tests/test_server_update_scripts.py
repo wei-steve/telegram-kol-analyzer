@@ -267,6 +267,94 @@ def test_activate_transport_failure_stops_after_one_ssh_call(
     assert payload[1] == "-"
 
 
+def test_activate_transport_preserves_payload_for_executed_remote_command(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "activate.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "action": "activate",
+                "risk_level": "L1",
+                "components": ["web"],
+                "requires_restart": True,
+                "schema_changed": False,
+                "production_data_mutation": False,
+                "exchange_write_semantics_changed": False,
+                "authority_changed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    remote_tmp = tmp_path / "remote-tmp"
+    capture = tmp_path / "captured-manifest"
+    rollback_commit = "2" * 40
+    release_root = tmp_path / "releases"
+    dispatcher = release_root / rollback_commit / "deploy/telegram-kol-update"
+    dispatcher.parent.mkdir(parents=True)
+    dispatcher.write_text(
+        "#!/usr/bin/env bash\n"
+        "cp \"$ACTION_MANIFEST\" \"$FAKE_MANIFEST_CAPTURE\"\n"
+        "printf '{\"status\":\"activated-test-double\"}\\n'\n",
+        encoding="utf-8",
+    )
+    dispatcher.chmod(0o755)
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\nremote_command=\"${!#}\"\nexec /bin/bash -c \"$remote_command\"\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        "#!/usr/bin/env bash\nmkdir -p \"$FAKE_REMOTE_TMP\"\nprintf '%s\\n' \"$FAKE_REMOTE_TMP\"\n",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    fake_sha256sum = fake_bin / "sha256sum"
+    fake_sha256sum.write_text(
+        "#!/usr/bin/env bash\nshasum -a 256 \"$1\"\n",
+        encoding="utf-8",
+    )
+    fake_sha256sum.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "activate",
+            "SERVER": "root@127.0.0.1",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": "1" * 40,
+            "ROLLBACK_COMMIT": rollback_commit,
+            "ACTION_MANIFEST": str(manifest),
+            "ACTIVATION_AUTHORIZATION": str(tmp_path / "authorization.json"),
+            "ACTIVATION_AUTHORIZATION_CONSUMED": str(
+                tmp_path / "authorization.consumed"
+            ),
+            "SOURCE_REPO": str(tmp_path / "source"),
+            "RELEASE_ROOT": str(release_root),
+            "SERVICE_DROPIN_ROOT": str(tmp_path / "dropins"),
+            "DATABASE_PATH": str(tmp_path / "research.db"),
+            "FAKE_REMOTE_TMP": str(remote_tmp),
+            "FAKE_MANIFEST_CAPTURE": str(capture),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"status": "activated-test-double"}
+    assert capture.read_bytes() == manifest.read_bytes()
+
+
 def test_workstation_and_server_helpers_have_no_legacy_or_trading_action() -> None:
     shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")

@@ -180,7 +180,7 @@ case "$action" in
 esac
 '@
     $encodedRemoteScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteScript))
-    $remote = "printf '%s' '$encodedRemoteScript' | base64 -d | bash -s -- " +
+    $remote = "bash -c `"`$(printf '%s' '$encodedRemoteScript' | base64 -d)`" -- " +
         "'$Action' '$ExpectedCommit' '$Branch' '$manifestSha' '$bundleSha' " +
         "'$RollbackCommit' '$ActivationAuthorization' " +
         "'$ActivationAuthorizationConsumed' '$SourceRepo' '$ReleaseRoot' " +
