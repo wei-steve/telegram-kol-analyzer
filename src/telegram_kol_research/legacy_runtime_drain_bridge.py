@@ -512,12 +512,7 @@ def fence_legacy_runtime_revisions(
                     "blocked", "legacy_bridge_prefreeze_jobs_active"
                 )
             active_batches = (
-                session.query(StrategyRevisionBatch)
-                .filter(
-                    StrategyRevisionBatch.status.not_in(
-                        _TERMINAL_REVISION_BATCH_STATES
-                    )
-                )
+                _active_revision_batches_query(session)
                 .order_by(StrategyRevisionBatch.id.asc())
                 .all()
             )
@@ -1537,10 +1532,8 @@ def _revision_sentinel_reason(
 ) -> str | None:
     active_ids = tuple(
         int(batch_id)
-        for (batch_id,) in session.query(StrategyRevisionBatch.id)
-        .filter(
-            StrategyRevisionBatch.status.not_in(_TERMINAL_REVISION_BATCH_STATES)
-        )
+        for (batch_id,) in _active_revision_batches_query(session)
+        .with_entities(StrategyRevisionBatch.id)
         .order_by(StrategyRevisionBatch.id.asc())
         .all()
     )
@@ -1549,10 +1542,13 @@ def _revision_sentinel_reason(
         return "legacy_bridge_active_revision_set_drift"
     claimed_ids = tuple(
         int(batch_id)
-        for (batch_id,) in session.query(StrategyRevisionBatch.id)
+        for (batch_id,) in _active_revision_batches_query(session)
+        .with_entities(StrategyRevisionBatch.id)
         .filter(
-            (StrategyRevisionBatch.advance_claim_token.is_not(None))
-            | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+            (
+                (StrategyRevisionBatch.advance_claim_token.is_not(None))
+                | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+            ),
         )
         .order_by(StrategyRevisionBatch.id.asc())
         .all()
@@ -1573,6 +1569,14 @@ def _revision_sentinel_reason(
     ):
         return "legacy_bridge_sentinel_drift"
     return None
+
+
+def _active_revision_batches_query(session):
+    return session.query(StrategyRevisionBatch).filter(
+        StrategyRevisionBatch.status.not_in(
+            _TERMINAL_REVISION_BATCH_STATES
+        )
+    )
 
 
 def _drain_evidence_reason(

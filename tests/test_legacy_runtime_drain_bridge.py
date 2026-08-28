@@ -26,6 +26,7 @@ from telegram_kol_research.legacy_runtime_drain_bridge import (
     read_local_legacy_worker_identity,
     release_legacy_runtime_bridge_for_deploy,
     rollback_legacy_runtime_drain_bridge,
+    validate_legacy_runtime_bridge_cancellation_ready,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -225,6 +226,120 @@ def test_bridge_plan_scopes_terminal_revision_child_ambiguity(
         )
     else:
         assert plan.conflicts == ()
+
+
+def _seed_revision_claim(
+    session_factory,
+    *,
+    status,
+    claim_token,
+    claimed_at,
+):
+    with session_factory() as session:
+        raw = RawMessage(chat_id=801, message_id=802, text="revision claim")
+        thread = StrategyThread(
+            chat_id=801,
+            root_message_id=802,
+            symbol="BTC",
+            side="long",
+            status="active",
+        )
+        session.add_all([raw, thread])
+        session.flush()
+        batch = StrategyRevisionBatch(
+            idempotency_fingerprint=hashlib.sha256(
+                f"{status}:{claim_token}".encode()
+            ).hexdigest(),
+            raw_message_id=raw.id,
+            strategy_thread_id=thread.id,
+            target_lifecycle_id=8101,
+            execution_binding_id=8102,
+            revision_kind="replacement",
+            status=status,
+            replacement_json="{}",
+            reason_code="historical_terminal" if status == "blocked" else None,
+            advance_claim_token=claim_token,
+            advance_claimed_at=claimed_at,
+            planned_at=NOW,
+            completed_at=NOW if status == "blocked" else None,
+        )
+        session.add(batch)
+        session.commit()
+
+
+def test_terminal_revision_claim_residue_does_not_block_ready_or_rollback(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "terminal-claim.db")
+    _seed_revision_claim(
+        session_factory,
+        status="blocked",
+        claim_token="historical-terminal-claim",
+        claimed_at=NOW,
+    )
+    bridge_token = _fenced_bridge(session_factory)
+
+    ready = validate_legacy_runtime_bridge_cancellation_ready(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        order_id=REVIEWED_IDS[0],
+    )
+    rolled_back = rollback_legacy_runtime_drain_bridge(
+        session_factory,
+        bridge_token=bridge_token,
+        runtime_identity=_identity(),
+        confirmation_token="terminal-residue-rollback-token",
+        rolled_back_at=NOW,
+    )
+
+    assert ready.status == "ready"
+    assert rolled_back.status == "rolled_back"
+    with session_factory() as session:
+        historical = session.query(StrategyRevisionBatch).one()
+        assert historical.status == "blocked"
+        assert historical.advance_claim_token == "historical-terminal-claim"
+        assert historical.advance_claimed_at == NOW.replace(tzinfo=None)
+
+
+def test_active_foreign_revision_claim_still_blocks_fence(tmp_path):
+    session_factory = create_session_factory(tmp_path / "active-claim.db")
+    _seed_revision_claim(
+        session_factory,
+        status="planned",
+        claim_token="active-foreign-claim",
+        claimed_at=NOW,
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=NOW,
+    )
+    plan = _absent_plan(session_factory)
+    frozen = freeze_legacy_runtime_drain_bridge(
+        session_factory,
+        plan=plan,
+        runtime_identity=_identity(),
+        reviewed_order_ids=REVIEWED_IDS,
+        expected_fingerprint=plan.fingerprint,
+        confirmation_token="active-claim-freeze-token",
+        frozen_at=NOW,
+    )
+
+    fenced = fence_legacy_runtime_revisions(
+        session_factory,
+        bridge_token=str(frozen.bridge_token),
+        runtime_identity=_identity(),
+        confirmation_token="active-claim-fence-token",
+        fenced_at=NOW,
+    )
+
+    assert fenced.status == "blocked"
+    assert fenced.reason_code == "legacy_bridge_foreign_revision_claim"
 
 
 @pytest.mark.parametrize(
