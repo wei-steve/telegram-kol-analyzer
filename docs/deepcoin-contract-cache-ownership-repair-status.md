@@ -31,6 +31,12 @@ pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
+legacy_runtime_drain_bridge_status: local_complete_unpushed_unexecuted
+legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
+legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
+legacy_runtime_drain_bridge_plan_sha: 1dd9868233670486ac8575f609e954fa221f6071
+legacy_runtime_drain_bridge_content_sha: 6e51eeed7ce23eabb691082198578421d5cc7c39
+legacy_runtime_drain_bridge_production_executed: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
 task12_latest_evidence_location: codex_task_transcript
 historical_replay_allowed: false
@@ -315,6 +321,40 @@ phase completes or pauses, record both verified evidence and outstanding work.
   handoff commit. The following status-only commit records that SHA; any future
   exact-SHA action must use its read-only `git rev-parse HEAD` result as the
   final local integration target, avoiding an impossible self-reference.
+- The legacy-runtime drain bridge was implemented locally from exact clean base
+  `be9d75cdab57ffe57daea03b9eb1cf862cae698b`. Design and plan commits are
+  `50aa78086f70286291a7161df64681c215957a38` and
+  `1dd9868233670486ac8575f609e954fa221f6071`; planner, freeze/fence,
+  cancellation binding, CLI/drain/release, and final race-review commits are
+  `ce692e80aa92bd9c2967f473588c25a356c4205e`,
+  `b8eeeecd7468bc7d96fadc49510334d01b4707e1`,
+  `9b8a9ca852fce50c9c04978da37b0f692603a2b0`,
+  `9b6292f1f10aad42dffc7ef3b336a26628b46e3b`, and
+  `6e51eeed7ce23eabb691082198578421d5cc7c39`.
+- Review RED proved four unsafe boundaries: worker identity could drift across
+  the read/apply exchange window; drain accepted tampered event evidence;
+  rollback restored settings after governed-setting drift; and drain accepted
+  incomplete binding terminalization. GREEN now re-reads exact HEAD,
+  systemd MainPID and descriptor-bound `/proc/<pid>/stat` identity at every
+  mutation boundary, retains both authority layers on any post-boundary drift,
+  rechecks target-related/unowned unknown mutations in the same SQLite write
+  transaction, and validates exact event, intent, protection, binding and
+  lifecycle terminal state before drain/release.
+- The bridge keeps the unchanged legacy worker and its protection/rescue/
+  management authority running. It fences only entry-revision authority with
+  exact null-time sentinel claims, executes no bulk loop, accepts one reviewed
+  order per explicit apply, and permanently stops on an unknown result.
+  Historical terminal revision children remain ignored only when their parent,
+  binding, lifecycle, leg and exact order are unrelated to the reviewed set;
+  orphan or target-related ambiguity remains fail-closed.
+- Final bridge verification passed the 12-file authority/protection regression
+  at 359 tests with 3 existing warnings, Python compilation, and
+  `git diff --check`. The single final repository suite passed 6563 tests with
+  2 skipped and 32 existing deprecation warnings in 558.69 seconds. No
+  production code changed after that full-suite run.
+- No push, deployment, SSH, restart, production freeze, settings/database or
+  Deepcoin write, order cancellation, historical replay, manufactured traffic,
+  or Telegram send occurred while building and reviewing this local bridge.
 
 ### Prior rejected candidate history
 
@@ -355,6 +395,19 @@ phase completes or pauses, record both verified evidence and outstanding work.
   integration target, avoiding an impossible self-referential status hash.
 
 ## Outstanding
+
+- The legacy-runtime drain bridge content commit
+  `6e51eeed7ce23eabb691082198578421d5cc7c39` is local only. It has not been
+  pushed, installed, invoked against production, or used to cancel any of the
+  seven reviewed orders. The following status-only commit records this evidence;
+  any future exact-SHA review or push must resolve the then-current local HEAD
+  rather than treating this content SHA as a self-referential handoff SHA.
+- Production use remains separately gated: exact-SHA review/push, a fresh
+  read-only preflight, each production freeze/fence transition, and each of the
+  seven single-order cancellation applies require explicit authorization.
+  Every order must be freshly replanned; an unknown result forbids retry and
+  stops the sequence. Deployment, restart and future-signal-only restore remain
+  later, separate authorities.
 
 - The cross-process quiescence reviewed cancellation candidate
   `708a479f7e20aba74869d87acb3839f3fd91e96b` has not been pushed, deployed, or
