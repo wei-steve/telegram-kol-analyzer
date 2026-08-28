@@ -71,7 +71,7 @@ Assert:
 - `stage` has immutable-candidate and inactive-destination gates and explicitly prohibits active mutations;
 - `activate` for `web` or `monitor` does not request Deepcoin/protection/active-write evidence;
 - `activate` for `ingest` or `worker` requires runtime identity, active-write quiescence, protection authority, rollback readiness, and affected-service health;
-- `L3` activation additionally requires scoped backup/integrity/rollback evidence;
+- `L3` activation with schema/data mutation additionally requires scoped backup/integrity/rollback evidence, while exchange-semantics-only changes do not inherit database gates;
 - `trading` requires fresh runtime/exchange evidence, no relevant unknown, explicit authorization, one target, and one confirmation token.
 
 **Step 2: Run the focused test and prove RED**
@@ -183,4 +183,3 @@ Delete the legacy one-command stage+activate behavior only after the separate st
 ## Acceptance and first falsifier
 
 The first falsifying test is: request `stage` for an `L3` worker change while production DB/runtime evidence is unavailable. The planner must still produce a valid stage-only plan and must prohibit service, DB, settings, Telegram, and exchange mutation. If it instead demands live evidence or permits activation side effects, the architecture has recreated the universal gate and must be rejected.
-
