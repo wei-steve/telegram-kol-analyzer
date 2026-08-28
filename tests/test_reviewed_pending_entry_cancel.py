@@ -1441,6 +1441,51 @@ def test_malformed_prewrite_refusal_remains_unknown(
     )
 
 
+def test_exact_prewrite_refusal_can_retry_with_fresh_plan_and_new_token(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+
+    session_factory = create_session_factory(tmp_path / "retry-refusal.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    original_gate = cancel_module._single_pending_cancel_write_gate
+    monkeypatch.setattr(
+        cancel_module,
+        "_single_pending_cancel_write_gate",
+        lambda *_args, **_kwargs: False,
+    )
+    first = _apply_one(session_factory, client, targets, plan)
+    assert first.status == "blocked"
+    assert client.cancel_payloads == []
+
+    monkeypatch.setattr(
+        cancel_module,
+        "_single_pending_cancel_write_gate",
+        original_gate,
+    )
+    fresh = _build_plan(session_factory, client, targets)
+    second = _apply_one(
+        session_factory,
+        client,
+        targets,
+        fresh,
+        confirmation_token="fresh-retry-token",
+    )
+
+    assert second.status == "cancelled"
+    assert client.cancel_payloads == [
+        {"instId": "ETH-USDT-SWAP", "ordId": "reviewed-1"}
+    ]
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "confirmed"
+        assert session.query(RepairConfirmationToken).count() == 2
+
+
 @pytest.mark.parametrize(
     "failure_point",
     ("under_authority_plan", "intent_reserve", "token_consume"),

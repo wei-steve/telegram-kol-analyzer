@@ -9,6 +9,8 @@ import hashlib
 import json
 from typing import Any, Iterable
 
+from sqlalchemy import text
+
 from telegram_kol_research.execution_events import (
     ExecutionEventRecord,
     record_execution_event,
@@ -740,6 +742,12 @@ def apply_reviewed_pending_entry_cancel_plan(
         venue="deepcoin",
     )
     intent_id = int(intent.id)
+    if intent.status == "prewrite_refused" and _rearm_exact_prewrite_refusal(
+        session_factory,
+        intent_id=intent_id,
+        rearmed_at=observed_at,
+    ):
+        intent.status = "reserved"
     if intent.status != "reserved":
         release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
@@ -778,15 +786,6 @@ def apply_reviewed_pending_entry_cancel_plan(
             expected_statuses={"reserved"},
             reason_code="exact_pending_cancel_write_gate_blocked",
             refused_at=observed_at,
-        )
-        _record_cancel_event(
-            session_factory,
-            action,
-            status="blocked",
-            reason="exact_pending_cancel_write_gate_blocked",
-            request=request,
-            response={"submitted": False},
-            now=observed_at,
         )
         release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
@@ -1213,6 +1212,30 @@ def _record_pending_cancel_prewrite_refusal(
         response={"submitted": False},
         error={"reason": reason_code},
     )
+
+
+def _rearm_exact_prewrite_refusal(
+    session_factory,
+    *,
+    intent_id: int,
+    rearmed_at: datetime,
+) -> bool:
+    """Re-arm only exact zero-write evidence under one SQLite write lock."""
+
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        row = session.get(PositionMutationIntent, int(intent_id))
+        if row is None or not is_valid_reviewed_pending_entry_prewrite_refusal(
+            row
+        ):
+            session.rollback()
+            return False
+        row.status = "reserved"
+        row.response_json = None
+        row.error_json = None
+        row.updated_at = rearmed_at
+        session.commit()
+        return True
 
 
 def _mark_bridge_unknown_after_write(
