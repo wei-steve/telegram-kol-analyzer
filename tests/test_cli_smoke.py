@@ -31,6 +31,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
     StrategyLifecycle,
     TradeSignal,
+    TradingSetting,
 )
 from telegram_kol_research.production_safety_monitor import (
     MonitorExpectations,
@@ -209,6 +210,184 @@ def test_legacy_verify_deployment_preflight_cli_is_unknown(tmp_path):
 
 def _canonical_json(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+
+
+def test_bridge_reviewed_pending_entries_defaults_to_redacted_read_only_plan(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeIdentity,
+    )
+
+    database_path = tmp_path / "bridge.db"
+    session_factory = create_session_factory(database_path)
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=101,
+        worker_start_ticks=202,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: (_ for _ in ()).throw(AssertionError("client must stay unused")),
+    )
+    with session_factory() as session:
+        before_rows = session.query(TradingSetting).count()
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            "--database-path",
+            str(database_path),
+            "--checkout-path",
+            str(tmp_path),
+            "--expected-production-sha",
+            identity.production_sha,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["mode"] == "dry_run"
+    assert payload["plan"]["state"] == "absent"
+    assert payload["runtime_identity"] == {
+        "production_sha": identity.production_sha,
+        "worker_pid": 101,
+        "worker_start_ticks": 202,
+    }
+    serialized = result.output
+    assert "bridge_token" not in serialized
+    assert "confirmation_token" not in serialized
+    with session_factory() as session:
+        assert session.query(TradingSetting).count() == before_rows
+
+
+@pytest.mark.parametrize(
+    "action,extra",
+    (
+        ("freeze", []),
+        ("fence", ["--bridge-token", "bridge-token"]),
+        ("rollback", ["--bridge-token", "bridge-token"]),
+        ("mark-drained", ["--bridge-token", "bridge-token"]),
+        ("release-for-deploy", ["--bridge-token", "bridge-token"]),
+    ),
+)
+def test_bridge_mutations_require_confirmation_before_runtime_or_database_access(
+    tmp_path,
+    monkeypatch,
+    action,
+    extra,
+):
+    import telegram_kol_research.cli as cli_module
+
+    touched = []
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: touched.append("identity"),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda *_args, **_kwargs: touched.append("database"),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            "--action",
+            action,
+            "--database-path",
+            str(tmp_path / "missing.db"),
+            "--checkout-path",
+            str(tmp_path),
+            "--expected-production-sha",
+            "0" * 40,
+            *extra,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "expected-fingerprint" in result.output
+    assert "confirmation-token" in result.output
+    assert touched == []
+
+
+def test_bridge_freeze_cli_uses_fresh_fingerprint_and_redacts_tokens(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeIdentity,
+    )
+    from telegram_kol_research.trading_settings import save_trading_settings
+
+    database_path = tmp_path / "bridge-freeze.db"
+    session_factory = create_session_factory(database_path)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "entry_revision_v2_mode": "live",
+            "message_pipeline_mode": "queue",
+        },
+        updated_at=datetime(2026, 8, 27, tzinfo=UTC),
+    )
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=101,
+        worker_start_ticks=202,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: identity,
+    )
+    base_args = [
+        "--database-path",
+        str(database_path),
+        "--checkout-path",
+        str(tmp_path),
+        "--expected-production-sha",
+        identity.production_sha,
+    ]
+    planned = CliRunner().invoke(
+        app,
+        ["bridge-reviewed-pending-entries", *base_args],
+    )
+    fingerprint = json.loads(planned.output)["plan"]["fingerprint"]
+
+    frozen = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            *base_args,
+            "--action",
+            "freeze",
+            "--expected-fingerprint",
+            fingerprint,
+            "--confirmation-token",
+            "do-not-print-this-token",
+        ],
+    )
+
+    assert frozen.exit_code == 0, frozen.output
+    assert json.loads(frozen.output) == {
+        "reason_code": None,
+        "status": "frozen",
+    }
+    assert "do-not-print-this-token" not in frozen.output
+    assert "bridge_token" not in frozen.output
 
 
 def test_entry_draft_revision_cli_is_dry_run_by_default(tmp_path):

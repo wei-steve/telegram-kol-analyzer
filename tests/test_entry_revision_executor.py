@@ -913,6 +913,7 @@ def test_legacy_bridge_null_time_sentinel_never_becomes_stale(tmp_path):
         session_factory,
         bridge_token=str(frozen.bridge_token),
         runtime_identity=identity,
+        confirmation_token="sentinel-fence-token",
         fenced_at=NOW,
     )
     assert fenced.status == "fenced"

@@ -110,6 +110,16 @@ from telegram_kol_research.reviewed_pending_entry_cancel import (
     apply_reviewed_pending_entry_cancel_plan,
     build_reviewed_pending_entry_cancel_plan,
 )
+from telegram_kol_research.legacy_runtime_drain_bridge import (
+    build_legacy_runtime_drain_bridge_plan,
+    build_legacy_runtime_drain_evidence,
+    fence_legacy_runtime_revisions,
+    freeze_legacy_runtime_drain_bridge,
+    mark_legacy_runtime_bridge_drained,
+    read_local_legacy_worker_identity,
+    release_legacy_runtime_bridge_for_deploy,
+    rollback_legacy_runtime_drain_bridge,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -4959,9 +4969,308 @@ def cancel_reviewed_legacy_conditionals(
         raise typer.Exit(code=2)
 
 
+class _LegacyDrainAuditClient:
+    """Capture bounded completeness metadata while delegating read-only calls."""
+
+    def __init__(self, client, *, reviewed_order_ids: set[str]) -> None:
+        self._client = client
+        self._reviewed_order_ids = reviewed_order_ids
+        self.positions: list[dict[str, Any]] = []
+        self.regular: list[dict[str, Any]] = []
+        self.pending: list[dict[str, Any]] = []
+        self.history: list[dict[str, Any]] = []
+        self.fills: list[dict[str, Any]] = []
+        self.queries_complete = True
+        self.history_complete = True
+
+    def list_positions(self, *, inst_id=None):
+        rows = self._rows(self._client.list_positions(inst_id=inst_id))
+        self.positions.extend(rows)
+        return rows
+
+    def list_open_orders(self, *, inst_id=None):
+        rows = self._rows(self._client.list_open_orders(inst_id=inst_id))
+        self.regular.extend(rows)
+        return rows
+
+    def list_trigger_orders_pending(self, *, inst_id):
+        raw_reader = getattr(self._client, "read_trigger_orders_pending", None)
+        if callable(raw_reader):
+            payload = raw_reader(inst_id=inst_id)
+            if not isinstance(payload, dict) or not isinstance(
+                payload.get("data"), list
+            ):
+                raise ValueError("pending trigger query incomplete")
+            rows = self._rows(payload["data"])
+            if any(
+                payload.get(key) not in (None, "", False, 0, "0")
+                for key in ("nextCursor", "nextPageCursor", "hasMore")
+            ):
+                self.queries_complete = False
+        else:
+            rows = self._rows(
+                self._client.list_trigger_orders_pending(inst_id=inst_id)
+            )
+        if len(rows) >= 100:
+            self.queries_complete = False
+        self.pending.extend(rows)
+        return rows
+
+    def list_trigger_order_history(self, *, inst_id):
+        rows = self._rows(
+            self._client.list_trigger_order_history(inst_id=inst_id)
+        )
+        if len(rows) >= 100:
+            self.history_complete = False
+        self.history.extend(rows)
+        return rows
+
+    def list_trade_fills(self, *, inst_id=None):
+        rows = self._rows(self._client.list_trade_fills(inst_id=inst_id))
+        if len(rows) >= 100:
+            self.queries_complete = False
+        self.fills.extend(rows)
+        return rows
+
+    @staticmethod
+    def _rows(value):
+        if not isinstance(value, list) or not all(
+            isinstance(row, dict) for row in value
+        ):
+            raise ValueError("legacy drain query returned invalid rows")
+        return list(value)
+
+    def evidence(self, *, plan, observed_at: datetime):
+        pending_ids = [_legacy_drain_order_id(row) for row in self.pending]
+        reviewed_fill_count = sum(
+            1
+            for row in self.fills
+            if _legacy_drain_order_id(row) in self._reviewed_order_ids
+        )
+        return build_legacy_runtime_drain_evidence(
+            reviewed_order_ids=tuple(sorted(self._reviewed_order_ids)),
+            completed_order_ids=tuple(plan.completed_order_ids),
+            plan_fingerprint=plan.fingerprint,
+            action_count=len(plan.actions),
+            conflict_count=len(plan.conflicts),
+            positions_count=len(self.positions),
+            regular_order_count=len(self.regular),
+            pending_trigger_count=len(self.pending),
+            unidentified_pending_count=sum(
+                1 for order_id in pending_ids if not order_id
+            ),
+            unreviewed_pending_count=len(
+                {
+                    order_id
+                    for order_id in pending_ids
+                    if order_id and order_id not in self._reviewed_order_ids
+                }
+            ),
+            fill_conflict_count=reviewed_fill_count,
+            queries_complete=self.queries_complete,
+            history_complete=self.history_complete,
+            observed_at=observed_at,
+        )
+
+
+def _legacy_drain_order_id(row: dict[str, Any]) -> str:
+    return str(
+        row.get("ordId")
+        or row.get("orderId")
+        or row.get("order_id")
+        or ""
+    ).strip()
+
+
+def _legacy_bridge_cli_result(result) -> dict[str, Any]:
+    return {
+        "reason_code": result.reason_code,
+        "status": result.status,
+    }
+
+
+@app.command("bridge-reviewed-pending-entries")
+def bridge_reviewed_pending_entries(
+    database_path: Path = Path("data/research.db"),
+    checkout_path: Path = Path("."),
+    expected_production_sha: str = typer.Option(
+        ..., "--expected-production-sha"
+    ),
+    service_name: str = typer.Option(
+        "telegram-kol.service", "--service-name"
+    ),
+    action: str = typer.Option("plan", "--action"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    expected_drain_evidence_fingerprint: str | None = typer.Option(
+        None, "--expected-drain-evidence-fingerprint"
+    ),
+    bridge_token: str | None = typer.Option(None, "--bridge-token"),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+) -> None:
+    """Plan or explicitly transition the seven-order legacy drain bridge."""
+
+    allowed_actions = {
+        "plan",
+        "freeze",
+        "fence",
+        "rollback",
+        "mark-drained",
+        "release-for-deploy",
+    }
+    if action not in allowed_actions:
+        raise typer.BadParameter("unknown bridge action")
+    if action != "plan":
+        missing = []
+        if not expected_fingerprint:
+            missing.append("--expected-fingerprint")
+        if not confirmation_token:
+            missing.append("--confirmation-token")
+        if action != "freeze" and not bridge_token:
+            missing.append("--bridge-token")
+        if action == "release-for-deploy" and not expected_drain_evidence_fingerprint:
+            missing.append("--expected-drain-evidence-fingerprint")
+        if missing:
+            raise typer.BadParameter(
+                f"{action} requires " + ", ".join(missing)
+            )
+
+    observed_at = datetime.now(UTC)
+    identity = read_local_legacy_worker_identity(
+        checkout_path=checkout_path,
+        expected_production_sha=expected_production_sha,
+        service_name=service_name,
+    )
+    session_factory = create_existing_session_factory(database_path)
+    reviewed_ids = tuple(
+        target.order_id for target in REVIEWED_PENDING_ENTRY_TARGETS
+    )
+    bridge_plan = build_legacy_runtime_drain_bridge_plan(
+        session_factory,
+        runtime_identity=identity,
+        expected_production_sha=expected_production_sha,
+        reviewed_order_ids=reviewed_ids,
+        planned_at=observed_at,
+    )
+    if action == "plan":
+        typer.echo(
+            json.dumps(
+                {
+                    "mode": "dry_run",
+                    "plan": asdict(bridge_plan),
+                    "runtime_identity": asdict(identity),
+                },
+                ensure_ascii=True,
+                sort_keys=True,
+                default=str,
+            )
+        )
+        if bridge_plan.conflicts:
+            raise typer.Exit(code=2)
+        return
+    if expected_fingerprint != bridge_plan.fingerprint:
+        raise typer.BadParameter("--expected-fingerprint does not match fresh plan")
+
+    if action == "freeze":
+        result = freeze_legacy_runtime_drain_bridge(
+            session_factory,
+            plan=bridge_plan,
+            runtime_identity=identity,
+            reviewed_order_ids=reviewed_ids,
+            expected_fingerprint=str(expected_fingerprint),
+            confirmation_token=str(confirmation_token),
+            frozen_at=observed_at,
+        )
+    elif action == "fence":
+        result = fence_legacy_runtime_revisions(
+            session_factory,
+            bridge_token=str(bridge_token),
+            runtime_identity=identity,
+            confirmation_token=str(confirmation_token),
+            fenced_at=observed_at,
+        )
+    elif action == "rollback":
+        result = rollback_legacy_runtime_drain_bridge(
+            session_factory,
+            bridge_token=str(bridge_token),
+            runtime_identity=identity,
+            confirmation_token=str(confirmation_token),
+            rolled_back_at=observed_at,
+        )
+    else:
+        client = build_deepcoin_client_from_env()
+        audit_client = _LegacyDrainAuditClient(
+            client,
+            reviewed_order_ids=set(reviewed_ids),
+        )
+        cancel_plan = build_reviewed_pending_entry_cancel_plan(
+            session_factory,
+            deepcoin_client=audit_client,
+            targets=REVIEWED_PENDING_ENTRY_TARGETS,
+            legacy_runtime_identity=identity,
+            now=observed_at,
+        )
+        evidence = audit_client.evidence(
+            plan=cancel_plan,
+            observed_at=observed_at,
+        )
+        if action == "mark-drained":
+            result = mark_legacy_runtime_bridge_drained(
+                session_factory,
+                bridge_token=str(bridge_token),
+                runtime_identity=identity,
+                evidence=evidence,
+                confirmation_token=str(confirmation_token),
+                drained_at=observed_at,
+            )
+        else:
+            if evidence.fingerprint != expected_drain_evidence_fingerprint:
+                raise typer.BadParameter(
+                    "--expected-drain-evidence-fingerprint does not match fresh evidence"
+                )
+            result = release_legacy_runtime_bridge_for_deploy(
+                session_factory,
+                bridge_token=str(bridge_token),
+                runtime_identity=identity,
+                evidence=evidence,
+                expected_drain_evidence_fingerprint=evidence.fingerprint,
+                confirmation_token=str(confirmation_token),
+                released_at=observed_at,
+            )
+    result_payload = _legacy_bridge_cli_result(result)
+    if action in {"mark-drained", "release-for-deploy"}:
+        result_payload["drain_evidence_fingerprint"] = evidence.fingerprint
+    typer.echo(
+        json.dumps(
+            result_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+        )
+    )
+    if result.status not in {
+        "frozen",
+        "fenced",
+        "rolled_back",
+        "drained",
+        "released_for_deploy",
+    }:
+        raise typer.Exit(code=2)
+
+
 @app.command("cancel-reviewed-pending-entries")
 def cancel_reviewed_pending_entries(
     database_path: Path = Path("data/research.db"),
+    checkout_path: Path = typer.Option(Path("."), "--checkout-path"),
+    expected_production_sha: str | None = typer.Option(
+        None, "--expected-production-sha"
+    ),
+    service_name: str = typer.Option(
+        "telegram-kol.service", "--service-name"
+    ),
+    bridge_token: str | None = typer.Option(None, "--bridge-token"),
     order_id: str | None = typer.Option(None, "--order-id"),
     action_id: str | None = typer.Option(None, "--action-id"),
     apply: bool = typer.Option(False, "--apply"),
@@ -4974,12 +5283,28 @@ def cancel_reviewed_pending_entries(
 ) -> None:
     """Plan or cancel one exact reviewed pending Deepcoin entry."""
 
+    bridge_identity = None
+    if bridge_token:
+        if not expected_production_sha:
+            raise typer.BadParameter(
+                "--bridge-token requires --expected-production-sha"
+            )
+        bridge_identity = read_local_legacy_worker_identity(
+            checkout_path=checkout_path,
+            expected_production_sha=expected_production_sha,
+            service_name=service_name,
+        )
+    elif expected_production_sha:
+        raise typer.BadParameter(
+            "--expected-production-sha requires --bridge-token"
+        )
     session_factory = create_existing_session_factory(database_path)
     client = build_deepcoin_client_from_env()
     plan = build_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=client,
         targets=REVIEWED_PENDING_ENTRY_TARGETS,
+        legacy_runtime_identity=bridge_identity,
         now=datetime.now(UTC),
     )
     typer.echo(
@@ -5018,6 +5343,8 @@ def cancel_reviewed_pending_entries(
         action_id=action_id,
         expected_fingerprint=expected_fingerprint,
         confirmation_token=confirmation_token,
+        legacy_bridge_token=bridge_token,
+        legacy_runtime_identity=bridge_identity,
         now=datetime.now(UTC),
     )
     typer.echo(

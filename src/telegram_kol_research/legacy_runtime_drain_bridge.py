@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+from pathlib import Path
 import re
+import stat
+import subprocess
 from typing import Any, Iterable
 import uuid
 
@@ -14,11 +17,21 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from telegram_kol_research.models import (
+    ExecutionEvent,
+    ExecutionOrderLeg,
     MessageProcessingJob,
+    PositionMutationIntent,
+    PositionProtectionLeg,
     RawMessage,
     RepairConfirmationToken,
     StrategyRevisionBatch,
     TradingSetting,
+    TriggerProtectionIntent,
+    TriggerTakeProfitConvergence,
+)
+from telegram_kol_research.entry_revision_exchange_authority import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    _authority_document,
 )
 from telegram_kol_research.trading_settings import (
     _persist_trading_settings_in_session,
@@ -56,6 +69,8 @@ _DOCUMENT_KEYS = frozenset(
         "reviewed_order_ids",
         "fenced_batch_ids",
         "completed_order_ids",
+        "drain_evidence_fingerprint",
+        "drained_at",
         "write_boundary_reached",
         "updated_at",
     }
@@ -110,6 +125,25 @@ class LegacyRuntimeDrainBridgeResult:
     status: str
     reason_code: str | None = None
     bridge_token: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyRuntimeDrainEvidence:
+    reviewed_order_ids: tuple[str, ...]
+    completed_order_ids: tuple[str, ...]
+    plan_fingerprint: str
+    action_count: int
+    conflict_count: int
+    positions_count: int
+    regular_order_count: int
+    pending_trigger_count: int
+    unidentified_pending_count: int
+    unreviewed_pending_count: int
+    fill_conflict_count: int
+    queries_complete: bool
+    history_complete: bool
+    observed_at: datetime
+    fingerprint: str
 
 
 def build_legacy_runtime_drain_bridge_plan(
@@ -211,7 +245,6 @@ def _build_plan_in_session(
         "completed_order_ids": list(completed_order_ids),
         "expected_production_sha": expected_sha,
         "fenced_batch_ids": list(fenced_batch_ids),
-        "planned_at": observed_at.isoformat(),
         "reviewed_order_ids": list(reviewed),
         "runtime_identity": {
             "production_sha": runtime_identity.production_sha,
@@ -314,6 +347,8 @@ def freeze_legacy_runtime_drain_bridge(
                 "active_order_id": None,
                 "bridge_token": bridge_token,
                 "completed_order_ids": [],
+                "drain_evidence_fingerprint": None,
+                "drained_at": None,
                 "fenced_batch_ids": [],
                 "freeze_raw_message_id": watermark,
                 "frozen_at": observed_at.isoformat(),
@@ -360,11 +395,13 @@ def fence_legacy_runtime_revisions(
     *,
     bridge_token: str,
     runtime_identity: LegacyRuntimeIdentity,
+    confirmation_token: str,
     fenced_at: datetime,
 ) -> LegacyRuntimeDrainBridgeResult:
     """Install exact null-time claims that the unchanged worker cannot steal."""
 
     clean_token = _bridge_token(bridge_token)
+    clean_confirmation = _confirmation_token(confirmation_token)
     observed_at = _aware_utc(fenced_at, field_name="fenced_at")
     try:
         with session_factory() as session:
@@ -426,11 +463,21 @@ def fence_legacy_runtime_revisions(
             document["updated_at"] = observed_at.isoformat()
             row.value_json = _canonical_json(document)
             row.updated_at = observed_at
+            _consume_confirmation_in_session(
+                session,
+                confirmation_token=clean_confirmation,
+                action_kind="fence_legacy_runtime_revisions",
+                action_id=clean_token,
+                pos_id=f"legacy-bridge:{clean_token}",
+                consumed_at=observed_at,
+            )
             session.commit()
             return LegacyRuntimeDrainBridgeResult(
                 status="fenced",
                 bridge_token=clean_token,
             )
+    except IntegrityError:
+        return _result("blocked", "legacy_bridge_confirmation_used")
     except SQLAlchemyError:
         return _result("blocked", "legacy_bridge_database_unavailable")
 
@@ -440,11 +487,13 @@ def rollback_legacy_runtime_drain_bridge(
     *,
     bridge_token: str,
     runtime_identity: LegacyRuntimeIdentity,
+    confirmation_token: str,
     rolled_back_at: datetime,
 ) -> LegacyRuntimeDrainBridgeResult:
     """Restore pre-freeze settings only before any reviewed write boundary."""
 
     clean_token = _bridge_token(bridge_token)
+    clean_confirmation = _confirmation_token(confirmation_token)
     observed_at = _aware_utc(rolled_back_at, field_name="rolled_back_at")
     try:
         with session_factory() as session:
@@ -507,9 +556,19 @@ def rollback_legacy_runtime_drain_bridge(
                 row=settings_row,
                 persisted_payload=persisted_payload,
             )
+            _consume_confirmation_in_session(
+                session,
+                confirmation_token=clean_confirmation,
+                action_kind="rollback_legacy_runtime_drain_bridge",
+                action_id=clean_token,
+                pos_id=f"legacy-bridge:{clean_token}",
+                consumed_at=observed_at,
+            )
             session.delete(row)
             session.commit()
             return LegacyRuntimeDrainBridgeResult(status="rolled_back")
+    except IntegrityError:
+        return _result("blocked", "legacy_bridge_confirmation_used")
     except SQLAlchemyError:
         return _result("blocked", "legacy_bridge_database_unavailable")
 
@@ -650,6 +709,313 @@ def mark_legacy_runtime_bridge_unknown(
         return _result("blocked", "legacy_bridge_database_unavailable")
 
 
+def build_legacy_runtime_drain_evidence(
+    *,
+    reviewed_order_ids: Iterable[str],
+    completed_order_ids: Iterable[str],
+    plan_fingerprint: str,
+    action_count: int,
+    conflict_count: int,
+    positions_count: int,
+    regular_order_count: int,
+    pending_trigger_count: int,
+    unidentified_pending_count: int,
+    unreviewed_pending_count: int,
+    fill_conflict_count: int,
+    queries_complete: bool,
+    history_complete: bool,
+    observed_at: datetime,
+) -> LegacyRuntimeDrainEvidence:
+    """Build bounded, raw-response-free evidence for the final drain gate."""
+
+    reviewed = _reviewed_order_ids(reviewed_order_ids)
+    completed = _completed_order_ids(
+        list(completed_order_ids),
+        reviewed=reviewed,
+    )
+    clean_plan_fingerprint = _sha256(
+        plan_fingerprint,
+        field_name="plan_fingerprint",
+    )
+    counts = {
+        "action_count": _nonnegative_int(action_count, field_name="action_count"),
+        "conflict_count": _nonnegative_int(
+            conflict_count, field_name="conflict_count"
+        ),
+        "positions_count": _nonnegative_int(
+            positions_count, field_name="positions_count"
+        ),
+        "regular_order_count": _nonnegative_int(
+            regular_order_count, field_name="regular_order_count"
+        ),
+        "pending_trigger_count": _nonnegative_int(
+            pending_trigger_count, field_name="pending_trigger_count"
+        ),
+        "unidentified_pending_count": _nonnegative_int(
+            unidentified_pending_count,
+            field_name="unidentified_pending_count",
+        ),
+        "unreviewed_pending_count": _nonnegative_int(
+            unreviewed_pending_count,
+            field_name="unreviewed_pending_count",
+        ),
+        "fill_conflict_count": _nonnegative_int(
+            fill_conflict_count, field_name="fill_conflict_count"
+        ),
+    }
+    if type(queries_complete) is not bool or type(history_complete) is not bool:
+        raise ValueError("drain completeness flags must be booleans")
+    timestamp = _aware_utc(observed_at, field_name="observed_at")
+    payload = {
+        **counts,
+        "completed_order_ids": list(completed),
+        "history_complete": history_complete,
+        "plan_fingerprint": clean_plan_fingerprint,
+        "queries_complete": queries_complete,
+        "reviewed_order_ids": list(reviewed),
+    }
+    return LegacyRuntimeDrainEvidence(
+        reviewed_order_ids=reviewed,
+        completed_order_ids=completed,
+        plan_fingerprint=clean_plan_fingerprint,
+        queries_complete=queries_complete,
+        history_complete=history_complete,
+        observed_at=timestamp,
+        fingerprint=hashlib.sha256(_canonical_json(payload).encode()).hexdigest(),
+        **counts,
+    )
+
+
+def mark_legacy_runtime_bridge_drained(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    evidence: LegacyRuntimeDrainEvidence,
+    confirmation_token: str,
+    drained_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Mark all seven reviewed orders drained after complete fresh evidence."""
+
+    clean_token = _bridge_token(bridge_token)
+    clean_confirmation = _confirmation_token(confirmation_token)
+    observed_at = _aware_utc(drained_at, field_name="drained_at")
+    evidence_reason = _drain_evidence_reason(evidence)
+    if evidence_reason is None:
+        evidence_reason = _drain_evidence_freshness_reason(
+            evidence,
+            transition_at=observed_at,
+        )
+    if evidence_reason is not None:
+        return _result("blocked", evidence_reason)
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"fenced"},
+            )
+            if error is None and tuple(document["reviewed_order_ids"]) != tuple(
+                evidence.reviewed_order_ids
+            ):
+                error = "legacy_bridge_reviewed_set_drift"
+            if error is None and tuple(document["completed_order_ids"]) != tuple(
+                document["reviewed_order_ids"]
+            ):
+                error = "legacy_bridge_reviewed_set_incomplete"
+            if error is None and tuple(evidence.completed_order_ids) != tuple(
+                document["reviewed_order_ids"]
+            ):
+                error = "legacy_bridge_evidence_set_incomplete"
+            if error is None:
+                error = _frozen_settings_reason(session)
+            if error is None:
+                error = _revision_sentinel_reason(session, document=document)
+            if error is None:
+                error = _local_drain_reason(session, document=document)
+            if error is None:
+                error = _inner_authority_reason(session)
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            document["state"] = "drained"
+            document["drained_at"] = observed_at.isoformat()
+            document["drain_evidence_fingerprint"] = evidence.fingerprint
+            document["updated_at"] = observed_at.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = observed_at
+            _consume_confirmation_in_session(
+                session,
+                confirmation_token=clean_confirmation,
+                action_kind="mark_legacy_runtime_bridge_drained",
+                action_id=evidence.fingerprint,
+                pos_id=f"legacy-bridge:{clean_token}",
+                consumed_at=observed_at,
+            )
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(status="drained")
+    except IntegrityError:
+        return _result("blocked", "legacy_bridge_confirmation_used")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
+def release_legacy_runtime_bridge_for_deploy(
+    session_factory,
+    *,
+    bridge_token: str,
+    runtime_identity: LegacyRuntimeIdentity,
+    evidence: LegacyRuntimeDrainEvidence,
+    expected_drain_evidence_fingerprint: str,
+    confirmation_token: str,
+    released_at: datetime,
+) -> LegacyRuntimeDrainBridgeResult:
+    """Release exact legacy revision sentinels while settings stay frozen."""
+
+    clean_token = _bridge_token(bridge_token)
+    expected_evidence = _sha256(
+        expected_drain_evidence_fingerprint,
+        field_name="expected_drain_evidence_fingerprint",
+    )
+    clean_confirmation = _confirmation_token(confirmation_token)
+    observed_at = _aware_utc(released_at, field_name="released_at")
+    evidence_reason = _drain_evidence_reason(evidence)
+    if evidence_reason is None:
+        evidence_reason = _drain_evidence_freshness_reason(
+            evidence,
+            transition_at=observed_at,
+        )
+    if evidence_reason is not None:
+        return _result("blocked", evidence_reason)
+    if evidence.fingerprint != expected_evidence:
+        return _result("blocked", "legacy_bridge_drain_evidence_drift")
+    try:
+        with session_factory() as session:
+            session.execute(text("BEGIN IMMEDIATE"))
+            row, document, error = _owned_bridge_in_session(
+                session,
+                bridge_token=clean_token,
+                runtime_identity=runtime_identity,
+                allowed_states={"drained"},
+            )
+            if (
+                error is None
+                and document["drain_evidence_fingerprint"] != expected_evidence
+            ):
+                error = "legacy_bridge_drain_evidence_drift"
+            if error is None and tuple(evidence.reviewed_order_ids) != tuple(
+                document["reviewed_order_ids"]
+            ):
+                error = "legacy_bridge_reviewed_set_drift"
+            if error is None and tuple(evidence.completed_order_ids) != tuple(
+                document["reviewed_order_ids"]
+            ):
+                error = "legacy_bridge_evidence_set_incomplete"
+            if error is None:
+                error = _frozen_settings_reason(session)
+            if error is None:
+                error = _revision_sentinel_reason(session, document=document)
+            if error is None:
+                error = _local_drain_reason(session, document=document)
+            if error is None:
+                error = _inner_authority_reason(session)
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
+            batches = (
+                session.query(StrategyRevisionBatch)
+                .filter(
+                    StrategyRevisionBatch.id.in_(document["fenced_batch_ids"])
+                )
+                .all()
+                if document["fenced_batch_ids"]
+                else []
+            )
+            for batch in batches:
+                batch.advance_claim_token = None
+                batch.advance_claimed_at = None
+                batch.updated_at = observed_at
+            document["state"] = "released_for_deploy"
+            document["updated_at"] = observed_at.isoformat()
+            row.value_json = _canonical_json(document)
+            row.updated_at = observed_at
+            _consume_confirmation_in_session(
+                session,
+                confirmation_token=clean_confirmation,
+                action_kind="release_legacy_runtime_bridge_for_deploy",
+                action_id=expected_evidence,
+                pos_id=f"legacy-bridge:{clean_token}",
+                consumed_at=observed_at,
+            )
+            session.commit()
+            return LegacyRuntimeDrainBridgeResult(status="released_for_deploy")
+    except IntegrityError:
+        return _result("blocked", "legacy_bridge_confirmation_used")
+    except SQLAlchemyError:
+        return _result("blocked", "legacy_bridge_database_unavailable")
+
+
+def read_local_legacy_worker_identity(
+    *,
+    checkout_path: Path,
+    expected_production_sha: str,
+    service_name: str,
+    proc_root: Path = Path("/proc"),
+    command_runner=subprocess.run,
+) -> LegacyRuntimeIdentity:
+    """Read exact checkout HEAD and stable Linux PID/start-tick identity."""
+
+    expected_sha = _sha(
+        expected_production_sha,
+        field_name="expected_production_sha",
+    )
+    checkout = Path(checkout_path)
+    if checkout.is_symlink() or not checkout.is_dir():
+        raise ValueError("checkout path is invalid")
+    checkout = checkout.resolve()
+    clean_service = str(service_name or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", clean_service):
+        raise ValueError("service_name is invalid")
+    root_text = _run_bounded_command(
+        command_runner,
+        ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
+    )
+    if Path(root_text).resolve() != checkout:
+        raise ValueError("checkout root mismatch")
+    head = _run_bounded_command(
+        command_runner,
+        ["git", "-C", str(checkout), "rev-parse", "--verify", "HEAD"],
+    )
+    if head != expected_sha:
+        raise ValueError("production SHA mismatch")
+    pid_text = _run_bounded_command(
+        command_runner,
+        [
+            "systemctl",
+            "show",
+            clean_service,
+            "--property",
+            "MainPID",
+            "--value",
+        ],
+    )
+    if not pid_text.isdigit() or int(pid_text) <= 1:
+        raise ValueError("service MainPID is invalid")
+    pid = int(pid_text)
+    stat_path = Path(proc_root) / str(pid) / "stat"
+    first_ticks = _read_proc_start_ticks(stat_path)
+    second_ticks = _read_proc_start_ticks(stat_path)
+    if first_ticks != second_ticks:
+        raise ValueError("proc stat changed during identity read")
+    return LegacyRuntimeIdentity(
+        production_sha=head,
+        worker_pid=pid,
+        worker_start_ticks=first_ticks,
+    )
+
+
 def legacy_runtime_bridge_revision_gate_state(
     session,
     *,
@@ -673,7 +1039,7 @@ def legacy_runtime_bridge_revision_gate_state(
     except ValueError:
         return "blocked"
     if (
-        document["state"] != "fenced"
+        document["state"] not in {"fenced", "drained"}
         or document["production_sha"] != runtime_identity.production_sha
         or document["worker_pid"] != runtime_identity.worker_pid
         or document["worker_start_ticks"]
@@ -793,6 +1159,21 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         active_order_id is not None or reason_code is not None
     ):
         return None
+    drained_at = value.get("drained_at")
+    drain_fingerprint = value.get("drain_evidence_fingerprint")
+    if value["state"] in {"drained", "released_for_deploy"}:
+        try:
+            drained_at = _aware_utc_text(drained_at).isoformat()
+            drain_fingerprint = _sha256(
+                drain_fingerprint,
+                field_name="drain_evidence_fingerprint",
+            )
+        except ValueError:
+            return None
+        if tuple(completed) != tuple(reviewed):
+            return None
+    elif drained_at is not None or drain_fingerprint is not None:
+        return None
     return {
         **value,
         "production_sha": production_sha,
@@ -801,6 +1182,8 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         "reviewed_order_ids": list(reviewed),
         "fenced_batch_ids": list(fenced),
         "completed_order_ids": list(completed),
+        "drained_at": drained_at,
+        "drain_evidence_fingerprint": drain_fingerprint,
     }
 
 
@@ -909,6 +1292,151 @@ def _revision_sentinel_reason(
     return None
 
 
+def _drain_evidence_reason(
+    evidence: LegacyRuntimeDrainEvidence,
+) -> str | None:
+    if not isinstance(evidence, LegacyRuntimeDrainEvidence):
+        return "legacy_bridge_drain_evidence_invalid"
+    rebuilt = build_legacy_runtime_drain_evidence(
+        reviewed_order_ids=evidence.reviewed_order_ids,
+        completed_order_ids=evidence.completed_order_ids,
+        plan_fingerprint=evidence.plan_fingerprint,
+        action_count=evidence.action_count,
+        conflict_count=evidence.conflict_count,
+        positions_count=evidence.positions_count,
+        regular_order_count=evidence.regular_order_count,
+        pending_trigger_count=evidence.pending_trigger_count,
+        unidentified_pending_count=evidence.unidentified_pending_count,
+        unreviewed_pending_count=evidence.unreviewed_pending_count,
+        fill_conflict_count=evidence.fill_conflict_count,
+        queries_complete=evidence.queries_complete,
+        history_complete=evidence.history_complete,
+        observed_at=evidence.observed_at,
+    )
+    if rebuilt != evidence:
+        return "legacy_bridge_drain_evidence_invalid"
+    if not evidence.queries_complete:
+        return "legacy_bridge_exchange_query_incomplete"
+    if not evidence.history_complete:
+        return "legacy_bridge_history_incomplete"
+    if evidence.positions_count:
+        return "legacy_bridge_position_present"
+    if evidence.regular_order_count:
+        return "legacy_bridge_regular_order_present"
+    if evidence.pending_trigger_count:
+        return "legacy_bridge_pending_trigger_present"
+    if evidence.unidentified_pending_count:
+        return "legacy_bridge_unidentified_pending_trigger"
+    if evidence.unreviewed_pending_count:
+        return "legacy_bridge_unreviewed_pending_trigger"
+    if evidence.fill_conflict_count:
+        return "legacy_bridge_fill_conflict"
+    if evidence.conflict_count:
+        return "legacy_bridge_drain_plan_conflict"
+    if evidence.action_count:
+        return "legacy_bridge_reviewed_set_incomplete"
+    return None
+
+
+def _drain_evidence_freshness_reason(
+    evidence: LegacyRuntimeDrainEvidence,
+    *,
+    transition_at: datetime,
+) -> str | None:
+    age_seconds = (transition_at - evidence.observed_at).total_seconds()
+    if age_seconds < 0 or age_seconds > 60:
+        return "legacy_bridge_exchange_evidence_stale"
+    return None
+
+
+def _local_drain_reason(session, *, document: dict[str, Any]) -> str | None:
+    for order_id in document["reviewed_order_ids"]:
+        intents = (
+            session.query(PositionMutationIntent)
+            .filter(
+                PositionMutationIntent.operation
+                == "cancel_reviewed_pending_entry",
+                PositionMutationIntent.order_id == order_id,
+            )
+            .all()
+        )
+        if len(intents) != 1 or intents[0].status != "confirmed":
+            return "legacy_bridge_local_state_incomplete"
+        intent = intents[0]
+        leg = session.get(ExecutionOrderLeg, intent.execution_order_leg_id)
+        if (
+            leg is None
+            or leg.order_id != order_id
+            or leg.execution_binding_id != intent.execution_binding_id
+            or leg.status not in {"cancelled", "canceled"}
+            or leg.terminal_reason != "operator_cancelled_unfilled_entry_leg"
+        ):
+            return "legacy_bridge_local_state_incomplete"
+        events = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "cancel_reviewed_pending_entry",
+                ExecutionEvent.order_id == order_id,
+                ExecutionEvent.status == "confirmed",
+            )
+            .all()
+        )
+        protection_intents = (
+            session.query(TriggerProtectionIntent)
+            .filter(
+                TriggerProtectionIntent.venue == "deepcoin",
+                TriggerProtectionIntent.execution_order_leg_id == leg.id,
+            )
+            .all()
+        )
+        protection_legs = (
+            session.query(PositionProtectionLeg)
+            .filter(
+                PositionProtectionLeg.venue == "deepcoin",
+                PositionProtectionLeg.execution_order_leg_id == leg.id,
+            )
+            .all()
+        )
+        convergence = (
+            session.query(TriggerTakeProfitConvergence)
+            .filter(
+                TriggerTakeProfitConvergence.venue == "deepcoin",
+                TriggerTakeProfitConvergence.execution_order_leg_id == leg.id,
+            )
+            .all()
+        )
+        if not (
+            len(events) == 1
+            and len(protection_intents) == 1
+            and protection_intents[0].recovery_state == "resolved"
+            and protection_intents[0].recovery_disposition == "terminal"
+            and len(protection_legs) == 2
+            and {row.role for row in protection_legs}
+            == {"primary_stop", "backup_stop"}
+            and all(row.status == "cancelled" for row in protection_legs)
+            and len(convergence) == 1
+            and convergence[0].status == "completed"
+        ):
+            return "legacy_bridge_local_state_incomplete"
+    return None
+
+
+def _inner_authority_reason(session) -> str | None:
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY)
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    document = _authority_document(row.value_json)
+    if document is None:
+        return "legacy_bridge_inner_authority_invalid"
+    if document["state"] != "idle":
+        return "legacy_bridge_inner_authority_held"
+    return None
+
+
 def _consume_confirmation_in_session(
     session,
     *,
@@ -976,6 +1504,69 @@ def _sha(value: Any, *, field_name: str) -> str:
     if not _SHA.fullmatch(text):
         raise ValueError(f"{field_name} must be a lowercase full SHA")
     return text
+
+
+def _sha256(value: Any, *, field_name: str) -> str:
+    text_value = str(value or "")
+    if len(text_value) != 64 or any(
+        character not in "0123456789abcdef" for character in text_value
+    ):
+        raise ValueError(f"{field_name} must be a lowercase SHA256")
+    return text_value
+
+
+def _nonnegative_int(value: Any, *, field_name: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(f"{field_name} must be a nonnegative integer")
+    return value
+
+
+def _run_bounded_command(command_runner, argv: list[str]) -> str:
+    try:
+        completed = command_runner(
+            argv,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise ValueError("runtime identity command failed") from exc
+    if completed.returncode != 0:
+        raise ValueError("runtime identity command failed")
+    output = str(completed.stdout or "")
+    if len(output) > 4096:
+        raise ValueError("runtime identity command output is too large")
+    clean = output.strip()
+    if not clean or "\n" in clean or "\r" in clean:
+        raise ValueError("runtime identity command output is invalid")
+    return clean
+
+
+def _read_proc_start_ticks(stat_path: Path) -> int:
+    try:
+        metadata = stat_path.lstat()
+    except OSError as exc:
+        raise ValueError("proc stat is unavailable") from exc
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise ValueError("proc stat is invalid")
+    try:
+        with stat_path.open("r", encoding="utf-8") as handle:
+            raw = handle.read(4097)
+    except OSError as exc:
+        raise ValueError("proc stat is unavailable") from exc
+    if len(raw) > 4096:
+        raise ValueError("proc stat is too large")
+    close_paren = raw.rfind(")")
+    if close_paren <= 0:
+        raise ValueError("proc stat is invalid")
+    fields = raw[close_paren + 1 :].strip().split()
+    if len(fields) <= 19 or not fields[19].isdigit():
+        raise ValueError("proc stat is invalid")
+    start_ticks = int(fields[19])
+    if start_ticks <= 0:
+        raise ValueError("proc stat is invalid")
+    return start_ticks
 
 
 def _reviewed_order_ids(values: Iterable[str]) -> tuple[str, ...]:

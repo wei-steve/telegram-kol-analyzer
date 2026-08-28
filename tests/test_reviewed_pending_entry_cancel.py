@@ -669,6 +669,7 @@ def test_exact_legacy_bridge_sentinel_is_the_only_revision_claim_exemption(
         session_factory,
         bridge_token=str(frozen.bridge_token),
         runtime_identity=identity,
+        confirmation_token="reviewed-bridge-fence-token",
         fenced_at=NOW,
     )
     assert fenced.status == "fenced"
@@ -2101,3 +2102,112 @@ def test_cli_help_exposes_reviewed_pending_entry_guards():
     assert "--action-id" in result.output
     assert "--expected-fingerprint" in result.output
     assert "--confirmation-token" in result.output
+    assert "--bridge-token" in result.output
+    assert "--expected-production-sha" in result.output
+
+
+def test_cli_bridge_mode_passes_exact_runtime_identity_to_plan_and_apply(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeIdentity,
+    )
+    from telegram_kol_research.reviewed_pending_entry_cancel import (
+        ReviewedPendingEntryCancelResult,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bridge-cli.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=303,
+        worker_start_ticks=404,
+    )
+    captured = []
+    monkeypatch.setattr(cli_module, "REVIEWED_PENDING_ENTRY_TARGETS", targets)
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_client_from_env", lambda: client
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda _path: session_factory,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: identity,
+    )
+    original_builder = cli_module.build_reviewed_pending_entry_cancel_plan
+
+    def build_plan(*args, **kwargs):
+        captured.append(("plan", kwargs.get("legacy_runtime_identity")))
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_reviewed_pending_entry_cancel_plan",
+        build_plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "apply_reviewed_pending_entry_cancel_plan",
+        lambda *_args, **kwargs: (
+            captured.append(
+                (
+                    "apply",
+                    kwargs.get("legacy_bridge_token"),
+                    kwargs.get("legacy_runtime_identity"),
+                )
+            )
+            or ReviewedPendingEntryCancelResult(
+                status="cancelled",
+                order_id=kwargs["order_id"],
+            )
+        ),
+    )
+    base_args = [
+        "--database-path",
+        str(tmp_path / "bridge-cli.db"),
+        "--bridge-token",
+        "exact-bridge-token",
+        "--checkout-path",
+        str(tmp_path),
+        "--expected-production-sha",
+        identity.production_sha,
+    ]
+    dry = CliRunner().invoke(
+        cli_module.app,
+        ["cancel-reviewed-pending-entries", *base_args],
+    )
+    plan = json.loads(dry.output)["plan"]
+    action = plan["actions"][0]
+
+    applied = CliRunner().invoke(
+        cli_module.app,
+        [
+            "cancel-reviewed-pending-entries",
+            *base_args,
+            "--apply",
+            "--order-id",
+            action["order_id"],
+            "--action-id",
+            action["action_id"],
+            "--expected-fingerprint",
+            plan["fingerprint"],
+            "--confirmation-token",
+            "bridge-cli-confirmation",
+        ],
+    )
+
+    assert dry.exit_code == 0, dry.output
+    assert applied.exit_code == 0, applied.output
+    assert captured == [
+        ("plan", identity),
+        ("plan", identity),
+        ("apply", "exact-bridge-token", identity),
+    ]
