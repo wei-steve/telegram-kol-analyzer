@@ -4,7 +4,9 @@ The deployment workflow has five independent actions. A successful action never 
 
 **A generated plan is not authorization.** It is a deterministic statement of required evidence and prohibited effects. The operator still grants each external action separately.
 
-The existing conservative updater remains authoritative for production activation until immutable staging and scoped activation are implemented and independently reviewed. The local planner does not weaken or bypass that updater.
+Immutable staging and scoped activation are the only deployment path in the
+local candidate. The planner does not authorize either action, and the
+workstation helpers require an explicit action instead of selecting a default.
 
 ## Action matrix
 
@@ -220,13 +222,43 @@ Three deliberate activation blockers remain:
    or repairing it is a separate production database write with its own review,
    backup, and authorization; activation never creates it.
 
-The legacy updater currently exposes this path only when
-`DEPLOYMENT_ACTION=activate`; its default remains the compatibility path until
-the workstation commands are split and the legacy path is removed in Batch 4.
+`deploy/telegram-kol-update` is now only an explicit activation dispatcher. It
+accepts `DEPLOYMENT_ACTION=activate` and executes the activator from the
+separately named immutable `ROLLBACK_COMMIT`; it has no checkout-mutating,
+stage-and-activate, settings, database, or service-control compatibility path.
 No local implementation or successful test authorizes installation, SSH,
 activation, restart, or any production write.
 
-## Removal sequence
+## Explicit workstation commands
+
+The Bash entry point exposes four separate commands:
+
+```bash
+ACTION_MANIFEST=/path/to/manifest.json ./scripts/server_git_update.sh plan
+ACTION_MANIFEST=/path/to/push.json EXPECTED_COMMIT=<reviewed-sha> \
+  ./scripts/server_git_update.sh push
+ACTION_MANIFEST=/path/to/stage.json EXPECTED_COMMIT=<reviewed-sha> \
+  ./scripts/server_git_update.sh stage
+ACTION_MANIFEST=/path/to/activate.json EXPECTED_COMMIT=<candidate-sha> \
+  ROLLBACK_COMMIT=<control-release-sha> \
+  ACTIVATION_AUTHORIZATION=/run/path/to/authorization.json \
+  ACTIVATION_AUTHORIZATION_CONSUMED=/run/path/to/authorization.consumed \
+  ./scripts/server_git_update.sh activate
+```
+
+PowerShell exposes the same `plan`, `push`, `stage`, and `activate` action names
+through its mandatory `-Action` parameter. Every non-plan command requires a
+manifest declaring that exact action. `push` requires a clean exact-HEAD
+worktree and refuses a non-fast-forward update. `stage` transports only an
+ephemeral exact-commit control bundle and creates the inactive immutable
+candidate. `activate` invokes only the dispatcher inside the declared immutable
+rollback release and requires server-side authorization paths.
+
+No helper command invokes the next action. In particular, push never stages,
+stage never activates, activation never changes trading state, and no trading
+command exists in these helpers. The legacy one-command updater has been removed.
+
+## Completed removal sequence
 
 The legacy one-command stage-and-activate path is removed only after these independent paths exist:
 
@@ -236,4 +268,6 @@ The legacy one-command stage-and-activate path is removed only after these indep
 4. explicit workstation commands that never chain actions;
 5. focused failure injection and a final full suite on the exact candidate.
 
-Until then, the universal updater is retained as a conservative compatibility path. Adding a bypass flag, operator override, or settings-based authority inference is not part of this design.
+The separate stage and activate paths passed focused failure-injection coverage
+before the compatibility implementation was deleted. A bypass flag, operator
+override, or settings-based authority inference is not part of this design.

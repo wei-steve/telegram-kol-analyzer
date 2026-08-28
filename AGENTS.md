@@ -22,10 +22,21 @@
   as the fallback and clearly report the Telegram failure in the final response.
   If both notification methods are unavailable, state that clearly in the final
   response.
-- Prefer the existing helper after pushing:
+- After a separately authorized push, use the explicit stage helper only when
+  staging is authorized. Activation remains a later independent authorization
+  and command; neither action enables trading:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
+  -Action stage -ActionManifest .\stage-action.json `
+  -ExpectedCommit <reviewed-40-character-sha>
+
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
+  -Action activate -ActionManifest .\activate-action.json `
+  -ExpectedCommit <candidate-40-character-sha> `
+  -RollbackCommit <control-release-40-character-sha> `
+  -ActivationAuthorization /run/path/to/authorization.json `
+  -ActivationAuthorizationConsumed /run/path/to/authorization.consumed
 ```
 
 # Risk-Adaptive Verification

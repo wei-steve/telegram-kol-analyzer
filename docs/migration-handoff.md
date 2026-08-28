@@ -19,7 +19,14 @@ Production Telegram sessions, databases, Deepcoin credentials, API secrets, and 
 
 ## Deployment ownership
 
-Use GitHub as the code-transfer channel. After a reviewed commit is pushed to `codex/deepcoin-auto-trading-v1`, use `./scripts/server_git_update.sh` on macOS/Linux or `scripts/server_git_update.ps1` on Windows from an approved workstation to update the server. Both helpers invoke the server update command, which reinstalls the editable package and restarts `telegram-kol.service`.
+Use GitHub as the code-transfer channel. The workstation helpers now require an
+explicit `plan`, `push`, `stage`, or `activate` action. For example, after a
+separately authorized push, run `./scripts/server_git_update.sh stage` with a
+stage manifest and exact commit; only a later separately authorized
+`./scripts/server_git_update.sh activate` may control the declared services.
+Windows uses `scripts/server_git_update.ps1` with the same action names. There
+is no one-command push/stage/activate path, and none of these commands enables
+trading.
 
 ## Exact stop-protection handoff
 

@@ -540,6 +540,7 @@ def test_action_gate_policy_documents_all_actions_and_authority_boundary() -> No
     for action in ("local", "push", "stage", "activate", "trading"):
         assert f"`{action}`" in policy
     assert "A generated plan is not authorization." in policy
-    assert "The existing conservative updater remains authoritative" in policy
+    assert "Immutable staging and scoped activation are the only deployment path" in policy
+    assert "legacy one-command updater has been removed" in policy
     assert "Stage must not inspect live runtime or database state" in policy
     assert "Trading enablement is never implied by activation" in policy

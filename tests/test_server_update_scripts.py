@@ -1,8 +1,16 @@
 from __future__ import annotations
 
+import base64
+import io
 from pathlib import Path
+import json
+import os
 import re
+import shutil
 import subprocess
+import tarfile
+
+import pytest
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +35,256 @@ CACHE_REPAIR_VERSION_AWARE_PLAN = (
     / "plans"
     / "2026-08-27-deepcoin-contract-cache-task12-version-aware-gates.md"
 )
+
+
+def _write_action_manifest(path: Path, action: str) -> None:
+    payload = {
+        "action": action,
+        "risk_level": "L1",
+        "components": [],
+        "requires_restart": False,
+        "schema_changed": False,
+        "production_data_mutation": False,
+        "exchange_write_semantics_changed": False,
+        "authority_changed": False,
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+
+def test_workstation_shell_requires_one_explicit_action(tmp_path: Path) -> None:
+    result = subprocess.run(
+        [str(ROOT / "scripts/server_git_update.sh")],
+        cwd=ROOT,
+        env={**os.environ, "PYTHONPATH": str(ROOT / "src")},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "plan|push|stage|activate" in result.stderr
+
+
+def test_workstation_plan_is_local_and_does_not_advance_to_ssh(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "plan.json"
+    _write_action_manifest(manifest, "local")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    ssh_marker = tmp_path / "ssh-called"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!/usr/bin/env bash\ntouch {ssh_marker!s}\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/server_git_update.sh"), "plan"],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "ACTION_MANIFEST": str(manifest),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "PYTHONPATH": str(ROOT / "src"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout)["action"] == "local"
+    assert not ssh_marker.exists()
+
+
+def test_bootstrap_rejects_ssh_option_injection_before_transport(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "activate.json"
+    manifest.write_text("{}", encoding="utf-8")
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "ssh-called"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 99\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "activate",
+            "SERVER": "-oProxyCommand=touch-injected",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": "1" * 40,
+            "ROLLBACK_COMMIT": "2" * 40,
+            "ACTION_MANIFEST": str(manifest),
+            "ACTIVATION_AUTHORIZATION": "/run/authorization.json",
+            "ACTIVATION_AUTHORIZATION_CONSUMED": "/run/authorization.consumed",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "Invalid SERVER" in result.stderr
+    assert not marker.exists()
+
+
+def test_stage_transport_is_one_ssh_call_with_two_line_payload(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "stage.json"
+    _write_action_manifest(manifest, "stage")
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    args_path = tmp_path / "ssh-args"
+    stdin_path = tmp_path / "ssh-stdin"
+    calls_path = tmp_path / "ssh-calls"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'x\\n' >> {calls_path!s}\n"
+        f"printf '%s\\0' \"$@\" > {args_path!s}\n"
+        f"while IFS= read -r line; do printf '%s\\n' \"$line\"; done > {stdin_path!s}\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "stage",
+            "SERVER": "root@127.0.0.1",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": expected_commit,
+            "ACTION_MANIFEST": str(manifest),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["x"]
+    arguments = args_path.read_bytes().rstrip(b"\0").decode().split("\0")
+    assert arguments[:3] == ["-i", str(key), "root@127.0.0.1"]
+    assert len(arguments) == 4
+    assert "'stage'" in arguments[3]
+    payload = stdin_path.read_text(encoding="utf-8").splitlines()
+    assert len(payload) == 2
+    assert base64.b64decode(payload[0]) == manifest.read_bytes()
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(payload[1]))) as archive:
+        assert "deploy/telegram-kol-stage" in archive.getnames()
+
+
+def test_activate_transport_failure_stops_after_one_ssh_call(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "activate.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "action": "activate",
+                "risk_level": "L1",
+                "components": ["web"],
+                "requires_restart": True,
+                "schema_changed": False,
+                "production_data_mutation": False,
+                "exchange_write_semantics_changed": False,
+                "authority_changed": False,
+            }
+        ),
+        encoding="utf-8",
+    )
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    args_path = tmp_path / "ssh-args"
+    stdin_path = tmp_path / "ssh-stdin"
+    calls_path = tmp_path / "ssh-calls"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf 'x\\n' >> {calls_path!s}\n"
+        f"printf '%s\\0' \"$@\" > {args_path!s}\n"
+        f"while IFS= read -r line; do printf '%s\\n' \"$line\"; done > {stdin_path!s}\n"
+        "exit 17\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "activate",
+            "SERVER": "root@127.0.0.1",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": "1" * 40,
+            "ROLLBACK_COMMIT": "2" * 40,
+            "ACTION_MANIFEST": str(manifest),
+            "ACTIVATION_AUTHORIZATION": "/run/authorization.json",
+            "ACTIVATION_AUTHORIZATION_CONSUMED": "/run/authorization.consumed",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 17
+    assert calls_path.read_text(encoding="utf-8").splitlines() == ["x"]
+    arguments = args_path.read_bytes().rstrip(b"\0").decode().split("\0")
+    assert len(arguments) == 4
+    assert "'activate'" in arguments[3]
+    payload = stdin_path.read_text(encoding="utf-8").splitlines()
+    assert len(payload) == 2
+    assert payload[1] == "-"
+
+
+def test_workstation_and_server_helpers_have_no_legacy_or_trading_action() -> None:
+    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    for source in (shell, powershell, bootstrap, updater):
+        assert "EXPECTED_AUTO_TRADE_STATE" not in source
+        assert "legacy)" not in source
+    assert "plan|push|stage|activate" in shell
+    assert 'ValidateSet("plan", "push", "stage", "activate")' in powershell
+    assert "stage|activate" in bootstrap
+    assert "git push" not in bootstrap
+    assert "DEPLOYMENT_ACTION:-" not in updater
+    assert "APP_DIR=" not in updater
+    assert "systemctl" not in updater
 
 
 def test_update_scripts_are_syntax_valid():
@@ -57,24 +315,86 @@ def test_update_scripts_are_syntax_valid():
     )
 
 
-def test_updater_dispatches_activate_before_legacy_universal_inputs():
+def test_updater_is_an_activate_only_immutable_dispatcher():
     updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    dispatch = updater.index('case "$DEPLOYMENT_ACTION" in')
-    activator_exec = updater.index('exec "$ACTIVATOR_PATH"', dispatch)
-    legacy_expected_commit = updater.index('EXPECTED_COMMIT="${EXPECTED_COMMIT:?')
-    assert dispatch < activator_exec < legacy_expected_commit
-    assert 'DEPLOYMENT_ACTION="${DEPLOYMENT_ACTION:-legacy}"' in updater
-    assert "DEPLOYMENT_ACTION must be activate or legacy" in updater
+    assert 'DEPLOYMENT_ACTION="${DEPLOYMENT_ACTION:?' in updater
+    assert 'if [ "$DEPLOYMENT_ACTION" != "activate" ]' in updater
+    assert 'exec "$ACTIVATOR_PATH"' in updater
+    for retired in ("APP_DIR=", "EXPECTED_AUTO_TRADE_STATE", "git fetch", "systemctl"):
+        assert retired not in updater
 
 
-def test_legacy_and_scoped_paths_share_one_deployment_control_lock():
-    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+def test_updater_dispatches_only_to_sibling_activator_in_named_release(
+    tmp_path: Path,
+) -> None:
+    rollback_commit = "2" * 40
+    deploy = tmp_path / rollback_commit / "deploy"
+    deploy.mkdir(parents=True)
+    dispatcher = deploy / "telegram-kol-update"
+    shutil.copy2(ROOT / "deploy/telegram-kol-update", dispatcher)
+    marker = tmp_path / "activator-called"
+    activator = deploy / "telegram-kol-activate"
+    activator.write_text(
+        f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 23\n",
+        encoding="utf-8",
+    )
+    activator.chmod(0o755)
+
+    result = subprocess.run(
+        [str(dispatcher)],
+        env={
+            **os.environ,
+            "DEPLOYMENT_ACTION": "activate",
+            "ROLLBACK_COMMIT": rollback_commit,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert marker.exists()
+
+
+def test_updater_refuses_dispatcher_directory_identity_mismatch(
+    tmp_path: Path,
+) -> None:
+    actual_commit = "2" * 40
+    deploy = tmp_path / actual_commit / "deploy"
+    deploy.mkdir(parents=True)
+    dispatcher = deploy / "telegram-kol-update"
+    shutil.copy2(ROOT / "deploy/telegram-kol-update", dispatcher)
+    marker = tmp_path / "activator-called"
+    activator = deploy / "telegram-kol-activate"
+    activator.write_text(
+        f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 0\n",
+        encoding="utf-8",
+    )
+    activator.chmod(0o755)
+
+    result = subprocess.run(
+        [str(dispatcher)],
+        env={
+            **os.environ,
+            "DEPLOYMENT_ACTION": "activate",
+            "ROLLBACK_COMMIT": "3" * 40,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 4
+    assert "identity does not match" in result.stderr
+    assert not marker.exists()
+
+
+def test_scoped_activator_owns_the_single_deployment_control_lock():
     activator = (
         ROOT / "src/telegram_kol_research/scoped_release_activation.py"
     ).read_text(encoding="utf-8")
 
-    assert 'LOCK_PATH="${LOCK_PATH:-/run/telegram-kol-update.lock}"' in updater
     assert 'Path("/run/telegram-kol-update.lock")' in activator
     assert "/run/telegram-kol-activate.lock" not in activator
 
@@ -102,7 +422,9 @@ def test_scoped_activator_has_no_settings_telegram_or_exchange_write_path():
     assert 'export PYTHONPATH="$ACTIVATOR_ROOT/src"' in script
     assert 'ACTIVATOR_PYTHON=/opt/telegram-kol-analyzer/.venv/bin/python' in script
     assert 'exec "$ACTIVATOR_PYTHON"' in script
-    assert 'ACTIVATOR_PATH="/opt/telegram-kol-releases/$ROLLBACK_COMMIT/' in updater
+    assert 'DISPATCHER_RELEASE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.."' in updater
+    assert 'basename -- "$DISPATCHER_RELEASE_ROOT"' in updater
+    assert 'ACTIVATOR_PATH="$DISPATCHER_RELEASE_ROOT/deploy/telegram-kol-activate"' in updater
     assert 'ACTIVATOR_PATH="${ACTIVATOR_PATH:-' not in updater
     assert "run_monitor_diagnostic" not in implementation
 
@@ -174,31 +496,19 @@ def test_scoped_activation_policy_documents_identity_rollback_and_blockers():
         assert required in policy
 
 
-def test_embedded_python_helpers_are_syntax_valid():
-    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-    helpers = re.findall(r"<<'PY'\n(.*?)\nPY", updater, flags=re.DOTALL)
-
-    assert len(helpers) == 1
-    for helper in helpers:
-        compile(helper, "deploy/telegram-kol-update", "exec")
-
-
-def test_workstation_helpers_require_exact_commit_and_auto_trade_expectation():
+def test_workstation_helpers_require_action_manifest_and_exact_commit():
     shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
     powershell = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
 
+    assert 'ACTION_MANIFEST="${ACTION_MANIFEST:?' in shell
     assert 'EXPECTED_COMMIT="${EXPECTED_COMMIT:?' in shell
-    assert 'EXPECTED_AUTO_TRADE_STATE="${EXPECTED_AUTO_TRADE_STATE:?' in shell
-    assert '[[ "$EXPECTED_AUTO_TRADE_STATE" =~ ^(enabled|disabled)$ ]]' in shell
     assert "bootstrap_server_updater.sh" in shell
     assert "[Parameter(Mandatory = $true)]" in powershell
+    assert "$ActionManifest" in powershell
     assert "$ExpectedCommit" in powershell
-    assert '[ValidateSet("enabled", "disabled")]' in powershell
-    assert "$ExpectedAutoTradeState" in powershell
     assert "$ChangeClass" not in powershell
     assert "$LASTEXITCODE -ne 0" in powershell
     assert "Get-FileHash -Algorithm SHA256" in powershell
-    assert "git -C \"$app_dir\" show" in powershell
     forbidden = (
         "CHANGE_CLASS",
         "ChangeClass",
@@ -212,13 +522,16 @@ def test_workstation_helpers_require_exact_commit_and_auto_trade_expectation():
 
 def test_shell_workstation_helper_preserves_safe_transport_checks():
     script = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
 
     assert "set -euo pipefail" in script
-    assert 'SERVER="${SERVER:-root@43.167.220.225}"' in script
-    assert 'KEY_PATH="${KEY_PATH:-$HOME/.ssh/tecent.pem}"' in script
+    assert 'SERVER="${SERVER:-root@43.167.220.225}"' in bootstrap
+    assert 'KEY_PATH="${KEY_PATH:-$HOME/.ssh/tecent.pem}"' in bootstrap
     assert 'BRANCH="${BRANCH:-codex/deepcoin-auto-trading-v1}"' in script
-    assert "command -v ssh" in script
-    assert '[ ! -r "$KEY_PATH" ]' in script
+    assert "command -v ssh" in bootstrap
+    assert '[ -r "$KEY_PATH" ]' in bootstrap
     assert "bootstrap_server_updater.sh" in script
     assert ",," not in script
 
@@ -226,10 +539,32 @@ def test_shell_workstation_helper_preserves_safe_transport_checks():
 def test_deployment_docs_keep_both_workstation_helpers_visible():
     deployment = (ROOT / "docs/server-deployment.md").read_text(encoding="utf-8")
     handoff = (ROOT / "docs/migration-handoff.md").read_text(encoding="utf-8")
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
     assert "./scripts/server_git_update.sh" in deployment
     assert "server_git_update.ps1" in deployment
     assert "./scripts/server_git_update.sh" in handoff
+    assert "server_git_update.sh stage" in deployment
+    assert "server_git_update.sh activate" in deployment
+    assert "server_git_update.sh stage" in handoff
+    assert "one-command" in handoff
+    assert '-Action stage' in agents
+    assert '-Action activate' in agents
+
+
+def test_action_gate_policy_documents_split_helpers_and_legacy_removal():
+    policy = (ROOT / "docs/deployment-action-gates.md").read_text(encoding="utf-8")
+
+    for command in (
+        "server_git_update.sh plan",
+        "server_git_update.sh push",
+        "server_git_update.sh stage",
+        "server_git_update.sh activate",
+    ):
+        assert command in policy
+    assert "No helper command invokes the next action" in policy
+    assert "legacy one-command updater has been removed" in policy
+    assert "default remains the compatibility path" not in policy
 
 
 def test_contract_cache_repair_docs_define_closed_freeze_and_restore_contract():
@@ -382,226 +717,177 @@ def test_version_aware_gate_documents_have_single_terminal_newline():
         assert not path.read_text(encoding="utf-8").endswith("\n\n")
 
 
-def test_server_updater_runs_two_active_checks_before_checkout_and_install():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+def test_push_path_is_exact_fast_forward_only_and_never_chains() -> None:
+    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
 
-    first_check = script.index("\nrun_active_write_check\n")
-    stop = script.index("\nstop_writer_service\n", first_check)
-    second_check = script.index("\nrun_active_write_check\n", first_check + 1)
-    checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
-    install = script.rindex(' -m pip install -e "$APP_DIR"')
-    start = script.rindex("\nif ! start_managed_services; then")
-    health = script.index("if ! verify_http_health", start)
-    updater_install = script.rindex(
-        'install -o root -g root -m 0755 "$stage_dir/deploy/telegram-kol-update"'
-    )
-    assert first_check < stop < second_check < checkout < install < start
-    assert start < health < updater_install
-    assert script.count("\nrun_active_write_check\n") == 2
-    assert "PYTHONPATH=$stage_dir/src" in script
-    assert "worktree add --detach" in script
-    assert 'update-ref "refs/heads/$BRANCH" "$previous_commit" "$EXPECTED_COMMIT"' in script
-    assert script.index("checkout_mutated=1") < script.rindex(
-        ' -m pip install -e "$APP_DIR"'
-    )
-    assert "ROLLBACK FAILED; managed runtime units may remain stopped." in script
-    assert 'if [ "$rollback_ok" -eq 1 ]; then' in script
-    assert "git pull" not in script
-    assert "schema_changed" in script
-    assert "sqlite3" in script
-    assert "os.O_EXCL" in script
-    assert script.rindex("updater_installed=1") < script.index(
-        'mv -f -- "$updater_candidate" "$UPDATER_PATH"'
+    push_start = shell.index('if [ "$ACTION" = "push" ]')
+    push_end = shell.index("\nfi\n", push_start)
+    push_path = shell[push_start:push_end]
+    assert 'status --porcelain --untracked-files=normal' in push_path
+    assert 'rev-parse HEAD' in push_path
+    assert 'merge-base --is-ancestor' in push_path
+    assert 'push origin "$EXPECTED_COMMIT:refs/heads/$BRANCH"' in push_path
+    assert "bootstrap_server_updater.sh" not in push_path
+    assert "ssh " not in push_path
+    assert "telegram-kol-stage" not in push_path
+
+
+def test_stage_transport_uses_exact_commit_bundle_and_no_active_checkout_fetch() -> None:
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
     )
 
+    assert 'git -C "$ROOT" archive' in bootstrap
+    assert '"$EXPECTED_COMMIT"' in bootstrap
+    assert "deploy/telegram-kol-stage" in bootstrap
+    assert 'PYTHONPATH="$temporary/control/src"' in bootstrap
+    assert 'SOURCE_REPO="$source_repo"' in bootstrap
+    assert 'RELEASE_ROOT="$release_root"' in bootstrap
+    assert 'git -C "$app_dir" fetch' not in bootstrap
+    assert "systemctl" not in bootstrap
+    assert "EXPECTED_AUTO_TRADE_STATE" not in bootstrap
 
-def test_server_updater_resolves_exactly_one_complete_runtime_topology():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    assert "resolve_managed_topology()" in script
-    assert 'MONOLITH_UNITS=("telegram-kol.service")' in script
-    assert "SPLIT_UNITS=(" in script
-    for unit in (
-        "telegram-kol-ingest.service",
-        "telegram-kol-worker.service",
-        "telegram-kol-web.service",
+def test_powershell_stage_payload_uses_stdin_not_command_line() -> None:
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    remote_command = powershell[powershell.index('$remote = "') :]
+    assert "'$manifestBase64'" not in remote_command
+    assert "'$bundleBase64'" not in remote_command
+    assert 'IFS= read -r manifest_base64' in powershell
+    assert 'IFS= read -r bundle_base64' in powershell
+    assert '$payload | ssh -i $KeyPath $Server $remote' in powershell
+
+
+def test_powershell_validates_ssh_destination_before_transport() -> None:
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    validation = powershell.index("function Test-SshDestination")
+    rejection = powershell.index('throw "Invalid Server."', validation)
+    transport = powershell.index("$payload | ssh", rejection)
+    assert validation < rejection < transport
+    assert "[A-Za-z_][A-Za-z0-9._-]*@" in powershell
+
+
+def test_powershell_helper_parses_when_pwsh_is_available() -> None:
+    pwsh = shutil.which("pwsh")
+    if pwsh is None:
+        pytest.skip("pwsh is unavailable; Windows CI owns this parser gate")
+    script = ROOT / "scripts/server_git_update.ps1"
+    command = (
+        "$tokens=$null; $errors=$null; "
+        "[System.Management.Automation.Language.Parser]::ParseFile("
+        "$args[0],[ref]$tokens,[ref]$errors) | Out-Null; "
+        "if ($errors.Count -ne 0) { $errors | Out-String | Write-Error; exit 1 }"
+    )
+    subprocess.run(
+        [pwsh, "-NoProfile", "-NonInteractive", "-Command", command, str(script)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_push_command_fast_forwards_only_the_exact_local_commit(
+    tmp_path: Path,
+) -> None:
+    repository = tmp_path / "work"
+    scripts = repository / "scripts"
+    scripts.mkdir(parents=True)
+    shutil.copy2(ROOT / "scripts/server_git_update.sh", scripts)
+    subprocess.run(["git", "init", str(repository)], check=True, capture_output=True)
+    for key, value in (("user.name", "Push Test"), ("user.email", "push@test.invalid")):
+        subprocess.run(
+            ["git", "-C", str(repository), "config", key, value], check=True
+        )
+    subprocess.run(
+        ["git", "-C", str(repository), "add", "scripts/server_git_update.sh"],
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(repository), "commit", "-m", "reviewed"],
+        check=True,
+        capture_output=True,
+    )
+    expected_commit = subprocess.run(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    origin = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(origin)], check=True, capture_output=True)
+    subprocess.run(
+        ["git", "-C", str(repository), "remote", "add", "origin", str(origin)],
+        check=True,
+    )
+    manifest = tmp_path / "push.json"
+    _write_action_manifest(manifest, "push")
+
+    result = subprocess.run(
+        [str(scripts / "server_git_update.sh"), "push"],
+        cwd=repository,
+        env={
+            **os.environ,
+            "PYTHONPATH": str(ROOT / "src"),
+            "PLANNER_PYTHON": str(ROOT / ".venv/bin/python"),
+            "ACTION_MANIFEST": str(manifest),
+            "EXPECTED_COMMIT": expected_commit,
+            "BRANCH": "codex/test",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {
+        "action": "push",
+        "commit": expected_commit,
+        "status": "complete",
+    }
+    remote_commit = subprocess.run(
+        ["git", "--git-dir", str(origin), "rev-parse", "refs/heads/codex/test"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert remote_commit == expected_commit
+
+
+def test_activate_transport_uses_only_the_rollback_release_dispatcher() -> None:
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+
+    activate = bootstrap[bootstrap.index("  activate)") :]
+    assert 'updater="$release_root/$rollback_commit/deploy/telegram-kol-update"' in activate
+    assert "DEPLOYMENT_ACTION=activate" in activate
+    assert 'EXPECTED_COMMIT="$expected_commit"' in activate
+    assert 'ROLLBACK_COMMIT="$rollback_commit"' in activate
+    assert 'ACTIVATION_AUTHORIZATION="$authorization"' in activate
+    assert 'ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed"' in activate
+    assert "git push" not in activate
+    assert "telegram-kol-stage" not in activate
+
+
+def test_retired_universal_updater_implementation_is_absent() -> None:
+    updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
+
+    assert len(updater.splitlines()) < 30
+    for retired in (
+        "git fetch",
+        "git merge",
+        "pip install",
+        "systemctl",
+        "sqlite3",
+        "EXPECTED_AUTO_TRADE_STATE",
+        "resolve_managed_topology",
+        "install_worker_cache_artifacts",
+        "sync_monitor_expectations",
     ):
-        assert f'"{unit}"' in script
-    assert "Ambiguous or incomplete runtime topology" in script
-    assert script.index("resolve_managed_topology") < script.index(
-        "exec 9>\"$LOCK_PATH\""
-    )
-
-
-def test_split_topology_stop_start_and_rollback_orders_are_explicit():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    assert re.search(
-        r'SPLIT_STOP_UNITS=\(\s*"telegram-kol-ingest\.service"\s*'
-        r'"telegram-kol-web\.service"\s*"telegram-kol-worker\.service"\s*\)',
-        script,
-    )
-    assert re.search(
-        r'SPLIT_START_UNITS=\(\s*"telegram-kol-worker\.service"\s*'
-        r'"telegram-kol-web\.service"\s*"telegram-kol-ingest\.service"\s*\)',
-        script,
-    )
-    assert 'for unit in "${managed_stop_units[@]}"' in script
-    assert 'for unit in "${managed_start_units[@]}"' in script
-    assert script.count('for unit in "${managed_start_units[@]}"') >= 2
-
-
-def test_workstation_bootstraps_require_the_dual_topology_updater_contract():
-    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
-    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
-        encoding="utf-8"
-    )
-    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'UPDATER_TOPOLOGY_CONTRACT="dual-v1"' in shell
-    assert "UPDATER_TOPOLOGY_CONTRACT" in bootstrap
-    assert "resolve_managed_topology()" in bootstrap
-    assert '$topologyContract = "dual-v1"' in powershell
-    assert "resolve_managed_topology()" in powershell
-
-
-def test_workstation_bootstraps_require_worker_cache_artifact_transaction():
-    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
-    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
-        encoding="utf-8"
-    )
-    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'UPDATER_CACHE_ARTIFACT_CONTRACT="worker-cache-v1"' in shell
-    assert "UPDATER_CACHE_ARTIFACT_CONTRACT" in bootstrap
-    assert "install_worker_cache_artifacts" in bootstrap
-    assert "telegram-kol-worker-prepare-contract-cache" in bootstrap
-    assert '$cacheArtifactContract = "worker-cache-v1"' in powershell
-    assert "install_worker_cache_artifacts" in powershell
-
-
-def test_workstation_bootstraps_require_monitor_expectation_transaction():
-    shell = (ROOT / "scripts/server_git_update.sh").read_text(encoding="utf-8")
-    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
-        encoding="utf-8"
-    )
-    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
-        encoding="utf-8"
-    )
-
-    assert 'UPDATER_MONITOR_EXPECTATION_CONTRACT="monitor-expectation-v1"' in shell
-    assert "UPDATER_MONITOR_EXPECTATION_CONTRACT" in bootstrap
-    assert "sync_monitor_expectations" in bootstrap
-    assert "install_monitor_service_artifact" in bootstrap
-    assert '$monitorExpectationContract = "monitor-expectation-v1"' in powershell
-    assert "sync_monitor_expectations" in powershell
-    assert "install_monitor_service_artifact" in powershell
-
-
-def test_server_updater_transactions_worker_cache_helper_and_unit():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    assert (
-        "WORKER_CACHE_HELPER_PATH=/usr/local/libexec/"
-        "telegram-kol-worker-prepare-contract-cache"
-    ) in script
-    assert (
-        "WORKER_UNIT_PATH=/etc/systemd/system/telegram-kol-worker.service" in script
-    )
-    assert "install_worker_cache_artifacts()" in script
-    assert "restore_worker_cache_artifacts()" in script
-    assert "worker_cache_artifacts_installed=1" in script
-    assert 'if [ "$managed_topology" = "split" ]; then' in script
-    assert 'systemctl daemon-reload' in script
-    pip_install = script.rindex(' -m pip install -e "$APP_DIR"')
-    artifact_install = script.index("install_worker_cache_artifacts", pip_install)
-    worker_start = script.index("\nif ! start_managed_services; then", artifact_install)
-    assert pip_install < artifact_install < worker_start
-
-
-def test_server_updater_transactions_monitor_expected_head_and_timer_state():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    monitor_stop = script.index("stop_monitor_for_deployment")
-    application_stop = script.index("\nstop_writer_service\n", monitor_stop)
-    previous_pin = script.index(
-        'sync_monitor_expectations "$previous_commit"', monitor_stop
-    )
-    checkout = script.index('git merge --ff-only "$EXPECTED_COMMIT"')
-    health = script.index("if ! verify_http_health", checkout)
-    candidate_pin = script.index(
-        'sync_monitor_expectations "$EXPECTED_COMMIT"', health
-    )
-    restore = script.index("restore_monitor_timer_state", candidate_pin)
-
-    assert monitor_stop < previous_pin < application_stop < checkout
-    assert checkout < health < candidate_pin < restore
-    assert 'MONITOR_TIMER="telegram-kol-monitor.timer"' in script
-    assert '"telegram-kol-monitor-test-notification.service"' in script
-    assert 'MONITOR_ENV_FILE="/etc/telegram-kol-monitor.env"' in script
-    assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=" in script
-    assert "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=" in script
-    assert 'EXPECTED_AUTO_TRADE_STATE="${EXPECTED_AUTO_TRADE_STATE:?' in script
-    assert '^(enabled|disabled)$' in script
-    assert "install_monitor_service_artifact()" in script
-    assert "restore_monitor_artifacts()" in script
-    assert "MONITOR_SERVICE_PATH=/etc/systemd/system/telegram-kol-monitor.service" in script
-    assert (
-        "MONITOR_DIAGNOSTIC_SERVICE_PATH=/etc/systemd/system/"
-        "telegram-kol-monitor-diagnostic.service"
-    ) in script
-    assert (
-        "MONITOR_TEST_NOTIFICATION_SERVICE_PATH=/etc/systemd/system/"
-        "telegram-kol-monitor-test-notification.service"
-    ) in script
-    assert "telegram-kol-monitor-diagnostic.service" in script
-    assert "telegram-kol-monitor-test-notification.service" in script
-    assert "auto_trade" not in script.lower().replace("expected_auto_trade", "")
-    assert "git reset" not in script
-    assert "git push" not in script
-
-
-def test_server_updater_detects_schema_changes_only_by_git_paths():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    assert 'git -C "$APP_DIR" diff --quiet' in script
-    assert "src/telegram_kol_research/models.py" in script
-    assert "src/telegram_kol_research/db.py" in script
-    assert "migrations" in script
-    assert "CHANGE_CLASS" not in script
-    assert "fingerprint" not in script
-
-
-def test_bootstrap_installs_only_sha_verified_helper_from_expected_commit():
-    script = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(encoding="utf-8")
-
-    assert "git -C \"$app_dir\" show" in script
-    assert "sha256sum" in script
-    assert "UPDATER_SHA256" in script
-    assert "chmod 0700" in script
-    assert "mktemp -d" in script
-    assert "install -o root" not in script
-    assert script.index("sha256sum") < script.index('bash "$temporary/updater"')
-
-
-def test_server_updater_refuses_unpinned_or_mismatched_remote_commit():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    assert 'EXPECTED_COMMIT="${EXPECTED_COMMIT:?' in script
-    assert "CHANGE_CLASS" not in script
-    assert 'remote_head="$(git rev-parse FETCH_HEAD)"' in script
-    assert 'if [ "$remote_head" != "$EXPECTED_COMMIT" ]' in script
-
-
-def test_schema_dry_run_uses_persistent_disk_and_is_always_removed():
-    script = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
-
-    assert 'BACKUP_DIR="${BACKUP_DIR:-$APP_DIR/data/backups}"' in script
-    assert '$BACKUP_DIR/schema-dry-run-' in script
-    assert "cleanup_schema_dry_run" in script
-    assert script.count("cleanup_schema_dry_run") >= 3
-    assert "PREFLIGHT_DIR" not in script
+        assert retired not in updater

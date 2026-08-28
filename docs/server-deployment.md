@@ -12,6 +12,29 @@ http://43.167.220.225/
 
 The site is protected by Nginx Basic Auth.
 
+## Current action-scoped release workflow
+
+The former one-command checkout update and restart path has been removed. Each
+step uses a manifest for that exact action and stops when that action finishes:
+
+```bash
+ACTION_MANIFEST=/path/to/push.json EXPECTED_COMMIT=<reviewed-sha> \
+  ./scripts/server_git_update.sh push
+ACTION_MANIFEST=/path/to/stage.json EXPECTED_COMMIT=<reviewed-sha> \
+  ./scripts/server_git_update.sh stage
+ACTION_MANIFEST=/path/to/activate.json EXPECTED_COMMIT=<candidate-sha> \
+  ROLLBACK_COMMIT=<control-release-sha> \
+  ACTIVATION_AUTHORIZATION=/run/path/to/authorization.json \
+  ACTIVATION_AUTHORIZATION_CONSUMED=/run/path/to/authorization.consumed \
+  ./scripts/server_git_update.sh activate
+```
+
+Use `./scripts/server_git_update.sh plan` with `ACTION_MANIFEST` for local
+read-only validation. Windows uses `scripts/server_git_update.ps1` with the
+same mandatory action names. Push does not stage; stage does not activate;
+activate does not enable trading. Every external action still needs its own
+authorization.
+
 ## Runtime Layout
 
 Server project directory:

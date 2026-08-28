@@ -1,57 +1,198 @@
 param(
+    [Parameter(Mandatory = $true, Position = 0)]
+    [ValidateSet("plan", "push", "stage", "activate")]
+    [string]$Action,
+    [Parameter(Mandatory = $true)]
+    [string]$ActionManifest,
     [string]$Server = "root@43.167.220.225",
     [string]$KeyPath = "$HOME\.ssh\tecent.pem",
     [string]$Branch = "codex/deepcoin-auto-trading-v1",
-    [Parameter(Mandatory = $true)]
-    [ValidatePattern('^[0-9a-fA-F]{40}$')]
-    [string]$ExpectedCommit,
-    [Parameter(Mandatory = $true)]
-    [ValidateSet("enabled", "disabled")]
-    [string]$ExpectedAutoTradeState
+    [string]$ExpectedCommit = "",
+    [string]$RollbackCommit = "",
+    [string]$ActivationAuthorization = "",
+    [string]$ActivationAuthorizationConsumed = "",
+    [string]$SourceRepo = "/opt/telegram-kol-analyzer",
+    [string]$ReleaseRoot = "/opt/telegram-kol-releases",
+    [string]$ServiceDropinRoot = "/etc/systemd/system",
+    [string]$DatabasePath = "/opt/telegram-kol-analyzer/data/research.db"
 )
 
 $ErrorActionPreference = "Stop"
+$root = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
+$pythonCandidates = @(
+    (Join-Path $root ".venv\Scripts\python.exe"),
+    (Join-Path $root ".venv/bin/python")
+)
+$plannerPython = $pythonCandidates | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+if (-not $plannerPython) {
+    throw "Planner Python is unavailable."
+}
+if (-not (Test-Path $ActionManifest -PathType Leaf)) {
+    throw "ActionManifest is unavailable."
+}
 
-if ($Branch -notmatch '^[A-Za-z0-9._/-]+$') {
+$planJson = & $plannerPython -m telegram_kol_research.deployment_action_plan `
+    --manifest $ActionManifest --format json
+if ($LASTEXITCODE -ne 0) {
+    throw "Action manifest validation failed."
+}
+if ($Action -eq "plan") {
+    $planJson
+    exit 0
+}
+$plan = $planJson | ConvertFrom-Json
+if ($plan.action -ne $Action) {
+    throw "Action manifest does not match requested action."
+}
+if ($ExpectedCommit -notmatch '^[0-9a-fA-F]{40}$') {
+    throw "ExpectedCommit must be a full 40-character hexadecimal commit."
+}
+$ExpectedCommit = $ExpectedCommit.ToLowerInvariant()
+if ($Branch -notmatch '^[A-Za-z0-9._/-]+$' -or $Branch.Contains("..")) {
     throw "Branch contains unsupported characters."
 }
 
-$updaterPath = Join-Path $PSScriptRoot "..\deploy\telegram-kol-update"
-$updaterSha = (Get-FileHash -Algorithm SHA256 $updaterPath).Hash.ToLowerInvariant()
-$topologyContract = "dual-v1"
-$cacheArtifactContract = "worker-cache-v1"
-$monitorExpectationContract = "monitor-expectation-v1"
-$bootstrapScript = @'
+if ($Action -eq "push") {
+    $dirty = & git -C $root status --porcelain --untracked-files=normal
+    if ($LASTEXITCODE -ne 0 -or $dirty) {
+        throw "Push requires a clean worktree."
+    }
+    $head = (& git -C $root rev-parse HEAD).Trim()
+    if ($LASTEXITCODE -ne 0 -or $head -ne $ExpectedCommit) {
+        throw "Push requires ExpectedCommit to equal the checked-out HEAD."
+    }
+    $remoteLine = & git -C $root ls-remote origin "refs/heads/$Branch"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Could not read the remote branch identity."
+    }
+    $remoteCommit = if ($remoteLine) { ($remoteLine -split '\s+')[0] } else { "" }
+    if ($remoteCommit) {
+        & git -C $root merge-base --is-ancestor $remoteCommit $ExpectedCommit
+        if ($LASTEXITCODE -ne 0) {
+            throw "Push would not be a fast-forward."
+        }
+    }
+    & git -C $root push origin "${ExpectedCommit}:refs/heads/$Branch"
+    if ($LASTEXITCODE -ne 0) {
+        throw "Git push failed."
+    }
+    $pushedLine = & git -C $root ls-remote origin "refs/heads/$Branch"
+    $pushedCommit = if ($pushedLine) { ($pushedLine -split '\s+')[0] } else { "" }
+    if ($LASTEXITCODE -ne 0 -or $pushedCommit -ne $ExpectedCommit) {
+        throw "Remote branch identity verification failed."
+    }
+    [pscustomobject]@{
+        action = "push"
+        commit = $ExpectedCommit
+        status = "complete"
+    } | ConvertTo-Json -Compress
+    exit 0
+}
+
+if (-not (Test-Path $KeyPath -PathType Leaf)) {
+    throw "SSH private key is not readable: $KeyPath"
+}
+function Test-SshDestination([string]$Value) {
+    return $Value -match '^([A-Za-z_][A-Za-z0-9._-]*@)?[A-Za-z0-9][A-Za-z0-9.-]*$' -and
+        -not $Value.Contains("..") -and -not $Value.Contains(".-") -and
+        -not $Value.EndsWith("-.")
+}
+if (-not (Test-SshDestination $Server)) {
+    throw "Invalid Server."
+}
+function Test-RemotePath([string]$Value) {
+    return $Value -match '^/[A-Za-z0-9._/-]+$' -and
+        -not $Value.Contains("..") -and -not $Value.Contains("//")
+}
+foreach ($remotePath in @($SourceRepo, $ReleaseRoot, $ServiceDropinRoot, $DatabasePath)) {
+    if (-not (Test-RemotePath $remotePath)) {
+        throw "Unsafe remote path."
+    }
+}
+if ($Action -eq "activate") {
+    if ($RollbackCommit -notmatch '^[0-9a-f]{40}$') {
+        throw "RollbackCommit must be a full lowercase commit."
+    }
+    if (-not (Test-RemotePath $ActivationAuthorization) -or
+        -not (Test-RemotePath $ActivationAuthorizationConsumed)) {
+        throw "Activation authorization paths are invalid."
+    }
+}
+
+$manifestBytes = [IO.File]::ReadAllBytes((Resolve-Path $ActionManifest).Path)
+if ($manifestBytes.Length -gt 65536) {
+    throw "ActionManifest is too large."
+}
+$manifestBase64 = [Convert]::ToBase64String($manifestBytes)
+$manifestSha = (Get-FileHash -Algorithm SHA256 $ActionManifest).Hash.ToLowerInvariant()
+$bundleBase64 = "-"
+$bundleSha = "-"
+$bundlePath = $null
+try {
+    if ($Action -eq "stage") {
+        $bundlePath = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
+        & git -C $root archive --format=tar "--output=$bundlePath" $ExpectedCommit `
+            deploy/telegram-kol-stage `
+            src/telegram_kol_research/__init__.py `
+            src/telegram_kol_research/deployment_action_plan.py
+        if ($LASTEXITCODE -ne 0) {
+            throw "Could not build the exact-commit stage control bundle."
+        }
+        $bundleBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bundlePath))
+        $bundleSha = (Get-FileHash -Algorithm SHA256 $bundlePath).Hash.ToLowerInvariant()
+    }
+
+    $remoteScript = @'
 set -euo pipefail
-expected_commit="$1"; branch="$2"; expected_sha="$3"; topology_contract="$4"; cache_artifact_contract="$5"; monitor_expectation_contract="$6"; expected_auto_trade_state="$7"
-app_dir="/opt/telegram-kol-analyzer"
-temporary="$(mktemp -d /run/telegram-kol-update.bootstrap.XXXXXX)"
+action="$1"; expected_commit="$2"; branch="$3"
+manifest_sha256="$4"; bundle_sha256="$5"
+rollback_commit="$6"; authorization="$7"; authorization_consumed="$8"
+source_repo="$9"; release_root="${10}"; service_dropin_root="${11}"; database_path="${12}"
+IFS= read -r manifest_base64
+IFS= read -r bundle_base64
+manifest_base64="${manifest_base64%$'\r'}"
+bundle_base64="${bundle_base64%$'\r'}"
+temporary="$(mktemp -d /run/telegram-kol-action.XXXXXX)"
 chmod 0700 "$temporary"
 trap 'rm -rf -- "$temporary"' EXIT
-git -C "$app_dir" fetch origin "$branch"
-[ "$(git -C "$app_dir" rev-parse FETCH_HEAD)" = "$expected_commit" ]
-git -C "$app_dir" show "$expected_commit:deploy/telegram-kol-update" >"$temporary/updater"
-chmod 0700 "$temporary/updater"
-[ "$(sha256sum "$temporary/updater" | awk '{print $1}')" = "$expected_sha" ]
-[ "$topology_contract" = "dual-v1" ]
-[ "$cache_artifact_contract" = "worker-cache-v1" ]
-[ "$monitor_expectation_contract" = "monitor-expectation-v1" ]
-grep -Fq 'resolve_managed_topology()' "$temporary/updater"
-grep -Fq 'install_worker_cache_artifacts' "$temporary/updater"
-grep -Fq 'telegram-kol-worker-prepare-contract-cache' "$temporary/updater"
-grep -Fq 'sync_monitor_expectations' "$temporary/updater"
-grep -Fq 'install_monitor_service_artifact' "$temporary/updater"
-grep -Fq 'telegram-kol-ingest.service' "$temporary/updater"
-grep -Fq 'telegram-kol-worker.service' "$temporary/updater"
-grep -Fq 'telegram-kol-web.service' "$temporary/updater"
-EXPECTED_COMMIT="$expected_commit" EXPECTED_AUTO_TRADE_STATE="$expected_auto_trade_state" BRANCH="$branch" bash "$temporary/updater"
+printf '%s' "$manifest_base64" | base64 -d >"$temporary/action-manifest.json"
+[ "$(sha256sum "$temporary/action-manifest.json" | awk '{print $1}')" = "$manifest_sha256" ]
+case "$action" in
+  stage)
+    printf '%s' "$bundle_base64" | base64 -d >"$temporary/stager.tar"
+    [ "$(sha256sum "$temporary/stager.tar" | awk '{print $1}')" = "$bundle_sha256" ]
+    mkdir "$temporary/control"
+    tar -xf "$temporary/stager.tar" -C "$temporary/control"
+    PYTHONPATH="$temporary/control/src" EXPECTED_COMMIT="$expected_commit" BRANCH="$branch" \
+      ACTION_MANIFEST="$temporary/action-manifest.json" SOURCE_REPO="$source_repo" \
+      RELEASE_ROOT="$release_root" /opt/telegram-kol-analyzer/.venv/bin/python \
+      "$temporary/control/deploy/telegram-kol-stage"
+    ;;
+  activate)
+    updater="$release_root/$rollback_commit/deploy/telegram-kol-update"
+    [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
+    DEPLOYMENT_ACTION=activate EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT="$rollback_commit" \
+      ACTION_MANIFEST="$temporary/action-manifest.json" ACTIVATION_AUTHORIZATION="$authorization" \
+      ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" RELEASE_ROOT="$release_root" \
+      SERVICE_DROPIN_ROOT="$service_dropin_root" DATABASE_PATH="$database_path" "$updater"
+    ;;
+  *) echo "Remote action must be stage or activate." >&2; exit 2 ;;
+esac
 '@
-$encodedBootstrap = [Convert]::ToBase64String(
-    [Text.Encoding]::UTF8.GetBytes($bootstrapScript)
-)
-$remote = "printf '%s' '$encodedBootstrap' | base64 -d | bash -s -- " +
-    "'$($ExpectedCommit.ToLowerInvariant())' '$Branch' '$updaterSha' '$topologyContract' '$cacheArtifactContract' '$monitorExpectationContract' '$ExpectedAutoTradeState'"
-ssh -i $KeyPath $Server $remote
-if ($LASTEXITCODE -ne 0) {
-    throw "Server deployment failed with exit code $LASTEXITCODE."
+    $encodedRemoteScript = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($remoteScript))
+    $remote = "printf '%s' '$encodedRemoteScript' | base64 -d | bash -s -- " +
+        "'$Action' '$ExpectedCommit' '$Branch' '$manifestSha' '$bundleSha' " +
+        "'$RollbackCommit' '$ActivationAuthorization' " +
+        "'$ActivationAuthorizationConsumed' '$SourceRepo' '$ReleaseRoot' " +
+        "'$ServiceDropinRoot' '$DatabasePath'"
+    $payload = "$manifestBase64`n$bundleBase64"
+    $payload | ssh -i $KeyPath $Server $remote
+    if ($LASTEXITCODE -ne 0) {
+        throw "Server $Action failed with exit code $LASTEXITCODE."
+    }
+}
+finally {
+    if ($bundlePath -and (Test-Path $bundlePath)) {
+        Remove-Item -Force $bundlePath
+    }
 }
