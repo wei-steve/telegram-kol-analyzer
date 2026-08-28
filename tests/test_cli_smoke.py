@@ -445,6 +445,100 @@ def test_bridge_handoff_cli_reads_exact_candidate_and_redacts_tokens(
     assert calls[1][2]["expected_candidate_sha"] == candidate_sha
 
 
+def test_bridge_drain_cli_timestamps_evidence_after_reads_and_transition_after_identity(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    identity = LegacyRuntimeIdentity(
+        production_sha="0" * 40,
+        worker_pid=303,
+        worker_start_ticks=404,
+    )
+    reviewed_ids = tuple(
+        target.order_id
+        for target in cli_module.REVIEWED_PENDING_ENTRY_TARGETS
+    )
+    plan = SimpleNamespace(
+        actions=(),
+        completed_order_ids=reviewed_ids,
+        conflicts=(),
+        fingerprint="a" * 64,
+    )
+    query_started_at = datetime(2026, 8, 27, 20, 0, tzinfo=UTC)
+    evidence_observed_at = query_started_at + timedelta(seconds=61)
+    transition_at = evidence_observed_at + timedelta(seconds=1)
+    clock = iter((query_started_at, evidence_observed_at, transition_at))
+    captured = {}
+
+    monkeypatch.setattr(cli_module, "_utc_now", lambda: next(clock), raising=False)
+    monkeypatch.setattr(
+        cli_module,
+        "read_local_legacy_worker_identity",
+        lambda **_kwargs: identity,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda *_args, **_kwargs: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_legacy_runtime_drain_bridge_plan",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_reviewed_pending_entry_cancel_plan",
+        lambda *_args, **_kwargs: plan,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: object(),
+    )
+
+    def mark_drained(*_args, **kwargs):
+        captured.update(kwargs)
+        return LegacyRuntimeDrainBridgeResult(status="drained")
+
+    monkeypatch.setattr(
+        cli_module,
+        "mark_legacy_runtime_bridge_drained",
+        mark_drained,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bridge-reviewed-pending-entries",
+            "--action",
+            "mark-drained",
+            "--database-path",
+            str(tmp_path / "bridge.db"),
+            "--checkout-path",
+            str(tmp_path),
+            "--expected-production-sha",
+            identity.production_sha,
+            "--expected-fingerprint",
+            plan.fingerprint,
+            "--bridge-token",
+            "bridge-token",
+            "--confirmation-token",
+            "drain-confirmation-token",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured["evidence"].observed_at == evidence_observed_at
+    assert captured["drained_at"] == transition_at
+
+
 def test_bridge_freeze_cli_uses_fresh_fingerprint_and_redacts_tokens(
     tmp_path,
     monkeypatch,

@@ -5090,6 +5090,10 @@ def _legacy_bridge_cli_result(result) -> dict[str, Any]:
     }
 
 
+def _utc_now() -> datetime:
+    return datetime.now(UTC)
+
+
 @app.command("bridge-reviewed-pending-entries")
 def bridge_reviewed_pending_entries(
     database_path: Path = Path("data/research.db"),
@@ -5156,7 +5160,7 @@ def bridge_reviewed_pending_entries(
             )
 
     if action == "handoff":
-        observed_at = datetime.now(UTC)
+        observed_at = _utc_now()
         candidate_identity = read_local_legacy_worker_identity(
             checkout_path=checkout_path,
             expected_production_sha=str(expected_candidate_sha),
@@ -5182,7 +5186,7 @@ def bridge_reviewed_pending_entries(
             raise typer.Exit(code=2)
         return
 
-    observed_at = datetime.now(UTC)
+    observed_at = _utc_now()
     identity = read_local_legacy_worker_identity(
         checkout_path=checkout_path,
         expected_production_sha=expected_production_sha,
@@ -5272,11 +5276,13 @@ def bridge_reviewed_pending_entries(
             legacy_runtime_identity=identity,
             now=observed_at,
         )
+        evidence_observed_at = _utc_now()
         evidence = audit_client.evidence(
             plan=cancel_plan,
-            observed_at=observed_at,
+            observed_at=evidence_observed_at,
         )
         identity = require_stable_identity()
+        transition_at = _utc_now()
         if action == "mark-drained":
             result = mark_legacy_runtime_bridge_drained(
                 session_factory,
@@ -5284,7 +5290,7 @@ def bridge_reviewed_pending_entries(
                 runtime_identity=identity,
                 evidence=evidence,
                 confirmation_token=str(confirmation_token),
-                drained_at=observed_at,
+                drained_at=transition_at,
             )
         else:
             if evidence.fingerprint != expected_drain_evidence_fingerprint:
@@ -5298,7 +5304,7 @@ def bridge_reviewed_pending_entries(
                 evidence=evidence,
                 expected_drain_evidence_fingerprint=evidence.fingerprint,
                 confirmation_token=str(confirmation_token),
-                released_at=observed_at,
+                released_at=transition_at,
             )
     result_payload = _legacy_bridge_cli_result(result)
     if action in {"mark-drained", "release-for-deploy"}:

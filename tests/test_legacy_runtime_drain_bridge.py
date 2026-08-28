@@ -1381,6 +1381,32 @@ def test_drain_refuses_incomplete_or_nonempty_exchange_evidence(
     assert _stored_bridge(session_factory)["state"] == "fenced"
 
 
+@pytest.mark.parametrize(
+    "transition_at",
+    (
+        NOW + timedelta(seconds=61),
+        NOW - timedelta(microseconds=1),
+    ),
+)
+def test_drain_refuses_stale_or_future_exchange_evidence(
+    tmp_path,
+    transition_at,
+):
+    session_factory = create_session_factory(tmp_path / "drain-clock.db")
+
+    result = mark_legacy_runtime_bridge_drained(
+        session_factory,
+        bridge_token="bridge-token",
+        runtime_identity=_identity(),
+        evidence=_complete_drain_evidence(observed_at=NOW),
+        confirmation_token="drain-clock-token",
+        drained_at=transition_at,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_exchange_evidence_stale"
+
+
 def test_drain_requires_full_local_state_then_release_keeps_settings_frozen(
     tmp_path,
 ):
