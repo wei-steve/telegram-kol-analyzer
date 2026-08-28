@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime, timedelta
 
 import pytest
@@ -10,7 +11,9 @@ from telegram_kol_research.models import (
     RawMessage,
     StrategyLifecycle,
     StrategyRevisionBatch,
+    TradingSetting,
 )
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.strategy_revision_planner import (
     advance_strategy_revision,
     plan_strategy_revision,
@@ -21,6 +24,22 @@ from telegram_kol_research.strategy_threads import (
 
 
 NOW = datetime(2026, 7, 27, 9, tzinfo=UTC)
+
+
+def _authority_document(session_factory):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        return json.loads(row.value_json)
 
 
 def _persist_revision_target(
@@ -249,6 +268,249 @@ def test_auto_execution_refuses_to_cancel_without_replacement_writer(tmp_path):
     }
     with session_factory() as session:
         assert session.query(StrategyRevisionBatch).count() == 0
+
+
+def test_legacy_revision_respects_frozen_auto_trade_before_planning(tmp_path):
+    session_factory = create_session_factory(tmp_path / "legacy-frozen.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": False},
+        updated_at=NOW,
+    )
+    calls = []
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **kwargs: calls.append(kwargs),
+        processed_at=NOW,
+    )
+
+    assert result == {"status": "blocked", "reason": "auto_trade_disabled"}
+    assert calls == []
+    with session_factory() as session:
+        assert session.query(StrategyRevisionBatch).count() == 0
+
+
+def test_cancellation_authority_blocks_legacy_revision_before_planning(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        acquire_entry_revision_exchange_authority,
+    )
+
+    session_factory = create_session_factory(tmp_path / "legacy-busy.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": False,
+            "entry_revision_v2_mode": "disabled",
+        },
+        updated_at=NOW,
+    )
+    cancellation = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="reviewed_pending_entry_cancel",
+        owner_id="order:reviewed-1",
+        acquired_at=NOW,
+        require_cancel_quiescence=True,
+    )
+    assert cancellation.acquired is True
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True},
+        updated_at=NOW + timedelta(seconds=1),
+    )
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement must not submit")
+        ),
+        processed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert result == {
+        "status": "in_progress",
+        "reason": "entry_revision_exchange_authority_busy",
+    }
+    with session_factory() as session:
+        assert session.query(StrategyRevisionBatch).count() == 0
+
+
+def test_legacy_revision_unknown_cancel_retains_worker_authority(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    session_factory = create_session_factory(tmp_path / "legacy-unknown.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True},
+        updated_at=NOW,
+    )
+    monkeypatch.setattr(
+        auto_module,
+        "cancel_revision_entry_leg",
+        lambda *_args, **_kwargs: {"status": "submit_unknown"},
+    )
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement must not submit")
+        ),
+        processed_at=NOW,
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "revision_cancel_outcome_unknown"
+    authority = _authority_document(session_factory)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
+
+
+def test_legacy_revision_unknown_replacement_retains_worker_authority(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    session_factory = create_session_factory(tmp_path / "legacy-replace-unknown.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True},
+        updated_at=NOW,
+    )
+    monkeypatch.setattr(
+        auto_module,
+        "cancel_revision_entry_leg",
+        lambda *_args, **_kwargs: {"status": "confirmed_cancelled"},
+    )
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **_kwargs: (_ for _ in ()).throw(
+            RuntimeError("replacement outcome unknown")
+        ),
+        processed_at=NOW,
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "revision_replacement_submit_unknown"
+    authority = _authority_document(session_factory)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
+
+
+def test_legacy_revision_post_cancel_size_drift_retains_worker_authority(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    session_factory = create_session_factory(tmp_path / "legacy-size-drift.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True},
+        updated_at=NOW,
+    )
+    cancel_calls = 0
+
+    def cancel_then_corrupt_size(*_args, **_kwargs):
+        nonlocal cancel_calls
+        cancel_calls += 1
+        if cancel_calls == 1:
+            with session_factory() as session:
+                for leg in session.query(ExecutionOrderLeg).all():
+                    leg.request_json = '{"sz":"invalid"}'
+                session.commit()
+        return {"status": "confirmed_cancelled"}
+
+    monkeypatch.setattr(
+        auto_module,
+        "cancel_revision_entry_leg",
+        cancel_then_corrupt_size,
+    )
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("replacement must not submit")
+        ),
+        processed_at=NOW,
+    )
+
+    assert result["status"] == "recovery_required"
+    assert result["reason"] == "revision_entry_leg_size_invalid"
+    assert cancel_calls == 2
+    authority = _authority_document(session_factory)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
+
+
+def test_legacy_revision_success_owns_then_releases_worker_authority(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.auto_trade_execution as auto_module
+
+    session_factory = create_session_factory(tmp_path / "legacy-success.db")
+    raw_id, _, thread_id = _persist_revision_target(session_factory)
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True},
+        updated_at=NOW,
+    )
+
+    def cancel_under_authority(*_args, **_kwargs):
+        authority = _authority_document(session_factory)
+        assert authority["state"] == "held"
+        assert authority["owner_kind"] == "entry_revision_worker"
+        assert authority["owner_id"] == f"legacy-raw:{raw_id}"
+        return {"status": "confirmed_cancelled"}
+
+    monkeypatch.setattr(
+        auto_module,
+        "cancel_revision_entry_leg",
+        cancel_under_authority,
+    )
+
+    result = execute_strategy_revision(
+        session_factory,
+        raw_message_id=raw_id,
+        strategy_thread_id=thread_id,
+        replacement={"entry": "65100-65400"},
+        deepcoin_client=object(),
+        replacement_writer=lambda **_kwargs: {"status": "confirmed"},
+        processed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert _authority_document(session_factory)["state"] == "idle"
 
 
 def test_revision_remaining_exposure_uses_leg_size_not_leg_count(tmp_path):

@@ -27,6 +27,10 @@ from telegram_kol_research.entry_strategy_assembly import (
     assemble_entry_strategy,
     finalize_adjacent_entry_assembly_draft,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    acquire_entry_revision_exchange_authority,
+    release_entry_revision_exchange_authority,
+)
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -114,6 +118,24 @@ def execute_strategy_revision(
             "reason": "revision_replacement_writer_unavailable",
         }
     now = processed_at or datetime.now(UTC)
+    settings = load_trading_settings(session_factory)
+    if not settings.auto_trade_enabled:
+        return {"status": "blocked", "reason": "auto_trade_disabled"}
+    authority = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="entry_revision_worker",
+        owner_id=f"legacy-raw:{int(raw_message_id)}",
+        acquired_at=now,
+        require_cancel_quiescence=False,
+    )
+    if not authority.acquired:
+        return {
+            "status": "in_progress",
+            "reason": (
+                authority.reason_code
+                or "entry_revision_exchange_authority_unavailable"
+            ),
+        }
     planned = plan_strategy_revision(
         session_factory,
         raw_message_id=raw_message_id,
@@ -122,11 +144,17 @@ def execute_strategy_revision(
         planned_at=now,
     )
     if planned.status != "planned" or planned.batch_id is None:
-        return {
+        result = {
             "status": planned.status,
             "reason": planned.reason_code,
             "batch_id": planned.batch_id,
         }
+        return _release_legacy_revision_authority(
+            session_factory,
+            authority_token=str(authority.token),
+            result=result,
+            released_at=now,
+        )
 
     def cancel_writer(**kwargs):
         return cancel_revision_entry_leg(
@@ -138,19 +166,86 @@ def execute_strategy_revision(
             executed_at=now,
         )
 
+    exchange_write_started = False
+
+    def mark_exchange_write_started() -> None:
+        nonlocal exchange_write_started
+        exchange_write_started = True
+
     advanced = advance_strategy_revision(
         session_factory,
         batch_id=planned.batch_id,
         cancel_leg_writer=cancel_writer,
         replacement_writer=replacement_writer,
         read_leg_state=read_leg_state,
+        on_exchange_write_started=mark_exchange_write_started,
         advanced_at=now,
     )
-    return {
+    result = {
         "status": advanced.status,
         "reason": advanced.reason_code,
         "batch_id": advanced.batch_id,
         "remaining_fraction": advanced.remaining_fraction,
+    }
+    if str(result.get("status") or "") != "succeeded" and (
+        exchange_write_started
+        or _legacy_revision_result_requires_retained_authority(result)
+    ):
+        return result
+    return _release_legacy_revision_authority(
+        session_factory,
+        authority_token=str(authority.token),
+        result=result,
+        released_at=now,
+    )
+
+
+_LEGACY_REVISION_RETAIN_REASON_CODES = frozenset(
+    {
+        "revision_advance_claim_stale",
+        "revision_advance_already_claimed",
+        "revision_replacement_reconciliation_required",
+        "revision_cancel_restart_requires_reconciliation",
+        "revision_cancel_outcome_unknown",
+        "revision_old_entries_not_terminal",
+        "revision_replacement_submit_unknown",
+        "revision_advance_claim_lost",
+    }
+)
+
+
+def _legacy_revision_result_requires_retained_authority(
+    result: dict[str, Any],
+) -> bool:
+    return (
+        str(result.get("status") or "") in {"in_progress", "reconciling"}
+        or str(result.get("reason") or "")
+        in _LEGACY_REVISION_RETAIN_REASON_CODES
+    )
+
+
+def _release_legacy_revision_authority(
+    session_factory: sessionmaker,
+    *,
+    authority_token: str,
+    result: dict[str, Any],
+    released_at: datetime,
+) -> dict[str, Any]:
+    released = release_entry_revision_exchange_authority(
+        session_factory,
+        token=authority_token,
+        owner_kind="entry_revision_worker",
+        released_at=released_at,
+    )
+    if released.released:
+        return result
+    return {
+        "status": "recovery_required",
+        "reason": (
+            released.reason_code
+            or "entry_revision_exchange_authority_release_failed"
+        ),
+        "batch_id": result.get("batch_id"),
     }
 
 

@@ -77,6 +77,14 @@ class EntryRevisionExecutionResult:
     reason_code: str | None = None
 
 
+@dataclass(slots=True)
+class _EntryRevisionAuthorityState:
+    write_started_or_ambiguous: bool = False
+
+    def mark_write_boundary(self) -> None:
+        self.write_started_or_ambiguous = True
+
+
 def _canonical_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
@@ -168,7 +176,13 @@ def _read_exact_order(client, *, instrument_id: str, order_kind: str, order_id: 
     return {"classification": "missing"}
 
 
-def _mark_recovery(session_factory, *, batch_id: int, reason: str, now: datetime):
+def _mark_recovery(
+    session_factory,
+    *,
+    batch_id: int,
+    reason: str,
+    now: datetime,
+):
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, int(batch_id))
         if batch is None:
@@ -467,6 +481,7 @@ def execute_entry_revision(
             int(batch_id),
             authority.reason_code or "entry_revision_exchange_authority_unavailable",
         )
+    authority_state = _EntryRevisionAuthorityState()
     try:
         result = _execute_entry_revision_with_position_authority(
             session_factory,
@@ -477,9 +492,15 @@ def execute_entry_revision(
             quantity_step=quantity_step,
             min_quantity=min_quantity,
             executed_at=now,
+            authority_state=authority_state,
         )
     except BaseException:
         raise
+    if (
+        result.status != "succeeded"
+        and authority_state.write_started_or_ambiguous
+    ):
+        return result
     released = release_entry_revision_exchange_authority(
         session_factory,
         token=str(authority.token),
@@ -507,19 +528,49 @@ def _execute_entry_revision_with_position_authority(
     quantity_step: object = "0.000001",
     min_quantity: object | None = None,
     executed_at: datetime | None = None,
+    authority_state: _EntryRevisionAuthorityState | None = None,
 ) -> EntryRevisionExecutionResult:
     """Cancel exact old legs, prove terminal state, then submit exact replacements."""
 
     now = executed_at or datetime.now(UTC)
+    execution_authority = authority_state or _EntryRevisionAuthorityState()
     claim_token = uuid.uuid4().hex
     with session_factory() as session:
         batch = session.get(StrategyRevisionBatch, int(batch_id))
         if batch is None or batch.revision_kind != "entry_sizing":
             raise LookupError("entry revision batch not found")
+        prior_leg_progress = (
+            session.query(StrategyRevisionLeg.id)
+            .filter(
+                StrategyRevisionLeg.revision_batch_id == int(batch.id),
+                StrategyRevisionLeg.status != "planned",
+            )
+            .first()
+            is not None
+        )
+        prior_replacement_progress = (
+            session.query(EntryRevisionReplacement.id)
+            .filter(
+                EntryRevisionReplacement.revision_batch_id == int(batch.id)
+            )
+            .first()
+            is not None
+        )
+        if prior_leg_progress or prior_replacement_progress or batch.status in {
+            "cancelling_old_entries",
+            "old_entries_terminal",
+            "rebuilding",
+            "reconciling",
+        }:
+            execution_authority.mark_write_boundary()
         if batch.status == "shadow_planned":
             return EntryRevisionExecutionResult("shadow_planned", int(batch.id))
         if batch.status in TERMINAL_BATCH_STATES:
-            return EntryRevisionExecutionResult(str(batch.status), int(batch.id), batch.reason_code)
+            return EntryRevisionExecutionResult(
+                str(batch.status),
+                int(batch.id),
+                batch.reason_code,
+            )
         binding_state = session.get(
             ExecutionBinding, int(batch.execution_binding_id)
         )
@@ -847,6 +898,7 @@ def _execute_entry_revision_with_position_authority(
             payload["ordId"] = order_id
         if client_order_id:
             payload["clOrdId"] = client_order_id
+        execution_authority.mark_write_boundary()
         try:
             if "trigger" in str(snapshot["order_kind"]).lower() or str(snapshot["order_kind"]).lower() == "limit":
                 response = deepcoin_client.cancel_trigger_order(payload)
@@ -1041,6 +1093,7 @@ def _execute_entry_revision_with_position_authority(
                     now=now,
                 )
             try:
+                execution_authority.mark_write_boundary()
                 response = execute_entry_revision_risk_reduction_via_management(
                     batch_id=int(batch_id),
                     execution_binding_id=int(binding.id),
@@ -1250,6 +1303,7 @@ def _execute_entry_revision_with_position_authority(
             row.request_json = _canonical_json(payload)
             row.updated_at = now
             session.commit()
+        execution_authority.mark_write_boundary()
         try:
             response = (
                 deepcoin_client.trigger_order(payload)
@@ -1415,8 +1469,11 @@ def _execute_entry_revision_with_position_authority(
         batch = session.get(StrategyRevisionBatch, int(batch_id))
         if batch.advance_claim_token != claim_token:
             session.rollback()
+            execution_authority.mark_write_boundary()
             return EntryRevisionExecutionResult(
-                "in_progress", int(batch_id), "entry_revision_claim_lost"
+                "in_progress",
+                int(batch_id),
+                "entry_revision_claim_lost",
             )
         batch.status = "succeeded"
         batch.advance_claim_token = None

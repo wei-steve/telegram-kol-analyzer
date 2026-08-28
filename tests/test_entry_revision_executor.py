@@ -641,6 +641,9 @@ def test_live_activation_retires_prior_shadow_batches_without_execution(tmp_path
 
 
 def test_entry_revision_unknown_cancel_is_recovery_required(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
     from telegram_kol_research.entry_revision_executor import execute_entry_revision
 
     session_factory = create_session_factory(tmp_path / "unknown.db")
@@ -657,6 +660,97 @@ def test_entry_revision_unknown_cancel_is_recovery_required(tmp_path):
     assert result.status == "recovery_required"
     assert result.reason_code == "entry_revision_cancel_outcome_unknown"
     assert not any(event[0] == "submit" for event in client.events)
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        authority = json.loads(row.value_json)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
+
+
+def test_entry_revision_postwrite_mismatch_retains_exchange_authority(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "postwrite-mismatch.db")
+    batch_id = _planned_batch(session_factory)
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=FakeRevisionClient(wrong_replacement=True),
+        executed_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "entry_revision_replacement_economics_mismatch"
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        authority = json.loads(row.value_json)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
+
+
+def test_entry_revision_claim_lost_after_verified_writes_retains_authority(
+    tmp_path,
+):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "claim-lost.db")
+    batch_id = _planned_batch(session_factory)
+
+    class ClaimLosingClient(FakeRevisionClient):
+        claim_lost = False
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            rows = super().list_trigger_orders_pending(inst_id=inst_id)
+            if not self.claim_lost and any(
+                str(row.get("ordId") or "").startswith("replacement-")
+                for row in rows
+            ):
+                with session_factory() as session:
+                    batch = session.get(StrategyRevisionBatch, batch_id)
+                    batch.advance_claim_token = "different-worker-token"
+                    session.commit()
+                self.claim_lost = True
+            return rows
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=ClaimLosingClient(),
+        executed_at=NOW,
+    )
+
+    assert result.status == "in_progress"
+    assert result.reason_code == "entry_revision_claim_lost"
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        authority = json.loads(row.value_json)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "entry_revision_worker"
 
 
 def test_entry_revision_cancels_exact_client_id_when_order_id_is_absent(tmp_path):
@@ -852,6 +946,9 @@ def test_partial_fill_cancels_all_pending_before_exact_risk_reduction(tmp_path):
 
 
 def test_partial_fill_without_verified_stop_never_rebuilds(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
     from telegram_kol_research.entry_revision_executor import execute_entry_revision
 
     session_factory = create_session_factory(tmp_path / "missing-stop.db")
@@ -871,9 +968,21 @@ def test_partial_fill_without_verified_stop_never_rebuilds(tmp_path):
     assert result.status == "recovery_required"
     assert result.reason_code == "entry_revision_verified_stop_missing"
     assert not any(event[0] in {"reduce", "submit"} for event in client.events)
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        assert json.loads(row.value_json)["state"] == "held"
 
 
 def test_headroom_change_at_replacement_boundary_fails_closed(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
     from telegram_kol_research.entry_revision_executor import execute_entry_revision
 
     session_factory = create_session_factory(tmp_path / "headroom-drift.db")
@@ -892,6 +1001,15 @@ def test_headroom_change_at_replacement_boundary_fails_closed(tmp_path):
     assert result.status == "recovery_required"
     assert result.reason_code == "entry_revision_state_changed_before_rebuild"
     assert not any(event[0] == "submit" for event in client.events)
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(
+                TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+            )
+            .one()
+        )
+        assert json.loads(row.value_json)["state"] == "held"
 
 
 def test_partial_fill_take_profit_is_not_accepted_as_stop(tmp_path):

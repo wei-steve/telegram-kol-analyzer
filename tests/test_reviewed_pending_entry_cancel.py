@@ -1285,6 +1285,64 @@ def test_prewrite_refusal_releases_exchange_authority(
     assert _authority_document(session_factory)["state"] == "idle"
 
 
+@pytest.mark.parametrize(
+    "failure_point",
+    ("under_authority_plan", "intent_reserve", "token_consume"),
+)
+def test_unhandled_prewrite_exception_retains_exchange_authority(
+    tmp_path,
+    monkeypatch,
+    failure_point,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    if failure_point == "under_authority_plan":
+        original_builder = cancel_module.build_reviewed_pending_entry_cancel_plan
+        calls = 0
+
+        def fail_third_plan(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("unhandled under-authority plan failure")
+            return original_builder(*args, **kwargs)
+
+        monkeypatch.setattr(
+            cancel_module,
+            "build_reviewed_pending_entry_cancel_plan",
+            fail_third_plan,
+        )
+    elif failure_point == "intent_reserve":
+        monkeypatch.setattr(
+            cancel_module,
+            "reserve_position_mutation_intent",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("unhandled intent reserve failure")
+            ),
+        )
+    else:
+        monkeypatch.setattr(
+            cancel_module,
+            "consume_repair_confirmation_token",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("unhandled token consume failure")
+            ),
+        )
+
+    with pytest.raises(RuntimeError, match="unhandled"):
+        _apply_one(session_factory, client, targets, plan)
+
+    assert client.cancel_payloads == []
+    authority = _authority_document(session_factory)
+    assert authority["state"] == "held"
+    assert authority["owner_kind"] == "reviewed_pending_entry_cancel"
+
+
 def test_apply_cancels_exactly_one_and_terminalizes_only_selected_leg(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id, lifecycle_id, leg_ids = _seed(session_factory)

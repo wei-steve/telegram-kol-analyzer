@@ -609,20 +609,12 @@ def apply_reviewed_pending_entry_cancel_plan(
         )
     authority_token = str(authority.token)
 
-    try:
-        under_authority = build_reviewed_pending_entry_cancel_plan(
-            session_factory,
-            deepcoin_client=deepcoin_client,
-            targets=reviewed,
-            now=now,
-        )
-    except BaseException:
-        _release_pending_cancel_authority_before_write(
-            session_factory,
-            authority_token=authority_token,
-            released_at=observed_at,
-        )
-        raise
+    under_authority = build_reviewed_pending_entry_cancel_plan(
+        session_factory,
+        deepcoin_client=deepcoin_client,
+        targets=reviewed,
+        now=now,
+    )
     if under_authority.fingerprint != expected_fingerprint:
         _release_pending_cancel_authority_before_write(
             session_factory,
@@ -654,31 +646,23 @@ def apply_reviewed_pending_entry_cancel_plan(
             "request_json_fingerprint": action.request_json_fingerprint,
         }
     )
-    try:
-        intent = reserve_position_mutation_intent(
-            session_factory,
-            idempotency_key=(
-                f"reviewed-pending-entry-cancel:{action.order_id}:{action.action_id}"
-            ),
-            operation="cancel_reviewed_pending_entry",
-            strategy_instance_id=action.strategy_instance_id,
-            execution_binding_id=action.execution_binding_id,
-            execution_order_leg_id=action.execution_order_leg_id,
-            pos_id=f"pending-entry:{action.order_id}",
-            order_id=action.order_id,
-            authority_fingerprint=authority_fingerprint,
-            request_fingerprint=_fingerprint(request),
-            request=request,
-            reserved_at=observed_at,
-            venue="deepcoin",
-        )
-    except BaseException:
-        _release_pending_cancel_authority_before_write(
-            session_factory,
-            authority_token=authority_token,
-            released_at=observed_at,
-        )
-        raise
+    intent = reserve_position_mutation_intent(
+        session_factory,
+        idempotency_key=(
+            f"reviewed-pending-entry-cancel:{action.order_id}:{action.action_id}"
+        ),
+        operation="cancel_reviewed_pending_entry",
+        strategy_instance_id=action.strategy_instance_id,
+        execution_binding_id=action.execution_binding_id,
+        execution_order_leg_id=action.execution_order_leg_id,
+        pos_id=f"pending-entry:{action.order_id}",
+        order_id=action.order_id,
+        authority_fingerprint=authority_fingerprint,
+        request_fingerprint=_fingerprint(request),
+        request=request,
+        reserved_at=observed_at,
+        venue="deepcoin",
+    )
     intent_id = int(intent.id)
     if intent.status != "reserved":
         release_failure = _release_pending_cancel_authority_before_write(
@@ -697,22 +681,14 @@ def apply_reviewed_pending_entry_cancel_plan(
             order_id=action.order_id,
             reason_code=str(intent.status),
         )
-    try:
-        consume_repair_confirmation_token(
-            session_factory,
-            confirmation_token=confirmation_token,
-            action_kind="cancel_reviewed_pending_entry",
-            action_id=action.action_id,
-            pos_id=f"pending-entry:{action.order_id}",
-            consumed_at=observed_at,
-        )
-    except BaseException:
-        _release_pending_cancel_authority_before_write(
-            session_factory,
-            authority_token=authority_token,
-            released_at=observed_at,
-        )
-        raise
+    consume_repair_confirmation_token(
+        session_factory,
+        confirmation_token=confirmation_token,
+        action_kind="cancel_reviewed_pending_entry",
+        action_id=action.action_id,
+        pos_id=f"pending-entry:{action.order_id}",
+        consumed_at=observed_at,
+    )
     if not _single_pending_cancel_write_gate(
         session_factory,
         action=action,

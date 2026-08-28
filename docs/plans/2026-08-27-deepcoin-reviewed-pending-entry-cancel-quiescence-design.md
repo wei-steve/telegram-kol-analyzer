@@ -25,14 +25,15 @@ Introduce one durable, database-backed exchange-authority lease stored under a
 dedicated `TradingSetting` key. Acquisition uses SQLite `BEGIN IMMEDIATE`, so
 selection and publication are atomic across processes without a schema change.
 
-Only two writers participate:
+Only two authority owner kinds participate:
 
-- the live entry-revision executor, with owner kind `entry_revision_worker`;
+- every live entry-revision writer, including the v2 worker and the legacy
+  `execute_strategy_revision` path, with owner kind `entry_revision_worker`;
 - the reviewed pending-entry cancellation apply path, with owner kind
   `reviewed_pending_entry_cancel`.
 
-Protection, rescue and position-management workers do not acquire this lease.
-Their existing authority and process lifecycle remain unchanged.
+Protection, rescue and non-revision position-management workers do not acquire
+this lease. Their existing authority and process lifecycle remain unchanged.
 
 The closed lease document contains only bounded operational fields: schema
 version, state, owner kind, random token, optional revision batch/order identity
@@ -49,10 +50,12 @@ transaction proves:
 - the lease is absent or explicitly idle;
 - no active or ambiguous exchange authority already exists.
 
-The worker acquires the same lease immediately before entering the live
-entry-revision executor. Therefore, after lease-aware code is deployed, an
-iteration that read `live` before the settings freeze either already owns the
-lease or must fail to acquire it. The CLI cannot overlap that iteration.
+Both the v2 worker and the legacy revision orchestration acquire the same lease
+before planning or claiming a live write. The legacy path also checks
+`auto_trade_enabled` before planning, closing the management-dispatch bypass of
+the later entry-only global gate. Therefore, after lease-aware code is deployed,
+an iteration that read an enabled setting before the freeze either already owns
+the lease or must fail to acquire it. The CLI cannot overlap that iteration.
 
 Dry-run planning never acquires or modifies the lease.
 
@@ -76,12 +79,14 @@ and lease acquisition.
 
 ## Worker data flow
 
-Disabled and shadow entry-revision modes remain write-free and do not acquire
-the lease. A live execution attempts to acquire the worker lease before its
-batch claim or any exchange write. If the lease is busy or malformed, the
-executor returns a bounded in-progress/fail-closed result and performs no batch
-or exchange mutation. A normal, fully recorded return releases the lease. An
-unhandled exception retains it.
+Disabled and shadow v2 entry-revision modes remain write-free and do not acquire
+the lease. A live v2 execution attempts to acquire the worker lease before its
+batch claim or any exchange write. The legacy revision path refuses execution
+when global auto trade is frozen and otherwise acquires the same worker lease
+before planning. If the lease is busy or malformed, either executor returns a
+bounded in-progress/fail-closed result and performs no batch or exchange
+mutation. A fully recorded result releases the lease. Post-write unknown,
+incomplete reconciliation, claim loss and any escaping exception retain it.
 
 ## Failure semantics
 
@@ -118,11 +123,17 @@ TDD must prove:
 - a live revision worker holding the lease blocks cancellation before the
   exchange call;
 - cancellation holding the lease blocks the revision worker before batch claim;
+- cancellation holding the lease blocks the legacy revision path before plan or
+  exchange mutation, and frozen auto trade blocks it independently;
 - protection code is not routed through the new lease;
 - pre-write refusals release authority;
 - successful exact cancellation releases authority;
 - every unknown or incomplete post-write outcome retains authority and remains
   non-retryable;
+- cancel unknown, replacement unknown/readback mismatch and post-write claim
+  loss retain worker authority for both revision implementations;
+- every escaping apply exception retains cancellation authority, while only
+  explicitly classified pre-write refusals may release;
 - dry-run remains read-only and one-order execution remains enforced.
 
 Run the focused cancellation and entry-revision files, adjacent authority and

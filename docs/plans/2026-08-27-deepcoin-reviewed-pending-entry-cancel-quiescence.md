@@ -86,7 +86,9 @@ git commit -m "feat: add entry revision exchange authority lease"
 
 **Files:**
 - Modify: `src/telegram_kol_research/entry_revision_executor.py`
+- Modify: `src/telegram_kol_research/auto_trade_execution.py`
 - Modify: `tests/test_entry_revision_executor.py`
+- Modify: `tests/test_strategy_revision_planner.py`
 
 **Step 1: Write failing worker-boundary tests**
 
@@ -94,7 +96,13 @@ Prove that a cancellation-owned lease returns
 `entry_revision_exchange_authority_busy` before any revision batch claim or
 exchange method. Prove a normal live worker execution owns the worker lease
 during its exchange call and releases it on a fully recorded return. Prove an
-unhandled exception retains the worker lease.
+unhandled exception retains the worker lease. Cover both the v2 worker and the
+legacy `execute_strategy_revision` orchestration; the legacy route must also
+refuse before planning when global auto trade is frozen.
+
+Prove that cancel unknown, replacement unknown/readback mismatch and a
+post-write claim loss retain worker authority even when the executor converts
+them into a normal `recovery_required` or `in_progress` return.
 
 Disabled and shadow modes must remain write-free and must not acquire the lease.
 
@@ -110,18 +118,24 @@ single-process-only executor.
 
 **Step 3: Implement the minimal worker wrapper**
 
-Keep disabled/shadow checks outside the lease. For live mode, acquire owner kind
-`entry_revision_worker` before the batch claim and call the existing executor
-body under the existing single-process position lock. Return a bounded
-in-progress result on contention. Release only after a normal fully recorded
-return; retain on an escaping exception.
+Keep disabled/shadow checks outside the v2 lease. For live mode, acquire owner
+kind `entry_revision_worker` before the batch claim and call the existing
+executor body under the existing single-process position lock. Route the legacy
+revision orchestration through the same owner kind before planning, and refuse
+that legacy path while `auto_trade_enabled=false`. Return a bounded in-progress
+result on contention. Track whether an exchange-write boundary was reached
+across converted results: release only after a fully recorded return; retain
+every later unknown/incomplete result, claim loss and escaping exception.
 
-Do not route protection, rescue or management writers through the new lease.
+Do not route protection, rescue or non-revision management writers through the
+new lease.
 
 **Step 4: Run GREEN and adjacent worker tests**
 
 ```bash
 .venv/bin/python -m pytest -q tests/test_entry_revision_executor.py \
+  tests/test_strategy_revision_planner.py \
+  tests/test_auto_trade_execution.py \
   tests/test_position_authority_lock.py \
   tests/test_position_authority_boundary_coverage.py
 ```
@@ -175,11 +189,11 @@ authority before reserving the mutation intent, then rebuild the plan while the
 lease is held. Preserve single-order selection and the existing last-moment
 database gate.
 
-Track whether an exchange write may have started. Release on every proven
-pre-write exit and only on final `cancelled` completion after local
-terminalization. Never release on any post-write unknown/incomplete path or
-escaping exception. Return bounded quiescence reason codes without leaking lease
-tokens.
+Track whether an exchange write may have started. Release on explicit, proven
+pre-write refusal or drift and only on final `cancelled` completion after local
+terminalization. Every escaping exception retains even when it occurs before
+the exchange call. Never release on any post-write unknown/incomplete path.
+Return bounded quiescence reason codes without leaking lease tokens.
 
 **Step 4: Run GREEN and the complete cancellation file**
 

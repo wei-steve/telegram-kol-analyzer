@@ -278,6 +278,7 @@ def advance_strategy_revision(
     cancel_leg_writer: Callable[..., dict[str, Any]],
     replacement_writer: Callable[..., dict[str, Any]],
     read_leg_state: Callable[..., dict[str, Any]] | None = None,
+    on_exchange_write_started: Callable[[], None] | None = None,
     advanced_at: datetime | None = None,
 ) -> StrategyRevisionResult:
     """Advance cancellation then replacement, never retrying unknown writes."""
@@ -434,6 +435,8 @@ def advance_strategy_revision(
             revision_leg.status = "cancel_submitting"
             revision_leg.updated_at = now
             session.commit()
+        if on_exchange_write_started is not None:
+            on_exchange_write_started()
         try:
             response = cancel_leg_writer(**writer_args)
         except Exception:
@@ -562,6 +565,8 @@ def advance_strategy_revision(
                 reason_code="revision_advance_claim_lost",
             )
         session.commit()
+    if on_exchange_write_started is not None:
+        on_exchange_write_started()
     try:
         replacement_response = replacement_writer(**writer_args)
     except Exception:
