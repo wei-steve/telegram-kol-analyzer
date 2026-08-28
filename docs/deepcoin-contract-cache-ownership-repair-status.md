@@ -22,11 +22,13 @@ task12_health_classification: legacy_capability_absent
 task12_observed_max_raw_message_id: 13534
 task12_refusal_baseline_count: 16
 task12_time_sensitive_pending_trigger_count: 7
-pending_entry_cancel_candidate_status: revision_ambiguity_scope_fix_local_complete_unpushed
-pending_entry_cancel_candidate_sha: afe5f50e6123182b34f5dc821521febc0120b851
+pending_entry_cancel_candidate_status: cross_process_quiescence_local_complete_unpushed
+pending_entry_cancel_candidate_sha: 708a479f7e20aba74869d87acb3839f3fd91e96b
 pending_entry_cancel_pushed_base_sha: 91bb257e2a1c808c25a54149a7c71c392c0952e4
 pending_entry_cancel_revision_gate_plan_sha: 7a17c3a0818c9f674fc5afb6bafb163bc48639b1
 pending_entry_cancel_revision_scope_fix_base_sha: be97f3233838e6e0867529cf04cd4e380d9c9625
+pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9a6
+pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -42,6 +44,49 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Verified
 
+- The reviewed cancellation cross-process quiescence repair started from exact
+  clean SHA `47ea0885d02532faf7a941694f6b19dcdb1af9a6` on branch
+  `codex/phase0-deploy-integration`. Design and implementation-plan commits are
+  `39221cc8dfd8a5681412aa075f97854e4bd79e41` and
+  `99ce6d9e3e52314b485ce9c7561a93e95a41a862`; the durable authority primitive,
+  v2 worker integration, cancellation integration and final review repair are
+  `fbfc9f7989434365e493bbd503d90b1cc28da8f0`,
+  `c8d0c0b673b94f428482644888256b1f2404c53c`,
+  `9267755707108e312349cf9207c7b98c7a89492e` and
+  `708a479f7e20aba74869d87acb3839f3fd91e96b`.
+- The closed-schema SQLite authority lease is acquired with `BEGIN IMMEDIATE`
+  and has no timeout, steal or automatic recovery. Malformed state, unsupported
+  schema and unknown owner remain fail-closed. Cancellation acquisition proves
+  `auto_trade_enabled=false` and `entry_revision_v2_mode=disabled` in the same
+  transaction. Protection, rescue and non-revision management authority is not
+  routed through this lease.
+- Both the v2 revision worker and the legacy revision orchestration acquire the
+  same worker authority before planning/claiming or any exchange write. Legacy
+  revision also refuses while global auto trade is frozen. Each implementation
+  marks the real cancel, risk-reduction and replacement write boundaries; every
+  non-success result after a write boundary, claim loss, inherited ambiguous
+  progress or escaping exception retains authority. Only complete success or an
+  explicit, proven pre-write result may release it.
+- Reviewed cancellation remains dry-run by default and exact-single-order per
+  apply. It rebuilds the reviewed plan while holding authority, preserves fresh
+  fingerprint/token/intent gates, never retries unknown, releases only on an
+  explicit pre-write refusal or complete local terminalization, and retains on
+  every escaping exception or post-write incomplete outcome.
+- RED reproduced v2 normal-return release after cancel unknown and replacement
+  mismatch, legacy bypass of frozen/held authority, and apply exception cleanup.
+  Later review RED covered post-cancel stop/evidence incompleteness, claim loss
+  and legacy post-cancel size drift. GREEN passed 37 authority/v2 tests, 93
+  legacy/auto-execution tests, 54 cancellation tests and the final 340-test
+  adjacent set. Three independent review rounds ended ready with zero remaining
+  Critical or Important findings.
+- The final repository run after production code commit `708a479f` completed
+  6513 passes, 2 skips and 32 warnings in 659.88 seconds; its only failure was
+  this canonical-status test still asserting the superseded Task 12 candidate
+  string. No production code changed afterward. The status-only correction and
+  exact handoff assertion were then verified separately.
+- No push, deployment, SSH, settings freeze, restart, production/database write,
+  Deepcoin write, historical replay or Telegram trading send occurred in this
+  local repair.
 - The historical-unrelated revision ambiguity scope repair started from exact
   clean SHA `be97f3233838e6e0867529cf04cd4e380d9c9625` on branch
   `codex/phase0-deploy-integration`. The approved design and implementation-plan
@@ -311,19 +356,18 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 ## Outstanding
 
-- The scoped gate-fixed reviewed cancellation candidate
-  `afe5f50e6123182b34f5dc821521febc0120b851` has not been pushed, deployed, or
-  executed in production. Its prior base was pushed at
+- The cross-process quiescence reviewed cancellation candidate
+  `708a479f7e20aba74869d87acb3839f3fd91e96b` has not been pushed, deployed, or
+  executed in production. Its earlier cancellation-tool base was pushed at
   `91bb257e2a1c808c25a54149a7c71c392c0952e4`. Any fresh production read-only
   plan, candidate push/deployment, and each individual Deepcoin cancellation
   require their own explicit authorization. An unknown result must stop the
   sequence and must not be retried; the remaining exact orders must be freshly
   replanned one at a time.
-- This scoped gate repair does not serialize the separate worker process with a
-  CLI apply between its last database authority check and the exchange request.
-  A future production apply therefore still requires a separately approved
-  quiescence protocol or a cross-process authority protocol honored by every
-  writer; neither is authorized or implemented here.
+- The local candidate closes the previously recorded separate-process TOCTOU in
+  code, but production remains on the older unleased runtime. Therefore no live
+  apply is safe until this exact candidate is separately pushed, deployed and
+  verified, then settings are separately frozen and a fresh dry-run is reviewed.
 - Production remains unchanged at
   `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; automatic entry remains enabled.
   Do not enter Task 13 while any of the seven unprotected pending trigger entries

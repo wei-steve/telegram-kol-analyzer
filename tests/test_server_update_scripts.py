@@ -194,11 +194,15 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "task12_time_sensitive_pending_trigger_count: 7" in status
     assert (
         "pending_entry_cancel_candidate_status: "
-        "revision_gate_fix_local_complete_unpushed" in status
+        "cross_process_quiescence_local_complete_unpushed" in status
     )
     assert (
         "pending_entry_cancel_candidate_sha: "
-        "1b561ebc95292d45080c0a014e71d848cc86466f" in status
+        "708a479f7e20aba74869d87acb3839f3fd91e96b" in status
+    )
+    assert (
+        "pending_entry_cancel_quiescence_base_sha: "
+        "47ea0885d02532faf7a941694f6b19dcdb1af9a6" in status
     )
     assert (
         "pending_entry_cancel_pushed_base_sha: "
