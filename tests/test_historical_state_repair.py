@@ -29,9 +29,45 @@ from telegram_kol_research.models import (
     TriggerTakeProfitConvergence,
 )
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
+from telegram_kol_research.repair_confirmation import (
+    consume_bound_entry_drain_confirmation_token,
+)
 
 
 NOW = datetime(2026, 8, 10, 1, 0, tzinfo=UTC)
+
+
+def test_entry_drain_token_is_globally_single_use_and_bound_to_authority(tmp_path):
+    session_factory = create_session_factory(tmp_path / "token-binding.db")
+    binding = consume_bound_entry_drain_confirmation_token(
+        session_factory,
+        confirmation_token="fresh-operator-token",
+        authority_action_id="drain-action-1",
+        target_order_id="canonical-order-1",
+        plan_sha256="a" * 64,
+        evidence_sha256="b" * 64,
+        generation=9,
+        consumed_at=NOW,
+    )
+
+    assert len(binding) == 64
+    with session_factory() as session:
+        row = session.query(RepairConfirmationToken).one()
+        assert row.action_kind == "drain_one_pending_entry"
+        assert row.action_id == binding
+        assert row.pos_id == "pending-entry:canonical-order-1"
+
+    with pytest.raises(ValueError, match="already consumed"):
+        consume_bound_entry_drain_confirmation_token(
+            session_factory,
+            confirmation_token="fresh-operator-token",
+            authority_action_id="different-action",
+            target_order_id="canonical-order-1",
+            plan_sha256="c" * 64,
+            evidence_sha256="d" * 64,
+            generation=10,
+            consumed_at=NOW,
+        )
 
 
 def _snapshot(

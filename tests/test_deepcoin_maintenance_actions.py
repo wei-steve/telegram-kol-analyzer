@@ -13,71 +13,11 @@ from telegram_kol_research.deepcoin_maintenance_actions import (
     run_single_order_drain,
 )
 from telegram_kol_research.entry_authority_seed import SeedResult
-
-
-class ExchangeThatAcceptedThenTimedOut:
-    def __init__(self) -> None:
-        self.cancel_calls = 0
-
-    def cancel_trigger_order(self, *, order_id: str) -> None:
-        self.cancel_calls += 1
-        raise TimeoutError(f"response lost for {order_id}")
-
-
-class FakeAuthority:
-    def __init__(self, *, state: str, generation: int) -> None:
-        self.state = state
-        self.generation = generation
-        self.write_boundary_reached = False
-        self.block_reason: str | None = None
-
-    def acquire(self, request: SingleOrderDrainRequest) -> None:
-        assert self.state == "idle"
-        self.state = "held"
-        self.generation += 1
-
-    def mark_write_boundary(self) -> None:
-        assert self.state == "held"
-        self.write_boundary_reached = True
-
-    def block(self, *, reason_code: str) -> None:
-        assert self.state == "held"
-        self.state = "blocked"
-        self.block_reason = reason_code
-
-
-@dataclass(frozen=True, slots=True)
-class RebootState:
-    worker_start_allowed: bool
-
-
-class FakePersistentGuard:
-    def __init__(self) -> None:
-        self.masked = False
-        self.block_reason: str | None = None
-        self.restore_calls = 0
-
-    def enter(self, *, action_id: str) -> None:
-        assert action_id
-        self.masked = True
-
-    def prove_quiescent(self) -> None:
-        assert self.masked
-
-    def block(self, *, reason_code: str) -> None:
-        self.block_reason = reason_code
-
-    def restore(self) -> None:
-        self.restore_calls += 1
-        self.masked = False
-
-    def simulate_host_reboot(self) -> RebootState:
-        return RebootState(worker_start_allowed=not self.masked)
-
-
-class FailIfCalled:
-    def terminalize(self) -> None:
-        raise AssertionError("terminalization must not run after unknown")
+from telegram_kol_research.reviewed_pending_entry_cancel import (
+    ReviewedPendingEntryCancelAction,
+    ReviewedPendingEntryCancelPlan,
+    ReviewedPendingEntryCancelResult,
+)
 
 
 def _request() -> SingleOrderDrainRequest:
@@ -90,29 +30,90 @@ def _request() -> SingleOrderDrainRequest:
     )
 
 
-def test_cancel_timeout_then_crash_and_reboot_never_retries_or_restores() -> None:
-    exchange = ExchangeThatAcceptedThenTimedOut()
-    authority = FakeAuthority(state="idle", generation=7)
-    guard = FakePersistentGuard()
+def _drain_plan() -> ReviewedPendingEntryCancelPlan:
+    action = ReviewedPendingEntryCancelAction(
+        order_id="canonical-order",
+        instrument_id="ETH-USDT-SWAP",
+        lifecycle_id=1,
+        execution_binding_id=2,
+        execution_order_leg_id=3,
+        strategy_instance_id="strategy",
+        trigger_price="1",
+        size="1",
+        embedded_stop_price="0.9",
+        request_fingerprint="c" * 64,
+        request_json_fingerprint="d" * 64,
+        exchange_row_fingerprint="e" * 64,
+        action_id="drain-001",
+    )
+    return ReviewedPendingEntryCancelPlan(
+        created_at=datetime(2026, 8, 28, tzinfo=UTC),
+        actions=(action,),
+        conflicts=(),
+        completed_order_ids=(),
+        expected_generation=7,
+        evidence_fingerprint="b" * 64,
+        pending_fingerprints=(("canonical-order", "e" * 64),),
+        fingerprint="a" * 64,
+    )
 
-    with pytest.raises(MaintenanceBlocked) as exc_info:
+
+def test_single_order_action_dispatches_exactly_once(monkeypatch) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    captured = []
+    expected = ReviewedPendingEntryCancelResult(
+        status="cancelled",
+        order_id="canonical-order",
+    )
+    monkeypatch.setattr(
+        actions,
+        "apply_reviewed_pending_entry_cancel_plan",
+        lambda *args, **kwargs: captured.append((args, kwargs)) or expected,
+    )
+
+    result = run_single_order_drain(
+        session_factory=object(),
+        plan=_drain_plan(),
+        request=_request(),
+        deepcoin_client=object(),
+        targets=(object(),),
+        guard=object(),
+        now=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+
+    assert result is expected
+    assert len(captured) == 1
+    assert captured[0][1]["order_id"] == "canonical-order"
+    assert captured[0][1]["confirmation_token"] == "fresh-token"
+
+
+def test_single_order_action_rejects_hash_or_action_mismatch(monkeypatch) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    monkeypatch.setattr(
+        actions,
+        "apply_reviewed_pending_entry_cancel_plan",
+        lambda *args, **kwargs: pytest.fail("must not dispatch"),
+    )
+    bad = SingleOrderDrainRequest(
+        action_id="other-action",
+        order_id="canonical-order",
+        plan_sha256="a" * 64,
+        evidence_sha256="b" * 64,
+        confirmation_token="fresh-token",
+    )
+
+    with pytest.raises(ValueError, match="exactly one"):
         run_single_order_drain(
-            request=_request(),
-            authority=authority,
-            exchange=exchange,
-            guard=guard,
-            terminalizer=FailIfCalled(),
+            session_factory=object(),
+            plan=_drain_plan(),
+            request=bad,
+            deepcoin_client=object(),
+            targets=(object(),),
+            guard=object(),
+            now=datetime(2026, 8, 28, tzinfo=UTC),
         )
-
-    rebooted = guard.simulate_host_reboot()
-    assert str(exc_info.value) == "exchange_outcome_unknown"
-    assert exchange.cancel_calls == 1
-    assert authority.state in {"held", "blocked"}
-    assert authority.write_boundary_reached is True
-    assert authority.block_reason == "exchange_outcome_unknown"
-    assert guard.block_reason == "exchange_outcome_unknown"
-    assert rebooted.worker_start_allowed is False
-    assert guard.restore_calls == 0
 
 
 @dataclass(frozen=True, slots=True)

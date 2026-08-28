@@ -6,12 +6,18 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import re
-from typing import Protocol
+from typing import Iterable, Protocol
 
 from telegram_kol_research.entry_authority_seed import (
     SeedPlanRefused,
     SeedResult,
     apply_entry_authority_seed_plan,
+)
+from telegram_kol_research.reviewed_pending_entry_cancel import (
+    ReviewedPendingEntryCancelPlan,
+    ReviewedPendingEntryCancelResult,
+    ReviewedPendingEntryTarget,
+    apply_reviewed_pending_entry_cancel_plan,
 )
 
 
@@ -43,28 +49,12 @@ class SingleOrderDrainRequest:
             object.__setattr__(self, field_name, value)
 
 
-class DrainAuthority(Protocol):
-    def acquire(self, request: SingleOrderDrainRequest) -> None: ...
-
-    def mark_write_boundary(self) -> None: ...
-
-    def block(self, *, reason_code: str) -> None: ...
-
-
-class DrainExchange(Protocol):
-    def cancel_trigger_order(self, *, order_id: str) -> object: ...
-
-
 class DrainGuard(Protocol):
     def enter(self, *, action_id: str) -> object: ...
 
     def prove_quiescent(self) -> None: ...
 
     def block(self, *, reason_code: str) -> object: ...
-
-
-class DrainTerminalizer(Protocol):
-    def terminalize(self) -> object: ...
 
 
 class SeedActionReceipt(Protocol):
@@ -121,57 +111,41 @@ def run_entry_authority_seed(
 
 def run_single_order_drain(
     *,
+    session_factory,
+    plan: ReviewedPendingEntryCancelPlan,
     request: SingleOrderDrainRequest,
-    authority: DrainAuthority,
-    exchange: DrainExchange,
+    deepcoin_client,
+    targets: Iterable[ReviewedPendingEntryTarget],
     guard: DrainGuard,
-    terminalizer: DrainTerminalizer,
-) -> None:
-    """Prove the post-write unknown boundary before implementing success."""
+    now: datetime,
+) -> ReviewedPendingEntryCancelResult:
+    """Dispatch one already planned exact drain; never iterate over targets."""
 
-    guard.enter(action_id=request.action_id)
-    guard.prove_quiescent()
-    authority.acquire(request)
-    authority.mark_write_boundary()
-    try:
-        exchange.cancel_trigger_order(order_id=request.order_id)
-    except Exception as exc:
-        _block_after_possible_write(
-            authority=authority,
-            guard=guard,
-            reason_code="exchange_outcome_unknown",
-        )
-        raise MaintenanceBlocked("exchange_outcome_unknown") from exc
-
-    # Task 5 will add exact exchange confirmation and local terminalization.
-    # Until then, a returned response is not sufficient evidence of success.
-    _ = terminalizer
-    _block_after_possible_write(
-        authority=authority,
+    matching = [
+        action
+        for action in plan.actions
+        if action.order_id == request.order_id
+        and action.action_id == request.action_id
+    ]
+    if len(matching) != 1:
+        raise ValueError("exactly one drain action must match the request")
+    if plan.fingerprint != request.plan_sha256:
+        raise ValueError("drain plan hash mismatch")
+    if plan.evidence_fingerprint != request.evidence_sha256:
+        raise ValueError("drain evidence hash mismatch")
+    return apply_reviewed_pending_entry_cancel_plan(
+        session_factory,
+        plan,
+        deepcoin_client=deepcoin_client,
+        targets=tuple(targets),
+        order_id=request.order_id,
+        action_id=request.action_id,
+        expected_fingerprint=request.plan_sha256,
+        expected_evidence_fingerprint=request.evidence_sha256,
+        confirmation_token=request.confirmation_token,
         guard=guard,
-        reason_code="single_order_drain_success_path_unimplemented",
+        now=now,
     )
-    raise MaintenanceBlocked("single_order_drain_success_path_unimplemented")
-
-
-def _block_after_possible_write(
-    *,
-    authority: DrainAuthority,
-    guard: DrainGuard,
-    reason_code: str,
-) -> None:
-    authority_error: Exception | None = None
-    try:
-        authority.block(reason_code=reason_code)
-    except Exception as exc:  # pragma: no cover - covered with v2 authority
-        authority_error = exc
-    try:
-        guard.block(reason_code=reason_code)
-    except Exception as guard_error:  # pragma: no cover - guard tests own this
-        if authority_error is None:
-            authority_error = guard_error
-    if authority_error is not None:
-        raise MaintenanceBlocked(reason_code) from authority_error
 
 
 def _restore_seed_guard(

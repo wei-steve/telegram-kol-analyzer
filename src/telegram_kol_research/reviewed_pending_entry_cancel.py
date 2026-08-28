@@ -16,17 +16,18 @@ from telegram_kol_research.execution_events import (
     record_execution_event,
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
     acquire_entry_revision_exchange_authority,
+    block_entry_revision_exchange_authority,
+    mark_entry_revision_exchange_write_boundary,
     release_entry_revision_exchange_authority,
 )
-from telegram_kol_research.legacy_runtime_drain_bridge import (
-    LegacyRuntimeIdentity,
-    begin_legacy_runtime_bridge_cancellation,
-    complete_legacy_runtime_bridge_cancellation,
-    is_valid_reviewed_pending_entry_prewrite_refusal,
-    legacy_runtime_bridge_revision_gate_state,
-    mark_legacy_runtime_bridge_unknown,
-    validate_legacy_runtime_bridge_cancellation_ready,
+from telegram_kol_research.deepcoin_maintenance_evidence import (
+    DeepcoinMaintenanceEvidence,
+    DeepcoinMaintenanceEvidenceRefused,
+    build_deepcoin_maintenance_evidence,
+    require_canonical_remaining_pending_set,
+    require_fresh_deepcoin_maintenance_evidence,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -46,6 +47,7 @@ from telegram_kol_research.models import (
     TradeSignal,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
+    TradingSetting,
     WorkerCommandJob,
 )
 from telegram_kol_research.position_mutation_intents import (
@@ -53,7 +55,7 @@ from telegram_kol_research.position_mutation_intents import (
     transition_position_mutation_intent,
 )
 from telegram_kol_research.repair_confirmation import (
-    consume_repair_confirmation_token,
+    consume_bound_entry_drain_confirmation_token,
     require_repair_confirmation_token_unused,
 )
 
@@ -76,6 +78,12 @@ _FILLED_HISTORY_STATES = frozenset(
 _TERMINAL_REVISION_BATCH_STATES = frozenset(
     {"succeeded", "blocked", "failed", "recovery_required"}
 )
+
+
+def _terminalization_checkpoint(stage: str) -> None:
+    """Test seam for proving transaction rollback at every local stage."""
+
+    _ = stage
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +122,9 @@ class ReviewedPendingEntryCancelPlan:
     actions: tuple[ReviewedPendingEntryCancelAction, ...]
     conflicts: tuple[dict[str, str], ...]
     completed_order_ids: tuple[str, ...]
+    expected_generation: int | None
+    evidence_fingerprint: str
+    pending_fingerprints: tuple[tuple[str, str], ...]
     fingerprint: str
 
 
@@ -210,7 +221,10 @@ def build_reviewed_pending_entry_cancel_plan(
     *,
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
-    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
+    order_id: str | None = None,
+    evidence: DeepcoinMaintenanceEvidence | None = None,
+    expected_held_action_id: str | None = None,
+    expected_generation: int | None = None,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelPlan:
     """Build a fresh, read-only plan for the closed reviewed target set."""
@@ -230,60 +244,51 @@ def build_reviewed_pending_entry_cancel_plan(
             (),
             ({"order_id": "*", "reason": "duplicate_reviewed_target"},),
         )
+    selected_order_id = str(order_id or "").strip() or None
+    if selected_order_id is not None and selected_order_id not in order_ids:
+        return _plan(
+            created_at,
+            (),
+            (
+                {
+                    "order_id": selected_order_id,
+                    "reason": "target_not_canonical",
+                },
+            ),
+        )
 
     instruments = tuple(
         sorted({*_GOVERNED_INSTRUMENTS, *(target.instrument_id for target in reviewed)})
     )
+    if evidence is None:
+        evidence = build_deepcoin_maintenance_evidence(
+            deepcoin_client,
+            instruments=instruments,
+            target_order_id=selected_order_id or reviewed[0].order_id,
+            expected_target_pending_count=(
+                1 if selected_order_id is not None else None
+            ),
+            observed_at=created_at,
+        )
     try:
-        snapshots = {
-            instrument_id: {
-                "positions": tuple(
-                    row
-                    for row in deepcoin_client.list_positions(
-                        inst_id=instrument_id
-                    )
-                    if isinstance(row, dict)
-                ),
-                "regular": tuple(
-                    row
-                    for row in deepcoin_client.list_open_orders(
-                        inst_id=instrument_id
-                    )
-                    if isinstance(row, dict)
-                ),
-                "pending": tuple(
-                    row
-                    for row in deepcoin_client.list_trigger_orders_pending(
-                        inst_id=instrument_id
-                    )
-                    if isinstance(row, dict)
-                ),
-                "history": tuple(
-                    row
-                    for row in deepcoin_client.list_trigger_order_history(
-                        inst_id=instrument_id
-                    )
-                    if isinstance(row, dict)
-                ),
-                "fills": tuple(
-                    row
-                    for row in deepcoin_client.list_trade_fills(
-                        inst_id=instrument_id
-                    )
-                    if isinstance(row, dict)
-                ),
-            }
-            for instrument_id in instruments
-        }
-    except Exception:
+        require_fresh_deepcoin_maintenance_evidence(
+            evidence,
+            now=created_at,
+        )
+    except DeepcoinMaintenanceEvidenceRefused:
         return _plan(
             created_at,
             (),
             tuple(
-                {"order_id": target.order_id, "reason": "exchange_snapshot_unavailable"}
+                {
+                    "order_id": target.order_id,
+                    "reason": evidence.reason_code or "exchange_snapshot_unavailable",
+                }
                 for target in reviewed
             ),
+            evidence_fingerprint=evidence.fingerprint,
         )
+    snapshots = _snapshots_from_evidence(evidence, instruments=instruments)
 
     global_conflicts: list[dict[str, str]] = []
     if any(snapshot["positions"] for snapshot in snapshots.values()):
@@ -315,16 +320,25 @@ def build_reviewed_pending_entry_cancel_plan(
             {"order_id": "*", "reason": "unreviewed_pending_trigger"}
         )
     if global_conflicts:
-        return _plan(created_at, (), tuple(global_conflicts))
+        return _plan(
+            created_at,
+            (),
+            tuple(global_conflicts),
+            evidence_fingerprint=evidence.fingerprint,
+        )
 
     actions: list[ReviewedPendingEntryCancelAction] = []
     conflicts: list[dict[str, str]] = []
     completed: list[str] = []
     with session_factory() as session:
-        if _active_exchange_authority_present(
+        authority_generation = _acceptable_authority_generation(
+            session,
+            expected_held_action_id=expected_held_action_id,
+            expected_generation=expected_generation,
+        )
+        if authority_generation is None or _active_exchange_authority_present(
             session,
             targets=reviewed,
-            legacy_runtime_identity=legacy_runtime_identity,
         ):
             return _plan(
                 created_at,
@@ -335,6 +349,7 @@ def build_reviewed_pending_entry_cancel_plan(
                         "reason": "active_exchange_authority_present",
                     },
                 ),
+                evidence_fingerprint=evidence.fingerprint,
             )
         for target in reviewed:
             snapshot = snapshots.get(target.instrument_id, {})
@@ -447,18 +462,46 @@ def build_reviewed_pending_entry_cancel_plan(
                 "request_json_fingerprint": _fingerprint(request),
                 "exchange_row_fingerprint": _fingerprint(row),
             }
-            actions.append(
-                ReviewedPendingEntryCancelAction(
-                    **base,
-                    action_id=_fingerprint(base),
+            if selected_order_id in (None, target.order_id):
+                actions.append(
+                    ReviewedPendingEntryCancelAction(
+                        **base,
+                        action_id=_fingerprint(base),
+                    )
                 )
-            )
 
+    try:
+        require_canonical_remaining_pending_set(
+            evidence,
+            canonical_order_ids=tuple(target.order_id for target in reviewed),
+            completed_order_ids=completed,
+        )
+    except DeepcoinMaintenanceEvidenceRefused as exc:
+        conflicts.append(
+            {"order_id": "*", "reason": str(exc)}
+        )
+
+    plan_generation = authority_generation
+    if expected_held_action_id is not None:
+        # Acquisition increments the lease generation exactly once.  Keep the
+        # immutable plan bound to the idle generation it was built against,
+        # while the held generation is validated separately above and at the
+        # write gate.
+        plan_generation = authority_generation - 1
     return _plan(
         created_at,
         () if conflicts else actions,
         conflicts,
         completed_order_ids=completed,
+        expected_generation=plan_generation,
+        evidence_fingerprint=evidence.fingerprint,
+        pending_fingerprints=tuple(
+            sorted(
+                (_order_id(row), _fingerprint(row))
+                for row in evidence.pending_triggers
+                if _order_id(row)
+            )
+        ),
     )
 
 
@@ -466,20 +509,12 @@ def _active_exchange_authority_present(
     session,
     *,
     targets: Iterable[ReviewedPendingEntryTarget],
-    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
 ) -> bool:
     reviewed = tuple(targets)
     binding_ids = {target.execution_binding_id for target in reviewed}
     lifecycle_ids = {target.lifecycle_id for target in reviewed}
     leg_ids = {target.execution_order_leg_id for target in reviewed}
     order_ids = {target.order_id for target in reviewed}
-    bridge_gate = legacy_runtime_bridge_revision_gate_state(
-        session,
-        runtime_identity=legacy_runtime_identity,
-        reviewed_order_ids=tuple(target.order_id for target in reviewed),
-    )
-    if bridge_gate == "blocked":
-        return True
     checks = [
         session.query(MessageProcessingJob.id).filter(
             MessageProcessingJob.shadow.is_(False),
@@ -558,21 +593,92 @@ def _active_exchange_authority_present(
             WorkerCommandJob.status.in_({"pending", "claimed", "executing"})
         ),
     ]
-    if bridge_gate != "fenced":
-        checks.extend(
-            (
-                session.query(StrategyRevisionBatch.id).filter(
-                    StrategyRevisionBatch.status.not_in(
-                        _TERMINAL_REVISION_BATCH_STATES
-                    )
-                ),
-                session.query(StrategyRevisionBatch.id).filter(
-                    (StrategyRevisionBatch.advance_claim_token.is_not(None))
-                    | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
-                ),
-            )
+    checks.extend(
+        (
+            session.query(StrategyRevisionBatch.id).filter(
+                StrategyRevisionBatch.status.not_in(
+                    _TERMINAL_REVISION_BATCH_STATES
+                )
+            ),
+            session.query(StrategyRevisionBatch.id).filter(
+                (StrategyRevisionBatch.advance_claim_token.is_not(None))
+                | (StrategyRevisionBatch.advance_claimed_at.is_not(None))
+            ),
         )
+    )
     return any(query.first() is not None for query in checks)
+
+
+def _acceptable_authority_generation(
+    session,
+    *,
+    expected_held_action_id: str | None,
+    expected_generation: int | None,
+) -> int | None:
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY)
+        .one_or_none()
+    )
+    if row is None:
+        return None
+    try:
+        document = json.loads(row.value_json)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(document, dict) or document.get("schema_version") != 2:
+        return None
+    generation = document.get("generation")
+    if (
+        isinstance(generation, bool)
+        or not isinstance(generation, int)
+        or generation < 0
+    ):
+        return None
+    if expected_held_action_id is None:
+        if set(document) != {
+            "schema_version",
+            "state",
+            "generation",
+            "released_at",
+        } or document.get("state") != "idle":
+            return None
+        return generation
+    if (
+        document.get("state") != "held"
+        or document.get("owner_kind") != "reviewed_pending_entry_cancel"
+        or document.get("action_id") != expected_held_action_id
+        or generation != expected_generation
+        or document.get("write_boundary_reached") is not False
+    ):
+        return None
+    return generation
+
+
+def _snapshots_from_evidence(
+    evidence: DeepcoinMaintenanceEvidence,
+    *,
+    instruments: Iterable[str],
+) -> dict[str, dict[str, tuple[dict[str, Any], ...]]]:
+    snapshots: dict[str, dict[str, tuple[dict[str, Any], ...]]] = {}
+    collections = {
+        "positions": evidence.positions,
+        "regular": evidence.regular_orders,
+        "pending": evidence.pending_triggers,
+        "history": evidence.trigger_history,
+        "fills": evidence.fills,
+    }
+    for instrument in instruments:
+        snapshots[instrument] = {
+            name: tuple(
+                row
+                for row in rows
+                if str(row.get("instId") or "").strip().upper()
+                == instrument
+            )
+            for name, rows in collections.items()
+        }
+    return snapshots
 
 
 def apply_reviewed_pending_entry_cancel_plan(
@@ -584,10 +690,9 @@ def apply_reviewed_pending_entry_cancel_plan(
     order_id: str,
     action_id: str,
     expected_fingerprint: str,
+    expected_evidence_fingerprint: str,
     confirmation_token: str,
-    legacy_bridge_token: str | None = None,
-    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
-    legacy_runtime_identity_reader=None,
+    guard,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelResult:
     """Cancel one exact reviewed entry, without ever retrying the write."""
@@ -604,45 +709,10 @@ def apply_reviewed_pending_entry_cancel_plan(
     ]
     if len(selected) != 1:
         raise ValueError("exactly one reviewed cancellation action is required")
-    bridge_enabled = (
-        legacy_bridge_token is not None or legacy_runtime_identity is not None
-    )
-    if bridge_enabled and (
-        legacy_bridge_token is None
-        or legacy_runtime_identity is None
-        or not callable(legacy_runtime_identity_reader)
-    ):
-        raise ValueError(
-            "legacy bridge token and live runtime identity reader are required"
-        )
-    if bridge_enabled:
-        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
-        if live_identity is None:
-            return ReviewedPendingEntryCancelResult(
-                status="blocked",
-                order_id=str(order_id),
-                reason_code="legacy_bridge_worker_identity_unavailable",
-            )
-        if live_identity != legacy_runtime_identity:
-            return ReviewedPendingEntryCancelResult(
-                status="blocked",
-                order_id=str(order_id),
-                reason_code="legacy_bridge_worker_identity_drift",
-            )
-        bridge_ready = validate_legacy_runtime_bridge_cancellation_ready(
-            session_factory,
-            bridge_token=str(legacy_bridge_token),
-            runtime_identity=legacy_runtime_identity,
-            order_id=str(order_id),
-        )
-        if bridge_ready.status != "ready":
-            return ReviewedPendingEntryCancelResult(
-                status="blocked",
-                order_id=str(order_id),
-                reason_code=(
-                    bridge_ready.reason_code or "legacy_bridge_not_ready"
-                ),
-            )
+    if expected_evidence_fingerprint != plan.evidence_fingerprint:
+        raise ValueError("evidence fingerprint mismatch")
+    receipt = guard.enter(action_id=str(action_id))
+    guard.prove_quiescent()
     require_repair_confirmation_token_unused(
         session_factory,
         confirmation_token=confirmation_token,
@@ -653,11 +723,15 @@ def apply_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
-        legacy_runtime_identity=legacy_runtime_identity,
+        order_id=str(order_id),
         now=now,
     )
     if fresh.fingerprint != expected_fingerprint:
+        _restore_guard_before_write(guard=guard, receipt=receipt)
         raise ValueError("plan fingerprint changed")
+    if fresh.evidence_fingerprint != expected_evidence_fingerprint:
+        _restore_guard_before_write(guard=guard, receipt=receipt)
+        raise ValueError("evidence fingerprint changed")
     current = [
         action
         for action in fresh.actions
@@ -665,6 +739,7 @@ def apply_reviewed_pending_entry_cancel_plan(
         and action.action_id == str(action_id)
     ]
     if len(current) != 1:
+        _restore_guard_before_write(guard=guard, receipt=receipt)
         raise ValueError("reviewed cancellation action changed")
     action = current[0]
     observed_at = now or datetime.now(UTC)
@@ -674,8 +749,17 @@ def apply_reviewed_pending_entry_cancel_plan(
         owner_id=f"order:{action.order_id}",
         acquired_at=observed_at,
         require_cancel_quiescence=True,
+        expected_generation=fresh.expected_generation,
+        action_id=action.action_id,
+        plan_sha256=fresh.fingerprint,
+        evidence_sha256=fresh.evidence_fingerprint,
     )
-    if not authority.acquired:
+    if (
+        not authority.acquired
+        or authority.token is None
+        or authority.generation is None
+    ):
+        _restore_guard_before_write(guard=guard, receipt=receipt)
         return ReviewedPendingEntryCancelResult(
             status="blocked",
             order_id=action.order_id,
@@ -685,20 +769,32 @@ def apply_reviewed_pending_entry_cancel_plan(
             ),
         )
     authority_token = str(authority.token)
+    authority_generation = int(authority.generation)
 
     under_authority = build_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
-        legacy_runtime_identity=legacy_runtime_identity,
+        order_id=str(order_id),
+        expected_held_action_id=action.action_id,
+        expected_generation=authority_generation,
         now=now,
     )
-    if under_authority.fingerprint != expected_fingerprint:
-        _release_pending_cancel_authority_before_write(
+    if (
+        under_authority.fingerprint != expected_fingerprint
+        or under_authority.evidence_fingerprint
+        != expected_evidence_fingerprint
+    ):
+        release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
             authority_token=authority_token,
+            authority_generation=authority_generation,
             released_at=observed_at,
         )
+        if release_failure is None:
+            _restore_guard_before_write(guard=guard, receipt=receipt)
+        else:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
         raise ValueError("plan fingerprint changed")
     under_authority_current = [
         candidate
@@ -707,11 +803,16 @@ def apply_reviewed_pending_entry_cancel_plan(
         and candidate.action_id == str(action_id)
     ]
     if len(under_authority_current) != 1:
-        _release_pending_cancel_authority_before_write(
+        release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
             authority_token=authority_token,
+            authority_generation=authority_generation,
             released_at=observed_at,
         )
+        if release_failure is None:
+            _restore_guard_before_write(guard=guard, receipt=receipt)
+        else:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
         raise ValueError("reviewed cancellation action changed")
     fresh = under_authority
     action = under_authority_current[0]
@@ -719,6 +820,8 @@ def apply_reviewed_pending_entry_cancel_plan(
     authority_fingerprint = _fingerprint(
         {
             "action_id": action.action_id,
+            "authority_generation": authority_generation,
+            "evidence_fingerprint": fresh.evidence_fingerprint,
             "plan_fingerprint": fresh.fingerprint,
             "exchange_row_fingerprint": action.exchange_row_fingerprint,
             "request_json_fingerprint": action.request_json_fingerprint,
@@ -752,25 +855,30 @@ def apply_reviewed_pending_entry_cancel_plan(
         release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
             authority_token=authority_token,
+            authority_generation=authority_generation,
             released_at=observed_at,
         )
         if release_failure is not None:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
             return ReviewedPendingEntryCancelResult(
                 status="blocked",
                 order_id=action.order_id,
                 reason_code=release_failure,
             )
+        _restore_guard_before_write(guard=guard, receipt=receipt)
         return ReviewedPendingEntryCancelResult(
             status=f"intent_{intent.status}",
             order_id=action.order_id,
             reason_code=str(intent.status),
         )
-    consume_repair_confirmation_token(
+    consume_bound_entry_drain_confirmation_token(
         session_factory,
         confirmation_token=confirmation_token,
-        action_kind="cancel_reviewed_pending_entry",
-        action_id=action.action_id,
-        pos_id=f"pending-entry:{action.order_id}",
+        authority_action_id=action.action_id,
+        target_order_id=action.order_id,
+        plan_sha256=fresh.fingerprint,
+        evidence_sha256=fresh.evidence_fingerprint,
+        generation=authority_generation,
         consumed_at=observed_at,
     )
     if not _single_pending_cancel_write_gate(
@@ -778,20 +886,39 @@ def apply_reviewed_pending_entry_cancel_plan(
         action=action,
         targets=reviewed,
         mutation_intent_id=intent_id,
-        legacy_runtime_identity=legacy_runtime_identity,
+        authority_generation=authority_generation,
     ):
-        _record_pending_cancel_prewrite_refusal(
+        refusal_recorded = _record_pending_cancel_prewrite_refusal(
             session_factory,
             intent_id=intent_id,
             expected_statuses={"reserved"},
             reason_code="exact_pending_cancel_write_gate_blocked",
             refused_at=observed_at,
         )
+        if not refusal_recorded:
+            _block_cancel_unknown(
+                session_factory,
+                guard=guard,
+                authority_token=authority_token,
+                authority_generation=authority_generation,
+                reason_code="prewrite_refusal_persistence_unknown",
+                observed_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=action.order_id,
+                reason_code="prewrite_refusal_persistence_unknown",
+            )
         release_failure = _release_pending_cancel_authority_before_write(
             session_factory,
             authority_token=authority_token,
+            authority_generation=authority_generation,
             released_at=observed_at,
         )
+        if release_failure is None:
+            _restore_guard_before_write(guard=guard, receipt=receipt)
+        else:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
         return ReviewedPendingEntryCancelResult(
             status="blocked",
             order_id=action.order_id,
@@ -806,100 +933,41 @@ def apply_reviewed_pending_entry_cancel_plan(
         new_status="submitting",
         transitioned_at=observed_at,
     ):
-        release_failure = _release_pending_cancel_authority_before_write(
+        _block_cancel_unknown(
             session_factory,
+            guard=guard,
             authority_token=authority_token,
-            released_at=observed_at,
+            authority_generation=authority_generation,
+            reason_code="mutation_intent_transition_unknown",
+            observed_at=observed_at,
         )
         return ReviewedPendingEntryCancelResult(
-            status="blocked" if release_failure else "intent_changed",
+            status="blocked",
             order_id=action.order_id,
-            reason_code=release_failure or "mutation_intent_changed",
+            reason_code="mutation_intent_transition_unknown",
         )
 
-    if bridge_enabled:
-        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
-        if live_identity != legacy_runtime_identity:
-            identity_reason = (
-                "legacy_bridge_worker_identity_unavailable"
-                if live_identity is None
-                else "legacy_bridge_worker_identity_drift"
-            )
-            _record_pending_cancel_prewrite_refusal(
-                session_factory,
-                intent_id=intent_id,
-                expected_statuses={"submitting"},
-                reason_code=identity_reason,
-                refused_at=observed_at,
-            )
-            release_failure = _release_pending_cancel_authority_before_write(
-                session_factory,
-                authority_token=authority_token,
-                released_at=observed_at,
-            )
-            return ReviewedPendingEntryCancelResult(
-                status="blocked",
-                order_id=action.order_id,
-                reason_code=(
-                    release_failure
-                    or (
-                        identity_reason
-                    )
-                ),
-            )
-        bridge_started = begin_legacy_runtime_bridge_cancellation(
+    boundary = mark_entry_revision_exchange_write_boundary(
+        session_factory,
+        token=authority_token,
+        owner_kind="reviewed_pending_entry_cancel",
+        expected_generation=authority_generation,
+        marked_at=observed_at,
+    )
+    if not boundary.marked:
+        _block_cancel_unknown(
             session_factory,
-            bridge_token=str(legacy_bridge_token),
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
-            started_at=observed_at,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
+            reason_code="write_boundary_persistence_unknown",
+            observed_at=observed_at,
         )
-        if bridge_started.status != "cancelling":
-            _record_pending_cancel_prewrite_refusal(
-                session_factory,
-                intent_id=intent_id,
-                expected_statuses={"submitting"},
-                reason_code="legacy_bridge_write_gate_blocked",
-                refused_at=observed_at,
-            )
-            release_failure = _release_pending_cancel_authority_before_write(
-                session_factory,
-                authority_token=authority_token,
-                released_at=observed_at,
-            )
-            return ReviewedPendingEntryCancelResult(
-                status="blocked",
-                order_id=action.order_id,
-                reason_code=(
-                    release_failure
-                    or bridge_started.reason_code
-                    or "legacy_bridge_write_gate_blocked"
-                ),
-            )
-        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
-        if live_identity != legacy_runtime_identity:
-            _mark_bridge_unknown_after_write(
-                session_factory,
-                enabled=True,
-                bridge_token=legacy_bridge_token,
-                runtime_identity=legacy_runtime_identity,
-                order_id=action.order_id,
-                reason_code=(
-                    "pre_exchange_identity_unavailable"
-                    if live_identity is None
-                    else "pre_exchange_identity_drift"
-                ),
-                observed_at=observed_at,
-            )
-            return ReviewedPendingEntryCancelResult(
-                status="blocked_authority_retained",
-                order_id=action.order_id,
-                reason_code=(
-                    "legacy_bridge_worker_identity_unavailable"
-                    if live_identity is None
-                    else "legacy_bridge_worker_identity_drift"
-                ),
-            )
+        return ReviewedPendingEntryCancelResult(
+            status="blocked",
+            order_id=action.order_id,
+            reason_code="write_boundary_persistence_unknown",
+        )
 
     try:
         response = deepcoin_client.cancel_trigger_order(request)
@@ -921,12 +989,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"outcome": "unknown"},
             now=observed_at,
         )
-        _mark_bridge_unknown_after_write(
+        _block_cancel_unknown(
             session_factory,
-            enabled=bridge_enabled,
-            bridge_token=legacy_bridge_token,
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
             reason_code="cancel_outcome_unknown",
             observed_at=observed_at,
         )
@@ -955,12 +1022,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"confirmed": False},
             now=observed_at,
         )
-        _mark_bridge_unknown_after_write(
+        _block_cancel_unknown(
             session_factory,
-            enabled=bridge_enabled,
-            bridge_token=legacy_bridge_token,
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
             reason_code="cancel_response_unconfirmed",
             observed_at=observed_at,
         )
@@ -970,7 +1036,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             reason_code="cancel_response_unconfirmed",
         )
 
-    transition_position_mutation_intent(
+    submitted_recorded = transition_position_mutation_intent(
         session_factory,
         intent_id,
         expected_statuses={"submitting"},
@@ -978,10 +1044,42 @@ def apply_reviewed_pending_entry_cancel_plan(
         transitioned_at=observed_at,
         response={"code": "0", "order_id": action.order_id},
     )
+    if not submitted_recorded:
+        _block_cancel_unknown(
+            session_factory,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
+            reason_code="confirmed_cancel_intent_unknown",
+            observed_at=observed_at,
+        )
+        return ReviewedPendingEntryCancelResult(
+            status="blocked",
+            order_id=action.order_id,
+            reason_code="confirmed_cancel_intent_unknown",
+        )
 
     try:
-        snapshots = _read_exchange_snapshots(
+        post_evidence = build_deepcoin_maintenance_evidence(
             deepcoin_client,
+            instruments=tuple(
+                sorted(
+                    {
+                        *_GOVERNED_INSTRUMENTS,
+                        *(target.instrument_id for target in reviewed),
+                    }
+                )
+            ),
+            target_order_id=action.order_id,
+            expected_target_pending_count=0,
+            observed_at=observed_at,
+        )
+        require_fresh_deepcoin_maintenance_evidence(
+            post_evidence,
+            now=observed_at,
+        )
+        snapshots = _snapshots_from_evidence(
+            post_evidence,
             instruments=tuple(
                 sorted(
                     {
@@ -1009,12 +1107,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
         )
-        _mark_bridge_unknown_after_write(
+        _block_cancel_unknown(
             session_factory,
-            enabled=bridge_enabled,
-            bridge_token=legacy_bridge_token,
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
             reason_code="cancel_readback_unavailable",
             observed_at=observed_at,
         )
@@ -1047,12 +1144,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
         )
-        _mark_bridge_unknown_after_write(
+        _block_cancel_unknown(
             session_factory,
-            enabled=bridge_enabled,
-            bridge_token=legacy_bridge_token,
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
             reason_code="post_cancel_state_changed",
             observed_at=observed_at,
         )
@@ -1062,14 +1158,20 @@ def apply_reviewed_pending_entry_cancel_plan(
             reason_code="post_cancel_state_changed",
         )
 
-    if not _terminalize_confirmed_cancel(
-        session_factory,
-        action,
-        mutation_intent_id=intent_id,
-        plan_fingerprint=fresh.fingerprint,
-        request=request,
-        now=observed_at,
-    ):
+    try:
+        terminalized = _terminalize_confirmed_cancel(
+            session_factory,
+            action,
+            mutation_intent_id=intent_id,
+            plan_fingerprint=fresh.fingerprint,
+            evidence_fingerprint=fresh.evidence_fingerprint,
+            authority_generation=authority_generation,
+            request=request,
+            now=observed_at,
+        )
+    except Exception:
+        terminalized = False
+    if not terminalized:
         transition_position_mutation_intent(
             session_factory,
             intent_id,
@@ -1088,12 +1190,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             response={"code": "0", "order_id": action.order_id},
             now=observed_at,
         )
-        _mark_bridge_unknown_after_write(
+        _block_cancel_unknown(
             session_factory,
-            enabled=bridge_enabled,
-            bridge_token=legacy_bridge_token,
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
+            guard=guard,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
             reason_code="confirmed_cancel_database_state_changed",
             observed_at=observed_at,
         )
@@ -1103,64 +1204,15 @@ def apply_reviewed_pending_entry_cancel_plan(
             reason_code="confirmed_cancel_database_state_changed",
         )
 
-    if bridge_enabled:
-        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
-        if live_identity != legacy_runtime_identity:
-            _mark_bridge_unknown_after_write(
-                session_factory,
-                enabled=True,
-                bridge_token=legacy_bridge_token,
-                runtime_identity=legacy_runtime_identity,
-                order_id=action.order_id,
-                reason_code=(
-                    "worker_identity_unavailable"
-                    if live_identity is None
-                    else "worker_identity_drift"
-                ),
-                observed_at=observed_at,
-            )
-            return ReviewedPendingEntryCancelResult(
-                status="cancelled_authority_retained",
-                order_id=action.order_id,
-                reason_code=(
-                    "legacy_bridge_worker_identity_unavailable"
-                    if live_identity is None
-                    else "legacy_bridge_worker_identity_drift"
-                ),
-            )
-        bridge_completed = complete_legacy_runtime_bridge_cancellation(
-            session_factory,
-            bridge_token=str(legacy_bridge_token),
-            runtime_identity=legacy_runtime_identity,
-            order_id=action.order_id,
-            completed_at=observed_at,
-        )
-        if bridge_completed.status not in {"fenced", "handed_off"}:
-            _mark_bridge_unknown_after_write(
-                session_factory,
-                enabled=True,
-                bridge_token=legacy_bridge_token,
-                runtime_identity=legacy_runtime_identity,
-                order_id=action.order_id,
-                reason_code="bridge_completion_unconfirmed",
-                observed_at=observed_at,
-            )
-            return ReviewedPendingEntryCancelResult(
-                status="cancelled_authority_retained",
-                order_id=action.order_id,
-                reason_code=(
-                    bridge_completed.reason_code
-                    or "legacy_bridge_completion_unconfirmed"
-                ),
-            )
-
     released = release_entry_revision_exchange_authority(
         session_factory,
         token=authority_token,
         owner_kind="reviewed_pending_entry_cancel",
         released_at=observed_at,
+        expected_generation=authority_generation,
     )
     if not released.released:
+        guard.block(reason_code="entry_drain_success_release_failed")
         return ReviewedPendingEntryCancelResult(
             status="cancelled_authority_retained",
             order_id=action.order_id,
@@ -1169,6 +1221,7 @@ def apply_reviewed_pending_entry_cancel_plan(
                 or "entry_revision_exchange_authority_release_failed"
             ),
         )
+    _restore_guard_before_write(guard=guard, receipt=receipt)
     return ReviewedPendingEntryCancelResult(
         status="cancelled",
         order_id=action.order_id,
@@ -1179,6 +1232,7 @@ def _release_pending_cancel_authority_before_write(
     session_factory,
     *,
     authority_token: str,
+    authority_generation: int,
     released_at: datetime,
 ) -> str | None:
     released = release_entry_revision_exchange_authority(
@@ -1186,6 +1240,7 @@ def _release_pending_cancel_authority_before_write(
         token=authority_token,
         owner_kind="reviewed_pending_entry_cancel",
         released_at=released_at,
+        expected_generation=authority_generation,
     )
     if released.released:
         return None
@@ -1238,34 +1293,70 @@ def _rearm_exact_prewrite_refusal(
         return True
 
 
-def _mark_bridge_unknown_after_write(
-    session_factory,
-    *,
-    enabled: bool,
-    bridge_token: str | None,
-    runtime_identity: LegacyRuntimeIdentity | None,
-    order_id: str,
-    reason_code: str,
-    observed_at: datetime,
-) -> None:
-    if not enabled:
-        return
-    mark_legacy_runtime_bridge_unknown(
-        session_factory,
-        bridge_token=str(bridge_token),
-        runtime_identity=runtime_identity,
-        order_id=order_id,
-        reason_code=reason_code,
-        observed_at=observed_at,
+def is_valid_reviewed_pending_entry_prewrite_refusal(
+    row: PositionMutationIntent,
+) -> bool:
+    """Accept only durable exact proof that the exchange call was not reached."""
+
+    if (
+        not isinstance(row, PositionMutationIntent)
+        or row.venue != "deepcoin"
+        or row.operation != "cancel_reviewed_pending_entry"
+        or row.status != "prewrite_refused"
+        or row.submitted_at is not None
+        or row.confirmed_at is not None
+        or not isinstance(row.order_id, str)
+        or not 1 <= len(row.order_id) <= 64
+        or row.pos_id != f"pending-entry:{row.order_id}"
+        or not _is_sha256(row.authority_fingerprint)
+        or not _is_sha256(row.request_fingerprint)
+    ):
+        return False
+    prefix = f"reviewed-pending-entry-cancel:{row.order_id}:"
+    if not row.idempotency_key.startswith(prefix) or not _is_sha256(
+        row.idempotency_key[len(prefix) :]
+    ):
+        return False
+    request = _strict_json_object(row.request_json)
+    response = _strict_json_object(row.response_json)
+    error = _strict_json_object(row.error_json)
+    return bool(
+        request is not None
+        and set(request) == {"instId", "ordId"}
+        and request.get("ordId") == row.order_id
+        and isinstance(request.get("instId"), str)
+        and 1 <= len(request["instId"]) <= 64
+        and row.request_fingerprint == _fingerprint(request)
+        and response == {"submitted": False}
+        and error == {"reason": "exact_pending_cancel_write_gate_blocked"}
     )
 
 
-def _read_live_bridge_identity(reader) -> LegacyRuntimeIdentity | None:
-    try:
-        identity = reader()
-    except Exception:
-        return None
-    return identity if isinstance(identity, LegacyRuntimeIdentity) else None
+def _block_cancel_unknown(
+    session_factory,
+    *,
+    guard,
+    authority_token: str,
+    authority_generation: int,
+    reason_code: str,
+    observed_at: datetime,
+) -> None:
+    block_entry_revision_exchange_authority(
+        session_factory,
+        token=authority_token,
+        owner_kind="reviewed_pending_entry_cancel",
+        expected_generation=authority_generation,
+        reason_code=reason_code,
+        blocked_at=observed_at,
+    )
+    guard.block(reason_code=reason_code)
+
+
+def _restore_guard_before_write(*, guard, receipt) -> None:
+    safe = guard.mark_safe_to_restore(
+        expected_fingerprint=receipt.fingerprint,
+    )
+    guard.restore(expected_fingerprint=safe.fingerprint)
 
 
 def _single_pending_cancel_write_gate(
@@ -1274,7 +1365,7 @@ def _single_pending_cancel_write_gate(
     action: ReviewedPendingEntryCancelAction,
     targets: Iterable[ReviewedPendingEntryTarget],
     mutation_intent_id: int,
-    legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
+    authority_generation: int,
 ) -> bool:
     """Last-moment database gate allowing only this one reserved cancel."""
 
@@ -1304,49 +1395,17 @@ def _single_pending_cancel_write_gate(
             and leg.order_id == action.order_id
             and str(leg.status or "").lower() in _PENDING_LEG_STATES
             and competing is None
+            and _acceptable_authority_generation(
+                session,
+                expected_held_action_id=action.action_id,
+                expected_generation=authority_generation,
+            )
+            == authority_generation
             and not _active_exchange_authority_present(
                 session,
                 targets=targets,
-                legacy_runtime_identity=legacy_runtime_identity,
             )
         )
-
-
-def _read_exchange_snapshots(deepcoin_client, *, instruments: Iterable[str]):
-    return {
-        instrument_id: {
-            "positions": tuple(
-                row
-                for row in deepcoin_client.list_positions(inst_id=instrument_id)
-                if isinstance(row, dict)
-            ),
-            "regular": tuple(
-                row
-                for row in deepcoin_client.list_open_orders(inst_id=instrument_id)
-                if isinstance(row, dict)
-            ),
-            "pending": tuple(
-                row
-                for row in deepcoin_client.list_trigger_orders_pending(
-                    inst_id=instrument_id
-                )
-                if isinstance(row, dict)
-            ),
-            "history": tuple(
-                row
-                for row in deepcoin_client.list_trigger_order_history(
-                    inst_id=instrument_id
-                )
-                if isinstance(row, dict)
-            ),
-            "fills": tuple(
-                row
-                for row in deepcoin_client.list_trade_fills(inst_id=instrument_id)
-                if isinstance(row, dict)
-            ),
-        }
-        for instrument_id in instruments
-    }
 
 
 def _post_cancel_exchange_state_matches(
@@ -1371,11 +1430,8 @@ def _post_cancel_exchange_state_matches(
     if any(_order_id(row) == selected.order_id for row in all_pending):
         return False
 
-    expected = {
-        action.order_id: action.exchange_row_fingerprint
-        for action in plan.actions
-        if action.order_id != selected.order_id
-    }
+    expected = dict(plan.pending_fingerprints)
+    expected.pop(selected.order_id, None)
     observed: dict[str, str] = {}
     for row in all_pending:
         order_id = _order_id(row)
@@ -1397,7 +1453,7 @@ def _post_cancel_exchange_state_matches(
         return False
     if _history_has_filled_state(history_rows):
         return False
-    reviewed_ids = {action.order_id for action in plan.actions}
+    reviewed_ids = set(dict(plan.pending_fingerprints))
     return not any(
         _order_id(row) in reviewed_ids
         for snapshot in snapshots.values()
@@ -1411,6 +1467,8 @@ def _terminalize_confirmed_cancel(
     *,
     mutation_intent_id: int,
     plan_fingerprint: str,
+    evidence_fingerprint: str,
+    authority_generation: int,
     request: dict[str, str],
     now: datetime,
 ) -> bool:
@@ -1472,6 +1530,8 @@ def _terminalize_confirmed_cancel(
         expected_authority_fingerprint = _fingerprint(
             {
                 "action_id": action.action_id,
+                "authority_generation": authority_generation,
+                "evidence_fingerprint": evidence_fingerprint,
                 "plan_fingerprint": plan_fingerprint,
                 "exchange_row_fingerprint": action.exchange_row_fingerprint,
                 "request_json_fingerprint": action.request_json_fingerprint,
@@ -1550,20 +1610,24 @@ def _terminalize_confirmed_cancel(
         leg.terminal_reason = "operator_cancelled_unfilled_entry_leg"
         leg.last_verified_at = now
         leg.updated_at = now
+        _terminalization_checkpoint("leg")
         intent = intents[0]
         intent.recovery_state = "resolved"
         intent.recovery_disposition = "terminal"
         intent.last_reason_code = "parent_trigger_cancelled_before_entry"
         intent.next_attempt_at = None
         intent.updated_at = now
+        _terminalization_checkpoint("protection_intent")
         for row in protection:
             row.status = "cancelled"
             row.updated_at = now
+        _terminalization_checkpoint("protection")
         convergence_row = convergence[0]
         convergence_row.status = "completed"
         convergence_row.reason_code = "parent_trigger_cancelled_before_entry"
         convergence_row.completed_at = now
         convergence_row.updated_at = now
+        _terminalization_checkpoint("convergence")
         mutation_intent.status = "confirmed"
         mutation_intent.response_json = json.dumps(
             {"code": "0", "order_id": action.order_id},
@@ -1573,6 +1637,7 @@ def _terminalize_confirmed_cancel(
         )
         mutation_intent.confirmed_at = now
         mutation_intent.updated_at = now
+        _terminalization_checkpoint("intent")
 
         entry_legs = (
             session.query(ExecutionOrderLeg)
@@ -1594,6 +1659,7 @@ def _terminalize_confirmed_cancel(
             binding.status = "cancelled"
             binding.last_exchange_status = "reviewed_pending_entries_cancelled"
             binding.updated_at = now
+            _terminalization_checkpoint("binding")
             lifecycle.lifecycle_status = "expired"
             lifecycle.exit_reason = "expired"
             lifecycle.exited_at = now
@@ -1603,6 +1669,7 @@ def _terminalize_confirmed_cancel(
             )
             lifecycle.expiry_review_next_at = None
             lifecycle.updated_at = now
+            _terminalization_checkpoint("lifecycle")
 
         record_execution_event(
             session_factory,
@@ -1618,6 +1685,8 @@ def _terminalize_confirmed_cancel(
                 reason="reviewed_stale_pending_entry_cancelled",
                 before={
                     "plan_fingerprint": plan_fingerprint,
+                    "evidence_fingerprint": evidence_fingerprint,
+                    "authority_generation": authority_generation,
                     "action_id": action.action_id,
                     "exchange_row_fingerprint": action.exchange_row_fingerprint,
                 },
@@ -1628,6 +1697,7 @@ def _terminalize_confirmed_cancel(
             ),
             session=session,
         )
+        _terminalization_checkpoint("event")
         session.commit()
         return True
 
@@ -1838,6 +1908,10 @@ def _completed_state_matches(
         event_before.get("exchange_row_fingerprint") or ""
     )
     plan_fingerprint = str(event_before.get("plan_fingerprint") or "")
+    evidence_fingerprint = str(
+        event_before.get("evidence_fingerprint") or ""
+    )
+    authority_generation = event_before.get("authority_generation")
     action_base = {
         "order_id": target.order_id,
         "instrument_id": target.instrument_id,
@@ -1856,6 +1930,8 @@ def _completed_state_matches(
     expected_authority_fingerprint = _fingerprint(
         {
             "action_id": expected_action_id,
+            "authority_generation": authority_generation,
+            "evidence_fingerprint": evidence_fingerprint,
             "plan_fingerprint": plan_fingerprint,
             "exchange_row_fingerprint": exchange_row_fingerprint,
             "request_json_fingerprint": _fingerprint(stored_request),
@@ -1865,10 +1941,16 @@ def _completed_state_matches(
         event is not None
         and mutation is not None
         and _is_sha256(plan_fingerprint)
+        and _is_sha256(evidence_fingerprint)
+        and isinstance(authority_generation, int)
+        and not isinstance(authority_generation, bool)
+        and authority_generation >= 0
         and _is_sha256(exchange_row_fingerprint)
         and event_before
         == {
             "plan_fingerprint": plan_fingerprint,
+            "evidence_fingerprint": evidence_fingerprint,
+            "authority_generation": authority_generation,
             "action_id": expected_action_id,
             "exchange_row_fingerprint": exchange_row_fingerprint,
         }
@@ -2070,6 +2152,16 @@ def _json_object(value: Any) -> dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 
+def _strict_json_object(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
 def _numbers_equal(left: Any, right: Any) -> bool:
     try:
         return Decimal(str(left)) == Decimal(str(right))
@@ -2110,6 +2202,9 @@ def _plan(
     conflicts: Iterable[dict[str, str]],
     *,
     completed_order_ids: Iterable[str] = (),
+    expected_generation: int | None = None,
+    evidence_fingerprint: str = "",
+    pending_fingerprints: Iterable[tuple[str, str]] = (),
 ) -> ReviewedPendingEntryCancelPlan:
     ordered_actions = tuple(sorted(actions, key=lambda item: item.order_id))
     ordered_conflicts = tuple(
@@ -2119,15 +2214,24 @@ def _plan(
         )
     )
     completed = tuple(sorted(str(value) for value in completed_order_ids))
+    pending = tuple(
+        sorted((str(key), str(value)) for key, value in pending_fingerprints)
+    )
     material = {
         "actions": [asdict(action) for action in ordered_actions],
         "conflicts": ordered_conflicts,
         "completed_order_ids": completed,
+        "evidence_fingerprint": evidence_fingerprint,
+        "expected_generation": expected_generation,
+        "pending_fingerprints": pending,
     }
     return ReviewedPendingEntryCancelPlan(
         created_at=created_at,
         actions=ordered_actions,
         conflicts=ordered_conflicts,
         completed_order_ids=completed,
+        expected_generation=expected_generation,
+        evidence_fingerprint=evidence_fingerprint,
+        pending_fingerprints=pending,
         fingerprint=_fingerprint(material),
     )
