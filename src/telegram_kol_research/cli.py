@@ -5101,7 +5101,7 @@ def bridge_reviewed_pending_entries(
         None, "--expected-candidate-sha"
     ),
     service_name: str = typer.Option(
-        "telegram-kol.service", "--service-name"
+        "telegram-kol-worker.service", "--service-name"
     ),
     action: str = typer.Option("plan", "--action"),
     expected_fingerprint: str | None = typer.Option(
@@ -5328,7 +5328,7 @@ def cancel_reviewed_pending_entries(
         None, "--expected-production-sha"
     ),
     service_name: str = typer.Option(
-        "telegram-kol.service", "--service-name"
+        "telegram-kol-worker.service", "--service-name"
     ),
     bridge_token: str | None = typer.Option(None, "--bridge-token"),
     order_id: str | None = typer.Option(None, "--order-id"),

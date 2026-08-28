@@ -46,7 +46,8 @@ from telegram_kol_research.trading_settings import (
 
 
 LEGACY_RUNTIME_DRAIN_BRIDGE_KEY = "legacy_runtime_drain_bridge"
-_SCHEMA_VERSION = 2
+LEGACY_RUNTIME_WORKER_SERVICE = "telegram-kol-worker.service"
+_SCHEMA_VERSION = 3
 _STATES = frozenset(
     {
         "frozen",
@@ -65,9 +66,11 @@ _DOCUMENT_KEYS = frozenset(
         "active_order_id",
         "bridge_token",
         "production_sha",
+        "service_name",
         "worker_pid",
         "worker_start_ticks",
         "authority_production_sha",
+        "authority_service_name",
         "authority_worker_pid",
         "authority_worker_start_ticks",
         "handoff_at",
@@ -103,6 +106,7 @@ class LegacyRuntimeIdentity:
     production_sha: str
     worker_pid: int
     worker_start_ticks: int
+    service_name: str = LEGACY_RUNTIME_WORKER_SERVICE
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -121,6 +125,8 @@ class LegacyRuntimeIdentity:
         object.__setattr__(
             self, "worker_start_ticks", int(self.worker_start_ticks)
         )
+        if self.service_name != LEGACY_RUNTIME_WORKER_SERVICE:
+            raise ValueError("service_name must identify the worker unit")
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,7 +222,9 @@ def _build_plan_in_session(
         if document["authority_production_sha"] != expected_sha:
             conflicts.append({"reason": "legacy_bridge_production_sha_drift"})
         if (
-            document["authority_worker_pid"] != runtime_identity.worker_pid
+            document["authority_service_name"]
+            != runtime_identity.service_name
+            or document["authority_worker_pid"] != runtime_identity.worker_pid
             or document["authority_worker_start_ticks"]
             != runtime_identity.worker_start_ticks
         ):
@@ -269,6 +277,7 @@ def _build_plan_in_session(
         "reviewed_order_ids": list(reviewed),
         "runtime_identity": {
             "production_sha": runtime_identity.production_sha,
+            "service_name": runtime_identity.service_name,
             "worker_pid": runtime_identity.worker_pid,
             "worker_start_ticks": runtime_identity.worker_start_ticks,
         },
@@ -400,7 +409,9 @@ def freeze_legacy_runtime_drain_bridge(
                 ),
                 "original_entry_revision_v2_mode": settings.entry_revision_v2_mode,
                 "production_sha": runtime_identity.production_sha,
+                "service_name": runtime_identity.service_name,
                 "authority_production_sha": runtime_identity.production_sha,
+                "authority_service_name": runtime_identity.service_name,
                 "reason_code": None,
                 "reviewed_order_ids": list(reviewed),
                 "schema_version": _SCHEMA_VERSION,
@@ -693,6 +704,8 @@ def handoff_legacy_runtime_drain_bridge(
             if (
                 document["authority_production_sha"]
                 != document["production_sha"]
+                or document["authority_service_name"]
+                != document["service_name"]
                 or document["authority_worker_pid"] != document["worker_pid"]
                 or document["authority_worker_start_ticks"]
                 != document["worker_start_ticks"]
@@ -727,6 +740,9 @@ def handoff_legacy_runtime_drain_bridge(
                 return _result("blocked", error)
             document["state"] = "handed_off"
             document["authority_production_sha"] = expected_sha
+            document["authority_service_name"] = (
+                candidate_runtime_identity.service_name
+            )
             document["authority_worker_pid"] = (
                 candidate_runtime_identity.worker_pid
             )
@@ -1171,8 +1187,8 @@ def read_local_legacy_worker_identity(
         raise ValueError("checkout path is invalid")
     checkout = checkout.resolve()
     clean_service = str(service_name or "").strip()
-    if not re.fullmatch(r"[A-Za-z0-9_.@-]{1,128}", clean_service):
-        raise ValueError("service_name is invalid")
+    if clean_service != LEGACY_RUNTIME_WORKER_SERVICE:
+        raise ValueError("service_name must identify the worker unit")
     root_text = _run_bounded_command(
         command_runner,
         ["git", "-C", str(checkout), "rev-parse", "--show-toplevel"],
@@ -1201,6 +1217,10 @@ def read_local_legacy_worker_identity(
     pid = int(pid_text)
     stat_path = Path(proc_root) / str(pid) / "stat"
     first_ticks = _read_proc_start_ticks(stat_path)
+    _read_proc_worker_evidence(
+        Path(proc_root) / str(pid),
+        checkout=checkout,
+    )
     confirmed_pid_text = _run_bounded_command(
         command_runner,
         [
@@ -1221,6 +1241,7 @@ def read_local_legacy_worker_identity(
         production_sha=head,
         worker_pid=pid,
         worker_start_ticks=first_ticks,
+        service_name=clean_service,
     )
 
 
@@ -1250,6 +1271,8 @@ def legacy_runtime_bridge_revision_gate_state(
         document["state"] not in {"fenced", "handed_off", "drained"}
         or document["authority_production_sha"]
         != runtime_identity.production_sha
+        or document["authority_service_name"]
+        != runtime_identity.service_name
         or document["authority_worker_pid"] != runtime_identity.worker_pid
         or document["authority_worker_start_ticks"]
         != runtime_identity.worker_start_ticks
@@ -1345,6 +1368,10 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
         return None
     if type(value.get("original_auto_trade_enabled")) is not bool:
         return None
+    if value.get("service_name") != LEGACY_RUNTIME_WORKER_SERVICE:
+        return None
+    if value.get("authority_service_name") != LEGACY_RUNTIME_WORKER_SERVICE:
+        return None
     if type(value.get("original_legacy_entry_submission_frozen")) is not bool:
         return None
     if value.get("original_entry_revision_v2_mode") not in {
@@ -1383,6 +1410,7 @@ def _bridge_document(raw: Any) -> dict[str, Any] | None:
     handoff_at = value.get("handoff_at")
     authority_is_legacy = (
         authority_production_sha == production_sha
+        and value["authority_service_name"] == value["service_name"]
         and authority_worker_pid == worker_pid
         and authority_worker_start_ticks == worker_start_ticks
     )
@@ -1450,6 +1478,8 @@ def _owned_bridge_in_session(
         != runtime_identity.production_sha
     ):
         return row, document, "legacy_bridge_production_sha_drift"
+    if document["authority_service_name"] != runtime_identity.service_name:
+        return row, document, "legacy_bridge_worker_identity_drift"
     if (
         document["authority_worker_pid"] != runtime_identity.worker_pid
         or document["authority_worker_start_ticks"]
@@ -2008,6 +2038,78 @@ def _run_bounded_command(command_runner, argv: list[str]) -> str:
     if not clean or "\n" in clean or "\r" in clean:
         raise ValueError("runtime identity command output is invalid")
     return clean
+
+
+def _read_proc_worker_evidence(
+    pid_root: Path,
+    *,
+    checkout: Path,
+) -> None:
+    try:
+        directory = os.open(
+            pid_root,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_DIRECTORY", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
+    except OSError as exc:
+        raise ValueError("proc worker identity is unavailable") from exc
+    try:
+        try:
+            cwd_text = os.readlink("cwd", dir_fd=directory)
+        except OSError as exc:
+            raise ValueError("proc cwd is unavailable") from exc
+        if (
+            len(cwd_text) > 4096
+            or not Path(cwd_text).is_absolute()
+            or Path(cwd_text).resolve() != checkout
+        ):
+            raise ValueError("proc cwd does not match checkout")
+        try:
+            cmdline_descriptor = os.open(
+                "cmdline",
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory,
+            )
+        except OSError as exc:
+            raise ValueError("proc cmdline is unavailable") from exc
+        try:
+            metadata = os.fstat(cmdline_descriptor)
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("proc cmdline is invalid")
+            raw_cmdline = os.read(cmdline_descriptor, 4097)
+        except OSError as exc:
+            raise ValueError("proc cmdline is unavailable") from exc
+        finally:
+            os.close(cmdline_descriptor)
+    finally:
+        os.close(directory)
+    if len(raw_cmdline) > 4096:
+        raise ValueError("proc cmdline is too large")
+    if not raw_cmdline or not raw_cmdline.endswith(b"\0"):
+        raise ValueError("proc cmdline is invalid")
+    try:
+        tokens = [
+            token.decode("utf-8")
+            for token in raw_cmdline[:-1].split(b"\0")
+        ]
+    except UnicodeDecodeError as exc:
+        raise ValueError("proc cmdline is invalid") from exc
+    if (
+        len(tokens) < 4
+        or len(tokens) > 128
+        or any(not token or len(token) > 1024 for token in tokens)
+        or Path(tokens[0]).name != "telegram-kol-research"
+        or tokens[1] != "web"
+        or tokens.count("--runtime-role") != 1
+    ):
+        raise ValueError("proc cmdline is invalid")
+    role_index = tokens.index("--runtime-role")
+    if role_index + 1 >= len(tokens) or tokens[role_index + 1] != "worker":
+        raise ValueError("proc cmdline does not identify worker role")
 
 
 def _read_proc_start_ticks(stat_path: Path) -> int:

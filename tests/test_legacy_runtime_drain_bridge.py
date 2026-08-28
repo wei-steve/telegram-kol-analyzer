@@ -766,9 +766,11 @@ def test_exact_candidate_handoff_retains_entry_freeze_and_live_management(
     assert stored["state"] == "handed_off"
     assert stored["bridge_token"] == bridge_token
     assert stored["production_sha"] == OLD_SHA
+    assert stored["service_name"] == "telegram-kol-worker.service"
     assert stored["worker_pid"] == _identity().worker_pid
     assert stored["worker_start_ticks"] == _identity().worker_start_ticks
     assert stored["authority_production_sha"] == CANDIDATE_SHA
+    assert stored["authority_service_name"] == "telegram-kol-worker.service"
     assert stored["authority_worker_pid"] == _candidate_identity().worker_pid
     assert (
         stored["authority_worker_start_ticks"]
@@ -1392,6 +1394,14 @@ def test_local_runtime_identity_rechecks_service_main_pid(tmp_path):
         + " ".join(["1"] * 18 + ["987654"] + ["0"] * 8),
         encoding="utf-8",
     )
+    (proc_root / "4321" / "cwd").symlink_to(
+        checkout,
+        target_is_directory=True,
+    )
+    (proc_root / "4321" / "cmdline").write_bytes(
+        b"/opt/app/.venv/bin/telegram-kol-research\0web\0"
+        b"--runtime-role\0worker\0"
+    )
     pid_reads = 0
 
     def runner(argv, **_kwargs):
@@ -1411,7 +1421,7 @@ def test_local_runtime_identity_rechecks_service_main_pid(tmp_path):
         read_local_legacy_worker_identity(
             checkout_path=checkout,
             expected_production_sha=OLD_SHA,
-            service_name="telegram-kol.service",
+            service_name="telegram-kol-worker.service",
             proc_root=proc_root,
             command_runner=runner,
         )
@@ -1429,6 +1439,14 @@ def test_local_runtime_identity_requires_exact_head_pid_and_stable_proc_stat(
         ["1"] * 18 + ["987654"] + ["0"] * 8
     )
     stat_path.write_text(stat_line, encoding="utf-8")
+    (proc_root / "4321" / "cwd").symlink_to(
+        checkout,
+        target_is_directory=True,
+    )
+    (proc_root / "4321" / "cmdline").write_bytes(
+        b"/opt/app/.venv/bin/telegram-kol-research\0web\0"
+        b"--runtime-role\0worker\0"
+    )
 
     def runner(argv, **_kwargs):
         if argv[-2:] == ["rev-parse", "--show-toplevel"]:
@@ -1446,7 +1464,7 @@ def test_local_runtime_identity_requires_exact_head_pid_and_stable_proc_stat(
     identity = read_local_legacy_worker_identity(
         checkout_path=checkout,
         expected_production_sha=OLD_SHA,
-        service_name="telegram-kol.service",
+        service_name="telegram-kol-worker.service",
         proc_root=proc_root,
         command_runner=runner,
     )
@@ -1462,7 +1480,132 @@ def test_local_runtime_identity_requires_exact_head_pid_and_stable_proc_stat(
         read_local_legacy_worker_identity(
             checkout_path=checkout,
             expected_production_sha=OLD_SHA,
+            service_name="telegram-kol-worker.service",
+            proc_root=proc_root,
+            command_runner=runner,
+        )
+
+
+def _runtime_identity_fixture(tmp_path, *, cmdline=None, cwd=None):
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    proc_root = tmp_path / "proc"
+    pid_root = proc_root / "4321"
+    pid_root.mkdir(parents=True)
+    (pid_root / "stat").write_text(
+        "4321 (telegram worker) S "
+        + " ".join(["1"] * 18 + ["987654"] + ["0"] * 8),
+        encoding="utf-8",
+    )
+    (pid_root / "cwd").symlink_to(
+        cwd or checkout,
+        target_is_directory=True,
+    )
+    (pid_root / "cmdline").write_bytes(
+        cmdline
+        if cmdline is not None
+        else (
+            b"/opt/app/.venv/bin/telegram-kol-research\0web\0"
+            b"--runtime-role\0worker\0--port\08002\0"
+        )
+    )
+
+    def runner(argv, **_kwargs):
+        if argv[-2:] == ["rev-parse", "--show-toplevel"]:
+            output = str(checkout.resolve())
+        elif argv[-3:] == ["rev-parse", "--verify", "HEAD"]:
+            output = OLD_SHA
+        elif argv[:2] == ["systemctl", "show"]:
+            output = "4321"
+        else:
+            raise AssertionError(argv)
+        return subprocess.CompletedProcess(argv, 0, output + "\n", "")
+
+    return checkout, proc_root, runner
+
+
+def test_runtime_identity_rejects_any_non_worker_service(tmp_path):
+    checkout, proc_root, runner = _runtime_identity_fixture(tmp_path)
+
+    with pytest.raises(ValueError, match="service_name"):
+        read_local_legacy_worker_identity(
+            checkout_path=checkout,
+            expected_production_sha=OLD_SHA,
             service_name="telegram-kol.service",
+            proc_root=proc_root,
+            command_runner=runner,
+        )
+
+
+def test_runtime_identity_binds_proc_cwd_to_exact_checkout(tmp_path):
+    wrong = tmp_path / "wrong-checkout"
+    wrong.mkdir()
+    checkout, proc_root, runner = _runtime_identity_fixture(
+        tmp_path,
+        cwd=wrong,
+    )
+
+    with pytest.raises(ValueError, match="proc cwd"):
+        read_local_legacy_worker_identity(
+            checkout_path=checkout,
+            expected_production_sha=OLD_SHA,
+            service_name="telegram-kol-worker.service",
+            proc_root=proc_root,
+            command_runner=runner,
+        )
+
+
+@pytest.mark.parametrize(
+    "cmdline",
+    (
+        b"/opt/app/.venv/bin/telegram-kol-research\0web\0"
+        b"--runtime-role\0web\0",
+        b"/opt/app/.venv/bin/telegram-kol-research\0worker\0",
+        b"not-null-terminated",
+        b"x" * 4097,
+    ),
+)
+def test_runtime_identity_rejects_malformed_or_non_worker_cmdline(
+    tmp_path,
+    cmdline,
+):
+    checkout, proc_root, runner = _runtime_identity_fixture(
+        tmp_path,
+        cmdline=cmdline,
+    )
+
+    with pytest.raises(ValueError, match="proc cmdline"):
+        read_local_legacy_worker_identity(
+            checkout_path=checkout,
+            expected_production_sha=OLD_SHA,
+            service_name="telegram-kol-worker.service",
+            proc_root=proc_root,
+            command_runner=runner,
+        )
+
+
+def test_runtime_identity_rechecks_start_ticks_after_proc_evidence(tmp_path):
+    checkout, proc_root, base_runner = _runtime_identity_fixture(tmp_path)
+    systemctl_reads = 0
+
+    def runner(argv, **kwargs):
+        nonlocal systemctl_reads
+        result = base_runner(argv, **kwargs)
+        if argv[:2] == ["systemctl", "show"]:
+            systemctl_reads += 1
+            if systemctl_reads == 2:
+                (proc_root / "4321" / "stat").write_text(
+                    "4321 (telegram worker) S "
+                    + " ".join(["1"] * 18 + ["987655"] + ["0"] * 8),
+                    encoding="utf-8",
+                )
+        return result
+
+    with pytest.raises(ValueError, match="proc stat"):
+        read_local_legacy_worker_identity(
+            checkout_path=checkout,
+            expected_production_sha=OLD_SHA,
+            service_name="telegram-kol-worker.service",
             proc_root=proc_root,
             command_runner=runner,
         )

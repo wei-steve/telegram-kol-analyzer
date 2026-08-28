@@ -260,6 +260,7 @@ def test_bridge_reviewed_pending_entries_defaults_to_redacted_read_only_plan(
     assert payload["plan"]["state"] == "absent"
     assert payload["runtime_identity"] == {
         "production_sha": identity.production_sha,
+        "service_name": "telegram-kol-worker.service",
         "worker_pid": 101,
         "worker_start_ticks": 202,
     }
@@ -437,6 +438,7 @@ def test_bridge_handoff_cli_reads_exact_candidate_and_redacts_tokens(
     assert "secret-confirmation-token" not in result.output
     assert calls[0][0] == "identity"
     assert calls[0][1]["expected_production_sha"] == candidate_sha
+    assert calls[0][1]["service_name"] == "telegram-kol-worker.service"
     assert calls[1][0] == "handoff"
     assert calls[1][1] is session_factory
     assert calls[1][2]["candidate_runtime_identity"] == candidate
