@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
 from telegram_kol_research.deepcoin_maintenance_actions import (
     MaintenanceBlocked,
     SingleOrderDrainRequest,
+    run_entry_authority_seed,
     run_single_order_drain,
 )
+from telegram_kol_research.entry_authority_seed import SeedResult
 
 
 class ExchangeThatAcceptedThenTimedOut:
@@ -109,3 +113,102 @@ def test_cancel_timeout_then_crash_and_reboot_never_retries_or_restores() -> Non
     assert guard.block_reason == "exchange_outcome_unknown"
     assert rebooted.worker_start_allowed is False
     assert guard.restore_calls == 0
+
+
+@dataclass(frozen=True, slots=True)
+class FakeReceipt:
+    fingerprint: str
+
+
+class FakeSeedActionGuard:
+    def __init__(self) -> None:
+        self.masked = False
+        self.block_reason: str | None = None
+        self.restore_fingerprints: list[str] = []
+
+    def enter(self, *, action_id: str) -> FakeReceipt:
+        assert action_id == "seed-001"
+        self.masked = True
+        return FakeReceipt(fingerprint="a" * 64)
+
+    def prove_quiescent(self) -> None:
+        assert self.masked is True
+
+    def block(self, *, reason_code: str) -> FakeReceipt:
+        self.block_reason = reason_code
+        return FakeReceipt(fingerprint="b" * 64)
+
+    def mark_safe_to_restore(self, *, expected_fingerprint: str) -> FakeReceipt:
+        assert expected_fingerprint == "a" * 64
+        return FakeReceipt(fingerprint="c" * 64)
+
+    def restore(self, *, expected_fingerprint: str) -> None:
+        self.restore_fingerprints.append(expected_fingerprint)
+        self.masked = False
+
+
+def test_seed_action_restores_exact_preimage_only_after_seed_success(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    database_path = tmp_path / "production.sqlite3"
+    backup_path = tmp_path / "backup.sqlite3"
+    guard = FakeSeedActionGuard()
+    monkeypatch.setattr(
+        actions,
+        "apply_entry_authority_seed_plan",
+        lambda *args, **kwargs: SeedResult(
+            status="seeded",
+            plan_fingerprint="d" * 64,
+            backup_path=backup_path,
+        ),
+    )
+
+    result = run_entry_authority_seed(
+        action_id="seed-001",
+        database_path=database_path,
+        backup_path=backup_path,
+        expected_fingerprint="d" * 64,
+        guard=guard,
+        now=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+
+    assert result.status == "seeded"
+    assert guard.restore_fingerprints == ["c" * 64]
+    assert guard.masked is False
+
+
+def test_seed_action_blocked_result_never_restores_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    database_path = tmp_path / "production.sqlite3"
+    backup_path = tmp_path / "backup.sqlite3"
+    guard = FakeSeedActionGuard()
+    monkeypatch.setattr(
+        actions,
+        "apply_entry_authority_seed_plan",
+        lambda *args, **kwargs: SeedResult(
+            status="blocked",
+            plan_fingerprint="d" * 64,
+            backup_path=backup_path,
+            reason_code="entry_authority_seed_restore_unknown",
+        ),
+    )
+
+    with pytest.raises(MaintenanceBlocked, match="entry_authority_seed_restore_unknown"):
+        run_entry_authority_seed(
+            action_id="seed-001",
+            database_path=database_path,
+            backup_path=backup_path,
+            expected_fingerprint="d" * 64,
+            guard=guard,
+            now=datetime(2026, 8, 28, tzinfo=UTC),
+        )
+
+    assert guard.restore_fingerprints == []
+    assert guard.masked is True

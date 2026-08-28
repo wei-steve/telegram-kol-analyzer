@@ -3,8 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 import re
 from typing import Protocol
+
+from telegram_kol_research.entry_authority_seed import (
+    SeedPlanRefused,
+    SeedResult,
+    apply_entry_authority_seed_plan,
+)
 
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -57,6 +65,58 @@ class DrainGuard(Protocol):
 
 class DrainTerminalizer(Protocol):
     def terminalize(self) -> object: ...
+
+
+class SeedActionReceipt(Protocol):
+    fingerprint: str
+
+
+class SeedActionGuard(DrainGuard, Protocol):
+    def enter(self, *, action_id: str) -> SeedActionReceipt: ...
+
+    def mark_safe_to_restore(
+        self,
+        *,
+        expected_fingerprint: str,
+    ) -> SeedActionReceipt: ...
+
+    def restore(self, *, expected_fingerprint: str) -> None: ...
+
+
+def run_entry_authority_seed(
+    *,
+    action_id: str,
+    database_path: Path,
+    backup_path: Path,
+    expected_fingerprint: str,
+    guard: SeedActionGuard,
+    now: datetime,
+) -> SeedResult:
+    """Coordinate persistent inhibition around one exact L3 seed plan."""
+
+    receipt = guard.enter(action_id=action_id)
+    try:
+        guard.prove_quiescent()
+        result = apply_entry_authority_seed_plan(
+            database_path,
+            backup_path=backup_path,
+            expected_fingerprint=expected_fingerprint,
+            guard=guard,
+            now=now,
+        )
+    except SeedPlanRefused:
+        _restore_seed_guard(guard=guard, receipt=receipt)
+        raise
+    except Exception as exc:
+        try:
+            guard.block(reason_code="entry_authority_seed_action_unknown")
+        except Exception:
+            pass
+        raise MaintenanceBlocked("entry_authority_seed_action_unknown") from exc
+    if result.status == "blocked":
+        raise MaintenanceBlocked(result.reason_code or "entry_authority_seed_blocked")
+    _restore_seed_guard(guard=guard, receipt=receipt)
+    return result
 
 
 def run_single_order_drain(
@@ -112,3 +172,23 @@ def _block_after_possible_write(
             authority_error = guard_error
     if authority_error is not None:
         raise MaintenanceBlocked(reason_code) from authority_error
+
+
+def _restore_seed_guard(
+    *,
+    guard: SeedActionGuard,
+    receipt: SeedActionReceipt,
+) -> None:
+    try:
+        safe_receipt = guard.mark_safe_to_restore(
+            expected_fingerprint=receipt.fingerprint,
+        )
+        guard.restore(expected_fingerprint=safe_receipt.fingerprint)
+    except Exception as exc:
+        try:
+            guard.block(reason_code="entry_authority_seed_runtime_restore_failed")
+        except Exception:
+            pass
+        raise MaintenanceBlocked(
+            "entry_authority_seed_runtime_restore_failed"
+        ) from exc
