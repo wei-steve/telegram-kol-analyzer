@@ -581,6 +581,7 @@ def apply_reviewed_pending_entry_cancel_plan(
     confirmation_token: str,
     legacy_bridge_token: str | None = None,
     legacy_runtime_identity: LegacyRuntimeIdentity | None = None,
+    legacy_runtime_identity_reader=None,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelResult:
     """Cancel one exact reviewed entry, without ever retrying the write."""
@@ -601,10 +602,27 @@ def apply_reviewed_pending_entry_cancel_plan(
         legacy_bridge_token is not None or legacy_runtime_identity is not None
     )
     if bridge_enabled and (
-        legacy_bridge_token is None or legacy_runtime_identity is None
+        legacy_bridge_token is None
+        or legacy_runtime_identity is None
+        or not callable(legacy_runtime_identity_reader)
     ):
-        raise ValueError("legacy bridge token and runtime identity are required")
+        raise ValueError(
+            "legacy bridge token and live runtime identity reader are required"
+        )
     if bridge_enabled:
+        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
+        if live_identity is None:
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=str(order_id),
+                reason_code="legacy_bridge_worker_identity_unavailable",
+            )
+        if live_identity != legacy_runtime_identity:
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=str(order_id),
+                reason_code="legacy_bridge_worker_identity_drift",
+            )
         bridge_ready = validate_legacy_runtime_bridge_cancellation_ready(
             session_factory,
             bridge_token=str(legacy_bridge_token),
@@ -798,6 +816,33 @@ def apply_reviewed_pending_entry_cancel_plan(
         )
 
     if bridge_enabled:
+        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
+        if live_identity != legacy_runtime_identity:
+            transition_position_mutation_intent(
+                session_factory,
+                intent_id,
+                expected_statuses={"submitting"},
+                new_status="blocked",
+                transitioned_at=observed_at,
+                error={"reason": "legacy_bridge_worker_identity_drift"},
+            )
+            release_failure = _release_pending_cancel_authority_before_write(
+                session_factory,
+                authority_token=authority_token,
+                released_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=action.order_id,
+                reason_code=(
+                    release_failure
+                    or (
+                        "legacy_bridge_worker_identity_unavailable"
+                        if live_identity is None
+                        else "legacy_bridge_worker_identity_drift"
+                    )
+                ),
+            )
         bridge_started = begin_legacy_runtime_bridge_cancellation(
             session_factory,
             bridge_token=str(legacy_bridge_token),
@@ -826,6 +871,30 @@ def apply_reviewed_pending_entry_cancel_plan(
                     release_failure
                     or bridge_started.reason_code
                     or "legacy_bridge_write_gate_blocked"
+                ),
+            )
+        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
+        if live_identity != legacy_runtime_identity:
+            _mark_bridge_unknown_after_write(
+                session_factory,
+                enabled=True,
+                bridge_token=legacy_bridge_token,
+                runtime_identity=legacy_runtime_identity,
+                order_id=action.order_id,
+                reason_code=(
+                    "pre_exchange_identity_unavailable"
+                    if live_identity is None
+                    else "pre_exchange_identity_drift"
+                ),
+                observed_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="blocked_authority_retained",
+                order_id=action.order_id,
+                reason_code=(
+                    "legacy_bridge_worker_identity_unavailable"
+                    if live_identity is None
+                    else "legacy_bridge_worker_identity_drift"
                 ),
             )
 
@@ -1032,6 +1101,30 @@ def apply_reviewed_pending_entry_cancel_plan(
         )
 
     if bridge_enabled:
+        live_identity = _read_live_bridge_identity(legacy_runtime_identity_reader)
+        if live_identity != legacy_runtime_identity:
+            _mark_bridge_unknown_after_write(
+                session_factory,
+                enabled=True,
+                bridge_token=legacy_bridge_token,
+                runtime_identity=legacy_runtime_identity,
+                order_id=action.order_id,
+                reason_code=(
+                    "worker_identity_unavailable"
+                    if live_identity is None
+                    else "worker_identity_drift"
+                ),
+                observed_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="cancelled_authority_retained",
+                order_id=action.order_id,
+                reason_code=(
+                    "legacy_bridge_worker_identity_unavailable"
+                    if live_identity is None
+                    else "legacy_bridge_worker_identity_drift"
+                ),
+            )
         bridge_completed = complete_legacy_runtime_bridge_cancellation(
             session_factory,
             bridge_token=str(legacy_bridge_token),
@@ -1119,6 +1212,14 @@ def _mark_bridge_unknown_after_write(
         reason_code=reason_code,
         observed_at=observed_at,
     )
+
+
+def _read_live_bridge_identity(reader) -> LegacyRuntimeIdentity | None:
+    try:
+        identity = reader()
+    except Exception:
+        return None
+    return identity if isinstance(identity, LegacyRuntimeIdentity) else None
 
 
 def _single_pending_cancel_write_gate(

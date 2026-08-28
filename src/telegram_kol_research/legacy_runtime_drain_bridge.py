@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import stat
@@ -17,6 +18,8 @@ from sqlalchemy import func, text
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from telegram_kol_research.models import (
+    EntryRevisionReplacement,
+    ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     MessageProcessingJob,
@@ -24,7 +27,9 @@ from telegram_kol_research.models import (
     PositionProtectionLeg,
     RawMessage,
     RepairConfirmationToken,
+    StrategyLifecycle,
     StrategyRevisionBatch,
+    StrategyRevisionLeg,
     TradingSetting,
     TriggerProtectionIntent,
     TriggerTakeProfitConvergence,
@@ -77,6 +82,9 @@ _DOCUMENT_KEYS = frozenset(
 )
 _TERMINAL_REVISION_BATCH_STATES = frozenset(
     {"succeeded", "blocked", "failed", "recovery_required"}
+)
+_TERMINAL_ENTRY_LEG_STATES = frozenset(
+    {"cancelled", "canceled", "expired", "rejected"}
 )
 _SHA = re.compile(r"[0-9a-f]{40}")
 _ORDER_ID = re.compile(r"[0-9]{1,64}")
@@ -209,6 +217,13 @@ def _build_plan_in_session(
             conflicts.append({"reason": "legacy_bridge_worker_identity_drift"})
         if tuple(document["reviewed_order_ids"]) != reviewed:
             conflicts.append({"reason": "legacy_bridge_reviewed_set_drift"})
+
+    unknown_reason = _bridge_unknown_mutation_reason(
+        session,
+        reviewed_order_ids=reviewed,
+    )
+    if unknown_reason is not None:
+        conflicts.append({"reason": unknown_reason})
 
     active_batches = tuple(
         (
@@ -419,6 +434,13 @@ def fence_legacy_runtime_revisions(
             if settings_reason is not None:
                 session.rollback()
                 return _result("blocked", settings_reason)
+            unknown_reason = _bridge_unknown_mutation_reason(
+                session,
+                reviewed_order_ids=tuple(document["reviewed_order_ids"]),
+            )
+            if unknown_reason is not None:
+                session.rollback()
+                return _result("blocked", unknown_reason)
             prefreeze_job = (
                 session.query(MessageProcessingJob.id)
                 .filter(
@@ -510,6 +532,17 @@ def rollback_legacy_runtime_drain_bridge(
             if document["write_boundary_reached"] or document["completed_order_ids"]:
                 session.rollback()
                 return _result("blocked", "legacy_bridge_rollback_forbidden")
+            error = _frozen_settings_reason(session)
+            if error is None and document["state"] == "fenced":
+                error = _revision_sentinel_reason(session, document=document)
+            if error is None:
+                error = _bridge_unknown_mutation_reason(
+                    session,
+                    reviewed_order_ids=tuple(document["reviewed_order_ids"]),
+                )
+            if error is not None:
+                session.rollback()
+                return _result("blocked", error)
             batches = (
                 session.query(StrategyRevisionBatch)
                 .filter(
@@ -834,6 +867,11 @@ def mark_legacy_runtime_bridge_drained(
             if error is None:
                 error = _revision_sentinel_reason(session, document=document)
             if error is None:
+                error = _bridge_unknown_mutation_reason(
+                    session,
+                    reviewed_order_ids=tuple(document["reviewed_order_ids"]),
+                )
+            if error is None:
                 error = _local_drain_reason(session, document=document)
             if error is None:
                 error = _inner_authority_reason(session)
@@ -917,6 +955,11 @@ def release_legacy_runtime_bridge_for_deploy(
                 error = _frozen_settings_reason(session)
             if error is None:
                 error = _revision_sentinel_reason(session, document=document)
+            if error is None:
+                error = _bridge_unknown_mutation_reason(
+                    session,
+                    reviewed_order_ids=tuple(document["reviewed_order_ids"]),
+                )
             if error is None:
                 error = _local_drain_reason(session, document=document)
             if error is None:
@@ -1006,6 +1049,19 @@ def read_local_legacy_worker_identity(
     pid = int(pid_text)
     stat_path = Path(proc_root) / str(pid) / "stat"
     first_ticks = _read_proc_start_ticks(stat_path)
+    confirmed_pid_text = _run_bounded_command(
+        command_runner,
+        [
+            "systemctl",
+            "show",
+            clean_service,
+            "--property",
+            "MainPID",
+            "--value",
+        ],
+    )
+    if confirmed_pid_text != pid_text:
+        raise ValueError("service MainPID changed during identity read")
     second_ticks = _read_proc_start_ticks(stat_path)
     if first_ticks != second_ticks:
         raise ValueError("proc stat changed during identity read")
@@ -1349,6 +1405,97 @@ def _drain_evidence_freshness_reason(
     return None
 
 
+def _bridge_unknown_mutation_reason(
+    session,
+    *,
+    reviewed_order_ids: tuple[str, ...],
+) -> str | None:
+    """Recheck target-related or unowned write ambiguity inside the gate tx."""
+
+    reviewed = tuple(reviewed_order_ids)
+    target_legs = tuple(
+        (int(leg_id), int(binding_id))
+        for leg_id, binding_id in session.query(
+            ExecutionOrderLeg.id,
+            ExecutionOrderLeg.execution_binding_id,
+        )
+        .filter(ExecutionOrderLeg.order_id.in_(reviewed))
+        .all()
+    )
+    leg_ids = {leg_id for leg_id, _binding_id in target_legs}
+    binding_ids = {binding_id for _leg_id, binding_id in target_legs}
+    lifecycle_ids = {
+        int(lifecycle_id)
+        for (lifecycle_id,) in session.query(StrategyLifecycle.id)
+        .filter(StrategyLifecycle.execution_binding_id.in_(binding_ids))
+        .all()
+    }
+    unknown_cancel = (
+        session.query(PositionMutationIntent.id)
+        .filter(
+            PositionMutationIntent.operation
+            == "cancel_reviewed_pending_entry",
+            PositionMutationIntent.status != "confirmed",
+            (
+                PositionMutationIntent.order_id.in_(reviewed)
+                | PositionMutationIntent.order_id.is_(None)
+                | (PositionMutationIntent.order_id == "")
+            ),
+        )
+        .first()
+    )
+    if unknown_cancel is not None:
+        return "legacy_bridge_unknown_mutation_present"
+
+    unknown_revision_leg = (
+        session.query(StrategyRevisionLeg.id)
+        .outerjoin(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id == StrategyRevisionLeg.revision_batch_id,
+        )
+        .filter(
+            StrategyRevisionLeg.status.in_(
+                {"cancel_submitting", "submit_unknown"}
+            ),
+            (
+                StrategyRevisionBatch.id.is_(None)
+                | StrategyRevisionBatch.execution_binding_id.in_(binding_ids)
+                | StrategyRevisionBatch.target_lifecycle_id.in_(lifecycle_ids)
+                | StrategyRevisionLeg.execution_order_leg_id.in_(leg_ids)
+                | StrategyRevisionLeg.order_id.in_(reviewed)
+            ),
+        )
+        .first()
+    )
+    if unknown_revision_leg is not None:
+        return "legacy_bridge_unknown_mutation_present"
+
+    unknown_replacement = (
+        session.query(EntryRevisionReplacement.id)
+        .outerjoin(
+            StrategyRevisionBatch,
+            StrategyRevisionBatch.id
+            == EntryRevisionReplacement.revision_batch_id,
+        )
+        .filter(
+            EntryRevisionReplacement.status.in_(
+                {"submit_reserved", "submitted"}
+            ),
+            (
+                StrategyRevisionBatch.id.is_(None)
+                | StrategyRevisionBatch.execution_binding_id.in_(binding_ids)
+                | StrategyRevisionBatch.target_lifecycle_id.in_(lifecycle_ids)
+                | EntryRevisionReplacement.execution_order_leg_id.in_(leg_ids)
+                | EntryRevisionReplacement.order_id.in_(reviewed)
+            ),
+        )
+        .first()
+    )
+    if unknown_replacement is not None:
+        return "legacy_bridge_unknown_mutation_present"
+    return None
+
+
 def _local_drain_reason(session, *, document: dict[str, Any]) -> str | None:
     for order_id in document["reviewed_order_ids"]:
         intents = (
@@ -1364,10 +1511,35 @@ def _local_drain_reason(session, *, document: dict[str, Any]) -> str | None:
             return "legacy_bridge_local_state_incomplete"
         intent = intents[0]
         leg = session.get(ExecutionOrderLeg, intent.execution_order_leg_id)
+        binding = session.get(ExecutionBinding, intent.execution_binding_id)
+        lifecycles = (
+            session.query(StrategyLifecycle)
+            .filter(
+                StrategyLifecycle.execution_binding_id
+                == intent.execution_binding_id
+            )
+            .all()
+        )
+        lifecycle = lifecycles[0] if len(lifecycles) == 1 else None
+        binding_entry_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(
+                ExecutionOrderLeg.execution_binding_id
+                == intent.execution_binding_id,
+                ExecutionOrderLeg.purpose == "entry",
+            )
+            .all()
+        )
         if (
             leg is None
+            or binding is None
+            or lifecycle is None
             or leg.order_id != order_id
             or leg.execution_binding_id != intent.execution_binding_id
+            or leg.strategy_instance_id != intent.strategy_instance_id
+            or str(leg.venue or "").lower() != "deepcoin"
+            or leg.purpose != "entry"
+            or leg.pos_id not in (None, "")
             or leg.status not in {"cancelled", "canceled"}
             or leg.terminal_reason != "operator_cancelled_unfilled_entry_leg"
         ):
@@ -1405,20 +1577,126 @@ def _local_drain_reason(session, *, document: dict[str, Any]) -> str | None:
             )
             .all()
         )
+        event = events[0] if len(events) == 1 else None
+        stored_request = _json_dict(leg.request_json)
+        cancel_request = _json_dict(intent.request_json)
+        cancel_response = _json_dict(intent.response_json)
+        event_before = _json_dict(
+            event.before_json if event is not None else None
+        )
+        expected_event_before = {
+            "action_id": event_before.get("action_id"),
+            "exchange_row_fingerprint": event_before.get(
+                "exchange_row_fingerprint"
+            ),
+            "plan_fingerprint": event_before.get("plan_fingerprint"),
+        }
+        expected_authority = {
+            **expected_event_before,
+            "request_json_fingerprint": _payload_fingerprint(stored_request),
+        }
         if not (
-            len(events) == 1
+            event is not None
+            and intent.venue == "deepcoin"
+            and intent.pos_id == f"pending-entry:{order_id}"
+            and binding.strategy_instance_id == intent.strategy_instance_id
+            and str(binding.venue or "").lower() == "deepcoin"
+            and str(binding.symbol or "").upper()
+            == cancel_request.get("instId", "").removesuffix("-USDT-SWAP")
+            and str(binding.side or "").lower() == "long"
+            and str(binding.status or "").lower() == "cancelled"
+            and binding.last_exchange_status
+            == "reviewed_pending_entries_cancelled"
+            and bool(binding_entry_legs)
+            and all(
+                str(row.status or "").lower() in _TERMINAL_ENTRY_LEG_STATES
+                for row in binding_entry_legs
+            )
+            and lifecycle.execution_binding_id == intent.execution_binding_id
+            and str(lifecycle.symbol or "").upper()
+            == cancel_request.get("instId", "").removesuffix("-USDT-SWAP")
+            and str(lifecycle.side or "").lower() == "long"
+            and str(lifecycle.lifecycle_status or "") == "expired"
+            and lifecycle.exit_reason == "expired"
+            and lifecycle.exited_at is not None
+            and lifecycle.management_action
+            == "reviewed_pending_entries_cancelled"
+            and event.execution_binding_id == intent.execution_binding_id
+            and event.strategy_instance_id == intent.strategy_instance_id
+            and event.venue == "deepcoin"
+            and event.symbol == cancel_request.get("instId", "").split("-")[0]
+            and event.side == "long"
+            and event.reason == "reviewed_stale_pending_entry_cancelled"
+            and event_before == expected_event_before
+            and all(
+                _is_sha256(expected_event_before[field])
+                for field in expected_event_before
+            )
+            and _json_dict(event.after_json)
+            == {"pending": False, "terminalized": True}
+            and _json_dict(event.request_json) == cancel_request
+            and _json_dict(event.response_json) == cancel_response
+            and cancel_request.get("ordId") == order_id
+            and isinstance(cancel_request.get("instId"), str)
+            and bool(cancel_request["instId"])
+            and cancel_response == {"code": "0", "order_id": order_id}
+            and intent.idempotency_key
+            == (
+                f"reviewed-pending-entry-cancel:{order_id}:"
+                f"{expected_event_before['action_id']}"
+            )
+            and intent.request_fingerprint
+            == _payload_fingerprint(cancel_request)
+            and intent.authority_fingerprint
+            == _payload_fingerprint(expected_authority)
+            and intent.error_json in (None, "")
+            and intent.submitted_at is not None
+            and intent.confirmed_at is not None
             and len(protection_intents) == 1
+            and protection_intents[0].execution_binding_id
+            == intent.execution_binding_id
+            and protection_intents[0].parent_trigger_order_id == order_id
             and protection_intents[0].recovery_state == "resolved"
             and protection_intents[0].recovery_disposition == "terminal"
+            and protection_intents[0].last_reason_code
+            == "parent_trigger_cancelled_before_entry"
             and len(protection_legs) == 2
             and {row.role for row in protection_legs}
             == {"primary_stop", "backup_stop"}
-            and all(row.status == "cancelled" for row in protection_legs)
+            and all(
+                row.status == "cancelled"
+                and row.execution_binding_id == intent.execution_binding_id
+                and row.parent_entry_order_id == order_id
+                for row in protection_legs
+            )
             and len(convergence) == 1
+            and convergence[0].execution_binding_id
+            == intent.execution_binding_id
             and convergence[0].status == "completed"
+            and convergence[0].reason_code
+            == "parent_trigger_cancelled_before_entry"
+            and convergence[0].completed_at is not None
         ):
             return "legacy_bridge_local_state_incomplete"
     return None
+
+
+def _json_dict(value: Any) -> dict[str, Any]:
+    try:
+        parsed = json.loads(str(value or ""))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _payload_fingerprint(value: Any) -> str:
+    return hashlib.sha256(_canonical_json(value).encode()).hexdigest()
+
+
+def _is_sha256(value: Any) -> bool:
+    return isinstance(value, str) and len(value) == 64 and all(
+        character in "0123456789abcdef" for character in value
+    )
 
 
 def _inner_authority_reason(session) -> str | None:
@@ -1545,18 +1823,29 @@ def _run_bounded_command(command_runner, argv: list[str]) -> str:
 
 def _read_proc_start_ticks(stat_path: Path) -> int:
     try:
-        metadata = stat_path.lstat()
+        descriptor = os.open(
+            stat_path,
+            os.O_RDONLY
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0),
+        )
     except OSError as exc:
         raise ValueError("proc stat is unavailable") from exc
-    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
-        raise ValueError("proc stat is invalid")
     try:
-        with stat_path.open("r", encoding="utf-8") as handle:
-            raw = handle.read(4097)
+        metadata = os.fstat(descriptor)
+        if not stat.S_ISREG(metadata.st_mode):
+            raise ValueError("proc stat is invalid")
+        raw_bytes = os.read(descriptor, 4097)
     except OSError as exc:
         raise ValueError("proc stat is unavailable") from exc
-    if len(raw) > 4096:
+    finally:
+        os.close(descriptor)
+    if len(raw_bytes) > 4096:
         raise ValueError("proc stat is too large")
+    try:
+        raw = raw_bytes.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ValueError("proc stat is invalid") from exc
     close_paren = raw.rfind(")")
     if close_paren <= 0:
         raise ValueError("proc stat is invalid")

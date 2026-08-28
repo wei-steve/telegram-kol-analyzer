@@ -5174,7 +5174,20 @@ def bridge_reviewed_pending_entries(
     if expected_fingerprint != bridge_plan.fingerprint:
         raise typer.BadParameter("--expected-fingerprint does not match fresh plan")
 
+    def require_stable_identity():
+        current_identity = read_local_legacy_worker_identity(
+            checkout_path=checkout_path,
+            expected_production_sha=expected_production_sha,
+            service_name=service_name,
+        )
+        if current_identity != identity:
+            raise typer.BadParameter(
+                "legacy worker identity changed after planning"
+            )
+        return current_identity
+
     if action == "freeze":
+        identity = require_stable_identity()
         result = freeze_legacy_runtime_drain_bridge(
             session_factory,
             plan=bridge_plan,
@@ -5185,6 +5198,7 @@ def bridge_reviewed_pending_entries(
             frozen_at=observed_at,
         )
     elif action == "fence":
+        identity = require_stable_identity()
         result = fence_legacy_runtime_revisions(
             session_factory,
             bridge_token=str(bridge_token),
@@ -5193,6 +5207,7 @@ def bridge_reviewed_pending_entries(
             fenced_at=observed_at,
         )
     elif action == "rollback":
+        identity = require_stable_identity()
         result = rollback_legacy_runtime_drain_bridge(
             session_factory,
             bridge_token=str(bridge_token),
@@ -5217,6 +5232,7 @@ def bridge_reviewed_pending_entries(
             plan=cancel_plan,
             observed_at=observed_at,
         )
+        identity = require_stable_identity()
         if action == "mark-drained":
             result = mark_legacy_runtime_bridge_drained(
                 session_factory,
@@ -5284,16 +5300,20 @@ def cancel_reviewed_pending_entries(
     """Plan or cancel one exact reviewed pending Deepcoin entry."""
 
     bridge_identity = None
+    bridge_identity_reader = None
     if bridge_token:
         if not expected_production_sha:
             raise typer.BadParameter(
                 "--bridge-token requires --expected-production-sha"
             )
-        bridge_identity = read_local_legacy_worker_identity(
-            checkout_path=checkout_path,
-            expected_production_sha=expected_production_sha,
-            service_name=service_name,
-        )
+        def bridge_identity_reader():
+            return read_local_legacy_worker_identity(
+                checkout_path=checkout_path,
+                expected_production_sha=expected_production_sha,
+                service_name=service_name,
+            )
+
+        bridge_identity = bridge_identity_reader()
     elif expected_production_sha:
         raise typer.BadParameter(
             "--expected-production-sha requires --bridge-token"
@@ -5345,6 +5365,7 @@ def cancel_reviewed_pending_entries(
         confirmation_token=confirmation_token,
         legacy_bridge_token=bridge_token,
         legacy_runtime_identity=bridge_identity,
+        legacy_runtime_identity_reader=bridge_identity_reader,
         now=datetime.now(UTC),
     )
     typer.echo(

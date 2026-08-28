@@ -1565,6 +1565,7 @@ def test_bridge_hooks_wrap_the_exact_single_order_exchange_boundary(
         plan,
         legacy_bridge_token="bridge-token",
         legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: identity,
     )
 
     assert result.status == "cancelled"
@@ -1634,6 +1635,7 @@ def test_bridge_unknown_hook_precedes_any_future_retry(tmp_path, monkeypatch):
         plan,
         legacy_bridge_token="bridge-token",
         legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: identity,
     )
     cancel_count = len(client.cancel_payloads)
     second = _apply_one(
@@ -1644,6 +1646,7 @@ def test_bridge_unknown_hook_precedes_any_future_retry(tmp_path, monkeypatch):
         confirmation_token="unused-second-token",
         legacy_bridge_token="bridge-token",
         legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: identity,
     )
 
     assert first.status == "cancel_outcome_unknown"
@@ -1651,6 +1654,138 @@ def test_bridge_unknown_hook_precedes_any_future_retry(tmp_path, monkeypatch):
     assert second.status == "blocked"
     assert second.reason_code == "legacy_bridge_state_mismatch"
     assert len(client.cancel_payloads) == cancel_count == 1
+
+
+def test_bridge_apply_rechecks_live_worker_identity_before_exchange_write(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    session_factory = create_session_factory(tmp_path / "worker-drift.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=55,
+        worker_start_ticks=89,
+    )
+    drifted = LegacyRuntimeIdentity(
+        production_sha=identity.production_sha,
+        worker_pid=55,
+        worker_start_ticks=90,
+    )
+    identities = iter((identity, drifted))
+    monkeypatch.setattr(
+        cancel_module,
+        "validate_legacy_runtime_bridge_cancellation_ready",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="ready"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "begin_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "drift must block before bridge write boundary"
+        ),
+    )
+
+    result = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: next(identities),
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "legacy_bridge_worker_identity_drift"
+    assert client.cancel_payloads == []
+    assert _authority_document(session_factory)["state"] == "idle"
+
+
+def test_bridge_apply_locks_unknown_when_worker_drifts_after_exchange_write(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.reviewed_pending_entry_cancel as cancel_module
+    from telegram_kol_research.legacy_runtime_drain_bridge import (
+        LegacyRuntimeDrainBridgeResult,
+        LegacyRuntimeIdentity,
+    )
+
+    session_factory = create_session_factory(tmp_path / "postwrite-drift.db")
+    binding_id, lifecycle_id, leg_ids = _seed(session_factory)
+    targets = _targets(binding_id, lifecycle_id, leg_ids)
+    client = _Client()
+    plan = _build_plan(session_factory, client, targets)
+    identity = LegacyRuntimeIdentity(
+        production_sha="0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f",
+        worker_pid=55,
+        worker_start_ticks=89,
+    )
+    drifted = LegacyRuntimeIdentity(
+        production_sha=identity.production_sha,
+        worker_pid=55,
+        worker_start_ticks=90,
+    )
+    identities = iter((identity, identity, identity, drifted))
+    unknown_reasons = []
+    monkeypatch.setattr(
+        cancel_module,
+        "validate_legacy_runtime_bridge_cancellation_ready",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="ready"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "begin_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: LegacyRuntimeDrainBridgeResult(
+            status="cancelling"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "complete_legacy_runtime_bridge_cancellation",
+        lambda *_args, **_kwargs: pytest.fail(
+            "drift must block bridge completion"
+        ),
+    )
+    monkeypatch.setattr(
+        cancel_module,
+        "mark_legacy_runtime_bridge_unknown",
+        lambda *_args, **kwargs: (
+            unknown_reasons.append(kwargs["reason_code"])
+            or LegacyRuntimeDrainBridgeResult(status="unknown_locked")
+        ),
+    )
+
+    result = _apply_one(
+        session_factory,
+        client,
+        targets,
+        plan,
+        legacy_bridge_token="bridge-token",
+        legacy_runtime_identity=identity,
+        legacy_runtime_identity_reader=lambda: next(identities),
+    )
+
+    assert result.status == "cancelled_authority_retained"
+    assert result.reason_code == "legacy_bridge_worker_identity_drift"
+    assert unknown_reasons == ["worker_identity_drift"]
+    assert len(client.cancel_payloads) == 1
+    authority = _authority_document(session_factory)
+    assert authority["state"] == "held"
 
 
 def test_last_cancel_terminalizes_binding_and_lifecycle(tmp_path):
