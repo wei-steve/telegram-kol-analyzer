@@ -79,11 +79,11 @@ phase completes or pauses, record both verified evidence and outstanding work.
   legacy/auto-execution tests, 54 cancellation tests and the final 340-test
   adjacent set. Three independent review rounds ended ready with zero remaining
   Critical or Important findings.
-- The final repository run after production code commit `708a479f` completed
-  6513 passes, 2 skips and 32 warnings in 659.88 seconds; its only failure was
-  this canonical-status test still asserting the superseded Task 12 candidate
-  string. No production code changed afterward. The status-only correction and
-  exact handoff assertion were then verified separately.
+- The first repository run after production code commit `708a479f` completed
+  6513 passes and exposed only a stale canonical-status assertion. After that
+  status/test-only correction, the final repository suite passed 6514 tests
+  with 2 skipped and 32 warnings in 546.97 seconds. No production code changed
+  after either full run.
 - No push, deployment, SSH, settings freeze, restart, production/database write,
   Deepcoin write, historical replay or Telegram trading send occurred in this
   local repair.
