@@ -1279,6 +1279,43 @@ def test_submit_recovery_order_live_blocks_when_auto_trade_is_disabled(tmp_path)
         raise AssertionError("expected disabled auto-trade to block live submit")
 
 
+def test_process_trade_signal_live_blocks_legacy_entry_freeze_before_exchange(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-frozen.db")
+    _persist_ready_item(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "legacy_entry_submission_frozen": True,
+            "management_execution_mode": "live",
+        },
+    )
+    signal = enqueue_recovery_trade_signal(
+        session_factory,
+        chat_id=100,
+        message_id=55,
+        symbol="BTC",
+        side="long",
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match="legacy_entry_submission_frozen",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    assert client.position_protection_payloads == []
+
+
 def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_item(session_factory)

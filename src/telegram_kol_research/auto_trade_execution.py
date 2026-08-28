@@ -119,8 +119,15 @@ def execute_strategy_revision(
         }
     now = processed_at or datetime.now(UTC)
     settings = load_trading_settings(session_factory)
-    if not settings.auto_trade_enabled:
-        return {"status": "blocked", "reason": "auto_trade_disabled"}
+    if not settings.entry_submission_enabled:
+        return {
+            "status": "blocked",
+            "reason": (
+                "legacy_entry_submission_frozen"
+                if settings.legacy_entry_submission_frozen
+                else "auto_trade_disabled"
+            ),
+        }
     authority = acquire_entry_revision_exchange_authority(
         session_factory,
         owner_kind="entry_revision_worker",
@@ -634,12 +641,16 @@ def _auto_process_single_message_trade_signal(
             message_instruction_item_id=message_instruction_item_id,
             execution_contract_mode=execution_contract_mode,
         )
-    if not settings.auto_trade_enabled:
+    if not settings.entry_submission_enabled:
         return _record_entry_auto_trade_skip(
             session_factory,
             raw_message=raw_message,
             candidate=candidate,
-            reason="auto_trade_disabled",
+            reason=(
+                "legacy_entry_submission_frozen"
+                if settings.legacy_entry_submission_frozen
+                else "auto_trade_disabled"
+            ),
             processed_at=now,
             message_instruction_item_id=message_instruction_item_id,
             execution_contract_mode=execution_contract_mode,

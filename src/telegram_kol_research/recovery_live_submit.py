@@ -365,8 +365,12 @@ def submit_recovery_order_live(
     """Enqueue and execute a confirmed recovery signal through the trade queue."""
 
     settings = load_trading_settings(session_factory)
-    if not settings.auto_trade_enabled:
-        raise RecoveryLiveSubmitError("auto_trade_disabled")
+    if not settings.entry_submission_enabled:
+        raise RecoveryLiveSubmitError(
+            "legacy_entry_submission_frozen"
+            if settings.legacy_entry_submission_frozen
+            else "auto_trade_disabled"
+        )
 
     trade_signal = enqueue_recovery_trade_signal(
         session_factory,
@@ -904,8 +908,12 @@ def process_trade_signal_live(
     """Receive and execute one pending trade signal."""
 
     settings = load_trading_settings(session_factory)
-    if not settings.auto_trade_enabled:
-        raise RecoveryLiveSubmitError("auto_trade_disabled")
+    if not settings.entry_submission_enabled:
+        raise RecoveryLiveSubmitError(
+            "legacy_entry_submission_frozen"
+            if settings.legacy_entry_submission_frozen
+            else "auto_trade_disabled"
+        )
 
     now = processed_at or datetime.now(UTC)
     try:

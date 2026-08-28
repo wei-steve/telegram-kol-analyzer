@@ -3094,6 +3094,37 @@ def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_d
     assert event.side == "long"
 
 
+def test_legacy_entry_freeze_refuses_auto_entry_before_exchange_access(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-frozen.db")
+    raw_message_id = _persist_candidate(session_factory)
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "legacy_entry_submission_frozen": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        },
+    )
+    fake_client = _FakeDeepcoinClient()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert result == {
+        "status": "skipped",
+        "reason": "legacy_entry_submission_frozen",
+    }
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    assert fake_client.protections == []
+
+
 def test_auto_process_message_trade_signal_submits_market_order_then_position_sltp(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _persist_candidate(

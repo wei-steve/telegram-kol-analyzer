@@ -905,6 +905,51 @@ def test_management_execution_mode_live_requires_global_auto_trade():
     assert enabled.live_management_execution_enabled is True
 
 
+def test_legacy_entry_submission_freeze_preserves_live_management_and_protection():
+    settings = trading_settings_from_payload(
+        {
+            "auto_trade_enabled": False,
+            "legacy_entry_submission_frozen": True,
+            "management_execution_mode": "live",
+            "composite_management_v2_mode": "live",
+            "trigger_protection_stop_rescue_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+        }
+    )
+
+    assert settings.legacy_entry_submission_frozen is True
+    assert settings.entry_submission_enabled is False
+    assert settings.management_planning_enabled is True
+    assert settings.live_management_execution_enabled is True
+    assert settings.effective_composite_management_v2_mode == "live"
+    assert settings.effective_trigger_protection_stop_rescue_mode == "live"
+    assert settings.effective_position_management_liveness_v2_mode == "live"
+
+
+def test_entry_submission_requires_auto_trade_without_legacy_freeze():
+    defaults = TradingSettings()
+    enabled = trading_settings_from_payload({"auto_trade_enabled": True})
+    frozen = trading_settings_from_payload(
+        {
+            "auto_trade_enabled": True,
+            "legacy_entry_submission_frozen": True,
+        }
+    )
+
+    assert defaults.legacy_entry_submission_frozen is False
+    assert defaults.entry_submission_enabled is False
+    assert enabled.entry_submission_enabled is True
+    assert frozen.entry_submission_enabled is False
+
+
+@pytest.mark.parametrize("value", ["false", "0", 0, 1, [], {}])
+def test_legacy_entry_submission_freeze_rejects_non_boolean_values(value):
+    with pytest.raises(ValueError, match="legacy_entry_submission_frozen"):
+        trading_settings_from_payload(
+            {"legacy_entry_submission_frozen": value}
+        )
+
+
 def test_management_execution_mode_rejects_invalid_value():
     with pytest.raises(ValueError, match="management_execution_mode"):
         trading_settings_from_payload({"management_execution_mode": "unsafe"})
