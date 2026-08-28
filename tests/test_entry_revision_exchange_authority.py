@@ -316,13 +316,16 @@ def test_new_entry_worker_is_an_exact_authority_owner(tmp_path):
     assert _stored_authority(session_factory)["owner_kind"] == "new_entry_worker"
 
 
-def test_legacy_entry_freeze_blocks_new_entry_authority(tmp_path):
+def test_deployment_entry_freeze_blocks_new_entry_authority(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
     session_factory = create_session_factory(tmp_path / "entry-frozen.db")
     save_trading_settings(
         session_factory,
         {
             "auto_trade_enabled": False,
-            "legacy_entry_submission_frozen": True,
             "entry_revision_v2_mode": "disabled",
         },
         updated_at=NOW,
@@ -337,7 +340,7 @@ def test_legacy_entry_freeze_blocks_new_entry_authority(tmp_path):
     )
 
     assert acquisition.acquired is False
-    assert acquisition.reason_code == "legacy_entry_submission_frozen"
+    assert acquisition.reason_code == "deployment_entry_frozen"
 
 
 def test_exact_owner_release_allows_next_quiesced_cancellation(tmp_path):

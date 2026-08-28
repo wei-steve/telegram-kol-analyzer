@@ -15,6 +15,9 @@ from sqlalchemy.orm import sessionmaker
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTradingClientProtocol
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.deepcoin_execution_actions import (
     cancel_revision_entry_leg,
 )
@@ -122,12 +125,10 @@ def execute_strategy_revision(
     if not settings.entry_submission_enabled:
         return {
             "status": "blocked",
-            "reason": (
-                "legacy_entry_submission_frozen"
-                if settings.legacy_entry_submission_frozen
-                else "auto_trade_disabled"
-            ),
+            "reason": "auto_trade_disabled",
         }
+    if deployment_entry_admission_frozen():
+        return {"status": "blocked", "reason": "deployment_entry_frozen"}
     authority = acquire_entry_revision_exchange_authority(
         session_factory,
         owner_kind="entry_revision_worker",
@@ -650,11 +651,17 @@ def _auto_process_single_message_trade_signal(
             session_factory,
             raw_message=raw_message,
             candidate=candidate,
-            reason=(
-                "legacy_entry_submission_frozen"
-                if settings.legacy_entry_submission_frozen
-                else "auto_trade_disabled"
-            ),
+            reason="auto_trade_disabled",
+            processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
+        )
+    if deployment_entry_admission_frozen():
+        return _record_entry_auto_trade_skip(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            reason="deployment_entry_frozen",
             processed_at=now,
             message_instruction_item_id=message_instruction_item_id,
             execution_contract_mode=execution_contract_mode,

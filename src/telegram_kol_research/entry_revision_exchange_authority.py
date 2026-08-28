@@ -16,6 +16,9 @@ import uuid
 from sqlalchemy import text
 from sqlalchemy.exc import SQLAlchemyError
 
+from telegram_kol_research.deployment_entry_freeze import (
+    deployment_entry_admission_frozen,
+)
 from telegram_kol_research.models import TradingSetting
 from telegram_kol_research.trading_settings import (
     TRADING_SETTINGS_KEY,
@@ -600,8 +603,8 @@ def _new_entry_quiescence_reason(session) -> str | None:
     if reason is not None:
         return reason
     assert settings is not None
-    if settings.legacy_entry_submission_frozen:
-        return "legacy_entry_submission_frozen"
+    if deployment_entry_admission_frozen():
+        return "deployment_entry_frozen"
     return None
 
 

@@ -36,6 +36,9 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
     publish_deepcoin_contract_spec_snapshot,
     validate_deepcoin_instrument_snapshot,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
@@ -87,6 +90,14 @@ def _loop_health_endpoint(app):
         if getattr(route, "path", None) == "/api/runtime/loop-health"
         and "GET" in getattr(route, "methods", set())
     )
+
+
+def _seed_entry_exchange_authority_for_test(session_factory) -> None:
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+    assert result.seeded is True
 
 
 def _deployment_identity_endpoint(app):
@@ -1153,6 +1164,7 @@ def test_deployment_entry_freeze_cannot_be_cleared_by_queue_setting(
         identity = client.get("/api/runtime/deployment-identity").json()
 
     assert response.status_code == 200
+    assert "legacy_entry_submission_frozen" not in response.json()
     assert app.state.deployment_entry_frozen is True
     assert started == []
     assert entry_response.status_code == 503
@@ -7315,6 +7327,7 @@ def test_recovery_live_submit_api_places_orders_with_injected_client(
         deepcoin_contract_spec_provider=_StaticContractSpecProvider(),
         deepcoin_client_factory=lambda: fake_client,
     )
+    _seed_entry_exchange_authority_for_test(app.state.session_factory)
     save_trading_settings(
         app.state.session_factory,
         {"auto_trade_enabled": True, "worker_command_mode": "queue"},
@@ -7432,6 +7445,7 @@ def test_trade_signal_process_next_api_consumes_pending_signal(tmp_path, monkeyp
         deepcoin_contract_spec_provider=_StaticContractSpecProvider(),
         deepcoin_client_factory=lambda: fake_client,
     )
+    _seed_entry_exchange_authority_for_test(app.state.session_factory)
     save_trading_settings(
         app.state.session_factory,
         {"auto_trade_enabled": True, "worker_command_mode": "queue"},

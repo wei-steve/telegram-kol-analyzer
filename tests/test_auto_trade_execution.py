@@ -29,6 +29,7 @@ from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, E
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
+from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
@@ -3113,14 +3114,17 @@ def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_d
     assert event.side == "long"
 
 
-def test_legacy_entry_freeze_refuses_auto_entry_before_exchange_access(tmp_path):
+def test_deployment_entry_freeze_blocks_entry_without_enabling_management(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
     session_factory = create_session_factory(tmp_path / "entry-frozen.db")
     raw_message_id = _persist_candidate(session_factory)
     save_trading_settings(
         session_factory,
         {
             "auto_trade_enabled": True,
-            "legacy_entry_submission_frozen": True,
             "management_execution_mode": "live",
             "position_management_liveness_v2_mode": "live",
         },
@@ -3137,8 +3141,11 @@ def test_legacy_entry_freeze_refuses_auto_entry_before_exchange_access(tmp_path)
 
     assert result == {
         "status": "skipped",
-        "reason": "legacy_entry_submission_frozen",
+        "reason": "deployment_entry_frozen",
     }
+    settings = load_trading_settings(session_factory)
+    assert settings.management_planning_enabled is True
+    assert settings.live_management_execution_enabled is True
     assert fake_client.orders == []
     assert fake_client.trigger_orders == []
     assert fake_client.protections == []

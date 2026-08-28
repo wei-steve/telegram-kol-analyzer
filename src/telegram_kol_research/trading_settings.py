@@ -62,7 +62,6 @@ class SymbolEntryThresholds:
 @dataclass(slots=True)
 class TradingSettings:
     auto_trade_enabled: bool = False
-    legacy_entry_submission_frozen: bool = False
     telegram_source_deletion_exit_enabled: bool = False
     management_execution_mode: Literal["disabled", "shadow", "live"] = "disabled"
     composite_management_v2_mode: Literal[
@@ -145,29 +144,20 @@ class TradingSettings:
 
     @property
     def entry_submission_enabled(self) -> bool:
-        return (
-            self.auto_trade_enabled
-            and not self.legacy_entry_submission_frozen
-        )
-
-    @property
-    def _management_authority_enabled(self) -> bool:
-        return (
-            self.auto_trade_enabled or self.legacy_entry_submission_frozen
-        )
+        return self.auto_trade_enabled
 
     @property
     def management_planning_enabled(self) -> bool:
         return self.management_execution_mode == "shadow" or (
             self.management_execution_mode == "live"
-            and self._management_authority_enabled
+            and self.auto_trade_enabled
         )
 
     @property
     def live_management_execution_enabled(self) -> bool:
         return (
             self.management_execution_mode == "live"
-            and self._management_authority_enabled
+            and self.auto_trade_enabled
         )
 
     @property
@@ -178,7 +168,7 @@ class TradingSettings:
             return "shadow"
         if (
             self.composite_management_v2_mode == "live"
-            and self._management_authority_enabled
+            and self.auto_trade_enabled
             and self.management_execution_mode == "live"
         ):
             return "live"
@@ -192,7 +182,7 @@ class TradingSettings:
             return "shadow"
         if (
             self.trigger_protection_stop_rescue_mode == "live"
-            and self._management_authority_enabled
+            and self.auto_trade_enabled
             and self.management_execution_mode == "live"
         ):
             return "live"
@@ -206,7 +196,7 @@ class TradingSettings:
             return "shadow"
         if (
             self.position_management_liveness_v2_mode == "live"
-            and self._management_authority_enabled
+            and self.auto_trade_enabled
             and self.management_execution_mode == "live"
         ):
             return "live"
@@ -433,6 +423,10 @@ def apply_trading_settings_to_group_config(
 
 def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSettings:
     raw = payload or {}
+    if "legacy_entry_submission_frozen" in raw:
+        raise ValueError(
+            "legacy_entry_submission_frozen is not an ordinary trading setting"
+        )
     defaults = TradingSettings()
     allowed_symbols = _parse_symbol_list(raw.get("allowed_symbols"), defaults.allowed_symbols)
     symbol_max_loss_usdt = _parse_symbol_max_loss_usdt(raw.get("symbol_max_loss_usdt"))
@@ -559,11 +553,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             raw,
             "auto_trade_enabled",
             defaults.auto_trade_enabled,
-        ),
-        legacy_entry_submission_frozen=_boolean_setting(
-            raw,
-            "legacy_entry_submission_frozen",
-            defaults.legacy_entry_submission_frozen,
         ),
         telegram_source_deletion_exit_enabled=_boolean_setting(
             raw,

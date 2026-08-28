@@ -1313,14 +1313,17 @@ def test_submit_recovery_order_live_blocks_when_auto_trade_is_disabled(tmp_path)
         raise AssertionError("expected disabled auto-trade to block live submit")
 
 
-def test_process_trade_signal_live_blocks_legacy_entry_freeze_before_exchange(tmp_path):
+def test_recovery_submit_uses_process_local_deployment_gate(
+    tmp_path,
+    monkeypatch,
+):
+    monkeypatch.setenv("TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN", "1")
     session_factory = create_session_factory(tmp_path / "entry-frozen.db")
     _persist_ready_item(session_factory)
     save_trading_settings(
         session_factory,
         {
             "auto_trade_enabled": True,
-            "legacy_entry_submission_frozen": True,
             "management_execution_mode": "live",
         },
     )
@@ -1336,7 +1339,7 @@ def test_process_trade_signal_live_blocks_legacy_entry_freeze_before_exchange(tm
 
     with pytest.raises(
         RecoveryLiveSubmitError,
-        match="legacy_entry_submission_frozen",
+        match="deployment_entry_frozen",
     ):
         process_trade_signal_live(
             session_factory,

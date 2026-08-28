@@ -3,6 +3,21 @@ from fastapi.testclient import TestClient
 from telegram_kol_research.web_app import create_web_app
 
 
+def test_settings_api_never_serializes_internal_entry_freeze(tmp_path):
+    app = create_web_app(database_path=tmp_path / "web-internal-freeze.db")
+
+    with TestClient(app) as client:
+        rejected = client.post(
+            "/api/trading-settings",
+            json={"legacy_entry_submission_frozen": True},
+        )
+        loaded = client.get("/api/trading-settings")
+
+    assert rejected.status_code == 422
+    assert "legacy_entry_submission_frozen" in rejected.json()["detail"]
+    assert "legacy_entry_submission_frozen" not in loaded.json()
+
+
 def test_position_management_liveness_v2_api_round_trip(tmp_path):
     app = create_web_app(database_path=tmp_path / "web-liveness-v2.db")
 
