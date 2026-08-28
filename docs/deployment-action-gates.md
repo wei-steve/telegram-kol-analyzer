@@ -90,6 +90,28 @@ The manifest schema is:
 
 The CLI reads one local JSON file and prints a deterministic, non-secret plan. It does not run Git, SSH, systemd, SQLite, Telegram, or Deepcoin commands.
 
+## Immutable stage-only command
+
+`deploy/telegram-kol-stage` implements only candidate staging. It requires:
+
+- `EXPECTED_COMMIT`: the reviewed full 40-character commit;
+- `BRANCH`: the reviewed remote branch;
+- `ACTION_MANIFEST`: a regular JSON file accepted by the action planner with `action=stage`;
+- `SOURCE_REPO`: a read-only source for the origin URL, defaulting to `/opt/telegram-kol-analyzer`;
+- `RELEASE_ROOT`: the root-owned, non-writable-by-group/others release directory, defaulting to `/opt/telegram-kol-releases`;
+- `STAGER_LOCK_PATH`: the exclusive staging lock, defaulting to `/run/telegram-kol-stage.lock`.
+
+The command reads only the origin URL from `SOURCE_REPO`. It creates a temporary bare repository under `RELEASE_ROOT`, fetches the declared branch there, and requires its head to equal `EXPECTED_COMMIT`. It never fetches, checks out, merges, or installs into the active source directory.
+
+The published directory is named by the exact commit and contains source files plus:
+
+- `.telegram-kol-release.json`: canonical commit, tree, content digest, branch, action manifest, and action-plan digest;
+- `.telegram-kol-stage-receipt.json`: canonical non-secret receipt bound to the release manifest.
+
+All published directories are mode `0555`; regular files are `0444` or `0555` according to their executable bit. Publication is same-filesystem and no-replace. Re-running the same commit with the same action manifest validates and returns the existing receipt. Any content, metadata, branch, or action-manifest mismatch fails closed and is not repaired automatically.
+
+Successful staging does not authorize activation. It does not inspect the production database, does not control any service, does not change settings, does not send Telegram messages, and does not access an exchange. A separate future `activate` command must independently verify the receipt and obtain activation authorization.
+
 ## Removal sequence
 
 The legacy one-command stage-and-activate path is removed only after these independent paths exist:

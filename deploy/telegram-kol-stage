@@ -1,0 +1,706 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import ctypes
+import errno
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path, PurePosixPath
+import re
+import shutil
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+from typing import Any, Final
+
+from telegram_kol_research.deployment_action_plan import (
+    ActionPlan,
+    DeploymentAction,
+    DeploymentManifest,
+    ManifestValidationError,
+    build_action_plan,
+    parse_manifest,
+)
+
+
+CONTRACT: Final = "immutable-release-v1"
+RELEASE_MANIFEST: Final = ".telegram-kol-release.json"
+STAGE_RECEIPT: Final = ".telegram-kol-stage-receipt.json"
+RENAME_NOREPLACE: Final = 1
+AT_FDCWD: Final = -100
+_SHA1_RE: Final = re.compile(r"^[0-9a-f]{40}$")
+_SHA256_RE: Final = re.compile(r"^[0-9a-f]{64}$")
+_BRANCH_RE: Final = re.compile(r"^[A-Za-z0-9._/-]+$")
+_MANIFEST_KEYS: Final = {
+    "action_manifest",
+    "action_plan_sha256",
+    "branch",
+    "commit",
+    "content_sha256",
+    "contract",
+    "schema_version",
+    "tree",
+}
+_RECEIPT_KEYS: Final = {
+    "action_plan_sha256",
+    "branch",
+    "commit",
+    "content_sha256",
+    "contract",
+    "manifest_sha256",
+    "release_name",
+    "schema_version",
+    "status",
+    "tree",
+}
+
+
+class StageError(RuntimeError):
+    pass
+
+
+def _required_env(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise StageError(f"{name} is required.")
+    return value
+
+
+def _canonical_json_bytes(payload: dict[str, Any]) -> bytes:
+    return (
+        json.dumps(
+            payload,
+            ensure_ascii=True,
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    ).encode("utf-8")
+
+
+def _safe_branch(value: str) -> str:
+    if (
+        not _BRANCH_RE.fullmatch(value)
+        or ".." in value
+        or "//" in value
+        or value.startswith(("/", "."))
+        or value.endswith(("/", ".", ".lock"))
+    ):
+        raise StageError("BRANCH contains unsupported characters.")
+    return value
+
+
+def _path_from_env(name: str, default: str | None = None) -> Path:
+    raw = os.environ.get(name, default or "")
+    if not raw:
+        raise StageError(f"{name} is required.")
+    path = Path(raw)
+    if not path.is_absolute():
+        raise StageError(f"{name} must be an absolute path.")
+    return path
+
+
+def _ensure_real_directory(path: Path, *, label: str) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise StageError(f"{label} is unavailable.") from exc
+    if not stat.S_ISDIR(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise StageError(f"{label} must be a real directory.")
+
+
+def _ensure_release_root(path: Path, *, expected_uid: int) -> None:
+    _ensure_real_directory(path, label="Release root")
+    metadata = path.lstat()
+    if metadata.st_uid != expected_uid or stat.S_IMODE(metadata.st_mode) & 0o022:
+        raise StageError("Release root ownership or mode is unsafe.")
+
+
+def _ensure_regular_file(path: Path) -> None:
+    try:
+        metadata = path.lstat()
+    except OSError as exc:
+        raise StageError("Action manifest is unavailable.") from exc
+    if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
+        raise StageError("Action manifest must be a regular file.")
+    if metadata.st_size > 65_536:
+        raise StageError("Action manifest is too large.")
+
+
+def _canonical_action_manifest(manifest: DeploymentManifest) -> dict[str, Any]:
+    return {
+        "action": manifest.action.value,
+        "authority_changed": manifest.authority_changed,
+        "components": [component.value for component in manifest.components],
+        "exchange_write_semantics_changed": (
+            manifest.exchange_write_semantics_changed
+        ),
+        "production_data_mutation": manifest.production_data_mutation,
+        "requires_restart": manifest.requires_restart,
+        "risk_level": manifest.risk_level.value,
+        "schema_changed": manifest.schema_changed,
+    }
+
+
+def _action_plan_payload(plan: ActionPlan) -> dict[str, Any]:
+    return {
+        "action": plan.action.value,
+        "components": [component.value for component in plan.components],
+        "gates": [
+            {
+                "disposition": gate.disposition.value,
+                "id": gate.gate_id,
+                "reason": gate.reason,
+            }
+            for gate in plan.gates
+        ],
+        "risk_level": plan.risk_level.value,
+        "schema_version": 1,
+    }
+
+
+def _read_action_manifest(path: Path) -> tuple[dict[str, Any], str]:
+    _ensure_regular_file(path)
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StageError("Action manifest is invalid.") from exc
+    if not isinstance(raw, dict):
+        raise StageError("Action manifest root must be an object.")
+    try:
+        manifest = parse_manifest(raw)
+    except ManifestValidationError as exc:
+        raise StageError("Action manifest is invalid.") from exc
+    if manifest.action is not DeploymentAction.STAGE:
+        raise StageError("Action manifest must declare stage.")
+    plan = build_action_plan(manifest)
+    canonical = _canonical_action_manifest(manifest)
+    plan_sha256 = hashlib.sha256(
+        _canonical_json_bytes(_action_plan_payload(plan))
+    ).hexdigest()
+    return canonical, plan_sha256
+
+
+def _run_git(arguments: list[str], *, timeout: int = 120) -> str:
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env=environment,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StageError("Git operation failed.") from exc
+    if result.returncode != 0:
+        raise StageError("Git operation failed.")
+    return result.stdout.strip()
+
+
+def _run_git_to_file(arguments: list[str], output: Path) -> None:
+    environment = os.environ.copy()
+    environment["GIT_TERMINAL_PROMPT"] = "0"
+    try:
+        with output.open("xb") as stream:
+            result = subprocess.run(
+                ["git", *arguments],
+                check=False,
+                stdout=stream,
+                stderr=subprocess.DEVNULL,
+                env=environment,
+                timeout=120,
+            )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StageError("Git archive failed.") from exc
+    if result.returncode != 0:
+        raise StageError("Git archive failed.")
+
+
+def _validate_archive_member(member: tarfile.TarInfo) -> None:
+    path = PurePosixPath(member.name)
+    if (
+        path.is_absolute()
+        or ".." in path.parts
+        or not member.name
+        or not (member.isdir() or member.isreg())
+        or path.as_posix() in {RELEASE_MANIFEST, STAGE_RECEIPT}
+    ):
+        raise StageError("Candidate archive contains an unsafe entry.")
+
+
+def _extract_archive(archive: Path, destination: Path) -> None:
+    try:
+        with tarfile.open(archive, mode="r:") as source:
+            members = source.getmembers()
+            for member in members:
+                _validate_archive_member(member)
+            source.extractall(destination, members=members, filter="data")
+    except (OSError, tarfile.TarError) as exc:
+        raise StageError("Candidate archive extraction failed.") from exc
+
+
+def _content_digest(root: Path) -> str:
+    digest = hashlib.sha256()
+    try:
+        paths = sorted(root.rglob("*"), key=lambda path: path.relative_to(root).as_posix())
+        for path in paths:
+            relative = path.relative_to(root).as_posix()
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise StageError("Release contains a symbolic link.")
+            if stat.S_ISDIR(metadata.st_mode):
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StageError("Release contains a special file.")
+            if relative in {RELEASE_MANIFEST, STAGE_RECEIPT}:
+                continue
+            relative_bytes = relative.encode("utf-8")
+            digest.update(len(relative_bytes).to_bytes(8, "big"))
+            digest.update(relative_bytes)
+            digest.update(b"x" if metadata.st_mode & 0o111 else b"-")
+            digest.update(metadata.st_size.to_bytes(8, "big"))
+            with path.open("rb") as stream:
+                while chunk := stream.read(1024 * 1024):
+                    digest.update(chunk)
+    except (OSError, UnicodeError) as exc:
+        raise StageError("Release content could not be hashed.") from exc
+    return digest.hexdigest()
+
+
+def _write_exclusive(path: Path, payload: dict[str, Any]) -> bytes:
+    encoded = _canonical_json_bytes(payload)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(encoded)
+            stream.flush()
+            os.fsync(stream.fileno())
+    except OSError as exc:
+        raise StageError("Release metadata could not be written.") from exc
+    return encoded
+
+
+def _freeze_release(root: Path) -> None:
+    try:
+        paths = sorted(
+            root.rglob("*"),
+            key=lambda path: len(path.relative_to(root).parts),
+            reverse=True,
+        )
+        for path in paths:
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise StageError("Release contains a symbolic link.")
+            if stat.S_ISDIR(metadata.st_mode):
+                path.chmod(0o555)
+            elif stat.S_ISREG(metadata.st_mode):
+                path.chmod(0o555 if metadata.st_mode & 0o111 else 0o444)
+            else:
+                raise StageError("Release contains a special file.")
+        root.chmod(0o555)
+    except OSError as exc:
+        raise StageError("Release could not be made immutable.") from exc
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _sync_release(root: Path) -> None:
+    try:
+        directories = [root]
+        for path in root.rglob("*"):
+            metadata = path.lstat()
+            if stat.S_ISLNK(metadata.st_mode):
+                raise StageError("Release contains a symbolic link.")
+            if stat.S_ISDIR(metadata.st_mode):
+                directories.append(path)
+                continue
+            if not stat.S_ISREG(metadata.st_mode):
+                raise StageError("Release contains a special file.")
+            flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(path, flags)
+            try:
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+        for directory in sorted(
+            directories,
+            key=lambda item: len(item.relative_to(root).parts),
+            reverse=True,
+        ):
+            _fsync_directory(directory)
+    except OSError as exc:
+        raise StageError("Release durability sync failed.") from exc
+
+
+def _load_metadata(
+    path: Path,
+    expected_keys: set[str],
+    expected_uid: int,
+) -> tuple[dict[str, Any], bytes]:
+    try:
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or stat.S_ISLNK(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o444
+            or metadata.st_size > 65_536
+        ):
+            raise StageError("Release metadata is unsafe.")
+        encoded = path.read_bytes()
+        payload = json.loads(encoded.decode("utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StageError("Release metadata is invalid.") from exc
+    if not isinstance(payload, dict) or set(payload) != expected_keys:
+        raise StageError("Release metadata shape is invalid.")
+    if encoded != _canonical_json_bytes(payload):
+        raise StageError("Release metadata is not canonical.")
+    return payload, encoded
+
+
+def _validate_release(
+    root: Path,
+    *,
+    commit: str,
+    branch: str,
+    action_manifest: dict[str, Any],
+    action_plan_sha256: str,
+    expected_uid: int,
+) -> dict[str, Any]:
+    try:
+        root_metadata = root.lstat()
+    except OSError as exc:
+        raise StageError("Release validation failed.") from exc
+    if (
+        not stat.S_ISDIR(root_metadata.st_mode)
+        or stat.S_ISLNK(root_metadata.st_mode)
+        or root_metadata.st_uid != expected_uid
+        or stat.S_IMODE(root_metadata.st_mode) != 0o555
+    ):
+        raise StageError("Release validation failed.")
+
+    try:
+        for path in root.rglob("*"):
+            metadata = path.lstat()
+            if metadata.st_uid != expected_uid or stat.S_ISLNK(metadata.st_mode):
+                raise StageError("Release validation failed.")
+            mode = stat.S_IMODE(metadata.st_mode)
+            if stat.S_ISDIR(metadata.st_mode) and mode != 0o555:
+                raise StageError("Release validation failed.")
+            if stat.S_ISREG(metadata.st_mode) and mode not in {0o444, 0o555}:
+                raise StageError("Release validation failed.")
+            if not (stat.S_ISDIR(metadata.st_mode) or stat.S_ISREG(metadata.st_mode)):
+                raise StageError("Release validation failed.")
+
+        manifest, manifest_bytes = _load_metadata(
+            root / RELEASE_MANIFEST,
+            _MANIFEST_KEYS,
+            expected_uid,
+        )
+        receipt, _ = _load_metadata(
+            root / STAGE_RECEIPT,
+            _RECEIPT_KEYS,
+            expected_uid,
+        )
+        content_sha256 = _content_digest(root)
+    except StageError as exc:
+        raise StageError("Release validation failed.") from exc
+
+    if (
+        manifest["contract"] != CONTRACT
+        or manifest["schema_version"] != 1
+        or manifest["commit"] != commit
+        or manifest["branch"] != branch
+        or manifest["action_manifest"] != action_manifest
+        or manifest["action_plan_sha256"] != action_plan_sha256
+        or not isinstance(manifest["tree"], str)
+        or not _SHA1_RE.fullmatch(manifest["tree"])
+        or manifest["content_sha256"] != content_sha256
+        or not _SHA256_RE.fullmatch(content_sha256)
+    ):
+        raise StageError("Release validation failed.")
+
+    manifest_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
+    if (
+        receipt["contract"] != CONTRACT
+        or receipt["schema_version"] != 1
+        or receipt["status"] != "staged"
+        or receipt["commit"] != commit
+        or receipt["branch"] != branch
+        or receipt["tree"] != manifest["tree"]
+        or receipt["content_sha256"] != content_sha256
+        or receipt["action_plan_sha256"] != action_plan_sha256
+        or receipt["manifest_sha256"] != manifest_sha256
+        or receipt["release_name"] != commit
+    ):
+        raise StageError("Release validation failed.")
+    return receipt
+
+
+def _publish_no_replace(source: Path, destination: Path, *, test_mode: bool) -> None:
+    if os.path.lexists(destination):
+        raise StageError("Release destination already exists.")
+    if test_mode:
+        try:
+            # Darwin refuses to rename a read-only directory owned by the caller.
+            # Test mode relaxes only the directory entry during the rename; the
+            # published tree is restored before it can be validated or returned.
+            source.chmod(0o755)
+            os.rename(source, destination)
+            destination.chmod(0o555)
+        except OSError as exc:
+            raise StageError(
+                f"Atomic release publication failed (errno {exc.errno})."
+            ) from exc
+        return
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    renameat2 = getattr(libc, "renameat2", None)
+    if renameat2 is None:
+        raise StageError("Atomic no-replace publication is unavailable.")
+    renameat2.argtypes = [
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_int,
+        ctypes.c_char_p,
+        ctypes.c_uint,
+    ]
+    renameat2.restype = ctypes.c_int
+    result = renameat2(
+        AT_FDCWD,
+        os.fsencode(source),
+        AT_FDCWD,
+        os.fsencode(destination),
+        RENAME_NOREPLACE,
+    )
+    if result != 0:
+        error = ctypes.get_errno()
+        if error == errno.EEXIST:
+            raise StageError("Release destination already exists.")
+        raise StageError("Atomic release publication failed.")
+
+
+def _open_lock(path: Path, *, expected_uid: int) -> int:
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(path, flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            raise StageError("Stage lock ownership or mode is unsafe.")
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except (OSError, BlockingIOError) as exc:
+        raise StageError("Another stage operation is already running.") from exc
+    return descriptor
+
+
+def _cleanup_temp(path: Path | None) -> None:
+    if path is None or not path.exists():
+        return
+    try:
+        for child in sorted(
+            path.rglob("*"),
+            key=lambda item: len(item.relative_to(path).parts),
+            reverse=True,
+        ):
+            if child.is_symlink():
+                continue
+            if child.is_dir():
+                child.chmod(0o700)
+            else:
+                child.chmod(0o600)
+        path.chmod(0o700)
+        shutil.rmtree(path)
+    except OSError:
+        pass
+
+
+def _stage() -> dict[str, Any]:
+    expected_commit = _required_env("EXPECTED_COMMIT").lower()
+    if not _SHA1_RE.fullmatch(expected_commit):
+        raise StageError("EXPECTED_COMMIT must be a full lowercase hexadecimal SHA.")
+    branch = _safe_branch(os.environ.get("BRANCH", "codex/deepcoin-auto-trading-v1"))
+    source_repo = _path_from_env("SOURCE_REPO", "/opt/telegram-kol-analyzer")
+    release_root = _path_from_env("RELEASE_ROOT", "/opt/telegram-kol-releases")
+    action_manifest_path = _path_from_env("ACTION_MANIFEST")
+    lock_path = _path_from_env("STAGER_LOCK_PATH", "/run/telegram-kol-stage.lock")
+    test_mode_raw = os.environ.get("STAGER_TEST_MODE", "0")
+    if test_mode_raw not in {"0", "1"}:
+        raise StageError("STAGER_TEST_MODE must be 0 or 1.")
+    test_mode = test_mode_raw == "1"
+    expected_uid = os.geteuid()
+    if not test_mode and expected_uid != 0:
+        raise StageError("Stage command must run as root.")
+
+    _ensure_real_directory(source_repo, label="Source repository")
+    _ensure_release_root(release_root, expected_uid=expected_uid)
+    action_manifest, action_plan_sha256 = _read_action_manifest(action_manifest_path)
+    release_path = release_root / expected_commit
+    lock_descriptor = _open_lock(lock_path, expected_uid=expected_uid)
+    temporary: Path | None = None
+    try:
+        if os.path.lexists(release_path):
+            try:
+                receipt = _validate_release(
+                    release_path,
+                    commit=expected_commit,
+                    branch=branch,
+                    action_manifest=action_manifest,
+                    action_plan_sha256=action_plan_sha256,
+                    expected_uid=expected_uid,
+                )
+            except StageError as exc:
+                raise StageError("Release validation failed.") from exc
+            return {**receipt, "status": "already_staged"}
+
+        remote_url = _run_git(
+            ["-C", str(source_repo), "remote", "get-url", "origin"],
+            timeout=15,
+        )
+        if not remote_url or any(ord(character) < 32 for character in remote_url):
+            raise StageError("Origin remote is invalid.")
+        if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://[^/]*@", remote_url):
+            raise StageError("Origin remote must not contain credentials.")
+
+        temporary = Path(
+            tempfile.mkdtemp(
+                prefix=f".telegram-kol-stage.{expected_commit}.",
+                dir=release_root,
+            )
+        )
+        repository = temporary / "repository.git"
+        archive = temporary / "candidate.tar"
+        artifact = temporary / "release"
+        artifact.mkdir(mode=0o700)
+        _run_git(["init", "--bare", str(repository)], timeout=15)
+        _run_git(
+            ["-C", str(repository), "remote", "add", "origin", remote_url],
+            timeout=15,
+        )
+        _run_git(
+            [
+                "-C",
+                str(repository),
+                "fetch",
+                "--depth=1",
+                "--no-tags",
+                "origin",
+                f"refs/heads/{branch}:refs/heads/candidate",
+            ]
+        )
+        remote_head = _run_git(
+            ["-C", str(repository), "rev-parse", "refs/heads/candidate"],
+            timeout=15,
+        )
+        if remote_head != expected_commit:
+            raise StageError("Remote branch head does not match EXPECTED_COMMIT.")
+        tree = _run_git(
+            ["-C", str(repository), "rev-parse", f"{expected_commit}^{{tree}}"],
+            timeout=15,
+        )
+        if not _SHA1_RE.fullmatch(tree):
+            raise StageError("Candidate tree identity is invalid.")
+        _run_git_to_file(
+            [
+                "-C",
+                str(repository),
+                "archive",
+                "--format=tar",
+                expected_commit,
+            ],
+            archive,
+        )
+        _extract_archive(archive, artifact)
+        content_sha256 = _content_digest(artifact)
+        manifest = {
+            "action_manifest": action_manifest,
+            "action_plan_sha256": action_plan_sha256,
+            "branch": branch,
+            "commit": expected_commit,
+            "content_sha256": content_sha256,
+            "contract": CONTRACT,
+            "schema_version": 1,
+            "tree": tree,
+        }
+        manifest_bytes = _write_exclusive(artifact / RELEASE_MANIFEST, manifest)
+        receipt = {
+            "action_plan_sha256": action_plan_sha256,
+            "branch": branch,
+            "commit": expected_commit,
+            "content_sha256": content_sha256,
+            "contract": CONTRACT,
+            "manifest_sha256": hashlib.sha256(manifest_bytes).hexdigest(),
+            "release_name": expected_commit,
+            "schema_version": 1,
+            "status": "staged",
+            "tree": tree,
+        }
+        _write_exclusive(artifact / STAGE_RECEIPT, receipt)
+        _freeze_release(artifact)
+        _sync_release(artifact)
+        _validate_release(
+            artifact,
+            commit=expected_commit,
+            branch=branch,
+            action_manifest=action_manifest,
+            action_plan_sha256=action_plan_sha256,
+            expected_uid=expected_uid,
+        )
+        _publish_no_replace(artifact, release_path, test_mode=test_mode)
+        _fsync_directory(release_root)
+        return _validate_release(
+            release_path,
+            commit=expected_commit,
+            branch=branch,
+            action_manifest=action_manifest,
+            action_plan_sha256=action_plan_sha256,
+            expected_uid=expected_uid,
+        )
+    finally:
+        _cleanup_temp(temporary)
+        os.close(lock_descriptor)
+
+
+def main() -> int:
+    try:
+        receipt = _stage()
+    except StageError as exc:
+        sys.stderr.write(f"{exc}\n")
+        return 4
+    except Exception:
+        sys.stderr.write("Stage operation failed.\n")
+        return 4
+    sys.stdout.buffer.write(_canonical_json_bytes(receipt))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

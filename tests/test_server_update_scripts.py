@@ -42,6 +42,62 @@ def test_update_scripts_are_syntax_valid():
         ["bash", "-n", str(ROOT / "scripts/bootstrap_server_updater.sh")],
         check=True,
     )
+    subprocess.run(
+        [
+            "python3",
+            "-m",
+            "py_compile",
+            str(ROOT / "deploy/telegram-kol-stage"),
+        ],
+        check=True,
+    )
+
+
+def test_stage_only_command_has_no_live_runtime_or_trading_dependencies():
+    stage = (ROOT / "deploy/telegram-kol-stage").read_text(encoding="utf-8")
+
+    for forbidden in (
+        "systemctl",
+        "DATABASE_PATH",
+        "research.db",
+        "sqlite3",
+        "api.deepcoin.com",
+        "DC-ACCESS-",
+        "deepcoin_client",
+        "auto_trade",
+        "requests",
+        "httpx",
+    ):
+        assert forbidden not in stage
+    assert "DeploymentAction.STAGE" in stage
+    assert "remote" in stage
+    assert "get-url" in stage
+    assert "renameat2" in stage
+    assert "RENAME_NOREPLACE" in stage
+    assert ".telegram-kol-release.json" in stage
+    assert ".telegram-kol-stage-receipt.json" in stage
+    sync_release = stage.index("_sync_release(artifact)")
+    publish = stage.index("_publish_no_replace(artifact", sync_release)
+    sync_root = stage.index("_fsync_directory(release_root)", publish)
+    assert sync_release < publish < sync_root
+
+
+def test_stage_only_policy_documents_inputs_outputs_and_non_authority():
+    policy = (ROOT / "docs/deployment-action-gates.md").read_text(encoding="utf-8")
+
+    assert "## Immutable stage-only command" in policy
+    for required in (
+        "`EXPECTED_COMMIT`",
+        "`ACTION_MANIFEST`",
+        "`SOURCE_REPO`",
+        "`RELEASE_ROOT`",
+        "`.telegram-kol-release.json`",
+        "`.telegram-kol-stage-receipt.json`",
+        "does not authorize activation",
+        "does not inspect the production database",
+        "does not control any service",
+    ):
+        assert required in policy
 
 
 def test_embedded_python_helpers_are_syntax_valid():

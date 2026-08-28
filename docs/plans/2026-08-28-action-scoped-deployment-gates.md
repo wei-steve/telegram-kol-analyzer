@@ -147,7 +147,7 @@ Expected: PASS, including documentation assertions for all five action names and
 
 The command must materialize an exact-SHA immutable release directory, validate its manifest, and write a non-secret receipt. It must have no code path to systemd, the production database, settings, Telegram, or Deepcoin. Re-running the same SHA is idempotent; a content mismatch is fail-closed.
 
-Do not begin this task until Batch 1 is reviewed.
+Implemented locally after Batch 1 review. The stage receipt is stored inside the same atomically published read-only release directory and binds the exact commit, Git tree, normalized content digest, branch, canonical stage action manifest, and action-plan digest. The active source checkout is used only to read its origin URL; fetch and archive operations occur in an isolated temporary bare repository.
 
 ## Batch 3 — Scoped activation
 
