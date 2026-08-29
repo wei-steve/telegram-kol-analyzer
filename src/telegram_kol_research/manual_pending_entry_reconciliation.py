@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import sqlite3
 import stat
+import time
 from typing import Callable, Iterable
 
 from sqlalchemy import text
@@ -50,6 +51,7 @@ _GOVERNED_INSTRUMENTS = (
     "ETH-USDT-SWAP",
     "SOL-USDT-SWAP",
 )
+_EXACT_PRIVATE_READ_INTERVAL_SECONDS = 0.41
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +72,33 @@ class ManualPendingEntryReconciliationResult:
     backup_path: Path
 
 
+class _MaintenanceExactReadPacer:
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float],
+        sleep: Callable[[float], None],
+        interval_seconds: float = _EXACT_PRIVATE_READ_INTERVAL_SECONDS,
+    ) -> None:
+        self._monotonic = monotonic
+        self._sleep = sleep
+        self._interval_seconds = interval_seconds
+        self._last_started_at: dict[str, float] = {}
+
+    def wait(self, endpoint: str) -> None:
+        now = self._monotonic()
+        previous = self._last_started_at.get(endpoint)
+        remaining = (
+            self._interval_seconds
+            if previous is None
+            else self._interval_seconds - (now - previous)
+        )
+        if remaining > 0:
+            self._sleep(remaining)
+            now = self._monotonic()
+        self._last_started_at[endpoint] = now
+
+
 def build_manual_pending_entry_reconciliation_plan(
     session_factory,
     *,
@@ -78,6 +107,8 @@ def build_manual_pending_entry_reconciliation_plan(
     runtime_guard: Callable[[], None] | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
+    read_monotonic: Callable[[], float] | None = None,
+    read_sleep: Callable[[float], None] | None = None,
 ) -> ManualPendingEntryReconciliationPlan:
     """Prove all exchange entries are gone and local targets are exact."""
 
@@ -113,12 +144,21 @@ def build_manual_pending_entry_reconciliation_plan(
         return _blocked("regular_order_present", order_ids, evidence.fingerprint)
     if evidence.pending_triggers:
         return _blocked("pending_trigger_present", order_ids, evidence.fingerprint)
-    exact_fill_reason = _exact_target_fill_risk_reason(deepcoin_client, reviewed)
+    pacer = _MaintenanceExactReadPacer(
+        monotonic=read_monotonic or time.monotonic,
+        sleep=read_sleep or time.sleep,
+    )
+    exact_fill_reason = _exact_target_fill_risk_reason(
+        deepcoin_client,
+        reviewed,
+        pacer=pacer,
+    )
     if exact_fill_reason is not None:
         return _blocked(exact_fill_reason, order_ids, evidence.fingerprint)
     exact_history_reason, exact_history_payload = _exact_target_history_evidence(
         deepcoin_client,
         reviewed,
+        pacer=pacer,
     )
     if exact_history_reason is not None:
         return _blocked(exact_history_reason, order_ids, evidence.fingerprint)
@@ -267,12 +307,15 @@ def _history_row_has_execution_risk(row: dict[str, object]) -> bool:
 def _exact_target_fill_risk_reason(
     deepcoin_client,
     reviewed: tuple[ReviewedPendingEntryTarget, ...],
+    *,
+    pacer: _MaintenanceExactReadPacer,
 ) -> str | None:
     reader = getattr(deepcoin_client, "list_trade_fills_by_order_id", None)
     if not callable(reader):
         return "target_fill_query_incomplete"
     for target in reviewed:
         try:
+            pacer.wait("fills")
             rows = reader(
                 inst_id=target.instrument_id,
                 order_id=target.order_id,
@@ -301,6 +344,8 @@ def _exact_target_fill_risk_reason(
 def _exact_target_history_evidence(
     deepcoin_client,
     reviewed: tuple[ReviewedPendingEntryTarget, ...],
+    *,
+    pacer: _MaintenanceExactReadPacer,
 ) -> tuple[str | None, list[dict[str, object]]]:
     reader = getattr(
         deepcoin_client,
@@ -312,6 +357,7 @@ def _exact_target_history_evidence(
     evidence: list[dict[str, object]] = []
     for target in reviewed:
         try:
+            pacer.wait("trigger_history")
             rows = reader(
                 inst_id=target.instrument_id,
                 order_id=target.order_id,
@@ -362,6 +408,8 @@ def apply_manual_pending_entry_reconciliation(
     runtime_guard: Callable[[], None] | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
+    read_monotonic: Callable[[], float] | None = None,
+    read_sleep: Callable[[float], None] | None = None,
 ) -> ManualPendingEntryReconciliationResult:
     """Back up SQLite and terminalize all reviewed targets in one transaction."""
 
@@ -373,6 +421,8 @@ def apply_manual_pending_entry_reconciliation(
         runtime_guard=runtime_guard,
         now=now,
         clock=clock,
+        read_monotonic=read_monotonic,
+        read_sleep=read_sleep,
     )
     if fresh.status != "ready" or fresh.fingerprint != expected_fingerprint:
         raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")

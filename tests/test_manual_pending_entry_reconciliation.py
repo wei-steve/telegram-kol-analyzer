@@ -24,6 +24,13 @@ from telegram_kol_research.models import (
 NOW = datetime(2026, 8, 28, 18, 0, tzinfo=UTC)
 
 
+@pytest.fixture(autouse=True)
+def _avoid_real_maintenance_read_sleep(monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    monkeypatch.setattr(reconciliation.time, "sleep", lambda _seconds: None)
+
+
 def _sha(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
@@ -2324,7 +2331,8 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
     backup_path = tmp_path / "backup.db"
     session_factory = create_session_factory(database_path)
     targets = _seed_all_canonical_targets(session_factory)
-    client = ReadOnlyClient()
+    clock = MaintenanceReadClock()
+    client = TimedReadOnlyClient(clock)
     for target in targets:
         _record_cancelled_history(client, target)
     plan = build_manual_pending_entry_reconciliation_plan(
@@ -2333,6 +2341,8 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
         targets=targets,
         runtime_guard=RuntimeGuard(),
         now=NOW,
+        read_monotonic=clock,
+        read_sleep=clock.sleep,
     )
     expected_exact_calls = [
         (target.instrument_id, target.order_id) for target in targets
@@ -2350,6 +2360,8 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
         expected_fingerprint=plan.fingerprint,
         runtime_guard=guard,
         now=NOW,
+        read_monotonic=clock,
+        read_sleep=clock.sleep,
     )
 
     assert result.status == "completed"
@@ -2358,6 +2370,7 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
     assert guard.calls == 3
     assert client.exact_history_calls == expected_exact_calls * 2
     assert client.exact_fill_calls == expected_exact_calls * 2
+    assert clock.sleeps == pytest.approx([0.41] * 28)
     with session_factory() as session:
         assert {
             session.get(ExecutionOrderLeg, target.execution_order_leg_id).status
