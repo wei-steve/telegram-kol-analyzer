@@ -51,6 +51,10 @@ from telegram_kol_research.production_safety_monitor import build_monitor_incide
 from telegram_kol_research.production_safety_monitor import send_monitor_incident_capture
 from telegram_kol_research.production_safety_monitor import send_monitor_test_notification
 from telegram_kol_research.production_safety_monitor import should_run_daily_audit
+from telegram_kol_research.scoped_release_activation import (
+    ReleaseEvidence,
+    render_release_dropin,
+)
 from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -89,6 +93,7 @@ EXPECTATIONS = MonitorExpectations(
 def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
     return {
         "runtime_role": role,
+        "loaded_artifact_verified": True,
         "release_commit": commit,
         "manifest_sha256": "a" * 64,
         "pid": 200 + ("web", "ingest", "worker", "monitor").index(role),
@@ -98,7 +103,11 @@ def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
         + ("web", "ingest", "worker", "monitor").index(role),
         "systemd_start_ticks": 1000
         + ("web", "ingest", "worker", "monitor").index(role),
-        "loaded_cwd": "/opt/telegram-kol-analyzer",
+        "loaded_cwd": (
+            "/var/lib/telegram-kol-monitor"
+            if role == "monitor"
+            else "/opt/telegram-kol-analyzer"
+        ),
         "command_role": role,
         "observed_at": datetime(2026, 8, 28, 12, 0, tzinfo=UTC).isoformat(),
         "entry_admission_frozen": role == "monitor" or True,
@@ -188,6 +197,91 @@ def test_release_scope_rejects_mixed_release_or_disabled_capabilities():
     assert "runtime_capability_unproven" in disabled.reason_codes
 
 
+def test_release_scope_rejects_unverified_loaded_code_wrong_cwd_or_shared_pid():
+    roles = {
+        role: _release_identity(role)
+        for role in ("web", "ingest", "worker", "monitor")
+    }
+    roles["worker"]["loaded_artifact_verified"] = False
+    roles["monitor"]["loaded_cwd"] = "/opt/telegram-kol-analyzer"
+    for key in (
+        "pid",
+        "process_start_ticks",
+        "systemd_main_pid",
+        "systemd_start_ticks",
+    ):
+        roles["ingest"][key] = roles["web"][key]
+
+    result = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert "runtime_identity_unproven" in result.reason_codes
+
+
+def test_release_unit_scope_includes_exact_activation_dropins(tmp_path):
+    release_path = tmp_path / "release"
+    release_units = release_path / "deploy/systemd"
+    installed_units = tmp_path / "installed"
+    release_units.mkdir(parents=True)
+    installed_units.mkdir()
+    component_units = {
+        "web": ("telegram-kol-web.service",),
+        "ingest": ("telegram-kol-ingest.service",),
+        "worker": ("telegram-kol-worker.service",),
+        "monitor": (
+            "telegram-kol-monitor.service",
+            "telegram-kol-monitor-diagnostic.service",
+            "telegram-kol-monitor-test-notification.service",
+        ),
+    }
+    for unit in (
+        *(unit for units in component_units.values() for unit in units),
+        "telegram-kol-monitor.timer",
+    ):
+        (release_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
+        (installed_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
+    release = ReleaseEvidence(
+        commit=REVIEWED_HEAD,
+        manifest_sha256="a" * 64,
+        content_sha256="b" * 64,
+        action_manifest={
+            "components": ["web", "ingest", "worker", "monitor"]
+        },
+        release_path=release_path,
+    )
+    for component, units in component_units.items():
+        expected = render_release_dropin(
+            release,
+            component=component,
+            entry_frozen=True,
+        )
+        for unit in units:
+            dropin = installed_units / f"{unit}.d/10-telegram-kol-release.conf"
+            dropin.parent.mkdir()
+            dropin.write_text(expected, encoding="utf-8")
+    adapters = ProductionSafetyAdapters(
+        database_path=tmp_path / "unused.db",
+        systemd_unit_root=installed_units,
+    )
+
+    assert adapters._release_unit_hashes_valid(release) is True
+    drifted = (
+        installed_units
+        / "telegram-kol-worker.service.d/10-telegram-kol-release.conf"
+    )
+    drifted.write_text("[Service]\n", encoding="utf-8")
+    assert adapters._release_unit_hashes_valid(release) is False
+
+
 def _clear_monitor_bot_environment(monkeypatch):
     for name in (
         "TELEGRAM_KOL_SYSTEM_BOT_TOKEN",
@@ -258,7 +352,10 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
     monkeypatch.setattr(
         cli_module,
         "ProductionSafetyAdapters",
-        lambda **kwargs: _RecordingAdapters(),
+        lambda **kwargs: _RecordingAdapters(
+            head="a" * 40,
+            manifest_sha256="b" * 64,
+        ),
     )
 
     assert get_type_hints(cli_module.monitor_production_safety)["state_path"] is str
@@ -266,8 +363,12 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
         app,
         [
             "monitor-production-safety",
-            "--expected-head",
+            "--expected-release-commit",
             "a" * 40,
+            "--expected-release-manifest-sha256",
+            "b" * 64,
+            "--release-path",
+            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -314,8 +415,12 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
         app,
         [
             "monitor-production-safety",
-            "--expected-head",
+            "--expected-release-commit",
             "a" * 40,
+            "--expected-release-manifest-sha256",
+            "b" * 64,
+            "--release-path",
+            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -3486,11 +3591,19 @@ def test_failed_recovery_delivery_preserves_active_cause_and_retries(tmp_path):
 
 
 class _RecordingAdapters:
-    def __init__(self, *, service_state="active", audit=None, head=REVIEWED_HEAD):
+    def __init__(
+        self,
+        *,
+        service_state="active",
+        audit=None,
+        head=REVIEWED_HEAD,
+        manifest_sha256="a" * 64,
+    ):
         self.calls = []
         self.service_state = service_state
         self.audit = audit or _healthy_audit()
         self.head = head
+        self.manifest_sha256 = manifest_sha256
 
     def read_service_state(self):
         self.calls.append("service")
@@ -3499,6 +3612,24 @@ class _RecordingAdapters:
     def read_git_head(self):
         self.calls.append("head")
         return self.head
+
+    def read_runtime_release_scope(self):
+        self.calls.append("release")
+        roles = {
+            role: _release_identity(role, commit=self.head)
+            for role in ("web", "ingest", "worker", "monitor")
+        }
+        for identity in roles.values():
+            identity["observed_at"] = (
+                datetime.now(UTC) - timedelta(seconds=1)
+            ).isoformat()
+            identity["manifest_sha256"] = self.manifest_sha256
+        return {
+            "commit": self.head,
+            "manifest_sha256": self.manifest_sha256,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        }
 
     def read_settings(self):
         self.calls.append("settings")

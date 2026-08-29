@@ -136,6 +136,53 @@ class EntryRevisionBootstrapAuthorityAdapter:
                 result.reason_code or "bootstrap_authority_block_unknown"
             )
 
+    def no_exchange_write_round_trip(
+        self,
+        plan: Any,
+        *,
+        expected_generation: int,
+    ) -> int:
+        acquired_at = _observed_now(self.clock)
+        acquisition = acquire_entry_revision_exchange_authority(
+            self.session_factory,
+            owner_kind="authority_self_test",
+            owner_id=f"bootstrap-self-test:{plan.action_id}",
+            acquired_at=acquired_at,
+            require_cancel_quiescence=False,
+            expected_generation=int(expected_generation),
+            action_id=str(plan.action_id),
+            plan_sha256=str(plan.fingerprint),
+            evidence_sha256=str(plan.evidence_sha256),
+        )
+        if not acquisition.acquired or not acquisition.token:
+            raise MaintenanceBlocked(
+                acquisition.reason_code or "authority_self_test_acquire_unknown"
+            )
+        generation = int(acquisition.generation or -1)
+        released_at = _observed_now(self.clock)
+        released = release_entry_revision_exchange_authority(
+            self.session_factory,
+            token=acquisition.token,
+            owner_kind="authority_self_test",
+            expected_generation=generation,
+            released_at=released_at,
+        )
+        if released.released:
+            return generation
+        blocked = block_entry_revision_exchange_authority(
+            self.session_factory,
+            token=acquisition.token,
+            owner_kind="authority_self_test",
+            expected_generation=generation,
+            reason_code="authority_self_test_release_unknown",
+            blocked_at=_observed_now(self.clock),
+        )
+        if not blocked.blocked:
+            raise MaintenanceBlocked("authority_self_test_compensation_failed")
+        raise MaintenanceBlocked(
+            released.reason_code or "authority_self_test_release_unknown"
+        )
+
 
 def run_entry_authority_seed(
     *,

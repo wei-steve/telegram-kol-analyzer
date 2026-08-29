@@ -335,3 +335,8 @@ def test_bootstrap_authority_adapter_acquires_and_releases_exact_generation(
         generation=lease.generation,
         released_at=datetime(2026, 8, 28, 0, 2, tzinfo=UTC),
     ) is True
+    adapter.clock = lambda: datetime(2026, 8, 28, 0, 3, tzinfo=UTC)
+    assert adapter.no_exchange_write_round_trip(
+        plan,
+        expected_generation=8,
+    ) == 9

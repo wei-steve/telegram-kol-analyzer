@@ -73,11 +73,33 @@ from telegram_kol_research.runtime_incident_snapshot import (
 from telegram_kol_research.runtime_deployment_identity import (
     build_runtime_deployment_identity,
 )
+from telegram_kol_research.scoped_release_activation import (
+    ReleaseEvidence,
+    render_release_dropin,
+)
 
 
 MAX_ALERT_LENGTH = 1200
 MAX_SAFE_COUNT = 1_000_000_000
 logger = logging.getLogger(__name__)
+
+
+def _monitor_command_matches_role(command: bytes, *, role: str) -> bool:
+    try:
+        parts = tuple(
+            part.decode("utf-8", errors="strict")
+            for part in command.split(b"\0")
+            if part
+        )
+    except UnicodeError:
+        return False
+    if role == "monitor":
+        return "monitor-production-safety" in parts
+    expected = ("web", "--runtime-role", role)
+    return any(
+        parts[index : index + 3] == expected
+        for index in range(len(parts) - 2)
+    )
 
 _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
@@ -488,6 +510,13 @@ def evaluate_runtime_release_scope(
         reasons.add("runtime_identity_unproven")
         roles = {}
     observed_now = _require_aware_datetime(checked_at).astimezone(UTC)
+    expected_cwds = {
+        "web": "/opt/telegram-kol-analyzer",
+        "ingest": "/opt/telegram-kol-analyzer",
+        "worker": "/opt/telegram-kol-analyzer",
+        "monitor": "/var/lib/telegram-kol-monitor",
+    }
+    process_tuples: set[tuple[int, int]] = set()
     for role in expected_roles:
         identity = roles.get(role)
         if not isinstance(identity, Mapping):
@@ -506,17 +535,20 @@ def evaluate_runtime_release_scope(
         except (TypeError, ValueError):
             age = timedelta.max
         cwd = str(identity.get("loaded_cwd") or "")
+        pid = identity.get("pid")
+        ticks = identity.get("process_start_ticks")
         if (
             identity.get("runtime_role") != role
             or identity.get("command_role") != role
-            or not cwd.startswith("/")
-            or type(identity.get("pid")) is not int
-            or identity.get("pid", 0) <= 1
-            or type(identity.get("process_start_ticks")) is not int
-            or identity.get("process_start_ticks", 0) <= 0
-            or identity.get("systemd_main_pid") != identity.get("pid")
+            or identity.get("loaded_artifact_verified") is not True
+            or cwd != expected_cwds[role]
+            or type(pid) is not int
+            or pid <= 1
+            or type(ticks) is not int
+            or ticks <= 0
+            or identity.get("systemd_main_pid") != pid
             or identity.get("systemd_start_ticks")
-            != identity.get("process_start_ticks")
+            != ticks
             or age < timedelta(0)
             or age > timedelta(seconds=10)
             or (
@@ -525,6 +557,10 @@ def evaluate_runtime_release_scope(
             )
         ):
             reasons.add("runtime_identity_unproven")
+        elif (pid, ticks) in process_tuples:
+            reasons.add("runtime_identity_unproven")
+        else:
+            process_tuples.add((pid, ticks))
     worker = roles.get("worker") if isinstance(roles, Mapping) else None
     if isinstance(worker, Mapping):
         capabilities = worker.get("capabilities")
@@ -727,8 +763,19 @@ class ProductionSafetyAdapters:
             or not isinstance(manifest, Mapping)
             or manifest.get("commit") != commit
             or manifest.get("contract") != "immutable-release-v1"
+            or not _SHA256_FINGERPRINT.fullmatch(
+                str(manifest.get("content_sha256") or "")
+            )
+            or not isinstance(manifest.get("action_manifest"), Mapping)
         ):
             raise RuntimeError("runtime_release_contract_invalid")
+        release_evidence = ReleaseEvidence(
+            commit=commit,
+            manifest_sha256=manifest_sha,
+            content_sha256=str(manifest["content_sha256"]),
+            action_manifest=manifest["action_manifest"],
+            release_path=release,
+        )
         urls = {
             "web": self.web_deployment_identity_url,
             "ingest": self.ingest_deployment_identity_url,
@@ -760,7 +807,9 @@ class ProductionSafetyAdapters:
             "commit": commit,
             "manifest_sha256": manifest_sha,
             "roles": roles,
-            "unit_hashes_valid": self._release_unit_hashes_valid(release),
+            "unit_hashes_valid": self._release_unit_hashes_valid(
+                release_evidence
+            ),
         }
 
     def _with_systemd_identity(
@@ -769,14 +818,34 @@ class ProductionSafetyAdapters:
         identity: Mapping[str, Any],
     ) -> Mapping[str, Any]:
         unit = f"telegram-kol-{role}.service"
+        if role == "monitor":
+            unit = os.environ.get(
+                "TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT",
+                "telegram-kol-monitor.service",
+            )
+            if unit not in {
+                "telegram-kol-monitor.service",
+                "telegram-kol-monitor-diagnostic.service",
+                "telegram-kol-monitor-test-notification.service",
+            }:
+                raise RuntimeError("runtime_systemd_identity_unknown")
         completed = _run_bounded_command(
             ("systemctl", "show", unit, "--property=MainPID", "--value"),
             timeout_seconds=5,
         )
+        if completed.returncode != 0:
+            raise RuntimeError("runtime_systemd_identity_unknown")
         try:
             pid = int(completed.output.strip())
             raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
             ticks = int(raw[raw.rindex(")") + 2 :].split()[19])
+            actual_cwd = os.readlink(f"/proc/{pid}/cwd")
+            command = Path(f"/proc/{pid}/cmdline").read_bytes()
+            if (
+                actual_cwd != identity.get("loaded_cwd")
+                or not _monitor_command_matches_role(command, role=role)
+            ):
+                raise RuntimeError("runtime_systemd_identity_unknown")
         except (OSError, ValueError, IndexError) as exc:
             raise RuntimeError("runtime_systemd_identity_unknown") from exc
         enriched = dict(identity)
@@ -784,20 +853,40 @@ class ProductionSafetyAdapters:
         enriched["systemd_start_ticks"] = ticks
         return enriched
 
-    def _release_unit_hashes_valid(self, release: Path) -> bool:
-        units = (
-            "telegram-kol-web.service",
-            "telegram-kol-ingest.service",
-            "telegram-kol-worker.service",
-            "telegram-kol-monitor.service",
-            "telegram-kol-monitor.timer",
-        )
+    def _release_unit_hashes_valid(self, release: ReleaseEvidence) -> bool:
+        component_units = {
+            "web": ("telegram-kol-web.service",),
+            "ingest": ("telegram-kol-ingest.service",),
+            "worker": ("telegram-kol-worker.service",),
+            "monitor": (
+                "telegram-kol-monitor.service",
+                "telegram-kol-monitor-diagnostic.service",
+                "telegram-kol-monitor-test-notification.service",
+            ),
+        }
+        units = tuple(
+            unit for values in component_units.values() for unit in values
+        ) + ("telegram-kol-monitor.timer",)
         try:
-            return all(
-                (release / "deploy/systemd" / unit).read_bytes()
+            base_units_match = all(
+                (release.release_path / "deploy/systemd" / unit).read_bytes()
                 == (self.systemd_unit_root / unit).read_bytes()
                 for unit in units
             )
+            dropins_match = all(
+                (
+                    self.systemd_unit_root
+                    / f"{unit}.d/10-telegram-kol-release.conf"
+                ).read_text(encoding="utf-8")
+                == render_release_dropin(
+                    release,
+                    component=component,
+                    entry_frozen=True,
+                )
+                for component, component_values in component_units.items()
+                for unit in component_values
+            )
+            return base_units_match and dropins_match
         except OSError:
             return False
 

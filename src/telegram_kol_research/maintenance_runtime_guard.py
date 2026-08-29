@@ -22,6 +22,8 @@ MAINTENANCE_UNITS: tuple[str, ...] = (
     "telegram-kol-worker.service",
     "telegram-kol-monitor.timer",
     "telegram-kol-monitor.service",
+    "telegram-kol-monitor-diagnostic.service",
+    "telegram-kol-monitor-test-notification.service",
 )
 _SCHEMA_VERSION = 1
 _ACTION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}$")

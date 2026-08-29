@@ -40,7 +40,7 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
-immutable_control_bootstrap_status: tasks_7_to_9_local_complete_task10_pending
+immutable_control_bootstrap_status: tasks_7_to_9_review_repairs_local_followup_pending
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -509,3 +509,26 @@ phase completes or pauses, record both verified evidence and outstanding work.
   Task 10. No push, production read, seed, order cancellation, activation,
   automatic thaw, SSH, restart, production/database/settings write, Deepcoin
   write, or Telegram replay occurred in this Tasks 7-9 local batch.
+- Independent review rejected initial Tasks 7-9 head `3198fb80` with five
+  Important findings: the bootstrap CLI had no concrete executor, evidence and
+  authority times were stale across boundaries, unknown compensation was not
+  proven, monitor scope omitted exact drop-ins/loaded identity, and ordinary
+  activation did not actually execute the candidate monitor.
+- The local follow-up now wires `bootstrap-control --apply` to the root guard,
+  exact generation-CAS authority adapter, and a concrete systemd runtime
+  adapter. It captures, atomically publishes, verifies, and can restore every
+  governed base unit and activation drop-in. Candidate processes are started
+  entry-frozen while bootstrap authority is held and are persistently
+  re-inhibited while identity and no-write authority self-test proof runs.
+  Compensation failures are explicit blocked terminal states rather than
+  swallowed exceptions.
+- Evidence freshness is rechecked at apply and candidate-start boundaries;
+  release/block/self-test operations use fresh boundary timestamps. Monitor
+  success now requires exact cwd, actual `/proc` command role, loaded artifact,
+  unique PID/start tuples, all governed unit/drop-in bytes, and an actual
+  no-notification diagnostic unit run from the candidate release. The checkout
+  `--expected-head` monitor fallback is removed.
+- The post-repair Tasks 7-9 adjacent regression passed 1084 tests with 1 skip
+  and 2 existing deprecation warnings. Follow-up independent review and Task 10
+  final full-suite/candidate evidence are still pending; this is not an
+  activation-ready or deployment-authorized claim.

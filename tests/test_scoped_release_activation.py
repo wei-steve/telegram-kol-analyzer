@@ -13,6 +13,7 @@ from telegram_kol_research.scoped_release_activation import (
     action_plan_sha256,
     activate_release,
     render_release_dropin,
+    SystemRuntimeAdapter,
 )
 from telegram_kol_research.deployment_action_plan import parse_manifest
 
@@ -48,6 +49,52 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
 
     assert f'TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}' in rendered
     assert 'TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1' in rendered
+
+    monitor = render_release_dropin(
+        release,
+        component="monitor",
+        entry_frozen=True,
+    )
+    assert (
+        "TELEGRAM_KOL_MONITOR_RELEASE_PATH="
+        "/opt/telegram-kol-releases/candidate"
+    ) in monitor
+    assert f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}" in monitor
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" in monitor
+
+
+def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+    calls = []
+
+    def run(command, *, environment=None):
+        calls.append((command, environment))
+        output = ""
+        if command[:3] == ["systemctl", "show", "telegram-kol-monitor-diagnostic.service"]:
+            output = "Result=success\nExecMainStatus=0\n"
+        return type("Result", (), {"stdout": output})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    runtime.verify_monitor_release(release)
+
+    assert any(
+        command == [
+            "systemctl",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]
+        for command, _ in calls
+    )
 
 
 def _content_digest(root: Path) -> str:

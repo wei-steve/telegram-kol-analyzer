@@ -690,7 +690,7 @@ def test_seed_dry_run_rebuilds_the_exact_manifest_issued_plan(monkeypatch):
     assert captured == {"path": manifest.database_path, "now": issued_at}
 
 
-def test_bootstrap_control_apply_fails_closed_until_task7(monkeypatch):
+def test_bootstrap_control_apply_dispatches_exact_plan(monkeypatch):
     from types import SimpleNamespace
     import telegram_kol_research.cli as cli_module
 
@@ -700,6 +700,11 @@ def test_bootstrap_control_apply_fails_closed_until_task7(monkeypatch):
         expires_at=datetime(2026, 8, 28, 13, 10, tzinfo=UTC),
         file_sha256="a" * 64,
         release_manifest_sha256="b" * 64,
+        candidate_release_path=Path("/opt/telegram-kol-releases/" + "c" * 40),
+        rollback_release_path=Path("/opt/telegram-kol-releases/" + "d" * 40),
+        candidate_commit="c" * 40,
+        database_path=Path("/opt/telegram-kol-analyzer/data/research.db"),
+        unit_manifest_sha256="e" * 64,
     )
     monkeypatch.setattr(
         cli_module,
@@ -708,9 +713,76 @@ def test_bootstrap_control_apply_fails_closed_until_task7(monkeypatch):
     )
     monkeypatch.setattr(
         cli_module,
-        "_require_loaded_immutable_maintenance_release",
-        lambda manifest: None,
+        "_validate_explicit_maintenance_release",
+        lambda path, **kwargs: SimpleNamespace(
+            commit=path.name,
+            manifest_sha256=("b" if path == manifest.candidate_release_path else "d") * 64,
+            content_sha256="1" * 64,
+            action_manifest={
+                "components": ["web", "monitor", "ingest", "worker"]
+            },
+            release_path=path,
+        ),
     )
+    monkeypatch.setattr(
+        cli_module, "bootstrap_unit_manifest_sha256", lambda release: "e" * 64
+    )
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(cli_module, "build_deepcoin_client_from_env", lambda: object())
+    monkeypatch.setattr(
+        cli_module,
+        "build_reviewed_pending_entry_cancel_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            conflicts=(),
+            completed_order_ids=tuple(
+                row.order_id for row in cli_module.REVIEWED_PENDING_ENTRY_TARGETS
+            ),
+            expected_generation=7,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module, "build_deepcoin_maintenance_evidence", lambda *args, **kwargs: object()
+    )
+    plan = SimpleNamespace(
+        evidence_sha256="9" * 64,
+        expected_generation=7,
+        fingerprint="f" * 64,
+    )
+    monkeypatch.setattr(
+        cli_module, "build_immutable_control_bootstrap_plan", lambda **kwargs: plan
+    )
+    monkeypatch.setattr(
+        cli_module, "_require_loaded_immutable_maintenance_release", lambda manifest: None
+    )
+    monkeypatch.setattr(cli_module, "SystemdMaintenanceRuntimeAdapter", lambda: object())
+
+    class ContextGuard:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(cli_module, "MaintenanceRuntimeGuard", lambda runtime: ContextGuard())
+    monkeypatch.setattr(
+        cli_module, "SystemdImmutableControlBootstrapRuntimeAdapter", lambda **kwargs: object()
+    )
+    monkeypatch.setattr(cli_module, "SystemRuntimeAdapter", lambda **kwargs: object())
+    monkeypatch.setattr(
+        cli_module, "EntryRevisionBootstrapAuthorityAdapter", lambda session_factory: object()
+    )
+    captured = {}
+
+    def apply_plan(applied_plan, **kwargs):
+        captured.update(plan=applied_plan, **kwargs)
+        return SimpleNamespace(
+            commit="c" * 40,
+            entry_admission_frozen=True,
+            generation=9,
+            status="bootstrapped_entry_frozen",
+        )
+
+    monkeypatch.setattr(cli_module, "apply_immutable_control_bootstrap_plan", apply_plan)
 
     result = CliRunner().invoke(
         app,
@@ -726,8 +798,11 @@ def test_bootstrap_control_apply_fails_closed_until_task7(monkeypatch):
         ],
     )
 
-    assert result.exit_code == 2
-    assert "bootstrap_implementation_pending" in result.output
+    assert result.exit_code == 0, result.output
+    assert captured["plan"] is plan
+    payload = json.loads(result.output.splitlines()[-1])
+    assert payload["status"] == "bootstrapped_entry_frozen"
+    assert payload["entry_admission_frozen"] is True
 
 
 def test_maintenance_release_identity_binds_commit_manifest_and_loaded_code(
@@ -1023,7 +1098,9 @@ def test_monitor_production_safety_help_has_required_flags():
 
     assert result.exit_code == 0, result.stdout
     for flag in (
-        "--expected-head",
+        "--expected-release-commit",
+        "--expected-release-manifest-sha256",
+        "--release-path",
         "--expected-auto-trade-enabled",
         "--expected-management-mode",
         "--expected-entry-preamble-mode",
@@ -1033,6 +1110,7 @@ def test_monitor_production_safety_help_has_required_flags():
         "--test-notification",
     ):
         assert flag in result.stdout
+    assert "--expected-head" not in result.stdout
 
 
 def test_monitor_production_test_notification_requires_notify():
@@ -1040,8 +1118,12 @@ def test_monitor_production_test_notification_requires_notify():
         app,
         [
             "monitor-production-safety",
-            "--expected-head",
+            "--expected-release-commit",
             "a" * 40,
+            "--expected-release-manifest-sha256",
+            "b" * 64,
+            "--release-path",
+            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -1076,8 +1158,12 @@ def test_monitor_production_test_notification_uses_fixed_text_only(monkeypatch):
         app,
         [
             "monitor-production-safety",
-            "--expected-head",
+            "--expected-release-commit",
             "a" * 40,
+            "--expected-release-manifest-sha256",
+            "b" * 64,
+            "--release-path",
+            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -1129,8 +1215,12 @@ def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monke
         app,
         [
             "monitor-production-safety",
-            "--expected-head",
+            "--expected-release-commit",
             "a" * 40,
+            "--expected-release-manifest-sha256",
+            "b" * 64,
+            "--release-path",
+            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",

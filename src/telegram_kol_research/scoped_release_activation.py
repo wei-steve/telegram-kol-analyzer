@@ -55,6 +55,22 @@ _REQUIRED_WORKER_CAPABILITIES = frozenset(
 )
 
 
+def _command_matches_role(command: bytes, *, role: str) -> bool:
+    try:
+        parts = tuple(
+            part.decode("utf-8", errors="strict")
+            for part in command.split(b"\0")
+            if part
+        )
+    except UnicodeError:
+        return False
+    expected = ("web", "--runtime-role", role)
+    return any(
+        parts[index : index + 3] == expected
+        for index in range(len(parts) - 2)
+    )
+
+
 class ActivationError(RuntimeError):
     pass
 
@@ -579,6 +595,14 @@ def render_release_dropin(
     if entry_frozen and component in _RUNTIME_COMPONENTS:
         lines.append('Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"')
     if component == "monitor":
+        lines.extend(
+            (
+                f'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH={release.release_path}"',
+                f'Environment="TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={release.commit}"',
+                "Environment=\"TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256="
+                f"{release.manifest_sha256}\"",
+            )
+        )
         lines.append(
             "ExecStartPre=/opt/telegram-kol-analyzer/.venv/bin/python -m "
             "telegram_kol_research.runtime_deployment_identity --verify-self"
@@ -781,9 +805,6 @@ def activate_release(
         runtime.daemon_reload()
         validate_release(paths.release_root, expected_commit, expected_uid=expected_uid)
         _start_units(runtime, components)
-        _activate_monitor(runtime, components, candidate)
-        if monitor_was_active:
-            runtime.start_unit("telegram-kol-monitor.timer")
         after_identities, _ = prove_release_runtime(
             runtime,
             release_root=paths.release_root,
@@ -803,6 +824,9 @@ def activate_release(
             after_identities,
             components,
         )
+        _activate_monitor(runtime, components, candidate)
+        if monitor_was_active:
+            runtime.start_unit("telegram-kol-monitor.timer")
     except Exception as exc:
         if not mutation_started:
             raise
@@ -816,9 +840,6 @@ def activate_release(
             )
             runtime.daemon_reload()
             _start_units(runtime, components)
-            _activate_monitor(runtime, components, rollback)
-            if monitor_was_active:
-                runtime.start_unit("telegram-kol-monitor.timer")
             prove_release_runtime(
                 runtime,
                 release_root=paths.release_root,
@@ -829,6 +850,9 @@ def activate_release(
                 require_entry_frozen=preserve_entry_freeze,
                 now=datetime.now(UTC),
             )
+            _activate_monitor(runtime, components, rollback)
+            if monitor_was_active:
+                runtime.start_unit("telegram-kol-monitor.timer")
         except Exception as rollback_exc:
             raise ActivationError("activation failed; rollback_failed") from rollback_exc
         raise ActivationError("activation failed; rollback_complete") from exc
@@ -906,6 +930,13 @@ class SystemRuntimeAdapter:
             raw = Path(f"/proc/{main_pid}/stat").read_text(encoding="ascii")
             suffix = raw[raw.rindex(")") + 2 :].split()
             start_ticks = int(suffix[19])
+            loaded_cwd = os.readlink(f"/proc/{main_pid}/cwd")
+            command = Path(f"/proc/{main_pid}/cmdline").read_bytes()
+            if loaded_cwd != payload.get("loaded_cwd") or not _command_matches_role(
+                command,
+                role=role,
+            ):
+                raise ActivationError("runtime identity proof failed")
         except Exception as exc:
             raise ActivationError("runtime identity proof failed") from exc
         payload["systemd_main_pid"] = main_pid
@@ -965,6 +996,23 @@ class SystemRuntimeAdapter:
                 "telegram-kol-monitor.timer",
             ]
         )
+        self._run(
+            ["systemctl", "start", "telegram-kol-monitor-diagnostic.service"]
+        )
+        result = self._run(
+            [
+                "systemctl",
+                "show",
+                "telegram-kol-monitor-diagnostic.service",
+                "--property=Result",
+                "--property=ExecMainStatus",
+            ]
+        )
+        if set(result.stdout.splitlines()) != {
+            "Result=success",
+            "ExecMainStatus=0",
+        }:
+            raise ActivationError("monitor runtime proof failed")
 
 
 def _required_absolute_env(name: str, default: str | None = None) -> Path:

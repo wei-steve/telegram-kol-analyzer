@@ -59,9 +59,13 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 )
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
 from telegram_kol_research.deepcoin_maintenance_actions import (
+    EntryRevisionBootstrapAuthorityAdapter,
     SingleOrderDrainRequest,
     run_entry_authority_seed,
     run_single_order_drain,
+)
+from telegram_kol_research.deepcoin_maintenance_evidence import (
+    build_deepcoin_maintenance_evidence,
 )
 from telegram_kol_research.deepcoin_maintenance_manifest import (
     MaintenanceAction,
@@ -128,8 +132,17 @@ from telegram_kol_research.maintenance_runtime_guard import (
     MaintenanceRuntimeGuard,
     SystemdMaintenanceRuntimeAdapter,
 )
+from telegram_kol_research.immutable_control_bootstrap import (
+    BootstrapBlocked,
+    SystemdImmutableControlBootstrapRuntimeAdapter,
+    apply_immutable_control_bootstrap_plan,
+    bootstrap_unit_manifest_sha256,
+    build_immutable_control_bootstrap_plan,
+)
 from telegram_kol_research.scoped_release_activation import (
     ActivationError,
+    ActivationPaths,
+    SystemRuntimeAdapter,
     validate_release,
 )
 from telegram_kol_research.position_attribution_repair import (
@@ -2592,7 +2605,6 @@ def repair_execution_order_legs(
 
 @app.command("monitor-production-safety")
 def monitor_production_safety(
-    expected_head: str | None = typer.Option(None, "--expected-head"),
     expected_release_commit: str | None = typer.Option(
         None, "--expected-release-commit"
     ),
@@ -2678,20 +2690,15 @@ def monitor_production_safety(
         raise typer.BadParameter(
             "choose --expected-auto-trade-enabled or --no-expected-auto-trade-enabled"
         )
-    if expected_release_commit is not None:
-        if expected_head is not None:
-            raise typer.BadParameter(
-                "--expected-head cannot be combined with immutable release options"
-            )
-        if expected_release_manifest_sha256 is None or release_path is None:
-            raise typer.BadParameter(
-                "immutable release monitoring requires commit, manifest hash, and path"
-            )
-        expected_head = expected_release_commit
-    elif expected_head is None:
+    if (
+        expected_release_commit is None
+        or expected_release_manifest_sha256 is None
+        or release_path is None
+    ):
         raise typer.BadParameter(
-            "--expected-release-commit is required for immutable monitoring"
+            "immutable release monitoring requires commit, manifest hash, and path"
         )
+    expected_head = expected_release_commit
     if test_notification:
         if not notify:
             raise typer.BadParameter("--test-notification requires --notify")
@@ -5255,6 +5262,25 @@ def drain_one_command(
         raise typer.Exit(code=2)
 
 
+def _validate_explicit_maintenance_release(
+    path: Path | None,
+    *,
+    expected_commit: str | None = None,
+):
+    candidate_path = Path(path or "")
+    commit = str(expected_commit or candidate_path.name)
+    if not candidate_path.is_absolute() or candidate_path.name != commit:
+        raise BootstrapBlocked("bootstrap_release_path_invalid")
+    release = validate_release(
+        candidate_path.parent,
+        commit,
+        expected_uid=0,
+    )
+    if release.release_path != candidate_path:
+        raise BootstrapBlocked("bootstrap_release_path_invalid")
+    return release
+
+
 @app.command("bootstrap-control")
 def bootstrap_control_command(
     manifest_path: Path = typer.Option(..., "--manifest-path"),
@@ -5266,7 +5292,7 @@ def bootstrap_control_command(
         None, "--expected-fingerprint"
     ),
 ) -> None:
-    """Validate bootstrap authorization; execution is implemented in Task 7."""
+    """Plan or apply the one-time entry-frozen immutable-control bootstrap."""
 
     observed_at = datetime.now(UTC)
     manifest = _load_deepcoin_action_manifest(
@@ -5274,17 +5300,72 @@ def bootstrap_control_command(
         action=MaintenanceAction.BOOTSTRAP_CONTROL,
         now=observed_at,
     )
+    try:
+        candidate = _validate_explicit_maintenance_release(
+            manifest.candidate_release_path,
+            expected_commit=manifest.candidate_commit,
+        )
+        control = _validate_explicit_maintenance_release(
+            manifest.rollback_release_path,
+        )
+        if candidate.manifest_sha256 != manifest.release_manifest_sha256:
+            raise BootstrapBlocked("bootstrap_release_manifest_mismatch")
+        if bootstrap_unit_manifest_sha256(candidate) != (
+            manifest.unit_manifest_sha256
+        ):
+            raise BootstrapBlocked("bootstrap_unit_manifest_mismatch")
+        session_factory = create_existing_session_factory(manifest.database_path)
+        client = build_deepcoin_client_from_env()
+        terminal_plan = build_reviewed_pending_entry_cancel_plan(
+            session_factory,
+            deepcoin_client=client,
+            targets=REVIEWED_PENDING_ENTRY_TARGETS,
+        )
+        evidence = build_deepcoin_maintenance_evidence(
+            client,
+            instruments=tuple(
+                target.instrument_id for target in REVIEWED_PENDING_ENTRY_TARGETS
+            ),
+            target_order_id="bootstrap-control",
+            expected_target_pending_count=0,
+        )
+        if terminal_plan.conflicts or terminal_plan.expected_generation is None:
+            raise BootstrapBlocked("bootstrap_terminal_plan_blocked")
+        plan = build_immutable_control_bootstrap_plan(
+            action_id=manifest.action_id,
+            candidate=candidate,
+            control=control,
+            evidence=evidence,
+            completed_order_ids=terminal_plan.completed_order_ids,
+            expected_generation=terminal_plan.expected_generation,
+            now=datetime.now(UTC),
+        )
+    except (ActivationError, BootstrapBlocked, OSError, ValueError) as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "action_id": manifest.action_id,
+                    "manifest_sha256": manifest.file_sha256,
+                    "mode": "apply" if apply else "dry_run",
+                    "reason_code": "bootstrap_plan_blocked",
+                    "status": "blocked",
+                },
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(code=2) from exc
     typer.echo(
         json.dumps(
             {
                 "action_id": manifest.action_id,
+                "evidence_sha256": plan.evidence_sha256,
                 "expires_at": manifest.expires_at.isoformat(),
+                "generation": plan.expected_generation,
                 "manifest_sha256": manifest.file_sha256,
                 "mode": "apply" if apply else "dry_run",
-                "release_manifest_sha256": (
-                    manifest.release_manifest_sha256
-                ),
-                "status": "authorization_valid",
+                "plan_sha256": plan.fingerprint,
+                "release_manifest_sha256": candidate.manifest_sha256,
+                "status": "ready",
             },
             sort_keys=True,
         )
@@ -5296,18 +5377,49 @@ def bootstrap_control_command(
         expected_manifest_sha256=expected_manifest_sha256,
         expected_fingerprint=expected_fingerprint,
     )
+    if manifest.expected_fingerprint != plan.fingerprint:
+        raise typer.BadParameter("bootstrap authorization does not match fresh plan")
     _require_loaded_immutable_maintenance_release(manifest)
+    control_runtime = SystemdMaintenanceRuntimeAdapter()
+    guard = MaintenanceRuntimeGuard(runtime=control_runtime)
+    activation_paths = ActivationPaths(
+        release_root=candidate.release_path.parent,
+        action_manifest=manifest_path,
+        authorization=manifest_path,
+        authorization_consumed=manifest_path,
+        dropin_root=Path("/etc/systemd/system"),
+        database_path=manifest.database_path,
+    )
+    runtime = SystemdImmutableControlBootstrapRuntimeAdapter(
+        paths=activation_paths,
+        scoped_runtime=SystemRuntimeAdapter(
+            python=Path("/opt/telegram-kol-analyzer/.venv/bin/python")
+        ),
+        control_runtime=control_runtime,
+    )
+    authority = EntryRevisionBootstrapAuthorityAdapter(session_factory)
+    try:
+        with guard:
+            result = apply_immutable_control_bootstrap_plan(
+                plan,
+                guard=guard,
+                authority=authority,
+                runtime=runtime,
+            )
+    except (BootstrapBlocked, GuardError, RuntimeError) as exc:
+        raise typer.BadParameter("immutable control bootstrap blocked") from exc
     typer.echo(
         json.dumps(
             {
                 "action_id": manifest.action_id,
-                "reason_code": "bootstrap_implementation_pending",
-                "status": "blocked",
+                "commit": result.commit,
+                "entry_admission_frozen": result.entry_admission_frozen,
+                "generation": result.generation,
+                "status": result.status,
             },
             sort_keys=True,
         )
     )
-    raise typer.Exit(code=2)
 
 
 @app.command("repair-position-management")

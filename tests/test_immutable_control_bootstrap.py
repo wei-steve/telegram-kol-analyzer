@@ -13,18 +13,24 @@ from telegram_kol_research.immutable_control_bootstrap import (
     BootstrapUnknown,
     apply_immutable_control_bootstrap_plan,
     build_immutable_control_bootstrap_plan,
+    SystemdImmutableControlBootstrapRuntimeAdapter,
 )
+import telegram_kol_research.immutable_control_bootstrap as bootstrap_module
 from telegram_kol_research.reviewed_pending_entry_cancel import (
     REVIEWED_PENDING_ENTRY_TARGETS,
 )
-from telegram_kol_research.scoped_release_activation import ReleaseEvidence
+from telegram_kol_research.scoped_release_activation import (
+    ActivationPaths,
+    ReleaseEvidence,
+)
 
 
 NOW = datetime(2026, 8, 28, 12, 0, tzinfo=UTC)
 CANDIDATE = "c" * 40
 CONTROL = "d" * 40
 REJECTED = "ffb06d19eabfd32dfdab2942b2152fd2809e3d17"
-COMPONENTS = ("web", "ingest", "worker", "monitor")
+COMPONENTS = ("web", "monitor", "ingest", "worker")
+LIVE_ROLES = ("web", "ingest", "worker")
 
 
 def _release(commit: str, *, components=COMPONENTS) -> ReleaseEvidence:
@@ -72,6 +78,7 @@ class Authority:
         self.state = "idle"
         self.generation = 7
         self.events: list[str] = []
+        self.released_at = None
 
     def acquire_bootstrap(self, plan):
         assert self.state == "idle"
@@ -84,12 +91,20 @@ class Authority:
         assert token == "bootstrap-token"
         assert generation == self.generation
         self.state = "idle"
+        self.released_at = released_at
         self.events.append("release")
         return True
 
     def block_bootstrap(self, *, token, generation, reason_code, blocked_at):
         self.state = "blocked"
         self.events.append(f"block:{reason_code}")
+
+    def no_exchange_write_round_trip(self, plan, *, expected_generation):
+        assert self.state == "idle"
+        assert expected_generation == self.generation
+        self.events.append("self-test")
+        self.generation += 1
+        return self.generation
 
 
 class Guard:
@@ -137,6 +152,9 @@ def _identity(role: str, *, capabilities=True, ticks=2000):
     }
     return {
         "runtime_role": role,
+        "command_role": role,
+        "loaded_artifact_verified": True,
+        "loaded_cwd": "/opt/telegram-kol-analyzer",
         "release_commit": CANDIDATE,
         "manifest_sha256": "a" * 64,
         "pid": 200 + COMPONENTS.index(role),
@@ -163,6 +181,7 @@ class Runtime:
         self.fail_static = False
         self.fail_rollback = False
         self.unknown_start = False
+        self.fail_reinhibit = False
         self.legacy_worker = (101, 1001)
 
     def legacy_identities(self):
@@ -191,21 +210,16 @@ class Runtime:
         self.events.append("candidate-identities")
         return {
             role: _identity(role, capabilities=self.capabilities)
-            for role in COMPONENTS
+            for role in LIVE_ROLES
         }
-
-    def no_exchange_write_authority_round_trip(self, *, expected_generation):
-        assert self.authority.state == "idle"
-        assert expected_generation == self.authority.generation
-        self.events.append("authority-self-test")
-        self.authority.generation += 1
-        return self.authority.generation
 
     def verify_monitor(self, plan):
         self.events.append("verify-monitor")
 
     def reinhibit_and_stop_candidate(self):
         self.events.append("reinhibit-candidate")
+        if self.fail_reinhibit:
+            raise RuntimeError("reinhibit_failed")
 
     def restore_control_configuration(self, preimages):
         self.events.append("restore-control")
@@ -270,10 +284,72 @@ def test_candidate_pid_start_tuple_must_differ_from_legacy():
     assert "reinhibit-candidate" in runtime.events
 
 
+def test_candidate_identity_requires_loaded_artifact_command_and_unique_process():
+    authority = Authority()
+    runtime = Runtime(authority)
+    original = runtime.candidate_identities
+
+    def unverified():
+        identities = original()
+        identities["worker"]["loaded_artifact_verified"] = False
+        return identities
+
+    runtime.candidate_identities = unverified
+    with pytest.raises(BootstrapBlocked, match="candidate_identity_unproven"):
+        _apply(runtime=runtime, authority=authority)
+
+    authority = Authority()
+    runtime = Runtime(authority)
+    original = runtime.candidate_identities
+
+    def duplicate_process():
+        identities = original()
+        for key in (
+            "pid",
+            "process_start_ticks",
+            "systemd_main_pid",
+            "systemd_start_ticks",
+        ):
+            identities["ingest"][key] = identities["web"][key]
+        return identities
+
+    runtime.candidate_identities = duplicate_process
+    with pytest.raises(BootstrapBlocked, match="candidate_identity_unproven"):
+        _apply(runtime=runtime, authority=authority)
+
+
+def test_apply_rejects_plan_that_became_stale_before_inhibition():
+    authority = Authority()
+    with pytest.raises(BootstrapBlocked, match="bootstrap_evidence_unavailable"):
+        apply_immutable_control_bootstrap_plan(
+            _plan(),
+            guard=Guard(),
+            authority=authority,
+            runtime=Runtime(authority),
+            now=NOW + timedelta(seconds=61),
+        )
+
+
+def test_authority_release_uses_fresh_boundary_time():
+    authority = Authority()
+    runtime = Runtime(authority)
+    clock = iter((NOW, NOW, NOW + timedelta(seconds=29)))
+
+    apply_immutable_control_bootstrap_plan(
+        _plan(),
+        guard=Guard(),
+        authority=authority,
+        runtime=runtime,
+        clock=lambda: next(clock),
+    )
+
+    assert authority.released_at == NOW + timedelta(seconds=29)
+
+
 def test_candidate_starts_while_bootstrap_authority_is_held():
     result, runtime, authority, guard = _apply()
     assert result.status == "bootstrapped_entry_frozen"
-    assert authority.events == ["acquire", "release"]
+    assert authority.events == ["acquire", "release", "self-test"]
     assert guard.completed is True
 
 
@@ -294,8 +370,79 @@ def test_all_disabled_capabilities_reject_bootstrap():
 
 def test_candidate_completes_no_exchange_write_authority_round_trip():
     result, runtime, authority, _ = _apply()
-    assert "authority-self-test" in runtime.events
+    assert "self-test" in authority.events
     assert result.generation == authority.generation == 9
+
+
+def test_unknown_reinhibit_failure_is_persisted_as_compensation_failed():
+    authority = Authority()
+    runtime = Runtime(authority)
+    runtime.unknown_start = True
+    runtime.fail_reinhibit = True
+    guard = Guard()
+
+    with pytest.raises(BootstrapBlocked, match="bootstrap_compensation_failed"):
+        _apply(runtime=runtime, authority=authority, guard=guard)
+
+    assert guard.blocked_reason == "bootstrap_compensation_failed"
+
+
+def test_concrete_runtime_publishes_and_restores_complete_unit_scope(
+    tmp_path,
+    monkeypatch,
+):
+    release_path = tmp_path / CANDIDATE
+    release_units = release_path / "deploy/systemd"
+    installed = tmp_path / "systemd"
+    release_units.mkdir(parents=True)
+    installed.mkdir()
+    units = bootstrap_module._bootstrap_unit_files()
+    for unit in units:
+        (release_units / unit).write_text(f"candidate:{unit}\n", encoding="utf-8")
+        (installed / unit).write_text(f"legacy:{unit}\n", encoding="utf-8")
+    candidate = ReleaseEvidence(
+        commit=CANDIDATE,
+        manifest_sha256="a" * 64,
+        content_sha256="1" * 64,
+        action_manifest={"components": list(COMPONENTS)},
+        release_path=release_path,
+    )
+    plan = _plan(candidate=candidate)
+
+    class Scoped:
+        def daemon_reload(self):
+            pass
+
+    adapter = SystemdImmutableControlBootstrapRuntimeAdapter(
+        paths=ActivationPaths(
+            release_root=tmp_path,
+            action_manifest=tmp_path / "unused-action",
+            authorization=tmp_path / "unused-auth",
+            authorization_consumed=tmp_path / "unused-consumed",
+            dropin_root=installed,
+            database_path=tmp_path / "unused.db",
+        ),
+        scoped_runtime=Scoped(),
+        control_runtime=object(),
+        expected_uid=0,
+    )
+    monkeypatch.setattr(bootstrap_module, "validate_release", lambda *args, **kwargs: candidate)
+    monkeypatch.setattr(bootstrap_module, "_run_systemd", lambda command: None)
+
+    preimages = adapter.capture_dropin_preimages()
+    adapter.publish_candidate_configuration(plan, entry_frozen=True)
+    adapter.verify_candidate_configuration(plan)
+    assert all(
+        (installed / unit).read_text(encoding="utf-8")
+        == f"candidate:{unit}\n"
+        for unit in units
+    )
+
+    adapter.restore_control_configuration(preimages)
+    assert all(
+        (installed / unit).read_text(encoding="utf-8") == f"legacy:{unit}\n"
+        for unit in units
+    )
 
 
 def test_partial_dropin_or_systemd_verify_failure_rolls_back_before_open():
