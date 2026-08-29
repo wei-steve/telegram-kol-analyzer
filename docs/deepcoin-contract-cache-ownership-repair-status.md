@@ -4,12 +4,12 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: manual_cleanup_production_cutover
-phase_state: planned
-claimed_by: null
-candidate_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
-candidate_content_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
-handoff_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
-pushed_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
+phase_state: in_progress
+claimed_by: codex-01a04f45-e0e5-7642-aeb7-0c398bd03375
+candidate_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+candidate_content_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+handoff_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+pushed_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -41,13 +41,13 @@ legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
 immutable_control_bootstrap_status: superseded_deleted_local
-simple_cancel_all_cutover_status: local_repair_complete_production_cutover_pending
+simple_cancel_all_cutover_status: production_preflight_failed_closed_history_query_incomplete
 simple_cancel_all_cutover_design_sha: 71eb1d4b
 simple_cancel_all_protocol_removal_sha: a3434ebb
 simple_cancel_all_reconciliation_sha: ec0b9dee
 simple_cancel_all_bytecode_fix_sha: d2c640e9
 simple_cancel_all_review_repair_base_sha: a61325181c54a2d3aef85247fbaabcef93d7489a
-simple_cancel_all_production_candidate_sha: 44b99d82c662c264554dcb07b18ed11faa3222ff
+simple_cancel_all_production_candidate_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
 simple_cancel_all_final_focused: 314_passed_1_skipped
 simple_cancel_all_final_suite: 6626_passed_3_skipped_32_warnings
 simple_cancel_all_production_executed: false
@@ -59,6 +59,18 @@ manual_cleanup_local_repair_status: complete_production_cutover_pending
 manual_cleanup_local_repair_base_sha: bd73ceb15eb7228f8d9e52641891578cb1883253
 manual_cleanup_local_repair_focused: 344_passed_1_skipped
 manual_cleanup_local_repair_final_suite: 6644_passed_3_skipped_32_warnings
+manual_cleanup_production_cutover_status: preflight_failed_closed
+manual_cleanup_production_stage_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+manual_cleanup_production_stage_content_sha256: ba99d1ec18a9252eff8aa3319260fc4f6687cff1a09a838e79324d27dcb8e7e4
+manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/evidence.jsonl
+manual_cleanup_production_evidence_sha256: ea563a1b2a9fbe2800662e9f6567a85206125841a34bd38083514cc1fcf62d92
+manual_cleanup_production_preflight_at: 2026-08-29T21:41:15Z
+manual_cleanup_production_preflight_blocker: history_query_incomplete_btc_100_row_boundary
+manual_cleanup_production_target_fill_status: fresh_query_not_reached
+manual_cleanup_production_database_mutation_executed: false
+manual_cleanup_production_service_control_executed: false
+manual_cleanup_production_activation_executed: false
+manual_cleanup_production_observation_started: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -809,3 +821,48 @@ expansion or an irreversible action that the approved phase did not include.
   entry thaw, historical replay, order retry, compensation order, or Telegram
   trading send. Historical production and account evidence above must be
   refreshed inside the later single production cutover phase.
+
+## Manual cleanup production cutover attempt
+
+- This task claimed `manual_cleanup_production_cutover` from exact clean local
+  SHA `c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609`. The exact reviewed commit was
+  fast-forward pushed from remote `2ce91a373bef5dc9878c54c4db5a23e0ace51d49`
+  and the remote `codex/deepcoin-auto-trading-v1` ref was independently verified
+  at `c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609`.
+- The separate stage action created immutable inactive release `c1c046a3` with
+  tree `2f7f7e081402b7f43093171eb45cc20cde7d85bc`, content SHA-256
+  `ba99d1ec18a9252eff8aa3319260fc4f6687cff1a09a838e79324d27dcb8e7e4`,
+  release mode `0555`, zero unsafe entries, and zero systemd references.
+- Fresh production identity still matched tracked-clean legacy SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. Web, ingest, worker and the
+  monitor timer remained active; the monolith remained inactive. No service
+  stop, mask, start, restart, drop-in publication or activation occurred.
+- The production database preflight was query-only with `total_changes=0`,
+  `quick_check=ok`, zero foreign-key issues and zero active exchange writes.
+  Before counts were 24 management components, 133 management legs, 150
+  management batches, 554 execution order legs, 320 bindings, 1034 lifecycles,
+  3 trading settings and 3803 execution events. Its root-owned `0600` online
+  copy also passed `query_only=1`, `quick_check=ok`, zero foreign-key issues and
+  `total_changes=0`.
+- The first attempted copy used `/run`, whose 394 MiB tmpfs is smaller than the
+  approximately 813 MiB database. It failed during local SQLite backup before
+  any Deepcoin query. The two incomplete files created by this task were
+  explicitly removed, and evidence moved to the root filesystem's owner-only
+  directory; no production database or service state changed.
+- Both fresh account attempts returned zero positions, zero regular open orders
+  and zero pending triggers for BTC, ETH and SOL. The BTC trigger-history reader
+  returned exactly its 100-row completeness boundary on both of its bounded
+  reads in each attempt. Both plans therefore stopped as
+  `history_query_incomplete` before the general fills reader or any of the seven
+  exact `ordId` fills queries could run.
+- The incomplete history result is external unknown and permanently stops this
+  production attempt. The task did not run the L3 copy rehearsal, enter the
+  maintenance boundary, create the transaction backup, terminalize any target,
+  seed authority, consume activation authorization, activate a candidate, or
+  begin L2 observation. The seven-target fresh fill state is unknown; historical
+  zero-fill evidence was not reused.
+- Raw exchange rows, the verified production copy, database counts, call counts,
+  unit state and the fail-closed terminal record are retained under
+  `/var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/`.
+  The `0600` evidence file is `evidence.jsonl`, SHA-256
+  `ea563a1b2a9fbe2800662e9f6567a85206125841a34bd38083514cc1fcf62d92`.
