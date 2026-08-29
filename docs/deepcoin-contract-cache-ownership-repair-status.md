@@ -55,7 +55,7 @@ manual_cleanup_read_only_verified_at: 2026-08-29T20:20:19Z
 manual_cleanup_exchange_snapshot_status: zero_live_orders_historical_requires_fresh_cutover_recheck
 manual_cleanup_target_fill_count: 0
 manual_cleanup_local_eligible_count: 7
-manual_cleanup_local_repair_status: exact_target_history_repair_complete_production_restage_pending
+manual_cleanup_local_repair_status: exact_target_history_repair_complete_production_stage_complete
 manual_cleanup_local_repair_base_sha: bd73ceb15eb7228f8d9e52641891578cb1883253
 manual_cleanup_local_repair_focused: 344_passed_1_skipped
 manual_cleanup_local_repair_final_suite: 6644_passed_3_skipped_32_warnings
@@ -64,14 +64,16 @@ manual_cleanup_exact_history_repair_code_sha: 5a3bb9383037d4e3e03b843352af947b46
 manual_cleanup_exact_history_repair_focused: 190_passed_plus_2_targeted_passed
 manual_cleanup_exact_history_repair_final_suite: 6663_passed_3_skipped_32_warnings
 manual_cleanup_exact_history_repair_review: no_remaining_p0_p1
-manual_cleanup_production_cutover_status: preflight_failed_closed_exact_fill_query_incomplete
+manual_cleanup_production_cutover_status: preflight_failed_closed_exact_fill_http_401
 manual_cleanup_production_stage_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
 manual_cleanup_production_stage_content_sha256: 68e373268885215a1bf0bd48492be8d7ce0d17d6c3a07bb744c7dc42fd14cad0
-manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/evidence.jsonl
-manual_cleanup_production_evidence_sha256: 890ba2452f55026a9ae231a725f59834dff881c85231713fd20ab0ad3a8af4b4
-manual_cleanup_production_preflight_at: 2026-08-29T22:33:16Z
-manual_cleanup_production_preflight_blocker: target_fill_query_incomplete_sixth_canonical_btc
+manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/evidence.jsonl
+manual_cleanup_production_evidence_sha256: a834effc653d338eddf054c83d317d6df790ec49aff602d07c0b7843ae0cc3b3
+manual_cleanup_production_preflight_at: 2026-08-29T22:39:31Z
+manual_cleanup_production_preflight_blocker: target_fill_query_http_401_sixth_canonical_btc
 manual_cleanup_production_target_fill_status: first_5_zero_sixth_unknown_remaining_not_queried
+manual_cleanup_production_preflight_attempt: 2
+manual_cleanup_production_preflight_http_status: 401
 manual_cleanup_production_database_mutation_executed: false
 manual_cleanup_production_service_control_executed: false
 manual_cleanup_production_activation_executed: false
@@ -973,3 +975,52 @@ expansion or an irreversible action that the approved phase did not include.
   The phase remains `in_progress`; another attempt requires explicit
   continuation and entirely fresh evidence. The failed exact query must never
   be retried automatically.
+
+## Exact-target production cutover diagnostic continuation
+
+- After explicit user continuation, one new read-only diagnostic preflight was
+  run with fresh runtime, database-copy and Deepcoin evidence. A local synthetic
+  classifier check first proved that the collector distinguishes HTTP status,
+  transport and response-schema failures without recording credentials. No
+  production code was changed and no automatic external-query retry was added.
+- Fresh runtime evidence at `2026-08-29T22:39:31Z` again proved production at
+  legacy SHA `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. Web, ingest and worker
+  retained the same PID/start-tick identities and exact legacy cwd and command
+  roles; the monitor timer remained active and the legacy monolith inactive.
+  A read-only check after the attempt confirmed those service states remained
+  unchanged, and candidate `8abaf2c6d6e361b7651fc41e11275e899bb6463a`
+  remained inactive.
+- The fresh root-owned `0600` database copy at
+  `/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/preflight.db`
+  has SHA-256
+  `4216d9828284f4885370f793525bc3402e79bb8651120050f0cce313c57b0e45`.
+  It again proved `query_only=1`, `quick_check=ok`, zero foreign-key issues,
+  `total_changes=0`, zero active exchange writes, the same eight critical table
+  counts and an absent canonical authority row.
+- The account-flat queries again completed with zero positions, zero regular
+  open orders and zero pending triggers across all three instruments. The first
+  five canonical exact fills queries again returned zero rows. The sole sixth
+  exact fills call failed with `DeepcoinClientError` caused by HTTP status `401`;
+  the seventh fills query, all history queries and the second stable snapshot
+  were not attempted. The collector's summary then hit a local null-timestamp
+  formatting defect after the reconciliation plan had already failed closed;
+  this did not issue another external request or change the production result.
+- HTTP `401` makes the required sixth-target fills evidence unknown. The second
+  explicitly authorized attempt therefore also stopped before the maintenance
+  boundary, with no third attempt. No unit was stopped or masked; no transaction
+  backup or production database/settings mutation occurred; no Deepcoin write,
+  activation authorization, activate, old-runtime restore, L2 observation or
+  entry thaw occurred.
+- Postmortem timing used only the already-recorded request timestamps: 15
+  private GETs were issued in 2.207 seconds with approximately 0.2 ms gaps, and
+  the HTTP `401` occurred at ordinal 15. The production host was NTP-synchronized
+  with approximately 0.05 ms clock offset, so local clock drift is not supported.
+  A burst-throttling or edge-authentication response is supported as a hypothesis
+  but is not proven and must not be treated as authorization to retry.
+- The second attempt's raw rows, sanitized failure category, runtime evidence,
+  database copy and terminal record are retained under
+  `/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/`.
+  Its root-owned `0600` `evidence.jsonl` has final SHA-256
+  `a834effc653d338eddf054c83d317d6df790ec49aff602d07c0b7843ae0cc3b3`.
+  The phase remains `in_progress`; resolving or explaining the Deepcoin `401`
+  read failure is required before a separately authorized fresh cutover attempt.
