@@ -360,6 +360,7 @@ def _validate_authorization(
     commit: str,
     components: list[str],
     plan_sha256: str,
+    source_mode: str,
     now: datetime,
 ) -> None:
     try:
@@ -391,12 +392,14 @@ def _validate_authorization(
             "issued_at",
             "nonce",
             "schema_version",
+            "source_mode",
         }
-        or payload.get("contract") != "scoped-activation-authorization-v1"
-        or payload.get("schema_version") != 1
+        or payload.get("contract") != "scoped-activation-authorization-v2"
+        or payload.get("schema_version") != 2
         or payload.get("commit") != commit
         or payload.get("components") != components
         or payload.get("action_plan_sha256") != plan_sha256
+        or payload.get("source_mode") != source_mode
         or not _SHA256_RE.fullmatch(str(payload.get("nonce", "")))
         or issued_at > now
         or expires_at <= now
@@ -793,6 +796,7 @@ def activate_release(
         commit=expected_commit,
         components=components,
         plan_sha256=plan_sha,
+        source_mode=source_mode,
         now=observed_now,
     )
     affected_runtime_roles = [
@@ -832,6 +836,7 @@ def activate_release(
         commit=expected_commit,
         components=components,
         plan_sha256=plan_sha,
+        source_mode=source_mode,
         now=datetime.now(UTC),
     )
     consume_activation_authorization(

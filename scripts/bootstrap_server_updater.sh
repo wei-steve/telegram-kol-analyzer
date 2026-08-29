@@ -42,10 +42,13 @@ done
 ROLLBACK_COMMIT="${ROLLBACK_COMMIT:-}"
 ACTIVATION_AUTHORIZATION="${ACTIVATION_AUTHORIZATION:-}"
 ACTIVATION_AUTHORIZATION_CONSUMED="${ACTIVATION_AUTHORIZATION_CONSUMED:-}"
+ACTIVATION_SOURCE_MODE="${ACTIVATION_SOURCE_MODE:-immutable}"
 if [ "$ACTION" = "activate" ]; then
   [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid ROLLBACK_COMMIT." >&2; exit 2; }
   safe_remote_path "$ACTIVATION_AUTHORIZATION" || { echo "Invalid ACTIVATION_AUTHORIZATION." >&2; exit 2; }
   safe_remote_path "$ACTIVATION_AUTHORIZATION_CONSUMED" || { echo "Invalid ACTIVATION_AUTHORIZATION_CONSUMED." >&2; exit 2; }
+  [[ "$ACTIVATION_SOURCE_MODE" == "immutable" || "$ACTIVATION_SOURCE_MODE" == "stopped_legacy" ]] \
+    || { echo "Invalid ACTIVATION_SOURCE_MODE." >&2; exit 2; }
 fi
 
 if command -v shasum >/dev/null 2>&1; then
@@ -87,6 +90,7 @@ action="$1"; expected_commit="$2"; branch="$3"
 manifest_sha256="$4"; bundle_sha256="$5"
 rollback_commit="$6"; authorization="$7"; authorization_consumed="$8"
 source_repo="$9"; release_root="${10}"; service_dropin_root="${11}"; database_path="${12}"
+source_mode="${13}"
 IFS= read -r manifest_base64
 IFS= read -r bundle_base64
 manifest_base64="${manifest_base64%$'\r'}"
@@ -121,6 +125,7 @@ case "$action" in
       ACTION_MANIFEST="$temporary/action-manifest.json" \
       ACTIVATION_AUTHORIZATION="$authorization" \
       ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" \
+      ACTIVATION_SOURCE_MODE="$source_mode" \
       RELEASE_ROOT="$release_root" \
       SERVICE_DROPIN_ROOT="$service_dropin_root" \
       DATABASE_PATH="$database_path" \
@@ -133,6 +138,7 @@ REMOTE_SCRIPT_BASE64="$(printf '%s' "$REMOTE_SCRIPT" | base64 | tr -d '\r\n')"
 REMOTE_COMMAND="bash -c \"\$(printf '%s' '$REMOTE_SCRIPT_BASE64' | base64 -d)\" -- \
 '$ACTION' '$EXPECTED_COMMIT' '$BRANCH' '$MANIFEST_SHA256' '$BUNDLE_SHA256' \
 '$ROLLBACK_COMMIT' '$ACTIVATION_AUTHORIZATION' '$ACTIVATION_AUTHORIZATION_CONSUMED' \
-'$SOURCE_REPO' '$RELEASE_ROOT' '$SERVICE_DROPIN_ROOT' '$DATABASE_PATH'"
+'$SOURCE_REPO' '$RELEASE_ROOT' '$SERVICE_DROPIN_ROOT' '$DATABASE_PATH' \
+'$ACTIVATION_SOURCE_MODE'"
 printf '%s\n%s\n' "$MANIFEST_BASE64" "$BUNDLE_BASE64" \
   | ssh -i "$KEY_PATH" "$SERVER" "$REMOTE_COMMAND"

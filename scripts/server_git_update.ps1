@@ -11,6 +11,8 @@ param(
     [string]$RollbackCommit = "",
     [string]$ActivationAuthorization = "",
     [string]$ActivationAuthorizationConsumed = "",
+    [ValidateSet("immutable", "stopped_legacy")]
+    [string]$ActivationSourceMode = "immutable",
     [string]$SourceRepo = "/opt/telegram-kol-analyzer",
     [string]$ReleaseRoot = "/opt/telegram-kol-releases",
     [string]$ServiceDropinRoot = "/etc/systemd/system",
@@ -148,6 +150,7 @@ action="$1"; expected_commit="$2"; branch="$3"
 manifest_sha256="$4"; bundle_sha256="$5"
 rollback_commit="$6"; authorization="$7"; authorization_consumed="$8"
 source_repo="$9"; release_root="${10}"; service_dropin_root="${11}"; database_path="${12}"
+source_mode="${13}"
 IFS= read -r manifest_base64
 IFS= read -r bundle_base64
 manifest_base64="${manifest_base64%$'\r'}"
@@ -174,7 +177,8 @@ case "$action" in
     DEPLOYMENT_ACTION=activate EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT="$rollback_commit" \
       ACTION_MANIFEST="$temporary/action-manifest.json" ACTIVATION_AUTHORIZATION="$authorization" \
       ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" RELEASE_ROOT="$release_root" \
-      SERVICE_DROPIN_ROOT="$service_dropin_root" DATABASE_PATH="$database_path" "$updater"
+      ACTIVATION_SOURCE_MODE="$source_mode" SERVICE_DROPIN_ROOT="$service_dropin_root" \
+      DATABASE_PATH="$database_path" "$updater"
     ;;
   *) echo "Remote action must be stage or activate." >&2; exit 2 ;;
 esac
@@ -184,7 +188,7 @@ esac
         "'$Action' '$ExpectedCommit' '$Branch' '$manifestSha' '$bundleSha' " +
         "'$RollbackCommit' '$ActivationAuthorization' " +
         "'$ActivationAuthorizationConsumed' '$SourceRepo' '$ReleaseRoot' " +
-        "'$ServiceDropinRoot' '$DatabasePath'"
+        "'$ServiceDropinRoot' '$DatabasePath' '$ActivationSourceMode'"
     $payload = "$manifestBase64`n$bundleBase64"
     $payload | ssh -i $KeyPath $Server $remote
     if ($LASTEXITCODE -ne 0) {

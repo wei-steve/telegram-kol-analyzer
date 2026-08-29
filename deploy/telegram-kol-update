@@ -10,6 +10,11 @@ if [[ ! "${ROLLBACK_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
   echo "ROLLBACK_COMMIT must identify the reviewed immutable control release." >&2
   exit 4
 fi
+if [[ "${ACTIVATION_SOURCE_MODE:-}" != "immutable" \
+  && "${ACTIVATION_SOURCE_MODE:-}" != "stopped_legacy" ]]; then
+  echo "ACTIVATION_SOURCE_MODE must be immutable or stopped_legacy." >&2
+  exit 4
+fi
 
 DISPATCHER_RELEASE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
 if [ "$(basename -- "$DISPATCHER_RELEASE_ROOT")" != "$ROLLBACK_COMMIT" ]; then

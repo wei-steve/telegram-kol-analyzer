@@ -435,6 +435,7 @@ def test_updater_dispatches_only_to_sibling_activator_in_named_release(
             **os.environ,
             "DEPLOYMENT_ACTION": "activate",
             "ROLLBACK_COMMIT": rollback_commit,
+            "ACTIVATION_SOURCE_MODE": "immutable",
         },
         capture_output=True,
         text=True,
@@ -467,6 +468,7 @@ def test_updater_refuses_dispatcher_directory_identity_mismatch(
             **os.environ,
             "DEPLOYMENT_ACTION": "activate",
             "ROLLBACK_COMMIT": "3" * 40,
+            "ACTIVATION_SOURCE_MODE": "immutable",
         },
         capture_output=True,
         text=True,
@@ -960,8 +962,21 @@ def test_activate_transport_uses_only_the_rollback_release_dispatcher() -> None:
     assert 'ROLLBACK_COMMIT="$rollback_commit"' in activate
     assert 'ACTIVATION_AUTHORIZATION="$authorization"' in activate
     assert 'ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed"' in activate
+    assert 'ACTIVATION_SOURCE_MODE="$source_mode"' in activate
+    assert 'source_mode="${13}"' in bootstrap
+    assert "'$ACTIVATION_SOURCE_MODE'" in bootstrap
     assert "git push" not in activate
     assert "telegram-kol-stage" not in activate
+
+
+def test_powershell_activate_transport_passes_explicit_source_mode() -> None:
+    script = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
+
+    assert '[ValidateSet("immutable", "stopped_legacy")]' in script
+    assert '[string]$ActivationSourceMode = "immutable"' in script
+    assert 'source_mode="${13}"' in script
+    assert 'ACTIVATION_SOURCE_MODE="$source_mode"' in script
+    assert "'$ActivationSourceMode'" in script
 
 
 def test_retired_universal_updater_implementation_is_absent() -> None:

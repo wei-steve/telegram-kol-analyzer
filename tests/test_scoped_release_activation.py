@@ -365,10 +365,11 @@ def activation_harness(tmp_path: Path):
     authorization.write_bytes(
         _canonical(
             {
-                "contract": "scoped-activation-authorization-v1",
-                "schema_version": 1,
+                "contract": "scoped-activation-authorization-v2",
+                "schema_version": 2,
                 "commit": CANDIDATE,
                 "components": ["web"],
+                "source_mode": "immutable",
                 "action_plan_sha256": action_plan_sha256(parsed),
                 "nonce": "c" * 64,
                 "issued_at": (now - timedelta(seconds=1)).isoformat(),
@@ -397,6 +398,14 @@ def activation_harness(tmp_path: Path):
         for commit in (ROLLBACK, CANDIDATE)
     }
     return paths, runtime, manifest
+
+
+def _set_authorization_source_mode(paths: ActivationPaths, source_mode: str) -> None:
+    payload = json.loads(paths.authorization.read_text(encoding="utf-8"))
+    payload["source_mode"] = source_mode
+    paths.authorization.chmod(0o600)
+    paths.authorization.write_bytes(_canonical(payload))
+    paths.authorization.chmod(0o400)
 
 
 def test_web_activation_consumes_verified_receipt_and_restarts_only_web(
@@ -701,6 +710,7 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
@@ -747,6 +757,7 @@ def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
@@ -784,6 +795,7 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
@@ -815,6 +827,7 @@ def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
@@ -890,6 +903,30 @@ def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
         scoped_activation._activation_source_mode()
 
 
+def test_stopped_legacy_source_mode_rejects_ordinary_immutable_authorization(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+
+    with pytest.raises(ActivationError, match="authorization is invalid"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert paths.authorization.exists()
+    assert runtime.events == []
+
+
 @pytest.mark.parametrize(
     ("unit", "state", "reason"),
     [
@@ -905,6 +942,7 @@ def test_stopped_legacy_activation_refuses_active_or_unmasked_unit_before_author
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         name: ("inactive", "masked")
         for name in runtime.maintenance_state_by_unit
@@ -931,6 +969,7 @@ def test_stopped_legacy_activation_refuses_partial_runtime_scope(
     activation_harness,
 ) -> None:
     paths, runtime, _ = activation_harness
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
@@ -954,6 +993,7 @@ def test_stopped_legacy_activation_refuses_unknown_unit_state(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
 
     def unavailable_state(unit: str) -> tuple[str, str]:
         raise OSError(f"cannot read {unit}")
@@ -991,6 +1031,7 @@ def test_stopped_legacy_activation_refuses_legacy_pid_cgroup_or_process(
 ) -> None:
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
         unit: ("inactive", "masked")
         for unit in runtime.maintenance_state_by_unit
