@@ -1,10 +1,16 @@
 # Deepcoin Single-Order Drain and Immutable Control Bootstrap Design
 
 **Date:** 2026-08-28
-**Status:** approved
+**Status:** superseded by `2026-08-28-deepcoin-simple-cancel-all-cutover-design.md`
 **Risk:** L3 for the authority seed and each exchange write; L2/L3 for the
 runtime authority cutover
 **Local design baseline:** `ffb06d19eabfd32dfdab2942b2152fd2809e3d17`
+
+> This design is retained as review history only. The operator chose a single
+> maintenance window with manual Deepcoin cancellation of all entry orders,
+> one local reconciliation transaction, and ordinary entry-frozen activation.
+> Its per-order drain, authority-seed command, persistent maintenance guard,
+> and one-time bootstrap are no longer implementation authority.
 
 ## Objective and Accepted Trade-off
 

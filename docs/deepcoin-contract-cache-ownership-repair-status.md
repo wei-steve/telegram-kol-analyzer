@@ -40,7 +40,12 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
-immutable_control_bootstrap_status: task10_local_complete_unpushed
+immutable_control_bootstrap_status: superseded_deleted_local
+simple_cancel_all_cutover_status: local_complete_unpushed
+simple_cancel_all_cutover_design_sha: 71eb1d4b
+simple_cancel_all_protocol_removal_sha: a3434ebb
+simple_cancel_all_reconciliation_sha: ec0b9dee
+simple_cancel_all_bytecode_fix_sha: d2c640e9
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -648,3 +653,35 @@ phase completes or pauses, record both verified evidence and outstanding work.
   authorizations recorded above. Every reviewed order still requires a fresh
   plan and new confirmation token, and any unknown result permanently stops the
   sequence without automatic retry.
+
+## Simplified cancel-all cutover replacement
+
+- The operator explicitly rejected further growth of the one-time handoff
+  mechanism and selected a single maintenance window: freshly prove zero
+  positions, stop the legacy runtime, cancel every entry order through the
+  Deepcoin operator interface, prove zero positions/orders, reconcile local
+  state once, and use ordinary entry-frozen activation.
+- Design and implementation plan commit `71eb1d4b` supersedes the nine-window
+  seed/drain/bootstrap design. Commit `a3434ebb` deletes the three maintenance
+  commands and their bootstrap, action coordinator, manifest and seed modules.
+  Commit `ec0b9dee` deletes the per-order cancellation executor and persistent
+  maintenance guard, extracts the sole canonical seven-target source, and adds
+  one read-only-exchange/local-write reconciliation command.
+- The new `finalize-cancelled-pending-entries` command has no Deepcoin write
+  path. It requires a fresh complete zero-position, zero-regular-order and
+  zero-pending-trigger snapshot, creates and verifies one SQLite backup, then
+  terminalizes intent, leg, protection, convergence, binding, lifecycle and
+  event state and creates the missing normal idle authority row in one SQLite
+  transaction. A malformed or non-idle existing row fails closed.
+- Commit `d2c640e9` directly repairs the staged-release mutation found during
+  read-only activation preflight: the activator invokes Python with `-B`, and
+  every release drop-in sets `PYTHONDONTWRITEBYTECODE=1`. Candidate code no
+  longer needs to run a self-referential bootstrap proof.
+- Focused verification passed 97 tests for protocol removal, 315 tests for the
+  reconciliation/authority/runtime boundary, and 63 tests with one existing
+  skip for activation and bytecode protection. Python compilation and
+  `git diff --check` passed. The one final repository suite after the final
+  production-code edit passed 6498 tests with 3 documented skips and 32
+  existing warnings in 470.34 seconds. No push, stage, SSH, production read, service control,
+  Deepcoin cancellation, database mutation, activation, restart or entry thaw
+  occurred in this local implementation.
