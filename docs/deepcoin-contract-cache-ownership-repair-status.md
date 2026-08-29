@@ -3,13 +3,13 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: candidate_integration
+current_phase: manual_cancel_reconciliation_history_repair
 phase_state: planned
 claimed_by: null
-candidate_sha: c3730ef6ea9406f490b44fab97847b556f946fb8
+candidate_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
 candidate_content_sha: 9a0b883515de1af4e3785383bd059e62d8ea4bff
-handoff_sha: c3730ef6ea9406f490b44fab97847b556f946fb8
-pushed_sha: c3730ef6ea9406f490b44fab97847b556f946fb8
+handoff_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
+pushed_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -30,7 +30,7 @@ pending_entry_cancel_revision_scope_fix_base_sha: be97f3233838e6e0867529cf04cd4e
 pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9a6
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
-pending_entry_cancel_live_order_count: 7
+pending_entry_cancel_live_order_count: 0
 legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_complete
 legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
 legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
@@ -41,7 +41,7 @@ legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
 immutable_control_bootstrap_status: superseded_deleted_local
-simple_cancel_all_cutover_status: final_local_candidate_unpushed
+simple_cancel_all_cutover_status: staged_inactive_history_contract_blocked
 simple_cancel_all_cutover_design_sha: 71eb1d4b
 simple_cancel_all_protocol_removal_sha: a3434ebb
 simple_cancel_all_reconciliation_sha: ec0b9dee
@@ -51,6 +51,10 @@ simple_cancel_all_production_candidate_sha: 44b99d82c662c264554dcb07b18ed11faa32
 simple_cancel_all_final_focused: 314_passed_1_skipped
 simple_cancel_all_final_suite: 6626_passed_3_skipped_32_warnings
 simple_cancel_all_production_executed: false
+manual_cleanup_read_only_verified_at: 2026-08-29T20:20:19Z
+manual_cleanup_exchange_snapshot_status: zero_live_orders_history_contract_blocked
+manual_cleanup_target_fill_count: 0
+manual_cleanup_local_eligible_count: 7
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -63,6 +67,14 @@ historical_replay_allowed: false
 If `phase_state` is `claimed` or `in_progress` and `claimed_by` does not match
 the current task, stop immediately without modifying the repository. When the
 phase completes or pauses, record both verified evidence and outstanding work.
+
+## Execution scope policy
+
+A user may approve one coherent phase covering all normal steps named in that
+scope. Those steps do not require repeated per-action confirmation. Exact SHAs,
+immutable manifests, fresh production evidence, backups, rollback boundaries,
+and fail-closed unknown handling remain mandatory. Stop for a material scope
+expansion or an irreversible action that the approved phase did not include.
 
 ## Verified
 
@@ -422,8 +434,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
 
 - Task 11 exact-SHA review rejected the prior candidate before push. The
   owner-authorized local RED→GREEN repair started at exact clean base
-  `49b8f40c9af0f38344724c84f39a7e065e5beabd`; push, SSH, deployment, restart,
-  production writes, and trading writes remain unauthorized.
+  `49b8f40c9af0f38344724c84f39a7e065e5beabd`. At that checkpoint no push, SSH,
+  deployment, restart, production write, or trading write had occurred.
 - The approved design and implementation plan were read in full.
 - Initial gates passed at `bad13a7b56c833919536dfb7f028725201fc22cc` on
   `codex/phase0-deploy-integration` in the authoritative workspace.
@@ -464,40 +476,28 @@ phase completes or pauses, record both verified evidence and outstanding work.
   seven reviewed orders. The following status-only commit records this evidence;
   any future exact-SHA review or push must resolve the then-current local HEAD
   rather than treating this content SHA as a self-referential handoff SHA.
-- Production use remains separately gated: exact-SHA review/push, a fresh
-  read-only preflight, each production freeze/fence transition, and each of the
-  seven single-order cancellation applies require explicit authorization.
-  Every order must be freshly replanned; an unknown result forbids retry and
-  stops the sequence. Deployment, restart and future-signal-only restore remain
-  later, separate authorities.
-
 - The cross-process quiescence reviewed cancellation candidate
   `708a479f7e20aba74869d87acb3839f3fd91e96b` has not been pushed, deployed, or
   executed in production. Its earlier cancellation-tool base was pushed at
-  `91bb257e2a1c808c25a54149a7c71c392c0952e4`. Any fresh production read-only
-  plan, candidate push/deployment, and each individual Deepcoin cancellation
-  require their own explicit authorization. An unknown result must stop the
-  sequence and must not be retried; the remaining exact orders must be freshly
+  `91bb257e2a1c808c25a54149a7c71c392c0952e4`. An unknown result must stop the
+  sequence and must not be retried; remaining exact orders must be freshly
   replanned one at a time.
 - The local candidate closes the previously recorded separate-process TOCTOU in
   code, but production remains on the older unleased runtime. Therefore no live
-  apply is safe until this exact candidate is separately pushed, deployed and
-  verified, then settings are separately frozen and a fresh dry-run is reviewed.
+  apply is safe until the exact candidate is deployed and verified, settings
+  are frozen, and a fresh dry-run is reviewed.
 - Production remains unchanged at
   `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; automatic entry remains enabled.
   Do not enter Task 13 while any of the seven unprotected pending trigger entries
   remains live. A new read-only preflight must prove zero such orders, or a
-  separately designed and authorized drain/cancellation procedure must safely
-  terminalize them before deployment. Unique ownership alone is not a safe
-  worker-stop window.
+  bounded drain/cancellation procedure must safely terminalize them before
+  deployment. Unique ownership alone is not a safe worker-stop window.
 - The legacy health classification remains closed: HTTP 404 alone is insufficient.
   It requires the same token, authenticated health on the exact worker port,
   `runtime_role=worker`, and exact previous SHA route absence in addition to the
   verified previous SHA and closed legacy monitor env.
-- Explicit freeze, exact-SHA deployment, Linux/root helper verification,
-  worker refresh/health checks, bounded observation, and future-signal-only
-  restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
-  restart, production write, Telegram replay, or Deepcoin write was performed.
+- No push, deployment, SSH, restart, production write, Telegram replay, or
+  Deepcoin write was performed during that phase.
 
 ## Immutable control bootstrap local replacement (Tasks 7-9)
 
@@ -562,8 +562,7 @@ phase completes or pauses, record both verified evidence and outstanding work.
   Independent exact-archive review of `905c0993` passed 597 tests with 1 skip,
   `git diff --check` passed, and found no remaining Critical or Important
   finding. Task 10's one final repository suite and final local handoff remain
-  separately pending; this is not an activation-ready, push-authorized or
-  deployment-authorized claim.
+  pending; this was not an activation-ready candidate.
 
 ## Task 10 final local verification (failed closed)
 
@@ -591,8 +590,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
   pre-write refusal through `RecoveryLiveSubmitError` rather than its older
   `DeepcoinExecutionActionError` contract. One stage-helper test is rejected by
   the stricter closed action-manifest schema before reaching its older exact
-  diagnostic string. These compatibility decisions and fixture repairs are not
-  authorized in this status-only Task 10 batch.
+  diagnostic string. Those compatibility decisions and fixture repairs remained
+  outside that status-only Task 10 batch.
 - The planned named cross-boundary first falsifier
   `test_cancel_timeout_then_crash_and_reboot_never_retries_or_restores` is not
   present in the implemented suite, so composed crash-after-unknown acceptance
@@ -611,20 +610,11 @@ phase completes or pauses, record both verified evidence and outstanding work.
   deployment, read-only production preflight, DB-copy rehearsal, production
   seed, order cancellation, bootstrap, entry thaw, freeze, restart, database or
   settings write, Deepcoin write, or Telegram replay occurred in this batch.
-- A separate local repair authorization is required before changing the stale
-  fixtures/contracts and adding the missing composed falsifier. Even after a
-  new green final candidate, the exact future authorizations remain separate:
-  push; stage; SSH and the read-only production preflight; deployment; every
-  service-control transition including freeze/mask/stop/start/restart; DB-copy
-  rehearsal; the production L3 seed; seven independent Deepcoin single-order
-  writes with a fresh plan and token for each; immutable bootstrap; and entry
-  thaw. Any additional settings write, database write, Deepcoin write, or
-  production mutation also requires its own explicit authorization. Unknown
-  remains permanently non-retryable and stops the sequence.
+- Unknown remains permanently non-retryable and stops the sequence.
 
 ## Task 10 compatibility repair and final local evidence
 
-- The separately authorized local compatibility repair is exact commit
+- The local compatibility repair is exact commit
   `3a641e5f192128960a5fc980c6fe2dc57ad89f1f` with tree
   `34d7152d22ae48705d28d9adc52bac68c11cf1eb`. It changes six test files only;
   production code remains the independently reviewed `905c0993` content
@@ -650,14 +640,9 @@ phase completes or pauses, record both verified evidence and outstanding work.
   414.94 seconds. No production code or tests changed after the final suite.
 - Independent review found no Critical, Important, or Minor finding in the
   six-file repair and approved it for final verification. This closes the local
-  Task 10 test gate only; it is not production-dependent acceptance and does
-  not authorize handoff, push, stage, SSH, deployment, service control, seed,
-  order cancellation, bootstrap, entry thaw, settings/database writes,
-  Deepcoin writes, or any other production mutation.
-- Future production work remains split across the exact independent
-  authorizations recorded above. Every reviewed order still requires a fresh
-  plan and new confirmation token, and any unknown result permanently stops the
-  sequence without automatic retry.
+  Task 10 test gate only; production remained unchanged. Every reviewed order
+  still requires a fresh plan and new confirmation token, and any unknown
+  result permanently stops the sequence without automatic retry.
 
 ## Simplified cancel-all cutover replacement
 
@@ -726,9 +711,8 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - This final local batch performed no push, stage, SSH, production read,
   service stop/mask/start/restart, Deepcoin UI cancellation, database/settings
   mutation, activation, rollback, entry thaw, historical replay, order retry,
-  or Telegram trading send. Every such production phase remains outstanding
-  and requires a new exact authorization. Historical production SHA and order
-  observations remain stale routing context, never current acceptance evidence.
+  or Telegram trading send. Historical production SHA and order observations
+  remain stale routing context, never current acceptance evidence.
 - This documentation/test handoff reconciliation started from exact clean,
   pushed SHA `6c6c5f320b6c9d34a9c5ea4caafd15d06d74b79d`. It changes only the stale
   Task 12 status assertion to the already-recorded
@@ -736,3 +720,36 @@ phase completes or pauses, record both verified evidence and outstanding work.
   production candidate `44b99d82c662c264554dcb07b18ed11faa3222ff`
   remain unchanged; the resulting handoff is local, unpushed, unstaged, and
   inactive.
+
+## Manual operator cleanup read-only verification
+
+- The operator manually removed the seven Deepcoin pending triggers. A bounded
+  production read-only verification ran from `2026-08-29T20:19:39Z` through
+  `2026-08-29T20:20:19Z` against canonical targets loaded from staged, inactive
+  release `2ce91a373bef5dc9878c54c4db5a23e0ace51d49`.
+- Both the before and after account snapshots contained zero positions, zero
+  regular open orders, zero pending triggers, and zero canonical targets still
+  pending. Exact per-target fill reads returned zero rows for all seven. The
+  completed run issued 32 GET requests with no query retry and no incomplete
+  response.
+- The current reconciliation history contract did not pass: five targets
+  returned one exact history row whose status was not represented as the
+  candidate's literal `cancelled|canceled`, and two exact `ordId` history reads
+  returned no row. This is a local evidence-contract blocker, not evidence that
+  an active order remains.
+- SQLite was read with `query_only=1`; `total_changes=0`, `quick_check=ok`,
+  foreign-key issues and active exchange writes were zero. All seven canonical
+  local targets remain eligible, none is partially terminalized, binding scope
+  is unchanged, and the normal authority row is still missing for the later L3
+  transaction.
+- Production remained on tracked-clean SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`; web, ingest, worker, and monitor
+  timer remained active and the monolith inactive. The first SSH result channel
+  was lost; one complete read-only rerun produced the evidence above. Neither
+  run performed a production, database, settings, service-control, or Deepcoin
+  write.
+- The next local phase should simplify only the manual reconciliation evidence
+  contract: require stable zero account snapshots, exact zero fills for every
+  canonical target, intact local identity, and stopped-runtime proof at the
+  eventual write boundary; explicit fill or identity conflict remains blocking.
+  Do not restore the deleted bridge or add another persistent handoff state.

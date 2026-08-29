@@ -765,7 +765,14 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
         "91bb257e2a1c808c25a54149a7c71c392c0952e4" in status
     )
     assert "pending_entry_cancel_production_executed: false" in status
-    assert "pending_entry_cancel_live_order_count: 7" in status
+    assert "current_phase: manual_cancel_reconciliation_history_repair" in status
+    assert "pending_entry_cancel_live_order_count: 0" in status
+    assert (
+        "manual_cleanup_exchange_snapshot_status: "
+        "zero_live_orders_history_contract_blocked" in status
+    )
+    assert "manual_cleanup_target_fill_count: 0" in status
+    assert "manual_cleanup_local_eligible_count: 7" in status
     assert "auto_trade_frozen: false" in status
     assert "freeze_raw_message_id: null" in status
     assert "restore_raw_message_id: null" in status

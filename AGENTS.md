@@ -6,9 +6,14 @@
   on the server only when acceptance actually depends on the live Telegram
   session, Deepcoin API IP allowlist, production keys, or deployed runtime state.
 - Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1` when
-  the active plan or user request calls for integration. Deploy only when the
-  phase or user request requires production verification; a local code change
-  does not by itself authorize or require a deployment.
+  the active plan or user request calls for integration. Deploy when the
+  approved phase requires production verification.
+- Treat a user-approved phase as one coherent execution scope. Normal steps
+  explicitly included in that scope do not require repeated confirmation.
+  Pause only when the work materially expands beyond the approved phase or an
+  irreversible action was not included. Exact SHAs, action manifests, fresh
+  evidence, backup/rollback boundaries, and fail-closed handling remain
+  technical requirements rather than separate conversational approval gates.
 - Send no Telegram notifications during active work. Concise in-app commentary
   is allowed at meaningful milestones, state changes, or blockers; do not stream
   repetitive polling or unchanged status. Send exactly one Telegram notification
@@ -22,9 +27,9 @@
   as the fallback and clearly report the Telegram failure in the final response.
   If both notification methods are unavailable, state that clearly in the final
   response.
-- After a separately authorized push, use the explicit stage helper only when
-  staging is authorized. Activation remains a later independent authorization
-  and command; neither action enables trading:
+- When the approved phase includes staging or activation, use the explicit
+  helper and exact reviewed manifests below. Stage and activate remain distinct
+  commands and evidence boundaries; neither action enables trading:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
@@ -70,7 +75,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
   mutation is planned. Preserve a backup, `PRAGMA quick_check`, and before/after
   counts for affected and critical business tables; do not hash every table
   unless an anomaly requires a wider audit. Any change to real exchange-write
-  semantics requires separate explicit user approval.
+  semantics must be explicitly included in the approved phase scope.
 - During development, use focused tests for each edit. Run the full suite once
   after all production-code changes are assembled into the final candidate. If
   production code changes after that run, it becomes a new final candidate: run
