@@ -94,6 +94,12 @@ class RuntimeAdapter(Protocol):
 
     def start_unit(self, unit: str) -> None: ...
 
+    def maintenance_unit_state(self, unit: str) -> tuple[str, str]: ...
+
+    def unmask_unit(self, unit: str) -> None: ...
+
+    def mask_unit(self, unit: str) -> None: ...
+
     def daemon_reload(self) -> None: ...
 
     def monitor_timer_active(self) -> bool: ...
@@ -631,7 +637,32 @@ def _stop_units(runtime: RuntimeAdapter, components: list[str]) -> None:
 
 def _start_units(runtime: RuntimeAdapter, components: list[str]) -> None:
     for unit in _start_order(components):
-        runtime.start_unit(unit)
+            runtime.start_unit(unit)
+
+
+def _require_stopped_legacy_boundary(
+    runtime: RuntimeAdapter,
+    components: list[str],
+) -> None:
+    if set(components) != _AUTHORITY_RUNTIME_SCOPE:
+        raise ActivationError("stopped legacy activation requires full runtime scope")
+    for unit in _controlled_units(components):
+        try:
+            active_state, enabled_state = runtime.maintenance_unit_state(unit)
+        except Exception as exc:
+            raise ActivationError("stopped legacy runtime state is unknown") from exc
+        if active_state != "inactive" or enabled_state != "masked":
+            raise ActivationError("stopped legacy runtime is not persistently stopped")
+
+
+def _unmask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
+    for unit in _controlled_units(components):
+        runtime.unmask_unit(unit)
+
+
+def _mask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
+    for unit in _controlled_units(components):
+        runtime.mask_unit(unit)
 
 
 def consume_activation_authorization(source: Path, consumed: Path) -> None:
@@ -666,6 +697,7 @@ def activate_release(
     runtime: RuntimeAdapter,
     expected_uid: int,
     now: datetime | None = None,
+    source_mode: str = "immutable",
 ) -> dict[str, Any]:
     observed_now = (now or datetime.now(UTC)).astimezone(UTC)
     manifest, canonical, plan_sha = _read_manifest(paths.action_manifest)
@@ -693,6 +725,8 @@ def activate_release(
         raise ActivationError("staged and activation declarations differ")
 
     require_authority = bool(set(components) & _AUTHORITY_COMPONENTS)
+    if source_mode not in {"immutable", "stopped_legacy"}:
+        raise ActivationError("activation source mode is invalid")
     _validate_authorization(
         paths.authorization,
         expected_uid=expected_uid,
@@ -704,25 +738,33 @@ def activate_release(
     affected_runtime_roles = [
         component for component in components if component in _RUNTIME_COMPONENTS
     ]
-    before_identities, before_releases = prove_release_runtime(
-        runtime,
-        release_root=paths.release_root,
-        expected_uid=expected_uid,
-        expected_releases={role: rollback for role in affected_runtime_roles},
-        components=components,
-        require_authority=require_authority,
-        require_entry_frozen=False,
-        now=observed_now,
-    )
-    preserve_entry_freeze = require_authority or any(
-        identity.get("entry_admission_frozen") is True
-        for identity in before_identities.values()
-    )
+    if source_mode == "stopped_legacy":
+        _require_stopped_legacy_boundary(runtime, components)
+        before_identities: dict[str, Mapping[str, Any]] = {}
+        before_releases = {role: rollback for role in affected_runtime_roles}
+        preserve_entry_freeze = True
+    else:
+        before_identities, before_releases = prove_release_runtime(
+            runtime,
+            release_root=paths.release_root,
+            expected_uid=expected_uid,
+            expected_releases={role: rollback for role in affected_runtime_roles},
+            components=components,
+            require_authority=require_authority,
+            require_entry_frozen=False,
+            now=observed_now,
+        )
+        preserve_entry_freeze = require_authority or any(
+            identity.get("entry_admission_frozen") is True
+            for identity in before_identities.values()
+        )
     if require_authority and runtime.active_write_count(paths.database_path) != 0:
         raise ActivationError("active exchange write blocks activation")
 
-    monitor_was_active = (
-        runtime.monitor_timer_active() if "monitor" in components else False
+    monitor_was_active = bool(
+        source_mode == "immutable"
+        and "monitor" in components
+        and runtime.monitor_timer_active()
     )
     _validate_authorization(
         paths.authorization,
@@ -740,7 +782,10 @@ def activate_release(
     mutation_started = False
     try:
         mutation_started = True
-        _stop_units(runtime, components)
+        if source_mode == "stopped_legacy":
+            _require_stopped_legacy_boundary(runtime, components)
+        else:
+            _stop_units(runtime, components)
         if require_authority and runtime.active_write_count(paths.database_path) != 0:
             raise ActivationError("post-stop active exchange write is unknown or nonzero")
         publish_release_dropins(
@@ -751,6 +796,8 @@ def activate_release(
         )
         runtime.daemon_reload()
         validate_release(paths.release_root, expected_commit, expected_uid=expected_uid)
+        if source_mode == "stopped_legacy":
+            _unmask_units(runtime, components)
         _start_units(runtime, components)
         after_identities, _ = prove_release_runtime(
             runtime,
@@ -765,14 +812,17 @@ def activate_release(
             require_entry_frozen=preserve_entry_freeze,
             now=datetime.now(UTC),
         )
-        _prove_restarted_processes(before_identities, after_identities, components)
-        _prove_undeclared_processes_unchanged(
-            before_identities,
-            after_identities,
-            components,
-        )
+        if source_mode == "immutable":
+            _prove_restarted_processes(before_identities, after_identities, components)
+            _prove_undeclared_processes_unchanged(
+                before_identities,
+                after_identities,
+                components,
+            )
         _activate_monitor(runtime, components, candidate)
-        if monitor_was_active:
+        if monitor_was_active or (
+            source_mode == "stopped_legacy" and "monitor" in components
+        ):
             runtime.start_unit("telegram-kol-monitor.timer")
     except Exception as exc:
         if not mutation_started:
@@ -801,6 +851,12 @@ def activate_release(
             if monitor_was_active:
                 runtime.start_unit("telegram-kol-monitor.timer")
         except Exception as rollback_exc:
+            if source_mode == "stopped_legacy":
+                try:
+                    _stop_units(runtime, components)
+                    _mask_units(runtime, components)
+                except Exception:
+                    pass
             raise ActivationError("activation failed; rollback_failed") from rollback_exc
         raise ActivationError("activation failed; rollback_complete") from exc
 
@@ -809,6 +865,7 @@ def activate_release(
         "commit": expected_commit,
         "rollback_commit": rollback_commit,
         "components": components,
+        "source_mode": source_mode,
         "authorization_consumed": True,
     }
 
@@ -895,6 +952,31 @@ class SystemRuntimeAdapter:
 
     def start_unit(self, unit: str) -> None:
         self._run(["systemctl", "start", unit])
+
+    def maintenance_unit_state(self, unit: str) -> tuple[str, str]:
+        active = self._run(
+            ["systemctl", "show", unit, "--property=ActiveState", "--value"]
+        ).stdout.strip()
+        try:
+            enabled_result = subprocess.run(
+                ["systemctl", "is-enabled", unit],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise ActivationError("runtime command failed") from exc
+        enabled = enabled_result.stdout.strip()
+        if enabled_result.returncode not in {0, 1} or not active or not enabled:
+            raise ActivationError("runtime command failed")
+        return active, enabled
+
+    def unmask_unit(self, unit: str) -> None:
+        self._run(["systemctl", "unmask", unit])
+
+    def mask_unit(self, unit: str) -> None:
+        self._run(["systemctl", "mask", unit])
 
     def daemon_reload(self) -> None:
         self._run(["systemctl", "daemon-reload"])

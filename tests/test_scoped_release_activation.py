@@ -196,6 +196,18 @@ class FakeRuntime:
         self.entry_frozen_by_role = {
             role: False for role in ("web", "ingest", "worker")
         }
+        self.maintenance_state_by_unit = {
+            unit: ("active", "enabled")
+            for unit in (
+                "telegram-kol-web.service",
+                "telegram-kol-ingest.service",
+                "telegram-kol-worker.service",
+                "telegram-kol-monitor.timer",
+                "telegram-kol-monitor.service",
+                "telegram-kol-monitor-diagnostic.service",
+                "telegram-kol-monitor-test-notification.service",
+            )
+        }
 
     def active_write_count(self, database_path: Path) -> int:
         self.events.append("active-write")
@@ -261,6 +273,8 @@ class FakeRuntime:
 
     def start_unit(self, unit: str) -> None:
         self.events.append(f"start:{unit}")
+        _, enabled_state = self.maintenance_state_by_unit[unit]
+        self.maintenance_state_by_unit[unit] = ("active", enabled_state)
         role = unit.removeprefix("telegram-kol-").removesuffix(".service")
         if role not in self.current_commit_by_role:
             return
@@ -276,6 +290,19 @@ class FakeRuntime:
 
     def daemon_reload(self) -> None:
         self.events.append("daemon-reload")
+
+    def maintenance_unit_state(self, unit: str) -> tuple[str, str]:
+        self.events.append(f"maintenance-state:{unit}")
+        return self.maintenance_state_by_unit[unit]
+
+    def unmask_unit(self, unit: str) -> None:
+        self.events.append(f"unmask:{unit}")
+        active_state, _ = self.maintenance_state_by_unit[unit]
+        self.maintenance_state_by_unit[unit] = (active_state, "enabled")
+
+    def mask_unit(self, unit: str) -> None:
+        self.events.append(f"mask:{unit}")
+        self.maintenance_state_by_unit[unit] = ("inactive", "masked")
 
     def monitor_timer_active(self) -> bool:
         return True
@@ -637,6 +664,124 @@ def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
         "start:telegram-kol-ingest.service",
         "start:telegram-kol-monitor.timer",
     ]
+
+
+def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+
+    immutable_identity = runtime.runtime_identity
+
+    def legacy_identity_is_unavailable(role: str) -> dict:
+        if runtime.current_commit_by_role[role] == ROLLBACK:
+            raise ActivationError(f"legacy {role} has no identity endpoint")
+        return immutable_identity(role)
+
+    runtime.runtime_identity = legacy_identity_is_unavailable
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        source_mode="stopped_legacy",
+    )
+
+    assert result["status"] == "activated"
+    assert result["source_mode"] == "stopped_legacy"
+
+
+@pytest.mark.parametrize(
+    ("unit", "state", "reason"),
+    [
+        ("telegram-kol-worker.service", ("active", "masked"), "not persistently stopped"),
+        ("telegram-kol-ingest.service", ("inactive", "enabled"), "not persistently stopped"),
+    ],
+)
+def test_stopped_legacy_activation_refuses_active_or_unmasked_unit_before_authorization(
+    activation_harness,
+    unit,
+    state,
+    reason,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        name: ("inactive", "masked")
+        for name in runtime.maintenance_state_by_unit
+    }
+    runtime.maintenance_state_by_unit[unit] = state
+
+    with pytest.raises(ActivationError, match=reason):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert paths.authorization.exists()
+    assert not any(
+        event.startswith(("unmask:", "start:")) for event in runtime.events
+    )
+
+
+def test_stopped_legacy_activation_refuses_partial_runtime_scope(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+
+    with pytest.raises(ActivationError, match="requires full runtime scope"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert paths.authorization.exists()
+
+
+def test_stopped_legacy_activation_refuses_unknown_unit_state(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+
+    def unavailable_state(unit: str) -> tuple[str, str]:
+        raise OSError(f"cannot read {unit}")
+
+    runtime.maintenance_unit_state = unavailable_state
+
+    with pytest.raises(ActivationError, match="runtime state is unknown"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert paths.authorization.exists()
+    assert not any(
+        event.startswith(("unmask:", "start:")) for event in runtime.events
+    )
 
 
 def test_partial_worker_authority_activation_is_rejected(
