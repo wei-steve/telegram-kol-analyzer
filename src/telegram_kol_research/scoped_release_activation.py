@@ -667,7 +667,7 @@ def _require_stopped_legacy_boundary(
             raise ActivationError("stopped legacy runtime state is unknown") from exc
         if (
             active_state != "inactive"
-            or enabled_state != "masked"
+            or enabled_state != "inhibited"
             or main_pid != 0
             or cgroup_pids
         ):
@@ -711,7 +711,7 @@ def _reinhibit_and_stop_all(
             active_state, enabled_state = runtime.maintenance_unit_state(unit)
             if (
                 active_state != "inactive"
-                or enabled_state != "masked"
+                or enabled_state != "inhibited"
                 or runtime.main_pid(unit) != 0
                 or runtime.cgroup_pids(unit)
             ):
@@ -1053,7 +1053,7 @@ class SystemRuntimeAdapter:
             ).stdout.strip()
             if pending != "no":
                 raise ActivationError("runtime command failed")
-            return active, "masked"
+            return active, "inhibited"
         try:
             enabled_result = subprocess.run(
                 ["systemctl", "is-enabled", unit],

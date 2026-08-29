@@ -313,6 +313,51 @@ def test_manual_reconciliation_refuses_target_fill_or_ambiguous_history(
     assert plan.reason_code == reason
 
 
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "ordId",
+        "orderId",
+        "order_id",
+        "orderSysID",
+        "OrderSysID",
+        "id",
+        "algoId",
+        "triggerOrderId",
+        "trigger_order_id",
+    ),
+)
+def test_manual_reconciliation_refuses_target_fill_for_every_supported_alias(
+    tmp_path,
+    alias,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    client.fills.append(
+        {
+            "instId": target.instrument_id,
+            alias: target.order_id,
+            "state": "filled",
+        }
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_fill_present"
+
+
 def test_manual_reconciliation_accepts_explicit_cancelled_target_history(tmp_path):
     from telegram_kol_research.manual_pending_entry_reconciliation import (
         build_manual_pending_entry_reconciliation_plan,
@@ -323,6 +368,49 @@ def test_manual_reconciliation_accepts_explicit_cancelled_target_history(tmp_pat
     client = ReadOnlyClient()
     client.history.append(
         {"instId": target.instrument_id, "ordId": target.order_id, "state": "canceled"}
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
+
+
+@pytest.mark.parametrize(
+    "alias",
+    (
+        "ordId",
+        "orderId",
+        "order_id",
+        "orderSysID",
+        "OrderSysID",
+        "id",
+        "algoId",
+        "triggerOrderId",
+        "trigger_order_id",
+    ),
+)
+def test_manual_reconciliation_accepts_cancelled_history_supported_alias(
+    tmp_path,
+    alias,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    client.history.append(
+        {
+            "instId": target.instrument_id,
+            alias: target.order_id,
+            "state": "cancelled",
+        }
     )
 
     plan = build_manual_pending_entry_reconciliation_plan(
@@ -393,6 +481,82 @@ def test_manual_reconciliation_refuses_conflicting_order_id_aliases(tmp_path):
 
     assert plan.status == "blocked"
     assert plan.reason_code == "target_history_identity_conflict"
+
+
+@pytest.mark.parametrize(
+    ("target_alias", "conflict_alias"),
+    (
+        ("ordId", "orderId"),
+        ("orderId", "order_id"),
+        ("order_id", "orderSysID"),
+        ("orderSysID", "OrderSysID"),
+        ("OrderSysID", "id"),
+        ("id", "algoId"),
+        ("algoId", "triggerOrderId"),
+        ("triggerOrderId", "trigger_order_id"),
+        ("trigger_order_id", "ordId"),
+    ),
+)
+def test_manual_reconciliation_refuses_every_history_alias_conflict(
+    tmp_path,
+    target_alias,
+    conflict_alias,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    client.history.append(
+        {
+            "instId": target.instrument_id,
+            target_alias: target.order_id,
+            conflict_alias: "different-order",
+            "state": "cancelled",
+        }
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_history_identity_conflict"
+
+
+@pytest.mark.parametrize("instrument_id", (None, "BTC-USDT-SWAP", "eth-usdt-swap"))
+def test_manual_reconciliation_refuses_history_without_exact_instrument(
+    tmp_path,
+    instrument_id,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    row = {"ordId": target.order_id, "state": "cancelled"}
+    if instrument_id is not None:
+        row["instId"] = instrument_id
+    client.list_trigger_order_history = (
+        lambda *, inst_id: [row] if inst_id == target.instrument_id else []
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_history_instrument_mismatch"
 
 
 def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, monkeypatch):

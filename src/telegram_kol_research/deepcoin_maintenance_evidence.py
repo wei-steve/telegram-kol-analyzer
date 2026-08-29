@@ -11,6 +11,21 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 
 _MAX_EVIDENCE_AGE = timedelta(seconds=30)
 _PAGE_LIMIT = 100
+_CANONICAL_ORDER_ID_ALIASES = (
+    "ordId",
+    "orderId",
+    "order_id",
+    "orderSysID",
+    "OrderSysID",
+    "id",
+    "algoId",
+    "triggerOrderId",
+    "trigger_order_id",
+)
+_ORDER_ID_ALIASES_BY_RESPONSE = {
+    response_kind: _CANONICAL_ORDER_ID_ALIASES
+    for response_kind in ("pending_trigger", "trigger_history", "fill")
+}
 
 
 class DeepcoinMaintenanceEvidenceRefused(RuntimeError):
@@ -44,12 +59,16 @@ class DeepcoinMaintenanceEvidence:
         return sum(
             1
             for row in self.pending_triggers
-            if deepcoin_order_id(row) == self.target_order_id
+            if deepcoin_order_id(row, response_kind="pending_trigger")
+            == self.target_order_id
         )
 
     @property
     def pending_order_ids(self) -> tuple[str, ...]:
-        return tuple(deepcoin_order_id(row) for row in self.pending_triggers)
+        return tuple(
+            deepcoin_order_id(row, response_kind="pending_trigger")
+            for row in self.pending_triggers
+        )
 
 
 def build_deepcoin_maintenance_evidence(
@@ -138,7 +157,11 @@ def build_deepcoin_maintenance_evidence(
                     retry_count=retries,
                 )
 
-    target_count = sum(1 for row in pending if deepcoin_order_id(row) == clean_target)
+    target_count = sum(
+        1
+        for row in pending
+        if deepcoin_order_id(row, response_kind="pending_trigger") == clean_target
+    )
     if (
         expected_target_pending_count is not None
         and target_count != expected_target_pending_count
@@ -308,19 +331,27 @@ def _evidence(
     )
 
 
-def deepcoin_order_id(row: Mapping[str, Any]) -> str:
+def deepcoin_order_id(
+    row: Mapping[str, Any],
+    *,
+    response_kind: Literal["pending_trigger", "trigger_history", "fill"],
+) -> str:
     """Return the exchange order identifier from documented Deepcoin aliases."""
 
-    values = deepcoin_order_ids(row)
+    values = deepcoin_order_ids(row, response_kind=response_kind)
     return next(iter(values)) if len(values) == 1 else ""
 
 
-def deepcoin_order_ids(row: Mapping[str, Any]) -> frozenset[str]:
-    """Return every non-empty Deepcoin order identifier without precedence."""
+def deepcoin_order_ids(
+    row: Mapping[str, Any],
+    *,
+    response_kind: Literal["pending_trigger", "trigger_history", "fill"],
+) -> frozenset[str]:
+    """Return non-empty order identifiers for one explicit response type."""
 
     return frozenset(
         clean
-        for key in ("ordId", "orderId", "order_id", "algoId", "triggerOrderId")
+        for key in _ORDER_ID_ALIASES_BY_RESPONSE[response_kind]
         if (clean := str(row.get(key) or "").strip())
     )
 

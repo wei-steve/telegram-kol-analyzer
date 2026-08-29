@@ -105,14 +105,19 @@ def build_manual_pending_entry_reconciliation_plan(
         return _blocked("regular_order_present", order_ids, evidence.fingerprint)
     if evidence.pending_triggers:
         return _blocked("pending_trigger_present", order_ids, evidence.fingerprint)
-    target_order_ids = set(order_ids)
-    if any(deepcoin_order_ids(row) & target_order_ids for row in evidence.fills):
+    target_by_order_id = {target.order_id: target for target in reviewed}
+    target_order_ids = set(target_by_order_id)
+    if any(
+        deepcoin_order_ids(row, response_kind="fill") & target_order_ids
+        for row in evidence.fills
+    ):
         return _blocked("target_fill_present", order_ids, evidence.fingerprint)
     for order_id in order_ids:
         matches = [
-            (row, deepcoin_order_ids(row))
+            (row, deepcoin_order_ids(row, response_kind="trigger_history"))
             for row in evidence.trigger_history
-            if order_id in deepcoin_order_ids(row)
+            if order_id
+            in deepcoin_order_ids(row, response_kind="trigger_history")
         ]
         if not matches:
             return _blocked(
@@ -128,6 +133,13 @@ def build_manual_pending_entry_reconciliation_plan(
         if identities != {order_id}:
             return _blocked(
                 "target_history_identity_conflict", order_ids, evidence.fingerprint
+            )
+        target = target_by_order_id[order_id]
+        if str(row.get("instId") or "").strip() != target.instrument_id:
+            return _blocked(
+                "target_history_instrument_mismatch",
+                order_ids,
+                evidence.fingerprint,
             )
         if str(row.get("state") or row.get("status") or "").strip().lower() not in {
             "cancelled",

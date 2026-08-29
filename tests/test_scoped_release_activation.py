@@ -320,7 +320,7 @@ class FakeRuntime:
         self.events.append(f"mask:{unit}")
         if unit in self.mask_fail_units:
             raise ActivationError(f"mask failed: {unit}")
-        self.maintenance_state_by_unit[unit] = ("inactive", "masked")
+        self.maintenance_state_by_unit[unit] = ("inactive", "inhibited")
 
     def main_pid(self, unit: str) -> int:
         self.events.append(f"main-pid:{unit}")
@@ -712,7 +712,7 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
 
@@ -759,7 +759,7 @@ def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
     immutable_identity = runtime.runtime_identity
@@ -797,7 +797,7 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
     original_start = runtime.start_unit
@@ -819,7 +819,7 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
             source_mode="stopped_legacy",
         )
 
-    assert set(runtime.maintenance_state_by_unit.values()) == {("inactive", "masked")}
+    assert set(runtime.maintenance_state_by_unit.values()) == {("inactive", "inhibited")}
 
 
 def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
@@ -829,7 +829,7 @@ def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
     runtime.mask_fail_units = {"telegram-kol-ingest.service"}
@@ -875,6 +875,8 @@ def test_system_runtime_adapter_uses_persistent_inhibit_dropin(tmp_path, monkeyp
 
     def run(command, *, environment=None):
         commands.append(command)
+        if "--property=ActiveState" in command:
+            return type("Result", (), {"stdout": "inactive\n"})()
         return type("Result", (), {"stdout": "no\n"})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -891,6 +893,14 @@ def test_system_runtime_adapter_uses_persistent_inhibit_dropin(tmp_path, monkeyp
     assert inhibit.stat().st_mode & 0o777 == 0o444
     assert ["systemctl", "mask", "telegram-kol.service"] not in commands
     assert ["systemctl", "daemon-reload"] in commands
+    assert runtime.maintenance_unit_state("telegram-kol.service") == (
+        "inactive",
+        "inhibited",
+    )
+
+    runtime.unmask_unit("telegram-kol.service")
+
+    assert not inhibit.exists()
 
 
 def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
@@ -909,7 +919,7 @@ def test_stopped_legacy_source_mode_rejects_ordinary_immutable_authorization(
     paths, runtime, manifest = activation_harness
     _configure_worker_harness(paths, runtime, manifest)
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
 
@@ -930,8 +940,9 @@ def test_stopped_legacy_source_mode_rejects_ordinary_immutable_authorization(
 @pytest.mark.parametrize(
     ("unit", "state", "reason"),
     [
-        ("telegram-kol-worker.service", ("active", "masked"), "not persistently stopped"),
+        ("telegram-kol-worker.service", ("active", "inhibited"), "not persistently stopped"),
         ("telegram-kol-ingest.service", ("inactive", "enabled"), "not persistently stopped"),
+        ("telegram-kol-worker.service", ("inactive", "masked"), "not persistently stopped"),
     ],
 )
 def test_stopped_legacy_activation_refuses_active_or_unmasked_unit_before_authorization(
@@ -944,7 +955,7 @@ def test_stopped_legacy_activation_refuses_active_or_unmasked_unit_before_author
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        name: ("inactive", "masked")
+        name: ("inactive", "inhibited")
         for name in runtime.maintenance_state_by_unit
     }
     runtime.maintenance_state_by_unit[unit] = state
@@ -971,7 +982,7 @@ def test_stopped_legacy_activation_refuses_partial_runtime_scope(
     paths, runtime, _ = activation_harness
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
 
@@ -1033,7 +1044,7 @@ def test_stopped_legacy_activation_refuses_legacy_pid_cgroup_or_process(
     _configure_worker_harness(paths, runtime, manifest)
     _set_authorization_source_mode(paths, "stopped_legacy")
     runtime.maintenance_state_by_unit = {
-        unit: ("inactive", "masked")
+        unit: ("inactive", "inhibited")
         for unit in runtime.maintenance_state_by_unit
     }
     mutation(runtime)
