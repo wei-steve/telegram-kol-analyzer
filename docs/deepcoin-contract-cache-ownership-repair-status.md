@@ -729,3 +729,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
   or Telegram trading send. Every such production phase remains outstanding
   and requires a new exact authorization. Historical production SHA and order
   observations remain stale routing context, never current acceptance evidence.
+- This documentation/test handoff reconciliation started from exact clean,
+  pushed SHA `6c6c5f320b6c9d34a9c5ea4caafd15d06d74b79d`. It changes only the stale
+  Task 12 status assertion to the already-recorded
+  `superseded_by_simple_cancel_all` state. Production code and reviewed
+  production candidate `44b99d82c662c264554dcb07b18ed11faa3222ff`
+  remain unchanged; the resulting handoff is local, unpushed, unstaged, and
+  inactive.

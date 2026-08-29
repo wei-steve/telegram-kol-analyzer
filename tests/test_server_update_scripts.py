@@ -750,7 +750,7 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
     assert "task12_time_sensitive_pending_trigger_count: 7" in status
     assert (
         "pending_entry_cancel_candidate_status: "
-        "cross_process_quiescence_local_complete_unpushed" in status
+        "superseded_by_simple_cancel_all" in status
     )
     assert (
         "pending_entry_cancel_candidate_sha: "
