@@ -31,7 +31,7 @@ pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
-legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_pending
+legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_failed_closed
 legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
 legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
 legacy_runtime_drain_bridge_plan_sha: 1dd9868233670486ac8575f609e954fa221f6071
@@ -40,7 +40,7 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
-immutable_control_bootstrap_status: tasks_7_to_9_reviewed_local_complete_task10_pending
+immutable_control_bootstrap_status: task10_full_suite_failed_closed_repair_pending
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -554,3 +554,57 @@ phase completes or pauses, record both verified evidence and outstanding work.
   finding. Task 10's one final repository suite and final local handoff remain
   separately pending; this is not an activation-ready, push-authorized or
   deployment-authorized claim.
+
+## Task 10 final local verification (failed closed)
+
+- The production-code candidate is exact commit
+  `905c099372d6ca26fc789443330ef657ccd39951` with tree
+  `be0cafaf1189357202746aea758885f6357f7bdb`. Task 10 began from the
+  status-only commit `fbbde09af98f2e4dee7ae8a111039f9187326a22` with tree
+  `7e6cba8e62a1a21ecbc88ccd2cce2f94a2e7638c` and a clean worktree.
+- Static verification passed `git diff --check`; production scope
+  `src scripts deploy` contains no `legacy_runtime_drain_bridge` or
+  `legacy_entry_submission_frozen` reference. The plan's broader command also
+  searched `tests`, where expected negative compatibility assertions still
+  mention the deleted names, so that command is not a valid zero-match gate as
+  written. CLI help exposes exactly the three maintenance actions
+  `seed-entry-authority`, `drain-one`, and `bootstrap-control`.
+- The exact focused Task 10 set passed 974 tests with 1 skip in 36.37 seconds.
+  The one and only final repository suite did not pass: 6585 tests passed, 14
+  failed, 3 skipped, with 32 warnings in 478.53 seconds. An isolated rerun of
+  only the failing files reproduced all 14 failures, with 4 adjacent tests
+  passing, so the result is deterministic rather than suite-order pollution.
+- Twelve failures use temporary databases without the now-required independently
+  seeded entry-revision exchange-authority row and therefore correctly stop at
+  `entry_revision_exchange_authority_missing` before reaching their older
+  fault-injection or planner assertions. One freeze test reaches the safe
+  pre-write refusal through `RecoveryLiveSubmitError` rather than its older
+  `DeepcoinExecutionActionError` contract. One stage-helper test is rejected by
+  the stricter closed action-manifest schema before reaching its older exact
+  diagnostic string. These compatibility decisions and fixture repairs are not
+  authorized in this status-only Task 10 batch.
+- The planned named cross-boundary first falsifier
+  `test_cancel_timeout_then_crash_and_reboot_never_retries_or_restores` is not
+  present in the implemented suite, so composed crash-after-unknown acceptance
+  is missing. Its two component proofs pass: write-boundary unknown blocks and
+  retains the token hash, and crash/reboot reconciliation keeps every governed
+  unit persistently masked without starting one (2 tests passed in 0.15
+  seconds). This is component evidence only, not a substitute for the missing
+  composed falsifier.
+- The rejected bridge implementation and its dedicated tests were deleted;
+  the compatibility CLI and ordinary-settings freeze field were removed. They
+  were replaced by the persistent runtime guard, immutable action manifests,
+  independent authority seed, exact-single-order drain, immutable bootstrap,
+  loaded-release monitor proof, and persistent target takeover described above.
+- Task 10 therefore stops failed closed. No final handoff candidate is claimed,
+  and no production-dependent acceptance is claimed. No push, stage, SSH,
+  deployment, read-only production preflight, DB-copy rehearsal, production
+  seed, order cancellation, bootstrap, entry thaw, freeze, restart, database or
+  settings write, Deepcoin write, or Telegram replay occurred in this batch.
+- A separate local repair authorization is required before changing the stale
+  fixtures/contracts and adding the missing composed falsifier. Even after a
+  new green final candidate, the exact future authorizations remain separate:
+  push, stage, read-only preflight, DB-copy rehearsal, L3 seed, seven independent
+  single-order writes with fresh plan and token for each, immutable bootstrap,
+  and entry thaw. Unknown remains permanently non-retryable and stops the
+  sequence.
