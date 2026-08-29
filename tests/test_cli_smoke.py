@@ -220,6 +220,66 @@ def test_legacy_bridge_cli_is_absent() -> None:
     assert "No such command 'bridge-reviewed-pending-entries'" in result.output
 
 
+def test_finalize_cancelled_entries_wires_exact_stopped_runtime_guard(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import telegram_kol_research.cli as cli_module
+
+    events = []
+    runtime = object()
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "SystemRuntimeAdapter",
+        lambda *, expected_uid: runtime,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "require_stopped_legacy_runtime_boundary",
+        lambda value: events.append(value),
+    )
+
+    def build_plan(*args, runtime_guard, **kwargs):
+        runtime_guard()
+        return SimpleNamespace(
+            status="blocked",
+            reason_code="pending_trigger_present",
+            target_order_ids=("one",),
+            evidence_sha256="a" * 64,
+            fingerprint="",
+        )
+
+    monkeypatch.setattr(
+        cli_module,
+        "build_manual_pending_entry_reconciliation_plan",
+        build_plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "finalize-cancelled-pending-entries",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--backup-path",
+            str(tmp_path / "backup.db"),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert events == [runtime]
+
+
 def test_entry_draft_revision_cli_is_dry_run_by_default(tmp_path):
     draft_path = tmp_path / "chen-draft.json"
     draft_path.write_text(json.dumps({

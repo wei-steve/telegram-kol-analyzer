@@ -109,6 +109,10 @@ from telegram_kol_research.manual_pending_entry_reconciliation import (
     apply_manual_pending_entry_reconciliation,
     build_manual_pending_entry_reconciliation_plan,
 )
+from telegram_kol_research.scoped_release_activation import (
+    SystemRuntimeAdapter,
+    require_stopped_legacy_runtime_boundary,
+)
 from telegram_kol_research.reviewed_pending_entry_targets import (
     REVIEWED_PENDING_ENTRY_TARGETS,
 )
@@ -4995,10 +4999,16 @@ def finalize_cancelled_pending_entries(
 
     session_factory = create_existing_session_factory(database_path)
     client = build_deepcoin_client_from_env()
+    runtime = SystemRuntimeAdapter(expected_uid=0)
+
+    def runtime_guard() -> None:
+        require_stopped_legacy_runtime_boundary(runtime)
+
     plan = build_manual_pending_entry_reconciliation_plan(
         session_factory,
         deepcoin_client=client,
         targets=REVIEWED_PENDING_ENTRY_TARGETS,
+        runtime_guard=runtime_guard,
     )
     typer.echo(
         json.dumps(
@@ -5028,6 +5038,7 @@ def finalize_cancelled_pending_entries(
         deepcoin_client=client,
         targets=REVIEWED_PENDING_ENTRY_TARGETS,
         expected_fingerprint=expected_fingerprint,
+        runtime_guard=runtime_guard,
     )
     typer.echo(
         json.dumps(

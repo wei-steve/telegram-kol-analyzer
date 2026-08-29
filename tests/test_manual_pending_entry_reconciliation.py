@@ -2,6 +2,9 @@ from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
+from pathlib import Path
+import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -59,6 +62,20 @@ class ReadOnlyClient:
         raise AssertionError("manual reconciliation must not write to Deepcoin")
 
 
+class RuntimeGuard:
+    def __init__(self, *, fail_on_call=None, events=None) -> None:
+        self.calls = 0
+        self.fail_on_call = fail_on_call
+        self.events = events
+
+    def __call__(self) -> None:
+        self.calls += 1
+        if self.events is not None:
+            self.events.append(f"guard:{self.calls}")
+        if self.calls == self.fail_on_call:
+            raise ValueError("maintenance_runtime_not_stopped")
+
+
 def _record_cancelled_history(client: ReadOnlyClient, target) -> None:
     client.history.append(
         {
@@ -77,6 +94,8 @@ def _seed_pending_target(session_factory):
     order_id = "manual-cancel-1"
     request = {
         "instId": "ETH-USDT-SWAP",
+        "posSide": "long",
+        "side": "buy",
         "triggerPrice": "1827",
         "sz": "3",
         "slTriggerPx": "1795",
@@ -143,6 +162,9 @@ def _seed_pending_target(session_factory):
                     execution_order_leg_id=leg.id,
                     role=role,
                     leg_index=1,
+                    planned_trigger_price=(
+                        "1795" if role == "primary_stop" else None
+                    ),
                     parent_entry_order_id=order_id,
                     status="planned",
                 )
@@ -202,6 +224,119 @@ def _seed_foreign_binding_and_leg(session):
     return binding, leg
 
 
+def _seed_all_canonical_targets(session_factory):
+    from telegram_kol_research.reviewed_pending_entry_targets import (
+        REVIEWED_PENDING_ENTRY_TARGETS,
+    )
+
+    grouped = {}
+    for target in REVIEWED_PENDING_ENTRY_TARGETS:
+        grouped.setdefault(target.execution_binding_id, []).append(target)
+    with session_factory() as session:
+        for binding_id, targets in grouped.items():
+            first = targets[0]
+            symbol = first.instrument_id.split("-", 1)[0]
+            chat_id = -binding_id
+            message_id = first.lifecycle_id
+            strategy_id = f"deepcoin:{chat_id}:{message_id}:{symbol}:long"
+            session.add(
+                ExecutionBinding(
+                    id=binding_id,
+                    kol_id=f"group:{binding_id}",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    symbol=symbol,
+                    side="long",
+                    venue="deepcoin",
+                    status="open",
+                    strategy_instance_id=strategy_id,
+                    margin_mode="cross",
+                    position_mode="split",
+                    last_exchange_status="entry_order_pending",
+                )
+            )
+            session.add(
+                StrategyLifecycle(
+                    id=first.lifecycle_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    symbol=symbol,
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=NOW,
+                    execution_binding_id=binding_id,
+                )
+            )
+            session.flush()
+            for leg_index, target in enumerate(targets, start=1):
+                request = {
+                    "instId": target.instrument_id,
+                    "posSide": "long",
+                    "side": "buy",
+                    "slTriggerPx": target.embedded_stop_price,
+                    "sz": target.size,
+                    "triggerPrice": target.trigger_price,
+                }
+                leg = ExecutionOrderLeg(
+                    id=target.execution_order_leg_id,
+                    execution_binding_id=binding_id,
+                    strategy_instance_id=strategy_id,
+                    leg_index=leg_index,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id=target.order_id,
+                    venue="deepcoin",
+                    status="pending",
+                    request_json=json.dumps(request, sort_keys=True),
+                )
+                session.add(leg)
+                session.flush()
+                session.add(
+                    TriggerProtectionIntent(
+                        venue="deepcoin",
+                        execution_binding_id=binding_id,
+                        execution_order_leg_id=leg.id,
+                        request_fingerprint=target.request_fingerprint,
+                        pre_submit_tpsl_baseline_json="[]",
+                        correlation_id=f"canonical:{leg.id}",
+                        parent_trigger_order_id=target.order_id,
+                        recovery_state="pending",
+                        retry_attempts=0,
+                    )
+                )
+                session.add_all(
+                    [
+                        PositionProtectionLeg(
+                            venue="deepcoin",
+                            execution_binding_id=binding_id,
+                            execution_order_leg_id=leg.id,
+                            role=role,
+                            leg_index=1,
+                            planned_trigger_price=(
+                                target.embedded_stop_price
+                                if role == "primary_stop"
+                                else None
+                            ),
+                            parent_entry_order_id=target.order_id,
+                            status="planned",
+                        )
+                        for role in ("primary_stop", "backup_stop")
+                    ]
+                )
+                session.add(
+                    TriggerTakeProfitConvergence(
+                        venue="deepcoin",
+                        execution_binding_id=binding_id,
+                        execution_order_leg_id=leg.id,
+                        desired_take_profits_json="[]",
+                        status="waiting_position",
+                        reason_code="waiting_position",
+                    )
+                )
+        session.commit()
+    return REVIEWED_PENDING_ENTRY_TARGETS
+
+
 def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path):
     from telegram_kol_research.entry_revision_exchange_authority import (
         ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
@@ -222,6 +357,7 @@ def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
     assert plan.status == "ready"
@@ -232,6 +368,7 @@ def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path
         backup_path=backup_path,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         expected_fingerprint=plan.fingerprint,
         now=NOW,
     )
@@ -271,6 +408,7 @@ def test_manual_reconciliation_refuses_any_live_exchange_object(tmp_path):
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -292,10 +430,107 @@ def test_manual_reconciliation_default_clock_is_taken_after_exchange_reads(tmp_p
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
     )
 
     assert plan.status == "ready"
     assert plan.reason_code is None
+
+
+def test_manual_reconciliation_proves_stopped_runtime_before_exchange_reads(
+    tmp_path,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    events = []
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    original = client.list_positions
+
+    def list_positions(*, inst_id):
+        events.append("exchange-read")
+        return original(inst_id=inst_id)
+
+    client.list_positions = list_positions
+    guard = RuntimeGuard(events=events)
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=guard,
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
+    assert events[0] == "guard:1"
+    assert guard.calls == 1
+
+
+def test_manual_reconciliation_without_runtime_proof_blocks_before_reads(
+    tmp_path,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "maintenance_runtime_not_stopped"
+
+
+def test_manual_reconciliation_reproves_runtime_before_backup(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    backup_path = tmp_path / "backup.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    guard = RuntimeGuard(fail_on_call=2)
+
+    with pytest.raises(ValueError, match="maintenance_runtime_not_stopped"):
+        apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=backup_path,
+            deepcoin_client=client,
+            targets=(target,),
+            expected_fingerprint=plan.fingerprint,
+            runtime_guard=guard,
+            now=NOW,
+        )
+
+    assert guard.calls == 2
+    assert not backup_path.exists()
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"
 
 
 @pytest.mark.parametrize(
@@ -336,6 +571,7 @@ def test_manual_reconciliation_refuses_target_fill_or_ambiguous_history(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -381,6 +617,7 @@ def test_manual_reconciliation_refuses_target_fill_for_every_supported_alias(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -404,6 +641,7 @@ def test_manual_reconciliation_accepts_explicit_cancelled_target_history(tmp_pat
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -447,6 +685,7 @@ def test_manual_reconciliation_accepts_cancelled_history_supported_alias(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -466,6 +705,7 @@ def test_manual_reconciliation_requires_one_cancelled_history_row_per_target(tmp
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
     assert missing.status == "blocked"
@@ -479,6 +719,7 @@ def test_manual_reconciliation_requires_one_cancelled_history_row_per_target(tmp
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
     assert duplicate.status == "blocked"
@@ -506,6 +747,7 @@ def test_manual_reconciliation_refuses_conflicting_order_id_aliases(tmp_path):
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -552,6 +794,7 @@ def test_manual_reconciliation_refuses_every_history_alias_conflict(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -582,6 +825,7 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -607,6 +851,7 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
         "intent_binding",
         "intent_leg",
         "protection_parent",
+        "protection_stop",
         "protection_binding",
         "protection_leg",
         "convergence_binding",
@@ -665,6 +910,11 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             intent.execution_order_leg_id = foreign_leg.id
         elif drift == "protection_parent":
             protection.parent_entry_order_id = "different-order"
+        elif drift == "protection_stop":
+            primary = session.query(PositionProtectionLeg).filter_by(
+                role="primary_stop"
+            ).one()
+            primary.planned_trigger_price = "different"
         elif drift == "protection_binding":
             protection.execution_binding_id = foreign_binding.id
         elif drift == "protection_leg":
@@ -681,6 +931,7 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -692,6 +943,8 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
     ("field", "value"),
     (
         ("instId", "BTC-USDT-SWAP"),
+        ("side", "sell"),
+        ("posSide", "short"),
         ("triggerPrice", "1828"),
         ("sz", "4"),
         ("slTriggerPx", "1794"),
@@ -724,6 +977,7 @@ def test_manual_reconciliation_compares_request_economics_beyond_fingerprint(
         session_factory,
         deepcoin_client=client,
         targets=(drifted_target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -742,6 +996,8 @@ def test_manual_reconciliation_accepts_documented_request_aliases(tmp_path):
     _record_cancelled_history(client, target)
     request = {
         "instrument_id": target.instrument_id,
+        "posSide": "long",
+        "side": "buy",
         "triggerPx": target.trigger_price,
         "size": target.size,
         "slTriggerPrice": target.embedded_stop_price,
@@ -758,6 +1014,7 @@ def test_manual_reconciliation_accepts_documented_request_aliases(tmp_path):
         session_factory,
         deepcoin_client=client,
         targets=(aliased_target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
@@ -789,6 +1046,7 @@ def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, m
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         clock=clock,
     )
     monkeypatch.setattr(reconciliation, "_create_verified_backup", lambda *_: None)
@@ -800,6 +1058,7 @@ def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, m
             backup_path=tmp_path / "backup.db",
             deepcoin_client=client,
             targets=(target,),
+            runtime_guard=RuntimeGuard(),
             expected_fingerprint=plan.fingerprint,
             clock=clock,
         )
@@ -823,6 +1082,7 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
     apply_manual_pending_entry_reconciliation(
@@ -831,6 +1091,7 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
         backup_path=tmp_path / "first.db",
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         expected_fingerprint=plan.fingerprint,
         now=NOW,
     )
@@ -839,8 +1100,321 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
         session_factory,
         deepcoin_client=client,
         targets=(target,),
+        runtime_guard=RuntimeGuard(),
         now=NOW,
     )
 
     assert repeated.status == "completed"
     assert repeated.reason_code is None
+
+
+def test_verified_backup_refuses_dangling_symlink(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    sqlite3.connect(source).close()
+    backup = tmp_path / "backup.db"
+    backup.symlink_to(tmp_path / "missing.db")
+
+    with pytest.raises(ValueError, match="backup_path_invalid"):
+        reconciliation._create_verified_backup(source, backup)
+
+
+def test_verified_backup_refuses_unsafe_parent_mode(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    sqlite3.connect(source).close()
+    parent = tmp_path / "unsafe"
+    parent.mkdir(mode=0o700)
+    parent.chmod(0o777)
+
+    with pytest.raises(ValueError, match="backup_parent_unsafe"):
+        reconciliation._create_verified_backup(source, parent / "backup.db")
+
+
+def test_verified_backup_is_created_with_exact_0600_mode(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    sqlite3.connect(source).close()
+    backup = tmp_path / "backup.db"
+
+    reconciliation._create_verified_backup(source, backup)
+
+    assert backup.stat().st_mode & 0o777 == 0o600
+
+
+def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    sqlite3.connect(source).close()
+    monkeypatch.setattr(
+        reconciliation.os,
+        "fchmod",
+        lambda *args: (_ for _ in ()).throw(OSError("mode refused")),
+    )
+
+    with pytest.raises(ValueError, match="backup_metadata_invalid"):
+        reconciliation._create_verified_backup(source, backup)
+
+    assert not backup.exists()
+
+
+def test_verified_backup_refuses_foreign_key_violations(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.executescript(
+        """
+        PRAGMA foreign_keys=OFF;
+        CREATE TABLE parent(id INTEGER PRIMARY KEY);
+        CREATE TABLE child(parent_id INTEGER REFERENCES parent(id));
+        INSERT INTO child(parent_id) VALUES (99);
+        """
+    )
+    connection.commit()
+    connection.close()
+
+    with pytest.raises(ValueError, match="backup_foreign_key_check_failed"):
+        reconciliation._create_verified_backup(source, tmp_path / "backup.db")
+
+
+def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    backup = tmp_path / "backup.db"
+    sqlite3.connect(source).close()
+    real_connect = reconciliation.sqlite3.connect
+
+    class FailedQuickCheckConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            if sql == "PRAGMA quick_check":
+                return SimpleNamespace(fetchone=lambda: ("corrupt",))
+            return super().execute(sql, parameters)
+
+    def connect(database, *args, **kwargs):
+        if Path(database) == backup:
+            kwargs["factory"] = FailedQuickCheckConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    with pytest.raises(ValueError, match="backup_quick_check_failed"):
+        reconciliation._create_verified_backup(source, backup)
+
+    assert not backup.exists()
+
+
+def test_manual_reconciliation_terminalization_failure_rolls_back_and_keeps_backup(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    database_path = tmp_path / "research.db"
+    backup_path = tmp_path / "backup.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = reconciliation.build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    original = reconciliation._terminalize_target
+
+    def fail_after_terminalization(*args, **kwargs):
+        original(*args, **kwargs)
+        raise RuntimeError("injected terminalization failure")
+
+    monkeypatch.setattr(
+        reconciliation,
+        "_terminalize_target",
+        fail_after_terminalization,
+    )
+
+    with pytest.raises(RuntimeError, match="injected terminalization failure"):
+        reconciliation.apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=backup_path,
+            deepcoin_client=client,
+            targets=(target,),
+            expected_fingerprint=plan.fingerprint,
+            runtime_guard=RuntimeGuard(),
+            now=NOW,
+        )
+
+    backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"
+        assert session.query(ExecutionEvent).count() == 0
+        assert session.query(TradingSetting).filter_by(
+            key="entry_revision_exchange_authority"
+        ).one_or_none() is None
+    assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == backup_sha256
+    with sqlite3.connect(backup_path) as backup_connection:
+        assert backup_connection.execute("PRAGMA quick_check").fetchone() == (
+            "ok",
+        )
+
+
+def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    backup_path = tmp_path / "backup.db"
+    session_factory = create_session_factory(database_path)
+    targets = _seed_all_canonical_targets(session_factory)
+    client = ReadOnlyClient()
+    for target in targets:
+        _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=targets,
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    guard = RuntimeGuard()
+
+    result = apply_manual_pending_entry_reconciliation(
+        session_factory,
+        database_path=database_path,
+        backup_path=backup_path,
+        deepcoin_client=client,
+        targets=targets,
+        expected_fingerprint=plan.fingerprint,
+        runtime_guard=guard,
+        now=NOW,
+    )
+
+    assert result.status == "completed"
+    assert result.terminalized_count == 7
+    assert result.authority_seeded is True
+    assert guard.calls == 3
+    with session_factory() as session:
+        assert {
+            session.get(ExecutionOrderLeg, target.execution_order_leg_id).status
+            for target in targets
+        } == {"cancelled"}
+        assert session.query(ExecutionEvent).filter_by(
+            action="reconcile_manual_pending_entry_cancel",
+            status="confirmed",
+        ).count() == 7
+        authority = session.query(TradingSetting).filter_by(
+            key="entry_revision_exchange_authority"
+        ).one()
+        assert json.loads(authority.value_json)["state"] == "idle"
+    with sqlite3.connect(backup_path) as backup_connection:
+        assert backup_connection.execute("PRAGMA quick_check").fetchone() == (
+            "ok",
+        )
+
+
+def test_all_canonical_terminalization_failure_is_atomic(tmp_path, monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    database_path = tmp_path / "research.db"
+    backup_path = tmp_path / "backup.db"
+    session_factory = create_session_factory(database_path)
+    targets = _seed_all_canonical_targets(session_factory)
+    client = ReadOnlyClient()
+    for target in targets:
+        _record_cancelled_history(client, target)
+    plan = reconciliation.build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=targets,
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    original = reconciliation._terminalize_target
+    calls = 0
+
+    def fail_on_fourth(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        original(*args, **kwargs)
+        if calls == 4:
+            raise RuntimeError("injected canonical terminalization failure")
+
+    monkeypatch.setattr(reconciliation, "_terminalize_target", fail_on_fourth)
+
+    with pytest.raises(
+        RuntimeError,
+        match="injected canonical terminalization failure",
+    ):
+        reconciliation.apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=backup_path,
+            deepcoin_client=client,
+            targets=targets,
+            expected_fingerprint=plan.fingerprint,
+            runtime_guard=RuntimeGuard(),
+            now=NOW,
+        )
+
+    backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
+    with session_factory() as session:
+        assert {
+            session.get(ExecutionOrderLeg, target.execution_order_leg_id).status
+            for target in targets
+        } == {"pending"}
+        assert session.query(ExecutionEvent).count() == 0
+        assert session.query(TradingSetting).filter_by(
+            key="entry_revision_exchange_authority"
+        ).one_or_none() is None
+    assert hashlib.sha256(backup_path.read_bytes()).hexdigest() == backup_sha256
+
+
+def test_manual_reconciliation_refuses_database_path_mismatch(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    other_database_path = tmp_path / "other.db"
+    session_factory = create_session_factory(database_path)
+    create_session_factory(other_database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    with pytest.raises(ValueError, match="database_path_mismatch"):
+        apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=other_database_path,
+            backup_path=tmp_path / "backup.db",
+            deepcoin_client=client,
+            targets=(target,),
+            runtime_guard=RuntimeGuard(),
+            expected_fingerprint=plan.fingerprint,
+            now=NOW,
+        )
+
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"

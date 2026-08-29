@@ -680,6 +680,15 @@ def _require_stopped_legacy_boundary(
         raise ActivationError("stopped legacy runtime process remains")
 
 
+def require_stopped_legacy_runtime_boundary(runtime: RuntimeAdapter) -> None:
+    """Prove the complete legacy/split runtime is persistently inhibited."""
+
+    _require_stopped_legacy_boundary(
+        runtime,
+        ["web", "monitor", "ingest", "worker"],
+    )
+
+
 def _unmask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
     for unit in _controlled_units(components):
         runtime.unmask_unit(unit)

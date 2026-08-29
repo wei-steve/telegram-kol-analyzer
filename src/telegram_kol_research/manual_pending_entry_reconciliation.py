@@ -7,8 +7,10 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
+import stat
 from typing import Callable, Iterable
 
 from sqlalchemy import text
@@ -73,6 +75,7 @@ def build_manual_pending_entry_reconciliation_plan(
     *,
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
+    runtime_guard: Callable[[], None] | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ManualPendingEntryReconciliationPlan:
@@ -83,6 +86,8 @@ def build_manual_pending_entry_reconciliation_plan(
     order_ids = tuple(target.order_id for target in reviewed)
     if not reviewed or len(set(order_ids)) != len(order_ids):
         return _blocked("canonical_target_set_invalid", order_ids)
+    if not _runtime_is_stopped(runtime_guard):
+        return _blocked("maintenance_runtime_not_stopped", order_ids)
     evidence = build_deepcoin_maintenance_evidence(
         deepcoin_client,
         instruments=_GOVERNED_INSTRUMENTS,
@@ -206,6 +211,7 @@ def apply_manual_pending_entry_reconciliation(
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
     expected_fingerprint: str,
+    runtime_guard: Callable[[], None] | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> ManualPendingEntryReconciliationResult:
@@ -216,13 +222,17 @@ def apply_manual_pending_entry_reconciliation(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
+        runtime_guard=runtime_guard,
         now=now,
         clock=clock,
     )
     if fresh.status != "ready" or fresh.fingerprint != expected_fingerprint:
         raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")
+    _require_runtime_stopped(runtime_guard)
+    _require_session_database_path(session_factory, Path(database_path))
     _require_write_boundary_freshness(fresh, now=now, clock=clock)
     _create_verified_backup(Path(database_path), Path(backup_path))
+    _require_runtime_stopped(runtime_guard)
     observed_at = _require_write_boundary_freshness(fresh, now=now, clock=clock)
 
     authority_seeded = False
@@ -358,6 +368,7 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
         and intents[0].recovery_state in {"pending", "retrying"}
         and len(protection) == 2
         and {row.role for row in protection} == {"primary_stop", "backup_stop"}
+        and _primary_protection_matches(protection, target)
         and all(
             row.execution_binding_id == target.execution_binding_id
             and row.execution_order_leg_id == target.execution_order_leg_id
@@ -503,18 +514,130 @@ def _terminalize_binding(session, binding_id: int, observed_at: datetime) -> Non
 
 
 def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
-    if backup_path.exists() or not backup_path.parent.is_dir():
-        raise ValueError("backup_path_invalid")
-    source = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
-    destination = sqlite3.connect(backup_path)
+    database_path = Path(database_path)
+    backup_path = Path(backup_path)
     try:
+        source_metadata = database_path.lstat()
+    except OSError as exc:
+        raise ValueError("backup_source_invalid") from exc
+    if not stat.S_ISREG(source_metadata.st_mode) or stat.S_ISLNK(
+        source_metadata.st_mode
+    ):
+        raise ValueError("backup_source_invalid")
+    try:
+        parent_metadata = backup_path.parent.lstat()
+    except OSError as exc:
+        raise ValueError("backup_parent_unsafe") from exc
+    if (
+        not stat.S_ISDIR(parent_metadata.st_mode)
+        or stat.S_ISLNK(parent_metadata.st_mode)
+        or parent_metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(parent_metadata.st_mode) & 0o022
+    ):
+        raise ValueError("backup_parent_unsafe")
+    try:
+        backup_path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        raise ValueError("backup_path_invalid")
+
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(backup_path, flags, 0o600)
+    except OSError as exc:
+        raise ValueError("backup_path_invalid") from exc
+    created_metadata = None
+    try:
+        created_metadata = os.fstat(descriptor)
+        os.fchmod(descriptor, 0o600)
+    except OSError as exc:
+        try:
+            current = backup_path.lstat()
+            if (
+                created_metadata is not None
+                and current.st_dev == created_metadata.st_dev
+                and current.st_ino == created_metadata.st_ino
+            ):
+                backup_path.unlink()
+        except OSError:
+            pass
+        os.close(descriptor)
+        raise ValueError("backup_metadata_invalid") from exc
+    source = None
+    destination = None
+    try:
+        source = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        destination = sqlite3.connect(backup_path)
         source.backup(destination)
         result = destination.execute("PRAGMA quick_check").fetchone()
         if result != ("ok",):
             raise ValueError("backup_quick_check_failed")
+        if destination.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise ValueError("backup_foreign_key_check_failed")
+        final_source_metadata = database_path.lstat()
+        final_metadata = backup_path.lstat()
+        if (
+            not stat.S_ISREG(final_source_metadata.st_mode)
+            or stat.S_ISLNK(final_source_metadata.st_mode)
+            or final_source_metadata.st_dev != source_metadata.st_dev
+            or final_source_metadata.st_ino != source_metadata.st_ino
+            or not stat.S_ISREG(final_metadata.st_mode)
+            or stat.S_ISLNK(final_metadata.st_mode)
+            or final_metadata.st_dev != created_metadata.st_dev
+            or final_metadata.st_ino != created_metadata.st_ino
+            or final_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(final_metadata.st_mode) != 0o600
+        ):
+            raise ValueError("backup_metadata_invalid")
+    except Exception:
+        try:
+            current = backup_path.lstat()
+            if (
+                current.st_dev == created_metadata.st_dev
+                and current.st_ino == created_metadata.st_ino
+            ):
+                backup_path.unlink()
+        except OSError:
+            pass
+        raise
     finally:
-        destination.close()
-        source.close()
+        if destination is not None:
+            destination.close()
+        if source is not None:
+            source.close()
+        os.close(descriptor)
+
+
+def _require_session_database_path(session_factory, database_path: Path) -> None:
+    try:
+        bound = Path(session_factory.kw["bind"].url.database).resolve(strict=True)
+        requested = database_path.resolve(strict=True)
+    except (KeyError, OSError, TypeError) as exc:
+        raise ValueError("database_path_mismatch") from exc
+    if bound != requested:
+        raise ValueError("database_path_mismatch")
+
+
+def _runtime_is_stopped(runtime_guard: Callable[[], None] | None) -> bool:
+    try:
+        _require_runtime_stopped(runtime_guard)
+    except ValueError:
+        return False
+    return True
+
+
+def _require_runtime_stopped(
+    runtime_guard: Callable[[], None] | None,
+) -> None:
+    if runtime_guard is None:
+        raise ValueError("maintenance_runtime_not_stopped")
+    try:
+        runtime_guard()
+    except Exception as exc:
+        raise ValueError("maintenance_runtime_not_stopped") from exc
 
 
 def _request_object(value_json: str | None) -> dict[str, object] | None:
@@ -529,10 +652,20 @@ def _request_matches_target(
     request: dict[str, object],
     target: ReviewedPendingEntryTarget,
 ) -> bool:
+    expected_side = _side_from_entry_and_stop(target)
+    expected_order_side = (
+        "buy"
+        if expected_side == "long"
+        else "sell"
+        if expected_side == "short"
+        else None
+    )
     return bool(
-        _fingerprint(request) == target.request_fingerprint
+        expected_side is not None
         and _one_text(request, "instId", "instrument_id")
         == target.instrument_id
+        and _one_text(request, "side") == expected_order_side
+        and _one_text(request, "posSide") == expected_side
         and _same_decimal(
             _one_text(request, "triggerPrice", "triggerPx"),
             target.trigger_price,
@@ -584,6 +717,20 @@ def _side_from_entry_and_stop(
     if stop > trigger:
         return "short"
     return None
+
+
+def _primary_protection_matches(
+    rows: list[PositionProtectionLeg],
+    target: ReviewedPendingEntryTarget,
+) -> bool:
+    primary = [row for row in rows if row.role == "primary_stop"]
+    return bool(
+        len(primary) == 1
+        and _same_decimal(
+            primary[0].planned_trigger_price,
+            target.embedded_stop_price,
+        )
+    )
 
 
 def _blocked(
