@@ -72,10 +72,13 @@ from telegram_kol_research.runtime_incident_snapshot import (
 )
 from telegram_kol_research.runtime_deployment_identity import (
     build_runtime_deployment_identity,
+    validate_runtime_authority_scope,
 )
 from telegram_kol_research.scoped_release_activation import (
+    ActivationError,
     ReleaseEvidence,
     render_release_dropin,
+    validate_release,
 )
 
 
@@ -563,34 +566,9 @@ def evaluate_runtime_release_scope(
             process_tuples.add((pid, ticks))
     worker = roles.get("worker") if isinstance(roles, Mapping) else None
     if isinstance(worker, Mapping):
-        capabilities = worker.get("capabilities")
-        evidence = worker.get("authority_evidence")
-        required = (
-            "global_exchange_authority",
-            "management",
-            "protection",
-            "close",
-            "tpsl",
-            "rescue",
-        )
-        cycles = (
-            "management_cycle",
-            "protection_cycle",
-            "close_cycle",
-            "tpsl_cycle",
-            "rescue_cycle",
-        )
-        if (
-            not isinstance(capabilities, Mapping)
-            or any(capabilities.get(name) is not True for name in required)
-            or not isinstance(evidence, Mapping)
-            or any(
-                not isinstance(evidence.get(name), Mapping)
-                or evidence[name].get("fresh") is not True
-                or evidence[name].get("successful") is not True
-                for name in cycles
-            )
-        ):
+        try:
+            validate_runtime_authority_scope(roles)
+        except ValueError:
             reasons.add("runtime_capability_unproven")
     else:
         reasons.add("runtime_capability_unproven")
@@ -752,30 +730,7 @@ class ProductionSafetyAdapters:
             or not _SHA256_FINGERPRINT.fullmatch(manifest_sha)
         ):
             raise RuntimeError("runtime_release_contract_invalid")
-        manifest_path = release / ".telegram-kol-release.json"
-        try:
-            encoded = manifest_path.read_bytes()
-            manifest = json.loads(encoded.decode("utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-            raise RuntimeError("runtime_release_contract_invalid") from exc
-        if (
-            hashlib.sha256(encoded).hexdigest() != manifest_sha
-            or not isinstance(manifest, Mapping)
-            or manifest.get("commit") != commit
-            or manifest.get("contract") != "immutable-release-v1"
-            or not _SHA256_FINGERPRINT.fullmatch(
-                str(manifest.get("content_sha256") or "")
-            )
-            or not isinstance(manifest.get("action_manifest"), Mapping)
-        ):
-            raise RuntimeError("runtime_release_contract_invalid")
-        release_evidence = ReleaseEvidence(
-            commit=commit,
-            manifest_sha256=manifest_sha,
-            content_sha256=str(manifest["content_sha256"]),
-            action_manifest=manifest["action_manifest"],
-            release_path=release,
-        )
+        release_evidence = self._validated_release_evidence()
         urls = {
             "web": self.web_deployment_identity_url,
             "ingest": self.ingest_deployment_identity_url,
@@ -811,6 +766,33 @@ class ProductionSafetyAdapters:
                 release_evidence
             ),
         }
+
+    def _validated_release_evidence(self) -> ReleaseEvidence:
+        release = self.release_path
+        commit = str(self.release_commit or "")
+        manifest_sha = str(self.release_manifest_sha256 or "")
+        if (
+            release is None
+            or release.name != commit
+            or not _GIT_HEAD.fullmatch(commit)
+            or not _SHA256_FINGERPRINT.fullmatch(manifest_sha)
+        ):
+            raise RuntimeError("runtime_release_contract_invalid")
+        try:
+            evidence = validate_release(
+                release.parent,
+                commit,
+                expected_uid=0,
+            )
+        except (ActivationError, OSError, ValueError) as exc:
+            raise RuntimeError("runtime_release_contract_invalid") from exc
+        if (
+            evidence.release_path != release
+            or evidence.commit != commit
+            or evidence.manifest_sha256 != manifest_sha
+        ):
+            raise RuntimeError("runtime_release_contract_invalid")
+        return evidence
 
     def _with_systemd_identity(
         self,
@@ -866,7 +848,10 @@ class ProductionSafetyAdapters:
         }
         units = tuple(
             unit for values in component_units.values() for unit in values
-        ) + ("telegram-kol-monitor.timer",)
+        ) + (
+            "telegram-kol-monitor.timer",
+            "telegram-kol-runtime.target",
+        )
         try:
             base_units_match = all(
                 (release.release_path / "deploy/systemd" / unit).read_bytes()
@@ -886,7 +871,33 @@ class ProductionSafetyAdapters:
                 for component, component_values in component_units.items()
                 for unit in component_values
             )
-            return base_units_match and dropins_match
+            direct_units = (
+                "telegram-kol-worker.service",
+                "telegram-kol-web.service",
+                "telegram-kol-ingest.service",
+                "telegram-kol-monitor.timer",
+            )
+            target = _run_bounded_command(
+                ("systemctl", "is-enabled", "telegram-kol-runtime.target"),
+                timeout_seconds=5,
+            )
+            direct = tuple(
+                _run_bounded_command(
+                    ("systemctl", "is-enabled", unit),
+                    timeout_seconds=5,
+                )
+                for unit in direct_units
+            )
+            boot_fence_valid = (
+                target.returncode == 0
+                and target.output.strip() == "enabled"
+                and all(
+                    result.output.strip() == "disabled"
+                    and result.returncode in {0, 1}
+                    for result in direct
+                )
+            )
+            return base_units_match and dropins_match and boot_fence_valid
         except OSError:
             return False
 

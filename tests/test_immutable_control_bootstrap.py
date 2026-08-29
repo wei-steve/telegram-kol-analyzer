@@ -162,13 +162,33 @@ def _identity(role: str, *, capabilities=True, ticks=2000):
         "systemd_main_pid": 200 + COMPONENTS.index(role),
         "systemd_start_ticks": ticks + COMPONENTS.index(role),
         "entry_admission_frozen": True,
+        "observed_at": NOW.isoformat(),
+        "health": {
+            "message_processing": False,
+            "ingest_live_listener": role == "ingest",
+            "ingest_reconcile": role == "ingest",
+            "worker_command": role == "worker",
+        },
         "capabilities": worker_capabilities if role == "worker" else {},
         "authority_evidence": {
-            "management_cycle": {"fresh": True, "successful": True},
-            "protection_cycle": {"fresh": True, "successful": True},
-            "close_cycle": {"fresh": True, "successful": True},
-            "tpsl_cycle": {"fresh": True, "successful": True},
-            "rescue_cycle": {"fresh": True, "successful": True},
+            "max_age_seconds": 90.0,
+            "management_cycle": {
+                "age_seconds": 1.0,
+                "fresh": True,
+                "successful": True,
+                "effective_management_enabled": True,
+                "effective_rescue_enabled": True,
+            },
+            "break_even_cycle": {
+                "age_seconds": 1.0,
+                "fresh": True,
+                "successful": True,
+            },
+            "reconcile_cycle": {
+                "age_seconds": 1.0,
+                "fresh": True,
+                "successful": True,
+            },
         } if role == "worker" else {},
     }
 
@@ -214,7 +234,12 @@ class Runtime:
         }
 
     def verify_monitor(self, plan):
+        assert self.authority.state == "held"
         self.events.append("verify-monitor")
+
+    def complete_candidate_start(self, plan):
+        assert self.authority.state == "idle"
+        self.events.append("complete-candidate-start")
 
     def reinhibit_and_stop_candidate(self):
         self.events.append("reinhibit-candidate")
@@ -330,10 +355,27 @@ def test_apply_rejects_plan_that_became_stale_before_inhibition():
         )
 
 
+def test_apply_rejects_expired_authorization_before_inhibition():
+    authority = Authority()
+    guard = Guard()
+    with pytest.raises(BootstrapBlocked, match="bootstrap_authorization_expired"):
+        apply_immutable_control_bootstrap_plan(
+            _plan(),
+            guard=guard,
+            authority=authority,
+            runtime=Runtime(authority),
+            authorization_expires_at=NOW,
+            now=NOW,
+        )
+
+    assert guard.quiescent is False
+    assert authority.events == []
+
+
 def test_authority_release_uses_fresh_boundary_time():
     authority = Authority()
     runtime = Runtime(authority)
-    clock = iter((NOW, NOW, NOW + timedelta(seconds=29)))
+    clock = iter((NOW, NOW, NOW, NOW + timedelta(seconds=29)))
 
     apply_immutable_control_bootstrap_plan(
         _plan(),
@@ -350,6 +392,7 @@ def test_candidate_starts_while_bootstrap_authority_is_held():
     result, runtime, authority, guard = _apply()
     assert result.status == "bootstrapped_entry_frozen"
     assert authority.events == ["acquire", "release", "self-test"]
+    assert runtime.events[-1] == "complete-candidate-start"
     assert guard.completed is True
 
 
@@ -366,6 +409,40 @@ def test_all_disabled_capabilities_reject_bootstrap():
     with pytest.raises(BootstrapBlocked, match="candidate_capability_unproven"):
         _apply(runtime=runtime, authority=authority)
     assert "reinhibit-candidate" in runtime.events
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda rows: rows["worker"]["authority_evidence"]["management_cycle"].update(
+            age_seconds=91.0
+        ),
+        lambda rows: rows["worker"]["authority_evidence"]["management_cycle"].pop(
+            "age_seconds"
+        ),
+        lambda rows: rows["worker"]["authority_evidence"]["management_cycle"].update(
+            effective_management_enabled=False
+        ),
+        lambda rows: rows["web"]["capabilities"].update(
+            global_exchange_authority=True
+        ),
+    ),
+)
+def test_candidate_authority_requires_numeric_freshness_effective_modes_and_one_owner(
+    mutation,
+):
+    authority = Authority()
+    runtime = Runtime(authority)
+    original = runtime.candidate_identities
+
+    def invalid_authority():
+        identities = original()
+        mutation(identities)
+        return identities
+
+    runtime.candidate_identities = invalid_authority
+    with pytest.raises(BootstrapBlocked, match="candidate_capability_unproven"):
+        _apply(runtime=runtime, authority=authority)
 
 
 def test_candidate_completes_no_exchange_write_authority_round_trip():
@@ -385,6 +462,108 @@ def test_unknown_reinhibit_failure_is_persisted_as_compensation_failed():
         _apply(runtime=runtime, authority=authority, guard=guard)
 
     assert guard.blocked_reason == "bootstrap_compensation_failed"
+
+
+def test_concrete_reinhibit_attempts_every_mask_and_stop_after_one_failure(
+    tmp_path,
+):
+    class Control:
+        def __init__(self):
+            self.masks = []
+            self.stops = []
+
+        def mask_unit(self, unit):
+            self.masks.append(unit)
+            if unit == bootstrap_module.MAINTENANCE_UNITS[0]:
+                raise RuntimeError("first mask failed")
+
+        def stop_unit(self, unit):
+            self.stops.append(unit)
+
+        def is_masked(self, unit):
+            return unit != bootstrap_module.MAINTENANCE_UNITS[0]
+
+        def main_pid(self, unit):
+            return 0
+
+        def cgroup_pids(self, unit):
+            return ()
+
+        def matching_processes(self):
+            return ()
+
+    control = Control()
+    adapter = SystemdImmutableControlBootstrapRuntimeAdapter(
+        paths=ActivationPaths(
+            release_root=tmp_path,
+            action_manifest=tmp_path / "action",
+            authorization=tmp_path / "auth",
+            authorization_consumed=tmp_path / "consumed",
+            dropin_root=tmp_path / "systemd",
+            database_path=tmp_path / "db",
+        ),
+        scoped_runtime=object(),
+        control_runtime=control,
+    )
+
+    with pytest.raises(BootstrapUnknown, match="candidate_reinhibit_unproven"):
+        adapter.reinhibit_and_stop_candidate()
+
+    assert control.masks == list(bootstrap_module.MAINTENANCE_UNITS)
+    assert control.stops == [bootstrap_module.BOOTSTRAP_TARGET, *bootstrap_module.MAINTENANCE_UNITS]
+
+
+def test_concrete_takeover_uses_one_target_as_the_only_boot_edge(tmp_path):
+    class Control:
+        def __init__(self):
+            self.masked = {
+                unit: True for unit in bootstrap_module.MAINTENANCE_UNITS
+            }
+            self.enabled = {
+                unit: "disabled"
+                for unit in bootstrap_module.BOOTSTRAP_AUTOSTART_UNITS
+            }
+            self.enabled[bootstrap_module.BOOTSTRAP_TARGET] = "disabled"
+            self.started = []
+
+        def unmask_unit(self, unit):
+            self.masked[unit] = False
+
+        def is_masked(self, unit):
+            return self.masked[unit]
+
+        def restore_enabled_state(self, unit, state):
+            self.enabled[unit] = state
+
+        def inspect_unit(self, unit):
+            return SimpleNamespace(enabled_state=self.enabled[unit])
+
+        def start_unit(self, unit):
+            self.started.append(unit)
+
+    control = Control()
+    adapter = SystemdImmutableControlBootstrapRuntimeAdapter(
+        paths=ActivationPaths(
+            release_root=tmp_path,
+            action_manifest=tmp_path / "action",
+            authorization=tmp_path / "auth",
+            authorization_consumed=tmp_path / "consumed",
+            dropin_root=tmp_path / "systemd",
+            database_path=tmp_path / "db",
+        ),
+        scoped_runtime=object(),
+        control_runtime=control,
+    )
+
+    adapter.complete_candidate_start(_plan())
+
+    assert all(not value for value in control.masked.values())
+    assert control.enabled[bootstrap_module.BOOTSTRAP_TARGET] == "enabled"
+    assert all(
+        control.enabled[unit] == "disabled"
+        for unit in bootstrap_module.BOOTSTRAP_AUTOSTART_UNITS
+    )
+    assert control.started == [bootstrap_module.BOOTSTRAP_TARGET]
 
 
 def test_concrete_runtime_publishes_and_restores_complete_unit_scope(
@@ -413,6 +592,22 @@ def test_concrete_runtime_publishes_and_restores_complete_unit_scope(
         def daemon_reload(self):
             pass
 
+    class Control:
+        def __init__(self):
+            self.enabled = {
+                unit: "enabled"
+                for unit in (
+                    *bootstrap_module.BOOTSTRAP_AUTOSTART_UNITS,
+                    bootstrap_module.BOOTSTRAP_TARGET,
+                )
+            }
+
+        def restore_enabled_state(self, unit, state):
+            self.enabled[unit] = state
+
+        def inspect_unit(self, unit):
+            return SimpleNamespace(enabled_state=self.enabled[unit])
+
     adapter = SystemdImmutableControlBootstrapRuntimeAdapter(
         paths=ActivationPaths(
             release_root=tmp_path,
@@ -423,7 +618,7 @@ def test_concrete_runtime_publishes_and_restores_complete_unit_scope(
             database_path=tmp_path / "unused.db",
         ),
         scoped_runtime=Scoped(),
-        control_runtime=object(),
+        control_runtime=Control(),
         expected_uid=0,
     )
     monkeypatch.setattr(bootstrap_module, "validate_release", lambda *args, **kwargs: candidate)
@@ -437,6 +632,7 @@ def test_concrete_runtime_publishes_and_restores_complete_unit_scope(
         == f"candidate:{unit}\n"
         for unit in units
     )
+    assert (installed / bootstrap_module.BOOTSTRAP_TARGET).exists()
 
     adapter.restore_control_configuration(preimages)
     assert all(

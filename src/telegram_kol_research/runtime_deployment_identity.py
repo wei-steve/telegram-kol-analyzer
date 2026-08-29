@@ -206,6 +206,66 @@ def _task_running(task: Any) -> bool:
         return False
 
 
+def validate_runtime_authority_scope(
+    identities: Mapping[str, Mapping[str, Any]],
+) -> None:
+    """Prove exactly one worker owner from bounded numeric cycle evidence."""
+
+    owners: list[str] = []
+    for role, identity in identities.items():
+        capabilities = identity.get("capabilities")
+        if not isinstance(capabilities, Mapping):
+            raise ValueError("runtime authority evidence invalid")
+        if capabilities.get("global_exchange_authority") is True:
+            owners.append(role)
+    if owners != ["worker"]:
+        raise ValueError("runtime authority evidence invalid")
+    worker = identities.get("worker")
+    if not isinstance(worker, Mapping):
+        raise ValueError("runtime authority evidence invalid")
+    capabilities = worker.get("capabilities")
+    required = (
+        "global_exchange_authority",
+        "management",
+        "protection",
+        "close",
+        "tpsl",
+        "rescue",
+    )
+    if not isinstance(capabilities, Mapping) or any(
+        capabilities.get(name) is not True for name in required
+    ):
+        raise ValueError("runtime authority evidence invalid")
+    evidence = worker.get("authority_evidence")
+    if not isinstance(evidence, Mapping):
+        raise ValueError("runtime authority evidence invalid")
+    max_age = evidence.get("max_age_seconds")
+    if (
+        isinstance(max_age, bool)
+        or not isinstance(max_age, (int, float))
+        or not 1 <= float(max_age) <= 300
+    ):
+        raise ValueError("runtime authority evidence invalid")
+    for name in ("management_cycle", "break_even_cycle", "reconcile_cycle"):
+        cycle = evidence.get(name)
+        age = cycle.get("age_seconds") if isinstance(cycle, Mapping) else None
+        if (
+            not isinstance(cycle, Mapping)
+            or cycle.get("fresh") is not True
+            or cycle.get("successful") is not True
+            or isinstance(age, bool)
+            or not isinstance(age, (int, float))
+            or not 0 <= float(age) <= float(max_age)
+        ):
+            raise ValueError("runtime authority evidence invalid")
+    management = evidence["management_cycle"]
+    if (
+        management.get("effective_management_enabled") is not True
+        or management.get("effective_rescue_enabled") is not True
+    ):
+        raise ValueError("runtime authority evidence invalid")
+
+
 def read_self_process_start_ticks() -> int | None:
     try:
         raw = Path("/proc/self/stat").read_text(encoding="ascii")

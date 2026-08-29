@@ -23,6 +23,9 @@ from telegram_kol_research.deployment_action_plan import (
     build_action_plan,
     parse_manifest,
 )
+from telegram_kol_research.runtime_deployment_identity import (
+    validate_runtime_authority_scope,
+)
 
 
 RELEASE_MANIFEST = ".telegram-kol-release.json"
@@ -43,18 +46,6 @@ _UNITS = {
     ),
 }
 _PORTS = {"web": 8000, "ingest": 8001, "worker": 8002}
-_REQUIRED_WORKER_CAPABILITIES = frozenset(
-    {
-        "global_exchange_authority",
-        "management",
-        "protection",
-        "close",
-        "tpsl",
-        "rescue",
-    }
-)
-
-
 def _command_matches_role(command: bytes, *, role: str) -> bool:
     try:
         parts = tuple(
@@ -485,54 +476,9 @@ def prove_release_runtime(
                 releases[role] = expected_release
             if not require_authority:
                 return identities, releases
-            owners = []
-            for role, identity in identities.items():
-                capabilities = identity.get("capabilities")
-                if not isinstance(capabilities, Mapping):
-                    raise ActivationError("authority proof failed")
-                if capabilities.get("global_exchange_authority") is True:
-                    owners.append(role)
-            worker_capabilities = identities["worker"].get("capabilities", {})
-            if owners != ["worker"] or any(
-                worker_capabilities.get(capability) is not True
-                for capability in _REQUIRED_WORKER_CAPABILITIES
-            ):
-                raise ActivationError("authority proof failed")
-            authority_evidence = identities["worker"].get("authority_evidence")
-            if not isinstance(authority_evidence, Mapping):
-                raise ActivationError("authority proof failed")
-            max_age = authority_evidence.get("max_age_seconds")
-            if (
-                isinstance(max_age, bool)
-                or not isinstance(max_age, (int, float))
-                or not 1 <= float(max_age) <= 300
-            ):
-                raise ActivationError("authority proof failed")
-            for cycle in (
-                "management_cycle",
-                "break_even_cycle",
-                "reconcile_cycle",
-            ):
-                evidence = authority_evidence.get(cycle)
-                age = (
-                    evidence.get("age_seconds")
-                    if isinstance(evidence, Mapping)
-                    else None
-                )
-                if (
-                    not isinstance(evidence, Mapping)
-                    or evidence.get("fresh") is not True
-                    or evidence.get("successful") is not True
-                    or isinstance(age, bool)
-                    or not isinstance(age, (int, float))
-                    or not 0 <= float(age) <= float(max_age)
-                ):
-                    raise ActivationError("authority proof failed")
-            management_evidence = authority_evidence["management_cycle"]
-            if (
-                management_evidence.get("effective_management_enabled") is not True
-                or management_evidence.get("effective_rescue_enabled") is not True
-            ):
+            try:
+                validate_runtime_authority_scope(identities)
+            except ValueError as exc:
                 raise ActivationError("authority proof failed")
             return identities, releases
         except ActivationError as exc:

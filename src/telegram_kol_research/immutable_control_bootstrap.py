@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import os
@@ -21,6 +21,9 @@ from telegram_kol_research.deepcoin_maintenance_evidence import (
 from telegram_kol_research.reviewed_pending_entry_cancel import (
     REVIEWED_PENDING_ENTRY_TARGETS,
 )
+from telegram_kol_research.runtime_deployment_identity import (
+    validate_runtime_authority_scope,
+)
 from telegram_kol_research.maintenance_runtime_guard import (
     MAINTENANCE_UNITS,
     SystemdMaintenanceRuntimeAdapter,
@@ -37,23 +40,15 @@ from telegram_kol_research.scoped_release_activation import (
 
 BOOTSTRAP_COMPONENTS = ("web", "monitor", "ingest", "worker")
 BOOTSTRAP_LIVE_RUNTIME_ROLES = ("web", "ingest", "worker")
+BOOTSTRAP_TARGET = "telegram-kol-runtime.target"
+BOOTSTRAP_AUTOSTART_UNITS = (
+    "telegram-kol-worker.service",
+    "telegram-kol-web.service",
+    "telegram-kol-ingest.service",
+    "telegram-kol-monitor.timer",
+)
 REJECTED_LEGACY_BRIDGE_RELEASE = (
     "ffb06d19eabfd32dfdab2942b2152fd2809e3d17"
-)
-_REQUIRED_CAPABILITIES = (
-    "global_exchange_authority",
-    "management",
-    "protection",
-    "close",
-    "tpsl",
-    "rescue",
-)
-_REQUIRED_CYCLES = (
-    "management_cycle",
-    "protection_cycle",
-    "close_cycle",
-    "tpsl_cycle",
-    "rescue_cycle",
 )
 
 
@@ -142,6 +137,7 @@ class BootstrapRuntimeAdapter(Protocol):
     def open_candidate_start_boundary(self, plan: BootstrapPlan) -> None: ...
     def candidate_identities(self) -> Mapping[str, Mapping[str, Any]]: ...
     def verify_monitor(self, plan: BootstrapPlan) -> None: ...
+    def complete_candidate_start(self, plan: BootstrapPlan) -> None: ...
     def reinhibit_and_stop_candidate(self) -> None: ...
     def restore_control_configuration(self, preimages: Any) -> None: ...
 
@@ -204,6 +200,11 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
             entry_frozen=entry_frozen,
         )
         self.scoped_runtime.daemon_reload()
+        # Old releases enabled each role independently.  Disable every direct
+        # boot edge and the new aggregate target before candidate processes are
+        # opened.  The target becomes the one final reboot fence.
+        for unit in (*BOOTSTRAP_AUTOSTART_UNITS, BOOTSTRAP_TARGET):
+            self.control_runtime.restore_enabled_state(unit, "disabled")
 
     def verify_candidate_configuration(self, plan: BootstrapPlan) -> None:
         release = validate_release(
@@ -241,10 +242,15 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
                 "verify",
                 *(
                     str(self.paths.dropin_root / unit)
-                    for unit in MAINTENANCE_UNITS
+                    for unit in _bootstrap_unit_files()
                 ),
             ]
         )
+        if any(
+            self.control_runtime.inspect_unit(unit).enabled_state != "disabled"
+            for unit in (*BOOTSTRAP_AUTOSTART_UNITS, BOOTSTRAP_TARGET)
+        ):
+            raise BootstrapBlocked("bootstrap_autostart_fence_invalid")
 
     def open_candidate_start_boundary(self, plan: BootstrapPlan) -> None:
         _ = plan
@@ -289,6 +295,9 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
             self.scoped_runtime.verify_monitor_release(plan.candidate)
         finally:
             self.control_runtime.mask_unit(diagnostic)
+
+    def complete_candidate_start(self, plan: BootstrapPlan) -> None:
+        _ = plan
         for unit in MAINTENANCE_UNITS:
             self.control_runtime.unmask_unit(unit)
         if any(
@@ -296,19 +305,63 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
             for unit in MAINTENANCE_UNITS
         ):
             raise BootstrapUnknown("candidate_final_unmask_unproven")
-        self.control_runtime.start_unit("telegram-kol-monitor.timer")
+        # One target enable is the persistent takeover fence.  A reboot before
+        # this point starts no individual role; after it, systemd requests the
+        # complete candidate scope rather than a partially unmasked subset.
+        self.control_runtime.restore_enabled_state(BOOTSTRAP_TARGET, "enabled")
+        if (
+            self.control_runtime.inspect_unit(BOOTSTRAP_TARGET).enabled_state
+            != "enabled"
+            or any(
+                self.control_runtime.inspect_unit(unit).enabled_state
+                != "disabled"
+                for unit in BOOTSTRAP_AUTOSTART_UNITS
+            )
+        ):
+            raise BootstrapUnknown("candidate_takeover_fence_unproven")
+        self.control_runtime.start_unit(BOOTSTRAP_TARGET)
 
     def reinhibit_and_stop_candidate(self) -> None:
+        failed = False
+        try:
+            self.control_runtime.restore_enabled_state(
+                BOOTSTRAP_TARGET,
+                "disabled",
+            )
+        except Exception:
+            failed = True
+        try:
+            self.control_runtime.stop_unit(BOOTSTRAP_TARGET)
+        except Exception:
+            failed = True
         for unit in MAINTENANCE_UNITS:
-            self.control_runtime.mask_unit(unit)
+            try:
+                self.control_runtime.mask_unit(unit)
+            except Exception:
+                failed = True
         for unit in MAINTENANCE_UNITS:
-            self.control_runtime.stop_unit(unit)
-        if any(
-            not self.control_runtime.is_masked(unit)
-            or self.control_runtime.main_pid(unit) != 0
-            or self.control_runtime.cgroup_pids(unit)
-            for unit in MAINTENANCE_UNITS
-        ):
+            try:
+                self.control_runtime.stop_unit(unit)
+            except Exception:
+                failed = True
+        for unit in MAINTENANCE_UNITS:
+            try:
+                if (
+                    not self.control_runtime.is_masked(unit)
+                    or self.control_runtime.main_pid(unit) != 0
+                    or self.control_runtime.cgroup_pids(unit)
+                ):
+                    failed = True
+            except Exception:
+                failed = True
+        try:
+            if self.control_runtime.matching_processes():
+                failed = True
+            if self.control_runtime.matching_processes():
+                failed = True
+        except Exception:
+            failed = True
+        if failed:
             raise BootstrapUnknown("candidate_reinhibit_unproven")
 
     def restore_control_configuration(
@@ -405,6 +458,14 @@ def bootstrap_unit_manifest_sha256(release: ReleaseEvidence) -> str:
             "none",
         )
     )
+    target = release.release_path / f"deploy/systemd/{BOOTSTRAP_TARGET}"
+    material.append(
+        (
+            BOOTSTRAP_TARGET,
+            hashlib.sha256(target.read_bytes()).hexdigest(),
+            "none",
+        )
+    )
     return _fingerprint({"unit_scope": material})
 
 
@@ -414,6 +475,7 @@ def apply_immutable_control_bootstrap_plan(
     guard: BootstrapGuard,
     authority: BootstrapAuthorityAdapter,
     runtime: BootstrapRuntimeAdapter,
+    authorization_expires_at: datetime | None = None,
     now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
 ) -> BootstrapResult:
@@ -433,6 +495,17 @@ def apply_immutable_control_bootstrap_plan(
             raise BootstrapBlocked("bootstrap_clock_invalid")
         return value.astimezone(UTC)
 
+    def require_live_authorization() -> None:
+        if authorization_expires_at is None:
+            return
+        if (
+            authorization_expires_at.tzinfo is None
+            or authorization_expires_at.utcoffset() is None
+        ):
+            raise BootstrapBlocked("bootstrap_authorization_invalid")
+        if boundary_time() >= authorization_expires_at.astimezone(UTC):
+            raise BootstrapBlocked("bootstrap_authorization_expired")
+
     try:
         require_fresh_deepcoin_maintenance_observed_at(
             plan.evidence_observed_at,
@@ -445,6 +518,10 @@ def apply_immutable_control_bootstrap_plan(
     if not isinstance(legacy_worker, Mapping):
         raise BootstrapBlocked("legacy_worker_identity_unavailable")
     legacy_tuple = _process_tuple(legacy_worker)
+    # Planning may include bounded database and exchange reads.  Recheck the
+    # signed deadline at the last read-only boundary before any inhibitor,
+    # authority, file, or systemd mutation.
+    require_live_authorization()
     receipt = guard.enter(action_id=plan.action_id)
     guard.prove_quiescent()
     preimages = runtime.capture_dropin_preimages()
@@ -466,6 +543,7 @@ def apply_immutable_control_bootstrap_plan(
             )
         except DeepcoinMaintenanceEvidenceRefused as exc:
             raise BootstrapBlocked("bootstrap_evidence_unavailable") from exc
+        require_live_authorization()
 
         # Revised, explicit boundary: static files are proven first.  The
         # official units are then opened only while the bootstrap lease is held
@@ -477,7 +555,12 @@ def apply_immutable_control_bootstrap_plan(
             identities,
             plan=plan,
             legacy_worker_tuple=legacy_tuple,
+            checked_at=boundary_time(),
         )
+        # The diagnostic process is the fourth runtime role.  Prove it while
+        # bootstrap authority is still held; a post-release monitor check would
+        # leave a role gap at the handoff boundary.
+        runtime.verify_monitor(plan)
         if not authority.release_bootstrap(
             token=token,
             generation=generation,
@@ -494,7 +577,7 @@ def apply_immutable_control_bootstrap_plan(
             raise BootstrapUnknown("authority_self_test_unknown") from exc
         if self_test_generation != generation + 1:
             raise BootstrapUnknown("authority_self_test_unknown")
-        runtime.verify_monitor(plan)
+        runtime.complete_candidate_start(plan)
         guard.complete_candidate_takeover(
             expected_fingerprint=receipt.fingerprint,
         )
@@ -572,6 +655,7 @@ def _validate_candidate_identities(
     *,
     plan: BootstrapPlan,
     legacy_worker_tuple: tuple[int, int],
+    checked_at: datetime,
 ) -> None:
     if tuple(identities) != BOOTSTRAP_LIVE_RUNTIME_ROLES:
         raise BootstrapBlocked("candidate_identity_scope_invalid")
@@ -594,6 +678,32 @@ def _validate_candidate_identities(
             != identity.get("process_start_ticks")
         ):
             raise BootstrapBlocked("candidate_identity_unproven")
+        try:
+            observed_at = datetime.fromisoformat(str(identity.get("observed_at")))
+            if observed_at.tzinfo is None:
+                raise ValueError
+            age = checked_at.astimezone(UTC) - observed_at.astimezone(UTC)
+        except (TypeError, ValueError):
+            age = timedelta.max
+        health = identity.get("health")
+        if (
+            age < timedelta(0)
+            or age > timedelta(seconds=10)
+            or not isinstance(health, Mapping)
+            or health.get("message_processing") is not False
+            or (
+                role == "ingest"
+                and (
+                    health.get("ingest_live_listener") is not True
+                    or health.get("ingest_reconcile") is not True
+                )
+            )
+            or (
+                role == "worker"
+                and health.get("worker_command") is not True
+            )
+        ):
+            raise BootstrapBlocked("candidate_identity_unproven")
         process_tuple = _process_tuple(identity)
         if process_tuple in process_tuples:
             raise BootstrapBlocked("candidate_identity_unproven")
@@ -602,23 +712,10 @@ def _validate_candidate_identities(
             raise BootstrapBlocked("candidate_entry_not_frozen")
     if _process_tuple(identities["worker"]) == legacy_worker_tuple:
         raise BootstrapBlocked("candidate_identity_not_distinct")
-    worker = identities["worker"]
-    capabilities = worker.get("capabilities")
-    if not isinstance(capabilities, Mapping) or any(
-        capabilities.get(name) is not True for name in _REQUIRED_CAPABILITIES
-    ):
-        raise BootstrapBlocked("candidate_capability_unproven")
-    evidence = worker.get("authority_evidence")
-    if not isinstance(evidence, Mapping):
-        raise BootstrapBlocked("candidate_capability_unproven")
-    for name in _REQUIRED_CYCLES:
-        cycle = evidence.get(name)
-        if (
-            not isinstance(cycle, Mapping)
-            or cycle.get("fresh") is not True
-            or cycle.get("successful") is not True
-        ):
-            raise BootstrapBlocked("candidate_capability_unproven")
+    try:
+        validate_runtime_authority_scope(identities)
+    except ValueError as exc:
+        raise BootstrapBlocked("candidate_capability_unproven") from exc
 
 
 def _process_tuple(identity: Mapping[str, Any]) -> tuple[int, int]:
@@ -652,7 +749,7 @@ def _component_units() -> Mapping[str, tuple[str, ...]]:
 def _bootstrap_unit_files() -> tuple[str, ...]:
     return tuple(
         unit for units in _component_units().values() for unit in units
-    ) + ("telegram-kol-monitor.timer",)
+    ) + ("telegram-kol-monitor.timer", BOOTSTRAP_TARGET)
 
 
 def _run_systemd(command: list[str]) -> None:

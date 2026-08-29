@@ -800,6 +800,7 @@ def test_bootstrap_control_apply_dispatches_exact_plan(monkeypatch):
 
     assert result.exit_code == 0, result.output
     assert captured["plan"] is plan
+    assert captured["authorization_expires_at"] == manifest.expires_at
     payload = json.loads(result.output.splitlines()[-1])
     assert payload["status"] == "bootstrapped_entry_frozen"
     assert payload["entry_admission_frozen"] is True

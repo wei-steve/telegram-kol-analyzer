@@ -123,14 +123,24 @@ def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
             )
         } if role == "worker" else {},
         "authority_evidence": {
-            name: {"fresh": capable, "successful": capable}
-            for name in (
-                "management_cycle",
-                "protection_cycle",
-                "close_cycle",
-                "tpsl_cycle",
-                "rescue_cycle",
-            )
+            "max_age_seconds": 90.0,
+            "management_cycle": {
+                "age_seconds": 1.0,
+                "fresh": capable,
+                "successful": capable,
+                "effective_management_enabled": capable,
+                "effective_rescue_enabled": capable,
+            },
+            "break_even_cycle": {
+                "age_seconds": 1.0,
+                "fresh": capable,
+                "successful": capable,
+            },
+            "reconcile_cycle": {
+                "age_seconds": 1.0,
+                "fresh": capable,
+                "successful": capable,
+            },
         } if role == "worker" else {},
     }
 
@@ -197,6 +207,45 @@ def test_release_scope_rejects_mixed_release_or_disabled_capabilities():
     assert "runtime_capability_unproven" in disabled.reason_codes
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].update(
+            age_seconds=91.0
+        ),
+        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].pop(
+            "age_seconds"
+        ),
+        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].update(
+            effective_rescue_enabled=False
+        ),
+        lambda roles: roles["web"]["capabilities"].update(
+            global_exchange_authority=True
+        ),
+    ),
+)
+def test_release_scope_rejects_unbounded_or_ambiguous_authority(mutation):
+    roles = {
+        role: _release_identity(role)
+        for role in ("web", "ingest", "worker", "monitor")
+    }
+    mutation(roles)
+
+    result = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert "runtime_capability_unproven" in result.reason_codes
+
+
 def test_release_scope_rejects_unverified_loaded_code_wrong_cwd_or_shared_pid():
     roles = {
         role: _release_identity(role)
@@ -227,7 +276,7 @@ def test_release_scope_rejects_unverified_loaded_code_wrong_cwd_or_shared_pid():
     assert "runtime_identity_unproven" in result.reason_codes
 
 
-def test_release_unit_scope_includes_exact_activation_dropins(tmp_path):
+def test_release_unit_scope_includes_exact_activation_dropins(tmp_path, monkeypatch):
     release_path = tmp_path / "release"
     release_units = release_path / "deploy/systemd"
     installed_units = tmp_path / "installed"
@@ -246,6 +295,7 @@ def test_release_unit_scope_includes_exact_activation_dropins(tmp_path):
     for unit in (
         *(unit for units in component_units.values() for unit in units),
         "telegram-kol-monitor.timer",
+        "telegram-kol-runtime.target",
     ):
         (release_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
         (installed_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
@@ -271,6 +321,18 @@ def test_release_unit_scope_includes_exact_activation_dropins(tmp_path):
     adapters = ProductionSafetyAdapters(
         database_path=tmp_path / "unused.db",
         systemd_unit_root=installed_units,
+    )
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda command, **kwargs: SimpleNamespace(
+            returncode=0 if command[-1] == "telegram-kol-runtime.target" else 1,
+            output=(
+                "enabled\n"
+                if command[-1] == "telegram-kol-runtime.target"
+                else "disabled\n"
+            ),
+        ),
     )
 
     assert adapters._release_unit_hashes_valid(release) is True
@@ -3646,6 +3708,27 @@ class _RecordingAdapters:
     def run_management_audit(self):
         self.calls.append("audit")
         return self.audit
+
+
+def test_runtime_release_validation_recomputes_immutable_content_and_ownership(
+    tmp_path,
+    monkeypatch,
+):
+    release = tmp_path / REVIEWED_HEAD
+    adapters = monitor_module.ProductionSafetyAdapters(
+        database_path=tmp_path / "research.db",
+        release_path=release,
+        release_commit=REVIEWED_HEAD,
+        release_manifest_sha256="a" * 64,
+    )
+
+    def refuse_tampered_release(*args, **kwargs):
+        raise monitor_module.ActivationError("release validation failed")
+
+    monkeypatch.setattr(monitor_module, "validate_release", refuse_tampered_release)
+
+    with pytest.raises(RuntimeError, match="runtime_release_contract_invalid"):
+        adapters._validated_release_evidence()
 
 
 def test_contract_spec_sources_share_since_and_fail_closed_as_one_adapter(tmp_path):
