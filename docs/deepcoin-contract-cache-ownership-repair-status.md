@@ -699,13 +699,14 @@ phase completes or pauses, record both verified evidence and outstanding work.
   one atomic local terminalization transaction.
 - The canonical targets now include the reviewed chat/message/strategy and
   client-order identities plus exact entry and protection economics. Any local
-  position identity, adopted child order, protection exchange order, active
+  position identity, adopted protection order, protection exchange order, active
   noncanonical sibling, ambiguous fill, malformed/missing completed authority,
   or coordinated identity drift fails closed before a database write. The
   command never calls a Deepcoin write endpoint.
 - The SQLite backup is created as an exclusive `0600` inode under a verified
-  owner-only parent, captures uncheckpointed WAL commits, detects source and
-  destination path replacement, validates the persisted bytes with
+  owner-only parent, captures uncheckpointed WAL commits, detects source
+  replacement, remains bound to the exclusive destination inode, rejects final
+  destination path/inode replacement, and validates the persisted bytes with
   `quick_check` and `foreign_key_check`, and is complete before
   `BEGIN IMMEDIATE`. A terminalization failure rolls back all seven targets and
   the authority seed together.
