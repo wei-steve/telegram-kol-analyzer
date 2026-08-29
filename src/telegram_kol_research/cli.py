@@ -105,6 +105,13 @@ from telegram_kol_research.legacy_conditional_cancel import (
     apply_reviewed_legacy_conditional_cancel_plan,
     build_reviewed_legacy_conditional_cancel_plan,
 )
+from telegram_kol_research.manual_pending_entry_reconciliation import (
+    apply_manual_pending_entry_reconciliation,
+    build_manual_pending_entry_reconciliation_plan,
+)
+from telegram_kol_research.reviewed_pending_entry_targets import (
+    REVIEWED_PENDING_ENTRY_TARGETS,
+)
 from telegram_kol_research.position_attribution_repair import (
     apply_position_attribution_repair_plan,
     build_position_attribution_repair_plan,
@@ -4971,6 +4978,68 @@ def cancel_reviewed_legacy_conditionals(
     typer.echo(json.dumps(asdict(result), ensure_ascii=False, sort_keys=True))
     if result.status != "cancelled":
         raise typer.Exit(code=2)
+
+
+@app.command("finalize-cancelled-pending-entries")
+def finalize_cancelled_pending_entries(
+    database_path: Path = typer.Option(
+        Path("data/research.db"), "--database-path"
+    ),
+    backup_path: Path = typer.Option(..., "--backup-path"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+) -> None:
+    """Finalize reviewed entries after the operator cancels all at Deepcoin."""
+
+    session_factory = create_existing_session_factory(database_path)
+    client = build_deepcoin_client_from_env()
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=REVIEWED_PENDING_ENTRY_TARGETS,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "mode": "apply" if apply else "dry_run",
+                "status": plan.status,
+                "reason_code": plan.reason_code,
+                "target_count": len(plan.target_order_ids),
+                "evidence_sha256": plan.evidence_sha256,
+                "fingerprint": plan.fingerprint,
+            },
+            sort_keys=True,
+        )
+    )
+    if plan.status == "completed":
+        return
+    if plan.status != "ready":
+        raise typer.Exit(code=2)
+    if not apply:
+        return
+    if not expected_fingerprint:
+        raise typer.BadParameter("--apply requires --expected-fingerprint")
+    result = apply_manual_pending_entry_reconciliation(
+        session_factory,
+        database_path=database_path,
+        backup_path=backup_path,
+        deepcoin_client=client,
+        targets=REVIEWED_PENDING_ENTRY_TARGETS,
+        expected_fingerprint=expected_fingerprint,
+    )
+    typer.echo(
+        json.dumps(
+            {
+                "status": result.status,
+                "terminalized_count": result.terminalized_count,
+                "authority_seeded": result.authority_seeded,
+                "backup_path": str(result.backup_path),
+            },
+            sort_keys=True,
+        )
+    )
 
 
 @app.command("repair-position-management")

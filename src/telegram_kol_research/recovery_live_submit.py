@@ -944,7 +944,6 @@ def process_trade_signal_live(
                 owner_kind="new_entry_worker",
                 owner_id=f"signal:{int(trade_signal.id)}",
                 acquired_at=authority_acquired_at,
-                require_cancel_quiescence=False,
             )
             if (
                 not authority.acquired

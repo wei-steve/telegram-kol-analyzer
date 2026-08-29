@@ -2215,7 +2215,6 @@ def test_new_entry_authority_covers_every_leg_and_releases_after_success(
                     owner_kind="entry_revision_worker",
                     owner_id=f"probe:{len(self.probes) + 1}",
                     acquired_at=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
-                    require_cancel_quiescence=False,
                 )
             )
             return super().trigger_order(order_payload)

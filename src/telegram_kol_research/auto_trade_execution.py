@@ -134,7 +134,6 @@ def execute_strategy_revision(
         owner_kind="entry_revision_worker",
         owner_id=f"legacy-raw:{int(raw_message_id)}",
         acquired_at=now,
-        require_cancel_quiescence=False,
     )
     if not authority.acquired or authority.generation is None:
         return {

@@ -408,10 +408,9 @@ def test_cancellation_authority_blocks_revision_before_batch_claim(tmp_path):
     )
     cancellation = acquire_entry_revision_exchange_authority(
         session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         owner_id="order:reviewed-1",
         acquired_at=NOW,
-        require_cancel_quiescence=True,
     )
     assert cancellation.acquired is True
     save_trading_settings(

@@ -67,7 +67,6 @@ def test_missing_authority_row_fails_closed_instead_of_auto_creating(
         owner_kind="entry_revision_worker",
         owner_id="batch:40",
         acquired_at=NOW,
-        require_cancel_quiescence=False,
     )
 
     assert result.acquired is False
@@ -91,7 +90,7 @@ def test_idle_acquire_increments_generation_and_binds_owner_identity(
 
     result = acquire_entry_revision_exchange_authority(
         session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         owner_id="order:1001",
         action_id="drain-001",
         acquired_at=NOW + timedelta(seconds=1),
@@ -101,7 +100,6 @@ def test_idle_acquire_increments_generation_and_binds_owner_identity(
         authority_token="fresh-confirmation-token",
         plan_sha256="a" * 64,
         evidence_sha256="b" * 64,
-        require_cancel_quiescence=True,
     )
 
     assert result.acquired is True
@@ -113,7 +111,7 @@ def test_idle_acquire_increments_generation_and_binds_owner_identity(
         "deadline_at": (NOW + timedelta(minutes=1)).isoformat(),
         "evidence_sha256": "b" * 64,
         "generation": 5,
-        "owner_kind": "reviewed_pending_entry_cancel",
+        "owner_kind": "entry_revision_worker",
         "owner_pid": 4321,
         "owner_start_ticks": 987654,
         "plan_sha256": "a" * 64,
@@ -136,7 +134,6 @@ def test_stale_generation_cannot_acquire_release_or_block(tmp_path):
         owner_id="batch:41",
         acquired_at=NOW,
         expected_generation=2,
-        require_cancel_quiescence=False,
     )
 
     assert stale.acquired is False
@@ -149,7 +146,7 @@ def test_write_boundary_unknown_blocks_and_retains_token_hash(tmp_path):
     _seed_idle(session_factory)
     acquired = acquire_entry_revision_exchange_authority(
         session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         owner_id="order:1001",
         action_id="drain-001",
         acquired_at=NOW,
@@ -159,19 +156,18 @@ def test_write_boundary_unknown_blocks_and_retains_token_hash(tmp_path):
         authority_token="fresh-confirmation-token",
         plan_sha256="a" * 64,
         evidence_sha256="b" * 64,
-        require_cancel_quiescence=True,
     )
     boundary = mark_entry_revision_exchange_write_boundary(
         session_factory,
         token="fresh-confirmation-token",
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         expected_generation=1,
         marked_at=NOW + timedelta(seconds=1),
     )
     blocked = block_entry_revision_exchange_authority(
         session_factory,
         token="fresh-confirmation-token",
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         expected_generation=1,
         reason_code="exchange_outcome_unknown",
         blocked_at=NOW + timedelta(seconds=2),
@@ -201,7 +197,6 @@ def test_expired_held_authority_becomes_blocked_never_idle(tmp_path):
         deadline_at=NOW + timedelta(seconds=1),
         expected_generation=0,
         owner_identity=PROCESS_IDENTITY,
-        require_cancel_quiescence=False,
     )
 
     later = acquire_entry_revision_exchange_authority(
@@ -211,7 +206,6 @@ def test_expired_held_authority_becomes_blocked_never_idle(tmp_path):
         acquired_at=NOW + timedelta(seconds=2),
         expected_generation=1,
         owner_identity=PROCESS_IDENTITY,
-        require_cancel_quiescence=False,
     )
 
     assert acquired.acquired is True
@@ -230,7 +224,6 @@ def test_release_cas_failure_leaves_exact_held_authority(tmp_path):
         acquired_at=NOW,
         expected_generation=0,
         owner_identity=PROCESS_IDENTITY,
-        require_cancel_quiescence=False,
     )
     before = _stored_authority(session_factory)
 
@@ -272,14 +265,12 @@ def test_independent_process_owner_cannot_replace_held_authority(tmp_path):
         owner_kind="entry_revision_worker",
         owner_id="batch:41",
         acquired_at=NOW,
-        require_cancel_quiescence=False,
     )
     cli = acquire_entry_revision_exchange_authority(
         cli_factory,
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         owner_id="order:1001",
         acquired_at=NOW + timedelta(seconds=1),
-        require_cancel_quiescence=True,
     )
 
     assert worker.acquired is True
@@ -309,7 +300,6 @@ def test_new_entry_worker_is_an_exact_authority_owner(tmp_path):
         owner_kind="new_entry_worker",
         owner_id="signal:71",
         acquired_at=NOW,
-        require_cancel_quiescence=False,
     )
 
     assert acquisition.acquired is True
@@ -336,7 +326,6 @@ def test_deployment_entry_freeze_blocks_new_entry_authority(
         owner_kind="new_entry_worker",
         owner_id="signal:72",
         acquired_at=NOW,
-        require_cancel_quiescence=False,
     )
 
     assert acquisition.acquired is False
@@ -351,7 +340,6 @@ def test_exact_owner_release_allows_next_quiesced_cancellation(tmp_path):
         owner_kind="entry_revision_worker",
         owner_id="batch:42",
         acquired_at=NOW,
-        require_cancel_quiescence=False,
     )
 
     wrong = release_entry_revision_exchange_authority(
@@ -383,57 +371,11 @@ def test_exact_owner_release_allows_next_quiesced_cancellation(tmp_path):
 
     cancellation = acquire_entry_revision_exchange_authority(
         session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
+        owner_kind="entry_revision_worker",
         owner_id="order:1002",
         acquired_at=NOW + timedelta(seconds=3),
-        require_cancel_quiescence=True,
     )
     assert cancellation.acquired is True
-
-
-@pytest.mark.parametrize(
-    ("settings", "reason_code"),
-    (
-        (
-            {"auto_trade_enabled": True, "entry_revision_v2_mode": "disabled"},
-            "pending_entry_cancel_auto_trade_not_frozen",
-        ),
-        (
-            {"auto_trade_enabled": False, "entry_revision_v2_mode": "shadow"},
-            "pending_entry_cancel_revision_not_disabled",
-        ),
-        (
-            {"auto_trade_enabled": False, "entry_revision_v2_mode": "live"},
-            "pending_entry_cancel_revision_not_disabled",
-        ),
-    ),
-)
-def test_cancellation_authority_requires_frozen_settings(
-    tmp_path,
-    settings,
-    reason_code,
-):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    save_trading_settings(session_factory, settings, updated_at=NOW)
-
-    result = acquire_entry_revision_exchange_authority(
-        session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
-        owner_id="order:1003",
-        acquired_at=NOW + timedelta(seconds=1),
-        require_cancel_quiescence=True,
-    )
-
-    assert result.acquired is False
-    assert result.token is None
-    assert result.reason_code == reason_code
-    with session_factory() as session:
-        assert (
-            session.query(TradingSetting)
-            .filter(TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY)
-            .one_or_none()
-            is None
-        )
 
 
 @pytest.mark.parametrize(
@@ -471,33 +413,8 @@ def test_malformed_or_unknown_authority_fails_closed(tmp_path, payload):
         owner_kind="entry_revision_worker",
         owner_id="batch:43",
         acquired_at=NOW + timedelta(seconds=1),
-        require_cancel_quiescence=False,
     )
 
     assert result.acquired is False
     assert result.token is None
     assert result.reason_code == "entry_revision_exchange_authority_invalid"
-
-
-def test_invalid_global_settings_fail_cancellation_closed(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        session.add(
-            TradingSetting(
-                key="global",
-                value_json="not-json",
-                updated_at=NOW,
-            )
-        )
-        session.commit()
-
-    result = acquire_entry_revision_exchange_authority(
-        session_factory,
-        owner_kind="reviewed_pending_entry_cancel",
-        owner_id="order:1004",
-        acquired_at=NOW + timedelta(seconds=1),
-        require_cancel_quiescence=True,
-    )
-
-    assert result.acquired is False
-    assert result.reason_code == "pending_entry_cancel_settings_invalid"

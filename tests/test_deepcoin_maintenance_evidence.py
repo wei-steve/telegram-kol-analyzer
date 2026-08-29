@@ -10,7 +10,7 @@ from telegram_kol_research.deepcoin_maintenance_evidence import (
     require_canonical_remaining_pending_set,
     require_fresh_deepcoin_maintenance_evidence,
 )
-from telegram_kol_research.reviewed_pending_entry_cancel import (
+from telegram_kol_research.reviewed_pending_entry_targets import (
     REVIEWED_PENDING_ENTRY_TARGETS,
 )
 
