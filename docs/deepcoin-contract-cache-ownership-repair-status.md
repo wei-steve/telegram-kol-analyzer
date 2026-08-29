@@ -55,7 +55,7 @@ manual_cleanup_read_only_verified_at: 2026-08-29T20:20:19Z
 manual_cleanup_exchange_snapshot_status: zero_live_orders_historical_requires_fresh_cutover_recheck
 manual_cleanup_target_fill_count: 0
 manual_cleanup_local_eligible_count: 7
-manual_cleanup_local_repair_status: exact_target_history_repair_complete_production_stage_complete
+manual_cleanup_local_repair_status: complete_production_cutover_pending
 manual_cleanup_local_repair_base_sha: bd73ceb15eb7228f8d9e52641891578cb1883253
 manual_cleanup_local_repair_focused: 344_passed_1_skipped
 manual_cleanup_local_repair_final_suite: 6644_passed_3_skipped_32_warnings
@@ -64,7 +64,16 @@ manual_cleanup_exact_history_repair_code_sha: 5a3bb9383037d4e3e03b843352af947b46
 manual_cleanup_exact_history_repair_focused: 190_passed_plus_2_targeted_passed
 manual_cleanup_exact_history_repair_final_suite: 6663_passed_3_skipped_32_warnings
 manual_cleanup_exact_history_repair_review: no_remaining_p0_p1
-manual_cleanup_production_cutover_status: preflight_failed_closed_exact_fill_http_401
+manual_cleanup_maintenance_pacing_status: complete_fresh_production_cutover_pending
+manual_cleanup_maintenance_pacing_base_sha: 98120385974870420c2be0abb3f297df3e8855ff
+manual_cleanup_maintenance_pacing_design_sha: 800b42659c6a2d199a49eec4998de750f8636064
+manual_cleanup_maintenance_pacing_plan_sha: 8370d474864d5167377a6615d69d0f63f69df4c3
+manual_cleanup_maintenance_pacing_red_sha: 7afcc9877c533a27a68c409f4d0eaecbe133e6c4
+manual_cleanup_maintenance_pacing_code_sha: 63088ad03f8696a0734da2ec1996ff68a2395ae4
+manual_cleanup_maintenance_pacing_focused: 270_passed
+manual_cleanup_maintenance_pacing_final_suite: 6665_passed_3_skipped_32_warnings
+manual_cleanup_maintenance_pacing_review: no_p0_p1
+manual_cleanup_production_cutover_status: local_pacing_repair_complete_fresh_cutover_pending
 manual_cleanup_production_stage_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
 manual_cleanup_production_stage_content_sha256: 68e373268885215a1bf0bd48492be8d7ce0d17d6c3a07bb744c7dc42fd14cad0
 manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/evidence.jsonl
@@ -1024,3 +1033,57 @@ expansion or an irreversible action that the approved phase did not include.
   `a834effc653d338eddf054c83d317d6df790ec49aff602d07c0b7843ae0cc3b3`.
   The phase remains `in_progress`; resolving or explaining the Deepcoin `401`
   read failure is required before a separately authorized fresh cutover attempt.
+
+## Maintenance exact-read pacing repair
+
+- The local repair began from exact clean HEAD
+  `98120385974870420c2be0abb3f297df3e8855ff`. Design and implementation-plan
+  commits are `800b42659c6a2d199a49eec4998de750f8636064` and
+  `8370d474864d5167377a6615d69d0f63f69df4c3`. The first production falsifier
+  tests were committed RED at `7afcc9877c533a27a68c409f4d0eaecbe133e6c4`:
+  both failed because the reconciliation plan did not yet accept deterministic
+  monotonic/sleep dependencies.
+- Deepcoin's official rate rules limit both `/deepcoin/trade/fills` and
+  `/deepcoin/trade/trigger-orders-history` to 5 requests per second and 150
+  requests per minute per UID. The failed production attempt issued its first
+  six exact fills reads in about 0.7 seconds, so the maintenance caller itself
+  violated the documented fills endpoint contract. The observed HTTP `401`
+  remains an external response rather than proof of Deepcoin's internal
+  classification, but local clock drift and static credential failure were not
+  supported by the evidence.
+- Code commit `63088ad03f8696a0734da2ec1996ff68a2395ae4` adds only an
+  invocation-local maintenance pacer. Exact fills and exact trigger-history
+  reads use independent endpoint keys and a 0.41-second minimum start interval,
+  including the first call. Deterministic arithmetic gives at most 3 calls in a
+  sampled one-second window and 147 in a sampled 60-second window. The apply
+  path forwards the same injectable monotonic clock and sleeper into its fresh
+  re-plan. No pacing value enters the evidence fingerprint.
+- The fail-closed contract is unchanged: a simulated sixth fills exception made
+  exactly six calls, did not query the seventh target or any history row, made
+  no exchange write and returned `target_fill_query_incomplete`. There is no
+  retry, backoff, persistent rate state, second target list, replay, bridge,
+  compensation order or trading thaw.
+- GREEN verification passed the three direct pacing/no-retry/apply tests, then
+  all 145 reconciliation tests in 12.21 seconds. The affected Deepcoin client,
+  maintenance-evidence, reconciliation and CLI set passed 270 tests in 17.31
+  seconds. Python compilation and exact-diff whitespace checks passed.
+- The first full-suite invocation exposed a pre-existing status-contract drift:
+  the status field did not match the repository's canonical
+  `complete_production_cutover_pending` assertion. Restoring that truthful
+  status-only value made the exact failed test pass. No production code changed.
+  The final full repository suite then passed 6665 tests with 3 documented skips
+  and 32 existing warnings in 578.55 seconds. No production code changed after
+  that final suite.
+- Independent local review of exact base
+  `98120385974870420c2be0abb3f297df3e8855ff` through code candidate
+  `63088ad03f8696a0734da2ec1996ff68a2395ae4` found no P0 or P1 issue. The
+  invocation-local pacer intentionally does not claim cross-process UID quota
+  coordination; any future incomplete production result remains unknown and
+  stops the attempt without retry.
+- This repair performed no push, SSH, production or Deepcoin query, production
+  database/settings mutation, service control, stage, activation authorization,
+  activate, observation, replay or entry thaw. The previously staged
+  `8abaf2c6d6e361b7651fc41e11275e899bb6463a` does not contain this repair and
+  must not be reused as the next candidate. A later explicitly authorized
+  production cutover must push the new reviewed handoff, create a new immutable
+  inactive stage and acquire entirely fresh evidence from the beginning.
