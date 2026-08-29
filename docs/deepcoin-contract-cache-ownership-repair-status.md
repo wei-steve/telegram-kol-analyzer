@@ -31,7 +31,7 @@ pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
-legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_failed_closed
+legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_complete
 legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
 legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
 legacy_runtime_drain_bridge_plan_sha: 1dd9868233670486ac8575f609e954fa221f6071
@@ -40,7 +40,7 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
-immutable_control_bootstrap_status: task10_full_suite_failed_closed_repair_pending
+immutable_control_bootstrap_status: task10_local_complete_unpushed
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -611,3 +611,40 @@ phase completes or pauses, record both verified evidence and outstanding work.
   thaw. Any additional settings write, database write, Deepcoin write, or
   production mutation also requires its own explicit authorization. Unknown
   remains permanently non-retryable and stops the sequence.
+
+## Task 10 compatibility repair and final local evidence
+
+- The separately authorized local compatibility repair is exact commit
+  `3a641e5f192128960a5fc980c6fe2dc57ad89f1f` with tree
+  `34d7152d22ae48705d28d9adc52bac68c11cf1eb`. It changes six test files only;
+  production code remains the independently reviewed `905c0993` content
+  candidate described above.
+- The twelve authority-dependent legacy tests now explicitly seed their
+  temporary databases so they exercise the intended post-L3-seed boundary;
+  the dedicated missing-row tests remain unseeded and continue to prove that
+  production never auto-creates authority. The direct live-submit freeze test
+  now expects its actual `RecoveryLiveSubmitError` API contract. The stage-only
+  test constructs a valid four-role activate manifest before asserting the
+  stage helper rejects the wrong action. The authority assertion uses closed
+  schema v2 `action_id` and proves that ordinary `owner_id` is absent.
+- The required composed first falsifier is now present and passes. It proves an
+  accepted-then-timeout cancel calls Deepcoin exactly once, blocks durable
+  authority, survives simulated process crash and host reboot with every unit
+  still persistently masked, starts no unit, rejects an explicit retry before
+  the exchange boundary, and never restores the legacy runtime.
+- Verification was GREEN at every final checkpoint: the original failing file
+  group passed 167 tests; the affected authority/guard group passed 229 tests;
+  the exact Task 10 focused safety set passed 975 tests with 1 documented skip
+  in 27.56 seconds; and the one final repository suite on exact commit
+  `3a641e5f` passed 6600 tests with 3 documented skips and 32 warnings in
+  414.94 seconds. No production code or tests changed after the final suite.
+- Independent review found no Critical, Important, or Minor finding in the
+  six-file repair and approved it for final verification. This closes the local
+  Task 10 test gate only; it is not production-dependent acceptance and does
+  not authorize handoff, push, stage, SSH, deployment, service control, seed,
+  order cancellation, bootstrap, entry thaw, settings/database writes,
+  Deepcoin writes, or any other production mutation.
+- Future production work remains split across the exact independent
+  authorizations recorded above. Every reviewed order still requires a fresh
+  plan and new confirmation token, and any unknown result permanently stops the
+  sequence without automatic retry.
