@@ -8,15 +8,16 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
-from typing import Iterable
+from typing import Callable, Iterable
 
 from sqlalchemy import text
 
 from telegram_kol_research.deepcoin_maintenance_evidence import (
     DeepcoinMaintenanceEvidenceRefused,
     build_deepcoin_maintenance_evidence,
-    deepcoin_order_id,
+    deepcoin_order_ids,
     require_fresh_deepcoin_maintenance_evidence,
+    require_fresh_deepcoin_maintenance_observed_at,
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
@@ -53,6 +54,7 @@ class ManualPendingEntryReconciliationPlan:
     reason_code: str | None
     target_order_ids: tuple[str, ...]
     evidence_sha256: str
+    evidence_observed_at: datetime | None
     fingerprint: str
 
 
@@ -70,10 +72,11 @@ def build_manual_pending_entry_reconciliation_plan(
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> ManualPendingEntryReconciliationPlan:
     """Prove all exchange entries are gone and local targets are exact."""
 
-    observed_at = _timestamp(now or datetime.now(UTC))
+    observed_at = _timestamp(now) if now is not None else None
     reviewed = tuple(targets)
     order_ids = tuple(target.order_id for target in reviewed)
     if not reviewed or len(set(order_ids)) != len(order_ids):
@@ -83,9 +86,10 @@ def build_manual_pending_entry_reconciliation_plan(
         instruments=_GOVERNED_INSTRUMENTS,
         target_order_id="manual-cancel-all",
         expected_target_pending_count=0,
-        observed_at=observed_at if now is not None else None,
+        observed_at=observed_at,
+        clock=clock,
     )
-    freshness_now = observed_at if now is not None else _timestamp(datetime.now(UTC))
+    freshness_now = observed_at or _clock_now(clock)
     try:
         require_fresh_deepcoin_maintenance_evidence(evidence, now=freshness_now)
     except DeepcoinMaintenanceEvidenceRefused:
@@ -93,6 +97,7 @@ def build_manual_pending_entry_reconciliation_plan(
             evidence.reason_code or "exchange_snapshot_unknown",
             order_ids,
             evidence_sha256=evidence.fingerprint,
+            evidence_observed_at=evidence.observed_at,
         )
     if evidence.positions:
         return _blocked("live_position_present", order_ids, evidence.fingerprint)
@@ -101,23 +106,36 @@ def build_manual_pending_entry_reconciliation_plan(
     if evidence.pending_triggers:
         return _blocked("pending_trigger_present", order_ids, evidence.fingerprint)
     target_order_ids = set(order_ids)
-    if any(deepcoin_order_id(row) in target_order_ids for row in evidence.fills):
+    if any(deepcoin_order_ids(row) & target_order_ids for row in evidence.fills):
         return _blocked("target_fill_present", order_ids, evidence.fingerprint)
-    target_history = (
-        row
-        for row in evidence.trigger_history
-        if deepcoin_order_id(row) in target_order_ids
-    )
-    if any(
-        str(row.get("state") or row.get("status") or "").strip().lower()
-        not in {"cancelled", "canceled"}
-        for row in target_history
-    ):
-        return _blocked(
-            "target_history_not_cancelled",
-            order_ids,
-            evidence.fingerprint,
-        )
+    for order_id in order_ids:
+        matches = [
+            (row, deepcoin_order_ids(row))
+            for row in evidence.trigger_history
+            if order_id in deepcoin_order_ids(row)
+        ]
+        if not matches:
+            return _blocked(
+                "target_cancelled_history_missing", order_ids, evidence.fingerprint
+            )
+        if len(matches) != 1:
+            return _blocked(
+                "target_cancelled_history_not_unique",
+                order_ids,
+                evidence.fingerprint,
+            )
+        row, identities = matches[0]
+        if identities != {order_id}:
+            return _blocked(
+                "target_history_identity_conflict", order_ids, evidence.fingerprint
+            )
+        if str(row.get("state") or row.get("status") or "").strip().lower() not in {
+            "cancelled",
+            "canceled",
+        }:
+            return _blocked(
+                "target_history_not_cancelled", order_ids, evidence.fingerprint
+            )
 
     completed_count = 0
     with session_factory() as session:
@@ -157,6 +175,7 @@ def build_manual_pending_entry_reconciliation_plan(
         reason_code=None,
         target_order_ids=order_ids,
         evidence_sha256=evidence.fingerprint,
+        evidence_observed_at=evidence.observed_at,
         fingerprint=fingerprint,
     )
 
@@ -170,20 +189,23 @@ def apply_manual_pending_entry_reconciliation(
     targets: Iterable[ReviewedPendingEntryTarget],
     expected_fingerprint: str,
     now: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> ManualPendingEntryReconciliationResult:
     """Back up SQLite and terminalize all reviewed targets in one transaction."""
 
-    observed_at = _timestamp(now or datetime.now(UTC))
     reviewed = tuple(targets)
     fresh = build_manual_pending_entry_reconciliation_plan(
         session_factory,
         deepcoin_client=deepcoin_client,
         targets=reviewed,
-        now=observed_at,
+        now=now,
+        clock=clock,
     )
     if fresh.status != "ready" or fresh.fingerprint != expected_fingerprint:
         raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")
+    _require_write_boundary_freshness(fresh, now=now, clock=clock)
     _create_verified_backup(Path(database_path), Path(backup_path))
+    observed_at = _require_write_boundary_freshness(fresh, now=now, clock=clock)
 
     authority_seeded = False
     with session_factory() as session:
@@ -461,14 +483,43 @@ def _valid_idle_authority(value_json: str) -> bool:
     )
 
 
-def _blocked(reason, order_ids, evidence_sha256=""):
+def _blocked(
+    reason,
+    order_ids,
+    evidence_sha256="",
+    evidence_observed_at: datetime | None = None,
+):
     return ManualPendingEntryReconciliationPlan(
         status="blocked",
         reason_code=reason,
         target_order_ids=tuple(order_ids),
         evidence_sha256=evidence_sha256,
+        evidence_observed_at=evidence_observed_at,
         fingerprint="",
     )
+
+
+def _require_write_boundary_freshness(
+    plan: ManualPendingEntryReconciliationPlan,
+    *,
+    now: datetime | None,
+    clock: Callable[[], datetime] | None,
+) -> datetime:
+    if plan.evidence_observed_at is None:
+        raise ValueError("exchange_snapshot_stale_at_write_boundary")
+    observed_now = _timestamp(now) if now is not None else _clock_now(clock)
+    try:
+        require_fresh_deepcoin_maintenance_observed_at(
+            plan.evidence_observed_at,
+            now=observed_now,
+        )
+    except DeepcoinMaintenanceEvidenceRefused as exc:
+        raise ValueError("exchange_snapshot_stale_at_write_boundary") from exc
+    return observed_now
+
+
+def _clock_now(clock: Callable[[], datetime] | None) -> datetime:
+    return _timestamp((clock or (lambda: datetime.now(UTC)))())
 
 
 def _fingerprint(value: object) -> str:

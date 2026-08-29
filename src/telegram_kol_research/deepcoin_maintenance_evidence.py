@@ -311,14 +311,18 @@ def _evidence(
 def deepcoin_order_id(row: Mapping[str, Any]) -> str:
     """Return the exchange order identifier from documented Deepcoin aliases."""
 
-    return str(
-        row.get("ordId")
-        or row.get("orderId")
-        or row.get("order_id")
-        or row.get("algoId")
-        or row.get("triggerOrderId")
-        or ""
-    ).strip()
+    values = deepcoin_order_ids(row)
+    return next(iter(values)) if len(values) == 1 else ""
+
+
+def deepcoin_order_ids(row: Mapping[str, Any]) -> frozenset[str]:
+    """Return every non-empty Deepcoin order identifier without precedence."""
+
+    return frozenset(
+        clean
+        for key in ("ordId", "orderId", "order_id", "algoId", "triggerOrderId")
+        if (clean := str(row.get(key) or "").strip())
+    )
 
 
 def _timestamp(value: datetime) -> datetime:
