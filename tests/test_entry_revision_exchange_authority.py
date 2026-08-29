@@ -418,3 +418,34 @@ def test_malformed_or_unknown_authority_fails_closed(tmp_path, payload):
     assert result.acquired is False
     assert result.token is None
     assert result.reason_code == "entry_revision_exchange_authority_invalid"
+
+
+def test_public_idle_authority_predicate_rejects_invalid_released_at():
+    import telegram_kol_research.entry_revision_exchange_authority as authority
+
+    predicate = getattr(
+        authority,
+        "is_canonical_idle_entry_revision_exchange_authority",
+        None,
+    )
+    assert predicate is not None
+    assert predicate(
+        json.dumps(
+            {
+                "generation": 0,
+                "released_at": NOW.isoformat(),
+                "schema_version": 2,
+                "state": "idle",
+            }
+        )
+    )
+    assert not predicate(
+        json.dumps(
+            {
+                "generation": 0,
+                "released_at": "not-a-timestamp",
+                "schema_version": 2,
+                "state": "idle",
+            }
+        )
+    )

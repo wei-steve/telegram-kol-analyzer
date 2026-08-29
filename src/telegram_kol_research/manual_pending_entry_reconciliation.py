@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 from pathlib import Path
@@ -21,6 +22,7 @@ from telegram_kol_research.deepcoin_maintenance_evidence import (
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    is_canonical_idle_entry_revision_exchange_authority,
 )
 from telegram_kol_research.execution_events import (
     ExecutionEventRecord,
@@ -163,7 +165,11 @@ def build_manual_pending_entry_reconciliation_plan(
             .filter(TradingSetting.key == ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY)
             .one_or_none()
         )
-        if authority is not None and not _valid_idle_authority(authority.value_json):
+        if authority is not None and not (
+            is_canonical_idle_entry_revision_exchange_authority(
+                authority.value_json
+            )
+        ):
             return _blocked(
                 "entry_revision_exchange_authority_not_idle",
                 order_ids,
@@ -248,7 +254,9 @@ def apply_manual_pending_entry_reconciliation(
                     )
                 )
                 authority_seeded = True
-            elif not _valid_idle_authority(authority.value_json):
+            elif not is_canonical_idle_entry_revision_exchange_authority(
+                authority.value_json
+            ):
                 raise ValueError("entry_revision_exchange_authority_not_idle")
 
             affected_bindings: set[int] = set()
@@ -309,26 +317,57 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
     )
     if events:
         return "manual_reconciliation_already_recorded"
+    request = _request_object(leg.request_json if leg is not None else None)
+    symbol = target.instrument_id.split("-", 1)[0]
+    expected_side = _side_from_entry_and_stop(target)
+    expected_strategy = (
+        f"deepcoin:{binding.chat_id}:{binding.message_id}:{symbol}:{expected_side}"
+        if binding is not None and expected_side is not None
+        else None
+    )
     if not (
         leg is not None
         and binding is not None
         and lifecycle is not None
+        and request is not None
+        and expected_side is not None
+        and binding.venue == "deepcoin"
+        and binding.symbol == symbol
+        and binding.side == expected_side
+        and lifecycle.symbol == symbol
+        and lifecycle.side == expected_side
+        and lifecycle.chat_id == binding.chat_id
+        and lifecycle.message_id == binding.message_id
         and leg.execution_binding_id == target.execution_binding_id
+        and leg.venue == "deepcoin"
+        and leg.strategy_instance_id == binding.strategy_instance_id
+        and binding.strategy_instance_id == expected_strategy
         and leg.order_id == target.order_id
         and leg.purpose == "entry"
+        and leg.order_kind == "trigger_limit"
         and str(leg.status or "").lower() in {"pending", "open", "submitted"}
         and str(binding.status or "").lower() in {"open", "active"}
         and lifecycle.execution_binding_id == target.execution_binding_id
         and lifecycle.lifecycle_status == "pending_entry"
+        and _request_matches_target(request, target)
         and len(intents) == 1
         and intents[0].execution_binding_id == target.execution_binding_id
+        and intents[0].execution_order_leg_id == target.execution_order_leg_id
         and intents[0].parent_trigger_order_id == target.order_id
         and intents[0].request_fingerprint == target.request_fingerprint
         and intents[0].recovery_state in {"pending", "retrying"}
         and len(protection) == 2
         and {row.role for row in protection} == {"primary_stop", "backup_stop"}
+        and all(
+            row.execution_binding_id == target.execution_binding_id
+            and row.execution_order_leg_id == target.execution_order_leg_id
+            and row.parent_entry_order_id == target.order_id
+            for row in protection
+        )
         and all(row.status in {"planned", "waiting_fill"} for row in protection)
         and len(convergence) == 1
+        and convergence[0].execution_binding_id == target.execution_binding_id
+        and convergence[0].execution_order_leg_id == target.execution_order_leg_id
         and convergence[0].status
         in {"waiting_backup_stop", "waiting_position", "ready"}
     ):
@@ -478,21 +517,73 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         source.close()
 
 
-def _valid_idle_authority(value_json: str) -> bool:
+def _request_object(value_json: str | None) -> dict[str, object] | None:
     try:
         value = json.loads(value_json)
     except (TypeError, json.JSONDecodeError):
-        return False
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def _request_matches_target(
+    request: dict[str, object],
+    target: ReviewedPendingEntryTarget,
+) -> bool:
     return bool(
-        isinstance(value, dict)
-        and set(value) == {"generation", "released_at", "schema_version", "state"}
-        and value.get("schema_version") == 2
-        and value.get("state") == "idle"
-        and isinstance(value.get("generation"), int)
-        and not isinstance(value.get("generation"), bool)
-        and value["generation"] >= 0
-        and isinstance(value.get("released_at"), str)
+        _fingerprint(request) == target.request_fingerprint
+        and _one_text(request, "instId", "instrument_id")
+        == target.instrument_id
+        and _same_decimal(
+            _one_text(request, "triggerPrice", "triggerPx"),
+            target.trigger_price,
+        )
+        and _same_decimal(
+            _one_text(request, "sz", "size", "quantity"),
+            target.size,
+        )
+        and _same_decimal(
+            _one_text(
+                request,
+                "slTriggerPx",
+                "slTriggerPrice",
+                "closeSLTriggerPrice",
+            ),
+            target.embedded_stop_price,
+        )
     )
+
+
+def _one_text(request: dict[str, object], *keys: str) -> str | None:
+    values = {
+        clean
+        for key in keys
+        if (clean := str(request.get(key) or "").strip())
+    }
+    return next(iter(values)) if len(values) == 1 else None
+
+
+def _same_decimal(left: str | None, right: str) -> bool:
+    if left is None:
+        return False
+    try:
+        return Decimal(left) == Decimal(right)
+    except InvalidOperation:
+        return False
+
+
+def _side_from_entry_and_stop(
+    target: ReviewedPendingEntryTarget,
+) -> str | None:
+    try:
+        trigger = Decimal(target.trigger_price)
+        stop = Decimal(target.embedded_stop_price)
+    except InvalidOperation:
+        return None
+    if stop < trigger:
+        return "long"
+    if stop > trigger:
+        return "short"
+    return None
 
 
 def _blocked(

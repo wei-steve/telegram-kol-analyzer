@@ -1,3 +1,4 @@
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
@@ -170,6 +171,35 @@ def _seed_pending_target(session_factory):
             embedded_stop_price="1795",
             request_fingerprint=request_fingerprint,
         )
+
+
+def _seed_foreign_binding_and_leg(session):
+    binding = ExecutionBinding(
+        kol_id="group:foreign",
+        chat_id=99,
+        message_id=100,
+        symbol="ETH",
+        side="long",
+        venue="deepcoin",
+        status="open",
+        strategy_instance_id="deepcoin:99:100:ETH:long",
+    )
+    session.add(binding)
+    session.flush()
+    leg = ExecutionOrderLeg(
+        execution_binding_id=binding.id,
+        strategy_instance_id=binding.strategy_instance_id,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="foreign-order",
+        venue="deepcoin",
+        status="pending",
+        request_json="{}",
+    )
+    session.add(leg)
+    session.flush()
+    return binding, leg
 
 
 def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path):
@@ -557,6 +587,181 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
 
     assert plan.status == "blocked"
     assert plan.reason_code == "target_history_instrument_mismatch"
+
+
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "binding_venue",
+        "binding_symbol",
+        "binding_side",
+        "lifecycle_symbol",
+        "lifecycle_side",
+        "leg_venue",
+        "leg_strategy",
+        "request_fingerprint",
+        "request_instrument",
+        "request_trigger_price",
+        "request_size",
+        "request_stop",
+        "intent_binding",
+        "intent_leg",
+        "protection_parent",
+        "protection_binding",
+        "protection_leg",
+        "convergence_binding",
+        "convergence_leg",
+    ),
+)
+def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
+    tmp_path,
+    drift,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, target.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        intent = session.query(TriggerProtectionIntent).one()
+        protection = session.query(PositionProtectionLeg).first()
+        convergence = session.query(TriggerTakeProfitConvergence).one()
+        foreign_binding, foreign_leg = _seed_foreign_binding_and_leg(session)
+        if drift == "binding_venue":
+            binding.venue = "other"
+        elif drift == "binding_symbol":
+            binding.symbol = "BTC"
+        elif drift == "binding_side":
+            binding.side = "short"
+        elif drift == "lifecycle_symbol":
+            lifecycle.symbol = "BTC"
+        elif drift == "lifecycle_side":
+            lifecycle.side = "short"
+        elif drift == "leg_venue":
+            leg.venue = "other"
+        elif drift == "leg_strategy":
+            leg.strategy_instance_id = "different-strategy"
+        elif drift == "request_fingerprint":
+            intent.request_fingerprint = "f" * 64
+        elif drift.startswith("request_"):
+            request = json.loads(leg.request_json)
+            key = {
+                "request_instrument": "instId",
+                "request_trigger_price": "triggerPrice",
+                "request_size": "sz",
+                "request_stop": "slTriggerPx",
+            }[drift]
+            request[key] = "different"
+            leg.request_json = json.dumps(request, sort_keys=True)
+        elif drift == "intent_binding":
+            intent.execution_binding_id = foreign_binding.id
+        elif drift == "intent_leg":
+            intent.execution_order_leg_id = foreign_leg.id
+        elif drift == "protection_parent":
+            protection.parent_entry_order_id = "different-order"
+        elif drift == "protection_binding":
+            protection.execution_binding_id = foreign_binding.id
+        elif drift == "protection_leg":
+            protection.execution_order_leg_id = foreign_leg.id
+        elif drift == "convergence_binding":
+            convergence.execution_binding_id = foreign_binding.id
+        elif drift == "convergence_leg":
+            convergence.execution_order_leg_id = foreign_leg.id
+        else:  # pragma: no cover - parameter list is closed above
+            raise AssertionError(drift)
+        session.commit()
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "reviewed_local_state_changed"
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    (
+        ("instId", "BTC-USDT-SWAP"),
+        ("triggerPrice", "1828"),
+        ("sz", "4"),
+        ("slTriggerPx", "1794"),
+    ),
+)
+def test_manual_reconciliation_compares_request_economics_beyond_fingerprint(
+    tmp_path,
+    field,
+    value,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        request = json.loads(leg.request_json)
+        request[field] = value
+        fingerprint = _sha(request)
+        leg.request_json = json.dumps(request, sort_keys=True)
+        session.query(TriggerProtectionIntent).one().request_fingerprint = fingerprint
+        session.commit()
+    drifted_target = replace(target, request_fingerprint=fingerprint)
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(drifted_target,),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "reviewed_local_state_changed"
+
+
+def test_manual_reconciliation_accepts_documented_request_aliases(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    request = {
+        "instrument_id": target.instrument_id,
+        "triggerPx": target.trigger_price,
+        "size": target.size,
+        "slTriggerPrice": target.embedded_stop_price,
+    }
+    fingerprint = _sha(request)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        leg.request_json = json.dumps(request, sort_keys=True)
+        session.query(TriggerProtectionIntent).one().request_fingerprint = fingerprint
+        session.commit()
+    aliased_target = replace(target, request_fingerprint=fingerprint)
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(aliased_target,),
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
 
 
 def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, monkeypatch):

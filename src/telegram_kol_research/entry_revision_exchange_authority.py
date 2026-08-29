@@ -127,6 +127,15 @@ class EntryRevisionExchangeAuthorityBlock:
     reason_code: str | None = None
 
 
+def is_canonical_idle_entry_revision_exchange_authority(
+    value_json: str,
+) -> bool:
+    """Return whether a stored document is the exact parseable idle schema."""
+
+    document = _authority_document(value_json)
+    return document is not None and document["state"] == "idle"
+
+
 def seed_entry_revision_exchange_authority(
     session_factory,
     *,
