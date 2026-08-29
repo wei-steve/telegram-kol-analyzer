@@ -13,6 +13,7 @@ import subprocess
 import sys
 import time
 from typing import Any, Mapping, Protocol
+import uuid
 from urllib.request import Request, urlopen
 
 from telegram_kol_research.deployment_action_plan import (
@@ -35,6 +36,7 @@ _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _AUTHORITY_COMPONENTS = frozenset({"ingest", "worker"})
 _RUNTIME_COMPONENTS = frozenset({"web", "ingest", "worker"})
 _AUTHORITY_RUNTIME_SCOPE = frozenset({"web", "monitor", "ingest", "worker"})
+_LEGACY_SOURCE_UNITS = ("telegram-kol.service",)
 _UNITS = {
     "web": ("telegram-kol-web.service",),
     "ingest": ("telegram-kol-ingest.service",),
@@ -99,6 +101,12 @@ class RuntimeAdapter(Protocol):
     def unmask_unit(self, unit: str) -> None: ...
 
     def mask_unit(self, unit: str) -> None: ...
+
+    def main_pid(self, unit: str) -> int: ...
+
+    def cgroup_pids(self, unit: str) -> tuple[int, ...]: ...
+
+    def matching_processes(self) -> tuple[int, ...]: ...
 
     def daemon_reload(self) -> None: ...
 
@@ -646,13 +654,27 @@ def _require_stopped_legacy_boundary(
 ) -> None:
     if set(components) != _AUTHORITY_RUNTIME_SCOPE:
         raise ActivationError("stopped legacy activation requires full runtime scope")
-    for unit in _controlled_units(components):
+    units = (*_controlled_units(components), *_LEGACY_SOURCE_UNITS)
+    for unit in units:
         try:
             active_state, enabled_state = runtime.maintenance_unit_state(unit)
+            main_pid = runtime.main_pid(unit)
+            cgroup_pids = runtime.cgroup_pids(unit)
         except Exception as exc:
             raise ActivationError("stopped legacy runtime state is unknown") from exc
-        if active_state != "inactive" or enabled_state != "masked":
+        if (
+            active_state != "inactive"
+            or enabled_state != "masked"
+            or main_pid != 0
+            or cgroup_pids
+        ):
             raise ActivationError("stopped legacy runtime is not persistently stopped")
+    try:
+        matching = runtime.matching_processes()
+    except Exception as exc:
+        raise ActivationError("stopped legacy runtime state is unknown") from exc
+    if matching:
+        raise ActivationError("stopped legacy runtime process remains")
 
 
 def _unmask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
@@ -663,6 +685,44 @@ def _unmask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
 def _mask_units(runtime: RuntimeAdapter, components: list[str]) -> None:
     for unit in _controlled_units(components):
         runtime.mask_unit(unit)
+
+
+def _reinhibit_and_stop_all(
+    runtime: RuntimeAdapter,
+    components: list[str],
+) -> None:
+    units = (*_controlled_units(components), *_LEGACY_SOURCE_UNITS)
+    failed = False
+    for unit in units:
+        try:
+            runtime.mask_unit(unit)
+        except Exception:
+            failed = True
+    for unit in units:
+        try:
+            runtime.stop_unit(unit)
+        except Exception:
+            failed = True
+    for unit in units:
+        try:
+            active_state, enabled_state = runtime.maintenance_unit_state(unit)
+            if (
+                active_state != "inactive"
+                or enabled_state != "masked"
+                or runtime.main_pid(unit) != 0
+                or runtime.cgroup_pids(unit)
+            ):
+                failed = True
+        except Exception:
+            failed = True
+    for _ in range(2):
+        try:
+            if runtime.matching_processes():
+                failed = True
+        except Exception:
+            failed = True
+    if failed:
+        raise ActivationError("stopped legacy reinhibit proof failed")
 
 
 def consume_activation_authorization(source: Path, consumed: Path) -> None:
@@ -855,8 +915,7 @@ def activate_release(
         except Exception as rollback_exc:
             if source_mode == "stopped_legacy":
                 try:
-                    _stop_units(runtime, components)
-                    _mask_units(runtime, components)
+                    _reinhibit_and_stop_all(runtime, components)
                 except Exception:
                     pass
             raise ActivationError("activation failed; rollback_failed") from rollback_exc
@@ -874,9 +933,26 @@ def activate_release(
 
 class SystemRuntimeAdapter:
     identity_retry_delay_seconds = 15
+    _INHIBIT_NAME = "00-telegram-kol-maintenance-inhibit.conf"
+    _INHIBIT_CONTENT = (
+        b"[Unit]\n"
+        b"ConditionPathExists=/dev/null/telegram-kol-maintenance-never\n"
+    )
+    _RUNTIME_MARKERS = (
+        b"telegram-kol-research\x00web\x00",
+        b"telegram-kol-research\x00monitor-production-safety\x00",
+    )
 
-    def __init__(self, *, python: Path = Path(sys.executable)) -> None:
+    def __init__(
+        self,
+        *,
+        python: Path = Path(sys.executable),
+        dropin_root: Path = Path("/etc/systemd/system"),
+        expected_uid: int | None = None,
+    ) -> None:
         self.python = python
+        self.dropin_root = Path(dropin_root)
+        self.expected_uid = os.geteuid() if expected_uid is None else int(expected_uid)
 
     @staticmethod
     def _run(
@@ -959,6 +1035,20 @@ class SystemRuntimeAdapter:
         active = self._run(
             ["systemctl", "show", unit, "--property=ActiveState", "--value"]
         ).stdout.strip()
+        inhibit = self._inhibit_path(unit)
+        if self._exact_inhibit_file(inhibit):
+            pending = self._run(
+                [
+                    "systemctl",
+                    "show",
+                    unit,
+                    "--property=NeedDaemonReload",
+                    "--value",
+                ]
+            ).stdout.strip()
+            if pending != "no":
+                raise ActivationError("runtime command failed")
+            return active, "masked"
         try:
             enabled_result = subprocess.run(
                 ["systemctl", "is-enabled", unit],
@@ -975,10 +1065,135 @@ class SystemRuntimeAdapter:
         return active, enabled
 
     def unmask_unit(self, unit: str) -> None:
-        self._run(["systemctl", "unmask", unit])
+        path = self._inhibit_path(unit)
+        if path.exists() or path.is_symlink():
+            if not self._exact_inhibit_file(path):
+                raise ActivationError("maintenance inhibit file is unsafe")
+            path.unlink()
+            self._fsync_directory(path.parent)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+        self._run(["systemctl", "daemon-reload"])
 
     def mask_unit(self, unit: str) -> None:
-        self._run(["systemctl", "mask", unit])
+        path = self._inhibit_path(unit)
+        path.parent.mkdir(mode=0o755, parents=False, exist_ok=True)
+        parent = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != self.expected_uid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            raise ActivationError("maintenance inhibit directory is unsafe")
+        if path.exists() or path.is_symlink():
+            if not self._exact_inhibit_file(path):
+                raise ActivationError("maintenance inhibit file is unsafe")
+        else:
+            temporary = path.with_name(
+                f".{self._INHIBIT_NAME}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary, flags, 0o444)
+            try:
+                with os.fdopen(descriptor, "wb") as stream:
+                    stream.write(self._INHIBIT_CONTENT)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                os.replace(temporary, path)
+                self._fsync_directory(path.parent)
+            except Exception:
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+                raise
+        self._run(["systemctl", "daemon-reload"])
+
+    def _inhibit_path(self, unit: str) -> Path:
+        allowed = {
+            *_controlled_units(list(_AUTHORITY_RUNTIME_SCOPE)),
+            *_LEGACY_SOURCE_UNITS,
+        }
+        if unit not in allowed:
+            raise ActivationError("maintenance unit is invalid")
+        return self.dropin_root / f"{unit}.d" / self._INHIBIT_NAME
+
+    def _exact_inhibit_file(self, path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+            return bool(
+                stat.S_ISREG(metadata.st_mode)
+                and not stat.S_ISLNK(metadata.st_mode)
+                and metadata.st_uid == self.expected_uid
+                and stat.S_IMODE(metadata.st_mode) == 0o444
+                and metadata.st_nlink == 1
+                and metadata.st_size == len(self._INHIBIT_CONTENT)
+                and path.read_bytes() == self._INHIBIT_CONTENT
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def main_pid(self, unit: str) -> int:
+        raw = self._run(
+            ["systemctl", "show", unit, "--property=MainPID", "--value"]
+        ).stdout.strip()
+        try:
+            value = int(raw)
+        except ValueError as exc:
+            raise ActivationError("runtime command failed") from exc
+        if value < 0:
+            raise ActivationError("runtime command failed")
+        return value
+
+    def cgroup_pids(self, unit: str) -> tuple[int, ...]:
+        group = self._run(
+            ["systemctl", "show", unit, "--property=ControlGroup", "--value"]
+        ).stdout.strip()
+        if not group:
+            return ()
+        if not group.startswith("/") or ".." in Path(group).parts:
+            raise ActivationError("runtime command failed")
+        try:
+            values = (
+                Path("/sys/fs/cgroup")
+                .joinpath(group.lstrip("/"), "cgroup.procs")
+                .read_text(encoding="ascii")
+                .split()
+            )
+            return tuple(sorted({int(value) for value in values}))
+        except (OSError, ValueError) as exc:
+            raise ActivationError("runtime command failed") from exc
+
+    def matching_processes(self) -> tuple[int, ...]:
+        matches = []
+        try:
+            candidates = tuple(Path("/proc").iterdir())
+        except OSError as exc:
+            raise ActivationError("runtime command failed") from exc
+        for candidate in candidates:
+            if not candidate.name.isdigit():
+                continue
+            try:
+                command = (candidate / "cmdline").read_bytes()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except OSError as exc:
+                raise ActivationError("runtime command failed") from exc
+            if any(marker in command for marker in self._RUNTIME_MARKERS):
+                matches.append(int(candidate.name))
+        return tuple(sorted(matches))
 
     def daemon_reload(self) -> None:
         self._run(["systemctl", "daemon-reload"])
@@ -1127,7 +1342,10 @@ def main() -> int:
             expected_commit=expected_commit,
             rollback_commit=rollback_commit,
             paths=paths,
-            runtime=SystemRuntimeAdapter(),
+            runtime=SystemRuntimeAdapter(
+                dropin_root=paths.dropin_root,
+                expected_uid=expected_uid,
+            ),
             expected_uid=expected_uid,
             source_mode=_activation_source_mode(),
         )

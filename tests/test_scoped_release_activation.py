@@ -208,8 +208,18 @@ class FakeRuntime:
                 "telegram-kol-monitor.service",
                 "telegram-kol-monitor-diagnostic.service",
                 "telegram-kol-monitor-test-notification.service",
+                "telegram-kol.service",
             )
         }
+        self.main_pid_by_unit = {
+            unit: 0 for unit in self.maintenance_state_by_unit
+        }
+        self.cgroup_pids_by_unit = {
+            unit: () for unit in self.maintenance_state_by_unit
+        }
+        self.matching_runtime_pids: tuple[int, ...] = ()
+        self.stop_fail_units: set[str] = set()
+        self.mask_fail_units: set[str] = set()
 
     def active_write_count(self, database_path: Path) -> int:
         self.events.append("active-write")
@@ -272,6 +282,10 @@ class FakeRuntime:
 
     def stop_unit(self, unit: str) -> None:
         self.events.append(f"stop:{unit}")
+        if unit in self.stop_fail_units:
+            raise ActivationError(f"stop failed: {unit}")
+        _, enabled_state = self.maintenance_state_by_unit[unit]
+        self.maintenance_state_by_unit[unit] = ("inactive", enabled_state)
 
     def start_unit(self, unit: str) -> None:
         self.events.append(f"start:{unit}")
@@ -304,7 +318,21 @@ class FakeRuntime:
 
     def mask_unit(self, unit: str) -> None:
         self.events.append(f"mask:{unit}")
+        if unit in self.mask_fail_units:
+            raise ActivationError(f"mask failed: {unit}")
         self.maintenance_state_by_unit[unit] = ("inactive", "masked")
+
+    def main_pid(self, unit: str) -> int:
+        self.events.append(f"main-pid:{unit}")
+        return self.main_pid_by_unit[unit]
+
+    def cgroup_pids(self, unit: str) -> tuple[int, ...]:
+        self.events.append(f"cgroup-pids:{unit}")
+        return self.cgroup_pids_by_unit[unit]
+
+    def matching_processes(self) -> tuple[int, ...]:
+        self.events.append("matching-processes")
+        return self.matching_runtime_pids
 
     def monitor_timer_active(self) -> bool:
         return True
@@ -701,8 +729,15 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
     assert {
         event for event in runtime.events if event.startswith("unmask:")
     } == {
-        f"unmask:{unit}" for unit in runtime.maintenance_state_by_unit
+        f"unmask:{unit}"
+        for unit in runtime.maintenance_state_by_unit
+        if unit != "telegram-kol.service"
     }
+    assert "maintenance-state:telegram-kol.service" in runtime.events
+    assert "main-pid:telegram-kol.service" in runtime.events
+    assert "cgroup-pids:telegram-kol.service" in runtime.events
+    assert "unmask:telegram-kol.service" not in runtime.events
+    assert "start:telegram-kol.service" not in runtime.events
     assert all(runtime.entry_frozen_by_role.values())
     assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
 
@@ -773,6 +808,76 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
         )
 
     assert set(runtime.maintenance_state_by_unit.values()) == {("inactive", "masked")}
+
+
+def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+    runtime.mask_fail_units = {"telegram-kol-ingest.service"}
+    runtime.stop_fail_units = {"telegram-kol-worker.service"}
+    original_start = runtime.start_unit
+
+    def no_worker_can_start(unit: str) -> None:
+        if unit == "telegram-kol-worker.service":
+            raise ActivationError("worker start failed")
+        original_start(unit)
+
+    runtime.start_unit = no_worker_can_start
+
+    with pytest.raises(ActivationError, match="rollback_failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    expected_units = set(runtime.maintenance_state_by_unit)
+    assert {
+        event.removeprefix("mask:")
+        for event in runtime.events
+        if event.startswith("mask:")
+    } == expected_units
+    assert {
+        event.removeprefix("stop:")
+        for event in runtime.events
+        if event.startswith("stop:")
+    } == expected_units
+
+
+def test_system_runtime_adapter_uses_persistent_inhibit_dropin(tmp_path, monkeypatch):
+    runtime = SystemRuntimeAdapter(
+        dropin_root=tmp_path,
+        expected_uid=tmp_path.stat().st_uid,
+    )
+    commands = []
+
+    def run(command, *, environment=None):
+        commands.append(command)
+        return type("Result", (), {"stdout": "no\n"})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+
+    runtime.mask_unit("telegram-kol.service")
+
+    inhibit = (
+        tmp_path
+        / "telegram-kol.service.d/00-telegram-kol-maintenance-inhibit.conf"
+    )
+    assert inhibit.read_bytes() == (
+        b"[Unit]\nConditionPathExists=/dev/null/telegram-kol-maintenance-never\n"
+    )
+    assert inhibit.stat().st_mode & 0o777 == 0o444
+    assert ["systemctl", "mask", "telegram-kol.service"] not in commands
+    assert ["systemctl", "daemon-reload"] in commands
 
 
 def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
@@ -869,6 +974,41 @@ def test_stopped_legacy_activation_refuses_unknown_unit_state(
     assert not any(
         event.startswith(("unmask:", "start:")) for event in runtime.events
     )
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        (lambda runtime: runtime.main_pid_by_unit.__setitem__("telegram-kol.service", 411), "not persistently stopped"),
+        (lambda runtime: runtime.cgroup_pids_by_unit.__setitem__("telegram-kol.service", (411,)), "not persistently stopped"),
+        (lambda runtime: setattr(runtime, "matching_runtime_pids", (411,)), "runtime process remains"),
+    ],
+)
+def test_stopped_legacy_activation_refuses_legacy_pid_cgroup_or_process(
+    activation_harness,
+    mutation,
+    reason,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+    mutation(runtime)
+
+    with pytest.raises(ActivationError, match=reason):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("unmask:") for event in runtime.events)
 
 
 def test_partial_worker_authority_activation_is_rejected(
