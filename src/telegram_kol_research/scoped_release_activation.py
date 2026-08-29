@@ -31,6 +31,7 @@ _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _AUTHORITY_COMPONENTS = frozenset({"ingest", "worker"})
 _RUNTIME_COMPONENTS = frozenset({"web", "ingest", "worker"})
+_AUTHORITY_RUNTIME_SCOPE = frozenset({"web", "monitor", "ingest", "worker"})
 _UNITS = {
     "web": ("telegram-kol-web.service",),
     "ingest": ("telegram-kol-ingest.service",),
@@ -703,10 +704,9 @@ def activate_release(
             "L3 database activation requires a separate backup/integrity executor"
         )
     authority_components = set(components) & _AUTHORITY_COMPONENTS
-    runtime_components = set(components) & _RUNTIME_COMPONENTS
-    if authority_components and runtime_components != _RUNTIME_COMPONENTS:
+    if authority_components and set(components) != _AUTHORITY_RUNTIME_SCOPE:
         raise ActivationError(
-            "authority activation must declare web, ingest, and worker"
+            "authority activation must declare web, monitor, ingest, and worker"
         )
     candidate = validate_release(paths.release_root, expected_commit, expected_uid=expected_uid)
     rollback = validate_release(paths.release_root, rollback_commit, expected_uid=expected_uid)

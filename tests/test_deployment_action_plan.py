@@ -59,7 +59,7 @@ def test_parse_manifest_builds_immutable_closed_model() -> None:
         _manifest(
             action="stage",
             risk_level="L3",
-            components=["worker", "ingest"],
+            components=["web", "monitor", "worker", "ingest"],
             requires_restart=True,
             schema_changed=True,
             authority_changed=True,
@@ -69,6 +69,8 @@ def test_parse_manifest_builds_immutable_closed_model() -> None:
     assert manifest.action is DeploymentAction.STAGE
     assert manifest.risk_level is RiskLevel.L3
     assert manifest.components == (
+        RuntimeComponent.WEB,
+        RuntimeComponent.MONITOR,
         RuntimeComponent.INGEST,
         RuntimeComponent.WORKER,
     )
@@ -77,6 +79,25 @@ def test_parse_manifest_builds_immutable_closed_model() -> None:
         manifest.action = DeploymentAction.LOCAL  # type: ignore[misc]
 
 
+@pytest.mark.parametrize(
+    "components",
+    (
+        ["worker"],
+        ["web", "ingest", "worker"],
+        ["monitor", "ingest", "worker"],
+    ),
+)
+def test_authority_change_requires_exact_four_component_scope(components) -> None:
+    with pytest.raises(ManifestValidationError, match="exact runtime scope"):
+        parse_manifest(
+            _manifest(
+                action="activate",
+                risk_level="L2",
+                components=components,
+                requires_restart=True,
+                authority_changed=True,
+            )
+        )
 @pytest.mark.parametrize(
     "manifest",
     (
@@ -136,7 +157,7 @@ def test_l3_accepts_every_explicit_high_risk_impact() -> None:
         _manifest(
             action="activate",
             risk_level="L3",
-            components=["worker"],
+            components=["web", "monitor", "ingest", "worker"],
             requires_restart=True,
             schema_changed=True,
             production_data_mutation=True,
@@ -258,14 +279,13 @@ def test_observer_activation_excludes_trading_authority_gates(component: str) ->
     assert "trading.protection_authority_proven" not in required
 
 
-@pytest.mark.parametrize("component", ("ingest", "worker"))
-def test_authority_activation_keeps_write_and_protection_gates(component: str) -> None:
+def test_authority_activation_keeps_write_and_protection_gates() -> None:
     plan = build_action_plan(
         parse_manifest(
             _manifest(
                 action="activate",
                 risk_level="L2",
-                components=[component],
+                components=["web", "monitor", "ingest", "worker"],
                 requires_restart=True,
                 authority_changed=True,
             )
@@ -412,7 +432,7 @@ def test_gate_output_is_deterministic_and_has_nonempty_reasons() -> None:
         _manifest(
             action="activate",
             risk_level="L2",
-            components=["worker", "ingest"],
+            components=["web", "monitor", "ingest", "worker"],
             requires_restart=True,
             authority_changed=True,
         )

@@ -230,7 +230,7 @@ class FakeRuntime:
         self.events.append("daemon-reload")
 
     def monitor_timer_active(self) -> bool:
-        return False
+        return True
 
     def verify_monitor_release(self, release) -> None:
         self.events.append(f"monitor-identity:{release.commit}")
@@ -519,14 +519,17 @@ def _configure_worker_harness(paths, runtime, manifest) -> None:
         _write_release(
             paths.release_root,
             commit,
-            components=["web", "ingest", "worker"],
+            components=["web", "monitor", "ingest", "worker"],
         )
     manifest.update(
-        {"components": ["web", "ingest", "worker"], "authority_changed": True}
+        {
+            "components": ["web", "monitor", "ingest", "worker"],
+            "authority_changed": True,
+        }
     )
     paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
     authorization = json.loads(paths.authorization.read_text(encoding="utf-8"))
-    authorization["components"] = ["web", "ingest", "worker"]
+    authorization["components"] = ["web", "monitor", "ingest", "worker"]
     authorization["action_plan_sha256"] = action_plan_sha256(parse_manifest(manifest))
     paths.authorization.chmod(0o600)
     paths.authorization.write_bytes(_canonical(authorization))
@@ -561,6 +564,7 @@ def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
         "ingest": CANDIDATE,
         "worker": CANDIDATE,
     }
+    assert f"monitor-identity:{CANDIDATE}" in runtime.events
     assert runtime.events.count("active-write") == 2
     assert all(runtime.entry_frozen_by_role.values())
     for role in ("web", "ingest", "worker"):
@@ -576,9 +580,14 @@ def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
         "stop:telegram-kol-ingest.service",
         "stop:telegram-kol-web.service",
         "stop:telegram-kol-worker.service",
+        "stop:telegram-kol-monitor.timer",
+        "stop:telegram-kol-monitor.service",
+        "stop:telegram-kol-monitor-diagnostic.service",
+        "stop:telegram-kol-monitor-test-notification.service",
         "start:telegram-kol-worker.service",
         "start:telegram-kol-web.service",
         "start:telegram-kol-ingest.service",
+        "start:telegram-kol-monitor.timer",
     ]
 
 
@@ -590,7 +599,7 @@ def test_partial_worker_authority_activation_is_rejected(
     manifest["components"] = ["worker"]
     paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ActivationError, match="web, ingest, and worker"):
+    with pytest.raises(ActivationError, match="action manifest is invalid"):
         activate_release(
             expected_commit=CANDIDATE,
             rollback_commit=ROLLBACK,
@@ -742,7 +751,7 @@ def test_partial_ingest_worker_authority_scope_is_rejected(
     manifest["components"] = ["ingest", "worker"]
     paths.action_manifest.write_text(json.dumps(manifest), encoding="utf-8")
 
-    with pytest.raises(ActivationError, match="web, ingest, and worker"):
+    with pytest.raises(ActivationError, match="action manifest is invalid"):
         activate_release(
             expected_commit=CANDIDATE,
             rollback_commit=ROLLBACK,

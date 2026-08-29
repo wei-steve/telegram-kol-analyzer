@@ -59,6 +59,9 @@ _COMPONENT_ORDER: Final[dict[RuntimeComponent, int]] = {
 _AUTHORITY_COMPONENTS: Final[frozenset[RuntimeComponent]] = frozenset(
     {RuntimeComponent.INGEST, RuntimeComponent.WORKER}
 )
+_AUTHORITY_RUNTIME_SCOPE: Final[frozenset[RuntimeComponent]] = frozenset(
+    RuntimeComponent
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,7 +152,18 @@ def _validate_consistency(manifest: DeploymentManifest) -> None:
     if manifest.authority_changed and not _AUTHORITY_COMPONENTS.intersection(
         manifest.components
     ):
-        raise ManifestValidationError("authority impact requires authority component scope")
+        raise ManifestValidationError(
+            "authority impact requires authority component scope"
+        )
+
+    if (
+        manifest.action is DeploymentAction.ACTIVATE
+        and manifest.authority_changed
+        and set(manifest.components) != _AUTHORITY_RUNTIME_SCOPE
+    ):
+        raise ManifestValidationError(
+            "authority impact requires exact runtime scope"
+        )
 
     if manifest.risk_level is RiskLevel.L0 and (
         manifest.components

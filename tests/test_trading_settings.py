@@ -935,14 +935,6 @@ def test_entry_submission_requires_auto_trade():
     assert enabled.entry_submission_enabled is True
 
 
-@pytest.mark.parametrize("value", [True, False, "false", 0, None])
-def test_ordinary_settings_payload_rejects_legacy_entry_submission_frozen(value):
-    with pytest.raises(ValueError, match="legacy_entry_submission_frozen"):
-        trading_settings_from_payload(
-            {"legacy_entry_submission_frozen": value}
-        )
-
-
 def test_management_execution_mode_rejects_invalid_value():
     with pytest.raises(ValueError, match="management_execution_mode"):
         trading_settings_from_payload({"management_execution_mode": "unsafe"})

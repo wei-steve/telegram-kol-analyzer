@@ -31,7 +31,7 @@ pending_entry_cancel_quiescence_base_sha: 47ea0885d02532faf7a941694f6b19dcdb1af9
 pending_entry_cancel_quiescence_plan_sha: 99ce6d9e3e52314b485ce9c7561a93e95a41a862
 pending_entry_cancel_production_executed: false
 pending_entry_cancel_live_order_count: 7
-legacy_runtime_drain_bridge_status: review_findings_repaired_local_complete_unpushed_unexecuted
+legacy_runtime_drain_bridge_status: rejected_deleted_local_task10_pending
 legacy_runtime_drain_bridge_base_sha: be9d75cdab57ffe57daea03b9eb1cf862cae698b
 legacy_runtime_drain_bridge_design_sha: 50aa78086f70286291a7161df64681c215957a38
 legacy_runtime_drain_bridge_plan_sha: 1dd9868233670486ac8575f609e954fa221f6071
@@ -40,6 +40,9 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
+immutable_control_bootstrap_status: tasks_7_to_9_local_complete_task10_pending
+rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
+rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
 task12_latest_evidence_location: codex_task_transcript
 historical_replay_allowed: false
@@ -485,3 +488,24 @@ phase completes or pauses, record both verified evidence and outstanding work.
   worker refresh/health checks, bounded observation, and future-signal-only
   restore are separate Phase 3-4 authorizations. No push, deployment, SSH,
   restart, production write, Telegram replay, or Deepcoin write was performed.
+
+## Immutable control bootstrap local replacement (Tasks 7-9)
+
+- The rejected release `ffb06d19eabfd32dfdab2942b2152fd2809e3d17`
+  remains inactive. It was not activated or used for any trading operation by
+  this local batch.
+- Local commit `e2f82058` introduces the one-time immutable-control bootstrap:
+  the candidate-start boundary is entered only while bootstrap authority is
+  held and the durable process-local entry freeze is installed. Local commit
+  `05c71c6c` makes the monitor verify the loaded immutable release scope rather
+  than checkout HEAD.
+- The rejected legacy drain bridge, its CLI surface, its compatibility command,
+  its dedicated tests, and the internal legacy settings freeze key have now
+  been deleted locally. Future authority-changing ordinary activation requires
+  the exact `web`, `monitor`, `ingest`, and `worker` component set. The existing
+  action plan continues to prohibit exchange writes, historical/frozen-message
+  replay, bulk order actions, production settings writes, and trading enablement.
+- Exact final local test evidence and the final candidate commit remain pending
+  Task 10. No push, production read, seed, order cancellation, activation,
+  automatic thaw, SSH, restart, production/database/settings write, Deepcoin
+  write, or Telegram replay occurred in this Tasks 7-9 local batch.

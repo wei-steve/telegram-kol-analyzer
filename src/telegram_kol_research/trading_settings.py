@@ -423,10 +423,6 @@ def apply_trading_settings_to_group_config(
 
 def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSettings:
     raw = payload or {}
-    if "legacy_entry_submission_frozen" in raw:
-        raise ValueError(
-            "legacy_entry_submission_frozen is not an ordinary trading setting"
-        )
     defaults = TradingSettings()
     allowed_symbols = _parse_symbol_list(raw.get("allowed_symbols"), defaults.allowed_symbols)
     symbol_max_loss_usdt = _parse_symbol_max_loss_usdt(raw.get("symbol_max_loss_usdt"))

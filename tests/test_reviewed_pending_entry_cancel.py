@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
 import json
+from pathlib import Path
 
 import pytest
 
@@ -354,6 +355,21 @@ def test_canonical_targets_are_the_only_order_source_and_bridge_is_absent():
     assert len(module.REVIEWED_PENDING_ENTRY_TARGETS) == 7
     assert len({row.order_id for row in module.REVIEWED_PENDING_ENTRY_TARGETS}) == 7
     assert "legacy_runtime_drain_bridge" not in inspect.getsource(module)
+
+
+def test_rejected_bridge_and_internal_freeze_key_are_absent_from_production():
+    root = Path(__file__).resolve().parents[1]
+    production = []
+    for directory in ("src", "scripts", "deploy"):
+        production.extend(
+            path
+            for path in (root / directory).rglob("*")
+            if path.is_file() and path.suffix in {".py", ".sh", ".ps1", ".service"}
+        )
+
+    sources = "\n".join(path.read_text(encoding="utf-8") for path in production)
+    assert "legacy_runtime_drain_bridge" not in sources
+    assert "legacy_entry_submission_frozen" not in sources
 
 
 def test_plan_is_exactly_one_canonical_order_with_fresh_evidence(tmp_path):
