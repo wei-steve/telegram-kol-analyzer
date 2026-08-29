@@ -131,6 +131,14 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return historical trigger / TPSL orders for one instrument."""
 
+    def list_trigger_order_history_by_order_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return trigger history for one exact exchange order identifier."""
+
     def get_ticker_price(self, *, inst_id: str) -> float | None:
         """Return the latest ticker price for one instrument."""
 
@@ -489,6 +497,21 @@ class DeepcoinRestClient:
             _path_with_query(
                 DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
                 {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
+
+    def list_trigger_order_history_by_order_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id, "ordId": order_id},
             ),
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)

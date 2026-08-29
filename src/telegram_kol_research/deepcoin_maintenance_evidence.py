@@ -11,6 +11,7 @@ from typing import Any, Callable, Iterable, Literal, Mapping
 
 _MAX_EVIDENCE_AGE = timedelta(seconds=30)
 _PAGE_LIMIT = 100
+_QUERY_KINDS = ("positions", "regular", "pending", "history", "fills")
 _CANONICAL_ORDER_ID_ALIASES = (
     "ordId",
     "orderId",
@@ -78,6 +79,7 @@ def build_deepcoin_maintenance_evidence(
     target_order_id: str,
     observed_at: datetime | None = None,
     expected_target_pending_count: int | None = 1,
+    query_kinds: Iterable[str] = _QUERY_KINDS,
     clock: Callable[[], datetime] | None = None,
 ) -> DeepcoinMaintenanceEvidence:
     """Read one bounded account snapshot with at most one retry per query."""
@@ -92,6 +94,9 @@ def build_deepcoin_maintenance_evidence(
         raise ValueError("maintenance evidence target is required")
     if expected_target_pending_count not in {None, 0, 1}:
         raise ValueError("expected target pending count is invalid")
+    selected_query_kinds = frozenset(str(value).strip() for value in query_kinds)
+    if not selected_query_kinds or not selected_query_kinds.issubset(_QUERY_KINDS):
+        raise ValueError("maintenance evidence query kinds are invalid")
 
     def completed_at() -> datetime:
         return _timestamp(
@@ -139,6 +144,8 @@ def build_deepcoin_maintenance_evidence(
         ),
     )
     for query_kind, destination, reader in readers:
+        if query_kind not in selected_query_kinds:
+            continue
         for instrument in clean_instruments:
             rows, retried, complete = _read_complete_rows(reader, instrument)
             retries += int(retried)

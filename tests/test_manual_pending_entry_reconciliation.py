@@ -37,7 +37,9 @@ class ReadOnlyClient:
         self.pending = []
         self.history = []
         self.fills = []
+        self.exact_history = {}
         self.exact_fills = {}
+        self.exact_history_calls = []
         self.exact_fill_calls = []
         self.write_calls = 0
         self.read_calls = {
@@ -74,6 +76,38 @@ class ReadOnlyClient:
     def list_trade_fills_by_order_id(self, *, inst_id, order_id):
         self.exact_fill_calls.append((inst_id, order_id))
         result = self.exact_fills.get(order_id, [])
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    def list_trigger_order_history_by_order_id(self, *, inst_id, order_id):
+        self.exact_history_calls.append((inst_id, order_id))
+        instrument_rows = [
+            row for row in self.history if row.get("instId") == inst_id
+        ]
+        matching_rows = [
+            row
+            for row in instrument_rows
+            if order_id
+            in {
+                str(row.get(alias) or "").strip()
+                for alias in (
+                    "ordId",
+                    "orderId",
+                    "order_id",
+                    "orderSysID",
+                    "OrderSysID",
+                    "id",
+                    "algoId",
+                    "triggerOrderId",
+                    "trigger_order_id",
+                )
+            }
+        ]
+        result = self.exact_history.get(
+            order_id,
+            matching_rows if len(instrument_rows) > 1 else instrument_rows,
+        )
         if isinstance(result, Exception):
             raise result
         return result
@@ -424,7 +458,17 @@ def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path
     assert result.status == "completed"
     assert backup_path.is_file()
     assert client.write_calls == 0
-    assert set(client.read_calls.values()) == {6}
+    assert client.read_calls == {
+        "positions": 6,
+        "regular": 6,
+        "pending": 6,
+        "history": 0,
+        "fills": 0,
+    }
+    assert client.exact_history_calls == [
+        (target.instrument_id, target.order_id),
+        (target.instrument_id, target.order_id),
+    ]
     assert client.exact_fill_calls == [
         (target.instrument_id, target.order_id),
         (target.instrument_id, target.order_id),
@@ -468,6 +512,34 @@ def test_manual_reconciliation_refuses_any_live_exchange_object(tmp_path):
 
     assert plan.status == "blocked"
     assert plan.reason_code == "live_position_present"
+
+
+def test_manual_reconciliation_never_reads_broad_history_or_fills(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+
+    def broad_read_forbidden(*, inst_id):
+        raise AssertionError(f"broad history/fills read is forbidden: {inst_id}")
+
+    client.list_trigger_order_history = broad_read_forbidden
+    client.list_trade_fills = broad_read_forbidden
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
+    assert client.exact_history_calls == [(target.instrument_id, target.order_id)]
+    assert client.exact_fill_calls == [(target.instrument_id, target.order_id)]
 
 
 def test_manual_reconciliation_default_clock_is_taken_after_exchange_reads(tmp_path):
@@ -644,6 +716,62 @@ def test_manual_reconciliation_reproves_runtime_before_backup(tmp_path):
             },
             "target_history_not_cancelled",
         ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "posId": "position-created",
+            },
+            "target_history_not_cancelled",
+        ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "filledQty": "1",
+            },
+            "target_history_not_cancelled",
+        ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "cumExecQty": "-1",
+            },
+            "target_history_not_cancelled",
+        ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "filled_quantity": "not-a-decimal",
+            },
+            "target_history_not_cancelled",
+        ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "triggerTime": "1784512900000",
+                "errorCode": "0",
+            },
+            "target_history_not_cancelled",
+        ),
+        (
+            "history",
+            {
+                "ordId": "manual-cancel-1",
+                "state": "operator_deleted",
+                "trigger_time": "not-a-number",
+                "error_code": "00000",
+            },
+            "target_history_not_cancelled",
+        ),
     ],
 )
 def test_manual_reconciliation_refuses_target_fill_or_ambiguous_history(
@@ -662,7 +790,10 @@ def test_manual_reconciliation_refuses_target_fill_or_ambiguous_history(
     if source == "fills":
         _record_cancelled_history(client, target)
     row["instId"] = target.instrument_id
-    getattr(client, source).append(row)
+    if source == "fills":
+        client.exact_fills[target.order_id] = [row]
+    else:
+        client.history.append(row)
 
     plan = build_manual_pending_entry_reconciliation_plan(
         session_factory,
@@ -702,13 +833,13 @@ def test_manual_reconciliation_refuses_target_fill_for_every_supported_alias(
     target = _seed_pending_target(session_factory)
     client = ReadOnlyClient()
     _record_cancelled_history(client, target)
-    client.fills.append(
+    client.exact_fills[target.order_id] = [
         {
             "instId": target.instrument_id,
             alias: target.order_id,
             "state": "filled",
         }
-    )
+    ]
 
     plan = build_manual_pending_entry_reconciliation_plan(
         session_factory,
@@ -731,13 +862,13 @@ def test_manual_reconciliation_refuses_target_fill_by_client_order_id(tmp_path):
     target = _seed_pending_target(session_factory)
     client = ReadOnlyClient()
     _record_cancelled_history(client, target)
-    client.fills.append(
+    client.exact_fills[target.order_id] = [
         {
             "instId": target.instrument_id,
             "clOrdId": target.client_order_id,
             "state": "filled",
         }
-    )
+    ]
 
     plan = build_manual_pending_entry_reconciliation_plan(
         session_factory,
@@ -748,7 +879,7 @@ def test_manual_reconciliation_refuses_target_fill_by_client_order_id(tmp_path):
     )
 
     assert plan.status == "blocked"
-    assert plan.reason_code == "target_fill_present"
+    assert plan.reason_code == "target_fill_identity_conflict"
 
 
 @pytest.mark.parametrize(
@@ -757,6 +888,12 @@ def test_manual_reconciliation_refuses_target_fill_by_client_order_id(tmp_path):
         ([{"ordId": "manual-cancel-1", "fillSz": "1"}], "target_fill_present"),
         ([{"ordId": "different-order", "fillSz": "1"}], "target_fill_identity_conflict"),
         (RuntimeError("query unknown"), "target_fill_query_incomplete"),
+        ({"not": "a list"}, "target_fill_query_incomplete"),
+        (["not-a-row"], "target_fill_query_incomplete"),
+        (
+            [{"ordId": "manual-cancel-1", "fillSz": "0"}] * 100,
+            "target_fill_query_incomplete",
+        ),
     ),
 )
 def test_manual_reconciliation_requires_exact_zero_fills_per_target(
@@ -784,6 +921,145 @@ def test_manual_reconciliation_requires_exact_zero_fills_per_target(
     assert plan.status == "blocked"
     assert plan.reason_code == reason
     assert client.exact_fill_calls == [(target.instrument_id, target.order_id)]
+
+
+@pytest.mark.parametrize(
+    ("exact_result", "reason"),
+    (
+        (RuntimeError("query unknown"), "target_history_query_incomplete"),
+        ({"not": "a list"}, "target_history_query_incomplete"),
+        (["not-a-row"], "target_history_query_incomplete"),
+        (
+            [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "manual-cancel-1",
+                    "state": "cancelled",
+                }
+            ]
+            * 100,
+            "target_history_query_incomplete",
+        ),
+        (
+            [
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "manual-cancel-1",
+                    "state": "cancelled",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "manual-cancel-1",
+                    "state": "cancelled",
+                },
+            ],
+            "target_cancelled_history_not_unique",
+        ),
+    ),
+)
+def test_manual_reconciliation_exact_history_is_single_attempt_and_fail_closed(
+    tmp_path,
+    exact_result,
+    reason,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    client.exact_history[target.order_id] = exact_result
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == reason
+    assert client.exact_history_calls == [(target.instrument_id, target.order_id)]
+
+
+def test_manual_reconciliation_fingerprint_binds_exact_history(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+
+    missing = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    client.exact_history[target.order_id] = [
+        {
+            "instId": target.instrument_id,
+            "ordId": target.order_id,
+            "state": "operator_deleted",
+        }
+    ]
+    nonliteral = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert missing.status == nonliteral.status == "ready"
+    assert missing.fingerprint != nonliteral.fingerprint
+
+
+def test_manual_reconciliation_apply_refuses_exact_history_drift_before_backup(
+    tmp_path,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    backup_path = tmp_path / "backup.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    client.exact_history[target.order_id] = [
+        {
+            "instId": target.instrument_id,
+            "ordId": target.order_id,
+            "state": "operator_deleted",
+        }
+    ]
+
+    with pytest.raises(ValueError, match="manual_reconciliation_plan_drift"):
+        apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=backup_path,
+            deepcoin_client=client,
+            targets=(target,),
+            expected_fingerprint=plan.fingerprint,
+            runtime_guard=RuntimeGuard(),
+            now=NOW,
+        )
+
+    assert not backup_path.exists()
 
 
 def test_manual_reconciliation_accepts_explicit_cancelled_target_history(tmp_path):
@@ -848,6 +1124,35 @@ def test_manual_reconciliation_accepts_history_without_literal_cancel_status(
 
     assert plan.status == "ready"
     assert plan.reason_code is None
+
+
+def test_manual_reconciliation_accepts_explicit_failed_trigger_history(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    client.history.append(
+        {
+            "instId": target.instrument_id,
+            "ordId": target.order_id,
+            "state": "operator_deleted",
+            "triggerTime": "1784512900000",
+            "errorCode": "203",
+        }
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
 
 
 @pytest.mark.parametrize(
@@ -1048,9 +1353,7 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
     row = {"ordId": target.order_id, "state": "cancelled"}
     if instrument_id is not None:
         row["instId"] = instrument_id
-    client.list_trigger_order_history = (
-        lambda *, inst_id: [row] if inst_id == target.instrument_id else []
-    )
+    client.exact_history[target.order_id] = [row]
 
     plan = build_manual_pending_entry_reconciliation_plan(
         session_factory,
@@ -1996,6 +2299,11 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
         runtime_guard=RuntimeGuard(),
         now=NOW,
     )
+    expected_exact_calls = [
+        (target.instrument_id, target.order_id) for target in targets
+    ]
+    assert client.exact_history_calls == expected_exact_calls
+    assert client.exact_fill_calls == expected_exact_calls
     guard = RuntimeGuard()
 
     result = apply_manual_pending_entry_reconciliation(
@@ -2013,6 +2321,8 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
     assert result.terminalized_count == 7
     assert result.authority_seeded is True
     assert guard.calls == 3
+    assert client.exact_history_calls == expected_exact_calls * 2
+    assert client.exact_fill_calls == expected_exact_calls * 2
     with session_factory() as session:
         assert {
             session.get(ExecutionOrderLeg, target.execution_order_leg_id).status

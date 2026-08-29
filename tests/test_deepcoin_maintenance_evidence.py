@@ -29,6 +29,8 @@ class CompleteEvidenceClient:
             for target in REVIEWED_PENDING_ENTRY_TARGETS
         ]
         self.pending_calls = 0
+        self.history_calls = 0
+        self.fill_calls = 0
 
     def list_positions(self, *, inst_id=None):
         return []
@@ -45,9 +47,11 @@ class CompleteEvidenceClient:
         }
 
     def list_trigger_order_history(self, *, inst_id):
+        self.history_calls += 1
         return []
 
     def list_trade_fills(self, *, inst_id=None):
+        self.fill_calls += 1
         return []
 
 
@@ -70,6 +74,8 @@ def test_evidence_requires_complete_positions_regular_pending_and_exact_target_r
     assert evidence.regular_order_count == 0
     assert evidence.target_pending_count == 1
     assert len(evidence.fingerprint) == 64
+    assert client.history_calls == len(INSTRUMENTS)
+    assert client.fill_calls == len(INSTRUMENTS)
 
     client.pending = [
         row for row in client.pending if row["ordId"] != TARGET.order_id
@@ -77,6 +83,24 @@ def test_evidence_requires_complete_positions_regular_pending_and_exact_target_r
     missing = _build(client)
     assert missing.status == "unknown"
     assert missing.reason_code == "target_pending_readback_not_exact"
+
+
+def test_account_flat_profile_skips_broad_history_and_fills():
+    client = CompleteEvidenceClient()
+
+    evidence = build_deepcoin_maintenance_evidence(
+        client,
+        instruments=INSTRUMENTS,
+        target_order_id="manual-cancel-all",
+        observed_at=NOW,
+        expected_target_pending_count=0,
+        query_kinds=("positions", "regular", "pending"),
+    )
+
+    assert evidence.status == "complete"
+    assert evidence.reason_code is None
+    assert client.history_calls == 0
+    assert client.fill_calls == 0
 
 
 def test_incomplete_query_gets_one_reasoned_retry_then_unknown():
