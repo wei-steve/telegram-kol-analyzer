@@ -604,7 +604,10 @@ phase completes or pauses, record both verified evidence and outstanding work.
 - A separate local repair authorization is required before changing the stale
   fixtures/contracts and adding the missing composed falsifier. Even after a
   new green final candidate, the exact future authorizations remain separate:
-  push, stage, read-only preflight, DB-copy rehearsal, L3 seed, seven independent
-  single-order writes with fresh plan and token for each, immutable bootstrap,
-  and entry thaw. Unknown remains permanently non-retryable and stops the
-  sequence.
+  push; stage; SSH and the read-only production preflight; deployment; every
+  service-control transition including freeze/mask/stop/start/restart; DB-copy
+  rehearsal; the production L3 seed; seven independent Deepcoin single-order
+  writes with a fresh plan and token for each; immutable bootstrap; and entry
+  thaw. Any additional settings write, database write, Deepcoin write, or
+  production mutation also requires its own explicit authorization. Unknown
+  remains permanently non-retryable and stops the sequence.
