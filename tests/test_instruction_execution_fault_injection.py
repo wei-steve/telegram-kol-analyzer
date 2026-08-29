@@ -16,6 +16,9 @@ from telegram_kol_research.entry_assembly_admission import (
     claim_ready_entry_assembly_wakeups,
     finish_entry_assembly_wakeup,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.instruction_execution_contracts import (
     load_or_create_instruction_execution_contract,
 )
@@ -50,6 +53,14 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 NOW = datetime(2026, 8, 10, 12, 0, tzinfo=UTC)
+
+
+def _seed_entry_exchange_authority(session_factory) -> None:
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=NOW,
+    )
+    assert result.seeded is True
 
 
 class _CrashInjected(RuntimeError):
@@ -259,6 +270,7 @@ def test_worker_start_before_deadline_cannot_write_after_boundary_expiry(tmp_pat
     from test_recovery_live_submit import _FakeDeepcoinClient
 
     session_factory = create_session_factory(tmp_path / "boundary-expired.db")
+    _seed_entry_exchange_authority(session_factory)
     signal, item_id, provider = _persist_real_writer_case(session_factory)
     client = _FakeDeepcoinClient()
 
@@ -385,6 +397,7 @@ def test_crash_after_submitting_before_http_never_reaches_real_writer(
     from test_recovery_live_submit import _FakeDeepcoinClient
 
     session_factory = create_session_factory(tmp_path / "before-http.db")
+    _seed_entry_exchange_authority(session_factory)
     signal, item_id, provider = _persist_real_writer_case(session_factory)
     client = _FakeDeepcoinClient()
     monkeypatch.setattr(
@@ -427,6 +440,7 @@ def test_crash_after_http_send_before_response_is_quarantined_by_real_writer(
             raise DeepcoinRequestOutcomeUnknown("response lost after HTTP send")
 
     session_factory = create_session_factory(tmp_path / "lost-response.db")
+    _seed_entry_exchange_authority(session_factory)
     signal, item_id, provider = _persist_real_writer_case(session_factory)
     client = _LostResponseClient()
 
@@ -465,6 +479,7 @@ def test_post_accept_crashes_do_not_resubmit_real_entry_writer(
     from test_recovery_live_submit import _FakeDeepcoinClient
 
     session_factory = create_session_factory(tmp_path / f"{boundary}.db")
+    _seed_entry_exchange_authority(session_factory)
     signal, item_id, provider = _persist_real_writer_case(session_factory)
     client = _FakeDeepcoinClient()
     if fault_target == "record_parent":
@@ -549,6 +564,7 @@ def test_position_created_before_protection_ledger_commit_is_not_reentered(
             ]
 
     session_factory = create_session_factory(tmp_path / "protection-ledger.db")
+    _seed_entry_exchange_authority(session_factory)
     signal, item_id, provider = _persist_real_writer_case(
         session_factory, market=True
     )

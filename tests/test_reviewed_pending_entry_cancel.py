@@ -5,6 +5,7 @@ from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,11 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_revision_exchange_authority import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
     seed_entry_revision_exchange_authority,
+)
+from telegram_kol_research.maintenance_runtime_guard import (
+    MAINTENANCE_UNITS,
+    GuardError,
+    MaintenanceRuntimeGuard,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -457,6 +463,62 @@ def test_cancel_timeout_is_permanent_unknown_and_never_restores(tmp_path):
     with session_factory() as session:
         intent = session.query(PositionMutationIntent).one()
         assert intent.status == "recovery_required"
+
+
+def test_cancel_timeout_then_crash_and_reboot_never_retries_or_restores(
+    tmp_path,
+):
+    from test_maintenance_runtime_guard import FakeSystemdRuntime
+
+    session_factory = create_session_factory(tmp_path / "reboot-unknown.db")
+    target = _seed(session_factory)
+    client = Client()
+    plan = _plan(session_factory, client, target)
+    runtime = FakeSystemdRuntime.active_legacy()
+    guard = MaintenanceRuntimeGuard(
+        runtime=runtime,
+        receipt_path=tmp_path / "guard.json",
+        lock_path=tmp_path / "guard.lock",
+        expected_uid=os.getuid(),
+    )
+    client.cancel_exception = TimeoutError("accepted then response lost")
+
+    result = _apply(session_factory, client, target, plan, guard)
+
+    assert result.status == "cancel_outcome_unknown"
+    assert client.cancel_calls == 1
+    assert _authority_document(session_factory)["state"] == "blocked"
+    assert all(runtime.is_masked(unit) for unit in MAINTENANCE_UNITS)
+    guard.close()
+
+    rebooted_runtime = FakeSystemdRuntime.from_persisted_masks(
+        MAINTENANCE_UNITS
+    )
+    rebooted_guard = MaintenanceRuntimeGuard(
+        runtime=rebooted_runtime,
+        receipt_path=tmp_path / "guard.json",
+        lock_path=tmp_path / "guard.lock",
+        expected_uid=os.getuid(),
+    )
+    receipt = rebooted_guard.reconcile_after_restart()
+
+    assert receipt.safe_to_restore is False
+    assert receipt.blocked_reason == "cancel_outcome_unknown"
+    assert rebooted_runtime.start_calls == []
+    assert all(
+        rebooted_runtime.is_masked(unit) for unit in MAINTENANCE_UNITS
+    )
+    with pytest.raises(GuardError, match="maintenance_receipt_exists"):
+        _apply(
+            session_factory,
+            client,
+            target,
+            plan,
+            rebooted_guard,
+            token="retry-token",
+        )
+    assert client.cancel_calls == 1
+    rebooted_guard.close()
 
 
 def test_prewrite_refusal_cas_failure_never_releases_inner_authority(

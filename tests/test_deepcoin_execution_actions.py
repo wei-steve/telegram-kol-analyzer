@@ -31,6 +31,7 @@ from telegram_kol_research.models import (
     RawMessage,
     StrategyLifecycle,
 )
+from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 
@@ -2960,7 +2961,7 @@ def test_deployment_entry_freeze_blocks_trigger_recreation_before_cancel(
         }
     ]
 
-    with pytest.raises(DeepcoinExecutionActionError, match="deployment_entry_frozen"):
+    with pytest.raises(RecoveryLiveSubmitError, match="deployment_entry_frozen"):
         process_trade_signal_live(
             session_factory,
             signal_id=trade_signal.id,

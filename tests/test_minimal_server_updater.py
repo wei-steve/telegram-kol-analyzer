@@ -201,6 +201,7 @@ def test_stage_only_requires_a_stage_action_manifest(stage_harness) -> None:
     action_manifest = stage_harness["action_manifest"]
     invalid = json.loads(action_manifest.read_text(encoding="utf-8"))
     invalid["action"] = "activate"
+    invalid["components"] = ["web", "monitor", "ingest", "worker"]
     action_manifest.write_text(json.dumps(invalid), encoding="utf-8")
 
     result = stage_harness["run"]()

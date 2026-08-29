@@ -5,6 +5,9 @@ import pytest
 
 from telegram_kol_research.auto_trade_execution import execute_strategy_revision
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -24,6 +27,14 @@ from telegram_kol_research.strategy_threads import (
 
 
 NOW = datetime(2026, 7, 27, 9, tzinfo=UTC)
+
+
+def _seed_entry_exchange_authority(session_factory) -> None:
+    result = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=NOW,
+    )
+    assert result.seeded is True
 
 
 def _authority_document(session_factory):
@@ -302,6 +313,7 @@ def test_cancellation_authority_blocks_legacy_revision_before_planning(tmp_path)
     )
 
     session_factory = create_session_factory(tmp_path / "legacy-busy.db")
+    _seed_entry_exchange_authority(session_factory)
     raw_id, _, thread_id = _persist_revision_target(session_factory)
     save_trading_settings(
         session_factory,
@@ -352,6 +364,7 @@ def test_legacy_revision_unknown_cancel_retains_worker_authority(
     import telegram_kol_research.auto_trade_execution as auto_module
 
     session_factory = create_session_factory(tmp_path / "legacy-unknown.db")
+    _seed_entry_exchange_authority(session_factory)
     raw_id, _, thread_id = _persist_revision_target(session_factory)
     save_trading_settings(
         session_factory,
@@ -390,6 +403,7 @@ def test_legacy_revision_unknown_replacement_retains_worker_authority(
     import telegram_kol_research.auto_trade_execution as auto_module
 
     session_factory = create_session_factory(tmp_path / "legacy-replace-unknown.db")
+    _seed_entry_exchange_authority(session_factory)
     raw_id, _, thread_id = _persist_revision_target(session_factory)
     save_trading_settings(
         session_factory,
@@ -428,6 +442,7 @@ def test_legacy_revision_post_cancel_size_drift_retains_worker_authority(
     import telegram_kol_research.auto_trade_execution as auto_module
 
     session_factory = create_session_factory(tmp_path / "legacy-size-drift.db")
+    _seed_entry_exchange_authority(session_factory)
     raw_id, _, thread_id = _persist_revision_target(session_factory)
     save_trading_settings(
         session_factory,
@@ -479,6 +494,7 @@ def test_legacy_revision_success_owns_then_releases_worker_authority(
     import telegram_kol_research.auto_trade_execution as auto_module
 
     session_factory = create_session_factory(tmp_path / "legacy-success.db")
+    _seed_entry_exchange_authority(session_factory)
     raw_id, _, thread_id = _persist_revision_target(session_factory)
     save_trading_settings(
         session_factory,
@@ -490,7 +506,8 @@ def test_legacy_revision_success_owns_then_releases_worker_authority(
         authority = _authority_document(session_factory)
         assert authority["state"] == "held"
         assert authority["owner_kind"] == "entry_revision_worker"
-        assert authority["owner_id"] == f"legacy-raw:{raw_id}"
+        assert authority["action_id"] == f"legacy-raw:{raw_id}"
+        assert "owner_id" not in authority
         return {"status": "confirmed_cancelled"}
 
     monkeypatch.setattr(

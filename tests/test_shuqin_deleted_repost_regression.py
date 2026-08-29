@@ -6,6 +6,9 @@ from telegram_kol_research.auto_trade_execution import (
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -328,6 +331,11 @@ def _confirm_exit_batch(session_factory, batch_id):
 
 def test_shuqin_deleted_strategy_exits_before_repost_can_own_new_orders(tmp_path):
     session_factory = create_session_factory(tmp_path / "shuqin-regression.db")
+    seeded = seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=NOW,
+    )
+    assert seeded.seeded is True
     old_raw_id, old_lifecycle_id, old_binding_id = _seed_old_strategy(
         session_factory
     )
