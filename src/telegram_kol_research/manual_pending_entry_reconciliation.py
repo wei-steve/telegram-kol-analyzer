@@ -15,6 +15,7 @@ from sqlalchemy import text
 from telegram_kol_research.deepcoin_maintenance_evidence import (
     DeepcoinMaintenanceEvidenceRefused,
     build_deepcoin_maintenance_evidence,
+    deepcoin_order_id,
     require_fresh_deepcoin_maintenance_evidence,
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
@@ -84,8 +85,9 @@ def build_manual_pending_entry_reconciliation_plan(
         expected_target_pending_count=0,
         observed_at=observed_at if now is not None else None,
     )
+    freshness_now = observed_at if now is not None else _timestamp(datetime.now(UTC))
     try:
-        require_fresh_deepcoin_maintenance_evidence(evidence, now=observed_at)
+        require_fresh_deepcoin_maintenance_evidence(evidence, now=freshness_now)
     except DeepcoinMaintenanceEvidenceRefused:
         return _blocked(
             evidence.reason_code or "exchange_snapshot_unknown",
@@ -98,6 +100,24 @@ def build_manual_pending_entry_reconciliation_plan(
         return _blocked("regular_order_present", order_ids, evidence.fingerprint)
     if evidence.pending_triggers:
         return _blocked("pending_trigger_present", order_ids, evidence.fingerprint)
+    target_order_ids = set(order_ids)
+    if any(deepcoin_order_id(row) in target_order_ids for row in evidence.fills):
+        return _blocked("target_fill_present", order_ids, evidence.fingerprint)
+    target_history = (
+        row
+        for row in evidence.trigger_history
+        if deepcoin_order_id(row) in target_order_ids
+    )
+    if any(
+        str(row.get("state") or row.get("status") or "").strip().lower()
+        not in {"cancelled", "canceled"}
+        for row in target_history
+    ):
+        return _blocked(
+            "target_history_not_cancelled",
+            order_ids,
+            evidence.fingerprint,
+        )
 
     completed_count = 0
     with session_factory() as session:

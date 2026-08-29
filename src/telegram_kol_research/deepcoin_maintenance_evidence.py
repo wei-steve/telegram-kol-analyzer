@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 import hashlib
 import json
-from typing import Any, Callable, Iterable, Literal
+from typing import Any, Callable, Iterable, Literal, Mapping
 
 
 _MAX_EVIDENCE_AGE = timedelta(seconds=30)
@@ -44,12 +44,12 @@ class DeepcoinMaintenanceEvidence:
         return sum(
             1
             for row in self.pending_triggers
-            if _order_id(row) == self.target_order_id
+            if deepcoin_order_id(row) == self.target_order_id
         )
 
     @property
     def pending_order_ids(self) -> tuple[str, ...]:
-        return tuple(_order_id(row) for row in self.pending_triggers)
+        return tuple(deepcoin_order_id(row) for row in self.pending_triggers)
 
 
 def build_deepcoin_maintenance_evidence(
@@ -138,7 +138,7 @@ def build_deepcoin_maintenance_evidence(
                     retry_count=retries,
                 )
 
-    target_count = sum(1 for row in pending if _order_id(row) == clean_target)
+    target_count = sum(1 for row in pending if deepcoin_order_id(row) == clean_target)
     if (
         expected_target_pending_count is not None
         and target_count != expected_target_pending_count
@@ -308,9 +308,16 @@ def _evidence(
     )
 
 
-def _order_id(row: dict[str, Any]) -> str:
+def deepcoin_order_id(row: Mapping[str, Any]) -> str:
+    """Return the exchange order identifier from documented Deepcoin aliases."""
+
     return str(
-        row.get("ordId") or row.get("orderId") or row.get("order_id") or ""
+        row.get("ordId")
+        or row.get("orderId")
+        or row.get("order_id")
+        or row.get("algoId")
+        or row.get("triggerOrderId")
+        or ""
     ).strip()
 
 
