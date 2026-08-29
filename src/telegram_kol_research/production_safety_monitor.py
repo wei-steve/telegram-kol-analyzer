@@ -73,6 +73,7 @@ from telegram_kol_research.runtime_incident_snapshot import (
 from telegram_kol_research.runtime_deployment_identity import (
     build_runtime_deployment_identity,
     validate_runtime_authority_scope,
+    validate_runtime_identity_health,
 )
 from telegram_kol_research.scoped_release_activation import (
     ActivationError,
@@ -530,13 +531,6 @@ def evaluate_runtime_release_scope(
             or identity.get("manifest_sha256") != expected_manifest_sha256
         ):
             reasons.add("runtime_release_mixed")
-        try:
-            observed_at = datetime.fromisoformat(str(identity.get("observed_at")))
-            if observed_at.tzinfo is None:
-                raise ValueError
-            age = observed_now - observed_at.astimezone(UTC)
-        except (TypeError, ValueError):
-            age = timedelta.max
         cwd = str(identity.get("loaded_cwd") or "")
         pid = identity.get("pid")
         ticks = identity.get("process_start_ticks")
@@ -552,18 +546,21 @@ def evaluate_runtime_release_scope(
             or identity.get("systemd_main_pid") != pid
             or identity.get("systemd_start_ticks")
             != ticks
-            or age < timedelta(0)
-            or age > timedelta(seconds=10)
-            or (
-                role != "monitor"
-                and identity.get("entry_admission_frozen") is not True
-            )
         ):
             reasons.add("runtime_identity_unproven")
         elif (pid, ticks) in process_tuples:
             reasons.add("runtime_identity_unproven")
         else:
             process_tuples.add((pid, ticks))
+        try:
+            validate_runtime_identity_health(
+                identity,
+                role=role,
+                checked_at=observed_now,
+                require_entry_frozen=role != "monitor",
+            )
+        except ValueError:
+            reasons.add("runtime_identity_unproven")
     worker = roles.get("worker") if isinstance(roles, Mapping) else None
     if isinstance(worker, Mapping):
         try:

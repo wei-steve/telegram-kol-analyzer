@@ -151,6 +151,7 @@ def _identity(role: str, *, capabilities=True, ticks=2000):
         )
     }
     return {
+        "contract": "runtime-deployment-identity-v1",
         "runtime_role": role,
         "command_role": role,
         "loaded_artifact_verified": True,
@@ -164,6 +165,7 @@ def _identity(role: str, *, capabilities=True, ticks=2000):
         "entry_admission_frozen": True,
         "observed_at": NOW.isoformat(),
         "health": {
+            "event_loop": True,
             "message_processing": False,
             "ingest_live_listener": role == "ingest",
             "ingest_reconcile": role == "ingest",
@@ -240,6 +242,7 @@ class Runtime:
     def complete_candidate_start(self, plan):
         assert self.authority.state == "idle"
         self.events.append("complete-candidate-start")
+        return self.candidate_identities()
 
     def reinhibit_and_stop_candidate(self):
         self.events.append("reinhibit-candidate")
@@ -375,7 +378,22 @@ def test_apply_rejects_expired_authorization_before_inhibition():
 def test_authority_release_uses_fresh_boundary_time():
     authority = Authority()
     runtime = Runtime(authority)
-    clock = iter((NOW, NOW, NOW, NOW + timedelta(seconds=29)))
+    original = runtime.candidate_identities
+    identity_reads = 0
+
+    def identities_at_boundary():
+        nonlocal identity_reads
+        identity_reads += 1
+        identities = original()
+        observed = NOW if identity_reads == 1 else NOW + timedelta(seconds=29)
+        for identity in identities.values():
+            identity["observed_at"] = observed.isoformat()
+        return identities
+
+    runtime.candidate_identities = identities_at_boundary
+    clock = iter(
+        (NOW, NOW, NOW, NOW + timedelta(seconds=29), NOW + timedelta(seconds=29))
+    )
 
     apply_immutable_control_bootstrap_plan(
         _plan(),
@@ -392,7 +410,8 @@ def test_candidate_starts_while_bootstrap_authority_is_held():
     result, runtime, authority, guard = _apply()
     assert result.status == "bootstrapped_entry_frozen"
     assert authority.events == ["acquire", "release", "self-test"]
-    assert runtime.events[-1] == "complete-candidate-start"
+    assert "complete-candidate-start" in runtime.events
+    assert runtime.events[-1] == "candidate-identities"
     assert guard.completed is True
 
 
@@ -445,6 +464,30 @@ def test_candidate_authority_requires_numeric_freshness_effective_modes_and_one_
         _apply(runtime=runtime, authority=authority)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda rows: rows["worker"].pop("contract"),
+        lambda rows: rows["web"]["health"].update(event_loop=False),
+        lambda rows: rows["ingest"]["health"].update(ingest_reconcile=False),
+        lambda rows: rows["worker"]["health"].update(worker_command=False),
+    ),
+)
+def test_candidate_identity_requires_complete_role_health(mutation):
+    authority = Authority()
+    runtime = Runtime(authority)
+    original = runtime.candidate_identities
+
+    def unhealthy():
+        identities = original()
+        mutation(identities)
+        return identities
+
+    runtime.candidate_identities = unhealthy
+    with pytest.raises(BootstrapBlocked, match="candidate_identity_unproven"):
+        _apply(runtime=runtime, authority=authority)
+
+
 def test_candidate_completes_no_exchange_write_authority_round_trip():
     result, runtime, authority, _ = _apply()
     assert "self-test" in authority.events
@@ -493,6 +536,7 @@ def test_concrete_reinhibit_attempts_every_mask_and_stop_after_one_failure(
             return ()
 
     control = Control()
+
     adapter = SystemdImmutableControlBootstrapRuntimeAdapter(
         paths=ActivationPaths(
             release_root=tmp_path,
@@ -514,6 +558,10 @@ def test_concrete_reinhibit_attempts_every_mask_and_stop_after_one_failure(
 
 
 def test_concrete_takeover_uses_one_target_as_the_only_boot_edge(tmp_path):
+    class Scoped:
+        def runtime_identity(self, role):
+            return _identity(role)
+
     class Control:
         def __init__(self):
             self.masked = {
@@ -536,7 +584,10 @@ def test_concrete_takeover_uses_one_target_as_the_only_boot_edge(tmp_path):
             self.enabled[unit] = state
 
         def inspect_unit(self, unit):
-            return SimpleNamespace(enabled_state=self.enabled[unit])
+            return SimpleNamespace(
+                enabled_state=self.enabled[unit],
+                active_state="active",
+            )
 
         def start_unit(self, unit):
             self.started.append(unit)
@@ -551,7 +602,7 @@ def test_concrete_takeover_uses_one_target_as_the_only_boot_edge(tmp_path):
             dropin_root=tmp_path / "systemd",
             database_path=tmp_path / "db",
         ),
-        scoped_runtime=object(),
+        scoped_runtime=Scoped(),
         control_runtime=control,
     )
 
@@ -564,6 +615,22 @@ def test_concrete_takeover_uses_one_target_as_the_only_boot_edge(tmp_path):
         for unit in bootstrap_module.BOOTSTRAP_AUTOSTART_UNITS
     )
     assert control.started == [bootstrap_module.BOOTSTRAP_TARGET]
+
+
+def test_takeover_child_failure_is_unknown_and_never_completes_guard():
+    authority = Authority()
+    runtime = Runtime(authority)
+    guard = Guard()
+
+    def child_failed(plan):
+        raise BootstrapUnknown("candidate_takeover_scope_unproven")
+
+    runtime.complete_candidate_start = child_failed
+    with pytest.raises(BootstrapBlocked, match="candidate_takeover_scope_unproven"):
+        _apply(runtime=runtime, authority=authority, guard=guard)
+
+    assert "reinhibit-candidate" in runtime.events
+    assert guard.completed is False
 
 
 def test_concrete_runtime_publishes_and_restores_complete_unit_scope(

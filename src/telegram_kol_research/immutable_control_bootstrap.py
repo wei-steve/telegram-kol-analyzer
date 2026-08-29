@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 import hashlib
 import json
 import os
@@ -23,6 +23,7 @@ from telegram_kol_research.reviewed_pending_entry_cancel import (
 )
 from telegram_kol_research.runtime_deployment_identity import (
     validate_runtime_authority_scope,
+    validate_runtime_identity_health,
 )
 from telegram_kol_research.maintenance_runtime_guard import (
     MAINTENANCE_UNITS,
@@ -137,7 +138,10 @@ class BootstrapRuntimeAdapter(Protocol):
     def open_candidate_start_boundary(self, plan: BootstrapPlan) -> None: ...
     def candidate_identities(self) -> Mapping[str, Mapping[str, Any]]: ...
     def verify_monitor(self, plan: BootstrapPlan) -> None: ...
-    def complete_candidate_start(self, plan: BootstrapPlan) -> None: ...
+    def complete_candidate_start(
+        self,
+        plan: BootstrapPlan,
+    ) -> Mapping[str, Mapping[str, Any]]: ...
     def reinhibit_and_stop_candidate(self) -> None: ...
     def restore_control_configuration(self, preimages: Any) -> None: ...
 
@@ -296,7 +300,10 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
         finally:
             self.control_runtime.mask_unit(diagnostic)
 
-    def complete_candidate_start(self, plan: BootstrapPlan) -> None:
+    def complete_candidate_start(
+        self,
+        plan: BootstrapPlan,
+    ) -> Mapping[str, Mapping[str, Any]]:
         _ = plan
         for unit in MAINTENANCE_UNITS:
             self.control_runtime.unmask_unit(unit)
@@ -320,6 +327,16 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
         ):
             raise BootstrapUnknown("candidate_takeover_fence_unproven")
         self.control_runtime.start_unit(BOOTSTRAP_TARGET)
+        if (
+            self.control_runtime.inspect_unit(BOOTSTRAP_TARGET).active_state
+            != "active"
+            or any(
+                self.control_runtime.inspect_unit(unit).active_state != "active"
+                for unit in BOOTSTRAP_AUTOSTART_UNITS
+            )
+        ):
+            raise BootstrapUnknown("candidate_takeover_scope_unproven")
+        return self.candidate_identities()
 
     def reinhibit_and_stop_candidate(self) -> None:
         failed = False
@@ -354,13 +371,12 @@ class SystemdImmutableControlBootstrapRuntimeAdapter:
                     failed = True
             except Exception:
                 failed = True
-        try:
-            if self.control_runtime.matching_processes():
+        for _ in range(2):
+            try:
+                if self.control_runtime.matching_processes():
+                    failed = True
+            except Exception:
                 failed = True
-            if self.control_runtime.matching_processes():
-                failed = True
-        except Exception:
-            failed = True
         if failed:
             raise BootstrapUnknown("candidate_reinhibit_unproven")
 
@@ -577,7 +593,19 @@ def apply_immutable_control_bootstrap_plan(
             raise BootstrapUnknown("authority_self_test_unknown") from exc
         if self_test_generation != generation + 1:
             raise BootstrapUnknown("authority_self_test_unknown")
-        runtime.complete_candidate_start(plan)
+        final_identities = runtime.complete_candidate_start(plan)
+        _validate_candidate_identities(
+            final_identities,
+            plan=plan,
+            legacy_worker_tuple=legacy_tuple,
+            checked_at=boundary_time(),
+        )
+        if any(
+            _process_tuple(final_identities[role])
+            != _process_tuple(identities[role])
+            for role in BOOTSTRAP_LIVE_RUNTIME_ROLES
+        ):
+            raise BootstrapUnknown("candidate_takeover_process_changed")
         guard.complete_candidate_takeover(
             expected_fingerprint=receipt.fingerprint,
         )
@@ -679,31 +707,14 @@ def _validate_candidate_identities(
         ):
             raise BootstrapBlocked("candidate_identity_unproven")
         try:
-            observed_at = datetime.fromisoformat(str(identity.get("observed_at")))
-            if observed_at.tzinfo is None:
-                raise ValueError
-            age = checked_at.astimezone(UTC) - observed_at.astimezone(UTC)
-        except (TypeError, ValueError):
-            age = timedelta.max
-        health = identity.get("health")
-        if (
-            age < timedelta(0)
-            or age > timedelta(seconds=10)
-            or not isinstance(health, Mapping)
-            or health.get("message_processing") is not False
-            or (
-                role == "ingest"
-                and (
-                    health.get("ingest_live_listener") is not True
-                    or health.get("ingest_reconcile") is not True
-                )
+            validate_runtime_identity_health(
+                identity,
+                role=role,
+                checked_at=checked_at,
+                require_entry_frozen=True,
             )
-            or (
-                role == "worker"
-                and health.get("worker_command") is not True
-            )
-        ):
-            raise BootstrapBlocked("candidate_identity_unproven")
+        except ValueError as exc:
+            raise BootstrapBlocked("candidate_identity_unproven") from exc
         process_tuple = _process_tuple(identity)
         if process_tuple in process_tuples:
             raise BootstrapBlocked("candidate_identity_unproven")

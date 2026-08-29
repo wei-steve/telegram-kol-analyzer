@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass, field
 import hashlib
 import json
@@ -264,6 +264,51 @@ def validate_runtime_authority_scope(
         or management.get("effective_rescue_enabled") is not True
     ):
         raise ValueError("runtime authority evidence invalid")
+
+
+def validate_runtime_identity_health(
+    identity: Mapping[str, Any],
+    *,
+    role: str,
+    checked_at: datetime,
+    require_entry_frozen: bool,
+) -> None:
+    """Validate bounded role health without trusting projected booleans alone."""
+
+    try:
+        observed_at = datetime.fromisoformat(str(identity.get("observed_at")))
+        if observed_at.tzinfo is None:
+            raise ValueError
+        age = checked_at.astimezone(UTC) - observed_at.astimezone(UTC)
+    except (TypeError, ValueError):
+        age = timedelta.max
+    health = identity.get("health")
+    if (
+        identity.get("contract") != "runtime-deployment-identity-v1"
+        or age < timedelta(0)
+        or age > timedelta(seconds=10)
+        or not isinstance(health, Mapping)
+        or health.get("event_loop") is not True
+        or (
+            require_entry_frozen
+            and (
+                identity.get("entry_admission_frozen") is not True
+                or health.get("message_processing") is not False
+            )
+        )
+        or (
+            role == "ingest"
+            and (
+                health.get("ingest_live_listener") is not True
+                or health.get("ingest_reconcile") is not True
+            )
+        )
+        or (
+            role == "worker"
+            and health.get("worker_command") is not True
+        )
+    ):
+        raise ValueError("runtime identity health invalid")
 
 
 def read_self_process_start_ticks() -> int | None:

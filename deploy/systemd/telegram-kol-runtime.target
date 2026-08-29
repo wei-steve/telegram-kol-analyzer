@@ -1,7 +1,7 @@
 [Unit]
 Description=Telegram KOL immutable runtime scope
-Wants=telegram-kol-worker.service telegram-kol-web.service telegram-kol-ingest.service telegram-kol-monitor.timer
-After=network-online.target
+Requires=telegram-kol-worker.service telegram-kol-web.service telegram-kol-ingest.service telegram-kol-monitor.timer
+After=network-online.target telegram-kol-worker.service telegram-kol-web.service telegram-kol-ingest.service telegram-kol-monitor.timer
 
 [Install]
 WantedBy=multi-user.target

@@ -92,6 +92,7 @@ EXPECTATIONS = MonitorExpectations(
 
 def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
     return {
+        "contract": "runtime-deployment-identity-v1",
         "runtime_role": role,
         "loaded_artifact_verified": True,
         "release_commit": commit,
@@ -111,6 +112,13 @@ def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
         "command_role": role,
         "observed_at": datetime(2026, 8, 28, 12, 0, tzinfo=UTC).isoformat(),
         "entry_admission_frozen": role == "monitor" or True,
+        "health": {
+            "event_loop": True,
+            "message_processing": False,
+            "ingest_live_listener": role == "ingest",
+            "ingest_reconcile": role == "ingest",
+            "worker_command": role == "worker",
+        },
         "capabilities": {
             name: capable
             for name in (
@@ -244,6 +252,39 @@ def test_release_scope_rejects_unbounded_or_ambiguous_authority(mutation):
     )
 
     assert "runtime_capability_unproven" in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    (
+        lambda roles: roles["worker"].pop("contract"),
+        lambda roles: roles["monitor"]["health"].update(event_loop=False),
+        lambda roles: roles["ingest"]["health"].update(
+            ingest_live_listener=False
+        ),
+        lambda roles: roles["worker"]["health"].update(worker_command=False),
+    ),
+)
+def test_release_scope_rejects_incomplete_role_health(mutation):
+    roles = {
+        role: _release_identity(role)
+        for role in ("web", "ingest", "worker", "monitor")
+    }
+    mutation(roles)
+
+    result = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert "runtime_identity_unproven" in result.reason_codes
 
 
 def test_release_scope_rejects_unverified_loaded_code_wrong_cwd_or_shared_pid():
