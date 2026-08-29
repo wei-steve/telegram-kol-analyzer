@@ -6,10 +6,10 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a04f45-e0e5-7642-aeb7-0c398bd03375
-candidate_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
-candidate_content_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
-handoff_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
-pushed_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+candidate_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
+candidate_content_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
+handoff_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
+pushed_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -64,14 +64,14 @@ manual_cleanup_exact_history_repair_code_sha: 5a3bb9383037d4e3e03b843352af947b46
 manual_cleanup_exact_history_repair_focused: 190_passed_plus_2_targeted_passed
 manual_cleanup_exact_history_repair_final_suite: 6663_passed_3_skipped_32_warnings
 manual_cleanup_exact_history_repair_review: no_remaining_p0_p1
-manual_cleanup_production_cutover_status: preflight_failed_closed
-manual_cleanup_production_stage_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
-manual_cleanup_production_stage_content_sha256: ba99d1ec18a9252eff8aa3319260fc4f6687cff1a09a838e79324d27dcb8e7e4
-manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/evidence.jsonl
-manual_cleanup_production_evidence_sha256: ea563a1b2a9fbe2800662e9f6567a85206125841a34bd38083514cc1fcf62d92
-manual_cleanup_production_preflight_at: 2026-08-29T21:41:15Z
-manual_cleanup_production_preflight_blocker: history_query_incomplete_btc_100_row_boundary
-manual_cleanup_production_target_fill_status: fresh_query_not_reached
+manual_cleanup_production_cutover_status: preflight_failed_closed_exact_fill_query_incomplete
+manual_cleanup_production_stage_sha: 8abaf2c6d6e361b7651fc41e11275e899bb6463a
+manual_cleanup_production_stage_content_sha256: 68e373268885215a1bf0bd48492be8d7ce0d17d6c3a07bb744c7dc42fd14cad0
+manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/evidence.jsonl
+manual_cleanup_production_evidence_sha256: 890ba2452f55026a9ae231a725f59834dff881c85231713fd20ab0ad3a8af4b4
+manual_cleanup_production_preflight_at: 2026-08-29T22:33:16Z
+manual_cleanup_production_preflight_blocker: target_fill_query_incomplete_sixth_canonical_btc
+manual_cleanup_production_target_fill_status: first_5_zero_sixth_unknown_remaining_not_queried
 manual_cleanup_production_database_mutation_executed: false
 manual_cleanup_production_service_control_executed: false
 manual_cleanup_production_activation_executed: false
@@ -914,3 +914,62 @@ expansion or an irreversible action that the approved phase did not include.
   continuation must push the new exact handoff, create and verify a new
   immutable inactive stage, and restart the complete fresh preflight from the
   beginning. No prior zero-fill or account snapshot may be reused.
+
+## Exact-target production cutover continuation
+
+- The continuation began from exact clean local HEAD
+  `8abaf2c6d6e361b7651fc41e11275e899bb6463a`. Its base-to-HEAD contained only
+  reviewed exact-target evidence code/tests/design plus the status-only record.
+  The explicit L2 full-scope push manifest prohibited service, database,
+  settings, Telegram and exchange writes. The remote
+  `codex/deepcoin-auto-trading-v1` ref was fast-forward pushed and independently
+  verified at exact `8abaf2c6d6e361b7651fc41e11275e899bb6463a`.
+- A separate stage action created immutable inactive release `8abaf2c6` with
+  tree `40a9e085227359a1f00cebda563c9ccbb02c261b`, content SHA-256
+  `68e373268885215a1bf0bd48492be8d7ce0d17d6c3a07bb744c7dc42fd14cad0`,
+  manifest SHA-256
+  `74c7abe4a3e76e99acedd9912edeffc2059afc56c6e5571d8643b12c58545395`
+  and action-plan SHA-256
+  `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`.
+  The release and receipt matched the exact commit, the release was root-owned
+  mode `0555`, and unsafe and group/other-writable entry counts were zero. It
+  was not activated.
+- The first preflight invocation used a superseded monitor unit name and stopped
+  before creating a database copy or making a Deepcoin request. Read-only unit
+  discovery identified the governed `telegram-kol-monitor.timer`; the corrected
+  collector then ran once. This was an operator-script correction, not an
+  external-query retry.
+- Fresh runtime evidence at `2026-08-29T22:30:41Z` proved production still at
+  legacy SHA `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. Web, ingest and worker
+  remained active from `/opt/telegram-kol-analyzer` with exact command roles and
+  unchanged PID/start-tick identities; the monitor timer was active and the
+  legacy monolith inactive. The candidate remained inactive.
+- The new root-owned `0600` preflight copy at
+  `/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/preflight.db`
+  has SHA-256
+  `e9990847d609619be3d9ff0e0dd9da79a0d9806858ffd869327480e26cc24445`.
+  It passed `query_only=1`, `quick_check=ok`, zero foreign-key issues,
+  `total_changes=0` and zero active exchange writes. Counts remained 24
+  management components, 133 management legs, 150 management batches, 554
+  execution order legs, 320 bindings, 1034 lifecycles, 3 trading settings and
+  3803 execution events. The canonical authority row remained absent.
+- The account-flat part of the first snapshot completed with zero positions,
+  zero regular open orders and zero pending triggers across all three governed
+  instruments. The first five canonical exact fills reads completed with zero
+  rows. The sixth, for BTC, raised `DeepcoinClientError` on its sole permitted
+  call at `2026-08-29T22:31:57Z`; the seventh fill and all exact history reads
+  were therefore not attempted.
+- This incomplete exact fill result is external unknown and permanently stops
+  this cutover attempt. No automatic retry was performed. The task did not
+  enter the maintenance boundary, stop or mask a unit, create the transaction
+  backup, mutate the production database, terminalize a target, create the
+  authority row, create or consume activation authorization, activate a
+  candidate, observe L2 traffic or thaw entry.
+- Raw rows, runtime/unit evidence, the read-only database copy and the terminal
+  record are retained under
+  `/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/`.
+  The root-owned `0600` `evidence.jsonl` has SHA-256
+  `890ba2452f55026a9ae231a725f59834dff881c85231713fd20ab0ad3a8af4b4`.
+  The phase remains `in_progress`; another attempt requires explicit
+  continuation and entirely fresh evidence. The failed exact query must never
+  be retried automatically.
