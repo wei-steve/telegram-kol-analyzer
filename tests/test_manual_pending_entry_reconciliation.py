@@ -117,6 +117,41 @@ class ReadOnlyClient:
         raise AssertionError("manual reconciliation must not write to Deepcoin")
 
 
+class MaintenanceReadClock:
+    def __init__(self) -> None:
+        self.current = 0.0
+        self.sleeps = []
+
+    def __call__(self) -> float:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+        self.current += seconds
+
+
+class TimedReadOnlyClient(ReadOnlyClient):
+    def __init__(self, clock: MaintenanceReadClock) -> None:
+        super().__init__()
+        self.clock = clock
+        self.exact_fill_started_at = []
+        self.exact_history_started_at = []
+
+    def list_trade_fills_by_order_id(self, *, inst_id, order_id):
+        self.exact_fill_started_at.append(self.clock())
+        return super().list_trade_fills_by_order_id(
+            inst_id=inst_id,
+            order_id=order_id,
+        )
+
+    def list_trigger_order_history_by_order_id(self, *, inst_id, order_id):
+        self.exact_history_started_at.append(self.clock())
+        return super().list_trigger_order_history_by_order_id(
+            inst_id=inst_id,
+            order_id=order_id,
+        )
+
+
 class RuntimeGuard:
     def __init__(self, *, fail_on_call=None, events=None) -> None:
         self.calls = 0
@@ -2340,6 +2375,73 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
         assert backup_connection.execute("PRAGMA quick_check").fetchone() == (
             "ok",
         )
+
+
+def test_manual_reconciliation_paces_all_canonical_exact_reads(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    targets = _seed_all_canonical_targets(session_factory)
+    clock = MaintenanceReadClock()
+    client = TimedReadOnlyClient(clock)
+    for target in targets:
+        _record_cancelled_history(client, target)
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=targets,
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+        read_monotonic=clock,
+        read_sleep=clock.sleep,
+    )
+
+    assert plan.status == "ready"
+    assert client.exact_fill_started_at == pytest.approx(
+        [0.41 * index for index in range(1, 8)]
+    )
+    assert client.exact_history_started_at == pytest.approx(
+        [0.41 * index for index in range(8, 15)]
+    )
+    assert clock.sleeps == pytest.approx([0.41] * 14)
+    assert client.write_calls == 0
+
+
+def test_manual_reconciliation_does_not_retry_failed_exact_fill(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    targets = _seed_all_canonical_targets(session_factory)
+    clock = MaintenanceReadClock()
+    client = TimedReadOnlyClient(clock)
+    client.exact_fills[targets[5].order_id] = RuntimeError("HTTP 401")
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=targets,
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+        read_monotonic=clock,
+        read_sleep=clock.sleep,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_fill_query_incomplete"
+    assert client.exact_fill_calls == [
+        (target.instrument_id, target.order_id) for target in targets[:6]
+    ]
+    assert client.exact_fill_started_at == pytest.approx(
+        [0.41 * index for index in range(1, 7)]
+    )
+    assert client.exact_history_calls == []
+    assert clock.sleeps == pytest.approx([0.41] * 6)
+    assert client.write_calls == 0
 
 
 def test_all_canonical_terminalization_failure_is_atomic(tmp_path, monkeypatch):
