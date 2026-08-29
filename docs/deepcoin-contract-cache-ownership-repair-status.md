@@ -6,9 +6,9 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a04f45-e0e5-7642-aeb7-0c398bd03375
-candidate_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
-candidate_content_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
-handoff_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
+candidate_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
+candidate_content_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
+handoff_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
 pushed_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
@@ -55,10 +55,15 @@ manual_cleanup_read_only_verified_at: 2026-08-29T20:20:19Z
 manual_cleanup_exchange_snapshot_status: zero_live_orders_historical_requires_fresh_cutover_recheck
 manual_cleanup_target_fill_count: 0
 manual_cleanup_local_eligible_count: 7
-manual_cleanup_local_repair_status: complete_production_cutover_pending
+manual_cleanup_local_repair_status: exact_target_history_repair_complete_production_restage_pending
 manual_cleanup_local_repair_base_sha: bd73ceb15eb7228f8d9e52641891578cb1883253
 manual_cleanup_local_repair_focused: 344_passed_1_skipped
 manual_cleanup_local_repair_final_suite: 6644_passed_3_skipped_32_warnings
+manual_cleanup_exact_history_repair_base_sha: eafe60cbadb69f52246c5e1c9cbb1d71850df506
+manual_cleanup_exact_history_repair_code_sha: 5a3bb9383037d4e3e03b843352af947b46356cb6
+manual_cleanup_exact_history_repair_focused: 190_passed_plus_2_targeted_passed
+manual_cleanup_exact_history_repair_final_suite: 6663_passed_3_skipped_32_warnings
+manual_cleanup_exact_history_repair_review: no_remaining_p0_p1
 manual_cleanup_production_cutover_status: preflight_failed_closed
 manual_cleanup_production_stage_sha: c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609
 manual_cleanup_production_stage_content_sha256: ba99d1ec18a9252eff8aa3319260fc4f6687cff1a09a838e79324d27dcb8e7e4
@@ -866,3 +871,46 @@ expansion or an irreversible action that the approved phase did not include.
   `/var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/`.
   The `0600` evidence file is `evidence.jsonl`, SHA-256
   `ea563a1b2a9fbe2800662e9f6567a85206125841a34bd38083514cc1fcf62d92`.
+
+## Exact-target history evidence repair
+
+- The local repair started from exact clean SHA
+  `eafe60cbadb69f52246c5e1c9cbb1d71850df506` and produced reviewed code commit
+  `5a3bb9383037d4e3e03b843352af947b46356cb6`. It performed no push, stage, SSH,
+  production read, service control, production database write, Deepcoin write,
+  activation, observation, replay, retry, compensation order, bridge restore or
+  entry thaw.
+- Manual-cleanup reconciliation now builds its stable account snapshot from
+  complete positions, regular-open-order and pending-trigger reads only. It no
+  longer calls broad trigger history or broad fills, so unrelated 100-row
+  account history cannot block this bounded seven-target workflow. The default
+  maintenance-evidence profile remains unchanged for every other caller.
+- Every canonical reviewed target receives one `instId + ordId` trigger-history
+  read and one `instId + ordId` fills read per plan. There is no automatic retry.
+  Exact fills must be a complete empty list. Exact history may be empty or have
+  one nonliteral-cancel row, but malformed/boundary-sized/duplicate responses,
+  exceptions, identity or instrument conflict, filled/live/executed states,
+  nonzero or malformed fill quantities, a position identity, and a successful
+  trigger timestamp remain fail-closed.
+- Exact history content is bound into the plan fingerprint. A changed history
+  result between dry-run and apply is rejected before backup or transaction.
+  The seven-target success test proves all seven exact history/fills pairs are
+  read once in dry-run and once in apply.
+- RED first reproduced the broad-history dependency, absent exact trigger
+  history API, missing fail-closed classifications and unbound history drift.
+  Independent review then found one P1 involving `posId`, additional fill-size
+  aliases and successful `triggerTime + errorCode` evidence; new RED tests
+  reproduced it and the adverse detector was extended. Final independent review
+  found no remaining P0/P1.
+- The affected three modules passed 190 tests after the final production-code
+  edit; two additional end-to-end test-only proofs also passed. Python
+  compilation and `git diff --check` passed. The one final repository suite
+  passed 6663 tests with 3 documented skips and 32 existing warnings in 635.98
+  seconds. No production code changed after that suite.
+- Production remains on legacy SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. The old inactive stage
+  `c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609` is superseded for the next
+  attempt. The phase stays `in_progress`: a later authorized production
+  continuation must push the new exact handoff, create and verify a new
+  immutable inactive stage, and restart the complete fresh preflight from the
+  beginning. No prior zero-fill or account snapshot may be reused.
