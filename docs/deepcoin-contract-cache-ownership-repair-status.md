@@ -40,7 +40,7 @@ legacy_runtime_drain_bridge_review_base_sha: 5024a59e97b4328acba101f9bc138d7bf3d
 legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b6652795
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
-immutable_control_bootstrap_status: tasks_7_to_9_review_repairs_local_followup_pending
+immutable_control_bootstrap_status: tasks_7_to_9_reviewed_local_complete_task10_pending
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -528,7 +528,29 @@ phase completes or pauses, record both verified evidence and outstanding work.
   unique PID/start tuples, all governed unit/drop-in bytes, and an actual
   no-notification diagnostic unit run from the candidate release. The checkout
   `--expected-head` monitor fallback is removed.
-- The post-repair Tasks 7-9 adjacent regression passed 1084 tests with 1 skip
-  and 2 existing deprecation warnings. Follow-up independent review and Task 10
-  final full-suite/candidate evidence are still pending; this is not an
-  activation-ready or deployment-authorized claim.
+- The first follow-up review rejected exact head `1a0c0876` because manifest
+  expiry was not rechecked at the mutation boundary, monitor proof followed
+  authority release, compensation could stop at its first failed mask, release
+  content/ownership was not fully revalidated, and authority freshness trusted
+  self-reported booleans. A later review also caught and repaired one misplaced
+  CLI reload that briefly broke the separate seed action.
+- Exact content candidate `905c0993` closes those findings. Bootstrap reloads
+  the same root-owned manifest after planning and rechecks its deadline before
+  mutation and candidate start. Monitor proof occurs while bootstrap authority
+  is held. Compensation attempts every target/unit disable, mask and stop before
+  proving quiescence. Monitor recomputes the complete immutable release and
+  ownership/mode contract. Shared authority evidence requires bounded numeric
+  ages, effective management/rescue modes, and exactly one worker owner.
+- Reboot takeover now has one persistent boot edge,
+  `telegram-kol-runtime.target`, with `Requires+After` for worker, web, ingest
+  and the monitor timer; every direct unit boot edge is disabled. Before the
+  guard receipt is removed, target, all three services and the timer must be
+  active, all three identities must again prove the exact release and complete
+  role health, and their PID/start-tick tuples must match the pre-release proof.
+  Any child failure or process replacement reinhibits and fails closed.
+- The final Tasks 7-9 adjacent set passed 609 tests with 1 existing skip.
+  Independent exact-archive review of `905c0993` passed 597 tests with 1 skip,
+  `git diff --check` passed, and found no remaining Critical or Important
+  finding. Task 10's one final repository suite and final local handoff remain
+  separately pending; this is not an activation-ready, push-authorized or
+  deployment-authorized claim.
