@@ -49,6 +49,7 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
 
     assert f'TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}' in rendered
     assert 'TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1' in rendered
+    assert 'Environment="PYTHONDONTWRITEBYTECODE=1"' in rendered
 
     monitor = render_release_dropin(
         release,

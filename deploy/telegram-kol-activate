@@ -8,4 +8,5 @@ else
   ACTIVATOR_PYTHON="$ACTIVATOR_ROOT/.venv/bin/python"
 fi
 export PYTHONPATH="$ACTIVATOR_ROOT/src"
-exec "$ACTIVATOR_PYTHON" -m telegram_kol_research.scoped_release_activation
+export PYTHONDONTWRITEBYTECODE=1
+exec "$ACTIVATOR_PYTHON" -B -m telegram_kol_research.scoped_release_activation

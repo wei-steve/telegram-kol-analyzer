@@ -534,6 +534,7 @@ def render_release_dropin(
     lines = [
         "[Service]",
         f'Environment="PYTHONPATH={release.release_path}/src"',
+        'Environment="PYTHONDONTWRITEBYTECODE=1"',
         f'Environment="TELEGRAM_KOL_RELEASE_COMMIT={release.commit}"',
         f'Environment="TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={release.manifest_sha256}"',
         f"ReadOnlyPaths={release.release_path}",

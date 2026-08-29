@@ -508,8 +508,9 @@ def test_scoped_activator_has_no_settings_telegram_or_exchange_write_path():
     assert "runtime-deployment-identity-v1" in implementation
     assert "rollback_complete" in implementation
     assert 'export PYTHONPATH="$ACTIVATOR_ROOT/src"' in script
+    assert 'export PYTHONDONTWRITEBYTECODE=1' in script
     assert 'ACTIVATOR_PYTHON=/opt/telegram-kol-analyzer/.venv/bin/python' in script
-    assert 'exec "$ACTIVATOR_PYTHON"' in script
+    assert 'exec "$ACTIVATOR_PYTHON" -B' in script
     assert 'DISPATCHER_RELEASE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.."' in updater
     assert 'basename -- "$DISPATCHER_RELEASE_ROOT"' in updater
     assert 'ACTIVATOR_PATH="$DISPATCHER_RELEASE_ROOT/deploy/telegram-kol-activate"' in updater
