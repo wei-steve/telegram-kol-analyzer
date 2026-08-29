@@ -12,7 +12,7 @@ from telegram_kol_research.deepcoin_maintenance_actions import (
     run_entry_authority_seed,
     run_single_order_drain,
 )
-from telegram_kol_research.entry_authority_seed import SeedResult
+from telegram_kol_research.entry_authority_seed import SeedPlanRefused, SeedResult
 from telegram_kol_research.reviewed_pending_entry_cancel import (
     ReviewedPendingEntryCancelAction,
     ReviewedPendingEntryCancelPlan,
@@ -79,6 +79,7 @@ def test_single_order_action_dispatches_exactly_once(monkeypatch) -> None:
         deepcoin_client=object(),
         targets=(object(),),
         guard=object(),
+        authorization_expires_at=datetime(2026, 8, 28, 0, 15, tzinfo=UTC),
         now=datetime(2026, 8, 28, tzinfo=UTC),
     )
 
@@ -86,6 +87,9 @@ def test_single_order_action_dispatches_exactly_once(monkeypatch) -> None:
     assert len(captured) == 1
     assert captured[0][1]["order_id"] == "canonical-order"
     assert captured[0][1]["confirmation_token"] == "fresh-token"
+    assert captured[0][1]["authorization_expires_at"] == datetime(
+        2026, 8, 28, 0, 15, tzinfo=UTC
+    )
 
 
 def test_single_order_action_rejects_hash_or_action_mismatch(monkeypatch) -> None:
@@ -112,6 +116,9 @@ def test_single_order_action_rejects_hash_or_action_mismatch(monkeypatch) -> Non
             deepcoin_client=object(),
             targets=(object(),),
             guard=object(),
+            authorization_expires_at=datetime(
+                2026, 8, 28, 0, 15, tzinfo=UTC
+            ),
             now=datetime(2026, 8, 28, tzinfo=UTC),
         )
 
@@ -148,6 +155,13 @@ class FakeSeedActionGuard:
         self.masked = False
 
 
+class CompensatedRestoreFailureGuard(FakeSeedActionGuard):
+    def restore(self, *, expected_fingerprint: str) -> None:
+        self.restore_fingerprints.append(expected_fingerprint)
+        self.block_reason = "maintenance_restore_compensation_failed"
+        raise RuntimeError("maintenance_restore_compensation_failed")
+
+
 def test_seed_action_restores_exact_preimage_only_after_seed_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -179,6 +193,39 @@ def test_seed_action_restores_exact_preimage_only_after_seed_success(
     assert result.status == "seeded"
     assert guard.restore_fingerprints == ["c" * 64]
     assert guard.masked is False
+
+
+def test_seed_action_preserves_specific_restore_compensation_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    guard = CompensatedRestoreFailureGuard()
+    monkeypatch.setattr(
+        actions,
+        "apply_entry_authority_seed_plan",
+        lambda *args, **kwargs: SeedResult(
+            status="seeded",
+            plan_fingerprint="d" * 64,
+            backup_path=tmp_path / "backup.sqlite3",
+        ),
+    )
+
+    with pytest.raises(
+        MaintenanceBlocked,
+        match="maintenance_restore_compensation_failed",
+    ):
+        run_entry_authority_seed(
+            action_id="seed-001",
+            database_path=tmp_path / "production.sqlite3",
+            backup_path=tmp_path / "backup.sqlite3",
+            expected_fingerprint="d" * 64,
+            guard=guard,
+            now=datetime(2026, 8, 28, tzinfo=UTC),
+        )
+
+    assert guard.block_reason == "maintenance_restore_compensation_failed"
 
 
 def test_seed_action_blocked_result_never_restores_runtime(
@@ -213,3 +260,33 @@ def test_seed_action_blocked_result_never_restores_runtime(
 
     assert guard.restore_fingerprints == []
     assert guard.masked is True
+
+
+def test_seed_authorization_expired_after_quiescence_restores_without_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import telegram_kol_research.deepcoin_maintenance_actions as actions
+
+    guard = FakeSeedActionGuard()
+    monkeypatch.setattr(
+        actions,
+        "apply_entry_authority_seed_plan",
+        lambda *args, **kwargs: pytest.fail("seed write must stay unreachable"),
+    )
+    deadline = datetime(2026, 8, 28, 0, 10, tzinfo=UTC)
+
+    with pytest.raises(SeedPlanRefused, match="maintenance_authorization_expired"):
+        run_entry_authority_seed(
+            action_id="seed-001",
+            database_path=tmp_path / "production.sqlite3",
+            backup_path=tmp_path / "backup.sqlite3",
+            expected_fingerprint="d" * 64,
+            guard=guard,
+            now=datetime(2026, 8, 28, tzinfo=UTC),
+            authorization_expires_at=deadline,
+            clock=lambda: deadline,
+        )
+
+    assert guard.restore_fingerprints == ["c" * 64]
+    assert guard.masked is False

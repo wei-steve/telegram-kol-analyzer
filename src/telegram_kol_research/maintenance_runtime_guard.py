@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 from typing import Protocol
 import uuid
 
@@ -111,6 +112,11 @@ class MaintenanceRuntimeGuard:
         try:
             for unit in MAINTENANCE_UNITS:
                 self.runtime.mask_unit(unit)
+            if any(
+                not self.runtime.is_masked(unit)
+                for unit in MAINTENANCE_UNITS
+            ):
+                raise GuardError("maintenance_unit_mask_not_persistent")
             for unit in MAINTENANCE_UNITS:
                 self.runtime.stop_unit(unit)
             self.prove_quiescent()
@@ -159,13 +165,61 @@ class MaintenanceRuntimeGuard:
             raise GuardError("maintenance_receipt_fingerprint_mismatch")
         if not receipt.safe_to_restore or receipt.blocked_reason is not None:
             raise GuardError("maintenance_restore_not_safe")
-        for row in receipt.units:
-            if not row.masked:
-                self.runtime.unmask_unit(row.unit)
-            self.runtime.restore_enabled_state(row.unit, row.enabled_state)
-            if row.active_state == "active":
-                self.runtime.start_unit(row.unit)
-        self._remove_receipt()
+        restoring = _with_receipt_state(
+            receipt,
+            safe_to_restore=False,
+            blocked_reason="maintenance_restore_in_progress",
+        )
+        self._publish(restoring)
+        try:
+            for row in receipt.units:
+                if not row.masked:
+                    self.runtime.unmask_unit(row.unit)
+                self.runtime.restore_enabled_state(
+                    row.unit,
+                    row.enabled_state,
+                )
+            for row in receipt.units:
+                if row.active_state == "active":
+                    self.runtime.start_unit(row.unit)
+            self._remove_receipt()
+        except Exception as exc:
+            compensation_failed = False
+            for unit in MAINTENANCE_UNITS:
+                try:
+                    self.runtime.stop_unit(unit)
+                except Exception:
+                    compensation_failed = True
+            for unit in MAINTENANCE_UNITS:
+                try:
+                    self.runtime.mask_unit(unit)
+                except Exception:
+                    compensation_failed = True
+            try:
+                if any(
+                    not self.runtime.is_masked(unit)
+                    for unit in MAINTENANCE_UNITS
+                ):
+                    compensation_failed = True
+            except Exception:
+                compensation_failed = True
+            try:
+                self.prove_quiescent()
+            except Exception:
+                compensation_failed = True
+            reason = (
+                "maintenance_restore_compensation_failed"
+                if compensation_failed
+                else "maintenance_restore_failed"
+            )
+            self._publish(
+                _with_receipt_state(
+                    receipt,
+                    safe_to_restore=False,
+                    blocked_reason=reason,
+                )
+            )
+            raise GuardError(reason) from exc
 
     def block(self, *, reason_code: str) -> GuardReceipt:
         self._require_lock()
@@ -184,6 +238,11 @@ class MaintenanceRuntimeGuard:
         receipt = self._load_receipt()
         for unit in MAINTENANCE_UNITS:
             self.runtime.mask_unit(unit)
+        if any(
+            not self.runtime.is_masked(unit)
+            for unit in MAINTENANCE_UNITS
+        ):
+            raise GuardError("maintenance_unit_mask_not_persistent")
         for unit in MAINTENANCE_UNITS:
             self.runtime.stop_unit(unit)
         self.prove_quiescent()
@@ -200,6 +259,7 @@ class MaintenanceRuntimeGuard:
             fcntl.flock(descriptor, fcntl.LOCK_UN)
         finally:
             os.close(descriptor)
+
 
     def _acquire_lock(self) -> None:
         if self._lock_descriptor is not None:
@@ -304,6 +364,221 @@ class MaintenanceRuntimeGuard:
 
     def __exit__(self, *_) -> None:
         self.close()
+
+
+class SystemdMaintenanceRuntimeAdapter:
+    """Narrow systemd and /proc adapter used by maintenance CLI actions."""
+
+    _INHIBIT_NAME = "00-telegram-kol-maintenance-inhibit.conf"
+    _INHIBIT_CONTENT = (
+        b"[Unit]\n"
+        b"ConditionPathExists=/dev/null/telegram-kol-maintenance-never\n"
+    )
+    _RUNTIME_MARKERS = (
+        b"telegram-kol-research\x00web\x00--runtime-role\x00",
+        b"telegram-kol-research\x00monitor-production-safety\x00",
+    )
+
+    def __init__(
+        self,
+        *,
+        dropin_root: Path = Path("/etc/systemd/system"),
+        expected_uid: int = 0,
+    ) -> None:
+        self.dropin_root = Path(dropin_root)
+        self.expected_uid = int(expected_uid)
+
+    @staticmethod
+    def _run(command: list[str], *, accepted: set[int] = {0}):
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise GuardError("maintenance_runtime_command_failed") from exc
+        if result.returncode not in accepted:
+            raise GuardError("maintenance_runtime_command_failed")
+        return result
+
+    def inspect_unit(self, unit: str) -> UnitPreimage:
+        enabled = self._run(
+            ["systemctl", "is-enabled", unit], accepted={0, 1}
+        ).stdout.strip()
+        active = self._run(
+            ["systemctl", "is-active", unit], accepted={0, 3}
+        ).stdout.strip()
+        if not enabled or not active:
+            raise GuardError("maintenance_unit_preimage_invalid")
+        return UnitPreimage(
+            unit=unit,
+            enabled_state=enabled,
+            active_state=active,
+            masked=enabled in {"masked", "masked-runtime"},
+        )
+
+    def mask_unit(self, unit: str) -> None:
+        path = self._inhibit_path(unit)
+        path.parent.mkdir(mode=0o755, parents=False, exist_ok=True)
+        parent = path.parent.lstat()
+        if (
+            not stat.S_ISDIR(parent.st_mode)
+            or parent.st_uid != self.expected_uid
+            or stat.S_IMODE(parent.st_mode) != 0o755
+        ):
+            raise GuardError("maintenance_inhibit_directory_unsafe")
+        if path.exists() or path.is_symlink():
+            if not self._exact_inhibit_file(path):
+                raise GuardError("maintenance_inhibit_file_unsafe")
+        else:
+            temporary = path.with_name(
+                f".{self._INHIBIT_NAME}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+            )
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(temporary, flags, 0o444)
+            try:
+                written = os.write(descriptor, self._INHIBIT_CONTENT)
+                if written != len(self._INHIBIT_CONTENT):
+                    raise GuardError("maintenance_inhibit_write_failed")
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            os.replace(temporary, path)
+            self._fsync_directory(path.parent)
+        self._run(["systemctl", "daemon-reload"])
+
+    def stop_unit(self, unit: str) -> None:
+        self._run(["systemctl", "stop", unit])
+
+    def unmask_unit(self, unit: str) -> None:
+        path = self._inhibit_path(unit)
+        if path.exists() or path.is_symlink():
+            if not self._exact_inhibit_file(path):
+                raise GuardError("maintenance_inhibit_file_unsafe")
+            path.unlink()
+            self._fsync_directory(path.parent)
+        try:
+            path.parent.rmdir()
+        except OSError:
+            pass
+        self._run(["systemctl", "daemon-reload"])
+
+    def start_unit(self, unit: str) -> None:
+        self._run(["systemctl", "start", unit])
+
+    def restore_enabled_state(self, unit: str, state: str) -> None:
+        if state == "enabled":
+            self._run(["systemctl", "enable", unit])
+        elif state == "disabled":
+            self._run(["systemctl", "disable", unit])
+        elif state not in {
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+            "alias",
+            "masked",
+            "masked-runtime",
+        }:
+            raise GuardError("maintenance_unit_preimage_invalid")
+
+    def is_masked(self, unit: str) -> bool:
+        path = self._inhibit_path(unit)
+        if not self._exact_inhibit_file(path):
+            return False
+        pending = self._run(
+            [
+                "systemctl",
+                "show",
+                unit,
+                "--property=NeedDaemonReload",
+                "--value",
+            ]
+        ).stdout.strip()
+        if pending not in {"yes", "no"}:
+            raise GuardError("maintenance_inhibit_load_unknown")
+        return pending == "no"
+
+    def main_pid(self, unit: str) -> int:
+        value = self._run(
+            ["systemctl", "show", unit, "--property=MainPID", "--value"]
+        ).stdout.strip()
+        try:
+            pid = int(value)
+        except ValueError as exc:
+            raise GuardError("maintenance_unit_main_pid_unknown") from exc
+        if pid < 0:
+            raise GuardError("maintenance_unit_main_pid_unknown")
+        return pid
+
+    def cgroup_pids(self, unit: str) -> tuple[int, ...]:
+        group = self._run(
+            ["systemctl", "show", unit, "--property=ControlGroup", "--value"]
+        ).stdout.strip()
+        if not group:
+            return ()
+        if not group.startswith("/") or ".." in Path(group).parts:
+            raise GuardError("maintenance_unit_cgroup_unknown")
+        path = Path("/sys/fs/cgroup") / group.lstrip("/") / "cgroup.procs"
+        try:
+            raw = path.read_text(encoding="ascii")
+            values = tuple(int(value) for value in raw.split())
+        except (OSError, ValueError) as exc:
+            raise GuardError("maintenance_unit_cgroup_unknown") from exc
+        return tuple(sorted(set(values)))
+
+    def matching_processes(self) -> tuple[int, ...]:
+        matches: list[int] = []
+        try:
+            candidates = tuple(Path("/proc").iterdir())
+        except OSError as exc:
+            raise GuardError("maintenance_process_scan_unknown") from exc
+        for candidate in candidates:
+            if not candidate.name.isdigit():
+                continue
+            try:
+                cmdline = (candidate / "cmdline").read_bytes()
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            except (PermissionError, OSError) as exc:
+                raise GuardError("maintenance_process_scan_unknown") from exc
+            if any(marker in cmdline for marker in self._RUNTIME_MARKERS):
+                matches.append(int(candidate.name))
+        return tuple(sorted(matches))
+
+    def _inhibit_path(self, unit: str) -> Path:
+        if unit not in MAINTENANCE_UNITS:
+            raise GuardError("maintenance_unit_preimage_invalid")
+        return self.dropin_root / f"{unit}.d" / self._INHIBIT_NAME
+
+    def _exact_inhibit_file(self, path: Path) -> bool:
+        try:
+            metadata = path.lstat()
+            return bool(
+                stat.S_ISREG(metadata.st_mode)
+                and metadata.st_uid == self.expected_uid
+                and stat.S_IMODE(metadata.st_mode) == 0o444
+                and metadata.st_nlink == 1
+                and path.read_bytes() == self._INHIBIT_CONTENT
+            )
+        except OSError:
+            return False
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
 
 def _new_receipt(

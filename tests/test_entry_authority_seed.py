@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 from pathlib import Path
 import sqlite3
@@ -190,6 +190,29 @@ def test_seed_backup_failure_is_a_prewrite_refusal(
 
     assert _authority_count(database_path) == 0
     assert guard.block_reason is None
+
+
+def test_seed_expiry_after_backup_refuses_database_write(
+    tmp_path: Path,
+) -> None:
+    database_path = _database(tmp_path)
+    plan = build_entry_authority_seed_plan(database_path, now=NOW)
+    deadline = NOW + timedelta(minutes=10)
+    clock = iter((NOW, deadline))
+
+    with pytest.raises(SeedPlanRefused, match="maintenance_authorization_expired"):
+        apply_entry_authority_seed_plan(
+            database_path,
+            backup_path=plan.backup_path,
+            expected_fingerprint=plan.fingerprint,
+            guard=FakeSeedGuard(),
+            now=NOW,
+            authorization_expires_at=deadline,
+            clock=lambda: next(clock),
+        )
+
+    assert plan.backup_path.is_file()
+    assert _authority_count(database_path) == 0
 
 
 def test_seed_apply_changes_only_one_trading_setting_count(tmp_path: Path) -> None:

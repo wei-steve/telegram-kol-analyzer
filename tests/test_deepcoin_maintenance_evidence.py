@@ -116,6 +116,29 @@ def test_evidence_state_fingerprint_is_stable_across_observation_times():
     assert first.fingerprint == second.fingerprint
 
 
+def test_production_observation_time_is_captured_after_all_required_reads():
+    class CompletionAwareClient(CompleteEvidenceClient):
+        reads_finished = False
+
+        def list_trade_fills(self, *, inst_id=None):
+            self.reads_finished = True
+            return []
+
+    client = CompletionAwareClient()
+    completed_at = NOW + timedelta(seconds=47)
+
+    evidence = build_deepcoin_maintenance_evidence(
+        client,
+        instruments=INSTRUMENTS,
+        target_order_id=TARGET.order_id,
+        clock=lambda: completed_at if client.reads_finished else pytest.fail(
+            "evidence timestamp was captured before the required reads"
+        ),
+    )
+
+    assert evidence.observed_at == completed_at
+
+
 def test_remaining_pending_set_must_equal_canonical_unfinished_subset():
     evidence = _build(CompleteEvidenceClient())
     canonical_ids = tuple(

@@ -57,8 +57,9 @@ def build_deepcoin_maintenance_evidence(
     *,
     instruments: Iterable[str],
     target_order_id: str,
-    observed_at: datetime,
+    observed_at: datetime | None = None,
     expected_target_pending_count: int | None = 1,
+    clock: Callable[[], datetime] | None = None,
 ) -> DeepcoinMaintenanceEvidence:
     """Read one bounded account snapshot with at most one retry per query."""
 
@@ -72,7 +73,14 @@ def build_deepcoin_maintenance_evidence(
         raise ValueError("maintenance evidence target is required")
     if expected_target_pending_count not in {None, 0, 1}:
         raise ValueError("expected target pending count is invalid")
-    timestamp = _timestamp(observed_at)
+
+    def completed_at() -> datetime:
+        return _timestamp(
+            observed_at
+            if observed_at is not None
+            else (clock or (lambda: datetime.now(UTC)))()
+        )
+
     positions: list[dict[str, Any]] = []
     regular: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
@@ -118,7 +126,7 @@ def build_deepcoin_maintenance_evidence(
             destination.extend(rows)
             if not complete:
                 return _evidence(
-                    observed_at=timestamp,
+                    observed_at=completed_at(),
                     target_order_id=clean_target,
                     status="unknown",
                     reason_code=f"{query_kind}_query_incomplete",
@@ -136,7 +144,7 @@ def build_deepcoin_maintenance_evidence(
         and target_count != expected_target_pending_count
     ):
         return _evidence(
-            observed_at=timestamp,
+            observed_at=completed_at(),
             target_order_id=clean_target,
             status="unknown",
             reason_code="target_pending_readback_not_exact",
@@ -148,7 +156,7 @@ def build_deepcoin_maintenance_evidence(
             retry_count=retries,
         )
     return _evidence(
-        observed_at=timestamp,
+        observed_at=completed_at(),
         target_order_id=clean_target,
         status="complete",
         reason_code=None,
@@ -171,7 +179,22 @@ def require_fresh_deepcoin_maintenance_evidence(
         raise DeepcoinMaintenanceEvidenceRefused(
             evidence.reason_code or "evidence_unknown"
         )
-    age = observed_now - evidence.observed_at
+    require_fresh_deepcoin_maintenance_observed_at(
+        evidence.observed_at,
+        now=observed_now,
+    )
+
+
+def require_fresh_deepcoin_maintenance_observed_at(
+    observed_at: datetime,
+    *,
+    now: datetime,
+) -> None:
+    """Revalidate a completed evidence timestamp at a later write boundary."""
+
+    observed_now = _timestamp(now)
+    completed_at = _timestamp(observed_at)
+    age = observed_now - completed_at
     if age < timedelta(0) or age > _MAX_EVIDENCE_AGE:
         raise DeepcoinMaintenanceEvidenceRefused("evidence_stale")
 

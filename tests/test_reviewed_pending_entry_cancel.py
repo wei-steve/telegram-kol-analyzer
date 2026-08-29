@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import hashlib
 import inspect
 import json
@@ -304,7 +304,18 @@ def _plan(session_factory, client, target):
     )
 
 
-def _apply(session_factory, client, target, plan, guard, *, token="fresh-token"):
+def _apply(
+    session_factory,
+    client,
+    target,
+    plan,
+    guard,
+    *,
+    token="fresh-token",
+    authorization_expires_at=NOW + timedelta(minutes=10),
+    clock=None,
+    apply_now=NOW,
+):
     from telegram_kol_research.reviewed_pending_entry_cancel import (
         apply_reviewed_pending_entry_cancel_plan,
     )
@@ -321,7 +332,9 @@ def _apply(session_factory, client, target, plan, guard, *, token="fresh-token")
         expected_evidence_fingerprint=plan.evidence_fingerprint,
         confirmation_token=token,
         guard=guard,
-        now=NOW,
+        authorization_expires_at=authorization_expires_at,
+        clock=clock,
+        now=apply_now,
     )
 
 
@@ -455,6 +468,131 @@ def test_prewrite_refusal_cas_failure_never_releases_inner_authority(
     assert client.cancel_calls == 0
     assert guard.restored is False
     assert _authority_document(session_factory)["state"] == "blocked"
+
+
+def test_authorization_expiring_immediately_before_transport_refuses_zero_write(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "expired.db")
+    target = _seed(session_factory)
+    client = Client()
+    plan = _plan(session_factory, client, target)
+    guard = Guard()
+    client.guard = guard
+    base = datetime.now(UTC)
+    times = iter(
+        (
+            base,
+            base,
+            base,
+            base,
+            base + timedelta(seconds=6),
+            base + timedelta(seconds=6),
+        )
+    )
+
+    result = _apply(
+        session_factory,
+        client,
+        target,
+        plan,
+        guard,
+        authorization_expires_at=base + timedelta(seconds=5),
+        clock=lambda: next(times),
+        apply_now=None,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "maintenance_authorization_expired"
+    assert client.cancel_calls == 0
+    assert guard.restored is True
+    assert _authority_document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "prewrite_refused"
+
+
+def test_expired_authority_lease_blocks_before_transport(tmp_path):
+    session_factory = create_session_factory(tmp_path / "lease-expired.db")
+    target = _seed(session_factory)
+    client = Client()
+    plan = _plan(session_factory, client, target)
+    guard = Guard()
+    client.guard = guard
+    base = datetime.now(UTC)
+    times = iter(
+        (
+            base,
+            base,
+            base,
+            base + timedelta(minutes=11),
+        )
+    )
+
+    result = _apply(
+        session_factory,
+        client,
+        target,
+        plan,
+        guard,
+        authorization_expires_at=base + timedelta(minutes=15),
+        clock=lambda: next(times),
+        apply_now=None,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == (
+        "entry_revision_exchange_authority_expired_blocked"
+    )
+    assert client.cancel_calls == 0
+    assert guard.restored is False
+    assert guard.block_reason == (
+        "entry_revision_exchange_authority_expired_blocked"
+    )
+    assert _authority_document(session_factory)["state"] == "blocked"
+
+
+def test_stale_under_authority_evidence_refuses_before_transport(tmp_path):
+    session_factory = create_session_factory(tmp_path / "evidence-stale.db")
+    target = _seed(session_factory)
+    client = Client()
+    plan = _plan(session_factory, client, target)
+    guard = Guard()
+    client.guard = guard
+    base = datetime.now(UTC)
+    times = iter(
+        (
+            base,
+            base,
+            base,
+            base,
+            base + timedelta(seconds=31),
+            base + timedelta(seconds=31),
+        )
+    )
+
+    result = _apply(
+        session_factory,
+        client,
+        target,
+        plan,
+        guard,
+        authorization_expires_at=base + timedelta(minutes=15),
+        clock=lambda: next(times),
+        apply_now=None,
+    )
+
+    assert result.status == "blocked"
+    assert result.reason_code == "maintenance_evidence_stale"
+    assert client.cancel_calls == 0
+    assert guard.restored is True
+    assert _authority_document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        intent = session.query(PositionMutationIntent).one()
+        assert intent.status == "prewrite_refused"
+        assert json.loads(intent.error_json) == {
+            "reason": "maintenance_evidence_stale"
+        }
 
 
 def test_confirmed_cancel_terminalizes_every_local_surface_and_token(tmp_path):

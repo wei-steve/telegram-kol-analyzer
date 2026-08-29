@@ -7,7 +7,7 @@ from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 import hashlib
 import json
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from sqlalchemy import text
 
@@ -28,6 +28,7 @@ from telegram_kol_research.deepcoin_maintenance_evidence import (
     build_deepcoin_maintenance_evidence,
     require_canonical_remaining_pending_set,
     require_fresh_deepcoin_maintenance_evidence,
+    require_fresh_deepcoin_maintenance_observed_at,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -126,6 +127,7 @@ class ReviewedPendingEntryCancelPlan:
     evidence_fingerprint: str
     pending_fingerprints: tuple[tuple[str, str], ...]
     fingerprint: str
+    evidence_observed_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -268,12 +270,13 @@ def build_reviewed_pending_entry_cancel_plan(
             expected_target_pending_count=(
                 1 if selected_order_id is not None else None
             ),
-            observed_at=created_at,
+            observed_at=created_at if now is not None else None,
         )
+    freshness_now = created_at if now is not None else datetime.now(UTC)
     try:
         require_fresh_deepcoin_maintenance_evidence(
             evidence,
-            now=created_at,
+            now=freshness_now,
         )
     except DeepcoinMaintenanceEvidenceRefused:
         return _plan(
@@ -495,6 +498,7 @@ def build_reviewed_pending_entry_cancel_plan(
         completed_order_ids=completed,
         expected_generation=plan_generation,
         evidence_fingerprint=evidence.fingerprint,
+        evidence_observed_at=evidence.observed_at,
         pending_fingerprints=tuple(
             sorted(
                 (_order_id(row), _fingerprint(row))
@@ -693,6 +697,8 @@ def apply_reviewed_pending_entry_cancel_plan(
     expected_evidence_fingerprint: str,
     confirmation_token: str,
     guard,
+    authorization_expires_at: datetime,
+    clock: Callable[[], datetime] | None = None,
     now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelResult:
     """Cancel one exact reviewed entry, without ever retrying the write."""
@@ -711,6 +717,12 @@ def apply_reviewed_pending_entry_cancel_plan(
         raise ValueError("exactly one reviewed cancellation action is required")
     if expected_evidence_fingerprint != plan.evidence_fingerprint:
         raise ValueError("evidence fingerprint mismatch")
+    authorization_deadline = _timestamp(authorization_expires_at)
+    current_time = lambda: (
+        _timestamp(now)
+        if now is not None
+        else _timestamp((clock or (lambda: datetime.now(UTC)))())
+    )
     receipt = guard.enter(action_id=str(action_id))
     guard.prove_quiescent()
     require_repair_confirmation_token_unused(
@@ -741,8 +753,11 @@ def apply_reviewed_pending_entry_cancel_plan(
     if len(current) != 1:
         _restore_guard_before_write(guard=guard, receipt=receipt)
         raise ValueError("reviewed cancellation action changed")
+    observed_at = current_time()
+    if observed_at >= authorization_deadline:
+        _restore_guard_before_write(guard=guard, receipt=receipt)
+        raise ValueError("maintenance authorization expired")
     action = current[0]
-    observed_at = now or datetime.now(UTC)
     authority = acquire_entry_revision_exchange_authority(
         session_factory,
         owner_kind="reviewed_pending_entry_cancel",
@@ -789,7 +804,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             session_factory,
             authority_token=authority_token,
             authority_generation=authority_generation,
-            released_at=observed_at,
+            released_at=current_time(),
         )
         if release_failure is None:
             _restore_guard_before_write(guard=guard, receipt=receipt)
@@ -807,13 +822,25 @@ def apply_reviewed_pending_entry_cancel_plan(
             session_factory,
             authority_token=authority_token,
             authority_generation=authority_generation,
-            released_at=observed_at,
+            released_at=current_time(),
         )
         if release_failure is None:
             _restore_guard_before_write(guard=guard, receipt=receipt)
         else:
             guard.block(reason_code="entry_drain_prewrite_release_failed")
         raise ValueError("reviewed cancellation action changed")
+    if current_time() >= authorization_deadline:
+        release_failure = _release_pending_cancel_authority_before_write(
+            session_factory,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
+            released_at=current_time(),
+        )
+        if release_failure is None:
+            _restore_guard_before_write(guard=guard, receipt=receipt)
+        else:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
+        raise ValueError("maintenance authorization expired")
     fresh = under_authority
     action = under_authority_current[0]
     request = {"instId": action.instrument_id, "ordId": action.order_id}
@@ -856,7 +883,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             session_factory,
             authority_token=authority_token,
             authority_generation=authority_generation,
-            released_at=observed_at,
+            released_at=current_time(),
         )
         if release_failure is not None:
             guard.block(reason_code="entry_drain_prewrite_release_failed")
@@ -881,18 +908,24 @@ def apply_reviewed_pending_entry_cancel_plan(
         generation=authority_generation,
         consumed_at=observed_at,
     )
-    if not _single_pending_cancel_write_gate(
+    authorization_expired = current_time() >= authorization_deadline
+    if authorization_expired or not _single_pending_cancel_write_gate(
         session_factory,
         action=action,
         targets=reviewed,
         mutation_intent_id=intent_id,
         authority_generation=authority_generation,
     ):
+        refusal_reason = (
+            "maintenance_authorization_expired"
+            if authorization_expired
+            else "exact_pending_cancel_write_gate_blocked"
+        )
         refusal_recorded = _record_pending_cancel_prewrite_refusal(
             session_factory,
             intent_id=intent_id,
             expected_statuses={"reserved"},
-            reason_code="exact_pending_cancel_write_gate_blocked",
+            reason_code=refusal_reason,
             refused_at=observed_at,
         )
         if not refusal_recorded:
@@ -913,7 +946,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             session_factory,
             authority_token=authority_token,
             authority_generation=authority_generation,
-            released_at=observed_at,
+            released_at=current_time(),
         )
         if release_failure is None:
             _restore_guard_before_write(guard=guard, receipt=receipt)
@@ -923,7 +956,7 @@ def apply_reviewed_pending_entry_cancel_plan(
             status="blocked",
             order_id=action.order_id,
             reason_code=(
-                release_failure or "exact_pending_cancel_write_gate_blocked"
+                release_failure or refusal_reason
             ),
         )
     if not transition_position_mutation_intent(
@@ -952,21 +985,80 @@ def apply_reviewed_pending_entry_cancel_plan(
         token=authority_token,
         owner_kind="reviewed_pending_entry_cancel",
         expected_generation=authority_generation,
-        marked_at=observed_at,
+        marked_at=current_time(),
     )
     if not boundary.marked:
+        boundary_reason = (
+            boundary.reason_code or "write_boundary_persistence_unknown"
+        )
         _block_cancel_unknown(
             session_factory,
             guard=guard,
             authority_token=authority_token,
             authority_generation=authority_generation,
-            reason_code="write_boundary_persistence_unknown",
+            reason_code=boundary_reason,
             observed_at=observed_at,
         )
         return ReviewedPendingEntryCancelResult(
             status="blocked",
             order_id=action.order_id,
-            reason_code="write_boundary_persistence_unknown",
+            reason_code=boundary_reason,
+        )
+
+    # These are deliberately the final checks before entering the transport.
+    # All durable pre-write state is already present, so stale evidence or an
+    # expired manifest still has exact proof of zero exchange writes.
+    pre_transport_at = current_time()
+    refusal_reason: str | None = None
+    try:
+        if fresh.evidence_observed_at is None:
+            raise DeepcoinMaintenanceEvidenceRefused("evidence_stale")
+        require_fresh_deepcoin_maintenance_observed_at(
+            fresh.evidence_observed_at,
+            now=pre_transport_at,
+        )
+    except DeepcoinMaintenanceEvidenceRefused:
+        refusal_reason = "maintenance_evidence_stale"
+    if refusal_reason is None and pre_transport_at >= authorization_deadline:
+        refusal_reason = "maintenance_authorization_expired"
+    if refusal_reason is not None:
+        refusal_recorded = _record_pending_cancel_prewrite_refusal(
+            session_factory,
+            intent_id=intent_id,
+            expected_statuses={"submitting"},
+            reason_code=refusal_reason,
+            refused_at=observed_at,
+        )
+        if not refusal_recorded:
+            _block_cancel_unknown(
+                session_factory,
+                guard=guard,
+                authority_token=authority_token,
+                authority_generation=authority_generation,
+                reason_code="prewrite_refusal_persistence_unknown",
+                observed_at=observed_at,
+            )
+            return ReviewedPendingEntryCancelResult(
+                status="blocked",
+                order_id=action.order_id,
+                reason_code="prewrite_refusal_persistence_unknown",
+            )
+        release_failure = _release_pending_cancel_authority_before_write(
+            session_factory,
+            authority_token=authority_token,
+            authority_generation=authority_generation,
+            released_at=current_time(),
+        )
+        if release_failure is None:
+            _restore_guard_before_write(guard=guard, receipt=receipt)
+        else:
+            guard.block(reason_code="entry_drain_prewrite_release_failed")
+        return ReviewedPendingEntryCancelResult(
+            status="blocked",
+            order_id=action.order_id,
+            reason_code=(
+                release_failure or refusal_reason
+            ),
         )
 
     try:
@@ -1072,11 +1164,11 @@ def apply_reviewed_pending_entry_cancel_plan(
             ),
             target_order_id=action.order_id,
             expected_target_pending_count=0,
-            observed_at=observed_at,
+            observed_at=observed_at if now is not None else None,
         )
         require_fresh_deepcoin_maintenance_evidence(
             post_evidence,
-            now=observed_at,
+            now=observed_at if now is not None else datetime.now(UTC),
         )
         snapshots = _snapshots_from_evidence(
             post_evidence,
@@ -1208,7 +1300,7 @@ def apply_reviewed_pending_entry_cancel_plan(
         session_factory,
         token=authority_token,
         owner_kind="reviewed_pending_entry_cancel",
-        released_at=observed_at,
+        released_at=current_time(),
         expected_generation=authority_generation,
     )
     if not released.released:
@@ -1328,7 +1420,12 @@ def is_valid_reviewed_pending_entry_prewrite_refusal(
         and 1 <= len(request["instId"]) <= 64
         and row.request_fingerprint == _fingerprint(request)
         and response == {"submitted": False}
-        and error == {"reason": "exact_pending_cancel_write_gate_blocked"}
+        and error
+        in (
+            {"reason": "exact_pending_cancel_write_gate_blocked"},
+            {"reason": "maintenance_authorization_expired"},
+            {"reason": "maintenance_evidence_stale"},
+        )
     )
 
 
@@ -2196,6 +2293,12 @@ def _fingerprint(value: Any) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+def _timestamp(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("maintenance authorization timestamp is invalid")
+    return value.astimezone(UTC)
+
+
 def _plan(
     created_at: datetime,
     actions: Iterable[ReviewedPendingEntryCancelAction],
@@ -2204,6 +2307,7 @@ def _plan(
     completed_order_ids: Iterable[str] = (),
     expected_generation: int | None = None,
     evidence_fingerprint: str = "",
+    evidence_observed_at: datetime | None = None,
     pending_fingerprints: Iterable[tuple[str, str]] = (),
 ) -> ReviewedPendingEntryCancelPlan:
     ordered_actions = tuple(sorted(actions, key=lambda item: item.order_id))
@@ -2234,4 +2338,5 @@ def _plan(
         evidence_fingerprint=evidence_fingerprint,
         pending_fingerprints=pending,
         fingerprint=_fingerprint(material),
+        evidence_observed_at=evidence_observed_at,
     )

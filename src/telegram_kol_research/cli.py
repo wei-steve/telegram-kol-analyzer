@@ -58,6 +58,16 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
     load_deepcoin_contract_spec_snapshot,
 )
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_maintenance_actions import (
+    SingleOrderDrainRequest,
+    run_entry_authority_seed,
+    run_single_order_drain,
+)
+from telegram_kol_research.deepcoin_maintenance_manifest import (
+    MaintenanceAction,
+    ManifestRefused,
+    load_maintenance_manifest,
+)
 from telegram_kol_research.deepcoin_order_builder import (
     deepcoin_order_draft_fingerprint,
 )
@@ -107,8 +117,20 @@ from telegram_kol_research.legacy_conditional_cancel import (
 )
 from telegram_kol_research.reviewed_pending_entry_cancel import (
     REVIEWED_PENDING_ENTRY_TARGETS,
-    apply_reviewed_pending_entry_cancel_plan,
     build_reviewed_pending_entry_cancel_plan,
+)
+from telegram_kol_research.entry_authority_seed import (
+    SeedPlanRefused,
+    build_entry_authority_seed_plan,
+)
+from telegram_kol_research.maintenance_runtime_guard import (
+    GuardError,
+    MaintenanceRuntimeGuard,
+    SystemdMaintenanceRuntimeAdapter,
+)
+from telegram_kol_research.scoped_release_activation import (
+    ActivationError,
+    validate_release,
 )
 from telegram_kol_research.legacy_runtime_drain_bridge import (
     build_legacy_runtime_drain_bridge_plan,
@@ -5132,6 +5154,10 @@ def bridge_reviewed_pending_entries(
     }
     if action not in allowed_actions:
         raise typer.BadParameter("unknown bridge action")
+    if action != "plan":
+        raise typer.BadParameter(
+            "legacy bridge mutation is retired; use an action-specific command"
+        )
     if action == "handoff":
         missing = []
         if not expected_candidate_sha:
@@ -5347,82 +5373,325 @@ def cancel_reviewed_pending_entries(
         None, "--confirmation-token"
     ),
 ) -> None:
-    """Plan or cancel one exact reviewed pending Deepcoin entry."""
+    """Retired bridge-backed surface; use the strict drain-one command."""
 
-    bridge_identity = None
-    bridge_identity_reader = None
-    if bridge_token:
-        if not expected_production_sha:
-            raise typer.BadParameter(
-                "--bridge-token requires --expected-production-sha"
-            )
-        def bridge_identity_reader():
-            return read_local_legacy_worker_identity(
-                checkout_path=checkout_path,
-                expected_production_sha=expected_production_sha,
-                service_name=service_name,
-            )
+    _ = (
+        database_path,
+        checkout_path,
+        expected_production_sha,
+        service_name,
+        bridge_token,
+        order_id,
+        action_id,
+        apply,
+        expected_fingerprint,
+        confirmation_token,
+    )
+    raise typer.BadParameter("command retired; use drain-one")
 
-        bridge_identity = bridge_identity_reader()
-    elif expected_production_sha:
-        raise typer.BadParameter(
-            "--expected-production-sha requires --bridge-token"
+
+def _load_deepcoin_action_manifest(
+    manifest_path: Path,
+    *,
+    action: MaintenanceAction,
+    now: datetime,
+):
+    try:
+        return load_maintenance_manifest(
+            manifest_path,
+            expected_action=action,
+            expected_uid=0,
+            now=now,
         )
-    session_factory = create_existing_session_factory(database_path)
+    except ManifestRefused as exc:
+        raise typer.BadParameter(str(exc)) from exc
+
+
+def _require_deepcoin_apply_authorization(
+    manifest,
+    *,
+    expected_manifest_sha256: str | None,
+    expected_fingerprint: str | None,
+) -> None:
+    if not expected_manifest_sha256 or not expected_fingerprint:
+        raise typer.BadParameter(
+            "--apply requires --expected-manifest-sha256 and "
+            "--expected-fingerprint"
+        )
+    if expected_manifest_sha256 != manifest.file_sha256:
+        raise typer.BadParameter("maintenance manifest hash mismatch")
+    if expected_fingerprint != manifest.expected_fingerprint:
+        raise typer.BadParameter("maintenance expected fingerprint mismatch")
+
+
+def _new_deepcoin_maintenance_guard() -> MaintenanceRuntimeGuard:
+    return MaintenanceRuntimeGuard(runtime=SystemdMaintenanceRuntimeAdapter())
+
+
+def _require_loaded_immutable_maintenance_release(manifest) -> None:
+    try:
+        release = validate_release(
+            Path("/opt/telegram-kol-releases"),
+            manifest.candidate_commit,
+            expected_uid=0,
+        )
+        Path(__file__).resolve().relative_to(release.release_path)
+    except (ActivationError, OSError, ValueError) as exc:
+        raise typer.BadParameter(
+            "maintenance command is not loaded from the authorized release"
+        ) from exc
+    if release.manifest_sha256 != manifest.release_manifest_sha256:
+        raise typer.BadParameter(
+            "maintenance release manifest hash mismatch"
+        )
+
+
+@app.command("seed-entry-authority")
+def seed_entry_authority_command(
+    manifest_path: Path = typer.Option(..., "--manifest-path"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_manifest_sha256: str | None = typer.Option(
+        None, "--expected-manifest-sha256"
+    ),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+) -> None:
+    """Plan or apply the separately authorized one-row L3 seed."""
+
+    observed_at = datetime.now(UTC)
+    manifest = _load_deepcoin_action_manifest(
+        manifest_path,
+        action=MaintenanceAction.SEED_ENTRY_AUTHORITY,
+        now=observed_at,
+    )
+    try:
+        plan = build_entry_authority_seed_plan(
+            manifest.database_path,
+            now=manifest.issued_at,
+        )
+    except (OSError, SeedPlanRefused) as exc:
+        typer.echo(
+            json.dumps(
+                {
+                    "action_id": manifest.action_id,
+                    "manifest_sha256": manifest.file_sha256,
+                    "mode": "apply" if apply else "dry_run",
+                    "reason_code": "entry_authority_seed_plan_refused",
+                    "status": "blocked",
+                },
+                sort_keys=True,
+            )
+        )
+        raise typer.Exit(code=2) from exc
+    payload = {
+        "action_id": manifest.action_id,
+        "expires_at": manifest.expires_at.isoformat(),
+        "manifest_sha256": manifest.file_sha256,
+        "mode": "apply" if apply else "dry_run",
+        "plan_sha256": plan.fingerprint,
+        "status": "ready",
+    }
+    typer.echo(json.dumps(payload, sort_keys=True))
+    if not apply:
+        return
+    _require_deepcoin_apply_authorization(
+        manifest,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_fingerprint=expected_fingerprint,
+    )
+    if plan.fingerprint != manifest.expected_fingerprint:
+        raise typer.BadParameter("entry authority seed plan drift")
+    if manifest.backup_path != plan.backup_path:
+        raise typer.BadParameter("entry authority seed backup path mismatch")
+    _require_loaded_immutable_maintenance_release(manifest)
+    try:
+        with _new_deepcoin_maintenance_guard() as guard:
+            result = run_entry_authority_seed(
+                action_id=manifest.action_id,
+                database_path=manifest.database_path,
+                backup_path=manifest.backup_path,
+                expected_fingerprint=plan.fingerprint,
+                guard=guard,
+                now=manifest.issued_at,
+                authorization_expires_at=manifest.expires_at,
+            )
+    except (GuardError, SeedPlanRefused, RuntimeError) as exc:
+        raise typer.BadParameter("entry authority seed blocked") from exc
+    typer.echo(
+        json.dumps(
+            {
+                "action_id": manifest.action_id,
+                "plan_sha256": result.plan_fingerprint,
+                "reason_code": result.reason_code,
+                "status": result.status,
+            },
+            sort_keys=True,
+        )
+    )
+
+
+@app.command("drain-one")
+def drain_one_command(
+    manifest_path: Path = typer.Option(..., "--manifest-path"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_manifest_sha256: str | None = typer.Option(
+        None, "--expected-manifest-sha256"
+    ),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+    confirmation_token: str | None = typer.Option(
+        None, "--confirmation-token"
+    ),
+) -> None:
+    """Plan or cancel exactly one canonical pending Deepcoin entry."""
+
+    observed_at = datetime.now(UTC)
+    manifest = _load_deepcoin_action_manifest(
+        manifest_path,
+        action=MaintenanceAction.DRAIN_ONE,
+        now=observed_at,
+    )
+    session_factory = create_existing_session_factory(manifest.database_path)
     client = build_deepcoin_client_from_env()
     plan = build_reviewed_pending_entry_cancel_plan(
         session_factory,
         deepcoin_client=client,
         targets=REVIEWED_PENDING_ENTRY_TARGETS,
-        legacy_runtime_identity=bridge_identity,
-        now=datetime.now(UTC),
+        order_id=manifest.target_order_id,
+    )
+    actions = tuple(
+        action
+        for action in plan.actions
+        if action.order_id == manifest.target_order_id
+    )
+    action_id = actions[0].action_id if len(actions) == 1 else None
+    typer.echo(
+        json.dumps(
+            {
+                "action_id": action_id,
+                "evidence_sha256": plan.evidence_fingerprint,
+                "expires_at": manifest.expires_at.isoformat(),
+                "generation": plan.expected_generation,
+                "manifest_sha256": manifest.file_sha256,
+                "mode": "apply" if apply else "dry_run",
+                "plan_sha256": plan.fingerprint,
+                "reason_code": (
+                    plan.conflicts[0]["reason"] if plan.conflicts else None
+                ),
+                "status": "ready" if len(actions) == 1 else "blocked",
+                "target_suffix": str(manifest.target_order_id)[-6:],
+            },
+            sort_keys=True,
+        )
+    )
+    if len(actions) != 1 or plan.conflicts:
+        raise typer.Exit(code=2)
+    if not apply:
+        return
+    _require_deepcoin_apply_authorization(
+        manifest,
+        expected_manifest_sha256=expected_manifest_sha256,
+        expected_fingerprint=expected_fingerprint,
+    )
+    if not confirmation_token:
+        raise typer.BadParameter("--apply requires --confirmation-token")
+    if (
+        manifest.action_id != action_id
+        or manifest.expected_fingerprint != plan.fingerprint
+        or manifest.evidence_sha256 != plan.evidence_fingerprint
+    ):
+        raise typer.BadParameter("drain authorization does not match fresh plan")
+    _require_loaded_immutable_maintenance_release(manifest)
+    request = SingleOrderDrainRequest(
+        action_id=action_id,
+        order_id=manifest.target_order_id,
+        plan_sha256=plan.fingerprint,
+        evidence_sha256=plan.evidence_fingerprint,
+        confirmation_token=confirmation_token,
+    )
+    try:
+        with _new_deepcoin_maintenance_guard() as guard:
+            result = run_single_order_drain(
+                session_factory=session_factory,
+                plan=plan,
+                request=request,
+                deepcoin_client=client,
+                targets=REVIEWED_PENDING_ENTRY_TARGETS,
+                guard=guard,
+                authorization_expires_at=manifest.expires_at,
+            )
+    except (GuardError, RuntimeError, ValueError) as exc:
+        raise typer.BadParameter("single-order drain blocked") from exc
+    typer.echo(
+        json.dumps(
+            {
+                "action_id": action_id,
+                "reason_code": result.reason_code,
+                "status": result.status,
+                "target_suffix": str(result.order_id)[-6:],
+            },
+            sort_keys=True,
+        )
+    )
+    if result.status != "cancelled":
+        raise typer.Exit(code=2)
+
+
+@app.command("bootstrap-control")
+def bootstrap_control_command(
+    manifest_path: Path = typer.Option(..., "--manifest-path"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_manifest_sha256: str | None = typer.Option(
+        None, "--expected-manifest-sha256"
+    ),
+    expected_fingerprint: str | None = typer.Option(
+        None, "--expected-fingerprint"
+    ),
+) -> None:
+    """Validate bootstrap authorization; execution is implemented in Task 7."""
+
+    observed_at = datetime.now(UTC)
+    manifest = _load_deepcoin_action_manifest(
+        manifest_path,
+        action=MaintenanceAction.BOOTSTRAP_CONTROL,
+        now=observed_at,
     )
     typer.echo(
         json.dumps(
             {
+                "action_id": manifest.action_id,
+                "expires_at": manifest.expires_at.isoformat(),
+                "manifest_sha256": manifest.file_sha256,
                 "mode": "apply" if apply else "dry_run",
-                "database_path": str(database_path),
-                "plan": asdict(plan),
+                "release_manifest_sha256": (
+                    manifest.release_manifest_sha256
+                ),
+                "status": "authorization_valid",
             },
-            ensure_ascii=True,
-            indent=2,
-            default=str,
+            sort_keys=True,
         )
     )
-    if plan.conflicts:
-        raise typer.Exit(code=2)
     if not apply:
         return
-    clean_order_id = str(order_id or "").strip()
-    if (
-        not clean_order_id
-        or not action_id
-        or not expected_fingerprint
-        or not confirmation_token
-    ):
-        raise typer.BadParameter(
-            "--apply requires --order-id, --action-id, "
-            "--expected-fingerprint, and --confirmation-token"
-        )
-    result = apply_reviewed_pending_entry_cancel_plan(
-        session_factory,
-        plan,
-        deepcoin_client=client,
-        targets=REVIEWED_PENDING_ENTRY_TARGETS,
-        order_id=clean_order_id,
-        action_id=action_id,
+    _require_deepcoin_apply_authorization(
+        manifest,
+        expected_manifest_sha256=expected_manifest_sha256,
         expected_fingerprint=expected_fingerprint,
-        confirmation_token=confirmation_token,
-        legacy_bridge_token=bridge_token,
-        legacy_runtime_identity=bridge_identity,
-        legacy_runtime_identity_reader=bridge_identity_reader,
-        now=datetime.now(UTC),
     )
+    _require_loaded_immutable_maintenance_release(manifest)
     typer.echo(
-        json.dumps(asdict(result), ensure_ascii=True, sort_keys=True)
+        json.dumps(
+            {
+                "action_id": manifest.action_id,
+                "reason_code": "bootstrap_implementation_pending",
+                "status": "blocked",
+            },
+            sort_keys=True,
+        )
     )
-    if result.status != "cancelled":
-        raise typer.Exit(code=2)
+    raise typer.Exit(code=2)
 
 
 @app.command("repair-position-management")

@@ -1,3 +1,4 @@
+import typer
 from typer.testing import CliRunner
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
@@ -318,8 +319,7 @@ def test_bridge_mutations_require_confirmation_before_runtime_or_database_access
     )
 
     assert result.exit_code == 2
-    assert "expected-fingerprint" in result.output
-    assert "confirmation-token" in result.output
+    assert "legacy bridge mutation is retired" in result.output + result.stderr
     assert touched == []
 
 
@@ -359,8 +359,7 @@ def test_bridge_handoff_requires_candidate_contract_before_any_access(
     )
 
     assert result.exit_code == 2
-    assert "expected-candidate-sha" in result.output
-    assert "confirmation-token" in result.output
+    assert "legacy bridge mutation is retired" in result.output + result.stderr
     assert touched == []
 
 
@@ -429,20 +428,11 @@ def test_bridge_handoff_cli_reads_exact_candidate_and_redacts_tokens(
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert json.loads(result.output) == {
-        "reason_code": None,
-        "status": "handed_off",
-    }
+    assert result.exit_code == 2
+    assert "legacy bridge mutation is retired" in result.output + result.stderr
     assert "secret-bridge-token" not in result.output
     assert "secret-confirmation-token" not in result.output
-    assert calls[0][0] == "identity"
-    assert calls[0][1]["expected_production_sha"] == candidate_sha
-    assert calls[0][1]["service_name"] == "telegram-kol-worker.service"
-    assert calls[1][0] == "handoff"
-    assert calls[1][1] is session_factory
-    assert calls[1][2]["candidate_runtime_identity"] == candidate
-    assert calls[1][2]["expected_candidate_sha"] == candidate_sha
+    assert calls == []
 
 
 def test_bridge_drain_cli_timestamps_evidence_after_reads_and_transition_after_identity(
@@ -534,12 +524,12 @@ def test_bridge_drain_cli_timestamps_evidence_after_reads_and_transition_after_i
         ],
     )
 
-    assert result.exit_code == 0, result.output
-    assert captured["evidence"].observed_at == evidence_observed_at
-    assert captured["drained_at"] == transition_at
+    assert result.exit_code == 2
+    assert "legacy bridge mutation is retired" in result.output + result.stderr
+    assert captured == {}
 
 
-def test_bridge_freeze_cli_uses_fresh_fingerprint_and_redacts_tokens(
+def test_bridge_freeze_cli_is_retired_and_redacts_tokens(
     tmp_path,
     monkeypatch,
 ):
@@ -598,11 +588,8 @@ def test_bridge_freeze_cli_uses_fresh_fingerprint_and_redacts_tokens(
         ],
     )
 
-    assert frozen.exit_code == 0, frozen.output
-    assert json.loads(frozen.output) == {
-        "reason_code": None,
-        "status": "frozen",
-    }
+    assert frozen.exit_code == 2
+    assert "legacy bridge mutation is retired" in frozen.output + frozen.stderr
     assert "do-not-print-this-token" not in frozen.output
     assert "bridge_token" not in frozen.output
 
@@ -964,6 +951,190 @@ def test_cli_help_renders():
     assert "audit-tpsl-ownership" in result.stdout
     assert "audit-kol-pnl" in result.stdout
     assert "backfill-canonical-tpsl-ledger" in result.stdout
+
+
+def test_deepcoin_maintenance_cli_exposes_only_action_specific_inputs():
+    root = CliRunner().invoke(app, ["--help"])
+    assert root.exit_code == 0
+    for command in ("seed-entry-authority", "drain-one", "bootstrap-control"):
+        assert command in root.stdout
+
+    drain = CliRunner().invoke(app, ["drain-one", "--help"])
+    assert drain.exit_code == 0
+    assert "--manifest-path" in drain.stdout
+    assert "--expected-manifest-sha256" in drain.stdout
+    assert "--expected-fingerprint" in drain.stdout
+    assert "--confirmation-token" in drain.stdout
+    assert "--order-id" not in drain.stdout
+    assert "--all" not in drain.stdout
+
+
+def test_drain_one_dry_run_is_bounded_and_redacted(monkeypatch):
+    from types import SimpleNamespace
+    import telegram_kol_research.cli as cli_module
+
+    target = cli_module.REVIEWED_PENDING_ENTRY_TARGETS[0]
+    manifest = SimpleNamespace(
+        action_id="authorized-action",
+        database_path=Path("/nonsecret/research.db"),
+        evidence_sha256="e" * 64,
+        expected_fingerprint="p" * 64,
+        expires_at=datetime(2026, 8, 28, 13, 10, tzinfo=UTC),
+        file_sha256="m" * 64,
+        target_order_id=target.order_id,
+    )
+    action = SimpleNamespace(
+        action_id="fresh-action",
+        order_id=target.order_id,
+    )
+    plan = SimpleNamespace(
+        actions=(action,),
+        conflicts=(),
+        evidence_fingerprint="e" * 64,
+        expected_generation=8,
+        fingerprint="f" * 64,
+    )
+    plan_calls = []
+    monkeypatch.setattr(
+        cli_module,
+        "_load_deepcoin_action_manifest",
+        lambda *args, **kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_deepcoin_client_from_env",
+        lambda: object(),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "build_reviewed_pending_entry_cancel_plan",
+        lambda *args, **kwargs: plan_calls.append(kwargs) or plan,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        ["drain-one", "--manifest-path", "/root/action.json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    assert payload["target_suffix"] == target.order_id[-6:]
+    assert "database_path" not in payload
+    assert target.order_id not in result.output
+    assert "now" not in plan_calls[0]
+
+
+def test_seed_dry_run_rebuilds_the_exact_manifest_issued_plan(monkeypatch):
+    from types import SimpleNamespace
+    import telegram_kol_research.cli as cli_module
+
+    issued_at = datetime(2026, 8, 28, 13, 0, tzinfo=UTC)
+    manifest = SimpleNamespace(
+        action_id="seed-001",
+        database_path=Path("/nonsecret/research.db"),
+        expires_at=issued_at + timedelta(minutes=10),
+        file_sha256="a" * 64,
+        issued_at=issued_at,
+    )
+    captured = {}
+    monkeypatch.setattr(
+        cli_module,
+        "_load_deepcoin_action_manifest",
+        lambda *args, **kwargs: manifest,
+    )
+
+    def build(path, *, now):
+        captured.update(path=path, now=now)
+        return SimpleNamespace(fingerprint="f" * 64)
+
+    monkeypatch.setattr(cli_module, "build_entry_authority_seed_plan", build)
+
+    result = CliRunner().invoke(
+        app,
+        ["seed-entry-authority", "--manifest-path", "/root/action.json"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert captured == {"path": manifest.database_path, "now": issued_at}
+
+
+def test_bootstrap_control_apply_fails_closed_until_task7(monkeypatch):
+    from types import SimpleNamespace
+    import telegram_kol_research.cli as cli_module
+
+    manifest = SimpleNamespace(
+        action_id="bootstrap-001",
+        expected_fingerprint="f" * 64,
+        expires_at=datetime(2026, 8, 28, 13, 10, tzinfo=UTC),
+        file_sha256="a" * 64,
+        release_manifest_sha256="b" * 64,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_load_deepcoin_action_manifest",
+        lambda *args, **kwargs: manifest,
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_require_loaded_immutable_maintenance_release",
+        lambda manifest: None,
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "bootstrap-control",
+            "--manifest-path",
+            "/root/action.json",
+            "--apply",
+            "--expected-manifest-sha256",
+            "a" * 64,
+            "--expected-fingerprint",
+            "f" * 64,
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "bootstrap_implementation_pending" in result.output
+
+
+def test_maintenance_release_identity_binds_commit_manifest_and_loaded_code(
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    captured = {}
+    release_path = Path(cli_module.__file__).resolve().parents[2]
+
+    def validate(root, commit, *, expected_uid):
+        captured.update(root=root, commit=commit, expected_uid=expected_uid)
+        return SimpleNamespace(
+            release_path=release_path,
+            manifest_sha256="b" * 64,
+        )
+
+    monkeypatch.setattr(cli_module, "validate_release", validate)
+    manifest = SimpleNamespace(
+        candidate_commit="a" * 40,
+        release_manifest_sha256="c" * 64,
+    )
+
+    with pytest.raises(typer.BadParameter, match="manifest hash mismatch"):
+        cli_module._require_loaded_immutable_maintenance_release(manifest)
+
+    manifest.release_manifest_sha256 = "b" * 64
+    cli_module._require_loaded_immutable_maintenance_release(manifest)
+    assert captured == {
+        "root": Path("/opt/telegram-kol-releases"),
+        "commit": "a" * 40,
+        "expected_uid": 0,
+    }
 
 
 def test_take_profit_protection_leg_repair_help_exposes_review_gates():

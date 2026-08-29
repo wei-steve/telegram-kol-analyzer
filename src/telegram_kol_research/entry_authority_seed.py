@@ -11,7 +11,7 @@ from pathlib import Path
 import re
 import sqlite3
 import stat
-from typing import Literal, Protocol
+from typing import Callable, Literal, Protocol
 
 from telegram_kol_research.entry_revision_exchange_authority import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
@@ -117,6 +117,8 @@ def apply_entry_authority_seed_plan(
     expected_fingerprint: str,
     guard: SeedGuard,
     now: datetime,
+    authorization_expires_at: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> SeedResult:
     """Back up, seed exactly one row, and restore on known postcheck failure."""
 
@@ -143,12 +145,20 @@ def apply_entry_authority_seed_plan(
 
         # A RESERVED writer lock blocks every competing writer. The backup uses
         # a separate read connection, so it captures the exact locked preimage.
+        _require_live_authorization(
+            authorization_expires_at,
+            clock=clock,
+        )
         _sqlite_backup(resolved_database, resolved_backup)
         backup_snapshot = _inspect_database(resolved_backup)
         if not _backup_matches_preimage(backup_snapshot, locked_snapshot):
             connection.rollback()
             raise SeedPlanRefused("entry_authority_seed_backup_verification_failed")
 
+        _require_live_authorization(
+            authorization_expires_at,
+            clock=clock,
+        )
         connection.execute(
             "INSERT INTO trading_settings (key, value_json, updated_at) "
             "VALUES (?, ?, ?)",
@@ -424,6 +434,21 @@ def _planned_backup_path(database_path: Path, observed_at: datetime) -> Path:
     return database_path.with_name(
         f"{database_path.name}.entry-authority-seed-{stamp}.backup.sqlite3"
     )
+
+
+def _require_live_authorization(
+    expires_at: datetime | None,
+    *,
+    clock: Callable[[], datetime] | None,
+) -> None:
+    if expires_at is None:
+        return
+    deadline = _timestamp(expires_at)
+    observed_at = _timestamp(
+        (clock or (lambda: datetime.now(UTC)))()
+    )
+    if observed_at >= deadline:
+        raise SeedPlanRefused("maintenance_authorization_expired")
 
 
 def _require_unused_backup_destination(backup_path: Path) -> None:

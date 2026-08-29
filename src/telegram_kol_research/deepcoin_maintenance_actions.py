@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 import re
-from typing import Iterable, Protocol
+from typing import Callable, Iterable, Protocol
 
 from telegram_kol_research.entry_authority_seed import (
     SeedPlanRefused,
@@ -81,18 +81,26 @@ def run_entry_authority_seed(
     expected_fingerprint: str,
     guard: SeedActionGuard,
     now: datetime,
+    authorization_expires_at: datetime | None = None,
+    clock: Callable[[], datetime] | None = None,
 ) -> SeedResult:
     """Coordinate persistent inhibition around one exact L3 seed plan."""
 
     receipt = guard.enter(action_id=action_id)
     try:
         guard.prove_quiescent()
+        if authorization_expires_at is not None and _observed_now(clock) >= (
+            _aware_timestamp(authorization_expires_at)
+        ):
+            raise SeedPlanRefused("maintenance_authorization_expired")
         result = apply_entry_authority_seed_plan(
             database_path,
             backup_path=backup_path,
             expected_fingerprint=expected_fingerprint,
             guard=guard,
             now=now,
+            authorization_expires_at=authorization_expires_at,
+            clock=clock,
         )
     except SeedPlanRefused:
         _restore_seed_guard(guard=guard, receipt=receipt)
@@ -117,7 +125,8 @@ def run_single_order_drain(
     deepcoin_client,
     targets: Iterable[ReviewedPendingEntryTarget],
     guard: DrainGuard,
-    now: datetime,
+    authorization_expires_at: datetime,
+    now: datetime | None = None,
 ) -> ReviewedPendingEntryCancelResult:
     """Dispatch one already planned exact drain; never iterate over targets."""
 
@@ -144,6 +153,7 @@ def run_single_order_drain(
         expected_evidence_fingerprint=request.evidence_sha256,
         confirmation_token=request.confirmation_token,
         guard=guard,
+        authorization_expires_at=authorization_expires_at,
         now=now,
     )
 
@@ -159,6 +169,12 @@ def _restore_seed_guard(
         )
         guard.restore(expected_fingerprint=safe_receipt.fingerprint)
     except Exception as exc:
+        reason = str(exc)
+        if reason in {
+            "maintenance_restore_failed",
+            "maintenance_restore_compensation_failed",
+        }:
+            raise MaintenanceBlocked(reason) from exc
         try:
             guard.block(reason_code="entry_authority_seed_runtime_restore_failed")
         except Exception:
@@ -166,3 +182,13 @@ def _restore_seed_guard(
         raise MaintenanceBlocked(
             "entry_authority_seed_runtime_restore_failed"
         ) from exc
+
+
+def _observed_now(clock: Callable[[], datetime] | None) -> datetime:
+    return _aware_timestamp((clock or (lambda: datetime.now(UTC)))())
+
+
+def _aware_timestamp(value: datetime) -> datetime:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        raise ValueError("maintenance authorization timestamp is invalid")
+    return value.astimezone(UTC)
