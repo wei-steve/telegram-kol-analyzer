@@ -64,29 +64,29 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
     assert "WorkingDirectory=/var/lib/telegram-kol-monitor" in service
     assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in service
     assert (
-        "ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
-        "monitor-production-safety "
-        "--expected-head ${TELEGRAM_KOL_MONITOR_EXPECTED_HEAD} "
-        "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION} "
-        "--expected-management-mode live "
-        "--expected-entry-preamble-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE} "
-        "--expected-entry-message-assembly-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE} "
-        "--expected-entry-revision-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE} "
-        "--expected-max-concurrent-positions 4 "
-        "--checkout-path /opt/telegram-kol-analyzer "
-        "--settings-url http://127.0.0.1:8000/api/trading-settings "
-        "--web-loop-health-url http://127.0.0.1:8000/api/runtime/loop-health "
-        "--ingest-loop-health-url http://127.0.0.1:8001/api/runtime/loop-health "
-        "--worker-loop-health-url http://127.0.0.1:8002/api/runtime/loop-health "
-        "--message-operation-coverage-url http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage "
-        "--live-position-sizes-url http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes "
-        "--contract-spec-health-url http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health "
-        "--database-path /opt/telegram-kol-analyzer/data/research.db "
-        "--state-path /var/lib/telegram-kol-monitor/state.json "
-        "--lookback-minutes 35 "
-        "--runtime-incident-capture-url http://127.0.0.1:8002/api/runtime-incidents/monitor-capture "
-        "--notify"
+        "ExecStart=/usr/bin/env "
+        "PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src"
     ) in normalized
+    assert (
+        "--expected-release-commit ${TELEGRAM_KOL_MONITOR_RELEASE_COMMIT}"
+    ) in normalized
+    assert "--release-path ${TELEGRAM_KOL_MONITOR_RELEASE_PATH}" in normalized
+    assert "--expected-head" not in normalized
+    assert "--checkout-path" not in normalized
+
+
+def test_monitor_install_and_service_bind_to_explicit_immutable_release():
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    service = SERVICE_PATH.read_text(encoding="utf-8")
+
+    assert "--release-path" in installer
+    assert "--release-commit" in installer
+    assert "--release-manifest-sha256" in installer
+    assert "git -C" not in installer
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in service
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" in service
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" in service
+    assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" not in service
 
 
 def test_monitor_service_drops_all_capabilities_and_denies_system_bus():
@@ -97,7 +97,7 @@ def test_monitor_service_drops_all_capabilities_and_denies_system_bus():
     assert "AmbientCapabilities=" in directives
     assert "NoNewPrivileges=true" in directives
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in directives
-    assert "InaccessiblePaths=-/run/dbus/system_bus_socket -/run/systemd/private" in directives
+    assert "InaccessiblePaths=-/run/dbus/system_bus_socket" in directives
     assert "SystemCallFilter=@system-service" in directives
     assert "SystemCallFilter=~@mount @privileged" in directives
     assert "RestrictNamespaces=true" in directives
@@ -228,7 +228,7 @@ def test_monitor_service_exposes_only_required_read_only_inputs_and_state():
     assert "TemporaryFileSystem=/opt/telegram-kol-analyzer:ro" in directives
     assert "BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv" in directives
     assert "BindReadOnlyPaths=/opt/telegram-kol-analyzer/src" in directives
-    assert "BindReadOnlyPaths=/opt/telegram-kol-analyzer/.git" in directives
+    assert "BindReadOnlyPaths=/opt/telegram-kol-analyzer/.git" not in directives
     assert "BindReadOnlyPaths=/opt/telegram-kol-analyzer/data/research.db" in directives
     assert "BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-wal" in directives
     assert "BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-shm" in directives
@@ -251,16 +251,14 @@ def test_monitor_timer_is_true_persistent_thirty_minute_calendar_timer():
     assert "Unit=telegram-kol-monitor.service" in timer
 
 
-def test_installer_validates_fixed_production_checkout_before_freezing_head():
+def test_installer_validates_explicit_immutable_release_without_checkout_head():
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
 
     assert 'PRODUCTION_ROOT="/opt/telegram-kol-analyzer"' in installer
-    assert 'if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then' in installer
-    assert 'git -C "$PRODUCTION_ROOT" rev-parse --show-toplevel' in installer
-    assert 'expected_head="$(git -C "$PRODUCTION_ROOT" rev-parse --verify HEAD)"' in installer
-    assert installer.index('if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then') < installer.index(
-        'expected_head="$(git -C "$PRODUCTION_ROOT" rev-parse --verify HEAD)"'
-    )
+    assert 'RELEASE_ROOT="/opt/telegram-kol-releases"' in installer
+    assert 'resolved_release_path="$(readlink -f -- "$release_path")"' in installer
+    assert 'sha256sum "$release_manifest"' in installer
+    assert "git -C" not in installer
 
 
 def test_installer_fails_closed_on_running_or_enabled_install_only_before_changes():
@@ -305,7 +303,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert 'RUNTIME_POLICY_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"' in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
-    assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" in installer
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in installer
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" in installer
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE" in installer
@@ -336,7 +336,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert env_block.strip() == """trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_PATH=%s\\n' "$resolved_release_path" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=%s\\n' "$release_commit" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=%s\\n' "$release_manifest_sha256" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"

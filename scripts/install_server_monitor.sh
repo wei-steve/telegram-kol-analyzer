@@ -12,6 +12,9 @@ expected_auto_trade_option=""
 expected_entry_preamble_mode=""
 expected_entry_message_assembly_v2_mode=""
 expected_entry_revision_v2_mode=""
+release_path=""
+release_commit=""
+release_manifest_sha256=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     --enable)
@@ -44,8 +47,23 @@ while [[ "$#" -gt 0 ]]; do
       expected_entry_revision_v2_mode="$2"
       shift 2
       ;;
+    --release-path)
+      [[ "$#" -ge 2 ]] || exit 2
+      release_path="$2"
+      shift 2
+      ;;
+    --release-commit)
+      [[ "$#" -ge 2 && "$2" =~ ^[0-9a-f]{40}$ ]] || exit 2
+      release_commit="$2"
+      shift 2
+      ;;
+    --release-manifest-sha256)
+      [[ "$#" -ge 2 && "$2" =~ ^[0-9a-f]{64}$ ]] || exit 2
+      release_manifest_sha256="$2"
+      shift 2
+      ;;
     *)
-      echo "Usage: $0 [--enable] --expected-auto-trade-state enabled|disabled [--expected-entry-preamble-mode disabled|shadow|live]" >&2
+      echo "Usage: $0 --release-path PATH --release-commit SHA --release-manifest-sha256 SHA256 [--enable] --expected-auto-trade-state enabled|disabled" >&2
       exit 2
       ;;
   esac
@@ -67,15 +85,19 @@ if [[ -z "$expected_entry_message_assembly_v2_mode" || -z "$expected_entry_revis
   echo "Both adjacent-entry v2 expected modes are required." >&2
   exit 2
 fi
+if [[ -z "$release_path" || -z "$release_commit" || -z "$release_manifest_sha256" ]]; then
+  echo "Immutable release path, commit, and manifest hash are required." >&2
+  exit 2
+fi
 
 PRODUCTION_ROOT="/opt/telegram-kol-analyzer"
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+RELEASE_ROOT="/opt/telegram-kol-releases"
 MONITOR_USER="telegram-kol-monitor"
 MONITOR_GROUP="telegram-kol-monitor"
-SERVICE_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.service"
-TIMER_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor.timer"
-TEST_NOTIFICATION_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor-test-notification.service"
-DIAGNOSTIC_SOURCE="$PRODUCTION_ROOT/deploy/systemd/telegram-kol-monitor-diagnostic.service"
+SERVICE_SOURCE="$release_path/deploy/systemd/telegram-kol-monitor.service"
+TIMER_SOURCE="$release_path/deploy/systemd/telegram-kol-monitor.timer"
+TEST_NOTIFICATION_SOURCE="$release_path/deploy/systemd/telegram-kol-monitor-test-notification.service"
+DIAGNOSTIC_SOURCE="$release_path/deploy/systemd/telegram-kol-monitor-diagnostic.service"
 SERVICE_DEST="/etc/systemd/system/telegram-kol-monitor.service"
 TIMER_DEST="/etc/systemd/system/telegram-kol-monitor.timer"
 TEST_NOTIFICATION_DEST="/etc/systemd/system/telegram-kol-monitor-test-notification.service"
@@ -86,20 +108,43 @@ ENV_FILE="/etc/telegram-kol-monitor.env"
 STATE_DIRECTORY="/var/lib/telegram-kol-monitor"
 STATE_FILE="$STATE_DIRECTORY/state.json"
 
-if [[ "$PROJECT_ROOT" != "$PRODUCTION_ROOT" ]]; then
-  echo "Run this installer only from the fixed production checkout $PRODUCTION_ROOT." >&2
+resolved_release_path="$(readlink -f -- "$release_path")"
+if [[ "$resolved_release_path" != "$RELEASE_ROOT/$release_commit" ]]; then
+  echo "Release path must be the exact immutable commit directory." >&2
   exit 1
 fi
-git_root="$(git -C "$PRODUCTION_ROOT" rev-parse --show-toplevel)"
-if [[ "$(cd "$git_root" && pwd -P)" != "$PRODUCTION_ROOT" ]]; then
-  echo "The production path is not the validated Git checkout root." >&2
+release_manifest="$resolved_release_path/.telegram-kol-release.json"
+if [[ ! -f "$release_manifest" || -L "$release_manifest" ]]; then
+  echo "Immutable release manifest is missing or unsafe." >&2
   exit 1
 fi
-expected_head="$(git -C "$PRODUCTION_ROOT" rev-parse --verify HEAD)"
-if [[ ! "$expected_head" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "Unable to capture a valid reviewed Git HEAD." >&2
+if [[ "$(stat -c %u "$resolved_release_path")" != "0" || "$(stat -c %a "$resolved_release_path")" != "555" ]]; then
+  echo "Immutable release directory must be root-owned and mode 0555." >&2
   exit 1
 fi
+if [[ "$(stat -c %u "$release_manifest")" != "0" || "$(stat -c %a "$release_manifest")" != "444" ]]; then
+  echo "Immutable release manifest must be root-owned and mode 0444." >&2
+  exit 1
+fi
+observed_manifest_sha256="$(sha256sum "$release_manifest" | awk '{print $1}')"
+if [[ "$observed_manifest_sha256" != "$release_manifest_sha256" ]]; then
+  echo "Immutable release manifest hash does not match authorization." >&2
+  exit 1
+fi
+python3 - "$release_manifest" "$release_commit" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], "r", encoding="utf-8") as stream:
+    payload = json.load(stream)
+if (
+    not isinstance(payload, dict)
+    or payload.get("contract") != "immutable-release-v1"
+    or payload.get("schema_version") != 1
+    or payload.get("commit") != sys.argv[2]
+):
+    raise SystemExit("Immutable release manifest content is invalid.")
+PY
 
 timer_active_status=0
 systemctl is-active --quiet telegram-kol-monitor.timer || timer_active_status=$?
@@ -310,7 +355,9 @@ env_source="$(mktemp)"
 trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_EXPECTED_HEAD=%s\n' "$expected_head" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_PATH=%s\n' "$resolved_release_path" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=%s\n' "$release_commit" >> "$env_source"
+printf 'TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=%s\n' "$release_manifest_sha256" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
@@ -329,7 +376,7 @@ if [[ "$enable_timer" == true ]]; then
   systemctl enable --now telegram-kol-monitor.timer
 fi
 
-echo "Installed telegram-kol-monitor for expected HEAD $expected_head."
+echo "Installed telegram-kol-monitor for immutable release $release_commit."
 if [[ "$enable_timer" == false ]]; then
   echo "Timer is disabled and inactive; complete the staged checks before --enable."
 fi

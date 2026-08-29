@@ -32,6 +32,7 @@ from telegram_kol_research.production_safety_monitor import MonitorState
 from telegram_kol_research.production_safety_monitor import ProductionSafetyAdapters
 from telegram_kol_research.production_safety_monitor import decide_monitor_notification
 from telegram_kol_research.production_safety_monitor import evaluate_monitor_snapshot
+from telegram_kol_research.production_safety_monitor import evaluate_runtime_release_scope
 from telegram_kol_research.production_safety_monitor import fingerprint_monitor_result
 from telegram_kol_research.production_safety_monitor import format_monitor_alert
 from telegram_kol_research.production_safety_monitor import load_monitor_state
@@ -83,6 +84,108 @@ EXPECTATIONS = MonitorExpectations(
     max_concurrent_positions=4,
     entry_preamble_mode="live",
 )
+
+
+def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
+    return {
+        "runtime_role": role,
+        "release_commit": commit,
+        "manifest_sha256": "a" * 64,
+        "pid": 200 + ("web", "ingest", "worker", "monitor").index(role),
+        "process_start_ticks": 1000
+        + ("web", "ingest", "worker", "monitor").index(role),
+        "systemd_main_pid": 200
+        + ("web", "ingest", "worker", "monitor").index(role),
+        "systemd_start_ticks": 1000
+        + ("web", "ingest", "worker", "monitor").index(role),
+        "loaded_cwd": "/opt/telegram-kol-analyzer",
+        "command_role": role,
+        "observed_at": datetime(2026, 8, 28, 12, 0, tzinfo=UTC).isoformat(),
+        "entry_admission_frozen": role == "monitor" or True,
+        "capabilities": {
+            name: capable
+            for name in (
+                "global_exchange_authority",
+                "management",
+                "protection",
+                "close",
+                "tpsl",
+                "rescue",
+            )
+        } if role == "worker" else {},
+        "authority_evidence": {
+            name: {"fresh": capable, "successful": capable}
+            for name in (
+                "management_cycle",
+                "protection_cycle",
+                "close_cycle",
+                "tpsl_cycle",
+                "rescue_cycle",
+            )
+        } if role == "worker" else {},
+    }
+
+
+def test_release_scope_accepts_exact_four_role_immutable_runtime():
+    result = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": {
+                role: _release_identity(role)
+                for role in ("web", "ingest", "worker", "monitor")
+            },
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is True
+    assert result.details == {
+        "manifest_sha256": "a" * 64,
+        "release_commit": REVIEWED_HEAD,
+        "role_count": 4,
+        "unit_hashes_valid": True,
+    }
+
+
+def test_release_scope_rejects_mixed_release_or_disabled_capabilities():
+    roles = {
+        role: _release_identity(role)
+        for role in ("web", "ingest", "worker", "monitor")
+    }
+    roles["ingest"] = _release_identity("ingest", commit=OTHER_HEAD)
+    mixed = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+            "raw_settings": {"token": "must-not-leak"},
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+    assert "runtime_release_mixed" in mixed.reason_codes
+    assert "must-not-leak" not in json.dumps(mixed.details)
+
+    roles["ingest"] = _release_identity("ingest")
+    roles["worker"] = _release_identity("worker", capable=False)
+    disabled = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+    assert "runtime_capability_unproven" in disabled.reason_codes
 
 
 def _clear_monitor_bot_environment(monkeypatch):
@@ -5020,9 +5123,10 @@ def test_monitor_incident_capture_projection_accepts_every_monitor_adapter():
             "audit",
             "composite",
             "coverage",
-            "entry_preamble",
-            "contract_specs",
-        ),
+                "entry_preamble",
+                "contract_specs",
+                "release",
+            ),
         notification_status="suppressed",
         monitor_error=None,
     )

@@ -154,3 +154,48 @@ def test_disabled_effective_management_never_claims_authority() -> None:
     status.record_reconcile_cycle(observed_at=now)
 
     assert not any(status.snapshot(now=now).values())
+
+
+def test_identity_reports_loaded_cwd_command_role_and_independent_entry_gate(
+    tmp_path: Path,
+) -> None:
+    commit = "c" * 40
+    release = tmp_path / commit
+    module = release / "src/telegram_kol_research/web_app.py"
+    module.parent.mkdir(parents=True)
+    module.write_text("# immutable module\n", encoding="utf-8")
+    manifest = {
+        "commit": commit,
+        "contract": "immutable-release-v1",
+        "schema_version": 1,
+    }
+    encoded = (
+        json.dumps(manifest, separators=(",", ":"), sort_keys=True) + "\n"
+    ).encode()
+    (release / ".telegram-kol-release.json").write_bytes(encoded)
+    manifest_sha = hashlib.sha256(encoded).hexdigest()
+
+    payload = build_runtime_deployment_identity(
+        runtime_role="worker",
+        command_role="worker",
+        loaded_cwd="/opt/telegram-kol-analyzer",
+        module_path=module,
+        expected_commit=commit,
+        expected_manifest_sha256=manifest_sha,
+        tasks={},
+        authority_snapshot={
+            "management": True,
+            "protection": True,
+            "close": True,
+            "tpsl": True,
+            "rescue": True,
+        },
+        process_start_ticks=4321,
+        entry_admission_frozen=True,
+        now=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert payload["loaded_cwd"] == "/opt/telegram-kol-analyzer"
+    assert payload["command_role"] == "worker"
+    assert payload["entry_admission_frozen"] is True
+    assert not any(payload["capabilities"].values())

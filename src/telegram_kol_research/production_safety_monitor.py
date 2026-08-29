@@ -70,6 +70,9 @@ from telegram_kol_research.system_operator_bot import (
 from telegram_kol_research.runtime_incident_snapshot import (
     INSTRUCTION_EXECUTION_CONTRADICTION_CODES,
 )
+from telegram_kol_research.runtime_deployment_identity import (
+    build_runtime_deployment_identity,
+)
 
 
 MAX_ALERT_LENGTH = 1200
@@ -167,6 +170,7 @@ MONITOR_ADAPTER_NAMES = frozenset(
         "coverage",
         "contract_specs",
         "entry_preamble",
+        "release",
     }
 )
 _MONITOR_CAPTURE_REASON_CODES = frozenset(
@@ -247,6 +251,11 @@ _FIXED_REASON_CODES = frozenset(
         "contract_spec_ownership_drift",
         "contract_spec_sync_refusal_detected",
         "contract_spec_refresh_warning",
+        "runtime_release_invalid",
+        "runtime_release_mixed",
+        "runtime_identity_unproven",
+        "runtime_capability_unproven",
+        "runtime_unit_hash_drift",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -422,6 +431,7 @@ class MonitorExpectations:
     entry_preamble_mode: str
     entry_message_assembly_v2_mode: str | None = None
     entry_revision_v2_mode: str | None = None
+    release_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -440,6 +450,7 @@ class MonitorSnapshot:
     message_operation_coverage: Mapping[str, Any] | None = None
     contract_spec_health: Mapping[str, Any] | None = None
     contract_spec_sync_refusal_count: int | None = None
+    runtime_release_scope: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -447,6 +458,123 @@ class MonitorResult:
     healthy: bool
     reason_codes: tuple[str, ...]
     details: Mapping[str, Any]
+
+
+def evaluate_runtime_release_scope(
+    scope: Mapping[str, Any],
+    *,
+    expected_commit: str,
+    expected_manifest_sha256: str,
+    checked_at: datetime,
+) -> MonitorResult:
+    """Evaluate only bounded immutable-release and four-role evidence."""
+
+    reasons: set[str] = set()
+    expected_roles = ("web", "ingest", "worker", "monitor")
+    if (
+        not isinstance(scope, Mapping)
+        or not _GIT_HEAD.fullmatch(str(expected_commit))
+        or not _SHA256_FINGERPRINT.fullmatch(
+            str(expected_manifest_sha256)
+        )
+        or scope.get("commit") != expected_commit
+        or scope.get("manifest_sha256") != expected_manifest_sha256
+    ):
+        reasons.add("runtime_release_invalid")
+    if scope.get("unit_hashes_valid") is not True:
+        reasons.add("runtime_unit_hash_drift")
+    roles = scope.get("roles")
+    if not isinstance(roles, Mapping) or set(roles) != set(expected_roles):
+        reasons.add("runtime_identity_unproven")
+        roles = {}
+    observed_now = _require_aware_datetime(checked_at).astimezone(UTC)
+    for role in expected_roles:
+        identity = roles.get(role)
+        if not isinstance(identity, Mapping):
+            reasons.add("runtime_identity_unproven")
+            continue
+        if (
+            identity.get("release_commit") != expected_commit
+            or identity.get("manifest_sha256") != expected_manifest_sha256
+        ):
+            reasons.add("runtime_release_mixed")
+        try:
+            observed_at = datetime.fromisoformat(str(identity.get("observed_at")))
+            if observed_at.tzinfo is None:
+                raise ValueError
+            age = observed_now - observed_at.astimezone(UTC)
+        except (TypeError, ValueError):
+            age = timedelta.max
+        cwd = str(identity.get("loaded_cwd") or "")
+        if (
+            identity.get("runtime_role") != role
+            or identity.get("command_role") != role
+            or not cwd.startswith("/")
+            or type(identity.get("pid")) is not int
+            or identity.get("pid", 0) <= 1
+            or type(identity.get("process_start_ticks")) is not int
+            or identity.get("process_start_ticks", 0) <= 0
+            or identity.get("systemd_main_pid") != identity.get("pid")
+            or identity.get("systemd_start_ticks")
+            != identity.get("process_start_ticks")
+            or age < timedelta(0)
+            or age > timedelta(seconds=10)
+            or (
+                role != "monitor"
+                and identity.get("entry_admission_frozen") is not True
+            )
+        ):
+            reasons.add("runtime_identity_unproven")
+    worker = roles.get("worker") if isinstance(roles, Mapping) else None
+    if isinstance(worker, Mapping):
+        capabilities = worker.get("capabilities")
+        evidence = worker.get("authority_evidence")
+        required = (
+            "global_exchange_authority",
+            "management",
+            "protection",
+            "close",
+            "tpsl",
+            "rescue",
+        )
+        cycles = (
+            "management_cycle",
+            "protection_cycle",
+            "close_cycle",
+            "tpsl_cycle",
+            "rescue_cycle",
+        )
+        if (
+            not isinstance(capabilities, Mapping)
+            or any(capabilities.get(name) is not True for name in required)
+            or not isinstance(evidence, Mapping)
+            or any(
+                not isinstance(evidence.get(name), Mapping)
+                or evidence[name].get("fresh") is not True
+                or evidence[name].get("successful") is not True
+                for name in cycles
+            )
+        ):
+            reasons.add("runtime_capability_unproven")
+    else:
+        reasons.add("runtime_capability_unproven")
+    details = {
+        "manifest_sha256": (
+            expected_manifest_sha256
+            if _SHA256_FINGERPRINT.fullmatch(expected_manifest_sha256)
+            else "invalid"
+        ),
+        "release_commit": (
+            expected_commit if _GIT_HEAD.fullmatch(expected_commit) else "invalid"
+        ),
+        "role_count": len(roles),
+        "unit_hashes_valid": scope.get("unit_hashes_valid") is True,
+    }
+    return MonitorResult(
+        healthy=not reasons,
+        reason_codes=tuple(sorted(reasons)),
+        details=details,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -497,6 +625,10 @@ class ProductionSafetyAdapters:
     database_path: Path
     live_position_snapshot_path: Path | None = None
     checkout_path: Path = Path(".")
+    release_path: Path | None = None
+    release_commit: str | None = None
+    release_manifest_sha256: str | None = None
+    systemd_unit_root: Path = Path("/etc/systemd/system")
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
     message_operation_coverage_url: str = (
         "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage"
@@ -522,6 +654,15 @@ class ProductionSafetyAdapters:
     )
     worker_loop_health_url: str = (
         "http://127.0.0.1:8002/api/runtime/loop-health"
+    )
+    web_deployment_identity_url: str = (
+        "http://127.0.0.1:8000/api/runtime/deployment-identity"
+    )
+    ingest_deployment_identity_url: str = (
+        "http://127.0.0.1:8001/api/runtime/deployment-identity"
+    )
+    worker_deployment_identity_url: str = (
+        "http://127.0.0.1:8002/api/runtime/deployment-identity"
     )
     audit_command: tuple[str, ...] = (
         sys.executable,
@@ -564,6 +705,101 @@ class ProductionSafetyAdapters:
         if completed.returncode != 0:
             raise RuntimeError("git_head_unavailable")
         return completed.output.strip()
+
+    def read_runtime_release_scope(self) -> Mapping[str, Any]:
+        release = self.release_path
+        commit = str(self.release_commit or "")
+        manifest_sha = str(self.release_manifest_sha256 or "")
+        if (
+            release is None
+            or not _GIT_HEAD.fullmatch(commit)
+            or not _SHA256_FINGERPRINT.fullmatch(manifest_sha)
+        ):
+            raise RuntimeError("runtime_release_contract_invalid")
+        manifest_path = release / ".telegram-kol-release.json"
+        try:
+            encoded = manifest_path.read_bytes()
+            manifest = json.loads(encoded.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("runtime_release_contract_invalid") from exc
+        if (
+            hashlib.sha256(encoded).hexdigest() != manifest_sha
+            or not isinstance(manifest, Mapping)
+            or manifest.get("commit") != commit
+            or manifest.get("contract") != "immutable-release-v1"
+        ):
+            raise RuntimeError("runtime_release_contract_invalid")
+        urls = {
+            "web": self.web_deployment_identity_url,
+            "ingest": self.ingest_deployment_identity_url,
+            "worker": self.worker_deployment_identity_url,
+        }
+        roles = {
+            role: self._with_systemd_identity(
+                role,
+                read_loopback_deployment_identity(url),
+            )
+            for role, url in urls.items()
+        }
+        monitor_identity = build_runtime_deployment_identity(
+            runtime_role="monitor",
+            command_role="monitor",
+            loaded_cwd=Path.cwd(),
+            module_path=Path(__file__),
+            expected_commit=commit,
+            expected_manifest_sha256=manifest_sha,
+            tasks={},
+            process_start_ticks=None,
+            now=datetime.now(UTC),
+        )
+        roles["monitor"] = self._with_systemd_identity(
+            "monitor",
+            monitor_identity,
+        )
+        return {
+            "commit": commit,
+            "manifest_sha256": manifest_sha,
+            "roles": roles,
+            "unit_hashes_valid": self._release_unit_hashes_valid(release),
+        }
+
+    def _with_systemd_identity(
+        self,
+        role: str,
+        identity: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        unit = f"telegram-kol-{role}.service"
+        completed = _run_bounded_command(
+            ("systemctl", "show", unit, "--property=MainPID", "--value"),
+            timeout_seconds=5,
+        )
+        try:
+            pid = int(completed.output.strip())
+            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
+            ticks = int(raw[raw.rindex(")") + 2 :].split()[19])
+        except (OSError, ValueError, IndexError) as exc:
+            raise RuntimeError("runtime_systemd_identity_unknown") from exc
+        enriched = dict(identity)
+        enriched["systemd_main_pid"] = pid
+        enriched["systemd_start_ticks"] = ticks
+        return enriched
+
+    def _release_unit_hashes_valid(self, release: Path) -> bool:
+        units = (
+            "telegram-kol-web.service",
+            "telegram-kol-ingest.service",
+            "telegram-kol-worker.service",
+            "telegram-kol-monitor.service",
+            "telegram-kol-monitor.timer",
+        )
+        try:
+            return all(
+                (release / "deploy/systemd" / unit).read_bytes()
+                == (self.systemd_unit_root / unit).read_bytes()
+                for unit in units
+            )
+        except OSError:
+            return False
 
     def read_settings(self) -> Mapping[str, Any]:
         return read_loopback_settings(self.settings_url)
@@ -2518,6 +2754,62 @@ def read_loopback_runtime_role(
     return role
 
 
+def read_loopback_deployment_identity(
+    url: str,
+    *,
+    timeout_seconds: float = 5.0,
+) -> Mapping[str, Any]:
+    """Read one bounded process-local identity without retaining raw errors."""
+
+    parsed = urlsplit(url)
+    if (
+        parsed.scheme != "http"
+        or parsed.hostname not in {"127.0.0.1", "::1"}
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path != "/api/runtime/deployment-identity"
+    ):
+        raise ValueError("deployment identity URL must use exact loopback HTTP")
+    body = bytearray()
+    with httpx.stream(
+        "GET",
+        url,
+        timeout=timeout_seconds,
+        trust_env=False,
+    ) as response:
+        response.raise_for_status()
+        for chunk in response.iter_bytes():
+            body.extend(chunk)
+            if len(body) > _MAX_HTTP_OUTPUT_BYTES:
+                raise ValueError("deployment identity response too large")
+    payload = json.loads(
+        body,
+        object_pairs_hook=_strict_json_object,
+        parse_constant=_reject_json_constant,
+    )
+    if not isinstance(payload, Mapping):
+        raise ValueError("deployment identity response must be an object")
+    # Return only the closed identity surface; unknown or sensitive keys vanish.
+    allowed = {
+        "runtime_role",
+        "release_commit",
+        "manifest_sha256",
+        "loaded_artifact_verified",
+        "pid",
+        "process_start_ticks",
+        "observed_at",
+        "entry_admission_frozen",
+        "authority_evidence",
+        "health",
+        "capabilities",
+        "loaded_cwd",
+        "command_role",
+    }
+    return {key: payload.get(key) for key in allowed}
+
+
 def read_monitor_live_position_sizes(
     url: str,
     *,
@@ -2851,7 +3143,20 @@ def run_production_safety_monitor(
 
     failures: list[str] = []
     service_state = _read_adapter(adapters.read_service_state, "service", failures, "unknown")
-    head = _read_adapter(adapters.read_git_head, "head", failures, "0" * 40)
+    runtime_release_scope = None
+    release_reader = getattr(adapters, "read_runtime_release_scope", None)
+    if expectations.release_manifest_sha256 is not None:
+        runtime_release_scope = _read_adapter(
+            release_reader,
+            "release",
+            failures,
+            None,
+        ) if callable(release_reader) else None
+        if runtime_release_scope is None and "release" not in failures:
+            failures.append("release")
+        head = expectations.head
+    else:
+        head = _read_adapter(adapters.read_git_head, "head", failures, "0" * 40)
     settings = _read_adapter(adapters.read_settings, "settings", failures, {})
     journal_summary_reader = getattr(adapters, "read_journal_summary", None)
     if callable(journal_summary_reader):
@@ -2974,6 +3279,7 @@ def run_production_safety_monitor(
             message_operation_coverage=message_operation_coverage,
             contract_spec_health=contract_spec_health,
             contract_spec_sync_refusal_count=contract_spec_sync_refusal_count,
+            runtime_release_scope=runtime_release_scope,
         ),
         expectations,
         checked_at=checked_at,
@@ -3839,13 +4145,23 @@ def evaluate_monitor_snapshot(
         reasons.add("service_inactive")
         details["service_state"] = service_state
 
-    observed_head = _safe_git_head(snapshot.head)
-    expected_head = _safe_git_head(expectations.head)
-    if observed_head is None or expected_head is None:
-        reasons.add("malformed_snapshot")
-    elif observed_head != expected_head:
-        details["head"] = observed_head or "invalid"
-        details["expected_head"] = expected_head or "invalid"
+    if expectations.release_manifest_sha256 is not None:
+        release_result = evaluate_runtime_release_scope(
+            snapshot.runtime_release_scope or {},
+            expected_commit=expectations.head,
+            expected_manifest_sha256=expectations.release_manifest_sha256,
+            checked_at=checked_at or datetime.now(UTC),
+        )
+        reasons.update(release_result.reason_codes)
+        details.update(release_result.details)
+    else:
+        observed_head = _safe_git_head(snapshot.head)
+        expected_head = _safe_git_head(expectations.head)
+        if observed_head is None or expected_head is None:
+            reasons.add("malformed_snapshot")
+        elif observed_head != expected_head:
+            details["head"] = observed_head or "invalid"
+            details["expected_head"] = expected_head or "invalid"
 
     _evaluate_settings(snapshot.settings, expectations, reasons, details)
 

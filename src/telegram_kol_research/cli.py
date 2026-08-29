@@ -2603,7 +2603,14 @@ def repair_execution_order_legs(
 
 @app.command("monitor-production-safety")
 def monitor_production_safety(
-    expected_head: str = typer.Option(..., "--expected-head"),
+    expected_head: str | None = typer.Option(None, "--expected-head"),
+    expected_release_commit: str | None = typer.Option(
+        None, "--expected-release-commit"
+    ),
+    expected_release_manifest_sha256: str | None = typer.Option(
+        None, "--expected-release-manifest-sha256"
+    ),
+    release_path: Path | None = typer.Option(None, "--release-path"),
     expected_auto_trade_enabled: bool | None = typer.Option(
         None,
         "--expected-auto-trade-enabled/--no-expected-auto-trade-enabled",
@@ -2682,6 +2689,20 @@ def monitor_production_safety(
         raise typer.BadParameter(
             "choose --expected-auto-trade-enabled or --no-expected-auto-trade-enabled"
         )
+    if expected_release_commit is not None:
+        if expected_head is not None:
+            raise typer.BadParameter(
+                "--expected-head cannot be combined with immutable release options"
+            )
+        if expected_release_manifest_sha256 is None or release_path is None:
+            raise typer.BadParameter(
+                "immutable release monitoring requires commit, manifest hash, and path"
+            )
+        expected_head = expected_release_commit
+    elif expected_head is None:
+        raise typer.BadParameter(
+            "--expected-release-commit is required for immutable monitoring"
+        )
     if test_notification:
         if not notify:
             raise typer.BadParameter("--test-notification requires --notify")
@@ -2732,11 +2753,15 @@ def monitor_production_safety(
             entry_preamble_mode=expected_entry_preamble_mode,
             entry_message_assembly_v2_mode=expected_entry_message_assembly_v2_mode,
             entry_revision_v2_mode=expected_entry_revision_v2_mode,
+            release_manifest_sha256=expected_release_manifest_sha256,
         ),
         state_path=Path(state_path),
         adapters=ProductionSafetyAdapters(
             database_path=database_path,
             checkout_path=checkout_path,
+            release_path=release_path,
+            release_commit=expected_release_commit,
+            release_manifest_sha256=expected_release_manifest_sha256,
             settings_url=settings_url,
             web_loop_health_url=web_loop_health_url,
             ingest_loop_health_url=ingest_loop_health_url,

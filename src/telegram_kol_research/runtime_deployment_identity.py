@@ -147,6 +147,53 @@ class RuntimeAuthorityStatus:
                 "successful": successful,
                 **extra,
             }
+        management = projected["management_cycle"]
+        break_even = projected["break_even_cycle"]
+        reconcile = projected["reconcile_cycle"]
+        projected["close_cycle"] = dict(management)
+        projected["tpsl_cycle"] = dict(management)
+        projected["protection_cycle"] = {
+            "age_seconds": max(
+                value
+                for value in (
+                    management["age_seconds"],
+                    break_even["age_seconds"],
+                    reconcile["age_seconds"],
+                )
+                if value is not None
+            ) if all(
+                row["age_seconds"] is not None
+                for row in (management, break_even, reconcile)
+            ) else None,
+            "fresh": all(
+                row["fresh"] is True
+                for row in (management, break_even, reconcile)
+            ),
+            "successful": all(
+                row["successful"] is True
+                for row in (management, break_even, reconcile)
+            ),
+        }
+        projected["rescue_cycle"] = {
+            "age_seconds": max(
+                value
+                for value in (
+                    management["age_seconds"],
+                    reconcile["age_seconds"],
+                )
+                if value is not None
+            ) if all(
+                row["age_seconds"] is not None
+                for row in (management, reconcile)
+            ) else None,
+            "fresh": all(
+                row["fresh"] is True for row in (management, reconcile)
+            ),
+            "successful": all(
+                row["successful"] is True
+                for row in (management, reconcile)
+            ),
+        }
         return projected
 
 
@@ -211,6 +258,8 @@ def _loaded_release_evidence(
 def build_runtime_deployment_identity(
     *,
     runtime_role: str,
+    command_role: str | None = None,
+    loaded_cwd: str | Path | None = None,
     module_path: str | Path,
     expected_commit: str,
     expected_manifest_sha256: str,
@@ -226,6 +275,14 @@ def build_runtime_deployment_identity(
         expected_commit=expected_commit,
         expected_manifest_sha256=expected_manifest_sha256,
     )
+    observed_command_role = str(command_role or runtime_role)
+    observed_cwd = str(
+        Path(loaded_cwd) if loaded_cwd is not None else Path.cwd()
+    )
+    if observed_command_role != runtime_role or not Path(observed_cwd).is_absolute():
+        verified = False
+        release_commit = None
+        manifest_sha = None
     observed_authority = authority_snapshot or {}
     management = (
         _task_running(tasks.get("strategy_management_worker"))
@@ -262,6 +319,8 @@ def build_runtime_deployment_identity(
     return {
         "contract": "runtime-deployment-identity-v1",
         "runtime_role": runtime_role,
+        "command_role": observed_command_role,
+        "loaded_cwd": observed_cwd,
         "release_commit": release_commit,
         "manifest_sha256": manifest_sha,
         "loaded_artifact_verified": verified,
