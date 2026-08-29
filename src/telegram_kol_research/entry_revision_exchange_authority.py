@@ -36,8 +36,6 @@ _OWNER_KINDS = frozenset(
         "entry_revision_worker",
         "new_entry_worker",
         "reviewed_pending_entry_cancel",
-        "immutable_control_bootstrap",
-        "authority_self_test",
     }
 )
 _IDLE_KEYS = frozenset(
@@ -181,8 +179,6 @@ def acquire_entry_revision_exchange_authority(
         "entry_revision_worker",
         "new_entry_worker",
         "reviewed_pending_entry_cancel",
-        "immutable_control_bootstrap",
-        "authority_self_test",
     ],
     owner_id: str,
     acquired_at: datetime,
