@@ -7,6 +7,8 @@ from pathlib import Path
 
 import pytest
 
+import telegram_kol_research.scoped_release_activation as scoped_activation
+
 from telegram_kol_research.scoped_release_activation import (
     ActivationError,
     ActivationPaths,
@@ -696,6 +698,91 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
 
     assert result["status"] == "activated"
     assert result["source_mode"] == "stopped_legacy"
+    assert {
+        event for event in runtime.events if event.startswith("unmask:")
+    } == {
+        f"unmask:{unit}" for unit in runtime.maintenance_state_by_unit
+    }
+    assert all(runtime.entry_frozen_by_role.values())
+    assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
+
+
+def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+    immutable_identity = runtime.runtime_identity
+
+    def candidate_worker_identity_fails(role: str) -> dict:
+        if role == "worker" and runtime.current_commit_by_role[role] == CANDIDATE:
+            raise ActivationError("candidate worker identity failed")
+        return immutable_identity(role)
+
+    runtime.runtime_identity = candidate_worker_identity_fails
+
+    with pytest.raises(ActivationError, match="rollback_complete"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert runtime.current_commit_by_role == {
+        "web": ROLLBACK,
+        "ingest": ROLLBACK,
+        "worker": ROLLBACK,
+    }
+    assert all(runtime.entry_frozen_by_role.values())
+    assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
+
+
+def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "masked")
+        for unit in runtime.maintenance_state_by_unit
+    }
+    original_start = runtime.start_unit
+
+    def no_worker_can_start(unit: str) -> None:
+        if unit == "telegram-kol-worker.service":
+            raise ActivationError("worker start failed")
+        original_start(unit)
+
+    runtime.start_unit = no_worker_can_start
+
+    with pytest.raises(ActivationError, match="rollback_failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert set(runtime.maintenance_state_by_unit.values()) == {("inactive", "masked")}
+
+
+def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
+    monkeypatch.delenv("ACTIVATION_SOURCE_MODE", raising=False)
+    assert scoped_activation._activation_source_mode() == "immutable"
+    monkeypatch.setenv("ACTIVATION_SOURCE_MODE", "stopped_legacy")
+    assert scoped_activation._activation_source_mode() == "stopped_legacy"
+    monkeypatch.setenv("ACTIVATION_SOURCE_MODE", "legacy-ish")
+    with pytest.raises(ActivationError, match="activation source mode is invalid"):
+        scoped_activation._activation_source_mode()
 
 
 @pytest.mark.parametrize(

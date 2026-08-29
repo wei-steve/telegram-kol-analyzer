@@ -848,7 +848,9 @@ def activate_release(
                 now=datetime.now(UTC),
             )
             _activate_monitor(runtime, components, rollback)
-            if monitor_was_active:
+            if monitor_was_active or (
+                source_mode == "stopped_legacy" and "monitor" in components
+            ):
                 runtime.start_unit("telegram-kol-monitor.timer")
         except Exception as rollback_exc:
             if source_mode == "stopped_legacy":
@@ -1054,6 +1056,13 @@ def _required_absolute_env(name: str, default: str | None = None) -> Path:
     return path
 
 
+def _activation_source_mode() -> str:
+    source_mode = os.environ.get("ACTIVATION_SOURCE_MODE", "immutable")
+    if source_mode not in {"immutable", "stopped_legacy"}:
+        raise ActivationError("activation source mode is invalid")
+    return source_mode
+
+
 def main() -> int:
     lock_descriptor: int | None = None
     try:
@@ -1120,6 +1129,7 @@ def main() -> int:
             paths=paths,
             runtime=SystemRuntimeAdapter(),
             expected_uid=expected_uid,
+            source_mode=_activation_source_mode(),
         )
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         return 0
