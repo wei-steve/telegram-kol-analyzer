@@ -84,7 +84,7 @@ def build_manual_pending_entry_reconciliation_plan(
     observed_at = _timestamp(now) if now is not None else None
     reviewed = tuple(targets)
     order_ids = tuple(target.order_id for target in reviewed)
-    if not reviewed or len(set(order_ids)) != len(order_ids):
+    if not _canonical_targets_valid(reviewed):
         return _blocked("canonical_target_set_invalid", order_ids)
     if not _runtime_is_stopped(runtime_guard):
         return _blocked("maintenance_runtime_not_stopped", order_ids)
@@ -158,6 +158,12 @@ def build_manual_pending_entry_reconciliation_plan(
 
     completed_count = 0
     with session_factory() as session:
+        if _reviewed_binding_scope_changed(session, reviewed):
+            return _blocked(
+                "reviewed_local_state_changed",
+                order_ids,
+                evidence.fingerprint,
+            )
         for target in reviewed:
             if _target_completed(session, target):
                 completed_count += 1
@@ -239,6 +245,8 @@ def apply_manual_pending_entry_reconciliation(
     with session_factory() as session:
         try:
             session.execute(text("BEGIN IMMEDIATE"))
+            if _reviewed_binding_scope_changed(session, reviewed):
+                raise ValueError("reviewed_local_state_changed")
             for target in reviewed:
                 reason = _target_reason(session, target)
                 if reason is not None:
@@ -276,6 +284,9 @@ def apply_manual_pending_entry_reconciliation(
             session.flush()
             for binding_id in affected_bindings:
                 _terminalize_binding(session, binding_id, observed_at)
+            session.flush()
+            if any(not _target_completed(session, target) for target in reviewed):
+                raise ValueError("local_terminalization_incomplete")
             session.commit()
         except Exception:
             session.rollback()
@@ -293,6 +304,11 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
     leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
     binding = session.get(ExecutionBinding, target.execution_binding_id)
     lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+    lifecycle_count = (
+        session.query(StrategyLifecycle)
+        .filter_by(execution_binding_id=target.execution_binding_id)
+        .count()
+    )
     intents = (
         session.query(TriggerProtectionIntent)
         .filter_by(
@@ -330,20 +346,19 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
     request = _request_object(leg.request_json if leg is not None else None)
     symbol = target.instrument_id.split("-", 1)[0]
     expected_side = _side_from_entry_and_stop(target)
-    expected_strategy = (
-        f"deepcoin:{binding.chat_id}:{binding.message_id}:{symbol}:{expected_side}"
-        if binding is not None and expected_side is not None
-        else None
-    )
+    expected_strategy = target.strategy_instance_id
     if not (
         leg is not None
         and binding is not None
         and lifecycle is not None
+        and lifecycle_count == 1
         and request is not None
         and expected_side is not None
         and binding.venue == "deepcoin"
         and binding.symbol == symbol
         and binding.side == expected_side
+        and binding.chat_id == target.chat_id
+        and binding.message_id == target.message_id
         and lifecycle.symbol == symbol
         and lifecycle.side == expected_side
         and lifecycle.chat_id == binding.chat_id
@@ -390,6 +405,11 @@ def _target_completed(session, target: ReviewedPendingEntryTarget) -> bool:
     leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
     binding = session.get(ExecutionBinding, target.execution_binding_id)
     lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+    lifecycle_count = (
+        session.query(StrategyLifecycle)
+        .filter_by(execution_binding_id=target.execution_binding_id)
+        .count()
+    )
     intents = (
         session.query(TriggerProtectionIntent)
         .filter_by(venue="deepcoin", execution_order_leg_id=target.execution_order_leg_id)
@@ -409,27 +429,83 @@ def _target_completed(session, target: ReviewedPendingEntryTarget) -> bool:
         session.query(ExecutionEvent)
         .filter_by(
             action="reconcile_manual_pending_entry_cancel",
+            execution_binding_id=target.execution_binding_id,
             order_id=target.order_id,
             status="confirmed",
         )
-        .count()
+        .all()
     )
+    request = _request_object(leg.request_json if leg is not None else None)
+    symbol = target.instrument_id.split("-", 1)[0]
+    expected_side = _side_from_entry_and_stop(target)
+    expected_strategy = target.strategy_instance_id
     return bool(
         leg is not None
         and binding is not None
         and lifecycle is not None
+        and lifecycle_count == 1
+        and request is not None
+        and expected_side is not None
+        and binding.venue == "deepcoin"
+        and binding.symbol == symbol
+        and binding.side == expected_side
+        and binding.chat_id == target.chat_id
+        and binding.message_id == target.message_id
+        and binding.strategy_instance_id == expected_strategy
+        and lifecycle.id == target.lifecycle_id
+        and lifecycle.execution_binding_id == target.execution_binding_id
+        and lifecycle.chat_id == binding.chat_id
+        and lifecycle.message_id == binding.message_id
+        and lifecycle.symbol == symbol
+        and lifecycle.side == expected_side
+        and leg.execution_binding_id == target.execution_binding_id
+        and leg.strategy_instance_id == binding.strategy_instance_id
+        and leg.venue == "deepcoin"
         and leg.order_id == target.order_id
+        and leg.purpose == "entry"
+        and leg.order_kind == "trigger_limit"
         and leg.status == "cancelled"
+        and leg.terminal_reason == "operator_cancelled_unfilled_entry_leg"
+        and leg.last_verified_at is not None
+        and _request_matches_target(request, target)
         and binding.status == "cancelled"
+        and binding.last_exchange_status == "operator_cancelled_pending_entries"
         and lifecycle.lifecycle_status == "expired"
+        and lifecycle.exit_reason == "expired"
+        and lifecycle.exited_at is not None
+        and lifecycle.management_action == "operator_cancelled_pending_entries"
+        and lifecycle.expiry_review_next_at is None
         and len(intents) == 1
+        and intents[0].execution_binding_id == target.execution_binding_id
+        and intents[0].execution_order_leg_id == target.execution_order_leg_id
+        and intents[0].parent_trigger_order_id == target.order_id
+        and intents[0].request_fingerprint == target.request_fingerprint
         and intents[0].recovery_state == "resolved"
         and intents[0].recovery_disposition == "terminal"
+        and intents[0].last_reason_code == "parent_trigger_cancelled_before_entry"
+        and intents[0].next_attempt_at is None
         and len(protection) == 2
+        and {row.role for row in protection} == {"primary_stop", "backup_stop"}
+        and _primary_protection_matches(protection, target)
+        and all(
+            row.execution_binding_id == target.execution_binding_id
+            and row.execution_order_leg_id == target.execution_order_leg_id
+            and row.parent_entry_order_id == target.order_id
+            for row in protection
+        )
         and all(row.status == "cancelled" for row in protection)
         and len(convergence) == 1
+        and convergence[0].execution_binding_id == target.execution_binding_id
+        and convergence[0].execution_order_leg_id == target.execution_order_leg_id
         and convergence[0].status == "completed"
-        and events == 1
+        and convergence[0].reason_code == "parent_trigger_cancelled_before_entry"
+        and convergence[0].completed_at is not None
+        and _terminal_event_matches(
+            events,
+            target=target,
+            symbol=symbol,
+            side=expected_side,
+        )
     )
 
 
@@ -473,7 +549,7 @@ def _terminalize_target(session_factory, session, target, observed_at) -> None:
             execution_binding_id=target.execution_binding_id,
             venue="deepcoin",
             symbol=target.instrument_id.split("-")[0],
-            side="long",
+            side=_side_from_entry_and_stop(target),
             order_id=target.order_id,
             reason="operator_confirmed_all_entry_orders_cancelled",
             after={"pending": False, "terminalized": True},
@@ -524,6 +600,7 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         source_metadata.st_mode
     ):
         raise ValueError("backup_source_invalid")
+    parent_descriptor = None
     try:
         parent_metadata = backup_path.parent.lstat()
     except OSError as exc:
@@ -535,19 +612,46 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         or stat.S_IMODE(parent_metadata.st_mode) & 0o022
     ):
         raise ValueError("backup_parent_unsafe")
+    parent_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        parent_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        parent_flags |= os.O_NOFOLLOW
     try:
-        backup_path.lstat()
-    except FileNotFoundError:
-        pass
-    else:
-        raise ValueError("backup_path_invalid")
+        parent_descriptor = os.open(backup_path.parent, parent_flags)
+        opened_parent = os.fstat(parent_descriptor)
+        if (
+            opened_parent.st_dev != parent_metadata.st_dev
+            or opened_parent.st_ino != parent_metadata.st_ino
+        ):
+            raise ValueError("backup_parent_unsafe")
+        try:
+            os.stat(
+                backup_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            raise ValueError("backup_path_invalid")
+    except Exception:
+        if parent_descriptor is not None:
+            os.close(parent_descriptor)
+        raise
 
     flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     try:
-        descriptor = os.open(backup_path, flags, 0o600)
+        descriptor = os.open(
+            backup_path.name,
+            flags,
+            0o600,
+            dir_fd=parent_descriptor,
+        )
     except OSError as exc:
+        os.close(parent_descriptor)
         raise ValueError("backup_path_invalid") from exc
     created_metadata = None
     try:
@@ -555,30 +659,73 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         os.fchmod(descriptor, 0o600)
     except OSError as exc:
         try:
-            current = backup_path.lstat()
+            current = os.stat(
+                backup_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
             if (
                 created_metadata is not None
                 and current.st_dev == created_metadata.st_dev
                 and current.st_ino == created_metadata.st_ino
             ):
-                backup_path.unlink()
+                os.unlink(backup_path.name, dir_fd=parent_descriptor)
         except OSError:
             pass
         os.close(descriptor)
+        os.close(parent_descriptor)
         raise ValueError("backup_metadata_invalid") from exc
     source = None
     destination = None
     try:
+        source_fds_before = _open_fd_inode_count(source_metadata)
         source = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
-        destination = sqlite3.connect(backup_path)
+        if _open_fd_inode_count(source_metadata) <= source_fds_before:
+            raise ValueError("backup_source_invalid")
+        destination = sqlite3.connect(":memory:")
         source.backup(destination)
         result = destination.execute("PRAGMA quick_check").fetchone()
         if result != ("ok",):
             raise ValueError("backup_quick_check_failed")
         if destination.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise ValueError("backup_foreign_key_check_failed")
+        serialized = destination.serialize()
+        if len(serialized) < 100 or not serialized.startswith(b"SQLite format 3\x00"):
+            raise ValueError("backup_quick_check_failed")
+        payload_buffer = bytearray(serialized)
+        # Online backup has already merged every WAL frame. Mark the standalone
+        # snapshot as rollback-journal format so reopening never seeks a WAL.
+        payload_buffer[18:20] = b"\x01\x01"
+        payload = bytes(payload_buffer)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        written = 0
+        view = memoryview(payload)
+        while written < len(view):
+            count = os.write(descriptor, view[written:])
+            if count <= 0:
+                raise OSError("backup write failed")
+            written += count
+        os.ftruncate(descriptor, len(payload))
+        os.fsync(descriptor)
+        os.fsync(parent_descriptor)
+        persisted = _read_exact_descriptor(descriptor, len(payload))
+        verification = sqlite3.connect(":memory:")
+        try:
+            verification.deserialize(persisted)
+            if verification.execute("PRAGMA quick_check").fetchone() != ("ok",):
+                raise ValueError("backup_quick_check_failed")
+            if verification.execute("PRAGMA foreign_key_check").fetchone() is not None:
+                raise ValueError("backup_foreign_key_check_failed")
+        finally:
+            verification.close()
         final_source_metadata = database_path.lstat()
-        final_metadata = backup_path.lstat()
+        final_metadata = os.stat(
+            backup_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        final_path_metadata = backup_path.lstat()
+        descriptor_metadata = os.fstat(descriptor)
         if (
             not stat.S_ISREG(final_source_metadata.st_mode)
             or stat.S_ISLNK(final_source_metadata.st_mode)
@@ -590,16 +737,25 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
             or final_metadata.st_ino != created_metadata.st_ino
             or final_metadata.st_uid != os.geteuid()
             or stat.S_IMODE(final_metadata.st_mode) != 0o600
+            or final_path_metadata.st_dev != final_metadata.st_dev
+            or final_path_metadata.st_ino != final_metadata.st_ino
+            or descriptor_metadata.st_dev != final_metadata.st_dev
+            or descriptor_metadata.st_ino != final_metadata.st_ino
+            or descriptor_metadata.st_size != len(payload)
         ):
             raise ValueError("backup_metadata_invalid")
     except Exception:
         try:
-            current = backup_path.lstat()
+            current = os.stat(
+                backup_path.name,
+                dir_fd=parent_descriptor,
+                follow_symlinks=False,
+            )
             if (
                 current.st_dev == created_metadata.st_dev
                 and current.st_ino == created_metadata.st_ino
             ):
-                backup_path.unlink()
+                os.unlink(backup_path.name, dir_fd=parent_descriptor)
         except OSError:
             pass
         raise
@@ -609,6 +765,90 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         if source is not None:
             source.close()
         os.close(descriptor)
+        os.close(parent_descriptor)
+
+
+def _open_fd_inode_count(metadata) -> int:
+    root = Path("/proc/self/fd")
+    if not root.is_dir():
+        root = Path("/dev/fd")
+    count = 0
+    try:
+        names = tuple(root.iterdir())
+    except OSError as exc:
+        raise ValueError("backup_source_invalid") from exc
+    for path in names:
+        try:
+            descriptor = int(path.name)
+            opened = os.fstat(descriptor)
+        except (OSError, ValueError):
+            continue
+        if opened.st_dev == metadata.st_dev and opened.st_ino == metadata.st_ino:
+            count += 1
+    return count
+
+
+def _read_exact_descriptor(descriptor: int, size: int) -> bytes:
+    chunks = []
+    offset = 0
+    while offset < size:
+        chunk = os.pread(descriptor, size - offset, offset)
+        if not chunk:
+            raise ValueError("backup_quick_check_failed")
+        chunks.append(chunk)
+        offset += len(chunk)
+    return b"".join(chunks)
+
+
+def _canonical_targets_valid(
+    reviewed: tuple[ReviewedPendingEntryTarget, ...],
+) -> bool:
+    if not reviewed:
+        return False
+    if len({target.order_id for target in reviewed}) != len(reviewed):
+        return False
+    if len({target.execution_order_leg_id for target in reviewed}) != len(reviewed):
+        return False
+    for target in reviewed:
+        symbol = target.instrument_id.split("-", 1)[0]
+        side = _side_from_entry_and_stop(target)
+        if (
+            side is None
+            or target.strategy_instance_id
+            != f"deepcoin:{target.chat_id}:{target.message_id}:{symbol}:{side}"
+        ):
+            return False
+    return all(
+        len(
+            {
+                (target.lifecycle_id, target.chat_id, target.message_id, target.strategy_instance_id)
+                for target in reviewed
+                if target.execution_binding_id == binding_id
+            }
+        )
+        == 1
+        for binding_id in {target.execution_binding_id for target in reviewed}
+    )
+
+
+def _reviewed_binding_scope_changed(session, reviewed) -> bool:
+    reviewed_leg_ids_by_binding: dict[int, set[int]] = {}
+    for target in reviewed:
+        reviewed_leg_ids_by_binding.setdefault(target.execution_binding_id, set()).add(
+            target.execution_order_leg_id
+        )
+    active_statuses = {"pending", "open", "submitted"}
+    for binding_id, reviewed_leg_ids in reviewed_leg_ids_by_binding.items():
+        active_leg_ids = {
+            row.id
+            for row in session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, purpose="entry")
+            .all()
+            if str(row.status or "").lower() in active_statuses
+        }
+        if active_leg_ids - reviewed_leg_ids:
+            return True
+    return False
 
 
 def _require_session_database_path(session_factory, database_path: Path) -> None:
@@ -730,6 +970,28 @@ def _primary_protection_matches(
             primary[0].planned_trigger_price,
             target.embedded_stop_price,
         )
+    )
+
+
+def _terminal_event_matches(
+    rows: list[ExecutionEvent],
+    *,
+    target: ReviewedPendingEntryTarget,
+    symbol: str,
+    side: str,
+) -> bool:
+    if len(rows) != 1:
+        return False
+    row = rows[0]
+    return bool(
+        row.execution_binding_id == target.execution_binding_id
+        and row.venue == "deepcoin"
+        and row.symbol == symbol
+        and row.side == side
+        and row.order_id == target.order_id
+        and row.reason == "operator_confirmed_all_entry_orders_cancelled"
+        and _request_object(row.after_json)
+        == {"pending": False, "terminalized": True}
     )
 
 

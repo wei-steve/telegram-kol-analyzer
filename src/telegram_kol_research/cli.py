@@ -110,7 +110,9 @@ from telegram_kol_research.manual_pending_entry_reconciliation import (
     build_manual_pending_entry_reconciliation_plan,
 )
 from telegram_kol_research.scoped_release_activation import (
+    ActivationError,
     SystemRuntimeAdapter,
+    exclusive_runtime_control_lock,
     require_stopped_legacy_runtime_boundary,
 )
 from telegram_kol_research.reviewed_pending_entry_targets import (
@@ -5004,53 +5006,57 @@ def finalize_cancelled_pending_entries(
     def runtime_guard() -> None:
         require_stopped_legacy_runtime_boundary(runtime)
 
-    plan = build_manual_pending_entry_reconciliation_plan(
-        session_factory,
-        deepcoin_client=client,
-        targets=REVIEWED_PENDING_ENTRY_TARGETS,
-        runtime_guard=runtime_guard,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "mode": "apply" if apply else "dry_run",
-                "status": plan.status,
-                "reason_code": plan.reason_code,
-                "target_count": len(plan.target_order_ids),
-                "evidence_sha256": plan.evidence_sha256,
-                "fingerprint": plan.fingerprint,
-            },
-            sort_keys=True,
-        )
-    )
-    if plan.status == "completed":
-        return
-    if plan.status != "ready":
-        raise typer.Exit(code=2)
-    if not apply:
-        return
-    if not expected_fingerprint:
-        raise typer.BadParameter("--apply requires --expected-fingerprint")
-    result = apply_manual_pending_entry_reconciliation(
-        session_factory,
-        database_path=database_path,
-        backup_path=backup_path,
-        deepcoin_client=client,
-        targets=REVIEWED_PENDING_ENTRY_TARGETS,
-        expected_fingerprint=expected_fingerprint,
-        runtime_guard=runtime_guard,
-    )
-    typer.echo(
-        json.dumps(
-            {
-                "status": result.status,
-                "terminalized_count": result.terminalized_count,
-                "authority_seeded": result.authority_seeded,
-                "backup_path": str(result.backup_path),
-            },
-            sort_keys=True,
-        )
-    )
+    try:
+        with exclusive_runtime_control_lock(expected_uid=0):
+            plan = build_manual_pending_entry_reconciliation_plan(
+                session_factory,
+                deepcoin_client=client,
+                targets=REVIEWED_PENDING_ENTRY_TARGETS,
+                runtime_guard=runtime_guard,
+            )
+            typer.echo(
+                json.dumps(
+                    {
+                        "mode": "apply" if apply else "dry_run",
+                        "status": plan.status,
+                        "reason_code": plan.reason_code,
+                        "target_count": len(plan.target_order_ids),
+                        "evidence_sha256": plan.evidence_sha256,
+                        "fingerprint": plan.fingerprint,
+                    },
+                    sort_keys=True,
+                )
+            )
+            if plan.status == "completed":
+                return
+            if plan.status != "ready":
+                raise typer.Exit(code=2)
+            if not apply:
+                return
+            if not expected_fingerprint:
+                raise typer.BadParameter("--apply requires --expected-fingerprint")
+            result = apply_manual_pending_entry_reconciliation(
+                session_factory,
+                database_path=database_path,
+                backup_path=backup_path,
+                deepcoin_client=client,
+                targets=REVIEWED_PENDING_ENTRY_TARGETS,
+                expected_fingerprint=expected_fingerprint,
+                runtime_guard=runtime_guard,
+            )
+            typer.echo(
+                json.dumps(
+                    {
+                        "status": result.status,
+                        "terminalized_count": result.terminalized_count,
+                        "authority_seeded": result.authority_seeded,
+                        "backup_path": str(result.backup_path),
+                    },
+                    sort_keys=True,
+                )
+            )
+    except ActivationError as exc:
+        raise typer.BadParameter(str(exc)) from exc
 
 
 @app.command("repair-position-management")

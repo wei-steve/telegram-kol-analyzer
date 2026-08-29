@@ -14,6 +14,7 @@ from telegram_kol_research.scoped_release_activation import (
     ActivationPaths,
     action_plan_sha256,
     activate_release,
+    exclusive_runtime_control_lock,
     render_release_dropin,
     SystemRuntimeAdapter,
 )
@@ -23,6 +24,21 @@ from telegram_kol_research.deployment_action_plan import parse_manifest
 CANDIDATE = "2" * 40
 ROLLBACK = "1" * 40
 OTHER = "3" * 40
+
+
+def test_runtime_control_lock_is_shared_and_nonblocking(tmp_path) -> None:
+    lock_path = tmp_path / "runtime-control.lock"
+
+    with exclusive_runtime_control_lock(
+        lock_path=lock_path,
+        expected_uid=lock_path.parent.stat().st_uid,
+    ):
+        with pytest.raises(ActivationError, match="runtime control is locked"):
+            with exclusive_runtime_control_lock(
+                lock_path=lock_path,
+                expected_uid=lock_path.parent.stat().st_uid,
+            ):
+                raise AssertionError("contended lock must not be entered")
 
 
 def _canonical(payload: dict) -> bytes:

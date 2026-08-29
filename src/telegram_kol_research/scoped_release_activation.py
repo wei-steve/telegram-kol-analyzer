@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from contextlib import contextmanager
 import hashlib
 import json
 import fcntl
@@ -48,6 +49,7 @@ _UNITS = {
     ),
 }
 _PORTS = {"web": 8000, "ingest": 8001, "worker": 8002}
+RUNTIME_CONTROL_LOCK_PATH = Path("/run/telegram-kol-update.lock")
 def _command_matches_role(command: bytes, *, role: str) -> bool:
     try:
         parts = tuple(
@@ -66,6 +68,45 @@ def _command_matches_role(command: bytes, *, role: str) -> bool:
 
 class ActivationError(RuntimeError):
     pass
+
+
+@contextmanager
+def exclusive_runtime_control_lock(
+    *,
+    lock_path: Path = RUNTIME_CONTROL_LOCK_PATH,
+    expected_uid: int = 0,
+):
+    """Hold the single supported service-control lock across a whole operation."""
+
+    descriptor = None
+    flags = os.O_RDWR | os.O_CREAT
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        descriptor = os.open(Path(lock_path), flags, 0o600)
+        metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != expected_uid
+            or stat.S_IMODE(metadata.st_mode) & 0o022
+        ):
+            raise ActivationError("runtime control lock is unsafe")
+        try:
+            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise ActivationError("runtime control is locked") from exc
+    except ActivationError:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise
+    except OSError as exc:
+        if descriptor is not None:
+            os.close(descriptor)
+        raise ActivationError("runtime control lock is unavailable") from exc
+    try:
+        yield
+    finally:
+        os.close(descriptor)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1293,7 +1334,6 @@ def _activation_source_mode() -> str:
 
 
 def main() -> int:
-    lock_descriptor: int | None = None
     try:
         expected_commit = os.environ.get("EXPECTED_COMMIT", "").lower()
         rollback_commit = os.environ.get("ROLLBACK_COMMIT", "").lower()
@@ -1337,32 +1377,21 @@ def main() -> int:
             if test_mode == "1" and os.environ.get("ACTIVATOR_LOCK_PATH")
             else Path("/run/telegram-kol-update.lock")
         )
-        flags = os.O_RDWR | os.O_CREAT
-        if hasattr(os, "O_NOFOLLOW"):
-            flags |= os.O_NOFOLLOW
-        lock_descriptor = os.open(lock_path, flags, 0o600)
-        lock_metadata = os.fstat(lock_descriptor)
-        if (
-            not stat.S_ISREG(lock_metadata.st_mode)
-            or lock_metadata.st_uid != expected_uid
-            or stat.S_IMODE(lock_metadata.st_mode) & 0o022
-        ):
-            raise ActivationError("activation lock is unsafe")
-        try:
-            fcntl.flock(lock_descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise ActivationError("another activation is running") from exc
-        result = activate_release(
-            expected_commit=expected_commit,
-            rollback_commit=rollback_commit,
-            paths=paths,
-            runtime=SystemRuntimeAdapter(
-                dropin_root=paths.dropin_root,
-                expected_uid=expected_uid,
-            ),
+        with exclusive_runtime_control_lock(
+            lock_path=lock_path,
             expected_uid=expected_uid,
-            source_mode=_activation_source_mode(),
-        )
+        ):
+            result = activate_release(
+                expected_commit=expected_commit,
+                rollback_commit=rollback_commit,
+                paths=paths,
+                runtime=SystemRuntimeAdapter(
+                    dropin_root=paths.dropin_root,
+                    expected_uid=expected_uid,
+                ),
+                expected_uid=expected_uid,
+                source_mode=_activation_source_mode(),
+            )
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         return 0
     except ActivationError as exc:
@@ -1371,9 +1400,6 @@ def main() -> int:
     except (OSError, ValueError):
         print("ERROR: activation failed", file=sys.stderr)
         return 4
-    finally:
-        if lock_descriptor is not None:
-            os.close(lock_descriptor)
 
 
 if __name__ == "__main__":

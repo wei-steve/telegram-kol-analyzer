@@ -188,6 +188,9 @@ def _seed_pending_target(session_factory):
             lifecycle_id=lifecycle.id,
             execution_binding_id=binding.id,
             execution_order_leg_id=leg.id,
+            chat_id=1,
+            message_id=2,
+            strategy_instance_id="deepcoin:1:2:ETH:long",
             trigger_price="1827",
             size="3",
             embedded_stop_price="1795",
@@ -236,9 +239,9 @@ def _seed_all_canonical_targets(session_factory):
         for binding_id, targets in grouped.items():
             first = targets[0]
             symbol = first.instrument_id.split("-", 1)[0]
-            chat_id = -binding_id
-            message_id = first.lifecycle_id
-            strategy_id = f"deepcoin:{chat_id}:{message_id}:{symbol}:long"
+            chat_id = first.chat_id
+            message_id = first.message_id
+            strategy_id = first.strategy_instance_id
             session.add(
                 ExecutionBinding(
                     id=binding_id,
@@ -841,6 +844,7 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
         "binding_side",
         "lifecycle_symbol",
         "lifecycle_side",
+        "duplicate_lifecycle",
         "leg_venue",
         "leg_strategy",
         "request_fingerprint",
@@ -888,6 +892,18 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             lifecycle.symbol = "BTC"
         elif drift == "lifecycle_side":
             lifecycle.side = "short"
+        elif drift == "duplicate_lifecycle":
+            session.add(
+                StrategyLifecycle(
+                    chat_id=88,
+                    message_id=89,
+                    symbol="ETH",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=NOW,
+                    execution_binding_id=target.execution_binding_id,
+                )
+            )
         elif drift == "leg_venue":
             leg.venue = "other"
         elif drift == "leg_strategy":
@@ -1021,6 +1037,171 @@ def test_manual_reconciliation_accepts_documented_request_aliases(tmp_path):
     assert plan.status == "ready"
 
 
+def test_manual_reconciliation_refuses_coordinated_strategy_identity_drift(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, target.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        binding.chat_id = 91
+        binding.message_id = 92
+        lifecycle.chat_id = 91
+        lifecycle.message_id = 92
+        binding.strategy_instance_id = "deepcoin:91:92:ETH:long"
+        leg.strategy_instance_id = binding.strategy_instance_id
+        session.commit()
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "reviewed_local_state_changed"
+
+
+def test_manual_reconciliation_refuses_unreviewed_active_entry_sibling(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=target.execution_binding_id,
+                strategy_instance_id=target.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="not-reviewed",
+                venue="deepcoin",
+                status="pending",
+                request_json=leg.request_json,
+            )
+        )
+        session.commit()
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "reviewed_local_state_changed"
+
+
+def test_manual_reconciliation_allows_terminal_unreviewed_entry_sibling(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=target.execution_binding_id,
+                strategy_instance_id=target.strategy_instance_id,
+                leg_index=2,
+                purpose="entry",
+                order_kind="trigger_limit",
+                order_id="already-terminal",
+                venue="deepcoin",
+                status="cancelled",
+                request_json=leg.request_json,
+            )
+        )
+        session.commit()
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "ready"
+
+
+def test_manual_reconciliation_apply_rechecks_unreviewed_active_sibling(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = reconciliation.build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    def add_sibling(*args):
+        with session_factory() as session:
+            leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+            session.add(
+                ExecutionOrderLeg(
+                    execution_binding_id=target.execution_binding_id,
+                    strategy_instance_id=target.strategy_instance_id,
+                    leg_index=2,
+                    purpose="entry",
+                    order_kind="trigger_limit",
+                    order_id="late-unreviewed",
+                    venue="deepcoin",
+                    status="pending",
+                    request_json=leg.request_json,
+                )
+            )
+            session.commit()
+
+    monkeypatch.setattr(reconciliation, "_create_verified_backup", add_sibling)
+
+    with pytest.raises(ValueError, match="reviewed_local_state_changed"):
+        reconciliation.apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=tmp_path / "backup.db",
+            deepcoin_client=client,
+            targets=(target,),
+            runtime_guard=RuntimeGuard(),
+            expected_fingerprint=plan.fingerprint,
+            now=NOW,
+        )
+
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"
+        assert session.get(ExecutionBinding, target.execution_binding_id).status == "open"
+        assert session.get(StrategyLifecycle, target.lifecycle_id).lifecycle_status == "pending_entry"
+
+
 def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, monkeypatch):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
@@ -1108,6 +1289,104 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
     assert repeated.reason_code is None
 
 
+@pytest.mark.parametrize(
+    "drift",
+    (
+        "event_binding",
+        "intent_binding",
+        "protection_binding",
+        "convergence_binding",
+        "request_trigger_price",
+        "leg_reason",
+        "intent_reason",
+        "binding_exchange",
+        "lifecycle_action",
+        "convergence_reason",
+        "event_after",
+    ),
+)
+def test_completed_reconciliation_still_requires_canonical_ownership(
+    tmp_path,
+    drift,
+):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    apply_manual_pending_entry_reconciliation(
+        session_factory,
+        database_path=database_path,
+        backup_path=tmp_path / "first.db",
+        deepcoin_client=client,
+        targets=(target,),
+        expected_fingerprint=plan.fingerprint,
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    with session_factory() as session:
+        foreign_binding, _ = _seed_foreign_binding_and_leg(session)
+        if drift == "event_binding":
+            session.query(ExecutionEvent).one().execution_binding_id = foreign_binding.id
+        elif drift == "intent_binding":
+            session.query(TriggerProtectionIntent).one().execution_binding_id = foreign_binding.id
+        elif drift == "protection_binding":
+            session.query(PositionProtectionLeg).first().execution_binding_id = foreign_binding.id
+        elif drift == "convergence_binding":
+            session.query(TriggerTakeProfitConvergence).one().execution_binding_id = foreign_binding.id
+        elif drift == "request_trigger_price":
+            leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+            request = json.loads(leg.request_json)
+            request["triggerPrice"] = "different"
+            leg.request_json = json.dumps(request, sort_keys=True)
+        elif drift == "leg_reason":
+            session.get(
+                ExecutionOrderLeg,
+                target.execution_order_leg_id,
+            ).terminal_reason = "different"
+        elif drift == "intent_reason":
+            session.query(TriggerProtectionIntent).one().last_reason_code = "different"
+        elif drift == "binding_exchange":
+            session.get(
+                ExecutionBinding,
+                target.execution_binding_id,
+            ).last_exchange_status = "different"
+        elif drift == "lifecycle_action":
+            session.get(
+                StrategyLifecycle,
+                target.lifecycle_id,
+            ).management_action = "different"
+        elif drift == "convergence_reason":
+            session.query(TriggerTakeProfitConvergence).one().reason_code = "different"
+        elif drift == "event_after":
+            session.query(ExecutionEvent).one().after_json = json.dumps(
+                {"pending": True, "terminalized": False}
+            )
+        session.commit()
+
+    repeated = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert repeated.status == "blocked"
+
+
 def test_verified_backup_refuses_dangling_symlink(tmp_path):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
@@ -1143,6 +1422,89 @@ def test_verified_backup_is_created_with_exact_0600_mode(tmp_path):
     reconciliation._create_verified_backup(source, backup)
 
     assert backup.stat().st_mode & 0o777 == 0o600
+
+
+def test_verified_backup_writes_the_exclusive_inode_without_path_reopen(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO evidence(value) VALUES ('reviewed')")
+    connection.commit()
+    connection.close()
+    backup = tmp_path / "backup.db"
+    real_connect = reconciliation.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        assert Path(str(database)) != backup
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    reconciliation._create_verified_backup(source, backup)
+
+    with real_connect(backup) as copied:
+        assert copied.execute("SELECT value FROM evidence").fetchone() == (
+            "reviewed",
+        )
+
+
+def test_verified_backup_refuses_source_path_aba(tmp_path, monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE original(value INTEGER)")
+    original.commit()
+    original.close()
+    replacement = tmp_path / "replacement.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE replacement(value INTEGER)")
+    other.commit()
+    other.close()
+    held = tmp_path / "held.db"
+    real_connect = reconciliation.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if str(database).startswith(f"file:{source}"):
+            source.rename(held)
+            replacement.rename(source)
+            opened = real_connect(database, *args, **kwargs)
+            source.rename(replacement)
+            held.rename(source)
+            return opened
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    with pytest.raises(ValueError, match="backup_source_invalid"):
+        reconciliation._create_verified_backup(source, tmp_path / "backup.db")
+
+
+def test_verified_backup_includes_uncheckpointed_wal_commit(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    writer = sqlite3.connect(source)
+    assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    writer.commit()
+    writer.execute("INSERT INTO evidence(value) VALUES ('wal-only')")
+    writer.commit()
+    backup = tmp_path / "backup.db"
+
+    reconciliation._create_verified_backup(source, backup)
+
+    with sqlite3.connect(backup) as copied:
+        assert copied.execute("SELECT value FROM evidence").fetchone() == (
+            "wal-only",
+        )
+    writer.close()
 
 
 def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
@@ -1201,7 +1563,7 @@ def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch
             return super().execute(sql, parameters)
 
     def connect(database, *args, **kwargs):
-        if Path(database) == backup:
+        if database == ":memory:":
             kwargs["factory"] = FailedQuickCheckConnection
         return real_connect(database, *args, **kwargs)
 

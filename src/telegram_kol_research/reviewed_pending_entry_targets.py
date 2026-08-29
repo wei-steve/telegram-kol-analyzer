@@ -10,6 +10,9 @@ class ReviewedPendingEntryTarget:
     lifecycle_id: int
     execution_binding_id: int
     execution_order_leg_id: int
+    chat_id: int
+    message_id: int
+    strategy_instance_id: str
     trigger_price: str
     size: str
     embedded_stop_price: str
@@ -23,6 +26,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=780,
         execution_binding_id=271,
         execution_order_leg_id=479,
+        chat_id=-1002370796392,
+        message_id=3485,
+        strategy_instance_id="deepcoin:-1002370796392:3485:ETH:long",
         trigger_price="1827",
         size="3",
         embedded_stop_price="1795",
@@ -34,6 +40,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=780,
         execution_binding_id=271,
         execution_order_leg_id=480,
+        chat_id=-1002370796392,
+        message_id=3485,
+        strategy_instance_id="deepcoin:-1002370796392:3485:ETH:long",
         trigger_price="1812",
         size="3",
         embedded_stop_price="1795",
@@ -45,6 +54,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=812,
         execution_binding_id=281,
         execution_order_leg_id=494,
+        chat_id=-1002370796392,
+        message_id=3507,
+        strategy_instance_id="deepcoin:-1002370796392:3507:BTC:long",
         trigger_price="61890",
         size="13",
         embedded_stop_price="60900",
@@ -56,6 +68,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=812,
         execution_binding_id=281,
         execution_order_leg_id=495,
+        chat_id=-1002370796392,
+        message_id=3507,
+        strategy_instance_id="deepcoin:-1002370796392:3507:BTC:long",
         trigger_price="61390",
         size="14",
         embedded_stop_price="60900",
@@ -67,6 +82,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=911,
         execution_binding_id=308,
         execution_order_leg_id=532,
+        chat_id=-1002409877375,
+        message_id=8798,
+        strategy_instance_id="deepcoin:-1002409877375:8798:ETH:long",
         trigger_price="2250",
         size="2.3",
         embedded_stop_price="2186",
@@ -78,6 +96,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=914,
         execution_binding_id=309,
         execution_order_leg_id=533,
+        chat_id=-1003825498321,
+        message_id=604,
+        strategy_instance_id="deepcoin:-1003825498321:604:BTC:long",
         trigger_price="73690",
         size="8",
         embedded_stop_price="72300",
@@ -89,6 +110,9 @@ REVIEWED_PENDING_ENTRY_TARGETS = (
         lifecycle_id=914,
         execution_binding_id=309,
         execution_order_leg_id=534,
+        chat_id=-1003825498321,
+        message_id=604,
+        strategy_instance_id="deepcoin:-1003825498321:604:BTC:long",
         trigger_price="73390",
         size="8",
         embedded_stop_price="72300",

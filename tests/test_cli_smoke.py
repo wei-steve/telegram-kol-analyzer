@@ -1,6 +1,7 @@
 import typer
 from typer.testing import CliRunner
 from copy import deepcopy
+from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 import importlib.util
 import json
@@ -249,6 +250,17 @@ def test_finalize_cancelled_entries_wires_exact_stopped_runtime_guard(
         lambda value: events.append(value),
     )
 
+    @contextmanager
+    def runtime_lock(*, expected_uid):
+        assert expected_uid == 0
+        events.append("lock-enter")
+        try:
+            yield
+        finally:
+            events.append("lock-exit")
+
+    monkeypatch.setattr(cli_module, "exclusive_runtime_control_lock", runtime_lock)
+
     def build_plan(*args, runtime_guard, **kwargs):
         runtime_guard()
         return SimpleNamespace(
@@ -277,7 +289,76 @@ def test_finalize_cancelled_entries_wires_exact_stopped_runtime_guard(
     )
 
     assert result.exit_code == 2
-    assert events == [runtime]
+    assert events == ["lock-enter", runtime, "lock-exit"]
+
+
+def test_finalize_cancelled_entries_holds_runtime_lock_through_apply(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    import telegram_kol_research.cli as cli_module
+
+    events = []
+    runtime = object()
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(cli_module, "build_deepcoin_client_from_env", lambda: object())
+    monkeypatch.setattr(cli_module, "SystemRuntimeAdapter", lambda *, expected_uid: runtime)
+    monkeypatch.setattr(
+        cli_module,
+        "require_stopped_legacy_runtime_boundary",
+        lambda value: events.append("guard"),
+    )
+
+    @contextmanager
+    def runtime_lock(*, expected_uid):
+        events.append("lock-enter")
+        try:
+            yield
+        finally:
+            events.append("lock-exit")
+
+    def build_plan(*args, runtime_guard, **kwargs):
+        assert events[-1] == "lock-enter"
+        runtime_guard()
+        return SimpleNamespace(
+            status="ready",
+            reason_code=None,
+            target_order_ids=("one",),
+            evidence_sha256="a" * 64,
+            fingerprint="b" * 64,
+        )
+
+    def apply_plan(*args, runtime_guard, **kwargs):
+        assert events[-1] == "guard"
+        events.append("apply")
+        runtime_guard()
+        return SimpleNamespace(
+            status="completed",
+            terminalized_count=1,
+            authority_seeded=True,
+            backup_path=tmp_path / "backup.db",
+        )
+
+    monkeypatch.setattr(cli_module, "exclusive_runtime_control_lock", runtime_lock)
+    monkeypatch.setattr(cli_module, "build_manual_pending_entry_reconciliation_plan", build_plan)
+    monkeypatch.setattr(cli_module, "apply_manual_pending_entry_reconciliation", apply_plan)
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "finalize-cancelled-pending-entries",
+            "--database-path",
+            str(tmp_path / "research.db"),
+            "--backup-path",
+            str(tmp_path / "backup.db"),
+            "--apply",
+            "--expected-fingerprint",
+            "b" * 64,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert events == ["lock-enter", "guard", "apply", "guard", "lock-exit"]
 
 
 def test_entry_draft_revision_cli_is_dry_run_by_default(tmp_path):
