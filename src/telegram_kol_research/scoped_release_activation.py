@@ -428,7 +428,7 @@ def _validate_identity(
         raise ActivationError("runtime identity proof failed")
 
 
-def _prove_runtime(
+def prove_release_runtime(
     runtime: RuntimeAdapter,
     *,
     release_root: Path,
@@ -562,7 +562,7 @@ def _prove_undeclared_processes_unchanged(
                 raise ActivationError("undeclared runtime changed during activation")
 
 
-def _dropin_content(
+def render_release_dropin(
     release: ReleaseEvidence,
     *,
     component: str,
@@ -613,7 +613,7 @@ def _atomic_write_dropin(root: Path, unit: str, content: str) -> None:
         raise ActivationError("drop-in publication failed") from exc
 
 
-def _install_dropins(
+def publish_release_dropins(
     paths: ActivationPaths,
     release: ReleaseEvidence,
     components: list[str],
@@ -625,7 +625,7 @@ def _install_dropins(
             _atomic_write_dropin(
                 paths.dropin_root,
                 unit,
-                _dropin_content(
+                render_release_dropin(
                     release,
                     component=component,
                     entry_frozen=entry_frozen,
@@ -662,7 +662,7 @@ def _start_units(runtime: RuntimeAdapter, components: list[str]) -> None:
         runtime.start_unit(unit)
 
 
-def _consume_authorization(source: Path, consumed: Path) -> None:
+def consume_activation_authorization(source: Path, consumed: Path) -> None:
     if source.parent != consumed.parent:
         raise ActivationError("authorization consumption must remain in one directory")
     try:
@@ -733,7 +733,7 @@ def activate_release(
     affected_runtime_roles = [
         component for component in components if component in _RUNTIME_COMPONENTS
     ]
-    before_identities, before_releases = _prove_runtime(
+    before_identities, before_releases = prove_release_runtime(
         runtime,
         release_root=paths.release_root,
         expected_uid=expected_uid,
@@ -761,7 +761,10 @@ def activate_release(
         plan_sha256=plan_sha,
         now=datetime.now(UTC),
     )
-    _consume_authorization(paths.authorization, paths.authorization_consumed)
+    consume_activation_authorization(
+        paths.authorization,
+        paths.authorization_consumed,
+    )
 
     mutation_started = False
     try:
@@ -769,7 +772,7 @@ def activate_release(
         _stop_units(runtime, components)
         if require_authority and runtime.active_write_count(paths.database_path) != 0:
             raise ActivationError("post-stop active exchange write is unknown or nonzero")
-        _install_dropins(
+        publish_release_dropins(
             paths,
             candidate,
             components,
@@ -781,7 +784,7 @@ def activate_release(
         _activate_monitor(runtime, components, candidate)
         if monitor_was_active:
             runtime.start_unit("telegram-kol-monitor.timer")
-        after_identities, _ = _prove_runtime(
+        after_identities, _ = prove_release_runtime(
             runtime,
             release_root=paths.release_root,
             expected_uid=expected_uid,
@@ -805,7 +808,7 @@ def activate_release(
             raise
         try:
             _stop_units(runtime, components)
-            _install_dropins(
+            publish_release_dropins(
                 paths,
                 rollback,
                 components,
@@ -816,7 +819,7 @@ def activate_release(
             _activate_monitor(runtime, components, rollback)
             if monitor_was_active:
                 runtime.start_unit("telegram-kol-monitor.timer")
-            _prove_runtime(
+            prove_release_runtime(
                 runtime,
                 release_root=paths.release_root,
                 expected_uid=expected_uid,

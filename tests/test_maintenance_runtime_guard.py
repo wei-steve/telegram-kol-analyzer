@@ -300,6 +300,27 @@ def test_receipt_removal_failure_reinhibits_and_proves_quiescence(
     assert stored["blocked_reason"] == "maintenance_restore_failed"
 
 
+def test_complete_candidate_takeover_requires_all_inhibitors_removed(
+    tmp_path: Path,
+) -> None:
+    runtime = FakeSystemdRuntime.active_legacy()
+    guard = _guard(tmp_path, runtime)
+    receipt = guard.enter(action_id="bootstrap-001")
+
+    with pytest.raises(GuardError, match="candidate_takeover_inhibited"):
+        guard.complete_candidate_takeover(
+            expected_fingerprint=receipt.fingerprint,
+        )
+
+    for unit in MAINTENANCE_UNITS:
+        runtime.unmask_unit(unit)
+    guard.complete_candidate_takeover(
+        expected_fingerprint=receipt.fingerprint,
+    )
+
+    assert not (tmp_path / "guard.json").exists()
+
+
 def test_reconcile_after_process_crash_and_reboot_keeps_units_masked(
     tmp_path: Path,
 ) -> None:

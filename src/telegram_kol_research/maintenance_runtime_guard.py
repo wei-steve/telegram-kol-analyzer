@@ -233,6 +233,23 @@ class MaintenanceRuntimeGuard:
         self._publish(updated)
         return updated
 
+    def complete_candidate_takeover(
+        self,
+        *,
+        expected_fingerprint: str,
+    ) -> None:
+        """Disarm the crash receipt only after candidate inhibitors are gone."""
+
+        self._require_lock()
+        receipt = self._load_receipt()
+        if receipt.fingerprint != _fingerprint(expected_fingerprint):
+            raise GuardError("maintenance_receipt_fingerprint_mismatch")
+        if receipt.safe_to_restore or receipt.blocked_reason is not None:
+            raise GuardError("candidate_takeover_receipt_invalid")
+        if any(self.runtime.is_masked(unit) for unit in MAINTENANCE_UNITS):
+            raise GuardError("candidate_takeover_inhibited")
+        self._remove_receipt()
+
     def reconcile_after_restart(self) -> GuardReceipt:
         self._acquire_lock()
         receipt = self._load_receipt()

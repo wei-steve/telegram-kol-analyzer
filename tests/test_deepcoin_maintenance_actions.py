@@ -7,11 +7,17 @@ from pathlib import Path
 import pytest
 
 from telegram_kol_research.deepcoin_maintenance_actions import (
+    EntryRevisionBootstrapAuthorityAdapter,
     MaintenanceBlocked,
     SingleOrderDrainRequest,
     run_entry_authority_seed,
     run_single_order_drain,
 )
+from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.entry_revision_exchange_authority import (
+    seed_entry_revision_exchange_authority,
+)
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.entry_authority_seed import SeedPlanRefused, SeedResult
 from telegram_kol_research.reviewed_pending_entry_cancel import (
     ReviewedPendingEntryCancelAction,
@@ -290,3 +296,42 @@ def test_seed_authorization_expired_after_quiescence_restores_without_write(
 
     assert guard.restore_fingerprints == ["c" * 64]
     assert guard.masked is False
+
+
+def test_bootstrap_authority_adapter_acquires_and_releases_exact_generation(
+    tmp_path: Path,
+) -> None:
+    session_factory = create_session_factory(tmp_path / "bootstrap.db")
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": False, "entry_revision_v2_mode": "disabled"},
+        updated_at=datetime(2026, 8, 28, tzinfo=UTC),
+    )
+    assert seed_entry_revision_exchange_authority(
+        session_factory,
+        seeded_at=datetime(2026, 8, 28, tzinfo=UTC),
+        initial_generation=7,
+    ).seeded
+    adapter = EntryRevisionBootstrapAuthorityAdapter(
+        session_factory=session_factory,
+        clock=lambda: datetime(2026, 8, 28, 0, 1, tzinfo=UTC),
+    )
+    plan = type(
+        "Plan",
+        (),
+        {
+            "action_id": "bootstrap-001",
+            "expected_generation": 7,
+            "fingerprint": "a" * 64,
+            "evidence_sha256": "b" * 64,
+        },
+    )()
+
+    lease = adapter.acquire_bootstrap(plan)
+
+    assert lease.generation == 8
+    assert adapter.release_bootstrap(
+        token=lease.token,
+        generation=lease.generation,
+        released_at=datetime(2026, 8, 28, 0, 2, tzinfo=UTC),
+    ) is True

@@ -12,6 +12,7 @@ from telegram_kol_research.scoped_release_activation import (
     ActivationPaths,
     action_plan_sha256,
     activate_release,
+    render_release_dropin,
 )
 from telegram_kol_research.deployment_action_plan import parse_manifest
 
@@ -26,6 +27,27 @@ def _canonical(payload: dict) -> bytes:
         json.dumps(payload, ensure_ascii=True, separators=(",", ":"), sort_keys=True)
         + "\n"
     ).encode()
+
+
+def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    rendered = render_release_dropin(
+        release,
+        component="worker",
+        entry_frozen=True,
+    )
+
+    assert f'TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}' in rendered
+    assert 'TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1' in rendered
 
 
 def _content_digest(root: Path) -> str:

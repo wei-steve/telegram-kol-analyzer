@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 import re
-from typing import Callable, Iterable, Protocol
+from typing import Any, Callable, Iterable, Protocol
+
+from telegram_kol_research.entry_revision_exchange_authority import (
+    acquire_entry_revision_exchange_authority,
+    block_entry_revision_exchange_authority,
+    release_entry_revision_exchange_authority,
+)
 
 from telegram_kol_research.entry_authority_seed import (
     SeedPlanRefused,
@@ -71,6 +77,64 @@ class SeedActionGuard(DrainGuard, Protocol):
     ) -> SeedActionReceipt: ...
 
     def restore(self, *, expected_fingerprint: str) -> None: ...
+
+
+@dataclass(slots=True)
+class EntryRevisionBootstrapAuthorityAdapter:
+    """Bind bootstrap orchestration to the exact v2 generation-CAS row."""
+
+    session_factory: Any
+    clock: Callable[[], datetime] = lambda: datetime.now(UTC)
+
+    def acquire_bootstrap(self, plan: Any):
+        return acquire_entry_revision_exchange_authority(
+            self.session_factory,
+            owner_kind="immutable_control_bootstrap",
+            owner_id=f"bootstrap:{plan.action_id}",
+            acquired_at=_observed_now(self.clock),
+            require_cancel_quiescence=False,
+            expected_generation=int(plan.expected_generation),
+            action_id=str(plan.action_id),
+            plan_sha256=str(plan.fingerprint),
+            evidence_sha256=str(plan.evidence_sha256),
+        )
+
+    def release_bootstrap(
+        self,
+        *,
+        token: str,
+        generation: int,
+        released_at: datetime,
+    ) -> bool:
+        result = release_entry_revision_exchange_authority(
+            self.session_factory,
+            token=token,
+            owner_kind="immutable_control_bootstrap",
+            expected_generation=generation,
+            released_at=released_at,
+        )
+        return bool(result.released)
+
+    def block_bootstrap(
+        self,
+        *,
+        token: str,
+        generation: int,
+        reason_code: str,
+        blocked_at: datetime,
+    ) -> None:
+        result = block_entry_revision_exchange_authority(
+            self.session_factory,
+            token=token,
+            owner_kind="immutable_control_bootstrap",
+            expected_generation=generation,
+            reason_code=reason_code,
+            blocked_at=blocked_at,
+        )
+        if not result.blocked:
+            raise MaintenanceBlocked(
+                result.reason_code or "bootstrap_authority_block_unknown"
+            )
 
 
 def run_entry_authority_seed(
