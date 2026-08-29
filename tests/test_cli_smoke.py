@@ -690,6 +690,79 @@ def test_seed_dry_run_rebuilds_the_exact_manifest_issued_plan(monkeypatch):
     assert captured == {"path": manifest.database_path, "now": issued_at}
 
 
+def test_seed_apply_never_reloads_as_bootstrap_action(monkeypatch):
+    from types import SimpleNamespace
+    import telegram_kol_research.cli as cli_module
+
+    issued_at = datetime(2026, 8, 28, 13, 0, tzinfo=UTC)
+    manifest = SimpleNamespace(
+        action_id="seed-001",
+        database_path=Path("/nonsecret/research.db"),
+        backup_path=Path("/nonsecret/research.seed-backup.db"),
+        candidate_commit="c" * 40,
+        release_manifest_sha256="b" * 64,
+        expected_fingerprint="f" * 64,
+        expires_at=issued_at + timedelta(minutes=10),
+        file_sha256="a" * 64,
+        issued_at=issued_at,
+    )
+    actions = []
+
+    def load(*args, **kwargs):
+        actions.append(kwargs["action"])
+        return manifest
+
+    monkeypatch.setattr(cli_module, "_load_deepcoin_action_manifest", load)
+    monkeypatch.setattr(
+        cli_module,
+        "build_entry_authority_seed_plan",
+        lambda *args, **kwargs: SimpleNamespace(
+            fingerprint="f" * 64,
+            backup_path=manifest.backup_path,
+        ),
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "_require_loaded_immutable_maintenance_release",
+        lambda manifest: None,
+    )
+
+    class Guard:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return False
+
+    monkeypatch.setattr(cli_module, "_new_deepcoin_maintenance_guard", Guard)
+    monkeypatch.setattr(
+        cli_module,
+        "run_entry_authority_seed",
+        lambda **kwargs: SimpleNamespace(
+            plan_fingerprint="f" * 64,
+            reason_code=None,
+            status="seeded",
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "seed-entry-authority",
+            "--manifest-path",
+            "/root/action.json",
+            "--apply",
+            "--expected-manifest-sha256",
+            "a" * 64,
+            "--expected-fingerprint",
+            "f" * 64,
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert actions == [cli_module.MaintenanceAction.SEED_ENTRY_AUTHORITY]
+
+
 def test_bootstrap_control_apply_dispatches_exact_plan(monkeypatch):
     from types import SimpleNamespace
     import telegram_kol_research.cli as cli_module
@@ -706,10 +779,16 @@ def test_bootstrap_control_apply_dispatches_exact_plan(monkeypatch):
         database_path=Path("/opt/telegram-kol-analyzer/data/research.db"),
         unit_manifest_sha256="e" * 64,
     )
+    loaded_actions = []
+
+    def load_manifest(*args, **kwargs):
+        loaded_actions.append(kwargs["action"])
+        return manifest
+
     monkeypatch.setattr(
         cli_module,
         "_load_deepcoin_action_manifest",
-        lambda *args, **kwargs: manifest,
+        load_manifest,
     )
     monkeypatch.setattr(
         cli_module,
@@ -799,6 +878,10 @@ def test_bootstrap_control_apply_dispatches_exact_plan(monkeypatch):
     )
 
     assert result.exit_code == 0, result.output
+    assert loaded_actions == [
+        cli_module.MaintenanceAction.BOOTSTRAP_CONTROL,
+        cli_module.MaintenanceAction.BOOTSTRAP_CONTROL,
+    ]
     assert captured["plan"] is plan
     assert captured["authorization_expires_at"] == manifest.expires_at
     payload = json.loads(result.output.splitlines()[-1])

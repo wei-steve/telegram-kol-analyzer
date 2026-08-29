@@ -5118,17 +5118,6 @@ def seed_entry_authority_command(
     typer.echo(json.dumps(payload, sort_keys=True))
     if not apply:
         return
-    # Planning performs bounded database and exchange reads.  Re-open the
-    # root-owned manifest at the mutation boundary so replacement and expiry
-    # cannot hide behind the earlier parsed object.
-    fresh_manifest = _load_deepcoin_action_manifest(
-        manifest_path,
-        action=MaintenanceAction.BOOTSTRAP_CONTROL,
-        now=datetime.now(UTC),
-    )
-    if fresh_manifest.file_sha256 != manifest.file_sha256:
-        raise typer.BadParameter("maintenance manifest changed during planning")
-    manifest = fresh_manifest
     _require_deepcoin_apply_authorization(
         manifest,
         expected_manifest_sha256=expected_manifest_sha256,
@@ -5383,6 +5372,17 @@ def bootstrap_control_command(
     )
     if not apply:
         return
+    # Planning performs bounded database and exchange reads.  Re-open the
+    # root-owned manifest at the mutation boundary so replacement and expiry
+    # cannot hide behind the earlier parsed object.
+    fresh_manifest = _load_deepcoin_action_manifest(
+        manifest_path,
+        action=MaintenanceAction.BOOTSTRAP_CONTROL,
+        now=datetime.now(UTC),
+    )
+    if fresh_manifest.file_sha256 != manifest.file_sha256:
+        raise typer.BadParameter("maintenance manifest changed during planning")
+    manifest = fresh_manifest
     _require_deepcoin_apply_authorization(
         manifest,
         expected_manifest_sha256=expected_manifest_sha256,
