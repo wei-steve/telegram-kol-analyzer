@@ -1,7 +1,7 @@
 # Deepcoin Simple Cancel-All Cutover Design
 
 **Date:** 2026-08-28
-**Status:** approved
+**Status:** final local candidate; production actions remain unauthorized
 **Risk:** L3 for local reconciliation; production service control and Deepcoin
 operator actions remain separately authorized
 
@@ -117,3 +117,42 @@ drain, handoff, or recovery state machine.
 This local implementation does not authorize push, stage, SSH, production
 reads, service stop/mask/start, Deepcoin UI cancellation, database mutation,
 activation, restart, rollback, or entry thaw.
+
+## Final Local Evidence
+
+The production/test candidate is exact commit
+`44b99d82c662c264554dcb07b18ed11faa3222ff`, reviewed from base
+`a61325181c54a2d3aef85247fbaabcef93d7489a`. The later documentation commit is
+evidence-only; any future push or stage authorization must resolve and review
+the then-current full local HEAD rather than treating this paragraph as a
+self-referential handoff SHA.
+
+The implementation keeps the three-state operational model above. It adds no
+bootstrap, drain, handoff, retry, or recovery protocol. Cross-process TOCTOU is
+closed by holding the same root-owned service-control lock from the first
+stopped-runtime proof through backup and transaction commit. The one canonical
+target source now binds reviewed local identity, client-order identity, entry
+economics, and protection economics. Any active target-related attribution or
+canonical-set drift refuses the operation instead of being cleared or guessed.
+
+Local verification completed with:
+
+- Python compilation and exact-base `git diff --check` passing;
+- 314 affected tests passing with 1 documented platform skip;
+- one final repository suite passing 6626 tests with 3 documented skips and 32
+  existing warnings in 555.17 seconds;
+- independent exact-base review reporting no P0/P1 and approving the candidate
+  for a later, separately authorized production workflow.
+
+Two review suggestions remain deliberately nonblocking: compare the convergence
+JSON as an additional audit duplicate of the already validated canonical
+protection rows, and add a direct malformed SQLite journal-header injection
+test for the existing closed allowlist. They do not justify another runtime
+gate or persistent state.
+
+The future production workflow is still split into independent authorizations:
+push; immutable stage; production read-only preflight; maintenance-window
+service stop and persistent inhibition; operator cancellation in the Deepcoin
+UI; fresh zero-position/order proof; the one L3 local reconciliation write;
+entry-frozen activation; rollback if required; and any later entry thaw. An
+unknown exchange result stops the window and is never automatically retried.

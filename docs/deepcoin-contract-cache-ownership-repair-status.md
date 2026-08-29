@@ -22,7 +22,7 @@ task12_health_classification: legacy_capability_absent
 task12_observed_max_raw_message_id: 13534
 task12_refusal_baseline_count: 16
 task12_time_sensitive_pending_trigger_count: 7
-pending_entry_cancel_candidate_status: cross_process_quiescence_local_complete_unpushed
+pending_entry_cancel_candidate_status: superseded_by_simple_cancel_all
 pending_entry_cancel_candidate_sha: 708a479f7e20aba74869d87acb3839f3fd91e96b
 pending_entry_cancel_pushed_base_sha: 91bb257e2a1c808c25a54149a7c71c392c0952e4
 pending_entry_cancel_revision_gate_plan_sha: 7a17c3a0818c9f674fc5afb6bafb163bc48639b1
@@ -41,11 +41,16 @@ legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
 immutable_control_bootstrap_status: superseded_deleted_local
-simple_cancel_all_cutover_status: local_complete_unpushed
+simple_cancel_all_cutover_status: final_local_candidate_unpushed
 simple_cancel_all_cutover_design_sha: 71eb1d4b
 simple_cancel_all_protocol_removal_sha: a3434ebb
 simple_cancel_all_reconciliation_sha: ec0b9dee
 simple_cancel_all_bytecode_fix_sha: d2c640e9
+simple_cancel_all_review_repair_base_sha: a61325181c54a2d3aef85247fbaabcef93d7489a
+simple_cancel_all_production_candidate_sha: 44b99d82c662c264554dcb07b18ed11faa3222ff
+simple_cancel_all_final_focused: 314_passed_1_skipped
+simple_cancel_all_final_suite: 6626_passed_3_skipped_32_warnings
+simple_cancel_all_production_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -685,3 +690,41 @@ phase completes or pauses, record both verified evidence and outstanding work.
   existing warnings in 470.34 seconds. No push, stage, SSH, production read, service control,
   Deepcoin cancellation, database mutation, activation, restart or entry thaw
   occurred in this local implementation.
+- The final review-repair batch started from exact clean commit
+  `a61325181c54a2d3aef85247fbaabcef93d7489a` on
+  `codex/phase0-deploy-integration`. Production/test commits `e56d721e`,
+  `b0bc47a3`, `faa2d015`, `4f49e9e2`, and `44b99d82` bind the maintenance
+  command to one shared service-control lock, exact stopped-runtime proof,
+  fresh read-only exchange evidence, the sole canonical seven-target set, and
+  one atomic local terminalization transaction.
+- The canonical targets now include the reviewed chat/message/strategy and
+  client-order identities plus exact entry and protection economics. Any local
+  position identity, adopted child order, protection exchange order, active
+  noncanonical sibling, ambiguous fill, malformed/missing completed authority,
+  or coordinated identity drift fails closed before a database write. The
+  command never calls a Deepcoin write endpoint.
+- The SQLite backup is created as an exclusive `0600` inode under a verified
+  owner-only parent, captures uncheckpointed WAL commits, detects source and
+  destination path replacement, validates the persisted bytes with
+  `quick_check` and `foreign_key_check`, and is complete before
+  `BEGIN IMMEDIATE`. A terminalization failure rolls back all seven targets and
+  the authority seed together.
+- Final static verification passed Python compilation and exact-base
+  `git diff --check`. The final affected set passed 314 tests with 1 documented
+  platform skip. The only final repository suite after the last production-code
+  edit passed 6626 tests with 3 documented skips and 32 existing warnings in
+  555.17 seconds. No production code changed after that suite.
+- Independent exact-base review approved
+  `a6132518..44b99d82` with no remaining P0/P1. It recorded two nonblocking P2
+  audit-hardening opportunities: `desired_take_profits_json` is not separately
+  compared after exact canonical protection-row validation, and the closed
+  SQLite journal-header allowlist lacks a direct mixed-header injection test.
+  Neither weakens the stopped-runtime, zero-position/order, no-attribution,
+  backup, atomicity, or no-exchange-write safety claims; no additional runtime
+  state or gate was added for them.
+- This final local batch performed no push, stage, SSH, production read,
+  service stop/mask/start/restart, Deepcoin UI cancellation, database/settings
+  mutation, activation, rollback, entry thaw, historical replay, order retry,
+  or Telegram trading send. Every such production phase remains outstanding
+  and requires a new exact authorization. Historical production SHA and order
+  observations remain stale routing context, never current acceptance evidence.
