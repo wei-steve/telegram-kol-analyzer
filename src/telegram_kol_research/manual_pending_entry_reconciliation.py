@@ -114,8 +114,10 @@ def build_manual_pending_entry_reconciliation_plan(
         return _blocked("pending_trigger_present", order_ids, evidence.fingerprint)
     target_by_order_id = {target.order_id: target for target in reviewed}
     target_order_ids = set(target_by_order_id)
+    target_client_order_ids = {target.client_order_id for target in reviewed}
     if any(
         deepcoin_order_ids(row, response_kind="fill") & target_order_ids
+        or _deepcoin_client_order_ids(row) & target_client_order_ids
         for row in evidence.fills
     ):
         return _blocked("target_fill_present", order_ids, evidence.fingerprint)
@@ -183,6 +185,12 @@ def build_manual_pending_entry_reconciliation_plan(
         ):
             return _blocked(
                 "entry_revision_exchange_authority_not_idle",
+                order_ids,
+                evidence.fingerprint,
+            )
+        if completed_count == len(reviewed) and authority is None:
+            return _blocked(
+                "entry_revision_exchange_authority_missing",
                 order_ids,
                 evidence.fingerprint,
             )
@@ -359,6 +367,7 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
         and binding.side == expected_side
         and binding.chat_id == target.chat_id
         and binding.message_id == target.message_id
+        and binding.pos_id is None
         and lifecycle.symbol == symbol
         and lifecycle.side == expected_side
         and lifecycle.chat_id == binding.chat_id
@@ -368,6 +377,9 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
         and leg.strategy_instance_id == binding.strategy_instance_id
         and binding.strategy_instance_id == expected_strategy
         and leg.order_id == target.order_id
+        and leg.client_order_id == target.client_order_id
+        and leg.pos_id is None
+        and leg.attribution_status == "unassigned"
         and leg.purpose == "entry"
         and leg.order_kind == "trigger_limit"
         and str(leg.status or "").lower() in {"pending", "open", "submitted"}
@@ -379,21 +391,18 @@ def _target_reason(session, target: ReviewedPendingEntryTarget) -> str | None:
         and intents[0].execution_binding_id == target.execution_binding_id
         and intents[0].execution_order_leg_id == target.execution_order_leg_id
         and intents[0].parent_trigger_order_id == target.order_id
+        and intents[0].adopted_order_id is None
         and intents[0].request_fingerprint == target.request_fingerprint
         and intents[0].recovery_state in {"pending", "retrying"}
-        and len(protection) == 2
-        and {row.role for row in protection} == {"primary_stop", "backup_stop"}
-        and _primary_protection_matches(protection, target)
-        and all(
-            row.execution_binding_id == target.execution_binding_id
-            and row.execution_order_leg_id == target.execution_order_leg_id
-            and row.parent_entry_order_id == target.order_id
-            for row in protection
+        and _protection_matches(
+            protection,
+            target,
+            allowed_statuses={"planned", "waiting_fill"},
         )
-        and all(row.status in {"planned", "waiting_fill"} for row in protection)
         and len(convergence) == 1
         and convergence[0].execution_binding_id == target.execution_binding_id
         and convergence[0].execution_order_leg_id == target.execution_order_leg_id
+        and convergence[0].pos_id is None
         and convergence[0].status
         in {"waiting_backup_stop", "waiting_position", "ready"}
     ):
@@ -452,6 +461,7 @@ def _target_completed(session, target: ReviewedPendingEntryTarget) -> bool:
         and binding.chat_id == target.chat_id
         and binding.message_id == target.message_id
         and binding.strategy_instance_id == expected_strategy
+        and binding.pos_id is None
         and lifecycle.id == target.lifecycle_id
         and lifecycle.execution_binding_id == target.execution_binding_id
         and lifecycle.chat_id == binding.chat_id
@@ -462,6 +472,9 @@ def _target_completed(session, target: ReviewedPendingEntryTarget) -> bool:
         and leg.strategy_instance_id == binding.strategy_instance_id
         and leg.venue == "deepcoin"
         and leg.order_id == target.order_id
+        and leg.client_order_id == target.client_order_id
+        and leg.pos_id is None
+        and leg.attribution_status == "unassigned"
         and leg.purpose == "entry"
         and leg.order_kind == "trigger_limit"
         and leg.status == "cancelled"
@@ -479,24 +492,21 @@ def _target_completed(session, target: ReviewedPendingEntryTarget) -> bool:
         and intents[0].execution_binding_id == target.execution_binding_id
         and intents[0].execution_order_leg_id == target.execution_order_leg_id
         and intents[0].parent_trigger_order_id == target.order_id
+        and intents[0].adopted_order_id is None
         and intents[0].request_fingerprint == target.request_fingerprint
         and intents[0].recovery_state == "resolved"
         and intents[0].recovery_disposition == "terminal"
         and intents[0].last_reason_code == "parent_trigger_cancelled_before_entry"
         and intents[0].next_attempt_at is None
-        and len(protection) == 2
-        and {row.role for row in protection} == {"primary_stop", "backup_stop"}
-        and _primary_protection_matches(protection, target)
-        and all(
-            row.execution_binding_id == target.execution_binding_id
-            and row.execution_order_leg_id == target.execution_order_leg_id
-            and row.parent_entry_order_id == target.order_id
-            for row in protection
+        and _protection_matches(
+            protection,
+            target,
+            allowed_statuses={"cancelled"},
         )
-        and all(row.status == "cancelled" for row in protection)
         and len(convergence) == 1
         and convergence[0].execution_binding_id == target.execution_binding_id
         and convergence[0].execution_order_leg_id == target.execution_order_leg_id
+        and convergence[0].pos_id is None
         and convergence[0].status == "completed"
         and convergence[0].reason_code == "parent_trigger_cancelled_before_entry"
         and convergence[0].completed_at is not None
@@ -845,9 +855,11 @@ def _canonical_target_payload(target: ReviewedPendingEntryTarget) -> dict[str, o
         "chat_id": target.chat_id,
         "message_id": target.message_id,
         "strategy_instance_id": target.strategy_instance_id,
+        "client_order_id": target.client_order_id,
         "trigger_price": target.trigger_price,
         "size": target.size,
         "embedded_stop_price": target.embedded_stop_price,
+        "take_profit_prices": target.take_profit_prices,
         "request_fingerprint": target.request_fingerprint,
     }
 
@@ -956,6 +968,14 @@ def _one_text(request: dict[str, object], *keys: str) -> str | None:
     return next(iter(values)) if len(values) == 1 else None
 
 
+def _deepcoin_client_order_ids(row: dict[str, object]) -> set[str]:
+    return {
+        clean
+        for key in ("clOrdId", "clientOrderId", "client_order_id")
+        if (clean := str(row.get(key) or "").strip())
+    }
+
+
 def _same_decimal(left: str | None, right: str) -> bool:
     if left is None:
         return False
@@ -987,9 +1007,48 @@ def _primary_protection_matches(
     primary = [row for row in rows if row.role == "primary_stop"]
     return bool(
         len(primary) == 1
+        and primary[0].leg_index == 1
         and _same_decimal(
             primary[0].planned_trigger_price,
             target.embedded_stop_price,
+        )
+    )
+
+
+def _protection_matches(
+    rows: list[PositionProtectionLeg],
+    target: ReviewedPendingEntryTarget,
+    *,
+    allowed_statuses: set[str],
+) -> bool:
+    if len(rows) != 2 + len(target.take_profit_prices):
+        return False
+    take_profits = [row for row in rows if row.role == "take_profit"]
+    expected_take_profits = {
+        index: price
+        for index, price in enumerate(target.take_profit_prices, start=1)
+    }
+    actual_take_profits = {row.leg_index: row.planned_trigger_price for row in take_profits}
+    return bool(
+        {row.role for row in rows} == {"primary_stop", "backup_stop", "take_profit"}
+        if target.take_profit_prices
+        else {row.role for row in rows} == {"primary_stop", "backup_stop"}
+    ) and bool(
+        _primary_protection_matches(rows, target)
+        and len(take_profits) == len(target.take_profit_prices)
+        and set(actual_take_profits) == set(expected_take_profits)
+        and all(
+            _same_decimal(actual_take_profits[index], price)
+            for index, price in expected_take_profits.items()
+        )
+        and all(
+            row.execution_binding_id == target.execution_binding_id
+            and row.execution_order_leg_id == target.execution_order_leg_id
+            and row.parent_entry_order_id == target.order_id
+            and row.pos_id is None
+            and row.exchange_order_id is None
+            and row.status in allowed_statuses
+            for row in rows
         )
     )
 

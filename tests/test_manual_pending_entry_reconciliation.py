@@ -135,6 +135,7 @@ def _seed_pending_target(session_factory):
             purpose="entry",
             order_kind="trigger_limit",
             order_id=order_id,
+            client_order_id="manual-cancel-1-client",
             venue="deepcoin",
             status="pending",
             request_json=json.dumps(request, sort_keys=True),
@@ -191,9 +192,11 @@ def _seed_pending_target(session_factory):
             chat_id=1,
             message_id=2,
             strategy_instance_id="deepcoin:1:2:ETH:long",
+            client_order_id="manual-cancel-1-client",
             trigger_price="1827",
             size="3",
             embedded_stop_price="1795",
+            take_profit_prices=(),
             request_fingerprint=request_fingerprint,
         )
 
@@ -288,6 +291,7 @@ def _seed_all_canonical_targets(session_factory):
                     purpose="entry",
                     order_kind="trigger_limit",
                     order_id=target.order_id,
+                    client_order_id=target.client_order_id,
                     venue="deepcoin",
                     status="pending",
                     request_json=json.dumps(request, sort_keys=True),
@@ -324,6 +328,24 @@ def _seed_all_canonical_targets(session_factory):
                             status="planned",
                         )
                         for role in ("primary_stop", "backup_stop")
+                    ]
+                )
+                session.add_all(
+                    [
+                        PositionProtectionLeg(
+                            venue="deepcoin",
+                            execution_binding_id=binding_id,
+                            execution_order_leg_id=leg.id,
+                            role="take_profit",
+                            leg_index=leg_index,
+                            planned_trigger_price=price,
+                            parent_entry_order_id=target.order_id,
+                            status="planned",
+                        )
+                        for leg_index, price in enumerate(
+                            target.take_profit_prices,
+                            start=1,
+                        )
                     ]
                 )
                 session.add(
@@ -628,6 +650,35 @@ def test_manual_reconciliation_refuses_target_fill_for_every_supported_alias(
     assert plan.reason_code == "target_fill_present"
 
 
+def test_manual_reconciliation_refuses_target_fill_by_client_order_id(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    client.fills.append(
+        {
+            "instId": target.instrument_id,
+            "clOrdId": target.client_order_id,
+            "state": "filled",
+        }
+    )
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_fill_present"
+
+
 def test_manual_reconciliation_accepts_explicit_cancelled_target_history(tmp_path):
     from telegram_kol_research.manual_pending_entry_reconciliation import (
         build_manual_pending_entry_reconciliation_plan,
@@ -842,11 +893,15 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
         "binding_venue",
         "binding_symbol",
         "binding_side",
+        "binding_pos",
         "lifecycle_symbol",
         "lifecycle_side",
         "duplicate_lifecycle",
         "leg_venue",
         "leg_strategy",
+        "leg_client_order",
+        "leg_pos",
+        "leg_attribution",
         "request_fingerprint",
         "request_instrument",
         "request_trigger_price",
@@ -854,12 +909,16 @@ def test_manual_reconciliation_refuses_history_without_exact_instrument(
         "request_stop",
         "intent_binding",
         "intent_leg",
+        "intent_adopted",
         "protection_parent",
         "protection_stop",
         "protection_binding",
         "protection_leg",
+        "protection_pos",
+        "protection_exchange",
         "convergence_binding",
         "convergence_leg",
+        "convergence_pos",
     ),
 )
 def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
@@ -888,6 +947,8 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             binding.symbol = "BTC"
         elif drift == "binding_side":
             binding.side = "short"
+        elif drift == "binding_pos":
+            binding.pos_id = "position-1"
         elif drift == "lifecycle_symbol":
             lifecycle.symbol = "BTC"
         elif drift == "lifecycle_side":
@@ -908,6 +969,12 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             leg.venue = "other"
         elif drift == "leg_strategy":
             leg.strategy_instance_id = "different-strategy"
+        elif drift == "leg_client_order":
+            leg.client_order_id = "different-client-order"
+        elif drift == "leg_pos":
+            leg.pos_id = "position-1"
+        elif drift == "leg_attribution":
+            leg.attribution_status = "attributed"
         elif drift == "request_fingerprint":
             intent.request_fingerprint = "f" * 64
         elif drift.startswith("request_"):
@@ -924,6 +991,8 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             intent.execution_binding_id = foreign_binding.id
         elif drift == "intent_leg":
             intent.execution_order_leg_id = foreign_leg.id
+        elif drift == "intent_adopted":
+            intent.adopted_order_id = "child-filled-1"
         elif drift == "protection_parent":
             protection.parent_entry_order_id = "different-order"
         elif drift == "protection_stop":
@@ -935,10 +1004,16 @@ def test_manual_reconciliation_refuses_canonical_local_ownership_drift(
             protection.execution_binding_id = foreign_binding.id
         elif drift == "protection_leg":
             protection.execution_order_leg_id = foreign_leg.id
+        elif drift == "protection_pos":
+            protection.pos_id = "position-1"
+        elif drift == "protection_exchange":
+            protection.exchange_order_id = "protection-order-1"
         elif drift == "convergence_binding":
             convergence.execution_binding_id = foreign_binding.id
         elif drift == "convergence_leg":
             convergence.execution_order_leg_id = foreign_leg.id
+        elif drift == "convergence_pos":
+            convergence.pos_id = "position-1"
         else:  # pragma: no cover - parameter list is closed above
             raise AssertionError(drift)
         session.commit()
@@ -1333,6 +1408,52 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
 
     assert repeated.status == "completed"
     assert repeated.reason_code is None
+
+
+def test_completed_reconciliation_refuses_missing_authority_row(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    apply_manual_pending_entry_reconciliation(
+        session_factory,
+        database_path=database_path,
+        backup_path=tmp_path / "first.db",
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        expected_fingerprint=plan.fingerprint,
+        now=NOW,
+    )
+    with session_factory() as session:
+        session.query(TradingSetting).filter_by(
+            key="entry_revision_exchange_authority"
+        ).delete()
+        session.commit()
+
+    repeated = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert repeated.status == "blocked"
+    assert repeated.reason_code == "entry_revision_exchange_authority_missing"
 
 
 @pytest.mark.parametrize(
