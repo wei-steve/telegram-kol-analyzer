@@ -1202,6 +1202,52 @@ def test_manual_reconciliation_apply_rechecks_unreviewed_active_sibling(
         assert session.get(StrategyLifecycle, target.lifecycle_id).lifecycle_status == "pending_entry"
 
 
+def test_manual_reconciliation_plan_fingerprint_binds_canonical_identity(tmp_path):
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+    drifted = replace(
+        target,
+        chat_id=91,
+        message_id=92,
+        strategy_instance_id="deepcoin:91:92:ETH:long",
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, target.execution_binding_id)
+        lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+        leg = session.get(ExecutionOrderLeg, target.execution_order_leg_id)
+        binding.chat_id = lifecycle.chat_id = 91
+        binding.message_id = lifecycle.message_id = 92
+        binding.strategy_instance_id = leg.strategy_instance_id = drifted.strategy_instance_id
+        session.commit()
+
+    with pytest.raises(ValueError, match="manual_reconciliation_plan_drift"):
+        apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=tmp_path / "backup.db",
+            deepcoin_client=client,
+            targets=(drifted,),
+            expected_fingerprint=plan.fingerprint,
+            runtime_guard=RuntimeGuard(),
+            now=NOW,
+        )
+
+
 def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, monkeypatch):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 

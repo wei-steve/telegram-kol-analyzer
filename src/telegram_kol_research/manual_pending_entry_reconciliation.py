@@ -196,7 +196,7 @@ def build_manual_pending_entry_reconciliation_plan(
     fingerprint = _fingerprint(
         {
             "evidence_sha256": evidence.fingerprint,
-            "target_order_ids": order_ids,
+            "targets": [_canonical_target_payload(target) for target in reviewed],
         }
     )
     return ManualPendingEntryReconciliationPlan(
@@ -690,7 +690,11 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         if destination.execute("PRAGMA foreign_key_check").fetchone() is not None:
             raise ValueError("backup_foreign_key_check_failed")
         serialized = destination.serialize()
-        if len(serialized) < 100 or not serialized.startswith(b"SQLite format 3\x00"):
+        if (
+            len(serialized) < 100
+            or not serialized.startswith(b"SQLite format 3\x00")
+            or serialized[18:20] not in {b"\x01\x01", b"\x02\x02"}
+        ):
             raise ValueError("backup_quick_check_failed")
         payload_buffer = bytearray(serialized)
         # Online backup has already merged every WAL frame. Mark the standalone
@@ -829,6 +833,23 @@ def _canonical_targets_valid(
         == 1
         for binding_id in {target.execution_binding_id for target in reviewed}
     )
+
+
+def _canonical_target_payload(target: ReviewedPendingEntryTarget) -> dict[str, object]:
+    return {
+        "order_id": target.order_id,
+        "instrument_id": target.instrument_id,
+        "lifecycle_id": target.lifecycle_id,
+        "execution_binding_id": target.execution_binding_id,
+        "execution_order_leg_id": target.execution_order_leg_id,
+        "chat_id": target.chat_id,
+        "message_id": target.message_id,
+        "strategy_instance_id": target.strategy_instance_id,
+        "trigger_price": target.trigger_price,
+        "size": target.size,
+        "embedded_stop_price": target.embedded_stop_price,
+        "request_fingerprint": target.request_fingerprint,
+    }
 
 
 def _reviewed_binding_scope_changed(session, reviewed) -> bool:
