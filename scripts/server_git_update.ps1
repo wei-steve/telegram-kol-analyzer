@@ -112,7 +112,8 @@ foreach ($remotePath in @($SourceRepo, $ReleaseRoot, $ServiceDropinRoot, $Databa
     }
 }
 if ($Action -eq "activate") {
-    if ($RollbackCommit -notmatch '^[0-9a-f]{40}$') {
+    if ($ActivationSourceMode -eq "immutable" -and
+        $RollbackCommit -notmatch '^[0-9a-f]{40}$') {
         throw "RollbackCommit must be a full lowercase commit."
     }
     if (-not (Test-RemotePath $ActivationAuthorization) -or
@@ -172,7 +173,11 @@ case "$action" in
       "$temporary/control/deploy/telegram-kol-stage"
     ;;
   activate)
-    updater="$release_root/$rollback_commit/deploy/telegram-kol-update"
+    dispatcher_commit="$rollback_commit"
+    if [ "$source_mode" = "stopped_legacy" ]; then
+      dispatcher_commit="$expected_commit"
+    fi
+    updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
     [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
     DEPLOYMENT_ACTION=activate EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT="$rollback_commit" \
       ACTION_MANIFEST="$temporary/action-manifest.json" ACTIVATION_AUTHORIZATION="$authorization" \

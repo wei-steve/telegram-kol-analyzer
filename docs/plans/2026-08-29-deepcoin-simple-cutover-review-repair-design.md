@@ -2,8 +2,8 @@
 
 **Date:** 2026-08-29
 **Status:** approved
-**Risk:** L2 activation behavior and L3 local reconciliation; every production
-action remains separately authorized
+**Risk:** L2 activation behavior and L3 local reconciliation; this local phase
+does not authorize the later production cutover phase
 
 ## Objective
 
@@ -15,7 +15,7 @@ lease/bootstrap/drain protocol or introduce another persistent handoff state.
 
 1. **Add a stopped-legacy mode to the existing scoped activator (selected).**
    Reuse immutable release validation, authorization consumption, entry-frozen
-   drop-ins, post-start runtime identity, and rollback. Replace only the
+   drop-ins and post-start runtime identity. Replace only the
    impossible pre-start runtime identity proof with direct proof that every
    controlled unit is inactive and persistently masked.
 2. Restore the deleted bootstrap protocol. This would recover the first-cutover
@@ -31,23 +31,26 @@ The existing activator gains one explicit `stopped_legacy` source mode. It is
 valid only for the full authority scope (`web`, `monitor`, `ingest`, `worker`).
 Before consuming authorization it proves:
 
-- candidate and rollback releases are independently immutable and compatible;
+- the candidate release is independently immutable and uses its own activator;
 - every controlled service and the monitor timer is inactive and persistently
   masked;
 - active exchange-write count is exactly zero;
-- entry admission will be frozen in every candidate and rollback drop-in.
+- entry admission will be frozen in every candidate drop-in.
 
 The activator then consumes the ordinary one-shot activation authorization,
 publishes candidate drop-ins, unmasks the declared units, and starts the
 candidate. Candidate runtime identity and live management, protection, close,
 TPSL, rescue, ingest, and worker capabilities are proved exactly as in ordinary
 activation. There is no pre-start PID comparison because the source is proven
-stopped. On candidate failure, the activator starts only the validated rollback
-release, still entry-frozen. If rollback also fails, it stops and persistently
-masks the entire scope and reports `rollback_failed`.
+stopped. Post-start identity and authority proof is single-attempt: any worker,
+protection, management, close, TPSL, rescue, ingest, monitor, or runtime-identity
+failure stops every controlled unit, proves `MainPID=0` and empty cgroups,
+restores persistent inhibits, and reports `maintenance_stopped`. It never starts
+the legacy runtime and never retries automatically.
 
 Ordinary release-to-release activation is unchanged and still requires the
-currently running immutable rollback identity.
+currently running immutable rollback identity and separately validated rollback
+release.
 
 ## Reconciliation Repairs
 
@@ -56,10 +59,17 @@ maintenance state before its first exchange read and again immediately before
 the database write transaction. Evidence time is the snapshot completion time,
 never a timestamp captured before network reads.
 
-The exchange snapshot refuses any current position, regular order, or pending
-trigger. It also refuses any target-related fill or trigger history that cannot
-prove the target ended unfilled and cancelled. Unknown or ambiguous history is
-permanently fail-closed; there is no automatic retry or recovery action.
+The dry-run and apply snapshots must remain fingerprint-identical and each
+refuses any current position, regular order, or pending trigger. Every canonical
+`ordId` also receives one exact fills query; incomplete results, a full boundary,
+identity conflict, or any returned fill blocks without automatic retry.
+
+History is adverse evidence rather than required cancellation proof. A missing
+row or a unique row without literal `cancelled|canceled` does not block by
+itself after the stable flat snapshots and exact zero fills. Explicit filled,
+partially-filled, executed, live/active, positive or malformed fill quantities,
+instrument mismatch, duplicate rows, or order/client identity conflict still
+fail closed.
 
 For every member of canonical `REVIEWED_PENDING_ENTRY_TARGETS`, local proof
 binds the exact lifecycle, binding, leg, venue, instrument, order ID, side,
@@ -90,12 +100,18 @@ legacy_running -> maintenance_stopped -> candidate_entry_frozen
   the full unit scope is inactive and persistently masked.
 - Any active, merely stopped-but-unmasked, or unknown unit blocks before
   authorization consumption and before database backup.
+- A candidate protection or worker-identity failure after partial startup leaves
+  every governed and legacy unit inactive, persistently inhibited, with
+  `MainPID=0`, empty cgroups, and no legacy restart.
 - Default-clock reconciliation produces fresh evidence; future or stale
   evidence still fails closed.
-- Any target-related fill, ambiguous history, economic drift, identity drift,
-  malformed authority timestamp, or noncanonical protection link blocks.
+- Any target-related fill, explicit risky history, economic drift, identity
+  drift, malformed authority timestamp, or noncanonical protection link blocks;
+  missing/nonliteral cancellation wording alone does not.
 - Successful apply terminalizes all seven canonical targets and seeds authority
-  in one transaction; failure leaves both the database and mask boundary safe.
+  in one transaction; the canonical v2 idle row passes the same read-only
+  quiescence parser used by activation. Failure leaves both the database and
+  mask boundary safe.
 - Ordinary release-to-release activation behavior and bytecode protections are
   unchanged.
 

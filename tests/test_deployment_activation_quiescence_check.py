@@ -32,7 +32,8 @@ def test_activation_quiescence_requires_exact_idle_durable_authority(tmp_path) -
         session_factory,
         {
             "released_at": datetime.now(UTC).isoformat(),
-            "schema_version": 1,
+            "generation": 0,
+            "schema_version": 2,
             "state": "idle",
         },
     )
@@ -53,6 +54,12 @@ def test_activation_quiescence_requires_exact_idle_durable_authority(tmp_path) -
             "token": "secret-not-reported",
         },
         {"schema_version": 1, "state": "idle", "released_at": ""},
+        {
+            "generation": 0,
+            "released_at": datetime.now(UTC).isoformat(),
+            "schema_version": 2,
+            "state": "blocked",
+        },
     ],
 )
 def test_activation_quiescence_fails_closed_for_missing_held_or_malformed_authority(

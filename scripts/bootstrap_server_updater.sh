@@ -44,11 +44,13 @@ ACTIVATION_AUTHORIZATION="${ACTIVATION_AUTHORIZATION:-}"
 ACTIVATION_AUTHORIZATION_CONSUMED="${ACTIVATION_AUTHORIZATION_CONSUMED:-}"
 ACTIVATION_SOURCE_MODE="${ACTIVATION_SOURCE_MODE:-immutable}"
 if [ "$ACTION" = "activate" ]; then
-  [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid ROLLBACK_COMMIT." >&2; exit 2; }
   safe_remote_path "$ACTIVATION_AUTHORIZATION" || { echo "Invalid ACTIVATION_AUTHORIZATION." >&2; exit 2; }
   safe_remote_path "$ACTIVATION_AUTHORIZATION_CONSUMED" || { echo "Invalid ACTIVATION_AUTHORIZATION_CONSUMED." >&2; exit 2; }
   [[ "$ACTIVATION_SOURCE_MODE" == "immutable" || "$ACTIVATION_SOURCE_MODE" == "stopped_legacy" ]] \
     || { echo "Invalid ACTIVATION_SOURCE_MODE." >&2; exit 2; }
+  if [ "$ACTIVATION_SOURCE_MODE" = "immutable" ]; then
+    [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid ROLLBACK_COMMIT." >&2; exit 2; }
+  fi
 fi
 
 if command -v shasum >/dev/null 2>&1; then
@@ -117,7 +119,11 @@ case "$action" in
       "$temporary/control/deploy/telegram-kol-stage"
     ;;
   activate)
-    updater="$release_root/$rollback_commit/deploy/telegram-kol-update"
+    dispatcher_commit="$rollback_commit"
+    if [ "$source_mode" = "stopped_legacy" ]; then
+      dispatcher_commit="$expected_commit"
+    fi
+    updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
     [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
     DEPLOYMENT_ACTION=activate \
       EXPECTED_COMMIT="$expected_commit" \

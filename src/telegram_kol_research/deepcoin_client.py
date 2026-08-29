@@ -114,6 +114,14 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return recent trade fills, optionally filtered by instrument."""
 
+    def list_trade_fills_by_order_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+        """Return fills for one exact exchange order identifier."""
+
     def list_trigger_orders_pending(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return pending trigger / TPSL orders for one instrument."""
 
@@ -426,6 +434,21 @@ class DeepcoinRestClient:
             _path_with_query(
                 DEEPCOIN_TRADE_FILLS_PATH,
                 {"instType": "SWAP", "instId": inst_id},
+            ),
+        )
+        return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)
+
+    def list_trade_fills_by_order_id(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+    ) -> list[dict[str, Any]]:
+        payload = self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_TRADE_FILLS_PATH,
+                {"instType": "SWAP", "instId": inst_id, "ordId": order_id},
             ),
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_TRADE_FILLS_PATH)

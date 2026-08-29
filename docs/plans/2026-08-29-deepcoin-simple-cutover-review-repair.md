@@ -34,7 +34,7 @@
    and verify GREEN.
 7. Commit only the activation source and test paths.
 
-### Task 2: Start candidate and preserve a stopped rollback boundary
+### Task 2: Start candidate and preserve a stopped maintenance boundary
 
 **Files:**
 - Modify: `src/telegram_kol_research/scoped_release_activation.py`
@@ -47,13 +47,16 @@
 1. Add failing tests proving stopped-legacy activation publishes entry-frozen
    drop-ins, unmasks only the declared full scope, starts the candidate, and
    validates post-start candidate runtime authority without a before-PID check.
-2. Add failing rollback tests: candidate failure starts only the validated
-   rollback entry-frozen; rollback failure stops and persistently masks the
-   entire scope.
+2. Add the first falsifier: after partial candidate startup, make worker identity
+   or protection authority fail. Prove every controlled and legacy unit ends
+   inactive and persistently inhibited with `MainPID=0` and empty cgroups, with
+   no legacy start and no database or exchange write.
 3. Add explicit `ACTIVATION_SOURCE_MODE=immutable|stopped_legacy` parsing in the
    activator entrypoint; reject every other value.
-4. Implement the minimal start/rollback branches while leaving ordinary
-   immutable-to-immutable activation unchanged.
+4. Dispatch `stopped_legacy` through the candidate's own activator without a
+   rollback release. Make post-start proof single-attempt and converge every
+   failure to `maintenance_stopped`; leave ordinary immutable-to-immutable
+   rollback unchanged.
 5. Run focused activation and deploy-script tests and verify GREEN.
 6. Commit explicit activation/deploy/test paths.
 
@@ -71,11 +74,12 @@
    reads complete; verify it currently refuses its own future evidence.
 2. Change the reconciliation freshness boundary to use a timestamp captured
    after evidence construction. Keep explicit clocks injectable in tests.
-3. Add failing tests for a target-related trade fill and for trigger history
-   whose terminal status is filled, ambiguous, or inconsistent with an
-   unfilled cancellation.
-4. Add one small public order-ID normalizer if needed and reject target-related
-   fills or noncanonical history before local planning. Do not retry or write.
+3. Add failing tests for every canonical `ordId` exact zero-fill query, including
+   incomplete, full-boundary, identity-conflict and nonzero results.
+4. Add failing tests showing missing history and nonliteral cancellation wording
+   are accepted only with complete flat snapshots and exact zero fills, while
+   explicit fill/executed/live states, status aliases, fill quantities, duplicate
+   rows and identity/instrument conflicts block. Do not retry or write.
 5. Run both focused test modules and verify GREEN.
 6. Commit explicit evidence/reconciliation/test paths.
 
@@ -102,6 +106,10 @@
    block as `reviewed_local_state_changed`.
 5. Run authority and reconciliation tests and verify GREEN.
 6. Commit explicit source/test paths.
+
+The activation quiescence check must reuse the same canonical v2 idle-authority
+parser. Add a reconciliation-seed-to-real-quiescence test; missing, held,
+blocked, legacy-schema and malformed rows remain fail-closed.
 
 ### Task 5: Revalidate maintenance stop and harden the SQLite backup
 
@@ -144,11 +152,11 @@
    authorization explicitly outstanding.
 2. Run `git diff --check` and Python compilation for changed modules.
 3. Run all affected focused tests.
-4. Run one final `.venv/bin/python -m pytest -q` after the last production-code
-   edit.
-5. Request an independent code review of the exact base-to-HEAD diff; repair all
+4. Request an independent code review of the exact base-to-HEAD diff; repair all
    Critical/Important findings with new RED→GREEN cycles.
-6. Re-run affected focused tests and the final full suite if production code
-   changes after review.
+5. After the final production-code edit and cleared review, run one final
+   `.venv/bin/python -m pytest -q`.
+6. Re-run affected focused tests before that final full suite whenever review
+   changes production code.
 7. Commit explicit documentation paths. Do not push, stage, SSH, deploy, freeze,
    restart, or perform production/Deepcoin writes.

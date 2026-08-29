@@ -446,6 +446,39 @@ def test_updater_dispatches_only_to_sibling_activator_in_named_release(
     assert marker.exists()
 
 
+def test_stopped_legacy_updater_uses_candidate_without_rollback_release(
+    tmp_path: Path,
+) -> None:
+    candidate_commit = "3" * 40
+    deploy = tmp_path / candidate_commit / "deploy"
+    deploy.mkdir(parents=True)
+    dispatcher = deploy / "telegram-kol-update"
+    shutil.copy2(ROOT / "deploy/telegram-kol-update", dispatcher)
+    marker = tmp_path / "candidate-activator-called"
+    activator = deploy / "telegram-kol-activate"
+    activator.write_text(
+        f"#!/usr/bin/env bash\ntouch {marker!s}\nexit 23\n",
+        encoding="utf-8",
+    )
+    activator.chmod(0o755)
+
+    result = subprocess.run(
+        [str(dispatcher)],
+        env={
+            **os.environ,
+            "DEPLOYMENT_ACTION": "activate",
+            "EXPECTED_COMMIT": candidate_commit,
+            "ACTIVATION_SOURCE_MODE": "stopped_legacy",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 23
+    assert marker.exists()
+
+
 def test_updater_refuses_dispatcher_directory_identity_mismatch(
     tmp_path: Path,
 ) -> None:
@@ -579,6 +612,8 @@ def test_scoped_activation_policy_documents_identity_rollback_and_blockers():
         "protection, close, TPSL, and rescue",
         "explicit short interruption",
         "separately validated `ROLLBACK_COMMIT`",
+        "`-ActivationSourceMode stopped_legacy`",
+        "-ActivationSourceMode stopped_legacy",
         "checkout HEAD is not accepted as a substitute",
         "Schema or production-data mutation is refused",
         "does not change settings",
@@ -765,14 +800,24 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
         "91bb257e2a1c808c25a54149a7c71c392c0952e4" in status
     )
     assert "pending_entry_cancel_production_executed: false" in status
-    assert "current_phase: manual_cancel_reconciliation_history_repair" in status
+    assert "current_phase: manual_cleanup_production_cutover" in status
     assert "pending_entry_cancel_live_order_count: 0" in status
     assert (
         "manual_cleanup_exchange_snapshot_status: "
-        "zero_live_orders_history_contract_blocked" in status
+        "zero_live_orders_historical_requires_fresh_cutover_recheck" in status
     )
     assert "manual_cleanup_target_fill_count: 0" in status
     assert "manual_cleanup_local_eligible_count: 7" in status
+    assert (
+        "manual_cleanup_local_repair_status: "
+        "complete_production_cutover_pending" in status
+    )
+    assert "manual_cleanup_local_repair_base_sha: " in status
+    assert "manual_cleanup_local_repair_focused: 344_passed_1_skipped" in status
+    assert (
+        "manual_cleanup_local_repair_final_suite: "
+        "6644_passed_3_skipped_32_warnings" in status
+    )
     assert "auto_trade_frozen: false" in status
     assert "freeze_raw_message_id: null" in status
     assert "restore_raw_message_id: null" in status
@@ -957,13 +1002,16 @@ def test_push_command_fast_forwards_only_the_exact_local_commit(
     assert remote_commit == expected_commit
 
 
-def test_activate_transport_uses_only_the_rollback_release_dispatcher() -> None:
+def test_activate_transport_selects_dispatcher_by_source_mode() -> None:
     bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
         encoding="utf-8"
     )
 
     activate = bootstrap[bootstrap.index("  activate)") :]
-    assert 'updater="$release_root/$rollback_commit/deploy/telegram-kol-update"' in activate
+    assert 'dispatcher_commit="$rollback_commit"' in activate
+    assert 'if [ "$source_mode" = "stopped_legacy" ]' in activate
+    assert 'dispatcher_commit="$expected_commit"' in activate
+    assert 'updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"' in activate
     assert "DEPLOYMENT_ACTION=activate" in activate
     assert 'EXPECTED_COMMIT="$expected_commit"' in activate
     assert 'ROLLBACK_COMMIT="$rollback_commit"' in activate
@@ -989,7 +1037,7 @@ def test_powershell_activate_transport_passes_explicit_source_mode() -> None:
 def test_retired_universal_updater_implementation_is_absent() -> None:
     updater = (ROOT / "deploy/telegram-kol-update").read_text(encoding="utf-8")
 
-    assert len(updater.splitlines()) < 30
+    assert len(updater.splitlines()) < 40
     for retired in (
         "git fetch",
         "git merge",

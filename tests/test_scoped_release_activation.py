@@ -236,6 +236,8 @@ class FakeRuntime:
         self.matching_runtime_pids: tuple[int, ...] = ()
         self.stop_fail_units: set[str] = set()
         self.mask_fail_units: set[str] = set()
+        self.database_write_count = 0
+        self.exchange_write_count = 0
 
     def active_write_count(self, database_path: Path) -> int:
         self.events.append("active-write")
@@ -302,6 +304,8 @@ class FakeRuntime:
             raise ActivationError(f"stop failed: {unit}")
         _, enabled_state = self.maintenance_state_by_unit[unit]
         self.maintenance_state_by_unit[unit] = ("inactive", enabled_state)
+        self.main_pid_by_unit[unit] = 0
+        self.cgroup_pids_by_unit[unit] = ()
 
     def start_unit(self, unit: str) -> None:
         self.events.append(f"start:{unit}")
@@ -310,6 +314,9 @@ class FakeRuntime:
         role = unit.removeprefix("telegram-kol-").removesuffix(".service")
         if role not in self.current_commit_by_role:
             return
+        pid = 100 + {"web": 0, "ingest": 1, "worker": 2}[role]
+        self.main_pid_by_unit[unit] = pid
+        self.cgroup_pids_by_unit[unit] = (pid,)
         self.start_ticks_by_role[role] += 10
         dropin = Path(self.dropin_root) / f"{unit}.d/10-telegram-kol-release.conf"
         text = dropin.read_text(encoding="utf-8")
@@ -768,7 +775,7 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
     assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
 
 
-def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
+def test_stopped_legacy_candidate_protection_failure_ends_maintenance_stopped(
     activation_harness,
 ) -> None:
     paths, runtime, manifest = activation_harness
@@ -780,14 +787,15 @@ def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
     }
     immutable_identity = runtime.runtime_identity
 
-    def candidate_worker_identity_fails(role: str) -> dict:
+    def candidate_worker_protection_fails(role: str) -> dict:
+        payload = immutable_identity(role)
         if role == "worker" and runtime.current_commit_by_role[role] == CANDIDATE:
-            raise ActivationError("candidate worker identity failed")
-        return immutable_identity(role)
+            payload["capabilities"]["protection"] = False
+        return payload
 
-    runtime.runtime_identity = candidate_worker_identity_fails
+    runtime.runtime_identity = candidate_worker_protection_fails
 
-    with pytest.raises(ActivationError, match="rollback_complete"):
+    with pytest.raises(ActivationError, match="maintenance_stopped"):
         activate_release(
             expected_commit=CANDIDATE,
             rollback_commit=ROLLBACK,
@@ -797,16 +805,88 @@ def test_stopped_legacy_candidate_failure_starts_verified_frozen_rollback(
             source_mode="stopped_legacy",
         )
 
-    assert runtime.current_commit_by_role == {
-        "web": ROLLBACK,
-        "ingest": ROLLBACK,
-        "worker": ROLLBACK,
+    assert set(runtime.maintenance_state_by_unit.values()) == {
+        ("inactive", "inhibited")
     }
-    assert all(runtime.entry_frozen_by_role.values())
-    assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
+    assert set(runtime.main_pid_by_unit.values()) == {0}
+    assert set(runtime.cgroup_pids_by_unit.values()) == {()}
+    assert "start:telegram-kol.service" not in runtime.events
+    assert runtime.current_commit_by_role == {
+        "web": CANDIDATE,
+        "ingest": CANDIDATE,
+        "worker": CANDIDATE,
+    }
+    assert runtime.database_write_count == 0
+    assert runtime.exchange_write_count == 0
+    assert paths.authorization_consumed.exists()
 
 
-def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
+def test_stopped_legacy_candidate_identity_unknown_is_never_retried(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "inhibited")
+        for unit in runtime.maintenance_state_by_unit
+    }
+    immutable_identity = runtime.runtime_identity
+    candidate_worker_attempts = 0
+
+    def first_candidate_worker_identity_is_unknown(role: str) -> dict:
+        nonlocal candidate_worker_attempts
+        if role == "worker" and runtime.current_commit_by_role[role] == CANDIDATE:
+            candidate_worker_attempts += 1
+            if candidate_worker_attempts == 1:
+                raise ActivationError("candidate worker identity unknown")
+        return immutable_identity(role)
+
+    runtime.runtime_identity = first_candidate_worker_identity_is_unknown
+
+    with pytest.raises(ActivationError, match="maintenance_stopped"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+        )
+
+    assert candidate_worker_attempts == 1
+    assert set(runtime.maintenance_state_by_unit.values()) == {
+        ("inactive", "inhibited")
+    }
+    assert set(runtime.main_pid_by_unit.values()) == {0}
+    assert set(runtime.cgroup_pids_by_unit.values()) == {()}
+
+
+def test_stopped_legacy_activation_does_not_require_rollback_release(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "inhibited")
+        for unit in runtime.maintenance_state_by_unit
+    }
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit="",
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        source_mode="stopped_legacy",
+    )
+
+    assert result["status"] == "activated"
+    assert result["rollback_commit"] is None
+
+
+def test_stopped_legacy_candidate_start_failure_returns_to_maintenance_stopped(
     activation_harness,
 ) -> None:
     paths, runtime, manifest = activation_harness
@@ -825,7 +905,7 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
 
     runtime.start_unit = no_worker_can_start
 
-    with pytest.raises(ActivationError, match="rollback_failed"):
+    with pytest.raises(ActivationError, match="maintenance_stopped"):
         activate_release(
             expected_commit=CANDIDATE,
             rollback_commit=ROLLBACK,
@@ -838,7 +918,7 @@ def test_stopped_legacy_rollback_failure_returns_to_persistently_stopped_scope(
     assert set(runtime.maintenance_state_by_unit.values()) == {("inactive", "inhibited")}
 
 
-def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
+def test_stopped_legacy_failed_stop_proof_attempts_every_inhibit_and_stop(
     activation_harness,
 ) -> None:
     paths, runtime, manifest = activation_harness
@@ -859,7 +939,7 @@ def test_stopped_legacy_rollback_failure_attempts_every_inhibit_and_stop(
 
     runtime.start_unit = no_worker_can_start
 
-    with pytest.raises(ActivationError, match="rollback_failed"):
+    with pytest.raises(ActivationError, match="maintenance_stop_failed"):
         activate_release(
             expected_commit=CANDIDATE,
             rollback_commit=ROLLBACK,

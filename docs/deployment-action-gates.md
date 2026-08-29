@@ -1,8 +1,12 @@
 # Action-scoped deployment gates
 
-The deployment workflow has five independent actions. A successful action never authorizes or automatically starts the next one.
+The deployment workflow has five independently gated actions. One approved
+phase may include several named actions; success never expands beyond that
+approved phase or automatically starts an action outside it.
 
-**A generated plan is not authorization.** It is a deterministic statement of required evidence and prohibited effects. The operator still grants each external action separately.
+**A generated plan is not authorization.** It is a deterministic statement of
+required evidence and prohibited effects. The operator grants one coherent
+external phase whose named actions define its boundary.
 
 Immutable staging and scoped activation are the only deployment path in the
 local candidate. The planner does not authorize either action, and the
@@ -10,12 +14,12 @@ workstation helpers require an explicit action instead of selecting a default.
 
 ## Action matrix
 
-| Action | Required evidence | Prohibited effects | Separate authorization |
+| Action | Required evidence | Prohibited effects | Scope boundary |
 | --- | --- | --- | --- |
 | `local` | correct workspace; risk-scoped tests | SSH, service control, production settings/DB, Telegram, exchange writes | no production authorization |
 | `push` | clean tree; reviewed diff; exact commit; fast-forward history | stage, activation, restart, production settings/DB, Telegram, exchange writes | push only |
 | `stage` | exact commit; immutable inactive artifact; non-secret receipt | active checkout mutation, service control, production settings/DB, Telegram, exchange writes | server staging only |
-| `activate` | verified stage receipt; explicit activation approval; exact loaded-artifact identity; affected-service scope; rollback; scoped health | undeclared services, new-entry admission, activator-originated exchange writes, historical/frozen-message replay, bulk order actions | activation/restart only |
+| `activate` | verified stage receipt; approved activation scope; exact loaded-artifact identity; affected-service scope; ordinary-upgrade rollback or stopped-legacy maintenance boundary; scoped health | undeclared services, new-entry admission, activator-originated exchange writes, historical/frozen-message replay, bulk order actions | activation/restart only |
 | `trading` | explicit trading approval; fresh runtime/exchange evidence; one canonical target; no unknown; fresh single-use confirmation; full local terminalization | bulk actions, historical/frozen-message replay, automatic retry after unknown | exactly one trading action |
 
 Stage must not inspect live runtime or database state. This remains true for an L3 worker candidate: risk changes what later activation must prove, not whether inert candidate files may be prepared.
@@ -47,7 +51,12 @@ The manifest is fail-closed:
 
 ## Component-scoped activation
 
-`web` and `monitor` activation proves the staged artifact, affected process identity, rollback, and scoped health. It does not query active exchange submissions or infer trading/protection authority because those services do not own it.
+`web` and `monitor` activation proves the staged artifact, affected process
+identity, source-mode failure boundary, and scoped health. Ordinary immutable
+upgrades additionally prove rollback; `stopped_legacy` proves the persistently
+stopped maintenance boundary instead. These services do not query active
+exchange submissions or infer trading/protection authority because they do not
+own it.
 
 `ingest` and `worker` activation additionally requires:
 
@@ -122,7 +131,7 @@ Successful staging does not authorize activation. It does not inspect the produc
 ## Scoped immutable activation command
 
 `deploy/telegram-kol-activate` is the separate activation entry point. It
-accepts `EXPECTED_COMMIT`, `ROLLBACK_COMMIT`, `ACTION_MANIFEST`,
+accepts `EXPECTED_COMMIT`, an ordinary-upgrade `ROLLBACK_COMMIT`, `ACTION_MANIFEST`,
 `ACTIVATION_AUTHORIZATION`, `ACTIVATION_AUTHORIZATION_CONSUMED`,
 `RELEASE_ROOT`, `SERVICE_DROPIN_ROOT`, and `DATABASE_PATH`. The activation
 manifest must describe the same risk, components, restart, schema/data,
@@ -132,10 +141,12 @@ action changes from `stage` to `activate`.
 The authorization is a root-owned mode-`0400` canonical JSON document bound to
 the candidate commit, ordered component scope, activation-plan digest, a
 64-hex nonce, and an at-most-15-minute issue/expiry window. Activation validates
-it only after validating both candidate and rollback releases and fresh runtime
-evidence. It then consumes the token once with a same-directory no-replace hard
-link plus unlink before controlling a service. Failure after consumption never
-restores the token.
+it only after validating the candidate and fresh source-mode evidence. Ordinary
+immutable-to-immutable activation also validates the rollback release;
+`stopped_legacy` does not require one. It then consumes the token once with a
+same-directory no-replace hard link plus unlink before controlling a service.
+Failure after consumption never restores the token.
+Ordinary upgrades retain a separately validated `ROLLBACK_COMMIT`.
 
 Runtime services load code with a component-specific systemd drop-in whose
 `PYTHONPATH` names the exact immutable release. Success requires the loopback
@@ -148,12 +159,15 @@ runtime endpoint to prove all of the following at once:
 - for worker authority, exactly the worker directly reports live management,
   protection, close, TPSL, and rescue task authority.
 
-The activation control program is imported from the separately verified
-immutable rollback release, not from the mutable active checkout. Candidate
-and rollback may differ in application source, tests, documentation, and
-activation control code, but their runtime configuration, dependency metadata,
-and installed systemd unit inputs must match for this Batch 3 activator. A
-change in that runtime-support scope fails before authorization is consumed.
+For ordinary immutable-to-immutable activation, the activation control program
+is imported from the separately verified immutable rollback release, not from
+the mutable active checkout. Candidate and rollback may differ in application
+source, tests, documentation, and activation control code, but their runtime
+configuration, dependency metadata, and installed systemd unit inputs must
+match. `stopped_legacy` instead dispatches the candidate's own validated
+activator after proving the full legacy/split scope inactive, persistently
+inhibited, `MainPID=0`, cgroup-empty, process-empty, and free of active exchange
+writes.
 
 Web-only activation does not query the database or trading authority. Worker
 activation performs a read-only active-write check both before and after the
@@ -200,18 +214,23 @@ diagnostic, or notification monitor command because those paths can update
 monitor state or capture an incident. If the timer was active before the switch,
 it is restored only after the identity probe passes.
 
-Any failure after service control rewrites the same scoped drop-ins to the
-separately validated `ROLLBACK_COMMIT`, starts only the declared services, and
-proves the rollback identities, authority, and runtime-wide entry freeze. It does not change settings,
-enable trading, replay messages, invoke a Telegram send, or call Deepcoin.
-Unknown evidence fails closed and is not converted to zero.
+For ordinary immutable-to-immutable activation, any failure after service
+control rewrites the same scoped drop-ins to the separately validated
+`ROLLBACK_COMMIT`, starts only the declared services, and proves the rollback
+identities, authority, and runtime-wide entry freeze. For `stopped_legacy`,
+post-start proof is single-attempt: any failure persistently inhibits and stops
+the full scope, proves `MainPID=0` and empty cgroups, and ends as
+`maintenance_stopped`. It never starts the legacy runtime or automatically
+retries. Neither path changes settings, enables trading, or can replay messages,
+invokes a Telegram send, or calls Deepcoin. Unknown evidence fails closed and
+is not converted to zero.
 
 Three deliberate activation blockers remain:
 
-1. A legacy checkout-loaded runtime cannot pass the immutable loaded-artifact
-   endpoint. Before the first immutable switch, the observability endpoint must
-   itself reach production through a separately reviewed and authorized
-   migration deployment; checkout HEAD is not accepted as a substitute.
+1. A `stopped_legacy` first switch requires the complete authority scope to be
+   inactive, persistently inhibited, `MainPID=0`, cgroup-empty and process-empty;
+   checkout HEAD is not accepted as a substitute for this stopped boundary or
+   the candidate's post-start loaded-artifact identity.
 2. Schema or production-data mutation is refused until a separate L3 executor
    can create and verify the scoped backup, `PRAGMA quick_check`, bounded counts,
    and database rollback boundary. The activator does not accept a bypass or an
@@ -223,9 +242,12 @@ Three deliberate activation blockers remain:
    backup, and authorization; activation never creates it.
 
 `deploy/telegram-kol-update` is now only an explicit activation dispatcher. It
-accepts `DEPLOYMENT_ACTION=activate` and executes the activator from the
-separately named immutable `ROLLBACK_COMMIT`; it has no checkout-mutating,
-stage-and-activate, settings, database, or service-control compatibility path.
+accepts `DEPLOYMENT_ACTION=activate`. Ordinary immutable-to-immutable activation
+executes the activator from the separately named immutable `ROLLBACK_COMMIT`;
+the first `stopped_legacy` switch executes the activator from the validated
+`EXPECTED_COMMIT` candidate and does not accept a rollback requirement. It has
+no checkout-mutating, stage-and-activate, settings, database, or service-control
+compatibility path.
 No local implementation or successful test authorizes installation, SSH,
 activation, restart, or any production write.
 
@@ -244,6 +266,11 @@ ACTION_MANIFEST=/path/to/activate.json EXPECTED_COMMIT=<candidate-sha> \
   ACTIVATION_AUTHORIZATION=/run/path/to/authorization.json \
   ACTIVATION_AUTHORIZATION_CONSUMED=/run/path/to/authorization.consumed \
   ./scripts/server_git_update.sh activate
+ACTION_MANIFEST=/path/to/activate.json EXPECTED_COMMIT=<candidate-sha> \
+  ACTIVATION_SOURCE_MODE=stopped_legacy \
+  ACTIVATION_AUTHORIZATION=/run/path/to/authorization.json \
+  ACTIVATION_AUTHORIZATION_CONSUMED=/run/path/to/authorization.consumed \
+  ./scripts/server_git_update.sh activate
 ```
 
 PowerShell exposes the same `plan`, `push`, `stage`, and `activate` action names
@@ -251,8 +278,18 @@ through its mandatory `-Action` parameter. Every non-plan command requires a
 manifest declaring that exact action. `push` requires a clean exact-HEAD
 worktree and refuses a non-fast-forward update. `stage` transports only an
 ephemeral exact-commit control bundle and creates the inactive immutable
-candidate. `activate` invokes only the dispatcher inside the declared immutable
-rollback release and requires server-side authorization paths.
+candidate. Ordinary `activate` invokes the rollback-release dispatcher;
+`-ActivationSourceMode stopped_legacy` invokes the candidate dispatcher without
+`-RollbackCommit`. Both require server-side authorization paths:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
+  -Action activate -ActionManifest .\activate-action.json `
+  -ExpectedCommit <candidate-40-character-sha> `
+  -ActivationSourceMode stopped_legacy `
+  -ActivationAuthorization /run/path/to/authorization.json `
+  -ActivationAuthorizationConsumed /run/path/to/authorization.consumed
+```
 
 No helper command invokes the next action. In particular, push never stages,
 stage never activates, activation never changes trading state, and no trading

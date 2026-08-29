@@ -3,7 +3,7 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: manual_cancel_reconciliation_history_repair
+current_phase: manual_cleanup_production_cutover
 phase_state: planned
 claimed_by: null
 candidate_sha: 2ce91a373bef5dc9878c54c4db5a23e0ace51d49
@@ -41,7 +41,7 @@ legacy_runtime_drain_bridge_review_design_sha: 4a2a2ac0793e3faddbbc69e4940e6391b
 legacy_runtime_drain_bridge_review_plan_sha: d53aadbe602f8397e29cb25216c6e131240f31fb
 legacy_runtime_drain_bridge_production_executed: false
 immutable_control_bootstrap_status: superseded_deleted_local
-simple_cancel_all_cutover_status: staged_inactive_history_contract_blocked
+simple_cancel_all_cutover_status: local_repair_complete_production_cutover_pending
 simple_cancel_all_cutover_design_sha: 71eb1d4b
 simple_cancel_all_protocol_removal_sha: a3434ebb
 simple_cancel_all_reconciliation_sha: ec0b9dee
@@ -52,9 +52,13 @@ simple_cancel_all_final_focused: 314_passed_1_skipped
 simple_cancel_all_final_suite: 6626_passed_3_skipped_32_warnings
 simple_cancel_all_production_executed: false
 manual_cleanup_read_only_verified_at: 2026-08-29T20:20:19Z
-manual_cleanup_exchange_snapshot_status: zero_live_orders_history_contract_blocked
+manual_cleanup_exchange_snapshot_status: zero_live_orders_historical_requires_fresh_cutover_recheck
 manual_cleanup_target_fill_count: 0
 manual_cleanup_local_eligible_count: 7
+manual_cleanup_local_repair_status: complete_production_cutover_pending
+manual_cleanup_local_repair_base_sha: bd73ceb15eb7228f8d9e52641891578cb1883253
+manual_cleanup_local_repair_focused: 344_passed_1_skipped
+manual_cleanup_local_repair_final_suite: 6644_passed_3_skipped_32_warnings
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -753,3 +757,55 @@ expansion or an irreversible action that the approved phase did not include.
   canonical target, intact local identity, and stopped-runtime proof at the
   eventual write boundary; explicit fill or identity conflict remains blocking.
   Do not restore the deleted bridge or add another persistent handoff state.
+
+## Manual cleanup local repair
+
+- The local phase started from exact clean SHA
+  `bd73ceb15eb7228f8d9e52641891578cb1883253` on
+  `codex/phase0-deploy-integration`. It changes only the manual-cleanup evidence
+  contract, the first `stopped_legacy` activation terminal state, their exact
+  transport/quiescence interfaces, tests, and current documentation.
+- Dry-run and apply remain the before/after stable account snapshots. Apply
+  rebuilds the complete plan and requires its fingerprint to equal the reviewed
+  dry-run fingerprint before backup or `BEGIN IMMEDIATE`. Every canonical
+  `ordId` now receives one exact fills GET per snapshot; incomplete, full-page,
+  identity-conflicting, or nonempty results fail closed without retry.
+- Missing history or a unique history row without literal
+  `cancelled|canceled` no longer blocks by itself. Explicit fill, partial fill,
+  executed/success/completed/live states across the supported Deepcoin status
+  aliases, nonzero or malformed fill quantities, duplicate rows, instrument
+  mismatch, and order/client identity conflict remain blocking.
+- The one-transaction reconciliation still uses only
+  `REVIEWED_PENDING_ENTRY_TARGETS`, validates all local identity, economics,
+  binding, leg, lifecycle, protection and convergence state, verifies an
+  exclusive `0600` SQLite backup, terminalizes all targets, and creates the
+  missing canonical v2 idle authority row atomically. The activation quiescence
+  check now reuses that same canonical parser; missing, legacy-schema, held,
+  blocked, or malformed documents remain unknown.
+- First `stopped_legacy` activation validates and dispatches the candidate's own
+  immutable activator without requiring a rollback release. It still requires
+  the full scope inactive, persistently inhibited, `MainPID=0`, empty cgroups,
+  no matching runtime process, and zero active exchange writes. Candidate
+  post-start runtime/authority proof is single-attempt.
+- The first falsifier passes: a protection-authority failure after partial
+  candidate startup leaves every governed and legacy unit inactive and
+  persistently inhibited with `MainPID=0` and empty cgroups, consumes no retry,
+  starts no legacy runtime, and performs no database or exchange write. Failure
+  ends `maintenance_stopped`; inability to prove that boundary reports
+  `maintenance_stop_failed` rather than claiming safety.
+- Ordinary immutable-to-immutable activation still requires and validates its
+  rollback release. No new table, field, persistent lifecycle state, lease,
+  bridge, confirmation protocol, replay, compensation order, or automatic retry
+  was added.
+- RED-to-GREEN checkpoints covered history relaxation/adverse evidence, exact
+  fills, v2 authority/quiescence compatibility, no-retry activation and the
+  partial-start falsifier. The affected final candidate passed 344 tests with
+  one documented platform skip. Independent exact-base review found no P0/P1.
+  Python compilation, Bash syntax and `git diff --check` passed. The one and only
+  final repository suite passed 6644 tests with 3 skips and 32 warnings in
+  592.53 seconds; no production code changed after that run.
+- This local phase performed no push, SSH, stage, deployment, service control,
+  production read/write, database/settings mutation, Deepcoin write, activate,
+  entry thaw, historical replay, order retry, compensation order, or Telegram
+  trading send. Historical production and account evidence above must be
+  refreshed inside the later single production cutover phase.

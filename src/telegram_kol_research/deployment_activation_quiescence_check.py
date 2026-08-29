@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-from datetime import datetime
 from pathlib import Path
 import sqlite3
 import sys
@@ -10,9 +8,10 @@ from telegram_kol_research.deployment_active_write_check import (
     ActiveWriteCheckError,
     count_active_exchange_writes_in_connection,
 )
-
-
-_AUTHORITY_KEY = "entry_revision_exchange_authority"
+from telegram_kol_research.entry_revision_exchange_authority import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    is_canonical_idle_entry_revision_exchange_authority,
+)
 
 
 class ActivationQuiescenceError(ValueError):
@@ -34,30 +33,11 @@ def inspect_activation_quiescence(database_path: str | Path) -> int:
         count = count_active_exchange_writes_in_connection(connection)
         rows = connection.execute(
             "SELECT value_json FROM trading_settings WHERE key = ?",
-            (_AUTHORITY_KEY,),
+            (ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,),
         ).fetchall()
         if len(rows) != 1:
             raise ActivationQuiescenceError("activation_quiescence_unknown")
-        try:
-            document = json.loads(rows[0][0])
-        except (json.JSONDecodeError, TypeError) as exc:
-            raise ActivationQuiescenceError("activation_quiescence_unknown") from exc
-        if (
-            not isinstance(document, dict)
-            or set(document) != {"released_at", "schema_version", "state"}
-            or document.get("schema_version") != 1
-            or document.get("state") != "idle"
-            or not isinstance(document.get("released_at"), str)
-            or not document["released_at"].strip()
-        ):
-            raise ActivationQuiescenceError("activation_quiescence_unknown")
-        try:
-            released_at = datetime.fromisoformat(
-                document["released_at"].replace("Z", "+00:00")
-            )
-        except ValueError as exc:
-            raise ActivationQuiescenceError("activation_quiescence_unknown") from exc
-        if released_at.tzinfo is None:
+        if not is_canonical_idle_entry_revision_exchange_authority(rows[0][0]):
             raise ActivationQuiescenceError("activation_quiescence_unknown")
     except (sqlite3.Error, OSError, ActiveWriteCheckError, ActivationQuiescenceError):
         failed = True

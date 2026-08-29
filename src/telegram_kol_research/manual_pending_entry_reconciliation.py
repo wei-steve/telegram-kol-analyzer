@@ -121,39 +121,47 @@ def build_manual_pending_entry_reconciliation_plan(
         for row in evidence.fills
     ):
         return _blocked("target_fill_present", order_ids, evidence.fingerprint)
+    exact_fill_reason = _exact_target_fill_risk_reason(deepcoin_client, reviewed)
+    if exact_fill_reason is not None:
+        return _blocked(exact_fill_reason, order_ids, evidence.fingerprint)
     for order_id in order_ids:
+        target = target_by_order_id[order_id]
         matches = [
-            (row, deepcoin_order_ids(row, response_kind="trigger_history"))
+            (
+                row,
+                deepcoin_order_ids(row, response_kind="trigger_history"),
+                _deepcoin_client_order_ids(row),
+            )
             for row in evidence.trigger_history
-            if order_id
-            in deepcoin_order_ids(row, response_kind="trigger_history")
+            if (
+                order_id
+                in deepcoin_order_ids(row, response_kind="trigger_history")
+                or target.client_order_id in _deepcoin_client_order_ids(row)
+            )
         ]
         if not matches:
-            return _blocked(
-                "target_cancelled_history_missing", order_ids, evidence.fingerprint
-            )
+            continue
         if len(matches) != 1:
             return _blocked(
                 "target_cancelled_history_not_unique",
                 order_ids,
                 evidence.fingerprint,
             )
-        row, identities = matches[0]
-        if identities != {order_id}:
+        row, identities, client_identities = matches[0]
+        if (identities and identities != {order_id}) or (
+            client_identities
+            and client_identities != {target.client_order_id}
+        ):
             return _blocked(
                 "target_history_identity_conflict", order_ids, evidence.fingerprint
             )
-        target = target_by_order_id[order_id]
         if str(row.get("instId") or "").strip() != target.instrument_id:
             return _blocked(
                 "target_history_instrument_mismatch",
                 order_ids,
                 evidence.fingerprint,
             )
-        if str(row.get("state") or row.get("status") or "").strip().lower() not in {
-            "cancelled",
-            "canceled",
-        }:
+        if _history_row_has_execution_risk(row):
             return _blocked(
                 "target_history_not_cancelled", order_ids, evidence.fingerprint
             )
@@ -204,6 +212,7 @@ def build_manual_pending_entry_reconciliation_plan(
     fingerprint = _fingerprint(
         {
             "evidence_sha256": evidence.fingerprint,
+            "exact_zero_fill_order_ids": list(order_ids),
             "targets": [_canonical_target_payload(target) for target in reviewed],
         }
     )
@@ -215,6 +224,86 @@ def build_manual_pending_entry_reconciliation_plan(
         evidence_observed_at=evidence.observed_at,
         fingerprint=fingerprint,
     )
+
+
+def _history_row_has_execution_risk(row: dict[str, object]) -> bool:
+    """Reject only affirmative execution/live-order history evidence."""
+
+    states = {
+        str(row.get(key) or "").strip().lower().replace("-", "_").replace(" ", "_")
+        for key in (
+            "state",
+            "status",
+            "algoStatus",
+            "algo_status",
+            "orderStatus",
+            "ordState",
+            "ordStatus",
+            "order_state",
+            "order_status",
+        )
+        if str(row.get(key) or "").strip()
+    }
+    risky_states = {
+        "active",
+        "complete",
+        "completed",
+        "done",
+        "effective",
+        "executed",
+        "live",
+        "open",
+        "pending",
+        "success",
+        "succeeded",
+        "triggered",
+    }
+    if any("fill" in state or state in risky_states for state in states):
+        return True
+    for key in ("accFillSz", "fillSz", "filledSize", "executedQty"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        try:
+            if Decimal(str(value)) != 0:
+                return True
+        except InvalidOperation:
+            return True
+    return False
+
+
+def _exact_target_fill_risk_reason(
+    deepcoin_client,
+    reviewed: tuple[ReviewedPendingEntryTarget, ...],
+) -> str | None:
+    reader = getattr(deepcoin_client, "list_trade_fills_by_order_id", None)
+    if not callable(reader):
+        return "target_fill_query_incomplete"
+    for target in reviewed:
+        try:
+            rows = reader(
+                inst_id=target.instrument_id,
+                order_id=target.order_id,
+            )
+        except Exception:
+            return "target_fill_query_incomplete"
+        if (
+            not isinstance(rows, list)
+            or len(rows) >= 100
+            or any(not isinstance(row, dict) for row in rows)
+        ):
+            return "target_fill_query_incomplete"
+        for row in rows:
+            identities = deepcoin_order_ids(row, response_kind="fill")
+            client_identities = _deepcoin_client_order_ids(row)
+            if identities != {target.order_id} or (
+                client_identities
+                and client_identities != {target.client_order_id}
+            ):
+                return "target_fill_identity_conflict"
+        if rows:
+            return "target_fill_present"
+    return None
 
 
 def apply_manual_pending_entry_reconciliation(

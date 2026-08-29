@@ -504,12 +504,15 @@ def prove_release_runtime(
     require_authority: bool,
     require_entry_frozen: bool,
     now: datetime,
+    max_attempts: int = 2,
 ) -> tuple[dict[str, Mapping[str, Any]], dict[str, ReleaseEvidence]]:
+    if max_attempts not in {1, 2}:
+        raise ValueError("runtime proof attempt count is invalid")
     roles = [role for role in components if role in _RUNTIME_COMPONENTS]
     if require_authority:
         roles = ["web", "ingest", "worker"]
     last_error: ActivationError | None = None
-    for attempt in range(2):
+    for attempt in range(max_attempts):
         try:
             identities: dict[str, Mapping[str, Any]] = {}
             releases: dict[str, ReleaseEvidence] = {}
@@ -541,7 +544,7 @@ def prove_release_runtime(
             return identities, releases
         except ActivationError as exc:
             last_error = exc
-            if attempt == 0:
+            if attempt + 1 < max_attempts:
                 time.sleep(float(getattr(runtime, "identity_retry_delay_seconds", 0)))
     assert last_error is not None
     raise last_error
@@ -824,22 +827,32 @@ def activate_release(
         raise ActivationError(
             "authority activation must declare web, monitor, ingest, and worker"
         )
-    candidate = validate_release(paths.release_root, expected_commit, expected_uid=expected_uid)
-    rollback = validate_release(paths.release_root, rollback_commit, expected_uid=expected_uid)
-    if expected_commit == rollback_commit:
-        raise ActivationError("candidate and rollback releases must differ")
-    if _runtime_support_digest(candidate.release_path) != _runtime_support_digest(
-        rollback.release_path
-    ):
-        raise ActivationError(
-            "release scope validation failed: runtime config, dependencies, or units changed"
+    if source_mode not in {"immutable", "stopped_legacy"}:
+        raise ActivationError("activation source mode is invalid")
+    candidate = validate_release(
+        paths.release_root,
+        expected_commit,
+        expected_uid=expected_uid,
+    )
+    rollback: ReleaseEvidence | None = None
+    if source_mode == "immutable":
+        rollback = validate_release(
+            paths.release_root,
+            rollback_commit,
+            expected_uid=expected_uid,
         )
+        if expected_commit == rollback_commit:
+            raise ActivationError("candidate and rollback releases must differ")
+        if _runtime_support_digest(candidate.release_path) != _runtime_support_digest(
+            rollback.release_path
+        ):
+            raise ActivationError(
+                "release scope validation failed: runtime config, dependencies, or units changed"
+            )
     if not _same_declared_change(candidate.action_manifest, canonical):
         raise ActivationError("staged and activation declarations differ")
 
     require_authority = bool(set(components) & _AUTHORITY_COMPONENTS)
-    if source_mode not in {"immutable", "stopped_legacy"}:
-        raise ActivationError("activation source mode is invalid")
     _validate_authorization(
         paths.authorization,
         expected_uid=expected_uid,
@@ -855,9 +868,10 @@ def activate_release(
     if source_mode == "stopped_legacy":
         _require_stopped_legacy_boundary(runtime, components)
         before_identities: dict[str, Mapping[str, Any]] = {}
-        before_releases = {role: rollback for role in affected_runtime_roles}
+        before_releases: dict[str, ReleaseEvidence] = {}
         preserve_entry_freeze = True
     else:
+        assert rollback is not None
         before_identities, before_releases = prove_release_runtime(
             runtime,
             release_root=paths.release_root,
@@ -926,6 +940,7 @@ def activate_release(
             require_authority=require_authority,
             require_entry_frozen=preserve_entry_freeze,
             now=datetime.now(UTC),
+            max_attempts=1 if source_mode == "stopped_legacy" else 2,
         )
         if source_mode == "immutable":
             _prove_restarted_processes(before_identities, after_identities, components)
@@ -942,6 +957,15 @@ def activate_release(
     except Exception as exc:
         if not mutation_started:
             raise
+        if source_mode == "stopped_legacy":
+            try:
+                _reinhibit_and_stop_all(runtime, components)
+            except Exception as stop_exc:
+                raise ActivationError(
+                    "activation failed; maintenance_stop_failed"
+                ) from stop_exc
+            raise ActivationError("activation failed; maintenance_stopped") from exc
+        assert rollback is not None
         try:
             _stop_units(runtime, components)
             publish_release_dropins(
@@ -968,18 +992,13 @@ def activate_release(
             ):
                 runtime.start_unit("telegram-kol-monitor.timer")
         except Exception as rollback_exc:
-            if source_mode == "stopped_legacy":
-                try:
-                    _reinhibit_and_stop_all(runtime, components)
-                except Exception:
-                    pass
             raise ActivationError("activation failed; rollback_failed") from rollback_exc
         raise ActivationError("activation failed; rollback_complete") from exc
 
     return {
         "status": "activated",
         "commit": expected_commit,
-        "rollback_commit": rollback_commit,
+        "rollback_commit": rollback.commit if rollback is not None else None,
         "components": components,
         "source_mode": source_mode,
         "authorization_consumed": True,
@@ -1337,10 +1356,11 @@ def main() -> int:
     try:
         expected_commit = os.environ.get("EXPECTED_COMMIT", "").lower()
         rollback_commit = os.environ.get("ROLLBACK_COMMIT", "").lower()
-        if not _SHA1_RE.fullmatch(expected_commit) or not _SHA1_RE.fullmatch(
-            rollback_commit
-        ):
-            raise ActivationError("EXPECTED_COMMIT and ROLLBACK_COMMIT must be full SHAs")
+        source_mode = _activation_source_mode()
+        if not _SHA1_RE.fullmatch(expected_commit):
+            raise ActivationError("EXPECTED_COMMIT must be a full SHA")
+        if source_mode == "immutable" and not _SHA1_RE.fullmatch(rollback_commit):
+            raise ActivationError("ROLLBACK_COMMIT must be a full SHA")
         release_root = _required_absolute_env(
             "RELEASE_ROOT", "/opt/telegram-kol-releases"
         )
@@ -1390,7 +1410,7 @@ def main() -> int:
                     expected_uid=expected_uid,
                 ),
                 expected_uid=expected_uid,
-                source_mode=_activation_source_mode(),
+                source_mode=source_mode,
             )
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         return 0

@@ -6,10 +6,6 @@ if [ "$DEPLOYMENT_ACTION" != "activate" ]; then
   echo "DEPLOYMENT_ACTION=activate is required; stage uses telegram-kol-stage." >&2
   exit 4
 fi
-if [[ ! "${ROLLBACK_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
-  echo "ROLLBACK_COMMIT must identify the reviewed immutable control release." >&2
-  exit 4
-fi
 if [[ "${ACTIVATION_SOURCE_MODE:-}" != "immutable" \
   && "${ACTIVATION_SOURCE_MODE:-}" != "stopped_legacy" ]]; then
   echo "ACTIVATION_SOURCE_MODE must be immutable or stopped_legacy." >&2
@@ -17,8 +13,18 @@ if [[ "${ACTIVATION_SOURCE_MODE:-}" != "immutable" \
 fi
 
 DISPATCHER_RELEASE_ROOT="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
-if [ "$(basename -- "$DISPATCHER_RELEASE_ROOT")" != "$ROLLBACK_COMMIT" ]; then
-  echo "Dispatcher release identity does not match ROLLBACK_COMMIT." >&2
+if [ "$ACTIVATION_SOURCE_MODE" = "immutable" ]; then
+  if [[ ! "${ROLLBACK_COMMIT:-}" =~ ^[0-9a-f]{40}$ ]]; then
+    echo "ROLLBACK_COMMIT must identify the reviewed immutable control release." >&2
+    exit 4
+  fi
+  dispatcher_commit="$ROLLBACK_COMMIT"
+else
+  dispatcher_commit="${EXPECTED_COMMIT:-}"
+fi
+if [[ ! "$dispatcher_commit" =~ ^[0-9a-f]{40}$ ]] \
+  || [ "$(basename -- "$DISPATCHER_RELEASE_ROOT")" != "$dispatcher_commit" ]; then
+  echo "Dispatcher release identity does not match activation source mode." >&2
   exit 4
 fi
 ACTIVATOR_PATH="$DISPATCHER_RELEASE_ROOT/deploy/telegram-kol-activate"
