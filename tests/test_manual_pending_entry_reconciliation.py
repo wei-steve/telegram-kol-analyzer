@@ -496,7 +496,7 @@ def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path
         targets=(target,),
         runtime_guard=RuntimeGuard(),
         expected_fingerprint=plan.fingerprint,
-        now=NOW,
+        clock=lambda: NOW,
     )
 
     assert result.status == "completed"
@@ -696,7 +696,7 @@ def test_manual_reconciliation_reproves_runtime_before_backup(tmp_path):
             targets=(target,),
             expected_fingerprint=plan.fingerprint,
             runtime_guard=guard,
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     assert guard.calls == 2
@@ -1102,7 +1102,7 @@ def test_manual_reconciliation_apply_refuses_exact_history_drift_before_backup(
             targets=(target,),
             expected_fingerprint=plan.fingerprint,
             runtime_guard=RuntimeGuard(),
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     assert not backup_path.exists()
@@ -1794,7 +1794,7 @@ def test_manual_reconciliation_apply_rechecks_unreviewed_active_sibling(
             targets=(target,),
             runtime_guard=RuntimeGuard(),
             expected_fingerprint=plan.fingerprint,
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     with session_factory() as session:
@@ -1845,7 +1845,7 @@ def test_manual_reconciliation_plan_fingerprint_binds_canonical_identity(tmp_pat
             targets=(drifted,),
             expected_fingerprint=plan.fingerprint,
             runtime_guard=RuntimeGuard(),
-            now=NOW,
+            clock=lambda: NOW,
         )
 
 
@@ -1892,6 +1892,18 @@ def test_manual_reconciliation_apply_refreshes_exchange_evidence_after_backup(
     assert result.status == "completed"
     with session_factory() as session:
         assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "cancelled"
+
+
+def test_manual_reconciliation_apply_has_no_frozen_now_override():
+    import inspect
+
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        apply_manual_pending_entry_reconciliation,
+    )
+
+    assert "now" not in inspect.signature(
+        apply_manual_pending_entry_reconciliation
+    ).parameters
 
 
 def test_manual_reconciliation_refuses_critical_count_drift_after_backup(
@@ -1943,7 +1955,7 @@ def test_manual_reconciliation_refuses_critical_count_drift_after_backup(
             targets=(target,),
             runtime_guard=RuntimeGuard(),
             expected_fingerprint=plan.fingerprint,
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     with session_factory() as session:
@@ -1982,7 +1994,7 @@ def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
         targets=(target,),
         runtime_guard=RuntimeGuard(),
         expected_fingerprint=plan.fingerprint,
-        now=NOW,
+        clock=lambda: NOW,
     )
 
     repeated = build_manual_pending_entry_reconciliation_plan(
@@ -2023,7 +2035,7 @@ def test_completed_reconciliation_refuses_missing_authority_row(tmp_path):
         targets=(target,),
         runtime_guard=RuntimeGuard(),
         expected_fingerprint=plan.fingerprint,
-        now=NOW,
+        clock=lambda: NOW,
     )
     with session_factory() as session:
         session.query(TradingSetting).filter_by(
@@ -2088,7 +2100,7 @@ def test_completed_reconciliation_still_requires_canonical_ownership(
         targets=(target,),
         expected_fingerprint=plan.fingerprint,
         runtime_guard=RuntimeGuard(),
-        now=NOW,
+        clock=lambda: NOW,
     )
     with session_factory() as session:
         foreign_binding, _ = _seed_foreign_binding_and_leg(session)
@@ -2785,7 +2797,7 @@ def test_manual_reconciliation_terminalization_failure_rolls_back_and_keeps_back
             targets=(target,),
             expected_fingerprint=plan.fingerprint,
             runtime_guard=RuntimeGuard(),
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
@@ -2840,7 +2852,7 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
         targets=targets,
         expected_fingerprint=plan.fingerprint,
         runtime_guard=guard,
-        now=NOW,
+        clock=lambda: NOW,
         read_monotonic=clock,
         read_sleep=clock.sleep,
     )
@@ -2979,7 +2991,7 @@ def test_all_canonical_terminalization_failure_is_atomic(tmp_path, monkeypatch):
             targets=targets,
             expected_fingerprint=plan.fingerprint,
             runtime_guard=RuntimeGuard(),
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     backup_sha256 = hashlib.sha256(backup_path.read_bytes()).hexdigest()
@@ -3025,7 +3037,7 @@ def test_manual_reconciliation_refuses_database_path_mismatch(tmp_path):
             targets=(target,),
             runtime_guard=RuntimeGuard(),
             expected_fingerprint=plan.fingerprint,
-            now=NOW,
+            clock=lambda: NOW,
         )
 
     with session_factory() as session:

@@ -417,7 +417,6 @@ def apply_manual_pending_entry_reconciliation(
     targets: Iterable[ReviewedPendingEntryTarget],
     expected_fingerprint: str,
     runtime_guard: Callable[[], None] | None = None,
-    now: datetime | None = None,
     clock: Callable[[], datetime] | None = None,
     read_monotonic: Callable[[], float] | None = None,
     read_sleep: Callable[[float], None] | None = None,
@@ -430,7 +429,6 @@ def apply_manual_pending_entry_reconciliation(
         deepcoin_client=deepcoin_client,
         targets=reviewed,
         runtime_guard=runtime_guard,
-        now=now,
         clock=clock,
         read_monotonic=read_monotonic,
         read_sleep=read_sleep,
@@ -439,7 +437,7 @@ def apply_manual_pending_entry_reconciliation(
         raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")
     _require_runtime_stopped(runtime_guard)
     _require_session_database_path(session_factory, Path(database_path))
-    _require_write_boundary_freshness(fresh, now=now, clock=clock)
+    _require_write_boundary_freshness(fresh, now=None, clock=clock)
     with session_factory() as count_session:
         before_counts = _session_table_counts(
             count_session,
@@ -456,7 +454,6 @@ def apply_manual_pending_entry_reconciliation(
         deepcoin_client=deepcoin_client,
         targets=reviewed,
         runtime_guard=runtime_guard,
-        now=now,
         clock=clock,
         read_monotonic=read_monotonic,
         read_sleep=read_sleep,
@@ -464,7 +461,7 @@ def apply_manual_pending_entry_reconciliation(
     if fresh.status != "ready" or fresh.fingerprint != expected_fingerprint:
         raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")
     _require_runtime_stopped(runtime_guard)
-    observed_at = _require_write_boundary_freshness(fresh, now=now, clock=clock)
+    observed_at = _require_write_boundary_freshness(fresh, now=None, clock=clock)
 
     authority_seeded = False
     with session_factory() as session:
