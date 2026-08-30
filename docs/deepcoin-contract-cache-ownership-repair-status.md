@@ -6,9 +6,9 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a04f45-e0e5-7642-aeb7-0c398bd03375
-candidate_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
-candidate_content_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
-handoff_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
+candidate_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
+candidate_content_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
+handoff_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
 pushed_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
@@ -73,7 +73,13 @@ manual_cleanup_maintenance_pacing_code_sha: 63088ad03f8696a0734da2ec1996ff68a239
 manual_cleanup_maintenance_pacing_focused: 270_passed
 manual_cleanup_maintenance_pacing_final_suite: 6665_passed_3_skipped_32_warnings
 manual_cleanup_maintenance_pacing_review: no_p0_p1
-manual_cleanup_production_cutover_status: pre_maintenance_contract_blocked_timer_main_pid_empty
+manual_cleanup_timer_pid_repair_status: complete_fresh_production_cutover_pending
+manual_cleanup_timer_pid_repair_base_sha: ac196e14951f657aa12ed68750b3501f6c94a5e8
+manual_cleanup_timer_pid_repair_code_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
+manual_cleanup_timer_pid_repair_focused: 299_passed_1_skipped
+manual_cleanup_timer_pid_repair_final_suite: 6667_passed_3_skipped_32_warnings
+manual_cleanup_timer_pid_repair_review: no_p0_p1
+manual_cleanup_production_cutover_status: local_timer_pid_repair_complete_fresh_cutover_pending
 manual_cleanup_production_stage_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
 manual_cleanup_production_stage_content_sha256: 273a971025b706c3fb03f592b99c0a036f666fd07287d2d48323165de59383ef
 manual_cleanup_production_stage_manifest_sha256: afa900de77a73c360f8b0024ef0038c31515a52845b17f6fbc91a3c6b6a15d56
@@ -1147,3 +1153,39 @@ expansion or an irreversible action that the approved phase did not include.
   The phase remains `in_progress` and now requires a minimal local timer PID
   compatibility repair, RED-to-GREEN coverage, final suite/review and a new
   exact production candidate before another fresh cutover attempt.
+
+## Monitor timer MainPID compatibility repair
+
+- The local repair began from exact clean HEAD
+  `ac196e14951f657aa12ed68750b3501f6c94a5e8`, after the paced production
+  attempt proved that a real `telegram-kol-monitor.timer` returns an empty
+  `MainPID` property before any service-control operation. Root-cause tracing
+  showed that the stopped-legacy boundary had applied a service-only numeric
+  `MainPID` assumption to every controlled systemd unit.
+- RED first reproduced the exact failure through
+  `SystemRuntimeAdapter.main_pid("telegram-kol-monitor.timer")`. A separate
+  service falsifier passed before implementation and continues to prove that an
+  empty `MainPID` for `telegram-kol-web.service` is unknown and raises rather
+  than being converted to zero.
+- Code commit `cce1f8654d94a572b0340a62f17226dbb93d2da0` adds one closed
+  processless-unit exception for the exact monitor timer. Only its successful
+  empty-property response is normalized to zero. Unknown units, every service,
+  malformed values, negative values, cgroup occupants and matching runtime
+  processes retain the existing fail-closed behavior. No mask, activation,
+  database, reconciliation, exchange or retry semantics changed.
+- The two direct boundary tests passed, the complete scoped-activation module
+  passed 39 tests, and the affected activation, reconciliation, CLI, updater
+  and quiescence set passed 299 tests with one documented skip. Python
+  compilation and exact-diff whitespace checks passed.
+- Local review of the exact two-file diff from
+  `ac196e14951f657aa12ed68750b3501f6c94a5e8` through code candidate
+  `cce1f8654d94a572b0340a62f17226dbb93d2da0` found no P0/P1. The one final
+  repository suite passed 6667 tests with 3 documented skips and 32 existing
+  warnings in 520.36 seconds. No production code changed after that suite.
+- This local phase performed no push, SSH, Deepcoin request or write, production
+  database/settings mutation, service control, stage, authorization, activate,
+  observation, replay, old-runtime restore or entry thaw. The inactive staged
+  release `287daacf8dbf2d44e56f311800ee85b83579e307` lacks this repair and is
+  superseded. A later production cutover must push the new exact handoff, create
+  and verify another immutable inactive stage and acquire all account, fills,
+  history, runtime, database and no-write evidence fresh from the beginning.
