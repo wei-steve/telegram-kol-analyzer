@@ -146,7 +146,13 @@ manual_cleanup_vacuum_into_focused: 309_passed_2_skipped
 manual_cleanup_vacuum_into_linux_probe: python_3_11_sqlite_3_40_1_136mib_512mib_complete_0_542s
 manual_cleanup_vacuum_into_final_suite: 6677_passed_4_skipped_32_warnings
 manual_cleanup_vacuum_into_review: no_p0_p1_p2
-manual_cleanup_vacuum_into_production_executed: false
+manual_cleanup_vacuum_into_production_executed: true_backup_only_database_write_refused_stale_evidence
+manual_cleanup_post_backup_refresh_status: local_complete_production_retry_pending
+manual_cleanup_post_backup_refresh_code_sha: ae668b8c23be18aeb8029e9064154f3169e561e1
+manual_cleanup_post_backup_refresh_focused: 310_passed_2_skipped
+manual_cleanup_post_backup_refresh_final_suite: 6678_passed_4_skipped_32_warnings
+manual_cleanup_post_backup_refresh_review: no_p0_p1_p2
+manual_cleanup_post_backup_refresh_production_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1573,3 +1579,35 @@ expansion or an irreversible action that the approved phase did not include.
   mutate production, control a service, call Deepcoin or activate. Production
   remains at the recorded `maintenance_stopped` boundary pending the remainder
   of this same approved cutover phase.
+
+## `VACUUM INTO` production freshness finding
+
+- Exact SHA `21314fc44fd4f7a05d3bbbd4842e73a825523fee` was pushed and staged as an
+  inactive immutable release with content SHA-256
+  `2281a4bce0e48380cd6ffc162e248202ffd91a883606b87ae8b5fe0125766dae`.
+  Fresh production preflight proved all eight units inactive and persistently
+  inhibited, zero PIDs/cgroup members/runtime processes, tracked-clean legacy
+  SHA, a valid candidate receipt, `quick_check=ok`, zero foreign-key rows and
+  the unchanged eight critical counts.
+- Two stable fresh plans were `ready` for all seven targets with fingerprint
+  `7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7`.
+  Two apply attempts created separate root-owned `0600` 805,208,064-byte
+  standalone backups but both refused before `BEGIN IMMEDIATE` because backup,
+  durability, integrity and hash verification exceeded the 30-second exchange
+  evidence freshness window. The first backup SHA-256 was
+  `eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af`;
+  it passed `quick_check`, foreign keys, journal mode and exact critical counts.
+  The live database retained three settings, 3,803 execution events, no
+  authority row and no reconciliation event. No exchange write or service
+  control occurred.
+- Root cause is sequencing, not backup correctness: the write boundary reused
+  evidence collected before the 805 MB backup. Commit
+  `3f8fadb0722266fad281fd430fe9b27d99eaf05a` reacquires the complete plan after
+  backup and requires the same ready fingerprint before the transaction.
+  Review then found and commit
+  `ae668b8c23be18aeb8029e9064154f3169e561e1` removed the fixed `now` apply
+  override so post-backup freshness always uses a live clock. RED/GREEN and the
+  affected set passed 310 tests with two skips; independent review found no
+  P0/P1/P2; the final repository suite passed 6,678 tests with four skips and
+  32 existing warnings in 468.20 seconds. Production remains safely
+  `maintenance_stopped`; the old staged candidate must not be activated.
