@@ -129,6 +129,15 @@ manual_cleanup_memory_bounded_backup_scale_oom_observed: false
 manual_cleanup_memory_bounded_backup_scale_restart_count: 0
 manual_cleanup_memory_bounded_backup_scale_destination_size: 4194304
 manual_cleanup_memory_bounded_backup_scale_blocker: backup_nonconverging_after_first_1024_page_batch
+manual_cleanup_backup_nonconvergence_repair_status: complete_scale_reproof_pending
+manual_cleanup_backup_nonconvergence_repair_base_sha: 233f9d4d4170d2d6ca4bb64f2abb37f6e964b519
+manual_cleanup_backup_nonconvergence_repair_code_sha: df28d9481f54e07ab6ac91cd79158bbeff2b3713
+manual_cleanup_backup_nonconvergence_repair_root_cause: source_snapshot_not_pinned_across_backup_steps
+manual_cleanup_backup_nonconvergence_repair_red: 3_failed_as_expected
+manual_cleanup_backup_nonconvergence_repair_focused: 278_passed_1_skipped
+manual_cleanup_backup_nonconvergence_repair_final_suite: 6679_passed_4_skipped_32_warnings
+manual_cleanup_backup_nonconvergence_repair_review: no_p0_p1
+manual_cleanup_backup_nonconvergence_repair_production_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1478,3 +1487,50 @@ expansion or an irreversible action that the approved phase did not include.
   a new local TDD diagnosis of why the Python 3.11.6 / SQLite 3.42.0 backup path
   repeatedly processes the first 1,024-page batch, followed by review and a new
   final suite before any separately authorized scale attempt.
+
+## Backup nonconvergence local repair
+
+- Local diagnosis began from clean base
+  `233f9d4d4170d2d6ca4bb64f2abb37f6e964b519` and did not connect to
+  production. The prior scale failure was reproduced with a WAL source whose
+  existing sidecars were mounted read-only: every backup callback returned
+  `SQLITE_OK`, but `remaining` stayed fixed after the first 1,024-page batch and
+  the destination stayed at 4 MiB. A separate 839,688,192-byte static WAL
+  fixture completed in about two seconds, excluding database size and
+  `MemoryMax` as the cause of that loop.
+- Root cause was the missing persistent source read transaction. The bounded
+  table-count reads completed before `Connection.backup()` and therefore did
+  not pin one snapshot across the internal `sqlite3_backup_step()` calls. An
+  explicit `BEGIN` alone was insufficient; `BEGIN` followed by an actual
+  `sqlite_schema` read made the remaining-page count decrease monotonically to
+  zero. The exact external state that made the production evidence copy appear
+  changed between steps remains unknown and is not attributed to an unproved
+  writer.
+- Three tests were RED before production-code modification: a real multi-batch
+  WAL backup with a writer commit between every step did not converge, the
+  implementation had no repeated-remaining guard, and `BUSY` did not abort via
+  a progress callback. Repair commit
+  `df28d9481f54e07ab6ac91cd79158bbeff2b3713` now pins one read snapshot before
+  the evidence counts, keeps it through every backup step, requires strictly
+  decreasing remaining pages and a stable total page count, and aborts on the
+  first `BUSY` or `LOCKED` result without retry.
+- The same Python 3.11 file-backed path then completed the previously failing
+  read-only WAL-mount reproduction in 0.14 seconds with equal 33,595,392-byte
+  source/output sizes and `quick_check=ok`. Independent review also exercised
+  the fixed flow with SQLite 3.42.0 and found no P0/P1. Static checks passed;
+  the affected reconciliation, CLI, scoped activation and quiescence suite
+  passed 278 tests with one documented skip. The one final repository suite
+  passed 6,679 tests with 4 documented skips and 32 existing warnings in
+  454.07 seconds. No production code changed afterward.
+- This local phase did not push, stage, SSH, control a production service,
+  access Deepcoin, touch the live database or evidence artifacts, activate,
+  replay, restore the old runtime or thaw entry. Production remains
+  `maintenance_stopped`; all seven reconciliation targets and the missing
+  authority row remain unchanged.
+- The next gate is one separately authorized production-copy scale reproof,
+  using the existing 814,260,224-byte read-only evidence copy and a new evidence
+  destination under `MemoryMax=1GiB`. It must record forward progress, exit,
+  peak memory, OOM/restart state, output identity/hash/integrity/counts and
+  unchanged source identity/hash, with no automatic retry. Only a successful
+  reproof may reopen the later push, fresh immutable stage and production
+  cutover decision.
