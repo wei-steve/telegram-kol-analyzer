@@ -3,7 +3,7 @@ import os
 import sqlite3
 import stat
 import sys
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, fields
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -32,7 +32,6 @@ from telegram_kol_research.production_safety_monitor import MonitorState
 from telegram_kol_research.production_safety_monitor import ProductionSafetyAdapters
 from telegram_kol_research.production_safety_monitor import decide_monitor_notification
 from telegram_kol_research.production_safety_monitor import evaluate_monitor_snapshot
-from telegram_kol_research.production_safety_monitor import evaluate_runtime_release_scope
 from telegram_kol_research.production_safety_monitor import fingerprint_monitor_result
 from telegram_kol_research.production_safety_monitor import format_monitor_alert
 from telegram_kol_research.production_safety_monitor import load_monitor_state
@@ -82,7 +81,6 @@ OTHER_HEAD = "a94c7b4cbb41331858be886bf341e79bd6bc2f4a"
 
 
 EXPECTATIONS = MonitorExpectations(
-    head=REVIEWED_HEAD,
     auto_trade_enabled=True,
     management_execution_mode="live",
     max_concurrent_positions=4,
@@ -90,265 +88,11 @@ EXPECTATIONS = MonitorExpectations(
 )
 
 
-def _release_identity(role: str, *, commit=REVIEWED_HEAD, capable=True):
-    return {
-        "contract": "runtime-deployment-identity-v1",
-        "runtime_role": role,
-        "loaded_artifact_verified": True,
-        "release_commit": commit,
-        "manifest_sha256": "a" * 64,
-        "pid": 200 + ("web", "ingest", "worker", "monitor").index(role),
-        "process_start_ticks": 1000
-        + ("web", "ingest", "worker", "monitor").index(role),
-        "systemd_main_pid": 200
-        + ("web", "ingest", "worker", "monitor").index(role),
-        "systemd_start_ticks": 1000
-        + ("web", "ingest", "worker", "monitor").index(role),
-        "loaded_cwd": (
-            "/var/lib/telegram-kol-monitor"
-            if role == "monitor"
-            else "/opt/telegram-kol-analyzer"
-        ),
-        "command_role": role,
-        "observed_at": datetime(2026, 8, 28, 12, 0, tzinfo=UTC).isoformat(),
-        "entry_admission_frozen": role == "monitor" or True,
-        "health": {
-            "event_loop": True,
-            "message_processing": False,
-            "ingest_live_listener": role == "ingest",
-            "ingest_reconcile": role == "ingest",
-            "worker_command": role == "worker",
-        },
-        "capabilities": {
-            name: capable
-            for name in (
-                "global_exchange_authority",
-                "management",
-                "protection",
-                "close",
-                "tpsl",
-                "rescue",
-            )
-        } if role == "worker" else {},
-        "authority_evidence": {
-            "max_age_seconds": 90.0,
-            "management_cycle": {
-                "age_seconds": 1.0,
-                "fresh": capable,
-                "successful": capable,
-                "effective_management_enabled": capable,
-                "effective_rescue_enabled": capable,
-            },
-            "break_even_cycle": {
-                "age_seconds": 1.0,
-                "fresh": capable,
-                "successful": capable,
-            },
-            "reconcile_cycle": {
-                "age_seconds": 1.0,
-                "fresh": capable,
-                "successful": capable,
-            },
-        } if role == "worker" else {},
+def test_monitor_snapshot_has_no_deployment_evidence_contract():
+    assert "runtime_release_scope" not in {
+        field.name for field in fields(MonitorSnapshot)
     }
-
-
-def test_release_scope_accepts_exact_four_role_immutable_runtime():
-    result = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": {
-                role: _release_identity(role)
-                for role in ("web", "ingest", "worker", "monitor")
-            },
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-
-    assert result.healthy is True
-    assert result.details == {
-        "manifest_sha256": "a" * 64,
-        "release_commit": REVIEWED_HEAD,
-        "role_count": 4,
-        "unit_hashes_valid": True,
-    }
-
-
-@pytest.mark.parametrize(
-    ("observed_at", "healthy"),
-    (
-        (datetime(2026, 8, 28, 12, 0, 1, tzinfo=UTC).isoformat(), True),
-        (datetime(2026, 8, 28, 12, 0, 10, tzinfo=UTC).isoformat(), True),
-        (datetime(2026, 8, 28, 12, 0, 11, tzinfo=UTC).isoformat(), False),
-        ("invalid", False),
-    ),
-)
-def test_release_scope_uses_latest_role_observation_as_snapshot_time(
-    observed_at, healthy
-):
-    roles = {
-        role: _release_identity(role)
-        for role in ("web", "ingest", "worker", "monitor")
-    }
-    roles["ingest"]["observed_at"] = observed_at
-
-    result = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-
-    assert result.healthy is healthy
-    assert ("runtime_identity_unproven" in result.reason_codes) is not healthy
-
-
-def test_release_scope_rejects_mixed_release_or_disabled_capabilities():
-    roles = {
-        role: _release_identity(role)
-        for role in ("web", "ingest", "worker", "monitor")
-    }
-    roles["ingest"] = _release_identity("ingest", commit=OTHER_HEAD)
-    mixed = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-            "raw_settings": {"token": "must-not-leak"},
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-    assert "runtime_release_mixed" in mixed.reason_codes
-    assert "must-not-leak" not in json.dumps(mixed.details)
-
-    roles["ingest"] = _release_identity("ingest")
-    roles["worker"] = _release_identity("worker", capable=False)
-    disabled = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-    assert "runtime_capability_unproven" in disabled.reason_codes
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    (
-        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].update(
-            age_seconds=91.0
-        ),
-        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].pop(
-            "age_seconds"
-        ),
-        lambda roles: roles["worker"]["authority_evidence"]["management_cycle"].update(
-            effective_rescue_enabled=False
-        ),
-        lambda roles: roles["web"]["capabilities"].update(
-            global_exchange_authority=True
-        ),
-    ),
-)
-def test_release_scope_rejects_unbounded_or_ambiguous_authority(mutation):
-    roles = {
-        role: _release_identity(role)
-        for role in ("web", "ingest", "worker", "monitor")
-    }
-    mutation(roles)
-
-    result = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-
-    assert "runtime_capability_unproven" in result.reason_codes
-
-
-@pytest.mark.parametrize(
-    "mutation",
-    (
-        lambda roles: roles["worker"].pop("contract"),
-        lambda roles: roles["monitor"]["health"].update(event_loop=False),
-        lambda roles: roles["ingest"]["health"].update(
-            ingest_live_listener=False
-        ),
-        lambda roles: roles["worker"]["health"].update(worker_command=False),
-    ),
-)
-def test_release_scope_rejects_incomplete_role_health(mutation):
-    roles = {
-        role: _release_identity(role)
-        for role in ("web", "ingest", "worker", "monitor")
-    }
-    mutation(roles)
-
-    result = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-
-    assert "runtime_identity_unproven" in result.reason_codes
-
-
-def test_release_scope_rejects_unverified_loaded_code_wrong_cwd_or_shared_pid():
-    roles = {
-        role: _release_identity(role)
-        for role in ("web", "ingest", "worker", "monitor")
-    }
-    roles["worker"]["loaded_artifact_verified"] = False
-    roles["monitor"]["loaded_cwd"] = "/opt/telegram-kol-analyzer"
-    for key in (
-        "pid",
-        "process_start_ticks",
-        "systemd_main_pid",
-        "systemd_start_ticks",
-    ):
-        roles["ingest"][key] = roles["web"][key]
-
-    result = evaluate_runtime_release_scope(
-        {
-            "commit": REVIEWED_HEAD,
-            "manifest_sha256": "a" * 64,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        },
-        expected_commit=REVIEWED_HEAD,
-        expected_manifest_sha256="a" * 64,
-        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
-    )
-
-    assert "runtime_identity_unproven" in result.reason_codes
+    assert not hasattr(monitor_module, "evaluate_runtime_release_scope")
 
 
 def test_release_unit_scope_includes_exact_activation_dropins(tmp_path, monkeypatch):
@@ -647,7 +391,6 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
 def _snapshot(**overrides):
     values = {
         "service_state": "active",
-        "head": REVIEWED_HEAD,
         "settings": {
             "auto_trade_enabled": True,
             "management_execution_mode": "live",
@@ -761,7 +504,6 @@ def test_frozen_auto_trade_reports_restore_not_ready_without_trade_incident():
             contract_spec_sync_refusal_count=2,
         ),
         MonitorExpectations(
-            head=REVIEWED_HEAD,
             auto_trade_enabled=False,
             management_execution_mode="live",
             max_concurrent_positions=4,
@@ -2058,7 +1800,6 @@ def test_entry_preamble_monitor_does_not_hide_second_mismatch(tmp_path):
 
 def test_monitor_detects_adjacent_entry_rollout_mode_drift():
     expectations = MonitorExpectations(
-        head=REVIEWED_HEAD,
         auto_trade_enabled=True,
         management_execution_mode="live",
         max_concurrent_positions=4,
@@ -2543,7 +2284,7 @@ def test_monitor_inputs_and_result_are_frozen():
     result = evaluate_monitor_snapshot(_snapshot(), EXPECTATIONS)
 
     with pytest.raises(FrozenInstanceError):
-        EXPECTATIONS.head = "other"  # type: ignore[misc]
+        EXPECTATIONS.auto_trade_enabled = False  # type: ignore[misc]
     with pytest.raises(FrozenInstanceError):
         result.healthy = False  # type: ignore[misc]
 
@@ -2582,17 +2323,6 @@ def test_system_drift_and_adapter_failure_alert(snapshot, expected_reasons):
     assert result.reason_codes == tuple(sorted(expected_reasons))
 
 
-def test_head_drift_is_version_context_not_safety_failure():
-    result = evaluate_monitor_snapshot(_snapshot(head=OTHER_HEAD), EXPECTATIONS)
-
-    assert result.healthy is True
-    assert result.reason_codes == ()
-    assert result.details == {
-        "head": OTHER_HEAD,
-        "expected_head": REVIEWED_HEAD,
-    }
-
-
 def test_entry_preamble_mode_drift_retains_only_valid_modes():
     settings = dict(_snapshot().settings)
     settings["entry_preamble_mode"] = "shadow"
@@ -2614,7 +2344,6 @@ def test_malformed_expected_auto_trade_value_is_never_compared_or_retained(
     invalid_expected,
 ):
     expectations = MonitorExpectations(
-        head=REVIEWED_HEAD,
         auto_trade_enabled=invalid_expected,
         management_execution_mode="live",
         max_concurrent_positions=4,
@@ -2905,7 +2634,7 @@ def test_malformed_inputs_use_fixed_reason_without_raw_values(field, value):
 
 def test_formatter_uses_readable_sections_and_sorted_reason_codes():
     result = evaluate_monitor_snapshot(
-        _snapshot(service_state="inactive", head=OTHER_HEAD, journal_error_count=2),
+        _snapshot(service_state="inactive", journal_error_count=2),
         EXPECTATIONS,
     )
 
@@ -3094,7 +2823,6 @@ def test_formatter_is_bounded_and_never_emits_sensitive_or_raw_fields():
     result = evaluate_monitor_snapshot(
         _snapshot(
             service_state="inactive\n" + secrets[0] * 500,
-            head=secrets[1] * 500,
             settings={
                 "auto_trade_enabled": False,
                 "management_execution_mode": secrets[2] * 500,
@@ -3128,7 +2856,6 @@ def test_realistic_short_bot_token_is_rejected_from_every_string_detail():
     result = evaluate_monitor_snapshot(
         _snapshot(
             service_state=bot_token,
-            head=bot_token,
             settings={
                 "auto_trade_enabled": False,
                 "management_execution_mode": bot_token,
@@ -3138,7 +2865,6 @@ def test_realistic_short_bot_token_is_rejected_from_every_string_detail():
             adapter_failures=(bot_token,),
         ),
         MonitorExpectations(
-            head=bot_token,
             auto_trade_enabled=True,
             management_execution_mode=bot_token,
             max_concurrent_positions=4,
@@ -3835,6 +3561,22 @@ class _RecordingAdapters:
         return self.audit
 
 
+def test_monitor_run_never_reads_runtime_release_scope(tmp_path):
+    class DeploymentTrapAdapters(_RecordingAdapters):
+        def read_runtime_release_scope(self):
+            raise AssertionError("deployment evidence must not be read")
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=DeploymentTrapAdapters(),
+        now=datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.healthy is True
+
+
 def test_runtime_release_validation_recomputes_immutable_content_and_ownership(
     tmp_path,
     monkeypatch,
@@ -3948,7 +3690,6 @@ def test_monitor_orchestration_reads_all_bounded_lightweight_sources(tmp_path):
     assert outcome.exit_code == 0
     assert adapters.calls == [
         "service",
-        "head",
         "settings",
         ("journal", datetime(2026, 7, 16, 0, 0, tzinfo=UTC)),
         ("events", datetime(2026, 7, 16, 0, 0, tzinfo=UTC), 50),

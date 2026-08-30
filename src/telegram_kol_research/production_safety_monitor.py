@@ -72,8 +72,6 @@ from telegram_kol_research.runtime_incident_snapshot import (
 )
 from telegram_kol_research.runtime_deployment_identity import (
     build_runtime_deployment_identity,
-    validate_runtime_authority_scope,
-    validate_runtime_identity_health,
 )
 from telegram_kol_research.scoped_release_activation import (
     ActivationError,
@@ -81,7 +79,6 @@ from telegram_kol_research.scoped_release_activation import (
     render_release_dropin,
     validate_release,
 )
-
 
 MAX_ALERT_LENGTH = 1200
 MAX_SAFE_COUNT = 1_000_000_000
@@ -277,11 +274,6 @@ _FIXED_REASON_CODES = frozenset(
         "contract_spec_ownership_drift",
         "contract_spec_sync_refusal_detected",
         "contract_spec_refresh_warning",
-        "runtime_release_invalid",
-        "runtime_release_mixed",
-        "runtime_identity_unproven",
-        "runtime_capability_unproven",
-        "runtime_unit_hash_drift",
     }
 )
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
@@ -450,11 +442,11 @@ def _load_monitor_bot_config():
 
 @dataclass(frozen=True, slots=True)
 class MonitorExpectations:
-    head: str
     auto_trade_enabled: bool
     management_execution_mode: str
     max_concurrent_positions: int
     entry_preamble_mode: str
+    head: str = ""
     entry_message_assembly_v2_mode: str | None = None
     entry_revision_v2_mode: str | None = None
     release_manifest_sha256: str | None = None
@@ -463,7 +455,6 @@ class MonitorExpectations:
 @dataclass(frozen=True, slots=True)
 class MonitorSnapshot:
     service_state: str
-    head: str
     settings: Mapping[str, Any]
     journal_error_count: int
     abnormal_events: Sequence[Mapping[str, Any]]
@@ -476,7 +467,6 @@ class MonitorSnapshot:
     message_operation_coverage: Mapping[str, Any] | None = None
     contract_spec_health: Mapping[str, Any] | None = None
     contract_spec_sync_refusal_count: int | None = None
-    runtime_release_scope: Mapping[str, Any] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -484,121 +474,6 @@ class MonitorResult:
     healthy: bool
     reason_codes: tuple[str, ...]
     details: Mapping[str, Any]
-
-
-def evaluate_runtime_release_scope(
-    scope: Mapping[str, Any],
-    *,
-    expected_commit: str,
-    expected_manifest_sha256: str,
-    checked_at: datetime,
-) -> MonitorResult:
-    """Evaluate only bounded immutable-release and four-role evidence."""
-
-    reasons: set[str] = set()
-    expected_roles = ("web", "ingest", "worker", "monitor")
-    if (
-        not isinstance(scope, Mapping)
-        or not _GIT_HEAD.fullmatch(str(expected_commit))
-        or not _SHA256_FINGERPRINT.fullmatch(
-            str(expected_manifest_sha256)
-        )
-        or scope.get("commit") != expected_commit
-        or scope.get("manifest_sha256") != expected_manifest_sha256
-    ):
-        reasons.add("runtime_release_invalid")
-    if scope.get("unit_hashes_valid") is not True:
-        reasons.add("runtime_unit_hash_drift")
-    roles = scope.get("roles")
-    if not isinstance(roles, Mapping) or set(roles) != set(expected_roles):
-        reasons.add("runtime_identity_unproven")
-        roles = {}
-    observed_now = _require_aware_datetime(checked_at).astimezone(UTC)
-    identity_checked_at = observed_now
-    try:
-        latest_role_observation = max(
-            datetime.fromisoformat(str(identity["observed_at"])).astimezone(UTC)
-            for identity in roles.values()
-            if isinstance(identity, Mapping)
-        )
-        if timedelta(0) <= latest_role_observation - observed_now <= timedelta(
-            seconds=10
-        ):
-            identity_checked_at = latest_role_observation
-    except (KeyError, TypeError, ValueError):
-        pass
-    expected_cwds = {
-        "web": "/opt/telegram-kol-analyzer",
-        "ingest": "/opt/telegram-kol-analyzer",
-        "worker": "/opt/telegram-kol-analyzer",
-        "monitor": "/var/lib/telegram-kol-monitor",
-    }
-    process_tuples: set[tuple[int, int]] = set()
-    for role in expected_roles:
-        identity = roles.get(role)
-        if not isinstance(identity, Mapping):
-            reasons.add("runtime_identity_unproven")
-            continue
-        if (
-            identity.get("release_commit") != expected_commit
-            or identity.get("manifest_sha256") != expected_manifest_sha256
-        ):
-            reasons.add("runtime_release_mixed")
-        cwd = str(identity.get("loaded_cwd") or "")
-        pid = identity.get("pid")
-        ticks = identity.get("process_start_ticks")
-        if (
-            identity.get("runtime_role") != role
-            or identity.get("command_role") != role
-            or identity.get("loaded_artifact_verified") is not True
-            or cwd != expected_cwds[role]
-            or type(pid) is not int
-            or pid <= 1
-            or type(ticks) is not int
-            or ticks <= 0
-            or identity.get("systemd_main_pid") != pid
-            or identity.get("systemd_start_ticks")
-            != ticks
-        ):
-            reasons.add("runtime_identity_unproven")
-        elif (pid, ticks) in process_tuples:
-            reasons.add("runtime_identity_unproven")
-        else:
-            process_tuples.add((pid, ticks))
-        try:
-            validate_runtime_identity_health(
-                identity,
-                role=role,
-                checked_at=identity_checked_at,
-                require_entry_frozen=role != "monitor",
-            )
-        except ValueError:
-            reasons.add("runtime_identity_unproven")
-    worker = roles.get("worker") if isinstance(roles, Mapping) else None
-    if isinstance(worker, Mapping):
-        try:
-            validate_runtime_authority_scope(roles)
-        except ValueError:
-            reasons.add("runtime_capability_unproven")
-    else:
-        reasons.add("runtime_capability_unproven")
-    details = {
-        "manifest_sha256": (
-            expected_manifest_sha256
-            if _SHA256_FINGERPRINT.fullmatch(expected_manifest_sha256)
-            else "invalid"
-        ),
-        "release_commit": (
-            expected_commit if _GIT_HEAD.fullmatch(expected_commit) else "invalid"
-        ),
-        "role_count": len(roles),
-        "unit_hashes_valid": scope.get("unit_hashes_valid") is True,
-    }
-    return MonitorResult(
-        healthy=not reasons,
-        reason_codes=tuple(sorted(reasons)),
-        details=details,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -3257,20 +3132,6 @@ def run_production_safety_monitor(
 
     failures: list[str] = []
     service_state = _read_adapter(adapters.read_service_state, "service", failures, "unknown")
-    runtime_release_scope = None
-    release_reader = getattr(adapters, "read_runtime_release_scope", None)
-    if expectations.release_manifest_sha256 is not None:
-        runtime_release_scope = _read_adapter(
-            release_reader,
-            "release",
-            failures,
-            None,
-        ) if callable(release_reader) else None
-        if runtime_release_scope is None and "release" not in failures:
-            failures.append("release")
-        head = expectations.head
-    else:
-        head = _read_adapter(adapters.read_git_head, "head", failures, "0" * 40)
     settings = _read_adapter(adapters.read_settings, "settings", failures, {})
     journal_summary_reader = getattr(adapters, "read_journal_summary", None)
     if callable(journal_summary_reader):
@@ -3380,7 +3241,6 @@ def run_production_safety_monitor(
     result = evaluate_monitor_snapshot(
         MonitorSnapshot(
             service_state=service_state,
-            head=head,
             settings=settings,
             journal_error_count=journal_error_count,
             abnormal_events=abnormal_events,
@@ -3393,7 +3253,6 @@ def run_production_safety_monitor(
             message_operation_coverage=message_operation_coverage,
             contract_spec_health=contract_spec_health,
             contract_spec_sync_refusal_count=contract_spec_sync_refusal_count,
-            runtime_release_scope=runtime_release_scope,
         ),
         expectations,
         checked_at=checked_at,
@@ -4258,24 +4117,6 @@ def evaluate_monitor_snapshot(
     if service_state != "active":
         reasons.add("service_inactive")
         details["service_state"] = service_state
-
-    if expectations.release_manifest_sha256 is not None:
-        release_result = evaluate_runtime_release_scope(
-            snapshot.runtime_release_scope or {},
-            expected_commit=expectations.head,
-            expected_manifest_sha256=expectations.release_manifest_sha256,
-            checked_at=checked_at or datetime.now(UTC),
-        )
-        reasons.update(release_result.reason_codes)
-        details.update(release_result.details)
-    else:
-        observed_head = _safe_git_head(snapshot.head)
-        expected_head = _safe_git_head(expectations.head)
-        if observed_head is None or expected_head is None:
-            reasons.add("malformed_snapshot")
-        elif observed_head != expected_head:
-            details["head"] = observed_head or "invalid"
-            details["expected_head"] = expected_head or "invalid"
 
     _evaluate_settings(snapshot.settings, expectations, reasons, details)
 
