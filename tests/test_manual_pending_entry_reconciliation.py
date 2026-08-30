@@ -4,6 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -2113,7 +2115,7 @@ def test_verified_backup_is_created_with_exact_0600_mode(tmp_path):
     assert backup.stat().st_mode & 0o777 == 0o600
 
 
-def test_verified_backup_writes_the_exclusive_inode_without_path_reopen(
+def test_verified_backup_is_file_backed_without_whole_database_materialization(
     tmp_path,
     monkeypatch,
 ):
@@ -2127,19 +2129,77 @@ def test_verified_backup_writes_the_exclusive_inode_without_path_reopen(
     connection.close()
     backup = tmp_path / "backup.db"
     real_connect = reconciliation.sqlite3.connect
+    opened = []
 
     def connect(database, *args, **kwargs):
-        assert Path(str(database)) != backup
+        assert database != ":memory:"
+        opened.append(str(database))
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+    monkeypatch.setattr(
+        reconciliation,
+        "_read_exact_descriptor",
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("backup must not be materialized in memory")
+        ),
+    )
 
     reconciliation._create_verified_backup(source, backup)
 
+    assert any(str(backup) in database for database in opened)
     with real_connect(backup) as copied:
         assert copied.execute("SELECT value FROM evidence").fetchone() == (
             "reviewed",
         )
+
+
+@pytest.mark.skipif(
+    sys.platform != "linux",
+    reason="RLIMIT_AS scale gate is enforced on the production OS",
+)
+def test_verified_backup_completes_under_bounded_address_space(tmp_path):
+    import resource
+
+    if not hasattr(resource, "RLIMIT_AS"):
+        pytest.fail("Linux backup scale gate requires RLIMIT_AS")
+    source = tmp_path / "large-source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("PRAGMA journal_mode=DELETE")
+    connection.execute("CREATE TABLE payload(value BLOB NOT NULL)")
+    for _ in range(136):
+        connection.execute(
+            "INSERT INTO payload(value) VALUES (randomblob(1048576))"
+        )
+    connection.commit()
+    connection.close()
+    assert source.stat().st_size > 128 * 1024 * 1024
+    backup = tmp_path / "large-backup.db"
+    helper = (
+        Path(__file__).parent
+        / "helpers"
+        / "run_reconciliation_backup_under_limit.py"
+    )
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(helper),
+            str(source),
+            str(backup),
+            str(512 * 1024 * 1024),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=180,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout)["status"] == "complete"
+    assert backup.stat().st_size >= source.stat().st_size
+    with sqlite3.connect(backup) as copied:
+        assert copied.execute("PRAGMA quick_check").fetchone() == ("ok",)
 
 
 def test_verified_backup_refuses_source_path_aba(tmp_path, monkeypatch):
