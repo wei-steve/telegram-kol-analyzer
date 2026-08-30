@@ -751,10 +751,11 @@ class ProductionSafetyAdapters:
             process_start_ticks=None,
             now=datetime.now(UTC),
         )
-        roles["monitor"] = self._with_systemd_identity(
-            "monitor",
-            monitor_identity,
-        )
+        monitor_identity["systemd_main_pid"] = monitor_identity["pid"]
+        monitor_identity["systemd_start_ticks"] = monitor_identity[
+            "process_start_ticks"
+        ]
+        roles["monitor"] = monitor_identity
         return {
             "commit": commit,
             "manifest_sha256": manifest_sha,
