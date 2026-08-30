@@ -98,7 +98,7 @@ manual_cleanup_production_backup_failure_anon_rss_kib: 1774996
 manual_cleanup_production_authority_seeded: false
 manual_cleanup_production_database_mutation_executed: false
 manual_cleanup_production_service_control_executed: true
-manual_cleanup_production_activation_executed: false
+manual_cleanup_production_activation_executed: true_failed_closed
 manual_cleanup_production_observation_started: false
 manual_cleanup_production_runtime_terminal_state: maintenance_stopped
 manual_cleanup_production_runtime_process_count: 0
@@ -153,31 +153,31 @@ manual_cleanup_post_backup_refresh_focused: 310_passed_2_skipped
 manual_cleanup_post_backup_refresh_final_suite: 6678_passed_4_skipped_32_warnings
 manual_cleanup_post_backup_refresh_review: no_p0_p1_p2
 manual_cleanup_post_backup_refresh_production_executed: true_completed_7_targets_authority_seeded
-manual_cleanup_activation_status: fresh_stage_created_activation_blocked_unproven_post_receipt_integrity
-manual_cleanup_activation_failed_candidate_sha: 7af12a535a786d33c1338e4f6d41d66aff088618
-manual_cleanup_activation_failure_service_control_executed: false
+manual_cleanup_activation_status: failed_closed_monitor_diagnostic_then_maintenance_stop_failed
+manual_cleanup_activation_failed_candidate_sha: 18ea345a23812ed131c500a6040174a07a4436db
+manual_cleanup_activation_failure_service_control_executed: true
 manual_cleanup_production_reconciliation_completed: true
 manual_cleanup_production_reconciliation_terminalized_count: 7
 manual_cleanup_production_reconciliation_authority_seeded: true
 manual_cleanup_production_reconciliation_dry_run: completed
 manual_cleanup_contaminated_stage_root_pyc_count: 206
 monitor_identity_repair_commits_recorded: 8
-monitor_deployment_self_check_removal_status: fresh_stage_created_activation_not_executed
+monitor_deployment_self_check_removal_status: production_diagnostic_exposed_identity_reason_residuals
 monitor_deployment_self_check_last_production_code_sha: f7c27a543554abc3a62f96095d99694b712452c5
 monitor_fail_closed_source_matrix: 7_passed
 monitor_local_focused_acceptance: 376_passed_1_skipped
 monitor_final_repository_suite: 6685_passed_4_skipped_32_warnings
 monitor_final_repository_suite_seconds: 440.24
 monitor_stage_authorized: true_executed
-monitor_activation_authorized: true_not_executed_due_failed_closed_integrity_gate
+monitor_activation_authorized: true_executed_failed_closed
 fresh_stage_sha: 18ea345a23812ed131c500a6040174a07a4436db
 fresh_stage_tree: 3caf9990f6aa4fbcdcd2d12e63fa3a1c1775a4ab
 fresh_stage_content_sha256: bda97ba8db70e0f0577e5383718040fe9a13159b77b0567bdd4b8825f962204a
 fresh_stage_manifest_sha256: 02f8a5a46788052ecad067fca4c5a71dcddf1c7ddde73e2091b27e97362bd0f4
 fresh_stage_action_plan_sha256: aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b
-fresh_stage_post_receipt_integrity_status: failed_closed_validator_reported_special
-fresh_stage_activation_executed: false
-fresh_stage_authorization_created: false
+fresh_stage_post_receipt_integrity_status: authoritative_validate_release_passed
+fresh_stage_activation_executed: true_failed_closed
+fresh_stage_authorization_created: true_consumed
 fresh_stage_runtime_terminal_state: maintenance_stopped
 fresh_stage_entry_admission_thawed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
@@ -1755,3 +1755,43 @@ expansion or an irreversible action that the approved phase did not include.
   occurred after the already completed reconciliation. A later separately
   authorized turn must first resolve the unknown post-receipt integrity state;
   this status does not authorize re-verification or activation.
+
+## Authoritative activation attempt and monitor diagnostic failure
+
+- The owner explicitly superseded the temporary shell verifier as redundant
+  and authorized continuation of the same production window. It was not
+  retried, repaired or replaced. Candidate integrity was delegated exclusively
+  to the activator's `validate_release()` gate, which runs before authorization
+  consumption and service control.
+- A canonical root-owned mode `0400` authorization bound exact candidate
+  `18ea345a23812ed131c500a6040174a07a4436db`, ordered components `web`,
+  `monitor`, `ingest`, `worker`, source mode `stopped_legacy` and activation
+  action-plan SHA-256
+  `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`.
+  The authorization was consumed. Therefore the candidate's authoritative
+  release validation and the pre-consumption stopped-legacy boundary both
+  passed.
+- Activation published candidate drop-ins and started the candidate far enough
+  to run `telegram-kol-monitor-diagnostic.service`, but the diagnostic exited
+  with status 1. Its candidate-release evidence named exact SHA `18ea345a...`; its
+  unhealthy result still contained retired deployment identity reasons
+  `runtime_identity_unproven`, `runtime_release_mixed` and
+  `runtime_unit_hash_drift`, plus business reason
+  `stale_entry_preamble_unresolved`. The requested proof that the rewritten
+  monitor produces no identity-class failures therefore failed. No successful
+  full monitor cycle, contract-spec cache verification or Telegram-gap report
+  was claimed.
+- The activator returned `activation failed; maintenance_stop_failed` during
+  stopped-legacy failure recovery. One read-only terminal-state capture then
+  proved web, monitor service, monitor timer, ingest and worker inactive with
+  `MainPID=0`; the diagnostic unit alone retained failed/exit-code status.
+  Maintenance-inhibit drop-ins were present for all controlled units. The
+  candidate drop-ins for web, ingest and worker each contained
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. Thus no runtime remained active and
+  entry admission was not thawed, although the activator's own reinhibit proof
+  did not complete successfully.
+- The activation was not retried. The release was not repaired or restaged;
+  reconciliation, Deepcoin writes, database mutation, historical replay and
+  message backfill were not run. Post-activation cache ownership, atomic
+  replacement, contract-spec health and Telegram collection-gap verification
+  remain unexecuted because activation did not succeed.
