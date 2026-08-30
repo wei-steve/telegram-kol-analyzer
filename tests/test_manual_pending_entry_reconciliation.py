@@ -2504,6 +2504,95 @@ def test_verified_backup_binds_read_only_verification_to_created_inode(
         reconciliation._create_verified_backup(source, backup)
 
 
+def test_verified_backup_rebinds_public_path_after_streaming_hash(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    original.execute("INSERT INTO evidence(value) VALUES ('source')")
+    original.commit()
+    original.close()
+    backup = tmp_path / "backup.db"
+    replacement = tmp_path / "replacement.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+    other.execute("INSERT INTO marker(value) VALUES ('replacement')")
+    other.commit()
+    other.close()
+    held = tmp_path / "held-created.db"
+    real_hash = reconciliation._streaming_descriptor_sha256
+
+    def hash_after_swap(descriptor, metadata):
+        digest = real_hash(descriptor, metadata)
+        backup.rename(held)
+        replacement.rename(backup)
+        return digest
+
+    monkeypatch.setattr(
+        reconciliation,
+        "_streaming_descriptor_sha256",
+        hash_after_swap,
+    )
+
+    with pytest.raises(ValueError, match="backup_metadata_invalid"):
+        reconciliation._create_verified_backup(source, backup)
+
+    with sqlite3.connect(backup) as current:
+        assert current.execute("SELECT value FROM marker").fetchone() == (
+            "replacement",
+        )
+
+
+def test_verified_backup_rebinds_parent_path_after_streaming_hash(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    original.commit()
+    original.close()
+    parent = tmp_path / "evidence"
+    parent.mkdir(mode=0o700)
+    backup = parent / "backup.db"
+    replacement_parent = tmp_path / "replacement-evidence"
+    replacement_parent.mkdir(mode=0o700)
+    replacement = replacement_parent / "backup.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+    other.execute("INSERT INTO marker(value) VALUES ('replacement-parent')")
+    other.commit()
+    other.close()
+    held_parent = tmp_path / "held-evidence"
+    real_hash = reconciliation._streaming_descriptor_sha256
+
+    def hash_after_parent_swap(descriptor, metadata):
+        digest = real_hash(descriptor, metadata)
+        parent.rename(held_parent)
+        replacement_parent.rename(parent)
+        return digest
+
+    monkeypatch.setattr(
+        reconciliation,
+        "_streaming_descriptor_sha256",
+        hash_after_parent_swap,
+    )
+
+    with pytest.raises(ValueError, match="backup_metadata_invalid"):
+        reconciliation._create_verified_backup(source, backup)
+
+    with sqlite3.connect(backup) as current:
+        assert current.execute("SELECT value FROM marker").fetchone() == (
+            "replacement-parent",
+        )
+
+
 def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
     tmp_path,
     monkeypatch,

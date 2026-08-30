@@ -999,6 +999,41 @@ def _create_verified_backup(
             descriptor,
             descriptor_metadata,
         )
+        post_hash_source_metadata = database_path.lstat()
+        post_hash_parent_metadata = backup_path.parent.lstat()
+        post_hash_metadata = os.stat(
+            backup_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
+        post_hash_path_metadata = backup_path.lstat()
+        post_hash_descriptor_metadata = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(post_hash_source_metadata.st_mode)
+            or stat.S_ISLNK(post_hash_source_metadata.st_mode)
+            or post_hash_source_metadata.st_dev != source_metadata.st_dev
+            or post_hash_source_metadata.st_ino != source_metadata.st_ino
+            or not stat.S_ISDIR(post_hash_parent_metadata.st_mode)
+            or stat.S_ISLNK(post_hash_parent_metadata.st_mode)
+            or post_hash_parent_metadata.st_dev != opened_parent.st_dev
+            or post_hash_parent_metadata.st_ino != opened_parent.st_ino
+            or not stat.S_ISREG(post_hash_metadata.st_mode)
+            or stat.S_ISLNK(post_hash_metadata.st_mode)
+            or post_hash_metadata.st_dev != created_metadata.st_dev
+            or post_hash_metadata.st_ino != created_metadata.st_ino
+            or post_hash_metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(post_hash_metadata.st_mode) != 0o600
+            or post_hash_path_metadata.st_dev != post_hash_metadata.st_dev
+            or post_hash_path_metadata.st_ino != post_hash_metadata.st_ino
+            or post_hash_descriptor_metadata.st_dev != post_hash_metadata.st_dev
+            or post_hash_descriptor_metadata.st_ino != post_hash_metadata.st_ino
+            or post_hash_descriptor_metadata.st_size != descriptor_metadata.st_size
+            or post_hash_descriptor_metadata.st_mtime_ns
+            != descriptor_metadata.st_mtime_ns
+            or post_hash_descriptor_metadata.st_ctime_ns
+            != descriptor_metadata.st_ctime_ns
+        ):
+            raise ValueError("backup_metadata_invalid")
     except Exception:
         try:
             current = os.stat(
