@@ -418,10 +418,8 @@ class MonitorExpectations:
     management_execution_mode: str
     max_concurrent_positions: int
     entry_preamble_mode: str
-    head: str = ""
     entry_message_assembly_v2_mode: str | None = None
     entry_revision_v2_mode: str | None = None
-    release_manifest_sha256: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -495,10 +493,6 @@ class ProductionSafetyAdapters:
 
     database_path: Path
     live_position_snapshot_path: Path | None = None
-    checkout_path: Path = Path(".")
-    release_path: Path | None = None
-    release_commit: str | None = None
-    release_manifest_sha256: str | None = None
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
     message_operation_coverage_url: str = (
         "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage"
@@ -516,9 +510,6 @@ class ProductionSafetyAdapters:
         "telegram-kol-web.service",
         "telegram-kol-ingest.service",
     )
-    web_loop_health_url: str = ""
-    ingest_loop_health_url: str = ""
-    worker_loop_health_url: str = ""
     audit_command: tuple[str, ...] = (
         sys.executable,
         "-m",

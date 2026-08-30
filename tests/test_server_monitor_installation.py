@@ -67,15 +67,20 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         "ExecStart=/usr/bin/env "
         "PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src"
     ) in normalized
-    assert (
-        "--expected-release-commit ${TELEGRAM_KOL_MONITOR_RELEASE_COMMIT}"
-    ) in normalized
-    assert "--release-path ${TELEGRAM_KOL_MONITOR_RELEASE_PATH}" in normalized
+    for removed_option in (
+        "--expected-release-commit",
+        "--expected-release-manifest-sha256",
+        "--release-path",
+        "--web-loop-health-url",
+        "--ingest-loop-health-url",
+        "--worker-loop-health-url",
+    ):
+        assert removed_option not in normalized
     assert "--expected-head" not in normalized
     assert "--checkout-path" not in normalized
 
 
-def test_monitor_install_and_service_bind_to_explicit_immutable_release():
+def test_monitor_installer_validates_release_and_service_loads_immutable_code():
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
     service = SERVICE_PATH.read_text(encoding="utf-8")
 
@@ -84,12 +89,12 @@ def test_monitor_install_and_service_bind_to_explicit_immutable_release():
     assert "--release-manifest-sha256" in installer
     assert "git -C" not in installer
     assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in service
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" in service
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" in service
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" not in service
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" not in service
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" not in service
 
 
-def test_monitor_units_drop_capabilities_but_allow_read_only_systemd_queries():
+def test_monitor_units_drop_capabilities_and_deny_system_bus():
     services = (
         SERVICE_PATH.read_text(encoding="utf-8"),
         DIAGNOSTIC_PATH.read_text(encoding="utf-8"),
@@ -102,16 +107,26 @@ def test_monitor_units_drop_capabilities_but_allow_read_only_systemd_queries():
     assert "NoNewPrivileges=true" in directives
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in directives
     assert all(
-        "InaccessiblePaths=-/run/dbus/system_bus_socket" not in service
-        for service in services[:2]
+        "InaccessiblePaths=-/run/dbus/system_bus_socket" in service
+        for service in services
     )
-    assert "InaccessiblePaths=-/run/dbus/system_bus_socket" in services[2]
+    for service in services:
+        normalized = " ".join(service.split())
+        for removed_option in (
+            "--expected-release-commit",
+            "--expected-release-manifest-sha256",
+            "--release-path",
+            "--web-loop-health-url",
+            "--ingest-loop-health-url",
+            "--worker-loop-health-url",
+        ):
+            assert removed_option not in normalized
     assert "SystemCallFilter=@system-service" in directives
     assert "SystemCallFilter=~@mount @privileged" in directives
     assert "RestrictNamespaces=true" in directives
 
 
-def test_test_notification_unit_keeps_stricter_bus_isolation():
+def test_test_notification_unit_matches_business_monitor_sandbox():
     service = SERVICE_PATH.read_text(encoding="utf-8")
     test_service = TEST_NOTIFICATION_PATH.read_text(encoding="utf-8")
     service_directives = set(service.splitlines())
@@ -128,14 +143,13 @@ def test_test_notification_unit_keeps_stricter_bus_isolation():
         test_service.split()
     )
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" not in test_service
-    assert (
-        "Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT="
-        "telegram-kol-monitor-test-notification.service"
-    ) in test_directives
+    assert all(
+        not line.startswith("Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT=")
+        for line in test_directives
+    )
     ignored_prefixes = (
         "Description=",
         "ExecStart=",
-        "Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT=",
     )
     expected_sandbox = {
         line
@@ -147,9 +161,7 @@ def test_test_notification_unit_keeps_stricter_bus_isolation():
         for line in test_directives
         if line and not line.startswith(ignored_prefixes)
     }
-    assert actual_sandbox == expected_sandbox | {
-        "InaccessiblePaths=-/run/dbus/system_bus_socket"
-    }
+    assert actual_sandbox == expected_sandbox
 
 
 def test_diagnostic_unit_uses_bounded_incremental_audit_without_notification():
@@ -167,14 +179,13 @@ def test_diagnostic_unit_uses_bounded_incremental_audit_without_notification():
     assert "--notify" not in normalized
     assert "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION}" in diagnostic
     assert " --expected-auto-trade-enabled " not in normalized
-    assert (
-        "Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT="
-        "telegram-kol-monitor-diagnostic.service"
-    ) in diagnostic_directives
+    assert all(
+        not line.startswith("Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT=")
+        for line in diagnostic_directives
+    )
     ignored_prefixes = (
         "Description=",
         "ExecStart=",
-        "Environment=TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT=",
     )
     assert {
         line

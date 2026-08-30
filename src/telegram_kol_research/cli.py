@@ -2578,13 +2578,6 @@ def repair_execution_order_legs(
 
 @app.command("monitor-production-safety")
 def monitor_production_safety(
-    expected_release_commit: str | None = typer.Option(
-        None, "--expected-release-commit"
-    ),
-    expected_release_manifest_sha256: str | None = typer.Option(
-        None, "--expected-release-manifest-sha256"
-    ),
-    release_path: Path | None = typer.Option(None, "--release-path"),
     expected_auto_trade_enabled: bool | None = typer.Option(
         None,
         "--expected-auto-trade-enabled/--no-expected-auto-trade-enabled",
@@ -2612,10 +2605,6 @@ def monitor_production_safety(
         Path("data/research.db"),
         "--database-path",
     ),
-    checkout_path: Path = typer.Option(
-        Path("."),
-        "--checkout-path",
-    ),
     state_path: str = typer.Option(
         "/var/lib/telegram-kol-monitor/state.json",
         "--state-path",
@@ -2623,18 +2612,6 @@ def monitor_production_safety(
     settings_url: str = typer.Option(
         "http://127.0.0.1:8000/api/trading-settings",
         "--settings-url",
-    ),
-    web_loop_health_url: str = typer.Option(
-        "http://127.0.0.1:8000/api/runtime/loop-health",
-        "--web-loop-health-url",
-    ),
-    ingest_loop_health_url: str = typer.Option(
-        "http://127.0.0.1:8001/api/runtime/loop-health",
-        "--ingest-loop-health-url",
-    ),
-    worker_loop_health_url: str = typer.Option(
-        "http://127.0.0.1:8002/api/runtime/loop-health",
-        "--worker-loop-health-url",
     ),
     message_operation_coverage_url: str = typer.Option(
         "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage",
@@ -2663,15 +2640,6 @@ def monitor_production_safety(
         raise typer.BadParameter(
             "choose --expected-auto-trade-enabled or --no-expected-auto-trade-enabled"
         )
-    if (
-        expected_release_commit is None
-        or expected_release_manifest_sha256 is None
-        or release_path is None
-    ):
-        raise typer.BadParameter(
-            "immutable release monitoring requires commit, manifest hash, and path"
-        )
-    expected_head = expected_release_commit
     if test_notification:
         if not notify:
             raise typer.BadParameter("--test-notification requires --notify")
@@ -2715,26 +2683,17 @@ def monitor_production_safety(
     )
     outcome = run_production_safety_monitor(
         expectations=MonitorExpectations(
-            head=expected_head,
             auto_trade_enabled=expected_auto_trade_enabled,
             management_execution_mode=expected_management_mode,
             max_concurrent_positions=expected_max_concurrent_positions,
             entry_preamble_mode=expected_entry_preamble_mode,
             entry_message_assembly_v2_mode=expected_entry_message_assembly_v2_mode,
             entry_revision_v2_mode=expected_entry_revision_v2_mode,
-            release_manifest_sha256=expected_release_manifest_sha256,
         ),
         state_path=Path(state_path),
         adapters=ProductionSafetyAdapters(
             database_path=database_path,
-            checkout_path=checkout_path,
-            release_path=release_path,
-            release_commit=expected_release_commit,
-            release_manifest_sha256=expected_release_manifest_sha256,
             settings_url=settings_url,
-            web_loop_health_url=web_loop_health_url,
-            ingest_loop_health_url=ingest_loop_health_url,
-            worker_loop_health_url=worker_loop_health_url,
             message_operation_coverage_url=message_operation_coverage_url,
             live_position_sizes_url=live_position_sizes_url,
             contract_spec_health_url=contract_spec_health_url,

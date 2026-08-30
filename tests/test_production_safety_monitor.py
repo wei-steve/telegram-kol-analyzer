@@ -89,6 +89,9 @@ def test_monitor_snapshot_has_no_deployment_evidence_contract():
         field.name for field in fields(MonitorSnapshot)
     }
     assert not hasattr(monitor_module, "evaluate_runtime_release_scope")
+    assert {field.name for field in fields(MonitorExpectations)}.isdisjoint(
+        {"head", "release_manifest_sha256"}
+    )
 
 
 def test_production_adapter_exposes_no_deployment_or_systemd_probes(tmp_path):
@@ -102,6 +105,17 @@ def test_production_adapter_exposes_no_deployment_or_systemd_probes(tmp_path):
         "_runtime_service_names",
     ):
         assert not hasattr(adapters, name)
+    assert {field.name for field in fields(ProductionSafetyAdapters)}.isdisjoint(
+        {
+            "checkout_path",
+            "release_path",
+            "release_commit",
+            "release_manifest_sha256",
+            "web_loop_health_url",
+            "ingest_loop_health_url",
+            "worker_loop_health_url",
+        }
+    )
 
 
 def _clear_monitor_bot_environment(monkeypatch):
@@ -182,12 +196,6 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
         app,
         [
             "monitor-production-safety",
-            "--expected-release-commit",
-            "a" * 40,
-            "--expected-release-manifest-sha256",
-            "b" * 64,
-            "--release-path",
-            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -234,12 +242,6 @@ def test_cli_routes_incident_capture_to_trusted_loopback_writer(monkeypatch):
         app,
         [
             "monitor-production-safety",
-            "--expected-release-commit",
-            "a" * 40,
-            "--expected-release-manifest-sha256",
-            "b" * 64,
-            "--release-path",
-            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
