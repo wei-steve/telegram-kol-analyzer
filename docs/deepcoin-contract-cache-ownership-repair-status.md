@@ -138,6 +138,15 @@ manual_cleanup_backup_nonconvergence_repair_focused: 278_passed_1_skipped
 manual_cleanup_backup_nonconvergence_repair_final_suite: 6679_passed_4_skipped_32_warnings
 manual_cleanup_backup_nonconvergence_repair_review: no_p0_p1
 manual_cleanup_backup_nonconvergence_repair_production_executed: false
+manual_cleanup_vacuum_into_status: local_complete_production_cutover_in_progress
+manual_cleanup_vacuum_into_base_sha: 4894a97e7ba0a29f0054df854e16e5b4ec62be90
+manual_cleanup_vacuum_into_code_sha: 13cf803c092a33df8cdc61ed4c69cdcb03a0fb1a
+manual_cleanup_vacuum_into_red: 1_failed_as_expected
+manual_cleanup_vacuum_into_focused: 309_passed_2_skipped
+manual_cleanup_vacuum_into_linux_probe: python_3_11_sqlite_3_40_1_136mib_512mib_complete_0_542s
+manual_cleanup_vacuum_into_final_suite: 6677_passed_4_skipped_32_warnings
+manual_cleanup_vacuum_into_review: no_p0_p1_p2
+manual_cleanup_vacuum_into_production_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1534,3 +1543,33 @@ expansion or an irreversible action that the approved phase did not include.
   unchanged source identity/hash, with no automatic retry. Only a successful
   reproof may reopen the later push, fresh immutable stage and production
   cutover decision.
+
+## `VACUUM INTO` cutover simplification
+
+- The owner approved one coherent subtraction phase covering local repair,
+  review, push, fresh immutable stage, production reconciliation, activation
+  and verification. It does not authorize a fifth cutover protocol or trading
+  thaw.
+- Starting from clean claimed base
+  `4894a97e7ba0a29f0054df854e16e5b4ec62be90`, RED proved the current path still
+  called `Connection.backup()`. Code commit
+  `13cf803c092a33df8cdc61ed4c69cdcb03a0fb1a` replaces the page-batched backup,
+  progress callback, retry/nonconvergence state and destination SQLite
+  connection with one parameterized `VACUUM INTO` statement.
+- The source remains `mode=ro`; `query_only` is enabled for initial evidence
+  counts and disabled only because SQLite classifies `VACUUM INTO` as a write
+  statement. The existing exclusive `0600` destination inode, parent binding,
+  double `fsync`, quick/foreign-key checks, critical counts, streaming SHA-256,
+  post-hash ABA checks and post-backup `BEGIN IMMEDIATE` recheck remain.
+- Three tests coupled only to incremental page progress, BUSY callbacks and
+  snapshot pinning were deleted. The updated focused set passed 309 tests with
+  two documented skips. A Linux Python 3.11 / SQLite 3.40.1 probe copied a
+  136 MiB WAL-backed fixture under a 512 MiB limit in 0.542 seconds with
+  `quick_check=ok` and exact row count. Independent review found no P0, P1 or
+  P2 issue.
+- The exact production-code candidate passed one final repository suite:
+  6,677 passed, 4 skipped and 32 existing warnings in 460.14 seconds. No
+  production code changed afterward. This local work did not push, SSH, stage,
+  mutate production, control a service, call Deepcoin or activate. Production
+  remains at the recorded `maintenance_stopped` boundary pending the remainder
+  of this same approved cutover phase.
