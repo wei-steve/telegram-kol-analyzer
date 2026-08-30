@@ -6,10 +6,10 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a04f45-e0e5-7642-aeb7-0c398bd03375
-candidate_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
-candidate_content_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
-handoff_sha: cce1f8654d94a572b0340a62f17226dbb93d2da0
-pushed_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
+candidate_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
+candidate_content_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
+handoff_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
+pushed_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -79,23 +79,27 @@ manual_cleanup_timer_pid_repair_code_sha: cce1f8654d94a572b0340a62f17226dbb93d2d
 manual_cleanup_timer_pid_repair_focused: 299_passed_1_skipped
 manual_cleanup_timer_pid_repair_final_suite: 6667_passed_3_skipped_32_warnings
 manual_cleanup_timer_pid_repair_review: no_p0_p1
-manual_cleanup_production_cutover_status: local_timer_pid_repair_complete_fresh_cutover_pending
-manual_cleanup_production_stage_sha: 287daacf8dbf2d44e56f311800ee85b83579e307
-manual_cleanup_production_stage_content_sha256: 273a971025b706c3fb03f592b99c0a036f666fd07287d2d48323165de59383ef
-manual_cleanup_production_stage_manifest_sha256: afa900de77a73c360f8b0024ef0038c31515a52845b17f6fbc91a3c6b6a15d56
-manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/287daacf8dbf2d44e56f311800ee85b83579e307/attempt-1/evidence.jsonl
-manual_cleanup_production_evidence_sha256: 1aef8a38edb7d5d290fdbaf1b2101c2e6528cdd5bd2c969dec3ff20505678377
-manual_cleanup_production_preflight_at: 2026-08-30T00:37:51Z
-manual_cleanup_production_preflight_blocker: monitor_timer_main_pid_property_empty_before_service_control
+manual_cleanup_production_cutover_status: maintenance_stop_failed_inhibit_directory_mode_0700
+manual_cleanup_production_stage_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
+manual_cleanup_production_stage_content_sha256: 8dee8c014b2be5fc2ae495b865d5d2f807b0da60d0b3f177793705961289c828
+manual_cleanup_production_stage_manifest_sha256: 2b614bba3dc0ea8c1101363ff98d23c59caf9c6f6b8ab788a0ee694eff86a6de
+manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl
+manual_cleanup_production_evidence_sha256: 93d2f23c8ca3fc3092e45880298199810793b7aa2195df16c1b2ba5083d88786
+manual_cleanup_production_preflight_at: 2026-08-30T01:41:14Z
+manual_cleanup_production_preflight_blocker: maintenance_inhibit_directory_mode_0700_expected_0755
 manual_cleanup_production_target_fill_status: all_7_zero_in_both_stable_snapshots
-manual_cleanup_production_preflight_attempt: 3
+manual_cleanup_production_preflight_attempt: 4
 manual_cleanup_production_preflight_http_status: null
 manual_cleanup_production_backup_created: false
 manual_cleanup_production_authority_seeded: false
 manual_cleanup_production_database_mutation_executed: false
-manual_cleanup_production_service_control_executed: false
+manual_cleanup_production_service_control_executed: true
 manual_cleanup_production_activation_executed: false
 manual_cleanup_production_observation_started: false
+manual_cleanup_production_runtime_terminal_state: maintenance_stop_failed
+manual_cleanup_production_runtime_process_count: 0
+manual_cleanup_production_persistent_inhibit_proven: false
+manual_cleanup_production_inhibit_directory_mode: 0700
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1189,3 +1193,62 @@ expansion or an irreversible action that the approved phase did not include.
   superseded. A later production cutover must push the new exact handoff, create
   and verify another immutable inactive stage and acquire all account, fills,
   history, runtime, database and no-write evidence fresh from the beginning.
+
+## Timer-fixed production cutover attempt
+
+- The continuation began from exact clean local HEAD
+  `89a7dc66ea0c788f48be2e9841cec010cd8feeb1`. The remote
+  `codex/deepcoin-auto-trading-v1` ref was fast-forward pushed from
+  `287daacf8dbf2d44e56f311800ee85b83579e307` and independently verified at the
+  exact candidate.
+- A separate stage action created immutable inactive release `89a7dc66` with
+  tree `ba35fc4ba7dd4cc59e277a5b91f645ee90a1b379`, content SHA-256
+  `8dee8c014b2be5fc2ae495b865d5d2f807b0da60d0b3f177793705961289c828`,
+  manifest SHA-256
+  `2b614bba3dc0ea8c1101363ff98d23c59caf9c6f6b8ab788a0ee694eff86a6de`
+  and action-plan SHA-256
+  `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48`.
+  It was root-owned mode `0555`, had zero unsafe or group/world-writable entries
+  and zero systemd/process references, and was not activated.
+- Fresh production preflight again proved tracked-clean legacy SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f` with unchanged web, ingest and
+  worker PID/start-tick identities. Both stable account snapshots returned zero
+  positions, zero regular open orders and zero pending triggers. Each made
+  exactly seven paced fills and seven paced trigger-history GETs with no retry
+  or exception; all fills were empty and history retained the accepted
+  five-row/two-missing shape. Both plans were `ready` with fingerprint
+  `7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7`.
+- The fresh root-owned `0600` preflight copy at
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/preflight.db`
+  has SHA-256
+  `6120bbefcba0753254e82602ebfdf8bc605fdfa1df7cecc6cc34b4b41ff60211`.
+  It passed `query_only=1`, `quick_check=ok`, zero foreign-key issues,
+  `total_changes=0` and zero active exchange writes; critical counts were
+  unchanged and the canonical authority row remained absent.
+- Maintenance entry then failed before writing any inhibit file. The operator
+  collector set `umask 077`; `SystemRuntimeAdapter.mask_unit()` created each new
+  unit drop-in directory with requested mode `0755`, but the umask reduced the
+  actual mode to `0700`. Its exact owner/mode guard rejected all eight
+  directories before publishing the persistent inhibit. The subsequent stop
+  loop completed for the running web, ingest, worker and timer units, while the
+  pre-existing failed monitor oneshot remained `failed` rather than `inactive`.
+- Post-failure proof found no exact matching runtime process, zero candidate
+  systemd/process references and zero active exchange writes. All web, ingest,
+  worker, timer and legacy `MainPID`/cgroup populations were zero, but no
+  persistent inhibit existed and the empty drop-in directories were mode
+  `0700`. The only valid terminal classification is therefore
+  `maintenance_stop_failed`, not `maintenance_stopped`.
+- No automatic retry, directory-mode repair, transaction backup, production
+  database/settings mutation, target terminalization, authority seed,
+  activation authorization, activation, old-runtime restore, historical replay,
+  Deepcoin write, L2 observation or entry thaw occurred. Production remained on
+  the legacy checkout SHA, but its split runtime is stopped and not persistently
+  inhibited. The root-owned `0600` evidence file is
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl`,
+  SHA-256
+  `93d2f23c8ca3fc3092e45880298199810793b7aa2195df16c1b2ba5083d88786`.
+  Further service-control requires explicit continuation; it must first repair
+  only the eight empty directory modes, publish and verify the exact persistent
+  inhibits, reset the failed monitor oneshot to inactive without starting any
+  runtime, and prove the complete stopped boundary before any fresh exchange
+  evidence or database transaction.
