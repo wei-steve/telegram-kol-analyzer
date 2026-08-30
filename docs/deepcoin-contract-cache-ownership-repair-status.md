@@ -152,7 +152,10 @@ manual_cleanup_post_backup_refresh_code_sha: ae668b8c23be18aeb8029e9064154f3169e
 manual_cleanup_post_backup_refresh_focused: 310_passed_2_skipped
 manual_cleanup_post_backup_refresh_final_suite: 6678_passed_4_skipped_32_warnings
 manual_cleanup_post_backup_refresh_review: no_p0_p1_p2
-manual_cleanup_post_backup_refresh_production_executed: false
+manual_cleanup_post_backup_refresh_production_executed: true_completed_7_targets_authority_seeded
+manual_cleanup_activation_status: fresh_restaged_candidate_required_after_root_bytecode_contamination
+manual_cleanup_activation_failed_candidate_sha: 7af12a535a786d33c1338e4f6d41d66aff088618
+manual_cleanup_activation_failure_service_control_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1611,3 +1614,26 @@ expansion or an irreversible action that the approved phase did not include.
   P0/P1/P2; the final repository suite passed 6,678 tests with four skips and
   32 existing warnings in 468.20 seconds. Production remains safely
   `maintenance_stopped`; the old staged candidate must not be activated.
+
+## Production reconciliation completion and stage contamination
+
+- Fresh immutable SHA `7af12a535a786d33c1338e4f6d41d66aff088618`
+  completed the same transaction in `attempt-3`. The output reported
+  `terminalized_count=7`, `authority_seeded=true` and backup SHA-256
+  `eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af`
+  with empty stderr. Live `quick_check=ok`, foreign-key rows remained zero,
+  trading settings changed from 3 to 4, execution events changed from 3,803 to
+  3,810, the sole authority document is canonical idle, and exactly seven
+  confirmed reconciliation events exist. A fresh dry-run returned `completed`.
+  All eight units remained inactive and inhibited.
+- Activation then refused before authorization consumption or service control
+  with `release validation failed`. Diagnosis found 206 root-owned mode `0600`
+  `.pyc` files under the stage. They were created because the root reconciliation
+  command imported directly from the immutable release without
+  `PYTHONDONTWRITEBYTECODE=1`, changing its content after receipt creation.
+  The activator correctly rejected the changed release. The one-time
+  authorization remains unconsumed; every unit is still inactive.
+- The contaminated release will not be edited, repaired or activated. The next
+  action is a new exact-SHA immutable stage containing the same fully tested
+  production code and this documentation-only evidence update. No preactivation
+  command may import from that new stage; reconciliation is already complete.
