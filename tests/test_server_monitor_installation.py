@@ -89,21 +89,29 @@ def test_monitor_install_and_service_bind_to_explicit_immutable_release():
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" not in service
 
 
-def test_monitor_service_drops_all_capabilities_and_denies_system_bus():
-    service = SERVICE_PATH.read_text(encoding="utf-8")
-    directives = set(service.splitlines())
+def test_monitor_units_drop_capabilities_but_allow_read_only_systemd_queries():
+    services = (
+        SERVICE_PATH.read_text(encoding="utf-8"),
+        DIAGNOSTIC_PATH.read_text(encoding="utf-8"),
+        TEST_NOTIFICATION_PATH.read_text(encoding="utf-8"),
+    )
+    directives = set(services[0].splitlines())
 
     assert "CapabilityBoundingSet=" in directives
     assert "AmbientCapabilities=" in directives
     assert "NoNewPrivileges=true" in directives
     assert "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6" in directives
-    assert "InaccessiblePaths=-/run/dbus/system_bus_socket" in directives
+    assert all(
+        "InaccessiblePaths=-/run/dbus/system_bus_socket" not in service
+        for service in services[:2]
+    )
+    assert "InaccessiblePaths=-/run/dbus/system_bus_socket" in services[2]
     assert "SystemCallFilter=@system-service" in directives
     assert "SystemCallFilter=~@mount @privileged" in directives
     assert "RestrictNamespaces=true" in directives
 
 
-def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once():
+def test_test_notification_unit_keeps_stricter_bus_isolation():
     service = SERVICE_PATH.read_text(encoding="utf-8")
     test_service = TEST_NOTIFICATION_PATH.read_text(encoding="utf-8")
     service_directives = set(service.splitlines())
@@ -139,7 +147,9 @@ def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once(
         for line in test_directives
         if line and not line.startswith(ignored_prefixes)
     }
-    assert actual_sandbox == expected_sandbox
+    assert actual_sandbox == expected_sandbox | {
+        "InaccessiblePaths=-/run/dbus/system_bus_socket"
+    }
 
 
 def test_diagnostic_unit_uses_bounded_incremental_audit_without_notification():

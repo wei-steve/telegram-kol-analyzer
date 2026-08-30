@@ -16,7 +16,6 @@ ExecStart=/usr/bin/env PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src /opt/
 
 AmbientCapabilities=
 CapabilityBoundingSet=
-InaccessiblePaths=-/run/dbus/system_bus_socket
 LockPersonality=true
 MemoryDenyWriteExecute=true
 NoNewPrivileges=true
