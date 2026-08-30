@@ -818,11 +818,9 @@ class ProductionSafetyAdapters:
             pid = int(completed.output.strip())
             raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
             ticks = int(raw[raw.rindex(")") + 2 :].split()[19])
-            actual_cwd = os.readlink(f"/proc/{pid}/cwd")
-            command = Path(f"/proc/{pid}/cmdline").read_bytes()
             if (
-                actual_cwd != identity.get("loaded_cwd")
-                or not _monitor_command_matches_role(command, role=role)
+                pid != identity.get("pid")
+                or ticks != identity.get("process_start_ticks")
             ):
                 raise RuntimeError("runtime_systemd_identity_unknown")
         except (OSError, ValueError, IndexError) as exc:

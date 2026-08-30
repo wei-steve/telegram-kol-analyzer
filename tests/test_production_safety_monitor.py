@@ -385,6 +385,46 @@ def test_release_unit_scope_includes_exact_activation_dropins(tmp_path, monkeypa
     assert adapters._release_unit_hashes_valid(release) is False
 
 
+def test_monitor_systemd_identity_does_not_require_cross_uid_proc_links(
+    tmp_path, monkeypatch
+):
+    adapters = ProductionSafetyAdapters(database_path=tmp_path / "unused.db")
+    identity = {
+        "pid": 123,
+        "process_start_ticks": 456,
+        "loaded_cwd": "/opt/telegram-kol-analyzer",
+    }
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, output="123\n"),
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_text",
+        lambda self, **kwargs: "123 (python) " + " ".join(["S", *(["0"] * 18), "456"]),
+    )
+    monkeypatch.setattr(
+        monitor_module.os,
+        "readlink",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("cross-uid cwd must not be read")
+        ),
+    )
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda self: (_ for _ in ()).throw(
+            AssertionError("cross-uid cmdline must not be read")
+        ),
+    )
+
+    enriched = adapters._with_systemd_identity("worker", identity)
+
+    assert enriched["systemd_main_pid"] == 123
+    assert enriched["systemd_start_ticks"] == 456
+
+
 def _clear_monitor_bot_environment(monkeypatch):
     for name in (
         "TELEGRAM_KOL_SYSTEM_BOT_TOKEN",
