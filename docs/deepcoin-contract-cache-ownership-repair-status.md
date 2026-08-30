@@ -3,13 +3,13 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: manual_cleanup_production_cutover
+current_phase: monitor_subtraction_local_acceptance
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
-candidate_content_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
-handoff_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
-pushed_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
+candidate_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
+candidate_content_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
+handoff_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
+pushed_sha: null
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -156,6 +156,20 @@ manual_cleanup_post_backup_refresh_production_executed: true_completed_7_targets
 manual_cleanup_activation_status: fresh_restaged_candidate_required_after_root_bytecode_contamination
 manual_cleanup_activation_failed_candidate_sha: 7af12a535a786d33c1338e4f6d41d66aff088618
 manual_cleanup_activation_failure_service_control_executed: false
+manual_cleanup_production_reconciliation_completed: true
+manual_cleanup_production_reconciliation_terminalized_count: 7
+manual_cleanup_production_reconciliation_authority_seeded: true
+manual_cleanup_production_reconciliation_dry_run: completed
+manual_cleanup_contaminated_stage_root_pyc_count: 206
+monitor_identity_repair_commits_recorded: 8
+monitor_deployment_self_check_removal_status: local_complete_review_pending
+monitor_deployment_self_check_last_production_code_sha: 3d78e9661bf1e5d76f72fe6c3925425442cb55a8
+monitor_fail_closed_source_matrix: 7_passed
+monitor_local_focused_acceptance: 376_passed_1_skipped
+monitor_final_repository_suite: 6680_passed_4_skipped_32_warnings
+monitor_final_repository_suite_seconds: 442.72
+monitor_stage_authorized: false
+monitor_activation_authorized: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1637,3 +1651,50 @@ expansion or an irreversible action that the approved phase did not include.
   action is a new exact-SHA immutable stage containing the same fully tested
   production code and this documentation-only evidence update. No preactivation
   command may import from that new stage; reconciliation is already complete.
+
+## Monitor identity repairs and deployment-self-check removal
+
+- This status resumed from documentation commit
+  `26e70505de979f44e80fd05a1c9ff0fa0a7dca11` at
+  `2026-08-30T01:36:15-07:00`. The next eight commits repaired activation and
+  monitor identity assumptions while preserving the stopped, inhibited
+  production boundary: `7e010b9e` allowed one bounded startup-identity retry;
+  `324e7d78` waited for the required authority startup cycles; `d13a5b68` kept
+  the activation diagnostic bounded; `27da1f6e` removed cross-user proc-link
+  reads; `f382a328` used the diagnostic process's own monitor identity;
+  `47f113c0` made the boot-fence query offline; `799aa556` permitted the then
+  required runtime-identity query; and `113bcddf` validated the collected
+  identity snapshot. None of these commits was activated in production.
+- The approved subtraction design and plan are `1c671c92` and exact review base
+  `d711e12b`. Production-code commits `bd639336`, `2a4b759f` and `3d78e966`
+  remove the monitor's deployment evidence reason codes, immutable-release and
+  unit/drop-in validation, runtime-topology probes, systemd/MainPID queries and
+  cross-process identity collection. The CLI and all three monitor units no
+  longer carry release or loop-health deployment arguments; all three deny the
+  system D-Bus socket. Immutable release `PYTHONPATH` remains solely as the code
+  loading boundary. Activation-controller release validation and its real
+  business diagnostic hard gate remain unchanged.
+- Business-safety monitoring remains fail-closed. Commit `b8fd8d02` proves that
+  missing or malformed evidence is unhealthy and that failures from settings,
+  journal, database events, exchange-backed composite snapshot, contract-spec,
+  message-operation and management-audit sources each independently produce
+  `adapter_failure`, retain the exact `adapter_failures` source and return a
+  complete unhealthy monitor outcome. Commit `99326a1d` removes only stale
+  full-suite test assumptions about the deleted deployment contract. Focused
+  monitor acceptance passed 376 tests with one platform skip; the activation
+  diagnostic hard-gate test also passed. The final repository suite passed
+  6,680 tests with four documented skips and 32 existing warnings in 442.72
+  seconds. No production code changed after `3d78e966`.
+- The production reconciliation recorded above remains complete and is not to
+  be rerun: all seven targets were terminalized, the missing authority row was
+  seeded, trading settings changed from 3 to 4, execution events changed from
+  3,803 to 3,810, exactly seven reconciliation events exist and a fresh dry-run
+  returned `completed`. The previous immutable stage remains rejected because
+  a root command wrote 206 root-owned mode `0600` `.pyc` files into it after
+  receipt creation. That stage must never be repaired or activated; any later
+  stage must be a fresh exact-SHA immutable stage.
+- This local acceptance performed no SSH, production query or mutation, stage,
+  activation authorization, activation, service control, Deepcoin call,
+  database write, replay or entry thaw. Stage and activation remain explicitly
+  unauthorized and require a separate user-approved turn after this exact
+  candidate is reviewed and pushed.
