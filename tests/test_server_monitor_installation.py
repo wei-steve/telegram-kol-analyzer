@@ -142,7 +142,7 @@ def test_test_notification_unit_uses_same_identity_environment_and_sandbox_once(
     assert actual_sandbox == expected_sandbox
 
 
-def test_diagnostic_unit_forces_full_audit_without_notification_in_same_sandbox():
+def test_diagnostic_unit_uses_bounded_incremental_audit_without_notification():
     service = SERVICE_PATH.read_text(encoding="utf-8")
     diagnostic = DIAGNOSTIC_PATH.read_text(encoding="utf-8")
     service_directives = set(service.splitlines())
@@ -153,7 +153,7 @@ def test_diagnostic_unit_forces_full_audit_without_notification_in_same_sandbox(
     assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in diagnostic_directives
     assert "[Install]" not in diagnostic_directives
     normalized = " ".join(diagnostic.split())
-    assert "--force-full-audit" in normalized
+    assert "--force-full-audit" not in normalized
     assert "--notify" not in normalized
     assert "${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION}" in diagnostic
     assert " --expected-auto-trade-enabled " not in normalized
