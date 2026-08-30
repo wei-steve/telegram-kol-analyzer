@@ -79,18 +79,22 @@ manual_cleanup_timer_pid_repair_code_sha: cce1f8654d94a572b0340a62f17226dbb93d2d
 manual_cleanup_timer_pid_repair_focused: 299_passed_1_skipped
 manual_cleanup_timer_pid_repair_final_suite: 6667_passed_3_skipped_32_warnings
 manual_cleanup_timer_pid_repair_review: no_p0_p1
-manual_cleanup_production_cutover_status: maintenance_stopped_fresh_reconciliation_ready
+manual_cleanup_production_cutover_status: maintenance_stopped_transaction_backup_oom
 manual_cleanup_production_stage_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
 manual_cleanup_production_stage_content_sha256: 8dee8c014b2be5fc2ae495b865d5d2f807b0da60d0b3f177793705961289c828
 manual_cleanup_production_stage_manifest_sha256: 2b614bba3dc0ea8c1101363ff98d23c59caf9c6f6b8ab788a0ee694eff86a6de
 manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl
-manual_cleanup_production_evidence_sha256: 9d81ee2f085cca2b9764950f36e467083a8f8e7c93361fea0b073bb897bfa608
-manual_cleanup_production_preflight_at: 2026-08-30T01:56:18Z
-manual_cleanup_production_preflight_blocker: null
+manual_cleanup_production_evidence_sha256: 5202d112aefcac93c63194633edd21357557a3bbaa51006614a496ccec93902a
+manual_cleanup_production_preflight_at: 2026-08-30T02:10:24Z
+manual_cleanup_production_preflight_blocker: transaction_backup_process_oom_killed_before_begin_immediate
 manual_cleanup_production_target_fill_status: all_7_zero_in_both_stable_snapshots
 manual_cleanup_production_preflight_attempt: 4
 manual_cleanup_production_preflight_http_status: null
 manual_cleanup_production_backup_created: false
+manual_cleanup_production_backup_invalid_placeholder_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/transaction-backup.db
+manual_cleanup_production_backup_invalid_placeholder_size: 0
+manual_cleanup_production_backup_failure_kernel_pid: 3158360
+manual_cleanup_production_backup_failure_anon_rss_kib: 1774996
 manual_cleanup_production_authority_seeded: false
 manual_cleanup_production_database_mutation_executed: false
 manual_cleanup_production_service_control_executed: true
@@ -1300,3 +1304,51 @@ expansion or an irreversible action that the approved phase did not include.
   boundary and must reacquire fresh evidence inside the transaction executor
   before creating the exclusive `0600` transaction backup and atomically
   terminalizing all seven targets plus the idle authority row.
+
+## Production transaction backup failure
+
+- The authorized transaction continuation began from clean local status commit
+  `79740c67e1a0729227ad26ac54594b2d12cccf3b`, the exact immutable staged
+  candidate `89a7dc66ea0c788f48be2e9841cec010cd8feeb1`, and the proven persistent
+  `maintenance_stopped` production boundary. The candidate receipt and release
+  manifest remained root-owned, immutable and fingerprint-identical to the
+  recorded stage; production checkout remained the stopped legacy SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`.
+- The transaction executor obtained two new single-attempt exchange plans. Raw
+  snapshot 5 ran from `2026-08-30T02:10:09Z` through
+  `2026-08-30T02:10:16Z`; raw snapshot 6 ran from
+  `2026-08-30T02:10:17Z` through `2026-08-30T02:10:24Z`. Each completed the
+  exact 3 positions, 3 regular-order, 3 pending-trigger, 7 per-order fills and
+  7 per-order history reads with no exception. Both had zero positions, zero
+  regular orders, zero pending triggers, zero fills, the accepted five-history
+  row/two-missing shape, and fingerprint
+  `7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7`.
+- After the second plan matched, the candidate backup implementation created
+  the destination exclusively as root-owned mode `0600` and began the SQLite
+  backup. At `2026-08-30T02:10:31Z`, before `_create_verified_backup()` could
+  return and therefore before `BEGIN IMMEDIATE`, the kernel OOM killer killed
+  Python PID `3158360`. The process had approximately `1774996` KiB anonymous
+  RSS on a host with about 2 GiB RAM and exhausted 1 GiB swap. The filesystem
+  still had about 15 GiB free, so this is a memory-bound backup failure rather
+  than disk exhaustion.
+- The failed backup left only an invalid zero-byte placeholder at
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/transaction-backup.db`.
+  It is not recorded as a valid backup and was not removed or reused. A fresh
+  read-only production audit proved all seven targets still unterminalized,
+  the authority row still absent, all critical table counts unchanged,
+  `quick_check=ok`, zero foreign-key issues, `total_changes=0`, and zero active
+  exchange writes.
+- No transaction commit, candidate activation, activation authorization,
+  legacy restart, automatic retry, Deepcoin write, replay, L2 observation or
+  entry thaw occurred. All eight governed and legacy units remain inactive and
+  persistently inhibited with `MainPID=0`, empty cgroups and no matching runtime
+  process. The safe terminal state remains `maintenance_stopped`.
+- Raw exchange rows, the reconstructed snapshot-6 summary, kernel OOM terminal
+  record and stopped-boundary evidence remain in root-owned mode `0600`
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl`,
+  SHA-256
+  `5202d112aefcac93c63194633edd21357557a3bbaa51006614a496ccec93902a`.
+  Any continuation requires a separately reviewed memory-bounded backup repair,
+  explicit handling of the invalid zero-byte placeholder, a fresh immutable
+  candidate and stage, and new single-attempt exchange evidence. It must not
+  retry this failed executor or activate the existing candidate.
