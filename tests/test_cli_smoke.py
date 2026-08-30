@@ -981,9 +981,6 @@ def test_monitor_production_safety_help_has_required_flags():
 
     assert result.exit_code == 0, result.stdout
     for flag in (
-        "--expected-release-commit",
-        "--expected-release-manifest-sha256",
-        "--release-path",
         "--expected-auto-trade-enabled",
         "--expected-management-mode",
         "--expected-entry-preamble-mode",
@@ -993,7 +990,13 @@ def test_monitor_production_safety_help_has_required_flags():
         "--test-notification",
     ):
         assert flag in result.stdout
-    assert "--expected-head" not in result.stdout
+    for removed_flag in (
+        "--expected-head",
+        "--expected-release-commit",
+        "--expected-release-manifest-sha256",
+        "--release-path",
+    ):
+        assert removed_flag not in result.stdout
 
 
 def test_monitor_production_test_notification_requires_notify():
@@ -1001,12 +1004,6 @@ def test_monitor_production_test_notification_requires_notify():
         app,
         [
             "monitor-production-safety",
-            "--expected-release-commit",
-            "a" * 40,
-            "--expected-release-manifest-sha256",
-            "b" * 64,
-            "--release-path",
-            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -1041,12 +1038,6 @@ def test_monitor_production_test_notification_uses_fixed_text_only(monkeypatch):
         app,
         [
             "monitor-production-safety",
-            "--expected-release-commit",
-            "a" * 40,
-            "--expected-release-manifest-sha256",
-            "b" * 64,
-            "--release-path",
-            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -1098,12 +1089,6 @@ def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monke
         app,
         [
             "monitor-production-safety",
-            "--expected-release-commit",
-            "a" * 40,
-            "--expected-release-manifest-sha256",
-            "b" * 64,
-            "--release-path",
-            "/opt/telegram-kol-releases/" + "a" * 40,
             "--expected-auto-trade-enabled",
             "--expected-management-mode",
             "live",
@@ -1727,11 +1712,9 @@ def _audit_payload_with_management_history(
 
 
 def _evaluate_real_audit_payload(payload: dict):
-    head = "a" * 40
     return evaluate_monitor_snapshot(
         MonitorSnapshot(
             service_state="active",
-            head=head,
             settings={
                 "auto_trade_enabled": False,
                 "management_execution_mode": "disabled",
@@ -1743,7 +1726,6 @@ def _evaluate_real_audit_payload(payload: dict):
             audit=payload,
         ),
         MonitorExpectations(
-            head=head,
             auto_trade_enabled=False,
             management_execution_mode="disabled",
             max_concurrent_positions=4,

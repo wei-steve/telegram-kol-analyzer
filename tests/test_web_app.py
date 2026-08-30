@@ -8157,7 +8157,6 @@ def test_monitor_incident_writer_accepts_every_monitor_adapter(
             "reason_codes": ["adapter_failure"],
             "adapter_failures": [
                 "service",
-                "head",
                 "settings",
                 "journal",
                 "events",
@@ -8175,7 +8174,6 @@ def test_monitor_incident_writer_accepts_every_monitor_adapter(
     assert response.json() == {"accepted": True, "captured": 0}
     assert captured[0]["adapter_failures"] == (
         "service",
-        "head",
         "settings",
         "journal",
         "events",
