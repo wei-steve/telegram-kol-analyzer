@@ -451,6 +451,18 @@ def apply_manual_pending_entry_reconciliation(
         _RECONCILIATION_BACKUP_COUNT_TABLES,
         before_counts,
     )
+    fresh = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=deepcoin_client,
+        targets=reviewed,
+        runtime_guard=runtime_guard,
+        now=now,
+        clock=clock,
+        read_monotonic=read_monotonic,
+        read_sleep=read_sleep,
+    )
+    if fresh.status != "ready" or fresh.fingerprint != expected_fingerprint:
+        raise ValueError(fresh.reason_code or "manual_reconciliation_plan_drift")
     _require_runtime_stopped(runtime_guard)
     observed_at = _require_write_boundary_freshness(fresh, now=now, clock=clock)
 

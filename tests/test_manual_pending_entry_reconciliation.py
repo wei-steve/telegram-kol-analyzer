@@ -503,17 +503,19 @@ def test_manual_reconciliation_terminalizes_locally_and_seeds_authority(tmp_path
     assert backup_path.is_file()
     assert client.write_calls == 0
     assert client.read_calls == {
-        "positions": 6,
-        "regular": 6,
-        "pending": 6,
+        "positions": 9,
+        "regular": 9,
+        "pending": 9,
         "history": 0,
         "fills": 0,
     }
     assert client.exact_history_calls == [
         (target.instrument_id, target.order_id),
         (target.instrument_id, target.order_id),
+        (target.instrument_id, target.order_id),
     ]
     assert client.exact_fill_calls == [
+        (target.instrument_id, target.order_id),
         (target.instrument_id, target.order_id),
         (target.instrument_id, target.order_id),
     ]
@@ -1783,7 +1785,7 @@ def test_manual_reconciliation_apply_rechecks_unreviewed_active_sibling(
 
     monkeypatch.setattr(reconciliation, "_create_verified_backup", add_sibling)
 
-    with pytest.raises(ValueError, match="backup_count_mismatch"):
+    with pytest.raises(ValueError, match="reviewed_local_state_changed"):
         reconciliation.apply_manual_pending_entry_reconciliation(
             session_factory,
             database_path=database_path,
@@ -1847,7 +1849,10 @@ def test_manual_reconciliation_plan_fingerprint_binds_canonical_identity(tmp_pat
         )
 
 
-def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, monkeypatch):
+def test_manual_reconciliation_apply_refreshes_exchange_evidence_after_backup(
+    tmp_path,
+    monkeypatch,
+):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
     database_path = tmp_path / "research.db"
@@ -1857,17 +1862,8 @@ def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, m
     client.history = [
         {"instId": target.instrument_id, "ordId": target.order_id, "state": "cancelled"}
     ]
-    moments = iter(
-        (
-            NOW,
-            NOW,
-            NOW,
-            NOW,
-            NOW,
-            NOW + timedelta(seconds=31),
-        )
-    )
-    clock = lambda: next(moments)
+    current = [NOW]
+    clock = lambda: current[0]
     plan = reconciliation.build_manual_pending_entry_reconciliation_plan(
         session_factory,
         deepcoin_client=client,
@@ -1875,22 +1871,27 @@ def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, m
         runtime_guard=RuntimeGuard(),
         clock=clock,
     )
-    monkeypatch.setattr(reconciliation, "_create_verified_backup", lambda *_: None)
 
-    with pytest.raises(ValueError, match="exchange_snapshot_stale_at_write_boundary"):
-        reconciliation.apply_manual_pending_entry_reconciliation(
-            session_factory,
-            database_path=database_path,
-            backup_path=tmp_path / "backup.db",
-            deepcoin_client=client,
-            targets=(target,),
-            runtime_guard=RuntimeGuard(),
-            expected_fingerprint=plan.fingerprint,
-            clock=clock,
-        )
+    def slow_backup(*args, **kwargs):
+        current[0] += timedelta(seconds=31)
+        return "a" * 64
 
+    monkeypatch.setattr(reconciliation, "_create_verified_backup", slow_backup)
+
+    result = reconciliation.apply_manual_pending_entry_reconciliation(
+        session_factory,
+        database_path=database_path,
+        backup_path=tmp_path / "backup.db",
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        expected_fingerprint=plan.fingerprint,
+        clock=clock,
+    )
+
+    assert result.status == "completed"
     with session_factory() as session:
-        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "cancelled"
 
 
 def test_manual_reconciliation_refuses_critical_count_drift_after_backup(
@@ -2847,10 +2848,10 @@ def test_manual_reconciliation_terminalizes_all_canonical_targets_once(tmp_path)
     assert result.status == "completed"
     assert result.terminalized_count == 7
     assert result.authority_seeded is True
-    assert guard.calls == 3
-    assert client.exact_history_calls == expected_exact_calls * 2
-    assert client.exact_fill_calls == expected_exact_calls * 2
-    assert clock.sleeps == pytest.approx([0.41] * 28)
+    assert guard.calls == 4
+    assert client.exact_history_calls == expected_exact_calls * 3
+    assert client.exact_fill_calls == expected_exact_calls * 3
+    assert clock.sleeps == pytest.approx([0.41] * 42)
     with session_factory() as session:
         assert {
             session.get(ExecutionOrderLeg, target.execution_order_leg_id).status
