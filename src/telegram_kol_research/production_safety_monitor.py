@@ -874,12 +874,17 @@ class ProductionSafetyAdapters:
                 "telegram-kol-monitor.timer",
             )
             target = _run_bounded_command(
-                ("systemctl", "is-enabled", "telegram-kol-runtime.target"),
+                (
+                    "systemctl",
+                    "--root=/",
+                    "is-enabled",
+                    "telegram-kol-runtime.target",
+                ),
                 timeout_seconds=5,
             )
             direct = tuple(
                 _run_bounded_command(
-                    ("systemctl", "is-enabled", unit),
+                    ("systemctl", "--root=/", "is-enabled", unit),
                     timeout_seconds=5,
                 )
                 for unit in direct_units

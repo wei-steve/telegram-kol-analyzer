@@ -363,20 +363,30 @@ def test_release_unit_scope_includes_exact_activation_dropins(tmp_path, monkeypa
         database_path=tmp_path / "unused.db",
         systemd_unit_root=installed_units,
     )
-    monkeypatch.setattr(
-        monitor_module,
-        "_run_bounded_command",
-        lambda command, **kwargs: SimpleNamespace(
+    systemctl_commands = []
+
+    def run_offline_systemctl(command, **kwargs):
+        systemctl_commands.append(command)
+        return SimpleNamespace(
             returncode=0 if command[-1] == "telegram-kol-runtime.target" else 1,
             output=(
                 "enabled\n"
                 if command[-1] == "telegram-kol-runtime.target"
                 else "disabled\n"
             ),
-        ),
+        )
+
+    monkeypatch.setattr(
+        monitor_module,
+        "_run_bounded_command",
+        run_offline_systemctl,
     )
 
     assert adapters._release_unit_hashes_valid(release) is True
+    assert all(
+        command[:3] == ("systemctl", "--root=/", "is-enabled")
+        for command in systemctl_commands
+    )
     drifted = (
         installed_units
         / "telegram-kol-worker.service.d/10-telegram-kol-release.conf"
