@@ -4,8 +4,8 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: manual_cleanup_production_cutover
-phase_state: planned
-claimed_by: null
+phase_state: claimed
+claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
 candidate_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
 candidate_content_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
 handoff_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
