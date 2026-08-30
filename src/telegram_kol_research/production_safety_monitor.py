@@ -248,6 +248,15 @@ _FIXED_REASON_CODES = frozenset(
         "contract_spec_refresh_warning",
     }
 )
+_RETIRED_DEPLOYMENT_REASON_CODES = frozenset(
+    {
+        "runtime_release_invalid",
+        "runtime_release_mixed",
+        "runtime_identity_unproven",
+        "runtime_capability_unproven",
+        "runtime_unit_hash_drift",
+    }
+)
 _LOW_REPEAT_REASON_CODES = frozenset({"audit_abnormal"})
 _LEGACY_STATE_FIELDS = frozenset(
     {
@@ -2839,16 +2848,18 @@ def run_production_safety_monitor(
     coverage_reader = getattr(
         adapters, "read_message_operation_coverage", None
     )
-    message_operation_coverage = (
-        _read_adapter(
+    if callable(coverage_reader):
+        message_operation_coverage = _read_adapter(
             coverage_reader,
             "coverage",
             failures,
             None,
         )
-        if callable(coverage_reader)
-        else None
-    )
+        if message_operation_coverage is None and "coverage" not in failures:
+            failures.append("coverage")
+    else:
+        failures.append("coverage")
+        message_operation_coverage = None
     contract_spec_health = None
     contract_spec_sync_refusal_count = None
     contract_health_reader = getattr(adapters, "read_contract_spec_health", None)
@@ -2859,11 +2870,18 @@ def run_production_safety_monitor(
         try:
             contract_spec_health = contract_health_reader()
             contract_spec_sync_refusal_count = contract_refusal_reader(since=since)
+            if (
+                contract_spec_health is None
+                or contract_spec_sync_refusal_count is None
+            ):
+                failures.append("contract_specs")
         except Exception:
             if "contract_specs" not in failures:
                 failures.append("contract_specs")
             contract_spec_health = None
             contract_spec_sync_refusal_count = None
+    else:
+        failures.append("contract_specs")
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
@@ -4950,12 +4968,17 @@ def _monitor_state_from_payload(payload: object) -> MonitorState:
         _STATE_FIELDS,
     }:
         raise ValueError("invalid monitor state schema")
+    active_reason_codes = tuple(payload.get("active_reason_codes", ()))
     state = MonitorState(
         last_window_at=payload["last_window_at"],
         last_full_audit_date=payload["last_full_audit_date"],
         anomaly_fingerprint=payload["anomaly_fingerprint"],
         last_notification_at=payload["last_notification_at"],
-        active_reason_codes=tuple(payload.get("active_reason_codes", ())),
+        active_reason_codes=tuple(
+            reason
+            for reason in active_reason_codes
+            if reason not in _RETIRED_DEPLOYMENT_REASON_CODES
+        ),
     )
     _monitor_state_payload(state)
     return state

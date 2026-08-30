@@ -2917,6 +2917,57 @@ def test_legacy_four_field_monitor_state_loads_without_speculative_causes(tmp_pa
     assert state.active_reason_codes == ()
 
 
+def test_retired_deployment_reasons_age_out_without_state_invalid(tmp_path):
+    state_path = tmp_path / "state.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "last_window_at": "2026-08-30T11:30:00+00:00",
+                "last_full_audit_date": "2026-08-30",
+                "anomaly_fingerprint": "a" * 64,
+                "last_notification_at": "2026-08-30T11:30:00+00:00",
+                "active_reason_codes": [
+                    "runtime_capability_unproven",
+                    "runtime_identity_unproven",
+                    "runtime_release_invalid",
+                    "runtime_release_mixed",
+                    "runtime_unit_hash_drift",
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class CompleteBusinessAdapters(_RecordingAdapters):
+        def read_composite_invariants(self, *, now):
+            return ()
+
+        def read_message_operation_coverage(self):
+            return _healthy_message_operation_coverage(
+                coverage_enabled=False,
+                supervisor_policy_status="disabled",
+                supervisor_last_success_at=None,
+            )
+
+        def read_contract_spec_health(self):
+            return _healthy_contract_spec_health()
+
+        def count_contract_spec_sync_refusals(self, *, since):
+            return 0
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=state_path,
+        adapters=CompleteBusinessAdapters(),
+        now=datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+        notify=False,
+    )
+
+    assert outcome.result.healthy is True
+    assert "state_invalid" not in outcome.result.reason_codes
+    assert load_monitor_state(state_path).active_reason_codes == ()
+
+
 def test_monitor_fingerprint_is_order_independent_and_canonical():
     first = MonitorResult(
         healthy=False,
@@ -3412,6 +3463,19 @@ class _RecordingAdapters:
         self.calls.append("settings")
         return _snapshot().settings
 
+    def read_message_operation_coverage(self):
+        return _healthy_message_operation_coverage(
+            coverage_enabled=False,
+            supervisor_policy_status="disabled",
+            supervisor_last_success_at=None,
+        )
+
+    def read_contract_spec_health(self):
+        return _healthy_contract_spec_health()
+
+    def count_contract_spec_sync_refusals(self, *, since):
+        return 0
+
     def count_journal_errors(self, *, since):
         self.calls.append(("journal", since))
         return 0
@@ -3515,7 +3579,11 @@ def test_each_business_source_failure_independently_fails_closed(
         def read_message_operation_coverage(self):
             return self._read(
                 "message_operation",
-                _healthy_message_operation_coverage(),
+                _healthy_message_operation_coverage(
+                    supervisor_last_success_at=(
+                        "2026-08-30T11:59:30+00:00"
+                    ),
+                ),
             )
 
         def run_management_audit(self):
@@ -3546,6 +3614,64 @@ def test_each_business_source_failure_independently_fails_closed(
         "message_operation",
         "management_audit",
     }
+
+
+@pytest.mark.parametrize(
+    ("missing_source", "reader_mode", "expected_adapter_failure"),
+    [
+        ("message_operation", "missing", "coverage"),
+        ("message_operation", "none", "coverage"),
+        ("contract_specs", "missing", "contract_specs"),
+        ("contract_specs", "none", "contract_specs"),
+    ],
+)
+def test_missing_business_source_reader_or_value_fails_closed(
+    tmp_path,
+    missing_source,
+    reader_mode,
+    expected_adapter_failure,
+):
+    class CompleteBusinessAdapters(_RecordingAdapters):
+        def read_composite_invariants(self, *, now):
+            return ()
+
+        def read_message_operation_coverage(self):
+            return _healthy_message_operation_coverage(
+                coverage_enabled=False,
+                supervisor_policy_status="disabled",
+                supervisor_last_success_at=None,
+            )
+
+        def read_contract_spec_health(self):
+            return _healthy_contract_spec_health()
+
+        def count_contract_spec_sync_refusals(self, *, since):
+            return 0
+
+    adapters = CompleteBusinessAdapters()
+    if missing_source == "message_operation":
+        adapters.read_message_operation_coverage = (
+            None if reader_mode == "missing" else lambda: None
+        )
+    else:
+        adapters.read_contract_spec_health = (
+            None if reader_mode == "missing" else lambda: None
+        )
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / f"{missing_source}-{reader_mode}.json",
+        adapters=adapters,
+        now=datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+        notify=False,
+        force_full_audit=True,
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.result.healthy is False
+    assert "adapter_failure" in outcome.result.reason_codes
+    assert outcome.result.details["adapter_failures"] == (
+        expected_adapter_failure,
+    )
 
 
 def test_monitor_run_never_reads_runtime_release_scope(tmp_path):
