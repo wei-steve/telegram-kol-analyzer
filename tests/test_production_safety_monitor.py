@@ -50,10 +50,6 @@ from telegram_kol_research.production_safety_monitor import build_monitor_incide
 from telegram_kol_research.production_safety_monitor import send_monitor_incident_capture
 from telegram_kol_research.production_safety_monitor import send_monitor_test_notification
 from telegram_kol_research.production_safety_monitor import should_run_daily_audit
-from telegram_kol_research.scoped_release_activation import (
-    ReleaseEvidence,
-    render_release_dropin,
-)
 from telegram_kol_research.config import RuntimeIncidentConfig
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -95,122 +91,17 @@ def test_monitor_snapshot_has_no_deployment_evidence_contract():
     assert not hasattr(monitor_module, "evaluate_runtime_release_scope")
 
 
-def test_release_unit_scope_includes_exact_activation_dropins(tmp_path, monkeypatch):
-    release_path = tmp_path / "release"
-    release_units = release_path / "deploy/systemd"
-    installed_units = tmp_path / "installed"
-    release_units.mkdir(parents=True)
-    installed_units.mkdir()
-    component_units = {
-        "web": ("telegram-kol-web.service",),
-        "ingest": ("telegram-kol-ingest.service",),
-        "worker": ("telegram-kol-worker.service",),
-        "monitor": (
-            "telegram-kol-monitor.service",
-            "telegram-kol-monitor-diagnostic.service",
-            "telegram-kol-monitor-test-notification.service",
-        ),
-    }
-    for unit in (
-        *(unit for units in component_units.values() for unit in units),
-        "telegram-kol-monitor.timer",
-        "telegram-kol-runtime.target",
-    ):
-        (release_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
-        (installed_units / unit).write_text(f"unit:{unit}\n", encoding="utf-8")
-    release = ReleaseEvidence(
-        commit=REVIEWED_HEAD,
-        manifest_sha256="a" * 64,
-        content_sha256="b" * 64,
-        action_manifest={
-            "components": ["web", "ingest", "worker", "monitor"]
-        },
-        release_path=release_path,
-    )
-    for component, units in component_units.items():
-        expected = render_release_dropin(
-            release,
-            component=component,
-            entry_frozen=True,
-        )
-        for unit in units:
-            dropin = installed_units / f"{unit}.d/10-telegram-kol-release.conf"
-            dropin.parent.mkdir()
-            dropin.write_text(expected, encoding="utf-8")
-    adapters = ProductionSafetyAdapters(
-        database_path=tmp_path / "unused.db",
-        systemd_unit_root=installed_units,
-    )
-    systemctl_commands = []
-
-    def run_offline_systemctl(command, **kwargs):
-        systemctl_commands.append(command)
-        return SimpleNamespace(
-            returncode=0 if command[-1] == "telegram-kol-runtime.target" else 1,
-            output=(
-                "enabled\n"
-                if command[-1] == "telegram-kol-runtime.target"
-                else "disabled\n"
-            ),
-        )
-
-    monkeypatch.setattr(
-        monitor_module,
-        "_run_bounded_command",
-        run_offline_systemctl,
-    )
-
-    assert adapters._release_unit_hashes_valid(release) is True
-    assert all(
-        command[:3] == ("systemctl", "--root=/", "is-enabled")
-        for command in systemctl_commands
-    )
-    drifted = (
-        installed_units
-        / "telegram-kol-worker.service.d/10-telegram-kol-release.conf"
-    )
-    drifted.write_text("[Service]\n", encoding="utf-8")
-    assert adapters._release_unit_hashes_valid(release) is False
-
-
-def test_monitor_systemd_identity_does_not_require_cross_uid_proc_links(
-    tmp_path, monkeypatch
-):
+def test_production_adapter_exposes_no_deployment_or_systemd_probes(tmp_path):
     adapters = ProductionSafetyAdapters(database_path=tmp_path / "unused.db")
-    identity = {
-        "pid": 123,
-        "process_start_ticks": 456,
-        "loaded_cwd": "/opt/telegram-kol-analyzer",
-    }
-    monkeypatch.setattr(
-        monitor_module,
-        "_run_bounded_command",
-        lambda *args, **kwargs: SimpleNamespace(returncode=0, output="123\n"),
-    )
-    monkeypatch.setattr(
-        Path,
-        "read_text",
-        lambda self, **kwargs: "123 (python) " + " ".join(["S", *(["0"] * 18), "456"]),
-    )
-    monkeypatch.setattr(
-        monitor_module.os,
-        "readlink",
-        lambda *args, **kwargs: (_ for _ in ()).throw(
-            AssertionError("cross-uid cwd must not be read")
-        ),
-    )
-    monkeypatch.setattr(
-        Path,
-        "read_bytes",
-        lambda self: (_ for _ in ()).throw(
-            AssertionError("cross-uid cmdline must not be read")
-        ),
-    )
-
-    enriched = adapters._with_systemd_identity("worker", identity)
-
-    assert enriched["systemd_main_pid"] == 123
-    assert enriched["systemd_start_ticks"] == 456
+    for name in (
+        "read_git_head",
+        "read_runtime_release_scope",
+        "_validated_release_evidence",
+        "_with_systemd_identity",
+        "_release_unit_hashes_valid",
+        "_runtime_service_names",
+    ):
+        assert not hasattr(adapters, name)
 
 
 def _clear_monitor_bot_environment(monkeypatch):
@@ -283,10 +174,7 @@ def test_cli_unreadable_state_reaches_bounded_monitor_handling(tmp_path, monkeyp
     monkeypatch.setattr(
         cli_module,
         "ProductionSafetyAdapters",
-        lambda **kwargs: _RecordingAdapters(
-            head="a" * 40,
-            manifest_sha256="b" * 64,
-        ),
+        lambda **kwargs: _RecordingAdapters(),
     )
 
     assert get_type_hints(cli_module.monitor_production_safety)["state_path"] is str
@@ -3509,40 +3397,14 @@ class _RecordingAdapters:
         *,
         service_state="active",
         audit=None,
-        head=REVIEWED_HEAD,
-        manifest_sha256="a" * 64,
     ):
         self.calls = []
         self.service_state = service_state
         self.audit = audit or _healthy_audit()
-        self.head = head
-        self.manifest_sha256 = manifest_sha256
 
     def read_service_state(self):
         self.calls.append("service")
         return self.service_state
-
-    def read_git_head(self):
-        self.calls.append("head")
-        return self.head
-
-    def read_runtime_release_scope(self):
-        self.calls.append("release")
-        roles = {
-            role: _release_identity(role, commit=self.head)
-            for role in ("web", "ingest", "worker", "monitor")
-        }
-        for identity in roles.values():
-            identity["observed_at"] = (
-                datetime.now(UTC) - timedelta(seconds=1)
-            ).isoformat()
-            identity["manifest_sha256"] = self.manifest_sha256
-        return {
-            "commit": self.head,
-            "manifest_sha256": self.manifest_sha256,
-            "unit_hashes_valid": True,
-            "roles": roles,
-        }
 
     def read_settings(self):
         self.calls.append("settings")
@@ -3575,27 +3437,6 @@ def test_monitor_run_never_reads_runtime_release_scope(tmp_path):
     )
 
     assert outcome.result.healthy is True
-
-
-def test_runtime_release_validation_recomputes_immutable_content_and_ownership(
-    tmp_path,
-    monkeypatch,
-):
-    release = tmp_path / REVIEWED_HEAD
-    adapters = monitor_module.ProductionSafetyAdapters(
-        database_path=tmp_path / "research.db",
-        release_path=release,
-        release_commit=REVIEWED_HEAD,
-        release_manifest_sha256="a" * 64,
-    )
-
-    def refuse_tampered_release(*args, **kwargs):
-        raise monitor_module.ActivationError("release validation failed")
-
-    monkeypatch.setattr(monitor_module, "validate_release", refuse_tampered_release)
-
-    with pytest.raises(RuntimeError, match="runtime_release_contract_invalid"):
-        adapters._validated_release_evidence()
 
 
 def test_contract_spec_sources_share_since_and_fail_closed_as_one_adapter(tmp_path):
@@ -4879,7 +4720,7 @@ def test_persistent_low_priority_anomaly_suppresses_repeat_but_advances_window(
         return run_production_safety_monitor(
             expectations=EXPECTATIONS,
             state_path=state_path,
-            adapters=_RecordingAdapters(audit=audit, head=OTHER_HEAD),
+            adapters=_RecordingAdapters(audit=audit),
             now=now,
             notify=True,
             force_full_audit=True,
@@ -5196,17 +5037,15 @@ def test_monitor_incident_capture_projection_accepts_every_monitor_adapter():
         reason_codes=("adapter_failure",),
         adapter_failures=(
             "service",
-            "head",
             "settings",
             "journal",
             "events",
             "audit",
             "composite",
             "coverage",
-                "entry_preamble",
-                "contract_specs",
-                "release",
-            ),
+            "entry_preamble",
+            "contract_specs",
+        ),
         notification_status="suppressed",
         monitor_error=None,
     )
@@ -5995,7 +5834,6 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     def run(argv, **kwargs):
         calls.append((argv, kwargs))
         output = {
-            "git": REVIEWED_HEAD + "\n",
             "journalctl": (
                 "recognition authority unavailable raw_message_id=123 "
                 "reason=authoritative_processor_required\n"
@@ -6008,7 +5846,6 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     monkeypatch.setattr(monitor_module, "_run_bounded_command", run)
     adapters = ProductionSafetyAdapters(
         database_path=Path("data/research.db"),
-        checkout_path=Path("/opt/telegram-kol-analyzer"),
     )
 
     monkeypatch.setattr(
@@ -6016,13 +5853,7 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
         "read_loopback_settings",
         lambda url: _snapshot().settings,
     )
-    monkeypatch.setattr(
-        monitor_module,
-        "read_loopback_runtime_role",
-        lambda _url: "all",
-    )
     assert adapters.read_service_state() == "active"
-    assert adapters.read_git_head() == REVIEWED_HEAD
     assert adapters.count_journal_errors(
         since=datetime(2026, 7, 16, 0, 0, tzinfo=UTC)
     ) == 2
@@ -6036,19 +5867,15 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     assert calls == [
         (
             (
-                "git",
-                "-c",
-                "safe.directory=/opt/telegram-kol-analyzer",
-                "rev-parse",
-                "HEAD",
-            ),
-            {"timeout_seconds": 5, "cwd": Path("/opt/telegram-kol-analyzer")},
-        ),
-        (
-            (
                 "journalctl",
                 "--unit",
                 "telegram-kol.service",
+                "--unit",
+                "telegram-kol-worker.service",
+                "--unit",
+                "telegram-kol-web.service",
+                "--unit",
+                "telegram-kol-ingest.service",
                 "--priority",
                 "err",
                 "--since",
@@ -6064,6 +5891,12 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
                 "journalctl",
                 "--unit",
                 "telegram-kol.service",
+                "--unit",
+                "telegram-kol-worker.service",
+                "--unit",
+                "telegram-kol-web.service",
+                "--unit",
+                "telegram-kol-ingest.service",
                 "--priority",
                 "err",
                 "--since",
@@ -6092,72 +5925,10 @@ def test_subprocess_adapters_use_fixed_argv_timeouts_and_output_caps(monkeypatch
     ]
 
 
-def test_service_adapter_requires_every_split_role_health_endpoint(monkeypatch):
-    import telegram_kol_research.production_safety_monitor as monitor_module
-
-    calls = []
-    roles = {
-        "http://127.0.0.1:8000/api/runtime/loop-health": "web",
-        "http://127.0.0.1:8001/api/runtime/loop-health": "ingest",
-        "http://127.0.0.1:8002/api/runtime/loop-health": "worker",
-    }
-    monkeypatch.setattr(
-        monitor_module,
-        "read_loopback_settings",
-        lambda _url: _snapshot().settings,
-    )
-    monkeypatch.setattr(
-        monitor_module,
-        "read_loopback_runtime_role",
-        lambda url: calls.append(url) or roles[url],
-        raising=False,
-    )
-    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
-
-    assert adapters.read_service_state() == "active"
-    assert calls == [
-        "http://127.0.0.1:8000/api/runtime/loop-health",
-        "http://127.0.0.1:8001/api/runtime/loop-health",
-        "http://127.0.0.1:8002/api/runtime/loop-health",
-    ]
-
-
-def test_service_adapter_fails_closed_when_one_split_role_is_unavailable(monkeypatch):
-    import telegram_kol_research.production_safety_monitor as monitor_module
-
-    monkeypatch.setattr(
-        monitor_module,
-        "read_loopback_settings",
-        lambda _url: _snapshot().settings,
-    )
-
-    def read_role(url):
-        if ":8002/" in url:
-            raise RuntimeError("worker unavailable")
-        return "web" if ":8000/" in url else "ingest"
-
-    monkeypatch.setattr(monitor_module, "read_loopback_runtime_role", read_role)
-    adapters = ProductionSafetyAdapters(database_path=Path("data/research.db"))
-
-    with pytest.raises(RuntimeError, match="worker unavailable"):
-        adapters.read_service_state()
-
-
-def test_split_journal_adapter_queries_all_three_runtime_units(monkeypatch):
+def test_journal_adapter_queries_only_fixed_business_runtime_units(monkeypatch):
     import telegram_kol_research.production_safety_monitor as monitor_module
 
     commands = []
-    roles = {
-        "http://127.0.0.1:8000/api/runtime/loop-health": "web",
-        "http://127.0.0.1:8001/api/runtime/loop-health": "ingest",
-        "http://127.0.0.1:8002/api/runtime/loop-health": "worker",
-    }
-    monkeypatch.setattr(
-        monitor_module,
-        "read_loopback_runtime_role",
-        lambda url: roles[url],
-        raising=False,
-    )
     monkeypatch.setattr(
         monitor_module,
         "_run_bounded_command",
@@ -6170,8 +5941,9 @@ def test_split_journal_adapter_queries_all_three_runtime_units(monkeypatch):
         since=datetime(2026, 8, 23, 0, 0, tzinfo=UTC)
     ) == 0
     command = commands[0]
-    assert command.count("--unit") == 3
+    assert command.count("--unit") == 4
     for unit in (
+        "telegram-kol.service",
         "telegram-kol-worker.service",
         "telegram-kol-web.service",
         "telegram-kol-ingest.service",

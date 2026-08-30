@@ -70,37 +70,11 @@ from telegram_kol_research.system_operator_bot import (
 from telegram_kol_research.runtime_incident_snapshot import (
     INSTRUCTION_EXECUTION_CONTRADICTION_CODES,
 )
-from telegram_kol_research.runtime_deployment_identity import (
-    build_runtime_deployment_identity,
-)
-from telegram_kol_research.scoped_release_activation import (
-    ActivationError,
-    ReleaseEvidence,
-    render_release_dropin,
-    validate_release,
-)
 
 MAX_ALERT_LENGTH = 1200
 MAX_SAFE_COUNT = 1_000_000_000
 logger = logging.getLogger(__name__)
 
-
-def _monitor_command_matches_role(command: bytes, *, role: str) -> bool:
-    try:
-        parts = tuple(
-            part.decode("utf-8", errors="strict")
-            for part in command.split(b"\0")
-            if part
-        )
-    except UnicodeError:
-        return False
-    if role == "monitor":
-        return "monitor-production-safety" in parts
-    expected = ("web", "--runtime-role", role)
-    return any(
-        parts[index : index + 3] == expected
-        for index in range(len(parts) - 2)
-    )
 
 _SAFE_EVENT_VALUE = re.compile(r"[A-Za-z0-9._-]{1,128}\Z")
 _GIT_HEAD = re.compile(r"[0-9a-f]{40}\Z")
@@ -184,7 +158,6 @@ _RECONCILIATION_SIGNAL_COLUMNS = frozenset(
 MONITOR_ADAPTER_NAMES = frozenset(
     {
         "service",
-        "head",
         "settings",
         "journal",
         "events",
@@ -193,7 +166,6 @@ MONITOR_ADAPTER_NAMES = frozenset(
         "coverage",
         "contract_specs",
         "entry_preamble",
-        "release",
     }
 )
 _MONITOR_CAPTURE_REASON_CODES = frozenset(
@@ -527,7 +499,6 @@ class ProductionSafetyAdapters:
     release_path: Path | None = None
     release_commit: str | None = None
     release_manifest_sha256: str | None = None
-    systemd_unit_root: Path = Path("/etc/systemd/system")
     settings_url: str = "http://127.0.0.1:8000/api/trading-settings"
     message_operation_coverage_url: str = (
         "http://127.0.0.1:8000/api/runtime-incidents/message-operation-coverage"
@@ -545,24 +516,9 @@ class ProductionSafetyAdapters:
         "telegram-kol-web.service",
         "telegram-kol-ingest.service",
     )
-    web_loop_health_url: str = (
-        "http://127.0.0.1:8000/api/runtime/loop-health"
-    )
-    ingest_loop_health_url: str = (
-        "http://127.0.0.1:8001/api/runtime/loop-health"
-    )
-    worker_loop_health_url: str = (
-        "http://127.0.0.1:8002/api/runtime/loop-health"
-    )
-    web_deployment_identity_url: str = (
-        "http://127.0.0.1:8000/api/runtime/deployment-identity"
-    )
-    ingest_deployment_identity_url: str = (
-        "http://127.0.0.1:8001/api/runtime/deployment-identity"
-    )
-    worker_deployment_identity_url: str = (
-        "http://127.0.0.1:8002/api/runtime/deployment-identity"
-    )
+    web_loop_health_url: str = ""
+    ingest_loop_health_url: str = ""
+    worker_loop_health_url: str = ""
     audit_command: tuple[str, ...] = (
         sys.executable,
         "-m",
@@ -570,225 +526,10 @@ class ProductionSafetyAdapters:
     )
 
     def read_service_state(self) -> str:
-        # A successful response from the service-owned loopback endpoint proves
-        # the app is serving without granting this monitor system-bus access.
+        # A successful business endpoint response is sufficient for this
+        # observer; deployment identity remains the activator's responsibility.
         read_loopback_settings(self.settings_url)
-        self._runtime_service_names()
         return "active"
-
-    def _runtime_service_names(self) -> tuple[str, ...]:
-        web_role = read_loopback_runtime_role(self.web_loop_health_url)
-        if web_role == "all":
-            return (self.service_name,)
-        if web_role != "web":
-            raise RuntimeError("runtime_topology_invalid")
-        if read_loopback_runtime_role(self.ingest_loop_health_url) != "ingest":
-            raise RuntimeError("runtime_topology_invalid")
-        if read_loopback_runtime_role(self.worker_loop_health_url) != "worker":
-            raise RuntimeError("runtime_topology_invalid")
-        return self.split_service_names
-
-    def read_git_head(self) -> str:
-        safe_checkout = self.checkout_path.resolve()
-        completed = _run_bounded_command(
-            (
-                "git",
-                "-c",
-                f"safe.directory={safe_checkout}",
-                "rev-parse",
-                "HEAD",
-            ),
-            timeout_seconds=5,
-            cwd=self.checkout_path,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError("git_head_unavailable")
-        return completed.output.strip()
-
-    def read_runtime_release_scope(self) -> Mapping[str, Any]:
-        release = self.release_path
-        commit = str(self.release_commit or "")
-        manifest_sha = str(self.release_manifest_sha256 or "")
-        if (
-            release is None
-            or not _GIT_HEAD.fullmatch(commit)
-            or not _SHA256_FINGERPRINT.fullmatch(manifest_sha)
-        ):
-            raise RuntimeError("runtime_release_contract_invalid")
-        release_evidence = self._validated_release_evidence()
-        urls = {
-            "web": self.web_deployment_identity_url,
-            "ingest": self.ingest_deployment_identity_url,
-            "worker": self.worker_deployment_identity_url,
-        }
-        roles = {
-            role: self._with_systemd_identity(
-                role,
-                read_loopback_deployment_identity(url),
-            )
-            for role, url in urls.items()
-        }
-        monitor_identity = build_runtime_deployment_identity(
-            runtime_role="monitor",
-            command_role="monitor",
-            loaded_cwd=Path.cwd(),
-            module_path=Path(__file__),
-            expected_commit=commit,
-            expected_manifest_sha256=manifest_sha,
-            tasks={},
-            process_start_ticks=None,
-            now=datetime.now(UTC),
-        )
-        monitor_identity["systemd_main_pid"] = monitor_identity["pid"]
-        monitor_identity["systemd_start_ticks"] = monitor_identity[
-            "process_start_ticks"
-        ]
-        roles["monitor"] = monitor_identity
-        return {
-            "commit": commit,
-            "manifest_sha256": manifest_sha,
-            "roles": roles,
-            "unit_hashes_valid": self._release_unit_hashes_valid(
-                release_evidence
-            ),
-        }
-
-    def _validated_release_evidence(self) -> ReleaseEvidence:
-        release = self.release_path
-        commit = str(self.release_commit or "")
-        manifest_sha = str(self.release_manifest_sha256 or "")
-        if (
-            release is None
-            or release.name != commit
-            or not _GIT_HEAD.fullmatch(commit)
-            or not _SHA256_FINGERPRINT.fullmatch(manifest_sha)
-        ):
-            raise RuntimeError("runtime_release_contract_invalid")
-        try:
-            evidence = validate_release(
-                release.parent,
-                commit,
-                expected_uid=0,
-            )
-        except (ActivationError, OSError, ValueError) as exc:
-            raise RuntimeError("runtime_release_contract_invalid") from exc
-        if (
-            evidence.release_path != release
-            or evidence.commit != commit
-            or evidence.manifest_sha256 != manifest_sha
-        ):
-            raise RuntimeError("runtime_release_contract_invalid")
-        return evidence
-
-    def _with_systemd_identity(
-        self,
-        role: str,
-        identity: Mapping[str, Any],
-    ) -> Mapping[str, Any]:
-        unit = f"telegram-kol-{role}.service"
-        if role == "monitor":
-            unit = os.environ.get(
-                "TELEGRAM_KOL_MONITOR_SYSTEMD_UNIT",
-                "telegram-kol-monitor.service",
-            )
-            if unit not in {
-                "telegram-kol-monitor.service",
-                "telegram-kol-monitor-diagnostic.service",
-                "telegram-kol-monitor-test-notification.service",
-            }:
-                raise RuntimeError("runtime_systemd_identity_unknown")
-        completed = _run_bounded_command(
-            ("systemctl", "show", unit, "--property=MainPID", "--value"),
-            timeout_seconds=5,
-        )
-        if completed.returncode != 0:
-            raise RuntimeError("runtime_systemd_identity_unknown")
-        try:
-            pid = int(completed.output.strip())
-            raw = Path(f"/proc/{pid}/stat").read_text(encoding="ascii")
-            ticks = int(raw[raw.rindex(")") + 2 :].split()[19])
-            if (
-                pid != identity.get("pid")
-                or ticks != identity.get("process_start_ticks")
-            ):
-                raise RuntimeError("runtime_systemd_identity_unknown")
-        except (OSError, ValueError, IndexError) as exc:
-            raise RuntimeError("runtime_systemd_identity_unknown") from exc
-        enriched = dict(identity)
-        enriched["systemd_main_pid"] = pid
-        enriched["systemd_start_ticks"] = ticks
-        return enriched
-
-    def _release_unit_hashes_valid(self, release: ReleaseEvidence) -> bool:
-        component_units = {
-            "web": ("telegram-kol-web.service",),
-            "ingest": ("telegram-kol-ingest.service",),
-            "worker": ("telegram-kol-worker.service",),
-            "monitor": (
-                "telegram-kol-monitor.service",
-                "telegram-kol-monitor-diagnostic.service",
-                "telegram-kol-monitor-test-notification.service",
-            ),
-        }
-        units = tuple(
-            unit for values in component_units.values() for unit in values
-        ) + (
-            "telegram-kol-monitor.timer",
-            "telegram-kol-runtime.target",
-        )
-        try:
-            base_units_match = all(
-                (release.release_path / "deploy/systemd" / unit).read_bytes()
-                == (self.systemd_unit_root / unit).read_bytes()
-                for unit in units
-            )
-            dropins_match = all(
-                (
-                    self.systemd_unit_root
-                    / f"{unit}.d/10-telegram-kol-release.conf"
-                ).read_text(encoding="utf-8")
-                == render_release_dropin(
-                    release,
-                    component=component,
-                    entry_frozen=True,
-                )
-                for component, component_values in component_units.items()
-                for unit in component_values
-            )
-            direct_units = (
-                "telegram-kol-worker.service",
-                "telegram-kol-web.service",
-                "telegram-kol-ingest.service",
-                "telegram-kol-monitor.timer",
-            )
-            target = _run_bounded_command(
-                (
-                    "systemctl",
-                    "--root=/",
-                    "is-enabled",
-                    "telegram-kol-runtime.target",
-                ),
-                timeout_seconds=5,
-            )
-            direct = tuple(
-                _run_bounded_command(
-                    ("systemctl", "--root=/", "is-enabled", unit),
-                    timeout_seconds=5,
-                )
-                for unit in direct_units
-            )
-            boot_fence_valid = (
-                target.returncode == 0
-                and target.output.strip() == "enabled"
-                and all(
-                    result.output.strip() == "disabled"
-                    and result.returncode in {0, 1}
-                    for result in direct
-                )
-            )
-            return base_units_match and dropins_match and boot_fence_valid
-        except OSError:
-            return False
 
     def read_settings(self) -> Mapping[str, Any]:
         return read_loopback_settings(self.settings_url)
@@ -831,9 +572,10 @@ class ProductionSafetyAdapters:
         }
 
     def _read_bounded_journal_lines(self, *, since: datetime) -> tuple[str, ...]:
+        service_names = (self.service_name, *self.split_service_names)
         journal_units = tuple(
             item
-            for service_name in self._runtime_service_names()
+            for service_name in service_names
             for item in ("--unit", service_name)
         )
         completed = _run_bounded_command(
@@ -2706,97 +2448,6 @@ def read_loopback_settings(
         ),
         "entry_revision_v2_mode": payload.get("entry_revision_v2_mode"),
     }
-
-
-def read_loopback_runtime_role(
-    url: str,
-    *,
-    timeout_seconds: float = 5.0,
-) -> str:
-    """Read one process-local role marker from a bounded loopback endpoint."""
-
-    parsed = urlsplit(url)
-    if parsed.scheme != "http" or parsed.hostname not in {"127.0.0.1", "::1"}:
-        raise ValueError("loop health URL must use loopback HTTP")
-    body = bytearray()
-    with httpx.stream(
-        "GET",
-        url,
-        timeout=timeout_seconds,
-        trust_env=False,
-    ) as response:
-        response.raise_for_status()
-        for chunk in response.iter_bytes():
-            body.extend(chunk)
-            if len(body) > _MAX_HTTP_OUTPUT_BYTES:
-                raise ValueError("loop health response too large")
-    payload = json.loads(
-        body,
-        object_pairs_hook=_strict_json_object,
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(payload, Mapping):
-        raise ValueError("loop health response must be an object")
-    role = payload.get("runtime_role")
-    if role not in {"all", "ingest", "worker", "web"}:
-        raise ValueError("loop health runtime role is invalid")
-    return role
-
-
-def read_loopback_deployment_identity(
-    url: str,
-    *,
-    timeout_seconds: float = 5.0,
-) -> Mapping[str, Any]:
-    """Read one bounded process-local identity without retaining raw errors."""
-
-    parsed = urlsplit(url)
-    if (
-        parsed.scheme != "http"
-        or parsed.hostname not in {"127.0.0.1", "::1"}
-        or parsed.username is not None
-        or parsed.password is not None
-        or parsed.query
-        or parsed.fragment
-        or parsed.path != "/api/runtime/deployment-identity"
-    ):
-        raise ValueError("deployment identity URL must use exact loopback HTTP")
-    body = bytearray()
-    with httpx.stream(
-        "GET",
-        url,
-        timeout=timeout_seconds,
-        trust_env=False,
-    ) as response:
-        response.raise_for_status()
-        for chunk in response.iter_bytes():
-            body.extend(chunk)
-            if len(body) > _MAX_HTTP_OUTPUT_BYTES:
-                raise ValueError("deployment identity response too large")
-    payload = json.loads(
-        body,
-        object_pairs_hook=_strict_json_object,
-        parse_constant=_reject_json_constant,
-    )
-    if not isinstance(payload, Mapping):
-        raise ValueError("deployment identity response must be an object")
-    # Return only the closed identity surface; unknown or sensitive keys vanish.
-    allowed = {
-        "runtime_role",
-        "release_commit",
-        "manifest_sha256",
-        "loaded_artifact_verified",
-        "pid",
-        "process_start_ticks",
-        "observed_at",
-        "entry_admission_frozen",
-        "authority_evidence",
-        "health",
-        "capabilities",
-        "loaded_cwd",
-        "command_role",
-    }
-    return {key: payload.get(key) for key in allowed}
 
 
 def read_monitor_live_position_sizes(
