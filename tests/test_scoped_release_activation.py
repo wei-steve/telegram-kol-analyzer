@@ -999,6 +999,39 @@ def test_system_runtime_adapter_uses_persistent_inhibit_dropin(tmp_path, monkeyp
     assert not inhibit.exists()
 
 
+def test_system_runtime_adapter_accepts_empty_main_pid_for_monitor_timer(
+    monkeypatch,
+) -> None:
+    runtime = SystemRuntimeAdapter()
+
+    monkeypatch.setattr(
+        runtime,
+        "_run",
+        lambda command, *, environment=None: type(
+            "Result", (), {"stdout": "\n"}
+        )(),
+    )
+
+    assert runtime.main_pid("telegram-kol-monitor.timer") == 0
+
+
+def test_system_runtime_adapter_rejects_empty_main_pid_for_service(
+    monkeypatch,
+) -> None:
+    runtime = SystemRuntimeAdapter()
+
+    monkeypatch.setattr(
+        runtime,
+        "_run",
+        lambda command, *, environment=None: type(
+            "Result", (), {"stdout": "\n"}
+        )(),
+    )
+
+    with pytest.raises(ActivationError, match="runtime command failed"):
+        runtime.main_pid("telegram-kol-web.service")
+
+
 def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
     monkeypatch.delenv("ACTIVATION_SOURCE_MODE", raising=False)
     assert scoped_activation._activation_source_mode() == "immutable"

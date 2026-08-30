@@ -38,6 +38,7 @@ _AUTHORITY_COMPONENTS = frozenset({"ingest", "worker"})
 _RUNTIME_COMPONENTS = frozenset({"web", "ingest", "worker"})
 _AUTHORITY_RUNTIME_SCOPE = frozenset({"web", "monitor", "ingest", "worker"})
 _LEGACY_SOURCE_UNITS = ("telegram-kol.service",)
+_PROCESSLESS_UNITS = frozenset({"telegram-kol-monitor.timer"})
 _UNITS = {
     "web": ("telegram-kol-web.service",),
     "ingest": ("telegram-kol-ingest.service",),
@@ -1223,6 +1224,8 @@ class SystemRuntimeAdapter:
         raw = self._run(
             ["systemctl", "show", unit, "--property=MainPID", "--value"]
         ).stdout.strip()
+        if not raw and unit in _PROCESSLESS_UNITS:
+            return 0
         try:
             value = int(raw)
         except ValueError as exc:
