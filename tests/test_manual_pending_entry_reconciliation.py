@@ -2243,11 +2243,59 @@ def test_verified_backup_includes_uncheckpointed_wal_commit(tmp_path):
 
     reconciliation._create_verified_backup(source, backup)
 
+    writer.close()
+    held_source = tmp_path / "held-source.db"
+    source.rename(held_source)
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(f"{source}{suffix}")
+        if sidecar.exists():
+            sidecar.rename(tmp_path / f"held-source.db{suffix}")
     with sqlite3.connect(backup) as copied:
         assert copied.execute("SELECT value FROM evidence").fetchone() == (
             "wal-only",
         )
-    writer.close()
+        assert copied.execute("PRAGMA journal_mode").fetchone() == ("delete",)
+
+
+def test_verified_backup_refuses_destination_path_aba(tmp_path, monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    original.execute("INSERT INTO evidence(value) VALUES ('source')")
+    original.commit()
+    original.close()
+    backup = tmp_path / "backup.db"
+    replacement = tmp_path / "replacement.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+    other.execute("INSERT INTO marker(value) VALUES ('replacement')")
+    other.commit()
+    other.close()
+    held = tmp_path / "held-exclusive.db"
+    real_connect = reconciliation.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if database == f"file:{backup}?mode=rw":
+            backup.rename(held)
+            replacement.rename(backup)
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    with pytest.raises(ValueError, match="backup_metadata_invalid"):
+        reconciliation._create_verified_backup(source, backup)
+
+    assert held.is_file()
+    with real_connect(backup) as current:
+        assert current.execute("SELECT value FROM marker").fetchone() == (
+            "replacement",
+        )
+    with real_connect(source) as unchanged:
+        assert unchanged.execute("SELECT value FROM evidence").fetchone() == (
+            "source",
+        )
 
 
 def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
@@ -2306,7 +2354,7 @@ def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch
             return super().execute(sql, parameters)
 
     def connect(database, *args, **kwargs):
-        if database == ":memory:":
+        if database == f"file:{backup}?mode=ro":
             kwargs["factory"] = FailedQuickCheckConnection
         return real_connect(database, *args, **kwargs)
 
