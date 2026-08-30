@@ -941,7 +941,6 @@ def activate_release(
             require_authority=require_authority,
             require_entry_frozen=preserve_entry_freeze,
             now=datetime.now(UTC),
-            max_attempts=1 if source_mode == "stopped_legacy" else 2,
         )
         if source_mode == "immutable":
             _prove_restarted_processes(before_identities, after_identities, components)

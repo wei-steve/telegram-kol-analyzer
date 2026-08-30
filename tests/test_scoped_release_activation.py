@@ -821,7 +821,7 @@ def test_stopped_legacy_candidate_protection_failure_ends_maintenance_stopped(
     assert paths.authorization_consumed.exists()
 
 
-def test_stopped_legacy_candidate_identity_unknown_is_never_retried(
+def test_stopped_legacy_candidate_identity_unknown_is_retried_once(
     activation_harness,
 ) -> None:
     paths, runtime, manifest = activation_harness
@@ -844,22 +844,19 @@ def test_stopped_legacy_candidate_identity_unknown_is_never_retried(
 
     runtime.runtime_identity = first_candidate_worker_identity_is_unknown
 
-    with pytest.raises(ActivationError, match="maintenance_stopped"):
-        activate_release(
-            expected_commit=CANDIDATE,
-            rollback_commit="",
-            paths=paths,
-            runtime=runtime,
-            expected_uid=paths.release_root.stat().st_uid,
-            source_mode="stopped_legacy",
-        )
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit="",
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        source_mode="stopped_legacy",
+    )
 
-    assert candidate_worker_attempts == 1
-    assert set(runtime.maintenance_state_by_unit.values()) == {
-        ("inactive", "inhibited")
-    }
-    assert set(runtime.main_pid_by_unit.values()) == {0}
-    assert set(runtime.cgroup_pids_by_unit.values()) == {()}
+    assert result["status"] == "activated"
+    assert candidate_worker_attempts == 2
+    assert runtime.database_write_count == 0
+    assert runtime.exchange_write_count == 0
 
 
 def test_stopped_legacy_activation_does_not_require_rollback_release(
