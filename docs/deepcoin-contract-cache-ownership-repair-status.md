@@ -6,10 +6,10 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: f7c27a543554abc3a62f96095d99694b712452c5
-candidate_content_sha: f7c27a543554abc3a62f96095d99694b712452c5
-handoff_sha: f7c27a543554abc3a62f96095d99694b712452c5
-pushed_sha: 85cb51bbfb786a48162c9c842969032154c758c2
+candidate_sha: 18ea345a23812ed131c500a6040174a07a4436db
+candidate_content_sha: 18ea345a23812ed131c500a6040174a07a4436db
+handoff_sha: 18ea345a23812ed131c500a6040174a07a4436db
+pushed_sha: 18ea345a23812ed131c500a6040174a07a4436db
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -153,7 +153,7 @@ manual_cleanup_post_backup_refresh_focused: 310_passed_2_skipped
 manual_cleanup_post_backup_refresh_final_suite: 6678_passed_4_skipped_32_warnings
 manual_cleanup_post_backup_refresh_review: no_p0_p1_p2
 manual_cleanup_post_backup_refresh_production_executed: true_completed_7_targets_authority_seeded
-manual_cleanup_activation_status: fresh_restaged_candidate_required_after_root_bytecode_contamination
+manual_cleanup_activation_status: fresh_stage_created_activation_blocked_unproven_post_receipt_integrity
 manual_cleanup_activation_failed_candidate_sha: 7af12a535a786d33c1338e4f6d41d66aff088618
 manual_cleanup_activation_failure_service_control_executed: false
 manual_cleanup_production_reconciliation_completed: true
@@ -162,14 +162,24 @@ manual_cleanup_production_reconciliation_authority_seeded: true
 manual_cleanup_production_reconciliation_dry_run: completed
 manual_cleanup_contaminated_stage_root_pyc_count: 206
 monitor_identity_repair_commits_recorded: 8
-monitor_deployment_self_check_removal_status: pushed_awaiting_stage_authorization
+monitor_deployment_self_check_removal_status: fresh_stage_created_activation_not_executed
 monitor_deployment_self_check_last_production_code_sha: f7c27a543554abc3a62f96095d99694b712452c5
 monitor_fail_closed_source_matrix: 7_passed
 monitor_local_focused_acceptance: 376_passed_1_skipped
 monitor_final_repository_suite: 6685_passed_4_skipped_32_warnings
 monitor_final_repository_suite_seconds: 440.24
-monitor_stage_authorized: false
-monitor_activation_authorized: false
+monitor_stage_authorized: true_executed
+monitor_activation_authorized: true_not_executed_due_failed_closed_integrity_gate
+fresh_stage_sha: 18ea345a23812ed131c500a6040174a07a4436db
+fresh_stage_tree: 3caf9990f6aa4fbcdcd2d12e63fa3a1c1775a4ab
+fresh_stage_content_sha256: bda97ba8db70e0f0577e5383718040fe9a13159b77b0567bdd4b8825f962204a
+fresh_stage_manifest_sha256: 02f8a5a46788052ecad067fca4c5a71dcddf1c7ddde73e2091b27e97362bd0f4
+fresh_stage_action_plan_sha256: aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b
+fresh_stage_post_receipt_integrity_status: failed_closed_validator_reported_special
+fresh_stage_activation_executed: false
+fresh_stage_authorization_created: false
+fresh_stage_runtime_terminal_state: maintenance_stopped
+fresh_stage_entry_admission_thawed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1709,3 +1719,39 @@ expansion or an irreversible action that the approved phase did not include.
   database write, replay or entry thaw. Stage and activation remain explicitly
   unauthorized and require a separate user-approved turn after this exact
   candidate is reviewed and pushed.
+
+## Fresh immutable stage and failed-closed integrity gate
+
+- The owner authorized one production window for a fresh immutable stage,
+  activation and verification while keeping entry admission frozen. A live
+  `ls-remote` check proved that
+  `origin/codex/deepcoin-auto-trading-v1` was exactly
+  `18ea345a23812ed131c500a6040174a07a4436db`; local HEAD and its tracking ref
+  matched and the worktree was clean. The target release did not exist before
+  staging. Web, monitor, monitor timer, ingest and worker were all inactive;
+  service `MainPID` values were zero and the timer was inactive.
+- The single authorized stage attempt succeeded and created fresh inactive
+  release `18ea345a23812ed131c500a6040174a07a4436db`. Its receipt records tree
+  `3caf9990f6aa4fbcdcd2d12e63fa3a1c1775a4ab`, content SHA-256
+  `bda97ba8db70e0f0577e5383718040fe9a13159b77b0567bdd4b8825f962204a`,
+  manifest SHA-256
+  `02f8a5a46788052ecad067fca4c5a71dcddf1c7ddde73e2091b27e97362bd0f4`
+  and action-plan SHA-256
+  `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`.
+  Reconciliation was not rerun and the previously contaminated release was not
+  repaired, executed or activated.
+- After receipt creation, no root command imported or executed code from the
+  new release. The first shell-only post-receipt verifier used only system
+  shell, `find`, `stat`, `sha256sum` and Perl byte reads, but its exact-content
+  digest traversal exited once with `special` before producing comparison
+  evidence. Therefore the required proof that release content remained exact
+  after receipt creation is unknown. Per the owner's one-failure stop rule, the
+  verifier was not retried, replaced or bypassed.
+- No activation authorization was created or consumed, no activation or
+  service start occurred, and no post-activation runtime, monitor, cache or
+  Telegram-gap verification was attempted. Production remains
+  `maintenance_stopped`; entry admission was not thawed, historical replay and
+  backfill were not executed, and no Deepcoin or production database action
+  occurred after the already completed reconciliation. A later separately
+  authorized turn must first resolve the unknown post-receipt integrity state;
+  this status does not authorize re-verification or activation.
