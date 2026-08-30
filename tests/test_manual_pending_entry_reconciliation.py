@@ -2137,13 +2137,7 @@ def test_verified_backup_is_file_backed_without_whole_database_materialization(
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
-    monkeypatch.setattr(
-        reconciliation,
-        "_read_exact_descriptor",
-        lambda *_args: (_ for _ in ()).throw(
-            AssertionError("backup must not be materialized in memory")
-        ),
-    )
+    assert not hasattr(reconciliation, "_read_exact_descriptor")
 
     reconciliation._create_verified_backup(source, backup)
 

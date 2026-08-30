@@ -876,44 +876,41 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         source = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
         if _open_fd_inode_count(source_metadata) <= source_fds_before:
             raise ValueError("backup_source_invalid")
-        destination = sqlite3.connect(":memory:")
-        source.backup(destination)
-        result = destination.execute("PRAGMA quick_check").fetchone()
-        if result != ("ok",):
-            raise ValueError("backup_quick_check_failed")
-        if destination.execute("PRAGMA foreign_key_check").fetchone() is not None:
-            raise ValueError("backup_foreign_key_check_failed")
-        serialized = destination.serialize()
+        source.execute("PRAGMA query_only=ON")
+        if source.execute("PRAGMA query_only").fetchone() != (1,):
+            raise ValueError("backup_source_invalid")
+        destination = sqlite3.connect(f"file:{backup_path}?mode=rw", uri=True)
+        opened_destination = os.stat(
+            backup_path.name,
+            dir_fd=parent_descriptor,
+            follow_symlinks=False,
+        )
         if (
-            len(serialized) < 100
-            or not serialized.startswith(b"SQLite format 3\x00")
-            or serialized[18:20] not in {b"\x01\x01", b"\x02\x02"}
+            opened_destination.st_dev != created_metadata.st_dev
+            or opened_destination.st_ino != created_metadata.st_ino
         ):
-            raise ValueError("backup_quick_check_failed")
-        payload_buffer = bytearray(serialized)
-        # Online backup has already merged every WAL frame. Mark the standalone
-        # snapshot as rollback-journal format so reopening never seeks a WAL.
-        payload_buffer[18:20] = b"\x01\x01"
-        payload = bytes(payload_buffer)
-        os.lseek(descriptor, 0, os.SEEK_SET)
-        written = 0
-        view = memoryview(payload)
-        while written < len(view):
-            count = os.write(descriptor, view[written:])
-            if count <= 0:
-                raise OSError("backup write failed")
-            written += count
-        os.ftruncate(descriptor, len(payload))
+            raise ValueError("backup_metadata_invalid")
+        source.backup(destination, pages=1024, sleep=0.01)
+        if destination.execute("PRAGMA journal_mode=DELETE").fetchone() != (
+            "delete",
+        ):
+            raise ValueError("backup_metadata_invalid")
+        destination.commit()
+        destination.close()
+        destination = None
         os.fsync(descriptor)
         os.fsync(parent_descriptor)
-        persisted = _read_exact_descriptor(descriptor, len(payload))
-        verification = sqlite3.connect(":memory:")
+        verification = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
         try:
-            verification.deserialize(persisted)
+            verification.execute("PRAGMA query_only=ON")
+            if verification.execute("PRAGMA query_only").fetchone() != (1,):
+                raise ValueError("backup_quick_check_failed")
             if verification.execute("PRAGMA quick_check").fetchone() != ("ok",):
                 raise ValueError("backup_quick_check_failed")
             if verification.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ValueError("backup_foreign_key_check_failed")
+            if verification.total_changes != 0:
+                raise ValueError("backup_quick_check_failed")
         finally:
             verification.close()
         final_source_metadata = database_path.lstat()
@@ -939,7 +936,7 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
             or final_path_metadata.st_ino != final_metadata.st_ino
             or descriptor_metadata.st_dev != final_metadata.st_dev
             or descriptor_metadata.st_ino != final_metadata.st_ino
-            or descriptor_metadata.st_size != len(payload)
+            or descriptor_metadata.st_size < 100
         ):
             raise ValueError("backup_metadata_invalid")
     except Exception:
@@ -984,18 +981,6 @@ def _open_fd_inode_count(metadata) -> int:
         if opened.st_dev == metadata.st_dev and opened.st_ino == metadata.st_ino:
             count += 1
     return count
-
-
-def _read_exact_descriptor(descriptor: int, size: int) -> bytes:
-    chunks = []
-    offset = 0
-    while offset < size:
-        chunk = os.pread(descriptor, size - offset, offset)
-        if not chunk:
-            raise ValueError("backup_quick_check_failed")
-        chunks.append(chunk)
-        offset += len(chunk)
-    return b"".join(chunks)
 
 
 def _canonical_targets_valid(
