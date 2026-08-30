@@ -162,7 +162,7 @@ manual_cleanup_production_reconciliation_authority_seeded: true
 manual_cleanup_production_reconciliation_dry_run: completed
 manual_cleanup_contaminated_stage_root_pyc_count: 206
 monitor_identity_repair_commits_recorded: 8
-monitor_deployment_self_check_removal_status: production_diagnostic_exposed_identity_reason_residuals
+monitor_deployment_self_check_removal_status: diagnosed_main_exec_loaded_stale_113bcddf_release
 monitor_deployment_self_check_last_production_code_sha: f7c27a543554abc3a62f96095d99694b712452c5
 monitor_fail_closed_source_matrix: 7_passed
 monitor_local_focused_acceptance: 376_passed_1_skipped
@@ -180,6 +180,13 @@ fresh_stage_activation_executed: true_failed_closed
 fresh_stage_authorization_created: true_consumed
 fresh_stage_runtime_terminal_state: maintenance_stopped
 fresh_stage_entry_admission_thawed: false
+monitor_read_only_diagnosis_status: complete
+monitor_diagnostic_prestart_release_sha: 18ea345a23812ed131c500a6040174a07a4436db
+monitor_diagnostic_main_exec_release_sha: 113bcddf8aad3c57bbc4d11847405118361a5f24
+monitor_diagnostic_installed_unit_matches_candidate: false
+monitor_diagnostic_last_invocation_id: 74c08cab4e704768843d09745d5a0d05
+monitor_diagnostic_last_exit_status: 1
+monitor_state_sha256: 1852dea161c185d4409fa029e08472cd03bcdd0cfd35b63af04222c6dab4d8aa
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1795,3 +1802,65 @@ expansion or an irreversible action that the approved phase did not include.
   message backfill were not run. Post-activation cache ownership, atomic
   replacement, contract-spec health and Telegram collection-gap verification
   remain unexecuted because activation did not succeed.
+
+## Read-only diagnosis of the monitor code actually loaded
+
+- A read-only production diagnosis proved that the diagnostic pre-start and
+  main command loaded different releases. No code, release, unit, environment
+  file, service state or production data was modified; no stage, activation or
+  service-control command was run.
+- The installed fragment is
+  `/etc/systemd/system/telegram-kol-monitor-diagnostic.service`, SHA-256
+  `3d99f2bae3dff3d7d139533bb20d4e538547ab2ec3d536d3074868c0f561913c`.
+  It does not equal the candidate unit, whose SHA-256 is
+  `a213562148842a45bb62d3e9c51e34a92fbbc07e0783c6d2adfea5836af4d12e`.
+  The installed `ExecStart` still supplies
+  `--expected-release-commit`,
+  `--expected-release-manifest-sha256`, `--release-path`, and all three
+  `--web-loop-health-url`, `--ingest-loop-health-url` and
+  `--worker-loop-health-url` arguments. The candidate unit removes all of
+  them.
+- `/etc/telegram-kol-monitor.env` still sets both
+  `TELEGRAM_KOL_MONITOR_RELEASE_PATH` and
+  `TELEGRAM_KOL_MONITOR_RELEASE_COMMIT` to stale release
+  `113bcddf8aad3c57bbc4d11847405118361a5f24`. The activation drop-in
+  `/etc/systemd/system/telegram-kol-monitor-diagnostic.service.d/10-telegram-kol-release.conf`
+  separately sets `PYTHONPATH`, the generic and monitor release identities,
+  and the monitor release path to candidate `18ea345a...`; it also runs
+  `ExecStartPre=/opt/telegram-kol-analyzer/.venv/bin/python -m
+  telegram_kol_research.runtime_deployment_identity --verify-self`.
+  `systemctl show` displayed the candidate values from the drop-in under
+  `Environment`, while the unchanged base `ExecStart` retained its old
+  variable-dependent command line.
+- The decisive runtime evidence is the complete journal for invocation
+  `74c08cab4e704768843d09745d5a0d05`. `ExecStartPre` PID 1657072 reported
+  `loaded_artifact_verified=true` and candidate release `18ea345a...`.
+  The main diagnostic PID 1657074 then had actual kernel `_CMDLINE` arguments
+  expanded to old commit `113bcddf...`, old manifest SHA-256
+  `409d329c2dc0c105a0b84b7ea2fb9253f0681e2ea329cc37f659e087d8474a6e`
+  and old release path
+  `/opt/telegram-kol-releases/113bcddf8aad3c57bbc4d11847405118361a5f24`.
+  It accepted the deleted release and loop-health options and emitted the
+  three deployment reason codes before exiting with `ExecMainCode=1`,
+  `ExecMainStatus=1` and `Result=exit-code`.
+- Static byte evidence agrees with the runtime command line. Candidate
+  `production_safety_monitor.py` has SHA-256
+  `307dcb19900cdfe8ca0a1209e4609d0fc7f98de248f04467e76494ff8127a9ce`
+  and contains the three reason names only in the retired-state stripping
+  list. Release `113bcddf...` has SHA-256
+  `8d241f67ac40a84aec3e3aabdf6939498744e7d5ba0be572713e69e22b81a510`
+  and still contains active producers for `runtime_identity_unproven`,
+  `runtime_release_mixed` and `runtime_unit_hash_drift`.
+- `/var/lib/telegram-kol-monitor/state.json` was a monitor-owned mode `0600`
+  261-byte file with SHA-256
+  `1852dea161c185d4409fa029e08472cd03bcdd0cfd35b63af04222c6dab4d8aa`.
+  Its complete current content was:
+  `{"active_reason_codes":[],"anomaly_fingerprint":"9c328f7d8e32a53214cc363d16f2cf2919c9bfec9aaf875357d41f46637c810e","last_full_audit_date":"2026-08-30","last_notification_at":"2026-08-30T00:32:04.163131+00:00","last_window_at":"2026-08-30T23:28:10.045391+00:00"}`.
+  The retired reason codes were therefore produced by the old main process,
+  not read from the current state's `active_reason_codes`.
+- Conclusion: the activation drop-in made the pre-start identity verifier load
+  candidate `18ea345a`, creating a misleading candidate-success line, but the
+  installed old base unit and stale monitor environment made the actual
+  `monitor-production-safety` main process load release `113bcddf`. The failed
+  diagnostic is not evidence that candidate `18ea345a` still generates the
+  retired identity reason codes.
