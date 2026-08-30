@@ -3425,6 +3425,129 @@ class _RecordingAdapters:
         return self.audit
 
 
+@pytest.mark.parametrize(
+    ("snapshot_overrides", "expected_reason"),
+    [
+        ({"settings": {}}, "malformed_snapshot"),
+        ({"journal_error_count": None}, "malformed_snapshot"),
+        ({"abnormal_events": (None,)}, "malformed_snapshot"),
+        ({"composite_invariant_codes": None}, "malformed_snapshot"),
+        (
+            {"message_operation_coverage": {}},
+            "message_operation_coverage_incomplete",
+        ),
+        (
+            {
+                "contract_spec_health": {},
+                "contract_spec_sync_refusal_count": 0,
+            },
+            "malformed_snapshot",
+        ),
+        ({"audit": {}}, "audit_incomplete"),
+    ],
+)
+def test_missing_or_malformed_business_evidence_never_becomes_healthy(
+    snapshot_overrides,
+    expected_reason,
+):
+    result = evaluate_monitor_snapshot(
+        _snapshot(**snapshot_overrides),
+        EXPECTATIONS,
+        checked_at=datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is False
+    assert expected_reason in result.reason_codes
+
+
+@pytest.mark.parametrize(
+    ("failed_source", "expected_adapter_failure"),
+    [
+        ("settings", "settings"),
+        ("journal", "journal"),
+        ("database", "events"),
+        ("exchange_snapshot", "composite"),
+        ("contract_specs", "contract_specs"),
+        ("message_operation", "coverage"),
+        ("management_audit", "audit"),
+    ],
+)
+def test_each_business_source_failure_independently_fails_closed(
+    tmp_path,
+    failed_source,
+    expected_adapter_failure,
+):
+    class SevenSourceAdapters(_RecordingAdapters):
+        def __init__(self):
+            super().__init__()
+            self.source_calls = []
+
+        def _read(self, source, value):
+            self.source_calls.append(source)
+            if source == failed_source:
+                raise RuntimeError(f"{source} unavailable")
+            return value
+
+        def read_settings(self):
+            return self._read("settings", _snapshot().settings)
+
+        def read_journal_summary(self, *, since):
+            return self._read(
+                "journal",
+                {"generic_error_count": 0, "reason_codes": ()},
+            )
+
+        def read_abnormal_events(self, *, since, limit):
+            return self._read("database", ())
+
+        def read_composite_invariants(self, *, now):
+            return self._read("exchange_snapshot", ())
+
+        def read_contract_spec_health(self):
+            return self._read(
+                "contract_specs",
+                _healthy_contract_spec_health(),
+            )
+
+        def count_contract_spec_sync_refusals(self, *, since):
+            return 0
+
+        def read_message_operation_coverage(self):
+            return self._read(
+                "message_operation",
+                _healthy_message_operation_coverage(),
+            )
+
+        def run_management_audit(self):
+            return self._read("management_audit", _healthy_audit())
+
+    adapters = SevenSourceAdapters()
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / f"{failed_source}.json",
+        adapters=adapters,
+        now=datetime(2026, 8, 30, 12, 0, tzinfo=UTC),
+        notify=False,
+        force_full_audit=True,
+    )
+
+    assert outcome.exit_code == 1
+    assert outcome.result.healthy is False
+    assert "adapter_failure" in outcome.result.reason_codes
+    assert outcome.result.details["adapter_failures"] == (
+        expected_adapter_failure,
+    )
+    assert set(adapters.source_calls) == {
+        "settings",
+        "journal",
+        "database",
+        "exchange_snapshot",
+        "contract_specs",
+        "message_operation",
+        "management_audit",
+    }
+
+
 def test_monitor_run_never_reads_runtime_release_scope(tmp_path):
     class DeploymentTrapAdapters(_RecordingAdapters):
         def read_runtime_release_scope(self):
