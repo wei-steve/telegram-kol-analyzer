@@ -2593,7 +2593,51 @@ def test_verified_backup_rebinds_parent_path_after_streaming_hash(
         )
 
 
-def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
+def test_verified_backup_failure_cleanup_never_unlinks_swapped_inode(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    original.commit()
+    original.close()
+    backup = tmp_path / "backup.db"
+    replacement = tmp_path / "replacement.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+    other.commit()
+    other.close()
+    held = tmp_path / "held-created.db"
+    real_stat = reconciliation.os.stat
+    hash_failed = False
+
+    def fail_hash(*args, **kwargs):
+        nonlocal hash_failed
+        hash_failed = True
+        raise OSError("hash failed")
+
+    def stat_then_swap(path, *args, **kwargs):
+        if hash_failed and path == backup.name and kwargs.get("dir_fd") is not None:
+            metadata = real_stat(path, *args, **kwargs)
+            backup.rename(held)
+            replacement.rename(backup)
+            return metadata
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation, "_streaming_descriptor_sha256", fail_hash)
+    monkeypatch.setattr(reconciliation.os, "stat", stat_then_swap)
+
+    with pytest.raises(OSError, match="hash failed"):
+        reconciliation._create_verified_backup(source, backup)
+
+    assert backup.exists()
+    assert replacement.exists()
+
+
+def test_verified_backup_preserves_failed_output_when_mode_cannot_be_enforced(
     tmp_path,
     monkeypatch,
 ):
@@ -2611,7 +2655,7 @@ def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
     with pytest.raises(ValueError, match="backup_metadata_invalid"):
         reconciliation._create_verified_backup(source, backup)
 
-    assert not backup.exists()
+    assert backup.exists()
 
 
 def test_verified_backup_refuses_foreign_key_violations(tmp_path):
@@ -2634,7 +2678,7 @@ def test_verified_backup_refuses_foreign_key_violations(tmp_path):
         reconciliation._create_verified_backup(source, tmp_path / "backup.db")
 
 
-def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch):
+def test_verified_backup_preserves_failed_quick_check_output(tmp_path, monkeypatch):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
     source = tmp_path / "source.db"
@@ -2658,7 +2702,7 @@ def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch
     with pytest.raises(ValueError, match="backup_quick_check_failed"):
         reconciliation._create_verified_backup(source, backup)
 
-    assert not backup.exists()
+    assert backup.exists()
 
 
 def test_manual_reconciliation_terminalization_failure_rolls_back_and_keeps_backup(

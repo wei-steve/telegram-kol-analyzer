@@ -888,20 +888,9 @@ def _create_verified_backup(
         created_metadata = os.fstat(descriptor)
         os.fchmod(descriptor, 0o600)
     except OSError as exc:
-        try:
-            current = os.stat(
-                backup_path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                created_metadata is not None
-                and current.st_dev == created_metadata.st_dev
-                and current.st_ino == created_metadata.st_ino
-            ):
-                os.unlink(backup_path.name, dir_fd=parent_descriptor)
-        except OSError:
-            pass
+        # POSIX has no conditional unlink-by-inode primitive. Once the path has
+        # been published, preserving a failed artifact is safer than risking a
+        # stat/unlink race that deletes an unrecognized replacement inode.
         os.close(descriptor)
         os.close(parent_descriptor)
         raise ValueError("backup_metadata_invalid") from exc
@@ -1034,21 +1023,6 @@ def _create_verified_backup(
             != descriptor_metadata.st_ctime_ns
         ):
             raise ValueError("backup_metadata_invalid")
-    except Exception:
-        try:
-            current = os.stat(
-                backup_path.name,
-                dir_fd=parent_descriptor,
-                follow_symlinks=False,
-            )
-            if (
-                current.st_dev == created_metadata.st_dev
-                and current.st_ino == created_metadata.st_ino
-            ):
-                os.unlink(backup_path.name, dir_fd=parent_descriptor)
-        except OSError:
-            pass
-        raise
     finally:
         if destination is not None:
             destination.close()

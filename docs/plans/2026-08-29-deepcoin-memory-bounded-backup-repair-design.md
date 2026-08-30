@@ -98,8 +98,12 @@ Those are outside the minimal repair.
 ## Failure Semantics
 
 - Before a verified backup exists, every exception closes descriptors and
-  connections and removes only the exact inode created by this invocation.
-- A path/inode mismatch never unlinks an unrecognized replacement.
+  connections but preserves the published failed artifact. POSIX provides no
+  atomic conditional unlink-by-inode operation, so automatic cleanup would
+  introduce a `stat`/`unlink` race capable of deleting an unrecognized
+  replacement. Any failed artifact requires a later explicitly authorized
+  identity check and cleanup.
+- No failure path automatically unlinks a published destination name.
 - Backup or verification failure occurs before `BEGIN IMMEDIATE`; all seven
   targets and the authority row remain unchanged and the runtime remains
   persistently inhibited.
@@ -122,7 +126,7 @@ Focused tests also preserve:
 - unsafe parent, existing path, dangling symlink, source/path ABA, and
   destination inode replacement refusal;
 - uncheckpointed WAL commit inclusion and standalone reopen;
-- `quick_check` and foreign-key failure cleanup;
+- `quick_check` and foreign-key failure retention;
 - write failure cleanup without removing an unrecognized inode;
 - terminalization rollback with the verified backup unchanged;
 - streaming hash and absence of whole-file materialization.

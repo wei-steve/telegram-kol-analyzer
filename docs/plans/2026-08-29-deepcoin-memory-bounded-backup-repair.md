@@ -155,11 +155,13 @@ _read_exact_descriptor(...)
 
 Delete `_read_exact_descriptor()` after all callers are gone.
 
-**Step 4: Preserve exact cleanup semantics**
+**Step 4: Preserve fail-closed artifact semantics**
 
-Every exception before verified completion must unlink only when the current
-path still names `created_metadata`. Close both SQLite connections and all
-descriptors exactly once. Do not unlink a mismatched replacement inode.
+Every exception before verified completion must close both SQLite connections
+and all descriptors exactly once, but must not automatically unlink the
+published destination. POSIX cannot atomically condition unlink on the created
+inode, so preserving the failed artifact is required to avoid deleting a
+replacement inode. Cleanup requires a later explicit identity check.
 
 **Step 5: Run the two RED tests and verify GREEN**
 
@@ -182,7 +184,8 @@ git commit -m "fix: bound reconciliation backup memory"
 
 Change `test_verified_backup_removes_failed_quick_check_output` so its custom
 connection factory targets the read-only backup reopen rather than
-`":memory:"`. Keep the assertion that the self-created failed output is gone.
+`":memory:"`. Require the self-created failed output to remain for explicit
+later cleanup.
 
 **Step 2: Add destination-path ABA coverage**
 
