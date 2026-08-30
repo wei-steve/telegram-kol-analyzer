@@ -895,7 +895,6 @@ def _create_verified_backup(
         os.close(parent_descriptor)
         raise ValueError("backup_metadata_invalid") from exc
     source = None
-    destination = None
     try:
         source_fds_before = _open_fd_inode_count(source_metadata)
         source = sqlite3.connect(
@@ -907,79 +906,28 @@ def _create_verified_backup(
         source.execute("PRAGMA query_only=ON")
         if source.execute("PRAGMA query_only").fetchone() != (1,):
             raise ValueError("backup_source_invalid")
-        source.execute("BEGIN")
-        # Pin one read snapshot across both the evidence counts and every
-        # sqlite3_backup_step(). Without an actual read after BEGIN, a WAL
-        # source can still restart between bounded page batches indefinitely.
-        source.execute("SELECT 1 FROM sqlite_schema LIMIT 1").fetchone()
         before_counts = _bounded_table_counts(source, bounded_count_tables)
         if expected_counts is not None and before_counts != expected_counts:
             raise ValueError("backup_count_mismatch")
-        destination_fds_before = _open_fd_inode_count(created_metadata)
-        destination = sqlite3.connect(
-            f"{backup_path.resolve(strict=True).as_uri()}?mode=rw",
-            uri=True,
-        )
-        if _open_fd_inode_count(created_metadata) <= destination_fds_before:
-            raise ValueError("backup_metadata_invalid")
-        opened_destination = os.stat(
+
+        # VACUUM INTO is allowed on a mode=ro connection but SQLite classifies
+        # it as a write statement for PRAGMA query_only. The URI still prevents
+        # all writes to the source database itself.
+        source.execute("PRAGMA query_only=OFF")
+        if source.execute("PRAGMA query_only").fetchone() != (0,):
+            raise ValueError("backup_source_invalid")
+        source.execute("VACUUM INTO ?", (str(backup_path),))
+
+        vacuumed_destination = os.stat(
             backup_path.name,
             dir_fd=parent_descriptor,
             follow_symlinks=False,
         )
         if (
-            opened_destination.st_dev != created_metadata.st_dev
-            or opened_destination.st_ino != created_metadata.st_ino
+            vacuumed_destination.st_dev != created_metadata.st_dev
+            or vacuumed_destination.st_ino != created_metadata.st_ino
         ):
             raise ValueError("backup_metadata_invalid")
-        previous_remaining = None
-        expected_page_count = None
-
-        def require_forward_progress(status, remaining, page_count):
-            nonlocal expected_page_count, previous_remaining
-            if status in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
-                raise ValueError("backup_source_unavailable")
-            if status not in {sqlite3.SQLITE_OK, sqlite3.SQLITE_DONE}:
-                raise ValueError("backup_source_invalid")
-            if (
-                page_count < 0
-                or remaining < 0
-                or remaining > page_count
-                or (
-                    expected_page_count is not None
-                    and page_count != expected_page_count
-                )
-            ):
-                raise ValueError("backup_nonconverging")
-            expected_page_count = page_count
-            if status == sqlite3.SQLITE_DONE:
-                if remaining != 0:
-                    raise ValueError("backup_nonconverging")
-                return
-            if (
-                remaining == 0
-                or (
-                    previous_remaining is not None
-                    and remaining >= previous_remaining
-                )
-            ):
-                raise ValueError("backup_nonconverging")
-            previous_remaining = remaining
-
-        source.backup(
-            destination,
-            pages=1024,
-            progress=require_forward_progress,
-            sleep=0.01,
-        )
-        source.rollback()
-        if destination.execute("PRAGMA journal_mode=DELETE").fetchone() != (
-            "delete",
-        ):
-            raise ValueError("backup_metadata_invalid")
-        destination.commit()
-        destination.close()
-        destination = None
         os.fsync(descriptor)
         os.fsync(parent_descriptor)
         verification_fds_before = _open_fd_inode_count(created_metadata)
@@ -1069,8 +1017,6 @@ def _create_verified_backup(
         ):
             raise ValueError("backup_metadata_invalid")
     finally:
-        if destination is not None:
-            destination.close()
         if source is not None:
             source.close()
         os.close(descriptor)

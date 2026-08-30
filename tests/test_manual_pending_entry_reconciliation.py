@@ -2177,6 +2177,41 @@ def test_verified_backup_is_created_with_exact_0600_mode(tmp_path):
     assert backup.stat().st_mode & 0o777 == 0o600
 
 
+def test_verified_backup_uses_vacuum_into_not_incremental_backup(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO evidence(value) VALUES ('reviewed')")
+    connection.commit()
+    connection.close()
+    backup = tmp_path / "backup.db"
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+    real_connect = reconciliation.sqlite3.connect
+
+    class VacuumOnlyConnection(sqlite3.Connection):
+        def backup(self, *args, **kwargs):
+            raise AssertionError("incremental backup API used")
+
+    def connect(database, *args, **kwargs):
+        if database == source_uri:
+            kwargs["factory"] = VacuumOnlyConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    reconciliation._create_verified_backup(source, backup)
+
+    with real_connect(backup) as copied:
+        assert copied.execute("SELECT value FROM evidence").fetchone() == (
+            "reviewed",
+        )
+
+
 def test_verified_backup_treats_uri_metacharacters_as_literal_path_bytes(tmp_path):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
@@ -2262,22 +2297,18 @@ def test_verified_backup_rejects_bounded_table_count_mismatch(
     connection.commit()
     connection.close()
     backup = tmp_path / "backup.db"
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
-    real_connect = reconciliation.sqlite3.connect
+    real_counts = reconciliation._bounded_table_counts
+    count_calls = 0
 
-    class CountDriftConnection(sqlite3.Connection):
-        def backup(self, target, *args, **kwargs):
-            result = super().backup(target, *args, **kwargs)
-            target.execute("DELETE FROM evidence WHERE value = 'second'")
-            target.commit()
-            return result
+    def drift_after_copy(connection, table_names):
+        nonlocal count_calls
+        count_calls += 1
+        counts = real_counts(connection, table_names)
+        if count_calls == 2:
+            counts["evidence"] -= 1
+        return counts
 
-    def connect(database, *args, **kwargs):
-        if database == source_uri:
-            kwargs["factory"] = CountDriftConnection
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+    monkeypatch.setattr(reconciliation, "_bounded_table_counts", drift_after_copy)
 
     with pytest.raises(ValueError, match="backup_count_mismatch"):
         reconciliation._create_verified_backup(
@@ -2422,142 +2453,6 @@ def test_verified_backup_includes_uncheckpointed_wal_commit(tmp_path):
         assert copied.execute("PRAGMA journal_mode").fetchone() == ("delete",)
 
 
-def test_verified_backup_pins_source_snapshot_across_page_batches(
-    tmp_path,
-    monkeypatch,
-):
-    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
-
-    source = tmp_path / "source.db"
-    connection = sqlite3.connect(source)
-    assert connection.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
-    connection.execute("CREATE TABLE payload(value BLOB NOT NULL)")
-    connection.execute("CREATE TABLE mutation(value INTEGER NOT NULL)")
-    connection.execute(
-        "INSERT INTO payload(value) VALUES (zeroblob(?))",
-        (16 * 1024 * 1024,),
-    )
-    connection.execute("INSERT INTO mutation(value) VALUES (0)")
-    connection.commit()
-    connection.close()
-    backup = tmp_path / "backup.db"
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
-    real_connect = reconciliation.sqlite3.connect
-    observed_progress = []
-
-    class ConcurrentWriterConnection(sqlite3.Connection):
-        def backup(self, target, *args, **kwargs):
-            writer = real_connect(source)
-            guarded_progress = kwargs.pop("progress", None)
-
-            def write_between_batches(status, remaining, total):
-                if guarded_progress is not None:
-                    guarded_progress(status, remaining, total)
-                observed_progress.append(
-                    (status, remaining, total, self.in_transaction)
-                )
-                writer.execute("UPDATE mutation SET value = value + 1")
-                writer.commit()
-                if len(observed_progress) >= 8:
-                    raise RuntimeError("backup_did_not_advance")
-
-            try:
-                return super().backup(
-                    target,
-                    *args,
-                    progress=write_between_batches,
-                    **kwargs,
-                )
-            finally:
-                writer.close()
-
-    def connect(database, *args, **kwargs):
-        if database == source_uri:
-            kwargs["factory"] = ConcurrentWriterConnection
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
-
-    reconciliation._create_verified_backup(
-        source,
-        backup,
-        count_tables=("payload",),
-        expected_counts={"payload": 1},
-    )
-
-    assert 1 < len(observed_progress) < 8
-    assert all(in_transaction for _, _, _, in_transaction in observed_progress)
-    remaining = [entry[1] for entry in observed_progress]
-    assert all(current < previous for previous, current in zip(remaining, remaining[1:]))
-    with real_connect(backup) as copied:
-        assert copied.execute("SELECT value FROM mutation").fetchone() == (0,)
-
-
-def test_verified_backup_fails_closed_when_page_progress_stalls(
-    tmp_path,
-    monkeypatch,
-):
-    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
-
-    source = tmp_path / "source.db"
-    sqlite3.connect(source).close()
-    backup = tmp_path / "backup.db"
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
-    real_connect = reconciliation.sqlite3.connect
-
-    class StalledBackupConnection(sqlite3.Connection):
-        def backup(self, target, *args, **kwargs):
-            progress = kwargs.get("progress")
-            assert progress is not None, "missing backup progress guard"
-            progress(sqlite3.SQLITE_OK, 10, 20)
-            progress(sqlite3.SQLITE_OK, 10, 20)
-
-    def connect(database, *args, **kwargs):
-        if database == source_uri:
-            kwargs["factory"] = StalledBackupConnection
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
-
-    with pytest.raises(ValueError, match="backup_nonconverging"):
-        reconciliation._create_verified_backup(source, backup)
-
-
-def test_verified_backup_fails_closed_on_busy_without_retry(
-    tmp_path,
-    monkeypatch,
-):
-    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
-
-    source = tmp_path / "source.db"
-    sqlite3.connect(source).close()
-    backup = tmp_path / "backup.db"
-    source_uri = f"{source.resolve().as_uri()}?mode=ro"
-    real_connect = reconciliation.sqlite3.connect
-    progress_calls = 0
-
-    class BusyBackupConnection(sqlite3.Connection):
-        def backup(self, target, *args, **kwargs):
-            nonlocal progress_calls
-            progress = kwargs.get("progress")
-            assert progress is not None, "missing backup progress guard"
-            progress_calls += 1
-            progress(sqlite3.SQLITE_BUSY, 10, 20)
-            raise AssertionError("busy backup was retried")
-
-    def connect(database, *args, **kwargs):
-        if database == source_uri:
-            kwargs["factory"] = BusyBackupConnection
-        return real_connect(database, *args, **kwargs)
-
-    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
-
-    with pytest.raises(ValueError, match="backup_source_unavailable"):
-        reconciliation._create_verified_backup(source, backup)
-
-    assert progress_calls == 1
-
-
 def test_verified_backup_refuses_destination_path_aba(tmp_path, monkeypatch):
     import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
 
@@ -2576,11 +2471,19 @@ def test_verified_backup_refuses_destination_path_aba(tmp_path, monkeypatch):
     other.close()
     held = tmp_path / "held-exclusive.db"
     real_connect = reconciliation.sqlite3.connect
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+
+    class VacuumSwapConnection(sqlite3.Connection):
+        def execute(self, sql, parameters=()):
+            result = super().execute(sql, parameters)
+            if sql == "VACUUM INTO ?":
+                backup.rename(held)
+                replacement.rename(backup)
+            return result
 
     def connect(database, *args, **kwargs):
-        if database == f"{backup.resolve().as_uri()}?mode=rw":
-            backup.rename(held)
-            replacement.rename(backup)
+        if database == source_uri:
+            kwargs["factory"] = VacuumSwapConnection
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
