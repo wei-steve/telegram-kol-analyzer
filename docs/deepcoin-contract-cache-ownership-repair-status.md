@@ -107,7 +107,7 @@ manual_cleanup_production_inhibit_directory_mode: 0755
 manual_cleanup_production_stopped_preflight_database_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db
 manual_cleanup_production_stopped_preflight_database_sha256: f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243
 manual_cleanup_production_stopped_preflight_fingerprint: 7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7
-manual_cleanup_memory_bounded_backup_status: local_complete_production_copy_scale_proof_pending
+manual_cleanup_memory_bounded_backup_status: production_copy_scale_proof_failed_closed_nonconverging
 manual_cleanup_memory_bounded_backup_base_sha: 9a688885ca9337cd57384ce8a98aa3617150661d
 manual_cleanup_memory_bounded_backup_design_sha: 77304b82
 manual_cleanup_memory_bounded_backup_plan_sha: 70855f2b
@@ -117,7 +117,18 @@ manual_cleanup_memory_bounded_backup_review_hardening_sha: d234ca90
 manual_cleanup_memory_bounded_backup_focused: 275_passed_1_skipped
 manual_cleanup_memory_bounded_backup_final_suite: 6676_passed_4_skipped_32_warnings
 manual_cleanup_memory_bounded_backup_review: no_p0_p1
-manual_cleanup_memory_bounded_backup_production_executed: false
+manual_cleanup_memory_bounded_backup_production_executed: true_read_only_copy_only
+manual_cleanup_memory_bounded_backup_scale_attempt: 1
+manual_cleanup_memory_bounded_backup_scale_evidence_path: /var/lib/telegram-kol-cutover-evidence/90bf0d79b7d1c34bf996d8894157a100aa6ab274/scale-proof-1
+manual_cleanup_memory_bounded_backup_scale_result_sha256: ce351961baf03cf7d51644c7e29532f1580bce9b8b096fb51b6b5aaef9bbb9b4
+manual_cleanup_memory_bounded_backup_scale_manifest_sha256: 2a39fc537ad0af6f3cbf88eda4ff9d0c0eaa85392c82116140f82e2ff308aad8
+manual_cleanup_memory_bounded_backup_scale_source_sha256: f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243
+manual_cleanup_memory_bounded_backup_scale_memory_max_bytes: 1073741824
+manual_cleanup_memory_bounded_backup_scale_memory_peak_bytes: 19308544
+manual_cleanup_memory_bounded_backup_scale_oom_observed: false
+manual_cleanup_memory_bounded_backup_scale_restart_count: 0
+manual_cleanup_memory_bounded_backup_scale_destination_size: 4194304
+manual_cleanup_memory_bounded_backup_scale_blocker: backup_nonconverging_after_first_1024_page_batch
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1410,3 +1421,60 @@ expansion or an irreversible action that the approved phase did not include.
   database, invalid zero-byte placeholder, service state, staged candidate,
   Deepcoin, replay or entry thaw. Only a successful scale proof can justify a
   later push, fresh immutable stage and newly authorized production cutover.
+
+## Production-copy MemoryMax scale proof
+
+- The separately authorized scale phase began from exact clean local HEAD
+  `90bf0d79b7d1c34bf996d8894157a100aa6ab274`. Read-only SSH proof at
+  `2026-08-30T05:40:08Z` found production still at legacy SHA
+  `0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`. All eight governed and legacy
+  units were inactive with `MainPID=0`, empty cgroups, no matching runtime
+  process and the exact root-owned `0444` persistent inhibit. The boundary
+  remained `maintenance_stopped` before and after the scale attempt.
+- The source was the existing evidence copy, not the live database:
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db`.
+  It was root-owned mode `0600`, one link, 814,260,224 bytes, inode-distinct
+  from the live database, and had SHA-256
+  `f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243`.
+  Read-only SQLite verification returned `query_only=1`, `quick_check=ok`, zero
+  foreign-key issues and `total_changes=0`. Exact counts were 320 bindings, 554
+  order legs, 742 position-protection legs, 1,034 lifecycles, 3 settings, 159
+  protection intents, 197 TP convergences and 3,803 execution events.
+- Because this HEAD was neither pushed nor staged, the new evidence directory
+  contained the exact local reconciliation module with SHA-256
+  `31f1d69820484989ab681b21b9a7633e284a3c191340b5cf92c685a2bf99bda0`
+  and a root-owned `0600` runner. The runner loaded only the exact four backup
+  function ASTs, whose SHA-256 was
+  `00edf692ef11df5c58dba87779bc1c029470963718feccbb5d8da0e88dc54ae8`.
+  It did not install into or modify a checkout, release or runtime.
+- Exactly one transient unit, `deepcoin-backup-scale-90bf0d79.service`, was
+  launched with `MemoryMax=1,073,741,824`, `Restart=no`, private networking,
+  `ProtectSystem=strict` and only the new evidence directory writable. It did
+  not OOM: pre-stop cgroup `MemoryPeak` was 19,308,544 bytes, swap peak was zero,
+  restart count was zero and the kernel OOM match count was zero.
+- The unit nevertheless failed the scale gate because it did not converge. It
+  remained CPU-bound near 100% for approximately 3 minutes 14 seconds while the
+  destination stayed exactly 4,194,304 bytes, one 1,024-page batch. Before the
+  explicit fail-closed stop, process counters had reached 337,664,560,228
+  logical read characters and 168,749,265,999 logical write characters against
+  an 814,260,224-byte source. No completed summary, output integrity result,
+  output foreign-key result or output count proof existed. The unit was stopped
+  once and was not restarted or retried.
+- The incomplete root-owned `0600` output and its journal are intentionally
+  retained as failed evidence under
+  `/var/lib/telegram-kol-cutover-evidence/90bf0d79b7d1c34bf996d8894157a100aa6ab274/scale-proof-1`.
+  `scale-result.json` has SHA-256
+  `ce351961baf03cf7d51644c7e29532f1580bce9b8b096fb51b6b5aaef9bbb9b4`;
+  `evidence-manifest.json` has SHA-256
+  `2a39fc537ad0af6f3cbf88eda4ff9d0c0eaa85392c82116140f82e2ff308aad8`.
+  The source DB file's inode, size, mtime, ctime and SHA remained exact. The
+  mode-ro SQLite reads created a zero-byte WAL and 32,768-byte SHM sidecar next
+  to the evidence copy; they are recorded and were not removed. The live
+  database and prior invalid zero-byte transaction placeholder were untouched.
+- This phase did not push, stage, activate, start a production runtime, call
+  Deepcoin, mutate the live database or settings, replay a message, restore the
+  old runtime or thaw entry. The scale proof is rejected and production remains
+  safely stopped. There must be no production-copy retry. The next work must be
+  a new local TDD diagnosis of why the Python 3.11.6 / SQLite 3.42.0 backup path
+  repeatedly processes the first 1,024-page batch, followed by review and a new
+  final suite before any separately authorized scale attempt.
