@@ -514,6 +514,19 @@ def evaluate_runtime_release_scope(
         reasons.add("runtime_identity_unproven")
         roles = {}
     observed_now = _require_aware_datetime(checked_at).astimezone(UTC)
+    identity_checked_at = observed_now
+    try:
+        latest_role_observation = max(
+            datetime.fromisoformat(str(identity["observed_at"])).astimezone(UTC)
+            for identity in roles.values()
+            if isinstance(identity, Mapping)
+        )
+        if timedelta(0) <= latest_role_observation - observed_now <= timedelta(
+            seconds=10
+        ):
+            identity_checked_at = latest_role_observation
+    except (KeyError, TypeError, ValueError):
+        pass
     expected_cwds = {
         "web": "/opt/telegram-kol-analyzer",
         "ingest": "/opt/telegram-kol-analyzer",
@@ -556,7 +569,7 @@ def evaluate_runtime_release_scope(
             validate_runtime_identity_health(
                 identity,
                 role=role,
-                checked_at=observed_now,
+                checked_at=identity_checked_at,
                 require_entry_frozen=role != "monitor",
             )
         except ValueError:

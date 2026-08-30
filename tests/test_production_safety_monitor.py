@@ -178,6 +178,40 @@ def test_release_scope_accepts_exact_four_role_immutable_runtime():
     }
 
 
+@pytest.mark.parametrize(
+    ("observed_at", "healthy"),
+    (
+        (datetime(2026, 8, 28, 12, 0, 1, tzinfo=UTC).isoformat(), True),
+        (datetime(2026, 8, 28, 12, 0, 10, tzinfo=UTC).isoformat(), True),
+        (datetime(2026, 8, 28, 12, 0, 11, tzinfo=UTC).isoformat(), False),
+        ("invalid", False),
+    ),
+)
+def test_release_scope_uses_latest_role_observation_as_snapshot_time(
+    observed_at, healthy
+):
+    roles = {
+        role: _release_identity(role)
+        for role in ("web", "ingest", "worker", "monitor")
+    }
+    roles["ingest"]["observed_at"] = observed_at
+
+    result = evaluate_runtime_release_scope(
+        {
+            "commit": REVIEWED_HEAD,
+            "manifest_sha256": "a" * 64,
+            "unit_hashes_valid": True,
+            "roles": roles,
+        },
+        expected_commit=REVIEWED_HEAD,
+        expected_manifest_sha256="a" * 64,
+        checked_at=datetime(2026, 8, 28, 12, 0, tzinfo=UTC),
+    )
+
+    assert result.healthy is healthy
+    assert ("runtime_identity_unproven" in result.reason_codes) is not healthy
+
+
 def test_release_scope_rejects_mixed_release_or_disabled_capabilities():
     roles = {
         role: _release_identity(role)
