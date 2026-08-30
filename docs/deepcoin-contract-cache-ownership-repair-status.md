@@ -79,14 +79,14 @@ manual_cleanup_timer_pid_repair_code_sha: cce1f8654d94a572b0340a62f17226dbb93d2d
 manual_cleanup_timer_pid_repair_focused: 299_passed_1_skipped
 manual_cleanup_timer_pid_repair_final_suite: 6667_passed_3_skipped_32_warnings
 manual_cleanup_timer_pid_repair_review: no_p0_p1
-manual_cleanup_production_cutover_status: maintenance_stop_failed_inhibit_directory_mode_0700
+manual_cleanup_production_cutover_status: maintenance_stopped_fresh_reconciliation_ready
 manual_cleanup_production_stage_sha: 89a7dc66ea0c788f48be2e9841cec010cd8feeb1
 manual_cleanup_production_stage_content_sha256: 8dee8c014b2be5fc2ae495b865d5d2f807b0da60d0b3f177793705961289c828
 manual_cleanup_production_stage_manifest_sha256: 2b614bba3dc0ea8c1101363ff98d23c59caf9c6f6b8ab788a0ee694eff86a6de
 manual_cleanup_production_evidence_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl
-manual_cleanup_production_evidence_sha256: 93d2f23c8ca3fc3092e45880298199810793b7aa2195df16c1b2ba5083d88786
-manual_cleanup_production_preflight_at: 2026-08-30T01:41:14Z
-manual_cleanup_production_preflight_blocker: maintenance_inhibit_directory_mode_0700_expected_0755
+manual_cleanup_production_evidence_sha256: 9d81ee2f085cca2b9764950f36e467083a8f8e7c93361fea0b073bb897bfa608
+manual_cleanup_production_preflight_at: 2026-08-30T01:56:18Z
+manual_cleanup_production_preflight_blocker: null
 manual_cleanup_production_target_fill_status: all_7_zero_in_both_stable_snapshots
 manual_cleanup_production_preflight_attempt: 4
 manual_cleanup_production_preflight_http_status: null
@@ -96,10 +96,13 @@ manual_cleanup_production_database_mutation_executed: false
 manual_cleanup_production_service_control_executed: true
 manual_cleanup_production_activation_executed: false
 manual_cleanup_production_observation_started: false
-manual_cleanup_production_runtime_terminal_state: maintenance_stop_failed
+manual_cleanup_production_runtime_terminal_state: maintenance_stopped
 manual_cleanup_production_runtime_process_count: 0
-manual_cleanup_production_persistent_inhibit_proven: false
-manual_cleanup_production_inhibit_directory_mode: 0700
+manual_cleanup_production_persistent_inhibit_proven: true
+manual_cleanup_production_inhibit_directory_mode: 0755
+manual_cleanup_production_stopped_preflight_database_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db
+manual_cleanup_production_stopped_preflight_database_sha256: f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243
+manual_cleanup_production_stopped_preflight_fingerprint: 7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1252,3 +1255,48 @@ expansion or an irreversible action that the approved phase did not include.
   inhibits, reset the failed monitor oneshot to inactive without starting any
   runtime, and prove the complete stopped boundary before any fresh exchange
   evidence or database transaction.
+
+## Maintenance stop convergence continuation
+
+- The explicitly authorized continuation started from local status HEAD
+  `3a0dab7e1bd729683b110d0b280c5bed22f9cfe0` and the exact recorded
+  `maintenance_stop_failed` production state. Read-only validation proved that
+  all eight target drop-in directories were root-owned, non-symlink, mode
+  `0700` and completely empty; no inhibit file existed. Every runtime MainPID
+  and cgroup population was zero, exact runtime-process matching returned none,
+  active exchange writes were zero, and only the monitor oneshot retained a
+  `failed` state.
+- One explicit convergence operation changed only those eight empty directory
+  modes to `0755`, published the candidate's exact root-owned `0444`
+  maintenance-inhibit document in each directory, reloaded systemd and cleared
+  the failed monitor oneshot without starting any unit. The resulting complete
+  scope proved inactive, inhibited, `MainPID=0`, empty cgroups, zero matching
+  runtime processes and zero active exchange writes. The valid terminal state
+  is now `maintenance_stopped`.
+- From that continuously inhibited boundary, a new root-owned `0600` read-only
+  database copy was created at
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db`,
+  SHA-256
+  `f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243`.
+  It passed `quick_check=ok`, zero foreign-key issues, `total_changes=0`, zero
+  active exchange writes, unchanged critical counts and an absent canonical
+  authority row.
+- Two further stopped-boundary account snapshots at
+  `2026-08-30T01:56:05Z` and `2026-08-30T01:56:18Z` each returned zero
+  positions, zero regular open orders, zero pending triggers, seven empty exact
+  fills reads and the accepted five-row/two-missing exact history shape. All
+  calls completed once with no exception or retry. Both plans were `ready` with
+  fingerprint
+  `7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7`.
+- This continuation did not start any runtime, create the transaction backup,
+  mutate production database/settings, terminalize a target, seed authority,
+  create or consume activation authorization, activate, restore the old
+  runtime, replay history, write Deepcoin, observe L2 traffic or thaw entry.
+  Evidence remains in the same root-owned `0600` file at
+  `/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/evidence.jsonl`,
+  now SHA-256
+  `9d81ee2f085cca2b9764950f36e467083a8f8e7c93361fea0b073bb897bfa608`.
+  The next authorized action may begin only from this proven persistent stop
+  boundary and must reacquire fresh evidence inside the transaction executor
+  before creating the exclusive `0600` transaction backup and atomically
+  terminalizing all seven targets plus the idle authority row.
