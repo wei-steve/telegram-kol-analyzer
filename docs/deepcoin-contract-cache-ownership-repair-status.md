@@ -107,6 +107,17 @@ manual_cleanup_production_inhibit_directory_mode: 0755
 manual_cleanup_production_stopped_preflight_database_path: /var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db
 manual_cleanup_production_stopped_preflight_database_sha256: f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243
 manual_cleanup_production_stopped_preflight_fingerprint: 7ead66602f3d73244ce9fa50c177a9fa3e3a81a3102ee8b8ee1bb218d807eda7
+manual_cleanup_memory_bounded_backup_status: local_complete_production_copy_scale_proof_pending
+manual_cleanup_memory_bounded_backup_base_sha: 9a688885ca9337cd57384ce8a98aa3617150661d
+manual_cleanup_memory_bounded_backup_design_sha: 77304b82
+manual_cleanup_memory_bounded_backup_plan_sha: 70855f2b
+manual_cleanup_memory_bounded_backup_red_sha: db770199
+manual_cleanup_memory_bounded_backup_core_sha: 264b55f8
+manual_cleanup_memory_bounded_backup_review_hardening_sha: d234ca90
+manual_cleanup_memory_bounded_backup_focused: 275_passed_1_skipped
+manual_cleanup_memory_bounded_backup_final_suite: 6676_passed_4_skipped_32_warnings
+manual_cleanup_memory_bounded_backup_review: no_p0_p1
+manual_cleanup_memory_bounded_backup_production_executed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1352,3 +1363,50 @@ expansion or an irreversible action that the approved phase did not include.
   explicit handling of the invalid zero-byte placeholder, a fresh immutable
   candidate and stage, and new single-attempt exchange evidence. It must not
   retry this failed executor or activate the existing candidate.
+
+## Memory-bounded backup local repair
+
+- The local-only repair began from exact status SHA
+  `9a688885ca9337cd57384ce8a98aa3617150661d`. Design, implementation plan and
+  the first scale RED are `77304b82`, `70855f2b` and `db770199`; the initial
+  file-backed implementation and safety tests are `264b55f8` and `3f53c2dd`.
+  Review hardening commits `fd34ed2d`, `60bf3e34` and `d234ca90` close the URI,
+  inode, count, hash, post-hash ABA and failed-artifact cleanup findings.
+- The repaired path uses SQLite's disk-backed online backup in bounded page
+  batches. It does not use an in-memory database, `serialize`, `deserialize`,
+  `read_bytes` or another whole-database Python allocation. Source, write
+  destination and read-only verification connections are bound to their exact
+  inodes; URI metacharacters are encoded literally; committed WAL frames are
+  included in a standalone rollback-journal snapshot.
+- Verification now requires `query_only=1`, `quick_check=ok`, zero foreign-key
+  rows, `total_changes=0`, and exact counts for the eight reconciliation-critical
+  tables. Those counts are bound before backup, inside the copied snapshot and
+  again after `BEGIN IMMEDIATE`, before any target or authority write. The
+  backup SHA-256 is computed with fixed-size descriptor reads and returned by
+  the CLI. File and parent paths are rebound after hashing.
+- Once an exclusive destination has been published, failures close every
+  connection and descriptor but do not automatically unlink the path. This
+  fail-closed rule avoids a non-atomic `stat`/`unlink` race deleting an unknown
+  replacement inode; a failed artifact requires separately authorized exact
+  identity verification and cleanup.
+- Static checks passed. The final affected reconciliation, CLI, scoped
+  activation and quiescence set passed 275 tests with one documented macOS
+  skip. Independent review of exact diff `9a688885..d234ca90` found no remaining
+  P0/P1. The one final repository suite passed 6676 tests with 4 documented
+  skips and 32 existing warnings in 461.88 seconds. No production code changed
+  after that suite.
+- This local phase did not push, create a stage, connect over SSH, control a
+  service, call Deepcoin, create or remove a production backup, mutate the
+  production database or settings, activate a release, replay messages, restore
+  the old runtime or thaw entry. Production remains persistently inhibited in
+  `maintenance_stopped`; the OOM candidate
+  `89a7dc66ea0c788f48be2e9841cec010cd8feeb1` remains inactive and must not be
+  reused.
+- The next and only authorized gate is a separate production-copy scale proof:
+  verify the existing root-owned read-only 814 MB evidence copy, run this exact
+  backup path once in a transient `MemoryMax=1GiB` unit, and record exit status,
+  peak memory, output owner/mode/size/SHA-256, integrity, foreign keys, critical
+  counts and unchanged source identity/hash. That phase must not touch the live
+  database, invalid zero-byte placeholder, service state, staged candidate,
+  Deepcoin, replay or entry thaw. Only a successful scale proof can justify a
+  later push, fresh immutable stage and newly authorized production cutover.
