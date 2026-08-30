@@ -1006,7 +1006,7 @@ def activate_release(
 
 
 class SystemRuntimeAdapter:
-    identity_retry_delay_seconds = 15
+    identity_retry_delay_seconds = 60
     _INHIBIT_NAME = "00-telegram-kol-maintenance-inhibit.conf"
     _INHIBIT_CONTENT = (
         b"[Unit]\n"

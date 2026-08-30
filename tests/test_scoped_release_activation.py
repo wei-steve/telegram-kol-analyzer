@@ -82,6 +82,10 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
     assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" in monitor
 
 
+def test_system_runtime_allows_first_authority_cycles_to_finish_before_retry() -> None:
+    assert SystemRuntimeAdapter.identity_retry_delay_seconds == 60
+
+
 def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> None:
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
     calls = []
