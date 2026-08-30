@@ -3,12 +3,12 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: monitor_subtraction_local_acceptance
+current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
-candidate_content_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
-handoff_sha: 99326a1df1a1c49becbb9c3d862c27fb16c029a3
+candidate_sha: f7c27a543554abc3a62f96095d99694b712452c5
+candidate_content_sha: f7c27a543554abc3a62f96095d99694b712452c5
+handoff_sha: f7c27a543554abc3a62f96095d99694b712452c5
 pushed_sha: null
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
@@ -162,12 +162,12 @@ manual_cleanup_production_reconciliation_authority_seeded: true
 manual_cleanup_production_reconciliation_dry_run: completed
 manual_cleanup_contaminated_stage_root_pyc_count: 206
 monitor_identity_repair_commits_recorded: 8
-monitor_deployment_self_check_removal_status: local_complete_review_pending
-monitor_deployment_self_check_last_production_code_sha: 3d78e9661bf1e5d76f72fe6c3925425442cb55a8
+monitor_deployment_self_check_removal_status: local_complete_re_review_pending
+monitor_deployment_self_check_last_production_code_sha: f7c27a543554abc3a62f96095d99694b712452c5
 monitor_fail_closed_source_matrix: 7_passed
 monitor_local_focused_acceptance: 376_passed_1_skipped
-monitor_final_repository_suite: 6680_passed_4_skipped_32_warnings
-monitor_final_repository_suite_seconds: 442.72
+monitor_final_repository_suite: 6685_passed_4_skipped_32_warnings
+monitor_final_repository_suite_seconds: 440.24
 monitor_stage_authorized: false
 monitor_activation_authorized: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
@@ -1684,7 +1684,18 @@ expansion or an irreversible action that the approved phase did not include.
   monitor acceptance passed 376 tests with one platform skip; the activation
   diagnostic hard-gate test also passed. The final repository suite passed
   6,680 tests with four documented skips and 32 existing warnings in 442.72
-  seconds. No production code changed after `3d78e966`.
+  seconds before independent review.
+- Independent exact-base review then found two fail-closed gaps. Existing state
+  containing one of the five explicitly retired deployment reasons was treated
+  as corrupt and could permanently block the activation diagnostic; a missing
+  or `None` message-operation or contract-spec reader could be skipped as
+  healthy. RED reproduced all five cases. Commit `f7c27a54` now strips only the
+  five retired deployment reasons while loading old state (unknown reasons
+  remain invalid) and records `coverage` or `contract_specs` adapter failure for
+  missing readers and missing values. The repaired adjacent monitor/audit set
+  passed 447 tests with one platform skip. The final repository suite after
+  this production-code commit passed 6,685 tests with four documented skips
+  and 32 existing warnings in 440.24 seconds.
 - The production reconciliation recorded above remains complete and is not to
   be rerun: all seven targets were terminalized, the missing authority row was
   seeded, trading settings changed from 3 to 4, execution events changed from
