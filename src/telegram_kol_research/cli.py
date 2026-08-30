@@ -5051,6 +5051,7 @@ def finalize_cancelled_pending_entries(
                         "terminalized_count": result.terminalized_count,
                         "authority_seeded": result.authority_seeded,
                         "backup_path": str(result.backup_path),
+                        "backup_sha256": result.backup_sha256,
                     },
                     sort_keys=True,
                 )

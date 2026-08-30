@@ -337,6 +337,7 @@ def test_finalize_cancelled_entries_holds_runtime_lock_through_apply(
             terminalized_count=1,
             authority_seeded=True,
             backup_path=tmp_path / "backup.db",
+            backup_sha256="c" * 64,
         )
 
     monkeypatch.setattr(cli_module, "exclusive_runtime_control_lock", runtime_lock)

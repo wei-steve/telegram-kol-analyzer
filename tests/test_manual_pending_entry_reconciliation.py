@@ -1783,7 +1783,7 @@ def test_manual_reconciliation_apply_rechecks_unreviewed_active_sibling(
 
     monkeypatch.setattr(reconciliation, "_create_verified_backup", add_sibling)
 
-    with pytest.raises(ValueError, match="reviewed_local_state_changed"):
+    with pytest.raises(ValueError, match="backup_count_mismatch"):
         reconciliation.apply_manual_pending_entry_reconciliation(
             session_factory,
             database_path=database_path,
@@ -1891,6 +1891,68 @@ def test_manual_reconciliation_apply_rechecks_freshness_after_backup(tmp_path, m
 
     with session_factory() as session:
         assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == "pending"
+
+
+def test_manual_reconciliation_refuses_critical_count_drift_after_backup(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    )
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    target = _seed_pending_target(session_factory)
+    client = ReadOnlyClient()
+    _record_cancelled_history(client, target)
+    plan = reconciliation.build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    def add_unrelated_setting(*args, **kwargs):
+        with session_factory() as session:
+            session.add(
+                TradingSetting(
+                    key="concurrent_unrelated_setting",
+                    value_json="{}",
+                    updated_at=NOW,
+                )
+            )
+            session.commit()
+        return "a" * 64
+
+    monkeypatch.setattr(
+        reconciliation,
+        "_create_verified_backup",
+        add_unrelated_setting,
+    )
+
+    with pytest.raises(ValueError, match="backup_count_mismatch"):
+        reconciliation.apply_manual_pending_entry_reconciliation(
+            session_factory,
+            database_path=database_path,
+            backup_path=tmp_path / "backup.db",
+            deepcoin_client=client,
+            targets=(target,),
+            runtime_guard=RuntimeGuard(),
+            expected_fingerprint=plan.fingerprint,
+            now=NOW,
+        )
+
+    with session_factory() as session:
+        assert session.get(ExecutionOrderLeg, target.execution_order_leg_id).status == (
+            "pending"
+        )
+        assert session.query(ExecutionEvent).count() == 0
+        assert session.query(TradingSetting).filter_by(
+            key=ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY
+        ).one_or_none() is None
 
 
 def test_manual_reconciliation_rerun_is_read_only_completed(tmp_path):
@@ -2115,6 +2177,29 @@ def test_verified_backup_is_created_with_exact_0600_mode(tmp_path):
     assert backup.stat().st_mode & 0o777 == 0o600
 
 
+def test_verified_backup_treats_uri_metacharacters_as_literal_path_bytes(tmp_path):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source?literal#name.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO evidence(value) VALUES ('reviewed')")
+    connection.commit()
+    connection.close()
+    backup = tmp_path / "backup?literal#name.db"
+
+    reconciliation._create_verified_backup(source, backup)
+
+    assert {path.name for path in tmp_path.iterdir()} == {
+        source.name,
+        backup.name,
+    }
+    with sqlite3.connect(backup) as copied:
+        assert copied.execute("SELECT value FROM evidence").fetchone() == (
+            "reviewed",
+        )
+
+
 def test_verified_backup_is_file_backed_without_whole_database_materialization(
     tmp_path,
     monkeypatch,
@@ -2131,12 +2216,25 @@ def test_verified_backup_is_file_backed_without_whole_database_materialization(
     real_connect = reconciliation.sqlite3.connect
     opened = []
 
+    class NoWholeFileConnection(sqlite3.Connection):
+        def serialize(self, *args, **kwargs):
+            raise AssertionError("whole-database serialize")
+
+        def deserialize(self, *args, **kwargs):
+            raise AssertionError("whole-database deserialize")
+
     def connect(database, *args, **kwargs):
         assert database != ":memory:"
         opened.append(str(database))
+        kwargs.setdefault("factory", NoWholeFileConnection)
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda *_: (_ for _ in ()).throw(AssertionError("whole-file read")),
+    )
     assert not hasattr(reconciliation, "_read_exact_descriptor")
 
     reconciliation._create_verified_backup(source, backup)
@@ -2146,6 +2244,72 @@ def test_verified_backup_is_file_backed_without_whole_database_materialization(
         assert copied.execute("SELECT value FROM evidence").fetchone() == (
             "reviewed",
         )
+
+
+def test_verified_backup_rejects_bounded_table_count_mismatch(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.executemany(
+        "INSERT INTO evidence(value) VALUES (?)",
+        (("first",), ("second",)),
+    )
+    connection.commit()
+    connection.close()
+    backup = tmp_path / "backup.db"
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
+    real_connect = reconciliation.sqlite3.connect
+
+    class CountDriftConnection(sqlite3.Connection):
+        def backup(self, target, *args, **kwargs):
+            result = super().backup(target, *args, **kwargs)
+            target.execute("DELETE FROM evidence WHERE value = 'second'")
+            target.commit()
+            return result
+
+    def connect(database, *args, **kwargs):
+        if database == source_uri:
+            kwargs["factory"] = CountDriftConnection
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    with pytest.raises(ValueError, match="backup_count_mismatch"):
+        reconciliation._create_verified_backup(
+            source,
+            backup,
+            count_tables=("evidence",),
+        )
+
+
+def test_verified_backup_returns_streaming_sha256(tmp_path, monkeypatch):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    connection = sqlite3.connect(source)
+    connection.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    connection.execute("INSERT INTO evidence(value) VALUES ('reviewed')")
+    connection.commit()
+    connection.close()
+    backup = tmp_path / "backup.db"
+    monkeypatch.setattr(
+        Path,
+        "read_bytes",
+        lambda *_: (_ for _ in ()).throw(AssertionError("whole-file read")),
+    )
+
+    observed_sha256 = reconciliation._create_verified_backup(source, backup)
+
+    digest = hashlib.sha256()
+    with backup.open("rb") as persisted:
+        while chunk := persisted.read(64 * 1024):
+            digest.update(chunk)
+    assert observed_sha256 == digest.hexdigest()
 
 
 @pytest.mark.skipif(
@@ -2211,9 +2375,10 @@ def test_verified_backup_refuses_source_path_aba(tmp_path, monkeypatch):
     other.close()
     held = tmp_path / "held.db"
     real_connect = reconciliation.sqlite3.connect
+    source_uri = f"{source.resolve().as_uri()}?mode=ro"
 
     def connect(database, *args, **kwargs):
-        if str(database).startswith(f"file:{source}"):
+        if database == source_uri:
             source.rename(held)
             replacement.rename(source)
             opened = real_connect(database, *args, **kwargs)
@@ -2277,7 +2442,7 @@ def test_verified_backup_refuses_destination_path_aba(tmp_path, monkeypatch):
     real_connect = reconciliation.sqlite3.connect
 
     def connect(database, *args, **kwargs):
-        if database == f"file:{backup}?mode=rw":
+        if database == f"{backup.resolve().as_uri()}?mode=rw":
             backup.rename(held)
             replacement.rename(backup)
         return real_connect(database, *args, **kwargs)
@@ -2296,6 +2461,47 @@ def test_verified_backup_refuses_destination_path_aba(tmp_path, monkeypatch):
         assert unchanged.execute("SELECT value FROM evidence").fetchone() == (
             "source",
         )
+
+
+def test_verified_backup_binds_read_only_verification_to_created_inode(
+    tmp_path,
+    monkeypatch,
+):
+    import telegram_kol_research.manual_pending_entry_reconciliation as reconciliation
+
+    source = tmp_path / "source.db"
+    original = sqlite3.connect(source)
+    original.execute("CREATE TABLE evidence(value TEXT NOT NULL)")
+    original.execute("INSERT INTO evidence(value) VALUES ('source')")
+    original.commit()
+    original.close()
+    backup = tmp_path / "backup.db"
+    replacement = tmp_path / "replacement.db"
+    other = sqlite3.connect(replacement)
+    other.execute("CREATE TABLE marker(value TEXT NOT NULL)")
+    other.execute("INSERT INTO marker(value) VALUES ('replacement')")
+    other.commit()
+    other.close()
+    held = tmp_path / "held-created.db"
+    verification_uri = f"{backup.resolve().as_uri()}?mode=ro"
+    real_connect = reconciliation.sqlite3.connect
+
+    def connect(database, *args, **kwargs):
+        if database == verification_uri:
+            backup.rename(held)
+            replacement.rename(backup)
+            opened = real_connect(database, *args, **kwargs)
+            backup.rename(replacement)
+            held.rename(backup)
+            with backup.open("r+b") as created:
+                created.write(b"not a sqlite database")
+            return opened
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(reconciliation.sqlite3, "connect", connect)
+
+    with pytest.raises(ValueError, match="backup_metadata_invalid"):
+        reconciliation._create_verified_backup(source, backup)
 
 
 def test_verified_backup_removes_output_when_mode_cannot_be_enforced(
@@ -2354,7 +2560,7 @@ def test_verified_backup_removes_failed_quick_check_output(tmp_path, monkeypatch
             return super().execute(sql, parameters)
 
     def connect(database, *args, **kwargs):
-        if database == f"file:{backup}?mode=ro":
+        if database == f"{backup.resolve().as_uri()}?mode=ro":
             kwargs["factory"] = FailedQuickCheckConnection
         return real_connect(database, *args, **kwargs)
 

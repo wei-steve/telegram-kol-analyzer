@@ -52,6 +52,16 @@ _GOVERNED_INSTRUMENTS = (
     "SOL-USDT-SWAP",
 )
 _EXACT_PRIVATE_READ_INTERVAL_SECONDS = 0.41
+_RECONCILIATION_BACKUP_COUNT_TABLES = (
+    "execution_bindings",
+    "execution_order_legs",
+    "position_protection_legs",
+    "strategy_lifecycles",
+    "trading_settings",
+    "trigger_protection_intents",
+    "trigger_take_profit_convergences",
+    "execution_events",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +80,7 @@ class ManualPendingEntryReconciliationResult:
     terminalized_count: int
     authority_seeded: bool
     backup_path: Path
+    backup_sha256: str
 
 
 class _MaintenanceExactReadPacer:
@@ -429,7 +440,17 @@ def apply_manual_pending_entry_reconciliation(
     _require_runtime_stopped(runtime_guard)
     _require_session_database_path(session_factory, Path(database_path))
     _require_write_boundary_freshness(fresh, now=now, clock=clock)
-    _create_verified_backup(Path(database_path), Path(backup_path))
+    with session_factory() as count_session:
+        before_counts = _session_table_counts(
+            count_session,
+            _RECONCILIATION_BACKUP_COUNT_TABLES,
+        )
+    backup_sha256 = _create_verified_backup(
+        Path(database_path),
+        Path(backup_path),
+        _RECONCILIATION_BACKUP_COUNT_TABLES,
+        before_counts,
+    )
     _require_runtime_stopped(runtime_guard)
     observed_at = _require_write_boundary_freshness(fresh, now=now, clock=clock)
 
@@ -437,6 +458,14 @@ def apply_manual_pending_entry_reconciliation(
     with session_factory() as session:
         try:
             session.execute(text("BEGIN IMMEDIATE"))
+            if (
+                _session_table_counts(
+                    session,
+                    _RECONCILIATION_BACKUP_COUNT_TABLES,
+                )
+                != before_counts
+            ):
+                raise ValueError("backup_count_mismatch")
             if _reviewed_binding_scope_changed(session, reviewed):
                 raise ValueError("reviewed_local_state_changed")
             for target in reviewed:
@@ -489,6 +518,7 @@ def apply_manual_pending_entry_reconciliation(
         terminalized_count=len(reviewed),
         authority_seeded=authority_seeded,
         backup_path=Path(backup_path),
+        backup_sha256=backup_sha256,
     )
 
 
@@ -783,9 +813,15 @@ def _terminalize_binding(session, binding_id: int, observed_at: datetime) -> Non
     lifecycle.updated_at = observed_at
 
 
-def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
+def _create_verified_backup(
+    database_path: Path,
+    backup_path: Path,
+    count_tables: Iterable[str] = (),
+    expected_counts: dict[str, int] | None = None,
+) -> str:
     database_path = Path(database_path)
     backup_path = Path(backup_path)
+    bounded_count_tables = tuple(count_tables)
     try:
         source_metadata = database_path.lstat()
     except OSError as exc:
@@ -873,13 +909,25 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
     destination = None
     try:
         source_fds_before = _open_fd_inode_count(source_metadata)
-        source = sqlite3.connect(f"file:{database_path}?mode=ro", uri=True)
+        source = sqlite3.connect(
+            f"{database_path.resolve(strict=True).as_uri()}?mode=ro",
+            uri=True,
+        )
         if _open_fd_inode_count(source_metadata) <= source_fds_before:
             raise ValueError("backup_source_invalid")
         source.execute("PRAGMA query_only=ON")
         if source.execute("PRAGMA query_only").fetchone() != (1,):
             raise ValueError("backup_source_invalid")
-        destination = sqlite3.connect(f"file:{backup_path}?mode=rw", uri=True)
+        before_counts = _bounded_table_counts(source, bounded_count_tables)
+        if expected_counts is not None and before_counts != expected_counts:
+            raise ValueError("backup_count_mismatch")
+        destination_fds_before = _open_fd_inode_count(created_metadata)
+        destination = sqlite3.connect(
+            f"{backup_path.resolve(strict=True).as_uri()}?mode=rw",
+            uri=True,
+        )
+        if _open_fd_inode_count(created_metadata) <= destination_fds_before:
+            raise ValueError("backup_metadata_invalid")
         opened_destination = os.stat(
             backup_path.name,
             dir_fd=parent_descriptor,
@@ -900,8 +948,14 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
         destination = None
         os.fsync(descriptor)
         os.fsync(parent_descriptor)
-        verification = sqlite3.connect(f"file:{backup_path}?mode=ro", uri=True)
+        verification_fds_before = _open_fd_inode_count(created_metadata)
+        verification = sqlite3.connect(
+            f"{backup_path.resolve(strict=True).as_uri()}?mode=ro",
+            uri=True,
+        )
         try:
+            if _open_fd_inode_count(created_metadata) <= verification_fds_before:
+                raise ValueError("backup_metadata_invalid")
             verification.execute("PRAGMA query_only=ON")
             if verification.execute("PRAGMA query_only").fetchone() != (1,):
                 raise ValueError("backup_quick_check_failed")
@@ -909,6 +963,8 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
                 raise ValueError("backup_quick_check_failed")
             if verification.execute("PRAGMA foreign_key_check").fetchone() is not None:
                 raise ValueError("backup_foreign_key_check_failed")
+            if _bounded_table_counts(verification, bounded_count_tables) != before_counts:
+                raise ValueError("backup_count_mismatch")
             if verification.total_changes != 0:
                 raise ValueError("backup_quick_check_failed")
         finally:
@@ -939,6 +995,10 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
             or descriptor_metadata.st_size < 100
         ):
             raise ValueError("backup_metadata_invalid")
+        backup_sha256 = _streaming_descriptor_sha256(
+            descriptor,
+            descriptor_metadata,
+        )
     except Exception:
         try:
             current = os.stat(
@@ -961,6 +1021,60 @@ def _create_verified_backup(database_path: Path, backup_path: Path) -> None:
             source.close()
         os.close(descriptor)
         os.close(parent_descriptor)
+    return backup_sha256
+
+
+def _bounded_table_counts(
+    connection: sqlite3.Connection,
+    table_names: tuple[str, ...],
+) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table_name in table_names:
+        if not table_name.isidentifier():
+            raise ValueError("backup_count_table_invalid")
+        row = connection.execute(
+            f'SELECT COUNT(*) FROM "{table_name}"'
+        ).fetchone()
+        if row is None or len(row) != 1 or not isinstance(row[0], int):
+            raise ValueError("backup_count_invalid")
+        counts[table_name] = row[0]
+    return counts
+
+
+def _session_table_counts(session, table_names: tuple[str, ...]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for table_name in table_names:
+        if not table_name.isidentifier():
+            raise ValueError("backup_count_table_invalid")
+        counts[table_name] = session.execute(
+            text(f'SELECT COUNT(*) FROM "{table_name}"')
+        ).scalar_one()
+    return counts
+
+
+def _streaming_descriptor_sha256(descriptor: int, metadata) -> str:
+    digest = hashlib.sha256()
+    offset = 0
+    while offset < metadata.st_size:
+        chunk = os.pread(
+            descriptor,
+            min(1024 * 1024, metadata.st_size - offset),
+            offset,
+        )
+        if not chunk:
+            raise ValueError("backup_metadata_invalid")
+        digest.update(chunk)
+        offset += len(chunk)
+    final_metadata = os.fstat(descriptor)
+    if (
+        final_metadata.st_dev != metadata.st_dev
+        or final_metadata.st_ino != metadata.st_ino
+        or final_metadata.st_size != metadata.st_size
+        or final_metadata.st_mtime_ns != metadata.st_mtime_ns
+        or final_metadata.st_ctime_ns != metadata.st_ctime_ns
+    ):
+        raise ValueError("backup_metadata_invalid")
+    return digest.hexdigest()
 
 
 def _open_fd_inode_count(metadata) -> int:
