@@ -300,7 +300,11 @@ def test_finalize_cancelled_entries_holds_runtime_lock_through_apply(
 
     events = []
     runtime = object()
-    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "create_existing_session_factory",
+        lambda path: object(),
+    )
     monkeypatch.setattr(cli_module, "build_deepcoin_client_from_env", lambda: object())
     monkeypatch.setattr(cli_module, "SystemRuntimeAdapter", lambda *, expected_uid: runtime)
     monkeypatch.setattr(
@@ -1227,6 +1231,54 @@ def test_deployment_diagnostic_source_failure_remains_nonzero(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout)["adapter_failures"] == ["settings"]
+
+
+def test_deployment_diagnostic_audit_trigger_remains_nonzero(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "build_runtime_deployment_identity",
+        lambda **kwargs: {
+            "loaded_artifact_verified": True,
+            "manifest_sha256": "a" * 64,
+            "release_commit": "2" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            adapter_failures=(),
+            audit_ran=True,
+            checked_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+            exit_code=0,
+            monitor_error=None,
+            notification_status="disabled",
+            result=SimpleNamespace(healthy=True, reason_codes=(), details={}),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-entry-preamble-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--disable-daily-management-audit",
+            "--deployment-diagnostic",
+        ],
+        env={"TELEGRAM_KOL_RELEASE_COMMIT": "2" * 40},
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["audit_ran"] is True
 
 
 def test_deployment_diagnostic_rejects_wrong_loaded_artifact_with_expected_env(

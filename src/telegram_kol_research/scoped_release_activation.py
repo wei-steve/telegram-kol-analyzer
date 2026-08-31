@@ -1012,128 +1012,10 @@ def activate_release(
     }
 
 
-_MONITOR_DIAGNOSTIC_FIELDS = frozenset(
-    {
-        "adapter_failures",
-        "audit_ran",
-        "checked_at",
-        "contract",
-        "details",
-        "healthy",
-        "loaded_artifact_verified",
-        "manifest_sha256",
-        "monitor_error",
-        "notification_status",
-        "reason_codes",
-        "release_commit",
-        "result_complete",
-        "schema_version",
-        "sources_complete",
-    }
-)
 _MONITOR_DIAGNOSTIC_UNIT = "telegram-kol-monitor-diagnostic.service"
-_SYSTEMD_JOB_STARTING_MESSAGE_ID = "7d4958e842da4a758f6c1cdc7b36dcc5"
-_SYSTEMD_JOB_FINISHED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
 
 
-def _parse_monitor_anchor_job(output: str) -> int:
-    anchors = []
-    for line in output.splitlines():
-        match = re.fullmatch(
-            r"Enqueued anchor job ([1-9][0-9]{0,9}) "
-            r"telegram-kol-monitor-diagnostic\.service/start\.",
-            line,
-        )
-        if match is not None:
-            anchors.append(int(match.group(1)))
-            continue
-        if re.fullmatch(
-            r"Enqueued auxiliary job [1-9][0-9]{0,9} "
-            r"[A-Za-z0-9@_.:-]+/[a-z-]+\.",
-            line,
-        ) is None:
-            raise ActivationError("monitor runtime proof failed")
-    if len(anchors) != 1 or anchors[0] > (2**32 - 1):
-        raise ActivationError("monitor runtime proof failed")
-    return anchors[0]
-
-
-def _monitor_invocation_messages(output: str, *, expected_job_id: int) -> str:
-    entries: list[Mapping[str, Any]] = []
-    for line in output.splitlines():
-        try:
-            entry = json.loads(line)
-        except (json.JSONDecodeError, TypeError, ValueError) as exc:
-            raise ActivationError("monitor runtime proof failed") from exc
-        if not isinstance(entry, Mapping):
-            raise ActivationError("monitor runtime proof failed")
-        entries.append(entry)
-
-    expected_job = str(expected_job_id)
-    job_entries = [
-        (index, entry)
-        for index, entry in enumerate(entries)
-        if entry.get("JOB_ID") == expected_job
-        and entry.get("JOB_TYPE") == "start"
-        and entry.get("UNIT") == _MONITOR_DIAGNOSTIC_UNIT
-    ]
-    starts = [
-        (index, entry)
-        for index, entry in job_entries
-        if entry.get("MESSAGE_ID") == _SYSTEMD_JOB_STARTING_MESSAGE_ID
-    ]
-    finishes = [
-        (index, entry)
-        for index, entry in job_entries
-        if entry.get("MESSAGE_ID") == _SYSTEMD_JOB_FINISHED_MESSAGE_ID
-        and entry.get("JOB_RESULT") == "done"
-    ]
-    if len(job_entries) != 2 or len(starts) != 1 or len(finishes) != 1:
-        raise ActivationError("monitor runtime proof failed")
-    start_index, start = starts[0]
-    finish_index, finish = finishes[0]
-    invocation_id = start.get("INVOCATION_ID")
-    boot_id = start.get("_BOOT_ID")
-    if (
-        start_index >= finish_index
-        or re.fullmatch(r"[0-9a-f]{32}", str(invocation_id or "")) is None
-        or re.fullmatch(r"[0-9a-f]{32}", str(boot_id or "")) is None
-        or finish.get("INVOCATION_ID") != invocation_id
-        or finish.get("_BOOT_ID") != boot_id
-    ):
-        raise ActivationError("monitor runtime proof failed")
-    for entry in (start, finish):
-        if (
-            entry.get("_TRANSPORT") != "journal"
-            or entry.get("_PID") != "1"
-            or entry.get("_UID") != "0"
-            or entry.get("_SYSTEMD_UNIT") != "init.scope"
-        ):
-            raise ActivationError("monitor runtime proof failed")
-
-    messages = []
-    for index, entry in enumerate(entries):
-        if entry.get("_SYSTEMD_INVOCATION_ID") != invocation_id:
-            continue
-        if (
-            index <= start_index
-            or index >= finish_index
-            or entry.get("_BOOT_ID") != boot_id
-            or entry.get("_SYSTEMD_UNIT") != _MONITOR_DIAGNOSTIC_UNIT
-            or entry.get("_TRANSPORT") != "stdout"
-            or not isinstance(entry.get("MESSAGE"), str)
-        ):
-            raise ActivationError("monitor runtime proof failed")
-        messages.append(entry["MESSAGE"])
-    return "\n".join(messages) + ("\n" if messages else "")
-
-
-def _parse_monitor_diagnostic_evidence(
-    output: str,
-    *,
-    expected_commit: str,
-    expected_manifest_sha256: str,
-) -> dict[str, Any]:
+def _best_effort_monitor_journal_evidence(output: str) -> dict[str, Any]:
     candidates: list[Mapping[str, Any]] = []
     for line in output.splitlines():
         try:
@@ -1145,53 +1027,39 @@ def _parse_monitor_diagnostic_evidence(
             and payload.get("contract") == "monitor-deployment-diagnostic-v1"
         ):
             candidates.append(payload)
-    if len(candidates) != 1:
-        raise ActivationError("monitor runtime proof failed")
-    payload = candidates[0]
-    if set(payload) != _MONITOR_DIAGNOSTIC_FIELDS:
-        raise ActivationError("monitor runtime proof failed")
-    reason_codes = payload.get("reason_codes")
-    details = payload.get("details")
-    checked_at = payload.get("checked_at")
-    notification_status = payload.get("notification_status")
-    if (
-        type(payload.get("schema_version")) is not int
-        or payload.get("schema_version") != 1
-        or payload.get("release_commit") != expected_commit
-        or payload.get("manifest_sha256") != expected_manifest_sha256
-        or payload.get("loaded_artifact_verified") is not True
-        or payload.get("audit_ran") is not False
-        or payload.get("sources_complete") is not True
-        or payload.get("result_complete") is not True
-        or payload.get("adapter_failures") != []
-        or payload.get("monitor_error") is not None
-        or type(payload.get("healthy")) is not bool
-        or not isinstance(reason_codes, list)
-        or not isinstance(details, Mapping)
-        or not isinstance(checked_at, str)
-        or not isinstance(notification_status, str)
-        or not notification_status
-    ):
-        raise ActivationError("monitor runtime proof failed")
-    if (
-        len(reason_codes) > 100
-        or any(
-            not isinstance(code, str)
-            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None
-            for code in reason_codes
-        )
-        or reason_codes != sorted(set(reason_codes))
-        or (payload["healthy"] is True and reason_codes)
-        or (payload["healthy"] is False and not reason_codes)
-    ):
-        raise ActivationError("monitor runtime proof failed")
-    try:
-        parsed_checked_at = datetime.fromisoformat(checked_at)
-    except ValueError as exc:
-        raise ActivationError("monitor runtime proof failed") from exc
-    if parsed_checked_at.tzinfo is None:
-        raise ActivationError("monitor runtime proof failed")
-    return dict(payload)
+    if not candidates:
+        return {
+            "reason": "diagnostic_payload_not_found",
+            "status": "unavailable",
+        }
+    return {
+        "association": "best_effort_latest_unit_payload",
+        "observed_payload_count": len(candidates),
+        "payload": dict(candidates[-1]),
+        "status": "available",
+    }
+
+
+def _emit_monitor_gate_evidence(evidence: Mapping[str, Any]) -> None:
+    print(
+        "MONITOR_ACTIVATION_GATE_EVIDENCE="
+        + _canonical_json_bytes(evidence).decode("utf-8").rstrip("\n"),
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _parse_monitor_systemd_status(output: str) -> tuple[str | None, str | None, bool]:
+    properties: dict[str, str] = {}
+    malformed = False
+    for line in output.splitlines():
+        key, separator, value = line.partition("=")
+        if not separator or key in properties:
+            malformed = True
+            continue
+        properties[key] = value
+    malformed = malformed or set(properties) != {"Result", "ExecMainStatus"}
+    return properties.get("Result"), properties.get("ExecMainStatus"), malformed
 
 
 class SystemRuntimeAdapter:
@@ -1481,6 +1349,42 @@ class SystemRuntimeAdapter:
             return False
         raise ActivationError("monitor timer state is unknown")
 
+    @staticmethod
+    def _best_effort_monitor_journal() -> dict[str, Any]:
+        command = [
+            "journalctl",
+            "-u",
+            _MONITOR_DIAGNOSTIC_UNIT,
+            "--lines=100",
+            "--output=cat",
+            "--no-pager",
+        ]
+        try:
+            result = subprocess.run(
+                command,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "reason": "journal_command_timeout",
+                "status": "unavailable",
+            }
+        except OSError:
+            return {
+                "reason": "journal_command_unavailable",
+                "status": "unavailable",
+            }
+        if result.returncode != 0:
+            return {
+                "reason": "journal_command_nonzero",
+                "returncode": result.returncode,
+                "status": "unavailable",
+            }
+        return _best_effort_monitor_journal_evidence(result.stdout)
+
     def verify_monitor_release(
         self, release: ReleaseEvidence
     ) -> Mapping[str, Any]:
@@ -1509,46 +1413,107 @@ class SystemRuntimeAdapter:
                 "telegram-kol-monitor.timer",
             ]
         )
-        cursor_result = self._run(
-            [
-                "journalctl",
-                "--lines=0",
-                "--show-cursor",
-                "--no-pager",
-                "--quiet",
-            ]
+        try:
+            self._run(["systemctl", "start", _MONITOR_DIAGNOSTIC_UNIT])
+        except ActivationError as exc:
+            try:
+                status = self._run(
+                    [
+                        "systemctl",
+                        "show",
+                        _MONITOR_DIAGNOSTIC_UNIT,
+                        "--property=Result",
+                        "--property=ExecMainStatus",
+                    ]
+                )
+                systemd_result, exec_main_status, status_malformed = (
+                    _parse_monitor_systemd_status(status.stdout)
+                )
+                status_observation = (
+                    "malformed" if status_malformed else "available"
+                )
+            except ActivationError:
+                systemd_result = None
+                exec_main_status = None
+                status_observation = "unavailable"
+            start_observation = (
+                "timeout"
+                if isinstance(exc.__cause__, subprocess.TimeoutExpired)
+                else "unavailable"
+                if isinstance(exc.__cause__, OSError)
+                else "nonzero_or_signal"
+            )
+            evidence = {
+                "contract": "monitor-activation-gate-evidence-v1",
+                "decision": {
+                    "basis": "systemctl_start_and_systemd_result_exec_main_status",
+                    "exec_main_status": exec_main_status,
+                    "passed": False,
+                    "reason": "diagnostic_start_failed",
+                    "start_observation": start_observation,
+                    "systemd_result": systemd_result,
+                    "systemd_status_observation": status_observation,
+                },
+                "journal_evidence": self._best_effort_monitor_journal(),
+                "schema_version": 1,
+            }
+            _emit_monitor_gate_evidence(evidence)
+            raise
+        try:
+            result = self._run(
+                [
+                    "systemctl",
+                    "show",
+                    _MONITOR_DIAGNOSTIC_UNIT,
+                    "--property=Result",
+                    "--property=ExecMainStatus",
+                ]
+            )
+        except ActivationError:
+            evidence = {
+                "contract": "monitor-activation-gate-evidence-v1",
+                "decision": {
+                    "basis": "systemctl_start_and_systemd_result_exec_main_status",
+                    "exec_main_status": None,
+                    "passed": False,
+                    "reason": "systemd_status_unavailable",
+                    "systemd_result": None,
+                    "systemd_status_observation": "unavailable",
+                },
+                "journal_evidence": self._best_effort_monitor_journal(),
+                "schema_version": 1,
+            }
+            _emit_monitor_gate_evidence(evidence)
+            raise
+
+        systemd_result, exec_main_status, malformed = _parse_monitor_systemd_status(
+            result.stdout
         )
-        cursor_match = re.fullmatch(
-            r"-- cursor: (\S{1,4096})\n?",
-            cursor_result.stdout,
+        passed = bool(
+            not malformed
+            and systemd_result == "success"
+            and exec_main_status == "0"
         )
-        if cursor_match is None:
+        decision: dict[str, Any] = {
+            "basis": "systemctl_start_and_systemd_result_exec_main_status",
+            "exec_main_status": exec_main_status,
+            "passed": passed,
+            "systemd_result": systemd_result,
+        }
+        if not passed:
+            decision["reason"] = (
+                "systemd_status_malformed" if malformed else "diagnostic_exit_failed"
+            )
+        evidence = {
+            "contract": "monitor-activation-gate-evidence-v1",
+            "decision": decision,
+            "journal_evidence": self._best_effort_monitor_journal(),
+            "schema_version": 1,
+        }
+        _emit_monitor_gate_evidence(evidence)
+        if not passed:
             raise ActivationError("monitor runtime proof failed")
-        journal_cursor = cursor_match.group(1)
-        transaction = self._run(
-            [
-                "systemctl",
-                "--show-transaction",
-                "start",
-                _MONITOR_DIAGNOSTIC_UNIT,
-            ]
-        )
-        job_id = _parse_monitor_anchor_job(transaction.stderr)
-        journal = self._run(
-            [
-                "journalctl",
-                "-u",
-                _MONITOR_DIAGNOSTIC_UNIT,
-                f"--after-cursor={journal_cursor}",
-                "--output=json",
-                "--no-pager",
-            ]
-        )
-        return _parse_monitor_diagnostic_evidence(
-            _monitor_invocation_messages(journal.stdout, expected_job_id=job_id),
-            expected_commit=release.commit,
-            expected_manifest_sha256=release.manifest_sha256,
-        )
+        return evidence
 
 
 def _required_absolute_env(name: str, default: str | None = None) -> Path:
