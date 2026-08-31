@@ -32,11 +32,19 @@ local_entered_lifecycle_count: 20
 local_entered_without_live_position_count: 20
 local_active_bound_lifecycle_count: 11
 local_bound_without_live_position_count: 11
-backlog_preterminalization_plan_status: proposed_waiting_authorization
+backlog_preterminalization_plan_status: approved_phase1_executed
 backlog_preterminalization_watermark_raw_message_id: 14030
 backlog_preterminalization_target_count: 154
 backlog_post_watermark_pending_observed_count: 13
-backlog_preterminalization_executed: false
+backlog_preterminalization_implementation_sha: f56d557deddca4b58d93c95b26dd641ffc1247d7
+backlog_preterminalization_final_suite: 6722_passed_4_skipped_32_warnings
+backlog_preterminalization_phase1_status: applied_core_gates_passed_strict_unrelated_snapshot_gate_not_met
+backlog_preterminalization_executed: true
+backlog_preterminalization_applied_at: 2026-08-31T07:20:30.768959Z
+backlog_preterminalization_expired_count: 154
+backlog_preterminalization_remaining_post_watermark_pending_count: 28
+backlog_preterminalization_final_seal_executed: false
+backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3204,5 +3212,114 @@ watermark.
 
 No business table, queue row, lifecycle, preamble, binding, raw message,
 service, release or Deepcoin state was modified during this read-only phase.
-The proposed L3 implementation and production apply both await separate owner
-authorization.
+That checkpoint awaited separate owner authorization; the subsequently
+authorized implementation and production result follow below.
+
+## Frozen backlog phase-one implementation and production apply
+
+Phase one was implemented, independently reviewed, pushed and applied at the
+fixed initial watermark. It did not perform the final seal or thaw entry
+admission.
+
+### Exact implementation and local acceptance
+
+- Commit `f56d557deddca4b58d93c95b26dd641ffc1247d7` refactors the existing expired
+  audit writer into a session-scoped core and adds the narrow
+  `expire-message-processing-backlog` command. The existing worker wrapper and
+  the new command call the same core and produce the existing
+  `authoritative_gap_recovery_expired`/`recovery_guard` records.
+- The command defaults to dry-run. Apply is explicit, uses one
+  `BEGIN IMMEDIATE`, re-reads the cohort inside the transaction and has one
+  commit. An injected mid-batch error proved that queue and audit writes all
+  roll back. It has no job-processor, model, candidate, lifecycle, binding or
+  exchange call.
+- Independent review found one P1 before production: the first implementation
+  accepted any internally consistent interval. A second RED demonstrated that
+  another continuous interval could be applied. The final implementation
+  hard-binds this phase to `13877 / 14030 / 154` before any database read; all
+  other triples are refused. Review after that repair concluded `no findings`.
+- Focused tests passed 119 checks. The only final full-suite run after the last
+  production-code edit completed with `6722 passed, 4 skipped, 32 warnings` in
+  442.31 seconds.
+
+### Execution source boundary
+
+- The production command did not import or execute code from the immutable
+  `cf30fdf7...` release and did not use the mutable server checkout. Exact
+  pushed commit `f56d557d...` was exported with `git archive` to a separate
+  root-owned maintenance evidence directory. The tar SHA-256 was
+  `c998f72f4e9812545fd44b648dccfa81c63103ccc5151f7728992c1f2559484a`.
+- It ran with `/opt/telegram-kol-analyzer/.venv/bin/python -B`, an explicit
+  `PYTHONPATH` pointing only at that extracted archive and
+  `PYTHONDONTWRITEBYTECODE=1`. The extracted tree hash manifest was identical
+  before and after execution, and no `.pyc` or `__pycache__` appeared.
+- The exclusive `/run/telegram-kol-update.lock` was held for the production
+  evidence, backup, dry-run, apply and initial verification window, then
+  released. No stage, activation, restart or service control occurred.
+
+### Backup and preimage evidence
+
+- Evidence is under root-owned mode `0700`
+  `/var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z`.
+  Its manifest SHA-256 is
+  `c171492f57eed93bd3f29c20c99b67a9e66a092c8f5d2de43d47ca5790e4c1c0`.
+- The existing verified `VACUUM INTO` path created a root-owned mode `0600`,
+  806,084,608-byte backup with SHA-256
+  `f244d67bfce2f6f9c4e134b30d1bf2173d81f41ecca682b05adb8311a6e701af`.
+  The backup and the post-apply live database both returned `quick_check=ok`
+  and zero foreign-key rows.
+- The exact target manifest contains the 154 continuous ids `13877..14030` and
+  has SHA-256
+  `570428b3666cbf1b8295ffb653e2572f4b38c56771d3970473b058d8c028a77b`.
+  Evidence preserves all 154 queue before-images, the full raw-message 13912
+  `execution_pending` decision before-image, affected/critical table counts and
+  lifecycle, binding and preamble snapshots.
+- Production dry-run exited 0 with target count 154, exact phase-one constants,
+  matching manifest hash, zero `execution_running`, zero changes and raw
+  message 13912 still `execution_pending`.
+
+### Apply and core acceptance
+
+- The single apply exited 0 and changed exactly 154 rows. Write-lock acquisition
+  took 0.001607 seconds and the `BEGIN IMMEDIATE` lock was held for 0.504745
+  seconds. No retry was used.
+- There are zero non-shadow `pending` or `claimed` rows at or below raw id
+  14030. Exactly 154 target rows are `expired`, remain attempt zero, carry
+  `expired_stale_instruction`, have no claim/next-attempt fields and have a
+  completion time.
+- Exactly 154 target decisions have the expected recovery-guard authority,
+  expired classification, skipped automation and suppressed-expiry
+  notification. Exactly 154 message-recognition rows have the matching failed
+  recovery-guard result. Target-linked signal candidates remain zero.
+- The verified backup was attached read-only. Bidirectional `EXCEPT` over every
+  `raw_messages` column for ids 13877..14030 returned zero in both directions.
+  Original raw messages were not updated or deleted.
+- Web PID 2224914, ingest PID 2224916 and worker PID 2224910 each still had
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. No target message was sent through
+  the processor or AI, replayed or manually advanced, and no Deepcoin action
+  occurred.
+
+### Strict unrelated-table snapshot deviation
+
+The requested byte-for-byte lifecycle/binding/preamble snapshot gate was not
+fully met, so this phase is not recorded as an unqualified complete acceptance:
+
+- Table counts stayed exact: 1,034 lifecycles, 320 bindings and 13 preambles.
+  Preamble before/after images were byte-identical.
+- All 20 protected `entered` lifecycle rows were byte-identical to the verified
+  backup in both directions. The only lifecycle differences were ids 452, 460,
+  469, 508, 509, 510 and 839, all `pending_entry`; only their `updated_at`
+  changed, from `07:15:46Z` to `07:23:13Z`.
+- 165 binding rows changed only `recovered_at` and `updated_at`, consistent with
+  the independently running binding recovery loop after the apply completed at
+  `07:20:30Z`. No binding status, order id, position id,
+  `last_exchange_status` or payload changed. Binding 114 retained its exact
+  conflict state and substantive fields.
+- The new maintenance module does not import or update lifecycle or binding
+  models. These timestamp-only changes occurred after commit while the normal
+  runtime continued writing, but they still mean the literal full-table
+  before/after image equality requirement cannot be claimed.
+
+No whole-database restore was attempted after commit. Entry remains frozen.
+There are now 28 newer non-shadow pending rows, ids `14031..14058`; they were
+not touched. The final seal remains a separate, unexecuted authorization.
