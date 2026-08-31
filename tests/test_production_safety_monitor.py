@@ -2326,6 +2326,36 @@ def test_reserved_is_not_globally_normal_for_other_actions():
     assert result.reason_codes == ("event_unknown_status",)
 
 
+def test_historical_state_convergence_completed_is_action_scoped_normal():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            abnormal_events=(
+                {
+                    "action": "historical_state_convergence_repair",
+                    "status": "completed",
+                },
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.healthy is True
+    assert result.reason_codes == ()
+
+
+def test_completed_is_not_globally_normal_for_other_actions():
+    result = evaluate_monitor_snapshot(
+        _snapshot(
+            abnormal_events=(
+                {"action": "submit_entry_order", "status": "completed"},
+            )
+        ),
+        EXPECTATIONS,
+    )
+
+    assert result.reason_codes == ("event_unknown_status",)
+
+
 def test_only_duplicate_exact_manual_close_for_same_pos_id_alerts():
     duplicate = {"action": "close_bound_position_market", "status": "submitted", "pos_id": "p-1"}
     result = evaluate_monitor_snapshot(

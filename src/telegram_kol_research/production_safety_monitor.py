@@ -4239,7 +4239,11 @@ def _evaluate_events(
         if status in _RECOVERY_EVENT_STATUSES:
             recovery_count += 1
         elif status not in _NORMAL_EVENT_STATUSES and not (
-            action == "close_bound_position_reservation" and status == "reserved"
+            (action == "close_bound_position_reservation" and status == "reserved")
+            or (
+                action == "historical_state_convergence_repair"
+                and status == "completed"
+            )
         ):
             unknown_count += 1
 
