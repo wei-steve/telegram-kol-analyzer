@@ -13,38 +13,84 @@ from typing import Any, Mapping
 
 
 ENTERED_LIFECYCLE_IDS = (
-    444, 547, 558, 623, 707, 713, 724, 736, 763, 767,
-    772, 777, 804, 807, 985, 1012, 1023, 1026, 1034, 1035,
+    444, 536, 547, 558, 607, 611, 623, 698, 707, 713, 724, 736, 763,
+    767, 772, 777, 804, 807, 985, 1012, 1023, 1026, 1034, 1035, 1036,
 )
+PENDING_LIFECYCLE_IDS = (423, 426, 447, 452, 460, 469, 508, 509, 510, 839)
+POSITION_BINDING_IDS = (
+    2, 3, 5, 6, 10, 15, 17, 18, 22, 24, 26, 27, 39, 114, 120,
+)
+ORDER_BINDING_IDS = (
+    4, 16, 19, 21, 25, 28, 31, 34, 36, 41, 43, 50, 54, 70, 80, 86,
+    94, 98, 101, 102, 105, 108, 116, 118, 119, 121, 128, 145, 146, 147,
+    289,
+)
+TARGET_BINDING_IDS = tuple(sorted(POSITION_BINDING_IDS + ORDER_BINDING_IDS))
 BINDING_TO_LIFECYCLE = {
-    98: 423, 101: 426, 114: 444, 116: 447, 119: 452,
-    121: 460, 128: 469, 145: 508, 146: 509, 147: 510, 289: 839,
+    6: 297, 15: 313, 16: 314, 17: 315, 18: 317, 19: 318, 21: 320,
+    22: 323, 24: 326, 25: 327, 26: 329, 27: 331, 28: 332, 31: 335,
+    34: 338, 36: 342, 39: 345, 41: 348, 43: 351, 50: 363, 54: 368,
+    70: 387, 80: 398, 86: 405, 94: 416, 98: 423, 101: 426, 102: 427,
+    105: 432, 108: 436, 114: 444, 116: 447, 118: 449, 119: 452,
+    120: 457, 121: 460, 128: 469, 145: 508, 146: 509, 147: 510,
+    289: 839,
 }
-PENDING_BINDING_IDS = (98, 101, 116, 119, 121, 128, 145, 146, 147, 289)
-PENDING_LEG_IDS = (
-    192, 193, 198, 199, 225, 226, 230, 231, 234,
-    235, 248, 249, 279, 280, 281, 506, 507,
+POSITION_LEG_IDS = (2, 3, 6, 7, 12, 17, 20, 21, 28, 32, 36, 37, 59, 222, 232)
+ORDER_LEG_IDS = (
+    4, 5, 18, 19, 22, 23, 26, 27, 29, 33, 34, 35, 38, 39, 40, 44,
+    45, 50, 51, 54, 55, 61, 62, 64, 65, 77, 78, 85, 86, 87, 88, 89,
+    90, 142, 143, 161, 162, 184, 185, 192, 193, 198, 199, 200, 201,
+    206, 207, 212, 213, 223, 225, 226, 228, 229, 230, 231, 233, 234,
+    235, 248, 249, 279, 280, 281, 506,
 )
-HISTORICAL_LEG_IDS = (222, 223)
+TERMINAL_GUARD_LEG_IDS = (171, 172, 507)
+TARGET_LEG_IDS = tuple(sorted(POSITION_LEG_IDS + ORDER_LEG_IDS))
+GUARD_LEG_IDS = tuple(sorted(TARGET_LEG_IDS + TERMINAL_GUARD_LEG_IDS))
 INTENT_IDS = (128, 129)
 PROTECTION_LEG_IDS = (545, 546, 547, 548, 549, 550, 551, 552)
 CONVERGENCE_IDS = (149, 150)
-EXPECTED_CHANGED_ROWS = 72
+EXPECTED_CHANGED_ROWS = 173
 
 _TERMINAL_BINDING_STATES = (
     "closed", "cancelled", "canceled", "completed", "failed",
     "resolved", "superseded", "expired", "rejected",
 )
+_TERMINAL_ENTRY_LEG_STATES = (
+    "cancelled", "manually_cancelled", "exchange_cancelled",
+    "manually_closed", "closed", "expired", "invalidated",
+)
+_UNRESOLVED_ORDER_LEG_STATES = (
+    "unknown", "pending", "submitted", "open",
+    "partially_filled", "partial_filled", "partial",
+)
+_TERMINAL_INTENT_STATES = (
+    "resolved", "completed", "cancelled", "canceled", "expired",
+    "rejected", "failed",
+)
+_TERMINAL_DEPENDENT_STATES = (
+    "closed", "cancelled", "canceled", "completed", "failed", "resolved",
+    "superseded", "expired", "rejected", "filled",
+)
 _DRIFT_FIELDS = frozenset({"updated_at", "recovered_at"})
+GUARD_LIFECYCLE_IDS = tuple(
+    sorted(set(ENTERED_LIFECYCLE_IDS) | set(BINDING_TO_LIFECYCLE.values()))
+)
 _TARGET_TABLES = {
-    "strategy_lifecycles": tuple(
-        sorted(set(ENTERED_LIFECYCLE_IDS) | set(BINDING_TO_LIFECYCLE.values()))
-    ),
-    "execution_bindings": tuple(sorted(BINDING_TO_LIFECYCLE)),
-    "execution_order_legs": tuple(sorted(PENDING_LEG_IDS + HISTORICAL_LEG_IDS)),
+    "strategy_lifecycles": GUARD_LIFECYCLE_IDS,
+    "execution_bindings": TARGET_BINDING_IDS,
+    "execution_order_legs": GUARD_LEG_IDS,
     "trigger_protection_intents": INTENT_IDS,
     "position_protection_legs": PROTECTION_LEG_IDS,
     "trigger_take_profit_convergences": CONVERGENCE_IDS,
+}
+_EXPECTED_TARGET_COUNTS = {
+    "entered_lifecycles": 25,
+    "pending_lifecycles": 10,
+    "execution_bindings": 46,
+    "execution_order_legs": 80,
+    "trigger_protection_intents": 2,
+    "position_protection_legs": 8,
+    "trigger_take_profit_convergences": 2,
 }
 
 
@@ -58,6 +104,7 @@ class AlignmentInspection:
     action_count: int
     exchange_fingerprint: str
     target_counts: Mapping[str, int]
+    guard_counts: Mapping[str, int]
 
 
 @dataclass(frozen=True, slots=True)
@@ -99,7 +146,8 @@ def inspect_alignment(
         fingerprint=_fingerprint({"code_sha": code_sha, "state": state}),
         action_count=EXPECTED_CHANGED_ROWS,
         exchange_fingerprint=_fingerprint(exchange),
-        target_counts={name: len(rows) for name, rows in state.items()},
+        target_counts=dict(_EXPECTED_TARGET_COUNTS),
+        guard_counts={name: len(rows) for name, rows in state.items()},
     )
 
 
@@ -133,7 +181,7 @@ def apply_alignment(
         if actual != expected_fingerprint:
             raise AlignmentRefused("database_state_changed")
         _require_audits_absent(
-            connection, code_sha=code_sha, repair_value=repair_value
+            connection, state=state, code_sha=code_sha, repair_value=repair_value
         )
         steps = (
             ("strategy_lifecycles", _update_entered_lifecycles),
@@ -153,7 +201,7 @@ def apply_alignment(
             connection, state=state, code_sha=code_sha, repair_value=repair_value
         )
         attribution_count = _insert_attribution_audits(
-            connection, code_sha=code_sha, repair_value=repair_value
+            connection, state=state, code_sha=code_sha, repair_value=repair_value
         )
         if sum(changed.values()) != EXPECTED_CHANGED_ROWS:
             raise AlignmentRefused("changed_row_count_mismatch")
@@ -177,130 +225,193 @@ def apply_alignment(
 def _read_and_validate_state(
     connection: sqlite3.Connection,
 ) -> dict[str, list[dict[str, Any]]]:
+    _derive_and_validate_targets(connection)
     state = {
         table: _read_rows(connection, table, ids)
         for table, ids in _TARGET_TABLES.items()
     }
-    entered = tuple(
-        row[0]
-        for row in connection.execute(
-            "SELECT id FROM strategy_lifecycles "
-            "WHERE lifecycle_status='entered' ORDER BY id"
-        )
-    )
-    if entered != ENTERED_LIFECYCLE_IDS:
-        raise AlignmentRefused("entered_lifecycle_set_changed")
-    terminal_slots = ",".join("?" for _ in _TERMINAL_BINDING_STATES)
-    active_bindings = tuple(
-        row[0]
-        for row in connection.execute(
-            "SELECT id FROM execution_bindings WHERE venue='deepcoin' "
-            f"AND lower(status) NOT IN ({terminal_slots}) ORDER BY id",
-            _TERMINAL_BINDING_STATES,
-        )
-    )
-    if active_bindings != tuple(sorted(BINDING_TO_LIFECYCLE)):
-        raise AlignmentRefused("active_binding_set_changed")
-    binding_slots = ",".join("?" for _ in BINDING_TO_LIFECYCLE)
-    for table, expected, reason in (
-        (
-            "execution_order_legs",
-            tuple(sorted(PENDING_LEG_IDS + HISTORICAL_LEG_IDS)),
-            "entry_leg_set_changed",
-        ),
-        ("trigger_protection_intents", INTENT_IDS, "trigger_intent_set_changed"),
-        ("position_protection_legs", PROTECTION_LEG_IDS, "protection_leg_set_changed"),
-        (
-            "trigger_take_profit_convergences",
-            CONVERGENCE_IDS,
-            "convergence_set_changed",
-        ),
-    ):
-        ids = tuple(
-            row[0]
-            for row in connection.execute(
-                f"SELECT id FROM {table} WHERE execution_binding_id IN "
-                f"({binding_slots}) ORDER BY id",
-                tuple(BINDING_TO_LIFECYCLE),
-            )
-        )
-        if ids != expected:
-            raise AlignmentRefused(reason)
-
-    lifecycles = {row["id"]: row for row in state["strategy_lifecycles"]}
-    bindings = {row["id"]: row for row in state["execution_bindings"]}
-    legs = {row["id"]: row for row in state["execution_order_legs"]}
-    for lifecycle_id in ENTERED_LIFECYCLE_IDS:
-        row = lifecycles[lifecycle_id]
-        expected_binding = 114 if lifecycle_id == 444 else None
-        if (
-            row["lifecycle_status"] != "entered"
-            or row["execution_binding_id"] != expected_binding
-        ):
-            raise AlignmentRefused("entered_lifecycle_changed")
-    expected_binding_status = {
-        98: "stale",
-        101: "stale",
-        114: "unknown",
-        116: "stale",
-    }
-    for binding_id, lifecycle_id in BINDING_TO_LIFECYCLE.items():
-        lifecycle = lifecycles[lifecycle_id]
-        binding = bindings[binding_id]
-        if lifecycle["execution_binding_id"] != binding_id:
-            raise AlignmentRefused("binding_lifecycle_identity_changed")
-        if binding_id != 114 and lifecycle["lifecycle_status"] != "pending_entry":
-            raise AlignmentRefused("pending_lifecycle_changed")
-        if (
-            binding["venue"] != "deepcoin"
-            or binding["status"] != expected_binding_status.get(binding_id, "open")
-            or binding["pos_id"] is not None
-        ):
-            raise AlignmentRefused("binding_state_changed")
-    expected_leg_binding = {
-        192: 98, 193: 98, 198: 101, 199: 101, 222: 114, 223: 114,
-        225: 116, 226: 116, 230: 119, 231: 119, 234: 121, 235: 121,
-        248: 128, 249: 128, 279: 145, 280: 146, 281: 147, 506: 289, 507: 289,
-    }
-    for leg_id, binding_id in expected_leg_binding.items():
-        row = legs[leg_id]
-        if (
-            row["execution_binding_id"] != binding_id
-            or row["venue"] != "deepcoin"
-            or row["purpose"] != "entry"
-            or row["order_kind"] != "trigger_limit"
-        ):
-            raise AlignmentRefused("entry_leg_identity_changed")
-    if not (
-        legs[222]["status"] == "active"
-        and legs[222]["attribution_status"] == "attribution_conflict"
-        and legs[222]["pos_id"] == "1001124072502100"
-        and legs[223]["status"] == "unknown"
-        and legs[223]["pos_id"] is None
-    ):
-        raise AlignmentRefused("historical_leg_state_changed")
-    for leg_id in PENDING_LEG_IDS:
-        if (
-            legs[leg_id]["status"] not in {"unknown", "pending", "cancelled"}
-            or legs[leg_id]["pos_id"] is not None
-        ):
-            raise AlignmentRefused("pending_leg_state_changed")
-    for row in state["trigger_protection_intents"]:
-        if row["execution_binding_id"] != 289 or row["recovery_state"] != "pending":
-            raise AlignmentRefused("trigger_intent_set_changed")
-    for row in state["position_protection_legs"]:
-        if row["execution_binding_id"] != 289 or row["status"] != "planned":
-            raise AlignmentRefused("protection_leg_set_changed")
-    for row in state["trigger_take_profit_convergences"]:
-        if (
-            row["execution_binding_id"] != 289
-            or row["status"] != "waiting_backup_stop"
-        ):
-            raise AlignmentRefused("convergence_set_changed")
     return {
         table: [_without_runtime_timestamps(row) for row in rows]
         for table, rows in state.items()
     }
+
+
+def _derive_and_validate_targets(connection: sqlite3.Connection) -> None:
+    entered = _query_ids(
+        connection,
+        "SELECT id FROM strategy_lifecycles "
+        "WHERE lifecycle_status='entered' ORDER BY id",
+    )
+    if entered != ENTERED_LIFECYCLE_IDS:
+        raise AlignmentRefused("entered_lifecycle_target_set_changed")
+
+    position_bindings, order_bindings = _query_binding_claims(connection)
+    if position_bindings != POSITION_BINDING_IDS:
+        raise AlignmentRefused("position_binding_target_set_changed")
+    if order_bindings != ORDER_BINDING_IDS:
+        raise AlignmentRefused("order_binding_target_set_changed")
+
+    binding_slots = _slots(TARGET_BINDING_IDS)
+    relationship_rows = tuple(
+        (int(row[0]), int(row[1]))
+        for row in connection.execute(
+            "SELECT execution_binding_id,id FROM strategy_lifecycles "
+            f"WHERE execution_binding_id IN ({binding_slots}) "
+            "ORDER BY execution_binding_id,id",
+            TARGET_BINDING_IDS,
+        )
+    )
+    if relationship_rows != tuple(sorted(BINDING_TO_LIFECYCLE.items())):
+        raise AlignmentRefused("binding_lifecycle_relationship_set_changed")
+
+    pending_lifecycles = _query_ids(
+        connection,
+        "SELECT id FROM strategy_lifecycles "
+        f"WHERE execution_binding_id IN ({binding_slots}) "
+        "AND lifecycle_status='pending_entry' ORDER BY id",
+        TARGET_BINDING_IDS,
+    )
+    if pending_lifecycles != PENDING_LIFECYCLE_IDS:
+        raise AlignmentRefused("pending_lifecycle_target_set_changed")
+
+    terminal_leg_slots = _slots(_TERMINAL_ENTRY_LEG_STATES)
+    guard_legs = _query_ids(
+        connection,
+        "SELECT id FROM execution_order_legs "
+        f"WHERE execution_binding_id IN ({binding_slots}) "
+        "AND purpose='entry' ORDER BY id",
+        TARGET_BINDING_IDS,
+    )
+    if guard_legs != GUARD_LEG_IDS:
+        raise AlignmentRefused("entry_leg_guard_set_changed")
+    target_legs = _query_ids(
+        connection,
+        "SELECT id FROM execution_order_legs "
+        f"WHERE execution_binding_id IN ({binding_slots}) "
+        "AND purpose='entry' "
+        f"AND lower(status) NOT IN ({terminal_leg_slots}) ORDER BY id",
+        TARGET_BINDING_IDS + _TERMINAL_ENTRY_LEG_STATES,
+    )
+    if target_legs != TARGET_LEG_IDS:
+        raise AlignmentRefused("entry_leg_target_set_changed")
+    position_legs = _query_ids(
+        connection,
+        "SELECT id FROM execution_order_legs "
+        f"WHERE id IN ({_slots(TARGET_LEG_IDS)}) "
+        "AND nullif(trim(pos_id),'') IS NOT NULL ORDER BY id",
+        TARGET_LEG_IDS,
+    )
+    if position_legs != POSITION_LEG_IDS:
+        raise AlignmentRefused("position_leg_target_set_changed")
+    if tuple(row for row in target_legs if row not in set(position_legs)) != ORDER_LEG_IDS:
+        raise AlignmentRefused("order_leg_target_set_changed")
+
+    dependent_specs = (
+        (
+            "trigger_protection_intents",
+            "recovery_state",
+            _TERMINAL_INTENT_STATES,
+            INTENT_IDS,
+            "trigger_intent_target_set_changed",
+        ),
+        (
+            "position_protection_legs",
+            "status",
+            _TERMINAL_DEPENDENT_STATES,
+            PROTECTION_LEG_IDS,
+            "protection_leg_target_set_changed",
+        ),
+        (
+            "trigger_take_profit_convergences",
+            "status",
+            _TERMINAL_DEPENDENT_STATES,
+            CONVERGENCE_IDS,
+            "convergence_target_set_changed",
+        ),
+    )
+    for table, status_column, terminal_states, expected, reason in dependent_specs:
+        ids = _query_ids(
+            connection,
+            f"SELECT id FROM {table} "
+            f"WHERE execution_binding_id IN ({binding_slots}) "
+            f"AND lower({status_column}) NOT IN ({_slots(terminal_states)}) "
+            "ORDER BY id",
+            TARGET_BINDING_IDS + terminal_states,
+        )
+        if ids != expected:
+            raise AlignmentRefused(reason)
+
+
+def _query_binding_claims(
+    connection: sqlite3.Connection,
+) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    binding_terminal_slots = _slots(_TERMINAL_BINDING_STATES)
+    leg_terminal_slots = _slots(_TERMINAL_ENTRY_LEG_STATES)
+    unresolved_order_slots = _slots(_UNRESOLVED_ORDER_LEG_STATES)
+    intent_terminal_slots = _slots(_TERMINAL_INTENT_STATES)
+    dependent_terminal_slots = _slots(_TERMINAL_DEPENDENT_STATES)
+    rows = connection.execute(
+        "WITH nonterminal AS ("
+        " SELECT b.* FROM execution_bindings b WHERE b.venue='deepcoin' "
+        f" AND lower(b.status) NOT IN ({binding_terminal_slots})"
+        ") SELECT b.id,"
+        " CASE WHEN nullif(trim(b.pos_id),'') IS NOT NULL"
+        "   OR EXISTS (SELECT 1 FROM strategy_lifecycles s"
+        "              WHERE s.execution_binding_id=b.id"
+        "              AND s.lifecycle_status='entered')"
+        "   OR EXISTS (SELECT 1 FROM execution_order_legs l"
+        "              WHERE l.execution_binding_id=b.id"
+        "              AND nullif(trim(l.pos_id),'') IS NOT NULL"
+        f"              AND lower(l.status) NOT IN ({leg_terminal_slots}))"
+        " THEN 1 ELSE 0 END AS claims_position,"
+        " CASE WHEN lower(b.status) IN ('open','active')"
+        "   OR EXISTS (SELECT 1 FROM execution_order_legs l"
+        "              WHERE l.execution_binding_id=b.id"
+        "              AND nullif(trim(l.order_id),'') IS NOT NULL"
+        f"              AND lower(l.status) IN ({unresolved_order_slots}))"
+        "   OR EXISTS (SELECT 1 FROM trigger_protection_intents i"
+        "              WHERE i.execution_binding_id=b.id"
+        "              AND (nullif(trim(i.parent_trigger_order_id),'') IS NOT NULL"
+        "                   OR nullif(trim(i.adopted_order_id),'') IS NOT NULL)"
+        f"              AND lower(i.recovery_state) NOT IN ({intent_terminal_slots}))"
+        "   OR EXISTS (SELECT 1 FROM position_protection_legs p"
+        "              WHERE p.execution_binding_id=b.id"
+        "              AND nullif(trim(p.exchange_order_id),'') IS NOT NULL"
+        f"              AND lower(p.status) NOT IN ({dependent_terminal_slots}))"
+        " THEN 1 ELSE 0 END AS claims_order"
+        " FROM nonterminal b ORDER BY b.id",
+        (
+            _TERMINAL_BINDING_STATES
+            + _TERMINAL_ENTRY_LEG_STATES
+            + _UNRESOLVED_ORDER_LEG_STATES
+            + _TERMINAL_INTENT_STATES
+            + _TERMINAL_DEPENDENT_STATES
+        ),
+    )
+    position: list[int] = []
+    order: list[int] = []
+    for binding_id, claims_position, claims_order in rows:
+        if claims_position:
+            position.append(int(binding_id))
+        elif claims_order:
+            order.append(int(binding_id))
+    return tuple(position), tuple(order)
+
+
+def _query_ids(
+    connection: sqlite3.Connection,
+    sql: str,
+    parameters: tuple[Any, ...] = (),
+) -> tuple[int, ...]:
+    return tuple(int(row[0]) for row in connection.execute(sql, parameters))
+
+
+def _slots(values: tuple[Any, ...]) -> str:
+    return ",".join("?" for _ in values)
+
+
+def _sql_literals(values: tuple[str, ...]) -> str:
+    return ",".join("'" + value.replace("'", "''") + "'" for value in values)
 
 
 def _update_entered_lifecycles(connection, repair_value: str) -> int:
@@ -319,7 +430,7 @@ def _update_pending_lifecycles(connection, repair_value: str) -> int:
     return _update_ids(
         connection,
         "strategy_lifecycles",
-        tuple(BINDING_TO_LIFECYCLE[row] for row in PENDING_BINDING_IDS),
+        PENDING_LIFECYCLE_IDS,
         "lifecycle_status='expired',exit_reason='expired',exited_at=?,"
         "management_action='operator_cancelled_pending_entries',"
         "management_note='All unfilled entry orders were cancelled at Deepcoin.',"
@@ -330,47 +441,49 @@ def _update_pending_lifecycles(connection, repair_value: str) -> int:
 
 
 def _update_bindings(connection, repair_value: str) -> int:
-    historical = _update_ids(
+    positions = _update_ids(
         connection,
         "execution_bindings",
-        (114,),
+        POSITION_BINDING_IDS,
         "status='closed',pos_id=NULL,last_exchange_status='historical_cleanup_terminal',"
         "recovered_at=?,updated_at=?",
         (repair_value, repair_value),
-        "status='unknown' AND pos_id IS NULL",
+        f"lower(status) NOT IN ({_sql_literals(_TERMINAL_BINDING_STATES)})",
     )
-    pending = _update_ids(
+    orders = _update_ids(
         connection,
         "execution_bindings",
-        PENDING_BINDING_IDS,
+        ORDER_BINDING_IDS,
         "status='cancelled',pos_id=NULL,"
         "last_exchange_status='operator_cancelled_pending_entries',updated_at=?",
         (repair_value,),
-        "pos_id IS NULL",
+        f"lower(status) NOT IN ({_sql_literals(_TERMINAL_BINDING_STATES)})",
     )
-    return historical + pending
+    return positions + orders
 
 
 def _update_order_legs(connection, repair_value: str) -> int:
-    historical = _update_ids(
+    positions = _update_ids(
         connection,
         "execution_order_legs",
-        HISTORICAL_LEG_IDS,
+        POSITION_LEG_IDS,
         "status='closed',terminal_reason='historical_exchange_position_closed',"
         "last_verified_at=?,updated_at=?",
         (repair_value, repair_value),
-        "purpose='entry'",
+        "purpose='entry' AND nullif(trim(pos_id),'') IS NOT NULL "
+        f"AND lower(status) NOT IN ({_sql_literals(_TERMINAL_ENTRY_LEG_STATES)})",
     )
-    pending = _update_ids(
+    orders = _update_ids(
         connection,
         "execution_order_legs",
-        PENDING_LEG_IDS,
+        ORDER_LEG_IDS,
         "status='cancelled',terminal_reason='operator_cancelled_unfilled_entry_leg',"
         "last_verified_at=?,updated_at=?",
         (repair_value, repair_value),
-        "purpose='entry' AND pos_id IS NULL",
+        "purpose='entry' AND nullif(trim(pos_id),'') IS NULL "
+        f"AND lower(status) IN ({_sql_literals(_UNRESOLVED_ORDER_LEG_STATES)})",
     )
-    return historical + pending
+    return positions + orders
 
 
 def _update_intents(connection, repair_value: str) -> int:
@@ -413,14 +526,14 @@ def _insert_execution_audits(
     connection, *, state, code_sha: str, repair_value: str
 ) -> int:
     bindings = {row["id"]: row for row in state["execution_bindings"]}
-    lifecycles = {row["id"]: row for row in state["strategy_lifecycles"]}
     legs = {row["id"]: row for row in state["execution_order_legs"]}
     rows = []
-    for leg_id in PENDING_LEG_IDS:
+    audited_binding_ids: set[int] = set()
+    for leg_id in ORDER_LEG_IDS:
         leg = legs[leg_id]
         binding_id = leg["execution_binding_id"]
+        audited_binding_ids.add(int(binding_id))
         binding = bindings[binding_id]
-        lifecycle = lifecycles[BINDING_TO_LIFECYCLE[binding_id]]
         rows.append(
             (
                 binding_id,
@@ -428,8 +541,8 @@ def _insert_execution_audits(
                 "deepcoin",
                 "reconcile_manual_pending_entry_cancel",
                 "confirmed",
-                lifecycle.get("chat_id"),
-                lifecycle.get("message_id"),
+                binding.get("chat_id"),
+                binding.get("message_id"),
                 binding.get("symbol"),
                 binding.get("side"),
                 leg.get("order_id"),
@@ -438,7 +551,32 @@ def _insert_execution_audits(
                 None,
                 repair_value,
                 "not_needed",
-                _audit_hash(code_sha, repair_value, "pending", leg_id),
+                _audit_hash(code_sha, repair_value, "order_leg", leg_id),
+                0,
+            )
+        )
+    for binding_id in ORDER_BINDING_IDS:
+        if binding_id in audited_binding_ids:
+            continue
+        binding = bindings[binding_id]
+        rows.append(
+            (
+                binding_id,
+                binding.get("strategy_instance_id"),
+                "deepcoin",
+                "reconcile_manual_pending_entry_cancel",
+                "confirmed",
+                binding.get("chat_id"),
+                binding.get("message_id"),
+                binding.get("symbol"),
+                binding.get("side"),
+                binding.get("order_id"),
+                "operator_confirmed_all_entry_orders_cancelled",
+                _canonical({"pending": False, "terminalized": True}),
+                None,
+                repair_value,
+                "not_needed",
+                _audit_hash(code_sha, repair_value, "order_binding", binding_id),
                 0,
             )
         )
@@ -460,7 +598,7 @@ def _insert_execution_audits(
                 {
                     "code_sha": code_sha,
                     "entered_lifecycle_ids": ENTERED_LIFECYCLE_IDS,
-                    "binding_ids": tuple(sorted(BINDING_TO_LIFECYCLE)),
+                    "binding_ids": TARGET_BINDING_IDS,
                     "reason": "complete_exchange_snapshot_empty",
                 }
             ),
@@ -482,33 +620,90 @@ def _insert_execution_audits(
 
 
 def _insert_attribution_audits(
-    connection, *, code_sha: str, repair_value: str
+    connection, *, state, code_sha: str, repair_value: str
 ) -> int:
-    specs = (
-        (222, "1001124072502100", "active", "closed", "terminalize_historical_entry_leg"),
-        (223, None, "unknown", "closed", "terminalize_historical_entry_leg"),
-        (None, None, "unknown", "closed", "close_historical_binding"),
-        (None, None, "entered", "exited", "exit_historical_lifecycle"),
-    )
+    bindings = {row["id"]: row for row in state["execution_bindings"]}
+    legs = {row["id"]: row for row in state["execution_order_legs"]}
+    lifecycles = {row["id"]: row for row in state["strategy_lifecycles"]}
     rows = []
-    for index, (leg_id, pos_id, prior, new, action) in enumerate(specs, 1):
+    for leg_id in POSITION_LEG_IDS:
+        leg = legs[leg_id]
+        binding_id = int(leg["execution_binding_id"])
         rows.append(
             (
-                114,
+                binding_id,
                 leg_id,
                 "deepcoin",
-                pos_id,
+                leg.get("pos_id"),
                 "historical_cleanup",
-                prior,
-                new,
-                _audit_hash(code_sha, repair_value, "historical", index),
+                leg.get("status"),
+                "closed",
+                _audit_hash(code_sha, repair_value, "position_leg", leg_id),
                 _canonical(
                     {
-                        "action": action,
+                        "action": "terminalize_historical_entry_leg",
                         "code_sha": code_sha,
-                        "lifecycle_id": 444,
-                        "old_pos_id": pos_id,
-                        "new_pos_id": pos_id,
+                        "lifecycle_id": BINDING_TO_LIFECYCLE.get(binding_id),
+                        "old_pos_id": leg.get("pos_id"),
+                        "new_pos_id": leg.get("pos_id"),
+                        "terminal_evidence": {
+                            "source": "complete_exchange_snapshot_empty",
+                            "reason": "exchange_closed",
+                        },
+                    }
+                ),
+                repair_value,
+            )
+        )
+    for binding_id in POSITION_BINDING_IDS:
+        binding = bindings[binding_id]
+        rows.append(
+            (
+                binding_id,
+                None,
+                "deepcoin",
+                binding.get("pos_id"),
+                "historical_cleanup",
+                binding.get("status"),
+                "closed",
+                _audit_hash(code_sha, repair_value, "position_binding", binding_id),
+                _canonical(
+                    {
+                        "action": "close_historical_binding",
+                        "code_sha": code_sha,
+                        "lifecycle_id": BINDING_TO_LIFECYCLE.get(binding_id),
+                        "old_pos_id": binding.get("pos_id"),
+                        "new_pos_id": None,
+                        "terminal_evidence": {
+                            "source": "complete_exchange_snapshot_empty",
+                            "reason": "exchange_closed",
+                        },
+                    }
+                ),
+                repair_value,
+            )
+        )
+    for lifecycle_id in ENTERED_LIFECYCLE_IDS:
+        lifecycle = lifecycles[lifecycle_id]
+        rows.append(
+            (
+                lifecycle.get("execution_binding_id"),
+                None,
+                "deepcoin",
+                None,
+                "historical_cleanup",
+                lifecycle.get("lifecycle_status"),
+                "exited",
+                _audit_hash(
+                    code_sha, repair_value, "entered_lifecycle", lifecycle_id
+                ),
+                _canonical(
+                    {
+                        "action": "exit_historical_lifecycle",
+                        "code_sha": code_sha,
+                        "lifecycle_id": lifecycle_id,
+                        "old_pos_id": None,
+                        "new_pos_id": None,
                         "terminal_evidence": {
                             "source": "complete_exchange_snapshot_empty",
                             "reason": "exchange_closed",
@@ -529,15 +724,35 @@ def _insert_attribution_audits(
 
 
 def _require_audits_absent(
-    connection, *, code_sha: str, repair_value: str
+    connection, *, state, code_sha: str, repair_value: str
 ) -> None:
     execution_hashes = [
-        _audit_hash(code_sha, repair_value, "pending", leg_id)
-        for leg_id in PENDING_LEG_IDS
+        _audit_hash(code_sha, repair_value, "order_leg", leg_id)
+        for leg_id in ORDER_LEG_IDS
     ] + [_audit_hash(code_sha, repair_value, "summary", 0)]
+    order_leg_binding_ids = {
+        int(row["execution_binding_id"])
+        for row in state["execution_order_legs"]
+        if int(row["id"]) in set(ORDER_LEG_IDS)
+    }
+    execution_hashes.extend(
+        _audit_hash(code_sha, repair_value, "order_binding", binding_id)
+        for binding_id in ORDER_BINDING_IDS
+        if binding_id not in order_leg_binding_ids
+    )
     attribution_hashes = [
-        _audit_hash(code_sha, repair_value, "historical", index)
-        for index in range(1, 5)
+        *(
+            _audit_hash(code_sha, repair_value, "position_leg", leg_id)
+            for leg_id in POSITION_LEG_IDS
+        ),
+        *(
+            _audit_hash(code_sha, repair_value, "position_binding", binding_id)
+            for binding_id in POSITION_BINDING_IDS
+        ),
+        *(
+            _audit_hash(code_sha, repair_value, "entered_lifecycle", lifecycle_id)
+            for lifecycle_id in ENTERED_LIFECYCLE_IDS
+        ),
     ]
     for table, column, hashes in (
         ("execution_events", "notification_fingerprint", execution_hashes),
@@ -556,22 +771,26 @@ def _validate_postconditions(connection) -> None:
         "WHERE lifecycle_status='entered' LIMIT 1"
     ).fetchone() is not None:
         raise AlignmentRefused("entered_lifecycle_remains")
-    slots = ",".join("?" for _ in _TERMINAL_BINDING_STATES)
-    if connection.execute(
-        "SELECT 1 FROM execution_bindings WHERE venue='deepcoin' "
-        f"AND lower(status) NOT IN ({slots}) LIMIT 1",
-        _TERMINAL_BINDING_STATES,
-    ).fetchone() is not None:
-        raise AlignmentRefused("active_binding_remains")
-    binding_ids = tuple(sorted(BINDING_TO_LIFECYCLE))
-    binding_slots = ",".join("?" for _ in binding_ids)
+    position_claims, order_claims = _query_binding_claims(connection)
+    if position_claims:
+        raise AlignmentRefused("position_binding_claim_remains")
+    if order_claims:
+        raise AlignmentRefused("order_binding_claim_remains")
+    binding_slots = _slots(TARGET_BINDING_IDS)
     if connection.execute(
         "SELECT 1 FROM execution_order_legs WHERE execution_binding_id IN "
-        f"({binding_slots}) AND lower(status) NOT IN "
-        "('closed','cancelled','canceled','expired','rejected','filled') LIMIT 1",
-        binding_ids,
+        f"({binding_slots}) AND purpose='entry' AND lower(status) NOT IN "
+        f"({_slots(_TERMINAL_ENTRY_LEG_STATES)}) LIMIT 1",
+        TARGET_BINDING_IDS + _TERMINAL_ENTRY_LEG_STATES,
     ).fetchone() is not None:
         raise AlignmentRefused("active_order_leg_remains")
+    if connection.execute(
+        "SELECT 1 FROM strategy_lifecycles "
+        f"WHERE execution_binding_id IN ({binding_slots}) "
+        "AND lifecycle_status='pending_entry' LIMIT 1",
+        TARGET_BINDING_IDS,
+    ).fetchone() is not None:
+        raise AlignmentRefused("pending_lifecycle_remains")
 
 
 def _read_rows(connection, table: str, ids) -> list[dict[str, Any]]:
