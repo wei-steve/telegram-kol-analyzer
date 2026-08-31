@@ -45,9 +45,9 @@ backlog_preterminalization_expired_count: 154
 backlog_preterminalization_remaining_post_watermark_pending_count: 28
 backlog_preterminalization_final_seal_executed: false
 backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
-local_exchange_alignment_implementation_sha: 829cfa49a00ee8db20451b149afc353e17e60291
-local_exchange_alignment_final_suite: 6731_passed_4_skipped_32_warnings
-local_exchange_alignment_status: dry_run_failed_closed_claim_census_complete_unified_repair_planned
+local_exchange_alignment_implementation_sha: 00cda0602bfa940ddddfc87e63eeffd92b9984ee
+local_exchange_alignment_final_suite: 6737_passed_4_skipped_32_warnings
+local_exchange_alignment_status: unified_claim_alignment_reviewed_tested_ready_for_production
 local_exchange_alignment_exchange_snapshot_at: 2026-08-31T12:58:25.021309Z
 local_exchange_alignment_position_read: complete_zero
 local_exchange_alignment_regular_order_read: complete_zero
@@ -72,7 +72,7 @@ local_exchange_alignment_unified_related_entry_leg_guard_count: 83
 local_exchange_alignment_unified_target_intent_count: 2
 local_exchange_alignment_unified_target_protection_leg_count: 8
 local_exchange_alignment_unified_target_convergence_count: 2
-local_exchange_alignment_unified_plan_status: planned_not_implemented
+local_exchange_alignment_unified_plan_status: implemented_reviewed_tested
 local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
@@ -3580,3 +3580,34 @@ This is a plan only. No command was changed or run, no writable transaction,
 `BEGIN IMMEDIATE` or runtime-control lock was opened, no
 lifecycle/binding/leg/intent/protection/convergence row was written, and entry
 admission remains frozen.
+
+## Unified claim alignment implementation checkpoint
+
+The previously approved claim census is now implemented locally and ready for
+the separately authorized production dry-run/apply window:
+
+- Exact reviewed production-code commit
+  `00cda0602bfa940ddddfc87e63eeffd92b9984ee` replaces the old 20/11 global-set
+  assertions with the approved exact claim-derived cohort: 25 entered
+  lifecycles, 46 bindings, 80 mutable entry legs, two intents, eight protection
+  legs and two convergences. The ten approved `pending_entry` lifecycles are
+  included in the 35 lifecycle mutations.
+- The substantive fingerprint covers 65 related lifecycles, all 46 target
+  bindings and all 83 related entry legs. The 52 no-claim bindings remain
+  outside the mutation target, and only `updated_at` / `recovered_at` drift is
+  ignored.
+- Review found and the final candidate fixed two fail-closed gaps before
+  production: the exchange evidence must contain complete, error-free, empty
+  pending-trigger results for each of `BTC-USDT-SWAP`, `ETH-USDT-SWAP` and
+  `SOL-USDT-SWAP`; and only `purpose='entry'` order legs can create a position
+  or active-order claim. The independent exact-base re-review returned no
+  findings and its isolated focused run passed 15 tests.
+- Local RED/GREEN and CLI coverage passed 97 tests. The final full suite passed
+  `6737` tests with `4` skips and `32` warnings in `416.19s`. Its first run had
+  one unrelated stale documentation assertion that still fixed `current_phase`
+  to the completed manual-cleanup phase; that obsolete assertion was removed,
+  its focused test passed, and the full suite then passed.
+
+No production exchange read, database backup, dry-run, `BEGIN IMMEDIATE` or
+apply was performed at this checkpoint. No service was controlled, no message
+was processed, final seal was not executed, and entry admission remains frozen.
