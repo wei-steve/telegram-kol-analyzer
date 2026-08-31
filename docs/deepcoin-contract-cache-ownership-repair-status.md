@@ -4,7 +4,7 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: manual_cleanup_production_cutover
-phase_state: in_progress
+phase_state: complete
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
 candidate_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
 candidate_content_sha: 588d1aadb47f25ca56f4e3815cff3dff67892f2d6f97b738a0a85bbb1a8c24ea
@@ -16,7 +16,14 @@ production_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
 production_activation_status: succeeded
 production_runtime_state: running_entry_frozen
 entry_admission_frozen: true
-l2_observation_status: in_progress_insufficient_realtime_messages
+l2_observation_status: complete_6_realtime_messages_5_chats
+l2_observation_completed_at: 2026-08-31T04:48:48.233Z
+frozen_queue_investigation_status: complete_read_only
+frozen_queue_pending_nonshadow_count: 154
+frozen_queue_attempt_zero_count: 154
+frozen_queue_claimed_count: 0
+frozen_queue_existing_candidate_count: 0
+frozen_queue_entry_thaw_executed: false
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -2901,3 +2908,117 @@ activation.
   `/var/lib/telegram-kol-cutover-evidence/cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62/monitor-install-20260831T035406Z-2221406`.
   Final observation evidence is mode `0600`, SHA-256
   `e671f56d5b1d2e21c41650259796869bb48d7af9f59be88b6b8a48218cb513bb`.
+
+## Frozen-entry backlog investigation and L2 observation completion
+
+- The authoritative YAML checkpoint was corrected and pushed before this
+  investigation as commit `2ff64269d795588b30236bb817ff76fb4232de4e`.
+  Production and candidate are exact `cf30fdf7...`, activation succeeded and
+  entry admission remains frozen. This investigation performed only SQLite
+  query-only reads, process/status reads and local documentation updates.
+- The earlier estimate of about 55 pending jobs was incomplete. At
+  `2026-08-31T04:48:48.233Z`, production had exactly 154 non-shadow pending
+  jobs, all at attempt count zero, no claimed jobs and no existing signal
+  candidate for any of those raw messages. The exact composition is 36 original
+  same-chat jobs, 19 history jobs from the successful startup, six subsequent
+  live `queue_enqueued` jobs, and 93 older jobs accumulated by earlier brief
+  starts. The grouped snapshot is:
+
+  | chat | enqueue reason | count | enqueued UTC range | attempts |
+  | --- | --- | ---: | --- | ---: |
+  | -1003942765613 | history_reconcile_enqueued | 2 | 2026-08-30 23:27:41.787920..23:27:41.787924 | 0 |
+  | -1003344714145 | queue_enqueued | 1 | 2026-08-30 09:58:05.004279 | 0 |
+  | -1003095914903 | history_reconcile_enqueued | 19 | 2026-08-30 09:08:11.461770..2026-08-31 03:56:02.837673 | 0 |
+  | -1003053031367 | history_reconcile_enqueued | 9 | 2026-08-30 23:27:30.001583..2026-08-31 00:32:47.723605 | 0 |
+  | -1003048800035 | history_reconcile_enqueued | 10 | 2026-08-30 09:08:11.631038..2026-08-31 03:56:02.993885 | 0 |
+  | -1003048800035 | queue_enqueued | 1 | 2026-08-31 04:41:11.443916 | 0 |
+  | -1002960443256 | history_reconcile_enqueued | 16 | 2026-08-30 09:08:09.657521..2026-08-31 02:51:23.508219 | 0 |
+  | -1002960443256 | queue_enqueued | 1 | 2026-08-31 04:31:26.654175 | 0 |
+  | -1002805019371 | history_reconcile_enqueued | 1 | 2026-08-31 03:56:02.430604 | 0 |
+  | -1002805019371 | queue_enqueued | 2 | 2026-08-31 03:56:18.958603..04:03:37.658217 | 0 |
+  | -1002409877375 | history_reconcile_enqueued | 16 | 2026-08-30 09:08:11.000785..2026-08-31 00:32:46.790463 | 0 |
+  | -1002409877375 | queue_enqueued | 2 | 2026-08-31 00:32:54.822680..04:20:45.826487 | 0 |
+  | -1002370796392 | history_reconcile_enqueued | 1 | 2026-08-30 11:25:01.321408 | 0 |
+  | -1002368892075 | history_reconcile_enqueued | 6 | 2026-08-30 23:27:46.779811..2026-08-31 03:56:02.168663 | 0 |
+  | -1002368892075 | queue_enqueued | 1 | 2026-08-31 04:18:25.952528 | 0 |
+  | -1002344190971 | history_reconcile_enqueued | 33 | 2026-08-30 09:08:05.794480..23:27:38.891191 | 0 |
+  | -1002344190971 | recovery_enqueued | 2 | 2026-08-30 11:38:53.548692..11:38:53.548694 | 0 |
+  | -1002344190971 | queue_enqueued | 1 | 2026-08-30 11:50:39.693853 | 0 |
+  | -1002337721508 | history_reconcile_enqueued | 18 | 2026-08-30 09:08:10.611466..2026-08-31 03:56:01.334603 | 0 |
+  | -1002282384698 | history_reconcile_enqueued | 6 | 2026-08-31 00:32:46.538797..00:32:46.538819 | 0 |
+  | -1002199068560 | history_reconcile_enqueued | 6 | 2026-08-30 23:27:46.448620..23:27:46.448635 | 0 |
+
+- The worker does not claim these rows because deployment entry freeze stops
+  the entire message-processing worker at `web_app.py:5459-5460`, before it
+  reads queue mode or starts recognition. Runtime identity consequently and
+  correctly reports `health.message_processing=false`. This is stronger than
+  an exchange-write-only freeze: ingestion still persists/enqueues messages,
+  but recognition does not run. The queue itself is healthy enough to be due:
+  all 154 rows have null claims and no retry delay.
+- The two older same-chat lifecycles are ids 360/LIT/long and 710/UAI/short,
+  both `pending_entry` and both without an execution binding. They are not a
+  lane blocker. Claim SQL considers only non-shadow jobs in `pending` or
+  `claimed`, selects `ROW_NUMBER()` by `chat_id` and `raw_message_id`, and never
+  joins lifecycle state. Those two rows can influence later AI target context,
+  but cannot prevent queue ownership.
+- If thawed, each chat is processed by ascending local `raw_message_id`; the
+  global refill chooses ascending chat id and at most the configured three chat
+  lanes concurrently. The loop refills on a 0.5-second cadence, but there is no
+  honest fixed jobs/second rate because AI and source processing dominate each
+  in-flight lane. Collected history is sometimes inserted newest-first, so
+  local raw-id order is not consistently Telegram chronological order. For
+  example, one lane would process a 05:40 message before its 02:57 entry post.
+- The production recovery maximum age is 15 minutes. At
+  `2026-08-31T04:45:42.865Z`, 152 of 154 rows were already older than that
+  threshold and would take the durable `expired` path before recognition; only
+  raw ids 14029 and 14030 were then younger. They sit behind older rows in their
+  respective chat lanes, so whether either reaches recognition before aging out
+  depends on actual drain latency. Old-row expiry still mutates queue/audit
+  state, and newly arriving live messages can enter recognition once their lane
+  is available.
+- Direct bounded text inspection covered all 154 rows: 109 have non-empty text,
+  45 have empty text and may carry media, and none has yet produced a candidate.
+  At least nine rows are self-contained enabled-symbol entry instructions:
+  13896/BTC short, 13975/ETH short, 13994/BTC long, 13995/BTC long,
+  13999/BTC long, 14019/BTC short, 14020/BTC short, 14022/BTC long and
+  14026/ETH short. Nine more are paired, conditional or context-dependent
+  BTC/ETH entry-like rows (13894, 13895, 13937, 13945, 13981, 13982, 14004,
+  14018 and 14021). Twelve further explicit entry/add rows concern currently
+  disallowed symbols such as ZKC, ZEC, NEAR, DOGE and CRV. Twenty-five rows have
+  explicit hold, add, stop, take-profit, close or exit wording; this category
+  overlaps the entry-like rows. The pending chats currently contain 35
+  `pending_entry` and 20 `entered` lifecycles, 48 of them BTC/ETH/SOL and 11
+  bound. Therefore a content-based read cannot prove exchange-write count zero.
+  Exact AI classifications are intentionally unknown because no message was
+  processed or artificially recognized in this investigation.
+- L2 observation is complete. By `04:48:48Z`, six live `queue_enqueued`
+  messages from five chats had arrived after activation, exceeding the required
+  five-message sample. PIDs remained web 2224914, ingest 2224916 and worker
+  2224910; each still loaded exact `cf30fdf7...`, verified its artifact and
+  retained `entry_admission_frozen=true`. Web, ingest and worker event loops
+  remained healthy; ingest listener/reconcile and worker authority loops were
+  healthy. Monitor completed healthy cycles at 04:02:07Z and 04:31:32Z with
+  empty reasons; its state is empty active reasons and
+  `last_window_at=2026-08-31T04:31:32.113918Z`. No warning-priority monitor
+  journal entry appeared. No PID or SHA changed, and no service control,
+  replay, queue drain, candidate creation, database mutation, entry thaw or
+  Deepcoin write was performed by this investigation.
+
+### Preconditions before any entry thaw
+
+1. Freeze an exact queue watermark and explicitly choose the disposition of all
+   154 pre-watermark rows. Thaw currently couples queue consumption,
+   recognition and live entry admission; it is not a pure runtime toggle.
+2. Resolve or explicitly accept the history-order mismatch: per-chat claims use
+   local raw id, while recovered Telegram history is not consistently inserted
+   in source chronology.
+3. Resolve the targeting risk from the 55 still-active lifecycles in affected
+   chats, especially stale unbound `pending_entry` rows, before allowing old
+   management/close language to reach normal resolution.
+4. Decide how the nine self-contained enabled-symbol entries, nine additional
+   entry-like rows, 25 management-like rows and 45 empty-text/media rows are to
+   be fenced. With auto trade enabled, absence of existing candidates is not a
+   no-write guarantee after recognition.
+5. Authorize a bounded thaw plan with an explicit stop/rollback trigger and
+   evidence proving that pre-watermark backlog cannot cause an unintended
+   Deepcoin write. No such authorization or action occurred in this phase.
