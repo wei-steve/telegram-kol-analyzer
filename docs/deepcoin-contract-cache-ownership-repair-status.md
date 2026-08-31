@@ -24,6 +24,19 @@ frozen_queue_attempt_zero_count: 154
 frozen_queue_claimed_count: 0
 frozen_queue_existing_candidate_count: 0
 frozen_queue_entry_thaw_executed: false
+prethaw_read_only_fact_check_status: complete
+deepcoin_position_snapshot_captured_at: 2026-08-31T06:07:18.870316Z
+deepcoin_position_snapshot_complete: true
+deepcoin_live_position_count: 0
+local_entered_lifecycle_count: 20
+local_entered_without_live_position_count: 20
+local_active_bound_lifecycle_count: 11
+local_bound_without_live_position_count: 11
+backlog_preterminalization_plan_status: proposed_waiting_authorization
+backlog_preterminalization_watermark_raw_message_id: 14030
+backlog_preterminalization_target_count: 154
+backlog_post_watermark_pending_observed_count: 13
+backlog_preterminalization_executed: false
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3022,3 +3035,174 @@ activation.
 5. Authorize a bounded thaw plan with an explicit stop/rollback trigger and
    evidence proving that pre-watermark backlog cannot cause an unintended
    Deepcoin write. No such authorization or action occurred in this phase.
+
+## Pre-thaw position audit and frozen-backlog terminalization plan
+
+### Read-only position reconciliation
+
+- At `2026-08-31T06:07:18.870316Z`, the worker's direct Deepcoin
+  `live-position-sizes` query returned `complete=true` and `positions=[]`.
+  This was a successful exchange read, not an unavailable snapshot or an
+  incomplete result. The independently persisted live-position snapshot also
+  had `error=null` and an empty position set.
+- The affected chats contain 20 local lifecycles whose status is `entered`.
+  Because the complete exchange snapshot contains zero positions, all 20 are
+  local/exchange inconsistencies: local state says entered, while Deepcoin has
+  no corresponding current position.
+
+  | lifecycle | chat | raw message | symbol | side | execution binding | exchange result |
+  | ---: | ---: | ---: | --- | --- | ---: | --- |
+  | 623 | -1003344714145 | 588 | BTC | short | - | absent |
+  | 763 | -1003095914903 | 2860 | ETH | short | - | absent |
+  | 767 | -1003095914903 | 2874 | ETH | short | - | absent |
+  | 772 | -1003095914903 | 2886 | ETH | short | - | absent |
+  | 1035 | -1002960443256 | 4464 | ETH | long | - | absent |
+  | 444 | -1002805019371 | 1444 | BTC | long | 114 | absent |
+  | 1023 | -1002409877375 | 9068 | BTC | long | - | absent |
+  | 807 | -1002370796392 | 3505 | SPCX | short | - | absent |
+  | 547 | -1002199068560 | 13236 | BTC | long | - | absent |
+  | 558 | -1002199068560 | 13241 | BTC | long | - | absent |
+  | 707 | -1002199068560 | 13348 | ETH | short | - | absent |
+  | 713 | -1002199068560 | 13364 | ETH | long | - | absent |
+  | 724 | -1002199068560 | 13373 | SNDK | long | - | absent |
+  | 736 | -1002199068560 | 13378 | SNDK | long | - | absent |
+  | 777 | -1002199068560 | 13427 | BTC | long | - | absent |
+  | 804 | -1002199068560 | 13450 | BTC | long | - | absent |
+  | 985 | -1002199068560 | 13620 | BTC | short | - | absent |
+  | 1012 | -1002199068560 | 13666 | BTC | long | - | absent |
+  | 1026 | -1002199068560 | 13687 | ETH | short | - | absent |
+  | 1034 | -1002199068560 | 13702 | BTC | short | - | absent |
+
+- Eleven active lifecycles have execution bindings, and none has a current
+  Deepcoin position. Ten are still `pending_entry`; the remaining row is the
+  entered lifecycle 444 above. Seven bindings are locally `open`, three are
+  `stale`, and binding 114 is `unknown` with
+  `position_attribution_conflict`. Binding 114 has no binding-level `pos_id`,
+  although one local order leg retains historical `pos_id=1001124072502100`;
+  the complete live snapshot proves that this is not a current position.
+
+  | lifecycle | chat | symbol/side | lifecycle status | binding | binding status | local position attribution | exchange result |
+  | ---: | ---: | --- | --- | ---: | --- | --- | --- |
+  | 460 | -1003048800035 | ETH/long | pending_entry | 121 | open | unassigned | absent |
+  | 510 | -1002960443256 | BTC/short | pending_entry | 147 | open | unassigned | absent |
+  | 839 | -1002805019371 | BTC/long | pending_entry | 289 | open | unassigned | absent |
+  | 426 | -1002370796392 | BTC/short | pending_entry | 101 | stale | unassigned | absent |
+  | 447 | -1002370796392 | BTC/long | pending_entry | 116 | stale | unassigned | absent |
+  | 452 | -1002370796392 | ETH/long | pending_entry | 119 | open | unassigned | absent |
+  | 469 | -1002370796392 | BTC/short | pending_entry | 128 | open | unassigned | absent |
+  | 508 | -1002368892075 | BTC/long | pending_entry | 145 | open | unassigned | absent |
+  | 509 | -1002368892075 | BTC/short | pending_entry | 146 | open | unassigned | absent |
+  | 423 | -1002199068560 | BTC/short | pending_entry | 98 | stale | unassigned | absent |
+  | 444 | -1002805019371 | BTC/long | entered | 114 | unknown | conflict; historical leg pos_id only | absent |
+
+These rows were not repaired or otherwise changed. They are a separate thaw
+risk: after recognition resumes, old management or close language can resolve
+against local entered/bound state that has no real exchange position.
+
+### Code-level proof of the existing expired path
+
+- `message_processing_worker.py:_run_claim_body` lines 562-593 call
+  `_classify_claim_expiry` before it constructs processor arguments or calls
+  `job_processor`/`process_message_job`. When classification is non-null, it
+  calls `_record_expired_authoritative_recovery_gap`, settles the queue row via
+  `_settle_message_processing_job(..., status="expired")`, increments the
+  expired count, and returns. The normal processor and history-candidate merge
+  are below that return and are unreachable from this branch.
+- `_classify_claim_expiry` at lines 771-808 only reads the raw message and
+  recovery settings.
+  `_record_expired_authoritative_recovery_gap` writes the existing
+  `recovery_guard` audit semantics: an expired authoritative recognition
+  decision, a failed/suppressed message-recognition record, and
+  `automation_status="skipped"`. It does not create a `SignalCandidate`,
+  lifecycle, binding, order, or Deepcoin client. Its implementation is at
+  `telegram_live_listener.py:786-859`. `_settle_message_processing_job` at
+  `message_processing_worker.py:458-479` updates only the claimed queue row's
+  terminal status, claim fields, reason and completion time.
+- `test_expired_job_is_never_executed` at
+  `tests/test_message_processing_worker.py:1086-1112` independently asserts
+  that the injected
+  job processor is never called and that the row becomes `expired`. The
+  authoritative-gap tests also assert skipped automation. Candidate creation
+  lives in the separate normal-recognition path and is unreachable after the
+  early return.
+
+Therefore the existing expiry semantics are suitable for explicit backlog
+terminalization, but the repository currently has no CLI or maintenance entry
+point that applies them to a frozen, exact raw-message watermark without first
+claiming and processing the queue. Reusing the worker normally would violate
+the required no-processing boundary.
+
+### Proposed frozen-state pre-terminalization
+
+This is an L3 production-data action and has **not** been executed. The minimum
+implementation is a narrow maintenance command, not a new queue framework:
+
+1. Refactor the existing expired audit writer just enough to expose a
+   session-scoped core. Both the current worker wrapper and the maintenance
+   command call that same core, so the command produces the existing
+   `authoritative_gap_recovery_expired`/`recovery_guard` audit records rather
+   than inventing a status or alternate evidence path.
+2. Add one bounded command such as
+   `expire-message-processing-backlog`, with dry-run as the default and an
+   explicit apply mode. For the already observed cohort it must require all of
+   these exact guards:
+   `watermark_raw_message_id=14030`, `expected_pending_count=154`, inclusive
+   raw ids `13877..14030`, `shadow=false`, `status=pending`, attempt count zero,
+   and no claim. It must refuse if membership/counts differ or if any target has
+   an `execution_running` decision. It must never invoke the job processor,
+   recognition model, candidate merge, lifecycle resolution or exchange code.
+3. Execute the entire apply under one SQLite `BEGIN IMMEDIATE` transaction.
+   Re-read and validate the exact cohort inside that transaction, record the
+   existing expired audit for each raw message, then set only those 154 job rows
+   to `status=expired`, `last_reason=expired_stale_instruction`, clear claim
+   fields and set the completion time. Audit writes come before job settlement,
+   but the single transaction makes the boundary all-or-nothing. Any exception
+   rolls back all 154 rows and leaves entry admission frozen.
+4. Preserve the one known partial audit before-image: raw message 13912 already
+   has an `execution_pending` recognition decision but no candidate. Existing
+   expiry semantics will replace that decision with the recovery-guard expired
+   outcome. The command must record this before-image explicitly and must still
+   refuse an `execution_running` target.
+
+The exact initial queue watermark is `raw_message_id=14030`; the 154 target ids
+are the inclusive sequence `13877..14030`. A later read-only snapshot already
+observed 13 newer pending rows, `14031..14043`, so terminalizing only this first
+cohort cannot by itself prove that the thawed system will see only post-thaw
+messages. Entry must remain frozen afterward. Immediately before a future thaw,
+the same narrow command needs a final seal operation: acquire the exclusive
+runtime-control lock, begin `BEGIN IMMEDIATE`, capture the then-current maximum
+pending raw id as the exact `restore_raw_message_id` inside that transaction,
+record it in evidence, and expire the remaining non-shadow pending rows through
+that captured id. Rows committed after that transaction are then, by definition,
+post-restore arrivals. No 15-minute age assumption participates in either
+watermark.
+
+### Backup, rollback and acceptance gates for a future authorized window
+
+- Before applying, create a root-owned `0700` evidence directory and a `0600`
+  database backup using the already-validated production SQLite backup path.
+  Require `PRAGMA quick_check` success and an empty foreign-key check. Store the
+  exact target-id manifest, its SHA-256, all 154 queue before-images, the raw
+  message 13912 decision before-image, and affected/critical table counts.
+- The normal rollback boundary is the single SQLite transaction: a failure
+  before commit leaves all business rows unchanged; after a successful commit,
+  entry remains frozen while acceptance runs. Do not blindly restore the whole
+  live database. Any database-file restoration would require stopping writers,
+  reconciling post-backup writes and a separate explicit authorization.
+- Acceptance must prove zero non-shadow `pending` or `claimed` jobs at or below
+  each committed watermark, and exactly the expected target rows in
+  `expired`/attempt-zero state with the expired reason. It must prove the exact
+  recovery-guard audit outcome for every target and zero target-linked signal
+  candidates. The final-seal transaction must repeat the zero-pre-watermark
+  query before thaw.
+- `raw_messages` are never updated or deleted. Prove preservation by attaching
+  the verified backup read-only and running bidirectional `EXCEPT` queries over
+  every raw-message column for the target ids; both differences must be empty.
+  Also compare lifecycle, binding and preamble before/after images and counts.
+  Thus original Telegram evidence remains complete even though its queue work
+  item has been explicitly terminalized.
+
+No business table, queue row, lifecycle, preamble, binding, raw message,
+service, release or Deepcoin state was modified during this read-only phase.
+The proposed L3 implementation and production apply both await separate owner
+authorization.
