@@ -2389,3 +2389,80 @@ activation.
   `maintenance_stop_failed_entry_frozen`; diagnosing or changing the monitor
   diagnostic runtime/timeout behavior and clearing its failed residue require a
   new explicit scope.
+
+## Monitor diagnostic timeout attribution and activation-gate subtraction
+
+- The authorized investigation was read-only. At the start of the timed-out
+  invocation, `/var/lib/telegram-kol-monitor/state.json` still contained
+  `last_full_audit_date=2026-08-30` and
+  `last_window_at=2026-08-31T00:33:21.467884+00:00`; its mtime remained
+  `2026-08-31 08:33:22.494746389 +0800`, proving the killed run never persisted
+  a new monitor window or audit date.
+- Invocation `f49904c2e00d40bb8e853b38a2fef5d6` started at
+  `2026-08-31T09:00:44.672912+08:00`. Its pre-start identity proof at
+  `09:00:44.754989+08:00` loaded immutable release `18ea345a...`. The four
+  application sources completed before the stall: trading-settings returned
+  HTTP 200 at `09:00:48.537395` and `09:00:48.586952`, live-position-sizes at
+  `09:00:50.213179`, message-operation-coverage at `09:00:50.327585`, and
+  contract-spec-health at `09:00:50.354502`, all Shanghai time. No final
+  monitor JSON followed. At `09:01:35.429584` the activator terminated the
+  process; systemd recorded `code=killed`, `status=15/TERM`, `Result=signal`,
+  17.045 seconds CPU, 1,322,147,840-byte memory peak and 113,926,144-byte swap
+  peak.
+- The killed run never serialized its internal `checked_at`, so an exact value
+  cannot be reconstructed honestly. It is bounded by the successful pre-start
+  at `2026-08-31T01:00:44.754989Z` and the first source request at
+  `2026-08-31T01:00:48.537395Z`. Every value in that interval is Shanghai hour
+  09. With the persisted successful audit date still `2026-08-30`, the
+  unchanged deterministic `should_run_daily_audit()` therefore returns true.
+  The immediately preceding diagnostic at Shanghai 08:33 finished in about
+  five seconds and explicitly emitted `audit_ran=false`; the 09:00 invocation
+  completed the four ordinary sources and then stalled exactly where
+  `run_daily_management_audit(adapters.run_management_audit)` follows them.
+  This confirms, rather than merely correlates, the scheduled daily audit as
+  the timeout cause.
+- Resource attribution is to audit snapshot construction, not the logical row
+  counts named in the incident. Production `research.db` was 814,436,352 bytes
+  (`page_count=198838`, `page_size=4096`), while the daily audit first builds
+  two complete private snapshots and falls back to a full SQLite online copy
+  if they differ. The 1.2 GB cgroup peak after all HTTP sources completed is
+  commensurate with those whole-file copies/page cache. The audit's own
+  management sets were only 150 batches and 133 legs; the database contained
+  1,034 lifecycles and 3,810 execution events. The largest physical consumers
+  were unrelated full-database tables and indexes, including
+  `context_resolution_attempts` at 334,036,992 bytes and
+  `pending_tpsl_snapshot_observations` at 281,985,024 bytes. Thus neither the
+  lifecycle nor execution-event cardinality explains the peak.
+- Commit `5cfc0cb48c8b63379a5a1fd79f5288361bc736dc` implements both approved
+  changes as one boundary. The diagnostic unit alone now passes explicit
+  `--disable-daily-management-audit` and `--deployment-diagnostic`; the normal
+  30-minute monitor unit passes neither, so its scheduled daily audit and all
+  business checks remain unchanged. Deployment diagnostics still execute all
+  non-audit business sources and emit full `reason_codes` and `details`, but a
+  structurally complete business-unhealthy result no longer denies activation.
+- The activation gate now consumes one exact-invocation structured journal
+  result. It still rejects a start failure, nonzero/signal exit, timeout,
+  adapter/source failure, incomplete or malformed result, duplicate/missing
+  result, or release mismatch. Successful activation output includes the full
+  monitor verification payload as evidence, even when `healthy=false`.
+- Independent exact-base review found one high-priority gap in the first
+  candidate: its reported commit originally came only from an environment
+  variable and did not prove which artifact the diagnostic process imported.
+  Commit `33a2ffe928986819484dfabb19ba79958cb202dd` closes that fail-open by binding
+  the diagnostic process's actual `Path(__file__)` to the expected immutable
+  release commit and manifest SHA-256, and by requiring
+  `loaded_artifact_verified=true` in the exact invocation result. A regression
+  test proves that correct candidate environment strings plus an incorrectly
+  loaded artifact are rejected. Final exact-base review of
+  `02ac0bdf..33a2ffe9` reported no findings.
+- RED proved the old scheduled diagnostic runs the due audit and that business
+  unhealthy status denied the old activation gate. Focused GREEN after the
+  review fix passed `510 passed, 1 skipped`. The one final full suite after the
+  last production-code edit passed `6697 passed, 4 skipped, 32 warnings` in
+  460.79 seconds. No production code changed after this run.
+- No stage, activation, release repair, reconciliation, message replay/drain,
+  entry thaw, production data write, service control or `reset-failed` ran in
+  this phase. The diagnostic unit's prior `failed/signal/15` residue was not
+  cleared. Entry admission remains frozen. The two local code commits and this
+  status update are being pushed to `codex/deepcoin-auto-trading-v1`; a new
+  immutable stage and activation require a separate authorization.
