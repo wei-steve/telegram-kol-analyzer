@@ -173,9 +173,10 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
     calls = []
 
-    def run(command, *, environment=None):
-        calls.append((command, environment))
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
         output = ""
+        error = ""
         if command == [
             "journalctl",
             "--lines=0",
@@ -190,7 +191,7 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
             "start",
             "telegram-kol-monitor-diagnostic.service",
         ]:
-            output = (
+            error = (
                 "Enqueued anchor job 42 "
                 "telegram-kol-monitor-diagnostic.service/start.\n"
             )
@@ -203,9 +204,14 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
             "--no-pager",
         ]:
             output = _monitor_journal_json(_monitor_diagnostic_payload())
-        return type("Result", (), {"stdout": output})()
+        return scoped_activation.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=output,
+            stderr=error,
+        )
 
-    monkeypatch.setattr(runtime, "_run", run)
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
     release = type(
         "Release",
         (),
@@ -242,6 +248,7 @@ def test_monitor_release_proof_rejects_other_invocation_after_current_cursor(
 
     def run(command, *, environment=None):
         output = ""
+        error = ""
         if command == [
             "journalctl",
             "--lines=0",
@@ -256,7 +263,7 @@ def test_monitor_release_proof_rejects_other_invocation_after_current_cursor(
             "start",
             "telegram-kol-monitor-diagnostic.service",
         ]:
-            output = (
+            error = (
                 "Enqueued anchor job 42 "
                 "telegram-kol-monitor-diagnostic.service/start.\n"
             )
@@ -288,7 +295,7 @@ def test_monitor_release_proof_rejects_other_invocation_after_current_cursor(
                 job_id=41,
                 invocation_id="3" * 32,
             )
-        return type("Result", (), {"stdout": output})()
+        return type("Result", (), {"stdout": output, "stderr": error})()
 
     monkeypatch.setattr(runtime, "_run", run)
     release = type(
@@ -314,6 +321,7 @@ def test_monitor_release_proof_rejects_missing_or_duplicate_current_result(
 
     def run(command, *, environment=None):
         output = ""
+        error = ""
         if command == [
             "journalctl",
             "--lines=0",
@@ -328,7 +336,7 @@ def test_monitor_release_proof_rejects_missing_or_duplicate_current_result(
             "start",
             "telegram-kol-monitor-diagnostic.service",
         ]:
-            output = (
+            error = (
                 "Enqueued anchor job 42 "
                 "telegram-kol-monitor-diagnostic.service/start.\n"
             )
@@ -344,7 +352,7 @@ def test_monitor_release_proof_rejects_missing_or_duplicate_current_result(
                 _monitor_diagnostic_payload(),
                 result_count=result_count,
             )
-        return type("Result", (), {"stdout": output})()
+        return type("Result", (), {"stdout": output, "stderr": error})()
 
     monkeypatch.setattr(runtime, "_run", run)
     release = type(
@@ -389,6 +397,7 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
 
     def run(command, *, environment=None):
         output = ""
+        error = ""
         if command == [
             "journalctl",
             "--lines=0",
@@ -403,7 +412,7 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
             "start",
             "telegram-kol-monitor-diagnostic.service",
         ]:
-            output = (
+            error = (
                 "Enqueued anchor job 42 "
                 "telegram-kol-monitor-diagnostic.service/start.\n"
             )
@@ -416,7 +425,7 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
             "--no-pager",
         ]:
             output = _monitor_journal_json(payload)
-        return type("Result", (), {"stdout": output})()
+        return type("Result", (), {"stdout": output, "stderr": error})()
 
     monkeypatch.setattr(runtime, "_run", run)
     release = type(

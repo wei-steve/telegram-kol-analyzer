@@ -1533,7 +1533,7 @@ class SystemRuntimeAdapter:
                 _MONITOR_DIAGNOSTIC_UNIT,
             ]
         )
-        job_id = _parse_monitor_anchor_job(transaction.stdout)
+        job_id = _parse_monitor_anchor_job(transaction.stderr)
         journal = self._run(
             [
                 "journalctl",
