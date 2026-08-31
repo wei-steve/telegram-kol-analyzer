@@ -470,6 +470,49 @@ def test_context_resolution_rejected_diagnostic_migrates_without_rewriting_rows(
         ).fetchone() == (81, "exhausted", None)
 
 
+def test_context_resolution_observability_columns_are_additive_and_nullable(
+    tmp_path,
+):
+    expected = {
+        "invocation_triggers_json": "TEXT",
+        "attempt_phase": "VARCHAR(32)",
+        "provider_request_count": "INTEGER",
+        "provider_usage_json": "TEXT",
+        "request_component_bytes_json": "TEXT",
+    }
+    for name, sql_type in expected.items():
+        assert SQLITE_COMPAT_COLUMNS["context_resolution_attempts"][name] == (
+            "ALTER TABLE context_resolution_attempts "
+            f"ADD COLUMN {name} {sql_type}"
+        )
+
+    database_path = tmp_path / "legacy-context-observability.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE context_resolution_attempts "
+            "(id INTEGER PRIMARY KEY, status VARCHAR(32) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO context_resolution_attempts (id, status) "
+            "VALUES (91, 'completed')"
+        )
+
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(context_resolution_attempts)"
+            )
+        }
+        assert set(expected) <= columns
+        assert connection.execute(
+            "SELECT invocation_triggers_json, attempt_phase, "
+            "provider_request_count, provider_usage_json, "
+            "request_component_bytes_json "
+            "FROM context_resolution_attempts WHERE id=91"
+        ).fetchone() == (None, None, None, None, None)
+
+
 def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
     database_path = tmp_path / "legacy.db"
     with sqlite3.connect(database_path) as connection:

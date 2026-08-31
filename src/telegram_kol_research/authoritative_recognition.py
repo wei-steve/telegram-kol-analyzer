@@ -944,6 +944,12 @@ def assess_message_authoritatively(
                             candidates,
                         )
                     ),
+                    invocation_triggers=context_triggers,
+                    attempt_phase=(
+                        "reanalysis"
+                        if reuse_current_evidence
+                        else "initial_resolution"
+                    ),
                 )
                 mimo = _resolved_mimo_result(
                     mimo,

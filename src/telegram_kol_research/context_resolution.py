@@ -166,6 +166,14 @@ class ContextResolutionDecision:
         }
 
 
+@dataclass(frozen=True, slots=True)
+class ContextProviderResult:
+    """Provider content plus the provider's unmodified usage object."""
+
+    content: Any
+    usage: Mapping[str, Any] | None = None
+
+
 def _fanout_allowed(decision: str, management_action: str | None) -> bool:
     effective_action = management_action
     if effective_action is None:
@@ -356,7 +364,7 @@ def _default_model_caller(
     provider: AiProviderConfig,
     system_prompt: str,
     request_payload: dict[str, Any],
-) -> str:
+) -> ContextProviderResult:
     if not provider.is_configured:
         raise RuntimeError("context resolution provider is not configured")
     headers = {"Content-Type": "application/json"}
@@ -381,7 +389,11 @@ def _default_model_caller(
         )
         response.raise_for_status()
         data = response.json()
-    return str(data["choices"][0]["message"]["content"])
+    usage = data.get("usage") if isinstance(data, Mapping) else None
+    return ContextProviderResult(
+        content=str(data["choices"][0]["message"]["content"]),
+        usage=usage if isinstance(usage, Mapping) else None,
+    )
 
 
 def _decode_model_payload(value: Any) -> Mapping[str, Any]:
@@ -397,6 +409,43 @@ def _decode_model_payload(value: Any) -> Mapping[str, Any]:
     if not isinstance(decoded, Mapping):
         raise json.JSONDecodeError("model response is not an object", text, 0)
     return decoded
+
+
+def _request_component_bytes(request_payload: Mapping[str, Any]) -> dict[str, Any]:
+    message_context = request_payload.get("message_context")
+    context = dict(message_context) if isinstance(message_context, Mapping) else {}
+    reply_chain = context.pop("reply_chain", [])
+    active_strategies = context.pop("active_strategies", [])
+    request_remainder = dict(request_payload)
+    current_message = request_remainder.pop("current_message", None)
+    request_remainder.pop("message_context", None)
+
+    def size(value: Any) -> int:
+        return len(_canonical_json(value).encode("utf-8"))
+
+    return {
+        "encoding": "utf-8-canonical-json-v1",
+        "request_total_bytes": size(request_payload),
+        "message_context_bytes": size(message_context),
+        "reply_chain_bytes": size(reply_chain),
+        "active_strategies_bytes": size(active_strategies),
+        "current_message_bytes": size(current_message),
+        "remainder_bytes": size(request_remainder) + size(context),
+    }
+
+
+def _provider_usage_entry(raw_result: Any, request_number: int) -> dict[str, Any]:
+    if isinstance(raw_result, ContextProviderResult) and raw_result.usage is not None:
+        return {
+            "available": True,
+            "request_number": int(request_number),
+            "usage": dict(raw_result.usage),
+        }
+    return {
+        "available": False,
+        "reason": "provider_usage_not_returned",
+        "request_number": int(request_number),
+    }
 
 
 def _current_evidence_version_id(session_factory, raw_message_id: int) -> int | None:
@@ -425,6 +474,9 @@ def _upsert_attempt(
     status: str,
     error_class: str | None,
     attempts: int,
+    invocation_triggers: tuple[str, ...] = (),
+    attempt_phase: str = "initial_resolution",
+    provider_usage_entries: tuple[Mapping[str, Any], ...] = (),
     rejected_response_diagnostic_json: str | None = None,
 ) -> int:
     from telegram_kol_research.context_resolution_worker import (
@@ -464,6 +516,17 @@ def _upsert_attempt(
                 rejected_response_diagnostic_json=(
                     rejected_response_diagnostic_json
                 ),
+                invocation_triggers_json=_canonical_json(
+                    list(invocation_triggers)
+                ),
+                attempt_phase=str(attempt_phase),
+                provider_request_count=len(provider_usage_entries),
+                provider_usage_json=_canonical_json(
+                    list(provider_usage_entries)
+                ),
+                request_component_bytes_json=_canonical_json(
+                    _request_component_bytes(request_payload)
+                ),
                 status=status,
                 error_class=error_class,
                 reanalysis_triggers_json="[]",
@@ -477,6 +540,17 @@ def _upsert_attempt(
             row.state_fingerprint = state_fingerprint
             row.model = model
             row.request_summary_json = _canonical_json(request_payload)
+            row.invocation_triggers_json = _canonical_json(
+                list(invocation_triggers)
+            )
+            row.attempt_phase = str(attempt_phase)
+            row.provider_request_count = len(provider_usage_entries)
+            row.provider_usage_json = _canonical_json(
+                list(provider_usage_entries)
+            )
+            row.request_component_bytes_json = _canonical_json(
+                _request_component_bytes(request_payload)
+            )
             row.status = status
             row.error_class = error_class
             row.attempts = int(attempts)
@@ -504,6 +578,8 @@ def resolve_contextual_strategy(
     candidates: Any,
     first_pass_payload: Any,
     exchange_state: Any,
+    invocation_triggers: tuple[str, ...] = (),
+    attempt_phase: str = "initial_resolution",
     model_caller: Callable[..., Any] = _default_model_caller,
 ) -> ContextResolutionDecision:
     """Call DeepSeek at most twice, preserving strict contract validation."""
@@ -592,6 +668,7 @@ def resolve_contextual_strategy(
                 str(exhausted.error_class or "context_contract_invalid")
             )
     prior_error_code: str | None = None
+    provider_usage_entries: list[Mapping[str, Any]] = []
     for attempt_number in (1, 2):
         failure: ContextResolutionError | None = None
         decoded: Mapping[str, Any] | None = None
@@ -608,11 +685,26 @@ def resolve_contextual_strategy(
                 request_payload=request_payload,
             )
         except Exception as exc:
+            provider_usage_entries.append(
+                {
+                    "available": False,
+                    "reason": "provider_request_failed",
+                    "request_number": attempt_number,
+                }
+            )
             failure = ContextResolutionError("network_error")
             failure.__cause__ = exc
         else:
+            provider_usage_entries.append(
+                _provider_usage_entry(raw_result, attempt_number)
+            )
+            decoded_input = (
+                raw_result.content
+                if isinstance(raw_result, ContextProviderResult)
+                else raw_result
+            )
             try:
-                decoded = _decode_model_payload(raw_result)
+                decoded = _decode_model_payload(decoded_input)
             except (json.JSONDecodeError, TypeError, ValueError) as exc:
                 failure = ContextResolutionError("malformed_json")
                 failure.__cause__ = exc
@@ -638,6 +730,9 @@ def resolve_contextual_strategy(
                 status="exhausted" if terminal else "retry_pending",
                 error_class=failure.code,
                 attempts=attempt_number,
+                invocation_triggers=tuple(invocation_triggers),
+                attempt_phase=attempt_phase,
+                provider_usage_entries=tuple(provider_usage_entries),
                 rejected_response_diagnostic_json=(
                     _rejected_response_diagnostic(
                         decoded,
@@ -671,6 +766,9 @@ def resolve_contextual_strategy(
             status="completed",
             error_class=None,
             attempts=attempt_number,
+            invocation_triggers=tuple(invocation_triggers),
+            attempt_phase=attempt_phase,
+            provider_usage_entries=tuple(provider_usage_entries),
         )
         return decision
     raise AssertionError("unreachable")

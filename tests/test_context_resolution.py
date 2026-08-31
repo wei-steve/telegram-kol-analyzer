@@ -8,6 +8,7 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
 )
 from telegram_kol_research.context_resolution import (
+    ContextProviderResult,
     ContextResolutionError,
     parse_context_resolution_decision,
     resolve_contextual_strategy,
@@ -214,6 +215,147 @@ def test_resolver_retries_malformed_json_once_and_persists_safe_attempt(tmp_path
     assert json.loads(attempt.decision_json)["decision"] == "revise_thread"
     assert attempt.rejected_response_diagnostic_json is None
     assert "secret" not in attempt.request_summary_json
+
+
+def test_resolver_persists_ordered_observability_and_raw_provider_usage(tmp_path):
+    session_factory = create_session_factory(tmp_path / "observability.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1468, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    usage = {
+        "prompt_tokens": 321,
+        "completion_tokens": 45,
+        "total_tokens": 366,
+        "provider_extension": {"cached_tokens": 12},
+    }
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={"conflicts": []},
+        context_window={
+            "current": {"message_id": 1468},
+            "messages": [{"message_id": 1460, "text": "BTC 多单"}],
+            "reply_chain": [{"message_id": 1460}],
+            "active_strategies": [{"lifecycle_id": 22}],
+        },
+        candidates=[{"thread_id": 12, "root_message_id": 1460}],
+        first_pass_payload={"recognition_result": "是策略"},
+        exchange_state={},
+        invocation_triggers=(
+            "revision_language",
+            "apparent_entry_may_be_revision",
+        ),
+        attempt_phase="reanalysis",
+        model_caller=lambda **_: ContextProviderResult(
+            content=json.dumps(
+                _valid_payload(supporting_message_ids=[1460, 1468]),
+                ensure_ascii=False,
+            ),
+            usage=usage,
+        ),
+    )
+
+    assert decision.decision == "revise_thread"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        request = json.loads(attempt.request_summary_json)
+        components = json.loads(attempt.request_component_bytes_json)
+        provider_usage = json.loads(attempt.provider_usage_json)
+    assert json.loads(attempt.invocation_triggers_json) == [
+        "revision_language",
+        "apparent_entry_may_be_revision",
+    ]
+    assert attempt.attempt_phase == "reanalysis"
+    assert attempt.provider_request_count == 1
+    assert provider_usage == [
+        {"available": True, "request_number": 1, "usage": usage}
+    ]
+    assert set(components) == {
+        "encoding",
+        "request_total_bytes",
+        "message_context_bytes",
+        "reply_chain_bytes",
+        "active_strategies_bytes",
+        "current_message_bytes",
+        "remainder_bytes",
+    }
+    canonical = lambda value: json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    assert components["encoding"] == "utf-8-canonical-json-v1"
+    assert components["request_total_bytes"] == len(canonical(request))
+    assert components["message_context_bytes"] == len(
+        canonical(request["message_context"])
+    )
+    assert components["reply_chain_bytes"] == len(
+        canonical(request["message_context"]["reply_chain"])
+    )
+    assert components["active_strategies_bytes"] == len(
+        canonical(request["message_context"]["active_strategies"])
+    )
+    assert components["current_message_bytes"] == len(
+        canonical(request["current_message"])
+    )
+    assert components["remainder_bytes"] > 0
+
+
+def test_resolver_marks_provider_usage_unavailable_and_null_metadata_is_ignored(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "unavailable-usage.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1469, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    kwargs = {
+        "raw_message_id": raw_id,
+        "ai_recognition_config": AiRecognitionConfig(),
+        "evidence": {},
+        "context_window": {
+            "current": {"message_id": 1469},
+            "messages": [{"message_id": 1460}],
+        },
+        "candidates": [{"thread_id": 12, "root_message_id": 1460}],
+        "first_pass_payload": {"recognition_result": "是策略"},
+        "exchange_state": {},
+    }
+    expected = resolve_contextual_strategy(
+        session_factory,
+        **kwargs,
+        model_caller=lambda **_: json.dumps(
+            _valid_payload(supporting_message_ids=[1460, 1469]),
+            ensure_ascii=False,
+        ),
+    )
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert json.loads(attempt.provider_usage_json) == [
+            {
+                "available": False,
+                "reason": "provider_usage_not_returned",
+                "request_number": 1,
+            }
+        ]
+        attempt.invocation_triggers_json = None
+        attempt.attempt_phase = None
+        attempt.provider_request_count = None
+        attempt.provider_usage_json = None
+        attempt.request_component_bytes_json = None
+        session.commit()
+
+    repeated = resolve_contextual_strategy(
+        session_factory,
+        **kwargs,
+        model_caller=lambda **_: (_ for _ in ()).throw(
+            AssertionError("cached decision must not call provider")
+        ),
+    )
+    assert repeated == expected
 
 
 def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):

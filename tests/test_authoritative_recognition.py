@@ -1185,6 +1185,8 @@ def test_revision_is_resolved_before_instruction_projection(tmp_path, monkeypatc
     result = apply_authoritative_assessment(session_factory, assessment)
 
     assert len(calls) == 1
+    assert calls[0]["invocation_triggers"] == assessment.context_resolution_triggers
+    assert calls[0]["attempt_phase"] == "initial_resolution"
     assert assessment.context_resolution.decision == "revise_thread"
     assert result.status == "非策略"
     with session_factory() as session:

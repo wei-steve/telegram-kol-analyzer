@@ -742,6 +742,17 @@ class ContextResolutionAttempt(Base):
     rejected_response_diagnostic_json: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )
+    invocation_triggers_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    attempt_phase: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    provider_request_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    provider_usage_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    request_component_bytes_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     error_class: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     reanalysis_triggers_json: Mapped[str] = mapped_column(

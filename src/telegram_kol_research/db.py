@@ -229,6 +229,26 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE context_resolution_attempts "
             "ADD COLUMN rejected_response_diagnostic_json TEXT"
         ),
+        "invocation_triggers_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN invocation_triggers_json TEXT"
+        ),
+        "attempt_phase": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN attempt_phase VARCHAR(32)"
+        ),
+        "provider_request_count": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN provider_request_count INTEGER"
+        ),
+        "provider_usage_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN provider_usage_json TEXT"
+        ),
+        "request_component_bytes_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN request_component_bytes_json TEXT"
+        ),
     },
     "message_instruction_items": {
         "retired_at": (
