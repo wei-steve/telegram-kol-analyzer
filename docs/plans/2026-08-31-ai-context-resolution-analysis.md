@@ -394,3 +394,613 @@ reply 深度上限 5 从未命中，实际最大只有 3，但 reply 本身的�
 5. 存量体积优先考虑“保留行和 decision，只裁剪/归档过期 `request_summary_json`”；六列全裁剪的额外空间收益很小，却会丢失更多追溯信息。
 
 任何进入实施的方案，都应保留现行路径为权威，先做历史回放和生产影子对比；在动作、目标 lifecycle、风险参数和最终订单投影上没有达到事先定义的零差异/全召回门槛前，不应接管交易决策。
+
+## 12. P0 观测口径与首轮结果
+
+### 12.1 固定窗口与数据完整性
+
+本轮将恢复观察窗口结束时的原始消息水位 `14158` 作为开区间边界，并固定本轮截止时间，避免多条查询使用滑动分母：
+
+- 开始：`2026-08-31T16:42:37Z`；
+- 截止：`2026-08-31T21:35:00Z`；
+- 时长：4 小时 52 分 23 秒（0.203 个 24 小时日）；
+- 原始消息口径：`raw_messages.id > 14158 AND created_at <= '2026-08-31 21:35:00'`；
+- 本轮截止时的最大 raw message ID：`14168`；
+- 新消息共 10 条，ID 连续为 `14159`–`14168`；10 条的 `created_at` 和 `posted_at` 均晚于窗口起点，没有把维护期旧消息或迟到旧帖算入分母。
+
+所有 SQLite 查询使用 `sqlite3 -readonly /opt/telegram-kol-analyzer/data/research.db`，核心链路查询使用同一个只读 `BEGIN/COMMIT` 快照。交易所证据使用 worker 进程的只读 exchange snapshot 与“当前委托” GET 端点；未调用任何 POST、取消、下单或重放端点。
+
+### 12.2 运行状态与身份
+
+2026-08-31T21:44:28Z 的进程自证结果：
+
+| role | PID | systemd 状态 | release | artifact | entry freeze | role-specific health |
+|---|---:|---|---|---|---|---|
+| web | 3,746,349 | active/running，`NRestarts=0` | `6e2321cecbb3adf61d7a5972d391e662d4aea300` | verified | `false` | event loop `true` |
+| ingest | 3,746,355 | active/running，`NRestarts=0` | 同上 | verified | `false` | event loop、live listener、reconcile 均 `true` |
+| worker | 3,746,343 | active/running，`NRestarts=0` | 同上 | verified | `false` | event loop、worker command、message processing 均 `true` |
+
+三个进程的 manifest SHA-256 均为 `4d011a9569dde31468db08cce20e1ce4e6570fad3a828f86d20db7832444cbb7`，`loaded_cwd` 均为 `/opt/telegram-kol-analyzer`。systemd 显示三个进程均于主机时间 2026-09-01 00:09:59（UTC `16:09:59Z`）启动，早于本 P0 窗口；当前 PID 与 16:42Z 恢复结束证据一致，因此窗口内无 PID 漂移。
+
+worker 的 management、break-even、reconcile、close、TPSL、protection 和 rescue 循环全部 `fresh=true, successful=true`，management/close/TPSL/rescue 的有效权限均为 `true`，`global_exchange_authority=true`。设置端点实测 `auto_trade_enabled=true`，`worker_command_mode=queue`。
+
+| role | P50 | P95 | P99 | 近期最大 | stall count | watchdog |
+|---|---:|---:|---:|---:|---:|---|
+| web | 1.260 ms | 1.764 ms | 2.264 ms | 4.543 ms | 0 | attached |
+| ingest | 1.296 ms | 1.788 ms | 2.231 ms | 10.383 ms | 0 | attached |
+| worker | 0.878 ms | 6.299 ms | 24.336 ms | 312.744 ms | 0 | attached |
+
+web/ingest 的 worker-only 健康位为 `false`，worker 的 ingest-only 健康位为 `false`，这是进程角色隔离，不是循环故障。
+
+### 12.3 monitor 自 16:42Z 起的每个周期
+
+| 周期开始（UTC） | release 自证 | healthy | reason codes | monitor error | audit ran |
+|---|---|---|---|---|---|
+| 17:01:48 | `6e2321ce...`, verified | true | `[]` | null | false |
+| 17:31:43 | 同上 | true | `[]` | null | false |
+| 18:00:18 | 同上 | true | `[]` | null | false |
+| 18:30:12 | 同上 | true | `[]` | null | false |
+| 19:01:21 | 同上 | true | `[]` | null | false |
+| 19:31:57 | 同上 | true | `[]` | null | false |
+| 20:01:13 | 同上 | true | `[]` | null | false |
+| 20:31:53 | 同上 | true | `[]` | null | false |
+| 21:00:27 | 同上 | true | `[]` | null | false |
+| 21:30:19 | 同上 | true | `[]` | null | false |
+
+10 个完整周期均加载同一 release，无 reason code，没有 SHA 漂移。
+
+### 12.4 真实消息到执行的链路
+
+| 阶段 | 消息数 | 说明 |
+|---|---:|---|
+| 新原始消息 | 10 | raw ID `14159`–`14168` |
+| 进入主识别 | 10 | 10 条均有 `message_recognitions`、authoritative MiMo run 和 `recognition_decisions` |
+| 队列 `succeeded` | 10 | 全部 `worker_completed` |
+| 产生 signal candidate | 1 条消息 / 1 条 candidate | raw `14166`，candidate `2123` |
+| 走 `expired` | 0 | — |
+| 仍 `pending/claimed` | 0 | — |
+
+首条恢复后完整交易链路已实际出现，不再是零消息推断：
+
+`raw_message 14166`（posted `19:31:18Z`）→ authoritative recognition `是策略`→ signal candidate `2123`（BTC short, confidence 0.95）→ lifecycle `1037`→ binding `321`→ execution events `3878/3879`→ Deepcoin 当前触发委托精确回读。
+
+lifecycle `1037` 的 `signal_candidate_id` 为空，因此 candidate 到 lifecycle 的追溯使用了精确 `(chat_id, message_id)=(-1002370796392, 3605)` 以及 binding 反向关联，而不是直接外键。这不改变本次交易所一致性结论，但是后续追溯时需保留的数据质量注记。
+
+### 12.5 Deepcoin 写入与 lifecycle/binding 对账
+
+窗口内有 2 笔 Deepcoin 写入，均来自 raw message `14166`。该消息的 `created_at=2026-08-31T19:31:19.021891Z`，比恢复窗口起点晚 2 小时 48 分 42 秒，不是维护期历史消息的重放。
+
+| event | symbol/方向 | 数量 | 触发/委托价 | raw message | 下单时间（UTC） | order ID | 当前交易所状态 |
+|---|---|---:|---:|---:|---|---|---|
+| 3878 | BTC-USDT-SWAP / sell short | 7 张 | 80,510 | 14166 | 19:31:41.572328 | `1001125071413372` | 当前触发委托中，`Conditional`，未成交 |
+| 3879 | BTC-USDT-SWAP / sell short | 7 张 | 81,110 | 14166 | 19:31:41.903314 | `1001125071413427` | 当前触发委托中，`Conditional`，未成交 |
+
+2026-08-31T21:44:29.892471Z 的交易所只读回读：持仓 0，普通当前委托 0，当前触发委托 2。两个 exchange order ID、方向、数量和价格与本地 order legs `555/556` 精确一致，exchange UI 投影均显示“已绑定”。
+
+| lifecycle | binding | 本地状态 | pos ID | 交易所证据 | 一致性 |
+|---:|---:|---|---|---|---|
+| 1037 | 321 | `pending_entry`; binding `open`; `last_exchange_status=entry_order_pending`; 两条 leg 均 `pending` | 空 | 0 持仓，2 条精确对应的 pending trigger orders | 一致：尚未成交，等待两个入场触发单 |
+
+leg 的 `attribution_status=unassigned` 表示尚未产生可归属的成交持仓；在 pos ID 为空、触发单未成交的当前状态下，它不与 exchange 回读矛盾。
+
+### 12.6 P0 触发率首轮基线
+
+与本文第 3、4 节完全同口径：8 个调用前确定性触发器从 `request_summary_json` 重建，不把 `reanalysis_triggers_json` 误当成这 8 个触发器。
+
+- 固定消息分母：10；
+- context-resolution attempt：2；
+- 涉及不同原始消息：2；
+- provider 请求：2；
+- 首轮描述性触发率：2/10 = 20.00%。
+
+该 20.00% 只是 10 条消息的首轮描述，不能与清理前 6,163 条消息的 47.51% 作统计性高低结论。
+
+| 触发器 | 次数 | attempt 占比 |
+|---|---:|---:|
+| `revision_language` | 1 | 50.00% |
+| `cancellation_language` | 0 | 0.00% |
+| `entered_holder_language` | 0 | 0.00% |
+| `management_without_exact_target` | 1 | 50.00% |
+| `multiple_same_source_candidates` | 0 | 0.00% |
+| `reply_target_disagreement` | 0 | 0.00% |
+| `text_image_conflict` | 0 | 0.00% |
+| `apparent_entry_may_be_revision` | 0 | 0.00% |
+
+| 同时命中数 | attempt | 占比 |
+|---:|---:|---:|
+| 1 | 2 | 100.00% |
+| 2–8 | 0 | 0.00% |
+
+| 状态 | attempt | provider 请求 | 留下决策 |
+|---|---:|---:|---:|
+| `completed` | 2 | 2 | 2 |
+| `exhausted` | 0 | 0 | 0 |
+| `superseded` | 0 | 0 | 0 |
+| `failed` | 0 | 0 | 0 |
+
+实质改变口径与第 4.1 节一致。本次 SQL 在历史 `id<=4245` 数据上复算为 2,767 条可比决策、580 条改变、2,187 条不变，与本文原始结果完全相同。首轮结果：
+
+| 分母口径 | 分母 | 实质改变 | 不变/无决策 | 比率 |
+|---|---:|---:|---:|---|
+| 有可比较 decision | 2 | 1 | 1 | **不报告** |
+| 全部 attempt | 2 | 1 | 1 | **不报告** |
+| `completed` attempt | 2 | 1 | 1 | **不报告** |
+
+**只有 2 条 attempt，样本不足以支撑改变率结论。** 因此上表仅保留计数，不用 1/2 生成百分比，也不根据该小样本判断哪个触发器更有效。
+
+### 12.7 距离 P0 目标
+
+P0 目标是“7 个正常日或 500 条消息，哪个先到用哪个”。本轮仅覆盖 4 小时 52 分 23 秒和 10 条消息：
+
+- 按连续时长计，还差 6 天 19 小时 7 分 37 秒；当前尚未完成 1 个整的正常日；
+- 按消息数计，还差 490 条；
+- 完成度为消息目标的 2.00%，不应把本轮命名为“清理后最终基线”。
+
+### 12.8 可重复的原始查询
+
+下列是形成本节最终数字的四组只读查询。后续观测只替换 `start_raw_message_id`、`window_start` 和 `window_end`；触发器和改变率 SQL 不改，才能与清理前和本轮直接比较。
+
+#### A. 运行身份、循环、monitor 和交易所只读证据
+
+```bash
+ssh tecent 'set -e
+printf "UTC_NOW\n"
+date -u +%Y-%m-%dT%H:%M:%SZ
+printf "SYSTEMD\n"
+for unit in telegram-kol-web.service telegram-kol-ingest.service telegram-kol-worker.service; do
+  systemctl show "$unit" --property=Id,ActiveState,SubState,MainPID,NRestarts,ExecMainStartTimestamp,Result --no-pager
+done
+printf "IDENTITIES_AND_LOOPS\n"
+for port in 8000 8001 8002; do
+  curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${port}/api/runtime/deployment-identity"
+  printf "\n"
+  curl --fail --silent --show-error --max-time 5 "http://127.0.0.1:${port}/api/runtime/loop-health"
+  printf "\n"
+done
+printf "TRADING_SETTINGS_SAFE_FIELDS\n"
+curl --fail --silent --show-error --max-time 5 http://127.0.0.1:8000/api/trading-settings | python3 -c "import json,sys; d=json.load(sys.stdin); print(json.dumps({k:d.get(k) for k in (\"auto_trade_enabled\",\"worker_command_mode\")},sort_keys=True))"
+printf "MONITOR_RESULTS\n"
+journalctl -u telegram-kol-monitor.service --since "2026-08-31 16:42:00 UTC" --until "2026-08-31 21:35:00 UTC" --no-pager -o short-iso-precise | grep -E "runtime-deployment-identity-v1|audit_ran"
+printf "EXCHANGE_COUNTS\n"
+curl --fail --silent --show-error --max-time 20 http://127.0.0.1:8002/api/runtime-agent/read-only-exchange-snapshot
+printf "\nEXCHANGE_PENDING_TRIGGER_ROWS\n"
+curl --fail --silent --show-error --max-time 30 http://127.0.0.1:8002/positions-panel/tabs/open-orders | grep -E "data-exchange-tab-(loaded|item-count|captured-at)|BTC-USDT-SWAP|side-badge|条件/开空|exchange-attribution-chip|order 100112507141|Conditional|委托价格|数量|创建时间|更新时间|暂无当前委托" | head -n 120
+'
+```
+
+#### B. 消息漏斗、真实执行链、lifecycle/binding 和 Deepcoin 写入
+
+以下内容原样通过标准输入传给 `ssh tecent "sqlite3 -readonly /opt/telegram-kol-analyzer/data/research.db"`：
+
+```sql
+.headers on
+.mode list
+BEGIN;
+SELECT 'window' AS section, 14158 AS start_raw_message_id,
+       '2026-08-31T16:42:37Z' AS window_start,
+       '2026-08-31T21:35:00Z' AS window_end,
+       MAX(id) AS database_max_raw_message_id
+FROM raw_messages;
+SELECT 'message_funnel' AS section,
+       COUNT(*) AS messages,
+       COUNT(DISTINCT mr.raw_message_id) AS entered_recognition,
+       COUNT(DISTINCT sc.raw_message_id) AS candidate_messages,
+       COUNT(DISTINCT CASE WHEN j.status='expired' THEN j.raw_message_id END) AS expired,
+       COUNT(DISTINCT CASE WHEN j.status IN ('pending','claimed') THEN j.raw_message_id END) AS pending_or_claimed,
+       COUNT(DISTINCT CASE WHEN j.status='succeeded' THEN j.raw_message_id END) AS succeeded
+FROM raw_messages r
+LEFT JOIN message_processing_jobs j ON j.raw_message_id=r.id AND j.shadow=0
+LEFT JOIN message_recognitions mr ON mr.raw_message_id=r.id
+LEFT JOIN signal_candidates sc ON sc.raw_message_id=r.id
+WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00';
+SELECT 'message_chain' AS section, r.id AS raw_message_id, r.chat_id,
+       r.message_id, r.posted_at, r.created_at,
+       j.status AS job_status, j.last_reason, j.enqueued_at, j.completed_at,
+       mr.status AS recognition_status,
+       mrr.status AS mimo_run_status, mrr.attempt_count AS mimo_provider_attempts,
+       rd.authoritative_status, rd.automation_status,
+       COUNT(DISTINCT sc.id) AS signal_candidates,
+       COUNT(DISTINCT cra.id) AS context_attempts
+FROM raw_messages r
+LEFT JOIN message_processing_jobs j ON j.raw_message_id=r.id AND j.shadow=0
+LEFT JOIN message_recognitions mr ON mr.raw_message_id=r.id
+LEFT JOIN mimo_recognition_runs mrr ON mrr.raw_message_id=r.id AND mrr.became_authoritative=1
+LEFT JOIN recognition_decisions rd ON rd.raw_message_id=r.id
+LEFT JOIN signal_candidates sc ON sc.raw_message_id=r.id
+LEFT JOIN context_resolution_attempts cra ON cra.raw_message_id=r.id
+WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+GROUP BY r.id ORDER BY r.id;
+SELECT 'candidate' AS section, sc.id, sc.raw_message_id, sc.symbol, sc.side,
+       sc.event_type, sc.confidence, sc.review_status, sc.created_at
+FROM signal_candidates sc JOIN raw_messages r ON r.id=sc.raw_message_id
+WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+ORDER BY sc.id;
+SELECT 'new_lifecycle_binding' AS section, sl.id AS lifecycle_id,
+       eb.id AS binding_id, r.id AS raw_message_id, r.created_at AS raw_created_at,
+       r.posted_at, sl.chat_id, sl.message_id, sl.symbol, sl.side,
+       sl.lifecycle_status, sl.signal_at, sl.execution_binding_id,
+       eb.status AS binding_status, eb.last_exchange_status,
+       eb.order_id, eb.client_order_id, eb.pos_id
+FROM strategy_lifecycles sl
+LEFT JOIN execution_bindings eb ON eb.id=sl.execution_binding_id
+LEFT JOIN raw_messages r ON r.chat_id=sl.chat_id AND r.message_id=sl.message_id
+WHERE sl.created_at>='2026-08-31 16:42:37'
+  AND sl.created_at<='2026-08-31 21:35:00'
+ORDER BY sl.id;
+SELECT 'deepcoin_write' AS section, ee.id AS execution_event_id,
+       ee.execution_binding_id, r.id AS raw_message_id, r.created_at AS raw_created_at,
+       ee.action, ee.status, ee.symbol, ee.side,
+       COALESCE(json_extract(ee.request_json,'$.sz'),json_extract(ee.request_json,'$.size')) AS quantity,
+       json_extract(ee.request_json,'$.triggerPrice') AS trigger_price,
+       ee.order_id, ee.client_order_id, ee.pos_id,
+       ee.created_at AS submitted_at
+FROM execution_events ee
+LEFT JOIN raw_messages r ON r.chat_id=ee.chat_id AND r.message_id=ee.source_message_id
+WHERE ee.created_at>='2026-08-31 16:42:37'
+  AND ee.created_at<='2026-08-31 21:35:00'
+ORDER BY ee.id;
+SELECT 'order_leg' AS section, eol.id, eol.execution_binding_id,
+       eol.leg_index, eol.purpose, eol.order_kind, eol.order_id,
+       eol.client_order_id, eol.pos_id, eol.attribution_status,
+       eol.status, eol.created_at, eol.updated_at,
+       json_extract(eol.request_json,'$.instId') AS instrument,
+       json_extract(eol.request_json,'$.sz') AS quantity,
+       json_extract(eol.request_json,'$.side') AS order_side,
+       json_extract(eol.request_json,'$.posSide') AS position_side,
+       json_extract(eol.request_json,'$.triggerPrice') AS trigger_price,
+       json_extract(eol.request_json,'$.price') AS order_price
+FROM execution_order_legs eol
+JOIN execution_bindings eb ON eb.id=eol.execution_binding_id
+WHERE eb.created_at>='2026-08-31 16:42:37'
+  AND eb.created_at<='2026-08-31 21:35:00'
+ORDER BY eol.id;
+COMMIT;
+```
+
+#### C. P0 触发器、状态、provider 请求和实质改变率
+
+以下内容原样通过标准输入传给 `ssh tecent "sqlite3 -readonly /opt/telegram-kol-analyzer/data/research.db"`：
+
+```sql
+.headers on
+.mode list
+BEGIN;
+SELECT 'p0_totals' AS section,
+       COUNT(DISTINCT r.id) AS messages,
+       COUNT(DISTINCT a.id) AS attempts,
+       COUNT(DISTINCT a.raw_message_id) AS distinct_raw_messages,
+       COALESCE(SUM(a.attempts),0) AS provider_requests
+FROM raw_messages r
+LEFT JOIN context_resolution_attempts a ON a.raw_message_id=r.id
+WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00';
+
+WITH base AS (
+  SELECT a.id, a.raw_message_id, a.request_summary_json,
+         lower(COALESCE(json_extract(a.request_summary_json,
+                                    '$.message_context.current.text'),'')) AS text,
+         COALESCE(json_extract(a.request_summary_json,
+                               '$.mimo_first_pass.recognition_result'),'') AS recognition_result,
+         COALESCE(json_extract(a.request_summary_json,
+                               '$.mimo_first_pass.lifecycle_event.event_type'),'none') AS event_type,
+         json_extract(a.request_summary_json,
+                      '$.mimo_first_pass.lifecycle_event.target_lifecycle_id') AS target_lifecycle_id,
+         COALESCE(json_array_length(json_extract(a.request_summary_json,
+                                                 '$.candidate_strategy_threads')),0) AS candidate_count
+  FROM context_resolution_attempts a
+  JOIN raw_messages r ON r.id=a.raw_message_id
+  WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+), sets AS (
+  SELECT b.*,
+         COALESCE((
+           SELECT group_concat(thread_id, ',') FROM (
+             SELECT DISTINCT
+                    CAST(json_extract(link.value,'$.strategy_thread_id') AS INTEGER) AS thread_id
+             FROM json_each(b.request_summary_json,
+                            '$.message_context.reply_chain[0].strategy_links') AS link
+             WHERE json_extract(link.value,'$.strategy_thread_id') IS NOT NULL
+             ORDER BY thread_id
+           )
+         ),'') AS reply_threads,
+         COALESCE((
+           SELECT group_concat(thread_id, ',') FROM (
+             SELECT DISTINCT
+                    CAST(json_extract(c.value,'$.thread_id') AS INTEGER) AS thread_id
+             FROM json_each(b.request_summary_json,'$.candidate_strategy_threads') AS c
+             WHERE b.target_lifecycle_id IS NOT NULL
+               AND CAST(json_extract(c.value,'$.lifecycle_id') AS INTEGER)
+                   = CAST(b.target_lifecycle_id AS INTEGER)
+             UNION
+             SELECT DISTINCT
+                    CAST(json_extract(s.value,'$.strategy_thread_id') AS INTEGER) AS thread_id
+             FROM json_each(b.request_summary_json,
+                            '$.message_context.active_strategies') AS s
+             WHERE b.target_lifecycle_id IS NOT NULL
+               AND CAST(json_extract(s.value,'$.lifecycle_id') AS INTEGER)
+                   = CAST(b.target_lifecycle_id AS INTEGER)
+               AND json_extract(s.value,'$.strategy_thread_id') IS NOT NULL
+             ORDER BY thread_id
+           )
+         ),'') AS target_threads
+  FROM base b
+), flags AS (
+  SELECT *,
+         (instr(text,'更新')>0 OR instr(text,'修改')>0 OR
+          instr(text,'改为')>0 OR instr(text,'调整')>0 OR
+          instr(text,'replace')>0 OR instr(text,'update')>0) AS revision_language,
+         (instr(text,'取消')>0 OR instr(text,'撤销')>0 OR
+          instr(text,'撤单')>0 OR instr(text,'cancel')>0) AS cancellation_language,
+         (instr(text,'有入场')>0 OR instr(text,'已入场')>0 OR
+          instr(text,'持仓')>0 OR instr(text,'保护成本')>0 OR
+          instr(text,'保本')>0 OR instr(text,'继续持有')>0) AS entered_holder_language,
+         (event_type<>'none' AND target_lifecycle_id IS NULL) AS management_without_exact_target,
+         (candidate_count>1) AS multiple_same_source_candidates,
+         (reply_threads<>'' AND target_threads<>'' AND
+          reply_threads<>target_threads) AS reply_target_disagreement,
+         (COALESCE(json_array_length(json_extract(request_summary_json,
+                                                   '$.saved_evidence.conflicts')),0)>0) AS text_image_conflict,
+         (recognition_result='是策略' AND candidate_count>0 AND (
+            (instr(text,'更新')>0 OR instr(text,'修改')>0 OR
+             instr(text,'改为')>0 OR instr(text,'调整')>0 OR
+             instr(text,'replace')>0 OR instr(text,'update')>0)
+            OR EXISTS (
+              SELECT 1
+              FROM json_each(request_summary_json,
+                             '$.candidate_strategy_threads') AS c,
+                   json_each(c.value,'$.reasons') AS reason
+              WHERE reason.value='overlapping_entry'
+            )
+          )) AS apparent_entry_may_be_revision
+  FROM sets
+), trigger_rows AS (
+  SELECT id,'revision_language' AS trigger FROM flags WHERE revision_language
+  UNION ALL SELECT id,'cancellation_language' FROM flags WHERE cancellation_language
+  UNION ALL SELECT id,'entered_holder_language' FROM flags WHERE entered_holder_language
+  UNION ALL SELECT id,'management_without_exact_target' FROM flags WHERE management_without_exact_target
+  UNION ALL SELECT id,'multiple_same_source_candidates' FROM flags WHERE multiple_same_source_candidates
+  UNION ALL SELECT id,'reply_target_disagreement' FROM flags WHERE reply_target_disagreement
+  UNION ALL SELECT id,'text_image_conflict' FROM flags WHERE text_image_conflict
+  UNION ALL SELECT id,'apparent_entry_may_be_revision' FROM flags WHERE apparent_entry_may_be_revision
+), trigger_names(trigger, ordinal) AS (
+  VALUES ('revision_language',1),
+         ('cancellation_language',2),
+         ('entered_holder_language',3),
+         ('management_without_exact_target',4),
+         ('multiple_same_source_candidates',5),
+         ('reply_target_disagreement',6),
+         ('text_image_conflict',7),
+         ('apparent_entry_may_be_revision',8)
+)
+SELECT 'trigger_distribution' AS section, n.trigger,
+       COUNT(t.id) AS attempts,
+       round(100.0*COUNT(t.id)/(SELECT COUNT(*) FROM flags),2) AS attempt_pct
+FROM trigger_names n
+LEFT JOIN trigger_rows t ON t.trigger=n.trigger
+GROUP BY n.trigger,n.ordinal
+ORDER BY n.ordinal;
+
+WITH base AS (
+  SELECT a.id, a.request_summary_json,
+         lower(COALESCE(json_extract(a.request_summary_json,
+                                    '$.message_context.current.text'),'')) AS text,
+         COALESCE(json_extract(a.request_summary_json,
+                               '$.mimo_first_pass.recognition_result'),'') AS recognition_result,
+         COALESCE(json_extract(a.request_summary_json,
+                               '$.mimo_first_pass.lifecycle_event.event_type'),'none') AS event_type,
+         json_extract(a.request_summary_json,
+                      '$.mimo_first_pass.lifecycle_event.target_lifecycle_id') AS target_lifecycle_id,
+         COALESCE(json_array_length(json_extract(a.request_summary_json,
+                                                 '$.candidate_strategy_threads')),0) AS candidate_count
+  FROM context_resolution_attempts a JOIN raw_messages r ON r.id=a.raw_message_id
+  WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+), sets AS (
+  SELECT b.*,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT
+                  CAST(json_extract(link.value,'$.strategy_thread_id') AS INTEGER) AS thread_id
+           FROM json_each(b.request_summary_json,
+                          '$.message_context.reply_chain[0].strategy_links') AS link
+           WHERE json_extract(link.value,'$.strategy_thread_id') IS NOT NULL
+           ORDER BY thread_id
+         )),'') AS reply_threads,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT CAST(json_extract(c.value,'$.thread_id') AS INTEGER) AS thread_id
+           FROM json_each(b.request_summary_json,'$.candidate_strategy_threads') AS c
+           WHERE b.target_lifecycle_id IS NOT NULL
+             AND CAST(json_extract(c.value,'$.lifecycle_id') AS INTEGER)
+                 = CAST(b.target_lifecycle_id AS INTEGER)
+           UNION
+           SELECT DISTINCT
+                  CAST(json_extract(s.value,'$.strategy_thread_id') AS INTEGER) AS thread_id
+           FROM json_each(b.request_summary_json,
+                          '$.message_context.active_strategies') AS s
+           WHERE b.target_lifecycle_id IS NOT NULL
+             AND CAST(json_extract(s.value,'$.lifecycle_id') AS INTEGER)
+                 = CAST(b.target_lifecycle_id AS INTEGER)
+             AND json_extract(s.value,'$.strategy_thread_id') IS NOT NULL
+           ORDER BY thread_id
+         )),'') AS target_threads
+  FROM base b
+), flags AS (
+  SELECT *,
+    (instr(text,'更新')>0 OR instr(text,'修改')>0 OR instr(text,'改为')>0 OR
+     instr(text,'调整')>0 OR instr(text,'replace')>0 OR instr(text,'update')>0) AS f1,
+    (instr(text,'取消')>0 OR instr(text,'撤销')>0 OR instr(text,'撤单')>0 OR instr(text,'cancel')>0) AS f2,
+    (instr(text,'有入场')>0 OR instr(text,'已入场')>0 OR instr(text,'持仓')>0 OR
+     instr(text,'保护成本')>0 OR instr(text,'保本')>0 OR instr(text,'继续持有')>0) AS f3,
+    (event_type<>'none' AND target_lifecycle_id IS NULL) AS f4,
+    (candidate_count>1) AS f5,
+    (reply_threads<>'' AND target_threads<>'' AND reply_threads<>target_threads) AS f6,
+    (COALESCE(json_array_length(json_extract(request_summary_json,
+                                              '$.saved_evidence.conflicts')),0)>0) AS f7,
+    (recognition_result='是策略' AND candidate_count>0 AND (
+      (instr(text,'更新')>0 OR instr(text,'修改')>0 OR instr(text,'改为')>0 OR
+       instr(text,'调整')>0 OR instr(text,'replace')>0 OR instr(text,'update')>0)
+      OR EXISTS (SELECT 1 FROM json_each(request_summary_json,
+                                         '$.candidate_strategy_threads') c,
+                              json_each(c.value,'$.reasons') reason
+                 WHERE reason.value='overlapping_entry'))) AS f8
+  FROM sets
+), counts AS (
+  SELECT id, f1+f2+f3+f4+f5+f6+f7+f8 AS trigger_count FROM flags
+), bucket_names(simultaneous_triggers, ordinal) AS (
+  VALUES ('1',1),('2-8',2)
+), observed AS (
+  SELECT CASE WHEN trigger_count=1 THEN '1' ELSE '2-8' END AS simultaneous_triggers,
+         COUNT(*) AS attempts
+  FROM counts GROUP BY simultaneous_triggers
+)
+SELECT 'trigger_multiplicity' AS section,
+       n.simultaneous_triggers,
+       COALESCE(o.attempts,0) AS attempts,
+       round(100.0*COALESCE(o.attempts,0)/(SELECT COUNT(*) FROM counts),2) AS attempt_pct
+FROM bucket_names n
+LEFT JOIN observed o ON o.simultaneous_triggers=n.simultaneous_triggers
+ORDER BY n.ordinal;
+
+WITH status_names(status, ordinal) AS (
+  VALUES ('completed',1),('exhausted',2),('superseded',3),('failed',4)
+), observed AS (
+  SELECT a.status, COUNT(*) AS attempts, SUM(a.attempts) AS provider_requests,
+         SUM(a.decision_json IS NOT NULL) AS decisions
+  FROM context_resolution_attempts a JOIN raw_messages r ON r.id=a.raw_message_id
+  WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+  GROUP BY a.status
+)
+SELECT 'attempt_status' AS section, n.status,
+       COALESCE(o.attempts,0) AS attempts,
+       COALESCE(o.provider_requests,0) AS provider_requests,
+       COALESCE(o.decisions,0) AS decisions
+FROM status_names n LEFT JOIN observed o ON o.status=n.status
+ORDER BY n.ordinal;
+
+WITH raw AS (
+  SELECT a.*,
+         json_extract(request_summary_json,
+                      '$.mimo_first_pass.lifecycle_event.target_lifecycle_id') AS first_lifecycle_id,
+         CASE
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.recognition_result')='是策略' THEN 'new'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='position_update' THEN 'manage'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='cancel_entry' THEN 'cancel'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='exit_position' THEN 'exit'
+           ELSE 'no_action'
+         END AS first_family,
+         CASE
+           WHEN json_extract(decision_json,'$.decision') IN ('hold','unresolved')
+             OR CAST(json_extract(decision_json,'$.confidence') AS REAL)<0.7 THEN 'no_action'
+           WHEN json_extract(decision_json,'$.decision')='new_thread' THEN 'new'
+           WHEN json_extract(decision_json,'$.decision')='revise_thread' THEN 'revise'
+           WHEN json_extract(decision_json,'$.decision')='manage_thread' THEN 'manage'
+           WHEN json_extract(decision_json,'$.decision')='cancel_thread' THEN 'cancel'
+           WHEN json_extract(decision_json,'$.decision')='exit_thread' THEN 'exit'
+           ELSE 'no_action'
+         END AS context_family
+  FROM context_resolution_attempts a JOIN raw_messages r ON r.id=a.raw_message_id
+  WHERE r.id>14158 AND r.created_at<='2026-08-31 21:35:00'
+), normalized AS (
+  SELECT raw.*,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT CAST(json_extract(c.value,'$.thread_id') AS INTEGER) AS thread_id
+           FROM json_each(raw.request_summary_json,'$.candidate_strategy_threads') AS c
+           WHERE CAST(json_extract(c.value,'$.lifecycle_id') AS INTEGER)
+                 = CAST(raw.first_lifecycle_id AS INTEGER)
+           ORDER BY thread_id
+         )),'') AS first_targets,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT CAST(t.value AS INTEGER) AS thread_id
+           FROM json_each(raw.decision_json,'$.target_thread_ids') AS t
+           ORDER BY thread_id
+         )),'') AS context_targets
+  FROM raw
+), scored AS (
+  SELECT *, CASE
+    WHEN decision_json IS NULL THEN 0
+    WHEN first_family<>context_family THEN 1
+    WHEN first_family=context_family
+      AND first_family IN ('manage','cancel','exit','revise')
+      AND first_targets<>context_targets THEN 1
+    ELSE 0 END AS changed
+  FROM normalized
+)
+SELECT 'change_rate_comparable_decisions' AS section,
+       SUM(decision_json IS NOT NULL) AS denominator,
+       SUM(CASE WHEN decision_json IS NOT NULL THEN changed ELSE 0 END) AS changed,
+       SUM(CASE WHEN decision_json IS NOT NULL THEN 1-changed ELSE 0 END) AS unchanged_or_no_decision
+FROM scored
+UNION ALL
+SELECT 'change_rate_all_attempts', COUNT(*), SUM(changed), SUM(1-changed) FROM scored
+UNION ALL
+SELECT 'change_rate_completed_attempts', SUM(status='completed'),
+       SUM(CASE WHEN status='completed' THEN changed ELSE 0 END),
+       SUM(CASE WHEN status='completed' THEN 1-changed ELSE 0 END)
+FROM scored;
+COMMIT;
+```
+
+#### D. 第 4.1 节历史改变率同口径复算
+
+为证明 C 中改变率定义没有漂移，以下是实际执行的完整历史复算查询：
+
+```sql
+WITH raw AS (
+  SELECT a.*,
+         json_extract(request_summary_json,
+                      '$.mimo_first_pass.lifecycle_event.target_lifecycle_id') AS first_lifecycle_id,
+         CASE
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.recognition_result')='是策略' THEN 'new'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='position_update' THEN 'manage'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='cancel_entry' THEN 'cancel'
+           WHEN json_extract(request_summary_json,
+                             '$.mimo_first_pass.lifecycle_event.event_type')='exit_position' THEN 'exit'
+           ELSE 'no_action'
+         END AS first_family,
+         CASE
+           WHEN json_extract(decision_json,'$.decision') IN ('hold','unresolved')
+             OR CAST(json_extract(decision_json,'$.confidence') AS REAL)<0.7 THEN 'no_action'
+           WHEN json_extract(decision_json,'$.decision')='new_thread' THEN 'new'
+           WHEN json_extract(decision_json,'$.decision')='revise_thread' THEN 'revise'
+           WHEN json_extract(decision_json,'$.decision')='manage_thread' THEN 'manage'
+           WHEN json_extract(decision_json,'$.decision')='cancel_thread' THEN 'cancel'
+           WHEN json_extract(decision_json,'$.decision')='exit_thread' THEN 'exit'
+           ELSE 'no_action'
+         END AS context_family
+  FROM context_resolution_attempts a
+  WHERE a.id<=4245
+), normalized AS (
+  SELECT raw.*,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT CAST(json_extract(c.value,'$.thread_id') AS INTEGER) AS thread_id
+           FROM json_each(raw.request_summary_json,'$.candidate_strategy_threads') AS c
+           WHERE CAST(json_extract(c.value,'$.lifecycle_id') AS INTEGER)
+                 = CAST(raw.first_lifecycle_id AS INTEGER)
+           ORDER BY thread_id
+         )),'') AS first_targets,
+         COALESCE((SELECT group_concat(thread_id, ',') FROM (
+           SELECT DISTINCT CAST(t.value AS INTEGER) AS thread_id
+           FROM json_each(raw.decision_json,'$.target_thread_ids') AS t
+           ORDER BY thread_id
+         )),'') AS context_targets
+  FROM raw
+), scored AS (
+  SELECT *, CASE
+    WHEN first_family<>context_family THEN 1
+    WHEN first_family=context_family
+      AND first_family IN ('manage','cancel','exit','revise')
+      AND first_targets<>context_targets THEN 1
+    ELSE 0 END AS changed
+  FROM normalized
+)
+SELECT COUNT(*) AS comparable_decisions,
+       SUM(changed) AS changed,
+       SUM(1-changed) AS unchanged
+FROM scored
+WHERE decision_json IS NOT NULL;
+```
+
+输出为 `2767|580|2187`，与本文第 4.1 节一致。A 中交易所 HTML 的 `grep` 含本轮已知 order ID 前缀，它是为了保留本轮原始命令的结果定位条件；下轮可重复观测应用当期新 binding 的 order ID 替换该前缀，不改变 SQL 口径。
