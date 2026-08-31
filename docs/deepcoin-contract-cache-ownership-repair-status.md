@@ -28,8 +28,8 @@ prethaw_read_only_fact_check_status: complete
 deepcoin_position_snapshot_captured_at: 2026-08-31T06:07:18.870316Z
 deepcoin_position_snapshot_complete: true
 deepcoin_live_position_count: 0
-local_entered_lifecycle_count: 20
-local_entered_without_live_position_count: 20
+local_entered_lifecycle_count: 25
+local_entered_without_live_position_count: 25
 local_active_bound_lifecycle_count: 11
 local_bound_without_live_position_count: 11
 backlog_preterminalization_plan_status: approved_phase1_executed
@@ -47,7 +47,7 @@ backlog_preterminalization_final_seal_executed: false
 backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
 local_exchange_alignment_implementation_sha: 829cfa49a00ee8db20451b149afc353e17e60291
 local_exchange_alignment_final_suite: 6731_passed_4_skipped_32_warnings
-local_exchange_alignment_status: dry_run_failed_closed_global_scope_guard_mismatch
+local_exchange_alignment_status: dry_run_failed_closed_claim_census_complete_unified_repair_planned
 local_exchange_alignment_exchange_snapshot_at: 2026-08-31T12:58:25.021309Z
 local_exchange_alignment_position_read: complete_zero
 local_exchange_alignment_regular_order_read: complete_zero
@@ -60,6 +60,19 @@ local_exchange_alignment_exact_target_entered_count: 20
 local_exchange_alignment_exact_target_binding_count: 11
 local_exchange_alignment_out_of_scope_entered_ids: [536, 607, 611, 698, 1036]
 local_exchange_alignment_global_nonterminal_binding_count: 98
+local_exchange_claim_census_status: complete_read_only
+local_exchange_claim_census_at: 2026-08-31T13:16:36.861151295Z
+local_exchange_claim_position_binding_count: 15
+local_exchange_claim_active_order_binding_count: 31
+local_exchange_claim_neither_binding_count: 52
+local_exchange_alignment_unified_target_lifecycle_count: 35
+local_exchange_alignment_unified_target_binding_count: 46
+local_exchange_alignment_unified_target_entry_leg_count: 80
+local_exchange_alignment_unified_related_entry_leg_guard_count: 83
+local_exchange_alignment_unified_target_intent_count: 2
+local_exchange_alignment_unified_target_protection_leg_count: 8
+local_exchange_alignment_unified_target_convergence_count: 2
+local_exchange_alignment_unified_plan_status: planned_not_implemented
 local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
@@ -3424,3 +3437,146 @@ substantive before-image fingerprint, related-row guards, exchange-flat gate
 and single-transaction postconditions. Expanding the production target beyond
 the owner-approved 20 lifecycles and 11 bindings is a separate scope and was
 not inferred in this window.
+
+## Read-only unified local claim census
+
+This phase performed no new exchange read and relies on the already accepted
+complete snapshot at `2026-08-31T12:58:25.021309Z`: account positions and
+regular open orders were empty, and the BTC, ETH and SOL pending-trigger reads
+were each complete and empty. The database census below was read-only and
+completed at `2026-08-31T13:16:36.861151295Z`. No local business row was
+changed.
+
+### Entered lifecycle claims
+
+There are 25 lifecycle rows whose literal local status is `entered`. Because
+the accepted complete account-position snapshot has zero rows, every one has
+exchange result `absent`:
+
+| lifecycle | chat | symbol | side | exchange position |
+| ---: | ---: | --- | --- | --- |
+| 444 | -1002805019371 | BTC | long | absent |
+| 536 | -1002451280921 | BTC | long | absent |
+| 547 | -1002199068560 | BTC | long | absent |
+| 558 | -1002199068560 | BTC | long | absent |
+| 607 | -1002451280921 | BTC | long | absent |
+| 611 | -1002451280921 | BTC | long | absent |
+| 623 | -1003344714145 | BTC | short | absent |
+| 698 | -1001716834927 | BTC | long | absent |
+| 707 | -1002199068560 | ETH | short | absent |
+| 713 | -1002199068560 | ETH | long | absent |
+| 724 | -1002199068560 | SNDK | long | absent |
+| 736 | -1002199068560 | SNDK | long | absent |
+| 763 | -1003095914903 | ETH | short | absent |
+| 767 | -1003095914903 | ETH | short | absent |
+| 772 | -1003095914903 | ETH | short | absent |
+| 777 | -1002199068560 | BTC | long | absent |
+| 804 | -1002199068560 | BTC | long | absent |
+| 807 | -1002370796392 | SPCX | short | absent |
+| 985 | -1002199068560 | BTC | short | absent |
+| 1012 | -1002199068560 | BTC | long | absent |
+| 1023 | -1002409877375 | BTC | long | absent |
+| 1026 | -1002199068560 | ETH | short | absent |
+| 1034 | -1002199068560 | BTC | short | absent |
+| 1035 | -1002960443256 | ETH | long | absent |
+| 1036 | -1003415020968 | BTC | long | absent |
+
+### Nonterminal binding classification
+
+The 98 Deepcoin bindings whose binding status is not terminal were classified
+by substantive local claims, not by historical cause. The classes are mutually
+exclusive; a position claim takes precedence when a row also retains order
+identity.
+
+- **Position claim: 15.** A binding qualifies when its own `pos_id`, an
+  attached `entered` lifecycle, or a nonterminal entry leg's `pos_id` is
+  present. IDs: `2, 3, 5, 6, 10, 15, 17, 18, 22, 24, 26, 27, 39, 114, 120`.
+  Representative rows are binding 2 (active leg 2 with an attribution-conflict
+  `pos_id`), binding 114 (entered lifecycle 444 plus active leg 222 retaining
+  historical `pos_id=1001124072502100`) and binding 120 (filled leg 232 with a
+  `pos_id`). All are absent from the complete exchange position snapshot.
+- **Active or unresolved exchange-order claim without a position claim: 31.**
+  A binding qualifies when it is locally `open`/`active`, or an attached
+  nonterminal leg, recovery intent or protection leg retains an exchange order
+  identity. IDs: `4, 16, 19, 21, 25, 28, 31, 34, 36, 41, 43, 50, 54, 70, 80,
+  86, 94, 98, 101, 102, 105, 108, 116, 118, 119, 121, 128, 145, 146, 147,
+  289`. Representative rows are binding 4 (stale with two unknown exchange
+  order legs), binding 119 (open with two pending trigger-order legs), binding
+  289 (open with one pending trigger leg and two pending trigger-protection
+  intents), and binding 86 (the binding itself remains `open` even though its
+  two attached legs are already terminal). The accepted regular-order and
+  governed pending-trigger snapshots contain none of these orders.
+- **Neither position nor active/unresolved exchange-order claim: 52.** IDs:
+  `1, 7, 8, 12, 13, 20, 30, 32, 35, 37, 38, 40, 42, 45, 47, 49, 51, 52,
+  53, 55, 56, 57, 59, 60, 61, 63, 64, 65, 69, 74, 75, 77, 78, 81, 83,
+  84, 85, 87, 89, 90, 93, 97, 99, 103, 106, 107, 109, 113, 115, 117,
+  122, 123`. Binding 8 has no entry leg or exchange order identity. The other
+  51 have only terminal entry legs (`manually_closed`) even if their binding
+  row retains historical order IDs. A historical ID attached only to a
+  terminal leg is identity evidence, not a local claim that the order remains
+  active. These 52 bindings are outside the terminalization target and must be
+  retained unchanged. There is no no-claim `pending_entry` example in this
+  snapshot: all ten nonterminal bindings attached to `pending_entry`
+  lifecycles retain unresolved exchange-order claims and are in the target.
+
+The class counts cross-foot exactly: `15 + 31 + 52 = 98`.
+
+### Exact unified terminalization target
+
+The target is the union of all substantive local claims, not all 98
+nonterminal bindings:
+
+- **35 lifecycles.** The 25 `entered` IDs above must use the existing
+  `exited/exchange_closed` semantic. The ten `pending_entry` lifecycles attached
+  to targeted unresolved orders must use the existing expired pending-entry
+  semantic: `423, 426, 447, 452, 460, 469, 508, 509, 510, 839`. Terminal
+  lifecycles already attached to other targeted bindings stay unchanged.
+- **46 bindings.** IDs: `2, 3, 4, 5, 6, 10, 15, 16, 17, 18, 19, 21, 22, 24,
+  25, 26, 27, 28, 31, 34, 36, 39, 41, 43, 50, 54, 70, 80, 86, 94, 98,
+  101, 102, 105, 108, 114, 116, 118, 119, 120, 121, 128, 145, 146, 147,
+  289`. The 15 position-claim bindings use the existing closed/historical
+  exchange-position semantic; the 31 order-claim bindings use the existing
+  cancelled/unfilled-entry semantic.
+- **80 nonterminal entry legs.** Position-claim legs to close are
+  `2, 3, 6, 7, 12, 17, 20, 21, 28, 32, 36, 37, 59, 222, 232`. Unresolved
+  order legs to cancel are `4, 5, 18, 19, 22, 23, 26, 27, 29, 33, 34, 35,
+  38, 39, 40, 44, 45, 50, 51, 54, 55, 61, 62, 64, 65, 77, 78, 85, 86,
+  87, 88, 89, 90, 142, 143, 161, 162, 184, 185, 192, 193, 198, 199, 200,
+  201, 206, 207, 212, 213, 223, 225, 226, 228, 229, 230, 231, 233, 234,
+  235, 248, 249, 279, 280, 281, 506`.
+- **Binding 289 dependents.** Resolve intents `128, 129`, cancel planned
+  protection legs `545..552`, and complete convergences `149, 150` with the
+  existing parent-trigger-cancelled-before-entry semantics.
+- **Guard-only related rows.** All 83 entry legs attached to the 46 bindings
+  remain in the substantive fingerprint and relationship guard. Legs 171, 172
+  and 507 are already terminal, so they are guarded but not mutated. The 52
+  no-claim bindings and all of their related rows remain untouched.
+
+### Required change to `829cfa49`
+
+The next implementation should remain a bounded revision of the existing L3
+command:
+
+1. Remove the two global equality assertions that require the entire database's
+   entered lifecycle and nonterminal binding sets to equal the old hard-coded
+   20/11 cohorts.
+2. Derive the exact target from the claim predicates above inside the same
+   read/fingerprint and `BEGIN IMMEDIATE` reread: all entered lifecycles;
+   bindings with a position claim or an active/unresolved exchange-order claim;
+   then only the corresponding nonterminal related rows. Require the resulting
+   exact IDs and counts to match the reviewed 25/46/80/2/8/2 cohort before any
+   update.
+3. Preserve the full substantive before-image fingerprint, including all 83
+   related entry legs and their lifecycle/binding relationships. Continue to
+   ignore only the already accepted online `updated_at`/`recovered_at` drift.
+4. Preserve the complete exchange-flat gate, existing audit paths and terminal
+   states, compare-and-set row counts, raw-message nonmutation proof, foreign-key
+   check, single `BEGIN IMMEDIATE` transaction and postconditions. The
+   postconditions should assert that no entered lifecycle and no substantive
+   position/order claim remains, not that every historical nonterminal binding
+   has been deleted or terminalized.
+
+This is a plan only. No command was changed or run, no writable transaction,
+`BEGIN IMMEDIATE` or runtime-control lock was opened, no
+lifecycle/binding/leg/intent/protection/convergence row was written, and entry
+admission remains frozen.
