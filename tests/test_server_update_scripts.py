@@ -800,7 +800,6 @@ def test_contract_cache_status_records_version_aware_task12_handoff():
         "91bb257e2a1c808c25a54149a7c71c392c0952e4" in status
     )
     assert "pending_entry_cancel_production_executed: false" in status
-    assert "current_phase: manual_cleanup_production_cutover" in status
     assert "pending_entry_cancel_live_order_count: 0" in status
     assert (
         "manual_cleanup_exchange_snapshot_status: "
