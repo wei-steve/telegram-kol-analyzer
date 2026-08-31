@@ -187,6 +187,14 @@ monitor_diagnostic_installed_unit_matches_candidate: false
 monitor_diagnostic_last_invocation_id: 74c08cab4e704768843d09745d5a0d05
 monitor_diagnostic_last_exit_status: 1
 monitor_state_sha256: 1852dea161c185d4409fa029e08472cd03bcdd0cfd35b63af04222c6dab4d8aa
+monitor_diagnosis_pushed_sha: e0d278f5537d8e3a797ce56b4ab252a99cbb9eb2
+monitor_unit_env_update_plan_status: proposed_awaiting_owner_approval
+monitor_unit_env_update_recommendation: install_only_then_stopped_legacy_activation
+monitor_installer_read_only_preflight: passed_all_actual_conditions
+monitor_installer_legacy_env_preflight_recurrence: not_applicable_retired_updater_only
+monitor_next_activation_candidate_sha: 18ea345a23812ed131c500a6040174a07a4436db
+monitor_next_activation_rollback_sha: none_for_stopped_legacy
+monitor_next_activation_source_mode: stopped_legacy
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1864,3 +1872,123 @@ expansion or an irreversible action that the approved phase did not include.
   `monitor-production-safety` main process load release `113bcddf`. The failed
   diagnostic is not evidence that candidate `18ea345a` still generates the
   retired identity reason codes.
+
+## Proposed monitor unit and environment update plan
+
+Status: proposed only; owner approval is required before any production write,
+installation, daemon reload, service control, authorization creation or
+activation.
+
+### Existing installer feasibility and preflight
+
+- `scripts/install_server_monitor.sh` can run install-only against the exact
+  immutable candidate while production remains `maintenance_stopped`. It must
+  be executed from the immutable candidate script, with `--enable` omitted.
+  It never starts web, ingest, worker, the monitor service or a diagnostic; its
+  only unconditional systemd mutation is `daemon-reload`. The existing
+  maintenance-inhibit and release drop-ins are separate files and are not
+  removed by the installer.
+- A production read-only mirror of every current installer condition passed.
+  Candidate release path, root ownership, `0555` directory, `0444` manifest and
+  manifest SHA-256 were exact. Timer, service and test-notification were
+  inactive; diagnostic was failed/inactive and returned the accepted
+  `is-active` code 3. The timer was disabled. Credential and runtime-policy
+  metadata, allowlisted fields, state path, monitor identity, CLI/database
+  access, policy denial, live-snapshot access and all candidate unit source
+  mount policies passed.
+- The historical `monitor-env preflight` failure will not recur in this
+  installer. That failure belonged to the retired universal updater, which
+  validated a legacy source env against a candidate-only schema before it could
+  normalize it. `install_server_monitor.sh` does not parse or validate the
+  existing `/etc/telegram-kol-monitor.env`; after its other preflight gates it
+  reconstructs a closed env from the root credential file, runtime capture
+  policy and explicit release/expectation arguments.
+- The install-only arguments are candidate path
+  `/opt/telegram-kol-releases/18ea345a23812ed131c500a6040174a07a4436db`,
+  candidate commit `18ea345a23812ed131c500a6040174a07a4436db` and manifest
+  SHA-256
+  `02f8a5a46788052ecad067fca4c5a71dcddf1c7ddde73e2091b27e97362bd0f4`.
+  The last observed governed expectations were auto trade `enabled` and entry
+  preamble, message-assembly-v2 and entry-revision-v2 all `live`. A future
+  authorized window must read-only re-confirm these four values immediately
+  before installation; any mismatch stops rather than silently changing the
+  expected monitor policy. Deployment entry admission remains independently
+  frozen by its existing drop-ins.
+
+### Ordering options and decision
+
+- **Recommended now: install-only before activation.** While every runtime is
+  inhibited and stopped, back up the existing monitor env and all four base
+  unit files, run the candidate installer without `--enable`, then prove the
+  installed file hashes equal the candidate, the rebuilt env names
+  `18ea345a...`, retired CLI options are absent, `systemd-analyze verify`
+  passes, and every governed unit remains inactive, inhibited and `MainPID=0`.
+  Only after those gates pass may a separately authorized activation start the
+  four roles. This uses the already staged and validated candidate and directly
+  fixes the generation mismatch without new production code or another stage.
+- The risk is a split configuration/activation transaction. The current
+  installer writes env and four unit files sequentially and has no built-in
+  rollback after mutation begins. Therefore the install window requires one
+  exclusive runtime-control lock, a bounded exact backup, and an explicit
+  restore-on-any-failure boundary. A successful install does not itself prove
+  monitor business health; the activation diagnostic remains the final gate.
+- **Alternative: activation owns unit/env installation.** Extend
+  `scoped_release_activation.py` to validate, back up, atomically install and
+  restore the monitor env and four base units before its diagnostic. This gives
+  one transaction and prevents future generation skew. It also substantially
+  expands the root activator's write and secret-handling surface, duplicates or
+  embeds installer behavior, requires new rollback tests, a new reviewed SHA,
+  a fresh immutable stage and another authorization. It is the cleaner
+  long-term architecture but is not the subtraction path for recovering this
+  already staged first cutover.
+- Installing only unit files or relying only on activation drop-ins is
+  rejected: the base command and env form one release-binding contract, and
+  updating only one side can reproduce the same mixed-generation failure.
+
+### Install-only failure recovery
+
+- Before the first write, under the existing exclusive runtime-control lock,
+  record presence, SHA-256, owner, group and mode for
+  `/etc/telegram-kol-monitor.env` and the monitor service, timer, diagnostic and
+  test-notification base unit files. Copy their exact bytes to one root-owned
+  `0700` evidence directory with `0600` files. Also record, but do not alter,
+  the maintenance-inhibit and candidate release drop-ins and monitor state-file
+  hash/metadata.
+- Run the candidate installer exactly once without `--enable`. On any nonzero
+  exit or any post-install mismatch, restore the five original files
+  byte-for-byte with their original metadata, remove only a destination that
+  was absent before, run one `daemon-reload`, and prove all legacy and split
+  units inactive, inhibited, `MainPID=0`, cgroup-empty and process-empty. Do not
+  run a diagnostic, retry installation or create activation authorization.
+- If file restoration itself cannot be proved, leave every inhibit drop-in in
+  place and all services stopped. Record
+  `maintenance_stopped_config_restore_failed`; do not activate. Thus a partial
+  base-unit/env install cannot create runtime authority or thaw entry even when
+  byte-identical configuration rollback is incomplete.
+- After a successful install-only phase, keep the backup through the activation
+  result. If activation fails, stopped-legacy recovery remains inhibition and
+  full stop; restoring the previous unit/env bytes is a separate bounded
+  configuration rollback decision, not an automatic restart of old code.
+
+### Next activation authorization and parameters
+
+- The consumed authorization cannot be reused. Create a new canonical
+  `scoped-activation-authorization-v2` document with a new 64-hex nonce, fresh
+  issue/expiry timestamps no more than 15 minutes apart, a new unused consumed
+  path in the same root-owned directory, and activation action-plan SHA-256
+  `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`
+  if the activation manifest is unchanged.
+- Candidate SHA / `EXPECTED_COMMIT`:
+  `18ea345a23812ed131c500a6040174a07a4436db`.
+- Components, in canonical order: `web`, `monitor`, `ingest`, `worker`.
+- Source mode: `stopped_legacy`, because no immutable runtime is active and the
+  complete system remains persistently stopped.
+- Rollback SHA / `ROLLBACK_COMMIT`: none and must be omitted for
+  `stopped_legacy`. The legacy checkout SHA and stale monitor release
+  `113bcddf...` are not valid immutable activation rollback/control releases.
+  Failure rollback is the tested `maintenance_stopped` terminal state, with
+  candidate entry-freeze drop-ins retained; it never starts legacy code.
+- Even after unit/env generation is corrected, the candidate business monitor
+  may independently report `stale_entry_preamble_unresolved`. That is a real
+  business-safety gate and must remain fail-closed; this plan does not suppress,
+  migrate or bypass it.
