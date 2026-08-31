@@ -47,15 +47,20 @@ backlog_preterminalization_final_seal_executed: false
 backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
 local_exchange_alignment_implementation_sha: 829cfa49a00ee8db20451b149afc353e17e60291
 local_exchange_alignment_final_suite: 6731_passed_4_skipped_32_warnings
-local_exchange_alignment_status: precondition_failed_closed_pending_trigger_unknown
-local_exchange_alignment_exchange_snapshot_at: 2026-08-31T08:31:59.048364Z
+local_exchange_alignment_status: dry_run_failed_closed_global_scope_guard_mismatch
+local_exchange_alignment_exchange_snapshot_at: 2026-08-31T12:58:25.021309Z
 local_exchange_alignment_position_read: complete_zero
 local_exchange_alignment_regular_order_read: complete_zero
-local_exchange_alignment_pending_trigger_read: incomplete_after_two_attempts
+local_exchange_alignment_pending_trigger_read: complete_zero_btc_eth_sol
 local_exchange_alignment_production_executed: false
-local_exchange_alignment_database_backup_created: false
+local_exchange_alignment_database_backup_created: true
+local_exchange_alignment_database_backup_sha256: 18c03d5152084256b814a0c2639d9a5b9a38ff4409fc26c73e1b2b32be8dbabd
 local_exchange_alignment_begin_immediate_acquired: false
-local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T083039Z
+local_exchange_alignment_exact_target_entered_count: 20
+local_exchange_alignment_exact_target_binding_count: 11
+local_exchange_alignment_out_of_scope_entered_ids: [536, 607, 611, 698, 1036]
+local_exchange_alignment_global_nonterminal_binding_count: 98
+local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3380,3 +3385,42 @@ aligned in this attempt.
   No message was processed or replayed, no service was controlled, no Deepcoin
   write occurred, final seal was not executed and entry admission remains
   frozen.
+
+### Corrected per-instrument preflight and command blocker
+
+- A second authorized window corrected the pending-trigger read to the
+  established governed instruments. At `2026-08-31T12:58:25.021309Z`, the
+  account positions and regular pending orders each completed with zero rows;
+  `BTC-USDT-SWAP`, `ETH-USDT-SWAP` and `SOL-USDT-SWAP` pending-trigger reads
+  each completed on their first attempt with zero rows. The composite snapshot
+  is complete with no errors and no exchange writes.
+- A fresh root-owned mode `0700` evidence directory was created at
+  `/var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z`.
+  The exact `829cfa49...` archive SHA-256 remains
+  `82ae634029fde5774702eb42bb871f37d5c8d6f24ab3dae88a6898fe5edb8c2b`.
+- The verified backup path created a root-owned mode `0600`, 807,387,136-byte
+  database backup with SHA-256
+  `18c03d5152084256b814a0c2639d9a5b9a38ff4409fc26c73e1b2b32be8dbabd`.
+  Its `quick_check` passed and foreign-key check returned no rows. All fixed
+  target before-images and table counts were saved before the dry-run.
+- The `829cfa49...` dry-run then refused before apply. Its fixed target rows are
+  still exactly present: all 20 requested lifecycle rows remain `entered`, and
+  all 11 requested bindings retain their original substantive states. However,
+  the command also contains two global-set assertions: it requires every
+  `entered` lifecycle in the entire database to equal those 20 ids and every
+  nonterminal Deepcoin binding to equal those 11 ids. Production currently has
+  five additional out-of-scope entered lifecycles (`536`, `607`, `611`, `698`,
+  `1036`) and 98 global nonterminal bindings. Those assertions therefore make
+  the exact reviewed command inapplicable to its own bounded target contract.
+- No `apply-result.json` exists, the runtime-control lock was released, the 20
+  target lifecycles and 11 bindings are unchanged, and no new alignment audit
+  rows were created. Web, ingest and worker still expose
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. No message processing, final seal,
+  service control or Deepcoin write occurred.
+
+Continuing now requires a new reviewed exact SHA that removes only the two
+over-broad global-set assertions while retaining the fixed target membership,
+substantive before-image fingerprint, related-row guards, exchange-flat gate
+and single-transaction postconditions. Expanding the production target beyond
+the owner-approved 20 lifecycles and 11 bindings is a separate scope and was
+not inferred in this window.
