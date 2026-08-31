@@ -1461,7 +1461,7 @@ class SystemRuntimeAdapter:
                 text=True,
                 timeout=45,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
             start_result = None
             start_failure = exc
         else:

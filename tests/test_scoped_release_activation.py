@@ -422,7 +422,9 @@ def test_monitor_release_proof_rejects_systemd_exit_status_and_records_actuals(
     }
 
 
-@pytest.mark.parametrize("failure_mode", ["timeout", "nonzero", "signal"])
+@pytest.mark.parametrize(
+    "failure_mode", ["timeout", "decode_error", "nonzero", "signal"]
+)
 def test_monitor_release_proof_rejects_real_runner_failure_modes(
     monkeypatch, capsys, failure_mode
 ) -> None:
@@ -441,6 +443,8 @@ def test_monitor_release_proof_rejects_real_runner_failure_modes(
                     command,
                     kwargs["timeout"],
                 )
+            if failure_mode == "decode_error":
+                raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
             returncode = 1 if failure_mode == "nonzero" else -15
             return scoped_activation.subprocess.CompletedProcess(
                 command,
@@ -509,8 +513,11 @@ def test_monitor_release_proof_rejects_real_runner_failure_modes(
         assert evidence["decision"]["start_returncode"] == 1
         assert evidence["decision"]["systemd_result"] == "exit-code"
         assert evidence["decision"]["exec_main_status"] == "1"
-    else:
+    elif failure_mode == "timeout":
         assert evidence["decision"]["start_observation"] == "timeout"
+        assert evidence["decision"]["start_returncode"] is None
+    else:
+        assert evidence["decision"]["start_observation"] == "unavailable"
         assert evidence["decision"]["start_returncode"] is None
 
 
