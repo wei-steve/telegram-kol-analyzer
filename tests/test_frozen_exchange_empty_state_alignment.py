@@ -207,6 +207,11 @@ def _evidence(**changes):
         "positions": [],
         "open_orders": [],
         "pending_trigger_orders": [],
+        "pending_trigger_orders_by_instrument": {
+            "BTC-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+            "ETH-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+            "SOL-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+        },
         "exchange_write_count": 0,
     }
     value.update(changes)
@@ -270,6 +275,62 @@ def test_inspection_refuses_unknown_or_nonflat_exchange(tmp_path, change):
             observed_at=datetime(2026, 8, 31, 6, 11, tzinfo=UTC),
             code_sha="a" * 40,
         )
+
+
+@pytest.mark.parametrize(
+    "instrument_rows",
+    [
+        {},
+        {
+            "BTC-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+            "ETH-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+        },
+        {
+            "BTC-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+            "ETH-USDT-SWAP": {"complete": False, "error": "timeout", "orders": []},
+            "SOL-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+        },
+        {
+            "BTC-USDT-SWAP": {"complete": True, "error": None, "orders": [{}]},
+            "ETH-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+            "SOL-USDT-SWAP": {"complete": True, "error": None, "orders": []},
+        },
+    ],
+)
+def test_inspection_requires_complete_zero_trigger_proof_for_each_instrument(
+    tmp_path, instrument_rows
+):
+    path = tmp_path / "db.sqlite"
+    _make_database(path)
+    with pytest.raises(AlignmentRefused):
+        inspect_alignment(
+            path,
+            exchange_evidence=_evidence(
+                pending_trigger_orders_by_instrument=instrument_rows
+            ),
+            observed_at=datetime(2026, 8, 31, 6, 11, tzinfo=UTC),
+            code_sha="a" * 40,
+        )
+
+
+def test_non_entry_leg_does_not_expand_the_reviewed_claim_target(tmp_path):
+    path = tmp_path / "db.sqlite"
+    _make_database(path)
+    db = sqlite3.connect(path)
+    db.execute(
+        "INSERT INTO execution_order_legs VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (
+            999, 8, "retained-8", "management", "market", "deepcoin",
+            "historical-management", "historical-management-client", "pos-old",
+            "attribution_conflict", "active", None, None, "now",
+        ),
+    )
+    db.commit()
+    db.close()
+
+    inspection = _inspect(path)
+
+    assert inspection.target_counts["execution_bindings"] == 46
 
 
 def test_apply_uses_existing_terminal_semantics_and_preserves_raw_messages(tmp_path):

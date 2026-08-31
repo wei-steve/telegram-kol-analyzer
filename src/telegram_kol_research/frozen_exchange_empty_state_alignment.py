@@ -50,6 +50,11 @@ INTENT_IDS = (128, 129)
 PROTECTION_LEG_IDS = (545, 546, 547, 548, 549, 550, 551, 552)
 CONVERGENCE_IDS = (149, 150)
 EXPECTED_CHANGED_ROWS = 173
+PENDING_TRIGGER_INSTRUMENTS = (
+    "BTC-USDT-SWAP",
+    "ETH-USDT-SWAP",
+    "SOL-USDT-SWAP",
+)
 
 _TERMINAL_BINDING_STATES = (
     "closed", "cancelled", "canceled", "completed", "failed",
@@ -361,12 +366,14 @@ def _query_binding_claims(
         "              AND s.lifecycle_status='entered')"
         "   OR EXISTS (SELECT 1 FROM execution_order_legs l"
         "              WHERE l.execution_binding_id=b.id"
+        "              AND l.purpose='entry'"
         "              AND nullif(trim(l.pos_id),'') IS NOT NULL"
         f"              AND lower(l.status) NOT IN ({leg_terminal_slots}))"
         " THEN 1 ELSE 0 END AS claims_position,"
         " CASE WHEN lower(b.status) IN ('open','active')"
         "   OR EXISTS (SELECT 1 FROM execution_order_legs l"
         "              WHERE l.execution_binding_id=b.id"
+        "              AND l.purpose='entry'"
         "              AND nullif(trim(l.order_id),'') IS NOT NULL"
         f"              AND lower(l.status) IN ({unresolved_order_slots}))"
         "   OR EXISTS (SELECT 1 FROM trigger_protection_intents i"
@@ -833,6 +840,23 @@ def _validate_exchange(value, *, now: datetime) -> dict[str, Any]:
         if not isinstance(rows, list):
             raise AlignmentRefused("exchange_snapshot_incomplete")
         if rows:
+            raise AlignmentRefused("exchange_account_not_flat")
+    trigger_results = payload.get("pending_trigger_orders_by_instrument")
+    if not isinstance(trigger_results, Mapping) or set(trigger_results) != set(
+        PENDING_TRIGGER_INSTRUMENTS
+    ):
+        raise AlignmentRefused("exchange_snapshot_incomplete")
+    for instrument in PENDING_TRIGGER_INSTRUMENTS:
+        result = trigger_results[instrument]
+        if (
+            not isinstance(result, Mapping)
+            or result.get("complete") is not True
+            or "error" not in result
+            or result.get("error") is not None
+            or not isinstance(result.get("orders"), list)
+        ):
+            raise AlignmentRefused("exchange_snapshot_incomplete")
+        if result["orders"]:
             raise AlignmentRefused("exchange_account_not_flat")
     captured = _parse_utc(payload.get("captured_at"))
     current = now.astimezone(UTC)
