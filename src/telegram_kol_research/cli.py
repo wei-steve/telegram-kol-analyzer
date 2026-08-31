@@ -115,6 +115,9 @@ from telegram_kol_research.scoped_release_activation import (
     exclusive_runtime_control_lock,
     require_stopped_legacy_runtime_boundary,
 )
+from telegram_kol_research.runtime_deployment_identity import (
+    build_runtime_deployment_identity,
+)
 from telegram_kol_research.reviewed_pending_entry_targets import (
     REVIEWED_PENDING_ENTRY_TARGETS,
 )
@@ -2727,7 +2730,20 @@ def monitor_production_safety(
         runtime_incident_capture_token=runtime_config.monitor_capture_token,
     )
     if deployment_diagnostic:
-        release_commit = os.environ.get("TELEGRAM_KOL_RELEASE_COMMIT", "").lower()
+        loaded_identity = build_runtime_deployment_identity(
+            runtime_role="monitor",
+            module_path=Path(__file__),
+            expected_commit=os.environ.get("TELEGRAM_KOL_RELEASE_COMMIT", "").lower(),
+            expected_manifest_sha256=os.environ.get(
+                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256", ""
+            ).lower(),
+            tasks={},
+        )
+        loaded_artifact_verified = (
+            loaded_identity.get("loaded_artifact_verified") is True
+        )
+        release_commit = loaded_identity.get("release_commit")
+        manifest_sha256 = loaded_identity.get("manifest_sha256")
         incomplete_reason_codes = {
             "adapter_failure",
             "adjacent_entry_invariant_scan_incomplete",
@@ -2745,6 +2761,8 @@ def monitor_production_safety(
             "contract": "monitor-deployment-diagnostic-v1",
             "details": outcome.result.details,
             "healthy": outcome.result.healthy,
+            "loaded_artifact_verified": loaded_artifact_verified,
+            "manifest_sha256": manifest_sha256,
             "monitor_error": outcome.monitor_error,
             "notification_status": outcome.notification_status,
             "reason_codes": list(outcome.result.reason_codes),
@@ -2775,8 +2793,12 @@ def monitor_production_safety(
             outcome.audit_ran
             or outcome.adapter_failures
             or outcome.monitor_error is not None
+            or not loaded_artifact_verified
             or not result_complete
+            or not isinstance(release_commit, str)
             or re.fullmatch(r"[0-9a-f]{40}", release_commit) is None
+            or not isinstance(manifest_sha256, str)
+            or re.fullmatch(r"[0-9a-f]{64}", manifest_sha256) is None
         )
     )
     if deployment_diagnostic_failed:

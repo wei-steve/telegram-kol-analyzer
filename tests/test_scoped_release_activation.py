@@ -36,6 +36,8 @@ def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
             "entry_preamble_invariant_codes": ["stale_entry_preamble_unresolved"]
         },
         "healthy": False,
+        "loaded_artifact_verified": True,
+        "manifest_sha256": "a" * 64,
         "monitor_error": None,
         "notification_status": "disabled",
         "reason_codes": ["stale_entry_preamble_unresolved"],
@@ -153,6 +155,7 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
     "payload",
     [
         _monitor_diagnostic_payload(release_commit=OTHER),
+        _monitor_diagnostic_payload(loaded_artifact_verified=False),
         _monitor_diagnostic_payload(
             adapter_failures=["settings"],
             details={"adapter_failures": ["settings"]},
@@ -162,7 +165,12 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
         ),
         {"contract": "monitor-deployment-diagnostic-v1"},
     ],
-    ids=("wrong_release", "source_failure", "incomplete_result"),
+    ids=(
+        "wrong_release",
+        "wrong_loaded_artifact",
+        "source_failure",
+        "incomplete_result",
+    ),
 )
 def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
     monkeypatch, payload

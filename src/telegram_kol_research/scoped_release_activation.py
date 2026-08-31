@@ -1020,6 +1020,8 @@ _MONITOR_DIAGNOSTIC_FIELDS = frozenset(
         "contract",
         "details",
         "healthy",
+        "loaded_artifact_verified",
+        "manifest_sha256",
         "monitor_error",
         "notification_status",
         "reason_codes",
@@ -1035,6 +1037,7 @@ def _parse_monitor_diagnostic_evidence(
     output: str,
     *,
     expected_commit: str,
+    expected_manifest_sha256: str,
 ) -> dict[str, Any]:
     candidates: list[Mapping[str, Any]] = []
     for line in output.splitlines():
@@ -1057,8 +1060,11 @@ def _parse_monitor_diagnostic_evidence(
     checked_at = payload.get("checked_at")
     notification_status = payload.get("notification_status")
     if (
-        payload.get("schema_version") != 1
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != 1
         or payload.get("release_commit") != expected_commit
+        or payload.get("manifest_sha256") != expected_manifest_sha256
+        or payload.get("loaded_artifact_verified") is not True
         or payload.get("audit_ran") is not False
         or payload.get("sources_complete") is not True
         or payload.get("result_complete") is not True
@@ -1445,6 +1451,7 @@ class SystemRuntimeAdapter:
         return _parse_monitor_diagnostic_evidence(
             journal.stdout,
             expected_commit=release.commit,
+            expected_manifest_sha256=release.manifest_sha256,
         )
 
 

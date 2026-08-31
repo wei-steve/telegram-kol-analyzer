@@ -1121,6 +1121,15 @@ def test_deployment_diagnostic_preserves_business_findings_but_exits_zero(monkey
     monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
     monkeypatch.setattr(
         cli_module,
+        "build_runtime_deployment_identity",
+        lambda **kwargs: {
+            "loaded_artifact_verified": True,
+            "manifest_sha256": "a" * 64,
+            "release_commit": "2" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
         "run_production_safety_monitor",
         lambda **kwargs: SimpleNamespace(
             adapter_failures=(),
@@ -1158,6 +1167,8 @@ def test_deployment_diagnostic_preserves_business_findings_but_exits_zero(monkey
     payload = json.loads(result.stdout)
     assert payload["contract"] == "monitor-deployment-diagnostic-v1"
     assert payload["release_commit"] == "2" * 40
+    assert payload["loaded_artifact_verified"] is True
+    assert payload["manifest_sha256"] == "a" * 64
     assert payload["sources_complete"] is True
     assert payload["healthy"] is False
     assert payload["reason_codes"] == ["stale_entry_preamble_unresolved"]
@@ -1170,6 +1181,15 @@ def test_deployment_diagnostic_source_failure_remains_nonzero(monkeypatch):
     import telegram_kol_research.cli as cli_module
 
     monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "build_runtime_deployment_identity",
+        lambda **kwargs: {
+            "loaded_artifact_verified": True,
+            "manifest_sha256": "a" * 64,
+            "release_commit": "2" * 40,
+        },
+    )
     monkeypatch.setattr(
         cli_module,
         "run_production_safety_monitor",
@@ -1207,6 +1227,113 @@ def test_deployment_diagnostic_source_failure_remains_nonzero(monkeypatch):
 
     assert result.exit_code == 1
     assert json.loads(result.stdout)["adapter_failures"] == ["settings"]
+
+
+def test_deployment_diagnostic_rejects_wrong_loaded_artifact_with_expected_env(
+    monkeypatch,
+):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "build_runtime_deployment_identity",
+        lambda **kwargs: {
+            "loaded_artifact_verified": False,
+            "manifest_sha256": None,
+            "release_commit": None,
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            adapter_failures=(),
+            audit_ran=False,
+            checked_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+            exit_code=0,
+            monitor_error=None,
+            notification_status="not_needed",
+            result=SimpleNamespace(healthy=True, reason_codes=(), details={}),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-entry-preamble-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--disable-daily-management-audit",
+            "--deployment-diagnostic",
+        ],
+        env={
+            "TELEGRAM_KOL_RELEASE_COMMIT": "2" * 40,
+            "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": "a" * 64,
+        },
+    )
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["loaded_artifact_verified"] is False
+    assert payload["release_commit"] is None
+
+
+def test_deployment_diagnostic_rejects_incomplete_business_result(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "build_runtime_deployment_identity",
+        lambda **kwargs: {
+            "loaded_artifact_verified": True,
+            "manifest_sha256": "a" * 64,
+            "release_commit": "2" * 40,
+        },
+    )
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            adapter_failures=(),
+            audit_ran=False,
+            checked_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+            exit_code=1,
+            monitor_error=None,
+            notification_status="disabled",
+            result=SimpleNamespace(
+                healthy=False,
+                reason_codes=("malformed_snapshot",),
+                details={},
+            ),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-entry-preamble-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--disable-daily-management-audit",
+            "--deployment-diagnostic",
+        ],
+        env={"TELEGRAM_KOL_RELEASE_COMMIT": "2" * 40},
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["result_complete"] is False
 
 
 def test_audit_management_batches_is_bounded_redacted_and_read_only(
