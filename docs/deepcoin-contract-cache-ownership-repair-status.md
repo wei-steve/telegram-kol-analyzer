@@ -4,18 +4,18 @@
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
 current_phase: two_stage_auto_trade_recovery
-phase_state: in_progress
+phase_state: complete
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
-candidate_content_sha: 588d1aadb47f25ca56f4e3815cff3dff67892f2d6f97b738a0a85bbb1a8c24ea
-handoff_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
-pushed_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
+candidate_sha: 6e2321cecbb3adf61d7a5972d391e662d4aea300
+candidate_content_sha: 8e32ade69efdee9dac7e47592f19f5528caedcf0b695d6547be9923c25c70419
+handoff_sha: 6e2321cecbb3adf61d7a5972d391e662d4aea300
+pushed_sha: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
-production_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
+production_sha: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_activation_status: succeeded
-production_runtime_state: running_entry_frozen
-entry_admission_frozen: true
+production_runtime_state: running_entry_unfrozen_auto_trade_enabled
+entry_admission_frozen: false
 l2_observation_status: complete_6_realtime_messages_5_chats
 l2_observation_completed_at: 2026-08-31T04:48:48.233Z
 frozen_queue_investigation_status: complete_read_only
@@ -86,22 +86,42 @@ local_exchange_alignment_raw_current_minus_backup_count: 9
 local_exchange_alignment_raw_existing_rows_unchanged: true
 local_exchange_alignment_raw_strict_bidirectional_equal: false
 local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z
-two_stage_recovery_status: aborted_prechange_monitor_critical_event_unknown_status
-two_stage_recovery_precondition_at: 2026-08-31T15:23:22.694664Z
+monitor_event_contract_fix_sha: 6e2321cecbb3adf61d7a5972d391e662d4aea300
+monitor_event_contract_fix_review: no_findings
+monitor_event_contract_fix_final_suite: 6739_passed_4_skipped_32_warnings
+two_stage_recovery_status: complete
+two_stage_recovery_precondition_at: 2026-08-31T16:06:54.256952Z
 two_stage_recovery_position_read: complete_zero
 two_stage_recovery_regular_order_read: complete_zero
 two_stage_recovery_pending_trigger_read: complete_zero_btc_eth_sol
-two_stage_recovery_settings_mutated: false
-two_stage_recovery_dropins_mutated: false
-two_stage_recovery_services_restarted: false
-two_stage_recovery_auto_trade_enabled_after_abort: true
-two_stage_recovery_entry_admission_frozen_after_abort: true
-two_stage_recovery_monitor_reason_codes: [event_unknown_status]
-two_stage_recovery_monitor_unknown_event_count: 1
+two_stage_recovery_settings_mutated: true
+two_stage_recovery_dropins_mutated: true
+two_stage_recovery_services_restarted: true
+two_stage_recovery_auto_trade_enabled_after_completion: true
+two_stage_recovery_entry_admission_frozen_after_completion: false
+two_stage_recovery_monitor_reason_codes: []
+two_stage_recovery_monitor_unknown_event_count: 0
 two_stage_recovery_window_watermark_raw_message_id: 14156
-two_stage_recovery_prewatermark_pending_or_claimed_count: 126
+two_stage_recovery_prewatermark_pending_or_claimed_before: 126
+two_stage_recovery_prewatermark_pending_or_claimed_after: 0
+two_stage_recovery_prewatermark_expired_count: 126
+two_stage_recovery_total_jobs_processed: 128
+two_stage_recovery_total_expired_delta: 127
+two_stage_recovery_total_succeeded_delta: 1
+two_stage_recovery_candidate_delta: 0
+two_stage_recovery_lifecycle_delta: 0
+two_stage_recovery_binding_delta: 0
+two_stage_recovery_execution_event_delta: 0
 two_stage_recovery_static_token_baseline_status: complete
-two_stage_recovery_live_token_baseline_status: not_started_due_monitor_abort
+two_stage_recovery_live_token_baseline_status: complete_no_live_message_sample
+two_stage_recovery_live_window_started_at: 2026-08-31T16:12:36.995Z
+two_stage_recovery_live_window_completed_at: 2026-08-31T16:42:37Z
+two_stage_recovery_live_message_count: 0
+two_stage_recovery_live_ai_invocation_count: 0
+two_stage_recovery_live_ai_calls_per_message: null_no_denominator
+two_stage_recovery_live_main_recognition_count: 0
+two_stage_recovery_live_context_resolution_count: 0
+two_stage_recovery_live_context_chat_ids: []
 context_resolution_enabled_observed: true
 context_resolution_whitelist_count: 33
 context_resolution_configured_active_chat_count: 34
@@ -111,7 +131,7 @@ context_resolution_attempt_span_days: 35
 context_resolution_attempt_rows_per_day: 121.28571428571429
 context_resolution_json_payload_bytes: 329466347
 context_resolution_json_payload_bytes_per_day: 9413324.2
-two_stage_recovery_evidence_path: /var/lib/telegram-kol-maintenance-evidence/two-stage-trading-recovery-20260831T152321Z
+two_stage_recovery_evidence_path: /var/lib/telegram-kol-cutover-evidence/6e2321cecbb3adf61d7a5972d391e662d4aea300/monitor-install
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3793,3 +3813,106 @@ there were 126 non-shadow pending or claimed jobs at or below it.
 
 Continuing requires a separate decision on the monitor/event status contract;
 this turn made no monitor-code or audit-row change and did not relax any check.
+
+## Monitor event-contract repair and completed two-stage trading recovery
+
+The owner-approved repair and recovery window completed on 2026-08-31 without
+changing recognition logic, context-resolution settings, message-age limits or
+any existing execution audit row.
+
+### Bounded event-status contract repair
+
+- Commit `6e2321cecbb3adf61d7a5972d391e662d4aea300` adds one action-scoped
+  normal terminal pair only:
+  `historical_state_convergence_repair / completed`. It does not add
+  `completed` to the global normal-status set. A different action with
+  `completed`, and all previously unknown or recovery statuses, still produce
+  `event_unknown_status` or their existing reason code.
+- The RED test reproduced the exact critical reason before implementation; the
+  GREEN set passed six focused cases and the complete monitor test module
+  passed 364 tests. Independent exact-base review returned `No findings` and
+  independently ran 13 focused tests. The sole final repository suite after
+  the production-code change passed `6739 passed, 4 skipped, 32 warnings` in
+  421.53 seconds. No production code changed afterwards.
+
+### Fresh immutable release, installation and activation
+
+- The pushed exact candidate matched the remote branch before staging. Its
+  fresh immutable release has tree
+  `bf407f32bb74a5ebe2419445a5a1e996ca2a39c4`, content SHA-256
+  `8e32ade69efdee9dac7e47592f19f5528caedcf0b695d6547be9923c25c70419`
+  and manifest SHA-256
+  `4d011a9569dde31468db08cce20e1ce4e6570fad3a828f86d20db7832444cbb7`.
+  Stage declared the exact four runtime components and no schema, production
+  data or exchange-write semantics change.
+- The four governed settings remained auto trade enabled, entry preamble live,
+  message-assembly-v2 live and entry-revision-v2 live. Monitor env and all four
+  base units were backed up under the evidence directory before installation.
+  Installed and candidate hashes matched by the same four exact filenames;
+  the diagnostic retained its two deployment-only flags, retired arguments
+  were absent and `systemd-analyze verify` returned zero. The monitor timer was
+  stopped only for the install write and restored active/waiting afterwards.
+- One canonical ten-minute activation authorization was consumed in immutable
+  source mode, bound to the candidate, the four exact components, action-plan
+  SHA-256 `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`
+  and rollback release `cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62`.
+  Activation succeeded. Web PID `3732072`, ingest PID `3732074` and worker PID
+  `3732070` initially proved the new release and retained entry freeze.
+- The deployment diagnostic loaded the new release with
+  `loaded_artifact_verified=true`, `audit_ran=false`, complete sources and
+  result, `healthy=true` and empty reason codes. The approved
+  `reset-failed telegram-kol-monitor.service` did not start another service;
+  the following full ordinary monitor cycle loaded the new release and was
+  healthy with no reasons. The scheduled cycle at `16:32:06Z` was also healthy.
+
+### First segment: execution off, processing on
+
+- A fresh complete Deepcoin read at `2026-08-31T16:06:54.256952Z` returned zero
+  account positions, zero regular open orders and zero pending triggers from
+  each exact per-contract BTC, ETH and SOL call. No account-wide trigger call
+  was made.
+- The loopback settings endpoint changed only `auto_trade_enabled` to false.
+  The monitor expected option was atomically changed to
+  `--no-expected-auto-trade-enabled`. The exact frozen drop-ins were backed up,
+  their one entry-freeze line was removed, systemd was reloaded and worker,
+  web and ingest restarted in that order under the runtime-control lock.
+- The post-restart identities loaded exact `6e2321ce...`, had entry admission
+  unfrozen and healthy role-specific loops. Worker execution, management,
+  protection, close, TPSL and rescue capabilities were all false while the
+  execution switch was off.
+- The 126 non-shadow pending or claimed jobs at or below watermark `14156`
+  converged immediately to zero, all through the existing expired path. Across
+  the whole queue, 128 jobs completed: 127 expired and one succeeded. Candidate,
+  lifecycle and binding totals remained exactly 2,120, 1,034 and 320; therefore
+  each delta is zero. Execution events remained exactly 3,877, and fresh
+  exchange reads remained empty. The monitor cycle was healthy with no reason
+  code.
+
+### Second segment: execution enabled and 30-minute observation
+
+- After every admission gate passed, the original candidate env bytes restored
+  `--expected-auto-trade-enabled` and the loopback endpoint changed
+  `auto_trade_enabled` to true. No restart was needed. Worker subsequently
+  reported fresh successful loops with global exchange authority, management,
+  protection, close, TPSL and rescue capabilities all true. Final runtime PIDs
+  were web `3746349`, ingest `3746355` and worker `3746343`; all retained exact
+  candidate identity and entry admission remained unfrozen.
+- The fixed observation window ran from `2026-08-31T16:12:36.995Z` through
+  `16:42:37Z`. It observed no new execution event, no pending or claimed job,
+  no monitor reason, no PID/SHA drift and no stack-trace or error storm. The
+  final complete exchange read at `16:44:09Z` still returned zero positions,
+  zero regular orders and zero BTC/ETH/SOL pending triggers. No emergency
+  rollback condition occurred.
+- Live traffic was zero: raw-message maximum stayed `14158`; AI-prompt
+  invocation maximum stayed `16284`; recognition-decision maximum stayed
+  `14157`; context-resolution-attempt maximum stayed `4245`. Therefore the
+  window has zero main-recognition calls, zero context-resolution calls and no
+  context chat IDs, but calls per message is recorded as unavailable because
+  the denominator is zero, not as an observed average of zero.
+
+No final seal, bulk expiry, manual processing, replay, message reordering,
+recognition change, threshold change, raw-message/lifecycle/binding edit or
+Deepcoin write was performed. Auto trade is enabled, monitor expectation agrees,
+entry admission is unfrozen, and the recovery phase is complete. Complete
+install, authorization and recovery evidence is root-owned under
+`/var/lib/telegram-kol-cutover-evidence/6e2321cecbb3adf61d7a5972d391e662d4aea300/monitor-install`.
