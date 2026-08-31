@@ -3,7 +3,7 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: prethaw_local_exchange_state_alignment
+current_phase: two_stage_auto_trade_recovery
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
 candidate_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
@@ -86,6 +86,32 @@ local_exchange_alignment_raw_current_minus_backup_count: 9
 local_exchange_alignment_raw_existing_rows_unchanged: true
 local_exchange_alignment_raw_strict_bidirectional_equal: false
 local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z
+two_stage_recovery_status: aborted_prechange_monitor_critical_event_unknown_status
+two_stage_recovery_precondition_at: 2026-08-31T15:23:22.694664Z
+two_stage_recovery_position_read: complete_zero
+two_stage_recovery_regular_order_read: complete_zero
+two_stage_recovery_pending_trigger_read: complete_zero_btc_eth_sol
+two_stage_recovery_settings_mutated: false
+two_stage_recovery_dropins_mutated: false
+two_stage_recovery_services_restarted: false
+two_stage_recovery_auto_trade_enabled_after_abort: true
+two_stage_recovery_entry_admission_frozen_after_abort: true
+two_stage_recovery_monitor_reason_codes: [event_unknown_status]
+two_stage_recovery_monitor_unknown_event_count: 1
+two_stage_recovery_window_watermark_raw_message_id: 14156
+two_stage_recovery_prewatermark_pending_or_claimed_count: 126
+two_stage_recovery_static_token_baseline_status: complete
+two_stage_recovery_live_token_baseline_status: not_started_due_monitor_abort
+context_resolution_enabled_observed: true
+context_resolution_whitelist_count: 33
+context_resolution_configured_active_chat_count: 34
+context_resolution_configured_active_chat_covered_count: 33
+context_resolution_attempt_count: 4245
+context_resolution_attempt_span_days: 35
+context_resolution_attempt_rows_per_day: 121.28571428571429
+context_resolution_json_payload_bytes: 329466347
+context_resolution_json_payload_bytes_per_day: 9413324.2
+two_stage_recovery_evidence_path: /var/lib/telegram-kol-maintenance-evidence/two-stage-trading-recovery-20260831T152321Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3689,3 +3715,81 @@ message processing/replay, service control, stage, activation or Deepcoin write
 was performed. Because strict raw bidirectional equality was not met, the
 overall pre-thaw phase remains `in_progress`; no rollback or whole-database
 restore was attempted after the successful commit.
+
+## Two-stage auto-trade recovery prechange abort
+
+The owner-approved two-stage recovery window stopped before its first setting,
+drop-in or service mutation. Evidence is in the root-owned mode `0700`
+directory
+`/var/lib/telegram-kol-maintenance-evidence/two-stage-trading-recovery-20260831T152321Z`.
+
+### Settled execution procedure
+
+- The supported auto-trade control is the existing loopback
+  `POST /api/trading-settings` endpoint with only
+  `{"auto_trade_enabled": false}` or `true`. It merges through
+  `save_trading_settings()` into `trading_settings(key='global')` and is read
+  dynamically by execution and management loops; the setting itself needs no
+  restart.
+- The monitor expectation was to be changed temporarily from
+  `--expected-auto-trade-enabled` to
+  `--no-expected-auto-trade-enabled`, preserving the drift check while the
+  owner-approved execution switch was off. The original env bytes were copied
+  to evidence, but `/etc/telegram-kol-monitor.env` was not changed.
+- Deployment thaw was to remove only the unique
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1` line from each web, ingest and worker
+  `10-telegram-kol-release.conf`, then daemon-reload and restart
+  `worker -> web -> ingest` under `/run/telegram-kol-update.lock`. Emergency
+  refreeze was fixed as auto-trade false first, then exact frozen drop-in
+  restore and the same restart order. No part of this procedure ran.
+
+### Fresh exchange precondition and blocking monitor reason
+
+- At `2026-08-31T15:23:22.694664Z`, the read-only exchange precondition was
+  complete and empty: zero account positions, zero regular open orders, and
+  zero pending triggers for each of BTC, ETH and SOL. No account-wide trigger
+  request or Deepcoin write occurred.
+- Before changing auto trade, monitor expectations or release drop-ins, the
+  installed `telegram-kol-monitor.service` was found already in
+  `failed/exit-code/1`. Its `2026-08-31T15:00:48.835129Z` result was unhealthy
+  with the critical funds-safety reason `event_unknown_status`; the timer
+  remained active/waiting.
+- The exact source is one execution audit row written by the preceding unified
+  alignment transaction:
+  `historical_state_convergence_repair / completed` at
+  `2026-08-31 14:40:59.123010`. The monitor normal-status allowlist does not
+  contain `completed`, so it classified this historical convergence summary as
+  an unknown exchange result. The same transaction's other 66 execution audit
+  rows are `reconcile_manual_pending_entry_cancel / confirmed` and are not
+  unknown. This explains the reason but does not authorize ignoring or
+  suppressing a critical monitor check.
+- Per the explicit immediate-abort rule, the phase stopped. Monitor failed
+  state was not reset, auto trade remains `true`, all three runtime drop-ins
+  still contain entry freeze `1`, and no runtime was restarted. No final seal,
+  recognition/replay, queue processing or business-table write occurred.
+
+### Static AI/context usage baseline
+
+The read-only static portion completed after checking the production table
+schemas directly. The window watermark is raw message id `14156`; at capture
+there were 126 non-shadow pending or claimed jobs at or below it.
+
+- `context_resolution_enabled=true`; the whitelist has 33 chat ids and covers
+  33 of 34 configured enabled chats. The uncovered configured chat is
+  `-1003942765613`.
+- `context_resolution_attempts` contains 4,245 rows from
+  `2026-07-27 09:38:38.230117` through
+  `2026-08-30 01:17:57.357331`, spanning 35 calendar days: 121.29 rows/day.
+  The six JSON payload columns total 329,466,347 UTF-8 bytes, or
+  9,413,324.2 bytes/day.
+- Eight chats contribute 81.48% of historical context attempts, in descending
+  order: `-1003095914903` 560, `-1002199068560` 525,
+  `-1002282384698` 499, `-1002960443256` 482,
+  `-1002368892075` 436, `-1002409877375` 385,
+  `-1003048800035` 359 and `-1002370796392` 213.
+- The live 30-minute AI-call baseline was not started because the window never
+  reached the second-stage enablement gate. No per-message live-call average or
+  live context-resolution chat set is claimed.
+
+Continuing requires a separate decision on the monitor/event status contract;
+this turn made no monitor-code or audit-row change and did not relax any check.
