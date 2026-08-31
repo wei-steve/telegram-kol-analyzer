@@ -6,10 +6,10 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
-candidate_content_sha: pending_fresh_immutable_stage
-handoff_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
-pushed_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
+candidate_sha: 1aa334830fced4029df2d5353b25166cea7d8cfb
+candidate_content_sha: 4386765e1f5ebeb62b875cb98a2f4a81f408f8bea02a8c6e1fd59a0ddc925bd6
+handoff_sha: 1aa334830fced4029df2d5353b25166cea7d8cfb
+pushed_sha: 1aa334830fced4029df2d5353b25166cea7d8cfb
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -280,11 +280,42 @@ recovery_activation_post_verification_status: not_run_activation_failed
 recovery_activation_entry_admission_thawed: false
 invocation_correlation_repair_base_sha: d12241aabe53c8f7de3b719b55b3d80d0604d895
 invocation_correlation_repair_code_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
-invocation_correlation_repair_status: local_complete_fresh_stage_pending
+invocation_correlation_repair_status: deployed_activation_failed_closed_immediate_evidence_read
 invocation_correlation_repair_focused: 246_passed_2_skipped
 invocation_correlation_repair_review: three_rounds_final_no_findings
 invocation_correlation_repair_final_suite: 6701_passed_4_skipped_32_warnings
 invocation_correlation_repair_final_suite_seconds: 412.95
+invocation_recovery_stage_sha: 1aa334830fced4029df2d5353b25166cea7d8cfb
+invocation_recovery_stage_tree: 85bef12c304a72dfef5200a8f7806de4605167b4
+invocation_recovery_stage_content_sha256: 4386765e1f5ebeb62b875cb98a2f4a81f408f8bea02a8c6e1fd59a0ddc925bd6
+invocation_recovery_stage_manifest_sha256: 3c3958b9d67510ce2961c325bd0e0e6f2743cc3539bbeccc3f0d140475a8eea7
+invocation_recovery_stage_action_plan_sha256: aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b
+invocation_recovery_stage_integrity_status: authoritative_validate_release_passed
+invocation_recovery_monitor_install_status: passed_all_hard_gates
+invocation_recovery_monitor_install_evidence_path: /var/lib/telegram-kol-cutover-evidence/1aa334830fced4029df2d5353b25166cea7d8cfb/monitor-install-20260831T024626Z-2076920
+invocation_recovery_activation_authorization_sha256: b92fa526c3459daa90d7f569151737b31eebf5bf169d5c6f32086c9088fb61de
+invocation_recovery_activation_authorization_consumed: true
+invocation_recovery_activation_status: failed_closed_immediate_monitor_evidence_read
+invocation_recovery_diagnostic_job_id: 21531429
+invocation_recovery_diagnostic_invocation_id: 43e684097f9340fe8c22c0c9992375bb
+invocation_recovery_diagnostic_audit_ran: false
+invocation_recovery_diagnostic_loaded_artifact_verified: true
+invocation_recovery_diagnostic_sources_complete: true
+invocation_recovery_diagnostic_result_complete: true
+invocation_recovery_diagnostic_healthy: true
+invocation_recovery_diagnostic_reason_codes: none
+invocation_recovery_diagnostic_adapter_failures: none
+invocation_recovery_later_exact_journal_parse: passed
+invocation_recovery_exact_immediate_subcondition: unavailable_not_persisted
+invocation_recovery_monitor_timer_started: false
+invocation_recovery_terminal_state: maintenance_stopped_entry_frozen
+invocation_recovery_entry_admission_thawed: false
+invocation_recovery_original_36_drained: 0
+invocation_recovery_same_chat_pending_after: 36
+invocation_recovery_same_chat_candidate_after: 0
+invocation_recovery_telegram_gap_seconds_before_attempt: 12155
+invocation_recovery_telegram_history_rows_inserted: 6
+invocation_recovery_telegram_history_rows_pending: 6
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -2627,3 +2658,97 @@ activation.
   exchange write, message replay/backfill, reconciliation or entry thaw. The
   next immutable stage must use the exact pushed HEAD that includes this status
   update; its content and manifest digests must be freshly derived.
+
+## Invocation-correlation recovery stage, install and failed activation
+
+- The repair and preceding status were pushed as exact clean commit
+  `1aa334830fced4029df2d5353b25166cea7d8cfb`, equal to
+  `origin/codex/deepcoin-auto-trading-v1`, before staging. The fresh immutable
+  release has tree `85bef12c304a72dfef5200a8f7806de4605167b4`, content SHA-256
+  `4386765e1f5ebeb62b875cb98a2f4a81f408f8bea02a8c6e1fd59a0ddc925bd6`
+  and manifest SHA-256
+  `3c3958b9d67510ce2961c325bd0e0e6f2743cc3539bbeccc3f0d140475a8eea7`.
+  Its receipt is `staged` with action-plan SHA-256
+  `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`.
+  The authoritative existing `validate_release()` path passed after receipt
+  without importing or executing code from the immutable release; its content
+  and manifest digests remained receipt-exact.
+- The four governed settings were read from the exact
+  `trading_settings(id,key,value_json,updated_at)` row and remained auto trade
+  enabled, entry preamble live, message-assembly-v2 live and entry-revision-v2
+  live. Under the exclusive runtime-control lock, the existing monitor env and
+  four exact base units were copied byte-for-byte into root-owned mode `0600`
+  files under root-owned mode `0700` evidence directory
+  `/var/lib/telegram-kol-cutover-evidence/1aa334830fced4029df2d5353b25166cea7d8cfb/monitor-install-20260831T024626Z-2076920`.
+  Maintenance inhibits and release drop-ins were recorded and not altered by
+  the installer.
+- Candidate `install_server_monitor.sh` completed install-only. All four
+  installed/candidate pairs were byte-equal: service
+  `9f1384bdf9b4c8b7e6c8e71de1809efc73be9b4653e7a28b0a36d2f2fafe4c0f`,
+  timer `59a27b2f35930ddb0943cf986c4dbd36bcab87f8086338a4499cfa4b8aed7ad5`,
+  diagnostic
+  `ae23b0b989ea7afe8bc8e87eb393e9c36f622672edb4cacd79327f068d297f54`
+  and test-notification
+  `450ec37ae1e547a324f75b3bddccfe647d1654b9c536fb0b29ff0b41d0261a15`.
+  The diagnostic alone retained `--disable-daily-management-audit` and
+  `--deployment-diagnostic`; all retired parameters were absent, the env
+  pointed to `1aa33483...`, `systemd-analyze verify` passed, and all eight
+  governed/legacy units remained inactive, processless, inhibited and
+  entry-frozen. Diagnostic state was already `inactive/dead`, result success,
+  so the conditionally authorized `reset-failed` was unnecessary and did not
+  run.
+- The raw activation manifest declared exactly `web`, `monitor`, `ingest`,
+  `worker`, no schema or production-data change, and source mode
+  `stopped_legacy`. Before consumption, it and the canonical nine-field
+  authorization payload were printed and preserved. The root-owned mode
+  `0400` authorization bound exact candidate `1aa33483...`, action-plan
+  SHA-256 `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`,
+  issuance `2026-08-31T02:50:29.477541Z`, expiry
+  `2026-08-31T03:00:29.477541Z` and a fresh nonce. Its SHA-256 is
+  `b92fa526c3459daa90d7f569151737b31eebf5bf169d5c6f32086c9088fb61de`;
+  it was consumed exactly once.
+- Candidate web, ingest and worker started and each returned HTTP 200 for exact
+  runtime identity. Diagnostic job `21531429`, invocation
+  `43e684097f9340fe8c22c0c9992375bb`, started at
+  `2026-08-31T02:51:55.799833Z` and finished successfully at
+  `02:52:01.264794Z`. It loaded exact release `1aa33483...` and produced one
+  complete result: `audit_ran=false`, `loaded_artifact_verified=true`,
+  `sources_complete=true`, `result_complete=true`, `healthy=true`, with empty
+  `adapter_failures`, `reason_codes` and `details`.
+- Activation nevertheless returned `activation failed; maintenance_stopped`
+  before any monitor-timer start. The cursor-bounded production JSON journal
+  retained exactly two matching PID-1 job records and two matching stdout
+  records; replaying those exact bytes later through the deployed parser and
+  result validator passes. Therefore the release, diagnostic and retained
+  invocation evidence are all valid, but the exact immediate-time rejection
+  subcondition was not persisted by the activator and cannot be reconstructed
+  honestly after the fact. A transient journal-visibility or transaction-output
+  difference is possible, but is not proven. Per the approved fail-closed rule,
+  activation was not retried, the release was not repaired or restaged, and no
+  new implementation was attempted in this window.
+- Failure recovery stopped the three candidate runtimes. All eight governed and
+  legacy units are `inactive/dead`, `MainPID=0`, result success, and each exact
+  inhibit retains SHA-256
+  `18624486bdc082f7c9aff9a6128cfa8842eb55b8fb0a91e1ceaaad84c14f2fa5`.
+  Web, ingest and worker drop-ins still bind `1aa33483...` with
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`; entry admission was never thawed.
+- Worker startup still completed the original cache objective. The previous
+  inode `76560953` was atomically replaced by inode `76939941`; current digest
+  is `0915b6f85a0e9c0d05158c19c9a40691933d95ea1bf16cee2720e76371604eff`,
+  snapshot time is `2026-08-31T02:51:02.963372Z`, instrument count is 249,
+  owner is `telegram-kol-worker`, group `telegram-kol-runtime`, and mode is
+  `0660`. The diagnostic's contract-spec source returned HTTP 200 with no
+  reason code.
+- None of the original 36 same-chat pending jobs drained; all remain pending at
+  attempt count zero and candidate count remains zero. One additional later
+  same-chat message completed, making the whole post-preamble set 52 raw
+  messages, 16 succeeded and 36 pending, still with zero candidates. The
+  continuously stopped ingest interval before this attempt was about 12,155
+  seconds (`2026-08-30T23:28:19.360814Z` to
+  `2026-08-31T02:50:54.836948Z`). During the brief runtime, six historical raw
+  messages posted from `02:02:09Z` through `02:24:51Z` were collected and all
+  six were created as pending `history_reconcile_enqueued` work. Thus future
+  normal recovery will treat collected history as processing work; completeness
+  for the earlier part of the outage remains unknown. No manual drain,
+  recognition, replay, backfill, reconciliation, Deepcoin write, business-table
+  mutation, preamble change or entry thaw occurred.
