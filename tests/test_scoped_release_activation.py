@@ -167,12 +167,96 @@ def test_monitor_release_proof_allows_success_when_journal_evidence_is_unavailab
         "basis": "systemctl_start_and_systemd_result_exec_main_status",
         "exec_main_status": "0",
         "passed": True,
+        "start_returncode": 0,
         "systemd_result": "success",
     }
     assert evidence["journal_evidence"] == {
         "reason": "journal_command_nonzero",
         "returncode": 1,
         "status": "unavailable",
+    }
+
+
+def test_monitor_release_proof_allows_success_when_journal_decoding_fails(
+    monkeypatch,
+) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+
+    def run(command, **kwargs):
+        if command == [
+            "systemctl",
+            "show",
+            "telegram-kol-monitor-diagnostic.service",
+            "--property=Result",
+            "--property=ExecMainStatus",
+        ]:
+            return scoped_activation.subprocess.CompletedProcess(
+                command,
+                0,
+                stdout="Result=success\nExecMainStatus=0\n",
+                stderr="",
+            )
+        if command[0] == "journalctl":
+            raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid")
+        return scoped_activation.subprocess.CompletedProcess(
+            command, 0, stdout="", stderr=""
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    evidence = runtime.verify_monitor_release(release)
+
+    assert evidence["decision"]["passed"] is True
+    assert evidence["journal_evidence"] == {
+        "reason": "journal_evidence_exception",
+        "status": "unavailable",
+    }
+
+
+def test_monitor_release_proof_records_identity_precheck_failure(
+    monkeypatch, capsys
+) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+
+    def run(command, **kwargs):
+        return scoped_activation.subprocess.CompletedProcess(
+            command,
+            1 if command[-1] == "telegram_kol_research.runtime_deployment_identity" else 0,
+            stdout="",
+            stderr="failed",
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    with pytest.raises(ActivationError, match="runtime command failed"):
+        runtime.verify_monitor_release(release)
+
+    evidence = json.loads(capsys.readouterr().err.strip().partition("=")[2])
+    assert evidence["decision"] == {
+        "basis": "runtime_identity_precheck",
+        "exec_main_status": None,
+        "passed": False,
+        "reason": "runtime_identity_precheck_failed",
+        "start_returncode": None,
+        "systemd_result": None,
     }
 
 
@@ -333,6 +417,7 @@ def test_monitor_release_proof_rejects_systemd_exit_status_and_records_actuals(
         "exec_main_status": exec_main_status,
         "passed": False,
         "reason": "diagnostic_exit_failed",
+        "start_returncode": 0,
         "systemd_result": systemd_result,
     }
 
@@ -416,14 +501,17 @@ def test_monitor_release_proof_rejects_real_runner_failure_modes(
     assert evidence["decision"]["systemd_status_observation"] == "available"
     if failure_mode == "signal":
         assert evidence["decision"]["start_observation"] == "nonzero_or_signal"
+        assert evidence["decision"]["start_returncode"] == -15
         assert evidence["decision"]["systemd_result"] == "signal"
         assert evidence["decision"]["exec_main_status"] == "15"
     elif failure_mode == "nonzero":
         assert evidence["decision"]["start_observation"] == "nonzero_or_signal"
+        assert evidence["decision"]["start_returncode"] == 1
         assert evidence["decision"]["systemd_result"] == "exit-code"
         assert evidence["decision"]["exec_main_status"] == "1"
     else:
         assert evidence["decision"]["start_observation"] == "timeout"
+        assert evidence["decision"]["start_returncode"] is None
 
 
 def _content_digest(root: Path) -> str:

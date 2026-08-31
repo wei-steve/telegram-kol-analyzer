@@ -1100,7 +1100,7 @@ class SystemRuntimeAdapter:
                 timeout=45,
                 env=environment,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
             raise ActivationError("runtime command failed") from exc
         if result.returncode != 0:
             raise ActivationError("runtime command failed")
@@ -1188,7 +1188,7 @@ class SystemRuntimeAdapter:
                 text=True,
                 timeout=10,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
             raise ActivationError("runtime command failed") from exc
         enabled = enabled_result.stdout.strip()
         if enabled_result.returncode not in {0, 1} or not active or not enabled:
@@ -1377,13 +1377,24 @@ class SystemRuntimeAdapter:
                 "reason": "journal_command_unavailable",
                 "status": "unavailable",
             }
+        except Exception:
+            return {
+                "reason": "journal_evidence_exception",
+                "status": "unavailable",
+            }
         if result.returncode != 0:
             return {
                 "reason": "journal_command_nonzero",
                 "returncode": result.returncode,
                 "status": "unavailable",
             }
-        return _best_effort_monitor_journal_evidence(result.stdout)
+        try:
+            return _best_effort_monitor_journal_evidence(result.stdout)
+        except Exception:
+            return {
+                "reason": "journal_evidence_exception",
+                "status": "unavailable",
+            }
 
     def verify_monitor_release(
         self, release: ReleaseEvidence
@@ -1397,25 +1408,65 @@ class SystemRuntimeAdapter:
                 "TELEGRAM_KOL_RUNTIME_ROLE": "monitor",
             }
         )
-        self._run(
-            [
-                str(self.python),
-                "-m",
-                "telegram_kol_research.runtime_deployment_identity",
-            ],
-            environment=environment,
+        prechecks = (
+            (
+                "runtime_identity_precheck",
+                "runtime_identity_precheck_failed",
+                [
+                    str(self.python),
+                    "-m",
+                    "telegram_kol_research.runtime_deployment_identity",
+                ],
+                environment,
+            ),
+            (
+                "systemd_unit_precheck",
+                "systemd_unit_precheck_failed",
+                [
+                    "systemd-analyze",
+                    "verify",
+                    *_UNITS["monitor"],
+                    "telegram-kol-monitor.timer",
+                ],
+                None,
+            ),
         )
-        self._run(
-            [
-                "systemd-analyze",
-                "verify",
-                *_UNITS["monitor"],
-                "telegram-kol-monitor.timer",
-            ]
-        )
+        for basis, reason, command, command_environment in prechecks:
+            try:
+                self._run(command, environment=command_environment)
+            except ActivationError:
+                evidence = {
+                    "contract": "monitor-activation-gate-evidence-v1",
+                    "decision": {
+                        "basis": basis,
+                        "exec_main_status": None,
+                        "passed": False,
+                        "reason": reason,
+                        "start_returncode": None,
+                        "systemd_result": None,
+                    },
+                    "journal_evidence": {
+                        "reason": "diagnostic_not_started",
+                        "status": "unavailable",
+                    },
+                    "schema_version": 1,
+                }
+                _emit_monitor_gate_evidence(evidence)
+                raise
         try:
-            self._run(["systemctl", "start", _MONITOR_DIAGNOSTIC_UNIT])
-        except ActivationError as exc:
+            start_result = subprocess.run(
+                ["systemctl", "start", _MONITOR_DIAGNOSTIC_UNIT],
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=45,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            start_result = None
+            start_failure = exc
+        else:
+            start_failure = None
+        if start_failure is not None or start_result.returncode != 0:
             try:
                 status = self._run(
                     [
@@ -1438,9 +1489,9 @@ class SystemRuntimeAdapter:
                 status_observation = "unavailable"
             start_observation = (
                 "timeout"
-                if isinstance(exc.__cause__, subprocess.TimeoutExpired)
+                if isinstance(start_failure, subprocess.TimeoutExpired)
                 else "unavailable"
-                if isinstance(exc.__cause__, OSError)
+                if isinstance(start_failure, (OSError, UnicodeError))
                 else "nonzero_or_signal"
             )
             evidence = {
@@ -1451,6 +1502,9 @@ class SystemRuntimeAdapter:
                     "passed": False,
                     "reason": "diagnostic_start_failed",
                     "start_observation": start_observation,
+                    "start_returncode": (
+                        None if start_result is None else start_result.returncode
+                    ),
                     "systemd_result": systemd_result,
                     "systemd_status_observation": status_observation,
                 },
@@ -1458,7 +1512,7 @@ class SystemRuntimeAdapter:
                 "schema_version": 1,
             }
             _emit_monitor_gate_evidence(evidence)
-            raise
+            raise ActivationError("runtime command failed") from start_failure
         try:
             result = self._run(
                 [
@@ -1477,6 +1531,7 @@ class SystemRuntimeAdapter:
                     "exec_main_status": None,
                     "passed": False,
                     "reason": "systemd_status_unavailable",
+                    "start_returncode": start_result.returncode,
                     "systemd_result": None,
                     "systemd_status_observation": "unavailable",
                 },
@@ -1498,6 +1553,7 @@ class SystemRuntimeAdapter:
             "basis": "systemctl_start_and_systemd_result_exec_main_status",
             "exec_main_status": exec_main_status,
             "passed": passed,
+            "start_returncode": start_result.returncode,
             "systemd_result": systemd_result,
         }
         if not passed:
