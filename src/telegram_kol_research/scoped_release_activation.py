@@ -1414,36 +1414,31 @@ class SystemRuntimeAdapter:
                 "telegram-kol-monitor.timer",
             ]
         )
+        cursor_result = self._run(
+            [
+                "journalctl",
+                "--lines=0",
+                "--show-cursor",
+                "--no-pager",
+                "--quiet",
+            ]
+        )
+        cursor_match = re.fullmatch(
+            r"-- cursor: (\S{1,4096})\n?",
+            cursor_result.stdout,
+        )
+        if cursor_match is None:
+            raise ActivationError("monitor runtime proof failed")
+        journal_cursor = cursor_match.group(1)
         self._run(
             ["systemctl", "start", "telegram-kol-monitor-diagnostic.service"]
         )
-        result = self._run(
-            [
-                "systemctl",
-                "show",
-                "telegram-kol-monitor-diagnostic.service",
-                "--property=Result",
-                "--property=ExecMainStatus",
-                "--property=InvocationID",
-            ]
-        )
-        properties = {}
-        for line in result.stdout.splitlines():
-            key, separator, value = line.partition("=")
-            if not separator or key in properties:
-                raise ActivationError("monitor runtime proof failed")
-            properties[key] = value
-        if (
-            set(properties) != {"Result", "ExecMainStatus", "InvocationID"}
-            or properties["Result"] != "success"
-            or properties["ExecMainStatus"] != "0"
-            or re.fullmatch(r"[0-9a-f]{6,64}", properties["InvocationID"]) is None
-        ):
-            raise ActivationError("monitor runtime proof failed")
         journal = self._run(
             [
                 "journalctl",
-                f"_SYSTEMD_INVOCATION_ID={properties['InvocationID']}",
+                "-u",
+                "telegram-kol-monitor-diagnostic.service",
+                f"--after-cursor={journal_cursor}",
                 "--output=cat",
                 "--no-pager",
             ]

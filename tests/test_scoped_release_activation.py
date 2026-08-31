@@ -24,6 +24,7 @@ from telegram_kol_research.deployment_action_plan import parse_manifest
 CANDIDATE = "2" * 40
 ROLLBACK = "1" * 40
 OTHER = "3" * 40
+JOURNAL_CURSOR = "s=current;i=1;b=boot;m=1;t=1;x=1"
 
 
 def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
@@ -110,16 +111,31 @@ def test_system_runtime_allows_first_authority_cycles_to_finish_before_retry() -
     assert SystemRuntimeAdapter.identity_retry_delay_seconds == 60
 
 
-def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> None:
+def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
+    monkeypatch,
+) -> None:
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
     calls = []
 
     def run(command, *, environment=None):
         calls.append((command, environment))
         output = ""
-        if command[:3] == ["systemctl", "show", "telegram-kol-monitor-diagnostic.service"]:
-            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
-        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+        if command == [
+            "journalctl",
+            "--lines=0",
+            "--show-cursor",
+            "--no-pager",
+            "--quiet",
+        ]:
+            output = f"-- cursor: {JOURNAL_CURSOR}\n"
+        if command == [
+            "journalctl",
+            "-u",
+            "telegram-kol-monitor-diagnostic.service",
+            f"--after-cursor={JOURNAL_CURSOR}",
+            "--output=cat",
+            "--no-pager",
+        ]:
             output = json.dumps(_monitor_diagnostic_payload()) + "\n"
         return type("Result", (), {"stdout": output})()
 
@@ -151,6 +167,88 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
     }
 
 
+def test_monitor_release_proof_rejects_result_before_current_cursor(monkeypatch) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+    old_payload = json.dumps(_monitor_diagnostic_payload()) + "\n"
+
+    def run(command, *, environment=None):
+        output = ""
+        if command == [
+            "journalctl",
+            "--lines=0",
+            "--show-cursor",
+            "--no-pager",
+            "--quiet",
+        ]:
+            output = f"-- cursor: {JOURNAL_CURSOR}\n"
+        if command[:3] == [
+            "systemctl",
+            "show",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
+        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+            output = old_payload
+        return type("Result", (), {"stdout": output})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    with pytest.raises(ActivationError, match="monitor runtime proof failed"):
+        runtime.verify_monitor_release(release)
+
+
+@pytest.mark.parametrize("result_count", [0, 2])
+def test_monitor_release_proof_rejects_missing_or_duplicate_current_result(
+    monkeypatch,
+    result_count,
+) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+
+    def run(command, *, environment=None):
+        output = ""
+        if command == [
+            "journalctl",
+            "--lines=0",
+            "--show-cursor",
+            "--no-pager",
+            "--quiet",
+        ]:
+            output = f"-- cursor: {JOURNAL_CURSOR}\n"
+        if command == [
+            "journalctl",
+            "-u",
+            "telegram-kol-monitor-diagnostic.service",
+            f"--after-cursor={JOURNAL_CURSOR}",
+            "--output=cat",
+            "--no-pager",
+        ]:
+            output = (json.dumps(_monitor_diagnostic_payload()) + "\n") * result_count
+        return type("Result", (), {"stdout": output})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    with pytest.raises(ActivationError, match="monitor runtime proof failed"):
+        runtime.verify_monitor_release(release)
+
+
 @pytest.mark.parametrize(
     "payload",
     [
@@ -179,9 +277,22 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
 
     def run(command, *, environment=None):
         output = ""
-        if command[:3] == ["systemctl", "show", "telegram-kol-monitor-diagnostic.service"]:
-            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
-        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+        if command == [
+            "journalctl",
+            "--lines=0",
+            "--show-cursor",
+            "--no-pager",
+            "--quiet",
+        ]:
+            output = f"-- cursor: {JOURNAL_CURSOR}\n"
+        if command == [
+            "journalctl",
+            "-u",
+            "telegram-kol-monitor-diagnostic.service",
+            f"--after-cursor={JOURNAL_CURSOR}",
+            "--output=cat",
+            "--no-pager",
+        ]:
             output = json.dumps(payload) + "\n"
         return type("Result", (), {"stdout": output})()
 
@@ -207,6 +318,18 @@ def test_monitor_release_proof_rejects_timeout_or_signal(
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
 
     def run(command, *, environment=None):
+        if command == [
+            "journalctl",
+            "--lines=0",
+            "--show-cursor",
+            "--no-pager",
+            "--quiet",
+        ]:
+            return type(
+                "Result",
+                (),
+                {"stdout": f"-- cursor: {JOURNAL_CURSOR}\n"},
+            )()
         if command == [
             "systemctl",
             "start",
