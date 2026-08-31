@@ -2798,3 +2798,102 @@ activation.
   service control, production or exchange write, replay, drain, reconciliation
   or entry thaw. Production remains `maintenance_stopped_entry_frozen` pending
   the authorized fresh immutable recovery window.
+
+## Exit-status recovery stage, install and successful activation
+
+- The reviewed and pushed candidate was exact clean commit
+  `cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62`, equal to
+  `origin/codex/deepcoin-auto-trading-v1` before staging. Its fresh immutable
+  release has tree `c0da79f1cff3635be15dddc36a271e521951a8d9`, content SHA-256
+  `588d1aadb47f25ca56f4e3815cff3dff67892f2d6f97b738a0a85bbb1a8c24ea`
+  and manifest SHA-256
+  `4b91fbecfe65e1fcb99af1b6cb7e7260ff6e37b2fecde78892ffb19fc0ad7c2a`.
+  The receipt is `staged` with action-plan SHA-256
+  `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`.
+  Receipt-later `validate_release()` ran from a `/run` copy of the reviewed
+  validator, not from release code, and returned the exact same content and
+  manifest digests.
+- The four governed expectations were re-read from
+  `trading_settings(id,key,value_json,updated_at)` and remained auto trade
+  enabled, entry preamble live, message-assembly-v2 live and entry-revision-v2
+  live. A first pre-write evidence command stopped because it incorrectly
+  assumed that the processless monitor timer has a release drop-in. Five target
+  files remained byte-equal to their recorded before hashes and all units
+  remained inactive; no installer or service control had run. The corrected
+  existence record then preserved the absent timer drop-in instead of treating
+  it as failure.
+- Install-only completed under the exclusive runtime-control lock. All four
+  installed/candidate unit hashes matched exactly: service
+  `9f1384bdf9b4c8b7e6c8e71de1809efc73be9b4653e7a28b0a36d2f2fafe4c0f`,
+  timer `59a27b2f35930ddb0943cf986c4dbd36bcab87f8086338a4499cfa4b8aed7ad5`,
+  diagnostic
+  `ae23b0b989ea7afe8bc8e87eb393e9c36f622672edb4cacd79327f068d297f54`
+  and test-notification
+  `450ec37ae1e547a324f75b3bddccfe647d1654b9c536fb0b29ff0b41d0261a15`.
+  The env points to `cf30fdf7...`; the diagnostic alone has the audit-disable
+  and deployment-diagnostic flags, retired CLI parameters are absent,
+  `systemd-analyze verify` passed, and all eight units were still inactive,
+  inhibited and processless before activation. Diagnostic state was already
+  `inactive/dead`, result success and status zero, so `reset-failed` was not
+  needed.
+- The exact activation manifest declared only `web`, `monitor`, `ingest` and
+  `worker`, with no schema, production-data or exchange-write semantics change.
+  Its complete raw bytes and the canonical nine-field authorization were
+  printed and preserved before consumption. The root-owned mode `0400`
+  authorization bound candidate `cf30fdf7...`, source mode `stopped_legacy`,
+  action-plan SHA-256
+  `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`,
+  issuance `2026-08-31T03:55:20.480324Z` and expiry
+  `2026-08-31T04:05:20.480324Z`. It was consumed exactly once; source is gone,
+  and the mode `0400` consumed file has SHA-256
+  `90ec8d345c19ced8225a80191ae879d676bab79fce246302e4703c46183c970d`.
+- Activation succeeded. The diagnostic decision was exactly
+  `Result=success`, `ExecMainStatus=0`, systemctl start return code zero and
+  `passed=true`. Its complete payload loaded release `cf30fdf7...` and manifest
+  `4b91fbec...`, with `audit_ran=false`, `loaded_artifact_verified=true`,
+  `sources_complete=true`, `result_complete=true`, `healthy=true`, empty
+  `adapter_failures`, empty `reason_codes`, empty `details` and no monitor
+  error. The complete activator output is root-owned mode `0600`, SHA-256
+  `3f19964493be8a3460d17ccccd8e87860000b5b751f95ab5877801a1024371e7`.
+- Web PID `2224914` runs as `telegram-kol-web`, ingest PID `2224916` as
+  `telegram-kol-ingest`, and worker PID `2224910` as `telegram-kol-worker`.
+  All three identity payloads bind exact candidate and manifest, report
+  `loaded_artifact_verified=true`, keep `entry_admission_frozen=true`, and show
+  healthy role-specific loops. The monitor timer is active/waiting; the normal
+  monitor oneshot runs as `telegram-kol-monitor`, loaded exact candidate and
+  completed healthy. Its current state has empty active reasons and
+  `last_window_at=2026-08-31T04:02:05.424266Z`.
+- Worker startup atomically replaced the prior inode `76939941` with inode
+  `76993812`. The new 249-instrument cache was fetched at
+  `2026-08-31T03:55:36.988867Z`, has SHA-256
+  `8212d3fb5f75efaa5b4fc5621c3f73f894cc114f9cbd28864a71737770ff8b6c`,
+  owner `telegram-kol-worker`, group `telegram-kol-runtime` and mode `0660`.
+  The authenticated contract-spec-health endpoint returned HTTP 200 with
+  `state=fresh`, `last_refresh_succeeded=true` and
+  `ownership_contract_satisfied=true`; monitor reasons contain no
+  `contract_spec_sync_unavailable`. Two earlier unauthenticated curl checks
+  correctly received the endpoint's designed 404 concealment and were not
+  treated as production failures.
+- The original same-chat set remains exactly 33
+  `history_reconcile_enqueued`, two `recovery_enqueued` and one
+  `queue_enqueued`, all pending with attempt count zero. The whole 51-message
+  later set remains 15 succeeded, 36 pending and zero candidates. No manual
+  drain, recognition, ordering intervention, replay or backfill ran.
+- The prior ingest attempt stopped at `2026-08-31T02:52:06Z`; this activation
+  started ingest at `03:55:28Z`, a direct gap of about 63 minutes 22 seconds.
+  Normal startup collected 19 historical messages posted from `02:52:55Z`
+  onward and enqueued every one as new `history_reconcile_enqueued` work. This
+  confirms that collected outage history is treated as new processing work;
+  Telegram completeness outside the observed recovered range remains unknown.
+  No operator-initiated message backfill or history replay was performed.
+- The L2 observation ran through `04:26:11Z` without PID/SHA change. It saw four
+  live-window messages from three chats, below the required five-message traffic
+  sample, so the traffic observation remains `in_progress` and was not extended.
+  All four live messages are pending under entry freeze and produced zero
+  candidates. Runtime activation itself is successful and stable; entry
+  admission remains frozen for a separately authorized next phase. Complete
+  install, authorization, activation, identity, cache and observation evidence
+  is root-owned under
+  `/var/lib/telegram-kol-cutover-evidence/cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62/monitor-install-20260831T035406Z-2221406`.
+  Final observation evidence is mode `0600`, SHA-256
+  `e671f56d5b1d2e21c41650259796869bb48d7af9f59be88b6b8a48218cb513bb`.
