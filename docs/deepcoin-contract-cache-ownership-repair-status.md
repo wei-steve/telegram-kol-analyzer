@@ -238,6 +238,24 @@ monitor_diagnostic_reset_failed_status: complete
 monitor_diagnostic_post_reset_state: inactive_dead_mainpid_0
 monitor_diagnostic_post_reset_all_inhibits_sha256: 18624486bdc082f7c9aff9a6128cfa8842eb55b8fb0a91e1ceaaad84c14f2fa5
 monitor_diagnostic_post_reset_entry_admission_thawed: false
+preamble13_l3_terminalization_status: complete_expired
+preamble13_l3_changed_rows: 1
+preamble13_l3_changed_columns: status_only
+preamble13_l3_backup_path: /var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/preamble13-expire-20260831T005721Z-1846228/research-before-preamble13.db
+preamble13_l3_backup_sha256: 1f4601ae22eba9dc1d443b60e49cbcebdb7f12e73cc1ff5b6c6b97629f5446c8
+preamble13_l3_backup_size: 805408768
+preamble13_l3_eligibility_after_count: 0
+preamble13_l3_ambiguous_after_count: 0
+preamble13_l3_activation_authorization_sha256: 84cf261adfe6234f0370ba5ddf621cb730c705c49ab7ba051f3b4f9945632fa9
+preamble13_l3_activation_authorization_consumed: true
+preamble13_l3_activation_status: failed_diagnostic_timeout_maintenance_stop_failed
+preamble13_l3_monitor_cycle_status: incomplete_killed_sigterm_before_result
+preamble13_l3_diagnostic_peak_memory: 1.2G
+preamble13_l3_runtime_terminal_state: maintenance_stop_failed_entry_frozen
+preamble13_l3_cache_inode_after: 76560953
+preamble13_l3_cache_owner_mode_after: telegram-kol-worker_0660
+preamble13_l3_same_chat_pending_after: 36
+preamble13_l3_same_chat_candidate_after: 0
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -2286,3 +2304,88 @@ activation.
   replayed, and no entry admission was thawed. Production is again fully
   `maintenance_stopped_entry_frozen`; selecting and authorizing a disposition
   is the next independent phase.
+
+## Preamble 13 L3 expiration and activation attempt
+
+- The owner selected exact disposition `expired` for preamble `13` based on its
+  43-hour age and explicitly rejected backlog-drain and shadow-recognition
+  alternatives. No monitor threshold, reason code or eligibility condition was
+  changed.
+- One exclusive `/run/telegram-kol-update.lock` holder first proved all eight
+  controlled units inactive, inhibited and processless, with entry admission
+  frozen. A root-owned mode `0600`, 805,408,768-byte `VACUUM INTO` backup was
+  created at
+  `/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/preamble13-expire-20260831T005721Z-1846228/research-before-preamble13.db`.
+  Its SHA-256 is
+  `1f4601ae22eba9dc1d443b60e49cbcebdb7f12e73cc1ff5b6c6b97629f5446c8`;
+  `quick_check` returned `ok`, foreign-key issues were zero, all tracked table
+  counts equaled production and its complete preamble-13 image matched the live
+  before-image exactly.
+- Under one `BEGIN IMMEDIATE` transaction, the only SQL mutation was
+  `UPDATE entry_preambles SET status='expired' WHERE id=13 AND
+  status='pending'`. Exactly one row changed. The complete after-image differed
+  only in `status`; `updated_at`, `consumed_at`, `invalidated_at`, fingerprint,
+  evidence and every other column remained byte-for-byte equivalent. Counts for
+  `entry_preambles`, assemblies, candidates, lifecycles, bindings, order legs,
+  trade signals and execution events were unchanged. Created assembly,
+  candidate, lifecycle, binding, order-leg, trade-signal and execution-event
+  deltas were all zero.
+- The unmodified production monitor eligibility query returned eligible
+  preamble count zero and ambiguous group count zero both inside the transaction
+  and after commit. Thus `stale_entry_preamble_unresolved` and
+  `entry_preamble_ambiguous` were cleared by terminalizing the actual orphan,
+  not by processing unrelated chat history. The canonical evidence JSON is
+  root-owned mode `0600` at
+  `/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/preamble13-expire-20260831T005721Z-1846228/preamble13-expiration-evidence.json`.
+- Before activation, the exact action manifest declared no schema change or
+  production-data mutation and exactly ordered components `web`, `monitor`,
+  `ingest`, `worker`. A new canonical nine-field, root-owned mode `0400`
+  authorization bound candidate `18ea345a...`, source mode `stopped_legacy` and
+  action-plan SHA-256
+  `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`.
+  Its complete payload and raw manifest were printed and preserved before
+  consumption. Authorization SHA-256
+  `84cf261adfe6234f0370ba5ddf621cb730c705c49ab7ba051f3b4f9945632fa9`
+  was consumed once.
+- Candidate web, ingest and worker started and each returned HTTP 200 for exact
+  deployment identity. The monitor diagnostic pre-start again proved loaded
+  release `18ea345a...`. Trading-settings, live-position-size,
+  message-operation-coverage and contract-spec-health source calls all returned
+  HTTP 200. However the oneshot did not finish within the activator's fixed
+  45-second subprocess timeout. It produced no final monitor result JSON and
+  did not update monitor state. Failure recovery stopped it with `SIGTERM` after
+  roughly 51 seconds; systemd recorded peak memory about 1.2 GB, 108.6 MB swap
+  and result `signal`. Therefore no current healthy result or remaining
+  business reason code can be claimed. The prior state file still has its old
+  `2026-08-31T00:33:21Z` window and is not evidence for this attempt.
+- The activator returned `activation failed; maintenance_stop_failed` because
+  the killed diagnostic retained `failed`, `Result=signal`, status `15` instead
+  of `inactive`. Web, ingest, worker, monitor service, test-notification, timer
+  and legacy monolith are inactive with `MainPID=0`; diagnostic also has
+  `MainPID=0` but remains failed. Every exact inhibit file still has SHA-256
+  `18624486bdc082f7c9aff9a6128cfa8842eb55b8fb0a91e1ceaaad84c14f2fa5`,
+  all units report `NeedDaemonReload=no`, and web/ingest/worker candidate
+  drop-ins retain `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. The authorization
+  was not reused and activation was not retried; no second `reset-failed` was
+  authorized or executed.
+- Worker startup again atomically replaced the contract cache: pre-activation
+  inode `76550597`, digest
+  `30129057137b022160a91d80c6246e73b9ab4fce8a60da37b49828a08ea15947`
+  became inode `76560953`, digest
+  `28df74f7a1a5733193c7a7e93a99d4d57e7f6cf705ab861ba8c215ac8a033236`.
+  The new 249-instrument snapshot was fetched at
+  `2026-08-31T00:59:52.598733Z`, owner is `telegram-kol-worker`, group
+  `telegram-kol-runtime`, mode `0660`, and contract-spec-health returned 200.
+- Normal runtime made no progress on the 36 same-chat pending tasks during this
+  short attempt. All 33 `history_reconcile_enqueued`, two `recovery_enqueued`
+  and one `queue_enqueued` rows remain pending with attempt count zero; the
+  corresponding 51-message set remains 15 succeeded/recognized, 36 pending and
+  zero messages with a signal candidate. No manual drain, ordering intervention,
+  replay, backfill or recognition was performed.
+- The L3 terminalization is complete and durable, but activation and its L2
+  observation did not complete. No Deepcoin write, other preamble mutation,
+  stage, release repair, reconciliation rerun or entry thaw occurred. The phase
+  remains `in_progress` at
+  `maintenance_stop_failed_entry_frozen`; diagnosing or changing the monitor
+  diagnostic runtime/timeout behavior and clearing its failed residue require a
+  new explicit scope.
