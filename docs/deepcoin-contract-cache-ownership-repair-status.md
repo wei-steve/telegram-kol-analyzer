@@ -203,6 +203,26 @@ monitor_install_evidence_path: /var/lib/telegram-kol-cutover-evidence/18ea345a23
 monitor_install_evidence_manifest_sha256: 2b2fd90ad8d50094427b17565c44c59937752553fdafe6a452894319a1a805d8
 monitor_install_activation_attempted: false
 monitor_install_terminal_state: maintenance_stopped_entry_frozen
+monitor_install_retry_status: passed_all_hard_gates
+monitor_install_retry_evidence_path: /var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/monitor-install-20260831T003048Z-1789527
+monitor_install_retry_preinstall_manifest_sha256: f1670666adb22489b6a7ca1c0026d74f762c879ae451b200338811477a32e516
+monitor_install_retry_activation_authorization_sha256: 72d294259fb5326e2c4dbdf1ff1e9fc56f92519e241bb83484c036ba6dcbe8b2
+monitor_install_retry_activation_authorization_consumed: true
+monitor_install_retry_activation_status: failed_stale_entry_preamble_then_maintenance_stop_failed
+monitor_install_retry_monitor_candidate_cycle: complete_business_unhealthy
+monitor_install_retry_retired_identity_reason_codes: absent
+monitor_install_retry_business_reason_codes: stale_entry_preamble_unresolved
+monitor_install_retry_controlled_runtime_active: false
+monitor_install_retry_diagnostic_state: failed_exit_1
+monitor_install_retry_entry_admission_thawed: false
+monitor_install_retry_cache_owner: telegram-kol-worker
+monitor_install_retry_cache_group: telegram-kol-runtime
+monitor_install_retry_cache_mode: "0660"
+monitor_install_retry_cache_atomic_replacement: proven_by_inode_and_digest_change
+monitor_install_retry_contract_spec_health: healthy_no_sync_unavailable
+monitor_install_retry_telegram_catchup_rows: 20
+monitor_install_retry_telegram_historical_pending_rows: 19
+monitor_install_retry_telegram_historical_replay_executed_manually: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -2043,3 +2063,103 @@ activation.
   start occurred, and no Deepcoin write, database mutation, replay, backfill or
   entry thaw occurred. The terminal state remains
   `maintenance_stopped_entry_frozen`.
+
+## Monitor install-only retry and single activation attempt
+
+- The approved continuation reused the exact immutable release
+  `18ea345a23812ed131c500a6040174a07a4436db`; it did not restage, repair a
+  rejected release or rerun reconciliation. Before any production write, one
+  initial read-only orchestration query failed because it named nonexistent
+  SQLite column `settings_json`. The schema was then proven read-only as
+  `id,key,value_json,updated_at`; all five production file hashes still equaled
+  their restored baseline, so no installer invocation or production write had
+  occurred during that checker failure.
+- Under the exclusive `/run/telegram-kol-update.lock`, the corrected query-only
+  proof and existing env both confirmed auto trade `enabled`, entry preamble
+  `live`, message-assembly-v2 `live` and entry-revision-v2 `live`. Before the
+  installer wrote any byte, `/etc/telegram-kol-monitor.env` and the four exact
+  monitor base units were copied byte-for-byte into root-owned mode `0600`
+  files beneath root-owned mode `0700` evidence directory
+  `/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/monitor-install-20260831T003048Z-1789527`.
+  The preinstall manifest records their hashes, owners, groups and modes plus
+  every inhibit and release drop-in; its SHA-256 is
+  `f1670666adb22489b6a7ca1c0026d74f762c879ae451b200338811477a32e516`.
+- The candidate installer completed without `--enable`. The four hard-coded,
+  same-name installed/candidate pairs were each proven regular and non-symlink,
+  hashed twice per side and then matched exactly. Installed service, timer,
+  diagnostic and test-notification SHA-256 values were respectively
+  `9f1384bdf9b4c8b7e6c8e71de1809efc73be9b4653e7a28b0a36d2f2fafe4c0f`,
+  `59a27b2f35930ddb0943cf986c4dbd36bcab87f8086338a4499cfa4b8aed7ad5`,
+  `a213562148842a45bb62d3e9c51e34a92fbbc07e0783c6d2adfea5836af4d12e`
+  and `450ec37ae1e547a324f75b3bddccfe647d1654b9c536fb0b29ff0b41d0261a15`.
+  The rebuilt env named the candidate path and commit; all retired CLI
+  arguments were absent from merged `ExecStart`; `systemd-analyze verify`
+  passed. Legacy monolith, web, ingest, worker, monitor service, diagnostic,
+  test-notification and timer were all inactive, inhibited and `MainPID=0`,
+  and the timer remained disabled. Thus every install hard gate passed.
+- The raw activation manifest was preserved before authorization consumption.
+  It declared no schema change or production data mutation and exactly ordered
+  components `web`, `monitor`, `ingest`, `worker`. One new canonical nine-field
+  `scoped-activation-authorization-v2` document bound that component list,
+  candidate commit, source mode `stopped_legacy` and action-plan SHA-256
+  `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`.
+  It was root-owned mode `0400`, valid for ten minutes, had SHA-256
+  `72d294259fb5326e2c4dbdf1ff1e9fc56f92519e241bb83484c036ba6dcbe8b2`
+  and was consumed once. Its source path is gone and the same-directory
+  `.consumed` regular file retains the identical SHA-256.
+- The candidate web, ingest and worker roles started and answered exact runtime
+  deployment-identity requests. The worker cache pre-start helper reported
+  every ownership/type/mode contract satisfied. The candidate monitor
+  diagnostic then loaded exact release `18ea345a...` and completed all business
+  sources, including HTTP 200 responses from trading settings, live position,
+  message-operation coverage and contract-spec-health. Its final result was
+  unhealthy only for separately scoped business reason
+  `stale_entry_preamble_unresolved`; retired reasons
+  `runtime_identity_unproven`, `runtime_release_mixed` and
+  `runtime_unit_hash_drift` did not appear. This proves the rewritten monitor
+  completed a candidate cycle and the old-code loading defect is gone, but the
+  business gate correctly blocked activation and was not altered or suppressed.
+- Failure recovery stopped web, ingest and worker, restored exact root-owned
+  mode `0444` inhibits for all eight controlled units and retained candidate
+  release drop-ins with `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. The diagnostic
+  oneshot retained systemd state `failed`, result `exit-code`, status `1`
+  instead of becoming `inactive`; consequently the reinhibit proof reported
+  `activation failed; maintenance_stop_failed`. All other controlled units
+  were inactive with `MainPID=0`; no controlled service process remained active,
+  every inhibit had the expected hash and `NeedDaemonReload=no`, and entry
+  admission was never thawed. Per the one-failure rule, there was no activation
+  retry, `reset-failed`, release repair, restage or other service control.
+- During the brief authorized worker start, the original cache path was
+  actually atomically replaced: inode `76560958` and digest
+  `e6b74be510d610bfcb302993c51204f47dd705edb42cc973ca5e35b3d2b7fa7a`
+  became inode `76550597` and digest
+  `30129057137b022160a91d80c6246e73b9ab4fce8a60da37b49828a08ea15947`.
+  The new snapshot was fetched at `2026-08-31T00:32:25.425419Z`, contains 249
+  instruments and expires one day later. Its actual metadata is owner
+  `telegram-kol-worker`, group `telegram-kol-runtime`, mode `0660`; the monitor
+  cycle reported no `contract_spec_sync_unavailable`. This completes the
+  original cache ownership/atomic-refresh proof even though activation as a
+  whole failed on the unrelated entry-preamble business gate.
+- The immediately preceding ingest run stopped at
+  `2026-08-30T23:28:19.360814Z`; this attempt started the role at
+  `2026-08-31T00:32:17.360919Z`, an observed continuous collection gap of about
+  64 minutes. During the brief start, normal ingest startup inserted 20 rows:
+  19 historical messages posted from `23:41:27Z` through `00:23:16Z` and one
+  live-window message. All 19 historical rows were automatically enqueued as
+  non-shadow pending jobs with reason `history_reconcile_enqueued`; none had
+  reached recognition before failure recovery stopped the runtime. Therefore
+  the current implementation does treat automatically collected history as new
+  processing work, although entry admission remained frozen and no signal or
+  exchange execution occurred. This was normal activation startup behavior,
+  not a manually requested backfill or replay; completeness outside the
+  observed recovered window remains unknown, and no additional collection or
+  replay was executed.
+- Detailed authorization, manifest, unit state, journal, cache and message-gap
+  evidence remains root-owned in the evidence directory above. The activation
+  journal SHA-256 is
+  `e307125637414a2bcf04fc1e5bddacbbee69563e1810071ecf7a17d549c18bda`;
+  terminal-state evidence SHA-256 is
+  `d77440518b2c21e0a0e32344e56a61d44efd4f8614203363801f3b6a63df3442`.
+  The phase remains `in_progress` at fail-closed
+  `maintenance_stop_failed_entry_frozen`; resolving the diagnostic unit's
+  failed state or the stale entry preamble requires a new explicit scope.
