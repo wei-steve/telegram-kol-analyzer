@@ -25,6 +25,9 @@ CANDIDATE = "2" * 40
 ROLLBACK = "1" * 40
 OTHER = "3" * 40
 JOURNAL_CURSOR = "s=current;i=1;b=boot;m=1;t=1;x=1"
+MONITOR_JOB_ID = 42
+MONITOR_INVOCATION_ID = "4" * 32
+MONITOR_BOOT_ID = "b" * 32
 
 
 def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
@@ -49,6 +52,59 @@ def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
     }
     payload.update(overrides)
     return payload
+
+
+def _monitor_journal_json(
+    diagnostic_payload,
+    *,
+    job_id=MONITOR_JOB_ID,
+    invocation_id=MONITOR_INVOCATION_ID,
+    result_count=1,
+):
+    unit = "telegram-kol-monitor-diagnostic.service"
+    entries = [
+        {
+            "INVOCATION_ID": invocation_id,
+            "JOB_ID": str(job_id),
+            "JOB_TYPE": "start",
+            "MESSAGE_ID": "7d4958e842da4a758f6c1cdc7b36dcc5",
+            "UNIT": unit,
+            "_BOOT_ID": MONITOR_BOOT_ID,
+            "_PID": "1",
+            "_SYSTEMD_UNIT": "init.scope",
+            "_TRANSPORT": "journal",
+            "_UID": "0",
+            "__MONOTONIC_TIMESTAMP": "100",
+        }
+    ]
+    entries.extend(
+        {
+            "MESSAGE": json.dumps(diagnostic_payload),
+            "_BOOT_ID": MONITOR_BOOT_ID,
+            "_SYSTEMD_INVOCATION_ID": invocation_id,
+            "_SYSTEMD_UNIT": unit,
+            "_TRANSPORT": "stdout",
+            "__MONOTONIC_TIMESTAMP": str(200 + index),
+        }
+        for index in range(result_count)
+    )
+    entries.append(
+        {
+            "INVOCATION_ID": invocation_id,
+            "JOB_ID": str(job_id),
+            "JOB_RESULT": "done",
+            "JOB_TYPE": "start",
+            "MESSAGE_ID": "39f53479d3a045ac8e11786248231fbf",
+            "UNIT": unit,
+            "_BOOT_ID": MONITOR_BOOT_ID,
+            "_PID": "1",
+            "_SYSTEMD_UNIT": "init.scope",
+            "_TRANSPORT": "journal",
+            "_UID": "0",
+            "__MONOTONIC_TIMESTAMP": "300",
+        }
+    )
+    return "".join(json.dumps(entry) + "\n" for entry in entries)
 
 
 def test_runtime_control_lock_is_shared_and_nonblocking(tmp_path) -> None:
@@ -129,14 +185,24 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
         ]:
             output = f"-- cursor: {JOURNAL_CURSOR}\n"
         if command == [
+            "systemctl",
+            "--show-transaction",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            output = (
+                "Enqueued anchor job 42 "
+                "telegram-kol-monitor-diagnostic.service/start.\n"
+            )
+        if command == [
             "journalctl",
             "-u",
             "telegram-kol-monitor-diagnostic.service",
             f"--after-cursor={JOURNAL_CURSOR}",
-            "--output=cat",
+            "--output=json",
             "--no-pager",
         ]:
-            output = json.dumps(_monitor_diagnostic_payload()) + "\n"
+            output = _monitor_journal_json(_monitor_diagnostic_payload())
         return type("Result", (), {"stdout": output})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -155,6 +221,7 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
     assert any(
         command == [
             "systemctl",
+            "--show-transaction",
             "start",
             "telegram-kol-monitor-diagnostic.service",
         ]
@@ -167,7 +234,9 @@ def test_monitor_release_proof_accepts_collected_oneshot_from_current_cursor(
     }
 
 
-def test_monitor_release_proof_rejects_result_before_current_cursor(monkeypatch) -> None:
+def test_monitor_release_proof_rejects_other_invocation_after_current_cursor(
+    monkeypatch,
+) -> None:
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
     old_payload = json.dumps(_monitor_diagnostic_payload()) + "\n"
 
@@ -181,14 +250,44 @@ def test_monitor_release_proof_rejects_result_before_current_cursor(monkeypatch)
             "--quiet",
         ]:
             output = f"-- cursor: {JOURNAL_CURSOR}\n"
-        if command[:3] == [
+        if command == [
             "systemctl",
-            "show",
+            "--show-transaction",
+            "start",
             "telegram-kol-monitor-diagnostic.service",
         ]:
-            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
-        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+            output = (
+                "Enqueued anchor job 42 "
+                "telegram-kol-monitor-diagnostic.service/start.\n"
+            )
+        if command == [
+            "systemctl",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            output = ""
+        if command == [
+            "journalctl",
+            "-u",
+            "telegram-kol-monitor-diagnostic.service",
+            f"--after-cursor={JOURNAL_CURSOR}",
+            "--output=cat",
+            "--no-pager",
+        ]:
             output = old_payload
+        if command == [
+            "journalctl",
+            "-u",
+            "telegram-kol-monitor-diagnostic.service",
+            f"--after-cursor={JOURNAL_CURSOR}",
+            "--output=json",
+            "--no-pager",
+        ]:
+            output = _monitor_journal_json(
+                _monitor_diagnostic_payload(),
+                job_id=41,
+                invocation_id="3" * 32,
+            )
         return type("Result", (), {"stdout": output})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -224,14 +323,27 @@ def test_monitor_release_proof_rejects_missing_or_duplicate_current_result(
         ]:
             output = f"-- cursor: {JOURNAL_CURSOR}\n"
         if command == [
+            "systemctl",
+            "--show-transaction",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            output = (
+                "Enqueued anchor job 42 "
+                "telegram-kol-monitor-diagnostic.service/start.\n"
+            )
+        if command == [
             "journalctl",
             "-u",
             "telegram-kol-monitor-diagnostic.service",
             f"--after-cursor={JOURNAL_CURSOR}",
-            "--output=cat",
+            "--output=json",
             "--no-pager",
         ]:
-            output = (json.dumps(_monitor_diagnostic_payload()) + "\n") * result_count
+            output = _monitor_journal_json(
+                _monitor_diagnostic_payload(),
+                result_count=result_count,
+            )
         return type("Result", (), {"stdout": output})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -286,14 +398,24 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
         ]:
             output = f"-- cursor: {JOURNAL_CURSOR}\n"
         if command == [
+            "systemctl",
+            "--show-transaction",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            output = (
+                "Enqueued anchor job 42 "
+                "telegram-kol-monitor-diagnostic.service/start.\n"
+            )
+        if command == [
             "journalctl",
             "-u",
             "telegram-kol-monitor-diagnostic.service",
             f"--after-cursor={JOURNAL_CURSOR}",
-            "--output=cat",
+            "--output=json",
             "--no-pager",
         ]:
-            output = json.dumps(payload) + "\n"
+            output = _monitor_journal_json(payload)
         return type("Result", (), {"stdout": output})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -311,13 +433,34 @@ def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
         runtime.verify_monitor_release(release)
 
 
-@pytest.mark.parametrize("failure_mode", ["timeout", "signal"])
-def test_monitor_release_proof_rejects_timeout_or_signal(
+@pytest.mark.parametrize("failure_mode", ["timeout", "nonzero", "signal"])
+def test_monitor_release_proof_rejects_real_runner_failure_modes(
     monkeypatch, failure_mode
 ) -> None:
     runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+    calls = []
 
-    def run(command, *, environment=None):
+    def run(command, **kwargs):
+        calls.append((command, kwargs))
+        if command == [
+            "systemctl",
+            "--show-transaction",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            if failure_mode == "timeout":
+                raise scoped_activation.subprocess.TimeoutExpired(
+                    command,
+                    kwargs["timeout"],
+                )
+            returncode = 1 if failure_mode == "nonzero" else -15
+            return scoped_activation.subprocess.CompletedProcess(
+                command,
+                returncode,
+                stdout="",
+                stderr="failed",
+            )
+        output = ""
         if command == [
             "journalctl",
             "--lines=0",
@@ -325,20 +468,15 @@ def test_monitor_release_proof_rejects_timeout_or_signal(
             "--no-pager",
             "--quiet",
         ]:
-            return type(
-                "Result",
-                (),
-                {"stdout": f"-- cursor: {JOURNAL_CURSOR}\n"},
-            )()
-        if command == [
-            "systemctl",
-            "start",
-            "telegram-kol-monitor-diagnostic.service",
-        ]:
-            raise ActivationError(f"runtime command failed: {failure_mode}")
-        return type("Result", (), {"stdout": ""})()
+            output = f"-- cursor: {JOURNAL_CURSOR}\n"
+        return scoped_activation.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout=output,
+            stderr="",
+        )
 
-    monkeypatch.setattr(runtime, "_run", run)
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
     release = type(
         "Release",
         (),
@@ -351,6 +489,13 @@ def test_monitor_release_proof_rejects_timeout_or_signal(
 
     with pytest.raises(ActivationError, match="runtime command failed"):
         runtime.verify_monitor_release(release)
+    start_calls = [
+        kwargs
+        for command, kwargs in calls
+        if command[:3] == ["systemctl", "--show-transaction", "start"]
+    ]
+    assert len(start_calls) == 1
+    assert start_calls[0]["timeout"] == 45
 
 
 def _content_digest(root: Path) -> str:

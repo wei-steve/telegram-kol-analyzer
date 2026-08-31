@@ -1031,6 +1031,101 @@ _MONITOR_DIAGNOSTIC_FIELDS = frozenset(
         "sources_complete",
     }
 )
+_MONITOR_DIAGNOSTIC_UNIT = "telegram-kol-monitor-diagnostic.service"
+_SYSTEMD_JOB_STARTING_MESSAGE_ID = "7d4958e842da4a758f6c1cdc7b36dcc5"
+_SYSTEMD_JOB_FINISHED_MESSAGE_ID = "39f53479d3a045ac8e11786248231fbf"
+
+
+def _parse_monitor_anchor_job(output: str) -> int:
+    anchors = []
+    for line in output.splitlines():
+        match = re.fullmatch(
+            r"Enqueued anchor job ([1-9][0-9]{0,9}) "
+            r"telegram-kol-monitor-diagnostic\.service/start\.",
+            line,
+        )
+        if match is not None:
+            anchors.append(int(match.group(1)))
+            continue
+        if re.fullmatch(
+            r"Enqueued auxiliary job [1-9][0-9]{0,9} "
+            r"[A-Za-z0-9@_.:-]+/[a-z-]+\.",
+            line,
+        ) is None:
+            raise ActivationError("monitor runtime proof failed")
+    if len(anchors) != 1 or anchors[0] > (2**32 - 1):
+        raise ActivationError("monitor runtime proof failed")
+    return anchors[0]
+
+
+def _monitor_invocation_messages(output: str, *, expected_job_id: int) -> str:
+    entries: list[Mapping[str, Any]] = []
+    for line in output.splitlines():
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError) as exc:
+            raise ActivationError("monitor runtime proof failed") from exc
+        if not isinstance(entry, Mapping):
+            raise ActivationError("monitor runtime proof failed")
+        entries.append(entry)
+
+    expected_job = str(expected_job_id)
+    job_entries = [
+        (index, entry)
+        for index, entry in enumerate(entries)
+        if entry.get("JOB_ID") == expected_job
+        and entry.get("JOB_TYPE") == "start"
+        and entry.get("UNIT") == _MONITOR_DIAGNOSTIC_UNIT
+    ]
+    starts = [
+        (index, entry)
+        for index, entry in job_entries
+        if entry.get("MESSAGE_ID") == _SYSTEMD_JOB_STARTING_MESSAGE_ID
+    ]
+    finishes = [
+        (index, entry)
+        for index, entry in job_entries
+        if entry.get("MESSAGE_ID") == _SYSTEMD_JOB_FINISHED_MESSAGE_ID
+        and entry.get("JOB_RESULT") == "done"
+    ]
+    if len(job_entries) != 2 or len(starts) != 1 or len(finishes) != 1:
+        raise ActivationError("monitor runtime proof failed")
+    start_index, start = starts[0]
+    finish_index, finish = finishes[0]
+    invocation_id = start.get("INVOCATION_ID")
+    boot_id = start.get("_BOOT_ID")
+    if (
+        start_index >= finish_index
+        or re.fullmatch(r"[0-9a-f]{32}", str(invocation_id or "")) is None
+        or re.fullmatch(r"[0-9a-f]{32}", str(boot_id or "")) is None
+        or finish.get("INVOCATION_ID") != invocation_id
+        or finish.get("_BOOT_ID") != boot_id
+    ):
+        raise ActivationError("monitor runtime proof failed")
+    for entry in (start, finish):
+        if (
+            entry.get("_TRANSPORT") != "journal"
+            or entry.get("_PID") != "1"
+            or entry.get("_UID") != "0"
+            or entry.get("_SYSTEMD_UNIT") != "init.scope"
+        ):
+            raise ActivationError("monitor runtime proof failed")
+
+    messages = []
+    for index, entry in enumerate(entries):
+        if entry.get("_SYSTEMD_INVOCATION_ID") != invocation_id:
+            continue
+        if (
+            index <= start_index
+            or index >= finish_index
+            or entry.get("_BOOT_ID") != boot_id
+            or entry.get("_SYSTEMD_UNIT") != _MONITOR_DIAGNOSTIC_UNIT
+            or entry.get("_TRANSPORT") != "stdout"
+            or not isinstance(entry.get("MESSAGE"), str)
+        ):
+            raise ActivationError("monitor runtime proof failed")
+        messages.append(entry["MESSAGE"])
+    return "\n".join(messages) + ("\n" if messages else "")
 
 
 def _parse_monitor_diagnostic_evidence(
@@ -1430,21 +1525,27 @@ class SystemRuntimeAdapter:
         if cursor_match is None:
             raise ActivationError("monitor runtime proof failed")
         journal_cursor = cursor_match.group(1)
-        self._run(
-            ["systemctl", "start", "telegram-kol-monitor-diagnostic.service"]
+        transaction = self._run(
+            [
+                "systemctl",
+                "--show-transaction",
+                "start",
+                _MONITOR_DIAGNOSTIC_UNIT,
+            ]
         )
+        job_id = _parse_monitor_anchor_job(transaction.stdout)
         journal = self._run(
             [
                 "journalctl",
                 "-u",
-                "telegram-kol-monitor-diagnostic.service",
+                _MONITOR_DIAGNOSTIC_UNIT,
                 f"--after-cursor={journal_cursor}",
-                "--output=cat",
+                "--output=json",
                 "--no-pager",
             ]
         )
         return _parse_monitor_diagnostic_evidence(
-            journal.stdout,
+            _monitor_invocation_messages(journal.stdout, expected_job_id=job_id),
             expected_commit=release.commit,
             expected_manifest_sha256=release.manifest_sha256,
         )
