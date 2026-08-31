@@ -48,6 +48,11 @@ from telegram_kol_research.config import (
 from telegram_kol_research.message_operation_supervisor import (
     run_message_operation_supervisor_cycle,
 )
+from telegram_kol_research.message_processing_backlog_expiry import (
+    BacklogExpiryRefused,
+    apply_message_processing_backlog_expiry,
+    build_message_processing_backlog_expiry_plan,
+)
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import (
     RefreshableDeepcoinContractSpecProvider,
@@ -6254,6 +6259,58 @@ def worker_command_reconcile(
             sort_keys=True,
         )
     )
+
+
+@app.command("expire-message-processing-backlog")
+def expire_message_processing_backlog(
+    database_path: Path = typer.Option(..., "--database-path"),
+    minimum_raw_message_id: int = typer.Option(
+        ..., "--minimum-raw-message-id", min=1
+    ),
+    watermark_raw_message_id: int = typer.Option(
+        ..., "--watermark-raw-message-id", min=1
+    ),
+    expected_pending_count: int = typer.Option(
+        ..., "--expected-pending-count", min=1
+    ),
+    apply: bool = typer.Option(False, "--apply"),
+) -> None:
+    """Dry-run or atomically expire one exact frozen queue watermark."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo("Refusing backlog expiry: database does not exist.", err=True)
+        raise typer.Exit(code=2)
+    try:
+        session_factory = create_existing_session_factory(resolved_path)
+        if apply:
+            result = apply_message_processing_backlog_expiry(
+                session_factory,
+                minimum_raw_message_id=minimum_raw_message_id,
+                watermark_raw_message_id=watermark_raw_message_id,
+                expected_pending_count=expected_pending_count,
+                completed_at=datetime.now(UTC),
+            )
+            payload = {
+                "mode": "apply",
+                **result.to_dict(),
+            }
+        else:
+            plan = build_message_processing_backlog_expiry_plan(
+                session_factory,
+                minimum_raw_message_id=minimum_raw_message_id,
+                watermark_raw_message_id=watermark_raw_message_id,
+                expected_pending_count=expected_pending_count,
+            )
+            payload = {
+                "mode": "dry_run",
+                **plan.to_dict(),
+                "changed_count": 0,
+            }
+    except (BacklogExpiryRefused, OSError, RuntimeError) as exc:
+        typer.echo(f"Refusing backlog expiry: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 
 
 def _semantic_review_disable_plan_from_dict(

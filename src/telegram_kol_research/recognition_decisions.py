@@ -10,7 +10,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import and_, case, or_, update
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy.orm import Session, sessionmaker
 
 from telegram_kol_research.models import RawMessage, RecognitionDecision, utc_now
 
@@ -57,6 +57,91 @@ def _canonical_json(value: Any) -> str:
     )
 
 
+def _save_terminal_authoritative_decision_in_session(
+    session: Session,
+    record: RecognitionDecisionRecord,
+) -> RecognitionDecision:
+    """Save fail-closed authority in the caller's transaction."""
+
+    row = (
+        session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
+        .one_or_none()
+    )
+    now = utc_now()
+    if row is None:
+        row = RecognitionDecision(
+            raw_message_id=record.raw_message_id,
+            input_kind=record.input_kind,
+            authoritative_model=record.authoritative_model,
+            authoritative_status=record.authoritative_status,
+            authoritative_payload_json=_json(record.authoritative_payload),
+            agreement_status=record.agreement_status,
+            differences_json=_json(record.differences),
+            prompt_versions_json=_json(record.prompt_versions),
+            comparison_status="completed",
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(row)
+        session.flush()
+        return row
+
+    if row.comparison_status == "execution_running":
+        raise RuntimeError("authoritative execution is already in progress")
+
+    observed_status = row.comparison_status
+    observed_token = row.comparison_claim_token
+    expected_token = (
+        RecognitionDecision.comparison_claim_token.is_(None)
+        if observed_token is None
+        else RecognitionDecision.comparison_claim_token == observed_token
+    )
+    result = session.execute(
+        update(RecognitionDecision)
+        .where(
+            RecognitionDecision.raw_message_id == record.raw_message_id,
+            RecognitionDecision.comparison_status == observed_status,
+            expected_token,
+        )
+        .values(
+            input_kind=record.input_kind,
+            authoritative_model=record.authoritative_model,
+            authoritative_status=record.authoritative_status,
+            authoritative_payload_json=_json(record.authoritative_payload),
+            auxiliary_model=record.auxiliary_model,
+            auxiliary_status=record.auxiliary_status,
+            auxiliary_payload_json=(
+                _json(record.auxiliary_payload)
+                if record.auxiliary_payload is not None
+                else None
+            ),
+            agreement_status=record.agreement_status,
+            differences_json=_json(record.differences),
+            prompt_versions_json=_json(record.prompt_versions),
+            comparison_status="completed",
+            disagreement_severity=None,
+            comparison_model=None,
+            comparison_payload_json=None,
+            comparison_error=None,
+            comparison_next_attempt_at=None,
+            comparison_started_at=None,
+            comparison_claim_token=None,
+            compared_at=None,
+            updated_at=now,
+        )
+    )
+    if result.rowcount != 1:
+        raise RuntimeError(
+            "authoritative decision changed or execution is already in progress"
+        )
+    return (
+        session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
+        .one()
+    )
+
+
 def save_terminal_authoritative_decision(
     session_factory: sessionmaker,
     record: RecognitionDecisionRecord,
@@ -64,87 +149,9 @@ def save_terminal_authoritative_decision(
     """Atomically save fail-closed authority without displacing an executor."""
 
     with session_factory() as session:
-        row = (
-            session.query(RecognitionDecision)
-            .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
-            .one_or_none()
-        )
-        now = utc_now()
-        if row is None:
-            row = RecognitionDecision(
-                raw_message_id=record.raw_message_id,
-                input_kind=record.input_kind,
-                authoritative_model=record.authoritative_model,
-                authoritative_status=record.authoritative_status,
-                authoritative_payload_json=_json(record.authoritative_payload),
-                agreement_status=record.agreement_status,
-                differences_json=_json(record.differences),
-                prompt_versions_json=_json(record.prompt_versions),
-                comparison_status="completed",
-                created_at=now,
-                updated_at=now,
-            )
-            session.add(row)
-            session.commit()
-            session.refresh(row)
-            session.expunge(row)
-            return row
-
-        if row.comparison_status == "execution_running":
-            raise RuntimeError("authoritative execution is already in progress")
-
-        observed_status = row.comparison_status
-        observed_token = row.comparison_claim_token
-        expected_token = (
-            RecognitionDecision.comparison_claim_token.is_(None)
-            if observed_token is None
-            else RecognitionDecision.comparison_claim_token == observed_token
-        )
-        result = session.execute(
-            update(RecognitionDecision)
-            .where(
-                RecognitionDecision.raw_message_id == record.raw_message_id,
-                RecognitionDecision.comparison_status == observed_status,
-                expected_token,
-            )
-            .values(
-                input_kind=record.input_kind,
-                authoritative_model=record.authoritative_model,
-                authoritative_status=record.authoritative_status,
-                authoritative_payload_json=_json(record.authoritative_payload),
-                auxiliary_model=record.auxiliary_model,
-                auxiliary_status=record.auxiliary_status,
-                auxiliary_payload_json=(
-                    _json(record.auxiliary_payload)
-                    if record.auxiliary_payload is not None
-                    else None
-                ),
-                agreement_status=record.agreement_status,
-                differences_json=_json(record.differences),
-                prompt_versions_json=_json(record.prompt_versions),
-                comparison_status="completed",
-                disagreement_severity=None,
-                comparison_model=None,
-                comparison_payload_json=None,
-                comparison_error=None,
-                comparison_next_attempt_at=None,
-                comparison_started_at=None,
-                comparison_claim_token=None,
-                compared_at=None,
-                updated_at=now,
-            )
-        )
-        if result.rowcount != 1:
-            session.rollback()
-            raise RuntimeError(
-                "authoritative decision changed or execution is already in progress"
-            )
+        saved = _save_terminal_authoritative_decision_in_session(session, record)
         session.commit()
-        saved = (
-            session.query(RecognitionDecision)
-            .filter(RecognitionDecision.raw_message_id == record.raw_message_id)
-            .one()
-        )
+        session.refresh(saved)
         session.expunge(saved)
         return saved
 
@@ -618,6 +625,30 @@ def claim_critical_notification(
         )
 
 
+def _update_recognition_execution_outcome_in_session(
+    session: Session,
+    *,
+    raw_message_id: int,
+    automation_status: str,
+    automation_reason: str | None,
+    notification_status: str | None = None,
+    notification_error: str | None = None,
+) -> None:
+    row = (
+        session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id == raw_message_id)
+        .one_or_none()
+    )
+    if row is None:
+        raise LookupError(f"Recognition decision not found for raw message {raw_message_id}")
+    row.automation_status = automation_status
+    row.automation_reason = automation_reason
+    if notification_status is not None:
+        row.notification_status = notification_status
+        row.notification_error = notification_error
+    row.updated_at = utc_now()
+
+
 def update_recognition_execution_outcome(
     session_factory: sessionmaker,
     *,
@@ -628,19 +659,14 @@ def update_recognition_execution_outcome(
     notification_error: str | None = None,
 ) -> None:
     with session_factory() as session:
-        row = (
-            session.query(RecognitionDecision)
-            .filter(RecognitionDecision.raw_message_id == raw_message_id)
-            .one_or_none()
+        _update_recognition_execution_outcome_in_session(
+            session,
+            raw_message_id=raw_message_id,
+            automation_status=automation_status,
+            automation_reason=automation_reason,
+            notification_status=notification_status,
+            notification_error=notification_error,
         )
-        if row is None:
-            raise LookupError(f"Recognition decision not found for raw message {raw_message_id}")
-        row.automation_status = automation_status
-        row.automation_reason = automation_reason
-        if notification_status is not None:
-            row.notification_status = notification_status
-            row.notification_error = notification_error
-        row.updated_at = utc_now()
         session.commit()
 
 

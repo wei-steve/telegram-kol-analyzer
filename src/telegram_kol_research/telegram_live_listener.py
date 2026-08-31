@@ -46,6 +46,8 @@ from telegram_kol_research.runtime_incident_adapters import (
 )
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
+    _save_terminal_authoritative_decision_in_session,
+    _update_recognition_execution_outcome_in_session,
     claim_authoritative_failure_notification,
     save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
@@ -801,6 +803,26 @@ def _record_expired_authoritative_recovery_gap(
     vary.
     """
 
+    with session_factory() as session:
+        attached_raw_message = session.get(RawMessage, raw_message.id)
+        if attached_raw_message is None:
+            raise LookupError(f"Raw message not found: {raw_message.id}")
+        _record_expired_authoritative_recovery_gap_in_session(
+            session,
+            raw_message=attached_raw_message,
+            classification=classification,
+        )
+        session.commit()
+
+
+def _record_expired_authoritative_recovery_gap_in_session(
+    session,
+    *,
+    raw_message: RawMessage,
+    classification: str = EXPIRED_STALE_INSTRUCTION,
+) -> None:
+    """Persist the existing expired audit in the caller's transaction."""
+
     reason = "authoritative_gap_recovery_expired"
     summary = (
         "消息未在窗口期内完成权威识别，原因为系统故障（事件循环阻塞）；"
@@ -808,8 +830,8 @@ def _record_expired_authoritative_recovery_gap(
         if classification == EXPIRED_AFTER_SYSTEM_STALL
         else "消息未在 15 分钟内完成权威识别；为防止执行过期信号，未自动交易。"
     )
-    save_terminal_authoritative_decision(
-        session_factory,
+    _save_terminal_authoritative_decision_in_session(
+        session,
         RecognitionDecisionRecord(
             raw_message_id=raw_message.id,
             input_kind="recovery_guard",
@@ -828,30 +850,28 @@ def _record_expired_authoritative_recovery_gap(
             prompt_versions={},
         ),
     )
-    with session_factory() as session:
-        recognition = (
-            session.query(MessageRecognition)
-            .filter(MessageRecognition.raw_message_id == raw_message.id)
-            .one_or_none()
-        )
-        if recognition is None:
-            session.add(
-                MessageRecognition(
-                    raw_message_id=raw_message.id,
-                    status="识别失败",
-                    reason=summary,
-                    summary=summary,
-                    engine="recovery_guard",
-                )
+    recognition = (
+        session.query(MessageRecognition)
+        .filter(MessageRecognition.raw_message_id == raw_message.id)
+        .one_or_none()
+    )
+    if recognition is None:
+        session.add(
+            MessageRecognition(
+                raw_message_id=raw_message.id,
+                status="识别失败",
+                reason=summary,
+                summary=summary,
+                engine="recovery_guard",
             )
-        else:
-            recognition.status = "识别失败"
-            recognition.reason = summary
-            recognition.summary = summary
-            recognition.engine = "recovery_guard"
-        session.commit()
-    update_recognition_execution_outcome(
-        session_factory,
+        )
+    else:
+        recognition.status = "识别失败"
+        recognition.reason = summary
+        recognition.summary = summary
+        recognition.engine = "recovery_guard"
+    _update_recognition_execution_outcome_in_session(
+        session,
         raw_message_id=raw_message.id,
         automation_status="skipped",
         automation_reason=reason,
