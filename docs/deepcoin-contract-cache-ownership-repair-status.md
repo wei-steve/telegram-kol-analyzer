@@ -223,6 +223,21 @@ monitor_install_retry_contract_spec_health: healthy_no_sync_unavailable
 monitor_install_retry_telegram_catchup_rows: 20
 monitor_install_retry_telegram_historical_pending_rows: 19
 monitor_install_retry_telegram_historical_replay_executed_manually: false
+stale_entry_preamble_investigation_status: complete_read_only
+stale_entry_preamble_eligible_count: 1
+stale_entry_preamble_eligible_ids: "13"
+stale_entry_preamble_ambiguous: false
+stale_entry_preamble_root_cause: preexisting_orphan_plus_unrecognized_same_chat_backlog
+stale_entry_preamble_same_chat_raw_after_count: 51
+stale_entry_preamble_same_chat_succeeded_after_count: 15
+stale_entry_preamble_same_chat_pending_after_count: 36
+stale_entry_preamble_same_chat_qualifying_candidate_count: 0
+stale_entry_preamble_current_19_history_same_chat_count: 0
+stale_entry_preamble_seven_target_relation: none
+monitor_diagnostic_reset_failed_status: complete
+monitor_diagnostic_post_reset_state: inactive_dead_mainpid_0
+monitor_diagnostic_post_reset_all_inhibits_sha256: 18624486bdc082f7c9aff9a6128cfa8842eb55b8fb0a91e1ceaaad84c14f2fa5
+monitor_diagnostic_post_reset_entry_admission_thawed: false
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -2163,3 +2178,111 @@ activation.
   The phase remains `in_progress` at fail-closed
   `maintenance_stop_failed_entry_frozen`; resolving the diagnostic unit's
   failed state or the stale entry preamble requires a new explicit scope.
+
+## Stale entry-preamble read-only investigation and diagnostic reset
+
+- The production monitor reader's exact eligibility was traced without
+  modifying it. It selects a `pending` preamble only when the same chat has no
+  strictly later `signal_candidates` row whose event type is `entry_signal`,
+  `strategy_revision` or `close_signal`, or whose management action is
+  `cancel_entry` or `cancel`. Ordering is exactly source `posted_at`, then
+  Telegram `message_id`, then local raw-message id. The six-hour threshold is
+  applied only after this eligibility test; symbol and side are not part of the
+  later-event exclusion.
+- At `2026-08-31T00:43:52.958083Z`, the six-hour cutoff was
+  `2026-08-30T18:43:52.958083Z`. Exactly one row was eligible and stale:
+  entry-preamble id `13`, chat `-1002344190971`, symbol `AKE`, side `long`, raw
+  message id `13783`, Telegram message id `14760`, source posted at
+  `2026-08-29T05:27:36Z`, created at `2026-08-29T05:27:57.947508Z`. No second
+  eligible row shares its chat/symbol/side, so `entry_preamble_ambiguous` did
+  not hit.
+- Source raw message `13783` itself completed job `2022` successfully before
+  the outage. Recognition classified it as non-strategy with confidence
+  `0.95`, no lifecycle event and no signal candidate, while normalized evidence
+  nevertheless contained non-executable AKE/long entry context with risk
+  multiplier `0.5`. The stored explanation says the message did not specify a
+  half-position or explicit percentage. Preamble `13` has never been consumed,
+  invalidated or attached to an `entry_strategy_assemblies` row; there is no
+  AKE lifecycle in that chat.
+- The strong hypothesis that this alert merely measured the 22.5-hour outage
+  is false. The row crossed the six-hour threshold at approximately
+  `2026-08-29T11:27:57Z`. After that time, the live runtime still successfully
+  processed 13 later messages in the same chat, through
+  `2026-08-30T01:38:03Z`; none produced a qualifying candidate. Thus the
+  preamble was already an orphan before the final maintenance stop.
+- The outage nevertheless created a real recovery deadlock. There are 51 raw
+  messages later than the source in the same chat. Fifteen completed with
+  `worker_completed` and no candidate; 36 remain pending and have never reached
+  recognition: 33 `history_reconcile_enqueued`, two `recovery_enqueued` and
+  one `queue_enqueued`. Their posted window is `2026-08-30T08:07:48Z` through
+  `2026-08-30T21:49:18Z`. Bounded read-only text inspection found explicit
+  event-like messages such as `Trade closed`, `Long #ZKC High Risk`, `Adding
+  more #ZKC` and `closd #ZKC`. They are not AKE follow-ups, but because current
+  eligibility is chat-wide rather than symbol-wide, recognizing any of them as
+  one of the five qualifying event/action kinds could make preamble `13`
+  ineligible. The monitor gate prevents the normal worker from draining those
+  tasks, while the undrained tasks can therefore keep the monitor gate red.
+- The 19 historical jobs inserted by the latest brief activation are all in
+  other chats; the same-chat count is zero. They cannot resolve preamble `13`.
+  No historical collection or replay was initiated in this investigation.
+- The seven manually cancelled/reconciled orders have no relationship to this
+  preamble. Their four lifecycles are ids `780`, `812`, `911` and `914`, chats
+  `-1002370796392`, `-1002409877375` and `-1003825498321`, symbols BTC/ETH and
+  bindings `271`, `281`, `308` and `309`. Preamble `13` is in a different chat,
+  has symbol AKE, no assembly, no binding and no lifecycle. Production contains
+  exactly seven confirmed `reconcile_manual_pending_entry_cancel` events
+  `3804` through `3810`; none links to its chat, symbol or source message.
+- The true unresolved cause is therefore mixed: the original casual AKE view
+  produced a durable, never-consumed preamble and no recognized follow-up
+  before the outage; later same-chat history was enqueued but 36 messages never
+  reached recognition. It is not possible to claim that no later qualifying
+  message was sent merely from the current zero-candidate count. Conversely,
+  there is no evidence of an AKE strategy, order or lifecycle that still needs
+  this preamble.
+- The sole authorized production mutation was executed once. Before
+  `systemctl reset-failed telegram-kol-monitor-diagnostic.service`, the unit was
+  `failed/failed`, result `exit-code`, status `1`, `MainPID=0`. Afterwards it is
+  `inactive/dead`, result `success`, status `0`, `MainPID=0`. The other seven
+  controlled units remained inactive with zero process ids. Before and after,
+  each of the eight exact inhibit files had SHA-256
+  `18624486bdc082f7c9aff9a6128cfa8842eb55b8fb0a91e1ceaaad84c14f2fa5`,
+  every unit reported `NeedDaemonReload=no`, and web/ingest/worker retained
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1`. No service started and entry
+  admission was not thawed.
+
+### Candidate dispositions for preamble 13
+
+1. **Recommended: evidence-bound one-row expiration/invalidation.** In a new
+   separately authorized L3 window, preserve a verified database backup and
+   exact before-image, then terminalize only preamble `13` after the owner
+   explicitly accepts that source message `14760` is a casual AKE view rather
+   than valid future sizing authority. Re-read the unchanged monitor eligibility
+   and prove no assembly, candidate, lifecycle, order or exchange write was
+   created. This is the smallest production action and does not process old
+   messages. Its risk is discarding a genuine half-risk instruction if the
+   contradictory extraction was actually intended; choosing `expired` versus
+   `invalidated` also needs an explicit semantic decision.
+2. **Bounded recognition-only drain for this chat.** Process exactly the 36
+   pending jobs in source order while entry admission remains frozen, with
+   exchange writes and Telegram sends disabled, then inspect the resulting
+   candidates before any activation. This preserves normal event derivation but
+   writes many business rows and can treat historical ZKC/ZKP/ZEC messages as
+   new work. Because eligibility is chat-wide, an unrelated-symbol candidate
+   may silence the AKE alert while leaving preamble `13` pending; management
+   messages could also affect the chat's two unrelated old pending lifecycles.
+   It therefore has materially higher scope and is not recommended as the first
+   recovery action.
+3. **Shadow classification on an isolated database copy, then choose 1 or 2.**
+   Run the 36 messages through candidate recognition with no production write,
+   notification or exchange authority. This reduces uncertainty about what a
+   controlled drain would emit, but model/provider nondeterminism means a copy
+   result is not identical to production execution, and it does not itself
+   clear the stale row. It is useful only if the owner is unwilling to make the
+   direct semantic decision required by option 1.
+
+- No threshold, reason code or eligibility condition was changed or bypassed.
+  No business table was written, no preamble was terminalized, no release was
+  modified or staged, no activation or reconciliation ran, no message was
+  replayed, and no entry admission was thawed. Production is again fully
+  `maintenance_stopped_entry_frozen`; selecting and authorizing a disposition
+  is the next independent phase.
