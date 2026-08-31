@@ -47,18 +47,19 @@ backlog_preterminalization_final_seal_executed: false
 backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
 local_exchange_alignment_implementation_sha: 00cda0602bfa940ddddfc87e63eeffd92b9984ee
 local_exchange_alignment_final_suite: 6737_passed_4_skipped_32_warnings
-local_exchange_alignment_status: unified_claim_alignment_reviewed_tested_ready_for_production
-local_exchange_alignment_exchange_snapshot_at: 2026-08-31T12:58:25.021309Z
+local_exchange_alignment_status: applied_core_claim_gates_passed_strict_raw_bidirectional_not_met_online_ingest
+local_exchange_alignment_exchange_snapshot_at: 2026-08-31T14:39:29.457810Z
 local_exchange_alignment_position_read: complete_zero
 local_exchange_alignment_regular_order_read: complete_zero
 local_exchange_alignment_pending_trigger_read: complete_zero_btc_eth_sol
-local_exchange_alignment_production_executed: false
+local_exchange_alignment_production_executed: true
 local_exchange_alignment_database_backup_created: true
-local_exchange_alignment_database_backup_sha256: 18c03d5152084256b814a0c2639d9a5b9a38ff4409fc26c73e1b2b32be8dbabd
-local_exchange_alignment_begin_immediate_acquired: false
-local_exchange_alignment_exact_target_entered_count: 20
-local_exchange_alignment_exact_target_binding_count: 11
-local_exchange_alignment_out_of_scope_entered_ids: [536, 607, 611, 698, 1036]
+local_exchange_alignment_database_backup_sha256: d8b1ebd73da9bb2da2af10e1094adad1a0d19d0311a74b1f6d21b5b8eca96a27
+local_exchange_alignment_begin_immediate_acquired: true
+local_exchange_alignment_exact_target_entered_count: 25
+local_exchange_alignment_exact_target_pending_entry_count: 10
+local_exchange_alignment_exact_target_binding_count: 46
+local_exchange_alignment_out_of_scope_entered_ids: []
 local_exchange_alignment_global_nonterminal_binding_count: 98
 local_exchange_claim_census_status: complete_read_only
 local_exchange_claim_census_at: 2026-08-31T13:16:36.861151295Z
@@ -73,7 +74,18 @@ local_exchange_alignment_unified_target_intent_count: 2
 local_exchange_alignment_unified_target_protection_leg_count: 8
 local_exchange_alignment_unified_target_convergence_count: 2
 local_exchange_alignment_unified_plan_status: implemented_reviewed_tested
-local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z
+local_exchange_alignment_apply_changed_row_count: 173
+local_exchange_alignment_execution_audit_rows: 67
+local_exchange_alignment_attribution_audit_rows: 55
+local_exchange_alignment_remaining_entered_count: 0
+local_exchange_alignment_remaining_position_claim_count: 0
+local_exchange_alignment_remaining_order_claim_count: 0
+local_exchange_alignment_retained_binding_substantive_diff_count: 0
+local_exchange_alignment_raw_backup_minus_current_count: 0
+local_exchange_alignment_raw_current_minus_backup_count: 9
+local_exchange_alignment_raw_existing_rows_unchanged: true
+local_exchange_alignment_raw_strict_bidirectional_equal: false
+local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3611,3 +3623,69 @@ the separately authorized production dry-run/apply window:
 No production exchange read, database backup, dry-run, `BEGIN IMMEDIATE` or
 apply was performed at this checkpoint. No service was controlled, no message
 was processed, final seal was not executed, and entry admission remains frozen.
+
+## Unified claim alignment production execution
+
+The approved L3 transaction was executed once from exact reviewed commit
+`00cda0602bfa940ddddfc87e63eeffd92b9984ee`. Evidence is in the root-owned mode
+`0700` directory
+`/var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z`;
+all evidence files and the database backup are root-owned mode `0600`.
+
+### Preconditions, backup and dry-run
+
+- The exact independent archive SHA-256 is
+  `e65da3bcedc42ba73aeeaeadaddddadfe409e5e3d5056a22e14695bbda638016`.
+  Execution used `/opt/telegram-kol-analyzer/.venv/bin/python -B` with
+  `PYTHONPATH` set only to that archive's `src` directory. The imported module
+  path was recorded and the archive contained zero `.pyc` files after the run.
+- At `2026-08-31T14:39:29.457810Z`, the fresh read-only snapshot completed with
+  zero account positions, zero regular open orders, and zero pending triggers
+  for each of `BTC-USDT-SWAP`, `ETH-USDT-SWAP` and `SOL-USDT-SWAP`. No
+  account-wide pending-trigger call and no Deepcoin write was made.
+- `research-before.db` is 807,567,360 bytes with SHA-256
+  `d8b1ebd73da9bb2da2af10e1094adad1a0d19d0311a74b1f6d21b5b8eca96a27`.
+  Its `quick_check` returned `ok` and foreign-key check returned zero rows.
+  Full pre-images for 65 related lifecycles, 46 target bindings, all 83 related
+  entry legs and the 2/8/2 dependents were saved, together with all 52 retained
+  binding rows and critical table counts.
+- The dry-run returned action count `173`, exact target counts
+  `25 entered + 10 pending_entry / 46 bindings / 80 entry legs / 2 intents /
+  8 protection legs / 2 convergences`, and guard counts
+  `65 / 46 / 83 / 2 / 8 / 2`. Its fingerprint is
+  `c15abb6b03070f3c07e274083ae475a99834972472f8a757c1005c7d0bd043c4`.
+
+### Apply and acceptance outcome
+
+- The single `BEGIN IMMEDIATE` apply committed successfully at approximately
+  `2026-08-31T14:41:14Z`. It changed 35 lifecycle rows, 46 binding rows,
+  80 entry-leg rows, two intent rows, eight protection-leg rows and two
+  convergence rows. It inserted 67 existing-path execution audit rows and 55
+  existing-path attribution audit rows. No second apply was attempted.
+- Core postconditions pass: zero `entered` lifecycle remains; the exact unified
+  claim predicate returns zero position-claim and zero active-order-claim
+  bindings; foreign-key check is empty; and all 52 retained no-claim bindings
+  have zero substantive-field differences from their pre-image. Normal binding
+  recovery subsequently converged 45 targets to `closed/entry_legs_terminal`
+  and left one `cancelled/operator_cancelled_pending_entries`; all 46 have no
+  `pos_id` and still produce no substantive claim.
+- The literal full-table raw-message bidirectional equality gate did **not**
+  pass because online ingest remained active as explicitly planned. At the
+  saved acceptance point it had inserted nine new rows, ids `14140..14148`,
+  after the backup. `backup EXCEPT current` is zero, proving that every
+  pre-existing `raw_messages` row is byte-for-byte still present and unchanged;
+  `current EXCEPT backup` is nine, so strict bidirectional equality is recorded
+  as false rather than silently relaxed.
+- The initial pre-image/evidence helpers exposed three operator-side path or
+  quoting errors before opening a writable transaction: archive-root versus
+  archive-`src` `PYTHONPATH`, one unbound SQL string literal, and one
+  single-quoted evidence path. Each failed read-only, was preserved in
+  `operator-path-correction.txt`, and was corrected before dry-run. The first
+  exchange snapshot was explicitly marked invalid and replaced. These helper
+  failures did not change the exchange or database.
+
+Entry admission remains frozen on web, ingest and worker. No final seal,
+message processing/replay, service control, stage, activation or Deepcoin write
+was performed. Because strict raw bidirectional equality was not met, the
+overall pre-thaw phase remains `in_progress`; no rollback or whole-database
+restore was attempted after the successful commit.
