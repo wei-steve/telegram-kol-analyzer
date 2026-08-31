@@ -2752,3 +2752,49 @@ activation.
   for the earlier part of the outage remains unknown. No manual drain,
   recognition, replay, backfill, reconciliation, Deepcoin write, business-table
   mutation, preamble change or entry thaw occurred.
+
+## Exit-status monitor activation gate repair
+
+- Exact local base was clean pushed commit
+  `d35192f0f5dae00f16c1b429046bb4bda96c3494`. RED reproduced the fourth
+  evidence-layer false rejection: a diagnostic with systemd `Result=success`
+  and `ExecMainStatus=0` was denied solely because structured journal evidence
+  was unavailable. The final implementation restores the previously proven
+  systemd exit-status gate. A successful diagnostic exit now admits activation;
+  business health and journal payload availability have no deployment veto.
+- The InvocationID, systemd job-ID, journal cursor and stderr transaction
+  parsers were deleted rather than retained as secondary criteria. Journal
+  reading is bounded to ten seconds and best effort. When available, the latest
+  diagnostic payload is returned in activation evidence; missing, duplicate,
+  malformed, non-UTF-8 or unreadable journal output is explicitly recorded as
+  unavailable and cannot overturn a successful exit status.
+- Every allow or reject path emits canonical
+  `MONITOR_ACTIVATION_GATE_EVIDENCE`, including its decision basis, systemctl
+  start return code, observed systemd `Result` and `ExecMainStatus`, and the
+  best-effort journal disposition. Runtime identity and unit precheck failures,
+  start timeout/unavailability, nonzero or signal exit, and unavailable or
+  malformed systemd status all preserve a specific rejection reason. The
+  production activation output must be copied byte-for-byte into the root
+  evidence directory so these emitted values remain durable on failure as well
+  as success.
+- The CLI deployment diagnostic remains the sole encoder of semantic failure:
+  daily audit execution, adapter/source failures, monitor errors, unverified
+  loaded artifact, incomplete result, invalid release commit or invalid
+  manifest digest all exit nonzero. Business `healthy` and `reason_codes`
+  remain deliberately outside that exit decision. No business check, timeout,
+  threshold, reason code, eligibility rule, monitor unit or installer changed.
+- Independent exact-base review found four evidence-boundary gaps in the first
+  candidate: journal decode exceptions could still veto, precheck failures did
+  not emit a decision, start return codes were folded together, and stderr had
+  to be durably captured by the production executor. New RED tests covered the
+  first three code paths and the production evidence requirement is explicit
+  above. A follow-up review found one remaining start-output decode gap; it too
+  was reproduced and closed. Final exact-base review of
+  `d35192f0..884d50d1` returned `No findings`.
+- Focused acceptance passed `517 passed, 1 skipped`. The one final repository
+  suite after the last production-code edit passed
+  `6704 passed, 4 skipped, 32 warnings` in 409.75 seconds. No production code
+  changed afterwards. This local phase performed no stage, install, activation,
+  service control, production or exchange write, replay, drain, reconciliation
+  or entry thaw. Production remains `maintenance_stopped_entry_frozen` pending
+  the authorized fresh immutable recovery window.
