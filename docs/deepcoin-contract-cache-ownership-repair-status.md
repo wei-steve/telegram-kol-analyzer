@@ -6,10 +6,10 @@ design_status: approved
 current_phase: manual_cleanup_production_cutover
 phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
-candidate_sha: 3c34eee0df334eb844ad39fb348db9bb029790ad
-candidate_content_sha: a7e33e2c6e6660b5b86942a367ad52867b2023ca81ba85bf1f9642c95b8e9343
-handoff_sha: 3c34eee0df334eb844ad39fb348db9bb029790ad
-pushed_sha: 3c34eee0df334eb844ad39fb348db9bb029790ad
+candidate_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
+candidate_content_sha: pending_fresh_immutable_stage
+handoff_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
+pushed_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
 review_findings_repair_base_sha: 49b8f40c9af0f38344724c84f39a7e065e5beabd
 task12_findings_repair_base_sha: eb3dc0d0868d8131f003c869842bddba07aa5c29
 production_sha: 0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f
@@ -278,6 +278,13 @@ recovery_activation_evidence_path: /var/lib/telegram-kol-cutover-evidence/3c34ee
 recovery_activation_evidence_sha256: 4cf5b8e705567d0673a9e18796624bd37b37c6142d325d3d1f91e03b09c383ec
 recovery_activation_post_verification_status: not_run_activation_failed
 recovery_activation_entry_admission_thawed: false
+invocation_correlation_repair_base_sha: d12241aabe53c8f7de3b719b55b3d80d0604d895
+invocation_correlation_repair_code_sha: c7d91df43e14bda12a798957df9bfe4f02d81e47
+invocation_correlation_repair_status: local_complete_fresh_stage_pending
+invocation_correlation_repair_focused: 246_passed_2_skipped
+invocation_correlation_repair_review: three_rounds_final_no_findings
+invocation_correlation_repair_final_suite: 6701_passed_4_skipped_32_warnings
+invocation_correlation_repair_final_suite_seconds: 412.95
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -2579,3 +2586,44 @@ activation.
   to the successful-oneshot journal correlation requires a new local-change
   scope and a new immutable candidate; it was not attempted in this production
   window.
+
+## Monitor oneshot invocation correlation repair
+
+- Exact local base was clean pushed commit
+  `d12241aabe53c8f7de3b719b55b3d80d0604d895`. RED reproduced both sides of the
+  defect: a successful collected oneshot was rejected after its runtime
+  properties disappeared, while the old unbounded InvocationID path could
+  accept a structurally valid earlier result.
+- The final repair is confined to
+  `src/telegram_kol_research/scoped_release_activation.py`; no monitor unit,
+  business check, timeout, threshold, reason code, eligibility rule or release
+  format changed. Before starting the diagnostic, the activator records a
+  global journal cursor. `systemctl --show-transaction` then returns its exact
+  anchor `JOB_ID`. Cursor-later JSON journal evidence is accepted only when PID
+  1's trusted start and successful done records have that same job ID, boot ID
+  and InvocationID, and the diagnostic stdout payload has the matching
+  `_SYSTEMD_INVOCATION_ID` strictly between those records.
+- The implementation reads the systemd v255 transaction anchor from stderr,
+  where `log_info()` actually writes it. A success test now crosses the real
+  `SystemRuntimeAdapter._run` subprocess boundary with the production-shaped
+  stderr and journal JSON fields. A different job/InvocationID after the cursor,
+  a cursor-before historical result, missing or duplicate results, untrusted or
+  malformed job records and wrong ordering all remain rejected.
+- Existing denials remain intact: `systemctl start` failure, the unchanged
+  45-second subprocess timeout, nonzero status, signal termination, source or
+  adapter failure, incomplete/malformed result, missing/duplicate result,
+  loaded-artifact failure and commit/manifest mismatch all fail closed.
+  Business-unhealthy but complete results still preserve their full reason
+  codes and details without receiving deployment veto authority.
+- Independent review required three rounds. Round one found the cursor-only
+  concurrent-invocation gap; round two found stdout/stderr incompatibility with
+  real systemd v255; both were captured by new RED tests before repair. The
+  third exact-base review of `d12241aa..c7d91df4` returned `No findings`.
+  Focused deployment acceptance passed `246 passed, 2 skipped`. The single
+  final repository suite after the last production-code edit passed
+  `6701 passed, 4 skipped, 32 warnings` in 412.95 seconds. No production code
+  changed afterwards.
+- This local phase performed no stage, activation, service control, business or
+  exchange write, message replay/backfill, reconciliation or entry thaw. The
+  next immutable stage must use the exact pushed HEAD that includes this status
+  update; its content and manifest digests must be freshly derived.
