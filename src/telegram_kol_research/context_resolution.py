@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import threading
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from typing import Any, Callable, Mapping
 
 import httpx
@@ -172,6 +175,138 @@ class ContextProviderResult:
 
     content: Any
     usage: Mapping[str, Any] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ContextNetworkRetryPolicy:
+    base_delay_seconds: float = 5.0
+    max_delay_seconds: float = 60.0
+    failure_threshold: int = 3
+    open_seconds: float = 120.0
+
+    @classmethod
+    def from_environ(
+        cls,
+        environ: Mapping[str, str] | None = None,
+    ) -> "ContextNetworkRetryPolicy":
+        values = os.environ if environ is None else environ
+
+        def number(name: str, default: float, lower: float, upper: float) -> float:
+            try:
+                parsed = float(values.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return parsed if lower <= parsed <= upper else default
+
+        def integer(name: str, default: int, lower: int, upper: int) -> int:
+            try:
+                parsed = int(values.get(name, default))
+            except (TypeError, ValueError):
+                return default
+            return parsed if lower <= parsed <= upper else default
+
+        base = number(
+            "TELEGRAM_KOL_CONTEXT_NETWORK_BASE_DELAY_SECONDS",
+            5.0,
+            0.1,
+            60.0,
+        )
+        maximum = number(
+            "TELEGRAM_KOL_CONTEXT_NETWORK_MAX_DELAY_SECONDS",
+            60.0,
+            base,
+            300.0,
+        )
+        return cls(
+            base_delay_seconds=base,
+            max_delay_seconds=maximum,
+            failure_threshold=integer(
+                "TELEGRAM_KOL_CONTEXT_NETWORK_FAILURE_THRESHOLD",
+                3,
+                2,
+                20,
+            ),
+            open_seconds=number(
+                "TELEGRAM_KOL_CONTEXT_NETWORK_OPEN_SECONDS",
+                120.0,
+                1.0,
+                900.0,
+            ),
+        )
+
+
+@dataclass(slots=True)
+class _ContextProviderCircuitState:
+    consecutive_failures: int = 0
+    open_until: datetime | None = None
+    half_open_in_flight: bool = False
+
+
+class ContextProviderCircuitRegistry:
+    """Process-local provider circuit; durable rows remain the retry authority."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, _ContextProviderCircuitState] = {}
+        self._lock = threading.Lock()
+
+    def record_network_failure(
+        self,
+        provider_key: str,
+        now: datetime,
+        policy: ContextNetworkRetryPolicy,
+    ) -> datetime:
+        with self._lock:
+            state = self._states.setdefault(
+                str(provider_key), _ContextProviderCircuitState()
+            )
+            state.consecutive_failures += 1
+            state.half_open_in_flight = False
+            delay = min(
+                float(policy.max_delay_seconds),
+                float(policy.base_delay_seconds)
+                * (2 ** max(0, state.consecutive_failures - 1)),
+            )
+            retry_at = now + timedelta(seconds=delay)
+            if state.consecutive_failures >= int(policy.failure_threshold):
+                state.open_until = now + timedelta(
+                    seconds=float(policy.open_seconds)
+                )
+                retry_at = max(retry_at, state.open_until)
+            return retry_at
+
+    def reserve_retry(
+        self,
+        provider_key: str,
+        now: datetime,
+        policy: ContextNetworkRetryPolicy | None = None,
+    ) -> tuple[bool, datetime | None]:
+        effective = policy or ContextNetworkRetryPolicy()
+        with self._lock:
+            state = self._states.get(str(provider_key))
+            if state is None or state.open_until is None:
+                return True, None
+            if now < state.open_until:
+                return False, state.open_until
+            if state.half_open_in_flight:
+                return False, now + timedelta(
+                    seconds=float(effective.open_seconds)
+                )
+            state.half_open_in_flight = True
+            state.open_until = now + timedelta(
+                seconds=float(effective.open_seconds)
+            )
+            return True, None
+
+    def record_success(self, provider_key: str) -> None:
+        with self._lock:
+            self._states.pop(str(provider_key), None)
+
+
+_CONTEXT_PROVIDER_CIRCUITS = ContextProviderCircuitRegistry()
+
+
+def _provider_circuit_key(provider: AiProviderConfig) -> str:
+    return f"{provider.base_url.rstrip('/')}|{provider.model}"
 
 
 def _fanout_allowed(decision: str, management_action: str | None) -> bool:
@@ -448,6 +583,16 @@ def _provider_usage_entry(raw_result: Any, request_number: int) -> dict[str, Any
     }
 
 
+def _provider_usage_entries(value: str | None) -> list[Mapping[str, Any]]:
+    try:
+        parsed = json.loads(value or "[]")
+    except (TypeError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    return [item for item in parsed if isinstance(item, Mapping)]
+
+
 def _current_evidence_version_id(session_factory, raw_message_id: int) -> int | None:
     with session_factory() as session:
         row = (
@@ -477,6 +622,7 @@ def _upsert_attempt(
     invocation_triggers: tuple[str, ...] = (),
     attempt_phase: str = "initial_resolution",
     provider_usage_entries: tuple[Mapping[str, Any], ...] = (),
+    next_attempt_at: datetime | None = None,
     rejected_response_diagnostic_json: str | None = None,
 ) -> int:
     from telegram_kol_research.context_resolution_worker import (
@@ -531,6 +677,7 @@ def _upsert_attempt(
                 error_class=error_class,
                 reanalysis_triggers_json="[]",
                 attempts=int(attempts),
+                next_attempt_at=next_attempt_at,
                 created_at=now,
                 updated_at=now,
             )
@@ -554,6 +701,10 @@ def _upsert_attempt(
             row.status = status
             row.error_class = error_class
             row.attempts = int(attempts)
+            row.next_attempt_at = next_attempt_at
+            if status != "running":
+                row.claim_token = None
+                row.claimed_at = None
             row.updated_at = now
             if rejected_response_diagnostic_json is not None:
                 row.rejected_response_diagnostic_json = (
@@ -581,6 +732,9 @@ def resolve_contextual_strategy(
     invocation_triggers: tuple[str, ...] = (),
     attempt_phase: str = "initial_resolution",
     model_caller: Callable[..., Any] = _default_model_caller,
+    network_retry_policy: ContextNetworkRetryPolicy | None = None,
+    circuit_registry: ContextProviderCircuitRegistry | None = None,
+    now_provider: Callable[[], datetime] = utc_now,
 ) -> ContextResolutionDecision:
     """Call DeepSeek at most twice, preserving strict contract validation."""
 
@@ -613,6 +767,9 @@ def resolve_contextual_strategy(
         int(raw_message_id),
     )
     provider = _select_provider(ai_recognition_config)
+    retry_policy = network_retry_policy or ContextNetworkRetryPolicy.from_environ()
+    circuits = circuit_registry or _CONTEXT_PROVIDER_CIRCUITS
+    provider_key = _provider_circuit_key(provider)
     fingerprint_payload = {
         "raw_message_id": int(raw_message_id),
         "evidence_version_id": evidence_version_id,
@@ -638,6 +795,10 @@ def resolve_contextual_strategy(
         },
         {"message_id", "source_message_id", "root_message_id"},
     )
+    existing_request_count = 0
+    existing_attempts = 0
+    existing_usage_entries: list[Mapping[str, Any]] = []
+    existing_phase: str | None = None
     with session_factory() as session:
         completed = (
             session.query(ContextResolutionAttempt)
@@ -667,11 +828,67 @@ def resolve_contextual_strategy(
             raise ContextResolutionError(
                 str(exhausted.error_class or "context_contract_invalid")
             )
+        retry_row = (
+            session.query(ContextResolutionAttempt)
+            .filter(
+                ContextResolutionAttempt.raw_message_id == int(raw_message_id),
+                ContextResolutionAttempt.context_fingerprint == context_fingerprint,
+                ContextResolutionAttempt.status.in_(("retry_pending", "running")),
+            )
+            .one_or_none()
+        )
+        if retry_row is not None:
+            existing_request_count = int(
+                retry_row.provider_request_count
+                if retry_row.provider_request_count is not None
+                else retry_row.attempts or 0
+            )
+            existing_attempts = int(retry_row.attempts or 0)
+            existing_usage_entries = _provider_usage_entries(
+                retry_row.provider_usage_json
+            )
+            for request_number in range(
+                len(existing_usage_entries) + 1,
+                existing_request_count + 1,
+            ):
+                existing_usage_entries.append(
+                    {
+                        "available": False,
+                        "reason": "legacy_provider_usage_unavailable",
+                        "request_number": request_number,
+                    }
+                )
+            existing_phase = retry_row.attempt_phase
     prior_error_code: str | None = None
-    provider_usage_entries: list[Mapping[str, Any]] = []
-    for attempt_number in (1, 2):
+    provider_usage_entries = list(existing_usage_entries)
+    effective_phase = existing_phase or attempt_phase
+    for attempt_number in range(existing_request_count + 1, 3):
         failure: ContextResolutionError | None = None
         decoded: Mapping[str, Any] | None = None
+        if attempt_number > 1:
+            allowed, retry_at = circuits.reserve_retry(
+                provider_key,
+                now_provider(),
+                retry_policy,
+            )
+            if not allowed:
+                _upsert_attempt(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    evidence_version_id=evidence_version_id,
+                    context_fingerprint=context_fingerprint,
+                    model=provider.model,
+                    request_payload=request_payload,
+                    decision=None,
+                    status="retry_pending",
+                    error_class="network_error",
+                    attempts=existing_attempts or existing_request_count,
+                    invocation_triggers=tuple(invocation_triggers),
+                    attempt_phase=effective_phase,
+                    provider_usage_entries=tuple(provider_usage_entries),
+                    next_attempt_at=retry_at,
+                )
+                raise ContextResolutionError("network_error")
         try:
             raw_result = model_caller(
                 provider=provider,
@@ -695,6 +912,7 @@ def resolve_contextual_strategy(
             failure = ContextResolutionError("network_error")
             failure.__cause__ = exc
         else:
+            circuits.record_success(provider_key)
             provider_usage_entries.append(
                 _provider_usage_entry(raw_result, attempt_number)
             )
@@ -719,6 +937,13 @@ def resolve_contextual_strategy(
                     failure = exc
         if failure is not None:
             terminal = attempt_number == 2
+            next_attempt_at = None
+            if failure.code == "network_error":
+                next_attempt_at = circuits.record_network_failure(
+                    provider_key,
+                    now_provider(),
+                    retry_policy,
+                )
             attempt_id = _upsert_attempt(
                 session_factory,
                 raw_message_id=raw_message_id,
@@ -731,8 +956,9 @@ def resolve_contextual_strategy(
                 error_class=failure.code,
                 attempts=attempt_number,
                 invocation_triggers=tuple(invocation_triggers),
-                attempt_phase=attempt_phase,
+                attempt_phase=effective_phase,
                 provider_usage_entries=tuple(provider_usage_entries),
+                next_attempt_at=(None if terminal else next_attempt_at),
                 rejected_response_diagnostic_json=(
                     _rejected_response_diagnostic(
                         decoded,
@@ -742,9 +968,11 @@ def resolve_contextual_strategy(
                     else None
                 ),
             )
-            if not terminal:
+            if not terminal and failure.code != "network_error":
                 prior_error_code = failure.code
                 continue
+            if not terminal:
+                raise failure
             capture_runtime_incident_best_effort(
                 capture_context_worker_state,
                 session_factory,
@@ -767,7 +995,7 @@ def resolve_contextual_strategy(
             error_class=None,
             attempts=attempt_number,
             invocation_triggers=tuple(invocation_triggers),
-            attempt_phase=attempt_phase,
+            attempt_phase=effective_phase,
             provider_usage_entries=tuple(provider_usage_entries),
         )
         return decision

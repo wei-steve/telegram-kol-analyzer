@@ -52,6 +52,7 @@ class ContextReanalysisClaim:
     context_fingerprint: str
     token: str
     trigger_event: dict[str, Any]
+    source_status: str = "pending_reanalysis"
 
 
 def build_context_state_fingerprint(
@@ -421,7 +422,9 @@ def schedule_context_reanalysis(
 def _claimable(now: datetime, stale_before: datetime):
     return or_(
         and_(
-            ContextResolutionAttempt.status == "pending_reanalysis",
+            ContextResolutionAttempt.status.in_(
+                ("pending_reanalysis", "retry_pending")
+            ),
             or_(
                 ContextResolutionAttempt.next_attempt_at.is_(None),
                 ContextResolutionAttempt.next_attempt_at <= now,
@@ -444,8 +447,11 @@ def claim_next_context_reanalysis(
 
     with session_factory() as session:
         while True:
-            attempt_id = session.execute(
-                session.query(ContextResolutionAttempt.id)
+            candidate = session.execute(
+                session.query(
+                    ContextResolutionAttempt.id,
+                    ContextResolutionAttempt.status,
+                )
                 .filter(_claimable(now, stale_before))
                 .order_by(
                     ContextResolutionAttempt.next_attempt_at,
@@ -453,9 +459,11 @@ def claim_next_context_reanalysis(
                 )
                 .limit(1)
                 .statement
-            ).scalar_one_or_none()
-            if attempt_id is None:
+            ).first()
+            if candidate is None:
                 return None
+            attempt_id = int(candidate.id)
+            source_status = str(candidate.status)
             token = uuid4().hex
             result = session.execute(
                 update(ContextResolutionAttempt)
@@ -482,6 +490,7 @@ def claim_next_context_reanalysis(
                     ),
                     token=token,
                     trigger_event=_json_dict(row.trigger_event_json),
+                    source_status=source_status,
                 )
             session.rollback()
 
@@ -578,7 +587,10 @@ def run_context_resolution_once(
             "raw_message_id": claim.raw_message_id,
         }
     fingerprint = str(context_fingerprint_factory(claim.raw_message_id))
-    if fingerprint == claim.context_fingerprint:
+    if (
+        claim.source_status != "retry_pending"
+        and fingerprint == claim.context_fingerprint
+    ):
         _finish_claim(
             session_factory,
             claim=claim,
@@ -594,7 +606,51 @@ def run_context_resolution_once(
     except Exception as exc:
         with session_factory() as session:
             row = session.get(ContextResolutionAttempt, claim.attempt_id)
+            persisted_status = str(row.status)
             attempt_count = int(row.attempts or 0)
+            delegated_retry = (
+                session.query(ContextResolutionAttempt.status)
+                .filter(
+                    ContextResolutionAttempt.raw_message_id
+                    == claim.raw_message_id,
+                    ContextResolutionAttempt.id != claim.attempt_id,
+                    ContextResolutionAttempt.context_fingerprint
+                    == fingerprint,
+                    ContextResolutionAttempt.status.in_(
+                        ("retry_pending", "exhausted")
+                    ),
+                )
+                .order_by(ContextResolutionAttempt.id.desc())
+                .first()
+            )
+        if claim.source_status == "retry_pending" and persisted_status in {
+            "retry_pending",
+            "exhausted",
+        }:
+            return {
+                "status": (
+                    "retry_scheduled"
+                    if persisted_status == "retry_pending"
+                    else "exhausted"
+                ),
+                "raw_message_id": claim.raw_message_id,
+            }
+        if delegated_retry is not None:
+            delegated_status = str(delegated_retry.status)
+            _finish_claim(
+                session_factory,
+                claim=claim,
+                status="superseded",
+                now=current,
+            )
+            return {
+                "status": (
+                    "retry_scheduled"
+                    if delegated_status == "retry_pending"
+                    else "exhausted"
+                ),
+                "raw_message_id": claim.raw_message_id,
+            }
         exhausted = attempt_count >= int(max_attempts)
         _finish_claim(
             session_factory,
@@ -636,12 +692,25 @@ def run_context_resolution_once(
             "status": "exhausted" if exhausted else "retry_scheduled",
             "raw_message_id": claim.raw_message_id,
         }
-    _finish_claim(
-        session_factory,
-        claim=claim,
-        status="superseded",
-        now=current,
-    )
+    if claim.source_status == "retry_pending":
+        with session_factory() as session:
+            persisted_status = str(
+                session.get(ContextResolutionAttempt, claim.attempt_id).status
+            )
+        if persisted_status == "running":
+            _finish_claim(
+                session_factory,
+                claim=claim,
+                status="completed",
+                now=current,
+            )
+    else:
+        _finish_claim(
+            session_factory,
+            claim=claim,
+            status="superseded",
+            now=current,
+        )
     return {
         "status": str(outcome.get("status") or "completed"),
         "raw_message_id": claim.raw_message_id,

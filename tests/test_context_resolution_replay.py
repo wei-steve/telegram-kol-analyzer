@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -9,6 +9,8 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
 )
 from telegram_kol_research.context_resolution import (
+    ContextNetworkRetryPolicy,
+    ContextProviderCircuitRegistry,
     ContextResolutionError,
     resolve_contextual_strategy,
 )
@@ -179,6 +181,9 @@ def test_exhausted_deepseek_cache_does_not_suppress_new_mimo_authority(tmp_path)
         "exchange_state": {},
     }
     deepseek_calls = 0
+    policy = ContextNetworkRetryPolicy()
+    circuit = ContextProviderCircuitRegistry()
+    first_at = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
 
     def failing_deepseek(**_kwargs):
         nonlocal deepseek_calls
@@ -193,9 +198,27 @@ def test_exhausted_deepseek_cache_does_not_suppress_new_mimo_authority(tmp_path)
                 context_resolution_model_id="deepseek-v4-flash",
             ),
             model_caller=failing_deepseek,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: first_at,
             **common,
         )
     assert exhausted.value.code == "network_error"
+    assert deepseek_calls == 1
+    with pytest.raises(ContextResolutionError) as exhausted_again:
+        resolve_contextual_strategy(
+            session_factory,
+            ai_recognition_config=AiRecognitionConfig(
+                ai_models=models,
+                context_resolution_model_id="deepseek-v4-flash",
+            ),
+            model_caller=failing_deepseek,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: first_at + timedelta(seconds=5),
+            **common,
+        )
+    assert exhausted_again.value.code == "network_error"
     assert deepseek_calls == 2
     mimo_calls = 0
 

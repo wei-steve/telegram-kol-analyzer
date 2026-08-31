@@ -478,6 +478,59 @@ def test_final_failure_notifies_once_after_bounded_attempts(tmp_path):
     assert len(notices) == 1
 
 
+def test_reanalysis_network_retry_uses_new_generation_without_duplicate_queue(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "delegated-retry.db")
+    raw_id, source_attempt_id = _persist_unresolved(session_factory)
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+
+    def persist_new_generation_then_fail(message_id, fingerprint):
+        with session_factory() as session:
+            session.add(
+                ContextResolutionAttempt(
+                    raw_message_id=message_id,
+                    context_fingerprint=fingerprint,
+                    model="deepseek",
+                    prompt_versions_json="{}",
+                    request_summary_json="{}",
+                    decision_json=None,
+                    status="retry_pending",
+                    error_class="network_error",
+                    attempts=1,
+                    next_attempt_at=NOW + timedelta(seconds=5),
+                    created_at=NOW,
+                    updated_at=NOW,
+                )
+            )
+            session.commit()
+        raise RuntimeError("network retry persisted by resolver")
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:new",
+        reanalyze=persist_new_generation_then_fail,
+        now=NOW,
+    )
+
+    assert result["status"] == "retry_scheduled"
+    with session_factory() as session:
+        rows = session.query(ContextResolutionAttempt).order_by(
+            ContextResolutionAttempt.id
+        ).all()
+        assert len(rows) == 2
+        assert session.get(ContextResolutionAttempt, source_attempt_id).status == (
+            "superseded"
+        )
+        assert rows[1].status == "retry_pending"
+        assert rows[1].attempts == 1
+
+
 def test_exhausted_worker_records_incident_only_after_source_state_commits(
     tmp_path,
     monkeypatch,

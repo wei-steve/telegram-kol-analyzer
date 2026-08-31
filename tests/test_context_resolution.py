@@ -1,4 +1,5 @@
 import json
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -8,10 +9,15 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
 )
 from telegram_kol_research.context_resolution import (
+    ContextNetworkRetryPolicy,
     ContextProviderResult,
+    ContextProviderCircuitRegistry,
     ContextResolutionError,
     parse_context_resolution_decision,
     resolve_contextual_strategy,
+)
+from telegram_kol_research.context_resolution_worker import (
+    run_context_resolution_once,
 )
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.context_resolution_prompt import (
@@ -356,6 +362,312 @@ def test_resolver_marks_provider_usage_unavailable_and_null_metadata_is_ignored(
         ),
     )
     assert repeated == expected
+
+
+def test_network_error_schedules_durable_retry_without_immediate_second_request(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "durable-network-retry.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1470, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    calls = []
+    now = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    policy = ContextNetworkRetryPolicy(
+        base_delay_seconds=5,
+        max_delay_seconds=60,
+        failure_threshold=3,
+        open_seconds=120,
+    )
+
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            evidence={},
+            context_window={"current": {"message_id": 1470}, "messages": []},
+            candidates=[],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=lambda **kwargs: calls.append(kwargs) or (_ for _ in ()).throw(
+                OSError("network unavailable")
+            ),
+            network_retry_policy=policy,
+            circuit_registry=ContextProviderCircuitRegistry(),
+            now_provider=lambda: now,
+        )
+
+    assert raised.value.code == "network_error"
+    assert len(calls) == 1
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "retry_pending"
+        assert attempt.attempts == 1
+        assert attempt.provider_request_count == 1
+        assert attempt.next_attempt_at == (
+            now + timedelta(seconds=5)
+        ).replace(tzinfo=None)
+        assert attempt.decision_json is None
+
+
+def test_isolated_network_error_retries_in_window_and_keeps_same_decision(
+    tmp_path,
+):
+    retry_factory = create_session_factory(tmp_path / "isolated-retry.db")
+    baseline_factory = create_session_factory(tmp_path / "immediate-success.db")
+    for factory in (retry_factory, baseline_factory):
+        with factory() as session:
+            raw = RawMessage(chat_id=88, message_id=1471, text="更新 BTC 多单")
+            session.add(raw)
+            session.commit()
+    policy = ContextNetworkRetryPolicy(
+        base_delay_seconds=5,
+        max_delay_seconds=60,
+        failure_threshold=3,
+        open_seconds=120,
+    )
+    circuit = ContextProviderCircuitRegistry()
+    start = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    success_payload = _valid_payload(
+        supporting_message_ids=[1471],
+        target_thread_ids=[],
+        decision="hold",
+    )
+    common = {
+        "ai_recognition_config": AiRecognitionConfig(),
+        "evidence": {},
+        "context_window": {"current": {"message_id": 1471}, "messages": []},
+        "candidates": [],
+        "first_pass_payload": {},
+        "exchange_state": {},
+    }
+    baseline = resolve_contextual_strategy(
+        baseline_factory,
+        raw_message_id=1,
+        **common,
+        model_caller=lambda **_: success_payload,
+    )
+    calls = []
+
+    def first_call(**kwargs):
+        calls.append(("first", start))
+        raise OSError("isolated reset")
+
+    with pytest.raises(ContextResolutionError):
+        resolve_contextual_strategy(
+            retry_factory,
+            raw_message_id=1,
+            **common,
+            model_caller=first_call,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: start,
+        )
+
+    second_at = start + timedelta(seconds=65)
+
+    def delayed_success(**kwargs):
+        calls.append(("second", second_at))
+        return success_payload
+
+    result_holder = {}
+
+    def reanalyze(raw_message_id, _fingerprint):
+        result_holder["decision"] = resolve_contextual_strategy(
+            retry_factory,
+            raw_message_id=raw_message_id,
+            **common,
+            model_caller=delayed_success,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: second_at,
+        )
+        return {"status": "completed"}
+
+    worker_result = run_context_resolution_once(
+        retry_factory,
+        context_fingerprint_factory=lambda _: "sha256:current",
+        reanalyze=reanalyze,
+        now=second_at,
+    )
+
+    assert worker_result["status"] == "completed"
+    assert result_holder["decision"] == baseline
+    assert calls == [("first", start), ("second", second_at)]
+    assert second_at - start < timedelta(minutes=15)
+    with retry_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "completed"
+        assert attempt.attempts == 2
+        assert attempt.provider_request_count == 2
+
+
+def test_legacy_retry_row_keeps_request_numbering_when_usage_columns_are_null(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "legacy-retry.db")
+    with session_factory() as session:
+        session.add(RawMessage(chat_id=88, message_id=1473, text="更新 BTC 多单"))
+        session.commit()
+    start = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    common = {
+        "raw_message_id": 1,
+        "ai_recognition_config": AiRecognitionConfig(),
+        "evidence": {},
+        "context_window": {"current": {"message_id": 1473}, "messages": []},
+        "candidates": [],
+        "first_pass_payload": {},
+        "exchange_state": {},
+        "network_retry_policy": ContextNetworkRetryPolicy(),
+        "circuit_registry": ContextProviderCircuitRegistry(),
+    }
+    with pytest.raises(ContextResolutionError):
+        resolve_contextual_strategy(
+            session_factory,
+            **common,
+            model_caller=lambda **_: (_ for _ in ()).throw(OSError("down")),
+            now_provider=lambda: start,
+        )
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        attempt.provider_request_count = None
+        attempt.provider_usage_json = None
+        session.commit()
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        **common,
+        model_caller=lambda **_: _valid_payload(
+            supporting_message_ids=[1473],
+            target_thread_ids=[],
+            decision="hold",
+        ),
+        now_provider=lambda: start + timedelta(seconds=5),
+    )
+
+    assert decision.decision == "hold"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.provider_request_count == 2
+        assert json.loads(attempt.provider_usage_json) == [
+            {
+                "available": False,
+                "reason": "legacy_provider_usage_unavailable",
+                "request_number": 1,
+            },
+            {
+                "available": False,
+                "reason": "provider_usage_not_returned",
+                "request_number": 2,
+            },
+        ]
+
+
+def test_consecutive_network_errors_open_circuit_and_admit_one_half_open_probe():
+    policy = ContextNetworkRetryPolicy(
+        base_delay_seconds=5,
+        max_delay_seconds=60,
+        failure_threshold=2,
+        open_seconds=120,
+    )
+    registry = ContextProviderCircuitRegistry()
+    provider_key = "https://provider.example|model"
+    now = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+
+    assert registry.record_network_failure(provider_key, now, policy) == (
+        now + timedelta(seconds=5)
+    )
+    open_until = registry.record_network_failure(
+        provider_key,
+        now + timedelta(seconds=1),
+        policy,
+    )
+    assert open_until == now + timedelta(seconds=121)
+    assert registry.reserve_retry(provider_key, now + timedelta(seconds=60)) == (
+        False,
+        open_until,
+    )
+    assert registry.reserve_retry(provider_key, open_until) == (True, None)
+    assert registry.reserve_retry(provider_key, open_until) == (
+        False,
+        open_until + timedelta(seconds=120),
+    )
+    registry.record_success(provider_key)
+    assert registry.reserve_retry(provider_key, open_until) == (True, None)
+
+
+def test_network_retry_policy_is_environment_configurable_with_bounded_defaults():
+    configured = ContextNetworkRetryPolicy.from_environ(
+        {
+            "TELEGRAM_KOL_CONTEXT_NETWORK_BASE_DELAY_SECONDS": "7",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_MAX_DELAY_SECONDS": "45",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_FAILURE_THRESHOLD": "4",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_OPEN_SECONDS": "180",
+        }
+    )
+    conservative = ContextNetworkRetryPolicy.from_environ(
+        {
+            "TELEGRAM_KOL_CONTEXT_NETWORK_BASE_DELAY_SECONDS": "invalid",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_MAX_DELAY_SECONDS": "0",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_FAILURE_THRESHOLD": "1",
+            "TELEGRAM_KOL_CONTEXT_NETWORK_OPEN_SECONDS": "99999",
+        }
+    )
+
+    assert configured == ContextNetworkRetryPolicy(7, 45, 4, 180)
+    assert conservative == ContextNetworkRetryPolicy()
+
+
+def test_open_circuit_reschedules_durable_retry_without_counting_or_dropping_it(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "open-circuit-durable.db")
+    with session_factory() as session:
+        session.add(RawMessage(chat_id=88, message_id=1472, text="更新 BTC 多单"))
+        session.commit()
+    start = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
+    policy = ContextNetworkRetryPolicy(5, 60, 2, 120)
+    circuit = ContextProviderCircuitRegistry()
+    common = {
+        "raw_message_id": 1,
+        "ai_recognition_config": AiRecognitionConfig(),
+        "evidence": {},
+        "context_window": {"current": {"message_id": 1472}, "messages": []},
+        "candidates": [],
+        "first_pass_payload": {},
+        "exchange_state": {},
+        "network_retry_policy": policy,
+        "circuit_registry": circuit,
+    }
+    with pytest.raises(ContextResolutionError):
+        resolve_contextual_strategy(
+            session_factory,
+            **common,
+            model_caller=lambda **_: (_ for _ in ()).throw(OSError("down")),
+            now_provider=lambda: start,
+        )
+    open_until = circuit.record_network_failure("|", start + timedelta(seconds=1), policy)
+    calls = []
+    with pytest.raises(ContextResolutionError) as raised:
+        resolve_contextual_strategy(
+            session_factory,
+            **common,
+            model_caller=lambda **kwargs: calls.append(kwargs),
+            now_provider=lambda: start + timedelta(seconds=5),
+        )
+
+    assert raised.value.code == "network_error"
+    assert calls == []
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "retry_pending"
+        assert attempt.attempts == 1
+        assert attempt.provider_request_count == 1
+        assert attempt.next_attempt_at == open_until.replace(tzinfo=None)
+        assert attempt.decision_json is None
 
 
 def test_resolver_retries_closed_contract_error_once_then_completes(tmp_path):
@@ -751,6 +1063,9 @@ def test_mimo_provider_failure_exhausts_without_deepseek_fallback_or_operations(
         session.commit()
         raw_id = raw.id
     calls = {"mimo": 0, "deepseek": 0}
+    policy = ContextNetworkRetryPolicy()
+    circuit = ContextProviderCircuitRegistry()
+    first_at = datetime(2026, 8, 31, 20, 0, tzinfo=UTC)
 
     def failing_caller(*, provider, **_kwargs):
         if provider.model == "mimo-v2.5":
@@ -793,9 +1108,40 @@ def test_mimo_provider_failure_exhausts_without_deepseek_fallback_or_operations(
             first_pass_payload={},
             exchange_state={},
             model_caller=failing_caller,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: first_at,
         )
 
     assert raised.value.code == "network_error"
+    assert calls == {"mimo": 1, "deepseek": 0}
+    with pytest.raises(ContextResolutionError) as exhausted:
+        resolve_contextual_strategy(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(
+                ai_models=[
+                    AiModelConfig(
+                        id="mimo-v2.5",
+                        label="MiMo",
+                        base_url="https://api.xiaomimimo.com/v1",
+                        api_key="mimo-secret",
+                        model="mimo-v2.5",
+                    )
+                ],
+                context_resolution_model_id="mimo-v2.5",
+            ),
+            evidence={},
+            context_window={"current": {"message_id": 1700}, "messages": []},
+            candidates=[],
+            first_pass_payload={},
+            exchange_state={},
+            model_caller=failing_caller,
+            network_retry_policy=policy,
+            circuit_registry=circuit,
+            now_provider=lambda: first_at + timedelta(seconds=5),
+        )
+    assert exhausted.value.code == "network_error"
     assert calls == {"mimo": 2, "deepseek": 0}
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()

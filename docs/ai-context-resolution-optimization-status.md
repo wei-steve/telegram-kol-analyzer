@@ -3,11 +3,11 @@
 ```yaml
 workstream: ai_context_resolution_observability_and_network_backoff
 phase_state: in_progress
-current_phase: local_change_a
+current_phase: immutable_deployment
 claimed_by: codex_current_session
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
-change_a_sha: null
-change_b_sha: null
+change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
+change_b_sha: self
 pushed_sha: null
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: null
@@ -42,3 +42,10 @@ Code rollback returns all services to the control release while leaving the five
 - Change A RED: the four exact observability tests failed at collection because `ContextProviderResult` and the five schema/write paths did not exist.
 - Change A GREEN: the four exact tests passed; the focused migration/context/authority/replay/worker regression set passed `115 passed in 6.15s`.
 - Change A exact-base review used base `387f638ba4afec26c106795724dcb27becdf30a7`. It confirmed the change is additive, no decision branch reads a new field, trigger order is passed from the already-computed tuple, provider usage is never inferred from bytes, and null telemetry retains cached-decision behavior. No Critical, Important or Minor finding remained before commit.
+- Change A was committed independently as `b1385ba4ab305d1406bea28bf12f987cbf5db546`.
+- Change B RED proved two pre-implementation gaps: a legacy retry row with nullable observability columns collapsed its provider request count from two to one, and a reanalysis network failure left both the source generation and the new generation queued. The exact tests failed with those two mismatches before the production fixes.
+- Change B GREEN preserves legacy request numbering with an explicit `legacy_provider_usage_unavailable` entry and supersedes the source generation when the resolver has already persisted a new durable retry. The exact two tests passed, followed by the focused context/worker/replay/authority/migration set: `157 passed in 8.53s`.
+- The required isolated-network-error case schedules request two durably, sends it on the next worker cycle at 65 seconds in the deterministic test, completes successfully, and yields the same decision object as the no-error baseline. It remains below 15 minutes even though context retry has no dependency on that message-recovery age gate.
+- Change B exact-base review used Change A commit `b1385ba4ab305d1406bea28bf12f987cbf5db546`. The review confirmed provider-key isolation, a single half-open probe, no provider-call/count increment while the circuit is open, no conversion of unknown to no-action, no silent durable-row deletion, and unchanged immediate retry behavior for non-network contract correction. No Critical, Important or Minor finding remained.
+- Final candidate full suite after the last production-code edit: `6749 passed, 4 skipped, 32 warnings in 413.26s`. The warnings are existing deprecation warnings; there were no failures.
+- `change_b_sha: self` means the commit containing this status record; it avoids a circular self-hash while preserving the required two-commit boundary. Deployment evidence must replace `pushed_sha` and `production_sha_after` only if a later documentation-only status commit is explicitly permitted; otherwise the exact pushed/deployed SHA remains authoritative in the immutable receipt and final handoff.
