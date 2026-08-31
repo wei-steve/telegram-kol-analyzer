@@ -3,8 +3,8 @@
 ```yaml
 workflow: deepcoin-contract-cache-ownership-repair
 design_status: approved
-current_phase: manual_cleanup_production_cutover
-phase_state: complete
+current_phase: prethaw_local_exchange_state_alignment
+phase_state: in_progress
 claimed_by: codex-01a05195-c0a7-7392-9d94-6841d784ddc0
 candidate_sha: cf30fdf7a3952bdd9c406ee6c8d74616bc7cfc62
 candidate_content_sha: 588d1aadb47f25ca56f4e3815cff3dff67892f2d6f97b738a0a85bbb1a8c24ea
@@ -45,6 +45,17 @@ backlog_preterminalization_expired_count: 154
 backlog_preterminalization_remaining_post_watermark_pending_count: 28
 backlog_preterminalization_final_seal_executed: false
 backlog_preterminalization_evidence_path: /var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z
+local_exchange_alignment_implementation_sha: 829cfa49a00ee8db20451b149afc353e17e60291
+local_exchange_alignment_final_suite: 6731_passed_4_skipped_32_warnings
+local_exchange_alignment_status: precondition_failed_closed_pending_trigger_unknown
+local_exchange_alignment_exchange_snapshot_at: 2026-08-31T08:31:59.048364Z
+local_exchange_alignment_position_read: complete_zero
+local_exchange_alignment_regular_order_read: complete_zero
+local_exchange_alignment_pending_trigger_read: incomplete_after_two_attempts
+local_exchange_alignment_production_executed: false
+local_exchange_alignment_database_backup_created: false
+local_exchange_alignment_begin_immediate_acquired: false
+local_exchange_alignment_evidence_path: /var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T083039Z
 auto_trade_frozen: false
 freeze_raw_message_id: null
 restore_raw_message_id: null
@@ -3323,3 +3334,49 @@ fully met, so this phase is not recorded as an unqualified complete acceptance:
 No whole-database restore was attempted after commit. Entry remains frozen.
 There are now 28 newer non-shadow pending rows, ids `14031..14058`; they were
 not touched. The final seal remains a separate, unexecuted authorization.
+
+## Frozen local/exchange state alignment checkpoint
+
+This L3 phase stopped at its first production precondition. No local state was
+aligned in this attempt.
+
+### Local implementation and review
+
+- Exact commit `829cfa49a00ee8db20451b149afc353e17e60291` adds one fixed-cohort
+  maintenance command. It can only address the reviewed 20 entered lifecycle
+  ids, 11 binding ids, 19 entry-leg ids and the two intents, eight protection
+  legs and two convergences already attached to binding 289.
+- The command reuses the existing terminal states and audit tables. It has no
+  message processor, recognition model, candidate merge, lifecycle resolver or
+  Deepcoin write import. Apply is one `BEGIN IMMEDIATE` transaction and ignores
+  only online `updated_at` / `recovered_at` drift; all substantive state is
+  fingerprinted and compared before mutation.
+- Focused tests proved incomplete/non-flat exchange refusal, exact terminal
+  semantics, timestamp-only tolerance, substantive drift refusal, related-row
+  set refusal, raw-message preservation and whole-transaction rollback.
+  The final full suite passed `6731` tests with `4` skips and `32` warnings in
+  `440.46s`.
+- The commit was pushed to `origin/codex/deepcoin-auto-trading-v1`. Its full
+  independent archive has SHA-256
+  `82ae634029fde5774702eb42bb871f37d5c8d6f24ab3dae88a6898fe5edb8c2b`.
+
+### Fresh exchange precondition and fail-closed stop
+
+- Evidence is in the root-owned mode `0700` directory
+  `/var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T083039Z`.
+  The read-only command used `/opt/telegram-kol-analyzer/.venv/bin/python -B`
+  with `PYTHONPATH` pointing only at the extracted exact-SHA archive. It did not
+  load the mutable server checkout or an immutable release and did not create
+  bytecode.
+- At `2026-08-31T08:31:59.048364Z`, the positions endpoint completed on its
+  first attempt with zero rows, and the regular pending-order endpoint
+  completed on its first attempt with zero rows.
+- The account-wide pending-trigger endpoint returned
+  `DeepcoinDefiniteRejection` twice. Its result is therefore unknown, not zero.
+  The combined snapshot records `snapshot_complete=false` and the phase stopped
+  immediately as required.
+- No SQLite backup was created, no `BEGIN IMMEDIATE` was attempted, and no
+  lifecycle, binding, order leg, audit row or other business row was changed.
+  No message was processed or replayed, no service was controlled, no Deepcoin
+  write occurred, final seal was not executed and entry admission remains
+  frozen.
