@@ -188,13 +188,21 @@ monitor_diagnostic_last_invocation_id: 74c08cab4e704768843d09745d5a0d05
 monitor_diagnostic_last_exit_status: 1
 monitor_state_sha256: 1852dea161c185d4409fa029e08472cd03bcdd0cfd35b63af04222c6dab4d8aa
 monitor_diagnosis_pushed_sha: e0d278f5537d8e3a797ce56b4ab252a99cbb9eb2
-monitor_unit_env_update_plan_status: proposed_awaiting_owner_approval
+monitor_unit_env_update_plan_status: production_attempt_failed_closed_restored
 monitor_unit_env_update_recommendation: install_only_then_stopped_legacy_activation
 monitor_installer_read_only_preflight: passed_all_actual_conditions
 monitor_installer_legacy_env_preflight_recurrence: not_applicable_retired_updater_only
 monitor_next_activation_candidate_sha: 18ea345a23812ed131c500a6040174a07a4436db
 monitor_next_activation_rollback_sha: none_for_stopped_legacy
 monitor_next_activation_source_mode: stopped_legacy
+monitor_install_production_attempted: true
+monitor_install_installer_exit_status: success
+monitor_install_post_gate_status: failed_verifier_candidate_path_mapping
+monitor_install_restore_status: complete_byte_exact
+monitor_install_evidence_path: /var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/monitor-install-20260831T001613Z-1758143
+monitor_install_evidence_manifest_sha256: 2b2fd90ad8d50094427b17565c44c59937752553fdafe6a452894319a1a805d8
+monitor_install_activation_attempted: false
+monitor_install_terminal_state: maintenance_stopped_entry_frozen
 rejected_release_sha: ffb06d19eabfd32dfdab2942b2152fd2809e3d17
 rejected_release_active: false
 task12_evidence_path: /run/deepcoin-cache-task12.wUO5Zp/evidence.jsonl
@@ -1992,3 +2000,46 @@ activation.
   may independently report `stale_entry_preamble_unresolved`. That is a real
   business-safety gate and must remain fail-closed; this plan does not suppress,
   migrate or bypass it.
+
+## Monitor install-only production attempt
+
+- The approved recovery window began only after the preceding diagnosis and
+  plan were committed and pushed as
+  `a0456202e0309eb71c0ed01674ab9200f8f5e007`. No stage or reconciliation was
+  rerun and no rejected release was touched.
+- One exclusive `/run/telegram-kol-update.lock` holder read the canonical
+  `trading_settings` row in SQLite query-only mode before any production write.
+  The governed values were exactly auto trade `enabled`, entry preamble `live`,
+  message-assembly-v2 `live` and entry-revision-v2 `live`; the existing monitor
+  env contained the same four expectations, so no policy expectation was
+  silently changed.
+- Before installation, the existing monitor env and four base unit files were
+  copied byte-for-byte to root-owned mode `0600` files beneath root-owned mode
+  `0700` evidence directory
+  `/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/monitor-install-20260831T001613Z-1758143`.
+  The preinstall manifest records each original SHA-256, owner, group and mode,
+  every maintenance-inhibit and release drop-in without changing them, and the
+  unchanged monitor state SHA-256. The manifest SHA-256 is
+  `2b2fd90ad8d50094427b17565c44c59937752553fdafe6a452894319a1a805d8`.
+- The candidate's `install_server_monitor.sh` completed install-only for exact
+  candidate `18ea345a23812ed131c500a6040174a07a4436db` and explicitly left the
+  timer disabled/inactive. The next hard gate failed before
+  `systemd-analyze verify`: the orchestration verifier incorrectly mapped the
+  backup label `monitor.service` to nonexistent candidate source
+  `deploy/systemd/monitor.service` instead of
+  `deploy/systemd/telegram-kol-monitor.service`. `cmp` returned exit status 2.
+  This is a verifier path-construction error, not evidence that the installer,
+  candidate unit bytes or systemd validation failed.
+- The approved exit trap immediately restored the env and all four base unit
+  files. Every restored SHA-256, UID, GID and mode equals its preinstall
+  manifest value; restore status is `complete`. No installation or gate retry
+  was attempted.
+- Final read-only proof found legacy monolith, web, ingest, worker, monitor
+  service, diagnostic, test-notification and timer all `inactive`, maintenance
+  inhibited and `MainPID=0`. Web, ingest and worker candidate release drop-ins
+  each still contain exactly one
+  `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1` and exact candidate commit. No
+  activation authorization was created or consumed, no activation or runtime
+  start occurred, and no Deepcoin write, database mutation, replay, backfill or
+  entry thaw occurred. The terminal state remains
+  `maintenance_stopped_entry_frozen`.
