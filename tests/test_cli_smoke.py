@@ -987,6 +987,8 @@ def test_monitor_production_safety_help_has_required_flags():
         "--expected-max-concurrent-positions",
         "--notify",
         "--force-full-audit",
+        "--disable-daily-management-audit",
+        "--deployment-diagnostic",
         "--test-notification",
     ):
         assert flag in result.stdout
@@ -1111,6 +1113,100 @@ def test_monitor_production_prints_compact_fixed_summary_and_exits_nonzero(monke
         "notification_status": "delivery_failed",
         "reason_codes": ["service_inactive"],
     }
+
+
+def test_deployment_diagnostic_preserves_business_findings_but_exits_zero(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            adapter_failures=(),
+            audit_ran=False,
+            checked_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+            exit_code=1,
+            monitor_error=None,
+            notification_status="disabled",
+            result=SimpleNamespace(
+                healthy=False,
+                reason_codes=("stale_entry_preamble_unresolved",),
+                details={"entry_preamble_invariant_codes": ("stale_entry_preamble_unresolved",)},
+            ),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-entry-preamble-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--disable-daily-management-audit",
+            "--deployment-diagnostic",
+        ],
+        env={"TELEGRAM_KOL_RELEASE_COMMIT": "2" * 40},
+    )
+
+    assert result.exit_code == 0, result.stdout
+    payload = json.loads(result.stdout)
+    assert payload["contract"] == "monitor-deployment-diagnostic-v1"
+    assert payload["release_commit"] == "2" * 40
+    assert payload["sources_complete"] is True
+    assert payload["healthy"] is False
+    assert payload["reason_codes"] == ["stale_entry_preamble_unresolved"]
+    assert payload["details"] == {
+        "entry_preamble_invariant_codes": ["stale_entry_preamble_unresolved"]
+    }
+
+
+def test_deployment_diagnostic_source_failure_remains_nonzero(monkeypatch):
+    import telegram_kol_research.cli as cli_module
+
+    monkeypatch.setattr(cli_module, "create_existing_session_factory", lambda path: object())
+    monkeypatch.setattr(
+        cli_module,
+        "run_production_safety_monitor",
+        lambda **kwargs: SimpleNamespace(
+            adapter_failures=("settings",),
+            audit_ran=False,
+            checked_at=datetime(2026, 8, 31, 1, 0, tzinfo=UTC),
+            exit_code=1,
+            monitor_error=None,
+            notification_status="disabled",
+            result=SimpleNamespace(
+                healthy=False,
+                reason_codes=("adapter_failure",),
+                details={"adapter_failures": ("settings",)},
+            ),
+        ),
+    )
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "monitor-production-safety",
+            "--expected-auto-trade-enabled",
+            "--expected-management-mode",
+            "live",
+            "--expected-entry-preamble-mode",
+            "live",
+            "--expected-max-concurrent-positions",
+            "4",
+            "--disable-daily-management-audit",
+            "--deployment-diagnostic",
+        ],
+        env={"TELEGRAM_KOL_RELEASE_COMMIT": "2" * 40},
+    )
+
+    assert result.exit_code == 1
+    assert json.loads(result.stdout)["adapter_failures"] == ["settings"]
 
 
 def test_audit_management_batches_is_bounded_redacted_and_read_only(

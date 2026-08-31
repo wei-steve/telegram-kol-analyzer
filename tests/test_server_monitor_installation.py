@@ -80,6 +80,16 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
     assert "--checkout-path" not in normalized
 
 
+def test_deployment_diagnostic_disables_daily_audit_without_changing_timer_monitor():
+    service = _normalized(SERVICE_PATH)
+    diagnostic = _normalized(DIAGNOSTIC_PATH)
+
+    assert "--disable-daily-management-audit" in diagnostic
+    assert "--deployment-diagnostic" in diagnostic
+    assert "--disable-daily-management-audit" not in service
+    assert "--deployment-diagnostic" not in service
+
+
 def test_monitor_installer_validates_release_and_service_loads_immutable_code():
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
     service = SERVICE_PATH.read_text(encoding="utf-8")

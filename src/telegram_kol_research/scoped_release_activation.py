@@ -154,7 +154,9 @@ class RuntimeAdapter(Protocol):
 
     def monitor_timer_active(self) -> bool: ...
 
-    def verify_monitor_release(self, release: ReleaseEvidence) -> None: ...
+    def verify_monitor_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]: ...
 
 
 def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
@@ -801,9 +803,13 @@ def _activate_monitor(
     runtime: RuntimeAdapter,
     components: list[str],
     release: ReleaseEvidence,
-) -> None:
+) -> Mapping[str, Any] | None:
     if "monitor" in components:
-        runtime.verify_monitor_release(release)
+        evidence = runtime.verify_monitor_release(release)
+        if not isinstance(evidence, Mapping):
+            raise ActivationError("monitor runtime proof failed")
+        return evidence
+    return None
 
 
 def activate_release(
@@ -949,7 +955,7 @@ def activate_release(
                 after_identities,
                 components,
             )
-        _activate_monitor(runtime, components, candidate)
+        monitor_verification = _activate_monitor(runtime, components, candidate)
         if monitor_was_active or (
             source_mode == "stopped_legacy" and "monitor" in components
         ):
@@ -1002,7 +1008,89 @@ def activate_release(
         "components": components,
         "source_mode": source_mode,
         "authorization_consumed": True,
+        "monitor_verification": monitor_verification,
     }
+
+
+_MONITOR_DIAGNOSTIC_FIELDS = frozenset(
+    {
+        "adapter_failures",
+        "audit_ran",
+        "checked_at",
+        "contract",
+        "details",
+        "healthy",
+        "monitor_error",
+        "notification_status",
+        "reason_codes",
+        "release_commit",
+        "result_complete",
+        "schema_version",
+        "sources_complete",
+    }
+)
+
+
+def _parse_monitor_diagnostic_evidence(
+    output: str,
+    *,
+    expected_commit: str,
+) -> dict[str, Any]:
+    candidates: list[Mapping[str, Any]] = []
+    for line in output.splitlines():
+        try:
+            payload = json.loads(line)
+        except (json.JSONDecodeError, TypeError, ValueError):
+            continue
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("contract") == "monitor-deployment-diagnostic-v1"
+        ):
+            candidates.append(payload)
+    if len(candidates) != 1:
+        raise ActivationError("monitor runtime proof failed")
+    payload = candidates[0]
+    if set(payload) != _MONITOR_DIAGNOSTIC_FIELDS:
+        raise ActivationError("monitor runtime proof failed")
+    reason_codes = payload.get("reason_codes")
+    details = payload.get("details")
+    checked_at = payload.get("checked_at")
+    notification_status = payload.get("notification_status")
+    if (
+        payload.get("schema_version") != 1
+        or payload.get("release_commit") != expected_commit
+        or payload.get("audit_ran") is not False
+        or payload.get("sources_complete") is not True
+        or payload.get("result_complete") is not True
+        or payload.get("adapter_failures") != []
+        or payload.get("monitor_error") is not None
+        or type(payload.get("healthy")) is not bool
+        or not isinstance(reason_codes, list)
+        or not isinstance(details, Mapping)
+        or not isinstance(checked_at, str)
+        or not isinstance(notification_status, str)
+        or not notification_status
+    ):
+        raise ActivationError("monitor runtime proof failed")
+    if (
+        len(reason_codes) > 100
+        or any(
+            not isinstance(code, str)
+            or re.fullmatch(r"[a-z][a-z0-9_]{0,63}", code) is None
+            for code in reason_codes
+        )
+        or reason_codes != sorted(set(reason_codes))
+        or (payload["healthy"] is True and reason_codes)
+        or (payload["healthy"] is False and not reason_codes)
+    ):
+        raise ActivationError("monitor runtime proof failed")
+    try:
+        parsed_checked_at = datetime.fromisoformat(checked_at)
+    except ValueError as exc:
+        raise ActivationError("monitor runtime proof failed") from exc
+    if parsed_checked_at.tzinfo is None:
+        raise ActivationError("monitor runtime proof failed")
+    return dict(payload)
 
 
 class SystemRuntimeAdapter:
@@ -1292,7 +1380,9 @@ class SystemRuntimeAdapter:
             return False
         raise ActivationError("monitor timer state is unknown")
 
-    def verify_monitor_release(self, release: ReleaseEvidence) -> None:
+    def verify_monitor_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]:
         environment = os.environ.copy()
         environment.update(
             {
@@ -1328,13 +1418,34 @@ class SystemRuntimeAdapter:
                 "telegram-kol-monitor-diagnostic.service",
                 "--property=Result",
                 "--property=ExecMainStatus",
+                "--property=InvocationID",
             ]
         )
-        if set(result.stdout.splitlines()) != {
-            "Result=success",
-            "ExecMainStatus=0",
-        }:
+        properties = {}
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if not separator or key in properties:
+                raise ActivationError("monitor runtime proof failed")
+            properties[key] = value
+        if (
+            set(properties) != {"Result", "ExecMainStatus", "InvocationID"}
+            or properties["Result"] != "success"
+            or properties["ExecMainStatus"] != "0"
+            or re.fullmatch(r"[0-9a-f]{6,64}", properties["InvocationID"]) is None
+        ):
             raise ActivationError("monitor runtime proof failed")
+        journal = self._run(
+            [
+                "journalctl",
+                f"_SYSTEMD_INVOCATION_ID={properties['InvocationID']}",
+                "--output=cat",
+                "--no-pager",
+            ]
+        )
+        return _parse_monitor_diagnostic_evidence(
+            journal.stdout,
+            expected_commit=release.commit,
+        )
 
 
 def _required_absolute_env(name: str, default: str | None = None) -> Path:

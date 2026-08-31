@@ -26,6 +26,28 @@ ROLLBACK = "1" * 40
 OTHER = "3" * 40
 
 
+def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
+    payload = {
+        "adapter_failures": [],
+        "audit_ran": False,
+        "checked_at": "2026-08-31T01:00:00+00:00",
+        "contract": "monitor-deployment-diagnostic-v1",
+        "details": {
+            "entry_preamble_invariant_codes": ["stale_entry_preamble_unresolved"]
+        },
+        "healthy": False,
+        "monitor_error": None,
+        "notification_status": "disabled",
+        "reason_codes": ["stale_entry_preamble_unresolved"],
+        "release_commit": release_commit,
+        "result_complete": True,
+        "schema_version": 1,
+        "sources_complete": True,
+    }
+    payload.update(overrides)
+    return payload
+
+
 def test_runtime_control_lock_is_shared_and_nonblocking(tmp_path) -> None:
     lock_path = tmp_path / "runtime-control.lock"
 
@@ -94,7 +116,9 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
         calls.append((command, environment))
         output = ""
         if command[:3] == ["systemctl", "show", "telegram-kol-monitor-diagnostic.service"]:
-            output = "Result=success\nExecMainStatus=0\n"
+            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
+        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+            output = json.dumps(_monitor_diagnostic_payload()) + "\n"
         return type("Result", (), {"stdout": output})()
 
     monkeypatch.setattr(runtime, "_run", run)
@@ -108,7 +132,7 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
         },
     )()
 
-    runtime.verify_monitor_release(release)
+    evidence = runtime.verify_monitor_release(release)
 
     assert any(
         command == [
@@ -118,6 +142,84 @@ def test_monitor_release_proof_runs_the_actual_diagnostic_unit(monkeypatch) -> N
         ]
         for command, _ in calls
     )
+    assert evidence["healthy"] is False
+    assert evidence["reason_codes"] == ["stale_entry_preamble_unresolved"]
+    assert evidence["details"] == {
+        "entry_preamble_invariant_codes": ["stale_entry_preamble_unresolved"]
+    }
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        _monitor_diagnostic_payload(release_commit=OTHER),
+        _monitor_diagnostic_payload(
+            adapter_failures=["settings"],
+            details={"adapter_failures": ["settings"]},
+            reason_codes=["adapter_failure"],
+            result_complete=False,
+            sources_complete=False,
+        ),
+        {"contract": "monitor-deployment-diagnostic-v1"},
+    ],
+    ids=("wrong_release", "source_failure", "incomplete_result"),
+)
+def test_monitor_release_proof_rejects_wrong_or_incomplete_evidence(
+    monkeypatch, payload
+) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+
+    def run(command, *, environment=None):
+        output = ""
+        if command[:3] == ["systemctl", "show", "telegram-kol-monitor-diagnostic.service"]:
+            output = "Result=success\nExecMainStatus=0\nInvocationID=abc123\n"
+        if command[:2] == ["journalctl", "_SYSTEMD_INVOCATION_ID=abc123"]:
+            output = json.dumps(payload) + "\n"
+        return type("Result", (), {"stdout": output})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    with pytest.raises(ActivationError, match="monitor runtime proof failed"):
+        runtime.verify_monitor_release(release)
+
+
+@pytest.mark.parametrize("failure_mode", ["timeout", "signal"])
+def test_monitor_release_proof_rejects_timeout_or_signal(
+    monkeypatch, failure_mode
+) -> None:
+    runtime = SystemRuntimeAdapter(python=Path("/venv/python"))
+
+    def run(command, *, environment=None):
+        if command == [
+            "systemctl",
+            "start",
+            "telegram-kol-monitor-diagnostic.service",
+        ]:
+            raise ActivationError(f"runtime command failed: {failure_mode}")
+        return type("Result", (), {"stdout": ""})()
+
+    monkeypatch.setattr(runtime, "_run", run)
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": Path("/opt/telegram-kol-releases/candidate"),
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+
+    with pytest.raises(ActivationError, match="runtime command failed"):
+        runtime.verify_monitor_release(release)
 
 
 def _content_digest(root: Path) -> str:
@@ -364,8 +466,9 @@ class FakeRuntime:
     def monitor_timer_active(self) -> bool:
         return True
 
-    def verify_monitor_release(self, release) -> None:
+    def verify_monitor_release(self, release):
         self.events.append(f"monitor-identity:{release.commit}")
+        return _monitor_diagnostic_payload(release_commit=release.commit)
 
 
 @pytest.fixture
@@ -700,6 +803,13 @@ def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
     )
 
     assert result["status"] == "activated"
+    assert result["monitor_verification"]["healthy"] is False
+    assert result["monitor_verification"]["reason_codes"] == [
+        "stale_entry_preamble_unresolved"
+    ]
+    assert result["monitor_verification"]["details"] == {
+        "entry_preamble_invariant_codes": ["stale_entry_preamble_unresolved"]
+    }
     assert runtime.current_commit_by_role == {
         "web": CANDIDATE,
         "ingest": CANDIDATE,

@@ -2628,6 +2628,16 @@ def monitor_production_safety(
     lookback_minutes: int = typer.Option(35, "--lookback-minutes", min=1, max=120),
     notify: bool = typer.Option(False, "--notify"),
     force_full_audit: bool = typer.Option(False, "--force-full-audit"),
+    disable_daily_management_audit: bool = typer.Option(
+        False,
+        "--disable-daily-management-audit",
+        help="Disable the scheduled daily management audit for this run.",
+    ),
+    deployment_diagnostic: bool = typer.Option(
+        False,
+        "--deployment-diagnostic",
+        help="Emit deployment proof and fail only on diagnostic infrastructure errors.",
+    ),
     test_notification: bool = typer.Option(False, "--test-notification"),
     runtime_incident_capture_url: str | None = typer.Option(
         None,
@@ -2639,6 +2649,14 @@ def monitor_production_safety(
     if expected_auto_trade_enabled is None:
         raise typer.BadParameter(
             "choose --expected-auto-trade-enabled or --no-expected-auto-trade-enabled"
+        )
+    if force_full_audit and disable_daily_management_audit:
+        raise typer.BadParameter(
+            "--force-full-audit conflicts with --disable-daily-management-audit"
+        )
+    if deployment_diagnostic and not disable_daily_management_audit:
+        raise typer.BadParameter(
+            "--deployment-diagnostic requires --disable-daily-management-audit"
         )
     if test_notification:
         if not notify:
@@ -2702,18 +2720,47 @@ def monitor_production_safety(
         now=datetime.now(UTC),
         notify=notify,
         force_full_audit=force_full_audit,
+        daily_management_audit_enabled=not disable_daily_management_audit,
         lookback=timedelta(minutes=lookback_minutes),
         runtime_incident_session_factory=runtime_incident_session_factory,
         runtime_incident_capture_url=runtime_incident_capture_url,
         runtime_incident_capture_token=runtime_config.monitor_capture_token,
     )
-    summary = {
-        "audit_ran": outcome.audit_ran,
-        "healthy": outcome.result.healthy,
-        "monitor_error": outcome.monitor_error,
-        "notification_status": outcome.notification_status,
-        "reason_codes": list(outcome.result.reason_codes),
-    }
+    if deployment_diagnostic:
+        release_commit = os.environ.get("TELEGRAM_KOL_RELEASE_COMMIT", "").lower()
+        incomplete_reason_codes = {
+            "adapter_failure",
+            "adjacent_entry_invariant_scan_incomplete",
+            "audit_incomplete",
+            "malformed_snapshot",
+            "message_operation_coverage_incomplete",
+        }
+        result_complete = not incomplete_reason_codes.intersection(
+            outcome.result.reason_codes
+        )
+        summary = {
+            "adapter_failures": list(outcome.adapter_failures),
+            "audit_ran": outcome.audit_ran,
+            "checked_at": outcome.checked_at.astimezone(UTC).isoformat(),
+            "contract": "monitor-deployment-diagnostic-v1",
+            "details": outcome.result.details,
+            "healthy": outcome.result.healthy,
+            "monitor_error": outcome.monitor_error,
+            "notification_status": outcome.notification_status,
+            "reason_codes": list(outcome.result.reason_codes),
+            "release_commit": release_commit,
+            "result_complete": result_complete,
+            "schema_version": 1,
+            "sources_complete": not outcome.adapter_failures,
+        }
+    else:
+        summary = {
+            "audit_ran": outcome.audit_ran,
+            "healthy": outcome.result.healthy,
+            "monitor_error": outcome.monitor_error,
+            "notification_status": outcome.notification_status,
+            "reason_codes": list(outcome.result.reason_codes),
+        }
     typer.echo(
         json.dumps(
             summary,
@@ -2722,7 +2769,19 @@ def monitor_production_safety(
             separators=(",", ":"),
         )
     )
-    if outcome.exit_code:
+    deployment_diagnostic_failed = bool(
+        deployment_diagnostic
+        and (
+            outcome.audit_ran
+            or outcome.adapter_failures
+            or outcome.monitor_error is not None
+            or not result_complete
+            or re.fullmatch(r"[0-9a-f]{40}", release_commit) is None
+        )
+    )
+    if deployment_diagnostic_failed:
+        raise typer.Exit(code=1)
+    if not deployment_diagnostic and outcome.exit_code:
         raise typer.Exit(code=outcome.exit_code)
 
 

@@ -489,6 +489,8 @@ class MonitorRunOutcome:
     result: MonitorResult
     notification_status: str
     audit_ran: bool
+    checked_at: datetime
+    adapter_failures: tuple[str, ...] = ()
     monitor_error: str | None = None
 
     @property
@@ -2754,6 +2756,7 @@ def run_production_safety_monitor(
     now: datetime,
     notify: bool,
     force_full_audit: bool = False,
+    daily_management_audit_enabled: bool = True,
     abnormal_event_limit: int = 100,
     lookback: timedelta = _DEFAULT_LOOKBACK,
     load_bot_config=_load_monitor_bot_config,
@@ -2885,7 +2888,7 @@ def run_production_safety_monitor(
     window_sources_complete = not {"journal", "events"}.intersection(failures)
 
     audit = None
-    audit_ran = should_run_daily_audit(
+    audit_ran = daily_management_audit_enabled and should_run_daily_audit(
         now=checked_at,
         last_successful_date=state.last_full_audit_date,
         force=force_full_audit,
@@ -3075,6 +3078,8 @@ def run_production_safety_monitor(
         result=result,
         notification_status=notification_status,
         audit_ran=audit_ran,
+        checked_at=checked_at,
+        adapter_failures=tuple(failures),
         monitor_error=monitor_error,
     )
 

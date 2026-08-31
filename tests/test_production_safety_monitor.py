@@ -5004,6 +5004,22 @@ def test_daily_audit_starts_only_after_nine_asia_shanghai(now, last_date, expect
     assert should_run_daily_audit(now=now, last_successful_date=last_date) is expected
 
 
+def test_deployment_diagnostic_explicitly_disables_scheduled_daily_audit(tmp_path):
+    adapters = _RecordingAdapters()
+
+    outcome = run_production_safety_monitor(
+        expectations=EXPECTATIONS,
+        state_path=tmp_path / "state.json",
+        adapters=adapters,
+        now=datetime(2026, 7, 16, 1, 0, tzinfo=UTC),
+        notify=False,
+        daily_management_audit_enabled=False,
+    )
+
+    assert outcome.audit_ran is False
+    assert "audit" not in adapters.calls
+
+
 @pytest.mark.parametrize(
     "reason",
     [
