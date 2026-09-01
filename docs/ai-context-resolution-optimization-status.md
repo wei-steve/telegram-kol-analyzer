@@ -169,3 +169,122 @@ Rollback boundaries:
 - After compaction, field-level restoration is still possible from the archive but grows the DB again. Whole-database restore requires stopped writers and separate authorization; it must not overwrite writes that occurred after the backup.
 
 SQLite is in WAL mode with `auto_vacuum=NONE`. Nulling/replacing large payloads can free pages for reuse, but it does not reduce the main file and can create a large WAL. Physical shrink therefore requires a full `VACUUM`-class rewrite. Reuse the established production SQLite backup path, require `quick_check=ok`, an empty foreign-key check and before/after critical counts, then stop all database writers for compaction. Allow at least one additional database-size temporary copy plus WAL and safety headroom, preserve ownership/mode, fsync, and rerun integrity/count checks before restart. Do not attempt online compaction against active ingest/web writes; leaving freed pages for later reuse is the no-downtime alternative, with the explicit tradeoff that file size and audit snapshot bytes do not fall until the maintenance window.
+
+## Integrated full-column archive design — dependency removal, source reduction and complete history
+
+This supersedes the 30-day retention proposal. The age-based plan is rejected: at 35 days of history it would recover only 11.101 MB while still requiring both a write-maintenance window and physical compaction. This section designs a full-column archive and a reference-only future write path. It is design and read-only sizing only; no code, schema, row, service, release or exchange state was changed.
+
+### Dependency graph and release boundaries
+
+The safe order is strict:
+
+1. persist the exact eight invocation triggers for the legacy cohort;
+2. persist the exact thread-ID projection and cut online readers over to it;
+3. stop writing duplicate request payloads and write references/fingerprints instead;
+4. archive every remaining full historical request, replace it with an explicit marker, then compact the stopped database.
+
+Steps 2 and 3 share schema, parsers and tests, but the actual cutover should use two backward-compatible code releases rather than one authority jump:
+
+- **Compatibility release R1:** add nullable reference/fingerprint columns through the existing L3 migration path; dual-write the full request plus the new fields; make the two worker readers prefer the new thread-ID column and use the old request only while that column is NULL; make the Web projection derive `context_message_count` from the new message references; add a strict tagged parser for legacy-full, reference-only and archived request storage. R1 does not change provider input or stop the old write.
+- Run Step 1 and Step 2 as independent, evidenced L3 data transactions. Once all rows have exact thread IDs and runtime tests show zero fallback reads, the full request is no longer an online authority.
+- **Reference-only release R2:** retain construction of the exact in-memory request and the existing context fingerprint, but store only the reference marker and new provenance fields. Remove the runtime fallback to request payload; an unexpected NULL thread-ID column fails closed instead of reopening the large JSON. This is the source reduction in Step 3.
+- Step 4 is a separate L3 archive/marker transaction plus a stopped-writer physical-compaction window. It is not part of either deployment.
+
+R1 contains the code support for Steps 2 and 3, but R2 is intentionally a second activation after the historical backfill proves coverage. Combining the two activations would make a failed or partial backfill share a failure boundary with the source cutover and is not worth saving one deployment. Step 1 and Step 2 may share one verified database backup and one operator window, but they retain separate transactions, before-images and acceptance receipts.
+
+### Step 1 — exact trigger backfill
+
+Use the pinned Python `requires_context_resolution` predicate as the only write authority for the 4,251 rows where `invocation_triggers_json IS NULL`. Do not write from the analysis SQL translation. The exact predicate is deterministic against the stored four input objects and has already matched all five directly observed rows.
+
+- **Storage change:** approximately 177,877 bytes in total at the measured legacy distribution, averaging 41.84 bytes per row. No behavior or decision input changes.
+- **Provenance:** leave `attempt_phase IS NULL` and `provider_request_count IS NULL` unchanged. Trigger queries may combine reconstructed and directly observed values; observability-coverage queries must continue to separate those cohorts.
+- **Backup/transaction:** reuse the verified SQLite backup path; require `quick_check=ok`, zero foreign-key rows, exact 4,251-ID/hash manifest and complete preimages. In one `BEGIN IMMEDIATE`, re-read the NULL set, recompute from the pinned Python code, compare source hashes, update only still-NULL cells and require an exact 4,251 compare-and-set count.
+- **Acceptance:** zero legacy NULL trigger cells; all five directly observed rows byte-identical; a second independent recomputation matches every stored ordered list; attempt/status/decision/request counts and hashes unchanged.
+- **Rollback:** any pre-commit issue rolls back the transaction. After commit, restore only the 4,251 before-images in a separately authorized transaction; no whole-database restore while writers are active.
+
+### Step 2 — remove the online request dependency
+
+Add `candidate_thread_ids_json TEXT NULL` and define it as the sorted unique output of the existing recursive `_collect_candidate_thread_ids(request_payload)` over the **whole request**, not merely `candidate_strategy_threads`. This distinction preserves IDs found in reply links and active-strategy context. The live sample averages 9.29 IDs, P90 26, maximum 36; canonical storage averages 34.95 bytes per attempt.
+
+The two worker reads have no hidden dependency on message text or any other request value:
+
+- `build_context_state_fingerprint` currently loads the latest attempt only when the caller did not supply candidate IDs, projects thread IDs, unions them with durable `StrategyMessageLink` IDs and then reads current thread/lifecycle state.
+- `build_redacted_exchange_state` always projects IDs from the latest attempt and unions them with IDs supplied by the caller before reading current thread/binding/protection state.
+
+The implicit contracts that must remain exact are the recursive key set (`thread_id` and `strategy_thread_id`), sorted/deduplicated integer normalization, latest-attempt selection and union with already-linked IDs. Neither function may reconstruct candidates differently after cutover. Keep the existing `context_fingerprint` computation over the complete in-memory request; replacing it with a reference hash would alter cache/retry identity and is forbidden.
+
+There are two non-trading consumers to remove from the large column as well. `web_queries.py` reads it only to calculate `context_message_count`; it should use the new message-reference column. `context_analysis_backfill.py` is an offline one-time tool, not an online decision path; after archival it must explicitly open the verified archive or fail closed with `request_payload_archived`, never treat an archive marker as `{}` or a valid empty request.
+
+- **Storage/behavior:** about 0.149 MB for the historical thread-ID projection. The change is storage-only if exact old/new projection equality holds; any difference blocks cutover.
+- **Backup/backfill:** use the same L3 controls as Step 1, but a separate `BEGIN IMMEDIATE` and exact all-row watermark. New R1 rows dual-write the projection, so the transaction only fills NULL rows and refuses any non-NULL mismatch.
+- **Acceptance:** full-row old-vs-new ID equality, zero NULL/malformed projections at the watermark, both worker functions produce identical state fingerprints and redacted exchange state before/after, Web context counts are identical, static call-site review finds no online full-payload reader, and a runtime fallback counter remains zero through the observation window.
+- **Rollback:** before R2, roll code back to request fallback and restore the new cells if necessary; the original request remains intact, so no archive restore is involved.
+
+### Step 3 — reference-only future persistence
+
+R2 must continue to build exactly the same request object and render exactly the same provider messages in memory. Persistence happens as a side effect after those bytes are fixed; it must not rebuild the live provider input from references. Store:
+
+- `context_message_refs_json`: an ordered, role-preserving object containing chat ID plus `current`, chronological `messages` and `reply_chain` references, each as `[raw_message_id, message_id, evidence_version_id]`;
+- `candidate_thread_ids_json`: the exact Step 2 projection;
+- `rendered_prompt_sha256`: SHA-256 of the exact canonical provider `messages` array containing the existing system prompt and the already-rendered user prompt;
+- `request_component_sha256_json`: hashes for `current_message`, `saved_evidence`, `message_context`, `candidate_strategy_threads`, `redacted_exchange_state` and `mimo_first_pass`, so a later mismatch can name the changed component rather than merely say that the whole prompt differs;
+- a valid NOT-NULL marker in `request_summary_json`, exactly shaped as `{"contract":"context-resolution-request-storage-v1","storage":"reference_only"}`. It is neither NULL nor `{}` and the tagged parser rejects unknown shapes.
+
+Read-only modeling over the live request shape found an average 37.73 message references (P90 51, maximum 54) and no unresolved reference lacking a raw-message ID. The modeled storage is:
+
+| New persisted part | Average bytes/attempt |
+|---|---:|
+| Ordered message/evidence references | 741.70 |
+| Six component SHA-256 values with keys | 529.00 |
+| Exact thread-ID list | 34.95 |
+| Rendered prompt SHA-256 | 64.00 |
+| Explicit reference-only marker | 79.00 |
+| **Total replacing the 77,123.91-byte request** | **1,448.65** |
+
+This is a 98.12% reduction. At the accepted 9.41 MB/day request growth, the replacement grows approximately 0.177 MB/day, saving about 9.233 MB/day. This estimate deliberately includes component hashes because without them an overall hash mismatch cannot identify its cause.
+
+Exact retrospective rendering is conditional, not guaranteed. Raw message text is available by ID and evidence rows are versioned, but active strategy state, candidate snapshots, exchange state and even edited raw-message content may later differ. Re-render with the exact prompt/code version, compare each component hash, then compare the final prompt hash. Equality proves byte-exact reproduction; inequality must return `not_exactly_reproducible` plus the mismatched component names. It must never silently substitute current state and claim historical equivalence. Full historical payloads remain exactly recoverable from the Step 4 archive; new reference-only rows intentionally retain verifiable provenance rather than a guaranteed replay copy.
+
+This source change does **not** alter model input or the trading decision path if all of the following are enforced: the provider still receives the original in-memory request, system/user prompt bytes are byte-equal in RED/GREEN tests, context and state fingerprints remain unchanged, new fields are never read by trigger/decision logic, and reference/hash failure can fail persistence but cannot select a different decision branch. Feeding a re-rendered request to the live provider, changing fingerprint construction or rebuilding candidates from references would be a behavioral change and would raise the work above storage-only scope; none belongs in this plan.
+
+- **Migration/rollback:** add nullable columns first and retain old-reader compatibility in R1. R2 is rollback-safe because the old release tolerates the new columns, but rows created under R2 contain explicit markers rather than full requests; rolling code back to an old reader that assumes full JSON is forbidden unless the compatibility parser is also present.
+- **Acceptance:** byte-for-byte provider request equality on all trigger families, identical decisions/fingerprints, correct tagged markers, non-NULL references/hashes for every R2 row, and measured average/day growth near the modeled envelope without changing trigger, prompt, context-window or settings contracts.
+
+### Step 4 — complete historical archive and live-column replacement
+
+Freeze an exact attempt watermark after R2 is live. Rows at or below the watermark that still contain legacy full payloads form the archive set; newer R2 rows already contain reference-only markers. Build a dedicated root-owned archive under `/var/lib/telegram-kol-context-archives/<UTC-run-id>/` (directory mode 0700, files mode 0600), preferably on storage separate from the live database. Use one bounded SQLite archive file rather than a new general framework:
+
+- table keyed by attempt ID containing raw message ID, context fingerprint, original `request_summary_json` bytes and per-record SHA-256;
+- manifest containing source backup SHA-256, exact watermark, ordered ID-list SHA-256, row count, sum of source bytes, min/max IDs and timestamps, per-record digest aggregate, archive-file SHA-256 and the trigger/thread backfill receipts;
+- `PRAGMA quick_check=ok`, exact one-to-one ID coverage, exact 328,239,382-byte baseline sum for the approved 4,256-row snapshot, and full per-row hash equality before the live database is writable;
+- one independently retained compressed copy outside the live database filesystem. Provision approximately 340 MB for the uncompressed primary archive plus the secondary copy; the compressed size is recorded only after actual verified creation and is not guessed in this design.
+
+The historical live marker is a valid tagged object, for example `{"archive_artifact_sha256":"<64 hex>","contract":"context-resolution-request-storage-v1","record_sha256":"<64 hex>","storage":"archive"}`. Its modeled size is 248 bytes/row. The offline loader resolves attempt ID plus record hash against the manifest/archive, verifies the original byte hash, and only then parses the request. Unknown/missing archive, hash mismatch or duplicate record fails closed.
+
+After archive verification, stop all database writers. In one `BEGIN IMMEDIATE`, re-read the watermark set and source hashes, replace exactly those full payloads with their markers, and assert `decision_json`, statuses, fingerprints and all unrelated tables are unchanged. At the accepted baseline:
+
+- request payload removed: 328.239 MB;
+- archive markers retained in the live DB: approximately 1.055 MB;
+- exact thread-ID backfill retained: approximately 0.149 MB;
+- exact trigger backfill retained: approximately 0.178 MB;
+- **net logical live-DB recovery:** approximately **326.857 MB**.
+
+Using the previously measured table physical/logical ratio only as a planning estimate, stopped physical compaction should reclaim approximately 331.396 MB and reduce the 820.179 MB database to about 488.783 MB. The two daily-audit private snapshots would together copy approximately 662.792 MB fewer bytes. A naive size-linear projection moves the observed 1.2 GB cgroup peak toward 0.715 GB, but this is not a promised memory result: the other large tables, SQLite/process memory and page-cache timing remain. The acceptance criterion is a post-compaction production audit measurement, not the projection.
+
+Reuse the existing verified backup, integrity and `VACUUM` path. Production evidence shows an approximately 805 MB backup plus durability/hash/integrity work can exceed 30 seconds, so do not plan a 30-second outage. Rehearse the exact marker update and compaction on a current production copy, then reserve a 10-minute stopped-writer window for final hash recheck, one transaction, checkpoint, compaction, `quick_check`, foreign-key/count verification, ownership/mode/fsync and restart. The expected core rewrite is tens of seconds to low minutes; the rehearsal sets the fail-closed upper bound.
+
+- **Rollback before marker commit:** transaction rollback leaves the live DB unchanged.
+- **Rollback after commit but before restart:** because writers remain stopped, restore the verified pre-change database backup or restore request bytes from the archive and re-verify.
+- **Rollback after service restart:** do not replace the whole database and discard newer writes. Restore only archived request bytes in a new authorized transaction if needed; R1/R2 code rollback must retain marker awareness.
+- **Final acceptance:** every pre-watermark attempt is represented exactly once in the archive; every corresponding live row has the correct explicit archive marker; every later row has the explicit reference-only marker; no online code reads a full request; `decision_json` and all business rows are byte/count stable; archive retrieval reproduces sampled and boundary payloads exactly; database integrity is clean; physical size and the next daily-audit peak are recorded.
+
+### Behavior classification
+
+| Part | Storage change | Possible behavior change |
+|---|---|---|
+| Trigger backfill | Yes, one small nullable telemetry cell per legacy row | None; predicate output is persisted, not consumed to change a decision |
+| Thread-ID projection/read cutover | Yes | None only if exact projection/state-fingerprint equivalence passes; otherwise cutover is blocked |
+| Reference/hash source write | Yes, large duplicate replaced by about 1.45 KB | None for live model/decision bytes; retrospective exact replay becomes conditional for future rows and is explicitly reported as such |
+| Historical archive/marker/compaction | Yes, approximately 326.857 MB logical recovery | No trading behavior; Web/offline diagnostics must display/resolve archive state explicitly rather than treating it as empty context |
+
+No step changes `requires_context_resolution`, its vocabulary/order, context-window limits, prompts, settings, model input, decision parsing, exchange-write semantics or the two existing BTC conditional orders and their lifecycle/binding state.
