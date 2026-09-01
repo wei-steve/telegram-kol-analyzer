@@ -3,7 +3,7 @@
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
 phase_state: blocked
-current_phase: r1_activation_root_cause_confirmed_stale_monitor_env
+current_phase: r1_activation_window_blocked_live_position_present
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -394,6 +394,15 @@ The root cause is a split release source inside one unit invocation. Candidate a
 The stored evidence proves the stale env file existed at invocation time but does not preserve a post-installer env after-image or the installer orchestration command stream. It cannot distinguish whether the candidate env was never written or was restored before activation. Resolve that provenance separately before another production window; do not infer it from the earlier `installer_gate=passed` marker.
 
 No code change or restage is required merely to make the existing immutable candidate satisfy the eight predicates: a later authorized install-only step can reinstall the candidate env, preserve its exact after-image, and prove immediately before activation that the effective `EnvironmentFile` monitor path/commit/hash equal the receipt. A more durable follow-up should also change the install/activation gate to validate the **effective main-process import source after EnvironmentFile precedence**, not only drop-in text or `ExecStartPre`; that would be a code change requiring RED/GREEN, review, a new candidate and a new stage. Neither option is implemented in this read-only turn.
+
+## R1 activation window stop — live position gate 2026-09-01
+
+- The approved resume window stopped at its first production checkpoint. No monitor env or unit byte was backed up or changed, install-only was not run, no activation authorization was created, activation was not retried, and no service was restarted.
+- The first local attempt to build a read-only client under the worker identity could not read `/opt/telegram-kol-analyzer/config/telegram.env` and raised `PermissionError` before making any Deepcoin request. The sole actual account query then inherited the running worker's `/etc/telegram-kol-worker.env` without printing credentials and executed only the client's GET methods from rollback release `18434b45...` under `telegram-kol-worker`, with `python -B` and `PYTHONDONTWRITEBYTECODE=1`.
+- The complete account snapshot succeeded at `2026-09-01T06:45:29.200649Z`. It returned one live position: `BTC-USDT-SWAP`, `posId=1001125076084723`, side `long`, size `8`. That fact alone triggers the owner's mandatory stop rule, so no install or activation may follow in this window.
+- Regular open orders were zero. Pending-trigger reads completed independently for all three managed instruments: BTC returned four rows, IDs `1001125076086511`, `1001125076086677`, `1001125077326101` and `1001125077326183`; ETH returned zero; SOL returned zero. The BTC projections were sell/long-side rows with sizes `4`, `4`, `0` and `0`. Their generic `triggerPx` projection was zero, so no meaningful distance was derived from that field; the already-triggered live-position gate made a further distance query unnecessary and prohibited continuing toward activation.
+- Simultaneous ticker reads returned BTC `78,835`, ETH `2,475.33` and SOL `103.76`, observed at `2026-09-01T06:45:28Z`. The snapshot was read-only; no Deepcoin write, setting change, database write, message processing, stage, deployment, freeze or restart occurred.
+- Production therefore remains on `18434b4552938ae3acb1160ad32618aab9c3ecf4`, with the previously recorded unfrozen/auto-trade-enabled state. Resume only in a new authorized window after a fresh complete snapshot finds zero positions and every pending trigger with a valid price is at least 1% from market. Do not infer safety from this expired snapshot.
 
 ### Behavior classification
 
