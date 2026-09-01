@@ -8,14 +8,14 @@ claimed_by: null
 base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: ff995723ac242b7c0c15f209a166b1acf3665cce
+pushed_sha: ff995723b64a331f963b49affb8827929213d8ac
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_schema_columns_added: true
-shadow_code_sha: ff995723ac242b7c0c15f209a166b1acf3665cce
+shadow_code_sha: ff995723b64a331f963b49affb8827929213d8ac
 shadow_schema_columns_added: false
 source_mode: immutable
 entry_admission_frozen_expected: false
@@ -26,7 +26,7 @@ auto_trade_enabled_observed: true
 
 ## Shadow invocation gate — local candidate 2026-09-01
 
-- The exact base is `1d82f29f2f1177b98e436fd578d0f4eb0b72fdae`; the reviewed production-code commit is `ff995723ac242b7c0c15f209a166b1acf3665cce`. The existing `requires_context_resolution` function remains byte-for-byte unchanged and remains the only provider-invocation authority. Candidate generation, `ACTIVE_LIFECYCLE_STATUSES`, context windows, prompts, provider payloads, model decisions and settings are unchanged.
+- The exact base is `1d82f29f2f1177b98e436fd578d0f4eb0b72fdae`; the reviewed production-code commit is `ff995723b64a331f963b49affb8827929213d8ac`. The existing `requires_context_resolution` function remains byte-for-byte unchanged and remains the only provider-invocation authority. Candidate generation, `ACTIVE_LIFECYCLE_STATUSES`, context windows, prompts, provider payloads, model decisions and settings are unchanged.
 - The candidate adds one separate pure shadow evaluator with a centralized immutable policy. It preserves every non-multiple authoritative trigger and applies the approved tightening only to `multiple_same_source_candidates`: first-pass strategy, non-`none` lifecycle event, the approved expanded action/correction expressions matched against raw text and first-pass `input_reading.observed_text`, or the both-text-empty `market_chart` fallback. The shadow result is never read by an invocation or decision branch.
 - Five nullable audit columns are added through the existing SQLite compatibility migration path: `shadow_would_trigger`, `shadow_conditions_json`, `shadow_agrees_with_authoritative`, `shadow_disagreement_direction` and `shadow_evaluation_error`. Legacy rows remain valid with all five NULL. New attempt writes retain the complete R1 payload and telemetry and additionally store the shadow result. Shadow evaluator, result-property and JSON-serialization failures are all inside one best-effort boundary; they leave the four result fields NULL, record only the exception type, and do not block the provider result or authoritative decision.
 - RED was observed before implementation: the dedicated test failed at collection because `telegram_kol_research.context_resolution_shadow` did not exist. Two later injected failures separately proved that JSON serialization and result-property access escaped the initial boundary before their fixes. GREEN passed the final 15 focused shadow/schema/persistence tests; the broader context, authority, migration, replay and worker set passed `137 passed` before the final boundary edit.
