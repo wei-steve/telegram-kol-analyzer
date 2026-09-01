@@ -2,18 +2,20 @@
 
 ```yaml
 workstream: ai_context_resolution_observability_and_network_backoff
-phase_state: in_progress
-current_phase: activation_with_transient_entry_freeze_then_immediate_thaw
+phase_state: complete
+current_phase: production_activation_and_live_observation_complete
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
 pushed_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
-production_sha_after: 6e2321cecbb3adf61d7a5972d391e662d4aea300
+production_sha_after: 18434b4552938ae3acb1160ad32618aab9c3ecf4
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
+entry_admission_frozen_observed: false
+auto_trade_enabled_observed: true
 ```
 
 ## Scope contract
@@ -71,3 +73,16 @@ Code rollback returns all services to the control release while leaving the five
 - A filled trigger remains covered by the normal attribution/protection pipeline during the frozen runtime: the Deepcoin reconciliation loop applies the exchange snapshot and exact leg attribution, adopts saved trigger-protection intent evidence, and then invokes `submit_verified_trigger_backup_stops` (`execution_bindings.py` lines 420-452 and 1040-1049). The rescue path is governed by the live liveness/management setting, not by the deployment entry-freeze flag. With `auto_trade_enabled=true`, the current live rollout settings therefore remain effective during the transient freeze.
 - The production rows support that code-level conclusion. Lifecycle 1037 is `pending_entry`; binding 321 is `open/entry_order_pending`. Legs 555 and 556 are pending `trigger_limit` entries for order IDs `1001125071413372` and `1001125071413427`, each with a stop request at 82,200. Each leg has one planned primary stop, one planned backup stop and three planned take-profit legs, plus its own pending `trigger_protection_intent` (IDs 160 and 161). If a trigger fills during the brief service stop/restart interval, protection is not instantaneous while the process is down; attribution and protection resume after the worker starts (the Deepcoin reconcile startup delay is 5 seconds and its normal interval is 30 seconds). The freeze itself does not suppress those paths.
 - A fresh Deepcoin public ticker read returned `BTC-USDT-SWAP last=78620` with exchange timestamp `2026-09-01T00:53:49Z`. The two short-entry triggers are above that price by `(80510-78620)/78620 = 2.403968%` and `(81110-78620)/78620 = 3.167133%`, respectively. Because protection is not blocked by the freeze, the conditional stop rule “protection frozen and market close to trigger” does not apply; activation may proceed under the approved transient-freeze contract.
+
+## Production activation and live verification — 2026-09-01
+
+- The existing runtime-only immutable release was reused; no new stage was needed. Its canonical receipt still declared `schema_changed=false`, tree `7c0a76b96c368c37eb151af52a55398bcdf72c73`, content SHA-256 `ce8737d1c4c5edd9985aa8cd03f5daee936511de991a13f0018c9c6f19545f9a`, and manifest SHA-256 `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc` for exact commit `18434b4552938ae3acb1160ad32618aab9c3ecf4`.
+- Because the previous attempt had restored monitor to the control release, the candidate installer was rerun under the update lock after preserving the old env and four base units. All four installed unit SHA-256 values matched their candidate files by exact filename; the monitor env names the candidate and its manifest; the diagnostic-only arguments are present only on the diagnostic unit; retired arguments remain absent; `systemd-analyze verify` succeeded. Installer evidence is under `/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/activation-20260901T0100Z/monitor-install`.
+- The activation manifest declared exactly web, monitor, ingest and worker with `schema_changed=false`, `production_data_mutation=false`, `exchange_write_semantics_changed=false` and source mode `immutable`. A canonical nine-field, root-owned mode-0400 authorization bound to action-plan SHA-256 `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3` was printed, persisted and consumed exactly once. The immutable helper activated the candidate with rollback release `6e2321cecbb3adf61d7a5972d391e662d4aea300`; its deployment diagnostic loaded the candidate, verified the artifact, completed all sources, ran no daily audit, and returned healthy with no reason codes.
+- The activator's deliberate freeze was transient. Candidate frozen processes began serving at approximately `2026-09-01T00:59:32Z`; immediately after helper success the single freeze line was removed from each web/ingest/worker release drop-in, followed under the update lock by the required worker -> web -> ingest restart at `01:00:30Z` to `01:00:39Z`. No unrelated work occurred between activation and thaw.
+- Final identities are web PID 657593, ingest PID 657598 and worker PID 657588. All three report exact release `18434b45...`, manifest `e58bc07d...`, `loaded_artifact_verified=true` and `entry_admission_frozen=false`. The web event loop is healthy; ingest listener and reconcile tasks are healthy; worker message processing and command tasks are healthy, and global exchange authority plus management, protection, close, TPSL and rescue capabilities are all true. `auto_trade_enabled` remained true throughout.
+- Two complete ordinary monitor runs succeeded. The first legitimately performed the due daily management audit and returned `healthy=true`, `reason_codes=[]`; the post-live-context run had `audit_ran=false` and also returned healthy with no reasons. The monitor timer remains active/waiting.
+- Read-only Deepcoin verification before and after the live sample returned zero positions, zero regular open orders, and exactly the same two BTC pending conditional entries: `1001125071413372` at 80,510 and `1001125071413427` at 81,110. Lifecycle 1037 remains `pending_entry`, binding 321 remains `open/entry_order_pending`, and legs 555-556 remain pending and mapped to those exact IDs. No fill occurred and no protection attachment was required during the window.
+- Natural traffic produced context attempts 4252 and 4253 after activation. Both populated all five additive fields: `invocation_triggers_json`, `attempt_phase`, `provider_request_count`, `provider_usage_json`, and `request_component_bytes_json`. Attempt 4252 recorded one provider request, 15,320 total tokens and 39,324 request bytes, decided `new_thread`, and projected raw message 14182 to one `entry_signal` candidate. Attempt 4253 recorded one provider request, 11,646 total tokens and 31,782 request bytes, decided `hold`, and preserved raw message 14180 as non-strategy. In both cases the first provider request succeeded, with no error, no durable retry time and no extra request; this is the unchanged pre-existing success decision path, so the observability and backoff changes did not alter the decision.
+- The live calls did not encounter a provider network error. The expected success-path behavior was observed: no backoff was scheduled and the provider circuit remained closed with zero consecutive transport failures. The network-error scheduling/open-circuit branch therefore retains its previously completed deterministic RED/GREEN and full-suite proof; this window does not claim a production fault-injection test.
+- Root-owned evidence for activation, thaw, identities, monitor cycles, exchange readbacks and live context rows is under `/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/activation-20260901T0100Z`. No activation rollback was needed. The five nullable columns remain in place by contract, and no recovery ledger, recognition setting, trigger condition, threshold, context window, whitelist, historical message or existing exchange order was modified by the rollout procedure.
