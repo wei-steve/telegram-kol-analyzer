@@ -1103,3 +1103,184 @@ The cumulative cohort remains anchored at `2026-08-31T16:42:37Z` and raw ID 1415
 - neither criterion is met, so this is a P0 checkpoint rather than the final baseline.
 
 The small cohort is sufficient to confirm that the five live observability fields are producing internally consistent direct measurements. It is not sufficient to conclude that the 56.25% descriptive trigger rate, any per-trigger token average, or the 2.219-million-token daily normalization is representative. No trigger, word list, threshold, prompt, context window, setting, row, release or service was changed while collecting this checkpoint.
+
+## 14. Token cost ROI, relevance-window replay, and main-recognition instrumentation design
+
+### 14.1 Fixed snapshot and metric contracts
+
+This section is read-only. It changed no code, setting, whitelist, threshold, prompt, database row, release, service or exchange state. The production SQLite database was opened in read-only mode and the core queries ran inside one read transaction. The fixed snapshot is:
+
+- query time: `2026-09-01T10:00:29.583Z`;
+- `context_resolution_attempts.id <= 4307`;
+- `raw_messages.id <= 14256`;
+- current whitelist: 33 chat IDs from `trading_settings.global.context_resolution_live_chat_ids`;
+- legacy decision-recall cohort: the already accepted `id <= 4245` cohort, containing the 580 material changes used throughout sections 4 and 6.
+
+The following definitions prevent three common overclaims:
+
+1. **Invocation count** is reported as `context_resolution_attempts` rows and provider requests separately. For legacy rows, provider requests use the persisted `attempts` count; for R1 rows, the exact number of entries in `provider_usage_json` is authoritative.
+2. **Material change** uses the unchanged section-4 contract: action family plus target thread set, with the existing confidence/applicability rule. Reason wording alone is not a material change.
+3. **Real exchange-write impact** is deliberately strict. It requires, after the attempt timestamp, both a `signal_candidates` row for the same `raw_message_id` and a directly linked `execution_events.source_message_id` whose action is an exchange-write action. Historical execution events that predate the attempt, local reconciliation/audit actions, `auto_trade_skipped`, and reservation-only rows do not count.
+
+Only two attempts satisfy the third contract:
+
+| attempt | chat | candidate | directly linked exchange write |
+|---:|---:|---|---|
+| 1308 / raw 10901 | -1002337721508 | candidate 1776, `position_update`, 14:36:05.948847Z | event 3505 cancel deferred trigger entry and event 3514 close submit, both 14:36:05.968916Z |
+| 1898 / raw 11780 | -1003825498321 | candidate 1898, `close_signal`, 08:10:26.334182Z | event 3630 management close submit, 08:10:26.432135Z |
+
+R1 provides 58 directly measured provider requests across 56 attempt rows: 828,098 total tokens over 2,274,427 canonical request bytes. Rows without usage are estimated with the observed aggregate conversion `0.3640908 total token / canonical request byte`; the per-request ratio has P10 `0.3388752`, median `0.3618721`, and P90 `0.4258418`. This proxy incorporates prompt overhead and completion tokens only through the small R1 cohort. It is not a provider bill and must not be presented as measured usage. Direct telemetry covers only 58/5,987 = **0.97%** of provider requests in this snapshot.
+
+### 14.2 Per-chat context-resolution ROI
+
+`A` below means directly observed tokens and `P` means the calibrated byte proxy. `changed` is material first-layer change; `write impact` is the strict post-attempt lineage defined above. Chats are sorted first by observed exchange-write impact, then by historical token burden. Token totals cover the full stored history through attempt 4307, not one day.
+
+| whitelisted chat | attempts / provider requests | token total (`A + P`) | changed | write impact | token / write impact |
+|---|---:|---:|---:|---:|---:|
+| 米娅 vip会员群 11分组 (`-1003825498321`) | 100 / 132 | 1.630M (`0.041M + 1.590M`) | 17 | 1 | 1.630M |
+| 比特币陈哥会员群-11分组 (`-1002337721508`) | 175 / 210 | 6.318M (`0.017M + 6.302M`) | 43 | 1 | 6.318M |
+| 三马哥会员群-11分组 (`-1002199068560`) | 527 / 711 | 28.441M (`0.045M + 28.396M`) | 110 | 0 | not defined |
+| 欧阳火箭滚仓班 (`-1003095914903`) | 573 / 765 | 23.673M (`0.235M + 23.438M`) | 102 | 0 | not defined |
+| 比特币军长 (`-1002282384698`) | 509 / 736 | 21.088M (`0.104M + 20.984M`) | 104 | 0 | not defined |
+| 币圈所长会员群 (`-1002368892075`) | 449 / 586 | 20.806M (`0.224M + 20.582M`) | 23 | 0 | not defined |
+| 峰哥高级会员群 (`-1002409877375`) | 385 / 666 | 20.229M (`0 + 20.229M`) | 6 | 0 | not defined |
+| 比特币飞扬 (`-1002960443256`) | 484 / 693 | 17.923M (`0.021M + 17.902M`) | 54 | 0 | not defined |
+| 大镖客 (`-1003048800035`) | 364 / 518 | 17.046M (`0.042M + 17.004M`) | 51 | 0 | not defined |
+| 舒琴会员群 (`-1002370796392`) | 213 / 300 | 8.430M (`0 + 8.430M`) | 7 | 0 | not defined |
+| ROSE会员群 (`-1002344190971`) | 48 / 62 | 2.197M (`0 + 2.197M`) | 19 | 0 | not defined |
+| 米哥会员群 (`-1002367395169`) | 164 / 192 | 2.100M (`0.074M + 2.026M`) | 18 | 0 | not defined |
+| 比特智 智哥 (`-1003344714145`) | 103 / 137 | 1.783M (`0 + 1.783M`) | 18 | 0 | not defined |
+| weichang tan (`-1003415020968`) | 37 / 64 | 0.622M (`0 + 0.622M`) | 1 | 0 | not defined |
+| 书 shu-crypto (`-1003053031367`) | 21 / 22 | 0.531M (`0.012M + 0.519M`) | 2 | 0 | not defined |
+| 提阿非罗 初塔 (`-1002918719121`) | 32 / 51 | 0.458M (`0.005M + 0.453M`) | 0 | 0 | not defined |
+| 大漂亮社区 (`-1002805019371`) | 46 / 53 | 0.454M (`0.009M + 0.445M`) | 13 | 0 | not defined |
+| 超V社区搬运群 (`-1001716834927`) | 56 / 68 | 0.349M (`0 + 0.349M`) | 0 | 0 | not defined |
+| 三姐精准策略群 (`-1003000736304`) | 8 / 8 | 0.046M (`0 + 0.046M`) | 2 | 0 | not defined |
+| unlabeled (`-1002451280921`) | 9 / 9 | 0.033M (`0 + 0.033M`) | 6 | 0 | not defined |
+| 龚有财策略群 (`-1002458558902`) | 4 / 4 | 0.021M (`0 + 0.021M`) | 1 | 0 | not defined |
+| `-1002274336512` | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-5025043055` | 0 / 0 | 0 | 0 | 0 | no sample |
+| 躺赢社区 (`-1001966634720`) | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-1002270839757` | 0 / 0 | 0 | 0 | 0 | no sample |
+| 凉兮 (`-1003585604552`) | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-4781287606` | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-1003496877217` | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-5046697627` | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-1002494435354` | 0 / 0 | 0 | 0 | 0 | no sample |
+| il Capo Of Crypto (`-1002168259610`) | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-4606125205` | 0 / 0 | 0 | 0 | 0 | no sample |
+| `-4623349778` | 0 / 0 | 0 | 0 | 0 | no sample |
+
+Totals are 4,307 attempts, 5,987 provider requests, approximately 174.179M total tokens (`0.828M` measured plus `173.351M` proxy), 597 material changes, and two strict exchange-write impacts.
+
+#### Can any zero-impact chat be removed harmlessly?
+
+No current row supports the word **harmless**:
+
+- 31/33 whitelisted chats have zero strict exchange-write impacts, but 19 of them have positive sample and many still materially changed a decision. A no-write or risk-reducing decision can be valuable precisely because it prevents an order; the lineage metric cannot observe that counterfactual benefit.
+- The largest zero-impact cohorts have 364–573 attempts. The rule-of-three 95% upper bound for an unseen per-attempt write impact is approximately 0.52%–0.82%, but that bound says nothing about prevented bad writes or safer lifecycle targeting.
+- The only positive-sample chats with zero material changes are 超V (56 attempts) and 提阿非罗 (32 attempts). Their corresponding rule-of-three upper bounds are still 5.36% and 9.38% per attempt. That is not enough evidence for a permanent behavior change.
+- Twelve whitelisted chats have no attempt at all. Zero observations are absence of evidence, not evidence of zero value.
+
+Changing `context_resolution_live_chat_ids` is a **pure configuration** action and the gate is read dynamically in `trading_settings.py:205-210`; it does not require a code deployment. It still changes the recognition/management decision path. The evidence supports, at most, a future bounded shadow/removal experiment for selected chats. It does not support calling any immediate removal harmless.
+
+### 14.3 Relevance-preserving window replay
+
+The replay retained the current message and existing non-history request components in all variants. The deployable, causal selector was evaluated with information available before the provider call:
+
+- direct reply ancestors;
+- full candidate/lifecycle root messages when present in the stored history;
+- active-lifecycle source messages;
+- messages already linked to a candidate thread;
+- message IDs cited by an earlier decision in the same chat;
+- for the semantic variant, any first-pass message already classified as a strategy or lifecycle event, plus any message carrying a strategy link.
+
+The result on all stored request bytes through attempt 4307, with explicit-reference recall evaluated on the accepted 580-change legacy cohort, is:
+
+| replay policy | weighted request-byte saving | changed attempts losing at least one observable explicit reference | lost reference IDs | online-causal? |
+|---|---:|---:|---:|---|
+| accepted blind 20 messages / 24 hours | 50.75% | 72 / 580 | accepted section-6 result | yes, but unsafe |
+| structural relevance only | 49.18% | 49 / 580 | 66 | yes |
+| structural + first-pass semantic relevance | 41.43% | 34 / 580 | 44 | yes |
+| semantic relevance + conservative 20/24 fallback | 26.23% | 8 / 580 | 15 | yes |
+| semantic relevance + the **current** decision's explicit references | 41.37% | 0 / 580 matchable | 0; one legacy reference was absent from its stored request | **no; post-hoc oracle** |
+
+The last row gives the requested zero-loss audit ceiling: average request bytes would fall by approximately **41.37%**, and every explicit supporting/opposing message that actually existed in the stored request would remain. It is not deployable as written, because the provider's current `decision_json` does not exist until after the request has already been sent. Treating that row as an online strategy would be look-ahead.
+
+The eight residual causal misses explain which evidence class is still absent. They are strategy-episode continuations that the first pass labelled `非策略/event=none`: paired entry and stop messages, “我的空还在”, profit/status updates, and narrative continuations such as the prior SNDK thesis. They are neither direct replies nor reliably linked lifecycle rows. To reach zero without look-ahead, the selector needs a durable **strategy-episode membership** relation that keeps these false-negative-but-related messages. A keyword-only patch is insufficient: these examples include pronouns and author-specific continuation patterns with no symbol.
+
+Therefore the safe design is:
+
+1. build a non-authoritative selector from reply ancestry, candidate/lifecycle roots, thread links, prior citations, and a strategy-episode relation;
+2. run it in shadow while the full window remains authoritative;
+3. require 100% recall of all explicit references and zero action/target/applicability differences on a predeclared sample before any cutover;
+4. if the selector cannot causally recall all references, retain the full window. The safe deployable saving is then **0%**, not the 41.37% oracle ceiling.
+
+This is materially safer than the blind 20/24 proposal: blind truncation offers about 9.38 percentage points more theoretical byte saving than the post-hoc relevance ceiling, but already loses explicit evidence in 72 material-change attempts. The current causal relevance selector reduces that observed risk to eight attempts, but has not reached the zero-recall target.
+
+#### R1 byte cross-check
+
+The R1 cohort now contains 56 attempt rows (IDs 4252–4307) and 58 provider requests over about nine hours. All 56 stored `request_total_bytes` values exactly equal an independent canonical UTF-8 re-encoding of `request_summary_json`. Mean request size is 39,160.34 B, P50 38,927.5 B, P90 58,034 B; mean `message_context` is 31,558.14 B and contributes 80.59% of aggregate request bytes.
+
+This validates the measurement implementation and independently confirms that context remains the dominant component. It is not enough to replace the historical 89.16% estimate: 56 attempts cover less than one day, only a subset of chats, and a different post-cleanup traffic mix.
+
+### 14.4 Main-recognition daily cost: best available estimate
+
+There is still no true provider usage on the main-recognition path. `ai_prompt_invocations` records invocation identity/status but no tokens; `mimo_recognition_attempts` records provider-attempt status/duration but no request components or provider usage. Consequently every main-recognition token number below is a proxy.
+
+For the fixed 35-calendar-day comparison window `[2026-07-27, 2026-08-31)`:
+
+- 6,163 raw messages arrived;
+- `ai_prompt_invocations.feature='message_recognition'` contains 7,035 high-level invocations over 5,821 distinct raw messages, of which 7,000 completed;
+- this is 201.0 invocations/day and 1.141 high-level invocations per raw message;
+- applying the already accepted 20K–28K token/request byte proxy yields **4.02M–5.63M tokens/day**.
+
+The failure-storm dates 2026-08-21 through 2026-08-23 contain 1,776 invocation records. Removing those three abnormal dates leaves 5,259 invocations over 32 days, or 164.34/day and **3.29M–4.60M proxy tokens/day**. This exclusion describes normal throughput; it is not a billing adjustment, because an HTTP error may or may not have reached the provider and no usage was persisted.
+
+The current MiMo audit tables reinforce the uncertainty: since 2026-08-12 they contain 4,463 completed and 184 HTTP-error provider attempts, but none has usage. Image inputs further weaken any byte-to-token mapping because provider image accounting is not UTF-8 text accounting.
+
+Against the accepted normal context-resolution proxy of 1.67M–2.22M/day, the full-window main estimate is roughly **1.81×–3.37×**. The previously stated 2.5×–3× expectation lies inside that uncertainty band, but is not yet a measurement. Optimization priority should therefore be:
+
+1. instrument main recognition first, because it is probably the larger cost and currently the larger measurement blind spot;
+2. keep collecting direct context-resolution usage;
+3. only then choose between chat gating and relevance-window work using comparable measured cost and decision-safety metrics.
+
+### 14.5 Additive main-recognition instrumentation design
+
+The correct grain is one provider attempt, not one raw message. The existing durable row is `mimo_recognition_attempts`, which already separates retries. Add nullable R1-shaped fields there:
+
+- `provider_usage_json`: the provider's unmodified usage object wrapped with `available`, request ordinal and an explicit unavailable reason;
+- `request_component_bytes_json`: encoding/version, total canonical request bytes, system-prompt bytes, current-message metadata/text bytes, rendered authoritative-context bytes, image data-URL bytes and structural overhead.
+
+The write path is narrowly defined:
+
+1. `recognition_experiments.py:1091-1126` already builds the exact in-memory payload and receives the provider JSON. Measure that same object without mutating or rebuilding it, and copy `data['usage']` when present.
+2. Carry the two telemetry objects with the existing provider result/exception metadata through both the v1 authority wrapper and the v2 attempt path.
+3. Extend `record_mimo_attempt()` in `mimo_recognition_runs.py:166-242` to persist telemetry on the matching ordinal. Missing provider usage must be recorded as unavailable, never as zero.
+4. Keep `ai_prompt_invocations` as the high-level feature audit; do not aggregate retries into it and do not make trading code read the new columns.
+
+Safety properties and acceptance tests:
+
+- the exact payload object passed to `httpx.Client.post(..., json=payload)` is unchanged byte-for-byte in canonical form;
+- model, prompt, context builder, image sequence, temperature, JSON mode and thinking mode are unchanged;
+- parsed content, canonical decision fingerprint and execution projection are identical with telemetry enabled/disabled;
+- one retry produces two attempt rows with two separate usage records;
+- provider-omitted usage is explicit `available=false`, while returned prompt/completion/total tokens are preserved exactly;
+- component bytes sum to total with a named structural-overhead remainder, and image bytes are reported separately rather than converted to fake text tokens.
+
+This is a **code + nullable L3 schema migration + deployment** change. It is pure additive storage/observability and should not change model input or decision behavior. It is not a configuration-only change. A later dashboard or cost alert could read the fields without touching recognition authority.
+
+### 14.6 Action-type summary
+
+| proposal | category | deployment required? | behavior change? | current evidence decision |
+|---|---|---:|---:|---|
+| remove selected chat IDs from context whitelist | pure configuration | no | yes | do not call harmless; insufficient causal evidence |
+| historical ROI and replay queries | read-only analysis | no | no | completed in this section |
+| relevance selector / strategy-episode relation | code | yes | yes, changes model input | shadow only until causal zero-recall and decision-equivalence gates pass |
+| main-recognition usage/component telemetry | additive code + nullable schema | yes | intended no | highest-priority implementation candidate |
+
+### 14.7 Validation and limitations
+
+The per-chat totals independently sum to 4,307 attempts, 5,987 provider requests, 597 material changes and two strict trade impacts. The two impacts were manually cross-checked against candidate/event timestamps and direct raw-message lineage. All 56 R1 component rows passed canonical-byte equality. The legacy material-change query remains 580 on `id <= 4245`.
+
+The main limitations are substantive, not formatting details: only 0.97% of historical context provider requests have true usage; only two strict trade impacts exist; prevented trades have no counterfactual outcome; one legacy explicit reference was not present in its stored request; and a current model citation cannot be known before the current call. These limitations prohibit a whitelist removal claim, a production window cutover, or a precise main/context billing ratio from this dataset alone.
