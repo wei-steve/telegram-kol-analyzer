@@ -765,6 +765,21 @@ class ContextResolutionAttempt(Base):
     request_component_bytes_json: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True
     )
+    shadow_would_trigger: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True
+    )
+    shadow_conditions_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    shadow_agrees_with_authoritative: Mapped[Optional[bool]] = mapped_column(
+        Boolean, nullable=True
+    )
+    shadow_disagreement_direction: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    shadow_evaluation_error: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
     status: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
     error_class: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     reanalysis_triggers_json: Mapped[str] = mapped_column(

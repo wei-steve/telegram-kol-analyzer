@@ -265,6 +265,26 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE context_resolution_attempts "
             "ADD COLUMN request_component_sha256_json TEXT"
         ),
+        "shadow_would_trigger": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN shadow_would_trigger BOOLEAN"
+        ),
+        "shadow_conditions_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN shadow_conditions_json TEXT"
+        ),
+        "shadow_agrees_with_authoritative": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN shadow_agrees_with_authoritative BOOLEAN"
+        ),
+        "shadow_disagreement_direction": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN shadow_disagreement_direction VARCHAR(32)"
+        ),
+        "shadow_evaluation_error": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN shadow_evaluation_error VARCHAR(128)"
+        ),
     },
     "message_instruction_items": {
         "retired_at": (

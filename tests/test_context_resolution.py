@@ -1,5 +1,6 @@
 import json
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 
 import pytest
 
@@ -300,6 +301,18 @@ def test_resolver_persists_ordered_observability_and_raw_provider_usage(tmp_path
     assert provider_usage == [
         {"available": True, "request_number": 1, "usage": usage}
     ]
+    assert attempt.shadow_would_trigger is True
+    assert json.loads(attempt.shadow_conditions_json) == {
+        "conditions": [
+            "authoritative:revision_language",
+            "authoritative:apparent_entry_may_be_revision",
+        ],
+        "contract": "context-resolution-shadow-v1",
+        "matched_action_patterns": [],
+    }
+    assert attempt.shadow_agrees_with_authoritative is True
+    assert attempt.shadow_disagreement_direction is None
+    assert attempt.shadow_evaluation_error is None
     assert set(components) == {
         "encoding",
         "request_total_bytes",
@@ -327,6 +340,192 @@ def test_resolver_persists_ordered_observability_and_raw_provider_usage(tmp_path
         canonical(request["current_message"])
     )
     assert components["remainder_bytes"] > 0
+
+
+def test_shadow_evaluation_failure_is_recorded_without_blocking_provider(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "shadow-failure.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1471, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.context_resolution.evaluate_context_resolution_shadow",
+        lambda **_kwargs: (_ for _ in ()).throw(ValueError("shadow broke")),
+    )
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1471}},
+        candidates=[{"thread_id": 12, "root_message_id": 1470}],
+        first_pass_payload={"recognition_result": "是策略"},
+        exchange_state={},
+        invocation_triggers=("multiple_same_source_candidates",),
+        model_caller=lambda **_: json.dumps(
+            _valid_payload(supporting_message_ids=[1470, 1471]),
+            ensure_ascii=False,
+        ),
+    )
+
+    assert decision.decision == "revise_thread"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "completed"
+        assert attempt.shadow_would_trigger is None
+        assert attempt.shadow_conditions_json is None
+        assert attempt.shadow_agrees_with_authoritative is None
+        assert attempt.shadow_disagreement_direction is None
+        assert attempt.shadow_evaluation_error == "ValueError"
+
+
+def test_shadow_serialization_failure_is_recorded_without_blocking_provider(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "shadow-json-failure.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1473, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.context_resolution.evaluate_context_resolution_shadow",
+        lambda **_kwargs: SimpleNamespace(
+            would_trigger=True,
+            conditions=(object(),),
+            matched_action_patterns=(),
+            agrees_with_authoritative=True,
+            disagreement_direction=None,
+        ),
+    )
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1473}},
+        candidates=[{"thread_id": 12, "root_message_id": 1470}],
+        first_pass_payload={"recognition_result": "是策略"},
+        exchange_state={},
+        invocation_triggers=("multiple_same_source_candidates",),
+        model_caller=lambda **_: json.dumps(
+            _valid_payload(supporting_message_ids=[1470, 1473]),
+            ensure_ascii=False,
+        ),
+    )
+
+    assert decision.decision == "revise_thread"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "completed"
+        assert attempt.shadow_would_trigger is None
+        assert attempt.shadow_conditions_json is None
+        assert attempt.shadow_agrees_with_authoritative is None
+        assert attempt.shadow_disagreement_direction is None
+        assert attempt.shadow_evaluation_error == "TypeError"
+
+
+def test_shadow_result_projection_failure_does_not_block_provider(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "shadow-projection.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1474, text="更新 BTC 多单")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.context_resolution.evaluate_context_resolution_shadow",
+        lambda **_kwargs: SimpleNamespace(
+            conditions=(),
+            matched_action_patterns=(),
+        ),
+    )
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1474}},
+        candidates=[{"thread_id": 12, "root_message_id": 1470}],
+        first_pass_payload={"recognition_result": "是策略"},
+        exchange_state={},
+        invocation_triggers=("multiple_same_source_candidates",),
+        model_caller=lambda **_: json.dumps(
+            _valid_payload(supporting_message_ids=[1470, 1474]),
+            ensure_ascii=False,
+        ),
+    )
+
+    assert decision.decision == "revise_thread"
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.status == "completed"
+        assert attempt.shadow_would_trigger is None
+        assert attempt.shadow_conditions_json is None
+        assert attempt.shadow_agrees_with_authoritative is None
+        assert attempt.shadow_disagreement_direction is None
+        assert attempt.shadow_evaluation_error == "AttributeError"
+
+
+def test_shadow_skip_is_audited_but_does_not_skip_the_authoritative_call(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "shadow-skip.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=88, message_id=1472, text="只是普通评论")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    provider_calls = []
+
+    def model_caller(**kwargs):
+        provider_calls.append(kwargs)
+        return json.dumps(
+            _valid_payload(supporting_message_ids=[1470, 1472]),
+            ensure_ascii=False,
+        )
+
+    decision = resolve_contextual_strategy(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        evidence={},
+        context_window={"current": {"message_id": 1472}},
+        candidates=[
+            {"thread_id": 12, "root_message_id": 1470},
+            {"thread_id": 13, "root_message_id": 1471},
+        ],
+        first_pass_payload={
+            "recognition_result": "非策略",
+            "lifecycle_event": {"event_type": "none"},
+            "input_reading": {"observed_text": ""},
+        },
+        exchange_state={},
+        invocation_triggers=("multiple_same_source_candidates",),
+        model_caller=model_caller,
+    )
+
+    assert decision.decision == "revise_thread"
+    assert len(provider_calls) == 1
+    with session_factory() as session:
+        attempt = session.query(ContextResolutionAttempt).one()
+        assert attempt.shadow_would_trigger is False
+        assert attempt.shadow_agrees_with_authoritative is False
+        assert (
+            attempt.shadow_disagreement_direction
+            == "shadow_would_skip"
+        )
+        assert attempt.shadow_evaluation_error is None
 
 
 def test_resolver_marks_provider_usage_unavailable_and_null_metadata_is_ignored(

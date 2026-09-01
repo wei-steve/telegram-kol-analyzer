@@ -29,6 +29,9 @@ from telegram_kol_research.context_request_storage import (
     collect_candidate_thread_ids,
     rendered_prompt_sha256,
 )
+from telegram_kol_research.context_resolution_shadow import (
+    evaluate_context_resolution_shadow,
+)
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
     MessageEvidenceVersion,
@@ -655,6 +658,36 @@ def _upsert_attempt(
     component_sha256_json = _canonical_json(
         build_request_component_sha256(request_payload)
     )
+    shadow_would_trigger = None
+    shadow_conditions_json = None
+    shadow_agrees_with_authoritative = None
+    shadow_disagreement_direction = None
+    shadow_evaluation_error = None
+    try:
+        shadow = evaluate_context_resolution_shadow(
+            request_payload=request_payload,
+            authoritative_triggers=tuple(invocation_triggers),
+            authoritative_would_trigger=True,
+        )
+        projected_shadow_would_trigger = shadow.would_trigger
+        projected_shadow_agreement = shadow.agrees_with_authoritative
+        projected_shadow_direction = shadow.disagreement_direction
+        serialized_shadow_conditions = _canonical_json(
+            {
+                "contract": "context-resolution-shadow-v1",
+                "conditions": list(shadow.conditions),
+                "matched_action_patterns": list(
+                    shadow.matched_action_patterns
+                ),
+            }
+        )
+    except Exception as exc:
+        shadow_evaluation_error = type(exc).__name__[:128]
+    else:
+        shadow_would_trigger = projected_shadow_would_trigger
+        shadow_conditions_json = serialized_shadow_conditions
+        shadow_agrees_with_authoritative = projected_shadow_agreement
+        shadow_disagreement_direction = projected_shadow_direction
     with session_factory() as session:
         row = (
             session.query(ContextResolutionAttempt)
@@ -679,6 +712,15 @@ def _upsert_attempt(
                 candidate_thread_ids_json=candidate_thread_ids_json,
                 rendered_prompt_sha256=prompt_sha256,
                 request_component_sha256_json=component_sha256_json,
+                shadow_would_trigger=shadow_would_trigger,
+                shadow_conditions_json=shadow_conditions_json,
+                shadow_agrees_with_authoritative=(
+                    shadow_agrees_with_authoritative
+                ),
+                shadow_disagreement_direction=(
+                    shadow_disagreement_direction
+                ),
+                shadow_evaluation_error=shadow_evaluation_error,
                 decision_json=None,
                 rejected_response_diagnostic_json=(
                     rejected_response_diagnostic_json
@@ -712,6 +754,15 @@ def _upsert_attempt(
             row.candidate_thread_ids_json = candidate_thread_ids_json
             row.rendered_prompt_sha256 = prompt_sha256
             row.request_component_sha256_json = component_sha256_json
+            row.shadow_would_trigger = shadow_would_trigger
+            row.shadow_conditions_json = shadow_conditions_json
+            row.shadow_agrees_with_authoritative = (
+                shadow_agrees_with_authoritative
+            )
+            row.shadow_disagreement_direction = (
+                shadow_disagreement_direction
+            )
+            row.shadow_evaluation_error = shadow_evaluation_error
             row.invocation_triggers_json = _canonical_json(
                 list(invocation_triggers)
             )

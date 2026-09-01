@@ -554,6 +554,47 @@ def test_context_resolution_request_reference_columns_are_additive_and_nullable(
         ).fetchone() == (None, None, None, None)
 
 
+def test_context_resolution_shadow_columns_are_additive_and_nullable(tmp_path):
+    expected = {
+        "shadow_would_trigger": "BOOLEAN",
+        "shadow_conditions_json": "TEXT",
+        "shadow_agrees_with_authoritative": "BOOLEAN",
+        "shadow_disagreement_direction": "VARCHAR(32)",
+        "shadow_evaluation_error": "VARCHAR(128)",
+    }
+    for name, sql_type in expected.items():
+        assert SQLITE_COMPAT_COLUMNS["context_resolution_attempts"][name] == (
+            "ALTER TABLE context_resolution_attempts "
+            f"ADD COLUMN {name} {sql_type}"
+        )
+
+    database_path = tmp_path / "legacy-context-shadow.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE context_resolution_attempts "
+            "(id INTEGER PRIMARY KEY, status VARCHAR(32) NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO context_resolution_attempts (id, status) "
+            "VALUES (93, 'completed')"
+        )
+
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        columns = {
+            row[1] for row in connection.execute(
+                "PRAGMA table_info(context_resolution_attempts)"
+            )
+        }
+        assert set(expected) <= columns
+        assert connection.execute(
+            "SELECT shadow_would_trigger, shadow_conditions_json, "
+            "shadow_agrees_with_authoritative, "
+            "shadow_disagreement_direction, shadow_evaluation_error "
+            "FROM context_resolution_attempts WHERE id=93"
+        ).fetchone() == (None, None, None, None, None)
+
+
 def test_runtime_incident_table_is_added_to_an_existing_database(tmp_path):
     database_path = tmp_path / "legacy.db"
     with sqlite3.connect(database_path) as connection:
