@@ -1284,3 +1284,151 @@ This is a **code + nullable L3 schema migration + deployment** change. It is pur
 The per-chat totals independently sum to 4,307 attempts, 5,987 provider requests, 597 material changes and two strict trade impacts. The two impacts were manually cross-checked against candidate/event timestamps and direct raw-message lineage. All 56 R1 component rows passed canonical-byte equality. The legacy material-change query remains 580 on `id <= 4245`.
 
 The main limitations are substantive, not formatting details: only 0.97% of historical context provider requests have true usage; only two strict trade impacts exist; prevented trades have no counterfactual outcome; one legacy explicit reference was not present in its stored request; and a current model citation cannot be known before the current call. These limitations prohibit a whitelist removal claim, a production window cutover, or a precise main/context billing ratio from this dataset alone.
+
+## 15. 目标消歧与语义消歧：只读分层抽样（2026-09-01）
+
+### 15.1 快照、口径与结论
+
+本节只读。生产 SQLite 以 URI mode=ro 打开，并在一个只读事务中固定快照；没有修改代码、设置、白名单、词表、阈值、prompt、数据库、release、服务或交易所状态。
+
+- 历史分组沿用已验收的 legacy cohort：context_resolution_attempts.id <= 4245，共 4,245 次 attempt。这样 92.01% 的 multiple_same_source_candidates 与既有 580 次实质改变口径不会漂移。
+- 最近样本固定在 2026-09-01T10:51:37.595Z：context_resolution_attempts.id <= 4313、raw_messages.id <= 14264。
+- 八个触发器互不排斥，因此各组之和会超过 attempt 总数。
+- “语义消歧”定义为第一层与最终结果的动作族不同：new / manage / cancel / exit / no_action；“目标消歧”定义为动作族相同且属于管理类，但 target thread 集合改变。reason 文案变化不算实质改变。
+- legacy 行没有真实 provider usage。其 token 只用当前 64 条 R1 实测 provider 请求校准：962,069 tokens / 2,649,223 canonical request bytes = **0.3631514 token/B**。下文明确标为“代理”，不是账单或实测 token。
+
+按触发器统计的最终决策如下。单元格为“次数（占该触发器 attempt）”；missing 表示没有 decision_json。
+
+| 触发器 | new | revise | manage | cancel | exit | hold | unresolved | missing |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| multiple_same_source_candidates（3,906） | 125 (3.2%) | 59 (1.5%) | 269 (6.9%) | 12 (0.3%) | 88 (2.3%) | 1,392 (35.6%) | 563 (14.4%) | 1,398 (35.8%) |
+| management_without_exact_target（533） | 3 (0.6%) | 0 | 46 (8.6%) | 6 (1.1%) | 22 (4.1%) | 33 (6.2%) | 270 (50.7%) | 153 (28.7%) |
+| entered_holder_language（515） | 26 (5.0%) | 9 (1.7%) | 142 (27.6%) | 2 (0.4%) | 18 (3.5%) | 65 (12.6%) | 118 (22.9%) | 135 (26.2%) |
+| revision_language（208） | 12 (5.8%) | 9 (4.3%) | 30 (14.4%) | 2 (1.0%) | 4 (1.9%) | 55 (26.4%) | 18 (8.7%) | 78 (37.5%) |
+| text_image_conflict（93） | 4 (4.3%) | 1 (1.1%) | 2 (2.2%) | 0 | 2 (2.2%) | 28 (30.1%) | 11 (11.8%) | 45 (48.4%) |
+| apparent_entry_may_be_revision（70） | 36 (51.4%) | 16 (22.9%) | 4 (5.7%) | 0 | 0 | 1 (1.4%) | 2 (2.9%) | 11 (15.7%) |
+| cancellation_language（17） | 0 | 0 | 1 (5.9%) | 1 (5.9%) | 1 (5.9%) | 1 (5.9%) | 7 (41.2%) | 6 (35.3%) |
+| reply_target_disagreement（7） | 0 | 0 | 4 (57.1%) | 0 | 0 | 0 | 3 (42.9%) | 0 |
+
+### 15.2 multiple_same_source_candidates 到底在做什么
+
+对 3,906 次调用的互斥拆分为：
+
+| 结果类别 | attempts | 占 3,906 | token（代理） | 占该组 token |
+|---|---:|---:|---:|---:|
+| **目标消歧**：动作族不变，只改变目标 thread | 60 | **1.54%** | 2.182M | 1.33% |
+| **语义消歧**：改变“是不是动作 / 是什么动作” | 414 | **10.60%** | 13.763M | 8.39% |
+| 目标确认：第一层目标与最终目标相同 | 215 | 5.50% | 5.264M | 3.21% |
+| 语义未变 / 其他 | 1,819 | 46.57% | 51.325M | 31.28% |
+| 无最终决策 | 1,398 | 35.79% | 91.551M | 55.79% |
+| **合计** | **3,906** | **100%** | **164.085M** | **100%** |
+
+在 474 次实质改变内部，严格目标消歧只有 **60 / 474 = 12.66%**，语义消歧为 **414 / 474 = 87.34%**。所以：
+
+1. 触发判据确实只是 len(candidates) > 1，它描述的是“存在目标歧义的可能”，不等于模型最终只做目标选择。
+2. 历史结果不支持把整个 multiple_same_source_candidates 解释成纯目标路由：真正改变结果的调用里，大多数改变了动作族。
+3. 反过来，3,217 次“未改变或无决策”也不能据此认定上下文必需。日志能证明结果差异，不能提供“如果不用完整上下文会怎样”的因果反事实；这正是下面人工标注与后续 replay 要补的证据。
+
+### 15.3 最近优先、按触发器分层的 60 条人工标注清单
+
+抽样先取快照内最近 60 个不同 raw_message_id，再以最少替换补齐稀有触发器；因此它是“最近优先的分层样本”，不是严格连续的最后 60 条。边际覆盖为：multiple 58、management_without_exact_target 10、entered_holder_language 7、revision_language 3、text_image_conflict 2，其余三个稀有触发器各 1。触发器非互斥；稀有组被有意过采样，不能用此样本计算总体触发率。
+
+60 条中，53 条有真实 usage（合计 816,427 tokens），7 条只能用上述字节代理（约 182,714 tokens）。按既有改变口径，样本含 12 条语义消歧、1 条目标消歧、7 条目标确认、40 条语义未变/其他。该分布同样只用于标注材料，不是总体率估计。
+
+| # | attempt / raw / chat / time | 原始消息与图片摘要 | 触发器 / 候选数 | 第一层 → 上下文后 | 改变分型 | token / 请求字节 | 所有者标注 |
+|---:|---|---|---|---|---|---|---|
+| 1 | 4313 / 14264<br>币圈所长会员群-11分组<br>2026-09-01 10:43:29.000000Z | 📣 因为比特币提前反弹了一波 这个77450 咱们先不做了 我看77200可能更精准一点，以太币不用改<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / cancel_entry / life=1038<br>→ cancel_thread / threads=[407] / cancel_pending_entry | **否**；目标确认 | 实测 26,244<br>74,102 B × 1 = 74,102 B | □ 是 / □ 否<br>备注：____ |
+| 2 | 4312 / 14263<br>币圈所长会员群-11分组<br>2026-09-01 10:42:54.000000Z | 比特币 在这就反弹了 78450附近 空一下<br>止损：15分钟有效突破78800<br>止盈：78000-77800-77450-77200 剩余尾仓如果成功空下来 就继续持有等派发<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：图表中标注价格点78456.1，与文本入场价格'78450附近'相关。；比特币价格走势图，显示下降趋势线与关键价位水平线，并有红色箭头指示潜在走势。 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br>候选 **6** | 是策略 / none<br>→ new_thread / threads=[] | **否**；语义未变/其他 | 实测 23,345<br>65,803 B × 1 = 65,803 B | □ 是 / □ 否<br>备注：____ |
+| 3 | 4311 / 14262<br>舒琴会员群-11分组<br>2026-09-01 10:27:22.000000Z | [空文本]<br>**媒体：** 有图 1 张；order_screenshot：0.0089；限价单 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 19,210<br>53,076 B × 1 = 53,076 B | □ 是 / □ 否<br>备注：____ |
+| 4 | 4310 / 14261<br>舒琴会员群-11分组<br>2026-09-01 10:27:22.000000Z | 跌跌跌，比特币怎么还不涨？Sol竟然都跌了10%了，还会继续跌吗，谈谈币圈后续走势。<br>1. 首先就是大家最关心的：币圈后面怎么走。说实话，现在比特币走势已经是超乎想象的强劲，短期暴涨30%后，竟然横盘一周都没有什么回调，这本身是一个强势的信号。那后面会怎么走？<br>2. 我个人认为，比特币可能会回踩一下继续涨，最好是回踩一下7.5万支撑，这样走势才会完美。现在一直在上面高位横盘，上不去也下不来，这种行情我不是很喜欢，但是也必须接受。因为币圈走势他不止是上涨和下跌，还有第三种走势：横盘！<br>3. 这里面除了7.5万强支撑外，小支撑可以留意7.7万，这里可以现货买点，合约的话 只能低倍操作，而阻力的话则是8.1万附近。行情要重启就必须要先消化完获利盘，这样才会继续进行。现在比较稳定的操作是做空原油，这个舒琴昨天讲过，就不重复了。<br>4. 那虽然比特币横盘没怎么跌，但是各个小币倒是如期回调，我非常喜欢，比如Sol已经回调了差不多10%，而Pengu双顶后更是跌了近20%！这个舒琴可是明确让大家逃顶Pengu的，欸，那现在都可以逢低接回~<br>5. 所以如图所示，舒琴在0.01逃顶Pengu后，现在在0.008附近开始重新分批买入。这来回一倒腾，又多赚了20%。所以炒币不用慌，跟着本琴慢慢来就好了，每天猛猛操作~<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；order_screenshot：0.009888；限价单 | <code>multiple_same_source_candidates</code><br><code>text_image_conflict</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 19,633<br>54,573 B × 1 = 54,573 B | □ 是 / □ 否<br>备注：____ |
+| 5 | 4309 / 14260<br>币圈所长会员群-11分组<br>2026-09-01 10:23:35.000000Z | XAU 已经上下磨了好几遍了，现在开始反弹奔着第一止盈点来，各位可以适当设个保护，因为所长看到左边有个针插过一次，怕后面不够强<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：图表显示XAU价格走势，标注水平线如4420.5、4402.3、4391.9，无具体交易策略参数；水印文字'币圈博主联盟策略实时搬运群 电报:@Tarderfengge QQ:158241758' | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 25,333<br>71,524 B × 1 = 71,524 B | □ 是 / □ 否<br>备注：____ |
+| 6 | 4308 / 14259<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 10:14:32.000000Z | 兄弟们，跟上节奏，直接进场‼️<br>🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ manage_thread / threads=[413] | **是**；语义消歧 | 实测 20,206<br>55,718 B × 1 = 55,718 B | □ 是 / □ 否<br>备注：____ |
+| 7 | 4307 / 14256<br>米哥会员群-11分组<br>2026-09-01 09:50:48.000000Z | eth和btc都抵达了周线级别boll上轨压力<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 12,007<br>35,562 B × 1 = 35,562 B | □ 是 / □ 否<br>备注：____ |
+| 8 | 4306 / 14255<br>米哥会员群-11分组<br>2026-09-01 09:50:38.000000Z | [空文本]<br>**媒体：** 有图 1 张；market_chart：ETH/USDT；2,452.56 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 11,837<br>34,159 B × 1 = 34,159 B | □ 是 / □ 否<br>备注：____ |
+| 9 | 4305 / 14254<br>米哥会员群-11分组<br>2026-09-01 09:50:38.000000Z | [空文本]<br>**媒体：** 有图 1 张；market_chart：Bitget交易界面；BTCUSDT | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 11,369<br>32,574 B × 1 = 32,574 B | □ 是 / □ 否<br>备注：____ |
+| 10 | 4304 / 14253<br>米哥会员群-11分组<br>2026-09-01 09:48:37.000000Z | https://fxtwitter.com/tradermige/status/2094721376947142725?s=46&t=KKMiMVU2m4rrdItyJ97y2Q<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：VIP策略群联系、返佣信息等广告文本；TradingView (Trader 米哥) | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 10,978<br>31,544 B × 1 = 31,544 B | □ 是 / □ 否<br>备注：____ |
+| 11 | 4303 / 14252<br>币圈所长会员群-11分组<br>2026-09-01 09:24:41.000000Z | 🔔🔔所长第23期集训班开始招生了，<br>活动到9月10日，有意向学习提升的同学<br>✍️可以联系 所长<br>🟢投资自己是最好的投资！💵<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；advertisement：图片中无任何交易策略参数（如入场、止损、止盈）或相关标识；所长课堂第23期集训班宣传图，包括课程介绍（K线几何形态学教学班）、价格（活动价588U）、上课时间等，为广告内容 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 23,762<br>67,560 B × 1 = 67,560 B | □ 是 / □ 否<br>备注：____ |
+| 12 | 4302 / 14251<br>币圈所长会员群-11分组<br>2026-09-01 09:10:29.000000Z | 止损：15分钟叠穿4360 止损给的小一点<br>止盈：4400-4420-4455<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ unresolved / threads=[] | **否**；语义未变/其他 | 实测 23,712<br>64,832 B × 1 = 64,832 B | □ 是 / □ 否<br>备注：____ |
+| 13 | 4301 / 14250<br>币圈所长会员群-11分组<br>2026-09-01 09:08:44.000000Z | XAU 在这多一下 试试<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：图表显示XAU价格走势，标注价格点如4373.0、4378.2、4380.6，但未包含交易策略参数（入场、止损、止盈）；水印文字'币圈博主联盟策略实时搬运群 电报:@Tarderfengge QQ:158241758' | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ unresolved / threads=[] | **否**；语义未变/其他 | 实测 22,353<br>63,365 B × 1 = 63,365 B | □ 是 / □ 否<br>备注：____ |
+| 14 | 4300 / 14249<br>比特币陈哥会员群-11分组<br>2026-09-01 09:08:14.000000Z | 限价挂单不要去整数，区间入场正常仓位操作。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 16,923<br>51,507 B × 1 = 51,507 B | □ 是 / □ 否<br>备注：____ |
+| 15 | 4299 / 14246<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 08:39:48.000000Z | 🔥到成本价附近直接出局！<br>🔥观察一下行情再进场！<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / exit_position / life=1040<br>→ exit_thread / threads=[409] / exit_full | **否**；目标确认 | 实测 17,754<br>50,302 B × 1 = 50,302 B | □ 是 / □ 否<br>备注：____ |
+| 16 | 4298 / 14245<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 08:39:40.000000Z | [空文本]<br>**媒体：** 有图 1 张；market_chart：77947.0；0.0079% | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 16,288<br>48,434 B × 1 = 48,434 B | □ 是 / □ 否<br>备注：____ |
+| 17 | 4297 / 14243<br>大漂亮社区 11分组<br>2026-09-01 08:33:20.000000Z | 🧛‍♂️分析师—#Nick<br>大饼77800附近可以止盈30%先<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / position_update / partial_take_profit<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 8,830<br>20,832 B × 1 = 20,832 B | □ 是 / □ 否<br>备注：____ |
+| 18 | 4296 / 14241<br>米娅 vip会员群 11分组<br>2026-09-01 08:22:50.000000Z | 等下笔信号！<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 7,221<br>16,957 B × 1 = 16,957 B | □ 是 / □ 否<br>备注：____ |
+| 19 | 4295 / 14240<br>米娅 vip会员群 11分组<br>2026-09-01 08:22:43.000000Z | 这两天行情整体还是偏震荡，波动空间比较小，短线操作有利润就先落袋为安，不必过度恋战。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 6,348<br>15,495 B × 1 = 15,495 B | □ 是 / □ 否<br>备注：____ |
+| 20 | 4294 / 14239<br>米娅 vip会员群 11分组<br>2026-09-01 08:19:58.000000Z | BTC现价78100，加仓仓位比较大，等效获利1000点，全部仓位止盈出局！<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：78109.5；市场K线图，显示价格在78109.5附近 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / exit_position / full_exit<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 7,622<br>14,886 B × 1 = 14,886 B | □ 是 / □ 否<br>备注：____ |
+| 21 | 4293 / 14220<br>米娅 vip会员群 11分组<br>2026-09-01 05:40:15.000000Z | BTC现价79200附近，可加仓同等仓位，入场均价78600<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / position_update / add_position<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 6,351<br>12,088 B × 1 = 12,088 B | □ 是 / □ 否<br>备注：____ |
+| 22 | 4292 / 14237<br>比特币军长-11分组<br>2026-09-01 07:32:06.000000Z | 💰如上图，最好是三角震荡直接向上突破，如往下破的话不知多深，止损设好；💰<br>---------------<br>当前参考价格：<br>BTC：78780<br>ETH：2475<br>---------------<br>军长禁言群免费进，电报联系<br>仅为市场观点分享，不构成任何交易建议。<br>不承诺收益，请理性判断并自行承担风险。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 13,623<br>41,081 B × 1 = 41,081 B | □ 是 / □ 否<br>备注：____ |
+| 23 | 4291 / 14236<br>比特币军长-11分组<br>2026-09-01 07:32:04.000000Z | 如上图，最好是三角震荡直接向上突破，如往下破的话不知多深，止损设好；<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 12,617<br>37,232 B × 1 = 37,232 B | □ 是 / □ 否<br>备注：____ |
+| 24 | 4290 / 14234<br>比特币军长-11分组<br>2026-09-01 07:29:40.000000Z | 💰比特止损设77000，以太止损设2400；如打到不重启💰<br>---------------<br>当前参考价格：<br>BTC：78758<br>ETH：2475<br>---------------<br>军长禁言群免费进，电报联系<br>仅为市场观点分享，不构成任何交易建议。<br>不承诺收益，请理性判断并自行承担风险。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / none<br>→ unresolved / threads=[] | **否**；语义未变/其他 | 实测 12,500<br>35,559 B × 1 = 35,559 B | □ 是 / □ 否<br>备注：____ |
+| 25 | 4289 / 14233<br>比特币军长-11分组<br>2026-09-01 07:29:39.000000Z | 比特止损设77000，以太止损设2400；如打到不重启<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / none<br>→ unresolved / threads=[] | **否**；语义未变/其他 | 实测 12,108<br>32,619 B × 1 = 32,619 B | □ 是 / □ 否<br>备注：____ |
+| 26 | 4288 / 14224<br>币圈所长会员群-11分组<br>2026-09-01 05:52:01.000000Z | 比特币 突破这个趋势线以后，还是没有下探让我们去做多，那各位就要注意今天视频讲的，积累了空头，会不会上去再打流动性 这个位置 还是可以参考80150这里，先注意一下<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：图表中黄色虚线标注阻力位在80000-80500附近，与文本提及的80150水平相关；比特币价格走势图，显示趋势线、关键水平线（如80000-80500区域）和红色箭头指示潜在走势 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 22,821<br>61,906 B × 1 = 61,906 B | □ 是 / □ 否<br>备注：____ |
+| 27 | 4287 / 14223<br>米哥会员群-11分组<br>2026-09-01 05:45:15.000000Z | [空文本]<br>**媒体：** 有图 1 张；unrelated | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 9,572<br>27,618 B × 1 = 27,618 B | □ 是 / □ 否<br>备注：____ |
+| 28 | 4286 / 14222<br>米哥会员群-11分组<br>2026-09-01 05:45:05.000000Z | 为了9月盯盘为大家更好的服务，我买入了新装备<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 9,208<br>26,463 B × 1 = 26,463 B | □ 是 / □ 否<br>备注：____ |
+| 29 | 4284 / 14219<br>大镖客 11分组<br>2026-09-01 05:39:59.000000Z | 大镖客·Andy<br>跟分析完全一样<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 13,512<br>38,531 B × 1 = 38,531 B | □ 是 / □ 否<br>备注：____ |
+| 30 | 4283 / 14217<br>米娅 vip会员群 11分组<br>2026-09-01 05:39:57.000000Z | 止损位上移300点，重设为79700<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / position_update / move_stop_loss<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 6,051<br>10,593 B × 1 = 10,593 B | □ 是 / □ 否<br>备注：____ |
+| 31 | 4282 / 14218<br>大镖客 11分组<br>2026-09-01 05:39:56.000000Z | 大镖客·Andy<br>现价进场注意保护利润，注意79200附近压力位，78800突破站稳4个小时可以继续反弹<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：79089.9；24h high: 79230.8, low: 77645.9 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / position_update / life=1041<br>→ manage_thread / threads=[410] / move_stop_to_protect | **否**；目标确认 | 实测 14,887<br>38,177 B × 1 = 38,177 B | □ 是 / □ 否<br>备注：____ |
+| 32 | 4281 / 14215<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 05:38:00.000000Z | 分享盈利给我，我看看大家并仓的均价在哪里？<br>❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️❤️<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 17,221<br>51,570 B × 1 = 51,570 B | □ 是 / □ 否<br>备注：____ |
+| 33 | 4280 / 14214<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 05:37:46.000000Z | 🔥现目前两笔多单分别获利：1500+600点！<br>🔥持仓收益达到200％➕90％！<br>分批止盈50％！！！<br>推保护价：78000！(成本价)<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / position_update / life=1040 / partial_take_profit, move_stop_to_protect<br>→ manage_thread / threads=[409] / partial_take_profit | **否**；目标确认 | 实测 18,693<br>51,448 B × 1 = 51,448 B | □ 是 / □ 否<br>备注：____ |
+| 34 | 4278 / 14213<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 05:37:01.000000Z | [空文本]<br>**媒体：** 有图 1 张；market_chart：+1.38%；79058.5 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 16,481<br>48,481 B × 1 = 48,481 B | □ 是 / □ 否<br>备注：____ |
+| 35 | 4277 / 14212<br>提阿非罗 初塔 11分组<br>2026-09-01 05:32:58.000000Z | #tia<br>目前盤口是明顯看漲的<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：78915.6；1h | <code>text_image_conflict</code><br>候选 **0** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 4,800<br>10,580 B × 1 = 10,580 B | □ 是 / □ 否<br>备注：____ |
+| 36 | 4276 / 14211<br>三马哥会员群-11分组<br>2026-09-01 04:51:54.000000Z | https://app.binance.com/uni-qr/cspa/45233639565673?l=zh-CN&r=SDR9QGU2&source=host_share&uc=web_square_share_link&us=telegram<br>“我正在币安广场收听语音直播“BTC冲8万”，和我一起在此处收听：…”<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：BTCUSDT；用户评论如'你咋贷的款'、'香港90平就是豪宅吗'、'马哥赚钱能力强'等，内容为闲聊，非策略指令。 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 23,719<br>66,785 B × 1 = 66,785 B | □ 是 / □ 否<br>备注：____ |
+| 37 | 4275 / 14210<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 04:23:05.000000Z | 🔥现目前两笔多单分别获利：1200+300点！<br>🔥持仓收益达到180％➕40％！<br>多单继续持有，等待今日份拉升！<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / position_update / life=1040 / hold<br>→ manage_thread / threads=[409] / hold_update | **否**；目标确认 | 实测 16,587<br>46,547 B × 1 = 46,547 B | □ 是 / □ 否<br>备注：____ |
+| 38 | 4274 / 14209<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 04:22:18.000000Z | [空文本]<br>**媒体：** 有图 1 张；market_chart：+1.45%；78707.7 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 15,065<br>43,955 B × 1 = 43,955 B | □ 是 / □ 否<br>备注：____ |
+| 39 | 4273 / 14208<br>三马哥会员群-11分组<br>2026-09-01 04:07:42.000000Z | BTC  做多     仓位思路强平控制U及以下55000U及以下<br>78650附近市价直接进  100倍 2%保证金<br>再挂77188 100倍 3%保证金<br>第一止盈 80288 止盈70%移动保本<br>第二止盈81388<br>止损75000<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br>候选 **11** | 是策略 / none<br>→ new_thread / threads=[] | **否**；语义未变/其他 | 实测 21,278<br>58,034 B × 1 = 58,034 B | □ 是 / □ 否<br>备注：____ |
+| 40 | 4272 / 14207<br>大镖客 11分组<br>2026-09-01 03:52:03.000000Z | 大镖客·Andy<br>https://youtu.be/MBNfDrYWudA<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：20260901；比特币图标 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 13,541<br>35,475 B × 1 = 35,475 B | □ 是 / □ 否<br>备注：____ |
+| 41 | 4271 / 14204<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 02:55:12.000000Z | 兄弟们，跟上节奏，直接进场‼️<br>🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️🏎️<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / entry_confirm / life=1040<br>→ manage_thread / threads=[409] | **是**；语义消歧 | 实测 17,899<br>48,171 B × 1 = 48,171 B | □ 是 / □ 否<br>备注：____ |
+| 42 | 4270 / 14196<br>欧阳火箭滚仓班🚀 11分组<br>2026-09-01 02:26:19.000000Z | 🔥本轮多单最大获利1700点！🔥<br>🔥持仓收益达到230％！！！🔥<br>继续推保护价持仓：77500！！！<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **2** | 非策略 / position_update / move_stop_to_protect<br>→ manage_thread / threads=[409] / move_stop_to_protect | **是**；目标消歧 | 实测 14,653<br>43,089 B × 1 = 43,089 B | □ 是 / □ 否<br>备注：____ |
+| 43 | 4267 / 14193<br>比特币军长-11分组<br>2026-09-01 02:17:41.000000Z | 💰CRV多单止盈💰<br>---------------<br>当前参考价格：<br>CRV：0.3482<br>---------------<br>军长禁言群免费进，电报联系<br>仅为市场观点分享，不构成任何交易建议。<br>不承诺收益，请理性判断并自行承担风险。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / exit_position<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 21,494<br>29,840 B × 2 = 59,680 B | □ 是 / □ 否<br>备注：____ |
+| 44 | 4266 / 14201<br>比特币军长-11分组<br>2026-09-01 02:50:08.000000Z | [空文本]<br>**媒体：** 有图 1 张；profit_review：币圈博主跟单策略实时搬运群 @Tarderfengge QQ:158241758；CRV多单盈利 \| 现货涨幅 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / exit_position<br>→ hold / threads=[] | **是**；语义消歧 | 实测 10,998<br>31,091 B × 1 = 31,091 B | □ 是 / □ 否<br>备注：____ |
+| 45 | 4265 / 14200<br>币圈所长会员群-11分组<br>2026-09-01 02:45:26.000000Z | https://youtu.be/CkJt8GCVAmU?si=824Ihlz4aOECZdW1<br>#比特幣 #比特币 #以太幣 #以太坊 #btc #eth #bitcoin #美股<br>比特幣高位繼續盤整 \| BTC小級別會不會積累流動性去打 \| 以太幣衝土狗導致變強？\|<br>比特币高位继续盘整 \| BTC小级别会不会积累流动性去打 \| 以太币冲土狗导致变强？\|<br>所长课堂公开频道：https://t.me/suozhangteac...<br>— 币圈所长课堂<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；advertisement：卡通人物和问号，表示疑问，无具体策略信息；比特币卡住了！现在做多还是做空？关键点位别做错 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 21,612<br>60,418 B × 1 = 60,418 B | □ 是 / □ 否<br>备注：____ |
+| 46 | 4264 / 14199<br>币圈所长会员群-11分组<br>2026-09-01 02:43:58.000000Z | 【大饼怎么吃？人怎么活？-哔哩哔哩直播】 https://b23.tv/7xaaTj1<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 19,683<br>54,763 B × 1 = 54,763 B | □ 是 / □ 否<br>备注：____ |
+| 47 | 4263 / 14198<br>币圈所长会员群-11分组<br>2026-09-01 02:43:58.000000Z | 哔哩哔哩（bilibili）直播，在这里看见最年轻的生活方式，学习、游戏、电竞、宅舞、唱见、绘画、美食等等应有尽有，快来捕捉你最喜欢的up主最真实的一面吧！弹幕，礼物，道具，活动多种玩法，bilibili 直播让您拉进与小伙伴们之间的距离。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 19,851<br>54,208 B × 1 = 54,208 B | □ 是 / □ 否<br>备注：____ |
+| 48 | 4262 / 14197<br>币圈所长会员群-11分组<br>2026-09-01 02:43:56.000000Z | 直播来聊会<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 18,576<br>50,340 B × 1 = 50,340 B | □ 是 / □ 否<br>备注：____ |
+| 49 | 4259 / 14192<br>比特币军长-11分组<br>2026-09-01 02:17:39.000000Z | CRV多单止盈<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / exit_position<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 10,134<br>27,347 B × 1 = 27,347 B | □ 是 / □ 否<br>备注：____ |
+| 50 | 4258 / 14188<br>比特币飞扬 11分组<br>2026-09-01 01:54:29.000000Z | [空文本]<br>**媒体：** 有图 1 张；position_screenshot：@Tarderfengge QQ:158241758；partial_take_profit, move_stop_to_protect | <code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **5** | 非策略 / position_update / partial_take_profit, move_stop_to_protect<br>→ unresolved / threads=[] | **是**；语义消歧 | 实测 11,356<br>29,696 B × 1 = 29,696 B | □ 是 / □ 否<br>备注：____ |
+| 51 | 4257 / 14187<br>比特币飞扬 11分组<br>2026-09-01 01:52:41.000000Z | [空文本]<br>**媒体：** 有图 1 张；advertisement：@Tarderfengge QQ:158241758；https://youtu.be/Ho8lnbUvxbU?si=oAJXRKs2lQ1l6JID | <code>multiple_same_source_candidates</code><br>候选 **5** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 9,874<br>27,225 B × 1 = 27,225 B | □ 是 / □ 否<br>备注：____ |
+| 52 | 4256 / 14185<br>币圈所长会员群-11分组<br>2026-09-01 01:30:56.000000Z | 🔔 提醒一下可能有些新同学刚来的，我们策略盈利以后，接近第一止盈了以后，建议各位就止盈5层以上，然后设置成本保护，这是最稳妥的方式，后面可以选择5-2-2-1，当然最稳的同学你就直接仓位9-1就完事了。<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **20** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 19,704<br>53,955 B × 1 = 53,955 B | □ 是 / □ 否<br>备注：____ |
+| 53 | 4255 / 14184<br>米哥会员群-11分组<br>2026-09-01 01:14:03.000000Z | 我今早去看奥德赛了，分析下午随缘出<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 实测 8,983<br>25,417 B × 1 = 25,417 B | □ 是 / □ 否<br>备注：____ |
+| 54 | 4247 / 14162<br>大镖客 11分组<br>2026-08-31 17:46:39.000000Z | 大镖客·Andy<br>买入卖出、分歧点信号已在Bitget更新，及时查看当前信号！<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>revision_language</code><br>候选 **1** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 代理约 11,361<br>31,285 B × 1 = 31,285 B | □ 是 / □ 否<br>备注：____ |
+| 55 | 4237 / 13864<br>比特币军长-11分组<br>2026-08-29 23:13:35.000000Z | 今日无视频更新<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>revision_language</code><br><code>multiple_same_source_candidates</code><br>候选 **4** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 代理约 18,661<br>51,385 B × 1 = 51,385 B | □ 是 / □ 否<br>备注：____ |
+| 56 | 4234 / 13848<br>欧阳火箭滚仓班🚀 11分组<br>2026-08-29 15:12:54.000000Z | 🔥设置好止盈止损持仓过夜！🔥<br>止盈位：73070！！！<br>止损位：78700！！！<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br>候选 **5** | 非策略 / position_update / life=1030 / set_stop_loss, set_take_profit<br>→ manage_thread / threads=[399] / risk_update | **否**；目标确认 | 代理约 33,519<br>92,299 B × 1 = 92,299 B | □ 是 / □ 否<br>备注：____ |
+| 57 | 4218 / 13827<br>大镖客 11分组<br>2026-08-29 14:05:41.000000Z | 大镖客·Andy<br>bg信号已更新，现在分歧点在77600，横盘震荡被磨成了买入信号，短期内注意分歧点的情况，站稳1个小时则有概率延续买入信号，只有跌破才会再次转为卖出<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>revision_language</code><br><code>multiple_same_source_candidates</code><br>候选 **3** | 非策略 / none<br>→ hold / threads=[] | **否**；语义未变/其他 | 代理约 18,330<br>50,475 B × 1 = 50,475 B | □ 是 / □ 否<br>备注：____ |
+| 58 | 4194 / 13792<br>三马哥会员群-11分组<br>2026-08-29 07:05:41.000000Z | BTC 中线 做空     仓位思路强平控制在95000U及以上<br>77480附近市价直接空 100倍 3%保证金<br>再挂78888  100倍 3%保证金<br>第一止盈76688 止盈70%仓位移动保本损<br>第二止盈75188<br>第三止盈72000<br>止损79800<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>entered_holder_language</code><br><code>multiple_same_source_candidates</code><br><code>apparent_entry_may_be_revision</code><br>候选 **4** | 是策略 / none<br>→ revise_thread / threads=[403] | **是**；语义消歧 | 代理约 53,266<br>146,676 B × 1 = 146,676 B | □ 是 / □ 否<br>备注：____ |
+| 59 | 4170 / 13749<br>比特智 智哥 11分组<br>2026-08-28 21:42:39.000000Z | 空单挂单取消，多上去再找机会空，最近的止盈和方向感无敌了，只是我们过于保守了！<br>@Tarderfengge QQ:158241758<br>**媒体：** 无图 | <code>cancellation_language</code><br><code>management_without_exact_target</code><br><code>multiple_same_source_candidates</code><br>候选 **9** | 非策略 / cancel_entry<br>→ unresolved / threads=[] | **是**；语义消歧 | 代理约 20,512<br>56,483 B × 1 = 56,483 B | □ 是 / □ 否<br>备注：____ |
+| 60 | 1673 / 11430<br>三马哥会员群-11分组<br>2026-08-18 14:59:34.000000Z | 走70%仓位利润，多单吃大肉了，汇报！#ET H<br>@Tarderfengge QQ:158241758<br>**媒体：** 有图 1 张；market_chart：ETHUSDT 1,913.53；ETH | <code>multiple_same_source_candidates</code><br><code>reply_target_disagreement</code><br>候选 **20** | 非策略 / position_update / life=713 / partial_take_profit<br>→ manage_thread / threads=[83] / partial_take_profit | **否**；目标确认 | 代理约 27,066<br>74,532 B × 1 = 74,532 B | □ 是 / □ 否<br>备注：____ |
+
+### 15.4 “仅目标消歧”精简 prompt 的量化上界
+
+按需求模拟“候选列表 + 回复链 + 当前消息，不含完整历史消息窗口”，同时保留其余非历史安全字段。只在事后已知为严格目标消歧的 60 次调用上计算：
+
+| 指标 | 现有完整请求 | 精简模拟 | 降幅 |
+|---|---:|---:|---:|
+| provider-request 加权字节 | 6,007,152 B | 890,141 B | **85.18%** |
+| token（同一代理率） | 2,181,502 | 323,253 | **85.18%** |
+| 35 天历史合计节省 | — | 1,858,249 tokens | 约 **53,093 tokens/日** |
+
+这是一个**事后上界**，不是可立即上线的节省。严格目标消歧只占 multiple 组 token 的 1.33%；即使这 60 次全部安全精简，对整个 multiple 历史 token 的净节省也只有约 **1.13%**。若人工把大量“目标确认”或“语义未变”样本也判定为只需精简上下文，机会会变大，但必须重新 replay，不能从当前 outcome 自动外推。
+
+主要风险：
+
+- “目标消歧”标签依赖完整模型调用后的结果，线上调用前并不知道某条消息会落入该类；用它直接路由会产生 look-ahead。
+- 候选摘要可能不足以表达策略 episode、时间顺序、代词指向、作者习惯或较早管理消息；省掉的历史可能正是选择正确 target 的证据。
+- 相同动作族不代表相同风险。选错 lifecycle 仍可能让管理或平仓语义作用到错误对象。
+- 当前 60 次只证明完整 prompt 的历史 outcome；不能证明精简 prompt 会生成相同 target、置信度、适用性与拒绝结果。
+
+在行为变更前至少需要：
+
+1. 对全部 60 次严格目标消歧历史调用做同模型、同参数的精简 prompt replay，要求 action family、target thread set、applicability 与 risk-reducing fanout **100% 一致**。
+2. 把 414 次语义消歧作为负对照，证明任何调用前 gate 都不会把它们误送到精简路径；否则节省没有安全意义。
+3. 对本节 60 条由所有者完成人工标注，先验证机器分型与领域判断是否一致。
+4. 生产只能先 shadow：完整 prompt 与旧决策继续权威，精简结果只记录差异；预先声明样本量与零 target/action 差异门槛。
+5. 任一目标、动作族、适用性或资金安全决策差异都使方案 fail closed，保留完整 prompt。
+
+分类建议：人工白名单调整属于**配置变更但会改变行为**；精简 prompt 与调用前 gate 属于**代码 + 部署 + 行为变更**；本节统计、标注与历史 replay 属于**只读分析**。本轮没有实施任何一项变更。
+
+### 15.5 交叉复核与限制
+
+同一固定 legacy cohort 由两条独立只读路径复核：SQLite 直接聚合得到 multiple=3906、有可比较决策 2,508、实质改变 474；Python 逐行分类得到语义改变 414、目标改变 60，两者精确相加为 474。八个触发器的 decision 分布逐行求和均等于各组 attempt；样本恰好 60 个不同 raw message，并覆盖全部八个触发器。
+
+限制仍然明确：legacy token 几乎全部是代理；触发器重叠导致各组 token 不可相加；最新 60 条是最近优先分层样本而非概率样本；模型 outcome 不能回答“完整上下文是否因果必需”；图片摘要来自已持久化识别证据，不是本轮重新识图。上述限制使本节足以区分“目标改变”和“动作族改变”，但不足以授权 prompt 精简、窗口变更或触发器调整。
