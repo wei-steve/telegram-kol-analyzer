@@ -3,7 +3,7 @@
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
 phase_state: blocked
-current_phase: r1_activation_blocked_candidate_identity_unverified
+current_phase: r1_activation_root_cause_confirmed_stale_monitor_env
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -297,7 +297,7 @@ Reuse the existing verified backup, integrity and `VACUUM` path. Production evid
 - The separate L3 schema step completed before staging. The verified root-owned mode-0600 backup is `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z/pre-r1-schema.db`, size 812,068,864 bytes, SHA-256 `da30f56e45ccc9d185d83c2d713ad5f2e3bf54cba8ff5ecedfd48aba5b78ea05`. It passed `PRAGMA quick_check=ok` and had zero foreign-key violations. The migration ran from an independent archive of reviewed code with `python -B`, under the runtime-control lock and one `BEGIN IMMEDIATE`; it did not import an immutable release or the mutable checkout.
 - Exactly the four R1 columns were added: `context_message_refs_json`, `candidate_thread_ids_json`, `rendered_prompt_sha256` and `request_component_sha256_json`. All 4,271 historical rows remained NULL in all four columns. Before/after counts were identical for `context_resolution_attempts=4271`, `execution_bindings=321`, `execution_events=3883`, `message_processing_jobs=2443`, `raw_messages=14204`, `recognition_decisions=14203`, `signal_candidates=2124` and `strategy_lifecycles=1038`; post-migration integrity remained clean. These additive nullable columns are retained under the approved rollback contract.
 - A fresh immutable runtime-only stage was created at exact pushed HEAD `4284d1a61226eb16812407c4f2489a207241db4c`, with `schema_changed=false`. Its tree is `0abf86970133f2d6d67bb21b42e9cd2436cf605d`, content SHA-256 `49ac8d529dcf3bdc2bf2e4951575413f26c84724862df9175be8c4ad4e72fe42`, manifest SHA-256 `81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167`, and stage action-plan SHA-256 `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`. No post-receipt command imported or executed release code.
-- The candidate monitor installer completed under the update lock after byte-preserving backups. The four installed base units matched the candidate by exact filename and SHA-256; the diagnostic-only arguments were present only on the diagnostic unit, retired arguments were absent, monitor env pointed to the candidate, and `systemd-analyze verify` passed. The monitor timer's prior enabled/active state was preserved.
+- The candidate monitor installer completed under the update lock after byte-preserving backups. The four installed base units matched the candidate by exact filename and SHA-256; the diagnostic-only arguments were present only on the diagnostic unit, retired arguments were absent, and `systemd-analyze verify` passed. The monitor timer's prior enabled/active state was preserved. The earlier claim that the effective monitor env pointed to the candidate is superseded by the read-only root-cause evidence below: `/etc/telegram-kol-monitor.env` still carried the rollback release at the failed invocation, and the prior gate did not capture the effective `EnvironmentFile=` precedence seen by `ExecStart`.
 - The pre-activation read-only price gate passed at `2026-09-01T03:13:02Z`: BTC-USDT-SWAP last was 78,444.2, with 80,510 and 81,110 respectively 2.633464% and 3.398339% above market. Neither distance was below 1%.
 - The activation manifest declared exactly web, monitor, ingest and worker, source mode `immutable`, rollback `18434b4552938ae3acb1160ad32618aab9c3ecf4`, `schema_changed=false`, no production-data mutation and no exchange-write semantics change. Its canonical nine-field authorization was root-owned, mode 0400, printed and preserved with the exact manifest before being consumed once; the activation action-plan SHA-256 was `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`.
 - Activation failed at the candidate deployment diagnostic and was not retried. The oneshot started and completed business-source collection, reporting `healthy=true`, `reason_codes=[]`, `adapter_failures=[]`, `sources_complete=true`, `result_complete=true` and `audit_ran=false`, but returned exit 1 because `loaded_artifact_verified=false`, `release_commit=null` and `manifest_sha256=null`. The exact unresolved blocker is therefore candidate runtime-identity proof, not a business-health reason. Per the fail-closed gate, the helper rejected the candidate and completed rollback to `18434b4552938ae3acb1160ad32618aab9c3ecf4` with exit code 4. No second activation, release repair or diagnostic workaround was attempted.
@@ -305,6 +305,95 @@ Reuse the existing verified backup, integrity and `VACUUM` path. Production evid
 - The final runtime is the rollback release: web PID 944570, ingest PID 944575 and worker PID 944565 all report release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, manifest `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`, `loaded_artifact_verified=true` and `entry_admission_frozen=false`. Web event-loop, ingest listener/reconcile, and worker command/message-processing health are true with zero observed stalls. Trading settings report `auto_trade_enabled=true`; monitor's rollback release drop-in names `18434b45...`, and its timer is enabled and active. R1 never became the running production release, so there is no live dual-write sample and no deployment-success claim.
 - The owner-provided order premise had already drifted before this activation. Final read-only evidence shows zero positions, zero regular open orders and zero pending BTC triggers. Both exact trigger IDs remain in exchange history with no fills and exchange `uTime=2026-09-01T02:02:38Z`, more than an hour before the `03:14–03:15Z` activation. Local state matches that earlier terminalization: lifecycle 1037 is `expired` with `exit_reason=expired` and `management_action=expiry_cancelled_and_expired`; binding 321 is `closed/entry_legs_terminal`; legs 555 and 556 are `cancelled`. This deployment did not submit, cancel or modify a Deepcoin order.
 - No Step 1 trigger backfill, Step 2 thread-ID backfill, Step 4 archive/marker transaction, `VACUUM`, R2 source cutover, setting change, prompt/threshold/window change, message replay or business-row repair was performed. Complete production evidence is rooted at `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z`.
+
+## R1 activation identity root cause — read-only diagnosis 2026-09-01
+
+This diagnosis did not start the diagnostic unit, retry activation, stage a release, modify a file or row, deploy, restart a service, or call Deepcoin. The failed process had already exited; its exact import path is reconstructed from the preserved unit command, the effective environment precedence, the journal's two process command lines and a collision-free filesystem check. No new process imported release code.
+
+### Candidate, receipt and manifest
+
+- Candidate release path and realpath are both `/opt/telegram-kol-releases/4284d1a61226eb16812407c4f2489a207241db4c`; the final directory name is the exact expected commit `4284d1a61226eb16812407c4f2489a207241db4c`. It remains a root-owned mode-0555 directory.
+- The candidate manifest's actual byte SHA-256 is `81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167`. The stage receipt records that exact value, and the consumed activation authorization binds the same candidate commit. The activation drop-in's generic `TELEGRAM_KOL_RELEASE_MANIFEST_SHA256` also carried this candidate value: the failed invocation's `ExecStartPre` could report `loaded_artifact_verified=true` for candidate `4284d1a6...` only after matching that manifest hash.
+- In contrast, `/etc/telegram-kol-monitor.env` carried monitor-specific rollback values at the failed invocation: path `/opt/telegram-kol-releases/18434b4552938ae3acb1160ad32618aab9c3ecf4`, commit `18434b4552938ae3acb1160ad32618aab9c3ecf4`, and manifest SHA-256 `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`. Its current SHA-256 exactly equals the byte-preserved pre-installer copy, and its inode ctime/mtime is `2026-09-01 11:12:20.115581316 +0800`, before the failed invocation began at `11:15:24 +0800`. Thus the stale values were already present during the failure, not introduced by the later rollback.
+- The complete candidate `.telegram-kol-release.json` is:
+
+```json
+{"action_manifest":{"action":"stage","authority_changed":true,"components":["web","monitor","ingest","worker"],"exchange_write_semantics_changed":false,"production_data_mutation":false,"requires_restart":true,"risk_level":"L2","schema_changed":false},"action_plan_sha256":"aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b","branch":"codex/deepcoin-auto-trading-v1","commit":"4284d1a61226eb16812407c4f2489a207241db4c","content_sha256":"49ac8d529dcf3bdc2bf2e4951575413f26c84724862df9175be8c4ad4e72fe42","contract":"immutable-release-v1","schema_version":1,"tree":"0abf86970133f2d6d67bb21b42e9cd2436cf605d"}
+```
+
+Its `contract`, `schema_version` and `commit` are exactly `immutable-release-v1`, `1` and `4284d1a61226eb16812407c4f2489a207241db4c`.
+
+### Effective unit command and environment
+
+The installed base unit has `EnvironmentFile=/etc/telegram-kol-monitor.env`. Its merged `ExecStart` is:
+
+```text
+/usr/bin/env PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src /opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research monitor-production-safety ${TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION} --expected-management-mode live --expected-entry-preamble-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE} --expected-entry-message-assembly-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE} --expected-entry-revision-v2-mode ${TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_REVISION_V2_MODE} --expected-max-concurrent-positions 4 --settings-url http://127.0.0.1:8000/api/trading-settings --message-operation-coverage-url http://127.0.0.1:8002/api/runtime-incidents/message-operation-coverage --live-position-sizes-url http://127.0.0.1:8002/api/runtime-incidents/live-position-sizes --contract-spec-health-url http://127.0.0.1:8002/api/runtime-incidents/contract-spec-health --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-monitor/state.json --lookback-minutes 35 --runtime-incident-capture-url http://127.0.0.1:8002/api/runtime-incidents/monitor-capture --disable-daily-management-audit --deployment-diagnostic
+```
+
+The identity-relevant effective environment for the failed main process was:
+
+```text
+TELEGRAM_KOL_RELEASE_COMMIT=4284d1a61226eb16812407c4f2489a207241db4c
+TELEGRAM_KOL_RELEASE_MANIFEST_SHA256=81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167
+TELEGRAM_KOL_MONITOR_RELEASE_PATH=/opt/telegram-kol-releases/18434b4552938ae3acb1160ad32618aab9c3ecf4
+TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=18434b4552938ae3acb1160ad32618aab9c3ecf4
+TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc
+PYTHONPATH=/opt/telegram-kol-releases/18434b4552938ae3acb1160ad32618aab9c3ecf4/src  # assigned by /usr/bin/env for ExecStart
+```
+
+The generic expected commit/hash came from the candidate activation drop-in and matched the stage receipt. The three monitor-specific values came from the stale env file and did not match. This precedence is not a guess: systemd reads `EnvironmentFile=` shortly before exec and explicitly specifies that its settings override `Environment=` settings; `${TELEGRAM_KOL_MONITOR_RELEASE_PATH}` is then expanded in `ExecStart`, and `/usr/bin/env` replaces `PYTHONPATH` for the main command. See the official [`systemd.exec` source](https://github.com/systemd/systemd/blob/main/man/systemd.exec.xml#L3314-L3321) and [`systemd.service` source](https://github.com/systemd/systemd/blob/main/man/systemd.service.xml#L1615-L1619). Unrelated environment values include production credentials and are intentionally not copied into this repository; all values consumed by the eight identity predicates are shown above.
+
+`ExecStartPre` did not contain the `/usr/bin/env PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src` override. It therefore imported candidate `runtime_deployment_identity.py` through the candidate generic `PYTHONPATH` and passed. The main console-script process did contain the override and imported:
+
+```text
+module_path=/opt/telegram-kol-releases/18434b4552938ae3acb1160ad32618aab9c3ecf4/src/telegram_kol_research/cli.py
+resolved=/opt/telegram-kol-releases/18434b4552938ae3acb1160ad32618aab9c3ecf4/src/telegram_kol_research/cli.py
+package_dir.name=telegram_kol_research
+source_dir.name=src
+release.name=18434b4552938ae3acb1160ad32618aab9c3ecf4
+```
+
+The console-script directory contains no competing `telegram_kol_research` package. Its editable `.pth` points to `/opt/telegram-kol-analyzer/src`, but that site-packages entry follows the explicit `PYTHONPATH`; it therefore cannot displace the selected rollback release.
+
+### Eight-condition evaluation
+
+| # | Actual | Expected | Result |
+|---:|---|---|---|
+| 1 | `expected_commit=4284d1a61226eb16812407c4f2489a207241db4c`, 40 lowercase hex | SHA1 regex | pass |
+| 2 | `expected_manifest_sha256=81d5ffb5...28b3167`, 64 lowercase hex | SHA256 regex | pass |
+| 3 | rollback `cli.py` resolves strictly to the absolute path shown above | `resolve(strict=True)` succeeds | pass |
+| 4 | `package_dir.name=telegram_kol_research` | `telegram_kol_research` | pass |
+| 5 | `source_dir.name=src` | `src` | pass |
+| 6 | `release.name=18434b4552938ae3acb1160ad32618aab9c3ecf4` | `4284d1a61226eb16812407c4f2489a207241db4c` | **fail; first live rejection** |
+| 7 | actual imported-release manifest byte SHA-256 `e58bc07d...83bfdc` | `81d5ffb5...28b3167` | **would fail if reached** |
+| 8 | actual imported manifest has `contract=immutable-release-v1`, `schema_version=1`, but `commit=18434b45...` | same contract/schema, `commit=4284d1a6...` | contract/schema pass; **commit would fail if reached** |
+
+The implementation returns immediately after the combined directory check containing condition 6, so conditions 7 and 8 were not reached by the failed process. They are nevertheless evaluated above from the exact imported-release manifest as requested. The candidate manifest itself satisfies conditions 7 and 8; the failure is that the main process never selected that candidate path.
+
+### Complete failed-invocation journal
+
+The exact invocation ID was `71467dc7bc824403832a2a85e34997e7`. Its complete unit journal is:
+
+```text
+2026-09-01T11:15:24.260906+08:00 VM-0-11-opencloudos systemd[1]: Starting telegram-kol-monitor-diagnostic.service - Run one no-notify Telegram KOL monitor diagnostic...
+2026-09-01T11:15:24.359010+08:00 VM-0-11-opencloudos python[939036]: {"contract":"runtime-deployment-identity-v1","loaded_artifact_verified":true,"release_commit":"4284d1a61226eb16812407c4f2489a207241db4c"}
+2026-09-01T11:15:30.291617+08:00 VM-0-11-opencloudos env[939038]: {"adapter_failures":[],"audit_ran":false,"checked_at":"2026-09-01T03:15:28.168909+00:00","contract":"monitor-deployment-diagnostic-v1","details":{},"healthy":true,"loaded_artifact_verified":false,"manifest_sha256":null,"monitor_error":null,"notification_status":"not_needed","reason_codes":[],"release_commit":null,"result_complete":true,"schema_version":1,"sources_complete":true}
+2026-09-01T11:15:30.737862+08:00 VM-0-11-opencloudos systemd[1]: telegram-kol-monitor-diagnostic.service: Main process exited, code=exited, status=1/FAILURE
+2026-09-01T11:15:30.738109+08:00 VM-0-11-opencloudos systemd[1]: telegram-kol-monitor-diagnostic.service: Failed with result 'exit-code'.
+2026-09-01T11:15:30.742872+08:00 VM-0-11-opencloudos systemd[1]: Failed to start telegram-kol-monitor-diagnostic.service - Run one no-notify Telegram KOL monitor diagnostic.
+2026-09-01T11:15:30.743203+08:00 VM-0-11-opencloudos systemd[1]: telegram-kol-monitor-diagnostic.service: Consumed 4.491s CPU time.
+```
+
+Journald additionally preserves the two exact command lines under the same invocation: PID 939036 ran `/opt/telegram-kol-analyzer/.venv/bin/python -m telegram_kol_research.runtime_deployment_identity --verify-self`; PID 939038 ran the complete console-script `monitor-production-safety ... --disable-daily-management-audit --deployment-diagnostic` command shown above.
+
+### Root cause and bounded next-step plan
+
+The root cause is a split release source inside one unit invocation. Candidate activation-drop-in variables supplied the expected identity and allowed `ExecStartPre` to verify candidate `4284d1a6...`; the stale `/etc/telegram-kol-monitor.env` overrode the drop-in's monitor-specific path, and main `ExecStart` used that stale path to replace `PYTHONPATH` with rollback release `18434b45...`. Condition 6 therefore failed first, producing the intentionally collapsed `(False, None, None)` result. The identity checker behaved correctly and must not be weakened.
+
+The stored evidence proves the stale env file existed at invocation time but does not preserve a post-installer env after-image or the installer orchestration command stream. It cannot distinguish whether the candidate env was never written or was restored before activation. Resolve that provenance separately before another production window; do not infer it from the earlier `installer_gate=passed` marker.
+
+No code change or restage is required merely to make the existing immutable candidate satisfy the eight predicates: a later authorized install-only step can reinstall the candidate env, preserve its exact after-image, and prove immediately before activation that the effective `EnvironmentFile` monitor path/commit/hash equal the receipt. A more durable follow-up should also change the install/activation gate to validate the **effective main-process import source after EnvironmentFile precedence**, not only drop-in text or `ExecStartPre`; that would be a code change requiring RED/GREEN, review, a new candidate and a new stage. Neither option is implemented in this read-only turn.
 
 ### Behavior classification
 
