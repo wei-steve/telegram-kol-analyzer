@@ -1556,3 +1556,154 @@ token 沿用第 15 节固定代理率 0.3631514 token / canonical request byte�
 - token 绝对值和未来节省仍是字节代理；需要继续积累真实 provider usage。
 
 本节只给出分析与收紧方向，没有修改 `requires_context_resolution`、任何触发判据、prompt、setting、数据、release 或服务。
+
+## 17. 候选状态与第一层事件联合门禁：只读反事实（2026-09-01）
+
+### 17.1 固定口径与反事实边界
+
+本节继续使用 `context_resolution_attempts.id <= 4245` 的固定 legacy cohort，以及第 15/16 节完全相同的实质改变定义和 0.3631514 token / canonical request byte 代理率。总体仍是 3,906 次 `multiple_same_source_candidates` 调用、474 次实质改变（语义 414、目标 60）、164.085M 代理 token。
+
+候选状态直接取调用时已持久化的 `candidate_strategy_threads[].status`。方向 A 只替换 `len(candidates) > 1` 中的计数集合，不删除传给模型的候选，也不改动其他七个触发器；方向 B 只限制 multiple 是否可单独触发。“毛排除”是 multiple 不再成立的行，“净避免”进一步要求该行没有其他触发器接管。只有净避免行的 token 才算实际节省，其中的实质改变才算真实漏失。
+
+独立 SQL 复核得到同样的 3,906 行、候选状态槽位、11–20 候选分组和联合分组计数。所有改变率均报告 Wilson 95% 区间。历史 token 仍是代理，不是账单实测。
+
+### 17.2 方向 A：候选的 lifecycle 状态构成
+
+3,906 次调用一共持久化 26,375 个候选槽位：
+
+| lifecycle status | 候选槽位 | 槽位占比 | 平均每次调用 | 至少含一个该状态的调用 |
+|---|---:|---:|---:|---:|
+| `pending_entry` | 3,825 | 14.50% | 0.98 | 1,861（47.64%） |
+| `entered` | 6,078 | 23.04% | 1.56 | 2,523（64.59%） |
+| `holding` | **0** | 0% | 0 | 0 |
+| `expired` | **16,472** | **62.45%** | **4.22** | **2,882（73.78%）** |
+| **合计** | **26,375** | **100%** | **6.75** | — |
+
+`expired` 是候选膨胀的主体。历史 cohort 没有任何 `holding` 候选，因此下面的 `entered + holding` 在本数据上实际等于只计 `entered`；不能据此推断未来 `holding` 流量的表现。
+
+候选数 11–20 的调用共有 795 次，其中 **781 / 795 = 98.24%** 的第一层 `strategy.symbol` 为空，候选生成走了完全不做 symbol 过滤的路径。其余 14 次有 symbol。这里能证明的是“781 次处于无过滤路径”，不能反推出若有正确 symbol 时一定会降到 10 个以下。
+
+三种替代计数的反事实如下。毛 token 只是被移出 multiple 组的负载；其中有其他触发器接管的部分仍会调用，所以实际节省只看净 token。
+
+| multiple 候选口径 | 毛排除（毛 token） | 毛排除组改变率（Wilson 95%） | 其他触发器接管 | 净避免 | 净节省 token | 漏失实质改变 | 其中语义改变 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 只计 `entered + holding` | 2,527（101.964M） | 238/2,527 = 9.42%（8.34%–10.62%） | 474 | 2,053 | 83.720M（51.02%） | 64（净避免组 3.12%，2.45%–3.96%） | 63 |
+| 计 `entered + holding + pending_entry`，仅排除 `expired` | 1,566（56.413M） | 170/1,566 = 10.86%（9.41%–12.49%） | 344 | 1,222 | 43.603M（26.57%） | 37（3.03%，2.20%–4.15%） | 36 |
+| 只计 `pending_entry` | 2,960（110.597M） | 378/2,960 = 12.77%（11.62%–14.02%） | 733 | 2,227 | 83.630M（50.97%） | 98（4.40%，3.62%–5.33%） | 97 |
+
+为与第 16.6 节可比，各口径都按 `0 / 1 / 2 / 3 / 4–5 / 6–10 / 11–20` 分桶，再对“是否实质改变”计算关联：
+
+| 候选数口径 | Cramér's V | 归一化信息增益 | 排名 |
+|---|---:|---:|---:|
+| 当前全部候选 | 0.098 | 1.31% | 4 |
+| 只计 `entered + holding` | 0.120 | 1.94% | 3 |
+| 只计 `pending_entry` | 0.153 | 2.52% | 2 |
+| **仅排除 `expired`** | **0.162** | **3.24%** | **1** |
+
+因此 A 中区分度最高的是“保留 `entered + holding + pending_entry`、只排除 `expired`”。但它仍会净漏失 37 次实质改变，其中 36 次是语义改变；“区分度最高”不等于可直接上线。
+
+### 17.3 方向 B：第一层 recognition 与 lifecycle event 联合分组
+
+| 第一层 recognition / event_type | 调用 | 实质改变 | 改变率（Wilson 95%） | token（代理） |
+|---|---:|---:|---:|---:|
+| 是策略 / `entry_confirm` | 3 | 2 | 66.67%（20.77%–93.85%） | 0.107M |
+| 是策略 / `none` | 213 | 26 | 12.21%（8.47%–17.28%） | 9.458M |
+| 非策略 / `cancel_entry` | 21 | 10 | 47.62%（28.34%–67.63%） | 0.973M |
+| 非策略 / `entry_confirm` | 68 | 44 | 64.71%（52.84%–75.00%） | 2.793M |
+| 非策略 / `exit_position` | 422 | 202 | 47.87%（43.14%–52.63%） | 17.753M |
+| **非策略 / `none`** | **2,765** | **34** | **1.23%（0.88%–1.71%）** | **115.890M** |
+| 非策略 / `position_update` | 414 | 156 | 37.68%（33.15%–42.44%） | 17.110M |
+
+联合信号的分层远强于单独的“是策略/非策略”。`非策略 + none` 占 70.79% 调用，却只有 1.23% 历史改变；其余 1,141 次调用有 440 次改变，改变率 38.56%（35.78%–41.42%）。
+
+若 multiple 仅在“`recognition_result == 是策略` 或 `event_type != none`”时允许触发：
+
+- 毛排除 2,765 次、115.890M token；其中 222 次仍由其他触发器调用；
+- 净避免 **2,543 次（65.10%）**，净节省 **107.269M token（65.37%）**；
+- 净漏失 **25 次实质改变（占全部 474 次的 5.27%）**，全部是语义改变；净避免组漏失率为 0.98%（Wilson 0.67%–1.45%）。
+
+这说明 B 是很强的成本信号，但还不是安全门禁：25 个漏失样本并非随机噪声，包含加仓、平仓、移动止损、保护利润和“第一个打上了”等明确策略延续语义。
+
+### 17.4 A 最优口径与 B 叠加
+
+联合规则为：multiple 只有在“排除 `expired` 后仍有至少两个候选”且“第一层是策略或 event 不为 none”时成立。
+
+- 毛排除 3,221 次、133.460M token；489 次仍由其他触发器接管；
+- 净避免 **2,732 次（69.94%）**，净节省 **115.068M token（70.13%）**；
+- 净漏失 **53 次实质改变（占全部改变 11.18%）**：52 次语义改变、1 次目标改变；净避免组漏失率 1.94%（Wilson 1.49%–2.53%）；
+- 被联合规则保留的 685 次调用有 280 次改变，改变率 40.88%（37.26%–44.60%）。
+
+与 B 单独使用相比，联合规则只多节省约 4.76 个百分点调用和 4.75 个百分点 token，却把漏失从 25 次增加到 53 次。因此历史数据不支持把 A 最优口径直接叠加到 B 作为上线规则。
+
+### 17.5 B 与联合规则的全部漏失样本
+
+下表合并列出联合规则漏失的 53 个 attempt：标记“B + 联合”的 25 行也是 B 单独规则的全部漏失；“仅联合”的 28 行只由 A 的 expired 排除新增。53 个 attempt 对应 47 条不同 raw message，重复行是同一 raw message 的独立历史 attempt，不应去重后当作调用数。
+
+| attempt / raw | 规则漏失 | 原始消息文本 | 候选构成 | 命中触发器 | 第一层 → 上下文后 | 改变类型 |
+|---|---|---|---|---|---|---|
+| 109 / 8471 | 仅联合 | 大镖客·Andy<br>在63900进的保护利润<br>@Tarderfengge QQ:158241758 | 2（entered=1, expired=1） | multiple only | 非策略/entry_confirm/life=660 → manage_thread/threads=[30]/move_stop_to_protect | 语义 |
+| 142 / 8586 | 仅联合 | 大镖客·Andy<br>您64600了，65200进场的保护利润<br>@Tarderfengge QQ:158241758 | 2（entered=1, expired=1） | multiple only | 非策略/position_update/life=669 → unresolved/threads=[] | 语义 |
+| 143 / 8586 | 仅联合 | 大镖客·Andy<br>您64600了，65200进场的保护利润<br>@Tarderfengge QQ:158241758 | 2（entered=1, expired=1） | multiple only | 非策略/position_update/life=669 → unresolved/threads=[] | 语义 |
+| 236 / 8850 | B + 联合 | [空文本] | 3（entered=1, expired=2） | multiple only | 非策略/none → cancel_thread/threads=[37]/cancel_pending_entry | 语义 |
+| 326 / 9079 | B + 联合 | 大镖客·Andy<br>今天的多单，轻仓，探个路<br>@Tarderfengge QQ:158241758 | 4（entered=3, expired=1） | multiple only | 非策略/none → revise_thread/threads=[76] | 语义 |
+| 390 / 9171 | B + 联合 | 大镖客·Andy<br>第一止盈位已到，注意锁定利润，及时移动止损！<br>@Tarderfengge QQ:158241758 | 4（entered=3, expired=1） | multiple only | 非策略/none → manage_thread/threads=[76]/move_stop_to_protect | 语义 |
+| 497 / 9409 | B + 联合 | XAG 咱们适当开个头仓吧，看样子都不想回调呢<br>@Tarderfengge QQ:158241758 | 12（pending_entry=4, entered=1, expired=7） | multiple only | 非策略/none → revise_thread/threads=[100] | 语义 |
+| 502 / 9420 | B + 联合 | ❤️昨天多单浮盈10个点！<br>❤️多单直接出局，掉头布局空单！<br>@Tarderfengge QQ:158241758 | 4（pending_entry=1, entered=3） | multiple only | 非策略/none → exit_thread/threads=[86]/exit_full | 语义 |
+| 546 / 9471 | 仅联合 | 比特币行情长话短说，在6.2和6.3万支撑附近做多，分2次入场，6.4止盈，6.1止损。<br>其实我更建议买现货，熊市还有一两个月就结束了，记得逢低买入。<br>做空的话到6.48万阻力区空，空到6.4止盈，小幅突破6.53就止损，在下一个阻力区6.67万再空即可。<br>以太坊做空则是在1920阻力下方做空，之前单子都有发，这些位置来了就干，80%胜率，打不了就止损然后在下一支撑、阻力位重新进场即可。<br>比特币近期一直在盘整，没什么大行情，还是要更多一些耐心。<br>@Tarderfengge QQ:158241758 | 2（pending_entry=1, expired=1） | multiple only | 是策略/none → unresolved/threads=[] | 语义 |
+| 743 / 9901 | 仅联合 | [空文本] | 3（expired=3） | multiple only | 非策略/exit_position/life=743 → unresolved/threads=[] | 语义 |
+| 755 / 9918 | 仅联合 | KGEN多单止盈<br>@Tarderfengge QQ:158241758 | 4（expired=4） | multiple only | 非策略/exit_position/life=759 → unresolved/threads=[] | 语义 |
+| 790 / 9998 | 仅联合 | [空文本] | 4（pending_entry=1, expired=3） | multiple only | 非策略/entry_confirm/life=766 → manage_thread/threads=[136]/hold_update | 语义 |
+| 833 / 10078 | 仅联合 | 比特币 早上打了流动性出现了回调 还没有收盘，<br>前面给的63100-62800的多 委托这<br>在挂一个反弹 63600附近 反弹<br>止损：小时级别有效跌破63350<br>止盈：64050-64350-64500<br>@Tarderfengge QQ:158241758 | 3（expired=3） | multiple only | 是策略/none → revise_thread/threads=[125]/replace_entry | 语义 |
+| 1015 / 10379 | B + 联合 | 分批追加50%多单，止损不变。<br>@Tarderfengge QQ:158241758 | 3（entered=2, expired=1） | multiple only | 非策略/none → manage_thread/threads=[151]/risk_update | 语义 |
+| 1078 / 10486 | 仅联合 | 比特币 昨天开的空 看看能不能 63950附近 再补进来一次空<br>止损：15分钟有效站稳64150 止损比较小了<br>止盈：63600-63350-63050-62650<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 是策略/none → manage_thread/threads=[153]/risk_update | 语义 |
+| 1133 / 10616 | B + 联合 | 上次闪迪做多的1358点位到了，继续走30%仓位无脑，不要墨迹。#SNDK<br>@Tarderfengge QQ:158241758 | 15（entered=8, expired=7） | multiple only | 非策略/none → manage_thread/threads=[107]/partial_take_profit | 语义 |
+| 1179 / 10703 | 仅联合 | 比特币 所长前面给的这个空单 还有一个点事 64650附近 一直没来 我在这复盘开的话，这里是可以打流动性的位置了，再委托上这里空 能不能来不知道<br>止损：小时级别有效站稳65000<br>止盈：64000-63800-63150-62650<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 是策略/none → revise_thread/threads=[153] | 语义 |
+| 1189 / 10727 | 仅联合 | 比特币 昨天空的位置 今天看到了么出现了反馈<br>一天坐不上个单子是挺急的 在这开空<br>止损：就用昨天咱们的空点 63950 小时级别站稳<br>止盈：63550-63200-62850-62650<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 是策略/none → revise_thread/threads=[153]/replace_entry | 语义 |
+| 1191 / 10729 | B + 联合 | 第一个打上了<br>@Tarderfengge QQ:158241758 | 20（pending_entry=3, expired=16, entered=1） | multiple only | 非策略/none → manage_thread/threads=[153]/hold_update | 语义 |
+| 1194 / 10736 | B + 联合 | 🔥现目前行情跌破进场价！🔥<br>🔥注意设置好止损点位！🔥<br>🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥<br>@Tarderfengge QQ:158241758 | 4（entered=4） | multiple only | 非策略/none → manage_thread/threads=[187]/risk_update | 语义 |
+| 1224 / 10779 | 仅联合 | [空文本] | 3（expired=3） | multiple only | 非策略/exit_position/life=510 → unresolved/threads=[] | 语义 |
+| 1225 / 10779 | 仅联合 | [空文本] | 3（expired=3） | multiple only | 非策略/exit_position/life=510 → unresolved/threads=[] | 语义 |
+| 1265 / 10779 | 仅联合 | [空文本] | 4（pending_entry=1, expired=3） | multiple only | 非策略/exit_position/life=510 → unresolved/threads=[] | 语义 |
+| 1266 / 10779 | 仅联合 | [空文本] | 4（entered=1, expired=3） | multiple only | 非策略/exit_position/life=510 → exit_thread/threads=[204]/exit_full | **目标** |
+| 1272 / 10841 | B + 联合 | 629附近都可以加仓btc空，我打算加仓到2000个，分批入场<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 非策略/none → manage_thread/threads=[165]/risk_update | 语义 |
+| 1277 / 10845 | B + 联合 | 算了先加个100个吧<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 非策略/none → manage_thread/threads=[165] | 语义 |
+| 1308 / 10901 | B + 联合 | BTC多单正常持有，剩余半仓挂单也正常挂单，目前行情还是在小级别震荡，如果晚间下探62300附近有机会接一根针，上方关注63800-64100阻力。<br>@Tarderfengge QQ:158241758 | 2（entered=2） | multiple only | 非策略/none → manage_thread/threads=[206]/hold_update | 语义 |
+| 1332 / 10928 | B + 联合 | [空文本] | 4（pending_entry=1, expired=3） | multiple only | 非策略/none → manage_thread/threads=[207]/hold_update | 语义 |
+| 1396 / 11038 | B + 联合 | [空文本] | 4（pending_entry=1, expired=3） | multiple only | 非策略/none → manage_thread/threads=[207]/hold_update | 语义 |
+| 1473 / 11163 | B + 联合 | 昨天开了空单，如果还持有的同学，平仓出来<br>@Tarderfengge QQ:158241758 | 20（expired=19, entered=1） | multiple only | 非策略/none → exit_thread/threads=[219]/exit_full | 语义 |
+| 1519 / 11229 | B + 联合 | 63600 加仓btc空，止损改64100，成本价63700<br>@Tarderfengge QQ:158241758 | 2（expired=2） | multiple only | 非策略/none → manage_thread/threads=[165]/risk_update | 语义 |
+| 1577 / 11319 | B + 联合 | 这是一笔黄金中长线策略，不要重仓，止损大就少开点！<br>@Tarderfengge QQ:158241758 | 4（pending_entry=1, entered=2, expired=1） | multiple only | 非策略/none → manage_thread/threads=[238]/risk_update | 语义 |
+| 1592 / 11338 | 仅联合 | 止盈点来了 💵💵💵 视频也提醒各位了 即便你没开空 希望你没在这里追多<br>@Tarderfengge QQ:158241758 | 20（entered=1, expired=19） | multiple only | 非策略/position_update/life=866 → hold/threads=[] | 语义 |
+| 1603 / 11351 | 仅联合 | [空文本] | 4（expired=4） | multiple only | 非策略/exit_position/life=849 → unresolved/threads=[] | 语义 |
+| 1652 / 11409 | 仅联合 | 突然拉上去了，小时级别收到 64450上面不要扛单出来，就在64450附近止损出来。四小时如果突破M头那可能还会涨，别扛单！<br>@Tarderfengge QQ:158241758 | 20（pending_entry=1, expired=19） | multiple only | 非策略/exit_position/life=866 → unresolved/threads=[] | 语义 |
+| 1653 / 11409 | 仅联合 | 突然拉上去了，小时级别收到 64450上面不要扛单出来，就在64450附近止损出来。四小时如果突破M头那可能还会涨，别扛单！<br>@Tarderfengge QQ:158241758 | 20（pending_entry=1, expired=19） | multiple only | 非策略/exit_position/life=866 → unresolved/threads=[] | 语义 |
+| 1682 / 11444 | B + 联合 | BTC65000未突破，目前浮亏500点左右，正常持有中，继续关注64000附近，小级别计划暂不做改变。<br>@Tarderfengge QQ:158241758 | 2（entered=2） | multiple only | 非策略/none → manage_thread/threads=[239]/hold_update | 语义 |
+| 1684 / 11448 | B + 联合 | 这单风险大一些，可以小仓位尝试，以小损追求较大的反弹机会。求稳就在下一强支撑1510附近做多。<br>@Tarderfengge QQ:158241758 | 18（pending_entry=4, entered=3, expired=11） | multiple only | 非策略/none → manage_thread/threads=[250]/risk_update | 语义 |
+| 1795 / 11589 | 仅联合 | 【三马哥现货Vip】<br>SNDKB/USDT 现货小波段第5批（不带杠杆不带合约，不然插针容易归零）<br>继续布局：<br>1）挂1560附近买入现货仓位的30%<br>2）挂1358附近买入现货仓位的50%<br>止盈目标：1650卖一半、1988清仓。<br>止損：成交后的周线收盘价低于1150美元，周收盘价低于1000直接割肉不犹豫<br>入选理由：美股存储三剑客，风头正劲但需要更严格但入场点才能有利可图。<br>策略供参考交流，控制好仓位，不作为做单依据，如有变更，另行通知。#SNDKB<br>@Tarderfengge QQ:158241758 | 2（pending_entry=1, expired=1） | multiple only | 是策略/none → manage_thread/threads=[261]/hold_update | 语义 |
+| 1927 / 11818 | B + 联合 | BTC短线空单，正常仓位操作。<br>@Tarderfengge QQ:158241758 | 2（entered=2） | multiple only | 非策略/none → manage_thread/threads=[277]/risk_update | 语义 |
+| 1929 / 11819 | B + 联合 | 市价附近直接入场<br>@Tarderfengge QQ:158241758 | 2（entered=2） | multiple only | 非策略/none → revise_thread/threads=[277]/replace_entry | 语义 |
+| 2055 / 12015 | B + 联合 | 名称错了，看价格就知道是eth，抱歉啊！<br>@Tarderfengge QQ:158241758 | 4（pending_entry=1, expired=3） | multiple only | 非策略/none → revise_thread/threads=[284] | 语义 |
+| 2080 / 12042 | B + 联合 | 限价空单不要取整不容易触发上下几十点浮动，两个点位各挂半仓，当前点位不建议追高容易空单也要带好止损，一对一指导以及之前私聊陈哥领取免费山寨币中长线多单建议可以止盈60%剩余可以私来我给向上移动止损他。<br>@Tarderfengge QQ:158241758 | 2（pending_entry=1, entered=1） | multiple only | 非策略/none → revise_thread/threads=[289]/replace_entry | 语义 |
+| 2116 / 12084 | 仅联合 | [空文本] | 6（pending_entry=1, expired=5） | multiple only | 非策略/entry_confirm/life=924 → manage_thread/threads=[293] | 语义 |
+| 2128 / 12096 | 仅联合 | [空文本] | 6（pending_entry=1, expired=5） | multiple only | 非策略/entry_confirm/life=924 → manage_thread/threads=[293] | 语义 |
+| 3629 / 12893 | 仅联合 | [空文本] | 6（entered=1, expired=5） | multiple only | 非策略/exit_position/life=963 → unresolved/threads=[] | 语义 |
+| 3633 / 12895 | 仅联合 | [空文本] | 5（expired=5） | multiple only | 非策略/exit_position/life=963 → unresolved/threads=[] | 语义 |
+| 3661 / 12941 | 仅联合 | 大镖客·Andy<br>第三止盈位已到，注意锁定利润，及时移动止损！<br>@Tarderfengge QQ:158241758 | 2（entered=1, expired=1） | multiple only | 非策略/position_update/life=957 → unresolved/threads=[] | 语义 |
+| 3694 / 13000 | 仅联合 | [空文本] | 5（expired=5） | multiple only | 非策略/cancel_entry/life=510 → unresolved/threads=[] | 语义 |
+| 4122 / 13693 | B + 联合 | [空文本] | 3（pending_entry=1, expired=2） | multiple only | 非策略/none → manage_thread/threads=[393]/hold_update | 语义 |
+| 4146 / 13722 | B + 联合 | 走势短线不太对，BTC的77188也挂上，如果成交成本会变成77888，然后毫不犹豫反弹到77888全部跑掉。往后支撑太远了75000和71188不值得扛到这么久。狗庄只给一次机会逃命，把握住。#BTC<br>@Tarderfengge QQ:158241758 | 20（entered=4, pending_entry=6, expired=10） | multiple only | 非策略/none → exit_thread/threads=[394]/exit_full | 语义 |
+| 4154 / 13730 | 仅联合 | [空文本] | 5（expired=5） | multiple only | 非策略/exit_position/life=1003 → unresolved/threads=[] | 语义 |
+| 4159 / 13730 | 仅联合 | [空文本] | 5（expired=5） | multiple only | 非策略/exit_position/life=1003 → unresolved/threads=[] | 语义 |
+
+### 17.6 结论与上线证据门槛
+
+历史样本充分支持以下描述性结论：`expired` 是候选数量的主要来源；高候选数几乎都发生在 symbol unknown 的无过滤路径；只排除 `expired` 是 A 中区分度最高的计数；B 的联合第一层信号远强于候选数量本身。
+
+但两个方向当前都不能直接上线：
+
+1. A 最优口径仍漏 37 次改变；联合后新增的 28 次漏失里包含正确撤销、退出、管理，也包含上下文否决第一层错误管理/退出的风险收缩结果。
+2. B 虽节省 65.37% token，仍漏 25 条明确的策略延续语义；这证明第一层 `非策略 + none` 不是可靠的“无上下文需要”标签。
+3. `holding` 历史样本为零，未来状态分布变化会使 A 的历史反事实外推失真。
+4. 空文本行可能依赖图片证据；仅凭表中的空文本不能人工判定“不需要上下文”。
+
+因此人工标注应优先覆盖表中 47 条不同 raw message，并把“上下文是否纠正了第一层漏识别”“是否仅改变目标”“是否风险收缩”分开标记。任何未来 gate 都必须先做全历史回放并对这 53 个 attempt 100% 召回，再以旧完整解析为权威做 shadow replay；在此之前，安全可实施节省仍为 0%。本节没有评估群组白名单或交易标的白名单，也没有修改任何代码、判据、prompt、设置、数据、release 或服务。
