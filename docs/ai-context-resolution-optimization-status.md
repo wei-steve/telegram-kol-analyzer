@@ -414,3 +414,46 @@ No code change or restage is required merely to make the existing immutable cand
 | Historical archive/marker/compaction | Yes, approximately 326.857 MB logical recovery | No trading behavior; Web/offline diagnostics must display/resolve archive state explicitly rather than treating it as empty context |
 
 No step changes `requires_context_resolution`, its vocabulary/order, context-window limits, prompts, settings, model input, decision parsing, exchange-write semantics or the two existing BTC conditional orders and their lifecycle/binding state.
+
+## Read-only live-position protection audit and P0 checkpoint — 2026-09-01T07:12:19Z
+
+This was a read-only checkpoint. It used authenticated Deepcoin GET methods under the running worker identity, `sqlite3 -readonly`, loopback runtime identity/health endpoints, and systemd journal reads. No code, release, service, setting, database row, message, order, lifecycle or binding was changed. The failed default `.env` probe stopped before any exchange request; the sole corrected account snapshot explicitly used the inherited worker environment and completed at `2026-09-01T07:10:15.235271Z`.
+
+### Exchange position and current protection
+
+- Deepcoin returned one position: `BTC-USDT-SWAP`, `posId=1001125076084723`, long, size `8`, average entry `78,669.0133333334`, last/market `78,726.7`, unrealized PnL `+0.46149333333282266 USDT`, leverage `125x`, cross margin, split position mode, and used margin `5.0348168533 USDT`. Regular open orders were zero; ETH and SOL pending TPSL rows were zero.
+- The current pending-TPSL endpoint returned exactly four BTC rows. Membership in that endpoint is the current-state proof; the rows do not expose a `state` field. `ordPx=0` together with the local `slOrdPx/tpOrdPx=-1` request means market-on-trigger.
+
+| Deepcoin order ID | side / position side | classification | trigger | order price | size | reduce-only evidence | current state | exact local mapping |
+|---|---|---|---:|---|---:|---|---|---|
+| `1001125076086511` | sell / long | take profit | 79,800 | market | 4 | API omits the boolean; exact position-scoped `set_position_sltp` request binds `posId=1001125076084723` | pending | ledger 598, planned leg 756, position-mutation intent 571, entry leg 557, binding 322, lifecycle 1041 |
+| `1001125076086677` | sell / long | take profit | 80,500 | market | 4 | same | pending | ledger 599, planned leg 757, position-mutation intent 572, entry leg 557, binding 322, lifecycle 1041 |
+| `1001125077326101` | sell / long | stop loss | 78,669.0133333334 | market | `0` = full position | same | pending | ledger 600, position-mutation intent 573, entry leg 557, binding 322, lifecycle 1041 |
+| `1001125077326183` | sell / long | backup stop | 78,669.0133333334 | market | `0` = full position | same | pending | ledger 601, position-mutation intent 574, entry leg 557, binding 322, lifecycle 1041 |
+
+These four position-protection orders have no `trigger_protection_intents` rows. That table covers protection recovery from pending entry triggers; this position entered through market entry leg 557. The durable authority here is the exact-posId `position_mutation_intents` plus `position_protection_ledger`, not a missing trigger-protection intent.
+
+At market `78,726.7`, both stops are `57.6866666666` points, or `0.0733%`, below market, so the long-side stop direction is correct. Each stop is full-position scoped; the two remaining take profits total `4+4=8`, exactly the live size, so there is no current TP oversell. The original plan was primary stop `77,400`, backup stop `77,245.2`, and TP legs `79,100×7`, `79,800×4`, `80,500×4` against the original size 15. Exchange regular-order history shows a filled sell order `1001125077305948`, size 7 at `79,099.8`, `reduceOnly=true`; together with the position decrease from 15 to 8, it is consistent with the first TP having fired, although the returned regular-order row does not carry the parent trigger ID and is therefore not treated as exact parent-child attribution. Management batch 151 then replaced both stops at break-even and retained the two 4-contract TP legs.
+
+The pending-TPSL response does **not** include a `reduceOnly` field, so a literal four-for-four boolean assertion is unavailable; absence of the field is not `false`. All four current rows are nevertheless exact position-bound TPSL mutations carrying the live `posId` locally, and the observed triggered child was explicitly `reduceOnly=true`. No generic, non-position-bound sell order or evidence of a non-reduce-only protection order was found. Under the exact-position TPSL contract, a second full-position stop cannot reverse the position after the first has closed it.
+
+Current exchange IDs and current verified ledger IDs are identical: `{1001125076086511, 1001125076086677, 1001125077326101, 1001125077326183}`. There is no exchange orphan and no current verified-ledger claim missing at the exchange. There is, however, a local projection-age defect that must not be confused with a live protection gap:
+
+- `position_protection_legs` 753/754/755 still say `verified` for old orders `1001125076084853`, `1001125076085673`, and `1001125076086408`, which are no longer pending. The current ledger correctly marks the first two `cancelled` and the third `protection_missing`; Deepcoin trigger history also returns the first two as historical, not pending.
+- protection revision 180 lists the four current order IDs but its stop rows retain the two old stop IDs and the revision status is `visibility_expired`. Protection incidents 352–356 record the earlier missing/conflict/snapshot conditions. Thus current exchange protection is complete, but future management/ownership logic may encounter stale projection evidence and block or duplicate a replacement attempt. This is the bounded worst-case risk found in this read-only audit; it is not an immediate naked-position or oversell condition, and no repair was attempted.
+
+### Source lineage and non-replay proof
+
+The entry source is raw message 14206, Telegram message 4456 in chat `-1003048800035`, posted `2026-09-01T03:34:16Z` and ingested at `03:34:16.548865Z`. It is 10 hours 51 minutes 39 seconds later than `2026-08-31T16:42Z`, so it is not a stopped-period replay. Recognition decision 14205 classified it `是策略` with confidence 0.95; signal candidate 2127 is `BTC/long/entry_signal`; lifecycle 1041 is `entered`; binding 322 and entry leg 557 carry exact posId `1001125076084723`. `strategy_lifecycles.signal_candidate_id` is NULL, so candidate-to-lifecycle lineage is through the exact chat/message identity and the binding, not a direct candidate foreign key.
+
+The later management message is raw 14218 / Telegram 4458, posted `05:39:56Z`; recognition decision 14216 resolved it to thread 410 and lifecycle 1041, candidate 2130 requested `move_stop_to_break_even`, and management batch 151 completed the current break-even replacement.
+
+### Runtime and monitor
+
+At `2026-09-01T07:12:19Z`, web PID 944570, ingest PID 944575 and worker PID 944565 were all active with `NRestarts=0`, exact release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, manifest `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`, `loaded_artifact_verified=true`, and `entry_admission_frozen=false`. These PIDs and the SHA equal the latest recorded rollback checkpoint, so there is no unexplained PID/SHA drift. Web event loop, ingest listener/reconcile, worker command/message processing, and every worker management/break-even/reconcile/close/TPSL/protection/rescue loop were fresh and successful; `auto_trade_enabled=true`.
+
+Since the latest live-position stop record at `06:45:29Z`, the `07:01:08Z` monitor cycle loaded `18434b45...`, completed healthy, and emitted no reason code. Across the full incremental P0 window after `2026-08-31T21:35:00Z`, 20 complete monitor invocations all returned `healthy=true`, `reason_codes=[]`, and `monitor_error=null`. Their starts were `22:01:58`, `22:31:57`, `23:00:16`, `23:30:38` on August 31 and `00:01:34`, `00:30:04`, `01:01:33`, `01:08:04`, `01:31:23`, `02:01:43`, `02:31:27`, `03:01:52`, `03:30:47`, `04:00:11`, `04:31:37`, `05:00:43`, `05:31:25`, `06:01:39`, `06:30:41`, `07:01:08` on September 1, all UTC. The `01:01:33Z` cycle ran the daily audit and stayed healthy; all others reported `audit_ran=false`. The release changed from `6e2321ce...` to the authorized `18434b45...` between the `00:30` and `01:01` cycles; no later SHA drift occurred.
+
+### P0 checkpoint summary
+
+The fixed incremental window is `(raw_message_id 14168, 2026-08-31T21:35:00Z]` through `2026-09-01T07:12:19Z`. It contains 64 messages, 41 attempts over 36 messages, 42 comparable provider requests, and 38 requests with direct usage telemetry. The complete calculation, direct eight-trigger distribution, token and request-byte measurements, status/error checks, and cumulative distance to target are appended to `docs/plans/2026-08-31-ai-context-resolution-analysis.md` section 13. The cumulative P0 cohort is only 74 messages over 14 hours 29 minutes 42 seconds; it remains below both stopping criteria and is not a final baseline.

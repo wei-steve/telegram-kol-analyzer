@@ -1004,3 +1004,102 @@ WHERE decision_json IS NOT NULL;
 ```
 
 输出为 `2767|580|2187`，与本文第 4.1 节一致。A 中交易所 HTML 的 `grep` 含本轮已知 order ID 前缀，它是为了保留本轮原始命令的结果定位条件；下轮可重复观测应用当期新 binding 的 order ID 替换该前缀，不改变 SQL 口径。
+
+## 13. P0 第二个固定窗口 — through 2026-09-01T07:12:19Z
+
+### 13.1 Window and denominator
+
+This checkpoint continues section 12 without changing its denominator contract. The previous fixed cutoff and raw-message high-water mark become the new open boundary:
+
+- incremental start: `2026-08-31T21:35:00Z`, `raw_messages.id > 14168`;
+- fixed end: `2026-09-01T07:12:19Z`;
+- duration: 9 hours 37 minutes 19 seconds, or 0.4009 24-hour days;
+- messages: 64, IDs 14169–14232;
+- all 64 `created_at` and `posted_at` values are after the start, so no delayed maintenance-period message entered the denominator;
+- attempts: 41 attempts over 36 distinct messages;
+- comparable provider requests: 42, using the section-12 legacy `attempts` fallback only for the four pre-observability attempts;
+- directly observed provider requests: 38 across 37 attempts; four legacy attempts have NULL in the five new observability fields and are never used to infer triggers, tokens or request-component bytes.
+
+The incremental descriptive context-resolution trigger rate is therefore 36/64 = 56.25%. This is a traffic description, not a stable rate estimate: the cumulative cohort still falls short of both P0 stopping rules.
+
+### 13.2 Direct eight-trigger observations
+
+The following values come only from `invocation_triggers_json`; no request-payload reconstruction is used. The denominator is the 37 directly observed attempts. Trigger categories are non-exclusive, so their percentages do not sum to 100%.
+
+| invocation trigger | attempts | descriptive share of 37 |
+|---|---:|---:|
+| `revision_language` | 0 | 0.00% |
+| `cancellation_language` | 0 | 0.00% |
+| `entered_holder_language` | 8 | 21.62% |
+| `management_without_exact_target` | 12 | 32.43% |
+| `multiple_same_source_candidates` | 33 | 89.19% |
+| `reply_target_disagreement` | 0 | 0.00% |
+| `text_image_conflict` | 1 | 2.70% |
+| `apparent_entry_may_be_revision` | 0 | 0.00% |
+
+These shares are reported only because the fixed P0 specification asks for a descriptive distribution. With 64 messages and 37 observable attempts, they must not be used to rank trigger quality or justify a trigger/threshold change.
+
+### 13.3 Direct provider usage
+
+All 38 `provider_usage_json` entries report `available=true`; there is no imputed token row. The partial-window totals are 510,453 prompt tokens, 53,214 completion tokens and 563,667 total tokens, including 67,584 cached prompt tokens.
+
+| per-provider-request total tokens | value |
+|---|---:|
+| minimum | 4,800 |
+| P50 | 15,065 |
+| mean | 14,833.34 |
+| P90 | 21,278 |
+| P95 | 22,821 |
+| maximum | 23,719 |
+
+P50/P90/P95 are empirical nearest-rank values on only 38 requests. They are measurements, not population estimates.
+
+Trigger-group averages are also direct and non-exclusive: a request is counted in every trigger it carried.
+
+| trigger | provider requests | mean total tokens | range |
+|---|---:|---:|---:|
+| `entered_holder_language` | 9 | 17,264.78 | 14,653–21,278 |
+| `management_without_exact_target` | 12 | 11,663.42 | 6,051–15,977 |
+| `multiple_same_source_candidates` | 34 | 15,178.79 | 6,051–23,719 |
+| `text_image_conflict` | 1 | 4,800.00 | 4,800–4,800 |
+| the other four triggers | 0 | not observed | — |
+
+Direct token telemetry begins at `2026-09-01T01:06:27.730519Z`. Dividing 563,667 tokens by the 6 hours 5 minutes 51 seconds from that first directly observed attempt through the fixed end yields a purely exposure-normalized 2.219 million tokens per 24 hours. That value is highly unstable: the window is one quarter of a day, contains only 38 requests, and excludes four earlier legacy requests whose token usage is unknowable. It is not the final daily baseline.
+
+### 13.4 Request component bytes
+
+The 37 directly observed attempts recorded 1,486,391 total canonical request bytes. `message_context_bytes` is a nested aggregate and must not be added to the disjoint components below.
+
+| component | bytes | share of request total | interpretation |
+|---|---:|---:|---|
+| `message_context_bytes` | 1,199,302 | 80.69% | nested whole message-context aggregate |
+| `active_strategies_bytes` | 254,197 | 17.10% | disjoint subcomponent |
+| `reply_chain_bytes` | 74 | 0.005% | disjoint subcomponent |
+| `current_message_bytes` | 10,658 | 0.72% | disjoint top-level component |
+| `remainder_bytes` | 1,218,724 | 81.99% | disjoint remainder, including context other than reply/active |
+| canonical structural overhead | 2,738 | 0.18% | total minus the four disjoint components |
+
+The disjoint rows sum to 100%. The nested `message_context_bytes` value independently confirms that historical/context material remains the dominant request component in this live cohort.
+
+### 13.5 Attempt outcomes and network behavior
+
+| status / phase | attempts | distinct messages | direct provider requests |
+|---|---:|---:|---:|
+| completed / initial resolution | 30 | 30 | 31 |
+| completed / reanalysis | 5 | 3 | 5 |
+| completed / legacy unobserved | 4 | 4 | 0 directly observed; 4 comparable |
+| exhausted / initial resolution | 2 | 2 | 2 |
+
+The two exhausted rows have one successful, usage-bearing provider request each, `error_class=NULL`, `last_error=RuntimeError`, and no scheduled retry; they are not network failures. Attempt 4279 used two provider requests because the first response targeted a thread outside the allowed candidate set (`target_outside_candidate_set`), then completed after the existing contract-correction retry. It is also not a network retry.
+
+Across all 38 direct usage entries there are zero `provider_request_failed` or other unavailable entries, zero `network_error` rows, zero `retry_pending` rows, and zero non-NULL `next_attempt_at` rows at the fixed snapshot. The provider circuit is process-local and the authorized R1 failure/rollback changed the worker PID inside this wider window, so the durable evidence supports the bounded conclusion that no network-error backoff or circuit-open episode was recorded; it is not a claim about unpersisted in-memory state before that restart.
+
+### 13.6 Cumulative distance to P0 target
+
+The cumulative cohort remains anchored at `2026-08-31T16:42:37Z` and raw ID 14158. Through the fixed end it contains 74 messages, 43 attempts and 44 comparable provider requests over 14 hours 29 minutes 42 seconds (0.604 normal days).
+
+- time criterion: 6 days 9 hours 30 minutes 18 seconds remain to 7 full normal days;
+- message criterion: 426 messages remain to 500; current completion is 14.80%;
+- neither criterion is met, so this is a P0 checkpoint rather than the final baseline.
+
+The small cohort is sufficient to confirm that the five live observability fields are producing internally consistent direct measurements. It is not sufficient to conclude that the 56.25% descriptive trigger rate, any per-trigger token average, or the 2.219-million-token daily normalization is representative. No trigger, word list, threshold, prompt, context window, setting, row, release or service was changed while collecting this checkpoint.
