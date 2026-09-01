@@ -2,8 +2,8 @@
 
 ```yaml
 workstream: ai_context_resolution_observability_and_network_backoff
-phase_state: blocked
-current_phase: activation_requires_unfrozen_capable_helper
+phase_state: in_progress
+current_phase: activation_with_transient_entry_freeze_then_immediate_thaw
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -63,3 +63,11 @@ Code rollback returns all services to the control release while leaving the five
 - No activation authorization was created or consumed. No web/ingest/worker restart, Deepcoin write, message replay, settings change, trigger/window/word-list change, lifecycle/binding transition or order mutation occurred. Because the candidate never ran, there is no post-deployment context-resolution attempt and no claim that the five fields were live-written.
 - Complete root-owned evidence is under `/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context`. Resumption requires a separately reviewed activation mechanism that can preserve an already-unfrozen authority state while retaining the exact four-component and fail-closed gates.
 - Three redundant 819,150,848-byte rehearsal working copies were removed after the pristine backup and successful migrated copy were safely retained in the evidence directory; no production database or business row was removed.
+
+## Transient-freeze activation gate — 2026-09-01T00:53:49Z
+
+- The owner approved one exact four-component activation with a transient deployment entry freeze, followed immediately by removal of the freeze from the web, ingest and worker release drop-ins and a worker -> web -> ingest restart. The completion condition remains all three roles self-reporting `entry_admission_frozen=false`; a terminal frozen state is not accepted.
+- The deployment freeze is an entry-admission fence, not a global worker stop. `web_app.py` reads it once at process creation and uses it to withhold the message-processing worker (`ensure_message_processing_worker_mode`, lines 5454-5460). Entry submission and entry revision also reject on `deployment_entry_admission_frozen()` in `auto_trade_execution.py`. In contrast, the worker role starts `deepcoin_reconcile`, `strategy_management_worker`, `break_even_convergence_worker`, lifecycle monitoring and the other protection/management tasks independently of that flag (`web_app.py` lines 327-347 and 4637-4707).
+- A filled trigger remains covered by the normal attribution/protection pipeline during the frozen runtime: the Deepcoin reconciliation loop applies the exchange snapshot and exact leg attribution, adopts saved trigger-protection intent evidence, and then invokes `submit_verified_trigger_backup_stops` (`execution_bindings.py` lines 420-452 and 1040-1049). The rescue path is governed by the live liveness/management setting, not by the deployment entry-freeze flag. With `auto_trade_enabled=true`, the current live rollout settings therefore remain effective during the transient freeze.
+- The production rows support that code-level conclusion. Lifecycle 1037 is `pending_entry`; binding 321 is `open/entry_order_pending`. Legs 555 and 556 are pending `trigger_limit` entries for order IDs `1001125071413372` and `1001125071413427`, each with a stop request at 82,200. Each leg has one planned primary stop, one planned backup stop and three planned take-profit legs, plus its own pending `trigger_protection_intent` (IDs 160 and 161). If a trigger fills during the brief service stop/restart interval, protection is not instantaneous while the process is down; attribution and protection resume after the worker starts (the Deepcoin reconcile startup delay is 5 seconds and its normal interval is 30 seconds). The freeze itself does not suppress those paths.
+- A fresh Deepcoin public ticker read returned `BTC-USDT-SWAP last=78620` with exchange timestamp `2026-09-01T00:53:49Z`. The two short-entry triggers are above that price by `(80510-78620)/78620 = 2.403968%` and `(81110-78620)/78620 = 3.167133%`, respectively. Because protection is not blocked by the freeze, the conditional stop rule “protection frozen and market close to trigger” does not apply; activation may proceed under the approved transient-freeze contract.
