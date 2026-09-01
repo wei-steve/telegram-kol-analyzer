@@ -2,8 +2,8 @@
 
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
-phase_state: in_progress
-current_phase: r1_local_complete_production_l3_pending
+phase_state: blocked
+current_phase: r1_activation_blocked_candidate_identity_unverified
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -14,6 +14,7 @@ production_sha_after: 18434b4552938ae3acb1160ad32618aab9c3ecf4
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: null
+r1_schema_columns_added: true
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
@@ -289,7 +290,21 @@ Reuse the existing verified backup, integrity and `VACUUM` path. Production evid
 - Both online worker readers select `candidate_thread_ids_json` when it is non-NULL and parse it as a sorted unique integer list. Only a SQL NULL activates the legacy full-request fallback. The Web projection selects the new chronological message references for `context_message_count`, with its legacy fallback retained for historical NULL rows.
 - The tagged parser distinguishes untagged `legacy-full`, exact `reference-only` and exact `archived` markers; unknown or extra tagged fields and invalid archive hashes fail closed. Worker fallback requires a legacy full request, and the offline analysis backfill also requires legacy-full storage, so an archived marker is never accepted as an empty request.
 - Independent exact-base review reported **no findings** and passed its own `113` focused tests. The final full suite ran after the last production-code edit and passed `6753 passed, 4 skipped, 32 warnings in 447.81s`; warnings are the existing deprecation warnings.
-- Production has not yet been touched by R1. The next authorized step in this same phase is the separate L3 nullable-column migration with a verified backup and integrity/count gates, followed by a fresh runtime-only stage declaring `schema_changed=false`.
+- At this local-only checkpoint, production had not yet been touched by R1; the subsequent production attempt and its terminal state are recorded immediately below.
+
+## R1 production attempt — fail-closed rollback 2026-09-01
+
+- The separate L3 schema step completed before staging. The verified root-owned mode-0600 backup is `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z/pre-r1-schema.db`, size 812,068,864 bytes, SHA-256 `da30f56e45ccc9d185d83c2d713ad5f2e3bf54cba8ff5ecedfd48aba5b78ea05`. It passed `PRAGMA quick_check=ok` and had zero foreign-key violations. The migration ran from an independent archive of reviewed code with `python -B`, under the runtime-control lock and one `BEGIN IMMEDIATE`; it did not import an immutable release or the mutable checkout.
+- Exactly the four R1 columns were added: `context_message_refs_json`, `candidate_thread_ids_json`, `rendered_prompt_sha256` and `request_component_sha256_json`. All 4,271 historical rows remained NULL in all four columns. Before/after counts were identical for `context_resolution_attempts=4271`, `execution_bindings=321`, `execution_events=3883`, `message_processing_jobs=2443`, `raw_messages=14204`, `recognition_decisions=14203`, `signal_candidates=2124` and `strategy_lifecycles=1038`; post-migration integrity remained clean. These additive nullable columns are retained under the approved rollback contract.
+- A fresh immutable runtime-only stage was created at exact pushed HEAD `4284d1a61226eb16812407c4f2489a207241db4c`, with `schema_changed=false`. Its tree is `0abf86970133f2d6d67bb21b42e9cd2436cf605d`, content SHA-256 `49ac8d529dcf3bdc2bf2e4951575413f26c84724862df9175be8c4ad4e72fe42`, manifest SHA-256 `81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167`, and stage action-plan SHA-256 `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`. No post-receipt command imported or executed release code.
+- The candidate monitor installer completed under the update lock after byte-preserving backups. The four installed base units matched the candidate by exact filename and SHA-256; the diagnostic-only arguments were present only on the diagnostic unit, retired arguments were absent, monitor env pointed to the candidate, and `systemd-analyze verify` passed. The monitor timer's prior enabled/active state was preserved.
+- The pre-activation read-only price gate passed at `2026-09-01T03:13:02Z`: BTC-USDT-SWAP last was 78,444.2, with 80,510 and 81,110 respectively 2.633464% and 3.398339% above market. Neither distance was below 1%.
+- The activation manifest declared exactly web, monitor, ingest and worker, source mode `immutable`, rollback `18434b4552938ae3acb1160ad32618aab9c3ecf4`, `schema_changed=false`, no production-data mutation and no exchange-write semantics change. Its canonical nine-field authorization was root-owned, mode 0400, printed and preserved with the exact manifest before being consumed once; the activation action-plan SHA-256 was `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`.
+- Activation failed at the candidate deployment diagnostic and was not retried. The oneshot started and completed business-source collection, reporting `healthy=true`, `reason_codes=[]`, `adapter_failures=[]`, `sources_complete=true`, `result_complete=true` and `audit_ran=false`, but returned exit 1 because `loaded_artifact_verified=false`, `release_commit=null` and `manifest_sha256=null`. The exact unresolved blocker is therefore candidate runtime-identity proof, not a business-health reason. Per the fail-closed gate, the helper rejected the candidate and completed rollback to `18434b4552938ae3acb1160ad32618aab9c3ecf4` with exit code 4. No second activation, release repair or diagnostic workaround was attempted.
+- The rollback initially retained the deliberate deployment freeze. A first thaw edit incorrectly matched an unquoted environment line and changed nothing; the immediate identity check correctly caught all three roles still frozen. Reading the exact drop-ins showed the quoted line `Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"`. The corrected bounded edit removed exactly that line from web, ingest and worker, then performed `daemon-reload` and the required worker -> web -> ingest restart under the update lock.
+- The final runtime is the rollback release: web PID 944570, ingest PID 944575 and worker PID 944565 all report release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, manifest `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`, `loaded_artifact_verified=true` and `entry_admission_frozen=false`. Web event-loop, ingest listener/reconcile, and worker command/message-processing health are true with zero observed stalls. Trading settings report `auto_trade_enabled=true`; monitor's rollback release drop-in names `18434b45...`, and its timer is enabled and active. R1 never became the running production release, so there is no live dual-write sample and no deployment-success claim.
+- The owner-provided order premise had already drifted before this activation. Final read-only evidence shows zero positions, zero regular open orders and zero pending BTC triggers. Both exact trigger IDs remain in exchange history with no fills and exchange `uTime=2026-09-01T02:02:38Z`, more than an hour before the `03:14–03:15Z` activation. Local state matches that earlier terminalization: lifecycle 1037 is `expired` with `exit_reason=expired` and `management_action=expiry_cancelled_and_expired`; binding 321 is `closed/entry_legs_terminal`; legs 555 and 556 are `cancelled`. This deployment did not submit, cancel or modify a Deepcoin order.
+- No Step 1 trigger backfill, Step 2 thread-ID backfill, Step 4 archive/marker transaction, `VACUUM`, R2 source cutover, setting change, prompt/threshold/window change, message replay or business-row repair was performed. Complete production evidence is rooted at `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z`.
 
 ### Behavior classification
 
