@@ -3,7 +3,7 @@
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
 phase_state: blocked
-current_phase: r1_activation_window_blocked_post_close_ledger_mismatch
+current_phase: r1_activation_blocked_effective_monitor_environment_stale
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -473,3 +473,15 @@ The final fill was approximately `0.2133` points below the break-even stop trigg
 The exact local-to-exchange protection gate nevertheless failed. Local reconciliation terminalized lifecycle `1041` as `exited/manual`, binding `322` as `closed` with `last_exchange_status=manual_closed_or_not_found_on_exchange`, and entry leg `557` as `manually_closed/manual_position_missing`. At the same time, protection-ledger rows `598`–`601` still retained `verified` for the two take-profit and two break-even-stop exchange IDs, while the fresh exchange current set was empty. Therefore the required one-to-one equality between current exchange protection and current local ledger claims was false; the run did not reinterpret or repair that mismatch and correctly stopped before the first production write.
 
 The final read-only runtime checkpoint remained unchanged: web PID `944570`, ingest PID `944575`, and worker PID `944565` were healthy on release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, artifact verification was true, `entry_admission_frozen=false`, and `auto_trade_enabled=true`. `/etc/telegram-kol-monitor.env` still pointed to that production release and manifest `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`. R1 activation remains blocked pending an owner-authorized resolution of the post-close ledger mismatch or an explicit acceptance criterion for terminal positions; neither was part of this window.
+
+## R1 install-only rolled back at effective-environment gate — 2026-09-01T07:46:32Z
+
+The owner accepted the terminal exchange state as the authoritative deployment-window gate and explicitly moved stale protection-ledger rows `598`–`601` to a separate follow-up. A fresh authenticated snapshot at `2026-09-01T07:43:04.152368Z` returned zero account positions, zero regular open orders, and zero pending triggers for BTC, ETH and SOL, so the corrected exchange gate passed.
+
+Install-only then ran once under `/run/telegram-kol-update.lock`. Before any installed byte changed, `/etc/telegram-kol-monitor.env` and the four exact monitor base units were copied byte-for-byte to root-owned mode-0600 files beneath the root-owned mode-0700 evidence directory `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-resume-20260901T074426Z`. Governed settings were confirmed as auto trade enabled and entry preamble, message-assembly-v2 and entry-revision-v2 all live. The candidate installer completed with timer enablement omitted.
+
+The installed env after-image correctly named candidate path `/opt/telegram-kol-releases/4284d1a61226eb16812407c4f2489a207241db4c`, commit `4284d1a61226eb16812407c4f2489a207241db4c`, and manifest SHA-256 `81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167`. All four installed base-unit SHA-256 values equalled the candidate files by exact filename, and `systemd-analyze verify` returned success apart from unrelated host-unit deprecation warnings.
+
+The newly required effective-environment gate nevertheless failed. `systemctl show` continued to expose `Environment=` values from the active release drop-ins for monitor path, commit and manifest, all naming rollback release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, even though `EnvironmentFiles=/etc/telegram-kol-monitor.env` pointed at the candidate after-image and `ExecStart` referenced `${TELEGRAM_KOL_MONITOR_RELEASE_PATH}`. The explicit phase rule said any effective value still naming `18434b45...` must stop before activation. No authorization was created or consumed, and the activation helper was not invoked.
+
+The install-only change was then rolled back under the same runtime-control lock. The env and all four base units compare byte-for-byte equal to their backups; the env again names rollback release `18434b45...`; the monitor timer is restored to enabled and active/waiting. At `2026-09-01T07:46:32Z`, web PID `944570`, ingest PID `944575`, and worker PID `944565` were unchanged, all three reported exact rollback release, verified artifact and `entry_admission_frozen=false`, worker management/protection/close/TPSL/rescue loops were fresh and healthy, and `auto_trade_enabled=true`. No service process was restarted, no release was restaged or modified, no Deepcoin write occurred, and stale ledger rows `598`–`601` were not changed.
