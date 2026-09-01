@@ -86,3 +86,86 @@ Code rollback returns all services to the control release while leaving the five
 - Natural traffic produced context attempts 4252 and 4253 after activation. Both populated all five additive fields: `invocation_triggers_json`, `attempt_phase`, `provider_request_count`, `provider_usage_json`, and `request_component_bytes_json`. Attempt 4252 recorded one provider request, 15,320 total tokens and 39,324 request bytes, decided `new_thread`, and projected raw message 14182 to one `entry_signal` candidate. Attempt 4253 recorded one provider request, 11,646 total tokens and 31,782 request bytes, decided `hold`, and preserved raw message 14180 as non-strategy. In both cases the first provider request succeeded, with no error, no durable retry time and no extra request; this is the unchanged pre-existing success decision path, so the observability and backoff changes did not alter the decision.
 - The live calls did not encounter a provider network error. The expected success-path behavior was observed: no backoff was scheduled and the provider circuit remained closed with zero consecutive transport failures. The network-error scheduling/open-circuit branch therefore retains its previously completed deterministic RED/GREEN and full-suite proof; this window does not claim a production fault-injection test.
 - Root-owned evidence for activation, thaw, identities, monitor cycles, exchange readbacks and live context rows is under `/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/activation-20260901T0100Z`. No activation rollback was needed. The five nullable columns remain in place by contract, and no recovery ledger, recognition setting, trigger condition, threshold, context window, whitelist, historical message or existing exchange order was modified by the rollout procedure.
+
+## `context_resolution_attempts` retention and pruning design — read-only measurement 2026-09-01
+
+This section is a design and read-only measurement only. No row, schema, setting, service, release or exchange state was changed. The production database was opened with `sqlite3 -readonly`; UTF-8 byte counts use `length(CAST(column AS BLOB))`. The fixed measurement anchor is `2026-09-01 01:41:17Z`, so the 30/60/90-day cutoffs do not move between queries.
+
+### Trigger-history ordering decision
+
+There are 4,256 attempts. The 4,251 legacy attempts have no `invocation_triggers_json`; the five post-rollout attempts do. Every `request_summary_json` is valid JSON and all 4,256 rows contain the four complete inputs consumed by `requires_context_resolution`: `mimo_first_pass`, `saved_evidence`, `message_context` and `candidate_strategy_threads`.
+
+The trigger reconstruction is deterministic and, for this dataset, semantically equivalent to the production invocation decision:
+
+- `requires_context_resolution` and its eight trigger terms/order were introduced by `663fe8b386871f2b86fce610eb0baa9a066f2e7a` and those lines have not changed since the first stored attempt.
+- `request_summary_json` is built from the same four objects immediately after that predicate is evaluated; all fields read by the predicate are retained.
+- Re-running the exact current Python predicate against the five rows that also carry directly persisted trigger lists produced exact ordered-list equality for all five rows. The earlier SQL analysis is a faithful hand translation, but any production backfill must call the pinned Python predicate rather than treat the SQL translation as the write authority.
+
+The only non-equivalence is provenance: a backfilled value is reconstructed after the event rather than captured during the event. It is trustworthy for the eight-trigger distribution, but it is not evidence that the other new telemetry was captured. Queries must continue to distinguish the legacy cohort by `attempt_phase IS NULL` / `provider_request_count IS NULL`; otherwise a blanket non-NULL coverage metric would be misleading.
+
+| Sequence choice | Implementation cost | Main risk | Information retained/lost |
+|---|---|---|---|
+| A. Backfill the 4,251 legacy trigger lists, then archive/prune old requests | Medium, L3 data update: pin the predicate commit, preserve exact ID/input hashes, update only NULL trigger fields with compare-and-set, and verify all lists before request pruning | Mixing reconstructed and directly observed provenance unless the legacy cohort and reconstruction manifest remain explicit | Preserves exact eight-trigger history online. Full historic prompt/window replay is still lost from the live DB after request pruning, but remains available from the archive |
+| B. Do not backfill, accept that old request inputs disappear | Lowest write complexity | Without an archive, the only source for the historic eight-trigger distribution and full resolver input is permanently lost | Keeps attempt/decision outcomes but loses online trigger reconstruction and full input replay. If a verified archive is retained, the loss is from the live DB rather than permanent |
+| C. Keep all legacy requests forever and apply retention only to new rows | Lowest historical risk | Does not solve the existing 328.239 MB request payload; at the measured 9.41 MB/day, another approximately 282.3/564.6/846.9 MB can accumulate before a 30/60/90-day policy first reaches steady state | Preserves all old history online, but gives no immediate space or audit-copy reduction |
+
+Recommended ordering is A only if online historical trigger analysis is still a requirement; otherwise use B **with a verified archive**, not destructive B. C is a temporary deferral, not a storage remedy. Backfilling directly into `invocation_triggers_json` does not pollute trigger counts because the output is exact, but its reconstructed cohort must never be presented as live-captured observability.
+
+### Live column profile
+
+The live database file is 820,178,944 bytes. `dbstat` attributes 334,442,496 bytes (40.78%) to the table body and 421,888 bytes to its indexes. The six pre-existing JSON columns contain 329,862,145 logical bytes, 98.63% of the table body. The three new JSON telemetry fields are immaterial to this storage issue: only five rows are populated and their combined payload is 2,238 bytes.
+
+| JSON column | Non-NULL / NULL rows | Logical bytes | Share of six JSON | Row-size distribution |
+|---|---:|---:|---:|---|
+| `request_summary_json` | 4,256 / 0 | 328.239 MB | 99.508% | min 4,348 B; avg 77,123.91 B; max 161,598 B; 32 rows 1–10 KiB, 3,238 rows 10–100 KiB, 986 rows at least 100 KiB |
+| `decision_json` | 2,778 / 1,478 | 1.369 MB | 0.415% | all non-NULL rows below 1 KiB; avg 492.97 B; max 987 B |
+| `prompt_versions_json` | 4,256 / 0 | 0.196 MB | 0.059% | every row exactly 46 B |
+| `trigger_event_json` | 266 / 3,990 | 0.033 MB | 0.010% | all non-NULL rows below 1 KiB; avg 122.96 B; max 131 B |
+| `reanalysis_triggers_json` | 4,256 / 0 | 0.019 MB | 0.006% | 3,981 rows are `[]`; avg 4.48 B; max 78 B |
+| `rejected_response_diagnostic_json` | 60 / 4,196 | 0.006 MB | 0.002% | all non-NULL rows below 1 KiB; avg 95.52 B; max 100 B |
+
+`decision_json` is the durable explanation of the resolver's historical decision. Keeping all of it costs only 1.369 MB: 0.409% of the table body and 0.167% of the whole database. It should not be pruned. The same conclusion applies to the other four small JSON fields: at the current 30-day cutoff, pruning all five in addition to `request_summary_json` would recover only another 0.120 MB.
+
+Row status distribution is 2,571 `completed`, 1,439 `exhausted`, 178 `superseded` and 68 `failed`. The request payload distribution is correspondingly 181.545, 131.169, 12.096 and 3.429 MB. Current code can use a completed unresolved attempt with non-empty `reanalysis_triggers_json` for a future reanalysis and state fingerprint, so a retention predicate must always exclude such runtime-eligible rows. At this measurement point there are zero such rows; all 256 rows older than 30 days pass this additional runtime-safety predicate.
+
+### 30/60/90-day logical recovery
+
+Only 256 rows (6.02%) are older than 30 days. The oldest attempt is `2026-07-27 09:38:38Z`; therefore no row is yet older than 60 or 90 days. Values below are logical JSON payload bytes. The main SQLite file will not shrink until a database rewrite.
+
+| Column | 30 days | 60 days | 90 days |
+|---|---:|---:|---:|
+| `request_summary_json` | 11.101 MB | 0 | 0 |
+| `decision_json` | 0.104 MB | 0 | 0 |
+| `prompt_versions_json` | 0.012 MB | 0 | 0 |
+| `trigger_event_json` | 0.003 MB | 0 | 0 |
+| `reanalysis_triggers_json` | 0.001 MB | 0 | 0 |
+| `rejected_response_diagnostic_json` | 0 | 0 | 0 |
+| All six | 11.222 MB | 0 | 0 |
+
+The preferred request-only 30-day policy retains 317.138 MB of current request payload. Using the observed table physical/logical ratio only as a planning estimate, a subsequent full SQLite rewrite would reduce the table by approximately 11.26 MB and the database from 820.179 MB to approximately 808.923 MB. A 60- or 90-day policy recovers nothing today and therefore does not address the present audit-copy cost.
+
+The daily management audit creates and verifies two complete private snapshots. Under the same estimate, the 30-day request-only pruning would reduce bytes copied across those two snapshots by approximately 22.51 MB. A naive linear projection changes the observed 1.2 GB cgroup peak to about 1.184 GB, but this is low-confidence: source page cache, destination page cache, SQLite process memory and timing do not scale one-for-one. The defensible forecast is “roughly unchanged to modestly lower”; the next authorized implementation must measure the post-compaction peak rather than use 1.184 GB as an acceptance value.
+
+### Ranked implementation plan for a later authorized L3 window
+
+1. **P1 — archive + exact legacy-trigger backfill + 30-day request-only retention.** Recover 11.101 MB logically today and bound future request growth to a rolling window. Preserve every row, every `decision_json`, status/error/retry metadata and all small JSON. Archive the full request first, then backfill only the 4,251 NULL trigger lists using the pinned unchanged predicate, and finally replace only runtime-ineligible, pre-cutoff request payloads with an explicit archived marker. This needs a minimal reader guard so offline backfill/analysis treats the marker as archived rather than as an empty valid request; the current NOT NULL column must not be silently set to NULL or `{}`. A short write-maintenance window is recommended for the one-transaction compare-and-set; physical compaction is a separate stopped-service window.
+2. **P2 — archive + 30-day request-only retention without trigger backfill.** Same 11.101 MB recovery and same runtime guards, with fewer live-row writes. Trigger reconstruction and full replay move to the archive. Choose this if online historical trigger queries are not required. The traceability loss is operational convenience, not evidence destruction, provided archive coverage is complete.
+3. **P3 — new-row-only retention.** No immediate recovery and legacy payload remains permanently in the live table. It can cap only future generations after the selected age is reached. This is safe as a temporary hold but does not meet the current size/audit objective.
+4. **Do not prioritize six-column pruning or whole-row deletion.** Six-column pruning gains only 0.120 MB beyond request-only at the current cutoff while deleting decisions and diagnostics. Whole-row deletion additionally destroys attempt/error/retry identity and index relationships for an unmeasured marginal benefit.
+
+| Priority | Current recovery | Traceability loss | Required interruption | Rollback |
+|---|---:|---|---|---|
+| P1 | 11.101 MB logical; approximately 11.26 MB physical after compaction | Full requests leave the live DB but remain in the archive; trigger lists remain online with reconstructed provenance | Short write-maintenance window for backfill/prune; full writer stop only for physical compaction | Transaction rollback before commit; verified archive field restore after commit; full backup only for disaster recovery |
+| P2 | Same as P1 | Full requests and trigger reconstruction leave online queries but remain recoverable from the archive | Short write-maintenance window for prune; full writer stop only for physical compaction | Transaction rollback before commit; verified archive field restore after commit |
+| P3 | 0 today | None for legacy rows | None until future eligible rows are pruned; eventual physical compaction still needs a stopped window | Stop applying the future policy; no legacy restoration needed |
+| Six-column / row deletion | At most another 0.120 MB at today's cutoff, plus unmeasured row/index overhead for deletion | Loses decision/diagnostic or entire attempt history | At least the same L3 write and compaction windows | More complex multi-column or row restoration; not justified by the marginal saving |
+
+Archive format should be a root-owned mode-0700 evidence directory containing mode-0600, ID-ordered canonical JSONL compressed with zstd. Each record should contain at least attempt ID, raw message ID, context fingerprint, creation time, the original `request_summary_json` bytes and their SHA-256. Its manifest should bind source database backup hash, fixed cutoff, predicate/code commit, row count, exact ordered ID-list hash, min/max IDs and timestamps, uncompressed canonical-stream SHA-256, compressed-file SHA-256 and byte counts. Before any live update, verify decompression, both hashes, exact one-to-one ID coverage and per-row request hashes. Keeping one copy off the live database filesystem is preferable; no compression ratio is claimed until it is measured.
+
+Rollback boundaries:
+
+- Before commit, one `BEGIN IMMEDIATE` transaction provides full rollback. It must re-read the exact cutoff set, confirm no row is currently claimable/reanalysis-eligible, compare input hashes and update only the expected rows.
+- After commit but before physical compaction, restore request bytes from the verified archive in a new bounded transaction; the original full database backup remains the disaster-recovery boundary.
+- After compaction, field-level restoration is still possible from the archive but grows the DB again. Whole-database restore requires stopped writers and separate authorization; it must not overwrite writes that occurred after the backup.
+
+SQLite is in WAL mode with `auto_vacuum=NONE`. Nulling/replacing large payloads can free pages for reuse, but it does not reduce the main file and can create a large WAL. Physical shrink therefore requires a full `VACUUM`-class rewrite. Reuse the established production SQLite backup path, require `quick_check=ok`, an empty foreign-key check and before/after critical counts, then stop all database writers for compaction. Allow at least one additional database-size temporary copy plus WAL and safety headroom, preserve ownership/mode, fsync, and rerun integrity/count checks before restart. Do not attempt online compaction against active ingest/web writes; leaving freed pages for later reuse is the no-downtime alternative, with the explicit tradeoff that file size and audit snapshot bytes do not fall until the maintenance window.
