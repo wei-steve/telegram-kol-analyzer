@@ -1,9 +1,9 @@
 # AI Context Resolution Optimization Status
 
 ```yaml
-workstream: ai_context_resolution_shadow_invocation_gate
+workstream: main_recognition_provider_observability
 phase_state: in_progress
-current_phase: shadow_deployed_pending_live_context_sample
+current_phase: main_recognition_candidate_tested_pending_l3_schema
 claimed_by: null
 base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -20,12 +20,26 @@ shadow_production_sha: 3205b074642436ed0f6aa35fefef7941a4f3f62f
 shadow_schema_columns_added: true
 shadow_activation_complete: true
 shadow_live_sample_verified: false
+main_recognition_code_sha: 24169cd03d22c7ba12d1e96e1fc26166f159615c
+main_recognition_production_sha: null
+main_recognition_schema_columns_added: false
+main_recognition_activation_complete: false
+main_recognition_live_sample_verified: false
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
 entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
+
+## Main-recognition provider observability — local candidate 2026-09-01
+
+- The implementation plan is commit `4d4ea8e22a22b2435c20f96b8377274c9355d54b`; the reviewed production-code commit is `24169cd03d22c7ba12d1e96e1fc26166f159615c`. Four nullable columns are added to `mimo_recognition_attempts`: `attempt_phase`, `provider_request_count`, `provider_usage_json` and `request_component_bytes_json`. Existing callers omit the new arguments and retain NULL in all four fields; `MimoRecognitionAttemptView` and all recognition/trading readers remain unchanged.
+- The exact object returned by the existing MiMo payload builder is measured without mutation and passed as the same object to `httpx.Client.post(..., json=payload)`. The provider's returned `usage` object is retained inside a request-ordinal wrapper; omitted usage is explicitly `available=false` with `provider_usage_not_returned` and is never inferred from bytes. The canonical UTF-8 component record partitions system prompt, current-message text, image data URLs, rendered authoritative context and structural overhead; those five values sum exactly to the canonical request total. Direct-reply bytes are separately reported as an explicitly nested subset of authoritative context.
+- V2 preserves one audit row per provider attempt and records an exact 0/1 provider-request count. V1 preserves its existing single aggregate audit row and records the actual number of internal provider calls plus per-request usage entries. A failure before any provider call records zero; an outer v1 exception whose provider-call state cannot be reconstructed leaves the new value NULL rather than inventing zero. Telemetry calculation and serialization failures degrade only the telemetry object and do not alter the provider result, retry decision, parsed content, canonical decision or execution projection.
+- RED was observed for absent schema/persistence arguments, absent provider side-channel metadata, observability exceptions escaping the main path, and a pre-provider failure incorrectly counted as one request. GREEN passed the final focused migration, persistence, provider, v1/v2 authority and decision set: `116 passed`.
+- Independent exact-base review against `4d4ea8e22a22b2435c20f96b8377274c9355d54b` reported no Critical, Important or Minor findings and a Ready verdict. It independently reran the 116 focused tests, confirmed payload object identity, nullable backward compatibility, exact 0/1 v2 counts, aggregated v1 counts, strict byte partitioning and the absence of any decision reader for the new columns.
+- The last production-code edit preceded the final full suite: `6776 passed, 4 skipped, 32 warnings in 414.48s`. The warnings are the existing YAML prompt and SQLite datetime deprecations. No production schema, row, setting, release, unit, service or exchange state has changed at this checkpoint. The next authorized action is the separate L3 nullable-column step; the later runtime-only stage must declare `schema_changed=false`.
 
 ## Shadow invocation gate — local candidate 2026-09-01
 
