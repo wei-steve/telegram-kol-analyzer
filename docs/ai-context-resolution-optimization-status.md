@@ -3,20 +3,23 @@
 ```yaml
 workstream: ai_context_resolution_shadow_invocation_gate
 phase_state: in_progress
-current_phase: shadow_candidate_verified_pending_l3_schema_and_activation
+current_phase: shadow_deployed_pending_live_context_sample
 claimed_by: null
 base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: ff995723b64a331f963b49affb8827929213d8ac
+pushed_sha: 3205b074642436ed0f6aa35fefef7941a4f3f62f
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
-production_sha_after: 4284d1a61226eb16812407c4f2489a207241db4c
+production_sha_after: 3205b074642436ed0f6aa35fefef7941a4f3f62f
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_schema_columns_added: true
 shadow_code_sha: ff995723b64a331f963b49affb8827929213d8ac
-shadow_schema_columns_added: false
+shadow_production_sha: 3205b074642436ed0f6aa35fefef7941a4f3f62f
+shadow_schema_columns_added: true
+shadow_activation_complete: true
+shadow_live_sample_verified: false
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
@@ -33,6 +36,16 @@ auto_trade_enabled_observed: true
 - A production SQLite read-only replay used the fixed `context_resolution_attempts.id <= 4245` cohort and the exact eight legacy trigger reconstruction. It reproduced 3,906 `multiple_same_source_candidates` attempts, 474 material changes (414 semantic and 60 target), and the 25 rule-B misses. The implemented shadow kept all 25/25 rule-B misses and all 474/474 material changes with `miss=[]`; it marked 1,465 calls as would-skip, exactly matching the approved historical rule.
 - Independent exact-base review initially found incomplete best-effort coverage around result serialization and property projection. Both findings were fixed with RED/GREEN failure injection. Final re-review reported no Critical, Important or Minor findings and a Ready verdict; it independently reran the focused tests and accepted the replay evidence.
 - The last production-code edit preceded the final full suite: `6768 passed, 4 skipped, 32 warnings in 416.17s`. The warnings are the existing YAML prompt and SQLite datetime deprecations. No production schema, row, setting, release, unit, service or exchange state has been changed at this checkpoint. The next authorized work is the separate L3 nullable-column step, followed by a runtime-only immutable stage with `schema_changed=false`.
+
+## Shadow invocation gate deployed; live sample pending — 2026-09-01T13:49:42Z
+
+- The separate L3 step used the reviewed exact archive and the established SQLite backup path. Backup `/var/lib/telegram-kol-cutover-evidence/3205b074642436ed0f6aa35fefef7941a4f3f62f/ai-context-shadow-20260901T132208Z/pre-shadow-schema.db` is root-owned mode 0600 with SHA-256 `a07882a2b88539050a40487a13ee2488a1c1299a9ac751d50ceee833f814ec23`; `quick_check=ok` and foreign-key rows were zero. One `BEGIN IMMEDIATE` transaction added exactly the five nullable `shadow_*` columns. All 4,327 legacy attempts were NULL in every new column; the eight critical table counts were identical before and after inside the transaction, and the post-commit `quick_check` and foreign-key check passed.
+- A fresh runtime-only immutable stage at exact pushed HEAD `3205b074642436ed0f6aa35fefef7941a4f3f62f` declared `schema_changed=false`. Its tree is `6f71aca3e58be0c960dc77cfca7e482cf44e808f`, content SHA-256 `3c2ee05884759ff77cb3f9b295ba8874309b862c5ef85f4491b22fc3008e623c`, manifest SHA-256 `37a5306613655dc6220a7344844306670d2142c879712204add3bb9b88a04c45`, and stage action-plan SHA-256 `aa8f2bdc71c3be810f02562f7137902b889722a2e36ce3e27fee9a8f0708f48b`. No post-receipt root command imported or executed candidate release code.
+- Install-only backed up `/etc/telegram-kol-monitor.env` and all four exact base units byte-for-byte before writing. The installed env points to candidate path, commit and manifest; each installed unit SHA-256 equals its same-named candidate file; the diagnostic-only flags and retired-argument checks passed; `systemd-analyze verify` passed. The first local gate incorrectly required a timer `MainPID`; its empty value is the defined processless-timer case, so the installed objects were not blamed or rolled back. The corrected gate validated timer inactivity separately and required `MainPID=0` only for the three service units.
+- The final authenticated pre-activation snapshot at `2026-09-01T13:31:33.876913Z` returned zero positions, zero regular open orders and zero pending triggers for BTC, ETH and SOL. A canonical nine-field, root-owned mode-0400 authorization bound candidate `3205b074...`, exact components `web`, `monitor`, `ingest`, `worker`, source mode `immutable` and activation action-plan SHA-256 `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`; the helper consumed it once and returned `status=activated`. Candidate deployment diagnostic returned exit 0 with `healthy=true`, `reason_codes=[]`, `adapter_failures=[]`, `audit_ran=false`, `sources_complete=true`, `result_complete=true` and `loaded_artifact_verified=true`.
+- Immediately after activation, the exact quoted/unquoted freeze line was removed once from each worker, web and ingest release drop-in, followed by `daemon-reload` and the required `worker -> web -> ingest` restart. The install-only contract had disabled the timer and immutable activation did not restore it because its pre-activation state was inactive; it was therefore restored to its established enabled/active state after thaw. Final PIDs were web `2222249`, ingest `2222254`, worker `2222244`; all three stayed active on `3205b074...`, verified manifest `37a53066...`, and reported `entry_admission_frozen=false`. Role-specific event, ingest, message-processing and command loops were healthy, and `auto_trade_enabled=true` remained unchanged.
+- An ordinary monitor run completed with `Result=success`, `ExecMainStatus=0`, candidate artifact verification true, `healthy=true`, `reason_codes=[]`, `monitor_error=null` and `notification_status=not_needed`; the timer ended active/waiting. The final authenticated exchange snapshot at `2026-09-01T13:49:42.030922Z` remained zero positions, zero regular open orders and zero BTC/ETH/SOL triggers. No deployment action wrote to Deepcoin.
+- The fixed L1 observation ran from `2026-09-01T13:34:00Z` through `13:49:11Z`. Only one real message from one chat arrived, no context-resolution attempt was naturally created, and no execution event was added. Consequently there is no non-zero production row proving the new shadow fields yet. Deployment and runtime acceptance passed, but `shadow_live_sample_verified` remains false and the phase stays `in_progress`; do not infer field correctness from a zero-sample window or manufacture a model call. Detailed raw evidence is under `/var/lib/telegram-kol-cutover-evidence/3205b074642436ed0f6aa35fefef7941a4f3f62f/ai-context-shadow-20260901T132208Z`.
 
 ## Scope contract
 
