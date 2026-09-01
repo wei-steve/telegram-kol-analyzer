@@ -1,26 +1,38 @@
 # AI Context Resolution Optimization Status
 
 ```yaml
-workstream: ai_context_resolution_full_column_archive_r1
-phase_state: complete
-current_phase: r1_activated_live_dual_write_verified
+workstream: ai_context_resolution_shadow_invocation_gate
+phase_state: in_progress
+current_phase: shadow_candidate_verified_pending_l3_schema_and_activation
 claimed_by: null
-base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
+base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: 4284d1a61226eb16812407c4f2489a207241db4c
+pushed_sha: ff995723ac242b7c0c15f209a166b1acf3665cce
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_schema_columns_added: true
+shadow_code_sha: ff995723ac242b7c0c15f209a166b1acf3665cce
+shadow_schema_columns_added: false
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
 entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
+
+## Shadow invocation gate — local candidate 2026-09-01
+
+- The exact base is `1d82f29f2f1177b98e436fd578d0f4eb0b72fdae`; the reviewed production-code commit is `ff995723ac242b7c0c15f209a166b1acf3665cce`. The existing `requires_context_resolution` function remains byte-for-byte unchanged and remains the only provider-invocation authority. Candidate generation, `ACTIVE_LIFECYCLE_STATUSES`, context windows, prompts, provider payloads, model decisions and settings are unchanged.
+- The candidate adds one separate pure shadow evaluator with a centralized immutable policy. It preserves every non-multiple authoritative trigger and applies the approved tightening only to `multiple_same_source_candidates`: first-pass strategy, non-`none` lifecycle event, the approved expanded action/correction expressions matched against raw text and first-pass `input_reading.observed_text`, or the both-text-empty `market_chart` fallback. The shadow result is never read by an invocation or decision branch.
+- Five nullable audit columns are added through the existing SQLite compatibility migration path: `shadow_would_trigger`, `shadow_conditions_json`, `shadow_agrees_with_authoritative`, `shadow_disagreement_direction` and `shadow_evaluation_error`. Legacy rows remain valid with all five NULL. New attempt writes retain the complete R1 payload and telemetry and additionally store the shadow result. Shadow evaluator, result-property and JSON-serialization failures are all inside one best-effort boundary; they leave the four result fields NULL, record only the exception type, and do not block the provider result or authoritative decision.
+- RED was observed before implementation: the dedicated test failed at collection because `telegram_kol_research.context_resolution_shadow` did not exist. Two later injected failures separately proved that JSON serialization and result-property access escaped the initial boundary before their fixes. GREEN passed the final 15 focused shadow/schema/persistence tests; the broader context, authority, migration, replay and worker set passed `137 passed` before the final boundary edit.
+- A production SQLite read-only replay used the fixed `context_resolution_attempts.id <= 4245` cohort and the exact eight legacy trigger reconstruction. It reproduced 3,906 `multiple_same_source_candidates` attempts, 474 material changes (414 semantic and 60 target), and the 25 rule-B misses. The implemented shadow kept all 25/25 rule-B misses and all 474/474 material changes with `miss=[]`; it marked 1,465 calls as would-skip, exactly matching the approved historical rule.
+- Independent exact-base review initially found incomplete best-effort coverage around result serialization and property projection. Both findings were fixed with RED/GREEN failure injection. Final re-review reported no Critical, Important or Minor findings and a Ready verdict; it independently reran the focused tests and accepted the replay evidence.
+- The last production-code edit preceded the final full suite: `6768 passed, 4 skipped, 32 warnings in 416.17s`. The warnings are the existing YAML prompt and SQLite datetime deprecations. No production schema, row, setting, release, unit, service or exchange state has been changed at this checkpoint. The next authorized work is the separate L3 nullable-column step, followed by a runtime-only immutable stage with `schema_changed=false`.
 
 ## Scope contract
 
