@@ -108,6 +108,68 @@ def test_run_records_ordered_attempts_and_terminal_selection(tmp_path):
             "trading.analysis.mimo_v2_authoritative": 12
         }
         assert session.query(MimoRecognitionAttempt).count() == 2
+        stored_attempt = session.query(MimoRecognitionAttempt).filter_by(
+            run_id=run.id, ordinal=1
+        ).one()
+        assert stored_attempt.attempt_phase is None
+        assert stored_attempt.provider_request_count is None
+        assert stored_attempt.provider_usage_json is None
+        assert stored_attempt.request_component_bytes_json is None
+
+
+def test_attempt_observability_is_additive_and_canonical(tmp_path):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _message(factory)
+    run = _start(factory, raw_message_id)
+    provider_usage = {
+        "requests": [
+            {
+                "available": True,
+                "request_number": 1,
+                "usage": {
+                    "completion_tokens": 13,
+                    "prompt_tokens": 21,
+                    "provider_extension": {"cache_hit": False},
+                },
+            }
+        ]
+    }
+    component_bytes = {
+        "encoding": "utf-8-canonical-json-v1",
+        "request_total_bytes": 300,
+        "system_prompt_bytes": 50,
+        "current_message_text_bytes": 20,
+        "image_evidence_bytes": 0,
+        "authoritative_context_bytes": 200,
+        "direct_reply_bytes": 30,
+        "direct_reply_included_in_authoritative_context": True,
+        "structural_overhead_bytes": 30,
+    }
+
+    record_mimo_attempt(
+        factory,
+        run_id=run.id,
+        ordinal=1,
+        status="completed",
+        response_payload={"ok": True},
+        attempt_phase="v2_authoritative",
+        provider_request_count=1,
+        provider_usage=provider_usage,
+        request_component_bytes=component_bytes,
+    )
+
+    with factory() as session:
+        row = session.query(MimoRecognitionAttempt).one()
+        assert row.attempt_phase == "v2_authoritative"
+        assert row.provider_request_count == 1
+        assert json.loads(row.provider_usage_json) == provider_usage
+        assert json.loads(row.request_component_bytes_json) == component_bytes
+        assert row.provider_usage_json == json.dumps(
+            provider_usage,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
 
 
 def test_attempts_are_append_only_and_terminal_run_is_guarded(tmp_path):

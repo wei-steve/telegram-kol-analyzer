@@ -1423,6 +1423,18 @@ class MimoRecognitionAttempt(Base):
     response_fingerprint: Mapped[Optional[str]] = mapped_column(
         String(64), nullable=True
     )
+    attempt_phase: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    provider_request_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    provider_usage_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    request_component_bytes_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     started_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     completed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
     duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)

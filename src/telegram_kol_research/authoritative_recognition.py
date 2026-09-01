@@ -84,6 +84,9 @@ from telegram_kol_research.recognition_decisions import (
 )
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
+    _latest_provider_request_telemetry,
+    _provider_usage_audit,
+    _request_component_bytes_audit,
     build_authoritative_context_for_message,
     infer_mimo_authoritative_v2,
     run_mimo_authoritative_for_message,
@@ -1119,6 +1122,7 @@ def _run_v1_authority_with_audit(
             duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
             started_at=started_at,
             completed_at=completed_at,
+            attempt_phase=run_kind,
         )
         complete_mimo_run(
             session_factory,
@@ -1156,6 +1160,17 @@ def _run_v1_authority_with_audit(
         duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
         started_at=started_at,
         completed_at=completed_at,
+        attempt_phase=run_kind,
+        provider_request_count=sum(
+            int(item.provider_request_made)
+            for item in mimo.provider_attempt_telemetry
+        ),
+        provider_usage=_provider_usage_audit(mimo.provider_attempt_telemetry),
+        request_component_bytes=_request_component_bytes_audit(
+            _latest_provider_request_telemetry(
+                mimo.provider_attempt_telemetry
+            )
+        ),
     )
     if failed:
         completed = complete_mimo_run(

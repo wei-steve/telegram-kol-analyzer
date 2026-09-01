@@ -1,3 +1,4 @@
+import copy
 import json
 from datetime import UTC, datetime
 
@@ -11,6 +12,7 @@ from telegram_kol_research.models import (
     AiPromptInvocation,
     MediaAsset,
     MessageRecognition,
+    MimoRecognitionAttempt,
     MimoRecognitionRun,
     RawMessage,
     RecognitionExperiment,
@@ -23,7 +25,10 @@ from telegram_kol_research.prompt_defaults import (
     SHARED_TRADING_PROMPT,
 )
 from telegram_kol_research.recognition_experiments import (
+    MimoProviderAttemptTelemetry,
     _build_mimo_payload,
+    _call_mimo_authoritative_with_retry,
+    _call_mimo_direct_model,
     infer_mimo_authoritative_v2,
     run_mimo_authoritative_for_message,
     run_mimo_direct_for_message,
@@ -996,6 +1001,383 @@ def test_mimo_v2_first_attempt_success_records_selected_attempt_and_prompt(
         assert session.query(StrategyLifecycle).count() == 0
 
 
+def test_mimo_v2_default_provider_persists_raw_usage_and_exact_request_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory, text="BTC 继续持有")
+    captured_payloads: list[dict] = []
+    built_payloads: list[dict] = []
+    built_payload_ids: list[int] = []
+    raw_usage = {
+        "prompt_tokens": 101,
+        "completion_tokens": 17,
+        "total_tokens": 118,
+        "provider_extension": {"cached_tokens": 9},
+    }
+
+    class FakeResponse:
+        content = b"provider-response"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                _v2_payload("BTC 继续持有"),
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ],
+                "usage": raw_usage,
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            captured_payloads.append(json)
+            assert id(json) == built_payload_ids[-1]
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments.httpx.Client",
+        FakeClient,
+    )
+    original_build_payload = _build_mimo_payload
+
+    def capture_build_payload(**kwargs):
+        payload = original_build_payload(**kwargs)
+        built_payload_ids.append(id(payload))
+        built_payloads.append(copy.deepcopy(payload))
+        return payload
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._build_mimo_payload",
+        capture_build_payload,
+    )
+    context_text = (
+        'Current message context:\n{"message_id":17}\n\n'
+        'Reply context:\n{"message_id":16,"text":"BTC initial entry"}\n\n'
+        "Active strategies:\n[]"
+    )
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        context_text=context_text,
+        retry_delay_seconds=0,
+    )
+
+    assert result.succeeded is True
+    assert len(captured_payloads) == 1
+    sent_payload = captured_payloads[0]
+    assert sent_payload == built_payloads[0]
+    assert sent_payload["messages"][1]["content"].endswith(context_text)
+    with factory() as session:
+        attempt = session.query(MimoRecognitionAttempt).one()
+        assert attempt.attempt_phase == "v2_authoritative"
+        assert attempt.provider_request_count == 1
+        usage = json.loads(attempt.provider_usage_json)
+        assert usage == {
+            "requests": [
+                {
+                    "available": True,
+                    "request_number": 1,
+                    "usage": raw_usage,
+                }
+            ]
+        }
+        components = json.loads(attempt.request_component_bytes_json)
+        assert components["available"] is True
+        assert components["encoding"] == "utf-8-canonical-json-v1"
+        assert components["request_total_bytes"] == len(
+            json.dumps(
+                sent_payload,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        assert components["current_message_text_bytes"] == len(
+            json.dumps(
+                "BTC 继续持有",
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        assert components["direct_reply_bytes"] > 0
+        assert components["image_evidence_bytes"] == 0
+        assert components["direct_reply_included_in_authoritative_context"] is True
+        assert components["structural_overhead_bytes"] >= 0
+        assert components["request_total_bytes"] == sum(
+            components[name]
+            for name in (
+                "system_prompt_bytes",
+                "current_message_text_bytes",
+                "image_evidence_bytes",
+                "authoritative_context_bytes",
+                "structural_overhead_bytes",
+            )
+        )
+
+
+def test_mimo_v2_custom_requester_records_usage_unavailable_without_behavior_change(
+    tmp_path,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    provider_payload = _v2_payload()
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        requester=lambda **kwargs: provider_payload,
+        retry_delay_seconds=0,
+    )
+
+    assert result.succeeded is True
+    assert result.parsed_result is not None
+    assert result.parsed_result.summary == provider_payload["summary"]
+    with factory() as session:
+        attempt = session.query(MimoRecognitionAttempt).one()
+        assert json.loads(attempt.provider_usage_json) == {
+            "requests": [
+                {
+                    "available": False,
+                    "reason": "provider_usage_not_returned",
+                    "request_number": 1,
+                }
+            ]
+        }
+        assert json.loads(attempt.request_component_bytes_json) == {
+            "available": False,
+            "reason": "request_payload_not_observed",
+        }
+
+
+def test_mimo_observability_failure_does_not_change_provider_result(
+    tmp_path,
+    monkeypatch,
+):
+    provider_payload = _v2_payload("BTC unchanged")
+
+    class FakeResponse:
+        content = b"response"
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                provider_payload,
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    class FakeClient:
+        def __init__(self, timeout):
+            self.timeout = timeout
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def post(self, url, json, headers):
+            return FakeResponse()
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments.httpx.Client",
+        FakeClient,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._measure_mimo_request_component_bytes",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("telemetry failed")),
+    )
+
+    result = _call_mimo_direct_model(
+        raw_message=RawMessage(
+            id=1,
+            chat_id=100,
+            message_id=11,
+            text="BTC unchanged",
+        ),
+        media_assets=[],
+        model_config=_v2_config().ai_models[0],
+        prompt="unchanged prompt",
+        media_root=tmp_path,
+    )
+
+    assert dict(result) == provider_payload
+    telemetry = result.mimo_provider_attempt_telemetry
+    assert telemetry.provider_usage is None
+    assert telemetry.request_component_bytes == {
+        "available": False,
+        "reason": "request_component_measurement_failed",
+    }
+
+
+def test_mimo_v2_pre_provider_failure_records_zero_provider_requests(
+    tmp_path,
+    monkeypatch,
+):
+    factory = create_session_factory(tmp_path / "research.db")
+    raw_message_id = _v2_message(factory)
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._build_mimo_payload",
+        lambda **kwargs: (_ for _ in ()).throw(ValueError("payload build failed")),
+    )
+
+    result = infer_mimo_authoritative_v2(
+        factory,
+        raw_message_id=raw_message_id,
+        config=_v2_config(),
+        max_attempts=1,
+        retry_delay_seconds=0,
+    )
+
+    assert result.succeeded is False
+    assert result.error_code == "invalid_json"
+    with factory() as session:
+        attempt = session.query(MimoRecognitionAttempt).one()
+        assert attempt.provider_request_count == 0
+        assert json.loads(attempt.provider_usage_json) == {"requests": []}
+
+
+def test_mimo_v1_retry_returns_actual_provider_request_telemetry(
+    tmp_path,
+    monkeypatch,
+):
+    raw_message = RawMessage(
+        id=1,
+        chat_id=100,
+        message_id=9,
+        text="现价附近出局",
+    )
+    valid_payload = {
+        "recognition_result": "非策略",
+        "reason": "仓位管理",
+        "strategy": {},
+        "lifecycle_event": {"event_type": "exit_position"},
+        "input_reading": {"observed_text": "现价附近出局"},
+    }
+    outcomes = [TimeoutError("first timeout"), valid_payload]
+    telemetry = MimoProviderAttemptTelemetry(
+        provider_usage={"prompt_tokens": 10, "completion_tokens": 2},
+        request_component_bytes={"available": True, "request_total_bytes": 99},
+    )
+
+    class ProviderPayload(dict):
+        pass
+
+    def fake_call(**kwargs):
+        outcome = outcomes.pop(0)
+        if isinstance(outcome, BaseException):
+            outcome.mimo_provider_attempt_telemetry = MimoProviderAttemptTelemetry(
+                provider_usage=None,
+                request_component_bytes={
+                    "available": True,
+                    "request_total_bytes": 99,
+                },
+            )
+            raise outcome
+        payload = ProviderPayload(outcome)
+        payload.mimo_provider_attempt_telemetry = telemetry
+        return payload
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+
+    payload, error, attempts = _call_mimo_authoritative_with_retry(
+        raw_message=raw_message,
+        media_assets=[],
+        model_config=_v2_config().ai_models[0],
+        prompt="unchanged prompt",
+        media_root=tmp_path,
+        context_text="unchanged context",
+        retry_delay_seconds=0,
+    )
+
+    assert payload == valid_payload
+    assert error is None
+    assert len(attempts) == 2
+    assert attempts[0].provider_usage is None
+    assert attempts[1].provider_usage == telemetry.provider_usage
+
+
+def test_mimo_v1_invalid_payload_counts_one_provider_request(
+    tmp_path,
+    monkeypatch,
+):
+    raw_message = RawMessage(
+        id=1,
+        chat_id=100,
+        message_id=10,
+        text="commentary",
+    )
+
+    class ProviderPayload(dict):
+        pass
+
+    provider_payload = ProviderPayload({"recognition_result": "非策略"})
+    provider_payload.mimo_provider_attempt_telemetry = (
+        MimoProviderAttemptTelemetry(
+            provider_usage={"prompt_tokens": 5},
+            request_component_bytes={
+                "available": True,
+                "request_total_bytes": 50,
+            },
+        )
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        lambda **kwargs: provider_payload,
+    )
+
+    payload, error, attempts = _call_mimo_authoritative_with_retry(
+        raw_message=raw_message,
+        media_assets=[],
+        model_config=_v2_config().ai_models[0],
+        prompt="unchanged prompt",
+        media_root=tmp_path,
+        context_text="unchanged context",
+        max_attempts=1,
+        retry_delay_seconds=0,
+    )
+
+    assert payload == {}
+    assert "missing strategy" in (error or "")
+    assert len(attempts) == 1
+    assert attempts[0].provider_usage == {"prompt_tokens": 5}
+
+
 def test_mimo_v2_timeout_then_success_records_two_attempts(tmp_path):
     factory = create_session_factory(tmp_path / "research.db")
     raw_message_id = _v2_message(factory)
@@ -1015,6 +1397,17 @@ def test_mimo_v2_timeout_then_success_records_two_attempts(tmp_path):
     assert [row.error_code for row in attempts] == ["provider_timeout", None]
     assert [row.retry_of_ordinal for row in attempts] == [None, 1]
     assert [row.selected for row in attempts] == [False, True]
+    with factory() as session:
+        rows = (
+            session.query(MimoRecognitionAttempt)
+            .order_by(MimoRecognitionAttempt.ordinal.asc())
+            .all()
+        )
+        assert [row.provider_request_count for row in rows] == [1, 1]
+        assert [
+            json.loads(row.provider_usage_json)["requests"][0]["request_number"]
+            for row in rows
+        ] == [1, 1]
 
 
 def test_mimo_v2_exhausted_timeout_fails_run_without_selection(tmp_path):

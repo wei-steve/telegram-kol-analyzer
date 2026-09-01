@@ -176,6 +176,10 @@ def record_mimo_attempt(
     duration_ms: int | None = None,
     started_at: datetime | None = None,
     completed_at: datetime | None = None,
+    attempt_phase: str | None = None,
+    provider_request_count: int | None = None,
+    provider_usage: Mapping[str, Any] | None = None,
+    request_component_bytes: Mapping[str, Any] | None = None,
 ) -> MimoRecognitionAttemptView:
     """Append exactly the next provider attempt; existing attempts never change."""
 
@@ -186,6 +190,26 @@ def record_mimo_attempt(
             "completed attempt cannot contain an error"
         )
     normalized_error_code = _optional_identifier(error_code, field="error code")
+    normalized_attempt_phase = _optional_identifier(
+        attempt_phase, field="attempt phase"
+    )
+    if (
+        provider_request_count is not None
+        and (
+            isinstance(provider_request_count, bool)
+            or not isinstance(provider_request_count, int)
+            or provider_request_count < 0
+        )
+    ):
+        raise MimoRecognitionRunValidationError(
+            "provider request count must be a nonnegative integer"
+        )
+    provider_usage_json = _canonical_optional_object(
+        provider_usage, field="provider usage"
+    )
+    request_component_bytes_json = _canonical_optional_object(
+        request_component_bytes, field="request component bytes"
+    )
     safe_error = _sanitize_error_message(error_message)
     started = started_at or utc_now()
     completed = completed_at or utc_now()
@@ -235,6 +259,10 @@ def record_mimo_attempt(
                 if response_payload is not None
                 else None
             ),
+            attempt_phase=normalized_attempt_phase,
+            provider_request_count=provider_request_count,
+            provider_usage_json=provider_usage_json,
+            request_component_bytes_json=request_component_bytes_json,
             started_at=started,
             completed_at=completed,
             duration_ms=duration_ms,
@@ -425,6 +453,28 @@ def _canonical_prompt_versions(prompt_versions: Mapping[str, int]) -> str:
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def _canonical_optional_object(
+    value: Mapping[str, Any] | None,
+    *,
+    field: str,
+) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise MimoRecognitionRunValidationError(f"{field} must be an object")
+    try:
+        return json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    except (TypeError, ValueError) as exc:
+        raise MimoRecognitionRunValidationError(
+            f"{field} is not canonical JSON"
+        ) from exc
 
 
 def _sanitize_error_message(value: str | None) -> str | None:

@@ -97,6 +97,10 @@ def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
         "completed_at",
         "duration_ms",
         "created_at",
+        "attempt_phase",
+        "provider_request_count",
+        "provider_usage_json",
+        "request_component_bytes_json",
     } <= attempt_columns
     run_indexes = {
         index["name"]
@@ -143,6 +147,49 @@ def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
         assert connection.execute(
             "SELECT id, display_name FROM sources WHERE id = 97"
         ).fetchone() == (97, "Legacy Source")
+
+
+def test_mimo_attempt_observability_columns_are_nullable_on_legacy_rows(tmp_path):
+    database_path = tmp_path / "legacy-mimo-attempt-observability.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE mimo_recognition_attempts ("
+            "id INTEGER PRIMARY KEY, run_id INTEGER NOT NULL, "
+            "ordinal INTEGER NOT NULL, retry_of_ordinal INTEGER, "
+            "status VARCHAR(32) NOT NULL, error_code VARCHAR(64), "
+            "error_message TEXT, response_fingerprint VARCHAR(64), "
+            "started_at DATETIME NOT NULL, completed_at DATETIME NOT NULL, "
+            "duration_ms INTEGER NOT NULL, created_at DATETIME NOT NULL)"
+        )
+        connection.execute(
+            "INSERT INTO mimo_recognition_attempts "
+            "(id, run_id, ordinal, status, started_at, completed_at, "
+            "duration_ms, created_at) VALUES "
+            "(1, 1, 1, 'completed', '2026-09-01 00:00:00', "
+            "'2026-09-01 00:00:01', 1000, '2026-09-01 00:00:01')"
+        )
+
+    session_factory = create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("mimo_recognition_attempts")
+    }
+
+    for name in (
+        "attempt_phase",
+        "provider_request_count",
+        "provider_usage_json",
+        "request_component_bytes_json",
+    ):
+        assert name in columns
+        assert columns[name]["nullable"] is True
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute(
+            "SELECT attempt_phase, provider_request_count, "
+            "provider_usage_json, request_component_bytes_json "
+            "FROM mimo_recognition_attempts WHERE id = 1"
+        ).fetchone() == (None, None, None, None)
 
 
 def test_mimo_evidence_run_link_is_added_to_existing_evidence_table(tmp_path):

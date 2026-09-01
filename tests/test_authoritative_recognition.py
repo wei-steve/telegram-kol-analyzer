@@ -29,6 +29,7 @@ from telegram_kol_research.models import (
     MessageEvidenceVersion,
     RawMessage,
     RecognitionDecision,
+    MimoRecognitionAttempt,
     MimoRecognitionRun,
     SignalCandidate,
     SourceMessageDeletionExit,
@@ -51,6 +52,7 @@ from telegram_kol_research.mimo_v2_execution_adapter import (
 )
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
+    MimoProviderAttemptTelemetry,
     MimoV2InferenceResult,
 )
 from telegram_kol_research.recognition_decisions import (
@@ -2416,7 +2418,21 @@ def test_mimo_v1_remains_default_and_v2_is_not_called(tmp_path, monkeypatch):
     )
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
-        lambda *args, **kwargs: _v1_nontrading_result(raw_id),
+        lambda *args, **kwargs: replace(
+            _v1_nontrading_result(raw_id),
+            provider_attempt_telemetry=(
+                MimoProviderAttemptTelemetry(
+                    provider_usage={
+                        "prompt_tokens": 80,
+                        "completion_tokens": 12,
+                    },
+                    request_component_bytes={
+                        "available": True,
+                        "request_total_bytes": 1400,
+                    },
+                ),
+            ),
+        ),
     )
 
     result = process_authoritative_message(
@@ -2430,12 +2446,31 @@ def test_mimo_v1_remains_default_and_v2_is_not_called(tmp_path, monkeypatch):
     assert result.assessment.mimo.fallback_from is None
     with session_factory() as session:
         run = session.get(MimoRecognitionRun, result.assessment.mimo.run_id)
+        attempt = (
+            session.query(MimoRecognitionAttempt)
+            .filter(MimoRecognitionAttempt.run_id == run.id)
+            .one()
+        )
         evidence = (
             session.query(MessageEvidenceVersion)
             .filter(MessageEvidenceVersion.raw_message_id == raw_id)
             .one()
         )
     assert run is not None
+    assert attempt.attempt_phase == "v1_authoritative"
+    assert attempt.provider_request_count == 1
+    assert json.loads(attempt.provider_usage_json) == {
+        "requests": [
+            {
+                "available": True,
+                "request_number": 1,
+                "usage": {
+                    "completion_tokens": 12,
+                    "prompt_tokens": 80,
+                },
+            }
+        ]
+    }
     assert json.loads(run.prompt_versions_json) == {
         "trading.analysis.shared": 11
     }

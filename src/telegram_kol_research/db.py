@@ -158,6 +158,24 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "mimo_recognition_run_id INTEGER REFERENCES mimo_recognition_runs(id)"
         ),
     },
+    "mimo_recognition_attempts": {
+        "attempt_phase": (
+            "ALTER TABLE mimo_recognition_attempts "
+            "ADD COLUMN attempt_phase VARCHAR(32)"
+        ),
+        "provider_request_count": (
+            "ALTER TABLE mimo_recognition_attempts "
+            "ADD COLUMN provider_request_count INTEGER"
+        ),
+        "provider_usage_json": (
+            "ALTER TABLE mimo_recognition_attempts "
+            "ADD COLUMN provider_usage_json TEXT"
+        ),
+        "request_component_bytes_json": (
+            "ALTER TABLE mimo_recognition_attempts "
+            "ADD COLUMN request_component_bytes_json TEXT"
+        ),
+    },
     "signal_candidates": {
         "source_id": "ALTER TABLE signal_candidates ADD COLUMN source_id INTEGER",
         "event_type": "ALTER TABLE signal_candidates ADD COLUMN event_type VARCHAR(64) NOT NULL DEFAULT 'entry_signal'",

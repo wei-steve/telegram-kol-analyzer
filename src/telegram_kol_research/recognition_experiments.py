@@ -99,6 +99,7 @@ class MimoAuthoritativeResult:
     run_id: int | None = None
     fallback_from: str | None = None
     projection_fingerprint: str | None = None
+    provider_attempt_telemetry: tuple[MimoProviderAttemptTelemetry, ...] = ()
 
     @property
     def is_actionable(self) -> bool:
@@ -136,12 +137,28 @@ class _MimoV2InvalidJson(ValueError):
         self.response_payload = response_payload
 
 
+@dataclass(frozen=True, slots=True)
+class MimoProviderAttemptTelemetry:
+    """Best-effort audit metadata that never participates in recognition."""
+
+    provider_request_made: bool = True
+    provider_usage: Mapping[str, Any] | None = None
+    request_component_bytes: Mapping[str, Any] | None = None
+
+
 class _MimoProviderPayload(dict[str, Any]):
     """Parsed provider payload retaining the raw HTTP response size."""
 
-    def __init__(self, payload: Mapping[str, Any], *, response_size_bytes: int):
+    def __init__(
+        self,
+        payload: Mapping[str, Any],
+        *,
+        response_size_bytes: int,
+        telemetry: MimoProviderAttemptTelemetry,
+    ):
         super().__init__(payload)
         self.response_size_bytes = max(0, int(response_size_bytes))
+        self.mimo_provider_attempt_telemetry = telemetry
 
 
 def run_mimo_direct_experiment(
@@ -452,6 +469,7 @@ def infer_mimo_authoritative_v2(
                 error_message=last_error_message,
                 started_at=attempt_started_at,
                 started_monotonic=started,
+                telemetry_source=exc,
             )
             last_error_message = attempt.error_message or last_error_message
             if not _mimo_v2_input_is_current(
@@ -490,6 +508,7 @@ def infer_mimo_authoritative_v2(
                 response_payload=response_payload,
                 started_at=attempt_started_at,
                 started_monotonic=started,
+                telemetry_source=response_payload,
             )
             last_error_message = attempt.error_message or last_error_message
             if not _mimo_v2_input_is_current(
@@ -532,6 +551,9 @@ def infer_mimo_authoritative_v2(
                 response_payload=invalid_response,
                 started_at=attempt_started_at,
                 started_monotonic=started,
+                telemetry_source=(
+                    response_payload if response_payload is not None else exc
+                ),
             )
             last_error_message = attempt.error_message or last_error_message
             if not _mimo_v2_input_is_current(
@@ -568,6 +590,7 @@ def infer_mimo_authoritative_v2(
                 error_message=last_error_message,
                 started_at=attempt_started_at,
                 started_monotonic=started,
+                telemetry_source=exc,
             )
             last_error_message = attempt.error_message or last_error_message
             if not _mimo_v2_input_is_current(
@@ -602,6 +625,7 @@ def infer_mimo_authoritative_v2(
                 response_payload=payload,
                 started_at=attempt_started_at,
                 started_monotonic=started,
+                telemetry_source=response_payload,
             )
             if not _mimo_v2_input_is_current(
                 session_factory,
@@ -716,8 +740,10 @@ def _record_v2_attempt(
     error_code: str | None = None,
     error_message: str | None = None,
     response_payload: Any | None = None,
+    telemetry_source: Any | None = None,
 ):
     completed_at = utc_now()
+    telemetry = _provider_attempt_telemetry(telemetry_source)
     return record_mimo_attempt(
         session_factory,
         run_id=run_id,
@@ -730,6 +756,10 @@ def _record_v2_attempt(
         duration_ms=max(0, round((time.perf_counter() - started_monotonic) * 1000)),
         started_at=started_at,
         completed_at=completed_at,
+        attempt_phase="v2_authoritative",
+        provider_request_count=int(telemetry.provider_request_made),
+        provider_usage=_provider_usage_audit((telemetry,)),
+        request_component_bytes=_request_component_bytes_audit(telemetry),
     )
 
 
@@ -974,13 +1004,15 @@ def run_mimo_authoritative_for_message(
             model_kind="mimo",
             context=effective_context,
         )
-        payload, error_message = _call_mimo_authoritative_with_retry(
-            raw_message=raw_message,
-            media_assets=media_assets,
-            model_config=model_config,
-            prompt=composition.system_prompt,
-            media_root=media_root,
-            context_text=composition.context,
+        payload, error_message, provider_attempt_telemetry = (
+            _call_mimo_authoritative_with_retry(
+                raw_message=raw_message,
+                media_assets=media_assets,
+                model_config=model_config,
+                prompt=composition.system_prompt,
+                media_root=media_root,
+                context_text=composition.context,
+            )
         )
         experiment = _upsert_experiment_result(
             session,
@@ -1013,6 +1045,7 @@ def run_mimo_authoritative_for_message(
             status=experiment.status,
             error_message=error_message,
             prompt_versions=composition.version_map,
+            provider_attempt_telemetry=provider_attempt_telemetry,
         )
 
 
@@ -1026,10 +1059,16 @@ def _call_mimo_authoritative_with_retry(
     context_text: str,
     max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
     retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
-) -> tuple[dict[str, Any], str | None]:
+) -> tuple[
+    dict[str, Any],
+    str | None,
+    tuple[MimoProviderAttemptTelemetry, ...],
+]:
     errors: list[str] = []
+    provider_attempts: list[MimoProviderAttemptTelemetry] = []
     attempts = max(1, max_attempts)
     for attempt in range(1, attempts + 1):
+        telemetry_recorded = False
         try:
             payload = _call_mimo_direct_model(
                 raw_message=raw_message,
@@ -1039,19 +1078,25 @@ def _call_mimo_authoritative_with_retry(
                 media_root=media_root,
                 context_text=context_text,
             )
+            provider_attempts.append(_provider_attempt_telemetry(payload))
+            telemetry_recorded = True
             _validate_authoritative_payload(payload)
-            return payload, None
+            return payload, None, tuple(provider_attempts)
         except Exception as exc:
+            if not telemetry_recorded:
+                provider_attempts.append(_provider_attempt_telemetry(exc))
             errors.append(str(exc))
             if attempt >= attempts:
                 break
             if retry_delay_seconds > 0:
                 time.sleep(retry_delay_seconds)
     if len(errors) == 1:
-        return {}, errors[0]
-    return {}, (
+        return {}, errors[0], tuple(provider_attempts)
+    return (
+        {},
         f"MiMo failed after {len(errors)} attempts: "
-        + " | ".join(f"attempt {idx + 1}: {error}" for idx, error in enumerate(errors))
+        + " | ".join(f"attempt {idx + 1}: {error}" for idx, error in enumerate(errors)),
+        tuple(provider_attempts),
     )
 
 
@@ -1102,45 +1147,242 @@ def _call_mimo_direct_model(
     headers = {"Content-Type": "application/json"}
     if model_config.api_key:
         headers["Authorization"] = f"Bearer {model_config.api_key}"
-    payload = _build_mimo_payload(
-        raw_message=raw_message,
-        media_assets=media_assets,
-        prompt=prompt,
-        model=model_config.model,
-        media_root=media_root,
-        context_text=context_text,
-        json_mode=json_mode,
-        disable_thinking=disable_thinking,
-    )
-    with httpx.Client(timeout=model_config.timeout_seconds) as client:
-        response = client.post(
-            f"{model_config.base_url.rstrip('/')}/chat/completions",
-            json=payload,
-            headers=headers,
+    try:
+        payload = _build_mimo_payload(
+            raw_message=raw_message,
+            media_assets=media_assets,
+            prompt=prompt,
+            model=model_config.model,
+            media_root=media_root,
+            context_text=context_text,
+            json_mode=json_mode,
+            disable_thinking=disable_thinking,
         )
-        try:
-            response.raise_for_status()
-        except httpx.HTTPStatusError as exc:
-            response_body = exc.response.text[:1200]
-            raise RuntimeError(f"{exc}; response_body={response_body}") from exc
-        data = response.json()
-    content = _extract_chat_content(data)
-    raw_response_content = getattr(response, "content", None)
-    if isinstance(raw_response_content, bytes):
-        response_size_bytes = len(raw_response_content)
-    else:
-        response_size_bytes = len(
-            json.dumps(
-                data,
-                ensure_ascii=False,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
+    except Exception as exc:
+        _attach_provider_attempt_telemetry(
+            exc,
+            MimoProviderAttemptTelemetry(provider_request_made=False),
         )
-    return _MimoProviderPayload(
-        _parse_json_object(content),
-        response_size_bytes=response_size_bytes,
+        raise
+    try:
+        request_component_bytes = _measure_mimo_request_component_bytes(
+            payload=payload,
+            raw_message=raw_message,
+            context_text=context_text,
+        )
+    except Exception:
+        request_component_bytes = {
+            "available": False,
+            "reason": "request_component_measurement_failed",
+        }
+    telemetry = MimoProviderAttemptTelemetry(
+        provider_request_made=False,
+        provider_usage=None,
+        request_component_bytes=request_component_bytes,
     )
+    try:
+        with httpx.Client(timeout=model_config.timeout_seconds) as client:
+            telemetry = MimoProviderAttemptTelemetry(
+                provider_request_made=True,
+                provider_usage=None,
+                request_component_bytes=request_component_bytes,
+            )
+            response = client.post(
+                f"{model_config.base_url.rstrip('/')}/chat/completions",
+                json=payload,
+                headers=headers,
+            )
+            try:
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                response_body = exc.response.text[:1200]
+                raise RuntimeError(f"{exc}; response_body={response_body}") from exc
+            data = response.json()
+        usage = data.get("usage") if isinstance(data, Mapping) else None
+        telemetry = MimoProviderAttemptTelemetry(
+            provider_request_made=True,
+            provider_usage=dict(usage) if isinstance(usage, Mapping) else None,
+            request_component_bytes=request_component_bytes,
+        )
+    except Exception as exc:
+        _attach_provider_attempt_telemetry(exc, telemetry)
+        raise
+    try:
+        content = _extract_chat_content(data)
+        raw_response_content = getattr(response, "content", None)
+        if isinstance(raw_response_content, bytes):
+            response_size_bytes = len(raw_response_content)
+        else:
+            response_size_bytes = len(
+                json.dumps(
+                    data,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            )
+        return _MimoProviderPayload(
+            _parse_json_object(content),
+            response_size_bytes=response_size_bytes,
+            telemetry=telemetry,
+        )
+    except Exception as exc:
+        _attach_provider_attempt_telemetry(exc, telemetry)
+        raise
+
+
+def _attach_provider_attempt_telemetry(
+    error: Exception,
+    telemetry: MimoProviderAttemptTelemetry,
+) -> None:
+    try:
+        setattr(error, "mimo_provider_attempt_telemetry", telemetry)
+    except Exception:
+        pass
+
+
+def _provider_attempt_telemetry(value: Any) -> MimoProviderAttemptTelemetry:
+    telemetry = getattr(value, "mimo_provider_attempt_telemetry", None)
+    if isinstance(telemetry, MimoProviderAttemptTelemetry):
+        return telemetry
+    return MimoProviderAttemptTelemetry(provider_request_made=True)
+
+
+def _provider_usage_audit(
+    attempts: tuple[MimoProviderAttemptTelemetry, ...],
+) -> dict[str, Any]:
+    requests: list[dict[str, Any]] = []
+    request_number = 0
+    for telemetry in attempts:
+        if not telemetry.provider_request_made:
+            continue
+        request_number += 1
+        usage = telemetry.provider_usage
+        if isinstance(usage, Mapping):
+            try:
+                raw_usage = json.loads(
+                    json.dumps(
+                        usage,
+                        ensure_ascii=False,
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    )
+                )
+            except (TypeError, ValueError):
+                raw_usage = None
+            if isinstance(raw_usage, dict):
+                requests.append(
+                    {
+                        "available": True,
+                        "request_number": request_number,
+                        "usage": raw_usage,
+                    }
+                )
+                continue
+            reason = "provider_usage_serialization_failed"
+        else:
+            reason = "provider_usage_not_returned"
+        requests.append(
+            {
+                "available": False,
+                "reason": reason,
+                "request_number": request_number,
+            }
+        )
+    return {"requests": requests}
+
+
+def _latest_provider_request_telemetry(
+    attempts: tuple[MimoProviderAttemptTelemetry, ...],
+) -> MimoProviderAttemptTelemetry:
+    for telemetry in reversed(attempts):
+        if telemetry.provider_request_made:
+            return telemetry
+    return MimoProviderAttemptTelemetry(provider_request_made=False)
+
+
+def _request_component_bytes_audit(
+    telemetry: MimoProviderAttemptTelemetry,
+) -> dict[str, Any]:
+    value = telemetry.request_component_bytes
+    if isinstance(value, Mapping):
+        return dict(value)
+    return {
+        "available": False,
+        "reason": "request_payload_not_observed",
+    }
+
+
+def _canonical_json_bytes(value: Any) -> int:
+    return len(
+        json.dumps(
+            value,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    )
+
+
+def _measure_mimo_request_component_bytes(
+    *,
+    payload: Mapping[str, Any],
+    raw_message: RawMessage,
+    context_text: str,
+) -> dict[str, Any]:
+    system_prompt = ""
+    image_urls: list[str] = []
+    messages = payload.get("messages")
+    if isinstance(messages, list) and len(messages) >= 2:
+        system = messages[0]
+        if isinstance(system, Mapping):
+            system_prompt = str(system.get("content") or "")
+        user = messages[1]
+        if isinstance(user, Mapping) and isinstance(user.get("content"), list):
+            for part in user["content"]:
+                if not isinstance(part, Mapping) or part.get("type") != "image_url":
+                    continue
+                image_url = part.get("image_url")
+                if isinstance(image_url, Mapping) and isinstance(image_url.get("url"), str):
+                    image_urls.append(image_url["url"])
+    normalized_context = context_text.strip()
+    current_message_text = (raw_message.text or "").strip() or "(empty)"
+    direct_reply = _extract_rendered_reply_context(normalized_context)
+    total = _canonical_json_bytes(payload)
+    system_bytes = _canonical_json_bytes(system_prompt)
+    current_bytes = _canonical_json_bytes(current_message_text)
+    image_bytes = _canonical_json_bytes(image_urls) if image_urls else 0
+    context_bytes = _canonical_json_bytes(normalized_context) if normalized_context else 0
+    component_total = system_bytes + current_bytes + image_bytes + context_bytes
+    structural_overhead_bytes = total - component_total
+    if structural_overhead_bytes < 0:
+        raise ValueError("request component partition exceeds total bytes")
+    return {
+        "available": True,
+        "encoding": "utf-8-canonical-json-v1",
+        "request_total_bytes": total,
+        "system_prompt_bytes": system_bytes,
+        "current_message_text_bytes": current_bytes,
+        "image_evidence_bytes": image_bytes,
+        "authoritative_context_bytes": context_bytes,
+        "direct_reply_bytes": (
+            _canonical_json_bytes(direct_reply) if direct_reply is not None else 0
+        ),
+        "direct_reply_included_in_authoritative_context": True,
+        "structural_overhead_bytes": structural_overhead_bytes,
+    }
+
+
+def _extract_rendered_reply_context(context_text: str) -> str | None:
+    marker = "Reply context:\n"
+    start = context_text.find(marker)
+    if start < 0:
+        return None
+    value_start = start + len(marker)
+    value_end = context_text.find("\n\n", value_start)
+    if value_end < 0:
+        value_end = len(context_text)
+    return context_text[value_start:value_end]
 
 
 def _build_mimo_payload(
