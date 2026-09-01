@@ -3,7 +3,7 @@
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
 phase_state: blocked
-current_phase: r1_activation_window_blocked_live_position_present
+current_phase: r1_activation_window_blocked_post_close_ledger_mismatch
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -457,3 +457,19 @@ Since the latest live-position stop record at `06:45:29Z`, the `07:01:08Z` monit
 ### P0 checkpoint summary
 
 The fixed incremental window is `(raw_message_id 14168, 2026-08-31T21:35:00Z]` through `2026-09-01T07:12:19Z`. It contains 64 messages, 41 attempts over 36 messages, 42 comparable provider requests, and 38 requests with direct usage telemetry. The complete calculation, direct eight-trigger distribution, token and request-byte measurements, status/error checks, and cumulative distance to target are appended to `docs/plans/2026-08-31-ai-context-resolution-analysis.md` section 13. The cumulative P0 cohort is only 74 messages over 14 hours 29 minutes 42 seconds; it remains below both stopping criteria and is not a final baseline.
+
+## R1 activation stopped at the fresh protection-ledger gate — 2026-09-01T07:33:11Z
+
+This activation window stopped before install-only or activation. No monitor env or base unit was backed up or changed, no activation authorization was created or consumed, the activation helper was not invoked, and no service was restarted. The candidate release `4284d1a61226eb16812407c4f2489a207241db4c` and its existing runtime-only receipt were not modified or restaged.
+
+The fresh authenticated exchange snapshot at `2026-09-01T07:32:10.109678Z` showed that the previously protected BTC position had closed shortly before the gate ran: positions were zero, regular open orders were zero, and pending BTC/ETH/SOL triggers were all zero. Exchange history places the close at `2026-09-01T07:27:58Z`:
+
+- position `1001125076084723` closed at average `78,869.9`, with gross PnL `+3.01379999 USDT`, total fees `1.41785052 USDT`, funding `0`, and net `+1.59594947 USDT`;
+- a final `sell/long` market child order `1001125078372293` filled size `8` at `78,668.8`, explicitly `reduceOnly=true`, with order PnL `-0.00170667 USDT` and fee `0.37761024 USDT`;
+- the earlier take-profit child `1001125077305948` had already filled size `7` at `79,099.8`, also `reduceOnly=true`.
+
+The final fill was approximately `0.2133` points below the break-even stop trigger `78,669.0133333334`; for `8 × 0.001 BTC`, that is approximately `0.00170667 USDT` of price loss before the final-order fee. The completed position was profitable after all recorded fees, so the loss-threshold gate passed and there is now no live position requiring unattended protection.
+
+The exact local-to-exchange protection gate nevertheless failed. Local reconciliation terminalized lifecycle `1041` as `exited/manual`, binding `322` as `closed` with `last_exchange_status=manual_closed_or_not_found_on_exchange`, and entry leg `557` as `manually_closed/manual_position_missing`. At the same time, protection-ledger rows `598`–`601` still retained `verified` for the two take-profit and two break-even-stop exchange IDs, while the fresh exchange current set was empty. Therefore the required one-to-one equality between current exchange protection and current local ledger claims was false; the run did not reinterpret or repair that mismatch and correctly stopped before the first production write.
+
+The final read-only runtime checkpoint remained unchanged: web PID `944570`, ingest PID `944575`, and worker PID `944565` were healthy on release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, artifact verification was true, `entry_admission_frozen=false`, and `auto_trade_enabled=true`. `/etc/telegram-kol-monitor.env` still pointed to that production release and manifest `e58bc07d59fdeb977482ee77c4a62343012371660001983803c9d8d7ea83bfdc`. R1 activation remains blocked pending an owner-authorized resolution of the post-close ledger mismatch or an explicit acceptance criterion for terminal positions; neither was part of this window.
