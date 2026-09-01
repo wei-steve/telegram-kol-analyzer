@@ -3,7 +3,7 @@
 ```yaml
 workstream: main_recognition_provider_observability
 phase_state: in_progress
-current_phase: main_recognition_candidate_tested_pending_l3_schema
+current_phase: main_recognition_l3_complete_deployment_blocked_exchange_snapshot_unknown
 claimed_by: null
 base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
@@ -22,7 +22,7 @@ shadow_activation_complete: true
 shadow_live_sample_verified: false
 main_recognition_code_sha: 24169cd03d22c7ba12d1e96e1fc26166f159615c
 main_recognition_production_sha: null
-main_recognition_schema_columns_added: false
+main_recognition_schema_columns_added: true
 main_recognition_activation_complete: false
 main_recognition_live_sample_verified: false
 source_mode: immutable
@@ -40,6 +40,13 @@ auto_trade_enabled_observed: true
 - RED was observed for absent schema/persistence arguments, absent provider side-channel metadata, observability exceptions escaping the main path, and a pre-provider failure incorrectly counted as one request. GREEN passed the final focused migration, persistence, provider, v1/v2 authority and decision set: `116 passed`.
 - Independent exact-base review against `4d4ea8e22a22b2435c20f96b8377274c9355d54b` reported no Critical, Important or Minor findings and a Ready verdict. It independently reran the 116 focused tests, confirmed payload object identity, nullable backward compatibility, exact 0/1 v2 counts, aggregated v1 counts, strict byte partitioning and the absence of any decision reader for the new columns.
 - The last production-code edit preceded the final full suite: `6776 passed, 4 skipped, 32 warnings in 414.48s`. The warnings are the existing YAML prompt and SQLite datetime deprecations. No production schema, row, setting, release, unit, service or exchange state has changed at this checkpoint. The next authorized action is the separate L3 nullable-column step; the later runtime-only stage must declare `schema_changed=false`.
+
+## Main-recognition nullable schema complete; deployment stopped at exchange gate — 2026-09-01T16:24:17Z
+
+- The independent L3 schema step completed before any runtime deployment. Evidence is rooted at `/var/lib/telegram-kol-cutover-evidence/b3137ed6c0f67c62ce8c3e35a52a0fdf68bac1f7/main-recognition-observability-20260901T161900Z`. The root-owned mode-0600 backup `pre-main-recognition-schema.db` is 819,408,896 bytes with SHA-256 `50c5f537c00b6220ecb20a9f3fe70eaee320a1dbdc020625812303afc69caa04`; its `quick_check` returned `ok` and its foreign-key check returned zero rows. The first backup command stopped before creating a backup because its local checker incorrectly tried to parameterize a table name; it made no production change. The corrected run used eight exact table queries.
+- One `BEGIN IMMEDIATE` transaction added exactly the nullable columns `attempt_phase`, `provider_request_count`, `provider_usage_json`, and `request_component_bytes_json` to `mimo_recognition_attempts`. All 4,695 legacy rows remained NULL in all four columns. The eight in-transaction critical counts matched their before-images: execution bindings 322, execution events 3,890, message-processing jobs 2,546, MiMo attempts 4,695, raw messages 14,307, recognition decisions 14,306, signal candidates 2,136, and strategy lifecycles 1,045. Post-commit `quick_check=ok` and foreign-key rows remained zero; web, ingest, worker and the monitor timer remained active.
+- Runtime deployment did not start. The fresh loopback read-only exchange snapshot at `2026-09-01T16:24:06Z` returned `complete=false`; a single reasoned retry at `16:24:17Z` returned the same result. Both responses contained zero projected positions and open orders but no fingerprint, and the web journal explicitly recorded `Runtime Agent read-only exchange snapshot is unavailable`. Incomplete exchange evidence is unknown rather than zero, so the deployment-window gate failed closed.
+- No immutable stage, install-only, activation authorization, activation, freeze, restart or Deepcoin write followed this failure. Production remains on `3205b074642436ed0f6aa35fefef7941a4f3f62f`; the four nullable schema columns intentionally remain in place. `main_recognition_activation_complete` and `main_recognition_live_sample_verified` remain false. Resume requires a new authorized deployment window with a complete read-only exchange snapshot; the runtime-only action manifest must still declare `schema_changed=false`.
 
 ## Shadow invocation gate — local candidate 2026-09-01
 
