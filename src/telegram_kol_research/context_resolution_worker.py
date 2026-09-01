@@ -24,6 +24,11 @@ from telegram_kol_research.models import (
     StrategyMessageLink,
     StrategyThread,
 )
+from telegram_kol_research.context_request_storage import (
+    collect_candidate_thread_ids,
+    parse_candidate_thread_ids,
+    parse_context_request_storage,
+)
 from telegram_kol_research.runtime_incident_adapters import (
     capture_context_worker_state,
     capture_runtime_incident_best_effort,
@@ -103,14 +108,15 @@ def build_context_state_fingerprint(
         }
         if candidate_thread_ids is None:
             latest_attempt = (
-                session.query(ContextResolutionAttempt.request_summary_json)
+                session.query(
+                    ContextResolutionAttempt.candidate_thread_ids_json,
+                    ContextResolutionAttempt.request_summary_json,
+                )
                 .filter(ContextResolutionAttempt.raw_message_id == raw.id)
                 .order_by(ContextResolutionAttempt.id.desc())
                 .first()
             )
-            candidate_thread_ids = _collect_candidate_thread_ids(
-                _json_dict(latest_attempt[0]) if latest_attempt is not None else {}
-            )
+            candidate_thread_ids = _attempt_candidate_thread_ids(latest_attempt)
         resolved_thread_ids.update(int(value) for value in candidate_thread_ids)
         candidate_threads = (
             session.query(StrategyThread)
@@ -300,16 +306,17 @@ def build_redacted_exchange_state(
 
     with session_factory() as session:
         latest_attempt = (
-            session.query(ContextResolutionAttempt.request_summary_json)
+            session.query(
+                ContextResolutionAttempt.candidate_thread_ids_json,
+                ContextResolutionAttempt.request_summary_json,
+            )
             .filter(ContextResolutionAttempt.raw_message_id == int(raw_message_id))
             .order_by(ContextResolutionAttempt.id.desc())
             .first()
         )
         thread_ids = set(candidate_thread_ids or ())
         thread_ids.update(
-            _collect_candidate_thread_ids(
-                _json_dict(latest_attempt[0]) if latest_attempt is not None else {}
-            )
+            _attempt_candidate_thread_ids(latest_attempt)
         )
         threads = (
             session.query(StrategyThread)
@@ -326,19 +333,17 @@ def build_redacted_exchange_state(
 
 
 def _collect_candidate_thread_ids(value: Any) -> set[int]:
-    found: set[int] = set()
-    if isinstance(value, dict):
-        for key, item in value.items():
-            if key in {"thread_id", "strategy_thread_id"}:
-                try:
-                    found.add(int(item))
-                except (TypeError, ValueError):
-                    pass
-            found.update(_collect_candidate_thread_ids(item))
-    elif isinstance(value, list):
-        for item in value:
-            found.update(_collect_candidate_thread_ids(item))
-    return found
+    return set(collect_candidate_thread_ids(value))
+
+
+def _attempt_candidate_thread_ids(latest_attempt: Any) -> set[int]:
+    if latest_attempt is None:
+        return set()
+    projection_json = latest_attempt[0]
+    if projection_json is not None:
+        return parse_candidate_thread_ids(str(projection_json))
+    stored = parse_context_request_storage(str(latest_attempt[1]))
+    return set(collect_candidate_thread_ids(stored.require_legacy_full()))
 
 
 def _json_dict(value: str | None) -> dict[str, Any]:

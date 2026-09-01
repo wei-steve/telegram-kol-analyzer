@@ -1600,6 +1600,11 @@ def _serialize_context_resolution(
         return None
     decision = _safe_json_dict(attempt.decision_json) if attempt is not None else {}
     request = _safe_json_dict(attempt.request_summary_json) if attempt is not None else {}
+    message_refs = (
+        _safe_json_dict(attempt.context_message_refs_json)
+        if attempt is not None and attempt.context_message_refs_json is not None
+        else None
+    )
     image_evidence = _safe_json_dict(evidence.image_evidence_json) if evidence is not None else {}
     linked = [
         {
@@ -1653,10 +1658,15 @@ def _serialize_context_resolution(
         "attempt_status": attempt.status if attempt is not None else None,
         "linked_threads": linked,
         "linked_messages": linked_messages,
-        "context_message_count": len(
-            request.get("message_context")
-            if isinstance(request.get("message_context"), list)
-            else []
+        "context_message_count": (
+            len(message_refs.get("messages", []))
+            if isinstance(message_refs, dict)
+            and isinstance(message_refs.get("messages"), list)
+            else len(
+                request.get("message_context")
+                if isinstance(request.get("message_context"), list)
+                else []
+            )
         ),
     }
 

@@ -124,3 +124,18 @@ def render_context_resolution_user_prompt(request_payload: dict[str, Any]) -> st
             separators=(",", ":"),
         )
     )
+
+
+def build_context_provider_messages(
+    system_prompt: str,
+    request_payload: dict[str, Any],
+) -> list[dict[str, str]]:
+    """Build the exact message array supplied to the context provider."""
+
+    return [
+        {"role": "system", "content": system_prompt},
+        {
+            "role": "user",
+            "content": render_context_resolution_user_prompt(request_payload),
+        },
+    ]

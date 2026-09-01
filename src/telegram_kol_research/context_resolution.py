@@ -20,8 +20,14 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.context_resolution_prompt import (
     CONTEXT_RESOLUTION_PROMPT_VERSION,
     CONTEXT_RESOLUTION_SYSTEM_PROMPT,
+    build_context_provider_messages,
     build_context_resolution_request,
-    render_context_resolution_user_prompt,
+)
+from telegram_kol_research.context_request_storage import (
+    build_context_message_refs,
+    build_request_component_sha256,
+    collect_candidate_thread_ids,
+    rendered_prompt_sha256,
 )
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -508,13 +514,7 @@ def _default_model_caller(
     payload = {
         "model": provider.model,
         "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {
-                "role": "user",
-                "content": render_context_resolution_user_prompt(request_payload),
-            },
-        ],
+        "messages": build_context_provider_messages(system_prompt, request_payload),
     }
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
@@ -624,6 +624,7 @@ def _upsert_attempt(
     provider_usage_entries: tuple[Mapping[str, Any], ...] = (),
     next_attempt_at: datetime | None = None,
     rejected_response_diagnostic_json: str | None = None,
+    system_prompt: str = CONTEXT_RESOLUTION_SYSTEM_PROMPT,
 ) -> int:
     from telegram_kol_research.context_resolution_worker import (
         build_context_state_fingerprint,
@@ -637,6 +638,22 @@ def _upsert_attempt(
             request_payload.get("candidate_strategy_threads"),
             {"thread_id", "strategy_thread_id"},
         ),
+    )
+    request_summary_json = _canonical_json(request_payload)
+    if request_summary_json == "{}":
+        raise ValueError("context request payload must not be empty")
+    context_message_refs_json = _canonical_json(
+        build_context_message_refs(request_payload)
+    )
+    candidate_thread_ids_json = _canonical_json(
+        collect_candidate_thread_ids(request_payload)
+    )
+    prompt_sha256 = rendered_prompt_sha256(
+        system_prompt=system_prompt,
+        request_payload=request_payload,
+    )
+    component_sha256_json = _canonical_json(
+        build_request_component_sha256(request_payload)
     )
     with session_factory() as session:
         row = (
@@ -657,7 +674,11 @@ def _upsert_attempt(
                 prompt_versions_json=_canonical_json(
                     {"context_resolution": CONTEXT_RESOLUTION_PROMPT_VERSION}
                 ),
-                request_summary_json=_canonical_json(request_payload),
+                request_summary_json=request_summary_json,
+                context_message_refs_json=context_message_refs_json,
+                candidate_thread_ids_json=candidate_thread_ids_json,
+                rendered_prompt_sha256=prompt_sha256,
+                request_component_sha256_json=component_sha256_json,
                 decision_json=None,
                 rejected_response_diagnostic_json=(
                     rejected_response_diagnostic_json
@@ -686,7 +707,11 @@ def _upsert_attempt(
             row.message_evidence_version_id = evidence_version_id
             row.state_fingerprint = state_fingerprint
             row.model = model
-            row.request_summary_json = _canonical_json(request_payload)
+            row.request_summary_json = request_summary_json
+            row.context_message_refs_json = context_message_refs_json
+            row.candidate_thread_ids_json = candidate_thread_ids_json
+            row.rendered_prompt_sha256 = prompt_sha256
+            row.request_component_sha256_json = component_sha256_json
             row.invocation_triggers_json = _canonical_json(
                 list(invocation_triggers)
             )
@@ -865,6 +890,13 @@ def resolve_contextual_strategy(
     for attempt_number in range(existing_request_count + 1, 3):
         failure: ContextResolutionError | None = None
         decoded: Mapping[str, Any] | None = None
+        active_system_prompt = (
+            CONTEXT_RESOLUTION_SYSTEM_PROMPT
+            if prior_error_code != "target_not_allowed"
+            else CONTEXT_RESOLUTION_SYSTEM_PROMPT
+            + "\n\n"
+            + _TARGET_NOT_ALLOWED_CORRECTION
+        )
         if attempt_number > 1:
             allowed, retry_at = circuits.reserve_retry(
                 provider_key,
@@ -887,18 +919,13 @@ def resolve_contextual_strategy(
                     attempt_phase=effective_phase,
                     provider_usage_entries=tuple(provider_usage_entries),
                     next_attempt_at=retry_at,
+                    system_prompt=active_system_prompt,
                 )
                 raise ContextResolutionError("network_error")
         try:
             raw_result = model_caller(
                 provider=provider,
-                system_prompt=(
-                    CONTEXT_RESOLUTION_SYSTEM_PROMPT
-                    if prior_error_code != "target_not_allowed"
-                    else CONTEXT_RESOLUTION_SYSTEM_PROMPT
-                    + "\n\n"
-                    + _TARGET_NOT_ALLOWED_CORRECTION
-                ),
+                system_prompt=active_system_prompt,
                 request_payload=request_payload,
             )
         except Exception as exc:
@@ -967,6 +994,7 @@ def resolve_contextual_strategy(
                     if decoded is not None
                     else None
                 ),
+                system_prompt=active_system_prompt,
             )
             if not terminal and failure.code != "network_error":
                 prior_error_code = failure.code
@@ -997,6 +1025,7 @@ def resolve_contextual_strategy(
             invocation_triggers=tuple(invocation_triggers),
             attempt_phase=effective_phase,
             provider_usage_entries=tuple(provider_usage_entries),
+            system_prompt=active_system_prompt,
         )
         return decision
     raise AssertionError("unreachable")

@@ -249,6 +249,22 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
             "ALTER TABLE context_resolution_attempts "
             "ADD COLUMN request_component_bytes_json TEXT"
         ),
+        "context_message_refs_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN context_message_refs_json TEXT"
+        ),
+        "candidate_thread_ids_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN candidate_thread_ids_json TEXT"
+        ),
+        "rendered_prompt_sha256": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN rendered_prompt_sha256 VARCHAR(64)"
+        ),
+        "request_component_sha256_json": (
+            "ALTER TABLE context_resolution_attempts "
+            "ADD COLUMN request_component_sha256_json TEXT"
+        ),
     },
     "message_instruction_items": {
         "retired_at": (

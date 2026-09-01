@@ -18,6 +18,10 @@ from .context_resolution import (
     parse_context_resolution_decision,
 )
 from .context_resolution_worker import build_context_state_fingerprint
+from .context_request_storage import (
+    ContextRequestStorageError,
+    parse_context_request_storage,
+)
 
 
 SCHEMA_VERSION = "context-analysis-backfill-v1"
@@ -672,9 +676,16 @@ def _select_export_records(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
         selected: tuple[sqlite3.Row, dict[str, Any], str] | None = None
         for row in by_message[raw_message_id]:
             try:
-                request = json.loads(str(row["request_summary_json"]))
+                request = parse_context_request_storage(
+                    str(row["request_summary_json"])
+                ).require_legacy_full()
                 prompt_versions = json.loads(str(row["prompt_versions_json"]))
-            except (json.JSONDecodeError, TypeError, ValueError):
+            except (
+                ContextRequestStorageError,
+                json.JSONDecodeError,
+                TypeError,
+                ValueError,
+            ):
                 continue
             if not isinstance(request, dict) or not isinstance(prompt_versions, dict):
                 continue
@@ -756,9 +767,16 @@ def _validate_record(connection: sqlite3.Connection, record: Any) -> None:
     ):
         raise ValueError("source attempt is outside incident filter")
     try:
-        request = json.loads(str(source["request_summary_json"]))
+        request = parse_context_request_storage(
+            str(source["request_summary_json"])
+        ).require_legacy_full()
         prompt_versions = json.loads(str(source["prompt_versions_json"]))
-    except (json.JSONDecodeError, TypeError, ValueError) as exc:
+    except (
+        ContextRequestStorageError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+    ) as exc:
         raise ValueError("source attempt request is malformed") from exc
     if not isinstance(request, dict) or not isinstance(prompt_versions, dict):
         raise ValueError("source attempt request is malformed")

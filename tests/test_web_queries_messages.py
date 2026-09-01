@@ -187,6 +187,10 @@ def test_load_group_messages_projects_safe_context_resolution_observability(tmp_
                     context_fingerprint="sha256:context",
                     model="deepseek",
                     request_summary_json='{"message_context":[{"message_id":1460}]}',
+                    context_message_refs_json=(
+                        '{"chat_id":-1009,"current":[1,1462,2],'
+                        '"messages":[[2,1460,1],[1,1462,2]],"reply_chain":[]}'
+                    ),
                     prompt_versions_json="{}",
                     decision_json=(
                         '{"decision":"unresolved","confidence":0.61,'
@@ -216,6 +220,7 @@ def test_load_group_messages_projects_safe_context_resolution_observability(tmp_
     assert context["supporting_message_ids"] == [1460, 1462]
     assert context["unresolved_reason"] == "等待入场状态"
     assert context["next_triggers"] == ["strategy_state_changed"]
+    assert context["context_message_count"] == 2
     assert "request_summary_json" not in context
 
 

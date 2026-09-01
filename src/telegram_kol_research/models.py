@@ -738,6 +738,18 @@ class ContextResolutionAttempt(Base):
     request_summary_json: Mapped[str] = mapped_column(
         Text, nullable=False, default="{}"
     )
+    context_message_refs_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    candidate_thread_ids_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    rendered_prompt_sha256: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    request_component_sha256_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     decision_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     rejected_response_diagnostic_json: Mapped[Optional[str]] = mapped_column(
         Text, nullable=True

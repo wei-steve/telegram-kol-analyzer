@@ -400,6 +400,101 @@ def test_redacted_exchange_state_uses_confirmed_db_rows_without_raw_payloads(tmp
     assert "must-not-leak" not in rendered
 
 
+def test_worker_prefers_persisted_thread_projection_and_falls_back_only_on_null(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "thread-projection.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=100, message_id=1550, text="更新策略")
+        binding = ExecutionBinding(
+            strategy_instance_id="deepcoin:100:1545:ETH:short",
+            kol_id="group:100",
+            chat_id=100,
+            message_id=1545,
+            symbol="ETH",
+            side="short",
+            status="open",
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=1545,
+            symbol="ETH",
+            side="short",
+            lifecycle_status="entered",
+            signal_at=NOW,
+            execution_binding_id=None,
+        )
+        session.add_all([raw, binding, lifecycle])
+        session.flush()
+        lifecycle.execution_binding_id = binding.id
+        old_thread = StrategyThread(
+            chat_id=100,
+            root_message_id=1540,
+            symbol="BTC",
+            side="long",
+            status="active",
+        )
+        new_thread = StrategyThread(
+            chat_id=100,
+            root_message_id=1545,
+            symbol="ETH",
+            side="short",
+            status="active",
+            current_lifecycle_id=lifecycle.id,
+        )
+        session.add_all([old_thread, new_thread])
+        session.flush()
+        lifecycle.strategy_thread_id = new_thread.id
+        attempt = ContextResolutionAttempt(
+            raw_message_id=raw.id,
+            context_fingerprint="sha256:projection",
+            model="deepseek",
+            prompt_versions_json="{}",
+            request_summary_json=json.dumps(
+                {"candidate_strategy_threads": [{"thread_id": old_thread.id}]}
+            ),
+            candidate_thread_ids_json=json.dumps([new_thread.id]),
+            status="completed",
+            reanalysis_triggers_json="[]",
+        )
+        session.add(attempt)
+        session.commit()
+        raw_id = raw.id
+        old_thread_id = old_thread.id
+        new_thread_id = new_thread.id
+        binding_id = binding.id
+        attempt_id = attempt.id
+
+    actual = build_context_state_fingerprint(session_factory, raw_id)
+    expected_new = build_context_state_fingerprint(
+        session_factory,
+        raw_id,
+        candidate_thread_ids={new_thread_id},
+    )
+    expected_old = build_context_state_fingerprint(
+        session_factory,
+        raw_id,
+        candidate_thread_ids={old_thread_id},
+    )
+    assert actual == expected_new
+    assert actual != expected_old
+    assert build_redacted_exchange_state(session_factory, raw_id)["bindings"] == [
+        {
+            "binding_id": binding_id,
+            "status": "open",
+            "last_exchange_status": None,
+            "position_id_hash": None,
+        }
+    ]
+
+    with session_factory() as session:
+        session.get(ContextResolutionAttempt, attempt_id).candidate_thread_ids_json = None
+        session.commit()
+
+    assert build_context_state_fingerprint(session_factory, raw_id) == expected_old
+    assert build_redacted_exchange_state(session_factory, raw_id)["bindings"] == []
+
+
 @pytest.mark.parametrize(
     "terminal_status",
     ["submitted", "submit_unknown", "succeeded", "unknown", "reconciled"],

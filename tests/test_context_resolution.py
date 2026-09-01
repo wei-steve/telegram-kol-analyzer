@@ -269,6 +269,9 @@ def test_resolver_persists_ordered_observability_and_raw_provider_usage(tmp_path
     with session_factory() as session:
         attempt = session.query(ContextResolutionAttempt).one()
         request = json.loads(attempt.request_summary_json)
+        refs = json.loads(attempt.context_message_refs_json)
+        thread_ids = json.loads(attempt.candidate_thread_ids_json)
+        component_hashes = json.loads(attempt.request_component_sha256_json)
         components = json.loads(attempt.request_component_bytes_json)
         provider_usage = json.loads(attempt.provider_usage_json)
     assert json.loads(attempt.invocation_triggers_json) == [
@@ -277,6 +280,23 @@ def test_resolver_persists_ordered_observability_and_raw_provider_usage(tmp_path
     ]
     assert attempt.attempt_phase == "reanalysis"
     assert attempt.provider_request_count == 1
+    assert request != {}
+    assert refs == {
+        "chat_id": 88,
+        "current": [raw_id, 1468, None],
+        "messages": [[None, 1460, None]],
+        "reply_chain": [[None, 1460, None]],
+    }
+    assert thread_ids == [12]
+    assert len(attempt.rendered_prompt_sha256) == 64
+    assert set(component_hashes) == {
+        "current_message",
+        "saved_evidence",
+        "message_context",
+        "candidate_strategy_threads",
+        "redacted_exchange_state",
+        "mimo_first_pass",
+    }
     assert provider_usage == [
         {"available": True, "request_number": 1, "usage": usage}
     ]
