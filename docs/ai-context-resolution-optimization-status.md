@@ -2,18 +2,18 @@
 
 ```yaml
 workstream: ai_context_resolution_full_column_archive_r1
-phase_state: blocked
-current_phase: r1_activation_blocked_effective_monitor_environment_stale
+phase_state: complete
+current_phase: r1_activated_live_dual_write_verified
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: 5c0ca501825163049da5062693fb46e5297e9e77
+pushed_sha: 4284d1a61226eb16812407c4f2489a207241db4c
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
-production_sha_after: 18434b4552938ae3acb1160ad32618aab9c3ecf4
+production_sha_after: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
-r1_production_sha: null
+r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
 r1_schema_columns_added: true
 source_mode: immutable
 entry_admission_frozen_expected: false
@@ -485,3 +485,17 @@ The installed env after-image correctly named candidate path `/opt/telegram-kol-
 The newly required effective-environment gate nevertheless failed. `systemctl show` continued to expose `Environment=` values from the active release drop-ins for monitor path, commit and manifest, all naming rollback release `18434b4552938ae3acb1160ad32618aab9c3ecf4`, even though `EnvironmentFiles=/etc/telegram-kol-monitor.env` pointed at the candidate after-image and `ExecStart` referenced `${TELEGRAM_KOL_MONITOR_RELEASE_PATH}`. The explicit phase rule said any effective value still naming `18434b45...` must stop before activation. No authorization was created or consumed, and the activation helper was not invoked.
 
 The install-only change was then rolled back under the same runtime-control lock. The env and all four base units compare byte-for-byte equal to their backups; the env again names rollback release `18434b45...`; the monitor timer is restored to enabled and active/waiting. At `2026-09-01T07:46:32Z`, web PID `944570`, ingest PID `944575`, and worker PID `944565` were unchanged, all three reported exact rollback release, verified artifact and `entry_admission_frozen=false`, worker management/protection/close/TPSL/rescue loops were fresh and healthy, and `auto_trade_enabled=true`. No service process was restarted, no release was restaged or modified, no Deepcoin write occurred, and stale ledger rows `598`–`601` were not changed.
+
+## R1 activated, thawed and live-dual-write verified — 2026-09-01T08:25:02Z
+
+The corrected deployment-window gate passed at `2026-09-01T08:01:06.341055Z`: the authenticated Deepcoin snapshot returned zero positions, zero regular open orders, and zero pending BTC/ETH/SOL triggers. Stale local protection-ledger rows `598`–`601` were recorded but neither treated as an exchange-state veto nor modified.
+
+Install-only ran once under `/run/telegram-kol-update.lock`. The existing monitor env and four exact base units were backed up byte-for-byte before modification in `/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-activate-20260901T080141Z`. The after-image env path, commit and manifest SHA-256 were exactly candidate `4284d1a61226eb16812407c4f2489a207241db4c` and `81d5ffb5cfe8d713f9cc21b84ecabda0e93e897c5dfea9439f28bb60328b3167`; all four installed unit hashes equalled their same-named candidate files; `systemd-analyze verify` passed. Per the corrected contract, the pre-activation release-drop-in environment was not used as a gate.
+
+The stored action manifest declared exact components `web`, `monitor`, `ingest`, `worker`, `source_mode=immutable`, rollback `18434b4552938ae3acb1160ad32618aab9c3ecf4`, `schema_changed=false`, no production-data mutation and no exchange-write-semantic change. Its action-plan SHA-256 was `0ab07af5c317f297e0a4c927485206ccfd859d6eba10f5876b66e3bcc20606a3`. A canonical nine-field, root-owned mode-0400 authorization was printed and preserved before the existing helper consumed it. The helper returned `status=activated`; candidate deployment diagnostic returned exit 0, `healthy=true`, `reason_codes=[]`, `adapter_failures=[]`, `audit_ran=false`, `sources_complete=true`, `result_complete=true`, `loaded_artifact_verified=true`, and the exact candidate release and manifest.
+
+The first thaw command searched for an unquoted `Environment=TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1` line, while the actual immutable drop-ins contained `Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"`; it therefore made no change. The immediate identity check caught all three roles still frozen before any success claim. Under the runtime-control lock, the exact quoted line was then removed once from each worker, web and ingest drop-in, followed by `daemon-reload` and the required `worker -> web -> ingest` restart. The monitor timer was restored to enabled and active. At the final checkpoint, web PID `1544740`, ingest PID `1544748`, and worker PID `1544734` all loaded candidate `4284d1a6...`, verified manifest `81d5ffb5...`, and reported `entry_admission_frozen=false`; `auto_trade_enabled=true`. Worker message processing and every management, protection, close, TPSL, rescue, reconcile and break-even loop were fresh and successful.
+
+An ordinary post-deployment monitor cycle completed with `Result=success`, `ExecMainStatus=0`, candidate artifact verification true, `healthy=true`, `reason_codes=[]`, `monitor_error=null`, and `notification_status=not_needed`. The final authenticated exchange snapshot at `2026-09-01T08:25:02.105242Z` remained zero positions, zero regular open orders and zero BTC/ETH/SOL triggers. No Deepcoin write was performed by the deployment workflow.
+
+The bounded L1 observation ran from `2026-09-01T08:08:41Z` through `08:23:42Z`. It observed three new raw messages and four naturally created context-resolution attempts: 4293 was a reanalysis of raw 14220, while 4294–4296 were initial resolutions for new raws 14239–14241. All four completed with one provider request and no error. Their stored request states remained `legacy-full`, with complete payloads of 12,088, 14,886, 15,495 and 16,957 UTF-8 bytes. For every row, the new context-message references and candidate-thread IDs exactly matched fresh projections from the same full request; the stored rendered-prompt SHA-256 and all component SHA-256 values exactly matched recomputation by the deployed R1 code. Decisions were `unresolved`, `unresolved`, `hold`, `hold`, with no management action and no target thread, preserving the existing decision schema and producing no execution request. This is a non-zero live proof that R1 continued the full-payload write while adding the four reference/fingerprint fields without changing provider input or the decision path.
