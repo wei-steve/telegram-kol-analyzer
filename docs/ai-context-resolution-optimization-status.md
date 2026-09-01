@@ -1,16 +1,19 @@
 # AI Context Resolution Optimization Status
 
 ```yaml
-workstream: ai_context_resolution_observability_and_network_backoff
-phase_state: complete
-current_phase: production_activation_and_live_observation_complete
+workstream: ai_context_resolution_full_column_archive_r1
+phase_state: in_progress
+current_phase: r1_local_complete_production_l3_pending
 claimed_by: null
 base_sha: 387f638ba4afec26c106795724dcb27becdf30a7
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
+pushed_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 18434b4552938ae3acb1160ad32618aab9c3ecf4
+r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
+r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
+r1_production_sha: null
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
@@ -277,6 +280,16 @@ Reuse the existing verified backup, integrity and `VACUUM` path. Production evid
 - **Rollback after commit but before restart:** because writers remain stopped, restore the verified pre-change database backup or restore request bytes from the archive and re-verify.
 - **Rollback after service restart:** do not replace the whole database and discard newer writes. Restore only archived request bytes in a new authorized transaction if needed; R1/R2 code rollback must retain marker awareness.
 - **Final acceptance:** every pre-watermark attempt is represented exactly once in the archive; every corresponding live row has the correct explicit archive marker; every later row has the explicit reference-only marker; no online code reads a full request; `decision_json` and all business rows are byte/count stable; archive retrieval reproduces sampled and boundary payloads exactly; database integrity is clean; physical size and the next daily-audit peak are recorded.
+
+## R1 implementation checkpoint — local candidate 2026-09-01
+
+- R1 code is commit `5c0ca501825163049da5062693fb46e5297e9e77`, exact-base reviewed from `51abb3177892c0ee0c8dd1cd249a083aa27d9abe`. It adds only the four nullable compatibility columns `context_message_refs_json`, `candidate_thread_ids_json`, `rendered_prompt_sha256` and `request_component_sha256_json` through `SQLITE_COMPAT_COLUMNS` and the ORM model. No trigger or thread-ID backfill, request archive, marker rewrite, `VACUUM` or R2 source cutover exists in this candidate.
+- RED was recorded before implementation: the dedicated storage-contract test failed at collection because `telegram_kol_research.context_request_storage` and all four schema/write paths did not exist. GREEN passed the exact six new acceptance tests, then the context/migration/worker/Web/offline-backfill regression set passed `147 passed`; a broader authority/window/Web set passed `189 passed`.
+- New attempts keep `request_summary_json` as the complete non-empty legacy request and additionally persist ordered message/evidence references, the whole-request recursive sorted unique thread-ID projection, the SHA-256 of the exact provider messages array and six named request-component SHA-256 values. The provider message builder is shared by the live call and persisted hash, while the existing request object, context fingerprint, trigger predicates, prompt text and decision parser are unchanged.
+- Both online worker readers select `candidate_thread_ids_json` when it is non-NULL and parse it as a sorted unique integer list. Only a SQL NULL activates the legacy full-request fallback. The Web projection selects the new chronological message references for `context_message_count`, with its legacy fallback retained for historical NULL rows.
+- The tagged parser distinguishes untagged `legacy-full`, exact `reference-only` and exact `archived` markers; unknown or extra tagged fields and invalid archive hashes fail closed. Worker fallback requires a legacy full request, and the offline analysis backfill also requires legacy-full storage, so an archived marker is never accepted as an empty request.
+- Independent exact-base review reported **no findings** and passed its own `113` focused tests. The final full suite ran after the last production-code edit and passed `6753 passed, 4 skipped, 32 warnings in 447.81s`; warnings are the existing deprecation warnings.
+- Production has not yet been touched by R1. The next authorized step in this same phase is the separate L3 nullable-column migration with a verified backup and integrity/count gates, followed by a fresh runtime-only stage declaring `schema_changed=false`.
 
 ### Behavior classification
 
