@@ -2,15 +2,15 @@
 
 ```yaml
 workstream: main_recognition_provider_observability
-phase_state: in_progress
-current_phase: main_recognition_l3_complete_deployment_blocked_structural_snapshot_role_mismatch
+phase_state: complete
+current_phase: main_recognition_observability_deployed_and_live_verified
 claimed_by: null
 base_sha: 1d82f29f2f1177b98e436fd578d0f4eb0b72fdae
 change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
-pushed_sha: 3205b074642436ed0f6aa35fefef7941a4f3f62f
+pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
-production_sha_after: 3205b074642436ed0f6aa35fefef7941a4f3f62f
+production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
@@ -19,12 +19,12 @@ shadow_code_sha: ff995723b64a331f963b49affb8827929213d8ac
 shadow_production_sha: 3205b074642436ed0f6aa35fefef7941a4f3f62f
 shadow_schema_columns_added: true
 shadow_activation_complete: true
-shadow_live_sample_verified: false
+shadow_live_sample_verified: true
 main_recognition_code_sha: 24169cd03d22c7ba12d1e96e1fc26166f159615c
-main_recognition_production_sha: null
+main_recognition_production_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 main_recognition_schema_columns_added: true
-main_recognition_activation_complete: false
-main_recognition_live_sample_verified: false
+main_recognition_activation_complete: true
+main_recognition_live_sample_verified: true
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
@@ -56,6 +56,18 @@ auto_trade_enabled_observed: true
 - The diagnosis is structural wrong-role/wrong-port invocation, not timeout, network jitter, provider rate limiting, a missing exchange interface, bad parameters or permission rejection at Deepcoin. The snapshot route itself contains no read pacer: its two methods normally run back-to-back. The historical 0.41-second pacer belongs only to the manual maintenance-reconciliation evidence path, while the 1.05-second client interval applies only to position-history reads. Therefore the failed Web calls did not bypass pacing to hit a limit—they sent zero provider requests—and the successful diagnostic intentionally observed the established 0.41-second private-read spacing.
 - Detailed root-owned mode-0600 evidence is under `/var/lib/telegram-kol-cutover-evidence/b3137ed6c0f67c62ce8c3e35a52a0fdf68bac1f7/main-recognition-snapshot-diagnostic-20260901T163000Z`. The core SHA-256 values are `d197756d8a90c484db69a736540f3637adb3e3c94aed13ce41e409056778311c` for role/Web-route evidence, `2b51c5340754434c083fa4065656587a00ba203db2eb9b675531d58269db59d9` for the exact Web factory failure, and `dda472709bb1617e216422222cf4f33ae6c950ab4d793a2c3548a0bf16332ebd` for the worker subquery evidence. The first attempt to persist worker results tried to write into the root-only directory after dropping privileges and failed after completing the same two spaced reads; no exchange result was claimed from it. The retained rerun made the same two reads, again spaced by 0.41 seconds, then stopped—four provider GETs total across the two evidence attempts, with no further retries. It retained worker identity but let the root shell own the already-open output descriptor, so the evidence was preserved without importing immutable code as root.
 - Per the owner's conditional scope, a structural failure cannot unlock deployment even though a worker-side complete snapshot was subsequently demonstrated. No stage, install-only, authorization, activation, freeze, restart, setting change, database/business-row change or Deepcoin write was performed. The minimal follow-up is to bind the deployment preflight to the existing worker listener at `127.0.0.1:8002` (or formally broker worker-produced evidence to the caller) and retain the same `complete=true` requirement; do not add credentials to Web and do not reinterpret the opaque Web failure as zero. That correction requires a new approved deployment window.
+
+## Main-recognition observability deployed and live-verified — 2026-09-01T22:42:06Z
+
+- The owner confirmed that selecting `127.0.0.1:8000` was a deployment-preflight workflow error, not an immutable-release or helper constant. The release registers the same loopback-only route in each split role; systemd assigns Web to port 8000 and the credential-bearing worker to port 8002. No code, credential boundary or endpoint semantics changed. A fresh worker preflight at `2026-09-01T22:20:06Z` returned HTTP 200 in 0.377 seconds with `complete=true`, zero positions, zero regular open orders and fingerprint `e0f66201bc8350918de6835335b70f9c5ba216820a8bd80dba07848e32b66f4a`, so the corrected deployment-window gate passed.
+- A new runtime-only immutable stage used exact pushed HEAD `0de19c1cbb2089fd58b8940d9b01a65096f9a063` and declared `schema_changed=false`, no production-data mutation, no exchange-write-semantic change and no authority change. The stage produced tree `84a9d4a7f63586b3d907018f91bf8a6c3b2eebe9`, content SHA-256 `17f4476b2127340653df653b44a19c78468172e41e2563d18d58f51bd6ade120`, manifest SHA-256 `89778577ec34a6eaaf4179c1949b119a6d66c798731ea43b641dd02016bceca1`, and stage-plan SHA-256 `0c5708c7e433472e62d1f6f7e75abc3184c0b7faa2b266f1d1c0d8a26ba82c56`. The four nullable columns had already been installed by the independent L3 executor; activation performed no schema or business-data write.
+- Governed expectations were read-only confirmed as auto trade enabled and entry preamble, message assembly v2 and entry revision v2 all live. Before install-only, `/etc/telegram-kol-monitor.env`, all four exact base units and the four release drop-ins were hashed and the mutable files were copied byte-for-byte to the root-owned backup directory. Install-only left every monitor unit inactive and wrote the candidate env. The installed/source SHA-256 pairs matched by exact filename: service `9f1384bd...`, timer `59a27b2f...`, diagnostic `ae23b0b...`, test notification `450ec37a...`. The env path, commit and manifest all named the candidate; retired CLI arguments were absent, diagnostic-only flags were present, and `systemd-analyze verify` passed.
+- The activation action-plan SHA-256 was `7e01d474f6cf9d168b7feb77225e0a01876e2bc08cf8eedb9c0491efd674663e`. A canonical nine-field, root-owned mode-0400 authorization bound exact components `web`, `monitor`, `ingest`, `worker`, source mode `immutable`, candidate `0de19c1c...` and rollback `3205b074...`; the full payload and action manifest were printed and preserved before one-time consumption. The local output session ended after 30 seconds while the remote helper continued under `/run/telegram-kol-update.lock`; the run was not repeated. The consumed authorization, candidate drop-ins, successful process identities and candidate diagnostic establish the helper result. The diagnostic completed with `healthy=true`, `reason_codes=[]`, `adapter_failures=[]`, `audit_ran=false`, `sources_complete=true`, `result_complete=true`, `loaded_artifact_verified=true`, and exact candidate release/manifest.
+- After the helper released the runtime-control lock, the exact quoted/unquoted freeze line was removed once from each worker, Web and ingest release drop-in, followed by `daemon-reload` and the required `worker -> web -> ingest` restart. The thaw completed at `2026-09-01T22:25:44Z`, and the monitor timer was restored to enabled/active. Final PIDs were worker `3315574`, Web `3315580` and ingest `3315585`; they did not drift during the observation window. Each role loaded candidate `0de19c1c...`, verified manifest `89778577...`, and reported `entry_admission_frozen=false`. `auto_trade_enabled=true`; Web event loop, ingest listener/reconcile, worker command/message processing, and all worker management, protection, close, TPSL, break-even, reconcile and rescue cycles were fresh and successful.
+- The natural timer-driven monitor cycle at `2026-09-01T22:31:50Z` completed with `Result=success`, `ExecMainStatus=0`, candidate artifact verification true, `healthy=true`, `reason_codes=[]`, `monitor_error=null`, `audit_ran=false` and `notification_status=not_needed`. The final worker exchange read at `22:42:06Z` remained `complete=true`, zero positions and zero regular open orders with the same fingerprint. The deployment workflow executed no Deepcoin write.
+- The bounded L1 observation ran from `2026-09-01T22:26:16Z` through `22:41:30Z`. Three new raw messages arrived, below the five-message early-stop target, so the window stopped at 15 minutes and was not extended. Four real main-recognition attempts, IDs 4721–4724, began after deployment and all completed as one-request authoritative v1 runs with no error. Actual provider totals were 31,201, 16,152, 16,445 and 31,107 tokens. Canonical request totals were 169,726, 181,889, 47,811 and 118,179 bytes; for every row the system prompt, current message, image evidence, authoritative context and structural overhead partition summed exactly to the total. All four decisions used the unchanged authoritative path and produced `非策略 / event_type=none / mimo_no_action`, with zero signal candidates. This is non-zero live proof of nullable field population without a decision-path change.
+- Shadow telemetry also acquired real production evidence without affecting authority: 23 rows total, 14 agreements and 9 `shadow_would_skip` disagreements, with zero shadow-evaluation errors. The disagreements are the intended observational output and did not suppress any actual context call. `shadow_live_sample_verified` is therefore true alongside the new main-recognition live proof.
+- Detailed evidence is rooted at `/var/lib/telegram-kol-cutover-evidence/0de19c1cbb2089fd58b8940d9b01a65096f9a063/main-recognition-observability-deploy-20260901T222006Z`. The final runtime evidence SHA-256 is `89fb0b1960a804149c5601b2e43564d5b572cdfbaf6f745cda6f6a3558763408`; the final database-observation evidence SHA-256 is `0d321a4573ea2940f2d01ec8350e68abf018e338c8919b8f2277d1d9ea14365a`. Normal rollback keeps the four additive nullable columns and returns code/runtime to `3205b074...`; physical column removal remains out of scope.
 
 ## Shadow invocation gate — local candidate 2026-09-01
 
