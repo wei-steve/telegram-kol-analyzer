@@ -5,6 +5,11 @@
   secrets or network identity. Run the production-dependent part of verification
   on the server only when acceptance actually depends on the live Telegram
   session, Deepcoin API IP allowlist, production keys, or deployed runtime state.
+- Any temporary analysis, diagnostic, or audit that imports code directly from
+  an immutable release directory must run with `python -B` or
+  `PYTHONDONTWRITEBYTECODE=1`. A source-adjacent `__pycache__`/`.pyc` write changes
+  the release content digest and can make that otherwise valid release unusable
+  as a rollback target.
 - Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1` when
   the active plan or user request calls for integration. Deploy when the
   approved phase requires production verification.
