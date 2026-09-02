@@ -323,6 +323,7 @@ function setMonitorStatus(status) {
   badge.title = status && status.detail ? status.detail : '';
   badge.classList.toggle('is-live', state === 'monitoring');
   badge.classList.toggle('is-idle', state === 'idle');
+  badge.classList.toggle('is-unknown', state === 'unknown');
   badge.classList.toggle('is-disconnected', state === 'disconnected');
 }
 
@@ -335,9 +336,9 @@ async function refreshMonitorStatus() {
     setMonitorStatus(await response.json());
   } catch {
     setMonitorStatus({
-      state: 'disconnected',
-      label: '已断开',
-      detail: 'Web 服务连接失败，等待恢复',
+      state: 'unknown',
+      label: '状态未知',
+      detail: '无法获取 Telegram 监听状态',
     });
   }
 }
@@ -4379,11 +4380,6 @@ async function refreshFromDatabaseChanges() {
   try {
     snapshot = await fetchFreshnessSnapshot();
   } catch {
-    setMonitorStatus({
-      state: 'disconnected',
-      label: '已断开',
-      detail: 'Web 服务连接失败，等待恢复',
-    });
     return;
   }
 
@@ -4457,23 +4453,14 @@ function connectLiveUpdates() {
     source.onerror = () => {
       sseWasDisconnected = true;
       setAiStatus('实时连接中断，自动重连中...', true);
-      setMonitorStatus({
-        state: 'reconnecting',
-        label: '重连中',
-        detail: '实时事件连接中断，浏览器将自动重连',
-      });
       // Do NOT call source.close() — let the browser's built-in
       // EventSource reconnection handle it with exponential backoff.
     };
-    source.onopen = () => {
+    source.onopen = async () => {
       if (sseWasDisconnected) {
         sseWasDisconnected = false;
         setAiStatus('实时连接已恢复，有新变化时可手动查看。');
-        setMonitorStatus({
-          state: 'monitoring',
-          label: '监控中',
-          detail: '实时事件连接已恢复',
-        });
+        await refreshMonitorStatus();
         noteStrategyRecordChanges();
       }
     };

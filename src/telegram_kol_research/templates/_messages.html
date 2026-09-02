@@ -19,7 +19,7 @@
       </span>
       <button type="button" class="secondary-button" data-refresh-now>立即刷新</button>
       <span
-        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% else %} is-disconnected{% endif %}"
+        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% elif monitor_status and monitor_status.state == 'unknown' %} is-unknown{% else %} is-disconnected{% endif %}"
         data-monitor-status
         data-monitor-state="{{ monitor_status.state if monitor_status else ('monitoring' if live_listener_enabled else 'disconnected') }}"
         title="{{ monitor_status.detail if monitor_status else '' }}"
@@ -33,7 +33,7 @@
         title="Show newest messages"
         hidden
       >↑</button>
-      {% if not live_listener_enabled and live_listener_status_reason %}
+      {% if not live_listener_enabled and live_listener_status_reason and not live_listener_delegated %}
         <span>{{ live_listener_status_reason }}</span>
         {% if session_lock_owner_pid %}
           <span class="session-lock-hint">

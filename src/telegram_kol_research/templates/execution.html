@@ -13,7 +13,7 @@
       <button type="button" class="secondary-button" data-sync-deepcoin-positions>同步 DeepCoin 仓位</button>
       <span class="execution-action-status" data-sync-deepcoin-status aria-live="polite"></span>
       <span
-        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% else %} is-disconnected{% endif %}"
+        class="message-sync-state{% if monitor_status and monitor_status.state == 'monitoring' %} is-live{% elif monitor_status and monitor_status.state == 'idle' %} is-idle{% elif monitor_status and monitor_status.state == 'unknown' %} is-unknown{% else %} is-disconnected{% endif %}"
         data-monitor-status
         data-monitor-state="{{ monitor_status.state if monitor_status else 'disconnected' }}"
         title="{{ monitor_status.detail if monitor_status else '' }}"

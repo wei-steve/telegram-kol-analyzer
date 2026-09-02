@@ -5860,6 +5860,7 @@ def web(
 
     telegram_client = None
     live_listener_status_reason = None
+    live_listener_delegated = False
     telegram_session_lock = None
     telegram_session_lock_entered = False
     if runtime_role_owns_telegram_session(runtime_role):
@@ -5893,9 +5894,7 @@ def web(
                 err=False,
             )
     else:
-        live_listener_status_reason = (
-            f"Telegram live listener is owned by the ingest runtime role, not {runtime_role}"
-        )
+        live_listener_delegated = True
 
     app_instance = create_web_app(
         database_path=database_path,
@@ -5904,6 +5903,7 @@ def web(
         live_target_titles=live_target_titles,
         telegram_client=telegram_client,
         live_listener_status_reason=live_listener_status_reason,
+        live_listener_delegated=live_listener_delegated,
         group_labels_by_title=group_labels_by_title,
         group_config=group_config,
         group_config_path=config_path,

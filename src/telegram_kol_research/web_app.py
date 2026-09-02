@@ -315,6 +315,20 @@ from telegram_kol_research.telegram_session_lock import (
 REFRESH_TIMEOUT_SECONDS = 180
 INGEST_REFRESH_RESPONSE_MAX_BYTES = 64 * 1024
 DEFAULT_INGEST_REFRESH_URL = "http://127.0.0.1:8001/api/refresh"
+DEFAULT_INGEST_MONITOR_STATUS_URL = (
+    "http://127.0.0.1:8001/api/monitor-status"
+)
+INGEST_MONITOR_STATUS_TIMEOUT_SECONDS = 5
+INGEST_MONITOR_STATUS_RESPONSE_MAX_BYTES = 16 * 1024
+DEFAULT_WORKER_EXCHANGE_TAB_BASE_URL = "http://127.0.0.1:8002"
+WORKER_EXCHANGE_TAB_TIMEOUT_SECONDS = 20
+WORKER_EXCHANGE_TAB_RESPONSE_MAX_BYTES = 4 * 1024 * 1024
+WORKER_EXCHANGE_TAB_NAMES = frozenset(
+    {"open-orders", "order-history", "position-history"}
+)
+WORKER_EXCHANGE_TAB_PARAM_NAMES = frozenset(
+    {"browse_token", "cursor", "closed_after", "closed_before"}
+)
 TRADING_SETTINGS_TIMEOUT_SECONDS = 10
 INGEST_TRADING_SETTINGS_RESPONSE_MAX_BYTES = 64 * 1024
 INGEST_TRADING_SETTINGS_REQUEST_MAX_BYTES = 64 * 1024
@@ -426,6 +440,43 @@ def resolve_ingest_refresh_url(value: str) -> str:
     return str(url)
 
 
+def resolve_worker_exchange_tab_base_url(value: str) -> str:
+    url = httpx.URL(str(value or "").strip())
+    if (
+        url.scheme != "http"
+        or url.host not in {"127.0.0.1", "localhost", "::1"}
+        or url.port != 8002
+        or url.path not in {"", "/"}
+        or url.query
+        or url.fragment
+        or url.username
+        or url.password
+    ):
+        raise ValueError(
+            "worker exchange tab base URL must be localhost:8002 over HTTP"
+        )
+    return str(url)
+
+
+def resolve_ingest_monitor_status_url(value: str) -> str:
+    url = httpx.URL(str(value or "").strip())
+    if (
+        url.scheme != "http"
+        or url.host not in {"127.0.0.1", "localhost", "::1"}
+        or url.port != 8001
+        or url.path != "/api/monitor-status"
+        or url.query
+        or url.fragment
+        or url.username
+        or url.password
+    ):
+        raise ValueError(
+            "ingest monitor status URL must be localhost:8001 "
+            "/api/monitor-status over HTTP"
+        )
+    return str(url)
+
+
 def resolve_ingest_trading_settings_url(value: str) -> str:
     url = httpx.URL(str(value or "").strip())
     if (
@@ -448,6 +499,31 @@ def resolve_ingest_trading_settings_url(value: str) -> str:
 async def request_ingest_refresh_once(url: str, *, timeout_seconds: float):
     async with httpx.AsyncClient(timeout=timeout_seconds) as client:
         return await client.post(url)
+
+
+async def request_worker_exchange_tab_once(
+    url: str,
+    *,
+    params: dict[str, str],
+    timeout_seconds: float,
+):
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+    ) as client:
+        return await client.get(url, params=params)
+
+
+async def request_ingest_monitor_status_once(
+    url: str,
+    *,
+    timeout_seconds: float,
+):
+    async with httpx.AsyncClient(
+        timeout=timeout_seconds,
+        follow_redirects=False,
+    ) as client:
+        return await client.get(url)
 
 
 async def request_ingest_trading_settings_once(
@@ -486,6 +562,96 @@ async def proxy_ingest_refresh_once(*, requester, url: str) -> Response:
         status_code=response.status_code,
         media_type="application/json",
     )
+
+
+async def proxy_worker_exchange_tab_once(
+    *,
+    requester,
+    base_url: str,
+    tab_name: str,
+    params: dict[str, Any],
+) -> HTMLResponse | None:
+    if tab_name not in WORKER_EXCHANGE_TAB_NAMES:
+        return None
+    filtered_params: dict[str, str] = {}
+    for key, value in params.items():
+        if key not in WORKER_EXCHANGE_TAB_PARAM_NAMES:
+            continue
+        if not isinstance(value, str) or len(value) > 256:
+            return None
+        filtered_params[key] = value
+    url = str(
+        httpx.URL(base_url).copy_with(
+            path=f"/positions-panel/tabs/{tab_name}",
+            query=None,
+            fragment=None,
+        )
+    )
+    try:
+        response = await requester(
+            url,
+            params=filtered_params,
+            timeout_seconds=WORKER_EXCHANGE_TAB_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "worker exchange tab RPC unavailable: %s",
+            type(exc).__name__,
+        )
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "worker exchange tab RPC returned status=%s",
+            response.status_code,
+        )
+        return None
+    if len(response.content) > WORKER_EXCHANGE_TAB_RESPONSE_MAX_BYTES:
+        logger.warning("worker exchange tab RPC response too large")
+        return None
+    content_type = response.headers.get("content-type", "")
+    if content_type.split(";", 1)[0].strip().lower() != "text/html":
+        logger.warning("worker exchange tab RPC content type invalid")
+        return None
+    return HTMLResponse(content=response.content, status_code=200)
+
+
+async def proxy_ingest_monitor_status_once(
+    *,
+    requester,
+    url: str,
+) -> dict[str, Any] | None:
+    try:
+        response = await requester(
+            url,
+            timeout_seconds=INGEST_MONITOR_STATUS_TIMEOUT_SECONDS,
+        )
+    except httpx.HTTPError as exc:
+        logger.warning(
+            "ingest monitor status RPC unavailable: %s",
+            type(exc).__name__,
+        )
+        return None
+    if response.status_code != 200:
+        logger.warning(
+            "ingest monitor status RPC returned status=%s",
+            response.status_code,
+        )
+        return None
+    if len(response.content) > INGEST_MONITOR_STATUS_RESPONSE_MAX_BYTES:
+        logger.warning("ingest monitor status RPC response too large")
+        return None
+    try:
+        payload = response.json()
+    except (TypeError, ValueError):
+        logger.warning("ingest monitor status RPC returned invalid JSON")
+        return None
+    if not isinstance(payload, dict) or any(
+        not isinstance(payload.get(key), str) or not payload.get(key)
+        for key in ("state", "label", "detail")
+    ):
+        logger.warning("ingest monitor status RPC payload invalid")
+        return None
+    return dict(payload)
 
 
 async def proxy_ingest_trading_settings_once(
@@ -4443,6 +4609,10 @@ def create_web_app(
     runtime_role: str = "all",
     ingest_refresh_url: str = DEFAULT_INGEST_REFRESH_URL,
     ingest_refresh_requester=None,
+    ingest_monitor_status_url: str = DEFAULT_INGEST_MONITOR_STATUS_URL,
+    ingest_monitor_status_requester=None,
+    worker_exchange_tab_base_url: str = DEFAULT_WORKER_EXCHANGE_TAB_BASE_URL,
+    worker_exchange_tab_requester=None,
     ingest_trading_settings_url: str = DEFAULT_INGEST_TRADING_SETTINGS_URL,
     ingest_trading_settings_requester=None,
     media_root: str | Path | None = None,
@@ -4451,6 +4621,7 @@ def create_web_app(
     source_deletion_recorder=None,
     telegram_client: Any | None = None,
     live_listener_status_reason: str | None = None,
+    live_listener_delegated: bool = False,
     group_labels_by_title: dict[str, str] | None = None,
     now_provider=None,
     reconcile_runner=None,
@@ -4507,6 +4678,12 @@ def create_web_app(
     deployment_entry_frozen = deployment_entry_admission_frozen()
     split_runtime = resolved_runtime_role != "all"
     resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
+    resolved_ingest_monitor_status_url = resolve_ingest_monitor_status_url(
+        ingest_monitor_status_url
+    )
+    resolved_worker_exchange_tab_base_url = resolve_worker_exchange_tab_base_url(
+        worker_exchange_tab_base_url
+    )
     resolved_ingest_trading_settings_url = resolve_ingest_trading_settings_url(
         ingest_trading_settings_url
     )
@@ -5101,6 +5278,16 @@ def create_web_app(
     app.state.ingest_refresh_requester = (
         ingest_refresh_requester or request_ingest_refresh_once
     )
+    app.state.ingest_monitor_status_url = resolved_ingest_monitor_status_url
+    app.state.ingest_monitor_status_requester = (
+        ingest_monitor_status_requester or request_ingest_monitor_status_once
+    )
+    app.state.worker_exchange_tab_base_url = (
+        resolved_worker_exchange_tab_base_url
+    )
+    app.state.worker_exchange_tab_requester = (
+        worker_exchange_tab_requester or request_worker_exchange_tab_once
+    )
     app.state.ingest_trading_settings_url = resolved_ingest_trading_settings_url
     app.state.ingest_trading_settings_requester = (
         ingest_trading_settings_requester
@@ -5237,6 +5424,7 @@ def create_web_app(
     app.state.live_listener_task = None
     app.state.telegram_client = telegram_client
     app.state.live_listener_status_reason = live_listener_status_reason
+    app.state.live_listener_delegated = bool(live_listener_delegated)
     app.state.group_labels_by_title = group_labels_by_title or {}
     app.state.group_config = group_config or GroupConfig()
     app.state.group_config_path = Path(group_config_path) if group_config_path else None
@@ -5603,7 +5791,17 @@ def create_web_app(
                 )
             )
 
+    def build_unknown_monitor_status() -> dict[str, Any]:
+        return {
+            "state": "unknown",
+            "label": "状态未知",
+            "detail": "无法从 ingest 获取 Telegram 监听状态",
+            "monitored_group_count": len(app.state.live_target_titles),
+        }
+
     def build_monitor_status() -> dict[str, Any]:
+        if app.state.runtime_role == "web":
+            return build_unknown_monitor_status()
         synced_group_count = len(app.state.live_target_titles)
         task = app.state.live_listener_task
         reconcile_task = app.state.reconcile_task
@@ -7126,7 +7324,7 @@ def create_web_app(
         )
 
     @app.get("/positions-panel/tabs/{tab_name}")
-    def positions_panel_tab_partial(
+    async def positions_panel_tab_partial(
         request: Request,
         tab_name: str,
         browse_token: str | None = None,
@@ -7145,6 +7343,24 @@ def create_web_app(
             raise HTTPException(status_code=422, detail="invalid history date filter") from exc
         if filter_key[0] and filter_key[1] and filter_key[0] > filter_key[1]:
             raise HTTPException(status_code=422, detail="history date range is reversed")
+        if app.state.runtime_role == "web":
+            proxied = await proxy_worker_exchange_tab_once(
+                requester=app.state.worker_exchange_tab_requester,
+                base_url=app.state.worker_exchange_tab_base_url,
+                tab_name=tab_name,
+                params={
+                    key: value
+                    for key, value in {
+                        "browse_token": browse_token,
+                        "cursor": cursor,
+                        "closed_after": closed_after,
+                        "closed_before": closed_before,
+                    }.items()
+                    if value is not None
+                },
+            )
+            if proxied is not None:
+                return proxied
         return templates.TemplateResponse(
             request,
             "_exchange_position_tab.html",
@@ -7168,6 +7384,7 @@ def create_web_app(
             "live_listener_enabled": live_listener_enabled,
             "monitor_status": monitor_status,
             "live_listener_status_reason": app.state.live_listener_status_reason,
+            "live_listener_delegated": app.state.live_listener_delegated,
             "session_lock_owner_pid": _extract_session_lock_owner_pid(
                 app.state.live_listener_status_reason
             ),
@@ -7204,6 +7421,7 @@ def create_web_app(
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
                 "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
+                "live_listener_delegated": app.state.live_listener_delegated,
                 "session_lock_owner_pid": _extract_session_lock_owner_pid(
                     app.state.live_listener_status_reason
                 ),
@@ -7349,6 +7567,7 @@ def create_web_app(
                 "monitor_status": monitor_status,
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
                 "live_listener_status_reason": app.state.live_listener_status_reason,
+                "live_listener_delegated": app.state.live_listener_delegated,
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "refresh_mode_label": (
@@ -7446,6 +7665,7 @@ def create_web_app(
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
                 "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
+                "live_listener_delegated": app.state.live_listener_delegated,
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "refresh_mode_label": (
@@ -7750,7 +7970,8 @@ def create_web_app(
         }
         app.state.live_target_titles.clear()
         app.state.live_target_titles.update(live_target_titles)
-        await ensure_live_tasks_match_targets()
+        if app.state.runtime_role != "web":
+            await ensure_live_tasks_match_targets()
         return {
             "chat_id": chat_id,
             "chat_title": group.chat_title,
@@ -8410,6 +8631,7 @@ def create_web_app(
                 "live_listener_enabled": monitor_status["state"] == "monitoring",
                 "monitor_status": monitor_status,
                 "live_listener_status_reason": app.state.live_listener_status_reason,
+                "live_listener_delegated": app.state.live_listener_delegated,
                 "database_latest_message_at": freshness["latest_message_at"],
                 "database_stale_hours": freshness["stale_hours"],
                 "refresh_mode_label": (
@@ -8500,6 +8722,12 @@ def create_web_app(
 
     @app.get("/api/monitor-status")
     async def api_monitor_status():
+        if app.state.runtime_role == "web":
+            proxied = await proxy_ingest_monitor_status_once(
+                requester=app.state.ingest_monitor_status_requester,
+                url=app.state.ingest_monitor_status_url,
+            )
+            return proxied if proxied is not None else build_unknown_monitor_status()
         status = build_monitor_status()
         if (
             status["state"] == "disconnected"

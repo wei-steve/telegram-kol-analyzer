@@ -679,6 +679,8 @@ def test_non_ingest_cli_roles_never_load_or_lock_telegram(role, tmp_path, monkey
     assert result.exit_code == 0, result.output
     assert captured["runtime_role"] == role
     assert captured["telegram_client"] is None
+    assert captured["live_listener_status_reason"] is None
+    assert captured["live_listener_delegated"] is True
 
 
 def test_ingest_cli_role_acquires_session_before_creating_client(
@@ -804,6 +806,299 @@ def test_web_role_proxies_refresh_once_and_preserves_success_body(tmp_path):
     assert response.status_code == 200
     assert json.loads(response.body) == {"checked": 7, "reconciled": 3}
     assert calls == [("http://127.0.0.1:8001/api/refresh", 180)]
+
+
+def test_web_role_proxies_exchange_tab_to_worker_with_filtered_query(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    calls = []
+
+    async def requester(url, *, params, timeout_seconds):
+        calls.append((url, params, timeout_seconds))
+        return httpx.Response(
+            200,
+            content=b'<section data-exchange-tab-loaded="true">worker-tab</section>',
+            headers={"content-type": "text/html; charset=utf-8"},
+        )
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        worker_exchange_tab_base_url="http://127.0.0.1:8002",
+        worker_exchange_tab_requester=requester,
+    )
+
+    response = TestClient(app).get(
+        "/positions-panel/tabs/order-history",
+        params={
+            "browse_token": "token-1",
+            "cursor": "cursor-1",
+            "closed_after": "2026-08-01",
+            "closed_before": "2026-08-31",
+            "unknown": "must-not-cross-process",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.text == (
+        '<section data-exchange-tab-loaded="true">worker-tab</section>'
+    )
+    assert calls == [
+        (
+            "http://127.0.0.1:8002/positions-panel/tabs/order-history",
+            {
+                "browse_token": "token-1",
+                "cursor": "cursor-1",
+                "closed_after": "2026-08-01",
+                "closed_before": "2026-08-31",
+            },
+            20,
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://127.0.0.1:8002",
+        "http://example.com:8002",
+        "http://127.0.0.1:8001",
+        "http://127.0.0.1:8002/path",
+        "http://127.0.0.1:8002?query=1",
+        "http://user:pass@127.0.0.1:8002",
+    ],
+)
+def test_worker_exchange_tab_base_url_rejects_non_loopback_8002(value):
+    from telegram_kol_research import web_app
+
+    resolver = getattr(web_app, "resolve_worker_exchange_tab_base_url", None)
+    assert resolver is not None, "worker exchange tab URL resolver is missing"
+    with pytest.raises(ValueError, match="worker exchange tab"):
+        resolver(value)
+
+
+def test_worker_exchange_tab_proxy_rejects_oversized_response():
+    from telegram_kol_research import web_app
+
+    proxy = getattr(web_app, "proxy_worker_exchange_tab_once", None)
+    assert proxy is not None, "worker exchange tab proxy is missing"
+
+    async def requester(url, *, params, timeout_seconds):
+        return httpx.Response(
+            200,
+            content=b"x" * (4 * 1024 * 1024 + 1),
+            headers={"content-type": "text/html"},
+        )
+
+    response = asyncio.run(
+        proxy(
+            requester=requester,
+            base_url="http://127.0.0.1:8002",
+            tab_name="open-orders",
+            params={},
+        )
+    )
+
+    assert response is None
+
+
+def test_web_exchange_tab_failure_falls_back_without_deepcoin_client(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    attempts = 0
+    factory_calls = []
+
+    async def requester(url, *, params, timeout_seconds):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("worker unavailable")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        worker_exchange_tab_requester=requester,
+        deepcoin_client_factory=lambda: factory_calls.append("called"),
+    )
+
+    response = TestClient(app).get("/positions-panel/tabs/open-orders")
+
+    assert response.status_code == 200
+    assert attempts == 1
+    assert factory_calls == []
+    assert 'data-exchange-tab-loaded="false"' in response.text
+    assert "Deepcoin 数据暂不可用" in response.text
+
+
+def test_web_monitor_status_proxies_ingest_state(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    calls = []
+
+    async def requester(url, *, timeout_seconds):
+        calls.append((url, timeout_seconds))
+        return httpx.Response(
+            200,
+            json={
+                "state": "monitoring",
+                "label": "监控中",
+                "detail": "Telegram 正在同步监听 2 个启用群组",
+                "monitored_group_count": 2,
+            },
+        )
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        live_target_titles={"one", "two"},
+        ingest_monitor_status_requester=requester,
+    )
+
+    response = TestClient(app).get("/api/monitor-status")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "state": "monitoring",
+        "label": "监控中",
+        "detail": "Telegram 正在同步监听 2 个启用群组",
+        "monitored_group_count": 2,
+    }
+    assert calls == [("http://127.0.0.1:8001/api/monitor-status", 5)]
+
+
+def test_web_monitor_status_returns_unknown_when_ingest_unavailable(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    attempts = 0
+
+    async def requester(url, *, timeout_seconds):
+        nonlocal attempts
+        attempts += 1
+        raise httpx.ConnectError("ingest unavailable")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        live_target_titles={"one", "two"},
+        ingest_monitor_status_requester=requester,
+    )
+
+    response = TestClient(app).get("/api/monitor-status")
+
+    assert response.status_code == 200
+    assert attempts == 1
+    assert response.json() == {
+        "state": "unknown",
+        "label": "状态未知",
+        "detail": "无法从 ingest 获取 Telegram 监听状态",
+        "monitored_group_count": 2,
+    }
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://127.0.0.1:8001/api/monitor-status",
+        "http://example.com:8001/api/monitor-status",
+        "http://127.0.0.1:8002/api/monitor-status",
+        "http://127.0.0.1:8001/api/refresh",
+        "http://127.0.0.1:8001/api/monitor-status?query=1",
+        "http://user:pass@127.0.0.1:8001/api/monitor-status",
+    ],
+)
+def test_ingest_monitor_status_url_rejects_non_loopback_8001_path(value):
+    from telegram_kol_research import web_app
+
+    resolver = getattr(web_app, "resolve_ingest_monitor_status_url", None)
+    assert resolver is not None, "ingest monitor status URL resolver is missing"
+    with pytest.raises(ValueError, match="ingest monitor status"):
+        resolver(value)
+
+
+def test_ingest_monitor_status_proxy_rejects_invalid_payload():
+    from telegram_kol_research import web_app
+
+    proxy = getattr(web_app, "proxy_ingest_monitor_status_once", None)
+    assert proxy is not None, "ingest monitor status proxy is missing"
+
+    async def requester(url, *, timeout_seconds):
+        return httpx.Response(200, json={"state": "monitoring"})
+
+    status = asyncio.run(
+        proxy(
+            requester=requester,
+            url="http://127.0.0.1:8001/api/monitor-status",
+        )
+    )
+
+    assert status is None
+
+
+def test_web_synchronous_monitor_badge_starts_unknown(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    async def forbidden_requester(url, *, timeout_seconds):
+        raise AssertionError("server-side rendering must not call ingest")
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        live_target_titles={"one"},
+        ingest_monitor_status_requester=forbidden_requester,
+    )
+
+    response = TestClient(app).get("/")
+
+    assert response.status_code == 200
+    assert 'data-monitor-state="unknown"' in response.text
+    assert "状态未知" in response.text
+    assert "is-unknown" in response.text
+
+
+def test_monitor_badge_is_updated_only_from_monitor_status_endpoint():
+    script_path = (
+        Path(__file__).resolve().parents[1]
+        / "src"
+        / "telegram_kol_research"
+        / "static"
+        / "app.js"
+    )
+    script = script_path.read_text(encoding="utf-8")
+    live_updates = script.split("function connectLiveUpdates()", 1)[1].split(
+        "function startPollingUpdates()", 1
+    )[0]
+    freshness = script.split("async function refreshFromDatabaseChanges()", 1)[
+        1
+    ].split("function scheduleRecoveryRefresh()", 1)[0]
+    monitor_refresh = script.split("async function refreshMonitorStatus()", 1)[
+        1
+    ].split("function getMessagePanel()", 1)[0]
+
+    assert "setMonitorStatus(" not in live_updates
+    assert "await refreshMonitorStatus();" in live_updates
+    assert "setMonitorStatus(" not in freshness
+    assert "state: 'unknown'" in monitor_refresh
+    assert "label: '状态未知'" in monitor_refresh
+
+
+def test_delegated_listener_hides_internal_reason_from_user_templates(tmp_path):
+    from telegram_kol_research.web_app import create_web_app
+
+    internal_reason = "Telegram live listener is owned by ingest"
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+        live_listener_status_reason=internal_reason,
+        live_listener_delegated=True,
+    )
+
+    root_response = TestClient(app).get("/")
+    messages_response = TestClient(app).get("/groups/1/messages")
+
+    assert root_response.status_code == 200
+    assert messages_response.status_code == 200
+    assert internal_reason not in root_response.text
+    assert internal_reason not in messages_response.text
+    assert "session-lock-banner" not in root_response.text
 
 
 def test_web_role_preserves_ingest_refresh_error_status_and_json(tmp_path):

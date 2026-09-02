@@ -1633,7 +1633,8 @@ def test_strategy_record_reconnect_marks_changes_without_reloading_the_page(tmp_
 
     assert "source.onopen" in block
     assert "noteStrategyRecordChanges();" in block
-    assert "state: 'monitoring'" in block
+    assert "await refreshMonitorStatus();" in block
+    assert "state: 'monitoring'" not in block
     assert "window.location.reload" not in block
 
 

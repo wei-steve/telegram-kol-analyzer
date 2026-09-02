@@ -874,6 +874,11 @@ body {
   border: 1px solid rgba(251, 191, 36, 0.35);
   color: #fde68a;
 }
+.message-sync-state.is-unknown {
+  background: rgba(148, 163, 184, 0.12);
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  color: #cbd5e1;
+}
 .message-sync-state.is-disconnected {
   background: rgba(248, 113, 113, 0.12);
   border: 1px solid rgba(248, 113, 113, 0.35);
