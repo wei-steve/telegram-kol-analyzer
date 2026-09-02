@@ -10,7 +10,11 @@ change_a_sha: b1385ba4ab305d1406bea28bf12f987cbf5db546
 change_b_sha: 18434b4552938ae3acb1160ad32618aab9c3ecf4
 pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
-production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
+production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063 # historical all-role main-recognition activation
+current_runtime_role_shas:
+  web: 3e27b57cd0de4a8415697f2ffc82e8ec82aa23cb
+  ingest: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
+  worker: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
@@ -68,6 +72,14 @@ auto_trade_enabled_observed: true
 - The bounded L1 observation ran from `2026-09-01T22:26:16Z` through `22:41:30Z`. Three new raw messages arrived, below the five-message early-stop target, so the window stopped at 15 minutes and was not extended. Four real main-recognition attempts, IDs 4721–4724, began after deployment and all completed as one-request authoritative v1 runs with no error. Actual provider totals were 31,201, 16,152, 16,445 and 31,107 tokens. Canonical request totals were 169,726, 181,889, 47,811 and 118,179 bytes; for every row the system prompt, current message, image evidence, authoritative context and structural overhead partition summed exactly to the total. All four decisions used the unchanged authoritative path and produced `非策略 / event_type=none / mimo_no_action`, with zero signal candidates. This is non-zero live proof of nullable field population without a decision-path change.
 - Shadow telemetry also acquired real production evidence without affecting authority: 23 rows total, 14 agreements and 9 `shadow_would_skip` disagreements, with zero shadow-evaluation errors. The disagreements are the intended observational output and did not suppress any actual context call. `shadow_live_sample_verified` is therefore true alongside the new main-recognition live proof.
 - Detailed evidence is rooted at `/var/lib/telegram-kol-cutover-evidence/0de19c1cbb2089fd58b8940d9b01a65096f9a063/main-recognition-observability-deploy-20260901T222006Z`. The final runtime evidence SHA-256 is `89fb0b1960a804149c5601b2e43564d5b572cdfbaf6f745cda6f6a3558763408`; the final database-observation evidence SHA-256 is `0d321a4573ea2940f2d01ec8350e68abf018e338c8919b8f2277d1d9ea14365a`. Normal rollback keeps the four additive nullable columns and returns code/runtime to `3205b074...`; physical column removal remains out of scope.
+
+## Split-runtime Web status parity activated and live-verified — 2026-09-02T00:29:14Z
+
+- Commit `3e27b57cd0de4a8415697f2ffc82e8ec82aa23cb` corrected three split-runtime Web display errors: the delegated Telegram listener was no longer rendered as an internal English warning banner, the top listener badge now reflects ingest's real status instead of always showing disconnected, and the current-order, order-history and position-history tabs no longer hard-code Deepcoin data as unavailable when the worker can serve it. The Web role uses bounded, loopback-only GET proxies to worker port 8002 for those exchange tabs and to ingest port 8001 for monitor status. The isolation boundary is unchanged: Web receives neither Deepcoin credentials nor Telegram session authority, proxy failures remain explicit `unavailable` or `unknown`, and no zero/healthy state is invented.
+- This was a Web-only scoped immutable activation with `schema_changed=false`. At the observation-end checkpoint the authoritative role identities were Web=`3e27b57cd0de4a8415697f2ffc82e8ec82aa23cb`, ingest=`0de19c1cbb2089fd58b8940d9b01a65096f9a063`, and worker=`0de19c1cbb2089fd58b8940d9b01a65096f9a063`; all three reported `loaded_artifact_verified=true`. The rollback commit is `0de19c1cbb2089fd58b8940d9b01a65096f9a063`.
+- **Immutable-source operational rule:** `git -C /opt/telegram-kol-analyzer rev-parse HEAD` reports the legacy checkout identity and does not identify the code loaded by a running immutable release. Runtime identity must be established independently for each role from its `/api/runtime/deployment-identity`, the effective systemd drop-in value `TELEGRAM_KOL_RELEASE_COMMIT`, and verification of the corresponding release manifest. A plan or status document SHA is historical evidence, not a substitute for those three live checks.
+- The L1 observation ran for 900 seconds and ended on duration rather than the five-message early-stop target. It received exactly two real messages, recorded no anomaly across 90 samples, and was not extended. The root-owned evidence is `/var/lib/telegram-kol-cutover-evidence/3e27b57cd0de4a8415697f2ffc82e8ec82aa23cb/web-ui-l1-20260902T001413Z.json`.
+- Rollback is bounded to returning only the Web role to `0de19c1cbb2089fd58b8940d9b01a65096f9a063`. That completely restores the pre-change runtime because this activation made no schema or business-data change and introduced no exchange-write semantic or authority change.
 
 ## Shadow invocation gate — local candidate 2026-09-01
 
