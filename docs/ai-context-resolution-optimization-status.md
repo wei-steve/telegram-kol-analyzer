@@ -36,6 +36,13 @@ entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
 
+## Message AI threshold calibration staged; activation blocked before service control — 2026-09-02
+
+- Reviewed candidate `5aa7ca077fa45728c0f3d8df93e0e90a33a4a262` implements only the approved Web display calibration: confidence `<0.25` is red, `0.25–0.8` is yellow, `>=0.8` is neutral, NULL remains a separate neutral state, and `runtime_not_authoritative` remains visible but no longer contributes warning state. The server-rendered statistic starts as `统计中…`; recognition-label confidence drift uses an absolute tolerance below `1e-9`. The final local suite passed `6840 passed, 4 skipped, 32 warnings in 460.28s`, and the exact commit was pushed to `codex/deepcoin-auto-trading-v1`.
+- Immutable predeploy identity established Web=`b78f16098c591978fe764e15c9b793182fc97f5b`, ingest/worker=`0de19c1cbb2089fd58b8940d9b01a65096f9a063`, with all three live endpoints reporting `loaded_artifact_verified=true`. The Web-only L1 stage declared `schema_changed=false` and succeeded for candidate `5aa7ca07...`; candidate release validation also passed.
+- Activation stopped before service control because the measured rollback Web release `b78f1609...` no longer passed immutable release validation. Its manifest expected content SHA-256 `ad9ceb99c43e589de5e301942964095b644d16cbb810b84cce66007951a595fd`, while the current release tree produced `bad06404...`; the unexpected generated content was one mode-0755 `src/telegram_kol_research/__pycache__` directory and 15 mode-0644 `.pyc` files. No release content was deleted or repaired, no authorization was consumed, and no service was restarted.
+- Final role identities and PIDs remained Web `b78f1609...`/`654288`, ingest `0de19c1c...`/`3315585`, worker `0de19c1c...`/`3315574`, all active with `NRestarts=0`. Therefore `current_runtime_role_shas` intentionally remains unchanged and no post-deploy L1 claim is made. Repairing or replacing the polluted rollback artifact is outside this display-only scope and requires a separately reviewed production action.
+
 ## Main-recognition provider observability — local candidate 2026-09-01
 
 - The implementation plan is commit `4d4ea8e22a22b2435c20f96b8377274c9355d54b`; the reviewed production-code commit is `24169cd03d22c7ba12d1e96e1fc26166f159615c`. Four nullable columns are added to `mimo_recognition_attempts`: `attempt_phase`, `provider_request_count`, `provider_usage_json` and `request_component_bytes_json`. Existing callers omit the new arguments and retain NULL in all four fields; `MimoRecognitionAttemptView` and all recognition/trading readers remain unchanged.
