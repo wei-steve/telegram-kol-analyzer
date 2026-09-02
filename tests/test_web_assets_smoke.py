@@ -1638,6 +1638,68 @@ def test_strategy_record_reconnect_marks_changes_without_reloading_the_page(tmp_
     assert "window.location.reload" not in block
 
 
+def test_monitor_status_updates_all_badges_and_caches_only_successful_reads(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    set_start = js.index("function setMonitorStatus")
+    refresh_start = js.index("async function refreshMonitorStatus", set_start)
+    get_panel_start = js.index("function getMessagePanel", refresh_start)
+    set_block = js[set_start:refresh_start]
+    refresh_block = js[refresh_start:get_panel_start]
+
+    assert "let latestMonitorStatus = null;" in js
+    assert "const badges = document.querySelectorAll('[data-monitor-status]');" in set_block
+    assert "badges.forEach((badge) => {" in set_block
+    for update in (
+        "badge.textContent = label;",
+        "badge.dataset.monitorState = state;",
+        "badge.title = status && status.detail ? status.detail : '';",
+        "badge.classList.toggle('is-live', state === 'monitoring');",
+        "badge.classList.toggle('is-idle', state === 'idle');",
+        "badge.classList.toggle('is-unknown', state === 'unknown');",
+        "badge.classList.toggle('is-disconnected', state === 'disconnected');",
+    ):
+        assert update in set_block
+    assert "function reapplyCachedMonitorStatus" in set_block
+    reapply_block = set_block[set_block.index("function reapplyCachedMonitorStatus"):]
+    assert "if (!latestMonitorStatus)" in reapply_block
+    assert "setMonitorStatus(latestMonitorStatus);" in reapply_block
+    assert "monitoring" not in reapply_block
+    assert "latestMonitorStatus = status;" in refresh_block
+    assert "latestMonitorStatus = null;" in refresh_block
+
+
+def test_message_panel_partial_renders_reapply_cached_monitor_status(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    message_controls = js[
+        js.index("function bindMessagePanelControls"):
+        js.index("async function refreshSelectedGroupPanel")
+    ]
+    selected_refresh = js[
+        js.index("async function refreshSelectedGroupPanel"):
+        js.index("async function refreshStrategyPanels")
+    ]
+    group_companion = js[
+        js.index("async function loadGroupDetailCompanion"):
+        js.index("function bindGroupAutomationToggles")
+    ]
+    current_group_refresh = js[
+        js.index("async function refreshCurrentGroupPanel"):
+        js.index("async function fetchFreshnessSnapshot")
+    ]
+
+    assert message_controls.count("reapplyCachedMonitorStatus();") >= 2
+    assert "currentMessagePanel.replaceWith(nextPanel);" in selected_refresh
+    assert "reapplyCachedMonitorStatus();" in selected_refresh
+    assert "detailPanel.appendChild(nextContent);" in group_companion
+    assert "reapplyCachedMonitorStatus();" in group_companion
+    assert "detailPanel.appendChild(nextContent);" in current_group_refresh
+    assert "reapplyCachedMonitorStatus();" in current_group_refresh
+
+
 def test_strategy_record_filter_and_group_commit_only_after_guarded_success(tmp_path):
     js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
         "/static/app.js"

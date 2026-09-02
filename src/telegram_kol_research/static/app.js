@@ -1,4 +1,5 @@
 let latestFreshnessSnapshot = null;
+let latestMonitorStatus = null;
 let currentSelectedChatId = null;
 let groupSwitchRequestId = 0;
 let activeGroupSwitchController = null;
@@ -312,19 +313,28 @@ function setAiStatus(message, isError = false) {
 }
 
 function setMonitorStatus(status) {
-  const badge = document.querySelector('[data-monitor-status]');
-  if (!badge) {
+  const badges = document.querySelectorAll('[data-monitor-status]');
+  if (!badges.length) {
     return;
   }
   const state = status && status.state ? status.state : 'disconnected';
   const label = status && status.label ? status.label : '已断开';
-  badge.textContent = label;
-  badge.dataset.monitorState = state;
-  badge.title = status && status.detail ? status.detail : '';
-  badge.classList.toggle('is-live', state === 'monitoring');
-  badge.classList.toggle('is-idle', state === 'idle');
-  badge.classList.toggle('is-unknown', state === 'unknown');
-  badge.classList.toggle('is-disconnected', state === 'disconnected');
+  badges.forEach((badge) => {
+    badge.textContent = label;
+    badge.dataset.monitorState = state;
+    badge.title = status && status.detail ? status.detail : '';
+    badge.classList.toggle('is-live', state === 'monitoring');
+    badge.classList.toggle('is-idle', state === 'idle');
+    badge.classList.toggle('is-unknown', state === 'unknown');
+    badge.classList.toggle('is-disconnected', state === 'disconnected');
+  });
+}
+
+function reapplyCachedMonitorStatus() {
+  if (!latestMonitorStatus) {
+    return;
+  }
+  setMonitorStatus(latestMonitorStatus);
 }
 
 async function refreshMonitorStatus() {
@@ -333,8 +343,11 @@ async function refreshMonitorStatus() {
     if (!response.ok) {
       throw new Error('monitor status request failed');
     }
-    setMonitorStatus(await response.json());
+    const status = await response.json();
+    latestMonitorStatus = status;
+    setMonitorStatus(status);
   } catch {
+    latestMonitorStatus = null;
     setMonitorStatus({
       state: 'unknown',
       label: '状态未知',
@@ -745,6 +758,7 @@ function bindDetailPanelControls() {
           
           // Re-bind controls for newly loaded content
           if (targetPanel === 'messages') {
+            reapplyCachedMonitorStatus();
             const msgPanel = panel.querySelector('[data-messages-panel]');
             if (msgPanel) bindMessagePanelControls(msgPanel);
           }
@@ -1019,6 +1033,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
+        reapplyCachedMonitorStatus();
         scrollMessagePanelToTop(nextPanel);
       }
     });
@@ -1046,6 +1061,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
       if (currentPanel && nextPanel) {
         currentPanel.replaceWith(nextPanel);
         bindMessagePanelControls(nextPanel);
+        reapplyCachedMonitorStatus();
         scrollMessagePanelToTop(nextPanel);
       }
     });
@@ -1143,6 +1159,7 @@ async function refreshSelectedGroupPanel() {
     if (nextPanel && currentMessagePanel) {
       currentMessagePanel.replaceWith(nextPanel);
       bindMessagePanelControls(nextPanel);
+      reapplyCachedMonitorStatus();
       const nextScrollContainer = getMessageScrollContainer(nextPanel);
       if (nextScrollContainer) {
         nextScrollContainer.scrollTop = previousMessageScrollTop;
@@ -1172,6 +1189,7 @@ async function refreshStrategyPanels(chatId) {
       detailPanel.innerHTML = '';
       detailPanel.appendChild(nextPanel);
       bindDetailPanelControls();
+      reapplyCachedMonitorStatus();
     }
   } catch (e) {
     // Silently ignore fetch errors
@@ -1258,6 +1276,7 @@ async function loadVisibleGroupDestination({
     detailPanel.appendChild(nextContent);
     bindDetailPanelControls();
     bindWorkflowFilters();
+    reapplyCachedMonitorStatus();
     return true;
   }
   const nextStrategyContent = await fetchStrategyMidPanel(chatId, filter, { signal });
@@ -1292,6 +1311,7 @@ async function loadGroupDetailCompanion({
   detailPanel.appendChild(nextContent);
   bindDetailPanelControls();
   bindWorkflowFilters();
+  reapplyCachedMonitorStatus();
   markWorkbenchLoaded('messages', chatId);
 }
 
@@ -4321,6 +4341,7 @@ async function refreshCurrentGroupPanel(options = {}) {
   detailPanel.appendChild(nextContent);
   bindDetailPanelControls();
   bindWorkflowFilters();
+  reapplyCachedMonitorStatus();
 
   const nextMessagePanel = getMessagePanel();
   if (options.scrollToTopAfterRefresh) {
