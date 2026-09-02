@@ -89,7 +89,7 @@
         <button type="button" data-message-ai-filter="unlabeled">未标注</button>
       </div>
       <div class="message-insight-stats" data-message-insight-stats aria-live="polite">
-        已加载 {{ messages | length }} 条：识别成功 0 · 平均置信度 未记录 · 上下文调用 0 · 需关注 0 · 已标注 0 条
+        统计中…
       </div>
     </div>
   </div>
@@ -157,13 +157,13 @@
         'ambiguous_candidate_projection': '候选投影不唯一'
       } %}
       {% set image_not_sent = message.media_assets and runtime and runtime.input_kind == 'text' %}
-      {% set low_confidence = confidence is not none and confidence < 0.6 %}
-      {% set medium_confidence = confidence is not none and confidence >= 0.6 and confidence < 0.8 %}
+      {% set low_confidence = confidence is not none and confidence < 0.25 %}
+      {% set medium_confidence = confidence is not none and confidence >= 0.25 and confidence < 0.8 %}
       {% set runtime_retry_count = (runtime.provider_retry_count + runtime.whole_run_retry_count) if runtime else 0 %}
       {% set runtime_not_authoritative = runtime and not runtime.became_authoritative %}
       {% set shadow_disagreement = context_called and context.shadow_agrees_with_authoritative is sameas false %}
       {% set danger_state = recognition_error or image_not_sent or missing_candidate or low_confidence %}
-      {% set warning_state = (not danger_state) and (medium_confidence or context_in_progress or context_unresolved or candidate_not_accepted or runtime_not_authoritative) %}
+      {% set warning_state = (not danger_state) and (medium_confidence or context_in_progress or context_unresolved or candidate_not_accepted) %}
       {% set needs_attention = danger_state or warning_state %}
       {% set recognition_success = recognition_result in ['是策略', '非策略'] and not recognition_error %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
@@ -295,7 +295,7 @@
               <span class="message-ai-chip is-neutral">置信度未记录</span>
             {% elif confidence >= 0.8 %}
               <span class="message-ai-chip is-neutral">置信度 {{ confidence }}</span>
-            {% elif confidence >= 0.6 %}
+            {% elif confidence >= 0.25 %}
               <span class="message-ai-chip is-warning">置信度 {{ confidence }}</span>
             {% else %}
               <span class="message-ai-chip is-danger">置信度 {{ confidence }}</span>
@@ -305,7 +305,7 @@
             {% if runtime_failed %}<span class="message-ai-chip is-danger">识别失败</span>{% endif %}
             {% if projection_failed %}<span class="message-ai-chip is-danger">投影失败</span>{% endif %}
             {% if context_exhausted %}<span class="message-ai-chip is-danger">上下文重试耗尽</span>{% endif %}
-            {% if runtime_not_authoritative %}<span class="message-ai-chip is-warning">未成为权威结果</span>{% endif %}
+            {% if runtime_not_authoritative %}<span class="message-ai-chip is-neutral">未成为权威结果</span>{% endif %}
             {% if message.media_assets %}
               <span class="message-ai-chip {{ 'is-danger' if image_not_sent else 'is-media' }}">🖼 {{ message.media_assets | length }}{% if image_not_sent %} 未送模型{% endif %}</span>
             {% endif %}

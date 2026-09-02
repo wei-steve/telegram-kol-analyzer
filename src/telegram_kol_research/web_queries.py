@@ -942,6 +942,22 @@ def _serialize_raw_messages(
             if isinstance(mimo_analysis, dict)
             else None
         )
+        labeled_confidence = (
+            serialized_recognition_label["labeled_confidence"]
+            if serialized_recognition_label is not None
+            else None
+        )
+        if (
+            isinstance(projected_confidence, (int, float))
+            and not isinstance(projected_confidence, bool)
+            and isinstance(labeled_confidence, (int, float))
+            and not isinstance(labeled_confidence, bool)
+        ):
+            confidence_matches_label = (
+                abs(float(projected_confidence) - float(labeled_confidence)) < 1e-9
+            )
+        else:
+            confidence_matches_label = projected_confidence == labeled_confidence
         recognition_label_has_drift = bool(
             serialized_recognition_label is not None
             and (
@@ -949,8 +965,7 @@ def _serialize_raw_messages(
                 != serialized_recognition_label["labeled_recognition_result"]
                 or lifecycle_event_type
                 != serialized_recognition_label["labeled_event_type"]
-                or projected_confidence
-                != serialized_recognition_label["labeled_confidence"]
+                or not confidence_matches_label
             )
         )
         matching_bindings = bindings_by_message_key.get(

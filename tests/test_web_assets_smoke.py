@@ -1339,7 +1339,10 @@ def test_message_ai_filters_and_loaded_statistics_are_dom_only(tmp_path):
     assert 'data-message-ai-filter="context"' in html
     assert 'data-message-ai-filter="media"' in html
     assert 'data-message-ai-filter="missing-candidate"' in html
-    assert "已加载 0 条" in html
+    assert "统计中…" in html
+    assert "识别成功 0" not in html
+    assert "上下文调用 0" not in html
+    assert "需关注 0" not in html
     assert "function messageMatchesInsightFilter" in js
     assert "function updateMessageInsightView" in js
     assert "function bindMessageInsightControls" in js
@@ -1385,7 +1388,8 @@ def test_message_recognition_label_assets_are_dom_scoped_and_server_snapshot_own
 
     assert 'data-message-ai-filter="labeled"' in html
     assert 'data-message-ai-filter="unlabeled"' in html
-    assert "已标注 0 条" in html
+    assert "统计中…" in html
+    assert "已标注 0 条" not in html
     assert "function bindRecognitionLabelControls" in js
     assert "function applyRecognitionLabelResponse" in js
     label_start = js.index("function bindRecognitionLabelControls")

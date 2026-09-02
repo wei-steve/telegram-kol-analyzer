@@ -362,6 +362,50 @@ def test_label_drift_compares_each_current_recognition_fact(
         assert label.labeled_confidence == 0.91
 
 
+@pytest.mark.parametrize(
+    ("current_confidence", "expected_drift"),
+    [
+        (0.9100000005, False),
+        (0.910000002, True),
+    ],
+)
+def test_label_drift_compares_confidence_with_tolerance(
+    tmp_path, current_confidence, expected_drift
+):
+    session_factory = create_session_factory(
+        tmp_path / f"confidence-tolerance-{expected_drift}.db"
+    )
+    with session_factory() as session:
+        raw = _add_message(session)
+        _add_decision(session, raw.id, confidence=0.91)
+        session.commit()
+        raw_id = raw.id
+    save_message_recognition_label(
+        session_factory,
+        raw_message_id=raw_id,
+        payload={"verdict": "incorrect"},
+    )
+
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=raw_id
+        ).one()
+        decision.authoritative_payload_json = json.dumps(
+            {
+                "recognition_result": "是策略",
+                "lifecycle_event": {"event_type": "entry_signal"},
+                "confidence": current_confidence,
+            },
+            ensure_ascii=False,
+        )
+        session.commit()
+
+    projected = load_group_messages(
+        session_factory, chat_id=77, limit=10, include_recognition_labels=True
+    )[0]
+    assert projected["recognition_label_has_drift"] is expected_drift
+
+
 def test_non_ui_message_projection_does_not_read_human_labels(tmp_path):
     session_factory = create_session_factory(tmp_path / "projection-boundary.db")
     with session_factory() as session:

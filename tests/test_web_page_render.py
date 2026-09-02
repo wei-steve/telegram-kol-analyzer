@@ -300,8 +300,8 @@ def test_message_ai_chips_cover_classification_confidence_and_candidate_states(
     assert re.search(r'class="mimo-system-outcome"[^>]* open', management)
 
     assert "闲聊无关" in irrelevant
-    assert 'message-ai-chip is-danger">置信度 0.42' in irrelevant
-    assert 'data-message-low-confidence="true"' in irrelevant
+    assert 'message-ai-chip is-warning">置信度 0.42' in irrelevant
+    assert 'data-message-low-confidence="false"' in irrelevant
     assert "候选未被接纳" not in irrelevant
 
     assert "结论未记录" in unknown
@@ -316,6 +316,123 @@ def test_message_ai_chips_cover_classification_confidence_and_candidate_states(
     assert "未生成候选" not in accepted
     assert "候选未被接纳" not in accepted
     assert not re.search(r'class="mimo-system-outcome"[^>]* open', accepted)
+
+
+@pytest.mark.parametrize(
+    ("message_id", "confidence", "chip_class", "card_class", "is_low"),
+    [
+        (9211, 0.24, "is-danger", "is-ai-danger", "true"),
+        (9212, 0.25, "is-warning", "is-ai-warning", "false"),
+        (9213, 0.79, "is-warning", "is-ai-warning", "false"),
+        (9214, 0.8, "is-neutral", None, "false"),
+    ],
+)
+def test_message_ai_confidence_threshold_boundaries(
+    tmp_path, message_id, confidence, chip_class, card_class, is_low
+):
+    database_path = tmp_path / f"message-ai-confidence-{message_id}.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=message_id, text="confidence")
+        session.add(raw)
+        session.flush()
+        _add_display_decision(
+            session,
+            raw,
+            recognition_result="非策略",
+            event_type="none",
+            confidence=confidence,
+        )
+        session.commit()
+        raw_id = raw.id
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    card = _message_card_fragment(body, raw_id)
+
+    assert f'message-ai-chip {chip_class}">置信度 {confidence}' in card
+    assert f'data-message-low-confidence="{is_low}"' in card
+    if card_class is None:
+        assert 'class="message-card"' in card
+        assert "is-ai-danger" not in card
+        assert "is-ai-warning" not in card
+    else:
+        assert f'class="message-card {card_class}"' in card
+
+
+def test_message_ai_unrecorded_confidence_is_neutral_and_not_numeric(tmp_path):
+    database_path = tmp_path / "message-ai-confidence-unrecorded.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9215, text="unrecorded")
+        session.add(raw)
+        session.flush()
+        _add_display_decision(
+            session,
+            raw,
+            recognition_result="非策略",
+            event_type="none",
+            confidence=None,
+        )
+        session.commit()
+        raw_id = raw.id
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    card = _message_card_fragment(body, raw_id)
+
+    assert 'message-ai-chip is-neutral">置信度未记录' in card
+    assert "置信度 0" not in card
+    assert 'data-message-low-confidence="false"' in card
+    assert 'data-message-confidence=""' in card
+    assert "is-ai-danger" not in card
+    assert "is-ai-warning" not in card
+
+
+def test_runtime_not_authoritative_is_neutral_without_warning_card(tmp_path):
+    database_path = tmp_path / "message-ai-not-authoritative.db"
+    session_factory = create_session_factory(database_path)
+    now = datetime(2026, 9, 2, 9, 0)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9216, text="not authoritative")
+        session.add(raw)
+        session.flush()
+        _add_display_decision(
+            session,
+            raw,
+            recognition_result="非策略",
+            event_type="none",
+            confidence=0.9,
+        )
+        session.add(
+            MimoRecognitionRun(
+                raw_message_id=raw.id,
+                run_kind="v1_authoritative",
+                contract_version="v1",
+                model="mimo-v2.5",
+                input_kind="text",
+                input_fingerprint="sha256:not-authoritative",
+                prompt_versions_json="{}",
+                status="completed",
+                attempt_count=1,
+                became_authoritative=False,
+                started_at=now,
+                completed_at=now + timedelta(milliseconds=10),
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    card = _message_card_fragment(body, raw_id)
+
+    assert 'message-ai-chip is-neutral">未成为权威结果' in card
+    assert 'data-message-needs-attention="false"' in card
+    assert "is-ai-warning" not in card
 
 
 def test_message_ai_chips_cover_runtime_image_context_and_shadow_states(tmp_path):
