@@ -1328,6 +1328,55 @@ def test_app_js_appends_loaded_history_below_current_messages(tmp_path):
     assert "currentList.insertAdjacentHTML('afterbegin', nextList.innerHTML);" not in response.text
 
 
+def test_message_ai_filters_and_loaded_statistics_are_dom_only(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+    html = client.get("/groups/77/messages").text
+
+    assert 'data-message-ai-filter="all"' in html
+    assert 'data-message-ai-filter="error"' in html
+    assert 'data-message-ai-filter="low-confidence"' in html
+    assert 'data-message-ai-filter="context"' in html
+    assert 'data-message-ai-filter="media"' in html
+    assert 'data-message-ai-filter="missing-candidate"' in html
+    assert "已加载 0 条" in html
+    assert "function messageMatchesInsightFilter" in js
+    assert "function updateMessageInsightView" in js
+    assert "function bindMessageInsightControls" in js
+
+    filter_start = js.index("function messageMatchesInsightFilter")
+    filter_end = js.index("\nfunction ", filter_start + 1)
+    filter_block = js[filter_start:filter_end]
+    assert "card.dataset.messageAiError === 'true'" in filter_block
+    assert "card.dataset.messageLowConfidence === 'true'" in filter_block
+    assert "card.dataset.messageContextUsed === 'true'" in filter_block
+    assert "card.dataset.messageHasMedia === 'true'" in filter_block
+    assert "card.dataset.messageMissingCandidate === 'true'" in filter_block
+    assert "URLSearchParams" not in filter_block
+    assert "localStorage" not in filter_block
+
+
+def test_message_ai_statistics_and_filter_reapply_after_history_append(tmp_path):
+    js = TestClient(create_web_app(database_path=tmp_path / "research.db")).get(
+        "/static/app.js"
+    ).text
+    summary_start = js.index("function updateMessageInsightView")
+    summary_end = js.index("\nfunction ", summary_start + 1)
+    summary_block = js[summary_start:summary_end]
+    load_start = js.index("async function loadMoreMessages")
+    load_end = js.index("\nfunction bindMessagePanelControls", load_start)
+    load_block = js[load_start:load_end]
+
+    assert "panel.querySelectorAll('[data-message-card]')" in summary_block
+    assert "data-message-insight-stats" in summary_block
+    assert "已加载 ${cards.length} 条" in summary_block
+    assert "平均置信度" in summary_block
+    assert "上下文调用" in summary_block
+    assert "需关注" in summary_block
+    assert "currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);" in load_block
+    assert "updateMessageInsightView(panel);" in load_block
+
+
 def test_app_js_loads_older_messages_once_near_scroll_boundary(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

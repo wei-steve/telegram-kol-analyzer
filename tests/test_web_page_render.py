@@ -18,7 +18,10 @@ from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import ContextAnalysisBackfill
 from telegram_kol_research.models import ContextResolutionAttempt
 from telegram_kol_research.models import MediaAsset
+from telegram_kol_research.models import MessageEvidenceVersion
 from telegram_kol_research.models import MessageRecognition
+from telegram_kol_research.models import MimoRecognitionAttempt
+from telegram_kol_research.models import MimoRecognitionRun
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionTakeProfitOrder
 from telegram_kol_research.models import RawMessage
@@ -39,6 +42,7 @@ from telegram_kol_research.web_app import _load_exchange_tab_snapshot
 from telegram_kol_research.web_app import HistoryPositionBrowseSnapshotStore
 from telegram_kol_research.web_app import create_web_app
 from telegram_kol_research.web_queries import list_exited_strategies
+from telegram_kol_research.web_queries import load_group_messages
 from telegram_kol_research.web_queries import list_verified_deepcoin_history_positions
 
 
@@ -86,6 +90,618 @@ def test_history_position_browse_snapshot_returns_stable_cursor_pages():
     ]
     assert last.next_cursor is None
     assert last.has_more is False
+
+
+def test_message_projection_exposes_only_persisted_display_facts(tmp_path):
+    database_path = tmp_path / "message-display-projection.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9001, text="BTC long")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json=json.dumps(
+                    {
+                        "recognition_result": "是策略",
+                        "lifecycle_event": {"event_type": "entry_signal"},
+                    },
+                    ensure_ascii=False,
+                ),
+                agreement_status="authoritative_only",
+                differences_json="[]",
+            )
+        )
+        session.add_all(
+            [
+                SignalCandidate(
+                    raw_message_id=raw.id,
+                    symbol="BTC",
+                    side="long",
+                    event_type="entry_signal",
+                ),
+                SignalCandidate(
+                    raw_message_id=raw.id,
+                    symbol="ETH",
+                    side="short",
+                    event_type="entry_signal",
+                ),
+            ]
+        )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=raw.id,
+                context_fingerprint="sha256:display",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                status="completed",
+                shadow_would_trigger=False,
+                shadow_agrees_with_authoritative=False,
+                shadow_disagreement_direction="shadow_would_skip",
+            )
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=77, limit=10)[0]
+
+    assert row["recognition_result"] == "是策略"
+    assert row["lifecycle_event_type"] == "entry_signal"
+    assert row["signal_candidate_count"] == 2
+    assert row["context_resolution"]["shadow_would_trigger"] is False
+    assert row["context_resolution"]["shadow_agrees_with_authoritative"] is False
+    assert (
+        row["context_resolution"]["shadow_disagreement_direction"]
+        == "shadow_would_skip"
+    )
+
+
+def test_message_projection_preserves_missing_facts_as_none(tmp_path):
+    database_path = tmp_path / "message-display-projection-none.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9002, text="无结构化权威字段")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_only",
+                differences_json="[]",
+            )
+        )
+        session.commit()
+
+    row = load_group_messages(session_factory, chat_id=77, limit=10)[0]
+
+    assert row["recognition_result"] is None
+    assert row["lifecycle_event_type"] is None
+    assert row["signal_candidate_count"] == 0
+
+
+def _add_display_decision(
+    session,
+    raw,
+    *,
+    recognition_result,
+    event_type,
+    confidence,
+    reason_code=None,
+):
+    payload = {}
+    if recognition_result is not None:
+        payload["recognition_result"] = recognition_result
+    if event_type is not None:
+        payload["lifecycle_event"] = {"event_type": event_type}
+    if confidence is not None:
+        payload["confidence"] = confidence
+    session.add(
+        RecognitionDecision(
+            raw_message_id=raw.id,
+            input_kind="text",
+            authoritative_model="mimo-v2.5",
+            authoritative_status=recognition_result or "非策略",
+            authoritative_payload_json=json.dumps(payload, ensure_ascii=False),
+            agreement_status="authoritative_only",
+            differences_json="[]",
+            automation_status="failed" if reason_code else None,
+            automation_reason=reason_code,
+        )
+    )
+
+
+def _message_card_fragment(body, raw_message_id):
+    marker = f'id="message-{raw_message_id}"'
+    marker_index = body.index(marker)
+    start = body.rfind("<article", 0, marker_index)
+    next_card = body.find('\n      <article\n        class="message-card', marker_index)
+    return body[start : next_card if next_card >= 0 else len(body)]
+
+
+def test_message_ai_chips_cover_classification_confidence_and_candidate_states(
+    tmp_path,
+):
+    database_path = tmp_path / "message-ai-chips.db"
+    session_factory = create_session_factory(database_path)
+    raw_ids = {}
+    with session_factory() as session:
+        cases = [
+            ("entry", 9201, "是策略", "entry_signal", 0.88),
+            ("management", 9202, "非策略", "position_update", 0.70),
+            ("irrelevant", 9203, "非策略", "none", 0.42),
+            ("unknown", 9204, None, None, None),
+            ("unmapped", 9205, "是策略", "add_entry", 0.81),
+            ("no_reason", 9206, "是策略", "entry_signal", 0.82),
+            ("accepted", 9207, "是策略", "entry_signal", 0.91),
+        ]
+        for key, message_id, result, event_type, confidence in cases:
+            raw = RawMessage(chat_id=77, message_id=message_id, text=key)
+            session.add(raw)
+            session.flush()
+            raw_ids[key] = raw.id
+            reason_code = (
+                "target_unresolved"
+                if key == "management"
+                else "future_unmapped_reason"
+                if key == "unmapped"
+                else None
+            )
+            _add_display_decision(
+                session,
+                raw,
+                recognition_result=result,
+                event_type=event_type,
+                confidence=confidence,
+                reason_code=reason_code,
+            )
+            if key in {"management", "unmapped", "no_reason", "accepted"}:
+                session.add(
+                    SignalCandidate(
+                        raw_message_id=raw.id,
+                        symbol="BTC",
+                        side="long",
+                        event_type=event_type or "entry_signal",
+                        parse_source=(
+                            "mimo_authoritative" if key == "accepted" else "text_ai"
+                        ),
+                    )
+                )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    entry = _message_card_fragment(body, raw_ids["entry"])
+    management = _message_card_fragment(body, raw_ids["management"])
+    irrelevant = _message_card_fragment(body, raw_ids["irrelevant"])
+    unknown = _message_card_fragment(body, raw_ids["unknown"])
+    unmapped = _message_card_fragment(body, raw_ids["unmapped"])
+    no_reason = _message_card_fragment(body, raw_ids["no_reason"])
+    accepted = _message_card_fragment(body, raw_ids["accepted"])
+
+    assert "开仓信号" in entry
+    assert 'message-ai-chip is-neutral">置信度 0.88' in entry
+    assert "⚠ 未生成候选" in entry
+    assert 'data-message-missing-candidate="true"' in entry
+
+    assert "仓位管理" in management
+    assert 'message-ai-chip is-warning">置信度 0.7' in management
+    assert "候选未被接纳：目标未解决" in management
+    assert 'title="target_unresolved"' in management
+    assert "⚠ 未生成候选" not in management
+    assert re.search(r'class="mimo-system-outcome"[^>]* open', management)
+
+    assert "闲聊无关" in irrelevant
+    assert 'message-ai-chip is-danger">置信度 0.42' in irrelevant
+    assert 'data-message-low-confidence="true"' in irrelevant
+    assert "候选未被接纳" not in irrelevant
+
+    assert "结论未记录" in unknown
+    assert "置信度未记录" in unknown
+    assert "置信度 0" not in unknown
+    assert 'data-message-recognition-result-recorded="false"' in unknown
+    assert 'data-message-event-type-recorded="false"' in unknown
+
+    assert "候选未被接纳：future_unmapped_reason" in unmapped
+    assert 'title="future_unmapped_reason"' in unmapped
+    assert "候选未被接纳（未记录原因）" in no_reason
+    assert "未生成候选" not in accepted
+    assert "候选未被接纳" not in accepted
+    assert not re.search(r'class="mimo-system-outcome"[^>]* open', accepted)
+
+
+def test_message_ai_chips_cover_runtime_image_context_and_shadow_states(tmp_path):
+    database_path = tmp_path / "message-ai-runtime-chips.db"
+    session_factory = create_session_factory(database_path)
+    now = datetime(2026, 9, 2, 8, 0)
+    raw_ids = {}
+    with session_factory() as session:
+        pending = RawMessage(chat_id=77, message_id=9301, text="need context")
+        exhausted = RawMessage(chat_id=77, message_id=9302, text="context failed")
+        shadow_skip = RawMessage(chat_id=77, message_id=9303, text="shadow skip")
+        shadow_extra = RawMessage(chat_id=77, message_id=9304, text="shadow extra")
+        image = RawMessage(chat_id=77, message_id=9305, text="image omitted")
+        session.add_all([pending, exhausted, shadow_skip, shadow_extra, image])
+        session.flush()
+        for key, raw in {
+            "pending": pending,
+            "exhausted": exhausted,
+            "shadow_skip": shadow_skip,
+            "shadow_extra": shadow_extra,
+            "image": image,
+        }.items():
+            raw_ids[key] = raw.id
+            _add_display_decision(
+                session,
+                raw,
+                recognition_result="非策略" if key != "image" else "是策略",
+                event_type="none" if key != "image" else "entry_signal",
+                confidence=0.9,
+            )
+        session.add_all(
+            [
+                ContextResolutionAttempt(
+                    raw_message_id=pending.id,
+                    context_fingerprint="sha256:pending",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    request_summary_json='{"message_context":[{"message_id":1}]}',
+                    status="retry_pending",
+                ),
+                ContextResolutionAttempt(
+                    raw_message_id=exhausted.id,
+                    context_fingerprint="sha256:exhausted",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    request_summary_json="{}",
+                    status="exhausted",
+                ),
+                ContextResolutionAttempt(
+                    raw_message_id=shadow_skip.id,
+                    context_fingerprint="sha256:skip",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    request_summary_json='{"message_context":[{},{}]}',
+                    decision_json='{"decision":"resolved","confidence":0.9}',
+                    status="completed",
+                    shadow_would_trigger=False,
+                    shadow_agrees_with_authoritative=False,
+                    shadow_disagreement_direction="shadow_would_skip",
+                ),
+                ContextResolutionAttempt(
+                    raw_message_id=shadow_extra.id,
+                    context_fingerprint="sha256:extra",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    request_summary_json='{"message_context":[{}]}',
+                    decision_json='{"decision":"resolved","confidence":0.9}',
+                    status="completed",
+                    shadow_would_trigger=True,
+                    shadow_agrees_with_authoritative=False,
+                    shadow_disagreement_direction="shadow_would_extra_trigger",
+                ),
+            ]
+        )
+        session.add(
+            MediaAsset(
+                raw_message_id=image.id,
+                kind="photo",
+                mime_type="image/jpeg",
+                local_path="data/media/77/9305.jpg",
+            )
+        )
+        run = MimoRecognitionRun(
+            raw_message_id=image.id,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:image-not-sent",
+            prompt_versions_json='{"recognition":"v1"}',
+            status="completed",
+            attempt_count=2,
+            selected_attempt_ordinal=2,
+            became_authoritative=False,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=240),
+        )
+        session.add(run)
+        session.flush()
+        session.add_all(
+            [
+                MimoRecognitionAttempt(
+                    run_id=run.id,
+                    ordinal=1,
+                    status="timeout",
+                    error_code="provider_timeout",
+                    error_message="first timeout",
+                    started_at=now,
+                    completed_at=now + timedelta(milliseconds=100),
+                    duration_ms=100,
+                ),
+                MimoRecognitionAttempt(
+                    run_id=run.id,
+                    ordinal=2,
+                    retry_of_ordinal=1,
+                    status="completed",
+                    started_at=now + timedelta(milliseconds=101),
+                    completed_at=now + timedelta(milliseconds=240),
+                    duration_ms=139,
+                ),
+            ]
+        )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    pending_card = _message_card_fragment(body, raw_ids["pending"])
+    exhausted_card = _message_card_fragment(body, raw_ids["exhausted"])
+    skip_card = _message_card_fragment(body, raw_ids["shadow_skip"])
+    extra_card = _message_card_fragment(body, raw_ids["shadow_extra"])
+    image_card = _message_card_fragment(body, raw_ids["image"])
+
+    assert "需要上下文" in pending_card
+    assert "🔗 判断中" in pending_card
+    assert 'data-message-context-used="true"' in pending_card
+    assert "识别异常" in exhausted_card
+    assert "上下文重试耗尽" in exhausted_card
+    assert 'data-message-ai-error="true"' in exhausted_card
+
+    assert "🔗 已结合(2 条)" in skip_card
+    assert "影子判据认为本次不必调用" in skip_card
+    assert "当前权威判据未改变" in skip_card
+    assert 'data-message-needs-attention="false"' in skip_card
+    assert "影子判据认为本次应调用" in extra_card
+
+    assert "🖼 1 未送模型" in image_card
+    assert "重试 1 次" in image_card
+    assert "未成为权威结果" in image_card
+    assert 'class="message-card is-ai-danger"' in image_card
+    assert "模型 mimo-v2.5" in image_card
+    assert "合约 v1" in image_card
+    assert "输入 text" in image_card
+    assert "耗时 240 ms" in image_card
+    assert "调用尝试明细" in image_card
+    assert "provider_timeout" in image_card
+
+
+def test_message_ai_shadow_chip_is_hidden_when_not_evaluated_or_agrees(tmp_path):
+    database_path = tmp_path / "message-ai-shadow-hidden.db"
+    session_factory = create_session_factory(database_path)
+    raw_ids = []
+    with session_factory() as session:
+        for index, agrees in enumerate((None, True), start=1):
+            raw = RawMessage(chat_id=77, message_id=9400 + index, text="shadow")
+            session.add(raw)
+            session.flush()
+            raw_ids.append(raw.id)
+            _add_display_decision(
+                session,
+                raw,
+                recognition_result="非策略",
+                event_type="none",
+                confidence=0.9,
+            )
+            session.add(
+                ContextResolutionAttempt(
+                    raw_message_id=raw.id,
+                    context_fingerprint=f"sha256:shadow-{index}",
+                    model="mimo-v2.5",
+                    prompt_versions_json="{}",
+                    request_summary_json="{}",
+                    status="completed",
+                    shadow_agrees_with_authoritative=agrees,
+                    shadow_disagreement_direction=(
+                        "shadow_would_skip" if agrees is not None else None
+                    ),
+                )
+            )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+
+    for raw_id in raw_ids:
+        card = _message_card_fragment(body, raw_id)
+        assert "影子判据认为" not in card
+        assert 'data-message-shadow-disagreement="false"' in card
+
+
+def test_message_ai_shadow_chip_preserves_missing_disagreement_direction(tmp_path):
+    database_path = tmp_path / "message-ai-shadow-direction-missing.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=77, message_id=9410, text="shadow direction missing")
+        session.add(raw)
+        session.flush()
+        _add_display_decision(
+            session,
+            raw,
+            recognition_result="非策略",
+            event_type="none",
+            confidence=0.9,
+        )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=raw.id,
+                context_fingerprint="sha256:shadow-direction-missing",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                status="completed",
+                shadow_agrees_with_authoritative=False,
+                shadow_disagreement_direction=None,
+            )
+        )
+        session.commit()
+        raw_id = raw.id
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    card = _message_card_fragment(body, raw_id)
+
+    assert "影子分歧（方向未记录）" in card
+    assert 'data-message-shadow-disagreement="true"' in card
+    assert 'data-message-needs-attention="false"' in card
+
+
+def test_message_ai_runtime_failure_fallback_and_projection_failure_chips(tmp_path):
+    database_path = tmp_path / "message-ai-runtime-failures.db"
+    session_factory = create_session_factory(database_path)
+    now = datetime(2026, 9, 2, 9, 0)
+    raw_ids = {}
+    with session_factory() as session:
+        failed = RawMessage(chat_id=77, message_id=9421, text="runtime failed")
+        fallback = RawMessage(chat_id=77, message_id=9422, text="fallback")
+        projection = RawMessage(chat_id=77, message_id=9423, text="projection failed")
+        normal = RawMessage(chat_id=77, message_id=9424, text="normal")
+        session.add_all([failed, fallback, projection, normal])
+        session.flush()
+        for key, raw in {
+            "failed": failed,
+            "fallback": fallback,
+            "projection": projection,
+            "normal": normal,
+        }.items():
+            raw_ids[key] = raw.id
+            _add_display_decision(
+                session,
+                raw,
+                recognition_result="非策略",
+                event_type="none",
+                confidence=0.9,
+            )
+
+        failed_run = MimoRecognitionRun(
+            raw_message_id=failed.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:runtime-failed",
+            prompt_versions_json="{}",
+            status="failed",
+            attempt_count=1,
+            final_error_code="provider_error",
+            became_authoritative=False,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=10),
+        )
+        fallback_source = MimoRecognitionRun(
+            raw_message_id=fallback.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:fallback-v2",
+            prompt_versions_json="{}",
+            status="failed",
+            attempt_count=1,
+            final_error_code="contract_invalid",
+            became_authoritative=False,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=10),
+        )
+        projection_run = MimoRecognitionRun(
+            raw_message_id=projection.id,
+            run_kind="v2_authoritative",
+            contract_version="mimo-authoritative-v2",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:projection-failed",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            became_authoritative=True,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=10),
+        )
+        normal_run = MimoRecognitionRun(
+            raw_message_id=normal.id,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:normal",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            became_authoritative=True,
+            started_at=now,
+            completed_at=now + timedelta(milliseconds=10),
+        )
+        session.add_all([failed_run, fallback_source, projection_run, normal_run])
+        session.flush()
+        fallback_run = MimoRecognitionRun(
+            raw_message_id=fallback.id,
+            run_kind="v1_fallback",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="sha256:fallback-v1",
+            prompt_versions_json="{}",
+            status="completed",
+            attempt_count=1,
+            retry_of_run_id=fallback_source.id,
+            became_authoritative=True,
+            started_at=now + timedelta(milliseconds=11),
+            completed_at=now + timedelta(milliseconds=20),
+        )
+        session.add(fallback_run)
+        session.flush()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=projection.id,
+                mimo_recognition_run_id=projection_run.id,
+                version=1,
+                input_fingerprint="sha256:projection-evidence",
+                model="mimo-v2.5",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=0.9,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=json.dumps(
+                    {
+                        "contract_version": "mimo-authoritative-v2",
+                        "summary": "invalid persisted projection",
+                        "confidence": 0.9,
+                        "intents": "not-a-list",
+                    }
+                ),
+            )
+        )
+        session.commit()
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/77/messages"
+    ).text
+    failed_card = _message_card_fragment(body, raw_ids["failed"])
+    fallback_card = _message_card_fragment(body, raw_ids["fallback"])
+    projection_card = _message_card_fragment(body, raw_ids["projection"])
+    normal_card = _message_card_fragment(body, raw_ids["normal"])
+
+    assert "识别失败" in failed_card
+    assert "未成为权威结果" in failed_card
+    assert re.search(r'class="mimo-first-pass"[^>]* open', failed_card)
+    assert "v1 回退" in fallback_card
+    assert "重试 1 次" in fallback_card
+    assert re.search(r'class="mimo-first-pass"[^>]* open', fallback_card)
+    assert "投影失败" in projection_card
+    assert re.search(r'class="mimo-first-pass"[^>]* open', projection_card)
+    for label in ("识别失败", "v1 回退", "投影失败", "未成为权威结果"):
+        assert label not in normal_card
 
 
 def test_history_position_browse_snapshot_rejects_expired_mismatched_or_unknown_cursor():

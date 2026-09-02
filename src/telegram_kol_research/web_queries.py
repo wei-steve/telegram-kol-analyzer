@@ -844,6 +844,25 @@ def _serialize_raw_messages(
             else []
         )
         decision = decisions_by_msg_id.get(raw_message.id)
+        authoritative_payload = (
+            _parse_json_object(decision.authoritative_payload_json)
+            if decision is not None
+            else {}
+        )
+        recognition_result = authoritative_payload.get("recognition_result")
+        recognition_result = (
+            recognition_result
+            if isinstance(recognition_result, str) and recognition_result.strip()
+            else None
+        )
+        lifecycle_event = authoritative_payload.get("lifecycle_event")
+        lifecycle_event = lifecycle_event if isinstance(lifecycle_event, dict) else {}
+        lifecycle_event_type = lifecycle_event.get("event_type")
+        lifecycle_event_type = (
+            lifecycle_event_type
+            if isinstance(lifecycle_event_type, str) and lifecycle_event_type.strip()
+            else None
+        )
         semantic_review = _serialize_semantic_review(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
@@ -891,6 +910,11 @@ def _serialize_raw_messages(
                 "text": raw_message.text,
                 "reply_to_message_id": raw_message.reply_to_message_id,
                 "media_assets": media_asset_rows,
+                "recognition_result": recognition_result,
+                "lifecycle_event_type": lifecycle_event_type,
+                "signal_candidate_count": len(
+                    candidates_by_msg_id.get(raw_message.id, [])
+                ),
                 "strategy_lifecycle_id": (
                     lifecycle_ids[0] if len(lifecycle_ids) == 1 else None
                 ),
@@ -1656,6 +1680,15 @@ def _serialize_context_resolution(
         ),
         "next_triggers": triggers,
         "attempt_status": attempt.status if attempt is not None else None,
+        "shadow_would_trigger": (
+            attempt.shadow_would_trigger if attempt is not None else None
+        ),
+        "shadow_agrees_with_authoritative": (
+            attempt.shadow_agrees_with_authoritative if attempt is not None else None
+        ),
+        "shadow_disagreement_direction": (
+            attempt.shadow_disagreement_direction if attempt is not None else None
+        ),
         "linked_threads": linked,
         "linked_messages": linked_messages,
         "context_message_count": (

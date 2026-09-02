@@ -428,6 +428,62 @@ function restoreDefaultMessageCardState(panel) {
   });
 }
 
+function messageMatchesInsightFilter(card, filterName) {
+  if (filterName === 'error') return card.dataset.messageAiError === 'true';
+  if (filterName === 'low-confidence') return card.dataset.messageLowConfidence === 'true';
+  if (filterName === 'context') return card.dataset.messageContextUsed === 'true';
+  if (filterName === 'media') return card.dataset.messageHasMedia === 'true';
+  if (filterName === 'missing-candidate') return card.dataset.messageMissingCandidate === 'true';
+  return true;
+}
+
+function updateMessageInsightView(panel) {
+  if (!panel) return;
+  const cards = Array.from(panel.querySelectorAll('[data-message-card]'));
+  const activeFilter = panel.dataset.messageAiFilter || 'all';
+  cards.forEach((card) => {
+    card.hidden = !messageMatchesInsightFilter(card, activeFilter);
+  });
+  panel.querySelectorAll('[data-message-ai-filter]').forEach((button) => {
+    button.classList.toggle('is-active', button.dataset.messageAiFilter === activeFilter);
+    button.setAttribute('aria-pressed', button.dataset.messageAiFilter === activeFilter ? 'true' : 'false');
+  });
+
+  const recognized = cards.filter(
+    (card) => card.dataset.messageRecognitionSuccess === 'true',
+  ).length;
+  const confidences = cards
+    .map((card) => Number.parseFloat(card.dataset.messageConfidence || ''))
+    .filter((value) => Number.isFinite(value));
+  const averageConfidence = confidences.length
+    ? (confidences.reduce((total, value) => total + value, 0) / confidences.length).toFixed(2)
+    : '未记录';
+  const contextCalls = cards.filter(
+    (card) => card.dataset.messageContextUsed === 'true',
+  ).length;
+  const attention = cards.filter(
+    (card) => card.dataset.messageNeedsAttention === 'true',
+  ).length;
+  const stats = panel.querySelector('[data-message-insight-stats]');
+  if (stats) {
+    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · 上下文调用 ${contextCalls} · 需关注 ${attention}`;
+  }
+}
+
+function bindMessageInsightControls(panel) {
+  if (!panel) return;
+  if (!panel.dataset.messageAiFilter) panel.dataset.messageAiFilter = 'all';
+  panel.querySelectorAll('[data-message-ai-filter]').forEach((button) => {
+    if (button.dataset.messageAiFilterBound === 'true') return;
+    button.dataset.messageAiFilterBound = 'true';
+    button.addEventListener('click', () => {
+      panel.dataset.messageAiFilter = button.dataset.messageAiFilter || 'all';
+      updateMessageInsightView(panel);
+    });
+  });
+  updateMessageInsightView(panel);
+}
+
 function scrollMessagePanelToTop(panel = getMessagePanel()) {
   const scrollContainer = getMessageScrollContainer(panel);
   if (!scrollContainer) {
@@ -926,6 +982,7 @@ async function loadMoreMessages(panel) {
     currentList.insertAdjacentHTML('beforeend', nextList.innerHTML);
     currentFooter.replaceWith(nextFooter);
     bindMessagePanelControls(panel);
+    updateMessageInsightView(panel);
   } catch {
     if (!panel.isConnected) return;
     loadMoreButton.dataset.loading = 'false';
@@ -938,6 +995,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
   if (!panel) {
     return;
   }
+  bindMessageInsightControls(panel);
 
   const scrollContainer = getMessageScrollContainer(panel);
   if (scrollContainer && scrollContainer.dataset.messageScrollBound !== 'true') {

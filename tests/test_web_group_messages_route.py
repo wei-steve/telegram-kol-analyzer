@@ -764,8 +764,9 @@ def test_group_messages_route_shows_ai_strategy_detection_results(tmp_path):
     assert 'data-message-list-expand-all' in response.text
     assert 'data-message-list-default' in response.text
     assert 'data-message-list-collapse-all' in response.text
-    assert response.text.count('data-message-default-expanded="true"') == 2
-    assert response.text.count('data-message-default-expanded="false"') == 1
+    assert response.text.count('data-message-default-expanded="true"') == 3
+    assert 'data-message-default-expanded="false"' not in response.text
+    assert response.text.count('data-message-ai-chip-row') == 3
 
 
 def test_group_messages_route_labels_submitted_execution_as_unconfirmed(tmp_path):

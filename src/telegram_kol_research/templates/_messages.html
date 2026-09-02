@@ -77,6 +77,19 @@
       <button type="button" class="secondary-button" data-message-list-default>恢复默认</button>
       <button type="button" class="secondary-button" data-message-list-collapse-all>折叠全部</button>
     </div>
+    <div class="message-insight-toolbar" data-message-insight-toolbar>
+      <div class="message-insight-filters" role="group" aria-label="AI识别结果筛选">
+        <button type="button" class="is-active" data-message-ai-filter="all">全部</button>
+        <button type="button" data-message-ai-filter="error">识别异常</button>
+        <button type="button" data-message-ai-filter="low-confidence">低置信度</button>
+        <button type="button" data-message-ai-filter="context">用了上下文</button>
+        <button type="button" data-message-ai-filter="media">有图片</button>
+        <button type="button" data-message-ai-filter="missing-candidate">未生成候选</button>
+      </div>
+      <div class="message-insight-stats" data-message-insight-stats aria-live="polite">
+        已加载 {{ messages | length }} 条：识别成功 0 · 平均置信度 未记录 · 上下文调用 0 · 需关注 0
+      </div>
+    </div>
   </div>
 
   <div class="message-list" data-message-list>
@@ -91,6 +104,64 @@
       {% set modern_mimo = mimo_analysis and mimo_analysis.format == 'v2' %}
       {% set system_acceptance = message.system_acceptance %}
       {% set low_confidence_exit_targets = message.low_confidence_exit_targets %}
+      {% set runtime = mimo_analysis.runtime if mimo_analysis and mimo_analysis.runtime else none %}
+      {% set context = message.context_resolution %}
+      {% set recognition_result = message.recognition_result %}
+      {% set lifecycle_event_type = message.lifecycle_event_type %}
+      {% set confidence = mimo_analysis.confidence if mimo_analysis else none %}
+      {% set context_called = context and context.attempt_status is not none %}
+      {% set context_in_progress = context_called and context.attempt_status in ['pending', 'running', 'retry_pending', 'pending_reanalysis'] %}
+      {% set context_unresolved = context and context.unresolved_reason %}
+      {% set context_exhausted = context_called and context.attempt_status == 'exhausted' %}
+      {% set runtime_failed = runtime and runtime.status == 'failed' %}
+      {% set projection_failed = mimo_analysis and mimo_analysis.projection.status == 'failed' %}
+      {% set entry_event_types = ['entry_signal', 'add_entry'] %}
+      {# Exact union of message_instruction_items.MANAGEMENT_EVENT_TYPES and
+         message_operation_contracts._EXECUTABLE_EVENT_TYPES, excluding entries. #}
+      {% set management_event_types = ['cancel_entry', 'close_signal', 'exit_position', 'position_update', 'strategy_revision'] %}
+      {% set recognition_error = runtime_failed or projection_failed or context_exhausted %}
+      {% if recognition_error %}
+        {% set display_classification = 'error' %}
+        {% set display_classification_label = '识别异常' %}
+      {% elif context_in_progress or context_unresolved %}
+        {% set display_classification = 'context' %}
+        {% set display_classification_label = '需要上下文' %}
+      {% elif recognition_result == '是策略' and lifecycle_event_type in entry_event_types %}
+        {% set display_classification = 'entry' %}
+        {% set display_classification_label = '开仓信号' %}
+      {% elif lifecycle_event_type in management_event_types %}
+        {% set display_classification = 'management' %}
+        {% set display_classification_label = '仓位管理' %}
+      {% elif recognition_result == '非策略' and lifecycle_event_type == 'none' %}
+        {% set display_classification = 'irrelevant' %}
+        {% set display_classification_label = '闲聊无关' %}
+      {% else %}
+        {% set display_classification = 'unknown' %}
+        {% set display_classification_label = '结论未记录' %}
+      {% endif %}
+      {% set strategy_classification = display_classification in ['entry', 'management'] %}
+      {% set accepted_candidate_count = system_acceptance.accepted_candidate_count if system_acceptance else 0 %}
+      {% set missing_candidate = strategy_classification and message.signal_candidate_count == 0 %}
+      {% set candidate_not_accepted = strategy_classification and message.signal_candidate_count > 0 and accepted_candidate_count == 0 %}
+      {% set candidate_rejection_code = system_acceptance.reason_code if system_acceptance else none %}
+      {% set rejection_reason_labels = {
+        'target_unresolved': '目标未解决',
+        'mimo_authoritative_failed': '权威识别失败',
+        'mimo_authoritative_not_safely_applied': '权威结果未安全应用',
+        'mimo_no_action': '未识别出可执行动作',
+        'not_projected': '未投影为候选',
+        'ambiguous_candidate_projection': '候选投影不唯一'
+      } %}
+      {% set image_not_sent = message.media_assets and runtime and runtime.input_kind == 'text' %}
+      {% set low_confidence = confidence is not none and confidence < 0.6 %}
+      {% set medium_confidence = confidence is not none and confidence >= 0.6 and confidence < 0.8 %}
+      {% set runtime_retry_count = (runtime.provider_retry_count + runtime.whole_run_retry_count) if runtime else 0 %}
+      {% set runtime_not_authoritative = runtime and not runtime.became_authoritative %}
+      {% set shadow_disagreement = context_called and context.shadow_agrees_with_authoritative is sameas false %}
+      {% set danger_state = recognition_error or image_not_sent or missing_candidate or low_confidence %}
+      {% set warning_state = (not danger_state) and (medium_confidence or context_in_progress or context_unresolved or candidate_not_accepted or runtime_not_authoritative) %}
+      {% set needs_attention = danger_state or warning_state %}
+      {% set recognition_success = recognition_result in ['是策略', '非策略'] and not recognition_error %}
       {% set ai_panel_class = detection.status_class if detection else 'is-pending' %}
       {% set strategy_related = ai_panel_class == 'is-strategy' %}
       {% if mimo_analysis and mimo_analysis.intents %}
@@ -114,14 +185,25 @@
         {% endfor %}
         {% set strategy_related = strategy_ns.value %}
       {% endif %}
-      {% set message_default_expanded = strategy_related or ai_panel_class != 'is-not-strategy' or (semantic_review and semantic_review.severity in ['critical', 'context']) %}
+      {% set message_default_expanded = true %}
       <article
-        class="message-card{% if not message_default_expanded %} is-message-collapsed{% endif %}"
+        class="message-card{% if danger_state %} is-ai-danger{% elif warning_state %} is-ai-warning{% endif %}"
         id="message-{{ message.raw_message_id }}"
         data-message-card
         data-message-kind="{% if strategy_related %}recognized{% else %}unrecognized{% endif %}"
         data-message-has-media="{{ 'true' if message.media_assets else 'false' }}"
         data-message-default-expanded="{{ 'true' if message_default_expanded else 'false' }}"
+        data-message-ai-classification="{{ display_classification }}"
+        data-message-ai-error="{{ 'true' if recognition_error else 'false' }}"
+        data-message-low-confidence="{{ 'true' if low_confidence else 'false' }}"
+        data-message-context-used="{{ 'true' if context_called else 'false' }}"
+        data-message-missing-candidate="{{ 'true' if missing_candidate else 'false' }}"
+        data-message-needs-attention="{{ 'true' if needs_attention else 'false' }}"
+        data-message-recognition-success="{{ 'true' if recognition_success else 'false' }}"
+        data-message-confidence="{{ confidence if confidence is not none else '' }}"
+        data-message-recognition-result-recorded="{{ 'true' if recognition_result is not none else 'false' }}"
+        data-message-event-type-recorded="{{ 'true' if lifecycle_event_type is not none else 'false' }}"
+        data-message-shadow-disagreement="{{ 'true' if shadow_disagreement else 'false' }}"
       >
         <header class="message-card-header">
           <div class="message-heading-main">
@@ -202,43 +284,96 @@
               {% endfor %}
             </div>
           {% endif %}
+          <div class="message-ai-chip-row" data-message-ai-chip-row aria-label="AI识别结论">
+            <span class="message-ai-chip is-{{ display_classification }}">{{ display_classification_label }}</span>
+            {% if confidence is none %}
+              <span class="message-ai-chip is-neutral">置信度未记录</span>
+            {% elif confidence >= 0.8 %}
+              <span class="message-ai-chip is-neutral">置信度 {{ confidence }}</span>
+            {% elif confidence >= 0.6 %}
+              <span class="message-ai-chip is-warning">置信度 {{ confidence }}</span>
+            {% else %}
+              <span class="message-ai-chip is-danger">置信度 {{ confidence }}</span>
+            {% endif %}
+            {% if runtime_retry_count > 0 %}<span class="message-ai-chip is-warning">重试 {{ runtime_retry_count }} 次</span>{% endif %}
+            {% if runtime and runtime.status == 'fallback' %}<span class="message-ai-chip is-warning">v1 回退</span>{% endif %}
+            {% if runtime_failed %}<span class="message-ai-chip is-danger">识别失败</span>{% endif %}
+            {% if projection_failed %}<span class="message-ai-chip is-danger">投影失败</span>{% endif %}
+            {% if context_exhausted %}<span class="message-ai-chip is-danger">上下文重试耗尽</span>{% endif %}
+            {% if runtime_not_authoritative %}<span class="message-ai-chip is-warning">未成为权威结果</span>{% endif %}
+            {% if message.media_assets %}
+              <span class="message-ai-chip {{ 'is-danger' if image_not_sent else 'is-media' }}">🖼 {{ message.media_assets | length }}{% if image_not_sent %} 未送模型{% endif %}</span>
+            {% endif %}
+            {% if context_called %}
+              {% if context_in_progress %}
+                <span class="message-ai-chip is-warning">🔗 判断中</span>
+              {% elif context_unresolved %}
+                <span class="message-ai-chip is-warning">🔗 待解决</span>
+              {% else %}
+                <span class="message-ai-chip is-context">🔗 已结合({{ context.context_message_count }} 条)</span>
+              {% endif %}
+            {% endif %}
+            {% if shadow_disagreement %}
+              {% if context.shadow_disagreement_direction == 'shadow_would_skip' %}
+                {% set shadow_label = '影子判据认为本次不必调用' %}
+              {% elif context.shadow_disagreement_direction == 'shadow_would_extra_trigger' %}
+                {% set shadow_label = '影子判据认为本次应调用' %}
+              {% elif context.shadow_disagreement_direction %}
+                {% set shadow_label = context.shadow_disagreement_direction %}
+              {% else %}
+                {% set shadow_label = '影子分歧（方向未记录）' %}
+              {% endif %}
+              <span class="message-ai-chip is-observation" title="这是观测记录，当前权威判据未改变">{{ shadow_label }}</span>
+            {% endif %}
+            {% if missing_candidate %}
+              <span class="message-ai-chip is-danger">⚠ 未生成候选</span>
+            {% elif candidate_not_accepted %}
+              {% if candidate_rejection_code %}
+                <span class="message-ai-chip is-warning" title="{{ candidate_rejection_code }}">⚠ 候选未被接纳：{{ rejection_reason_labels.get(candidate_rejection_code, candidate_rejection_code) }}</span>
+              {% else %}
+                <span class="message-ai-chip is-warning">⚠ 候选未被接纳（未记录原因）</span>
+              {% endif %}
+            {% endif %}
+          </div>
           {% if mimo_analysis %}
-            <section class="mimo-first-pass" aria-label="MiMo第一次识别">
-              <div class="mimo-section-heading">
+            <details class="mimo-first-pass" aria-label="MiMo第一次识别"{% if runtime_failed or projection_failed or image_not_sent or low_confidence or runtime_retry_count > 0 or (runtime and runtime.status == 'fallback') or runtime_not_authoritative %} open{% endif %}>
+              <summary class="mimo-section-heading">
                 <strong>{{ mimo_analysis.history_label or mimo_analysis.version_label or 'MiMo第一次识别' }}</strong>
                 {% if mimo_analysis.runtime %}
                   <span class="mimo-runtime-status is-{{ mimo_analysis.runtime.status }}">
                     {{ mimo_analysis.runtime.status_label }}
                   </span>
                 {% endif %}
-              </div>
+              </summary>
               {% if mimo_analysis.runtime %}
-                {% set runtime = mimo_analysis.runtime %}
-                <div class="mimo-runtime-facts">
-                  <small>模型 {{ runtime.model }} · 合约 {{ runtime.contract_version }} · 输入 {{ runtime.input_kind }}</small>
-                  <small>尝试 {{ runtime.attempt_count }} 次 · 整次重试 {{ runtime.whole_run_retry_count }} 次 · 耗时 {{ runtime.duration_ms if runtime.duration_ms is not none else '-' }} ms</small>
-                  <small>{{ '当前运行已成为权威结果' if runtime.became_authoritative else '当前运行未成为权威结果' }}</small>
-                  {% if runtime.fallback_source %}
-                    <small class="mimo-runtime-warning">
-                      v2 {{ runtime.fallback_source.error_code or '失败' }}：{{ runtime.fallback_source.error_message or '未记录详情' }}；当前权威结果为v1回退。
-                    </small>
-                  {% elif runtime.error_code %}
-                    <small class="mimo-runtime-warning">{{ runtime.error_code }}：{{ runtime.error_message or '未记录详情' }}</small>
+                <details class="mimo-technical-details">
+                  <summary>运行技术明细</summary>
+                  <div class="mimo-runtime-facts">
+                    <small>模型 {{ runtime.model }} · 合约 {{ runtime.contract_version }} · 输入 {{ runtime.input_kind }}</small>
+                    <small>尝试 {{ runtime.attempt_count }} 次 · 整次重试 {{ runtime.whole_run_retry_count }} 次 · 耗时 {{ runtime.duration_ms if runtime.duration_ms is not none else '-' }} ms</small>
+                    <small>{{ '当前运行已成为权威结果' if runtime.became_authoritative else '当前运行未成为权威结果' }}</small>
+                    {% if runtime.fallback_source %}
+                      <small class="mimo-runtime-warning">
+                        v2 {{ runtime.fallback_source.error_code or '失败' }}：{{ runtime.fallback_source.error_message or '未记录详情' }}；当前权威结果为v1回退。
+                      </small>
+                    {% elif runtime.error_code %}
+                      <small class="mimo-runtime-warning">{{ runtime.error_code }}：{{ runtime.error_message or '未记录详情' }}</small>
+                    {% endif %}
+                  </div>
+                  {% if runtime.attempts %}
+                    <details class="mimo-attempts">
+                      <summary>调用尝试明细</summary>
+                      <ol>
+                        {% for attempt in runtime.attempts %}
+                          <li>
+                            <span>{{ attempt.run_kind }} · {{ attempt.contract_version }} · 尝试 {{ attempt.ordinal }}：{{ attempt.status }} · {{ attempt.duration_ms }} ms{% if attempt.selected %} · 已选用{% endif %}</span>
+                            {% if attempt.error_code %}<small>{{ attempt.error_code }}{% if attempt.error_message %}：{{ attempt.error_message }}{% endif %}</small>{% endif %}
+                          </li>
+                        {% endfor %}
+                      </ol>
+                    </details>
                   {% endif %}
-                </div>
-                {% if runtime.attempts %}
-                  <details class="mimo-attempts">
-                    <summary>调用尝试明细</summary>
-                    <ol>
-                      {% for attempt in runtime.attempts %}
-                        <li>
-                          <span>{{ attempt.run_kind }} · {{ attempt.contract_version }} · 尝试 {{ attempt.ordinal }}：{{ attempt.status }} · {{ attempt.duration_ms }} ms{% if attempt.selected %} · 已选用{% endif %}</span>
-                          {% if attempt.error_code %}<small>{{ attempt.error_code }}{% if attempt.error_message %}：{{ attempt.error_message }}{% endif %}</small>{% endif %}
-                        </li>
-                      {% endfor %}
-                    </ol>
-                  </details>
-                {% endif %}
+                </details>
               {% endif %}
               {% if mimo_analysis.projection.status == 'failed' %}
                 <div class="mimo-projection-error" role="status">展示投影失败：{{ mimo_analysis.projection.reason_code }}</div>
@@ -280,10 +415,10 @@
                   <details class="mimo-raw-evidence"><summary>历史图片证据</summary><pre>{{ mimo_analysis.legacy_image_evidence | tojson(indent=2) }}</pre></details>
                 {% endif %}
               {% endif %}
-            </section>
+            </details>
             {% if mimo_analysis.evidence.images %}
-              <section class="mimo-image-evidence" aria-label="图片证据">
-                <div class="mimo-section-heading"><strong>图片证据</strong><small>每张图片独立归因</small></div>
+              <details class="mimo-image-evidence" aria-label="图片证据"{% if image_not_sent %} open{% endif %}>
+                <summary class="mimo-section-heading"><strong>图片证据</strong><small>每张图片独立归因</small></summary>
                 {% for image in mimo_analysis.evidence.images %}
                   <article class="mimo-image-evidence-row">
                     {% if image.media and image.media.local_path %}
@@ -306,21 +441,24 @@
                   </article>
                 {% endfor %}
                 {% if mimo_analysis.evidence.conflicts %}<div class="mimo-evidence-conflicts"><strong>证据冲突</strong><span>{{ mimo_analysis.evidence.conflicts | join('；') }}</span></div>{% endif %}
-              </section>
+              </details>
             {% endif %}
           {% endif %}
           {% if message.context_resolution and (message.context_resolution.attempt_status or message.context_resolution.linked_threads) %}
-            {% set context = message.context_resolution %}
-            <section class="mimo-context-result" aria-label="上下文二次判断">
-              <strong>上下文二次判断</strong>
-              <small>
-                {% if context.linked_threads %}{% for link in context.linked_threads %}线程 #{{ link.thread_id }}（根消息 #{{ link.root_message_id }}，{{ link.relation }}，置信度 {{ link.confidence }}）{% if not loop.last %}；{% endif %}{% endfor %}{% else %}尚未关联策略线程{% endif %}
-              </small>
-              {% if context.linked_messages %}<small>关联消息：{% for linked_message in context.linked_messages %}#{{ linked_message.message_id }} {{ linked_message.relation }} {{ linked_message.posted_at.strftime('%Y-%m-%d %H:%M') if linked_message.posted_at else '-' }}{% if not loop.last %}；{% endif %}{% endfor %}</small>{% endif %}
-              <small>引用消息：{{ '#' ~ context.reply_to_message_id if context.reply_to_message_id else '无' }} · 证据版本：{{ context.evidence_version or '-' }} · 输入：{{ context.evidence_input_kind or '-' }}</small>
-              {% if context.decision %}<small>决策：{{ context.decision }} · 置信度：{{ context.confidence if context.confidence is not none else '-' }} · 支持消息：{{ context.supporting_message_ids | join(', ') if context.supporting_message_ids else '无' }} · 反对消息：{{ context.opposing_message_ids | join(', ') if context.opposing_message_ids else '无' }}</small>{% endif %}
-              {% if context.unresolved_reason %}<small>待解决原因：{{ context.unresolved_reason }} · 下次触发：{{ context.next_triggers | join(', ') if context.next_triggers else '未声明' }}</small>{% endif %}
-            </section>
+            <details class="mimo-context-result" aria-label="上下文二次判断"{% if context_in_progress or context_unresolved or context_exhausted %} open{% endif %}>
+              <summary><strong>上下文二次判断</strong>{% if context.decision %}<span>决策：{{ context.decision }}</span>{% endif %}</summary>
+              {% if context.decision %}<p class="mimo-context-decision">{{ context.decision }} · 置信度：{{ context.confidence if context.confidence is not none else '未记录' }}</p>{% endif %}
+              <details class="mimo-technical-details">
+                <summary>上下文技术明细</summary>
+                <small>
+                  {% if context.linked_threads %}{% for link in context.linked_threads %}线程 #{{ link.thread_id }}（根消息 #{{ link.root_message_id }}，{{ link.relation }}，置信度 {{ link.confidence }}）{% if not loop.last %}；{% endif %}{% endfor %}{% else %}尚未关联策略线程{% endif %}
+                </small>
+                {% if context.linked_messages %}<small>关联消息：{% for linked_message in context.linked_messages %}#{{ linked_message.message_id }} {{ linked_message.relation }} {{ linked_message.posted_at.strftime('%Y-%m-%d %H:%M') if linked_message.posted_at else '-' }}{% if not loop.last %}；{% endif %}{% endfor %}</small>{% endif %}
+                <small>引用消息：{{ '#' ~ context.reply_to_message_id if context.reply_to_message_id else '无' }} · 证据版本：{{ context.evidence_version or '-' }} · 输入：{{ context.evidence_input_kind or '-' }}</small>
+                {% if context.decision %}<small>决策：{{ context.decision }} · 置信度：{{ context.confidence if context.confidence is not none else '-' }} · 支持消息：{{ context.supporting_message_ids | join(', ') if context.supporting_message_ids else '无' }} · 反对消息：{{ context.opposing_message_ids | join(', ') if context.opposing_message_ids else '无' }}</small>{% endif %}
+                {% if context.unresolved_reason %}<small>待解决原因：{{ context.unresolved_reason }} · 下次触发：{{ context.next_triggers | join(', ') if context.next_triggers else '未声明' }}</small>{% endif %}
+              </details>
+            </details>
           {% endif %}
           {% if historical_context_analysis %}
             <section class="message-context-resolution is-historical-analysis" aria-label="历史分析补齐">
@@ -336,8 +474,8 @@
             </section>
           {% endif %}
           {% if system_acceptance or execution_outcome %}
-            <section class="mimo-system-outcome" aria-label="系统接纳与自动交易">
-              <strong>系统接纳与自动交易</strong>
+            <details class="mimo-system-outcome" aria-label="系统接纳与自动交易"{% if missing_candidate or candidate_not_accepted or recognition_error %} open{% endif %}>
+              <summary><strong>系统接纳与自动交易</strong></summary>
               {% if system_acceptance %}
                 <span>{{ '系统处理失败' if system_acceptance.status == 'failed' else system_acceptance.status_label }}</span>
                 <small>接纳状态 {{ system_acceptance.status }} · 候选 {{ system_acceptance.accepted_candidate_count }}{% if system_acceptance.reason_code %} · {{ system_acceptance.reason_code }}{% endif %}</small>
@@ -353,7 +491,7 @@
                 {% endif %}
               {% endif %}
               {% if execution_outcome %}<span>自动交易：{{ execution_outcome.label }}</span>{% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}{% else %}<span>自动交易：未执行</span>{% endif %}
-            </section>
+            </details>
           {% endif %}
           {% if modern_mimo and semantic_review and semantic_review.model %}
             <details

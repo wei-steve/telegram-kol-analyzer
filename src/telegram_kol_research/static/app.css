@@ -2950,6 +2950,7 @@ body {
 
 .messages-panel-header {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
@@ -3093,11 +3094,58 @@ body {
   padding: 0 14px;
 }
 
+.message-insight-toolbar {
+  display: grid;
+  flex: 1 1 100%;
+  min-width: 0;
+  gap: 7px;
+  margin-top: 8px;
+}
+
+.message-insight-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.message-insight-filters button {
+  width: auto;
+  min-height: 28px;
+  margin: 0;
+  padding: 4px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(100, 116, 139, 0.42);
+  background: rgba(15, 23, 42, 0.72);
+  color: #cbd5e1;
+  font-size: 0.72rem;
+}
+
+.message-insight-filters button.is-active {
+  border-color: #38bdf8;
+  background: rgba(14, 116, 144, 0.24);
+  color: #e0f2fe;
+}
+
+.message-insight-stats {
+  color: #94a3b8;
+  font-size: 0.72rem;
+}
+
 .message-card {
   border-top: 1px solid #1f2937;
   padding: 10px 0;
   transition: background-color 0.2s, box-shadow 0.2s;
   overflow-wrap: anywhere;
+}
+
+.message-card.is-ai-danger {
+  border-left: 4px solid #ef4444;
+  padding-left: 10px;
+}
+
+.message-card.is-ai-warning {
+  border-left: 4px solid #f59e0b;
+  padding-left: 10px;
 }
 
 .message-card-header {
@@ -3242,6 +3290,64 @@ body {
   font-size: 0.88rem;
 }
 
+.message-ai-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+
+.message-ai-chip {
+  display: inline-flex;
+  align-items: center;
+  min-height: 23px;
+  padding: 2px 8px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: rgba(71, 85, 105, 0.22);
+  color: #cbd5e1;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1.25;
+}
+
+.message-ai-chip.is-entry {
+  background: rgba(34, 197, 94, 0.14);
+  color: #bbf7d0;
+}
+
+.message-ai-chip.is-management,
+.message-ai-chip.is-context,
+.message-ai-chip.is-media {
+  background: rgba(56, 189, 248, 0.14);
+  color: #bae6fd;
+}
+
+.message-ai-chip.is-warning,
+.message-ai-chip.is-context {
+  border-color: rgba(245, 158, 11, 0.28);
+}
+
+.message-ai-chip.is-warning {
+  background: rgba(245, 158, 11, 0.16);
+  color: #fde68a;
+}
+
+.message-ai-chip.is-danger,
+.message-ai-chip.is-error {
+  background: rgba(239, 68, 68, 0.17);
+  border-color: rgba(239, 68, 68, 0.32);
+  color: #fecaca;
+}
+
+.message-ai-chip.is-observation,
+.message-ai-chip.is-neutral,
+.message-ai-chip.is-irrelevant,
+.message-ai-chip.is-unknown {
+  background: rgba(71, 85, 105, 0.22);
+  color: #cbd5e1;
+}
+
 .message-decision-card {
   display: grid;
   gap: 10px;
@@ -3266,6 +3372,40 @@ body {
   border: 1px solid rgba(71, 85, 105, 0.72);
   border-radius: 12px;
   background: rgba(15, 23, 42, 0.72);
+}
+
+.mimo-first-pass > summary,
+.mimo-image-evidence > summary,
+.mimo-context-result > summary,
+.mimo-system-outcome > summary,
+.mimo-technical-details > summary {
+  cursor: pointer;
+}
+
+.mimo-technical-details {
+  margin-top: 10px;
+  border-top: 1px solid rgba(71, 85, 105, 0.5);
+  padding-top: 8px;
+  color: #94a3b8;
+  font-size: 0.78rem;
+}
+
+.mimo-technical-details[open] {
+  display: grid;
+  gap: 8px;
+}
+
+.mimo-context-result > summary,
+.mimo-system-outcome > summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.mimo-context-decision {
+  margin: 10px 0 0;
+  color: #f8fafc;
 }
 
 .mimo-first-pass { border-left: 4px solid #38bdf8; }
