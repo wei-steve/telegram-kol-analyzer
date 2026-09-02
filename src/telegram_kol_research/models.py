@@ -1566,6 +1566,100 @@ class RecognitionDecision(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
 
+class MessageRecognitionLabel(Base):
+    """Web-only human ground truth; never consumed by automated decision paths."""
+
+    __tablename__ = "message_recognition_labels"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            name="uq_message_recognition_labels_raw_message_id",
+        ),
+        Index(
+            "ix_message_recognition_labels_raw_message_id",
+            "raw_message_id",
+        ),
+        CheckConstraint(
+            "verdict IN ('correct', 'incorrect', 'uncertain')",
+            name="ck_message_recognition_labels_verdict",
+        ),
+        CheckConstraint(
+            "error_kind IS NULL OR error_kind IN ("
+            "'should_be_strategy', 'should_not_be_strategy', "
+            "'wrong_event_type', 'wrong_target', 'wrong_image_reading', "
+            "'wrong_parameters', 'context_should_have_been_used', 'other')",
+            name="ck_message_recognition_labels_error_kind",
+        ),
+        CheckConstraint(
+            "verdict = 'incorrect' OR error_kind IS NULL",
+            name="ck_message_recognition_labels_error_kind_scope",
+        ),
+        CheckConstraint(
+            "note IS NULL OR length(note) <= 2000",
+            name="ck_message_recognition_labels_note_length",
+        ),
+        CheckConstraint(
+            "labeled_prompt_versions_source IS NULL OR "
+            "labeled_prompt_versions_source IN ('mimo_run', 'recognition_decision')",
+            name="ck_message_recognition_labels_prompt_source",
+        ),
+        CheckConstraint(
+            "(labeled_prompt_versions_json IS NULL AND "
+            "labeled_prompt_versions_source IS NULL) OR "
+            "(labeled_prompt_versions_json IS NOT NULL AND "
+            "labeled_prompt_versions_source IS NOT NULL)",
+            name="ck_message_recognition_labels_prompt_provenance_pair",
+        ),
+        CheckConstraint(
+            "labeled_signal_candidate_count IS NULL OR "
+            "labeled_signal_candidate_count >= 0",
+            name="ck_message_recognition_labels_candidate_count",
+        ),
+        CheckConstraint(
+            "labeled_accepted_candidate_count IS NULL OR "
+            "labeled_accepted_candidate_count >= 0",
+            name="ck_message_recognition_labels_accepted_count",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False
+    )
+    verdict: Mapped[str] = mapped_column(String(16), nullable=False)
+    error_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    note: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    labeled_recognition_result: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    labeled_event_type: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    labeled_confidence: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    labeled_model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    labeled_prompt_versions_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
+    labeled_prompt_versions_source: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    labeled_signal_candidate_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    labeled_accepted_candidate_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    labeled_context_attempt_status: Mapped[Optional[str]] = mapped_column(
+        String(32), nullable=True
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, default=utc_now, nullable=False
+    )
+
+
 class AiPromptDefinition(Base):
     __tablename__ = "ai_prompt_definitions"
     __table_args__ = (

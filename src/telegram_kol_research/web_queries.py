@@ -19,6 +19,7 @@ from telegram_kol_research.models import (
     EntryRevisionReplacement,
     MediaAsset,
     MessageRecognition,
+    MessageRecognitionLabel,
     MessageEvidenceVersion,
     MessageInstructionItem,
     MimoRecognitionAttempt,
@@ -424,6 +425,7 @@ def load_group_messages(
     before_message_id: int | None = None,
     search_text: str | None = None,
     sender_name: str | None = None,
+    include_recognition_labels: bool = False,
 ) -> list[dict[str, object | None]]:
     """Load message timeline rows for a single group."""
 
@@ -440,7 +442,11 @@ def load_group_messages(
             .all()
         )
 
-        return _serialize_raw_messages(session, raw_messages)
+        return _serialize_raw_messages(
+            session,
+            raw_messages,
+            include_recognition_labels=include_recognition_labels,
+        )
 
 
 def load_group_message_page(
@@ -451,6 +457,7 @@ def load_group_message_page(
     before_message_id: int | None = None,
     search_text: str | None = None,
     sender_name: str | None = None,
+    include_recognition_labels: bool = False,
 ) -> tuple[list[dict[str, object | None]], bool]:
     """Load one message page and report whether an older matching page exists."""
 
@@ -467,7 +474,14 @@ def load_group_message_page(
             .all()
         )
         has_more = len(raw_messages) > page_size
-        return _serialize_raw_messages(session, raw_messages[:page_size]), has_more
+        return (
+            _serialize_raw_messages(
+                session,
+                raw_messages[:page_size],
+                include_recognition_labels=include_recognition_labels,
+            ),
+            has_more,
+        )
 
 
 def load_selected_messages(
@@ -522,11 +536,26 @@ def load_messages_in_time_window(
 def _serialize_raw_messages(
     session,
     raw_messages: list[RawMessage],
+    *,
+    include_recognition_labels: bool = False,
 ) -> list[dict[str, object | None]]:
     if not raw_messages:
         return []
 
     raw_message_ids = [msg.id for msg in raw_messages]
+
+    # Human labels are Web-only observation records. They are bulk-loaded for
+    # display and are never consumed by recognition or trading decisions.
+    recognition_labels = (
+        session.query(MessageRecognitionLabel)
+        .filter(MessageRecognitionLabel.raw_message_id.in_(raw_message_ids))
+        .all()
+        if include_recognition_labels
+        else []
+    )
+    recognition_label_by_msg_id = {
+        int(label.raw_message_id): label for label in recognition_labels
+    }
 
     # ── Bulk-load media assets ──
     ranked_media = (
@@ -873,6 +902,57 @@ def _serialize_raw_messages(
             attempts_by_run_id=mimo_attempts_by_run_id,
             media_by_id=evidence_media_by_id,
         )
+        recognition_label = recognition_label_by_msg_id.get(raw_message.id)
+        serialized_recognition_label = (
+            {
+                "id": int(recognition_label.id),
+                "raw_message_id": int(recognition_label.raw_message_id),
+                "verdict": recognition_label.verdict,
+                "error_kind": recognition_label.error_kind,
+                "note": recognition_label.note,
+                "labeled_recognition_result": (
+                    recognition_label.labeled_recognition_result
+                ),
+                "labeled_event_type": recognition_label.labeled_event_type,
+                "labeled_confidence": recognition_label.labeled_confidence,
+                "labeled_model": recognition_label.labeled_model,
+                "labeled_prompt_versions_json": (
+                    recognition_label.labeled_prompt_versions_json
+                ),
+                "labeled_prompt_versions_source": (
+                    recognition_label.labeled_prompt_versions_source
+                ),
+                "labeled_signal_candidate_count": (
+                    recognition_label.labeled_signal_candidate_count
+                ),
+                "labeled_accepted_candidate_count": (
+                    recognition_label.labeled_accepted_candidate_count
+                ),
+                "labeled_context_attempt_status": (
+                    recognition_label.labeled_context_attempt_status
+                ),
+                "created_at": utc_naive_to_local(recognition_label.created_at),
+                "updated_at": utc_naive_to_local(recognition_label.updated_at),
+            }
+            if recognition_label is not None
+            else None
+        )
+        projected_confidence = (
+            mimo_analysis.get("confidence")
+            if isinstance(mimo_analysis, dict)
+            else None
+        )
+        recognition_label_has_drift = bool(
+            serialized_recognition_label is not None
+            and (
+                recognition_result
+                != serialized_recognition_label["labeled_recognition_result"]
+                or lifecycle_event_type
+                != serialized_recognition_label["labeled_event_type"]
+                or projected_confidence
+                != serialized_recognition_label["labeled_confidence"]
+            )
+        )
         matching_bindings = bindings_by_message_key.get(
             (int(raw_message.chat_id), int(raw_message.message_id)), []
         )
@@ -915,6 +995,8 @@ def _serialize_raw_messages(
                 "signal_candidate_count": len(
                     candidates_by_msg_id.get(raw_message.id, [])
                 ),
+                "recognition_label": serialized_recognition_label,
+                "recognition_label_has_drift": recognition_label_has_drift,
                 "strategy_lifecycle_id": (
                     lifecycle_ids[0] if len(lifecycle_ids) == 1 else None
                 ),
@@ -1003,6 +1085,30 @@ def _serialize_historical_context_analysis(
     }
 
 
+def _select_current_mimo_run(
+    *,
+    evidence: MessageEvidenceVersion | None,
+    runs: list[MimoRecognitionRun],
+) -> MimoRecognitionRun | None:
+    """Select the run that owns the current Web authoritative projection."""
+
+    if evidence is not None and evidence.mimo_recognition_run_id is not None:
+        linked = next(
+            (
+                run
+                for run in runs
+                if int(run.id) == int(evidence.mimo_recognition_run_id)
+            ),
+            None,
+        )
+        if linked is not None:
+            return linked
+    return next(
+        (run for run in reversed(runs) if run.became_authoritative),
+        runs[-1] if runs else None,
+    )
+
+
 def _serialize_mimo_analysis(
     *,
     recognition: MessageRecognition | None,
@@ -1047,21 +1153,7 @@ def _serialize_mimo_analysis(
         else {}
     )
     contract_version = str(normalized.get("contract_version") or "")
-    linked_run = None
-    if evidence is not None and evidence.mimo_recognition_run_id is not None:
-        linked_run = next(
-            (
-                run
-                for run in runs
-                if int(run.id) == int(evidence.mimo_recognition_run_id)
-            ),
-            None,
-        )
-    if linked_run is None:
-        linked_run = next(
-            (run for run in reversed(runs) if run.became_authoritative),
-            runs[-1] if runs else None,
-        )
+    linked_run = _select_current_mimo_run(evidence=evidence, runs=runs)
     runtime = _serialize_mimo_runtime(
         run=linked_run,
         runs=runs,

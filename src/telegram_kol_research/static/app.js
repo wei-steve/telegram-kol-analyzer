@@ -434,6 +434,8 @@ function messageMatchesInsightFilter(card, filterName) {
   if (filterName === 'context') return card.dataset.messageContextUsed === 'true';
   if (filterName === 'media') return card.dataset.messageHasMedia === 'true';
   if (filterName === 'missing-candidate') return card.dataset.messageMissingCandidate === 'true';
+  if (filterName === 'labeled') return card.dataset.messageLabeled === 'true';
+  if (filterName === 'unlabeled') return card.dataset.messageLabeled !== 'true';
   return true;
 }
 
@@ -464,9 +466,12 @@ function updateMessageInsightView(panel) {
   const attention = cards.filter(
     (card) => card.dataset.messageNeedsAttention === 'true',
   ).length;
+  const labeled = cards.filter(
+    (card) => card.dataset.messageLabeled === 'true',
+  ).length;
   const stats = panel.querySelector('[data-message-insight-stats]');
   if (stats) {
-    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · 上下文调用 ${contextCalls} · 需关注 ${attention}`;
+    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · 上下文调用 ${contextCalls} · 需关注 ${attention} · 已标注 ${labeled} 条`;
   }
 }
 
@@ -482,6 +487,117 @@ function bindMessageInsightControls(panel) {
     });
   });
   updateMessageInsightView(panel);
+}
+
+function applyRecognitionLabelResponse(card, label) {
+  if (!card || !label) return;
+  card.dataset.messageLabeled = 'true';
+  const row = card.querySelector('[data-message-ai-chip-row]');
+  const toggle = card.querySelector('[data-recognition-label-toggle]');
+  let chip = card.querySelector('[data-recognition-label-chip]');
+  if (!chip && row) {
+    chip = document.createElement('span');
+    chip.dataset.recognitionLabelChip = '';
+    row.insertBefore(chip, toggle || null);
+  }
+  const views = {
+    correct: ['is-human-correct', '人工标注：正确'],
+    incorrect: ['is-human-incorrect', '人工标注：错了'],
+    uncertain: ['is-human-uncertain', '人工标注：不确定'],
+  };
+  const view = views[label.verdict] || views.uncertain;
+  if (chip) {
+    chip.className = `message-ai-chip ${view[0]}`;
+    chip.textContent = view[1];
+  }
+  card.querySelector('[data-recognition-label-drift]')?.remove();
+  if (toggle) toggle.textContent = '修改标注';
+
+  const form = card.querySelector('[data-recognition-label-form]');
+  if (form) {
+    form.querySelectorAll('[name="verdict"]').forEach((input) => {
+      input.checked = input.value === label.verdict;
+    });
+    const errorKind = form.querySelector('[name="error_kind"]');
+    if (errorKind) errorKind.value = label.error_kind || '';
+    const note = form.querySelector('[name="note"]');
+    if (note) note.value = label.note || '';
+    const errorFields = form.querySelector('[data-recognition-label-error-fields]');
+    if (errorFields) errorFields.hidden = label.verdict !== 'incorrect';
+  }
+}
+
+function bindRecognitionLabelControls(panel) {
+  if (!panel) return;
+  panel.querySelectorAll('[data-recognition-label-form]').forEach((form) => {
+    if (form.dataset.recognitionLabelBound === 'true') return;
+    form.dataset.recognitionLabelBound = 'true';
+    const card = form.closest('[data-message-card]');
+    const toggle = card?.querySelector('[data-recognition-label-toggle]');
+    const cancel = form.querySelector('[data-recognition-label-cancel]');
+    const errorFields = form.querySelector('[data-recognition-label-error-fields]');
+    const status = form.querySelector('[data-recognition-label-status]');
+
+    const setOpen = (open) => {
+      form.hidden = !open;
+      if (toggle) toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+    };
+    toggle?.addEventListener('click', () => setOpen(form.hidden));
+    cancel?.addEventListener('click', () => setOpen(false));
+    form.querySelectorAll('[name="verdict"]').forEach((input) => {
+      input.addEventListener('change', () => {
+        if (errorFields) errorFields.hidden = input.value !== 'incorrect';
+      });
+    });
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const rawMessageId = Number(form.dataset.rawMessageId || '0');
+      const verdict = form.querySelector('[name="verdict"]:checked')?.value || '';
+      if (!rawMessageId || !verdict) {
+        if (status) {
+          status.textContent = '请选择人工判断。';
+          status.classList.add('is-error');
+        }
+        return;
+      }
+      const errorKindInput = form.querySelector('[name="error_kind"]');
+      const noteInput = form.querySelector('[name="note"]');
+      const requestBody = {
+        verdict,
+        error_kind: verdict === 'incorrect' ? (errorKindInput?.value || null) : null,
+        note: noteInput?.value || null,
+      };
+      const submit = form.querySelector('[type="submit"]');
+      if (submit) submit.disabled = true;
+      if (status) {
+        status.textContent = '保存中…';
+        status.classList.remove('is-error');
+      }
+      try {
+        const response = await fetch(`/api/messages/${rawMessageId}/recognition-label`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(requestBody),
+        });
+        const payload = await response.json();
+        if (!response.ok || !payload.label) {
+          const detail = typeof payload.detail === 'string' ? payload.detail : '标注保存失败';
+          throw new Error(detail);
+        }
+        applyRecognitionLabelResponse(card, payload.label);
+        if (status) status.textContent = '已保存';
+        setOpen(false);
+        updateMessageInsightView(panel);
+      } catch (error) {
+        if (status) {
+          status.textContent = error instanceof Error ? error.message : '标注保存失败';
+          status.classList.add('is-error');
+        }
+      } finally {
+        if (submit) submit.disabled = false;
+      }
+    });
+  });
 }
 
 function scrollMessagePanelToTop(panel = getMessagePanel()) {
@@ -996,6 +1112,7 @@ function bindMessagePanelControls(panel = getMessagePanel()) {
     return;
   }
   bindMessageInsightControls(panel);
+  bindRecognitionLabelControls(panel);
 
   const scrollContainer = getMessageScrollContainer(panel);
   if (scrollContainer && scrollContainer.dataset.messageScrollBound !== 'true') {

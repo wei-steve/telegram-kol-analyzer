@@ -1377,6 +1377,45 @@ def test_message_ai_statistics_and_filter_reapply_after_history_append(tmp_path)
     assert "updateMessageInsightView(panel);" in load_block
 
 
+def test_message_recognition_label_assets_are_dom_scoped_and_server_snapshot_owned(tmp_path):
+    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
+    js = client.get("/static/app.js").text
+    html = client.get("/groups/77/messages").text
+    css = client.get("/static/app.css").text
+
+    assert 'data-message-ai-filter="labeled"' in html
+    assert 'data-message-ai-filter="unlabeled"' in html
+    assert "已标注 0 条" in html
+    assert "function bindRecognitionLabelControls" in js
+    assert "function applyRecognitionLabelResponse" in js
+    label_start = js.index("function bindRecognitionLabelControls")
+    label_end = js.index("\nfunction ", label_start + 1)
+    label_block = js[label_start:label_end]
+    assert "fetch(`/api/messages/${rawMessageId}/recognition-label`" in label_block
+    assert "method: 'POST'" in label_block
+    assert "verdict" in label_block
+    assert "error_kind" in label_block
+    assert "note" in label_block
+    for forbidden in (
+        "labeled_recognition_result",
+        "labeled_event_type",
+        "labeled_confidence",
+        "labeled_model",
+        "labeled_prompt_versions_json",
+    ):
+        assert forbidden not in label_block
+    assert "updateMessageInsightView(panel);" in label_block
+    assert "card.dataset.messageLabeled" in js
+    assert "card.dataset.messageLabeled === 'true'" in js
+    assert "card.dataset.messageLabeled !== 'true'" in js
+    assert "const labeled = cards.filter(" in js
+    assert "已标注 ${labeled} 条" in js
+    assert ".message-ai-chip.is-human-incorrect" in css
+    assert ".message-ai-chip.is-human-correct" in css
+    assert ".message-ai-chip.is-human-uncertain" in css
+    assert ".message-ai-chip.is-label-drift" in css
+
+
 def test_app_js_loads_older_messages_once_near_scroll_boundary(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 

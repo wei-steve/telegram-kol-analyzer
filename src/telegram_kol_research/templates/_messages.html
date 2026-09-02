@@ -85,9 +85,11 @@
         <button type="button" data-message-ai-filter="context">用了上下文</button>
         <button type="button" data-message-ai-filter="media">有图片</button>
         <button type="button" data-message-ai-filter="missing-candidate">未生成候选</button>
+        <button type="button" data-message-ai-filter="labeled">已标注</button>
+        <button type="button" data-message-ai-filter="unlabeled">未标注</button>
       </div>
       <div class="message-insight-stats" data-message-insight-stats aria-live="polite">
-        已加载 {{ messages | length }} 条：识别成功 0 · 平均置信度 未记录 · 上下文调用 0 · 需关注 0
+        已加载 {{ messages | length }} 条：识别成功 0 · 平均置信度 未记录 · 上下文调用 0 · 需关注 0 · 已标注 0 条
       </div>
     </div>
   </div>
@@ -108,6 +110,8 @@
       {% set context = message.context_resolution %}
       {% set recognition_result = message.recognition_result %}
       {% set lifecycle_event_type = message.lifecycle_event_type %}
+      {% set recognition_label = message.recognition_label %}
+      {% set recognition_label_has_drift = message.recognition_label_has_drift %}
       {% set confidence = mimo_analysis.confidence if mimo_analysis else none %}
       {% set context_called = context and context.attempt_status is not none %}
       {% set context_in_progress = context_called and context.attempt_status in ['pending', 'running', 'retry_pending', 'pending_reanalysis'] %}
@@ -204,6 +208,7 @@
         data-message-recognition-result-recorded="{{ 'true' if recognition_result is not none else 'false' }}"
         data-message-event-type-recorded="{{ 'true' if lifecycle_event_type is not none else 'false' }}"
         data-message-shadow-disagreement="{{ 'true' if shadow_disagreement else 'false' }}"
+        data-message-labeled="{{ 'true' if recognition_label else 'false' }}"
       >
         <header class="message-card-header">
           <div class="message-heading-main">
@@ -334,7 +339,65 @@
                 <span class="message-ai-chip is-warning">⚠ 候选未被接纳（未记录原因）</span>
               {% endif %}
             {% endif %}
+            {% if recognition_label %}
+              {% if recognition_label.verdict == 'incorrect' %}
+                {% set recognition_label_text = '人工标注：错了' %}
+                {% set recognition_label_class = 'is-human-incorrect' %}
+              {% elif recognition_label.verdict == 'uncertain' %}
+                {% set recognition_label_text = '人工标注：不确定' %}
+                {% set recognition_label_class = 'is-human-uncertain' %}
+              {% else %}
+                {% set recognition_label_text = '人工标注：正确' %}
+                {% set recognition_label_class = 'is-human-correct' %}
+              {% endif %}
+              <span class="message-ai-chip {{ recognition_label_class }}" data-recognition-label-chip>{{ recognition_label_text }}</span>
+              {% if recognition_label_has_drift %}
+                <span class="message-ai-chip is-label-drift" data-recognition-label-drift title="该标注针对的是标注当时的识别结果">识别已变更</span>
+              {% endif %}
+            {% endif %}
+            <button
+              type="button"
+              class="recognition-label-toggle"
+              data-recognition-label-toggle
+              aria-expanded="false"
+            >{{ '修改标注' if recognition_label else '标注' }}</button>
           </div>
+          <form
+            class="recognition-label-form"
+            data-recognition-label-form
+            data-raw-message-id="{{ message.raw_message_id }}"
+            hidden
+          >
+            <fieldset>
+              <legend>人工判断</legend>
+              <label><input type="radio" name="verdict" value="correct"{% if recognition_label and recognition_label.verdict == 'correct' %} checked{% endif %}> 正确</label>
+              <label><input type="radio" name="verdict" value="incorrect"{% if recognition_label and recognition_label.verdict == 'incorrect' %} checked{% endif %}> 错了</label>
+              <label><input type="radio" name="verdict" value="uncertain"{% if recognition_label and recognition_label.verdict == 'uncertain' %} checked{% endif %}> 不确定</label>
+            </fieldset>
+            <label data-recognition-label-error-fields{% if not recognition_label or recognition_label.verdict != 'incorrect' %} hidden{% endif %}>
+              错误类型
+              <select name="error_kind">
+                <option value="">未选择</option>
+                <option value="should_be_strategy"{% if recognition_label and recognition_label.error_kind == 'should_be_strategy' %} selected{% endif %}>该是策略却判成无关</option>
+                <option value="should_not_be_strategy"{% if recognition_label and recognition_label.error_kind == 'should_not_be_strategy' %} selected{% endif %}>不是策略却判成策略</option>
+                <option value="wrong_event_type"{% if recognition_label and recognition_label.error_kind == 'wrong_event_type' %} selected{% endif %}>动作类型判错</option>
+                <option value="wrong_target"{% if recognition_label and recognition_label.error_kind == 'wrong_target' %} selected{% endif %}>目标持仓/线程认错</option>
+                <option value="wrong_image_reading"{% if recognition_label and recognition_label.error_kind == 'wrong_image_reading' %} selected{% endif %}>图片内容读错</option>
+                <option value="wrong_parameters"{% if recognition_label and recognition_label.error_kind == 'wrong_parameters' %} selected{% endif %}>入场价/止损/止盈等参数错</option>
+                <option value="context_should_have_been_used"{% if recognition_label and recognition_label.error_kind == 'context_should_have_been_used' %} selected{% endif %}>应结合上下文却没有</option>
+                <option value="other"{% if recognition_label and recognition_label.error_kind == 'other' %} selected{% endif %}>其他</option>
+              </select>
+            </label>
+            <label>
+              可选备注
+              <textarea name="note" maxlength="2000" rows="3">{{ recognition_label.note if recognition_label and recognition_label.note else '' }}</textarea>
+            </label>
+            <div class="recognition-label-actions">
+              <button type="submit">保存标注</button>
+              <button type="button" class="secondary-button" data-recognition-label-cancel>取消</button>
+              <span data-recognition-label-status aria-live="polite"></span>
+            </div>
+          </form>
           {% if mimo_analysis %}
             <details class="mimo-first-pass" aria-label="MiMo第一次识别"{% if runtime_failed or projection_failed or image_not_sent or low_confidence or runtime_retry_count > 0 or (runtime and runtime.status == 'fallback') or runtime_not_authoritative %} open{% endif %}>
               <summary class="mimo-section-heading">

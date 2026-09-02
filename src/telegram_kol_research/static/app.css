@@ -3348,6 +3348,103 @@ body {
   color: #cbd5e1;
 }
 
+.message-ai-chip.is-human-incorrect {
+  border-color: rgba(192, 132, 252, 0.42);
+  background: rgba(147, 51, 234, 0.22);
+  color: #e9d5ff;
+}
+
+.message-ai-chip.is-human-correct,
+.message-ai-chip.is-human-uncertain,
+.message-ai-chip.is-label-drift {
+  border-color: rgba(148, 163, 184, 0.28);
+  background: rgba(71, 85, 105, 0.22);
+  color: #cbd5e1;
+}
+
+.recognition-label-toggle {
+  width: auto;
+  min-height: 23px;
+  margin: 0;
+  padding: 2px 8px;
+  border: 1px dashed rgba(148, 163, 184, 0.38);
+  border-radius: 999px;
+  background: transparent;
+  color: #94a3b8;
+  font-size: 0.7rem;
+}
+
+.recognition-label-form {
+  display: grid;
+  gap: 9px;
+  margin-top: 8px;
+  padding: 11px;
+  border: 1px solid rgba(168, 85, 247, 0.28);
+  border-radius: 10px;
+  background: rgba(30, 27, 75, 0.24);
+  color: #cbd5e1;
+  font-size: 0.78rem;
+}
+
+.recognition-label-form[hidden],
+.recognition-label-form [hidden] {
+  display: none;
+}
+
+.recognition-label-form fieldset {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+.recognition-label-form legend {
+  margin-bottom: 5px;
+  color: #e2e8f0;
+  font-weight: 700;
+}
+
+.recognition-label-form label {
+  display: grid;
+  gap: 5px;
+}
+
+.recognition-label-form fieldset label {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.recognition-label-form select,
+.recognition-label-form textarea {
+  width: 100%;
+  max-width: 620px;
+}
+
+.recognition-label-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 7px;
+}
+
+.recognition-label-actions button {
+  width: auto;
+  min-height: 30px;
+  margin: 0;
+  padding: 5px 10px;
+}
+
+.recognition-label-actions [data-recognition-label-status] {
+  color: #94a3b8;
+}
+
+.recognition-label-actions [data-recognition-label-status].is-error {
+  color: #fca5a5;
+}
+
 .message-decision-card {
   display: grid;
   gap: 10px;

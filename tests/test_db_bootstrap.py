@@ -1,6 +1,6 @@
 import sqlite3
 
-from sqlalchemy import text
+from sqlalchemy import inspect, text
 
 from telegram_kol_research import db as db_module
 from telegram_kol_research.db import create_session_factory
@@ -25,6 +25,110 @@ def test_database_bootstrap_creates_tables(tmp_path):
     assert "entry_strategy_fragments" in tables
     assert "entry_assembly_fragments" in tables
     assert engine is not None
+
+
+def test_message_recognition_labels_schema_is_additive_constrained_and_indexed(tmp_path):
+    database_path = tmp_path / "research.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE legacy_rows (id INTEGER PRIMARY KEY, value TEXT NOT NULL)"
+        )
+        connection.execute("INSERT INTO legacy_rows VALUES (1, 'keep')")
+
+    session_factory = create_session_factory(database_path)
+    create_session_factory(database_path)
+    inspector = inspect(session_factory.kw["bind"])
+
+    assert inspector.has_table("message_recognition_labels")
+    columns = {
+        column["name"]: column
+        for column in inspector.get_columns("message_recognition_labels")
+    }
+    assert set(columns) == {
+        "id",
+        "raw_message_id",
+        "verdict",
+        "error_kind",
+        "note",
+        "labeled_recognition_result",
+        "labeled_event_type",
+        "labeled_confidence",
+        "labeled_model",
+        "labeled_prompt_versions_json",
+        "labeled_prompt_versions_source",
+        "labeled_signal_candidate_count",
+        "labeled_accepted_candidate_count",
+        "labeled_context_attempt_status",
+        "created_at",
+        "updated_at",
+    }
+    assert columns["raw_message_id"]["nullable"] is False
+    for name in {
+        "error_kind",
+        "note",
+        "labeled_recognition_result",
+        "labeled_event_type",
+        "labeled_confidence",
+        "labeled_model",
+        "labeled_prompt_versions_json",
+        "labeled_prompt_versions_source",
+        "labeled_signal_candidate_count",
+        "labeled_accepted_candidate_count",
+        "labeled_context_attempt_status",
+    }:
+        assert columns[name]["nullable"] is True
+
+    assert inspector.get_foreign_keys("message_recognition_labels") == [
+        {
+            "name": None,
+            "constrained_columns": ["raw_message_id"],
+            "referred_schema": None,
+            "referred_table": "raw_messages",
+            "referred_columns": ["id"],
+            "options": {},
+        }
+    ]
+    assert {
+        constraint["name"]
+        for constraint in inspector.get_unique_constraints(
+            "message_recognition_labels"
+        )
+    } == {"uq_message_recognition_labels_raw_message_id"}
+    assert "ix_message_recognition_labels_raw_message_id" in {
+        index["name"]
+        for index in inspector.get_indexes("message_recognition_labels")
+    }
+    check_sql = "\n".join(
+        str(constraint["sqltext"])
+        for constraint in inspector.get_check_constraints(
+            "message_recognition_labels"
+        )
+    )
+    for value in {
+        "correct",
+        "incorrect",
+        "uncertain",
+        "should_be_strategy",
+        "should_not_be_strategy",
+        "wrong_event_type",
+        "wrong_target",
+        "wrong_image_reading",
+        "wrong_parameters",
+        "context_should_have_been_used",
+        "other",
+        "mimo_run",
+        "recognition_decision",
+    }:
+        assert value in check_sql
+    assert "length(note) <= 2000" in check_sql
+    assert "verdict = 'incorrect' OR error_kind IS NULL" in check_sql
+    assert "labeled_prompt_versions_json IS NULL" in check_sql
+    assert "labeled_prompt_versions_source IS NOT NULL" in check_sql
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("SELECT value FROM legacy_rows").fetchone() == (
+            "keep",
+        )
 
 
 def test_entry_preamble_tables_are_added_to_existing_database(tmp_path):

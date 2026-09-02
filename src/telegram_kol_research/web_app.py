@@ -78,6 +78,10 @@ from telegram_kol_research.runtime_agent_production_audit import (
 )
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.message_lock_provider import MessageLockProvider
+from telegram_kol_research.message_recognition_labels import (
+    load_message_recognition_label,
+    save_message_recognition_label,
+)
 from telegram_kol_research.message_processing_worker import (
     MessageProcessingActivity,
     run_message_processing_worker_loop,
@@ -7543,6 +7547,7 @@ def create_web_app(
             app.state.session_factory,
             chat_id=chat_id,
             page_size=MESSAGE_PAGE_SIZE,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
         )
         messages_ms = _elapsed_ms(step_started_at)
         step_started_at = time.perf_counter()
@@ -7638,6 +7643,7 @@ def create_web_app(
             app.state.session_factory,
             chat_id=chat_id,
             page_size=MESSAGE_PAGE_SIZE,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
         )
         monitor_status = build_monitor_status()
         freshness = load_database_freshness(
@@ -8183,6 +8189,44 @@ def create_web_app(
         )
         return response
 
+    def require_recognition_label_role() -> None:
+        if app.state.runtime_role not in {"all", "web"}:
+            raise HTTPException(
+                status_code=503,
+                detail={"code": "label_not_owned_by_runtime_role"},
+            )
+
+    @app.get("/api/messages/{raw_message_id}/recognition-label")
+    def get_recognition_label(raw_message_id: int):
+        require_recognition_label_role()
+        try:
+            label = load_message_recognition_label(
+                app.state.session_factory,
+                raw_message_id=raw_message_id,
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        return {"raw_message_id": raw_message_id, "label": label}
+
+    @app.post("/api/messages/{raw_message_id}/recognition-label")
+    def put_recognition_label(
+        raw_message_id: int,
+        payload: dict[str, Any] | None = None,
+    ):
+        require_recognition_label_role()
+        try:
+            label = save_message_recognition_label(
+                app.state.session_factory,
+                raw_message_id=raw_message_id,
+                payload=payload or {},
+                now=app.state.now_provider(),
+            )
+        except LookupError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        return {"raw_message_id": raw_message_id, "label": label}
+
     @app.post("/api/messages/{raw_message_id}/recognize")
     async def recognize_message(raw_message_id: int):
         try:
@@ -8605,6 +8649,7 @@ def create_web_app(
             before_message_id=before_message_id,
             search_text=search_text,
             sender_name=sender_name,
+            include_recognition_labels=app.state.runtime_role in {"all", "web"},
         )
         freshness = load_database_freshness(
             app.state.session_factory,
