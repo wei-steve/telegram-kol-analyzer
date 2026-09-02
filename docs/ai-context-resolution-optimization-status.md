@@ -12,7 +12,7 @@ pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063 # historical all-role main-recognition activation
 current_runtime_role_shas:
-  web: 3e27b57cd0de4a8415697f2ffc82e8ec82aa23cb
+  web: 38d01ea44a25ff523de7572cf73484513ecc29f6
   ingest: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
   worker: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
