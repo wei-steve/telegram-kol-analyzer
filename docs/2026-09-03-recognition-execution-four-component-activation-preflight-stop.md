@@ -89,9 +89,12 @@ root-owned mode-0600 证据：
 
 SHA-256：`67877dc3961128a0786dd493869cc34dff6ee3e6cff5a70ce7b619e84a9c10c8`
 
-## 后续需要的新授权
+## 后续边界
 
-在“不修改、不绕过现有激活器”的决定下，能够满足其 uniform rollback precondition 的路径，
-需要先通过一次独立、显式授权的 Web-only activation，把 Web 从 `5aa7ca07...` 回退到
-`0de19c1c...`；确认三角色统一运行 `0de19c1c...` 后，才能再执行四组件候选激活。
-这会增加一次 Web 服务控制并暂时撤回纯展示改动，不属于本轮已授权动作，本文不自行执行。
+不能直接把 Web 单独激活到现有 `0de19c1c...` release 来满足 uniform rollback precondition：
+该 release 的 immutable stage manifest 本身绑定 `web`、`monitor`、`ingest`、`worker` 四组件，
+而激活器要求 activation declaration 与 stage declaration 完全相同。
+
+因此，在“不修改、不绕过现有激活器”、不手工控制服务且只使用现有 immutable release 的约束下，
+目前没有已证明可行的路径把 split-runtime pre-state 收敛成统一 `0de19c1c...` 后再激活候选。
+后续需要单独设计并授权一个符合现有安全语义的收敛步骤；本文不猜测或执行该步骤。
