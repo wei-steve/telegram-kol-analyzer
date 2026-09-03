@@ -1595,18 +1595,24 @@ class SystemRuntimeAdapter:
                     if key in properties:
                         raise ActivationError("monitor rollback identity proof failed")
                     properties[key] = value
-            if set(properties) != {"Environment", "FragmentPath", "DropInPaths"}:
+            required_properties = {"FragmentPath", "DropInPaths"}
+            if unit not in _PROCESSLESS_UNITS:
+                # Timer units have no exec context, so systemd does not expose
+                # Environment for them. They still participate in file-mtime proof.
+                required_properties.add("Environment")
+            if not required_properties.issubset(properties):
                 raise ActivationError("monitor rollback identity proof failed")
             unit_paths = [properties["FragmentPath"], *shlex.split(properties["DropInPaths"])]
             if not properties["FragmentPath"]:
                 raise ActivationError("monitor rollback identity proof failed")
             environment: dict[str, str] = {}
-            for assignment in shlex.split(properties["Environment"]):
-                key, separator, value = assignment.partition("=")
-                if separator:
-                    if key in environment:
-                        raise ActivationError("monitor rollback identity proof failed")
-                    environment[key] = value
+            if unit not in _PROCESSLESS_UNITS:
+                for assignment in shlex.split(properties["Environment"]):
+                    key, separator, value = assignment.partition("=")
+                    if separator:
+                        if key in environment:
+                            raise ActivationError("monitor rollback identity proof failed")
+                        environment[key] = value
             if unit in _UNITS["monitor"]:
                 expected = {
                     "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,

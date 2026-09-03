@@ -171,7 +171,6 @@ def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_confi
         if command[0:2] == ["systemctl", "show"] and "--property=Environment" in command:
             unit = command[2]
             fragment, dropin = unit_files[unit]
-            environment = ""
             if unit in scoped_activation._UNITS["monitor"]:
                 environment = " ".join(
                     (
@@ -182,11 +181,8 @@ def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_confi
                         "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" + "a" * 64,
                     )
                 )
-            stdout = (
-                f"Environment={environment}\n"
-                f"FragmentPath={fragment}\n"
-                f"DropInPaths={dropin}\n"
-            )
+                stdout = f"Environment={environment}\n"
+            stdout += f"FragmentPath={fragment}\nDropInPaths={dropin}\n"
         elif command == [
             "systemctl",
             "show",
@@ -207,6 +203,116 @@ def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_confi
         evidence = runtime.prove_monitor_rollback_release(release)
         assert evidence["release_commit"] == CANDIDATE
         assert evidence["latest_configuration_mtime_ns"] == config_mtime_ns
+    else:
+        with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
+            runtime.prove_monitor_rollback_release(release)
+
+
+@pytest.mark.parametrize(
+    "missing_environment_unit,missing_fragment_unit,timer_environment,expected_pass",
+    (
+        (scoped_activation._UNITS["monitor"][0], None, False, False),
+        (None, scoped_activation._UNITS["monitor"][0], False, False),
+        (None, scoped_activation._UNITS["monitor"][1], False, False),
+        (None, scoped_activation._UNITS["monitor"][2], False, False),
+        (None, "telegram-kol-monitor.timer", False, False),
+        (None, None, True, True),
+    ),
+    ids=(
+        "service-missing-environment",
+        "monitor-service-missing-fragment",
+        "diagnostic-service-missing-fragment",
+        "test-notification-service-missing-fragment",
+        "timer-missing-fragment",
+        "timer-extra-environment-accepted",
+    ),
+)
+def test_monitor_rollback_identity_requires_unit_type_specific_systemd_properties(
+    tmp_path: Path,
+    monkeypatch,
+    missing_environment_unit: str | None,
+    missing_fragment_unit: str | None,
+    timer_environment: bool,
+    expected_pass: bool,
+) -> None:
+    runtime = SystemRuntimeAdapter(
+        python=Path("/venv/python"),
+        expected_uid=tmp_path.stat().st_uid,
+    )
+    release_path = tmp_path / CANDIDATE
+    release_path.mkdir()
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": release_path,
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+    config_mtime_ns = 1_800_000_000_000_000_000
+    unit_files: dict[str, tuple[Path, Path]] = {}
+    units = (*scoped_activation._UNITS["monitor"], "telegram-kol-monitor.timer")
+    for index, unit in enumerate(units):
+        fragment = tmp_path / f"property-fragment-{index}"
+        dropin = tmp_path / f"property-dropin-{index}.conf"
+        fragment.write_text("[Unit]\n", encoding="utf-8")
+        dropin.write_text("[Service]\n", encoding="utf-8")
+        os.utime(fragment, ns=(config_mtime_ns, config_mtime_ns))
+        os.utime(dropin, ns=(config_mtime_ns, config_mtime_ns))
+        unit_files[unit] = (fragment, dropin)
+    payload = _monitor_diagnostic_payload(
+        checked_at=datetime.fromtimestamp(
+            (config_mtime_ns + 1_000_000_000) / 1_000_000_000,
+            tz=UTC,
+        ).isoformat()
+    )
+
+    def run(command, **kwargs):
+        stdout = ""
+        if command[0:2] == ["systemctl", "show"] and "--property=Environment" in command:
+            unit = command[2]
+            fragment, dropin = unit_files[unit]
+            lines = []
+            if unit in scoped_activation._UNITS["monitor"]:
+                if unit != missing_environment_unit:
+                    lines.append(
+                        "Environment="
+                        + " ".join(
+                            (
+                                f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
+                                f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
+                                f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
+                                f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
+                                "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256="
+                                + "a" * 64,
+                            )
+                        )
+                    )
+            elif timer_environment:
+                lines.append("Environment=IGNORED_FOR_PROCESSLESS_TIMER=1")
+            if unit != missing_fragment_unit:
+                lines.append(f"FragmentPath={fragment}")
+            lines.append(f"DropInPaths={dropin}")
+            stdout = "\n".join(lines) + "\n"
+        elif command == [
+            "systemctl",
+            "show",
+            "telegram-kol-monitor-diagnostic.service",
+            "--property=Result",
+            "--property=ExecMainStatus",
+        ]:
+            stdout = "Result=success\nExecMainStatus=0\n"
+        elif command[0] == "journalctl":
+            stdout = json.dumps(payload) + "\n"
+        return scoped_activation.subprocess.CompletedProcess(
+            command, 0, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+
+    if expected_pass:
+        assert runtime.prove_monitor_rollback_release(release)["release_commit"] == CANDIDATE
     else:
         with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
             runtime.prove_monitor_rollback_release(release)
