@@ -87,8 +87,10 @@ def _save_terminal_authoritative_decision_in_session(
         session.flush()
         return row
 
-    if row.comparison_status == "execution_running":
-        raise RuntimeError("authoritative execution is already in progress")
+    if row.comparison_status in {"execution_running", "execution_uncertain"}:
+        raise RuntimeError(
+            "authoritative execution is already in progress or outcome is uncertain"
+        )
 
     observed_status = row.comparison_status
     observed_token = row.comparison_claim_token
@@ -199,8 +201,10 @@ def save_pending_authoritative_decision(
             session.expunge(row)
             return row
 
-        if row.comparison_status == "execution_running":
-            raise RuntimeError("authoritative execution is already in progress")
+        if row.comparison_status in {"execution_running", "execution_uncertain"}:
+            raise RuntimeError(
+                "authoritative execution is already in progress or outcome is uncertain"
+            )
 
         observed_status = row.comparison_status
         observed_token = row.comparison_claim_token

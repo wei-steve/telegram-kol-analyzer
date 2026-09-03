@@ -9,7 +9,16 @@ from sqlalchemy.orm import Query
 
 import telegram_kol_research.message_processing_worker as worker_module
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import MessageProcessingJob, RawMessage
+from telegram_kol_research.context_resolution_worker import (
+    run_context_resolution_once,
+    schedule_context_reanalysis,
+)
+from telegram_kol_research.models import (
+    ContextResolutionAttempt,
+    MessageProcessingJob,
+    RawMessage,
+    RecognitionDecision,
+)
 from telegram_kol_research.message_processing_worker import (
     claim_message_processing_jobs,
     process_message_job,
@@ -17,6 +26,11 @@ from telegram_kol_research.message_processing_worker import (
     run_message_processing_worker_tick,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.recognition_decisions import (
+    RecognitionDecisionRecord,
+    claim_authoritative_execution,
+    save_pending_authoritative_decision,
+)
 
 
 NOW = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
@@ -79,6 +93,250 @@ def test_process_message_job_runs_the_post_persist_chain_from_raw_id(tmp_path):
         "evidence_version_changed",
     ]
     assert context_runs == ["ran"]
+
+
+def test_legacy_nested_context_reanalysis_failure_is_re_raised_to_outer_job(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "nested-context-job.db")
+    outer_raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    with session_factory() as session:
+        nested_raw = RawMessage(
+            chat_id=2,
+            message_id=2,
+            text="nested message",
+            posted_at=NOW,
+        )
+        session.add(nested_raw)
+        session.flush()
+        nested_raw_id = int(nested_raw.id)
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=nested_raw_id,
+                context_fingerprint="sha256:old",
+                model="deepseek",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                decision_json=(
+                    '{"decision":"unresolved","reanalysis_triggers":'
+                    '["message_edited"]}'
+                ),
+                status="completed",
+                reanalysis_triggers_json='["message_edited"]',
+                attempts=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=nested_raw_id,
+        occurred_at=NOW,
+    )
+
+    def reanalyze(message_id, _fingerprint, **_):
+        saved = save_pending_authoritative_decision(
+            session_factory,
+            RecognitionDecisionRecord(
+                raw_message_id=message_id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload={"recognition_result": "非策略"},
+                auxiliary_model=None,
+                auxiliary_status=None,
+                auxiliary_payload=None,
+                agreement_status="agreed",
+                differences=[],
+            ),
+        )
+        assert claim_authoritative_execution(
+            session_factory,
+            raw_message_id=message_id,
+            authoritative_generation=str(saved.comparison_claim_token),
+        )
+        raise RuntimeError("nested execution failed after claim")
+
+    def context_worker():
+        return run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=reanalyze,
+            now=NOW,
+        )
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            process_kwargs={
+                "authoritative_processor": lambda _raw_id: _processing_result(),
+                "context_resolution_worker": context_worker,
+            },
+        )
+    )
+
+    assert result.succeeded == 0
+    assert result.retried == 1
+    assert result.failed == 0
+    with session_factory() as session:
+        outer_job = session.query(MessageProcessingJob).filter_by(
+            raw_message_id=outer_raw_id
+        ).one()
+        nested_decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=nested_raw_id
+        ).one()
+        assert outer_job.status == "pending"
+        assert outer_job.last_reason == "processing_error:RuntimeError"
+        assert nested_decision.comparison_status == "execution_running"
+
+
+def test_real_leased_nested_failure_is_classified_and_outer_job_is_not_succeeded(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+    from telegram_kol_research.authoritative_execution_attempts import (
+        ExecutionOwnerIdentity,
+    )
+    from telegram_kol_research.authoritative_execution_schema import (
+        apply_recognition_execution_schema,
+        build_recognition_execution_schema_plan,
+    )
+    from telegram_kol_research.authoritative_recognition import (
+        AuthoritativeAssessment,
+        process_authoritative_message,
+    )
+    from telegram_kol_research.models import AuthoritativeExecutionAttempt
+    from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
+
+    session_factory = create_session_factory(tmp_path / "nested-leased-failure.db")
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(engine, expected_plan_sha256=plan.plan_sha256)
+    outer_raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    with session_factory() as session:
+        nested_raw = RawMessage(
+            chat_id=2,
+            message_id=2,
+            text="nested message",
+            posted_at=NOW,
+        )
+        session.add(nested_raw)
+        session.flush()
+        nested_raw_id = int(nested_raw.id)
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=nested_raw_id,
+                context_fingerprint="sha256:old",
+                model="deepseek",
+                prompt_versions_json="{}",
+                request_summary_json="{}",
+                decision_json=(
+                    '{"decision":"unresolved","reanalysis_triggers":'
+                    '["message_edited"]}'
+                ),
+                status="completed",
+                reanalysis_triggers_json='["message_edited"]',
+                attempts=1,
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=nested_raw_id,
+        occurred_at=NOW,
+    )
+    original = RuntimeError("apply failed after durable claim")
+
+    def assess(_session_factory, *, raw_message_id, **_kwargs):
+        saved = save_pending_authoritative_decision(
+            session_factory,
+            RecognitionDecisionRecord(
+                raw_message_id=raw_message_id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload={"recognition_result": "非策略"},
+                auxiliary_model=None,
+                auxiliary_status=None,
+                auxiliary_payload=None,
+                agreement_status="pending",
+                differences=[],
+            ),
+        )
+        return AuthoritativeAssessment(
+            raw_message_id=raw_message_id,
+            mimo=MimoAuthoritativeResult(
+                raw_message_id=raw_message_id,
+                payload={"recognition_result": "非策略"},
+                input_kind="text",
+                model="mimo-v2.5",
+                status="非策略",
+            ),
+            deepseek_payload=None,
+            agreement_status="pending",
+            differences=[],
+            semantic_review_status="execution_pending",
+            authoritative_generation=str(saved.comparison_claim_token),
+        )
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
+        assess,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(original),
+    )
+    owner = ExecutionOwnerIdentity("worker", "instance", 123, "boot", "456")
+
+    def context_worker():
+        return run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=lambda message_id, _fingerprint, **_: process_authoritative_message(
+                session_factory,
+                raw_message_id=message_id,
+                ai_recognition_config=AiRecognitionConfig(),
+                media_root=tmp_path,
+                auto_trade_executor=lambda _: pytest.fail("adapter must not run"),
+                execution_owner=owner,
+            ),
+            now=NOW,
+        )
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            process_kwargs={
+                "authoritative_processor": lambda _raw_id: _processing_result(),
+                "context_resolution_worker": context_worker,
+            },
+        )
+    )
+
+    assert result.succeeded == 0
+    assert result.retried == 1
+    with session_factory() as session:
+        outer_job = session.query(MessageProcessingJob).filter_by(
+            raw_message_id=outer_raw_id
+        ).one()
+        decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=nested_raw_id
+        ).one()
+        attempt = session.query(AuthoritativeExecutionAttempt).one()
+        assert outer_job.status == "pending"
+        assert decision.comparison_status == "completed"
+        assert decision.automation_reason == (
+            "authoritative_execution_abandoned_before_side_effect"
+        )
+        assert attempt.status == "failed_safe"
 
 
 def _add_job(session_factory, *, chat_id, message_id, posted_at=NOW):

@@ -666,8 +666,21 @@ def run_message_operation_shadow_once(
     }
     for raw_message_id, comparison_status, contract_id in rows:
         result["messages_scanned"] += 1
-        if comparison_status not in {"completed", "failed"}:
+        # `execution_uncertain` is intentionally non-terminal.  Keep the
+        # complete state vocabulary explicit so future additions cannot fall
+        # through to projection by accident.
+        if comparison_status in {
+            None,
+            "pending",
+            "running",
+            "execution_pending",
+            "execution_running",
+            "execution_uncertain",
+        }:
             result["pending_blocked"] = 1
+            break
+        if comparison_status not in {"completed", "failed"}:
+            result["errors"] += 1
             break
         if contract_id is not None:
             result["existing_skipped"] += 1

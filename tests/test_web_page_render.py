@@ -5077,6 +5077,14 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
         ("completed", None, "agreed", "待重新复核", None, []),
         ("execution_pending", None, "pending", "等待中", None, []),
         ("execution_running", None, "pending", "等待中", None, []),
+        (
+            "execution_uncertain",
+            None,
+            "pending",
+            "执行结果未知",
+            None,
+            [],
+        ),
         ("failed", None, "pending", "失败", None, []),
     ]
     with session_factory() as session:
@@ -5143,6 +5151,39 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     assert "never-render-frozen-token" not in response.text
     assert "provider timeout" not in response.text
     assert "历史记录没有语义分歧等级，需重新复核" in response.text
+
+
+def test_execution_uncertain_is_not_masked_by_legacy_auxiliary_model(tmp_path):
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=78, message_id=1, text="message")
+        session.add(raw)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                auxiliary_model="legacy-deepseek",
+                auxiliary_status="completed",
+                agreement_status="pending",
+                differences_json="[]",
+                comparison_status="execution_uncertain",
+                comparison_model=None,
+            )
+        )
+        session.commit()
+
+    response = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/78/detail/tab/messages"
+    )
+
+    assert response.status_code == 200
+    assert "AI复核：执行结果未知" in response.text
+    assert "交易所副作用结果尚未得到确定证据" in response.text
 
 
 def test_message_detail_renders_review_disabled_without_deepseek_claim(tmp_path):

@@ -9,8 +9,12 @@ from telegram_kol_research.cli import (
     _process_raw_messages_with_mimo_authority,
     _run_telegram_sync,
 )
+from telegram_kol_research.authoritative_execution_schema import (
+    apply_recognition_execution_schema,
+    build_recognition_execution_schema_plan,
+)
 from telegram_kol_research.db import create_session_factory
-from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import AuthoritativeExecutionAttempt, RawMessage
 
 
 def test_cli_parse_uses_authoritative_processor_without_auto_trade(tmp_path, monkeypatch):
@@ -48,6 +52,87 @@ def test_cli_parse_uses_authoritative_processor_without_auto_trade(tmp_path, mon
     assert len(calls) == 1
     assert calls[0]["raw_message_id"] == raw_id
     assert calls[0]["auto_trade_executor"] is None
+    assert calls[0]["execution_owner"] is None
+    assert calls[0]["execution_registry"] is None
+
+
+def test_cli_parse_uses_execution_lease_when_exact_schema_is_installed(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(
+        engine,
+        expected_plan_sha256=plan.plan_sha256,
+    )
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=11, text="BTC long")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    calls: list[dict] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_ai_recognition_config",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.process_authoritative_message",
+        lambda *args, **kwargs: calls.append(kwargs)
+        or SimpleNamespace(
+            assessment=SimpleNamespace(agreement_status="agreed"),
+            automation={"status": "skipped", "reason": "test"},
+        ),
+    )
+
+    asyncio.run(
+        _process_raw_messages_with_mimo_authority(
+            session_factory,
+            raw_message_ids=[raw_id],
+            ai_recognition_config_path=Path("ai.yaml"),
+            media_root=tmp_path / "media",
+        )
+    )
+
+    assert calls[0]["execution_owner"].runtime_role == "all"
+    assert calls[0]["execution_registry"] is not None
+
+
+def test_cli_parse_fails_closed_when_execution_schema_is_partially_installed(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    engine = session_factory.kw["bind"]
+    AuthoritativeExecutionAttempt.__table__.create(engine)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=12, text="BTC long")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.load_ai_recognition_config",
+        lambda path: object(),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.cli.process_authoritative_message",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("processor must not run with partial schema")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="schema is incomplete or invalid"):
+        asyncio.run(
+            _process_raw_messages_with_mimo_authority(
+                session_factory,
+                raw_message_ids=[raw_id],
+                ai_recognition_config_path=Path("ai.yaml"),
+                media_root=tmp_path / "media",
+            )
+        )
 
 
 def test_cli_authoritative_result_leaves_semantic_review_pending(

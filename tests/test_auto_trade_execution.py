@@ -400,7 +400,7 @@ def test_same_message_management_submission_precedes_entry_submission(
     ]
 
 
-def test_unknown_management_submission_does_not_retry_or_block_same_message_entry(
+def test_unknown_management_submission_propagates_to_lease_and_is_not_retried(
     tmp_path, monkeypatch
 ):
     session_factory = create_session_factory(tmp_path / "unknown-submission.db")
@@ -422,12 +422,13 @@ def test_unknown_management_submission_does_not_retry_or_block_same_message_entr
         raising=False,
     )
 
-    first = auto_process_message_trade_signal(
-        session_factory,
-        raw_message_id=raw_message_id,
-        group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
-    )
+    with pytest.raises(DeepcoinRequestOutcomeUnknown):
+        auto_process_message_trade_signal(
+            session_factory,
+            raw_message_id=raw_message_id,
+            group_config=_group_config(),
+            deepcoin_client=_FakeDeepcoinClient(),
+        )
     second = auto_process_message_trade_signal(
         session_factory,
         raw_message_id=raw_message_id,
@@ -436,8 +437,7 @@ def test_unknown_management_submission_does_not_retry_or_block_same_message_entr
     )
 
     assert call_counts == {"management": 1, "entry": 1}
-    assert [item["status"] for item in first["items"]] == ["unknown", "submitted"]
-    assert second == first
+    assert [item["status"] for item in second["items"]] == ["unknown", "submitted"]
 
 
 def test_retired_instruction_set_never_falls_back_to_candidate_execution(

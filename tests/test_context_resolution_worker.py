@@ -20,10 +20,16 @@ from telegram_kol_research.models import (
     MessageInstructionItem,
     PositionProtectionLedger,
     RawMessage,
+    RecognitionDecision,
     RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
     StrategyThread,
+)
+from telegram_kol_research.recognition_decisions import (
+    RecognitionDecisionRecord,
+    claim_authoritative_execution,
+    save_pending_authoritative_decision,
 )
 
 
@@ -174,7 +180,7 @@ def test_unchanged_fingerprint_does_not_call_ai(tmp_path):
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:old",
-        reanalyze=lambda *_: (_ for _ in ()).throw(
+        reanalyze=lambda *_, **__: (_ for _ in ()).throw(
             AssertionError("unchanged context must not call AI")
         ),
         now=NOW,
@@ -199,7 +205,8 @@ def test_disabled_or_removed_chat_is_never_reanalyzed(tmp_path):
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=lambda *_: calls.append("resolver") or {"status": "completed"},
+        reanalyze=lambda *_, **__: calls.append("resolver")
+        or {"status": "completed"},
         now=NOW,
         is_eligible=lambda _: False,
     )
@@ -227,7 +234,7 @@ def test_new_fingerprint_runs_once_and_supersedes_old_attempt(tmp_path):
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=lambda message_id, fingerprint: calls.append(
+        reanalyze=lambda message_id, fingerprint, **_: calls.append(
             (message_id, fingerprint)
         )
         or {"status": "completed"},
@@ -252,7 +259,7 @@ def test_unchanged_exchange_snapshot_does_not_force_a_new_generation(tmp_path):
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:old",
-        reanalyze=lambda *_: (_ for _ in ()).throw(
+        reanalyze=lambda *_, **__: (_ for _ in ()).throw(
             AssertionError("unchanged exchange state must not call AI")
         ),
         now=NOW,
@@ -531,7 +538,7 @@ def test_terminal_instruction_is_never_replayed(tmp_path, terminal_status):
     result = run_context_resolution_once(
         session_factory,
         context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=lambda *_: (_ for _ in ()).throw(
+        reanalyze=lambda *_, **__: (_ for _ in ()).throw(
             AssertionError("terminal instruction must not replay")
         ),
         now=NOW,
@@ -560,17 +567,47 @@ def test_final_failure_notifies_once_after_bounded_attempts(tmp_path):
     )
     notices = []
 
-    result = run_context_resolution_once(
-        session_factory,
-        context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=lambda *_: (_ for _ in ()).throw(RuntimeError("temporary")),
-        notify_final_failure=lambda payload: notices.append(payload),
-        max_attempts=3,
-        now=NOW,
-    )
-
-    assert result["status"] == "exhausted"
+    with pytest.raises(RuntimeError, match="temporary"):
+        run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=lambda *_, **__: (_ for _ in ()).throw(
+                RuntimeError("temporary")
+            ),
+            notify_final_failure=lambda payload: notices.append(payload),
+            max_attempts=3,
+            now=NOW,
+        )
     assert len(notices) == 1
+
+
+def test_final_failure_notification_error_does_not_replace_reanalysis_error(tmp_path):
+    session_factory = create_session_factory(tmp_path / "failure-identity.db")
+    raw_id, attempt_id = _persist_unresolved(session_factory)
+    with session_factory() as session:
+        session.get(ContextResolutionAttempt, attempt_id).attempts = 3
+        session.commit()
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+    original = RuntimeError("original reanalysis failure")
+
+    with pytest.raises(RuntimeError) as raised:
+        run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=lambda *_, **__: (_ for _ in ()).throw(original),
+            notify_final_failure=lambda _: (_ for _ in ()).throw(
+                ValueError("notification failed")
+            ),
+            max_attempts=3,
+            now=NOW,
+        )
+
+    assert raised.value is original
 
 
 def test_reanalysis_network_retry_uses_new_generation_without_duplicate_queue(
@@ -585,7 +622,7 @@ def test_reanalysis_network_retry_uses_new_generation_without_duplicate_queue(
         occurred_at=NOW,
     )
 
-    def persist_new_generation_then_fail(message_id, fingerprint):
+    def persist_new_generation_then_fail(message_id, fingerprint, **_):
         with session_factory() as session:
             session.add(
                 ContextResolutionAttempt(
@@ -606,14 +643,13 @@ def test_reanalysis_network_retry_uses_new_generation_without_duplicate_queue(
             session.commit()
         raise RuntimeError("network retry persisted by resolver")
 
-    result = run_context_resolution_once(
-        session_factory,
-        context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=persist_new_generation_then_fail,
-        now=NOW,
-    )
-
-    assert result["status"] == "retry_scheduled"
+    with pytest.raises(RuntimeError, match="network retry persisted by resolver"):
+        run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=persist_new_generation_then_fail,
+            now=NOW,
+        )
     with session_factory() as session:
         rows = session.query(ContextResolutionAttempt).order_by(
             ContextResolutionAttempt.id
@@ -624,6 +660,53 @@ def test_reanalysis_network_retry_uses_new_generation_without_duplicate_queue(
         )
         assert rows[1].status == "retry_pending"
         assert rows[1].attempts == 1
+
+
+def test_nested_reanalysis_exception_is_re_raised_after_retry_is_persisted(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "nested-running-root-cause.db")
+    raw_id, _ = _persist_unresolved(session_factory)
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+
+    def claim_then_raise(message_id, _fingerprint, **_):
+        saved = save_pending_authoritative_decision(
+            session_factory,
+            RecognitionDecisionRecord(
+                raw_message_id=message_id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="非策略",
+                authoritative_payload={"recognition_result": "非策略"},
+                auxiliary_model=None,
+                auxiliary_status=None,
+                auxiliary_payload=None,
+                agreement_status="agreed",
+                differences=[],
+            ),
+        )
+        assert claim_authoritative_execution(
+            session_factory,
+            raw_message_id=message_id,
+            authoritative_generation=str(saved.comparison_claim_token),
+        )
+        raise RuntimeError("nested authoritative execution failed")
+
+    with pytest.raises(RuntimeError, match="nested authoritative execution failed"):
+        run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=claim_then_raise,
+            now=NOW,
+        )
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "execution_running"
 
 
 def test_exhausted_worker_records_incident_only_after_source_state_commits(
@@ -678,15 +761,16 @@ def test_exhausted_worker_records_incident_only_after_source_state_commits(
         capture_best_effort,
     )
 
-    result = run_context_resolution_once(
-        session_factory,
-        context_fingerprint_factory=lambda _: "sha256:new",
-        reanalyze=lambda *_: (_ for _ in ()).throw(RuntimeError("temporary")),
-        max_attempts=3,
-        now=NOW,
-    )
-
-    assert result["status"] == "exhausted"
+    with pytest.raises(RuntimeError, match="temporary"):
+        run_context_resolution_once(
+            session_factory,
+            context_fingerprint_factory=lambda _: "sha256:new",
+            reanalyze=lambda *_, **__: (_ for _ in ()).throw(
+                RuntimeError("temporary")
+            ),
+            max_attempts=3,
+            now=NOW,
+        )
     assert captured == [
         (
             context_worker_module.capture_context_worker_state,

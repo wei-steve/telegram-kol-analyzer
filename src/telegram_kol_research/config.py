@@ -24,6 +24,7 @@ READ_ONLY_CAPTURE_PROFILE = frozenset(
         "monitor_adapter_failure",
         "monitor_audit_incomplete",
         "notification_delivery_failure",
+        "recognition_execution_orphan",
     }
 )
 _SQLITE_MAX_INTEGER = 2**63 - 1

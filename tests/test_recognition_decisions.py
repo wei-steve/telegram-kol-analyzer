@@ -168,6 +168,67 @@ def test_stale_automation_generation_cannot_publish_new_rerecognition(tmp_path):
     assert finalized.automation_reason == "new_generation"
 
 
+@pytest.mark.parametrize(
+    "protected_status", ["execution_running", "execution_uncertain"]
+)
+def test_active_or_uncertain_execution_rejects_pending_authoritative_overwrite(
+    tmp_path,
+    protected_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    saved = save_pending_authoritative_decision(session_factory, _record(raw_id))
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        row.comparison_status = protected_status
+        session.commit()
+
+    with pytest.raises(RuntimeError, match="already in progress|outcome is uncertain"):
+        save_pending_authoritative_decision(
+            session_factory,
+            _record(raw_id, {"lifecycle_event": {"event_type": "position_update"}}),
+        )
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == protected_status
+        assert row.comparison_claim_token == saved.comparison_claim_token
+
+
+@pytest.mark.parametrize(
+    "protected_status", ["execution_running", "execution_uncertain"]
+)
+def test_active_or_uncertain_execution_rejects_terminal_authoritative_overwrite(
+    tmp_path,
+    protected_status,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id = _raw_message(session_factory)
+    saved = save_pending_authoritative_decision(session_factory, _record(raw_id))
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        row.comparison_status = protected_status
+        session.commit()
+
+    terminal = _record(
+        raw_id,
+        {"lifecycle_event": {"event_type": "position_update"}},
+    )
+    terminal = RecognitionDecisionRecord(
+        **{
+            **terminal.__dict__,
+            "agreement_status": "authoritative_failed",
+        }
+    )
+    with pytest.raises(RuntimeError, match="already in progress|outcome is uncertain"):
+        save_terminal_authoritative_decision(session_factory, terminal)
+
+    with session_factory() as session:
+        row = session.query(RecognitionDecision).one()
+        assert row.comparison_status == protected_status
+        assert row.comparison_claim_token == saved.comparison_claim_token
+
+
 def test_disabled_semantic_review_finalizes_as_compatible_terminal_state(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id = _raw_message(session_factory)

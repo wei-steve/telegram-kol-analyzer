@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import update
+from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -24,6 +24,7 @@ from telegram_kol_research.adjacent_entry_assembly import (
 )
 from telegram_kol_research.models import (
     EntryAssemblyAttempt,
+    EntryAssemblyWakeupExecution,
     EntryPreamble,
     EntryStrategyFragment,
     MessageEvidenceExtractionClaim,
@@ -59,7 +60,10 @@ class EntryAdmissionDecision:
 class EntryAssemblyWakeClaim:
     attempt_id: int
     strategy_raw_message_id: int
+    trigger_raw_message_id: int
     claim_token: str
+    child_execution_id: int | None = None
+    wake_generation: int | None = None
 
 
 def _canonical_json(value: object) -> str:
@@ -645,34 +649,24 @@ def claim_ready_entry_assembly_wakeups(
     completed_raw_message_id: int,
     now: datetime,
     limit: int = 20,
+    execution_owner=None,
+    execution_registry=None,
 ) -> tuple[EntryAssemblyWakeClaim, ...]:
     """Claim each strategy whose final unresolved source fact just became terminal."""
 
     claimed: list[EntryAssemblyWakeClaim] = []
+    if execution_owner is None:
+        raise RuntimeError("entry_assembly_wakeup_execution_owner_required")
+    from telegram_kol_research.authoritative_execution_schema import (
+        require_recognition_execution_schema,
+    )
+
+    require_recognition_execution_schema(session_factory)
+    if execution_owner.runtime_role not in {"worker", "all"}:
+        raise RuntimeError("entry_assembly_wakeup_not_owned_by_runtime_role")
+    if execution_registry is not None:
+        execution_registry.require_accepting()
     with session_factory() as session:
-        stale_before = now - timedelta(minutes=5)
-        stale_attempt_ids = {
-            int(row_id)
-            for (row_id,) in session.query(EntryAssemblyAttempt.id)
-            .filter(
-                EntryAssemblyAttempt.status == "claimed",
-                EntryAssemblyAttempt.wake_claimed_at <= stale_before,
-            )
-            .all()
-        }
-        session.execute(
-            update(EntryAssemblyAttempt)
-            .where(
-                EntryAssemblyAttempt.status == "claimed",
-                EntryAssemblyAttempt.wake_claimed_at <= stale_before,
-            )
-            .values(
-                status="pending",
-                wake_claim_token=None,
-                wake_claimed_at=None,
-                updated_at=now,
-            )
-        )
         pending_rows = (
             session.query(EntryAssemblyAttempt.id)
             .filter(EntryAssemblyAttempt.status == "pending")
@@ -681,7 +675,10 @@ def claim_ready_entry_assembly_wakeups(
         )
         attempt_ids = [int(row_id) for (row_id,) in pending_rows]
         session.commit()
-    claim_limit = max(1, min(int(limit), 100))
+    # Claim exactly one child at a time. A batch of durable claims made before
+    # adapter admission can strand the unvisited children when the first child
+    # fails or process drain begins.
+    claim_limit = 1
     for attempt_id in attempt_ids:
         if len(claimed) >= claim_limit:
             break
@@ -694,19 +691,14 @@ def claim_ready_entry_assembly_wakeups(
                 try:
                     blockers = [int(value) for value in json.loads(old_blockers_json)]
                 except (TypeError, ValueError, json.JSONDecodeError):
-                    blockers = []
-                stale_recovery = int(attempt.id) in stale_attempt_ids
-                if not stale_recovery and int(completed_raw_message_id) not in blockers:
                     break
-                remaining = (
-                    []
-                    if stale_recovery
-                    else [
-                        value
-                        for value in blockers
-                        if value != int(completed_raw_message_id)
-                    ]
-                )
+                if not blockers or int(completed_raw_message_id) not in blockers:
+                    break
+                remaining = [
+                    value
+                    for value in blockers
+                    if value != int(completed_raw_message_id)
+                ]
                 if remaining:
                     result = session.execute(
                         update(EntryAssemblyAttempt)
@@ -736,6 +728,7 @@ def claim_ready_entry_assembly_wakeups(
                     )
                     .values(
                         status="claimed",
+                        blocking_raw_message_ids_json=_canonical_json(remaining),
                         wake_claim_token=claim_token,
                         wake_claimed_at=now,
                         updated_at=now,
@@ -764,6 +757,51 @@ def claim_ready_entry_assembly_wakeups(
                         )
                         session.commit()
                         break
+                    child_execution_id = None
+                    wake_generation = None
+                    wake_generation = int(
+                        session.query(
+                            func.coalesce(
+                                func.max(
+                                    EntryAssemblyWakeupExecution.wake_generation
+                                ),
+                                0,
+                            )
+                        )
+                        .filter(
+                            EntryAssemblyWakeupExecution.entry_assembly_attempt_id
+                            == int(attempt.id)
+                        )
+                        .scalar()
+                    ) + 1
+                    child = EntryAssemblyWakeupExecution(
+                        entry_assembly_attempt_id=int(attempt.id),
+                        wake_generation=wake_generation,
+                        strategy_raw_message_id=int(attempt.strategy_raw_message_id),
+                        trigger_raw_message_id=int(completed_raw_message_id),
+                        status="claimed",
+                        claim_token=claim_token,
+                        owner_runtime_role=execution_owner.runtime_role,
+                        owner_instance_id=execution_owner.instance_id[:64],
+                        owner_pid=int(execution_owner.pid),
+                        owner_boot_id=execution_owner.boot_id[:128],
+                        owner_process_start_ticks=(
+                            execution_owner.process_start_ticks[:64]
+                        ),
+                        owner_systemd_invocation_id=(
+                            execution_owner.systemd_invocation_id[:128]
+                            if execution_owner.systemd_invocation_id
+                            else None
+                        ),
+                        claimed_at=now,
+                        heartbeat_at=now,
+                        lease_expires_at=now + timedelta(minutes=2),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                    session.add(child)
+                    session.flush()
+                    child_execution_id = int(child.id)
                     session.commit()
                     claimed.append(
                         EntryAssemblyWakeClaim(
@@ -771,38 +809,12 @@ def claim_ready_entry_assembly_wakeups(
                             strategy_raw_message_id=int(
                                 attempt.strategy_raw_message_id
                             ),
+                            trigger_raw_message_id=int(completed_raw_message_id),
                             claim_token=claim_token,
+                            child_execution_id=child_execution_id,
+                            wake_generation=wake_generation,
                         )
                     )
                     break
                 session.commit()
     return tuple(claimed)
-
-
-def finish_entry_assembly_wakeup(
-    session_factory: sessionmaker,
-    *,
-    attempt_id: int,
-    claim_token: str,
-    succeeded: bool,
-    now: datetime,
-) -> None:
-    with session_factory() as session:
-        result = session.execute(
-            update(EntryAssemblyAttempt)
-            .where(
-                EntryAssemblyAttempt.id == int(attempt_id),
-                EntryAssemblyAttempt.status == "claimed",
-                EntryAssemblyAttempt.wake_claim_token == str(claim_token),
-            )
-            .values(
-                status="woken" if succeeded else "pending",
-                woken_at=now if succeeded else None,
-                wake_claim_token=None,
-                wake_claimed_at=None,
-                updated_at=now,
-            )
-        )
-        session.commit()
-        if int(result.rowcount or 0) != 1:
-            raise RuntimeError("entry assembly wake claim identity changed")

@@ -25,6 +25,7 @@ from telegram_kol_research.models import (
     ExecutionEvent,
     ExecutionOrderLeg,
     InstructionExecutionContract,
+    MessageProcessingJob,
     MessageInstructionItem,
     MessageEvidenceVersion,
     RawMessage,
@@ -67,6 +68,7 @@ from telegram_kol_research.strategy_threads import (
 )
 from telegram_kol_research.strategy_thread_candidates import StrategyThreadCandidate
 from telegram_kol_research.trading_settings import save_trading_settings
+from telegram_kol_research.execution_boundary import ExecutionBoundaryOutcome
 
 
 def _v1_nontrading_result(raw_message_id: int) -> MimoAuthoritativeResult:
@@ -90,6 +92,60 @@ def _v1_nontrading_result(raw_message_id: int) -> MimoAuthoritativeResult:
         status="非策略",
         prompt_versions={"trading.analysis.shared": 11},
     )
+
+
+def _install_execution_schema(session_factory):
+    from telegram_kol_research.authoritative_execution_schema import (
+        apply_recognition_execution_schema,
+        build_recognition_execution_schema_plan,
+    )
+
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(
+        engine, expected_plan_sha256=plan.plan_sha256
+    )
+
+
+def _execution_owner():
+    from telegram_kol_research.authoritative_execution_attempts import (
+        ExecutionOwnerIdentity,
+    )
+
+    return ExecutionOwnerIdentity(
+        runtime_role="worker",
+        instance_id="test-instance",
+        pid=123,
+        boot_id="test-boot",
+        process_start_ticks="456",
+    )
+
+
+def test_owned_execution_requires_explicit_schema_before_recognition(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "missing-lease-schema.db")
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=3199, text="message")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    calls = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: calls.append("mimo"),
+    )
+
+    with pytest.raises(RuntimeError, match="recognition_execution_schema_invalid"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            execution_owner=_execution_owner(),
+        )
+
+    assert calls == []
 
 
 def _v2_nontrading_inference(session_factory, raw_message_id: int):
@@ -2287,6 +2343,456 @@ def test_outcome_persist_failure_after_submit_leaves_review_unclaimable(
         decision = session.query(RecognitionDecision).one()
         assert decision.comparison_status == "execution_running"
         assert decision.automation_status is None
+
+
+def test_post_claim_exception_must_not_leave_unclassified_running_decision(
+    tmp_path,
+    monkeypatch,
+):
+    session_factory = create_session_factory(tmp_path / "post-claim-release.db")
+    _install_execution_schema(session_factory)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=3201, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: _v1_nontrading_result(raw_id),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("post-claim assessment failure")
+        ),
+    )
+
+    with pytest.raises(RuntimeError, match="post-claim assessment failure"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            execution_owner=_execution_owner(),
+        )
+
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "completed"
+        assert decision.automation_status == "failed"
+        assert (
+            decision.automation_reason
+            == "authoritative_execution_abandoned_before_side_effect"
+        )
+
+
+def _prepare_leased_authoritative_case(tmp_path, monkeypatch, name):
+    session_factory = create_session_factory(tmp_path / f"{name}.db")
+    _install_execution_schema(session_factory)
+    with session_factory() as session:
+        raw = RawMessage(chat_id=1, message_id=3300, text="ordinary commentary")
+        session.add(raw)
+        session.commit()
+        raw_id = int(raw.id)
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.run_mimo_authoritative_for_message",
+        lambda *args, **kwargs: _v1_nontrading_result(raw_id),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
+        lambda *args, **kwargs: SimpleNamespace(status="非策略"),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._has_current_mimo_candidate",
+        lambda *args, **kwargs: True,
+    )
+    return session_factory, raw_id
+
+
+def test_boundary_cas_failure_prevents_adapter_call(tmp_path, monkeypatch):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "boundary-cas"
+    )
+    calls = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.mark_authoritative_side_effect_started",
+        lambda *args, **kwargs: False,
+    )
+
+    with pytest.raises(RuntimeError, match="boundary_cas_failed"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda message_id: calls.append(message_id),
+            execution_owner=_execution_owner(),
+        )
+
+    assert calls == []
+
+
+def test_process_drain_refuses_before_durable_execution_claim(tmp_path, monkeypatch):
+    from telegram_kol_research.models import AuthoritativeExecutionAttempt
+    from telegram_kol_research.recognition_execution_runtime import (
+        RecognitionExecutionRegistry,
+    )
+
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "drain-before-claim"
+    )
+    registry = RecognitionExecutionRegistry()
+    registry.stop_admission()
+
+    with pytest.raises(RuntimeError, match="draining"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda _: pytest.fail("adapter must not run"),
+            execution_owner=_execution_owner(),
+            execution_registry=registry,
+        )
+
+    with session_factory() as session:
+        assert session.query(AuthoritativeExecutionAttempt).count() == 0
+
+
+def test_process_drain_race_classifies_claim_before_adapter(tmp_path, monkeypatch):
+    from telegram_kol_research.models import AuthoritativeExecutionAttempt
+
+    class _RaceRegistry:
+        def require_accepting(self):
+            return None
+
+        def admitted(self, _token):
+            class _RejectedScope:
+                def __enter__(self):
+                    raise RuntimeError("recognition_execution_draining")
+
+                def __exit__(self, *_args):
+                    return None
+
+            return _RejectedScope()
+
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "drain-race"
+    )
+    with pytest.raises(RuntimeError, match="draining"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda _: pytest.fail("adapter must not run"),
+            execution_owner=_execution_owner(),
+            execution_registry=_RaceRegistry(),
+        )
+
+    with session_factory() as session:
+        attempt = session.query(AuthoritativeExecutionAttempt).one()
+        assert attempt.status == "failed_safe"
+
+
+def test_process_drain_race_preserves_original_error_when_fail_safe_raises(
+    tmp_path, monkeypatch
+):
+    original = RuntimeError("recognition_execution_draining")
+
+    class _RaceRegistry:
+        def require_accepting(self):
+            return None
+
+        def admitted(self, _token):
+            class _RejectedScope:
+                def __enter__(self):
+                    raise original
+
+                def __exit__(self, *_args):
+                    return None
+
+            return _RejectedScope()
+
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "drain-race-original-error"
+    )
+    incidents = []
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.fail_safe_authoritative_execution_attempt",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("terminalization unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._capture_terminalization_failure",
+        lambda *args, **kwargs: incidents.append(kwargs),
+    )
+
+    with pytest.raises(RuntimeError) as raised:
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=lambda _: pytest.fail("adapter must not run"),
+            execution_owner=_execution_owner(),
+            execution_registry=_RaceRegistry(),
+        )
+
+    assert raised.value is original
+    assert incidents[0]["action"] == "drain_race_terminalize_failed"
+
+
+def test_post_boundary_unknown_freezes_generation_and_never_replays(
+    tmp_path, monkeypatch
+):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "boundary-unknown"
+    )
+    calls = []
+
+    def executor(message_id):
+        calls.append(message_id)
+        return ExecutionBoundaryOutcome(
+            status="outcome_unknown",
+            exchange_effect="outcome_unknown",
+            raw_status="unknown",
+            reason_code="venue_timeout",
+            evidence_refs=(),
+            public_result={"status": "unknown", "reason": "venue_timeout"},
+        )
+
+    with pytest.raises(RuntimeError, match="outcome_unknown"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=executor,
+            execution_owner=_execution_owner(),
+        )
+    assert calls == [raw_id]
+
+    with pytest.raises(RuntimeError, match="uncertain"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=executor,
+            execution_owner=_execution_owner(),
+        )
+    assert calls == [raw_id]
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.comparison_status == "execution_uncertain"
+
+
+@pytest.mark.parametrize(
+    ("exchange_effect", "public_result"),
+    [
+        (
+            "confirmed_applied",
+            {"status": "submitted", "reason": "entry_submitted", "order_id": "7"},
+        ),
+        (
+            "confirmed_rejected",
+            {"status": "failed", "reason": "venue_rejected"},
+        ),
+        (
+            "not_started",
+            {"status": "blocked", "reason": "policy_blocked"},
+        ),
+    ],
+)
+def test_leased_executor_preserves_canonical_public_result_byte_for_byte(
+    tmp_path, monkeypatch, exchange_effect, public_result
+):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, f"public-{exchange_effect}"
+    )
+
+    result = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda _: ExecutionBoundaryOutcome(
+            status="completed",
+            exchange_effect=exchange_effect,
+            raw_status=str(public_result["status"]),
+            reason_code=str(public_result["reason"]),
+            evidence_refs=(
+                ({"kind": "deepcoin_write", "ordinal": 1},)
+                if exchange_effect != "not_started"
+                else ()
+            ),
+            public_result=dict(public_result),
+        ),
+        execution_owner=_execution_owner(),
+    )
+
+    assert result.automation == public_result
+
+
+def test_persisted_outcome_can_finalize_without_replaying_adapter(
+    tmp_path, monkeypatch
+):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "finalize-only"
+    )
+    calls = []
+    incidents = []
+    real_finalize = __import__(
+        "telegram_kol_research.authoritative_execution_attempts",
+        fromlist=["finalize_recorded_authoritative_execution"],
+    ).finalize_recorded_authoritative_execution
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.finalize_recorded_authoritative_execution",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("finalize unavailable")
+        ),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition._capture_terminalization_failure",
+        lambda *args, **kwargs: incidents.append(kwargs),
+    )
+
+    def executor(message_id):
+        calls.append(message_id)
+        return ExecutionBoundaryOutcome(
+            status="completed",
+            exchange_effect="confirmed_applied",
+            raw_status="submitted",
+            reason_code="entry_submitted",
+            evidence_refs=({"kind": "deepcoin_write", "ordinal": 1},),
+            public_result={"status": "submitted", "reason": "entry_submitted"},
+        )
+
+    with pytest.raises(RuntimeError, match="finalize unavailable"):
+        process_authoritative_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=AiRecognitionConfig(),
+            media_root=tmp_path,
+            auto_trade_executor=executor,
+            execution_owner=_execution_owner(),
+        )
+    assert calls == [raw_id]
+    assert incidents == [
+        {
+            "family": "active_authoritative_attempt",
+            "row_id": 1,
+            "raw_message_id": raw_id,
+            "phase": "outcome_recorded",
+            "action": "finalize_raised",
+        }
+    ]
+
+    from telegram_kol_research.models import AuthoritativeExecutionAttempt
+
+    with session_factory() as session:
+        attempt = session.query(AuthoritativeExecutionAttempt).one()
+        assert attempt.status == "outcome_recorded"
+        raw = session.get(RawMessage, raw_id)
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=raw_id,
+                chat_id=int(raw.chat_id),
+                status="claimed",
+                attempt_count=1,
+                claim_token="retry-token",
+                claimed_at=datetime.now(UTC),
+                last_reason="worker_claimed",
+                shadow=False,
+            )
+        )
+        session.commit()
+    def scanner_wins_finalize_race(*args, **kwargs):
+        real_finalize(*args, **kwargs)
+        raise RuntimeError("scanner won finalize race")
+
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.finalize_recorded_authoritative_execution",
+        scanner_wins_finalize_race,
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
+        lambda *args, **kwargs: pytest.fail("provider path must not rerun"),
+    )
+    retried = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda _: pytest.fail("adapter must not replay"),
+        execution_owner=_execution_owner(),
+    )
+    assert calls == [raw_id]
+    assert retried.automation == {
+        "status": "submitted",
+        "reason": "entry_submitted",
+    }
+    with session_factory() as session:
+        assert session.query(AuthoritativeExecutionAttempt).one().status == "succeeded"
+
+
+def test_automatic_job_retry_reuses_exact_succeeded_execution_without_provider_or_adapter(
+    tmp_path, monkeypatch
+):
+    session_factory, raw_id = _prepare_leased_authoritative_case(
+        tmp_path, monkeypatch, "automatic-retry-no-replay"
+    )
+    adapter_calls = []
+    first = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda message_id: adapter_calls.append(message_id)
+        or ExecutionBoundaryOutcome(
+            status="completed",
+            exchange_effect="confirmed_applied",
+            raw_status="submitted",
+            reason_code="entry_submitted",
+            evidence_refs=({"kind": "deepcoin_write", "ordinal": 1},),
+            public_result={"status": "submitted", "reason": "entry_submitted"},
+        ),
+        execution_owner=_execution_owner(),
+    )
+    with session_factory() as session:
+        raw = session.get(RawMessage, raw_id)
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=raw_id,
+                chat_id=int(raw.chat_id),
+                status="claimed",
+                attempt_count=1,
+                claim_token="retry-token",
+                claimed_at=datetime.now(UTC),
+                last_reason="worker_claimed",
+                shadow=False,
+            )
+        )
+        session.commit()
+    monkeypatch.setattr(
+        "telegram_kol_research.authoritative_recognition.assess_message_authoritatively",
+        lambda *args, **kwargs: pytest.fail("provider path must not run"),
+    )
+
+    retried = process_authoritative_message(
+        session_factory,
+        raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(),
+        media_root=tmp_path,
+        auto_trade_executor=lambda _: pytest.fail("adapter must not replay"),
+        execution_owner=_execution_owner(),
+    )
+
+    assert adapter_calls == [raw_id]
+    assert retried.automation == first.automation
 
 
 def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(

@@ -59,6 +59,44 @@ def test_create_web_app_defaults_to_the_existing_all_role(tmp_path):
     assert app.state.runtime_role == "all"
 
 
+@pytest.mark.parametrize(
+    ("role", "owns_execution"),
+    [("all", True), ("worker", True), ("ingest", False), ("web", False)],
+)
+def test_only_worker_and_all_own_recognition_execution_leases(
+    tmp_path, role, owns_execution
+):
+    from telegram_kol_research.web_app import create_web_app
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}.db",
+        runtime_role=role,
+    )
+
+    assert (app.state.recognition_execution_owner is not None) is owns_execution
+    if owns_execution:
+        assert app.state.recognition_execution_owner.runtime_role == role
+    assert app.state.recognition_execution_schema_valid is False
+
+
+@pytest.mark.parametrize("role", ["web", "ingest"])
+def test_non_owner_roles_fail_closed_before_authoritative_processing(
+    tmp_path, role
+):
+    from telegram_kol_research.web_app import (
+        _run_authoritative_processor,
+        create_web_app,
+    )
+
+    app = create_web_app(
+        database_path=tmp_path / f"{role}-recognition.db",
+        runtime_role=role,
+    )
+
+    with pytest.raises(RuntimeError, match="not_owned_by_runtime_role"):
+        _run_authoritative_processor(app, raw_message_id=1)
+
+
 def test_explicit_empty_env_file_paths_disable_checkout_secret_fallbacks(
     tmp_path, monkeypatch
 ):

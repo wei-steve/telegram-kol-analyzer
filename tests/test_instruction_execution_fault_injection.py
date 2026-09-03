@@ -10,11 +10,17 @@ import telegram_kol_research.auto_trade_execution as auto_trade_execution_module
 from telegram_kol_research.auto_trade_execution import (
     execute_message_instruction_items,
 )
+from telegram_kol_research.authoritative_execution_attempts import (
+    ExecutionOwnerIdentity,
+)
+from telegram_kol_research.authoritative_execution_schema import (
+    apply_recognition_execution_schema,
+    build_recognition_execution_schema_plan,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.entry_assembly_admission import (
     claim_ready_entry_assembly_wakeups,
-    finish_entry_assembly_wakeup,
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
     seed_entry_revision_exchange_authority,
@@ -649,8 +655,12 @@ def test_restart_reconciliation_is_read_only_and_replayable(tmp_path):
     assert _contract(session_factory) == ("verified", True)
 
 
-def test_lost_wakeup_is_reclaimed_without_exchange_write(tmp_path):
+def test_lost_wakeup_is_not_time_reclaimed_without_child_reconciliation(tmp_path):
     session_factory = create_session_factory(tmp_path / "lost-wakeup.db")
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(engine, expected_plan_sha256=plan.plan_sha256)
+    owner = ExecutionOwnerIdentity("worker", "test-instance", 123, "boot", "456")
     item_id, _, _ = _persist_entry_chain(session_factory)
     with session_factory() as session:
         item = session.get(MessageInstructionItem, item_id)
@@ -679,25 +689,20 @@ def test_lost_wakeup_is_reclaimed_without_exchange_write(tmp_path):
         session_factory,
         completed_raw_message_id=999,
         now=NOW + timedelta(seconds=1),
+        execution_owner=owner,
     )[0]
     second_claim = claim_ready_entry_assembly_wakeups(
         session_factory,
         completed_raw_message_id=123456,
         now=NOW + timedelta(minutes=6),
-    )[0]
-    finish_entry_assembly_wakeup(
-        session_factory,
-        attempt_id=second_claim.attempt_id,
-        claim_token=second_claim.claim_token,
-        succeeded=True,
-        now=NOW + timedelta(minutes=6, seconds=1),
+        execution_owner=owner,
     )
 
-    assert first_claim.attempt_id == second_claim.attempt_id == attempt_id
-    assert first_claim.claim_token != second_claim.claim_token
+    assert first_claim.attempt_id == attempt_id
+    assert second_claim == ()
     with session_factory() as session:
         attempt = session.get(EntryAssemblyAttempt, attempt_id)
         item = session.get(MessageInstructionItem, item_id)
-        assert attempt.status == "woken"
+        assert attempt.status == "claimed"
         assert item.visibility_next_attempt_at is None
         assert session.query(ExecutionBinding).count() == 0

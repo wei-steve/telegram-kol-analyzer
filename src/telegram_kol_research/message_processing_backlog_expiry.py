@@ -8,7 +8,16 @@ from datetime import UTC, datetime
 from time import perf_counter
 from typing import Any
 
+from sqlalchemy import inspect
+
+from telegram_kol_research.authoritative_execution_schema import (
+    REQUIRED_TABLES as RECOGNITION_EXECUTION_TABLES,
+    validate_recognition_execution_schema,
+)
+
 from telegram_kol_research.models import (
+    AuthoritativeExecutionAttempt,
+    EntryAssemblyWakeupExecution,
     MessageProcessingJob,
     RawMessage,
     RecognitionDecision,
@@ -152,6 +161,59 @@ def _build_message_processing_backlog_expiry_plan_in_session(
     )
     if running_count:
         raise BacklogExpiryRefused("execution_running_decision_present")
+    uncertain_count = (
+        session.query(RecognitionDecision)
+        .filter(
+            RecognitionDecision.raw_message_id.in_(expected_ids),
+            RecognitionDecision.comparison_status == "execution_uncertain",
+        )
+        .count()
+    )
+    if uncertain_count:
+        raise BacklogExpiryRefused("execution_uncertain_decision_present")
+    table_names = set(inspect(session.get_bind()).get_table_names())
+    installed_execution_tables = table_names & set(RECOGNITION_EXECUTION_TABLES)
+    if installed_execution_tables:
+        validation = validate_recognition_execution_schema(session.get_bind())
+        if not validation.valid:
+            raise BacklogExpiryRefused("recognition_execution_schema_invalid")
+        active_attempt_count = (
+            session.query(AuthoritativeExecutionAttempt)
+            .filter(
+                AuthoritativeExecutionAttempt.raw_message_id.in_(expected_ids),
+                AuthoritativeExecutionAttempt.status.in_(
+                    ("executing", "uncertain", "outcome_recorded")
+                ),
+            )
+            .count()
+        )
+        active_wakeup_count = (
+            session.query(EntryAssemblyWakeupExecution)
+            .filter(
+                (
+                    EntryAssemblyWakeupExecution.strategy_raw_message_id.in_(
+                        expected_ids
+                    )
+                )
+                | (
+                    EntryAssemblyWakeupExecution.trigger_raw_message_id.in_(
+                        expected_ids
+                    )
+                ),
+                EntryAssemblyWakeupExecution.status.in_(
+                    ("executing", "uncertain", "outcome_recorded")
+                ),
+            )
+            .count()
+        )
+    else:
+        # Compatibility for the pre-schema runtime/tooling. With none of the
+        # additive tables installed there cannot be a new-style active fence;
+        # the legacy execution_running guard above remains authoritative.
+        active_attempt_count = 0
+        active_wakeup_count = 0
+    if active_attempt_count or active_wakeup_count:
+        raise BacklogExpiryRefused("execution_attempt_active")
 
     decision_13912 = (
         session.query(RecognitionDecision)

@@ -361,6 +361,18 @@ def execute_message_instruction_items(
         except DeepcoinRequestOutcomeUnknown as exc:
             finish_status = "unknown"
             result = {"type": type(exc).__name__, "message": str(exc)}
+            finish_message_instruction_item(
+                session_factory,
+                item_id=item.id,
+                status=finish_status,
+                result=result,
+                now=now,
+                execution_contract_mode=enforcement_mode,
+            )
+            # The authoritative execution lease must see the venue boundary as
+            # unknown.  Compressing this into an ordinary item result would let
+            # an upper layer incorrectly finalize or replay the generation.
+            raise
         except Exception as exc:
             finish_status = "failed"
             result = {"type": type(exc).__name__, "message": str(exc)}

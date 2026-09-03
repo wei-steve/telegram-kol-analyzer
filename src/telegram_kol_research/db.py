@@ -98,6 +98,14 @@ REQUIRED_MANAGEMENT_UNIQUE_INDEX_NAMES = frozenset(
     }
 )
 
+EXPLICIT_RECOGNITION_EXECUTION_TABLES = frozenset(
+    {
+        "authoritative_execution_attempts",
+        "entry_assembly_wakeup_executions",
+        "recognition_execution_scan_cursors",
+    }
+)
+
 
 SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
     "trigger_protection_intents": {
@@ -845,7 +853,17 @@ def init_db(engine: Engine) -> None:
     """Create all database tables if they do not already exist."""
 
     _configure_sqlite(engine)
-    Base.metadata.create_all(engine)
+    # Recognition execution lease tables are intentionally excluded. Production
+    # must install them through the reviewed, plan-hash-bound schema command;
+    # runtime validates their exact shape and fails closed when they are absent.
+    Base.metadata.create_all(
+        engine,
+        tables=[
+            table
+            for name, table in Base.metadata.tables.items()
+            if name not in EXPLICIT_RECOGNITION_EXECUTION_TABLES
+        ],
+    )
     _make_sqlite_entry_assembly_preamble_nullable(engine)
     _backfill_sqlite_columns(engine)
     _backfill_sqlite_expiry_review_state(engine)

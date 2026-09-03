@@ -22,12 +22,22 @@ from typing import Any
 
 import httpx
 import typer
-from sqlalchemy import create_engine, tuple_
+from sqlalchemy import create_engine, inspect, tuple_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.backfill import build_backfill_windows
 from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
 from telegram_kol_research.authoritative_recognition import process_authoritative_message
+from telegram_kol_research.authoritative_execution_schema import (
+    REQUIRED_TABLES as RECOGNITION_EXECUTION_TABLES,
+    apply_recognition_execution_schema,
+    build_recognition_execution_schema_plan,
+    validate_recognition_execution_schema,
+)
+from telegram_kol_research.recognition_execution_runtime import (
+    RecognitionExecutionRegistry,
+    build_execution_owner_identity,
+)
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
 from telegram_kol_research.context_resolution_worker import (
     build_redacted_exchange_state,
@@ -1741,6 +1751,21 @@ async def _process_raw_messages_with_mimo_authority(
     if not raw_message_ids:
         return 0
     config = load_ai_recognition_config(ai_recognition_config_path)
+    engine = session_factory.kw["bind"]
+    installed_execution_tables = set(inspect(engine).get_table_names()) & set(
+        RECOGNITION_EXECUTION_TABLES
+    )
+    execution_owner = None
+    execution_registry = None
+    if installed_execution_tables:
+        validation = validate_recognition_execution_schema(engine)
+        if not validation.valid:
+            raise RuntimeError(
+                "recognition execution schema is incomplete or invalid: "
+                + ", ".join(validation.errors)
+            )
+        execution_owner = build_execution_owner_identity("all")
+        execution_registry = RecognitionExecutionRegistry()
     with session_factory() as session:
         before_ids = {
             row[0]
@@ -1759,6 +1784,8 @@ async def _process_raw_messages_with_mimo_authority(
                 ai_recognition_config=config,
                 media_root=media_root,
                 auto_trade_executor=None,
+                execution_owner=execution_owner,
+                execution_registry=execution_registry,
             )
             # Successful MiMo decisions remain pending for the Web service's
             # semantic-review worker. CLI parse has no live worker of its own.
@@ -5568,8 +5595,15 @@ def resolve_context_once(
         typer.echo(json.dumps({"status": "disabled"}, ensure_ascii=False))
         return
     ai_config = load_ai_recognition_config(ai_config_path)
+    execution_owner = build_execution_owner_identity("all")
+    execution_registry = RecognitionExecutionRegistry()
 
-    def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
+    def reanalyze(
+        raw_message_id: int,
+        _fingerprint: str,
+        *,
+        retrying: bool = False,
+    ) -> dict[str, Any]:
         result = process_authoritative_message(
             session_factory,
             raw_message_id=raw_message_id,
@@ -5583,6 +5617,9 @@ def resolve_context_once(
                 candidate_thread_ids=candidate_thread_ids,
             ),
             reuse_current_evidence=True,
+            resume_completed_execution=retrying,
+            execution_owner=execution_owner,
+            execution_registry=execution_registry,
         )
         if result.assessment.agreement_status == "authoritative_failed":
             raise RuntimeError(
@@ -5999,6 +6036,8 @@ def alerts(
             broker = LiveUpdateBroker()
             system_operator_bot_config = load_system_operator_bot_config()
             notification_bot_config = load_notification_bot_config()
+            execution_owner = build_execution_owner_identity("all")
+            execution_registry = RecognitionExecutionRegistry()
 
             def authoritative_processor(raw_message_id: int):
                 return process_authoritative_message(
@@ -6009,6 +6048,8 @@ def alerts(
                     ),
                     media_root=media_root,
                     auto_trade_executor=None,
+                    execution_owner=execution_owner,
+                    execution_registry=execution_registry,
                 )
 
             try:
@@ -6534,6 +6575,54 @@ def media_dedupe(
     typer.echo(f"Scanned assets: {result.scanned_assets}")
     typer.echo(f"Kept assets: {result.kept_assets}")
     typer.echo(f"Deleted assets: {result.deleted_assets}")
+
+
+@app.command("recognition-execution-schema")
+def recognition_execution_schema(
+    database_path: Path = typer.Option(..., "--database-path"),
+    mode: str = typer.Option("plan", "--mode"),
+    expected_plan_sha256: str | None = typer.Option(
+        None, "--expected-plan-sha256"
+    ),
+) -> None:
+    """Plan, rehearse, or apply only the execution-fence additive schema."""
+
+    resolved_path = database_path.expanduser().resolve()
+    if mode not in {"plan", "rehearse", "apply"}:
+        typer.echo("Refusing schema action: invalid --mode.", err=True)
+        raise typer.Exit(code=2)
+    if not resolved_path.is_file():
+        typer.echo("Refusing schema action: database does not exist.", err=True)
+        raise typer.Exit(code=2)
+    engine = create_engine(f"sqlite:///{resolved_path}", future=True)
+    plan = build_recognition_execution_schema_plan(engine)
+    evidence: dict[str, Any] = {
+        "mode": mode,
+        "database_path": str(resolved_path),
+        "plan_sha256": plan.plan_sha256,
+        "table_names": list(plan.table_names),
+        "ddl_statements": list(plan.ddl_statements),
+        "changed": False,
+    }
+    if mode in {"rehearse", "apply"}:
+        if expected_plan_sha256 is None:
+            typer.echo(
+                "Refusing schema action: --expected-plan-sha256 is required.",
+                err=True,
+            )
+            raise typer.Exit(code=2)
+        result = apply_recognition_execution_schema(
+            engine,
+            expected_plan_sha256=expected_plan_sha256,
+        )
+        evidence["created_tables"] = list(result.created_tables)
+        evidence["changed"] = bool(result.created_tables)
+    validation = validate_recognition_execution_schema(engine)
+    evidence["validation"] = {
+        "valid": validation.valid,
+        "errors": list(validation.errors),
+    }
+    typer.echo(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
 
 
 def main() -> None:

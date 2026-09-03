@@ -11,6 +11,9 @@ from telegram_kol_research.message_processing_backlog_expiry import (
     build_message_processing_backlog_expiry_plan,
 )
 from telegram_kol_research.models import (
+    AuthoritativeExecutionAttempt,
+    Base,
+    EntryAssemblyWakeupExecution,
     MessageProcessingJob,
     MessageRecognition,
     RawMessage,
@@ -29,6 +32,16 @@ COMPLETED_AT = datetime(2026, 8, 31, 7, 0, tzinfo=UTC)
 
 
 def _seed_exact_backlog(session_factory) -> None:
+    from telegram_kol_research.authoritative_execution_schema import (
+        apply_recognition_execution_schema,
+        build_recognition_execution_schema_plan,
+    )
+
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(
+        engine, expected_plan_sha256=plan.plan_sha256
+    )
     with session_factory() as session:
         for raw_id in range(MIN_RAW_ID, WATERMARK_RAW_ID + 1):
             session.add(
@@ -84,6 +97,32 @@ def _apply(session_factory):
     )
 
 
+@pytest.mark.parametrize("installed_count", [1, 2])
+def test_backlog_expiry_refuses_partially_installed_execution_schema(
+    tmp_path,
+    installed_count,
+):
+    session_factory = create_session_factory(tmp_path / "partial.db")
+    _seed_exact_backlog(session_factory)
+    engine = session_factory.kw["bind"]
+    from telegram_kol_research.authoritative_execution_schema import REQUIRED_TABLES
+
+    for name in reversed(REQUIRED_TABLES):
+        Base.metadata.tables[name].drop(engine)
+    explicit_tables = (
+        AuthoritativeExecutionAttempt.__table__,
+        EntryAssemblyWakeupExecution.__table__,
+    )
+    for table in explicit_tables[:installed_count]:
+        table.create(engine)
+
+    with pytest.raises(
+        BacklogExpiryRefused,
+        match="recognition_execution_schema_invalid",
+    ):
+        _build_plan(session_factory)
+
+
 def test_session_scoped_expired_audit_core_never_commits(tmp_path):
     session_factory = create_session_factory(tmp_path / "core.db")
     with session_factory() as session:
@@ -122,6 +161,53 @@ def test_exact_backlog_plan_is_read_only_and_manifest_is_deterministic(tmp_path)
         assert session.query(MessageProcessingJob).filter_by(status="pending").count() == 154
         assert session.query(MessageRecognition).count() == 0
         assert session.query(RecognitionDecision).one().comparison_status == "execution_pending"
+
+
+def test_backlog_plan_refuses_execution_uncertain_decision(tmp_path):
+    session_factory = create_session_factory(tmp_path / "uncertain.db")
+    _seed_exact_backlog(session_factory)
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).filter_by(
+            raw_message_id=13912
+        ).one()
+        decision.comparison_status = "execution_uncertain"
+        session.commit()
+
+    with pytest.raises(
+        BacklogExpiryRefused, match="execution_uncertain_decision_present"
+    ):
+        _build_plan(session_factory)
+
+
+def test_backlog_plan_refuses_active_execution_attempt(tmp_path):
+    session_factory = create_session_factory(tmp_path / "attempt.db")
+    _seed_exact_backlog(session_factory)
+    with session_factory() as session:
+        session.add(
+            AuthoritativeExecutionAttempt(
+                raw_message_id=13912,
+                authoritative_generation="generation",
+                status="uncertain",
+                claim_token="claim",
+                owner_runtime_role="worker",
+                owner_instance_id="instance",
+                owner_pid=123,
+                owner_boot_id="boot",
+                owner_process_start_ticks="456",
+                claimed_at=COMPLETED_AT,
+                heartbeat_at=COMPLETED_AT,
+                lease_expires_at=COMPLETED_AT,
+                side_effect_started_at=COMPLETED_AT,
+                uncertain_at=COMPLETED_AT,
+                completed_at=COMPLETED_AT,
+                created_at=COMPLETED_AT,
+                updated_at=COMPLETED_AT,
+            )
+        )
+        session.commit()
+
+    with pytest.raises(BacklogExpiryRefused, match="execution_attempt_active"):
+        _build_plan(session_factory)
 
 
 def test_apply_expires_exact_backlog_with_existing_recovery_guard_audit(tmp_path):

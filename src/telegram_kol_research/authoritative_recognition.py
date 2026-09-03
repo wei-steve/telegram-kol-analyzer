@@ -8,7 +8,9 @@ import logging
 import re
 import time
 from collections.abc import Mapping, Sequence
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -64,11 +66,15 @@ from telegram_kol_research.mimo_v2_execution_adapter import (
     adapt_mimo_v2_to_current_payload,
 )
 from telegram_kol_research.models import (
+    AuthoritativeExecutionAttempt,
     MediaAsset,
+    MessageProcessingJob,
+    MessageRecognition,
     MessageEvidenceVersion,
     MessageInstructionItem,
     MimoRecognitionRun,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
     StrategyLifecycle,
     StrategyThread,
@@ -81,6 +87,24 @@ from telegram_kol_research.recognition_decisions import (
     save_pending_authoritative_decision,
     save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
+)
+from telegram_kol_research.authoritative_execution_attempts import (
+    ExecutionOwnerIdentity,
+    claim_authoritative_execution_attempt,
+    fail_safe_authoritative_execution_attempt,
+    finalize_recorded_authoritative_execution,
+    heartbeat_authoritative_execution_attempt,
+    load_authoritative_execution_attempt,
+    mark_authoritative_execution_uncertain,
+    mark_authoritative_side_effect_started,
+    record_authoritative_automation_outcome,
+)
+from telegram_kol_research.authoritative_execution_schema import (
+    require_recognition_execution_schema,
+)
+from telegram_kol_research.execution_boundary import ExecutionBoundaryOutcome
+from telegram_kol_research.recognition_execution_runtime import (
+    periodic_lease_heartbeat,
 )
 from telegram_kol_research.recognition_experiments import (
     MimoAuthoritativeResult,
@@ -1418,8 +1442,26 @@ def process_authoritative_message(
     exchange_state_provider=None,
     reuse_current_evidence: bool = False,
     multi_target_management_config: MultiTargetManagementConfig | None = None,
+    execution_owner: ExecutionOwnerIdentity | None = None,
+    execution_registry=None,
+    resume_completed_execution: bool = False,
 ) -> AuthoritativeProcessingResult:
     """Gate review until MiMo application and automation persistence finish."""
+
+    if execution_owner is not None:
+        require_recognition_execution_schema(session_factory)
+
+    completed = (
+        _load_completed_execution_for_automatic_retry(
+            session_factory,
+            raw_message_id=raw_message_id,
+            explicitly_retrying=resume_completed_execution,
+        )
+        if execution_owner is not None
+        else None
+    )
+    if completed is not None:
+        return completed
 
     assessment = assess_message_authoritatively(
         session_factory,
@@ -1430,17 +1472,300 @@ def process_authoritative_message(
         exchange_state_provider=exchange_state_provider,
         reuse_current_evidence=reuse_current_evidence,
     )
+    lease_claim = None
     if assessment.agreement_status != "authoritative_failed":
         if assessment.authoritative_generation is None:
             raise RuntimeError("authoritative execution generation is missing")
-        if not claim_authoritative_execution(
+        if execution_owner is None:
+            if not claim_authoritative_execution(
+                session_factory,
+                raw_message_id=raw_message_id,
+                authoritative_generation=assessment.authoritative_generation,
+            ):
+                raise RuntimeError(
+                    "authoritative execution claim failed for stale generation"
+                )
+        else:
+            if execution_registry is not None:
+                execution_registry.require_accepting()
+            claimed_at = datetime.now(UTC)
+            lease_claim = claim_authoritative_execution_attempt(
+                session_factory,
+                raw_message_id=raw_message_id,
+                authoritative_generation=assessment.authoritative_generation,
+                owner=execution_owner,
+                claimed_at=claimed_at,
+                lease_expires_at=claimed_at + timedelta(minutes=2),
+            )
+    if lease_claim is not None:
+        scope = (
+            execution_registry.admitted(lease_claim.claim_token)
+            if execution_registry is not None
+            else nullcontext()
+        )
+        try:
+            scope.__enter__()
+        except BaseException as exc:
+            classified = False
+            try:
+                classified = fail_safe_authoritative_execution_attempt(
+                    session_factory,
+                    attempt_id=lease_claim.attempt_id,
+                    claim_token=lease_claim.claim_token,
+                    failed_at=datetime.now(UTC),
+                    error_class=type(exc).__name__,
+                    error_summary=str(exc),
+                )
+            except BaseException:
+                logger.critical(
+                    "authoritative execution drain-race persistence raised raw_message_id=%s attempt_id=%s",
+                    raw_message_id,
+                    lease_claim.attempt_id,
+                    exc_info=True,
+                )
+            if not classified:
+                logger.critical(
+                    "authoritative execution drain-race classification failed raw_message_id=%s attempt_id=%s",
+                    raw_message_id,
+                    lease_claim.attempt_id,
+                )
+                try:
+                    _capture_terminalization_failure(
+                        session_factory,
+                        family="active_authoritative_attempt",
+                        row_id=lease_claim.attempt_id,
+                        raw_message_id=raw_message_id,
+                        phase="claimed",
+                        action="drain_race_terminalize_failed",
+                    )
+                except BaseException:
+                    logger.critical(
+                        "authoritative execution drain-race incident capture raised raw_message_id=%s attempt_id=%s",
+                        raw_message_id,
+                        lease_claim.attempt_id,
+                        exc_info=True,
+                    )
+            raise
+        try:
+            def renew_main_lease():
+                heartbeat_at = datetime.now(UTC)
+                heartbeat_authoritative_execution_attempt(
+                    session_factory,
+                    attempt_id=lease_claim.attempt_id,
+                    claim_token=lease_claim.claim_token,
+                    heartbeat_at=heartbeat_at,
+                    lease_expires_at=heartbeat_at + timedelta(minutes=2),
+                )
+
+            with periodic_lease_heartbeat(renew_main_lease):
+                recognition, automation, assessment = _run_leased_authoritative_execution(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    assessment=assessment,
+                    lease_claim=lease_claim,
+                    auto_trade_executor=auto_trade_executor,
+                    multi_target_management_config=multi_target_management_config,
+                )
+        finally:
+            scope.__exit__(None, None, None)
+    else:
+        recognition, automation, assessment = _run_legacy_authoritative_execution(
             session_factory,
             raw_message_id=raw_message_id,
-            authoritative_generation=assessment.authoritative_generation,
-        ):
-            raise RuntimeError(
-                "authoritative execution claim failed for stale generation"
+            assessment=assessment,
+            auto_trade_executor=auto_trade_executor,
+            multi_target_management_config=multi_target_management_config,
+        )
+    if auto_trade_executor is not None:
+        _run_entry_assembly_wakeups(
+            session_factory,
+            completed_raw_message_id=int(raw_message_id),
+            auto_trade_executor=auto_trade_executor,
+            execution_owner=execution_owner,
+            execution_registry=execution_registry,
+        )
+    return AuthoritativeProcessingResult(
+        assessment=assessment,
+        recognition=recognition,
+        automation=automation,
+    )
+
+
+def _load_completed_execution_for_automatic_retry(
+    session_factory,
+    *,
+    raw_message_id: int,
+    explicitly_retrying: bool,
+    _finalize_attempted: bool = False,
+) -> AuthoritativeProcessingResult | None:
+    """Return an exact durable success instead of replaying an automatic retry.
+
+    Manual/new invocations remain eligible for a new authoritative generation.
+    Queue retries are identified by a reclaimed/previously failed claimed job;
+    context retry ownership is passed explicitly by its durable scheduler.
+    """
+
+    with session_factory() as session:
+        job = (
+            session.query(MessageProcessingJob)
+            .filter(MessageProcessingJob.raw_message_id == int(raw_message_id))
+            .one_or_none()
+        )
+        automatic_job_retry = bool(
+            job is not None
+            and job.status == "claimed"
+            and (
+                int(job.attempt_count or 0) > 0
+                or job.last_reason == "stale_claim_reclaimed"
             )
+        )
+        if not explicitly_retrying and not automatic_job_retry:
+            return None
+        attempt = (
+            session.query(AuthoritativeExecutionAttempt)
+            .filter(
+                AuthoritativeExecutionAttempt.raw_message_id
+                == int(raw_message_id)
+            )
+            .order_by(AuthoritativeExecutionAttempt.id.desc())
+            .first()
+        )
+        if attempt is not None and attempt.status in {
+            "claimed",
+            "executing",
+            "uncertain",
+        }:
+            raise RuntimeError(
+                "automatic retry blocked by active or uncertain authoritative execution"
+            )
+        if attempt is not None and attempt.status == "outcome_recorded":
+            if _finalize_attempted:
+                raise RuntimeError(
+                    "automatic retry blocked by unfinalized authoritative outcome"
+                )
+            attempt_id = int(attempt.id)
+            claim_token = str(attempt.claim_token)
+            session.commit()
+            try:
+                finalize_recorded_authoritative_execution(
+                    session_factory,
+                    attempt_id=attempt_id,
+                    claim_token=claim_token,
+                    semantic_review_enabled=load_trading_settings(
+                        session_factory
+                    ).semantic_review_enabled,
+                    finalized_at=datetime.now(UTC),
+                )
+            except RuntimeError:
+                # A concurrent scanner may have won the same exact-token CAS.
+                # Reload once; a still-unfinalized outcome remains fail-closed.
+                pass
+            return _load_completed_execution_for_automatic_retry(
+                session_factory,
+                raw_message_id=raw_message_id,
+                explicitly_retrying=True,
+                _finalize_attempted=True,
+            )
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == int(raw_message_id))
+            .one_or_none()
+        )
+        recognition_row = (
+            session.query(MessageRecognition)
+            .filter(MessageRecognition.raw_message_id == int(raw_message_id))
+            .one_or_none()
+        )
+        if (
+            attempt is None
+            or attempt.status != "succeeded"
+            or decision is None
+            or decision.comparison_status
+            in {"execution_pending", "execution_running", "execution_uncertain"}
+            or decision.agreement_status == "authoritative_failed"
+            or decision.automation_status != attempt.automation_status
+            or decision.automation_reason != attempt.automation_reason
+        ):
+            return None
+        try:
+            payload = json.loads(decision.authoritative_payload_json)
+            prompt_versions = json.loads(decision.prompt_versions_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if not isinstance(payload, dict) or not isinstance(prompt_versions, dict):
+            return None
+        assessment = AuthoritativeAssessment(
+            raw_message_id=int(raw_message_id),
+            mimo=MimoAuthoritativeResult(
+                raw_message_id=int(raw_message_id),
+                payload=payload,
+                input_kind=str(decision.input_kind),
+                model=str(decision.authoritative_model),
+                status=str(decision.authoritative_status),
+                prompt_versions=(
+                    prompt_versions.get("mimo", {})
+                    if isinstance(prompt_versions.get("mimo", {}), dict)
+                    else {}
+                ),
+            ),
+            deepseek_payload=None,
+            agreement_status=str(decision.agreement_status),
+            differences=list(json.loads(decision.differences_json or "[]")),
+            semantic_review_status=str(decision.comparison_status),
+            authoritative_generation=None,
+        )
+        recognition = MessageRecognitionResult(
+            raw_message_id=int(raw_message_id),
+            status=(
+                str(recognition_row.status)
+                if recognition_row is not None
+                else str(decision.authoritative_status)
+            ),
+            summary=(
+                recognition_row.summary
+                if recognition_row is not None
+                else (
+                    str(payload["summary"])
+                    if payload.get("summary") is not None
+                    else None
+                )
+            ),
+            reason=(
+                recognition_row.reason
+                if recognition_row is not None
+                else (
+                    str(payload["reason"])
+                    if payload.get("reason") is not None
+                    else None
+                )
+            ),
+            ai_payload=payload,
+            parse_source=(
+                recognition_row.engine
+                if recognition_row is not None
+                else "mimo_authoritative"
+            ),
+        )
+        automation = {
+            "status": str(attempt.automation_status or "unknown"),
+            "reason": attempt.automation_reason,
+        }
+        session.expunge(attempt)
+    return AuthoritativeProcessingResult(
+        assessment=assessment,
+        recognition=recognition,
+        automation=automation,
+    )
+
+
+def _run_legacy_authoritative_execution(
+    session_factory,
+    *,
+    raw_message_id,
+    assessment,
+    auto_trade_executor,
+    multi_target_management_config,
+):
     if multi_target_management_config is None:
         recognition = apply_authoritative_assessment(session_factory, assessment)
     else:
@@ -1513,42 +1838,276 @@ def process_authoritative_message(
             semantic_review_status=finalized.comparison_status,
             authoritative_generation=None,
         )
-    if auto_trade_executor is not None:
-        from telegram_kol_research.entry_assembly_admission import (
-            claim_ready_entry_assembly_wakeups,
-            finish_entry_assembly_wakeup,
-        )
+    return recognition, automation, assessment
 
-        wake_now = utc_now()
-        wake_strategy_ids = claim_ready_entry_assembly_wakeups(
-            session_factory,
-            completed_raw_message_id=int(raw_message_id),
-            now=wake_now,
-        )
-        for wake_claim in wake_strategy_ids:
-            try:
-                auto_trade_executor(int(wake_claim.strategy_raw_message_id))
-            except Exception:
-                finish_entry_assembly_wakeup(
-                    session_factory,
-                    attempt_id=int(wake_claim.attempt_id),
-                    claim_token=str(wake_claim.claim_token),
-                    succeeded=False,
-                    now=utc_now(),
-                )
-                raise
-            finish_entry_assembly_wakeup(
+
+def _run_leased_authoritative_execution(
+    session_factory,
+    *,
+    raw_message_id: int,
+    assessment,
+    lease_claim,
+    auto_trade_executor,
+    multi_target_management_config,
+):
+    """Classify every claimed generation without ever making it replayable."""
+
+    try:
+        if multi_target_management_config is None:
+            recognition = apply_authoritative_assessment(session_factory, assessment)
+        else:
+            recognition = apply_authoritative_assessment(
                 session_factory,
-                attempt_id=int(wake_claim.attempt_id),
-                claim_token=str(wake_claim.claim_token),
-                succeeded=True,
-                now=utc_now(),
+                assessment,
+                multi_target_management_config=multi_target_management_config,
             )
-    return AuthoritativeProcessingResult(
-        assessment=assessment,
-        recognition=recognition,
-        automation=automation,
+        from telegram_kol_research.source_message_deletion import (
+            source_execution_barrier,
+        )
+        barrier = source_execution_barrier(
+            session_factory,
+            raw_message_id=raw_message_id,
+        )
+        if barrier.status == "block":
+            automation = {"status": "blocked", "reason": barrier.reason}
+            boundary = ExecutionBoundaryOutcome(
+                status="completed",
+                exchange_effect="not_started",
+                raw_status="blocked",
+                reason_code=barrier.reason,
+                evidence_refs=(),
+                public_result=automation,
+            )
+        elif barrier.status == "hold":
+            automation = {"status": "deferred", "reason": barrier.reason}
+            boundary = ExecutionBoundaryOutcome(
+                status="completed",
+                exchange_effect="not_started",
+                raw_status="deferred",
+                reason_code=barrier.reason,
+                evidence_refs=(),
+                public_result=automation,
+            )
+        elif recognition.status == "识别失败":
+            automation = {
+                "status": "skipped",
+                "reason": "mimo_authoritative_not_safely_applied",
+            }
+            boundary = ExecutionBoundaryOutcome(
+                "completed", "not_started", "skipped",
+                "mimo_authoritative_not_safely_applied", (), automation
+            )
+        elif not _has_current_mimo_candidate(session_factory, raw_message_id):
+            automation = {"status": "skipped", "reason": "mimo_no_action"}
+            boundary = ExecutionBoundaryOutcome(
+                "completed", "not_started", "skipped", "mimo_no_action", (), automation
+            )
+        elif auto_trade_executor is None:
+            automation = {
+                "status": "skipped",
+                "reason": "auto_trade_not_configured",
+            }
+            boundary = ExecutionBoundaryOutcome(
+                "completed", "not_started", "skipped",
+                "auto_trade_not_configured", (), automation
+            )
+        else:
+            if not mark_authoritative_side_effect_started(
+                session_factory,
+                attempt_id=lease_claim.attempt_id,
+                raw_message_id=lease_claim.raw_message_id,
+                authoritative_generation=lease_claim.authoritative_generation,
+                claim_token=lease_claim.claim_token,
+                started_at=datetime.now(UTC),
+            ):
+                raise RuntimeError("authoritative_side_effect_boundary_cas_failed")
+            observed = auto_trade_executor(raw_message_id)
+            if not isinstance(observed, ExecutionBoundaryOutcome):
+                raise RuntimeError("execution_boundary_outcome_missing")
+            boundary = observed
+            automation = dict(boundary.public_result)
+        if boundary.exchange_effect == "outcome_unknown":
+            if not mark_authoritative_execution_uncertain(
+                session_factory,
+                attempt_id=lease_claim.attempt_id,
+                claim_token=lease_claim.claim_token,
+                uncertain_at=datetime.now(UTC),
+                error_class="ExecutionBoundaryOutcomeUnknown",
+                error_summary=boundary.reason_code or boundary.raw_status,
+            ):
+                raise RuntimeError("authoritative_uncertain_transition_failed")
+            raise RuntimeError("authoritative_execution_outcome_unknown")
+        if not record_authoritative_automation_outcome(
+            session_factory,
+            attempt_id=lease_claim.attempt_id,
+            claim_token=lease_claim.claim_token,
+            automation_status=str(automation.get("status") or "unknown"),
+            automation_reason=(
+                str(automation.get("reason"))
+                if automation.get("reason") is not None
+                else None
+            ),
+            exchange_effect=boundary.exchange_effect,
+            evidence_refs=list(boundary.evidence_refs),
+            recorded_at=datetime.now(UTC),
+        ):
+            raise RuntimeError("authoritative_outcome_record_cas_failed")
+        semantic_review_enabled = load_trading_settings(
+            session_factory
+        ).semantic_review_enabled
+        finalized = finalize_recorded_authoritative_execution(
+            session_factory,
+            attempt_id=lease_claim.attempt_id,
+            claim_token=lease_claim.claim_token,
+            semantic_review_enabled=semantic_review_enabled,
+            finalized_at=datetime.now(UTC),
+        )
+        assessment = replace(
+            assessment,
+            agreement_status=finalized.agreement_status,
+            differences=list(json.loads(finalized.differences_json or "[]")),
+            semantic_review_status=finalized.comparison_status,
+            authoritative_generation=None,
+        )
+        return recognition, automation, assessment
+    except BaseException as exc:
+        classified = False
+        try:
+            snapshot = load_authoritative_execution_attempt(
+                session_factory, attempt_id=lease_claim.attempt_id
+            )
+            classified = snapshot.status in {
+                "failed_safe",
+                "uncertain",
+                "succeeded",
+            }
+            if snapshot.status == "claimed":
+                classified = fail_safe_authoritative_execution_attempt(
+                    session_factory,
+                    attempt_id=lease_claim.attempt_id,
+                    claim_token=lease_claim.claim_token,
+                    failed_at=datetime.now(UTC),
+                    error_class=type(exc).__name__,
+                    error_summary=str(exc),
+                )
+            elif snapshot.status == "executing":
+                classified = mark_authoritative_execution_uncertain(
+                    session_factory,
+                    attempt_id=lease_claim.attempt_id,
+                    claim_token=lease_claim.claim_token,
+                    uncertain_at=datetime.now(UTC),
+                    error_class=type(exc).__name__,
+                    error_summary=str(exc),
+                )
+            elif snapshot.status == "outcome_recorded":
+                _capture_terminalization_failure(
+                    session_factory,
+                    family="active_authoritative_attempt",
+                    row_id=lease_claim.attempt_id,
+                    raw_message_id=raw_message_id,
+                    phase="outcome_recorded",
+                    action="finalize_raised",
+                )
+                classified = True
+        except Exception:
+            logger.critical(
+                "authoritative execution classification persistence raised raw_message_id=%s attempt_id=%s",
+                raw_message_id,
+                lease_claim.attempt_id,
+                exc_info=True,
+            )
+        if not classified:
+            logger.critical(
+                "authoritative execution remained unclassified raw_message_id=%s attempt_id=%s",
+                raw_message_id,
+                lease_claim.attempt_id,
+            )
+            try:
+                _capture_terminalization_failure(
+                    session_factory,
+                    family="active_authoritative_attempt",
+                    row_id=lease_claim.attempt_id,
+                    raw_message_id=raw_message_id,
+                    phase="unclassified",
+                    action="exception_terminalize_failed",
+                )
+            except BaseException:
+                logger.critical(
+                    "authoritative execution incident capture raised raw_message_id=%s attempt_id=%s",
+                    raw_message_id,
+                    lease_claim.attempt_id,
+                    exc_info=True,
+                )
+        raise
+
+
+def _capture_terminalization_failure(
+    session_factory,
+    *,
+    family: str,
+    row_id: int,
+    raw_message_id: int,
+    phase: str,
+    action: str,
+) -> None:
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_recognition_execution_state,
+        capture_runtime_incident_best_effort,
     )
+
+    capture_runtime_incident_best_effort(
+        capture_recognition_execution_state,
+        session_factory,
+        family=family,
+        row_id=row_id,
+        raw_message_id=raw_message_id,
+        phase=phase,
+        action=action,
+        occurred_at=datetime.now(UTC),
+    )
+
+
+def _run_entry_assembly_wakeups(
+    session_factory,
+    *,
+    completed_raw_message_id: int,
+    auto_trade_executor,
+    execution_owner,
+    execution_registry,
+) -> None:
+    from telegram_kol_research.entry_assembly_admission import (
+        claim_ready_entry_assembly_wakeups,
+    )
+
+    wake_now = utc_now()
+    wake_kwargs = {
+        "completed_raw_message_id": completed_raw_message_id,
+        "now": wake_now,
+    }
+    if execution_owner is None:
+        # Legacy/test callers do not own the independent durable child fence.
+        # They may complete the primary recognition path, but must never claim
+        # or execute a wakeup through the retired unfenced path.
+        return
+    wake_kwargs["execution_owner"] = execution_owner
+    wake_kwargs["execution_registry"] = execution_registry
+    while True:
+        wake_claims = claim_ready_entry_assembly_wakeups(
+            session_factory,
+            **wake_kwargs,
+        )
+        if not wake_claims:
+            return
+        wake_claim = wake_claims[0]
+        from telegram_kol_research.entry_assembly_wakeup_executions import (
+            run_claimed_entry_assembly_wakeup,
+        )
+        run_claimed_entry_assembly_wakeup(
+            session_factory,
+            wake_claim=wake_claim,
+            auto_trade_executor=auto_trade_executor,
+            execution_registry=execution_registry,
+        )
 
 
 def _has_current_mimo_candidate(session_factory: sessionmaker, raw_message_id: int) -> bool:

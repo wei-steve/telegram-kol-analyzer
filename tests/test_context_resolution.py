@@ -694,7 +694,7 @@ def test_isolated_network_error_retries_in_window_and_keeps_same_decision(
 
     result_holder = {}
 
-    def reanalyze(raw_message_id, _fingerprint):
+    def reanalyze(raw_message_id, _fingerprint, **_):
         result_holder["decision"] = resolve_contextual_strategy(
             retry_factory,
             raw_message_id=raw_message_id,

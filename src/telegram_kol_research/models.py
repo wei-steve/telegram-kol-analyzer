@@ -608,6 +608,188 @@ class EntryAssemblyAttempt(Base):
     updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
 
 
+class AuthoritativeExecutionAttempt(Base):
+    """Durable ownership fence for one authoritative recognition generation."""
+
+    __tablename__ = "authoritative_execution_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "raw_message_id",
+            "authoritative_generation",
+            name="uq_authoritative_execution_attempts_generation",
+        ),
+        UniqueConstraint(
+            "claim_token",
+            name="uq_authoritative_execution_attempts_claim_token",
+        ),
+        CheckConstraint(
+            "status IN ('claimed','executing','outcome_recorded','succeeded',"
+            "'failed_safe','uncertain')",
+            name="ck_authoritative_execution_attempts_status",
+        ),
+        CheckConstraint(
+            "owner_runtime_role IN ('worker','all')",
+            name="ck_authoritative_execution_attempts_owner_role",
+        ),
+        CheckConstraint(
+            "exchange_effect IS NULL OR exchange_effect IN ("
+            "'not_started','confirmed_applied','confirmed_rejected','outcome_unknown')",
+            name="ck_authoritative_execution_attempts_exchange_effect",
+        ),
+        Index(
+            "ix_authoritative_execution_attempts_status_lease",
+            "status",
+            "lease_expires_at",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False, index=True
+    )
+    authoritative_generation: Mapped[str] = mapped_column(String(64), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    claim_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_runtime_role: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    owner_boot_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_process_start_ticks: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_systemd_invocation_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    side_effect_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    outcome_recorded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    exchange_effect: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    automation_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    automation_reason: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    evidence_refs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_class: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    error_summary: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    uncertain_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
+class EntryAssemblyWakeupExecution(Base):
+    """Independent child fence for an entry-assembly wakeup adapter call."""
+
+    __tablename__ = "entry_assembly_wakeup_executions"
+    __table_args__ = (
+        UniqueConstraint(
+            "entry_assembly_attempt_id",
+            "wake_generation",
+            name="uq_entry_assembly_wakeup_executions_generation",
+        ),
+        UniqueConstraint(
+            "claim_token",
+            name="uq_entry_assembly_wakeup_executions_claim_token",
+        ),
+        CheckConstraint(
+            "status IN ('claimed','executing','outcome_recorded','succeeded',"
+            "'failed_safe','uncertain')",
+            name="ck_entry_assembly_wakeup_executions_status",
+        ),
+        CheckConstraint(
+            "owner_runtime_role IN ('worker','all')",
+            name="ck_entry_assembly_wakeup_executions_owner_role",
+        ),
+        CheckConstraint(
+            "exchange_effect IS NULL OR exchange_effect IN ("
+            "'not_started','confirmed_applied','confirmed_rejected','outcome_unknown')",
+            name="ck_entry_assembly_wakeup_executions_exchange_effect",
+        ),
+        Index(
+            "ix_entry_assembly_wakeup_executions_status_lease",
+            "status",
+            "lease_expires_at",
+        ),
+        Index(
+            "ix_entry_assembly_wakeup_executions_attempt_id",
+            "entry_assembly_attempt_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    entry_assembly_attempt_id: Mapped[int] = mapped_column(
+        ForeignKey("entry_assembly_attempts.id"), nullable=False
+    )
+    wake_generation: Mapped[int] = mapped_column(Integer, nullable=False)
+    strategy_raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False
+    )
+    trigger_raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    claim_token: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_runtime_role: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_instance_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_pid: Mapped[int] = mapped_column(Integer, nullable=False)
+    owner_boot_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    owner_process_start_ticks: Mapped[str] = mapped_column(String(64), nullable=False)
+    owner_systemd_invocation_id: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    claimed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    heartbeat_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    lease_expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    side_effect_started_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    outcome_recorded_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    exchange_effect: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    result_status: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    result_reason: Mapped[Optional[str]] = mapped_column(String(256), nullable=True)
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    evidence_refs_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    error_class: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    error_summary: Mapped[Optional[str]] = mapped_column(String(512), nullable=True)
+    uncertain_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
+class RecognitionExecutionScanCursor(Base):
+    """Durable keyset cursor for one recognition-execution scan family."""
+
+    __tablename__ = "recognition_execution_scan_cursors"
+    __table_args__ = (
+        UniqueConstraint(
+            "scan_family", name="uq_recognition_execution_scan_cursors_family"
+        ),
+        CheckConstraint(
+            "scan_family IN ('succeeded_job_running_decision',"
+            "'legacy_running_decision','legacy_claimed_wakeup_parent',"
+            "'active_authoritative_attempt',"
+            "'active_wakeup_execution')",
+            name="ck_recognition_execution_scan_cursors_family",
+        ),
+        Index("ix_recognition_execution_scan_cursors_updated_at", "updated_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    scan_family: Mapped[str] = mapped_column(String(64), nullable=False)
+    last_seen_id: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pass_generation: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    pass_started_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    wrapped_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime, nullable=False, default=utc_now)
+
+
 class MessageEvidenceExtractionClaim(Base):
     __tablename__ = "message_evidence_extraction_claims"
 

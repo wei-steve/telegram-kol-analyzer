@@ -67,8 +67,21 @@ from telegram_kol_research.deepcoin_contract_spec_cache import (
 from telegram_kol_research.contract_cache_permissions import (
     inspect_contract_cache_permissions,
 )
-from telegram_kol_research.deepcoin_client import DeepcoinClientError
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinClientError,
+    DeepcoinDefiniteRejection,
+)
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.execution_boundary import (
+    ExecutionBoundaryTracker,
+    TrackedDeepcoinClient,
+    build_execution_boundary_outcome,
+)
+from telegram_kol_research.recognition_execution_runtime import (
+    RecognitionExecutionRegistry,
+    build_execution_owner_identity,
+    count_owned_durable_executions,
+)
 from telegram_kol_research.deployment_entry_freeze import (
     deployment_entry_admission_frozen,
 )
@@ -89,6 +102,14 @@ from telegram_kol_research.message_processing_worker import (
 from telegram_kol_research.runtime_incident_adapters import (
     capture_monitor_state,
     capture_notification_failure,
+    capture_recognition_execution_state,
+    capture_runtime_incident_best_effort,
+)
+from telegram_kol_research.authoritative_execution_schema import (
+    validate_recognition_execution_schema,
+)
+from telegram_kol_research.recognition_execution_scanner import (
+    scan_recognition_execution_cycle,
 )
 from telegram_kol_research.runtime_loop_health import LoopLagMonitor
 from telegram_kol_research.runtime_deployment_identity import (
@@ -112,6 +133,7 @@ from telegram_kol_research.live_position_snapshot import LivePositionSnapshotSto
 from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
+    InstructionExecutionContract,
     ExecutionOrderLeg,
     MediaAsset,
     MessageEvidenceVersion,
@@ -4116,17 +4138,22 @@ def _group_ai_strategy_enabled(group_config: GroupConfig, chat_title: str) -> bo
     )
 
 
-def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, Any]:
-    try:
-        deepcoin_client = (
-            None
-            if disabled_management_message_needs_no_client(
-                app.state.session_factory,
-                raw_message_id=raw_message_id,
-            )
-            else app.state.deepcoin_client_factory()
+def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int):
+    """Run the legacy adapter while preserving a typed exchange boundary."""
+
+    tracker = ExecutionBoundaryTracker()
+    deepcoin_client = (
+        None
+        if disabled_management_message_needs_no_client(
+            app.state.session_factory,
+            raw_message_id=raw_message_id,
         )
-        return auto_process_message_trade_signal(
+        else TrackedDeepcoinClient(app.state.deepcoin_client_factory(), tracker)
+    )
+    # Do not squash exceptions here.  The attempt owner classifies and
+    # durably freezes every post-boundary failure before re-raising it.
+    try:
+        result = auto_process_message_trade_signal(
             app.state.session_factory,
             raw_message_id=raw_message_id,
             group_config=app.state.group_config,
@@ -4134,12 +4161,90 @@ def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int) -> dict[str, 
             contract_spec_provider=app.state.deepcoin_contract_spec_provider,
             processed_at=app.state.now_provider(),
         )
-    except Exception:
-        logger.exception("automatic Deepcoin trade execution failed")
-        return {"status": "failed", "reason": "auto_trade_executor_error"}
+    except DeepcoinDefiniteRejection as exc:
+        result = {
+            "status": "failed",
+            "reason": "deepcoin_definite_rejection",
+            "error_class": type(exc).__name__,
+        }
+    return build_execution_boundary_outcome(
+        result,
+        tracker,
+        canonical_item_evidence=_verified_instruction_contract_evidence(
+            app.state.session_factory,
+            result=result,
+        ),
+    )
+
+
+def _verified_instruction_contract_evidence(
+    session_factory,
+    *,
+    result: dict[str, Any],
+) -> tuple[dict[str, Any], ...]:
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return ()
+    item_ids: list[int] = []
+    for item in items:
+        item_id = item.get("item_id") if isinstance(item, dict) else None
+        if not isinstance(item_id, int) or isinstance(item_id, bool):
+            return ()
+        item_ids.append(int(item_id))
+    if len(set(item_ids)) != len(item_ids):
+        return ()
+    with session_factory() as session:
+        contracts = (
+            session.query(InstructionExecutionContract)
+            .filter(
+                InstructionExecutionContract.message_instruction_item_id.in_(
+                    item_ids
+                ),
+                InstructionExecutionContract.state == "verified",
+                InstructionExecutionContract.verified_at.is_not(None),
+                InstructionExecutionContract.terminal_kind.is_not(None),
+            )
+            .all()
+        )
+    by_item = {
+        int(contract.message_instruction_item_id): contract
+        for contract in contracts
+    }
+    if set(by_item) != set(item_ids):
+        return ()
+    refs: list[dict[str, Any]] = []
+    for item_id in item_ids:
+        contract = by_item[item_id]
+        if contract.attempted_exchange_write:
+            try:
+                durable_refs = json.loads(contract.evidence_refs_json or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return ()
+            if not isinstance(durable_refs, list) or not durable_refs:
+                return ()
+        refs.append(
+            {
+                "kind": "instruction_execution_contract",
+                "contract_id": int(contract.id),
+                "item_id": item_id,
+                "attempted_exchange_write": bool(
+                    contract.attempted_exchange_write
+                ),
+                "terminal_kind": str(contract.terminal_kind),
+                "completion_scope": str(contract.completion_scope),
+            }
+        )
+    return tuple(refs)
 
 
 def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
+    if (
+        app.state.runtime_role not in {"worker", "all"}
+        or app.state.recognition_execution_owner is None
+    ):
+        raise RuntimeError(
+            "authoritative_recognition_not_owned_by_runtime_role"
+        )
     ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
     with app.state.session_factory() as session:
         raw_message = session.get(RawMessage, int(raw_message_id))
@@ -4164,6 +4269,8 @@ def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
             )
         ) if context_enabled else None,
         multi_target_management_config=app.state.multi_target_management_config,
+        execution_owner=app.state.recognition_execution_owner,
+        execution_registry=app.state.recognition_execution_registry,
     )
 
 
@@ -4251,7 +4358,12 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
             }
         return {"status": "disabled"}
 
-    def reanalyze(raw_message_id: int, _fingerprint: str) -> dict[str, Any]:
+    def reanalyze(
+        raw_message_id: int,
+        _fingerprint: str,
+        *,
+        retrying: bool = False,
+    ) -> dict[str, Any]:
         ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
         result = process_authoritative_message(
             app.state.session_factory,
@@ -4266,6 +4378,9 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
                 candidate_thread_ids=candidate_thread_ids,
             ),
             reuse_current_evidence=True,
+            resume_completed_execution=retrying,
+            execution_owner=app.state.recognition_execution_owner,
+            execution_registry=app.state.recognition_execution_registry,
         )
         if result.assessment.agreement_status == "authoritative_failed":
             raise RuntimeError(
@@ -4338,6 +4453,102 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
         "context_resolution": context_result,
         "entry_revision": revision_result,
     }
+
+
+async def _run_recognition_execution_scanner_loop(app: FastAPI) -> None:
+    """Worker-only bounded orphan scan with durable per-family cursors."""
+
+    while True:
+        observed_at = app.state.now_provider()
+        try:
+            await _run_recognition_execution_scanner_cycle_async(
+                app,
+                observed_at=observed_at,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("recognition execution scanner cycle failed")
+            await asyncio.sleep(60.0)
+            continue
+        await asyncio.sleep(60.0)
+
+
+async def _run_recognition_execution_scanner_cycle_async(
+    app: FastAPI,
+    *,
+    observed_at: datetime,
+) -> int:
+    return await _run_monitor_capture_writer(
+        lambda: _run_recognition_execution_scanner_cycle(
+            app,
+            observed_at=observed_at,
+        )
+    )
+
+
+def _run_recognition_execution_scanner_cycle(
+    app: FastAPI,
+    *,
+    observed_at: datetime,
+) -> int:
+    """Run scan and incident writes in one cancellation-drained worker."""
+
+    findings = scan_recognition_execution_cycle(
+        app.state.session_factory,
+        runtime_role=app.state.runtime_role,
+        now=observed_at,
+        limit=100,
+    )
+    for finding in findings:
+        logger.error(
+            "recognition execution finding family=%s row_id=%s raw_message_id=%s phase=%s action=%s",
+            finding.family,
+            finding.row_id,
+            finding.raw_message_id,
+            finding.phase,
+            finding.action,
+        )
+        capture_runtime_incident_best_effort(
+            capture_recognition_execution_state,
+            app.state.session_factory,
+            config_loader=app.state.runtime_incident_config_loader,
+            family=finding.family,
+            row_id=finding.row_id,
+            raw_message_id=finding.raw_message_id,
+            phase=finding.phase,
+            action=finding.action,
+            occurred_at=observed_at,
+        )
+    return len(findings)
+
+
+async def _wait_recognition_execution_drain(
+    app: FastAPI, *, timeout_seconds: float
+) -> bool:
+    deadline = asyncio.get_running_loop().time() + max(0.0, timeout_seconds)
+    while True:
+        registry_active = app.state.recognition_execution_registry.snapshot().active
+        message_active = int(
+            app.state.message_processing_activity.snapshot()["active_chat_lanes"]
+        )
+        durable_active = 0
+        if (
+            app.state.recognition_execution_schema_valid
+            and app.state.recognition_execution_owner is not None
+        ):
+            durable_active = await asyncio.to_thread(
+                count_owned_durable_executions,
+                app.state.session_factory,
+                owner_instance_id=(
+                    app.state.recognition_execution_owner.instance_id
+                ),
+            )
+        if registry_active == 0 and message_active == 0 and durable_active == 0:
+            return True
+        if asyncio.get_running_loop().time() >= deadline:
+            return False
+        await asyncio.sleep(0.1)
 
 
 async def _run_message_operation_supervisor_loop(app: FastAPI) -> None:
@@ -4700,6 +4911,19 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         try:
             app.state.web_event_loop = asyncio.get_running_loop()
+            if (
+                app.state.runtime_role in {"worker", "all"}
+                and app.state.recognition_execution_schema_valid
+                and app.state.recognition_execution_scanner_task is None
+            ):
+                app.state.recognition_execution_scanner_task = asyncio.create_task(
+                    _run_recognition_execution_scanner_loop(app)
+                )
+                app.state.recognition_execution_scanner_task.add_done_callback(
+                    _log_background_task_result(
+                        "recognition_execution_scanner_task"
+                    )
+                )
             if app.state.loop_lag_monitor_task is None:
                 app.state.loop_lag_monitor_task = asyncio.create_task(
                     app.state.loop_lag_monitor.run()
@@ -5070,6 +5294,41 @@ def create_web_app(
                 )
             yield
         finally:
+            app.state.recognition_execution_registry.stop_admission()
+            scanner_task = app.state.recognition_execution_scanner_task
+            if scanner_task is not None:
+                scanner_task.cancel()
+                try:
+                    await scanner_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.recognition_execution_scanner_task = None
+            # Stop the queue claimant before waiting for durable execution
+            # ownership to drain. Cancelling its asyncio waiter does not prove
+            # an underlying to_thread call stopped; that work remains in the
+            # process-wide registry and is covered by the drain below.
+            message_processing_worker_task = (
+                app.state.message_processing_worker_task
+            )
+            if message_processing_worker_task is not None:
+                message_processing_worker_task.cancel()
+                try:
+                    await message_processing_worker_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.message_processing_worker_task = None
+            registry_drained = await _wait_recognition_execution_drain(
+                app,
+                timeout_seconds=30.0,
+            )
+            if not registry_drained:
+                logger.critical(
+                    "recognition execution process-wide drain timed out; active ownership remains fenced"
+                )
             loop_lag_monitor_task = app.state.loop_lag_monitor_task
             if loop_lag_monitor_task is not None:
                 loop_lag_monitor_task.cancel()
@@ -5278,6 +5537,12 @@ def create_web_app(
     app = FastAPI(title="Telegram KOL Research Web", lifespan=lifespan)
     app.state.database_path = Path(database_path)
     app.state.runtime_role = resolved_runtime_role
+    app.state.recognition_execution_registry = RecognitionExecutionRegistry()
+    app.state.recognition_execution_owner = (
+        build_execution_owner_identity(resolved_runtime_role)
+        if resolved_runtime_role in {"worker", "all"}
+        else None
+    )
     app.state.ingest_refresh_url = resolved_ingest_refresh_url
     app.state.ingest_refresh_requester = (
         ingest_refresh_requester or request_ingest_refresh_once
@@ -5308,6 +5573,19 @@ def create_web_app(
     app.state.runtime_agent_production_audit_lock = threading.Lock()
     app.state.log_directory = log_directory
     app.state.session_factory = create_session_factory(database_path)
+    schema_validation = validate_recognition_execution_schema(
+        app.state.session_factory
+    )
+    app.state.recognition_execution_schema_valid = schema_validation.valid
+    app.state.recognition_execution_scanner_task = None
+    if (
+        app.state.runtime_role in {"worker", "all"}
+        and not schema_validation.valid
+    ):
+        logger.critical(
+            "recognition execution schema unavailable; exchange-capable recognition paths will fail closed: %s",
+            ",".join(schema_validation.errors),
+        )
     app.state.media_root = resolved_media_root.resolve()
     app.state.live_update_broker = LiveUpdateBroker()
     app.state.llm_proxy_config = (
@@ -8280,6 +8558,7 @@ def create_web_app(
             "pending",
             "execution_pending",
             "execution_running",
+            "execution_uncertain",
         }:
             semantic_review_status = "pending"
         return {

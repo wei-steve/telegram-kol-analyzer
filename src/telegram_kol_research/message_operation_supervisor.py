@@ -106,6 +106,16 @@ class MessageOperationEvaluationError(ValueError):
 _COVERAGE_LIMIT_MAX = 1_000
 _COVERAGE_AGE_MAX_SECONDS = 1_000_000_000
 _TERMINAL_RECOGNITION_STATES = frozenset({"completed", "failed"})
+_NONTERMINAL_RECOGNITION_STATES = frozenset(
+    {
+        "",
+        "pending",
+        "running",
+        "execution_pending",
+        "execution_running",
+        "execution_uncertain",
+    }
+)
 
 
 def audit_multi_instruction_completeness(
@@ -309,9 +319,10 @@ def build_message_operation_coverage_snapshot(
     missing_contract_times: list[datetime] = []
     terminal_raw_ids: list[int] = []
     for raw_id, posted_at, created_at, comparison_status in source_rows:
-        if str(comparison_status or "").strip().lower() not in (
-            _TERMINAL_RECOGNITION_STATES
-        ):
+        normalized_status = str(comparison_status or "").strip().lower()
+        if normalized_status in _NONTERMINAL_RECOGNITION_STATES:
+            continue
+        if normalized_status not in _TERMINAL_RECOGNITION_STATES:
             continue
         terminal_raw_ids.append(int(raw_id))
         projection = project_message_operation_contract(

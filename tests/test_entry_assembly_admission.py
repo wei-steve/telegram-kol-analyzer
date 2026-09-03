@@ -1,8 +1,18 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
+from telegram_kol_research.authoritative_execution_attempts import (
+    ExecutionOwnerIdentity,
+)
+from telegram_kol_research.authoritative_execution_schema import (
+    apply_recognition_execution_schema,
+    build_recognition_execution_schema_plan,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
+    EntryAssemblyAttempt,
     EntryPreamble,
     MessageEvidenceExtractionClaim,
     MessageEvidenceVersion,
@@ -13,6 +23,16 @@ from telegram_kol_research.models import (
 
 
 NOW = datetime(2026, 8, 8, 9, 0, tzinfo=UTC)
+
+
+def _wakeup_owner() -> ExecutionOwnerIdentity:
+    return ExecutionOwnerIdentity("worker", "test-instance", 123, "boot", "456")
+
+
+def _install_wakeup_fence(session_factory) -> None:
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(engine, expected_plan_sha256=plan.plan_sha256)
 
 
 def _persist_strategy_and_later_claim(session_factory):
@@ -62,6 +82,7 @@ def test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence(tmp_p
     from telegram_kol_research.models import EntryAssemblyAttempt
 
     session_factory = create_session_factory(tmp_path / "admission.db")
+    _install_wakeup_fence(session_factory)
     strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
         session_factory
     )
@@ -106,11 +127,13 @@ def test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence(tmp_p
         session_factory,
         completed_raw_message_id=later_id,
         now=NOW + timedelta(seconds=3),
+        execution_owner=_wakeup_owner(),
     )
     repeated = claim_ready_entry_assembly_wakeups(
         session_factory,
         completed_raw_message_id=later_id,
         now=NOW + timedelta(seconds=4),
+        execution_owner=_wakeup_owner(),
     )
 
     assert tuple(item.strategy_raw_message_id for item in first) == (strategy_id,)
@@ -129,6 +152,7 @@ def test_final_wakeup_releases_matching_adjacent_deferred_entry_item(tmp_path):
     from telegram_kol_research.models import MessageInstructionItem
 
     session_factory = create_session_factory(tmp_path / "wakeup-item-release.db")
+    _install_wakeup_fence(session_factory)
     strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
         session_factory
     )
@@ -182,6 +206,7 @@ def test_final_wakeup_releases_matching_adjacent_deferred_entry_item(tmp_path):
         session_factory,
         completed_raw_message_id=later_id,
         now=NOW + timedelta(seconds=3),
+        execution_owner=_wakeup_owner(),
     )
 
     assert tuple(claim.strategy_raw_message_id for claim in claims) == (strategy_id,)
@@ -223,49 +248,7 @@ def test_shadow_records_proposal_without_deferring(tmp_path):
         assert session.query(EntryAssemblyAttempt).one().status == "shadow"
 
 
-def test_failed_wakeup_releases_claim_for_durable_retry(tmp_path):
-    from telegram_kol_research.entry_assembly_admission import (
-        assess_entry_assembly_admission,
-        claim_ready_entry_assembly_wakeups,
-        finish_entry_assembly_wakeup,
-    )
-
-    session_factory = create_session_factory(tmp_path / "wakeup-retry.db")
-    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
-        session_factory
-    )
-    assess_entry_assembly_admission(
-        session_factory,
-        strategy_raw_message_id=strategy_id,
-        signal_candidate_id=candidate_id,
-        mode="live",
-        assessed_at=NOW + timedelta(seconds=2),
-    )
-
-    first_claims = claim_ready_entry_assembly_wakeups(
-        session_factory,
-        completed_raw_message_id=later_id,
-        now=NOW + timedelta(seconds=3),
-    )
-    assert tuple(item.strategy_raw_message_id for item in first_claims) == (strategy_id,)
-    first_claim = first_claims[0]
-    finish_entry_assembly_wakeup(
-        session_factory,
-        attempt_id=first_claim.attempt_id,
-        claim_token=first_claim.claim_token,
-        succeeded=False,
-        now=NOW + timedelta(seconds=4),
-    )
-
-    retried = claim_ready_entry_assembly_wakeups(
-        session_factory,
-        completed_raw_message_id=later_id,
-        now=NOW + timedelta(seconds=5),
-    )
-    assert tuple(item.strategy_raw_message_id for item in retried) == (strategy_id,)
-
-
-def test_stale_wakeup_claim_is_reclaimed_on_later_worker_scan(tmp_path):
+def test_wakeup_claim_without_execution_owner_fails_closed_without_reclaim(tmp_path):
     from telegram_kol_research.entry_assembly_admission import (
         assess_entry_assembly_admission,
         claim_ready_entry_assembly_wakeups,
@@ -282,21 +265,20 @@ def test_stale_wakeup_claim_is_reclaimed_on_later_worker_scan(tmp_path):
         mode="live",
         assessed_at=NOW + timedelta(seconds=2),
     )
-    first = claim_ready_entry_assembly_wakeups(
-        session_factory,
-        completed_raw_message_id=later_id,
-        now=NOW + timedelta(seconds=3),
-    )
-    assert len(first) == 1
+    with pytest.raises(
+        RuntimeError,
+        match="entry_assembly_wakeup_execution_owner_required",
+    ):
+        claim_ready_entry_assembly_wakeups(
+            session_factory,
+            completed_raw_message_id=later_id,
+            now=NOW + timedelta(minutes=6),
+        )
 
-    recovered = claim_ready_entry_assembly_wakeups(
-        session_factory,
-        completed_raw_message_id=999999,
-        now=NOW + timedelta(minutes=6),
-    )
-
-    assert len(recovered) == 1
-    assert recovered[0].attempt_id == first[0].attempt_id
+    with session_factory() as session:
+        attempt = session.query(EntryAssemblyAttempt).one()
+        assert attempt.status == "pending"
+        assert attempt.wake_claim_token is None
 
 
 def test_two_blockers_are_removed_without_lost_wakeup(tmp_path):
@@ -306,6 +288,7 @@ def test_two_blockers_are_removed_without_lost_wakeup(tmp_path):
     )
 
     session_factory = create_session_factory(tmp_path / "two-blockers.db")
+    _install_wakeup_fence(session_factory)
     strategy_id, candidate_id, first_later_id = _persist_strategy_and_later_claim(
         session_factory
     )
@@ -342,11 +325,13 @@ def test_two_blockers_are_removed_without_lost_wakeup(tmp_path):
         session_factory,
         completed_raw_message_id=first_later_id,
         now=NOW + timedelta(seconds=4),
+        execution_owner=_wakeup_owner(),
     ) == ()
     final = claim_ready_entry_assembly_wakeups(
         session_factory,
         completed_raw_message_id=second_later_id,
         now=NOW + timedelta(seconds=5),
+        execution_owner=_wakeup_owner(),
     )
 
     assert tuple(item.strategy_raw_message_id for item in final) == (strategy_id,)

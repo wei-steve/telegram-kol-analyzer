@@ -30,6 +30,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_notification_failure,
     capture_protection_state,
     capture_provider_failure,
+    capture_recognition_execution_state,
 )
 from telegram_kol_research.runtime_incidents import (
     RuntimeIncidentBoundsError,
@@ -38,6 +39,39 @@ from telegram_kol_research.runtime_incidents import (
 
 
 NOW = datetime(2026, 7, 28, 12, 0, tzinfo=UTC)
+
+
+def test_recognition_execution_finding_is_recorded_and_deduplicated(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recognition-execution.db")
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset({"recognition_execution_orphan"})
+    )
+
+    first = capture_recognition_execution_state(
+        session_factory,
+        config=config,
+        family="active_authoritative_attempt",
+        row_id=17,
+        raw_message_id=41,
+        phase="executing",
+        action="marked_uncertain",
+        occurred_at=NOW,
+    )
+    second = capture_recognition_execution_state(
+        session_factory,
+        config=config,
+        family="active_authoritative_attempt",
+        row_id=17,
+        raw_message_id=41,
+        phase="executing",
+        action="marked_uncertain",
+        occurred_at=NOW,
+    )
+
+    assert first is not None
+    assert second.id == first.id
+    assert second.repeat_count == 2
+    assert second.incident_type == "recognition_execution_orphan"
 
 
 def _message_operation_contract(
@@ -273,6 +307,7 @@ def test_read_only_capture_profile_is_closed_and_excludes_business_ambiguity():
             "monitor_adapter_failure",
             "monitor_audit_incomplete",
             "notification_delivery_failure",
+            "recognition_execution_orphan",
         }
     )
 

@@ -99,6 +99,11 @@ def test_disable_plan_is_deterministic_read_only_and_targets_only_pending_failed
         comparison_status="completed",
         agreement_status="review_disabled",
     )
+    _seed_decision(
+        session_factory,
+        message_id=7,
+        comparison_status="execution_uncertain",
+    )
     with session_factory() as session:
         before = [
             (row.raw_message_id, row.comparison_status, row.updated_at)
@@ -122,6 +127,7 @@ def test_disable_plan_is_deterministic_read_only_and_targets_only_pending_failed
     ]
     assert first.status_counts == {
         "completed": 3,
+        "execution_uncertain": 1,
         "failed": 1,
         "pending": 1,
         "running": 1,

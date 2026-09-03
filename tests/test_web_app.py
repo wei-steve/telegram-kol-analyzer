@@ -618,7 +618,7 @@ def test_runtime_incident_notifications_use_system_operator_bot_lifespan(
             stopped.set()
 
     monkeypatch.setattr(
-        web_module,
+        web_app_module,
         "run_runtime_incident_notification_loop",
         fake_runtime_incident_loop,
     )
@@ -1125,6 +1125,56 @@ def test_message_pipeline_parity_observes_authoritative_queue_jobs(tmp_path):
     assert payload["shadow_jobs"] == 0
     assert payload["missing_job_count"] == 0
     assert payload["stuck_pending_count"] == 1
+
+
+def test_shutdown_stops_queue_job_claims_before_recognition_execution_drain(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.authoritative_execution_schema import (
+        apply_recognition_execution_schema,
+        build_recognition_execution_schema_plan,
+    )
+
+    started = threading.Event()
+    stopped = threading.Event()
+    drain_observations = []
+
+    async def message_worker(**_kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            stopped.set()
+
+    async def assert_worker_stopped_before_drain(app, *, timeout_seconds):
+        task = app.state.message_processing_worker_task
+        drain_observations.append((task, stopped.is_set(), timeout_seconds))
+        assert task is None or task.done()
+        assert stopped.is_set()
+        return True
+
+    monkeypatch.setattr(
+        web_app_module,
+        "_wait_recognition_execution_drain",
+        assert_worker_stopped_before_drain,
+    )
+    app = create_web_app(
+        database_path=tmp_path / "shutdown-order.db",
+        runtime_role="worker",
+        message_processing_worker_runner=message_worker,
+    )
+    engine = app.state.session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(engine, expected_plan_sha256=plan.plan_sha256)
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    with TestClient(app):
+        assert started.wait(timeout=1)
+
+    assert drain_observations
 
 
 def test_deployment_entry_freeze_cannot_be_cleared_by_queue_setting(
@@ -8958,6 +9008,64 @@ def test_monitor_incident_writer_cancellation_waits_for_worker_completion():
     async def scenario():
         task = asyncio.create_task(
             web_app_module._run_monitor_capture_writer(writer)
+        )
+        for _ in range(100):
+            if started.is_set():
+                break
+            await asyncio.sleep(0.001)
+        assert started.is_set()
+        task.cancel()
+        await asyncio.sleep(0.01)
+        assert task.done() is False
+        assert finished.is_set() is False
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert finished.is_set() is True
+
+    asyncio.run(scenario())
+
+
+def test_recognition_execution_scanner_cancellation_waits_for_cycle_writes(
+    tmp_path,
+    monkeypatch,
+):
+    started = threading.Event()
+    release = threading.Event()
+    finished = threading.Event()
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="worker",
+    )
+    finding = SimpleNamespace(
+        family="legacy_decision",
+        row_id=7,
+        raw_message_id=11,
+        phase="execution_running",
+        action="incident_only",
+    )
+
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_recognition_execution_cycle",
+        lambda *args, **kwargs: (finding,),
+    )
+
+    def blocking_capture(*args, **kwargs):
+        started.set()
+        release.wait(timeout=5)
+        finished.set()
+        return 1
+
+    monkeypatch.setattr(
+        web_app_module,
+        "capture_runtime_incident_best_effort",
+        blocking_capture,
+    )
+
+    async def scenario():
+        task = asyncio.create_task(
+            web_app_module._run_recognition_execution_scanner_loop(app)
         )
         for _ in range(100):
             if started.is_set():

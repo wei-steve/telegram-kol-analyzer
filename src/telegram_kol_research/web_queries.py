@@ -2038,7 +2038,24 @@ def _serialize_semantic_review(
     conflict_types = [item for item in conflict_types if isinstance(item, str)]
 
     legacy_auxiliary = bool(decision.auxiliary_model and not decision.comparison_model)
-    status = "completed" if legacy_auxiliary else decision.comparison_status or "pending"
+    recorded_status = decision.comparison_status or "pending"
+    if recorded_status in {
+        "execution_pending",
+        "execution_running",
+        "execution_uncertain",
+    }:
+        status = recorded_status
+    else:
+        status = "completed" if legacy_auxiliary else recorded_status
+    if status == "execution_uncertain":
+        return {
+            "status": status,
+            "severity": "unresolved",
+            "label": "执行结果未知",
+            "reason": "交易所副作用结果尚未得到确定证据",
+            "conflict_types": [],
+            "model": decision.comparison_model or decision.auxiliary_model,
+        }
     if decision.agreement_status == "review_disabled":
         return {
             "status": "review_disabled",

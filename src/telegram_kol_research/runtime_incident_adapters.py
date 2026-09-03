@@ -101,6 +101,44 @@ def capture_runtime_incident_best_effort(
         return None
 
 
+def capture_recognition_execution_state(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    family: str,
+    row_id: int,
+    raw_message_id: int | None,
+    phase: str,
+    action: str,
+    occurred_at: datetime,
+):
+    """Route a secret-free lease/orphan finding through the incident ledger."""
+
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind="recognition_execution",
+        source_record_id=f"{family}:{int(row_id)}",
+        incident_type="recognition_execution_orphan",
+        severity=(
+            "critical"
+            if phase in {"executing", "execution_uncertain", "uncertain"}
+            else "high"
+        ),
+        redacted_summary=_summary(
+            component=_safe_label(family, limit=64),
+            operation=_safe_label(action, limit=64),
+            source_status=_safe_label(phase, limit=32),
+            impact=(
+                f"raw_message_id:{int(raw_message_id)}"
+                if raw_message_id is not None
+                else "raw_message_id:not_recorded"
+            ),
+        ),
+        occurred_at=occurred_at,
+    )
+
+
 def _safe_label(value: Any, *, fallback: str = "unknown", limit: int = 128) -> str:
     text = str(value or "").strip()
     lowered = text.lower()

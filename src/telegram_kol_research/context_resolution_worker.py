@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable
@@ -48,6 +49,7 @@ TERMINAL_INSTRUCTION_STATUSES = frozenset(
 )
 DEFAULT_STALE_AFTER = timedelta(minutes=5)
 DEFAULT_RETRY_DELAY = timedelta(minutes=2)
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -607,96 +609,99 @@ def run_context_resolution_once(
             "raw_message_id": claim.raw_message_id,
         }
     try:
-        outcome = reanalyze(claim.raw_message_id, fingerprint)
-    except Exception as exc:
-        with session_factory() as session:
-            row = session.get(ContextResolutionAttempt, claim.attempt_id)
-            persisted_status = str(row.status)
-            attempt_count = int(row.attempts or 0)
-            delegated_retry = (
-                session.query(ContextResolutionAttempt.status)
-                .filter(
-                    ContextResolutionAttempt.raw_message_id
-                    == claim.raw_message_id,
-                    ContextResolutionAttempt.id != claim.attempt_id,
-                    ContextResolutionAttempt.context_fingerprint
-                    == fingerprint,
-                    ContextResolutionAttempt.status.in_(
-                        ("retry_pending", "exhausted")
-                    ),
-                )
-                .order_by(ContextResolutionAttempt.id.desc())
-                .first()
-            )
-        if claim.source_status == "retry_pending" and persisted_status in {
-            "retry_pending",
-            "exhausted",
-        }:
-            return {
-                "status": (
-                    "retry_scheduled"
-                    if persisted_status == "retry_pending"
-                    else "exhausted"
-                ),
-                "raw_message_id": claim.raw_message_id,
-            }
-        if delegated_retry is not None:
-            delegated_status = str(delegated_retry.status)
-            _finish_claim(
-                session_factory,
-                claim=claim,
-                status="superseded",
-                now=current,
-            )
-            return {
-                "status": (
-                    "retry_scheduled"
-                    if delegated_status == "retry_pending"
-                    else "exhausted"
-                ),
-                "raw_message_id": claim.raw_message_id,
-            }
-        exhausted = attempt_count >= int(max_attempts)
-        _finish_claim(
-            session_factory,
-            claim=claim,
-            status="exhausted" if exhausted else "pending_reanalysis",
-            now=current,
-            last_error=type(exc).__name__,
-            next_attempt_at=(
-                None if exhausted else current + DEFAULT_RETRY_DELAY
-            ),
-            increment_attempts=not exhausted,
+        outcome = reanalyze(
+            claim.raw_message_id,
+            fingerprint,
+            retrying=claim.source_status == "retry_pending",
         )
-        if exhausted:
-            capture_runtime_incident_best_effort(
-                capture_context_worker_state,
-                session_factory,
-                attempt_id=claim.attempt_id,
-                raw_message_id=claim.raw_message_id,
-                status="exhausted",
-                occurred_at=current,
-                error_type=type(exc).__name__,
-            )
-        if exhausted and notify_final_failure is not None:
-            should_notify = False
+    except Exception as exc:
+        logger.exception(
+            "context reanalysis failed raw_message_id=%s context_attempt_id=%s",
+            claim.raw_message_id,
+            claim.attempt_id,
+        )
+        try:
             with session_factory() as session:
                 row = session.get(ContextResolutionAttempt, claim.attempt_id)
-                if row.exhausted_notified_at is None:
-                    row.exhausted_notified_at = current
-                    session.commit()
-                    should_notify = True
-            if should_notify:
-                notify_final_failure(
-                    {
-                        "raw_message_id": claim.raw_message_id,
-                        "reason": "context_reanalysis_exhausted",
-                    }
+                persisted_status = str(row.status)
+                attempt_count = int(row.attempts or 0)
+                delegated_retry = (
+                    session.query(ContextResolutionAttempt.status)
+                    .filter(
+                        ContextResolutionAttempt.raw_message_id
+                        == claim.raw_message_id,
+                        ContextResolutionAttempt.id != claim.attempt_id,
+                        ContextResolutionAttempt.context_fingerprint
+                        == fingerprint,
+                        ContextResolutionAttempt.status.in_(
+                            ("retry_pending", "exhausted")
+                        ),
+                    )
+                    .order_by(ContextResolutionAttempt.id.desc())
+                    .first()
                 )
-        return {
-            "status": "exhausted" if exhausted else "retry_scheduled",
-            "raw_message_id": claim.raw_message_id,
-        }
+            already_classified = (
+                claim.source_status == "retry_pending"
+                and persisted_status in {"retry_pending", "exhausted"}
+            )
+            if not already_classified and delegated_retry is not None:
+                _finish_claim(
+                    session_factory,
+                    claim=claim,
+                    status="superseded",
+                    now=current,
+                )
+                already_classified = True
+            exhausted = attempt_count >= int(max_attempts)
+            if not already_classified:
+                _finish_claim(
+                    session_factory,
+                    claim=claim,
+                    status="exhausted" if exhausted else "pending_reanalysis",
+                    now=current,
+                    last_error=type(exc).__name__,
+                    next_attempt_at=(
+                        None if exhausted else current + DEFAULT_RETRY_DELAY
+                    ),
+                    increment_attempts=not exhausted,
+                )
+            if exhausted and not already_classified:
+                capture_runtime_incident_best_effort(
+                    capture_context_worker_state,
+                    session_factory,
+                    attempt_id=claim.attempt_id,
+                    raw_message_id=claim.raw_message_id,
+                    status="exhausted",
+                    occurred_at=current,
+                    error_type=type(exc).__name__,
+                )
+            if (
+                exhausted
+                and not already_classified
+                and notify_final_failure is not None
+            ):
+                should_notify = False
+                with session_factory() as session:
+                    row = session.get(ContextResolutionAttempt, claim.attempt_id)
+                    if row.exhausted_notified_at is None:
+                        row.exhausted_notified_at = current
+                        session.commit()
+                        should_notify = True
+                if should_notify:
+                    notify_final_failure(
+                        {
+                            "raw_message_id": claim.raw_message_id,
+                            "reason": "context_reanalysis_exhausted",
+                        }
+                    )
+        except BaseException:
+            logger.critical(
+                "context reanalysis failure classification raised raw_message_id=%s context_attempt_id=%s",
+                claim.raw_message_id,
+                claim.attempt_id,
+                exc_info=True,
+            )
+        raise
     if claim.source_status == "retry_pending":
         with session_factory() as session:
             persisted_status = str(
