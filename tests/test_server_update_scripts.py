@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import io
 from pathlib import Path
 import json
@@ -1037,7 +1038,10 @@ def test_per_role_activate_transport_uses_hash_bound_exact_commit_controller() -
         assert "ACTIVATION_CONTROLLER_BUNDLE_SHA256" in source
         assert "ACTIVATION_DRY_RUN" in source
         assert "scoped_release_activation.py" in source
+        assert "deployment_activation_quiescence_check.py" in source
+        assert "deployment_active_write_check.py" in source
         assert "deployment_action_plan.py" in source
+        assert "entry_revision_exchange_authority_contract.py" in source
         assert "runtime_deployment_identity.py" in source
         assert "PYTHONDONTWRITEBYTECODE=1" in source
         assert " -B -m telegram_kol_research.scoped_release_activation" in source
@@ -1131,11 +1135,151 @@ def test_per_role_activate_transport_sends_only_exact_controller_bundle(
             "src",
             "src/telegram_kol_research",
             "src/telegram_kol_research/__init__.py",
+            "src/telegram_kol_research/deployment_activation_quiescence_check.py",
+            "src/telegram_kol_research/deployment_active_write_check.py",
             "src/telegram_kol_research/deployment_action_plan.py",
+            "src/telegram_kol_research/entry_revision_exchange_authority_contract.py",
             "src/telegram_kol_research/runtime_deployment_identity.py",
             "src/telegram_kol_research/scoped_release_activation.py",
         ]
         assert all(member.isfile() or member.isdir() for member in archive.getmembers())
+
+
+def test_activation_controller_bundle_can_execute_quiescence_helper(
+    tmp_path: Path,
+) -> None:
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    activation_bundle = bootstrap.split('bundle="$temporary/activation-controller.tar"', 1)[
+        1
+    ].split(")", 1)[0]
+    members = re.findall(r"^\s+(src/telegram_kol_research/\S+\.py)$", activation_bundle, re.M)
+    control = tmp_path / "control"
+    for relative in members:
+        destination = control / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(ROOT / relative, destination)
+
+    result = subprocess.run(
+        [
+            os.sys.executable,
+            "-B",
+            "-m",
+            "telegram_kol_research.deployment_activation_quiescence_check",
+            str(tmp_path / "missing.db"),
+        ],
+        env={
+            **os.environ,
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPATH": str(control / "src"),
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 4
+    assert result.stderr.strip() == "ERROR activation_quiescence_unknown"
+
+
+def test_remote_activation_controller_rejects_link_archive_before_extraction(
+    tmp_path: Path,
+) -> None:
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    remote_script = bootstrap.split("<<'REMOTE' || true\n", 1)[1].split(
+        "\nREMOTE\n", 1
+    )[0]
+    manifest = b"{}"
+    bundle = tmp_path / "controller.tar"
+    names = (
+        "src/",
+        "src/telegram_kol_research/",
+        "src/telegram_kol_research/__init__.py",
+        "src/telegram_kol_research/deployment_activation_quiescence_check.py",
+        "src/telegram_kol_research/deployment_active_write_check.py",
+        "src/telegram_kol_research/deployment_action_plan.py",
+        "src/telegram_kol_research/entry_revision_exchange_authority_contract.py",
+        "src/telegram_kol_research/runtime_deployment_identity.py",
+        "src/telegram_kol_research/scoped_release_activation.py",
+    )
+    with tarfile.open(bundle, "w") as archive:
+        for name in names:
+            member = tarfile.TarInfo(name)
+            if name.endswith("/"):
+                member.type = tarfile.DIRTYPE
+                archive.addfile(member)
+            elif name.endswith("scoped_release_activation.py"):
+                member.type = tarfile.SYMTYPE
+                member.linkname = "/tmp/not-allowed"
+                archive.addfile(member)
+            else:
+                payload = b"# test\n"
+                member.size = len(payload)
+                archive.addfile(member, io.BytesIO(payload))
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    remote_tmp = tmp_path / "remote"
+    fake_mktemp = fake_bin / "mktemp"
+    fake_mktemp.write_text(
+        "#!/usr/bin/env bash\nmkdir -p \"$FAKE_REMOTE_TMP\"\nprintf '%s\\n' \"$FAKE_REMOTE_TMP\"\n",
+        encoding="utf-8",
+    )
+    fake_mktemp.chmod(0o755)
+    fake_sha = fake_bin / "sha256sum"
+    fake_sha.write_text(
+        "#!/usr/bin/env bash\nshasum -a 256 \"$1\"\n", encoding="utf-8"
+    )
+    fake_sha.chmod(0o755)
+    payload = "\n".join(
+        (
+            base64.b64encode(manifest).decode(),
+            base64.b64encode(bundle.read_bytes()).decode(),
+            "",
+        )
+    )
+    manifest_sha = hashlib.sha256(manifest).hexdigest()
+    bundle_sha = hashlib.sha256(bundle.read_bytes()).hexdigest()
+
+    result = subprocess.run(
+        [
+            "/bin/bash",
+            "-c",
+            remote_script,
+            "--",
+            "activate",
+            "1" * 40,
+            "codex/test",
+            manifest_sha,
+            bundle_sha,
+            "",
+            "/run/authorization.json",
+            "/run/authorization.consumed",
+            "/opt/source",
+            "/opt/releases",
+            "/etc/systemd/system",
+            "/opt/data/research.db",
+            "immutable",
+            "1",
+            "1",
+            "2" * 40,
+        ],
+        input=payload,
+        env={
+            **os.environ,
+            "FAKE_REMOTE_TMP": str(remote_tmp),
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 4
+    assert "contains a link or non-file entry" in result.stderr
+    assert not (remote_tmp / "control").exists()
 
 
 def test_per_role_activate_transport_rejects_legacy_rollback_commit_before_ssh(

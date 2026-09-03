@@ -168,6 +168,10 @@ def _parse_rollback_releases(
         raise ManifestValidationError(
             "manifest field rollback_releases must be an object"
         )
+    if not value:
+        raise ManifestValidationError(
+            "manifest field rollback_releases must not be empty"
+        )
     expected = {component.value for component in components}
     if set(value) != expected:
         raise ManifestValidationError(
@@ -314,6 +318,12 @@ def _validate_typed_manifest(manifest: DeploymentManifest) -> None:
     ) != manifest.rollback_releases:
         raise ManifestValidationError(
             "manifest model has non-canonical rollback release order"
+        )
+    if len({target.component for target in manifest.rollback_releases}) != len(
+        manifest.rollback_releases
+    ):
+        raise ManifestValidationError(
+            "manifest model has duplicate rollback release components"
         )
     for target in manifest.rollback_releases:
         if (

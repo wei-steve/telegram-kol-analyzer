@@ -157,7 +157,10 @@ try {
         else {
             @(
                 "src/telegram_kol_research/__init__.py",
+                "src/telegram_kol_research/deployment_activation_quiescence_check.py",
+                "src/telegram_kol_research/deployment_active_write_check.py",
                 "src/telegram_kol_research/deployment_action_plan.py",
+                "src/telegram_kol_research/entry_revision_exchange_authority_contract.py",
                 "src/telegram_kol_research/runtime_deployment_identity.py",
                 "src/telegram_kol_research/scoped_release_activation.py"
             )
@@ -214,7 +217,10 @@ case "$action" in
         src/ \
         src/telegram_kol_research/ \
         src/telegram_kol_research/__init__.py \
+        src/telegram_kol_research/deployment_activation_quiescence_check.py \
+        src/telegram_kol_research/deployment_active_write_check.py \
         src/telegram_kol_research/deployment_action_plan.py \
+        src/telegram_kol_research/entry_revision_exchange_authority_contract.py \
         src/telegram_kol_research/runtime_deployment_identity.py \
         src/telegram_kol_research/scoped_release_activation.py | LC_ALL=C sort)"
       [ "$entries" = "$expected_entries" ] || { echo "Activation controller archive is unsafe." >&2; exit 4; }

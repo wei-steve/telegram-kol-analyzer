@@ -141,10 +141,11 @@ validated before and immediately before consumption. Dry-run validates it but ne
 An old rollback release cannot parse the new protocol. The standard shell and PowerShell clients
 therefore require an explicit full-lowercase `ACTIVATION_CONTROLLER_COMMIT` (PowerShell:
 `ActivationControllerCommit`) and build an exact-controller-commit activation archive containing
-only the activator,
-deployment action-plan parser, package initializer, and activation launcher required for the
-control process. They compute its SHA-256, send it with the activation manifest, and the remote
-wrapper:
+only the activator, deployment action-plan parser, runtime identity helper, dependency-light
+activation-quiescence helper and its two stdlib-only contract modules, and the package initializer.
+The quiescence closure is required because the controller invokes it as a separate `python -m`
+process; omitting it would fail closed before the active-write gate can complete. The clients
+compute the archive SHA-256, send it with the activation manifest, and the remote wrapper:
 
 1. creates a root-only temporary directory under `/run`;
 2. verifies the received manifest and bundle hashes before extraction;

@@ -12,6 +12,7 @@ from telegram_kol_research.deployment_action_plan import (
     GateDisposition,
     ManifestValidationError,
     RiskLevel,
+    RollbackReleaseTarget,
     RuntimeComponent,
     build_action_plan,
     main,
@@ -150,6 +151,7 @@ def test_activation_manifest_accepts_exact_per_component_rollback_releases() -> 
                 }
             },
         ),
+        ("local", [], {}),
     ),
     ids=(
         "activation-only",
@@ -158,6 +160,7 @@ def test_activation_manifest_accepts_exact_per_component_rollback_releases() -> 
         "uppercase-commit",
         "short-manifest-digest",
         "unknown-target-field",
+        "empty-map",
     ),
 )
 def test_rollback_release_manifest_contract_is_closed(
@@ -196,6 +199,28 @@ def test_manifest_json_rejects_duplicate_rollback_component_keys(
 
     assert main(["--manifest", str(manifest), "--format", "json"]) == 2
     assert json.loads(capsys.readouterr().err)["error"] == "invalid_json"
+
+
+def test_typed_manifest_rejects_duplicate_rollback_components() -> None:
+    target = RollbackReleaseTarget(
+        component=RuntimeComponent.WEB,
+        commit="1" * 40,
+        manifest_sha256="a" * 64,
+    )
+    manifest = DeploymentManifest(
+        action=DeploymentAction.ACTIVATE,
+        risk_level=RiskLevel.L1,
+        components=(RuntimeComponent.WEB,),
+        requires_restart=True,
+        schema_changed=False,
+        production_data_mutation=False,
+        exchange_write_semantics_changed=False,
+        authority_changed=False,
+        rollback_releases=(target, target),
+    )
+
+    with pytest.raises(ManifestValidationError, match="duplicate rollback"):
+        build_action_plan(manifest)
 
 
 @pytest.mark.parametrize(

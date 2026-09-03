@@ -8,7 +8,7 @@ from telegram_kol_research.deployment_active_write_check import (
     ActiveWriteCheckError,
     count_active_exchange_writes_in_connection,
 )
-from telegram_kol_research.entry_revision_exchange_authority import (
+from telegram_kol_research.entry_revision_exchange_authority_contract import (
     ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
     is_canonical_idle_entry_revision_exchange_authority,
 )

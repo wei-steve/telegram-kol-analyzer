@@ -19,6 +19,10 @@ from sqlalchemy.exc import SQLAlchemyError
 from telegram_kol_research.deployment_entry_freeze import (
     deployment_entry_admission_frozen,
 )
+from telegram_kol_research.entry_revision_exchange_authority_contract import (
+    ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY,
+    is_canonical_idle_entry_revision_exchange_authority,
+)
 from telegram_kol_research.models import TradingSetting
 from telegram_kol_research.trading_settings import (
     TRADING_SETTINGS_KEY,
@@ -27,7 +31,6 @@ from telegram_kol_research.trading_settings import (
 )
 
 
-ENTRY_REVISION_EXCHANGE_AUTHORITY_KEY = "entry_revision_exchange_authority"
 _SCHEMA_VERSION = 2
 _MAX_LEASE = timedelta(minutes=10)
 _PROCESS_START_FALLBACK = time.monotonic_ns()
@@ -125,15 +128,6 @@ class EntryRevisionExchangeAuthorityBlock:
     blocked: bool
     generation: int | None = None
     reason_code: str | None = None
-
-
-def is_canonical_idle_entry_revision_exchange_authority(
-    value_json: str,
-) -> bool:
-    """Return whether a stored document is the exact parseable idle schema."""
-
-    document = _authority_document(value_json)
-    return document is not None and document["state"] == "idle"
 
 
 def seed_entry_revision_exchange_authority(
