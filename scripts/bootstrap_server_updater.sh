@@ -13,6 +13,7 @@ BRANCH="${BRANCH:-codex/deepcoin-auto-trading-v1}"
 EXPECTED_COMMIT="${EXPECTED_COMMIT:?set EXPECTED_COMMIT to the reviewed 40-character commit}"
 ACTION_MANIFEST="${ACTION_MANIFEST:?set ACTION_MANIFEST to the local action manifest}"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+PLANNER_PYTHON="${PLANNER_PYTHON:-$ROOT/.venv/bin/python}"
 
 command -v ssh >/dev/null 2>&1 || { echo "ssh is required." >&2; exit 2; }
 [ -r "$KEY_PATH" ] || { echo "SSH private key is not readable: $KEY_PATH" >&2; exit 2; }
@@ -43,13 +44,26 @@ ROLLBACK_COMMIT="${ROLLBACK_COMMIT:-}"
 ACTIVATION_AUTHORIZATION="${ACTIVATION_AUTHORIZATION:-}"
 ACTIVATION_AUTHORIZATION_CONSUMED="${ACTIVATION_AUTHORIZATION_CONSUMED:-}"
 ACTIVATION_SOURCE_MODE="${ACTIVATION_SOURCE_MODE:-immutable}"
+ACTIVATION_DRY_RUN="${ACTIVATION_DRY_RUN:-0}"
+ACTIVATION_CONTROLLER_COMMIT="${ACTIVATION_CONTROLLER_COMMIT:-}"
+[[ "$ACTIVATION_DRY_RUN" == "0" || "$ACTIVATION_DRY_RUN" == "1" ]] \
+  || { echo "Invalid ACTIVATION_DRY_RUN." >&2; exit 2; }
+PER_ROLE_ROLLBACK="$($PLANNER_PYTHON -c \
+  'import json,sys; print("1" if "rollback_releases" in json.load(open(sys.argv[1], encoding="utf-8")) else "0")' \
+  "$ACTION_MANIFEST")"
 if [ "$ACTION" = "activate" ]; then
   safe_remote_path "$ACTIVATION_AUTHORIZATION" || { echo "Invalid ACTIVATION_AUTHORIZATION." >&2; exit 2; }
   safe_remote_path "$ACTIVATION_AUTHORIZATION_CONSUMED" || { echo "Invalid ACTIVATION_AUTHORIZATION_CONSUMED." >&2; exit 2; }
   [[ "$ACTIVATION_SOURCE_MODE" == "immutable" || "$ACTIVATION_SOURCE_MODE" == "stopped_legacy" ]] \
     || { echo "Invalid ACTIVATION_SOURCE_MODE." >&2; exit 2; }
   if [ "$ACTIVATION_SOURCE_MODE" = "immutable" ]; then
-    [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid ROLLBACK_COMMIT." >&2; exit 2; }
+    if [ "$PER_ROLE_ROLLBACK" = "1" ]; then
+      [ -z "$ROLLBACK_COMMIT" ] || { echo "ROLLBACK_COMMIT conflicts with rollback_releases." >&2; exit 2; }
+      [[ "$ACTIVATION_CONTROLLER_COMMIT" =~ ^[0-9a-f]{40}$ ]] \
+        || { echo "Invalid ACTIVATION_CONTROLLER_COMMIT." >&2; exit 2; }
+    else
+      [[ "$ROLLBACK_COMMIT" =~ ^[0-9a-f]{40}$ ]] || { echo "Invalid ROLLBACK_COMMIT." >&2; exit 2; }
+    fi
   fi
 fi
 
@@ -69,14 +83,31 @@ cleanup() {
 }
 trap cleanup EXIT
 
-if [ "$ACTION" = "stage" ]; then
+if [ "$ACTION" = "stage" ] || { [ "$ACTION" = "activate" ] && [ "$PER_ROLE_ROLLBACK" = "1" ]; }; then
   temporary="$(mktemp -d "${TMPDIR:-/tmp}/telegram-kol-stage-bootstrap.XXXXXX")"
-  bundle="$temporary/stager.tar"
-  git -C "$ROOT" cat-file -e "$EXPECTED_COMMIT^{commit}"
-  git -C "$ROOT" archive --format=tar --output="$bundle" "$EXPECTED_COMMIT" \
-    deploy/telegram-kol-stage \
-    src/telegram_kol_research/__init__.py \
-    src/telegram_kol_research/deployment_action_plan.py
+  if [ "$ACTION" = "stage" ]; then
+    bundle="$temporary/stager.tar"
+    bundle_files=(
+      deploy/telegram-kol-stage
+      src/telegram_kol_research/__init__.py
+      src/telegram_kol_research/deployment_action_plan.py
+    )
+  else
+    bundle="$temporary/activation-controller.tar"
+    bundle_files=(
+      src/telegram_kol_research/__init__.py
+      src/telegram_kol_research/deployment_action_plan.py
+      src/telegram_kol_research/runtime_deployment_identity.py
+      src/telegram_kol_research/scoped_release_activation.py
+    )
+  fi
+  bundle_commit="$EXPECTED_COMMIT"
+  if [ "$ACTION" = "activate" ]; then
+    bundle_commit="$ACTIVATION_CONTROLLER_COMMIT"
+  fi
+  git -C "$ROOT" cat-file -e "$bundle_commit^{commit}"
+  git -C "$ROOT" archive --format=tar --output="$bundle" "$bundle_commit" \
+    "${bundle_files[@]}"
   if command -v shasum >/dev/null 2>&1; then
     BUNDLE_SHA256="$(shasum -a 256 "$bundle" | awk '{print $1}')"
   else
@@ -93,6 +124,8 @@ manifest_sha256="$4"; bundle_sha256="$5"
 rollback_commit="$6"; authorization="$7"; authorization_consumed="$8"
 source_repo="$9"; release_root="${10}"; service_dropin_root="${11}"; database_path="${12}"
 source_mode="${13}"
+per_role_rollback="${14}"; dry_run="${15}"
+controller_commit="${16}"
 IFS= read -r manifest_base64
 IFS= read -r bundle_base64
 manifest_base64="${manifest_base64%$'\r'}"
@@ -119,23 +152,58 @@ case "$action" in
       "$temporary/control/deploy/telegram-kol-stage"
     ;;
   activate)
-    dispatcher_commit="$rollback_commit"
-    if [ "$source_mode" = "stopped_legacy" ]; then
-      dispatcher_commit="$expected_commit"
+    if [ "$per_role_rollback" = "1" ]; then
+      printf '%s' "$bundle_base64" | base64 -d >"$temporary/activation-controller.tar"
+      [ "$(sha256sum "$temporary/activation-controller.tar" | awk '{print $1}')" = "$bundle_sha256" ]
+      entries="$(tar -tf "$temporary/activation-controller.tar" | LC_ALL=C sort)"
+      expected_entries="$(printf '%s\n' \
+        src/ \
+        src/telegram_kol_research/ \
+        src/telegram_kol_research/__init__.py \
+        src/telegram_kol_research/deployment_action_plan.py \
+        src/telegram_kol_research/runtime_deployment_identity.py \
+        src/telegram_kol_research/scoped_release_activation.py | LC_ALL=C sort)"
+      [ "$entries" = "$expected_entries" ] || { echo "Activation controller archive is unsafe." >&2; exit 4; }
+      tar -tvf "$temporary/activation-controller.tar" \
+        | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }' \
+        || { echo "Activation controller archive contains a link or non-file entry." >&2; exit 4; }
+      mkdir "$temporary/control"
+      tar -xf "$temporary/activation-controller.tar" -C "$temporary/control"
+      PYTHONPATH="$temporary/control/src" \
+        PYTHONDONTWRITEBYTECODE=1 \
+        EXPECTED_COMMIT="$expected_commit" \
+        ROLLBACK_COMMIT= \
+        ACTION_MANIFEST="$temporary/action-manifest.json" \
+        ACTIVATION_AUTHORIZATION="$authorization" \
+        ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" \
+        ACTIVATION_SOURCE_MODE="$source_mode" \
+        ACTIVATION_CONTROLLER_COMMIT="$controller_commit" \
+        ACTIVATION_CONTROLLER_BUNDLE_SHA256="$bundle_sha256" \
+        ACTIVATION_DRY_RUN="$dry_run" \
+        RELEASE_ROOT="$release_root" \
+        SERVICE_DROPIN_ROOT="$service_dropin_root" \
+        DATABASE_PATH="$database_path" \
+        /opt/telegram-kol-analyzer/.venv/bin/python -B -m telegram_kol_research.scoped_release_activation
+    else
+      dispatcher_commit="$rollback_commit"
+      if [ "$source_mode" = "stopped_legacy" ]; then
+        dispatcher_commit="$expected_commit"
+      fi
+      updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
+      [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
+      DEPLOYMENT_ACTION=activate \
+        EXPECTED_COMMIT="$expected_commit" \
+        ROLLBACK_COMMIT="$rollback_commit" \
+        ACTION_MANIFEST="$temporary/action-manifest.json" \
+        ACTIVATION_AUTHORIZATION="$authorization" \
+        ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" \
+        ACTIVATION_SOURCE_MODE="$source_mode" \
+        ACTIVATION_DRY_RUN="$dry_run" \
+        RELEASE_ROOT="$release_root" \
+        SERVICE_DROPIN_ROOT="$service_dropin_root" \
+        DATABASE_PATH="$database_path" \
+        "$updater"
     fi
-    updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
-    [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
-    DEPLOYMENT_ACTION=activate \
-      EXPECTED_COMMIT="$expected_commit" \
-      ROLLBACK_COMMIT="$rollback_commit" \
-      ACTION_MANIFEST="$temporary/action-manifest.json" \
-      ACTIVATION_AUTHORIZATION="$authorization" \
-      ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" \
-      ACTIVATION_SOURCE_MODE="$source_mode" \
-      RELEASE_ROOT="$release_root" \
-      SERVICE_DROPIN_ROOT="$service_dropin_root" \
-      DATABASE_PATH="$database_path" \
-      "$updater"
     ;;
   *) echo "Remote action must be stage or activate." >&2; exit 2 ;;
 esac
@@ -145,6 +213,7 @@ REMOTE_COMMAND="bash -c \"\$(printf '%s' '$REMOTE_SCRIPT_BASE64' | base64 -d)\" 
 '$ACTION' '$EXPECTED_COMMIT' '$BRANCH' '$MANIFEST_SHA256' '$BUNDLE_SHA256' \
 '$ROLLBACK_COMMIT' '$ACTIVATION_AUTHORIZATION' '$ACTIVATION_AUTHORIZATION_CONSUMED' \
 '$SOURCE_REPO' '$RELEASE_ROOT' '$SERVICE_DROPIN_ROOT' '$DATABASE_PATH' \
-'$ACTIVATION_SOURCE_MODE'"
+'$ACTIVATION_SOURCE_MODE' '$PER_ROLE_ROLLBACK' '$ACTIVATION_DRY_RUN' \
+'$ACTIVATION_CONTROLLER_COMMIT'"
 printf '%s\n%s\n' "$MANIFEST_BASE64" "$BUNDLE_BASE64" \
   | ssh -i "$KEY_PATH" "$SERVER" "$REMOTE_COMMAND"

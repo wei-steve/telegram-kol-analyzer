@@ -116,7 +116,8 @@
 **Steps:**
 
 1. Detect the per-role manifest through the typed local action-plan parser.
-2. Archive only the required controller files from the exact reviewed commit.
+2. Require an explicit controller commit independent of the runtime candidate, then archive only
+   the required controller files from that exact reviewed controller commit.
 3. Compute and transport the bundle SHA-256 and controller commit.
 4. Verify hashes and safe archive entries before root-only `/run` extraction.
 5. Run the controller with `python -B` and `PYTHONDONTWRITEBYTECODE=1`.

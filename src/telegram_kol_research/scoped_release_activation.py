@@ -9,6 +9,7 @@ import fcntl
 import os
 from pathlib import Path
 import re
+import shlex
 import stat
 import subprocess
 import sys
@@ -22,6 +23,7 @@ from telegram_kol_research.deployment_action_plan import (
     DeploymentAction,
     DeploymentManifest,
     ManifestValidationError,
+    _reject_duplicate_json_keys,
     build_action_plan,
     parse_manifest,
 )
@@ -154,6 +156,10 @@ class RuntimeAdapter(Protocol):
 
     def monitor_timer_active(self) -> bool: ...
 
+    def prove_monitor_rollback_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]: ...
+
     def verify_monitor_release(
         self, release: ReleaseEvidence
     ) -> Mapping[str, Any]: ...
@@ -167,7 +173,7 @@ def _canonical_json_bytes(payload: Mapping[str, Any]) -> bytes:
 
 
 def _canonical_manifest(manifest: DeploymentManifest) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "action": manifest.action.value,
         "authority_changed": manifest.authority_changed,
         "components": [component.value for component in manifest.components],
@@ -177,10 +183,19 @@ def _canonical_manifest(manifest: DeploymentManifest) -> dict[str, Any]:
         "risk_level": manifest.risk_level.value,
         "schema_changed": manifest.schema_changed,
     }
+    if manifest.rollback_releases:
+        payload["rollback_releases"] = {
+            target.component.value: {
+                "commit": target.commit,
+                "manifest_sha256": target.manifest_sha256,
+            }
+            for target in manifest.rollback_releases
+        }
+    return payload
 
 
 def _plan_payload(plan: ActionPlan) -> dict[str, Any]:
-    return {
+    payload: dict[str, Any] = {
         "action": plan.action.value,
         "components": [component.value for component in plan.components],
         "gates": [
@@ -194,6 +209,15 @@ def _plan_payload(plan: ActionPlan) -> dict[str, Any]:
         "risk_level": plan.risk_level.value,
         "schema_version": 1,
     }
+    if plan.rollback_releases:
+        payload["rollback_releases"] = {
+            target.component.value: {
+                "commit": target.commit,
+                "manifest_sha256": target.manifest_sha256,
+            }
+            for target in plan.rollback_releases
+        }
+    return payload
 
 
 def action_plan_sha256(manifest: DeploymentManifest) -> str:
@@ -209,11 +233,20 @@ def _read_manifest(path: Path) -> tuple[DeploymentManifest, dict[str, Any], str]
             raise ActivationError("action manifest is unsafe")
         if metadata.st_size > 65_536:
             raise ActivationError("action manifest is too large")
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
         if not isinstance(payload, dict):
             raise ActivationError("action manifest is invalid")
         manifest = parse_manifest(payload)
-    except (OSError, UnicodeError, json.JSONDecodeError, ManifestValidationError) as exc:
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        ValueError,
+        ManifestValidationError,
+    ) as exc:
         raise ActivationError("action manifest is invalid") from exc
     if manifest.action is not DeploymentAction.ACTIVATE:
         raise ActivationError("action manifest must declare activate")
@@ -381,8 +414,18 @@ def validate_release(
 
 
 def _same_declared_change(stage: Mapping[str, Any], activate: Mapping[str, Any]) -> bool:
-    keys = set(activate) - {"action"}
+    keys = set(activate) - {"action", "rollback_releases"}
     return keys == set(stage) - {"action"} and all(stage[key] == activate[key] for key in keys)
+
+
+def _rollback_release_payload(manifest: DeploymentManifest) -> dict[str, dict[str, str]]:
+    return {
+        target.component.value: {
+            "commit": target.commit,
+            "manifest_sha256": target.manifest_sha256,
+        }
+        for target in manifest.rollback_releases
+    }
 
 
 def _parse_time(value: Any) -> datetime:
@@ -406,6 +449,9 @@ def _validate_authorization(
     plan_sha256: str,
     source_mode: str,
     now: datetime,
+    rollback_releases: Mapping[str, Mapping[str, str]] | None = None,
+    controller_commit: str | None = None,
+    controller_bundle_sha256: str | None = None,
 ) -> None:
     try:
         metadata = path.lstat()
@@ -425,21 +471,33 @@ def _validate_authorization(
         raise ActivationError("authorization is invalid")
     issued_at = _parse_time(payload.get("issued_at"))
     expires_at = _parse_time(payload.get("expires_at"))
+    legacy_fields = {
+        "action_plan_sha256",
+        "commit",
+        "components",
+        "contract",
+        "expires_at",
+        "issued_at",
+        "nonce",
+        "schema_version",
+        "source_mode",
+    }
+    per_role_fields = legacy_fields | {
+        "rollback_releases",
+        "controller_commit",
+        "controller_bundle_sha256",
+    }
+    per_role = rollback_releases is not None
+    expected_fields = per_role_fields if per_role else legacy_fields
     if (
-        set(payload)
-        != {
-            "action_plan_sha256",
-            "commit",
-            "components",
-            "contract",
-            "expires_at",
-            "issued_at",
-            "nonce",
-            "schema_version",
-            "source_mode",
-        }
-        or payload.get("contract") != "scoped-activation-authorization-v2"
-        or payload.get("schema_version") != 2
+        set(payload) != expected_fields
+        or payload.get("contract")
+        != (
+            "scoped-activation-authorization-v3"
+            if per_role
+            else "scoped-activation-authorization-v2"
+        )
+        or payload.get("schema_version") != (3 if per_role else 2)
         or payload.get("commit") != commit
         or payload.get("components") != components
         or payload.get("action_plan_sha256") != plan_sha256
@@ -448,6 +506,17 @@ def _validate_authorization(
         or issued_at > now
         or expires_at <= now
         or expires_at - issued_at > timedelta(minutes=15)
+        or (
+            per_role
+            and (
+                payload.get("rollback_releases") != rollback_releases
+                or payload.get("controller_commit") != controller_commit
+                or payload.get("controller_bundle_sha256")
+                != controller_bundle_sha256
+                or not _SHA1_RE.fullmatch(str(controller_commit or ""))
+                or not _SHA256_RE.fullmatch(str(controller_bundle_sha256 or ""))
+            )
+        )
     ):
         raise ActivationError("authorization is invalid")
 
@@ -669,6 +738,27 @@ def publish_release_dropins(
             )
 
 
+def publish_component_release_dropins(
+    paths: ActivationPaths,
+    releases: Mapping[str, ReleaseEvidence],
+    components: list[str],
+    *,
+    entry_frozen: bool,
+) -> None:
+    for component in components:
+        release = releases[component]
+        for unit in _UNITS[component]:
+            _atomic_write_dropin(
+                paths.dropin_root,
+                unit,
+                render_release_dropin(
+                    release,
+                    component=component,
+                    entry_frozen=entry_frozen,
+                ),
+            )
+
+
 def _controlled_units(components: list[str]) -> list[str]:
     units = []
     for component in ("ingest", "web", "worker"):
@@ -691,6 +781,14 @@ def _start_order(components: list[str]) -> list[str]:
 def _stop_units(runtime: RuntimeAdapter, components: list[str]) -> None:
     for unit in _controlled_units(components):
         runtime.stop_unit(unit)
+
+
+def _best_effort_stop_units(runtime: RuntimeAdapter, components: list[str]) -> None:
+    for unit in _controlled_units(components):
+        try:
+            runtime.stop_unit(unit)
+        except Exception:
+            pass
 
 
 def _start_units(runtime: RuntimeAdapter, components: list[str]) -> None:
@@ -812,6 +910,82 @@ def _activate_monitor(
     return None
 
 
+def _resolve_rollback_releases(
+    *,
+    manifest: DeploymentManifest,
+    rollback_commit: str,
+    candidate: ReleaseEvidence,
+    release_root: Path,
+    expected_uid: int,
+) -> tuple[dict[str, ReleaseEvidence], dict[str, dict[str, str]] | None]:
+    components = [component.value for component in manifest.components]
+    if manifest.rollback_releases:
+        if rollback_commit:
+            raise ActivationError(
+                "legacy rollback commit cannot accompany per-role rollback releases"
+            )
+        releases: dict[str, ReleaseEvidence] = {}
+        payload = _rollback_release_payload(manifest)
+        validated: dict[str, ReleaseEvidence] = {}
+        for target in manifest.rollback_releases:
+            if target.commit == candidate.commit:
+                raise ActivationError("candidate and rollback releases must differ")
+            release = validated.get(target.commit)
+            if release is None:
+                release = validate_release(
+                    release_root,
+                    target.commit,
+                    expected_uid=expected_uid,
+                )
+                validated[target.commit] = release
+            if release.manifest_sha256 != target.manifest_sha256:
+                raise ActivationError("rollback release manifest does not match declaration")
+            if _runtime_support_digest(candidate.release_path) != _runtime_support_digest(
+                release.release_path
+            ):
+                raise ActivationError(
+                    "release scope validation failed: runtime config, dependencies, or units changed"
+                )
+            releases[target.component.value] = release
+        return releases, payload
+
+    rollback = validate_release(
+        release_root,
+        rollback_commit,
+        expected_uid=expected_uid,
+    )
+    if candidate.commit == rollback.commit:
+        raise ActivationError("candidate and rollback releases must differ")
+    if _runtime_support_digest(candidate.release_path) != _runtime_support_digest(
+        rollback.release_path
+    ):
+        raise ActivationError(
+            "release scope validation failed: runtime config, dependencies, or units changed"
+        )
+    return {component: rollback for component in components}, None
+
+
+def _revalidate_release_set(
+    release_root: Path,
+    releases: Mapping[str, ReleaseEvidence],
+    *,
+    expected_uid: int,
+) -> None:
+    validated: set[tuple[str, str]] = set()
+    for release in releases.values():
+        identity = (release.commit, release.manifest_sha256)
+        if identity in validated:
+            continue
+        observed = validate_release(
+            release_root,
+            release.commit,
+            expected_uid=expected_uid,
+        )
+        if observed.manifest_sha256 != release.manifest_sha256:
+            raise ActivationError("release changed after preflight")
+        validated.add(identity)
+
+
 def activate_release(
     *,
     expected_commit: str,
@@ -821,6 +995,9 @@ def activate_release(
     expected_uid: int,
     now: datetime | None = None,
     source_mode: str = "immutable",
+    controller_commit: str | None = None,
+    controller_bundle_sha256: str | None = None,
+    dry_run: bool = False,
 ) -> dict[str, Any]:
     observed_now = (now or datetime.now(UTC)).astimezone(UTC)
     manifest, canonical, plan_sha = _read_manifest(paths.action_manifest)
@@ -836,26 +1013,25 @@ def activate_release(
         )
     if source_mode not in {"immutable", "stopped_legacy"}:
         raise ActivationError("activation source mode is invalid")
+    if source_mode == "stopped_legacy" and manifest.rollback_releases:
+        raise ActivationError(
+            "per-role rollback releases require immutable source mode"
+        )
     candidate = validate_release(
         paths.release_root,
         expected_commit,
         expected_uid=expected_uid,
     )
-    rollback: ReleaseEvidence | None = None
+    rollback_releases: dict[str, ReleaseEvidence] = {}
+    rollback_payload: dict[str, dict[str, str]] | None = None
     if source_mode == "immutable":
-        rollback = validate_release(
-            paths.release_root,
-            rollback_commit,
+        rollback_releases, rollback_payload = _resolve_rollback_releases(
+            manifest=manifest,
+            rollback_commit=rollback_commit,
+            candidate=candidate,
+            release_root=paths.release_root,
             expected_uid=expected_uid,
         )
-        if expected_commit == rollback_commit:
-            raise ActivationError("candidate and rollback releases must differ")
-        if _runtime_support_digest(candidate.release_path) != _runtime_support_digest(
-            rollback.release_path
-        ):
-            raise ActivationError(
-                "release scope validation failed: runtime config, dependencies, or units changed"
-            )
     if not _same_declared_change(candidate.action_manifest, canonical):
         raise ActivationError("staged and activation declarations differ")
 
@@ -868,6 +1044,9 @@ def activate_release(
         plan_sha256=plan_sha,
         source_mode=source_mode,
         now=observed_now,
+        rollback_releases=rollback_payload,
+        controller_commit=controller_commit,
+        controller_bundle_sha256=controller_bundle_sha256,
     )
     affected_runtime_roles = [
         component for component in components if component in _RUNTIME_COMPONENTS
@@ -878,17 +1057,20 @@ def activate_release(
         before_releases: dict[str, ReleaseEvidence] = {}
         preserve_entry_freeze = True
     else:
-        assert rollback is not None
         before_identities, before_releases = prove_release_runtime(
             runtime,
             release_root=paths.release_root,
             expected_uid=expected_uid,
-            expected_releases={role: rollback for role in affected_runtime_roles},
+            expected_releases={
+                role: rollback_releases[role] for role in affected_runtime_roles
+            },
             components=components,
             require_authority=require_authority,
             require_entry_frozen=False,
             now=observed_now,
         )
+        if rollback_payload is not None and "monitor" in components:
+            runtime.prove_monitor_rollback_release(rollback_releases["monitor"])
         preserve_entry_freeze = require_authority or any(
             identity.get("entry_admission_frozen") is True
             for identity in before_identities.values()
@@ -909,7 +1091,26 @@ def activate_release(
         plan_sha256=plan_sha,
         source_mode=source_mode,
         now=datetime.now(UTC),
+        rollback_releases=rollback_payload,
+        controller_commit=controller_commit,
+        controller_bundle_sha256=controller_bundle_sha256,
     )
+    if dry_run:
+        result: dict[str, Any] = {
+            "status": "validated",
+            "commit": expected_commit,
+            "rollback_commit": (
+                rollback_releases[components[0]].commit
+                if rollback_payload is None and rollback_releases
+                else None
+            ),
+            "components": components,
+            "source_mode": source_mode,
+            "authorization_consumed": False,
+        }
+        if rollback_payload is not None:
+            result["rollback_releases"] = rollback_payload
+        return result
     consume_activation_authorization(
         paths.authorization,
         paths.authorization_consumed,
@@ -932,6 +1133,12 @@ def activate_release(
         )
         runtime.daemon_reload()
         validate_release(paths.release_root, expected_commit, expected_uid=expected_uid)
+        if source_mode == "immutable":
+            _revalidate_release_set(
+                paths.release_root,
+                rollback_releases,
+                expected_uid=expected_uid,
+            )
         if source_mode == "stopped_legacy":
             _unmask_units(runtime, components)
         _start_units(runtime, components)
@@ -971,12 +1178,16 @@ def activate_release(
                     "activation failed; maintenance_stop_failed"
                 ) from stop_exc
             raise ActivationError("activation failed; maintenance_stopped") from exc
-        assert rollback is not None
         try:
             _stop_units(runtime, components)
-            publish_release_dropins(
+            _revalidate_release_set(
+                paths.release_root,
+                rollback_releases,
+                expected_uid=expected_uid,
+            )
+            publish_component_release_dropins(
                 paths,
-                rollback,
+                rollback_releases,
                 components,
                 entry_frozen=preserve_entry_freeze,
             )
@@ -992,24 +1203,35 @@ def activate_release(
                 require_entry_frozen=preserve_entry_freeze,
                 now=datetime.now(UTC),
             )
-            _activate_monitor(runtime, components, rollback)
+            if "monitor" in components:
+                _activate_monitor(runtime, components, rollback_releases["monitor"])
             if monitor_was_active or (
                 source_mode == "stopped_legacy" and "monitor" in components
             ):
                 runtime.start_unit("telegram-kol-monitor.timer")
         except Exception as rollback_exc:
+            _best_effort_stop_units(runtime, components)
             raise ActivationError("activation failed; rollback_failed") from rollback_exc
         raise ActivationError("activation failed; rollback_complete") from exc
 
-    return {
+    result = {
         "status": "activated",
         "commit": expected_commit,
-        "rollback_commit": rollback.commit if rollback is not None else None,
+        "rollback_commit": (
+            rollback_releases[components[0]].commit
+            if source_mode == "immutable"
+            and rollback_payload is None
+            and rollback_releases
+            else None
+        ),
         "components": components,
         "source_mode": source_mode,
         "authorization_consumed": True,
         "monitor_verification": monitor_verification,
     }
+    if rollback_payload is not None:
+        result["rollback_releases"] = rollback_payload
+    return result
 
 
 _MONITOR_DIAGNOSTIC_UNIT = "telegram-kol-monitor-diagnostic.service"
@@ -1349,6 +1571,125 @@ class SystemRuntimeAdapter:
             return False
         raise ActivationError("monitor timer state is unknown")
 
+    def prove_monitor_rollback_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]:
+        units = (*_UNITS["monitor"], "telegram-kol-monitor.timer")
+        observed_units: dict[str, dict[str, Any]] = {}
+        paths: set[Path] = set()
+        for unit in units:
+            result = self._run(
+                [
+                    "systemctl",
+                    "show",
+                    unit,
+                    "--property=Environment",
+                    "--property=FragmentPath",
+                    "--property=DropInPaths",
+                ]
+            )
+            properties: dict[str, str] = {}
+            for line in result.stdout.splitlines():
+                key, separator, value = line.partition("=")
+                if separator and key in {"Environment", "FragmentPath", "DropInPaths"}:
+                    if key in properties:
+                        raise ActivationError("monitor rollback identity proof failed")
+                    properties[key] = value
+            if set(properties) != {"Environment", "FragmentPath", "DropInPaths"}:
+                raise ActivationError("monitor rollback identity proof failed")
+            unit_paths = [properties["FragmentPath"], *shlex.split(properties["DropInPaths"])]
+            if not properties["FragmentPath"]:
+                raise ActivationError("monitor rollback identity proof failed")
+            environment: dict[str, str] = {}
+            for assignment in shlex.split(properties["Environment"]):
+                key, separator, value = assignment.partition("=")
+                if separator:
+                    if key in environment:
+                        raise ActivationError("monitor rollback identity proof failed")
+                    environment[key] = value
+            if unit in _UNITS["monitor"]:
+                expected = {
+                    "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
+                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+                    "TELEGRAM_KOL_MONITOR_RELEASE_PATH": str(release.release_path),
+                    "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT": release.commit,
+                    "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+                }
+                if any(environment.get(key) != value for key, value in expected.items()):
+                    raise ActivationError("monitor rollback identity proof failed")
+            for raw_path in unit_paths:
+                path = Path(raw_path)
+                if not path.is_absolute():
+                    raise ActivationError("monitor rollback identity proof failed")
+                paths.add(path)
+            observed_units[unit] = {
+                "dropin_paths": shlex.split(properties["DropInPaths"]),
+                "fragment_path": properties["FragmentPath"],
+            }
+
+        latest_mtime_ns = 0
+        for path in paths:
+            try:
+                metadata = path.lstat()
+            except OSError as exc:
+                raise ActivationError("monitor rollback identity proof failed") from exc
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != self.expected_uid
+            ):
+                raise ActivationError("monitor rollback identity proof failed")
+            latest_mtime_ns = max(latest_mtime_ns, metadata.st_mtime_ns)
+
+        status = self._run(
+            [
+                "systemctl",
+                "show",
+                _MONITOR_DIAGNOSTIC_UNIT,
+                "--property=Result",
+                "--property=ExecMainStatus",
+            ]
+        )
+        systemd_result, exec_main_status, malformed = _parse_monitor_systemd_status(
+            status.stdout
+        )
+        journal = self._best_effort_monitor_journal()
+        payload = journal.get("payload") if isinstance(journal, Mapping) else None
+        if (
+            malformed
+            or systemd_result != "success"
+            or exec_main_status != "0"
+            or journal.get("status") != "available"
+            or not isinstance(payload, Mapping)
+            or payload.get("contract") != "monitor-deployment-diagnostic-v1"
+            or payload.get("release_commit") != release.commit
+            or payload.get("manifest_sha256") != release.manifest_sha256
+            or payload.get("loaded_artifact_verified") is not True
+            or payload.get("result_complete") is not True
+            or payload.get("sources_complete") is not True
+        ):
+            raise ActivationError("monitor rollback identity proof failed")
+        try:
+            checked_at = _parse_time(payload.get("checked_at"))
+        except ActivationError as exc:
+            raise ActivationError("monitor rollback identity proof failed") from exc
+        epoch = datetime(1970, 1, 1, tzinfo=UTC)
+        elapsed = checked_at.astimezone(UTC) - epoch
+        checked_at_ns = (
+            (elapsed.days * 86_400 + elapsed.seconds) * 1_000_000_000
+            + elapsed.microseconds * 1_000
+        )
+        if checked_at_ns <= latest_mtime_ns:
+            raise ActivationError("monitor rollback identity proof failed")
+        return {
+            "contract": "monitor-rollback-identity-v1",
+            "diagnostic_checked_at": checked_at.isoformat(),
+            "latest_configuration_mtime_ns": latest_mtime_ns,
+            "manifest_sha256": release.manifest_sha256,
+            "release_commit": release.commit,
+            "units": observed_units,
+        }
+
     @staticmethod
     def _best_effort_monitor_journal() -> dict[str, Any]:
         command = [
@@ -1589,21 +1930,32 @@ def _activation_source_mode() -> str:
     return source_mode
 
 
+def _activation_dry_run() -> bool:
+    raw = os.environ.get("ACTIVATION_DRY_RUN", "0")
+    if raw not in {"0", "1"}:
+        raise ActivationError("activation dry-run mode is invalid")
+    return raw == "1"
+
+
 def main() -> int:
     try:
         expected_commit = os.environ.get("EXPECTED_COMMIT", "").lower()
         rollback_commit = os.environ.get("ROLLBACK_COMMIT", "").lower()
+        controller_commit = os.environ.get("ACTIVATION_CONTROLLER_COMMIT", "").lower()
+        controller_bundle_sha256 = os.environ.get(
+            "ACTIVATION_CONTROLLER_BUNDLE_SHA256", ""
+        ).lower()
         source_mode = _activation_source_mode()
+        dry_run = _activation_dry_run()
         if not _SHA1_RE.fullmatch(expected_commit):
             raise ActivationError("EXPECTED_COMMIT must be a full SHA")
-        if source_mode == "immutable" and not _SHA1_RE.fullmatch(rollback_commit):
-            raise ActivationError("ROLLBACK_COMMIT must be a full SHA")
         release_root = _required_absolute_env(
             "RELEASE_ROOT", "/opt/telegram-kol-releases"
         )
+        action_manifest = _required_absolute_env("ACTION_MANIFEST")
         paths = ActivationPaths(
             release_root=release_root,
-            action_manifest=_required_absolute_env("ACTION_MANIFEST"),
+            action_manifest=action_manifest,
             authorization=_required_absolute_env("ACTIVATION_AUTHORIZATION"),
             authorization_consumed=_required_absolute_env(
                 "ACTIVATION_AUTHORIZATION_CONSUMED"
@@ -1615,6 +1967,19 @@ def main() -> int:
                 "DATABASE_PATH", "/opt/telegram-kol-analyzer/data/research.db"
             ),
         )
+        parsed_manifest, _, _ = _read_manifest(action_manifest)
+        if source_mode == "immutable":
+            if parsed_manifest.rollback_releases:
+                if rollback_commit:
+                    raise ActivationError(
+                        "ROLLBACK_COMMIT is prohibited with per-role rollback releases"
+                    )
+                if not _SHA1_RE.fullmatch(controller_commit) or not _SHA256_RE.fullmatch(
+                    controller_bundle_sha256
+                ):
+                    raise ActivationError("activation controller identity is invalid")
+            elif not _SHA1_RE.fullmatch(rollback_commit):
+                raise ActivationError("ROLLBACK_COMMIT must be a full SHA")
         test_mode = os.environ.get("ACTIVATOR_TEST_MODE", "0")
         if test_mode not in {"0", "1"}:
             raise ActivationError("ACTIVATOR_TEST_MODE must be 0 or 1")
@@ -1648,6 +2013,9 @@ def main() -> int:
                 ),
                 expected_uid=expected_uid,
                 source_mode=source_mode,
+                controller_commit=controller_commit or None,
+                controller_bundle_sha256=controller_bundle_sha256 or None,
+                dry_run=dry_run,
             )
         print(json.dumps(result, separators=(",", ":"), sort_keys=True))
         return 0

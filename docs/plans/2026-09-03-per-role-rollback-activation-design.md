@@ -126,7 +126,9 @@ The v3 canonical JSON contains exactly:
   `action_plan_sha256`, `nonce`, `issued_at`, and `expires_at` fields;
 - `rollback_releases`, byte-for-byte equivalent after canonical parsing to the activation
   manifest map;
-- `controller_commit`, equal to the exact reviewed commit used to build the control bundle;
+- `controller_commit`, equal to the exact reviewed activator commit used to build the control
+  bundle. It is an independent identity and may differ from the runtime candidate commit; this is
+  required when a newly reviewed controller activates an already-staged older candidate;
 - `controller_bundle_sha256`, equal to the received control bundle's SHA-256.
 
 The contract is `scoped-activation-authorization-v3`, schema version is 3, and the existing
@@ -137,14 +139,17 @@ validated before and immediately before consumption. Dry-run validates it but ne
 ## Control-bundle bootstrap
 
 An old rollback release cannot parse the new protocol. The standard shell and PowerShell clients
-therefore build an exact-commit activation control archive containing only the activator,
+therefore require an explicit full-lowercase `ACTIVATION_CONTROLLER_COMMIT` (PowerShell:
+`ActivationControllerCommit`) and build an exact-controller-commit activation archive containing
+only the activator,
 deployment action-plan parser, package initializer, and activation launcher required for the
 control process. They compute its SHA-256, send it with the activation manifest, and the remote
 wrapper:
 
 1. creates a root-only temporary directory under `/run`;
 2. verifies the received manifest and bundle hashes before extraction;
-3. rejects unsafe archive paths and links;
+3. requires the exact expected directory/file member set and rejects every link or other archive
+   member type;
 4. executes the controller with `python -B` and `PYTHONDONTWRITEBYTECODE=1`;
 5. passes the exact controller commit and bundle digest for v3 authorization validation;
 6. removes the temporary directory on exit.

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from enum import Enum
 import json
 from pathlib import Path
+import re
 import sys
 from typing import Final, Sequence
 
@@ -41,7 +42,7 @@ class GateDisposition(str, Enum):
     PROHIBITED = "prohibited"
 
 
-_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
+_REQUIRED_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "action",
         "risk_level",
@@ -53,6 +54,12 @@ _MANIFEST_FIELDS: Final[frozenset[str]] = frozenset(
         "authority_changed",
     }
 )
+_OPTIONAL_MANIFEST_FIELDS: Final[frozenset[str]] = frozenset({"rollback_releases"})
+_MANIFEST_FIELDS: Final[frozenset[str]] = (
+    _REQUIRED_MANIFEST_FIELDS | _OPTIONAL_MANIFEST_FIELDS
+)
+_SHA1_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{40}")
+_SHA256_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-f]{64}")
 _COMPONENT_ORDER: Final[dict[RuntimeComponent, int]] = {
     component: index for index, component in enumerate(RuntimeComponent)
 }
@@ -62,6 +69,22 @@ _AUTHORITY_COMPONENTS: Final[frozenset[RuntimeComponent]] = frozenset(
 _AUTHORITY_RUNTIME_SCOPE: Final[frozenset[RuntimeComponent]] = frozenset(
     RuntimeComponent
 )
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate JSON key")
+        result[key] = value
+    return result
+
+
+@dataclass(frozen=True, slots=True)
+class RollbackReleaseTarget:
+    component: RuntimeComponent
+    commit: str
+    manifest_sha256: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,6 +97,7 @@ class DeploymentManifest:
     production_data_mutation: bool
     exchange_write_semantics_changed: bool
     authority_changed: bool
+    rollback_releases: tuple[RollbackReleaseTarget, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,6 +113,7 @@ class ActionPlan:
     risk_level: RiskLevel
     components: tuple[RuntimeComponent, ...]
     gates: tuple[ActionGate, ...]
+    rollback_releases: tuple[RollbackReleaseTarget, ...] = ()
 
 
 def _parse_enum(
@@ -134,6 +159,53 @@ def _parse_components(value: object) -> tuple[RuntimeComponent, ...]:
     return tuple(sorted(components, key=_COMPONENT_ORDER.__getitem__))
 
 
+def _parse_rollback_releases(
+    value: object,
+    *,
+    components: tuple[RuntimeComponent, ...],
+) -> tuple[RollbackReleaseTarget, ...]:
+    if not isinstance(value, Mapping):
+        raise ManifestValidationError(
+            "manifest field rollback_releases must be an object"
+        )
+    expected = {component.value for component in components}
+    if set(value) != expected:
+        raise ManifestValidationError(
+            "manifest field rollback_releases must exactly cover components"
+        )
+    targets: list[RollbackReleaseTarget] = []
+    for component in components:
+        raw_target = value.get(component.value)
+        if not isinstance(raw_target, Mapping) or set(raw_target) != {
+            "commit",
+            "manifest_sha256",
+        }:
+            raise ManifestValidationError(
+                "manifest rollback release has invalid fields"
+            )
+        commit = raw_target.get("commit")
+        manifest_sha256 = raw_target.get("manifest_sha256")
+        if not isinstance(commit, str) or _SHA1_RE.fullmatch(commit) is None:
+            raise ManifestValidationError(
+                "manifest rollback release has invalid commit"
+            )
+        if (
+            not isinstance(manifest_sha256, str)
+            or _SHA256_RE.fullmatch(manifest_sha256) is None
+        ):
+            raise ManifestValidationError(
+                "manifest rollback release has invalid manifest digest"
+            )
+        targets.append(
+            RollbackReleaseTarget(
+                component=component,
+                commit=commit,
+                manifest_sha256=manifest_sha256,
+            )
+        )
+    return tuple(targets)
+
+
 def _validate_consistency(manifest: DeploymentManifest) -> None:
     high_risk_impact = (
         manifest.schema_changed
@@ -154,6 +226,21 @@ def _validate_consistency(manifest: DeploymentManifest) -> None:
     ):
         raise ManifestValidationError(
             "authority impact requires authority component scope"
+        )
+
+    if (
+        manifest.rollback_releases
+        and manifest.action is not DeploymentAction.ACTIVATE
+    ):
+        raise ManifestValidationError(
+            "rollback releases are allowed only for activate actions"
+        )
+
+    if manifest.rollback_releases and {
+        target.component for target in manifest.rollback_releases
+    } != set(manifest.components):
+        raise ManifestValidationError(
+            "rollback releases must exactly cover activation components"
         )
 
     if (
@@ -214,6 +301,29 @@ def _validate_typed_manifest(manifest: DeploymentManifest) -> None:
         manifest.components
     ):
         raise ManifestValidationError("manifest model has non-canonical component order")
+    if type(manifest.rollback_releases) is not tuple or any(
+        type(target) is not RollbackReleaseTarget
+        for target in manifest.rollback_releases
+    ):
+        raise ManifestValidationError("manifest model has invalid rollback releases")
+    if tuple(
+        sorted(
+            manifest.rollback_releases,
+            key=lambda target: _COMPONENT_ORDER[target.component],
+        )
+    ) != manifest.rollback_releases:
+        raise ManifestValidationError(
+            "manifest model has non-canonical rollback release order"
+        )
+    for target in manifest.rollback_releases:
+        if (
+            type(target.component) is not RuntimeComponent
+            or type(target.commit) is not str
+            or _SHA1_RE.fullmatch(target.commit) is None
+            or type(target.manifest_sha256) is not str
+            or _SHA256_RE.fullmatch(target.manifest_sha256) is None
+        ):
+            raise ManifestValidationError("manifest model has invalid rollback target")
 
     boolean_fields = (
         manifest.requires_restart,
@@ -235,7 +345,7 @@ def parse_manifest(data: Mapping[str, object]) -> DeploymentManifest:
     if not supplied_fields.issubset(_MANIFEST_FIELDS):
         raise ManifestValidationError("manifest contains unknown fields")
 
-    missing_fields = _MANIFEST_FIELDS - supplied_fields
+    missing_fields = _REQUIRED_MANIFEST_FIELDS - supplied_fields
     if missing_fields:
         missing = ", ".join(sorted(missing_fields))
         raise ManifestValidationError(f"manifest is missing required fields: {missing}")
@@ -249,10 +359,19 @@ def parse_manifest(data: Mapping[str, object]) -> DeploymentManifest:
     assert isinstance(action, DeploymentAction)
     assert isinstance(risk_level, RiskLevel)
 
+    components = _parse_components(data["components"])
+    rollback_releases = (
+        _parse_rollback_releases(
+            data["rollback_releases"],
+            components=components,
+        )
+        if "rollback_releases" in data
+        else ()
+    )
     manifest = DeploymentManifest(
         action=action,
         risk_level=risk_level,
-        components=_parse_components(data["components"]),
+        components=components,
         requires_restart=_parse_bool(data, "requires_restart"),
         schema_changed=_parse_bool(data, "schema_changed"),
         production_data_mutation=_parse_bool(data, "production_data_mutation"),
@@ -261,6 +380,7 @@ def parse_manifest(data: Mapping[str, object]) -> DeploymentManifest:
             "exchange_write_semantics_changed",
         ),
         authority_changed=_parse_bool(data, "authority_changed"),
+        rollback_releases=rollback_releases,
     )
     _validate_consistency(manifest)
     return manifest
@@ -530,11 +650,12 @@ def build_action_plan(manifest: DeploymentManifest) -> ActionPlan:
         risk_level=manifest.risk_level,
         components=manifest.components,
         gates=tuple(sorted(gates, key=lambda gate: gate.gate_id)),
+        rollback_releases=manifest.rollback_releases,
     )
 
 
 def _plan_payload(plan: ActionPlan) -> dict[str, object]:
-    return {
+    payload: dict[str, object] = {
         "schema_version": 1,
         "action": plan.action.value,
         "risk_level": plan.risk_level.value,
@@ -548,6 +669,15 @@ def _plan_payload(plan: ActionPlan) -> dict[str, object]:
             for gate in plan.gates
         ],
     }
+    if plan.rollback_releases:
+        payload["rollback_releases"] = {
+            target.component.value: {
+                "commit": target.commit,
+                "manifest_sha256": target.manifest_sha256,
+            }
+            for target in plan.rollback_releases
+        }
+    return payload
 
 
 def _render_json(plan: ActionPlan) -> str:
@@ -591,11 +721,14 @@ def main(argv: Sequence[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        raw_manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+        raw_manifest = json.loads(
+            args.manifest.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
     except OSError:
         _write_error("manifest_unavailable")
         return 2
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError):
         _write_error("invalid_json")
         return 2
 

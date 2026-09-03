@@ -13,6 +13,9 @@ param(
     [string]$ActivationAuthorizationConsumed = "",
     [ValidateSet("immutable", "stopped_legacy")]
     [string]$ActivationSourceMode = "immutable",
+    [ValidateSet("0", "1")]
+    [string]$ActivationDryRun = "0",
+    [string]$ActivationControllerCommit = "",
     [string]$SourceRepo = "/opt/telegram-kol-analyzer",
     [string]$ReleaseRoot = "/opt/telegram-kol-releases",
     [string]$ServiceDropinRoot = "/etc/systemd/system",
@@ -46,6 +49,7 @@ $plan = $planJson | ConvertFrom-Json
 if ($plan.action -ne $Action) {
     throw "Action manifest does not match requested action."
 }
+$perRoleRollback = $null -ne $plan.rollback_releases
 if ($ExpectedCommit -notmatch '^[0-9a-fA-F]{40}$') {
     throw "ExpectedCommit must be a full 40-character hexadecimal commit."
 }
@@ -112,9 +116,18 @@ foreach ($remotePath in @($SourceRepo, $ReleaseRoot, $ServiceDropinRoot, $Databa
     }
 }
 if ($Action -eq "activate") {
-    if ($ActivationSourceMode -eq "immutable" -and
-        $RollbackCommit -notmatch '^[0-9a-f]{40}$') {
-        throw "RollbackCommit must be a full lowercase commit."
+    if ($ActivationSourceMode -eq "immutable") {
+        if ($perRoleRollback) {
+            if ($RollbackCommit) {
+                throw "RollbackCommit conflicts with rollback_releases."
+            }
+            if ($ActivationControllerCommit -notmatch '^[0-9a-f]{40}$') {
+                throw "ActivationControllerCommit must be a full lowercase commit."
+            }
+        }
+        elseif ($RollbackCommit -notmatch '^[0-9a-f]{40}$') {
+            throw "RollbackCommit must be a full lowercase commit."
+        }
     }
     if (-not (Test-RemotePath $ActivationAuthorization) -or
         -not (Test-RemotePath $ActivationAuthorizationConsumed)) {
@@ -132,14 +145,32 @@ $bundleBase64 = "-"
 $bundleSha = "-"
 $bundlePath = $null
 try {
-    if ($Action -eq "stage") {
+    if ($Action -eq "stage" -or ($Action -eq "activate" -and $perRoleRollback)) {
         $bundlePath = Join-Path ([IO.Path]::GetTempPath()) ([IO.Path]::GetRandomFileName())
-        & git -C $root archive --format=tar "--output=$bundlePath" $ExpectedCommit `
-            deploy/telegram-kol-stage `
-            src/telegram_kol_research/__init__.py `
-            src/telegram_kol_research/deployment_action_plan.py
+        $bundleFiles = if ($Action -eq "stage") {
+            @(
+                "deploy/telegram-kol-stage",
+                "src/telegram_kol_research/__init__.py",
+                "src/telegram_kol_research/deployment_action_plan.py"
+            )
+        }
+        else {
+            @(
+                "src/telegram_kol_research/__init__.py",
+                "src/telegram_kol_research/deployment_action_plan.py",
+                "src/telegram_kol_research/runtime_deployment_identity.py",
+                "src/telegram_kol_research/scoped_release_activation.py"
+            )
+        }
+        $bundleCommit = if ($Action -eq "activate") {
+            $ActivationControllerCommit
+        }
+        else {
+            $ExpectedCommit
+        }
+        & git -C $root archive --format=tar "--output=$bundlePath" $bundleCommit @bundleFiles
         if ($LASTEXITCODE -ne 0) {
-            throw "Could not build the exact-commit stage control bundle."
+            throw "Could not build the exact-commit control bundle."
         }
         $bundleBase64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($bundlePath))
         $bundleSha = (Get-FileHash -Algorithm SHA256 $bundlePath).Hash.ToLowerInvariant()
@@ -152,6 +183,8 @@ manifest_sha256="$4"; bundle_sha256="$5"
 rollback_commit="$6"; authorization="$7"; authorization_consumed="$8"
 source_repo="$9"; release_root="${10}"; service_dropin_root="${11}"; database_path="${12}"
 source_mode="${13}"
+per_role_rollback="${14}"; dry_run="${15}"
+controller_commit="${16}"
 IFS= read -r manifest_base64
 IFS= read -r bundle_base64
 manifest_base64="${manifest_base64%$'\r'}"
@@ -173,17 +206,47 @@ case "$action" in
       "$temporary/control/deploy/telegram-kol-stage"
     ;;
   activate)
-    dispatcher_commit="$rollback_commit"
-    if [ "$source_mode" = "stopped_legacy" ]; then
-      dispatcher_commit="$expected_commit"
+    if [ "$per_role_rollback" = "1" ]; then
+      printf '%s' "$bundle_base64" | base64 -d >"$temporary/activation-controller.tar"
+      [ "$(sha256sum "$temporary/activation-controller.tar" | awk '{print $1}')" = "$bundle_sha256" ]
+      entries="$(tar -tf "$temporary/activation-controller.tar" | LC_ALL=C sort)"
+      expected_entries="$(printf '%s\n' \
+        src/ \
+        src/telegram_kol_research/ \
+        src/telegram_kol_research/__init__.py \
+        src/telegram_kol_research/deployment_action_plan.py \
+        src/telegram_kol_research/runtime_deployment_identity.py \
+        src/telegram_kol_research/scoped_release_activation.py | LC_ALL=C sort)"
+      [ "$entries" = "$expected_entries" ] || { echo "Activation controller archive is unsafe." >&2; exit 4; }
+      tar -tvf "$temporary/activation-controller.tar" \
+        | awk 'substr($1, 1, 1) != "-" && substr($1, 1, 1) != "d" { exit 1 }' \
+        || { echo "Activation controller archive contains a link or non-file entry." >&2; exit 4; }
+      mkdir "$temporary/control"
+      tar -xf "$temporary/activation-controller.tar" -C "$temporary/control"
+      PYTHONPATH="$temporary/control/src" PYTHONDONTWRITEBYTECODE=1 \
+        EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT= \
+        ACTION_MANIFEST="$temporary/action-manifest.json" \
+        ACTIVATION_AUTHORIZATION="$authorization" \
+        ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" \
+        ACTIVATION_SOURCE_MODE="$source_mode" \
+        ACTIVATION_CONTROLLER_COMMIT="$controller_commit" \
+        ACTIVATION_CONTROLLER_BUNDLE_SHA256="$bundle_sha256" \
+        ACTIVATION_DRY_RUN="$dry_run" RELEASE_ROOT="$release_root" \
+        SERVICE_DROPIN_ROOT="$service_dropin_root" DATABASE_PATH="$database_path" \
+        /opt/telegram-kol-analyzer/.venv/bin/python -B -m telegram_kol_research.scoped_release_activation
+    else
+      dispatcher_commit="$rollback_commit"
+      if [ "$source_mode" = "stopped_legacy" ]; then
+        dispatcher_commit="$expected_commit"
+      fi
+      updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
+      [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
+      DEPLOYMENT_ACTION=activate EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT="$rollback_commit" \
+        ACTION_MANIFEST="$temporary/action-manifest.json" ACTIVATION_AUTHORIZATION="$authorization" \
+        ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" RELEASE_ROOT="$release_root" \
+        ACTIVATION_SOURCE_MODE="$source_mode" ACTIVATION_DRY_RUN="$dry_run" \
+        SERVICE_DROPIN_ROOT="$service_dropin_root" DATABASE_PATH="$database_path" "$updater"
     fi
-    updater="$release_root/$dispatcher_commit/deploy/telegram-kol-update"
-    [ -x "$updater" ] || { echo "Immutable activation dispatcher is unavailable." >&2; exit 4; }
-    DEPLOYMENT_ACTION=activate EXPECTED_COMMIT="$expected_commit" ROLLBACK_COMMIT="$rollback_commit" \
-      ACTION_MANIFEST="$temporary/action-manifest.json" ACTIVATION_AUTHORIZATION="$authorization" \
-      ACTIVATION_AUTHORIZATION_CONSUMED="$authorization_consumed" RELEASE_ROOT="$release_root" \
-      ACTIVATION_SOURCE_MODE="$source_mode" SERVICE_DROPIN_ROOT="$service_dropin_root" \
-      DATABASE_PATH="$database_path" "$updater"
     ;;
   *) echo "Remote action must be stage or activate." >&2; exit 2 ;;
 esac
@@ -193,7 +256,9 @@ esac
         "'$Action' '$ExpectedCommit' '$Branch' '$manifestSha' '$bundleSha' " +
         "'$RollbackCommit' '$ActivationAuthorization' " +
         "'$ActivationAuthorizationConsumed' '$SourceRepo' '$ReleaseRoot' " +
-        "'$ServiceDropinRoot' '$DatabasePath' '$ActivationSourceMode'"
+        "'$ServiceDropinRoot' '$DatabasePath' '$ActivationSourceMode' " +
+        "'$([int]$perRoleRollback)' '$ActivationDryRun' " +
+        "'$ActivationControllerCommit'"
     $payload = "$manifestBase64`n$bundleBase64"
     $payload | ssh -i $KeyPath $Server $remote
     if ($LASTEXITCODE -ne 0) {

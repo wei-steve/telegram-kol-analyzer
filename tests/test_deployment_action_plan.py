@@ -79,6 +79,125 @@ def test_parse_manifest_builds_immutable_closed_model() -> None:
         manifest.action = DeploymentAction.LOCAL  # type: ignore[misc]
 
 
+def test_activation_manifest_accepts_exact_per_component_rollback_releases() -> None:
+    rollback_releases = {
+        component: {"commit": str(index) * 40, "manifest_sha256": str(index) * 64}
+        for index, component in enumerate(
+            ("web", "monitor", "ingest", "worker"),
+            start=1,
+        )
+    }
+
+    manifest = parse_manifest(
+        _manifest(
+            action="activate",
+            risk_level="L2",
+            components=["web", "monitor", "ingest", "worker"],
+            requires_restart=True,
+            authority_changed=True,
+            rollback_releases=rollback_releases,
+        )
+    )
+
+    assert {
+        target.component.value: {
+            "commit": target.commit,
+            "manifest_sha256": target.manifest_sha256,
+        }
+        for target in manifest.rollback_releases
+    } == rollback_releases
+
+
+@pytest.mark.parametrize(
+    "action,components,rollback_releases",
+    (
+        (
+            "stage",
+            ["web"],
+            {"web": {"commit": "1" * 40, "manifest_sha256": "a" * 64}},
+        ),
+        (
+            "activate",
+            ["web", "monitor"],
+            {"web": {"commit": "1" * 40, "manifest_sha256": "a" * 64}},
+        ),
+        (
+            "activate",
+            ["web"],
+            {
+                "web": {"commit": "1" * 40, "manifest_sha256": "a" * 64},
+                "monitor": {"commit": "2" * 40, "manifest_sha256": "b" * 64},
+            },
+        ),
+        (
+            "activate",
+            ["web"],
+            {"web": {"commit": "A" * 40, "manifest_sha256": "a" * 64}},
+        ),
+        (
+            "activate",
+            ["web"],
+            {"web": {"commit": "1" * 40, "manifest_sha256": "a" * 63}},
+        ),
+        (
+            "activate",
+            ["web"],
+            {
+                "web": {
+                    "commit": "1" * 40,
+                    "manifest_sha256": "a" * 64,
+                    "extra": "rejected",
+                }
+            },
+        ),
+    ),
+    ids=(
+        "activation-only",
+        "missing-component",
+        "extra-component",
+        "uppercase-commit",
+        "short-manifest-digest",
+        "unknown-target-field",
+    ),
+)
+def test_rollback_release_manifest_contract_is_closed(
+    action: str,
+    components: list[str],
+    rollback_releases: object,
+) -> None:
+    with pytest.raises(ManifestValidationError):
+        parse_manifest(
+            _manifest(
+                action=action,
+                risk_level="L2",
+                components=components,
+                requires_restart=True,
+                rollback_releases=rollback_releases,
+            )
+        )
+
+
+def test_manifest_json_rejects_duplicate_rollback_component_keys(
+    tmp_path: Path,
+    capsys,
+) -> None:
+    manifest = tmp_path / "duplicate.json"
+    manifest.write_text(
+        '{"action":"activate","risk_level":"L1","components":["web"],'
+        '"requires_restart":true,"schema_changed":false,'
+        '"production_data_mutation":false,'
+        '"exchange_write_semantics_changed":false,"authority_changed":false,'
+        '"rollback_releases":{"web":{"commit":"' + "1" * 40
+        + '","manifest_sha256":"' + "a" * 64
+        + '"},"web":{"commit":"' + "2" * 40
+        + '","manifest_sha256":"' + "b" * 64 + '"}}}',
+        encoding="utf-8",
+    )
+
+    assert main(["--manifest", str(manifest), "--format", "json"]) == 2
+    assert json.loads(capsys.readouterr().err)["error"] == "invalid_json"
+
+
 @pytest.mark.parametrize(
     "components",
     (

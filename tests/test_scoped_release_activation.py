@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -24,6 +25,8 @@ from telegram_kol_research.deployment_action_plan import parse_manifest
 CANDIDATE = "2" * 40
 ROLLBACK = "1" * 40
 OTHER = "3" * 40
+CONTROLLER = "4" * 40
+MONITOR_ROLLBACK = "5" * 40
 
 
 def _monitor_diagnostic_payload(*, release_commit=CANDIDATE, **overrides):
@@ -108,6 +111,195 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
 
 def test_system_runtime_allows_first_authority_cycles_to_finish_before_retry() -> None:
     assert SystemRuntimeAdapter.identity_retry_delay_seconds == 60
+
+
+@pytest.mark.parametrize(
+    "diagnostic_offset_ns,manifest_sha256,expected_pass",
+    (
+        (1_000_000_000, "a" * 64, True),
+        (0, "a" * 64, False),
+        (-1, "a" * 64, False),
+        (1_000_000_000, "b" * 64, False),
+    ),
+    ids=("fresh", "equal-mtime", "stale", "manifest-mismatch"),
+)
+def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_config(
+    tmp_path: Path,
+    monkeypatch,
+    diagnostic_offset_ns: int,
+    manifest_sha256: str,
+    expected_pass: bool,
+) -> None:
+    runtime = SystemRuntimeAdapter(
+        python=Path("/venv/python"),
+        expected_uid=tmp_path.stat().st_uid,
+    )
+    release_path = tmp_path / CANDIDATE
+    release_path.mkdir()
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": release_path,
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+    config_mtime_ns = 1_800_000_000_000_000_000
+    unit_files: dict[str, tuple[Path, Path]] = {}
+    for index, unit in enumerate(
+        (*scoped_activation._UNITS["monitor"], "telegram-kol-monitor.timer")
+    ):
+        fragment = tmp_path / f"fragment-{index}.service"
+        dropin = tmp_path / f"dropin-{index}.conf"
+        fragment.write_text("[Unit]\n", encoding="utf-8")
+        dropin.write_text("[Service]\n", encoding="utf-8")
+        os.utime(fragment, ns=(config_mtime_ns, config_mtime_ns))
+        os.utime(dropin, ns=(config_mtime_ns, config_mtime_ns))
+        unit_files[unit] = (fragment, dropin)
+    checked_at = datetime.fromtimestamp(
+        (config_mtime_ns + diagnostic_offset_ns) / 1_000_000_000,
+        tz=UTC,
+    ).isoformat()
+    payload = _monitor_diagnostic_payload(
+        checked_at=checked_at,
+        manifest_sha256=manifest_sha256,
+    )
+
+    def run(command, **kwargs):
+        stdout = ""
+        if command[0:2] == ["systemctl", "show"] and "--property=Environment" in command:
+            unit = command[2]
+            fragment, dropin = unit_files[unit]
+            environment = ""
+            if unit in scoped_activation._UNITS["monitor"]:
+                environment = " ".join(
+                    (
+                        f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
+                        f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
+                        f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
+                        f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
+                        "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" + "a" * 64,
+                    )
+                )
+            stdout = (
+                f"Environment={environment}\n"
+                f"FragmentPath={fragment}\n"
+                f"DropInPaths={dropin}\n"
+            )
+        elif command == [
+            "systemctl",
+            "show",
+            "telegram-kol-monitor-diagnostic.service",
+            "--property=Result",
+            "--property=ExecMainStatus",
+        ]:
+            stdout = "Result=success\nExecMainStatus=0\n"
+        elif command[0] == "journalctl":
+            stdout = json.dumps(payload) + "\n"
+        return scoped_activation.subprocess.CompletedProcess(
+            command, 0, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+
+    if expected_pass:
+        evidence = runtime.prove_monitor_rollback_release(release)
+        assert evidence["release_commit"] == CANDIDATE
+        assert evidence["latest_configuration_mtime_ns"] == config_mtime_ns
+    else:
+        with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
+            runtime.prove_monitor_rollback_release(release)
+
+
+@pytest.mark.parametrize(
+    "journal_payload,unsafe_config",
+    (
+        (None, False),
+        (
+            _monitor_diagnostic_payload(
+                checked_at="2027-01-01T00:00:00+00:00",
+                result_complete=False,
+            ),
+            False,
+        ),
+        (
+            _monitor_diagnostic_payload(
+                checked_at="2027-01-01T00:00:00+00:00",
+            ),
+            True,
+        ),
+    ),
+    ids=("missing-diagnostic", "incomplete-diagnostic", "unsafe-config-path"),
+)
+def test_monitor_rollback_identity_fails_closed_on_incomplete_evidence(
+    tmp_path: Path,
+    monkeypatch,
+    journal_payload: dict | None,
+    unsafe_config: bool,
+) -> None:
+    runtime = SystemRuntimeAdapter(
+        python=Path("/venv/python"),
+        expected_uid=tmp_path.stat().st_uid,
+    )
+    release_path = tmp_path / CANDIDATE
+    release_path.mkdir()
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": release_path,
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+    unit_files: dict[str, tuple[Path, Path]] = {}
+    for index, unit in enumerate(
+        (*scoped_activation._UNITS["monitor"], "telegram-kol-monitor.timer")
+    ):
+        fragment = tmp_path / f"fragment-incomplete-{index}.service"
+        dropin = tmp_path / f"dropin-incomplete-{index}.conf"
+        fragment.write_text("[Unit]\n", encoding="utf-8")
+        dropin.write_text("[Service]\n", encoding="utf-8")
+        unit_files[unit] = (fragment, dropin)
+    if unsafe_config:
+        fragment, dropin = unit_files[scoped_activation._UNITS["monitor"][0]]
+        fragment.unlink()
+        fragment.symlink_to(dropin)
+
+    def run(command, **kwargs):
+        stdout = ""
+        if command[0:2] == ["systemctl", "show"] and "--property=Environment" in command:
+            unit = command[2]
+            fragment, dropin = unit_files[unit]
+            environment = ""
+            if unit in scoped_activation._UNITS["monitor"]:
+                environment = " ".join(
+                    (
+                        f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
+                        f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
+                        f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
+                        f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
+                        "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" + "a" * 64,
+                    )
+                )
+            stdout = (
+                f"Environment={environment}\n"
+                f"FragmentPath={fragment}\n"
+                f"DropInPaths={dropin}\n"
+            )
+        elif command[0:2] == ["systemctl", "show"]:
+            stdout = "Result=success\nExecMainStatus=0\n"
+        elif command[0] == "journalctl" and journal_payload is not None:
+            stdout = json.dumps(journal_payload) + "\n"
+        return scoped_activation.subprocess.CompletedProcess(
+            command, 0, stdout=stdout, stderr=""
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+
+    with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
+        runtime.prove_monitor_rollback_release(release)
 
 
 def test_monitor_release_proof_allows_success_when_journal_evidence_is_unavailable(
@@ -728,7 +920,7 @@ class FakeRuntime:
         self.entry_frozen_by_role[role] = (
             'Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"' in text
         )
-        for commit in (CANDIDATE, ROLLBACK):
+        for commit in self.manifest_by_commit:
             if commit in text:
                 self.current_commit_by_role[role] = commit
 
@@ -764,6 +956,14 @@ class FakeRuntime:
 
     def monitor_timer_active(self) -> bool:
         return True
+
+    def prove_monitor_rollback_release(self, release):
+        self.events.append(f"monitor-rollback-identity:{release.commit}")
+        return {
+            "contract": "monitor-rollback-identity-v1",
+            "release_commit": release.commit,
+            "manifest_sha256": release.manifest_sha256,
+        }
 
     def verify_monitor_release(self, release):
         self.events.append(f"monitor-identity:{release.commit}")
@@ -854,6 +1054,368 @@ def _set_authorization_source_mode(paths: ActivationPaths, source_mode: str) -> 
     paths.authorization.chmod(0o400)
 
 
+def _split_runtime_activation_harness(
+    tmp_path: Path,
+) -> tuple[ActivationPaths, FakeRuntime, dict[str, dict[str, str]]]:
+    release_root = tmp_path / "releases"
+    release_root.mkdir()
+    for commit in (ROLLBACK, OTHER, MONITOR_ROLLBACK, CANDIDATE):
+        _write_release(
+            release_root,
+            commit,
+            components=["web", "monitor", "ingest", "worker"],
+        )
+    manifests = {
+        commit: json.loads(
+            (release_root / commit / ".telegram-kol-stage-receipt.json").read_text(
+                encoding="utf-8"
+            )
+        )["manifest_sha256"]
+        for commit in (ROLLBACK, OTHER, MONITOR_ROLLBACK, CANDIDATE)
+    }
+    rollback_releases = {
+        "web": {"commit": OTHER, "manifest_sha256": manifests[OTHER]},
+        "monitor": {
+            "commit": MONITOR_ROLLBACK,
+            "manifest_sha256": manifests[MONITOR_ROLLBACK],
+        },
+        "ingest": {"commit": ROLLBACK, "manifest_sha256": manifests[ROLLBACK]},
+        "worker": {"commit": ROLLBACK, "manifest_sha256": manifests[ROLLBACK]},
+    }
+    manifest = {
+        "action": "activate",
+        "authority_changed": True,
+        "components": ["web", "monitor", "ingest", "worker"],
+        "exchange_write_semantics_changed": False,
+        "production_data_mutation": False,
+        "requires_restart": True,
+        "risk_level": "L2",
+        "rollback_releases": rollback_releases,
+        "schema_changed": False,
+    }
+    manifest_path = tmp_path / "activate.json"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    parsed = parse_manifest(manifest)
+    now = datetime.now(UTC)
+    authorization = tmp_path / "authorization.json"
+    authorization.write_bytes(
+        _canonical(
+            {
+                "action_plan_sha256": action_plan_sha256(parsed),
+                "commit": CANDIDATE,
+                "components": ["web", "monitor", "ingest", "worker"],
+                "contract": "scoped-activation-authorization-v3",
+                "controller_bundle_sha256": "d" * 64,
+                "controller_commit": CONTROLLER,
+                "expires_at": (now + timedelta(minutes=5)).isoformat(),
+                "issued_at": (now - timedelta(seconds=1)).isoformat(),
+                "nonce": "c" * 64,
+                "rollback_releases": rollback_releases,
+                "schema_version": 3,
+                "source_mode": "immutable",
+            }
+        )
+    )
+    authorization.chmod(0o400)
+    paths = ActivationPaths(
+        release_root=release_root,
+        action_manifest=manifest_path,
+        authorization=authorization,
+        authorization_consumed=tmp_path / "authorization.used.json",
+        dropin_root=tmp_path / "systemd",
+        database_path=tmp_path / "research.db",
+    )
+    paths.database_path.write_bytes(b"not-used")
+    runtime = FakeRuntime(current_commit=ROLLBACK)
+    runtime.current_commit_by_role["web"] = OTHER
+    runtime.dropin_root = paths.dropin_root
+    runtime.manifest_by_commit = manifests
+    return paths, runtime, rollback_releases
+
+
+def test_legacy_single_rollback_rejects_split_runtime_authority_state(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    runtime.current_commit_by_role["web"] = OTHER
+    runtime.manifest_by_commit[OTHER] = "e" * 64
+
+    with pytest.raises(ActivationError, match="runtime identity proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_split_runtime_authority_activation_accepts_bound_per_role_rollbacks(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, rollback_releases = _split_runtime_activation_harness(tmp_path)
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit="",
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        controller_commit=CONTROLLER,
+        controller_bundle_sha256="d" * 64,
+    )
+
+    assert result["status"] == "activated"
+    assert result["rollback_releases"] == rollback_releases
+
+
+def test_legacy_single_rollback_result_contract_does_not_gain_v3_fields(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+    )
+
+    assert "rollback_releases" not in result
+    assert result["rollback_commit"] == ROLLBACK
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    (
+        ("controller_commit", ROLLBACK),
+        ("controller_bundle_sha256", "e" * 64),
+        (
+            "rollback_releases",
+            {
+                "web": {"commit": ROLLBACK, "manifest_sha256": "f" * 64},
+                "monitor": {"commit": OTHER, "manifest_sha256": "f" * 64},
+                "ingest": {"commit": ROLLBACK, "manifest_sha256": "f" * 64},
+                "worker": {"commit": ROLLBACK, "manifest_sha256": "f" * 64},
+            },
+        ),
+    ),
+)
+def test_per_role_authorization_binds_map_and_controller_identity(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+    authorization = json.loads(paths.authorization.read_text(encoding="utf-8"))
+    authorization[field] = value
+    paths.authorization.chmod(0o600)
+    paths.authorization.write_bytes(_canonical(authorization))
+    paths.authorization.chmod(0o400)
+
+    with pytest.raises(ActivationError, match="authorization is invalid"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_per_role_manifest_digest_mismatch_fails_before_authorization(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, rollback_releases = _split_runtime_activation_harness(tmp_path)
+    declared = json.loads(paths.action_manifest.read_text(encoding="utf-8"))
+    rollback_releases["web"]["manifest_sha256"] = "f" * 64
+    declared["rollback_releases"] = rollback_releases
+    paths.action_manifest.write_text(json.dumps(declared), encoding="utf-8")
+    authorization = json.loads(paths.authorization.read_text(encoding="utf-8"))
+    authorization["rollback_releases"] = rollback_releases
+    authorization["action_plan_sha256"] = action_plan_sha256(parse_manifest(declared))
+    paths.authorization.chmod(0o600)
+    paths.authorization.write_bytes(_canonical(authorization))
+    paths.authorization.chmod(0o400)
+
+    with pytest.raises(ActivationError, match="manifest does not match declaration"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_arbitrary_valid_per_role_release_cannot_replace_observed_runtime(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+    runtime.current_commit_by_role["web"] = ROLLBACK
+
+    with pytest.raises(ActivationError, match="runtime identity proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_monitor_observed_release_mismatch_fails_before_service_control(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+
+    def reject_monitor_identity(release) -> dict:
+        raise ActivationError("monitor rollback identity proof failed")
+
+    runtime.prove_monitor_rollback_release = reject_monitor_identity
+
+    with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert paths.authorization.exists()
+    assert not any(event.startswith("stop:") for event in runtime.events)
+
+
+def test_per_role_dry_run_executes_authority_and_monitor_gates_without_mutation(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, rollback_releases = _split_runtime_activation_harness(tmp_path)
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit="",
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        controller_commit=CONTROLLER,
+        controller_bundle_sha256="d" * 64,
+        dry_run=True,
+    )
+
+    assert result["status"] == "validated"
+    assert result["rollback_releases"] == rollback_releases
+    assert runtime.events.count("active-write") == 1
+    assert f"monitor-rollback-identity:{MONITOR_ROLLBACK}" in runtime.events
+    assert all(
+        any(event.startswith(f"identity:{role}:") for event in runtime.events)
+        for role in ("web", "ingest", "worker")
+    )
+    assert not any(
+        event.startswith(("stop:", "start:", "monitor-identity:"))
+        or event == "daemon-reload"
+        for event in runtime.events
+    )
+    assert paths.authorization.exists()
+    assert not paths.authorization_consumed.exists()
+
+
+def test_per_role_rollback_restores_each_component_to_its_bound_release(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+    original_identity = runtime.runtime_identity
+
+    def fail_candidate_worker_identity(role: str) -> dict:
+        payload = original_identity(role)
+        if role == "worker" and payload["release_commit"] == CANDIDATE:
+            payload["loaded_artifact_verified"] = False
+        return payload
+
+    runtime.runtime_identity = fail_candidate_worker_identity
+
+    with pytest.raises(ActivationError, match="rollback_complete"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert runtime.current_commit_by_role == {
+        "web": OTHER,
+        "ingest": ROLLBACK,
+        "worker": ROLLBACK,
+    }
+    monitor_dropin = (
+        paths.dropin_root
+        / "telegram-kol-monitor.service.d/10-telegram-kol-release.conf"
+    ).read_text(encoding="utf-8")
+    assert MONITOR_ROLLBACK in monitor_dropin
+    assert CANDIDATE not in monitor_dropin
+
+
+def test_release_tree_change_after_preflight_stops_without_starting_any_unit(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+    original_reload = runtime.daemon_reload
+
+    def corrupt_rollback_after_publication() -> None:
+        original_reload()
+        release = paths.release_root / OTHER
+        release.chmod(0o755)
+        source = release / "src/telegram_kol_research/__init__.py"
+        source.chmod(0o644)
+        source.write_text("corrupt\n", encoding="utf-8")
+
+    runtime.daemon_reload = corrupt_rollback_after_publication
+
+    with pytest.raises(ActivationError, match="rollback_failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+        )
+
+    assert not any(event.startswith("start:") for event in runtime.events)
+    assert all(
+        runtime.maintenance_state_by_unit[unit][0] == "inactive"
+        for unit in scoped_activation._controlled_units(
+            ["web", "monitor", "ingest", "worker"]
+        )
+    )
+
+
 def test_web_activation_consumes_verified_receipt_and_restarts_only_web(
     activation_harness,
 ) -> None:
@@ -876,6 +1438,31 @@ def test_web_activation_consumes_verified_receipt_and_restarts_only_web(
         "stop:telegram-kol-web.service",
         "start:telegram-kol-web.service",
     ]
+
+
+def test_dry_run_validates_without_consuming_authorization_or_controlling_services(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+
+    result = activate_release(
+        expected_commit=CANDIDATE,
+        rollback_commit=ROLLBACK,
+        paths=paths,
+        runtime=runtime,
+        expected_uid=paths.release_root.stat().st_uid,
+        dry_run=True,
+    )
+
+    assert result["status"] == "validated"
+    assert result["authorization_consumed"] is False
+    assert paths.authorization.exists()
+    assert not paths.authorization_consumed.exists()
+    assert not paths.dropin_root.exists()
+    assert not any(
+        event.startswith(("stop:", "start:")) or event == "daemon-reload"
+        for event in runtime.events
+    )
 
 
 def test_web_only_activation_preserves_existing_entry_freeze(
@@ -1472,6 +2059,16 @@ def test_activation_source_mode_is_explicit_and_closed(monkeypatch) -> None:
         scoped_activation._activation_source_mode()
 
 
+def test_activation_dry_run_mode_is_explicit_and_closed(monkeypatch) -> None:
+    monkeypatch.delenv("ACTIVATION_DRY_RUN", raising=False)
+    assert scoped_activation._activation_dry_run() is False
+    monkeypatch.setenv("ACTIVATION_DRY_RUN", "1")
+    assert scoped_activation._activation_dry_run() is True
+    monkeypatch.setenv("ACTIVATION_DRY_RUN", "yes")
+    with pytest.raises(ActivationError, match="dry-run mode is invalid"):
+        scoped_activation._activation_dry_run()
+
+
 def test_stopped_legacy_source_mode_rejects_ordinary_immutable_authorization(
     activation_harness,
 ) -> None:
@@ -1719,6 +2316,34 @@ def test_post_start_identity_mismatch_rolls_back_to_verified_release(
     assert runtime.current_commit_by_role["web"] == ROLLBACK
     assert runtime.events.count("daemon-reload") == 2
     assert paths.authorization_consumed.exists()
+
+
+def test_partial_rollback_failure_best_effort_stops_all_declared_units(
+    activation_harness,
+) -> None:
+    paths, runtime, _ = activation_harness
+    original_start = runtime.start_unit
+    start_count = 0
+
+    def fail_candidate_and_rollback_start(unit: str) -> None:
+        nonlocal start_count
+        start_count += 1
+        original_start(unit)
+        raise ActivationError(f"start failed {start_count}")
+
+    runtime.start_unit = fail_candidate_and_rollback_start
+
+    with pytest.raises(ActivationError, match="rollback_failed"):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+        )
+
+    assert runtime.maintenance_state_by_unit["telegram-kol-web.service"][0] == "inactive"
+    assert runtime.events.count("stop:telegram-kol-web.service") >= 3
 
 
 def test_worker_activation_rolls_back_when_candidate_does_not_prove_entry_freeze(

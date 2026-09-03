@@ -1023,6 +1023,185 @@ def test_activate_transport_selects_dispatcher_by_source_mode() -> None:
     assert "telegram-kol-stage" not in activate
 
 
+def test_per_role_activate_transport_uses_hash_bound_exact_commit_controller() -> None:
+    bootstrap = (ROOT / "scripts/bootstrap_server_updater.sh").read_text(
+        encoding="utf-8"
+    )
+    powershell = (ROOT / "scripts/server_git_update.ps1").read_text(
+        encoding="utf-8"
+    )
+
+    for source in (bootstrap, powershell):
+        assert "rollback_releases" in source
+        assert "ACTIVATION_CONTROLLER_COMMIT" in source
+        assert "ACTIVATION_CONTROLLER_BUNDLE_SHA256" in source
+        assert "ACTIVATION_DRY_RUN" in source
+        assert "scoped_release_activation.py" in source
+        assert "deployment_action_plan.py" in source
+        assert "runtime_deployment_identity.py" in source
+        assert "PYTHONDONTWRITEBYTECODE=1" in source
+        assert " -B -m telegram_kol_research.scoped_release_activation" in source
+        assert "tar -tvf" in source
+        assert 'substr($1, 1, 1) != "d"' in source
+
+    assert 'git -C "$ROOT" archive --format=tar' in bootstrap
+    assert 'bundle_commit="$ACTIVATION_CONTROLLER_COMMIT"' in bootstrap
+    assert '"$bundle_commit"' in bootstrap
+    assert '"$temporary/activation-controller.tar"' in bootstrap
+    assert '"$release_root/$dispatcher_commit/deploy/telegram-kol-update"' in bootstrap
+
+
+def test_per_role_activate_transport_sends_only_exact_controller_bundle(
+    tmp_path: Path,
+) -> None:
+    rollback_releases = {
+        component: {"commit": str(index) * 40, "manifest_sha256": str(index) * 64}
+        for index, component in enumerate(
+            ("web", "monitor", "ingest", "worker"), start=1
+        )
+    }
+    manifest = tmp_path / "activate.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "action": "activate",
+                "risk_level": "L2",
+                "components": ["web", "monitor", "ingest", "worker"],
+                "requires_restart": True,
+                "schema_changed": False,
+                "production_data_mutation": False,
+                "exchange_write_semantics_changed": False,
+                "authority_changed": True,
+                "rollback_releases": rollback_releases,
+            }
+        ),
+        encoding="utf-8",
+    )
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    args_path = tmp_path / "ssh-args"
+    stdin_path = tmp_path / "ssh-stdin"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        "#!/usr/bin/env bash\n"
+        f"printf '%s\\0' \"$@\" > {args_path!s}\n"
+        f"while IFS= read -r line; do printf '%s\\n' \"$line\"; done > {stdin_path!s}\n",
+        encoding="utf-8",
+    )
+    fake_ssh.chmod(0o755)
+    expected_commit = subprocess.run(
+        ["git", "rev-parse", "HEAD"],
+        cwd=ROOT,
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "activate",
+            "SERVER": "root@127.0.0.1",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": expected_commit,
+            "ACTION_MANIFEST": str(manifest),
+            "ACTIVATION_AUTHORIZATION": "/run/authorization.json",
+            "ACTIVATION_AUTHORIZATION_CONSUMED": "/run/authorization.consumed",
+            "ACTIVATION_DRY_RUN": "1",
+            "ACTIVATION_CONTROLLER_COMMIT": expected_commit,
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stderr
+    arguments = args_path.read_bytes().rstrip(b"\0").decode().split("\0")
+    assert "''" in arguments[3]
+    assert "'1' '1'" in arguments[3]
+    payload = stdin_path.read_text(encoding="utf-8").splitlines()
+    assert len(payload) == 2
+    with tarfile.open(fileobj=io.BytesIO(base64.b64decode(payload[1]))) as archive:
+        assert archive.getnames() == [
+            "src",
+            "src/telegram_kol_research",
+            "src/telegram_kol_research/__init__.py",
+            "src/telegram_kol_research/deployment_action_plan.py",
+            "src/telegram_kol_research/runtime_deployment_identity.py",
+            "src/telegram_kol_research/scoped_release_activation.py",
+        ]
+        assert all(member.isfile() or member.isdir() for member in archive.getmembers())
+
+
+def test_per_role_activate_transport_rejects_legacy_rollback_commit_before_ssh(
+    tmp_path: Path,
+) -> None:
+    manifest = tmp_path / "activate.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "action": "activate",
+                "risk_level": "L2",
+                "components": ["web"],
+                "requires_restart": True,
+                "schema_changed": False,
+                "production_data_mutation": False,
+                "exchange_write_semantics_changed": False,
+                "authority_changed": False,
+                "rollback_releases": {
+                    "web": {"commit": "1" * 40, "manifest_sha256": "a" * 64}
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    key = tmp_path / "key"
+    key.write_text("test-only", encoding="utf-8")
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    marker = tmp_path / "ssh-called"
+    fake_ssh = fake_bin / "ssh"
+    fake_ssh.write_text(
+        f"#!/usr/bin/env bash\ntouch {marker!s}\n", encoding="utf-8"
+    )
+    fake_ssh.chmod(0o755)
+
+    result = subprocess.run(
+        [str(ROOT / "scripts/bootstrap_server_updater.sh")],
+        cwd=ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{fake_bin}:{os.environ['PATH']}",
+            "DEPLOYMENT_ACTION": "activate",
+            "SERVER": "root@127.0.0.1",
+            "KEY_PATH": str(key),
+            "EXPECTED_COMMIT": subprocess.run(
+                ["git", "rev-parse", "HEAD"],
+                cwd=ROOT,
+                check=True,
+                capture_output=True,
+                text=True,
+            ).stdout.strip(),
+            "ROLLBACK_COMMIT": "2" * 40,
+            "ACTION_MANIFEST": str(manifest),
+            "ACTIVATION_AUTHORIZATION": "/run/authorization.json",
+            "ACTIVATION_AUTHORIZATION_CONSUMED": "/run/authorization.consumed",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode != 0
+    assert "conflicts with rollback_releases" in result.stderr
+    assert not marker.exists()
+
+
 def test_powershell_activate_transport_passes_explicit_source_mode() -> None:
     script = (ROOT / "scripts/server_git_update.ps1").read_text(encoding="utf-8")
 
