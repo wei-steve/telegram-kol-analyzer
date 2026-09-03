@@ -161,3 +161,122 @@ monitor 共 68 个周期，55 个 healthy、13 个 unhealthy；所有周期 `mon
 ### 本轮边界
 
 本轮只追加本日志。未修改计划文档、代码、settings、白名单、词表、阈值、prompt、schema、数据库或业务数据；未 stage、部署、激活、重启服务；未处理、识别或重放消息；未执行 Deepcoin 写入。ATTENTION 仅记录观测结果，不改变 shadow 或实际决策。
+
+## 2026-09-03 — ATTENTION
+
+> **ATTENTION：P0 累计消息首次达到 500 条；48/48 个 monitor 周期均 `healthy=false` 且全部含资金安全相关 `stalled_composite_component`；Web 在窗口内发生 PID / release 漂移；两笔补保护写入的原始策略消息早于窗口起点；当前一个 5 张 BTC 空仓的止损方向和数量虽匹配，但保护归属未验证。** Shadow 判据没有影响权威路径，worker 首次 bounded exchange snapshot 完整。
+
+### 固定窗口
+
+- 起点（开区间）：`2026-09-02T16:02:13Z`，承接本日志上次截止；原始消息边界 `raw_messages.id > 14504`。
+- 固定终点：`2026-09-03T16:02:02Z`；时长 23 小时 59 分 49 秒（0.999873 个 24 小时日）。`raw_messages`、attempt、execution event 和 journal 均显式限制到该终点；终点没有滑动。
+- 新消息：184 条，ID `14505–14688`；`created_at` 为 `2026-09-02T16:30:46.591342Z–2026-09-03T16:01:54.270089Z`。`created_at` 或 `posted_at` 早于/等于窗口起点的增量消息为 0。
+- 生产 checkout HEAD：`0a6a9a18d1d62ff3c7d0c4c27cdab5961d94339f`。当前三个运行 release 均与 checkout HEAD 不同，Web 与 ingest/worker 也不是同一 release。
+- 数据来源：生产 `research.db` 的 `sqlite3 -readonly` 固定窗口查询、systemd/runtime identity/loop health、monitor journal，以及 worker `http://127.0.0.1:8002` 的只读 bounded snapshot、持仓和当前委托 GET。未使用 Web 8000 获取交易所证据。
+
+### 异常优先
+
+1. **P0 首次达到 500 条：是。** 累计第 500 条为 `raw_messages.id=14658`，`created_at=2026-09-03T14:51:25.124334Z`；固定终点累计 530 条，超过目标 30 条。
+2. **资金安全类 monitor reason：是。** 48/48 个周期均含 `stalled_composite_component`；另有 `adapter_failure`、`audit_abnormal`、`event_unknown_status`、`stale_entry_preamble_unresolved`。没有健康周期。
+3. **PID / SHA 漂移：是。** 上次截止后 Web 从 `b78f1609...` / PID 654288 变为 `5aa7ca07...` / PID 1396631，当前进程启动于 `2026-09-02T16:55:31Z`；ingest、worker 仍为 `0de19c1c...` / PID 3315585、3315574。
+4. **存在 binding 原始消息早于窗口的交易所写入：是。** `execution_events.id=3925` 和 `3950` 均为 `create_backup_stop submitted`；其 binding 原始消息分别为 raw 14403（`2026-09-02T07:34:10.669285Z`）和 raw 14389（`2026-09-02T04:07:11.467959Z`），都早于本窗口。两笔是既有仓位的补保护写入，不是新入场；event 没有直接 source raw，不能进一步证明是哪条当期消息触发，仍按既定 fail-closed 规则标记 ATTENTION。
+5. **持仓保护证据异常：是。** `posId=1001125113096711` 的 5 张 BTC 空仓显示一张 83000 ×5 的平空 TPSL，但 worker 标为“保护归属未验证 / TPSL 未命中保护 ledger / 自动管理已冻结”，持仓卡片的已验证保护数为 0。方向、数量和 native TPSL 平仓语义相符，但 exact-posId 归属不能确认，因此保护完整性按未知处理。
+6. **Shadow 改变实际决策：否。** 27 条 `shadow_would_skip` 仍全部走了权威上下文解析，且逐条均未实质改变第一层动作族或目标集合。
+7. **交易所快照连续两次不完整：否。** 首次 worker bounded snapshot 即 `complete=true`，未重试。
+8. **主识别实测日均 token 较上次变化 >50%：未实测到。** 可得 usage 下界从上次 6.403M 降至本次 4.086M token/日，表面变化 -36.19%；但 usage 可得率从 99.46% 降至 72.32%，62 个 provider request 没有 usage，故真实变化不能完整判定。
+
+### 1. Shadow 生产分歧
+
+- 窗口 context attempts 107，覆盖 88 条消息；shadow 样本 107，一致 80，`shadow_would_trigger=80`，`shadow_would_skip=27`，额外触发 0，计算错误 0。Shadow 字段只记录旁路判断，107 条权威 attempt 均未被它跳过。
+- 27 条 would-skip 中 26 条权威结果为 `hold`、1 条为 `unresolved`；第一层均为 `非策略 / none / target=NULL`，上下文目标集合均为空，因此没有动作族或目标实质变化：
+
+| attempt / raw | 权威上下文结果 | 实质改变第一层 |
+|---|---|---|
+| 4482 / 14517 | hold | 否 |
+| 4483 / 14518 | unresolved | 否 |
+| 4484 / 14520 | hold | 否 |
+| 4488 / 14534 | hold | 否 |
+| 4489 / 14537 | hold | 否 |
+| 4490 / 14538 | hold | 否 |
+| 4495 / 14544 | hold | 否 |
+| 4499 / 14553 | hold | 否 |
+| 4504 / 14564 | hold | 否 |
+| 4514 / 14586 | hold | 否 |
+| 4522 / 14595 | hold | 否 |
+| 4525 / 14598 | hold | 否 |
+| 4530 / 14603 | hold | 否 |
+| 4537 / 14615 | hold | 否 |
+| 4538 / 14616 | hold | 否 |
+| 4541 / 14619 | hold | 否 |
+| 4549 / 14638 | hold | 否 |
+| 4559 / 14641 | hold | 否 |
+| 4564 / 14643 | hold | 否 |
+| 4566 / 14644 | hold | 否 |
+| 4569 / 14645 | hold | 否 |
+| 4570 / 14646 | hold | 否 |
+| 4575 / 14655 | hold | 否 |
+| 4577 / 14663 | hold | 否 |
+| 4579 / 14665 | hold | 否 |
+| 4580 / 14670 | hold | 否 |
+| 4587 / 14678 | hold | 否 |
+
+按计划文档同一动作族、置信度 `<0.7` 不可应用和目标集合口径复算：累计全历史 shadow 样本 259，39 条实质改变全部被 shadow 保留，召回率 **100%（39/39）**，Wilson 95% CI **91.03%–100%**。P0 消息停止条件所差样本数为 **0**，当前为 530/500；这只表示达到观测停止样本量，不替代人工标注、留出回放、零漏失评审和上线授权。
+
+### 2. 主识别真实成本
+
+- 窗口内 `mimo_recognition_attempts` 199 行、224 个 provider request；162 行 completed，37 行 `http_error / v1_authoritative_failed`，后者共发起 62 个 provider request。
+- 224 个 usage entry 中 162 个 `available=true`，真实 usage 可得比例 **72.32%**；62 个均为 `provider_usage_not_returned`。以下 token 只来自 162 个可得请求，是直接测量下界：prompt 3,815,029，completion 269,959，总计 **4,084,988**。
+- 每个可得 provider request 的 total token：中位数 **25,041**，P90 **39,435**，最大 **42,231**，平均 **25,215.98**。
+- 224 个请求的持久化组件字节合计 34,304,191 B：当前消息文本 34,032 B（**0.099%**）；图片证据 15,980,237 B（**46.584%**）；直接 reply 1,571,234 B（**4.580%**，是 authoritative context 的嵌套子集，分区时只扣一次）；其余部分 16,718,688 B（**48.737%**）。
+- 按 0.999873 日归一化，主识别实测为至少 **4.086M token/日**；按窗口 184 条消息为至少 **22,201.02 token/消息**。usage 缺口使这两个数只能作为下界。
+
+### 3. 成本对照
+
+- 上下文解析窗口有 107 attempts、121 个 provider request，121/121 usage 可得；prompt 2,845,017，completion 175,144，总计 **3,020,161 token**。日均 **3.021M**，每条窗口消息 **16,413.92 token**。
+- 同一增量窗口的直接实测对照：主识别至少 4.086M token/日，占两阶段可得 token 的 **57.49%**；上下文解析 3.021M token/日，占 **42.51%**。主识别可得下界仍比上下文解析高约 **1.065M token/日**。
+- 从主识别直接 telemetry 起点 `2026-09-01T22:25:52.941030Z` 到本次终点的共同累计口径，共 355 条消息：主识别 407 requests、344 usage 可得（84.52%）、8,711,340 token，折合至少 **5.025M/日、24,538.99/消息**；上下文解析 255/255 usage 可得、6,144,842 token，折合 **3.545M/日、17,309.41/消息**。两阶段累计可得 token 占比为 **58.64% / 41.36%**。
+- 因此仅从累计直接测量绝对量看，主识别仍是更大的成本侧；优先优化它的数字收益上界更大。但主识别直接决定第一层输入，且本窗口 usage 缺失显著，本结论不授权改变 prompt、窗口或决策路径。
+
+### 4. 常规 P0 与运行健康
+
+- 窗口消息 184；context attempts 107，覆盖 88 条消息，provider requests 121。状态：completed 89（91 requests、89 decisions）；exhausted 18（30 requests、9 decisions）。
+- 8 个直接持久化触发器（非互斥）：`multiple_same_source_candidates=98`、`entered_holder_language=9`、`management_without_exact_target=6`、`apparent_entry_may_be_revision=4`、`text_image_conflict=3`、`revision_language=2`、`reply_target_disagreement=1`、`cancellation_language=0`。
+- 98 条可比较 decision 中 21 条实质改变，描述值 **21.43%**；另 9 条无 decision。该窗口仍只是一个流量切片，不用单日比例调整触发器、词表或阈值。
+- P0 自 `2026-08-31T16:42:37Z` 起累计 530 条消息、约 2.972 个 24 小时日；消息样本目标已超过 30 条，时间条件尚未达到 7 日。按“先到者”规则，500 条停止条件已达到。
+
+当前三角色（固定终点后采样于 `2026-09-03T16:03:17Z`）：
+
+| role | release / PID | artifact | entry freeze | 角色与循环健康 |
+|---|---|---|---|---|
+| web | `5aa7ca077fa45728c0f3d8df93e0e90a33a4a262` / 1396631 | verified | false | event loop=true；当前 1 小时窗口 max=58.481 ms，累计 stall_count=4，watchdog attached |
+| ingest | `0de19c1cbb2089fd58b8940d9b01a65096f9a063` / 3315585 | verified | false | event loop/listener/reconcile=true；max=12.286 ms，累计 stall_count=7，watchdog attached |
+| worker | `0de19c1cbb2089fd58b8940d9b01a65096f9a063` / 3315574 | verified | false | event loop/command/message processing=true；management、break-even、reconcile、close、TPSL、protection、rescue 均 fresh/successful；global exchange authority=true；max=344.226 ms，累计 stall_count=8，watchdog attached |
+
+`auto_trade_enabled=true`，`worker_command_mode=queue`。三个角色当前均未冻结；Web 的 release/PID 漂移及三角色 release 不一致仍是 ATTENTION。
+
+monitor 从上次截止后到固定终点共 48 个周期：0 healthy、48 unhealthy，全部 `monitor_error=null`；以下按完全相同的健康状态/reason codes 分组列出每个 UTC 周期：
+
+- `healthy=false, reason_codes=[stalled_composite_component], audit_ran=false`（39）：2026-09-02 `16:31:16, 17:00:48, 17:31:58, 18:01:19, 18:31:06, 19:01:30, 19:31:50, 20:00:31, 20:31:58, 21:01:41, 21:31:43, 22:00:25, 22:32:05, 23:00:33, 23:30:48`；2026-09-03 `00:00:57, 00:30:49, 02:00:31, 02:30:50, 03:00:43, 03:30:34, 04:01:08, 04:31:26, 05:00:43, 05:30:44, 06:00:41, 06:31:24, 07:01:13, 08:02:06, 08:31:49, 09:02:02, 09:31:07, 10:00:42, 10:31:48, 11:00:59, 11:30:35, 12:00:49, 12:30:28, 13:30:21`。
+- `healthy=false, reason_codes=[adapter_failure, stalled_composite_component], audit_ran=true`（1）：2026-09-03 `01:02:11`。
+- `healthy=false, reason_codes=[audit_abnormal, stalled_composite_component], audit_ran=true`（1）：2026-09-03 `01:33:30`。
+- `healthy=false, reason_codes=[event_unknown_status, stalled_composite_component], audit_ran=false`（2）：2026-09-03 `07:31:07, 13:01:45`。
+- `healthy=false, reason_codes=[stale_entry_preamble_unresolved, stalled_composite_component], audit_ran=false`（5）：2026-09-03 `14:02:07, 14:31:47, 15:02:05, 15:31:27, 16:01:45`。
+
+monitor 的 48 次加载身份均为 verified release `0de19c1c...`；通知结果为 sent 9、suppressed 39。窗口 execution events 中实际 `submitted` 写入 30 条：`create_trigger_entry=11`、`create_backup_stop=8`、`open_market_position=3`、`set_position_tpsl=3`、`strategy_management_close_submit=3`、`cancel_trigger_entry=1`、`strategy_management_cancel_deferred_trigger_entry=1`；另有 `auto_trade_skipped=2`、保护预取消 reserved/succeeded 各 8、terminal cleanup resolved 1。30 条 submitted 中 18 条有直接 source raw，均不早于窗口；其余 12 条没有直接 source raw。当前 lifecycle 状态能为其中 6 条提供窗口内 management message 指针，但该指针可能晚于 event，不能倒推为因果来源；另外 6 条连该指针也没有。其中两条补保护 event 的 binding 原始策略消息早于窗口，已在异常项逐笔列出，因此不能把缺失直接来源当成“没有历史来源”。
+
+### 5. 交易所只读快照（worker 8002）
+
+- `2026-09-03T16:03:17Z` 首次 bounded snapshot：`complete=true`，持仓 2，普通挂单 0，fingerprint `60bbcad96c097cdf6df061360b88c80f8c9c465590b4a9cdd050f9a565638716`；未触发第二次重试。
+- `2026-09-03T16:04:13Z` 当前委托 GET：`loaded=true`，共 9 条触发单；BTC=5、ETH=2、SOL=2。BTC 包含 1 张待入场空单和 4 张平空 TPSL；ETH、SOL 各 2 张待入场多单。普通挂单为 0。
+- `2026-09-03T16:09:16Z` 最新 durable TPSL 观察：BTC `complete=true, response_count=5`，ETH `complete=true, response_count=2`，SOL `complete=true, response_count=2`。这是固定终点后的当前状态交叉检查，不进入窗口计数。
+
+| posId | 仓位 | 保护回读 | 方向 / 数量覆盖 | reduce-only / 归属结论 |
+|---|---|---|---|---|
+| `1001125113096711` | BTC short，5 contracts，均价 81110 | 持仓卡片已验证保护 0；另见 TPSL SL 83000 ×5，order `1001125113096710` | 委托显示 `side-long / TPSL 平空`，数量覆盖 5 | native TPSL 为平仓语义，但缺少 position protection ledger 和 exact-posId 归属；worker 明示“保护归属未验证 / 自动管理已冻结”，因此整体按未知，不宣称已验证 reduce-only/保护完整 |
+| `1001125112876816` | BTC short，20 contracts，均价 80811 | TP 77890 ×20；SL 81800 ×20；备份 SL 81963.6 ×全部剩余 | 三条均为 `side-long / TPSL 平空`；TP 和任一 SL 均完整覆盖 20 | 三条均绑定 exact posId 并标为已验证保护；native TPSL / close-position 语义，按 reduce-only 保护确认 |
+
+第二个仓位没有缺失、反向或数量不足。第一个仓位存在一张看似正确的止损，但归属证据不完整；按只读 fail-closed 口径保留 ATTENTION，不人工归属、不处理订单。
+
+### 本轮边界
+
+本轮只追加本日志。未修改计划文档、代码、settings、白名单、词表、阈值、prompt、schema、数据库或业务数据；未 stage、部署、激活、重启服务；未处理、识别或重放消息；未执行 Deepcoin 写入。ATTENTION 仅记录只读证据，没有让 shadow 影响实际决策。
