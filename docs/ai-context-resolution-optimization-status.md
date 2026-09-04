@@ -12,9 +12,10 @@ pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063 # historical all-role main-recognition activation
 current_runtime_role_shas:
-  web: 5aa7ca077fa45728c0f3d8df93e0e90a33a4a262
-  ingest: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
-  worker: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
+  web: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
+  monitor: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
+  ingest: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
+  worker: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
@@ -32,9 +33,16 @@ main_recognition_live_sample_verified: true
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
-entry_admission_frozen_observed: true
+entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
+
+## Monitor identity convergence and recognition lease activation — 2026-09-04T12:26:29Z
+
+- The standard immutable helper activated candidate `6a493d1588a2a4cdd34abfb2abd85580fc8f3b71` for Web, monitor, ingest and worker with `schema_changed=false`. Canonical v3 authorization bound the observed per-role rollback mapping Web→`5aa7ca077...` and monitor/ingest/worker→`0de19c1c...`; the new source was consumed exactly once. All three runtime endpoints now report the candidate manifest `7ac1c94946d58b8ed9eca52cef9ff6504582632ed799f14ad01e90a43f1a2468` with `loaded_artifact_verified=true`.
+- The conservative freeze interval was `2026-09-04T12:25:07Z`–`12:26:36Z` (89 seconds). No message arrived in that interval and no new stale expiry was recorded. Entry admission is unfrozen and automatic trading remains enabled.
+- L2 exceeded its traffic target with 23 messages from 7 chats but was stopped at `12:47:49Z`, before the planned 30-minute endpoint, when a new unbound BTC short position `1001125126568015` (2 contracts) appeared with no verified stop-loss or take-profit orders and automatic management frozen. No exchange or business-data write was performed. Raw message `14825` also produced one new fail-closed `execution_uncertain` lease after the adapter boundary returned `in_progress`; retries were blocked and the scanner detected it within one cycle. The 30 legacy `execution_running` rows were untouched and did not increase.
+- The specifically gated BTC position `1001125123045253` retained its same complete verified stop/take-profit coverage, but the unrelated naked position is an unresolved live risk. The monitor timer remained enabled/active, while its natural invocation exited 1 only on the four already documented historical business residuals; a successful natural timed run is not claimed. Full activation and partial-observation evidence is in `docs/2026-09-04-monitor-identity-convergence-production-activation.md`.
 
 ## Recognition execution lease activation rolled back at monitor diagnostic — 2026-09-04T08:57:46Z
 
