@@ -85,7 +85,6 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
             "manifest_sha256": "a" * 64,
         },
     )()
-
     rendered = render_release_dropin(
         release,
         component="worker",
@@ -101,16 +100,59 @@ def test_bootstrap_can_render_canonical_entry_frozen_release_dropin() -> None:
         component="monitor",
         entry_frozen=True,
     )
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH=" not in monitor
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=" not in monitor
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" not in monitor
     assert (
-        "TELEGRAM_KOL_MONITOR_RELEASE_PATH="
-        "/opt/telegram-kol-releases/candidate"
-    ) in monitor
-    assert f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}" in monitor
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" in monitor
+        'Environment="PYTHONPATH=/opt/telegram-kol-releases/candidate/src"'
+        in monitor
+    )
 
 
 def test_system_runtime_allows_first_authority_cycles_to_finish_before_retry() -> None:
     assert SystemRuntimeAdapter.identity_retry_delay_seconds == 60
+
+
+def test_runtime_support_digest_allows_only_canonical_monitor_execstart_migration(
+    tmp_path: Path,
+) -> None:
+    legacy = tmp_path / "legacy"
+    canonical = tmp_path / "canonical"
+    changed = tmp_path / "changed"
+    for root in (legacy, canonical, changed):
+        unit_dir = root / "deploy/systemd"
+        unit_dir.mkdir(parents=True)
+        (root / "config").mkdir()
+        (root / "config/groups.yaml").write_text("groups: []\n", encoding="utf-8")
+    legacy_command = (
+        "ExecStart=/usr/bin/env "
+        "PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src "
+        "/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+        "monitor-production-safety --notify\n"
+    )
+    canonical_command = (
+        "ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+        "monitor-production-safety --notify\n"
+    )
+    (legacy / "deploy/systemd/telegram-kol-monitor.service").write_text(
+        "[Service]\n" + legacy_command + "NoNewPrivileges=true\n",
+        encoding="utf-8",
+    )
+    (canonical / "deploy/systemd/telegram-kol-monitor.service").write_text(
+        "[Service]\n" + canonical_command + "NoNewPrivileges=true\n",
+        encoding="utf-8",
+    )
+    (changed / "deploy/systemd/telegram-kol-monitor.service").write_text(
+        "[Service]\n" + canonical_command + "NoNewPrivileges=false\n",
+        encoding="utf-8",
+    )
+
+    assert scoped_activation._runtime_support_digest(
+        legacy
+    ) == scoped_activation._runtime_support_digest(canonical)
+    assert scoped_activation._runtime_support_digest(
+        canonical
+    ) != scoped_activation._runtime_support_digest(changed)
 
 
 @pytest.mark.parametrize(
@@ -145,6 +187,9 @@ def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_confi
             "manifest_sha256": "a" * 64,
         },
     )()
+    environment_file = tmp_path / "monitor.env"
+    environment_file.write_text("MONITOR_POLICY=live\n", encoding="utf-8")
+    environment_file.chmod(0o600)
     config_mtime_ns = 1_800_000_000_000_000_000
     unit_files: dict[str, tuple[Path, Path]] = {}
     for index, unit in enumerate(
@@ -174,14 +219,18 @@ def test_monitor_rollback_identity_requires_matching_diagnostic_newer_than_confi
             if unit in scoped_activation._UNITS["monitor"]:
                 environment = " ".join(
                     (
+                        f"PYTHONPATH={release_path}/src",
                         f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
                         f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
-                        f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
-                        f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
-                        "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" + "a" * 64,
                     )
                 )
-                stdout = f"Environment={environment}\n"
+                stdout = (
+                    f"Environment={environment}\n"
+                    f"EnvironmentFiles={environment_file} (ignore_errors=no)\n"
+                    "ExecStart={ path=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research ; "
+                    "argv[]=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+                    "monitor-production-safety ; }\n"
+                )
             stdout += f"FragmentPath={fragment}\nDropInPaths={dropin}\n"
         elif command == [
             "systemctl",
@@ -250,6 +299,9 @@ def test_monitor_rollback_identity_requires_unit_type_specific_systemd_propertie
             "manifest_sha256": "a" * 64,
         },
     )()
+    environment_file = tmp_path / "monitor-properties.env"
+    environment_file.write_text("MONITOR_POLICY=live\n", encoding="utf-8")
+    environment_file.chmod(0o600)
     config_mtime_ns = 1_800_000_000_000_000_000
     unit_files: dict[str, tuple[Path, Path]] = {}
     units = (*scoped_activation._UNITS["monitor"], "telegram-kol-monitor.timer")
@@ -282,12 +334,17 @@ def test_monitor_rollback_identity_requires_unit_type_specific_systemd_propertie
                             (
                                 f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
                                 f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
-                                f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
-                                f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
-                                "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256="
-                                + "a" * 64,
+                                f"PYTHONPATH={release_path}/src",
                             )
                         )
+                    )
+                    lines.append(
+                        f"EnvironmentFiles={environment_file} (ignore_errors=no)"
+                    )
+                    lines.append(
+                        "ExecStart={ path=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research ; "
+                        "argv[]=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+                        "monitor-production-safety ; }"
                     )
             elif timer_environment:
                 lines.append("Environment=IGNORED_FOR_PROCESSLESS_TIMER=1")
@@ -359,6 +416,9 @@ def test_monitor_rollback_identity_fails_closed_on_incomplete_evidence(
             "manifest_sha256": "a" * 64,
         },
     )()
+    environment_file = tmp_path / "monitor-incomplete.env"
+    environment_file.write_text("MONITOR_POLICY=live\n", encoding="utf-8")
+    environment_file.chmod(0o600)
     unit_files: dict[str, tuple[Path, Path]] = {}
     for index, unit in enumerate(
         (*scoped_activation._UNITS["monitor"], "telegram-kol-monitor.timer")
@@ -382,15 +442,22 @@ def test_monitor_rollback_identity_fails_closed_on_incomplete_evidence(
             if unit in scoped_activation._UNITS["monitor"]:
                 environment = " ".join(
                     (
+                        f"PYTHONPATH={release_path}/src",
                         f"TELEGRAM_KOL_RELEASE_COMMIT={CANDIDATE}",
                         f"TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={'a' * 64}",
-                        f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={release_path}",
-                        f"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={CANDIDATE}",
-                        "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" + "a" * 64,
                     )
                 )
             stdout = (
                 f"Environment={environment}\n"
+                + (
+                    f"EnvironmentFiles={environment_file} (ignore_errors=no)\n"
+                    "ExecStart={ path=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research ; "
+                    "argv[]=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+                    "monitor-production-safety ; }\n"
+                    if unit in scoped_activation._UNITS["monitor"]
+                    else ""
+                )
+                +
                 f"FragmentPath={fragment}\n"
                 f"DropInPaths={dropin}\n"
             )
@@ -406,6 +473,138 @@ def test_monitor_rollback_identity_fails_closed_on_incomplete_evidence(
 
     with pytest.raises(ActivationError, match="monitor rollback identity proof failed"):
         runtime.prove_monitor_rollback_release(release)
+
+
+@pytest.mark.parametrize(
+    "case,expected_pass",
+    (
+        ("clean", True),
+        ("generic-current-matches-candidate", True),
+        ("retired-env-key", False),
+        ("missing-environment", False),
+        ("missing-environment-files", False),
+        ("missing-environment-file", False),
+        ("missing-pythonpath", False),
+        ("missing-release-commit", False),
+        ("missing-manifest-sha256", False),
+        ("legacy-execstart", False),
+    ),
+)
+def test_monitor_candidate_main_import_proof_uses_effective_systemd_sources(
+    tmp_path: Path,
+    monkeypatch,
+    case: str,
+    expected_pass: bool,
+) -> None:
+    runtime = SystemRuntimeAdapter(
+        python=Path("/venv/python"),
+        expected_uid=tmp_path.stat().st_uid,
+    )
+    release_path = tmp_path / CANDIDATE
+    release_path.mkdir()
+    release = type(
+        "Release",
+        (),
+        {
+            "release_path": release_path,
+            "commit": CANDIDATE,
+            "manifest_sha256": "a" * 64,
+        },
+    )()
+    current_matches_candidate = case == "generic-current-matches-candidate"
+    current_path = release_path if current_matches_candidate else tmp_path / ROLLBACK
+    if current_path != release_path:
+        current_path.mkdir()
+    environment_file = tmp_path / "telegram-kol-monitor.env"
+    environment_file.write_text("MONITOR_POLICY=live\n", encoding="utf-8")
+    environment_file.chmod(0o600)
+    if case == "retired-env-key":
+        environment_file.write_text(
+            f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={current_path}\n",
+            encoding="utf-8",
+        )
+    if case == "missing-environment-file":
+        environment_file.unlink()
+
+    def run(command, **kwargs):
+        if command[0:2] != ["systemctl", "show"]:
+            raise AssertionError(command)
+        environment = " ".join(
+            (
+                f"PYTHONPATH={current_path}/src",
+                "TELEGRAM_KOL_RELEASE_COMMIT="
+                f"{CANDIDATE if current_matches_candidate else ROLLBACK}",
+                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256="
+                f"{'a' * 64 if current_matches_candidate else 'b' * 64}",
+            )
+        )
+        if case == "missing-pythonpath":
+            environment = " ".join(
+                item for item in environment.split() if not item.startswith("PYTHONPATH=")
+            )
+        if case == "missing-release-commit":
+            environment = " ".join(
+                item
+                for item in environment.split()
+                if not item.startswith("TELEGRAM_KOL_RELEASE_COMMIT=")
+            )
+        if case == "missing-manifest-sha256":
+            environment = " ".join(
+                item
+                for item in environment.split()
+                if not item.startswith("TELEGRAM_KOL_RELEASE_MANIFEST_SHA256=")
+            )
+        if case == "retired-env-key":
+            environment += f" TELEGRAM_KOL_MONITOR_RELEASE_PATH={current_path}"
+        exec_start = (
+            "{ path=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research ; "
+            "argv[]=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+            "monitor-production-safety --deployment-diagnostic ; }"
+        )
+        if case == "legacy-execstart":
+            exec_start = (
+                "{ path=/usr/bin/env ; argv[]=/usr/bin/env "
+                "PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src "
+                "/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+                "monitor-production-safety ; }"
+            )
+        lines = [
+            f"Environment={environment}",
+            f"EnvironmentFiles={environment_file} (ignore_errors=no)",
+            f"ExecStart={exec_start}",
+            f"FragmentPath={tmp_path / command[2]}",
+            "DropInPaths=",
+        ]
+        if case == "missing-environment":
+            lines.pop(0)
+        if case == "missing-environment-files":
+            lines.pop(1)
+        return scoped_activation.subprocess.CompletedProcess(
+            command,
+            0,
+            stdout="\n".join(lines) + "\n",
+            stderr="",
+        )
+
+    monkeypatch.setattr(scoped_activation.subprocess, "run", run)
+
+    if expected_pass:
+        evidence = runtime.prove_monitor_candidate_release(release)
+        assert evidence["release_commit"] == CANDIDATE
+        assert evidence["main_pythonpath"] == f"{release_path}/src"
+    else:
+        with pytest.raises(ActivationError, match="monitor candidate main import") as error:
+            runtime.prove_monitor_candidate_release(release)
+        if case == "retired-env-key":
+            assert (
+                "source=EnvironmentFile "
+                "key=TELEGRAM_KOL_MONITOR_RELEASE_PATH "
+                f"observed={current_path}"
+            ) in str(error.value)
+            assert (
+                f"source=prospective_dropin observed={release_path}"
+                in str(error.value)
+            )
 
 
 def test_monitor_release_proof_allows_success_when_journal_evidence_is_unavailable(
@@ -1071,6 +1270,14 @@ class FakeRuntime:
             "manifest_sha256": release.manifest_sha256,
         }
 
+    def prove_monitor_candidate_release(self, release):
+        self.events.append(f"monitor-candidate-identity:{release.commit}")
+        return {
+            "contract": "monitor-candidate-main-identity-v1",
+            "release_commit": release.commit,
+            "manifest_sha256": release.manifest_sha256,
+        }
+
     def verify_monitor_release(self, release):
         self.events.append(f"monitor-identity:{release.commit}")
         return {
@@ -1435,6 +1642,7 @@ def test_per_role_dry_run_executes_authority_and_monitor_gates_without_mutation(
     assert result["rollback_releases"] == rollback_releases
     assert runtime.events.count("active-write") == 1
     assert f"monitor-rollback-identity:{MONITOR_ROLLBACK}" in runtime.events
+    assert f"monitor-candidate-identity:{CANDIDATE}" in runtime.events
     assert all(
         any(event.startswith(f"identity:{role}:") for event in runtime.events)
         for role in ("web", "ingest", "worker")
@@ -1446,6 +1654,46 @@ def test_per_role_dry_run_executes_authority_and_monitor_gates_without_mutation(
     )
     assert paths.authorization.exists()
     assert not paths.authorization_consumed.exists()
+
+
+def test_per_role_dry_run_rejects_monitor_main_import_from_stale_environment_file(
+    tmp_path: Path,
+) -> None:
+    paths, runtime, _ = _split_runtime_activation_harness(tmp_path)
+
+    def reject_split_main_identity(release) -> dict:
+        raise ActivationError(
+            "monitor candidate main import conflict: "
+            f"dropin={release.commit} environment_file={MONITOR_ROLLBACK}"
+        )
+
+    runtime.prove_monitor_candidate_release = reject_split_main_identity
+
+    with pytest.raises(
+        ActivationError,
+        match=(
+            "monitor candidate main import conflict: "
+            f"dropin={CANDIDATE} environment_file={MONITOR_ROLLBACK}"
+        ),
+    ):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit="",
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            controller_commit=CONTROLLER,
+            controller_bundle_sha256="d" * 64,
+            dry_run=True,
+        )
+
+    assert paths.authorization.exists()
+    assert not paths.authorization_consumed.exists()
+    assert "active-write" not in runtime.events
+    assert not any(
+        event.startswith(("stop:", "start:")) or event == "daemon-reload"
+        for event in runtime.events
+    )
 
 
 def test_per_role_rollback_restores_each_component_to_its_bound_release(
@@ -1810,6 +2058,9 @@ def test_authority_activation_freezes_all_entry_runtimes_and_checks_quiescence(
         runtime=runtime,
         expected_uid=paths.release_root.stat().st_uid,
     )
+
+    assert f"monitor-rollback-identity:{ROLLBACK}" in runtime.events
+    assert f"monitor-candidate-identity:{CANDIDATE}" in runtime.events
 
     assert result["status"] == "activated"
     monitor_verification = result["monitor_verification"]

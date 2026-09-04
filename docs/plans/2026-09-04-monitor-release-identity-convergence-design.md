@@ -26,9 +26,18 @@ install-only procedure while the monitor units are inactive. The updated install
 2. write a policy/credential env file with no release-identity keys;
 3. install the three service units whose `ExecStart` directly invokes the production virtualenv
    CLI and therefore inherits the generic release `PYTHONPATH` from the release drop-in;
-4. leave service start and authority activation to their existing bounded phases.
+4. remove only the three retired `TELEGRAM_KOL_MONITOR_RELEASE_*` assignments from existing
+   release drop-ins using a root-owned, single-link, atomic rewrite; malformed or duplicate
+   assignments fail closed;
+5. leave service start and authority activation to their existing bounded phases.
 
 No installer or unit change is executed in this implementation-only turn.
+
+The future migration must run while the monitor services and timer are inactive. After installing
+the canonical units and removing the retired assignments, it must run a successful diagnostic for
+the observed rollback commit/manifest. That diagnostic must be newer than the env file, every
+monitor unit, and every release drop-in before any activation dry-run may use it. The migration
+cannot reuse diagnostic evidence captured before the configuration rewrite.
 
 The release-support digest normally requires byte-identical systemd units between candidate and
 rollback. The old and new monitor commands differ only by removal of the exact legacy prefix
@@ -66,6 +75,11 @@ Errors are source-specific and fail closed: malformed or missing `systemctl show
 missing EnvironmentFile, a release key in that file, a legacy main command, missing generic
 identity, or a mismatched prospective import path reports the conflicting source/value category.
 No secret or unrelated env value is included in the error.
+
+For a release key in `EnvironmentFile`, the dry-run error records the offending key and its value,
+the corresponding prospective drop-in value, and the requirement that the file contain no release
+identity. This makes the two conflicting sources explicit without exposing credentials or unrelated
+policy values.
 
 ## Freeze-window message loss record
 

@@ -355,9 +355,6 @@ env_source="$(mktemp)"
 trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_PATH=%s\n' "$resolved_release_path" >> "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=%s\n' "$release_commit" >> "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=%s\n' "$release_manifest_sha256" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
@@ -370,6 +367,83 @@ install -o root -g root -m 0644 "$SERVICE_SOURCE" "$SERVICE_DEST"
 install -o root -g root -m 0644 "$TIMER_SOURCE" "$TIMER_DEST"
 install -o root -g root -m 0644 "$TEST_NOTIFICATION_SOURCE" "$TEST_NOTIFICATION_DEST"
 install -o root -g root -m 0644 "$DIAGNOSTIC_SOURCE" "$DIAGNOSTIC_DEST"
+for monitor_dropin in \
+  "/etc/systemd/system/telegram-kol-monitor.service.d/10-telegram-kol-release.conf" \
+  "/etc/systemd/system/telegram-kol-monitor-diagnostic.service.d/10-telegram-kol-release.conf" \
+  "/etc/systemd/system/telegram-kol-monitor-test-notification.service.d/10-telegram-kol-release.conf"
+do
+  if [[ -e "$monitor_dropin" || -L "$monitor_dropin" ]]; then
+    python3 -B - "$monitor_dropin" "$(id -u)" <<'PY'
+# BEGIN_MONITOR_RELEASE_DROPIN_CLEANUP
+import os
+from pathlib import Path
+import stat
+import sys
+import uuid
+
+path = Path(sys.argv[1])
+expected_uid = int(sys.argv[2])
+metadata = path.lstat()
+if (
+    not stat.S_ISREG(metadata.st_mode)
+    or stat.S_ISLNK(metadata.st_mode)
+    or metadata.st_uid != expected_uid
+    or metadata.st_nlink != 1
+):
+    raise SystemExit("Existing monitor release drop-in is unsafe.")
+lines = path.read_bytes().splitlines(keepends=True)
+keys = (
+    b"TELEGRAM_KOL_MONITOR_RELEASE_PATH",
+    b"TELEGRAM_KOL_MONITOR_RELEASE_COMMIT",
+    b"TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256",
+)
+removed = {key: 0 for key in keys}
+kept = []
+for line in lines:
+    matched = False
+    for key in keys:
+        if line.startswith(b'Environment="' + key + b"=") and line.rstrip(
+            b"\r\n"
+        ).endswith(b'"'):
+            removed[key] += 1
+            if removed[key] > 1:
+                raise SystemExit("Existing monitor release drop-in has duplicate identity.")
+            matched = True
+            break
+    if not matched:
+        kept.append(line)
+after = b"".join(kept)
+if b"TELEGRAM_KOL_MONITOR_RELEASE_" in after:
+    raise SystemExit("Existing monitor release drop-in identity is malformed.")
+before = b"".join(lines)
+if after == before:
+    raise SystemExit(0)
+temporary = path.with_name(f".{path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp")
+flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+if hasattr(os, "O_NOFOLLOW"):
+    flags |= os.O_NOFOLLOW
+descriptor = os.open(temporary, flags, stat.S_IMODE(metadata.st_mode))
+try:
+    with os.fdopen(descriptor, "wb") as stream:
+        stream.write(after)
+        stream.flush()
+        os.fsync(stream.fileno())
+    os.chown(temporary, metadata.st_uid, metadata.st_gid)
+    os.replace(temporary, path)
+    directory = os.open(path.parent, os.O_RDONLY)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+finally:
+    try:
+        temporary.unlink()
+    except FileNotFoundError:
+        pass
+# END_MONITOR_RELEASE_DROPIN_CLEANUP
+PY
+  fi
+done
 systemctl daemon-reload
 
 if [[ "$enable_timer" == true ]]; then

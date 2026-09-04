@@ -33,7 +33,9 @@
 1. Add failing static assertions that all three units directly invoke the virtualenv CLI and no
    monitor release key is emitted by the installer.
 2. Remove the legacy command-local `PYTHONPATH` prefix and the three installer env writes.
-3. Run the focused installation tests to GREEN.
+3. Add a fail-closed, exact cleanup of the three retired assignments from existing monitor release
+   drop-ins; preserve every other byte and reject malformed/duplicate identity lines.
+4. Run the focused installation tests to GREEN.
 
 ### Task 3: Publish only the generic monitor identity
 
@@ -58,7 +60,9 @@
 3. Invoke the proof after rollback identity proof but before the active-write gate and dry-run
    return.
 4. Cover matching sources, legacy conflict, missing Environment, missing/missing-file
-   EnvironmentFile, and malformed ExecStart; assert zero service-control events.
+   EnvironmentFile, each missing generic release field, and malformed ExecStart; assert zero
+   service-control events. Conflict errors must include the EnvironmentFile value and the
+   prospective drop-in value without exposing unrelated environment values.
 5. Re-run the focused activation tests to GREEN.
 
 ### Task 5: Preserve rollback proof and support-digest safety

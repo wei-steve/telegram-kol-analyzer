@@ -52,6 +52,32 @@ _UNITS = {
     ),
 }
 _PORTS = {"web": 8000, "ingest": 8001, "worker": 8002}
+_MONITOR_CLI_PATH = "/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research"
+_GENERIC_RELEASE_ENV_KEYS = frozenset(
+    {
+        "PYTHONPATH",
+        "TELEGRAM_KOL_RELEASE_COMMIT",
+        "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256",
+    }
+)
+_RETIRED_MONITOR_RELEASE_ENV_KEYS = frozenset(
+    {
+        "TELEGRAM_KOL_MONITOR_RELEASE_PATH",
+        "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT",
+        "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256",
+    }
+)
+_MONITOR_SERVICE_UNIT_PATHS = frozenset(
+    f"deploy/systemd/{unit}" for unit in _UNITS["monitor"]
+)
+_LEGACY_MONITOR_EXECSTART_PREFIX = (
+    b"ExecStart=/usr/bin/env "
+    b"PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src "
+    b"/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+)
+_CANONICAL_MONITOR_EXECSTART_PREFIX = (
+    b"ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
+)
 RUNTIME_CONTROL_LOCK_PATH = Path("/run/telegram-kol-update.lock")
 def _command_matches_role(command: bytes, *, role: str) -> bool:
     try:
@@ -157,6 +183,10 @@ class RuntimeAdapter(Protocol):
     def monitor_timer_active(self) -> bool: ...
 
     def prove_monitor_rollback_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]: ...
+
+    def prove_monitor_candidate_release(
         self, release: ReleaseEvidence
     ) -> Mapping[str, Any]: ...
 
@@ -309,12 +339,25 @@ def _runtime_support_digest(root: Path) -> str:
                 continue
             if not stat.S_ISREG(metadata.st_mode) or stat.S_ISLNK(metadata.st_mode):
                 raise ActivationError("release scope validation failed")
+            content = path.read_bytes()
+            if relative in _MONITOR_SERVICE_UNIT_PATHS:
+                # The installed canonical unit inherits the generic release
+                # PYTHONPATH from the per-role drop-in. Treat only the exact
+                # retired command prefix as the same rollback-compatible unit;
+                # every argument and sandbox byte remains significant.
+                if content.count(_LEGACY_MONITOR_EXECSTART_PREFIX) > 1:
+                    raise ActivationError("release scope validation failed")
+                content = content.replace(
+                    _LEGACY_MONITOR_EXECSTART_PREFIX,
+                    _CANONICAL_MONITOR_EXECSTART_PREFIX,
+                    1,
+                )
             encoded = relative.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
             digest.update(b"x" if metadata.st_mode & 0o111 else b"-")
-            digest.update(metadata.st_size.to_bytes(8, "big"))
-            digest.update(path.read_bytes())
+            digest.update(len(content).to_bytes(8, "big"))
+            digest.update(content)
     except OSError as exc:
         raise ActivationError("release scope validation failed") from exc
     return digest.hexdigest()
@@ -675,14 +718,6 @@ def render_release_dropin(
     if entry_frozen and component in _RUNTIME_COMPONENTS:
         lines.append('Environment="TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN=1"')
     if component == "monitor":
-        lines.extend(
-            (
-                f'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH={release.release_path}"',
-                f'Environment="TELEGRAM_KOL_MONITOR_RELEASE_COMMIT={release.commit}"',
-                "Environment=\"TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256="
-                f"{release.manifest_sha256}\"",
-            )
-        )
         lines.append(
             "ExecStartPre=/opt/telegram-kol-analyzer/.venv/bin/python -m "
             "telegram_kol_research.runtime_deployment_identity --verify-self"
@@ -1069,8 +1104,9 @@ def activate_release(
             require_entry_frozen=False,
             now=observed_now,
         )
-        if rollback_payload is not None and "monitor" in components:
+        if "monitor" in components:
             runtime.prove_monitor_rollback_release(rollback_releases["monitor"])
+            runtime.prove_monitor_candidate_release(candidate)
         preserve_entry_freeze = require_authority or any(
             identity.get("entry_admission_frozen") is True
             for identity in before_identities.values()
@@ -1571,6 +1607,228 @@ class SystemRuntimeAdapter:
             return False
         raise ActivationError("monitor timer state is unknown")
 
+    @staticmethod
+    def _parse_unique_assignments(raw: str, *, error: str) -> dict[str, str]:
+        assignments: dict[str, str] = {}
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise ActivationError(error) from exc
+        for assignment in parts:
+            key, separator, value = assignment.partition("=")
+            if not separator or not key or key in assignments:
+                raise ActivationError(error)
+            assignments[key] = value
+        return assignments
+
+    def _read_monitor_environment_file(
+        self,
+        raw: str,
+        *,
+        release: ReleaseEvidence,
+    ) -> tuple[tuple[Path, ...], dict[str, str]]:
+        try:
+            parts = shlex.split(raw)
+        except ValueError as exc:
+            raise ActivationError(
+                "monitor candidate main import: EnvironmentFiles malformed"
+            ) from exc
+        if len(parts) != 2 or parts[1] != "(ignore_errors=no)":
+            raise ActivationError("monitor candidate main import: EnvironmentFiles unsupported")
+        path = Path(parts[0])
+        if not path.is_absolute():
+            raise ActivationError("monitor candidate main import: EnvironmentFile path invalid")
+        try:
+            metadata = path.lstat()
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_ISLNK(metadata.st_mode)
+                or metadata.st_uid != self.expected_uid
+                or metadata.st_nlink != 1
+                or stat.S_IMODE(metadata.st_mode) & 0o077
+                or metadata.st_size > 65_536
+            ):
+                raise ActivationError(
+                    "monitor candidate main import: EnvironmentFile metadata unsafe"
+                )
+            text = path.read_text(encoding="utf-8")
+        except ActivationError:
+            raise
+        except (OSError, UnicodeError) as exc:
+            raise ActivationError(
+                "monitor candidate main import: EnvironmentFile unavailable"
+            ) from exc
+        assignments: dict[str, str] = {}
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith(("#", ";")):
+                continue
+            key, separator, value = stripped.partition("=")
+            if (
+                not separator
+                or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key)
+                or key in assignments
+            ):
+                raise ActivationError(
+                    "monitor candidate main import: EnvironmentFile syntax unsupported"
+                )
+            assignments[key] = value
+        forbidden = set(assignments) & (
+            _GENERIC_RELEASE_ENV_KEYS | _RETIRED_MONITOR_RELEASE_ENV_KEYS
+        )
+        if forbidden:
+            key = sorted(forbidden)[0]
+            candidate_values = {
+                "PYTHONPATH": str(release.release_path / "src"),
+                "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
+                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+                "TELEGRAM_KOL_MONITOR_RELEASE_PATH": str(release.release_path),
+                "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT": release.commit,
+                "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+            }
+            raise ActivationError(
+                "monitor candidate main import conflict: "
+                f"source=EnvironmentFile key={key} observed={assignments[key]} "
+                f"source=prospective_dropin observed={candidate_values[key]} "
+                "expected_environment_file=absent"
+            )
+        return (path,), assignments
+
+    def _monitor_main_unit_properties(
+        self,
+        unit: str,
+        *,
+        release: ReleaseEvidence,
+    ) -> dict[str, Any]:
+        result = self._run(
+            [
+                "systemctl",
+                "show",
+                unit,
+                "--property=Environment",
+                "--property=EnvironmentFiles",
+                "--property=ExecStart",
+                "--property=FragmentPath",
+                "--property=DropInPaths",
+            ]
+        )
+        properties: dict[str, str] = {}
+        allowed = {
+            "Environment",
+            "EnvironmentFiles",
+            "ExecStart",
+            "FragmentPath",
+            "DropInPaths",
+        }
+        for line in result.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator and key in allowed:
+                if key in properties:
+                    raise ActivationError(
+                        "monitor candidate main import: systemctl property duplicated"
+                    )
+                properties[key] = value
+        if set(properties) != allowed:
+            missing = sorted(allowed - set(properties))
+            label = missing[0] if missing else "unknown"
+            raise ActivationError(
+                f"monitor candidate main import: systemctl property missing {label}"
+            )
+        if not properties["FragmentPath"]:
+            raise ActivationError(
+                "monitor candidate main import: FragmentPath missing"
+            )
+        environment = self._parse_unique_assignments(
+            properties["Environment"],
+            error="monitor candidate main import: Environment malformed",
+        )
+        environment_files, environment_file_assignments = (
+            self._read_monitor_environment_file(
+                properties["EnvironmentFiles"], release=release
+            )
+        )
+        command = properties["ExecStart"]
+        if (
+            f"path={_MONITOR_CLI_PATH} " not in command
+            or f"argv[]={_MONITOR_CLI_PATH} monitor-production-safety" not in command
+            or "PYTHONPATH=" in command
+            or any(key in command for key in _RETIRED_MONITOR_RELEASE_ENV_KEYS)
+        ):
+            observed = (
+                "legacy_monitor_release_path"
+                if "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in command
+                else "unexpected_execstart"
+            )
+            raise ActivationError(
+                "monitor candidate main import conflict: "
+                f"source=ExecStart observed={observed} expected=generic_environment"
+            )
+        retired = sorted(set(environment) & _RETIRED_MONITOR_RELEASE_ENV_KEYS)
+        if retired:
+            raise ActivationError(
+                "monitor candidate main import conflict: "
+                f"source=effective_environment key={retired[0]} expected=absent"
+            )
+        current_commit = environment.get("TELEGRAM_KOL_RELEASE_COMMIT", "")
+        current_manifest = environment.get(
+            "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256", ""
+        )
+        current_pythonpath = environment.get("PYTHONPATH", "")
+        if (
+            not _SHA1_RE.fullmatch(current_commit)
+            or not _SHA256_RE.fullmatch(current_manifest)
+            or current_pythonpath
+            != str(Path(current_pythonpath).parent.parent / current_commit / "src")
+        ):
+            raise ActivationError(
+                "monitor candidate main import: current generic identity incomplete"
+            )
+        return {
+            "command": command,
+            "environment": environment,
+            "environment_file_assignments": environment_file_assignments,
+            "environment_files": environment_files,
+            "fragment_path": properties["FragmentPath"],
+            "dropin_paths": shlex.split(properties["DropInPaths"]),
+        }
+
+    def prove_monitor_candidate_release(
+        self, release: ReleaseEvidence
+    ) -> Mapping[str, Any]:
+        expected_pythonpath = str(release.release_path / "src")
+        units: dict[str, Any] = {}
+        for unit in _UNITS["monitor"]:
+            observed = self._monitor_main_unit_properties(unit, release=release)
+            prospective = dict(observed["environment"])
+            prospective.update(
+                {
+                    "PYTHONPATH": expected_pythonpath,
+                    "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
+                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+                }
+            )
+            expected = {
+                "PYTHONPATH": expected_pythonpath,
+                "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
+                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+            }
+            if any(prospective.get(key) != value for key, value in expected.items()):
+                raise ActivationError(
+                    "monitor candidate main import conflict: "
+                    "source=prospective_effective_environment expected=candidate"
+                )
+            units[unit] = {
+                "environment_files": [str(path) for path in observed["environment_files"]],
+                "main_pythonpath": prospective["PYTHONPATH"],
+            }
+        return {
+            "contract": "monitor-candidate-main-identity-v1",
+            "main_pythonpath": expected_pythonpath,
+            "manifest_sha256": release.manifest_sha256,
+            "release_commit": release.commit,
+            "units": units,
+        }
+
     def prove_monitor_rollback_release(
         self, release: ReleaseEvidence
     ) -> Mapping[str, Any]:
@@ -1578,6 +1836,42 @@ class SystemRuntimeAdapter:
         observed_units: dict[str, dict[str, Any]] = {}
         paths: set[Path] = set()
         for unit in units:
+            if unit in _UNITS["monitor"]:
+                try:
+                    observed = self._monitor_main_unit_properties(
+                        unit,
+                        release=release,
+                    )
+                except ActivationError as exc:
+                    raise ActivationError(
+                        "monitor rollback identity proof failed"
+                    ) from exc
+                environment = observed["environment"]
+                expected = {
+                    "PYTHONPATH": str(release.release_path / "src"),
+                    "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
+                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+                }
+                if any(environment.get(key) != value for key, value in expected.items()):
+                    raise ActivationError("monitor rollback identity proof failed")
+                unit_paths = [
+                    observed["fragment_path"],
+                    *observed["dropin_paths"],
+                    *(str(path) for path in observed["environment_files"]),
+                ]
+                observed_units[unit] = {
+                    "dropin_paths": observed["dropin_paths"],
+                    "environment_files": [
+                        str(path) for path in observed["environment_files"]
+                    ],
+                    "fragment_path": observed["fragment_path"],
+                }
+                for raw_path in unit_paths:
+                    path = Path(raw_path)
+                    if not path.is_absolute():
+                        raise ActivationError("monitor rollback identity proof failed")
+                    paths.add(path)
+                continue
             result = self._run(
                 [
                     "systemctl",
@@ -1605,24 +1899,6 @@ class SystemRuntimeAdapter:
             unit_paths = [properties["FragmentPath"], *shlex.split(properties["DropInPaths"])]
             if not properties["FragmentPath"]:
                 raise ActivationError("monitor rollback identity proof failed")
-            environment: dict[str, str] = {}
-            if unit not in _PROCESSLESS_UNITS:
-                for assignment in shlex.split(properties["Environment"]):
-                    key, separator, value = assignment.partition("=")
-                    if separator:
-                        if key in environment:
-                            raise ActivationError("monitor rollback identity proof failed")
-                        environment[key] = value
-            if unit in _UNITS["monitor"]:
-                expected = {
-                    "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
-                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
-                    "TELEGRAM_KOL_MONITOR_RELEASE_PATH": str(release.release_path),
-                    "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT": release.commit,
-                    "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
-                }
-                if any(environment.get(key) != value for key, value in expected.items()):
-                    raise ActivationError("monitor rollback identity proof failed")
             for raw_path in unit_paths:
                 path = Path(raw_path)
                 if not path.is_absolute():

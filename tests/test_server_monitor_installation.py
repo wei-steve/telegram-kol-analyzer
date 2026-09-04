@@ -33,6 +33,13 @@ def _state_repair_program() -> str:
     )[0]
 
 
+def _release_dropin_cleanup_program() -> str:
+    installer = INSTALLER_PATH.read_text(encoding="utf-8")
+    return installer.split("# BEGIN_MONITOR_RELEASE_DROPIN_CLEANUP\n", 1)[1].split(
+        "# END_MONITOR_RELEASE_DROPIN_CLEANUP", 1
+    )[0]
+
+
 def test_operator_docs_define_readable_deterministic_monitor_notifications():
     documentation = (
         RUNBOOK_PATH.read_text(encoding="utf-8")
@@ -53,7 +60,7 @@ def test_operator_docs_define_readable_deterministic_monitor_notifications():
     assert "版本号不参与" in documentation
 
 
-def test_monitor_service_uses_dedicated_identity_and_exact_command():
+def test_monitor_service_uses_generic_release_identity_and_exact_command():
     service = SERVICE_PATH.read_text(encoding="utf-8")
     normalized = _normalized(SERVICE_PATH)
 
@@ -64,9 +71,10 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
     assert "WorkingDirectory=/var/lib/telegram-kol-monitor" in service
     assert "EnvironmentFile=/etc/telegram-kol-monitor.env" in service
     assert (
-        "ExecStart=/usr/bin/env "
-        "PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src"
+        "ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research"
     ) in normalized
+    assert "/usr/bin/env PYTHONPATH=" not in normalized
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_" not in normalized
     for removed_option in (
         "--expected-release-commit",
         "--expected-release-manifest-sha256",
@@ -78,6 +86,22 @@ def test_monitor_service_uses_dedicated_identity_and_exact_command():
         assert removed_option not in normalized
     assert "--expected-head" not in normalized
     assert "--checkout-path" not in normalized
+
+
+@pytest.mark.parametrize(
+    "unit_path",
+    (SERVICE_PATH, DIAGNOSTIC_PATH, TEST_NOTIFICATION_PATH),
+)
+def test_every_monitor_service_uses_generic_dropin_pythonpath(
+    unit_path: Path,
+) -> None:
+    normalized = _normalized(unit_path)
+
+    assert (
+        "ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research"
+    ) in normalized
+    assert "/usr/bin/env PYTHONPATH=" not in normalized
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_" not in normalized
 
 
 def test_deployment_diagnostic_disables_daily_audit_without_changing_timer_monitor():
@@ -98,7 +122,7 @@ def test_monitor_installer_validates_release_and_service_loads_immutable_code():
     assert "--release-commit" in installer
     assert "--release-manifest-sha256" in installer
     assert "git -C" not in installer
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in service
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" not in service
     assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" not in service
     assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" not in service
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_HEAD" not in service
@@ -350,9 +374,9 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert 'RUNTIME_POLICY_FILE="$PRODUCTION_ROOT/config/runtime_incident_agent.env"' in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_TOKEN" in installer
     assert "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID" in installer
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_PATH" in installer
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT" in installer
-    assert "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256" in installer
+    assert "printf 'TELEGRAM_KOL_MONITOR_RELEASE_PATH=" not in installer
+    assert "printf 'TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=" not in installer
+    assert "printf 'TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=" not in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE" in installer
     assert "TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE" in installer
@@ -383,9 +407,6 @@ def test_installer_creates_identity_and_allowlisted_monitor_environment():
     assert env_block.strip() == """trap 'rm -f "$env_source"' EXIT
 chmod 0600 "$env_source"
 grep '^TELEGRAM_KOL_SYSTEM_BOT_' "$CREDENTIAL_FILE" > "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_PATH=%s\\n' "$resolved_release_path" >> "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=%s\\n' "$release_commit" >> "$env_source"
-printf 'TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=%s\\n' "$release_manifest_sha256" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_AUTO_TRADE_OPTION=%s\\n' "$expected_auto_trade_option" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_PREAMBLE_MODE=%s\\n' "$expected_entry_preamble_mode" >> "$env_source"
 printf 'TELEGRAM_KOL_MONITOR_EXPECTED_ENTRY_MESSAGE_ASSEMBLY_V2_MODE=%s\\n' "$expected_entry_message_assembly_v2_mode" >> "$env_source"
@@ -409,6 +430,65 @@ printf '%s\\n' "$monitor_capture_token" >> "$env_source"
         'install -o root -g root -m 0644 "$DIAGNOSTIC_SOURCE" '
         '"$DIAGNOSTIC_DEST"'
     ) in installer
+
+
+def test_installer_removes_only_retired_monitor_release_keys_from_existing_dropin(
+    tmp_path: Path,
+) -> None:
+    dropin = tmp_path / "10-telegram-kol-release.conf"
+    dropin.write_text(
+        "[Service]\n"
+        'Environment="PYTHONPATH=/opt/telegram-kol-releases/old/src"\n'
+        'Environment="TELEGRAM_KOL_RELEASE_COMMIT=' + "a" * 40 + '"\n'
+        'Environment="TELEGRAM_KOL_RELEASE_MANIFEST_SHA256=' + "b" * 64 + '"\n'
+        'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH=/old"\n'
+        'Environment="TELEGRAM_KOL_MONITOR_RELEASE_COMMIT=' + "a" * 40 + '"\n'
+        'Environment="TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256=' + "b" * 64 + '"\n'
+        "ReadOnlyPaths=/opt/telegram-kol-releases/old\n",
+        encoding="utf-8",
+    )
+    dropin.chmod(0o644)
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-", str(dropin), str(os.getuid())],
+        input=_release_dropin_cleanup_program(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    result = dropin.read_text(encoding="utf-8")
+    assert "TELEGRAM_KOL_MONITOR_RELEASE_" not in result
+    assert f'TELEGRAM_KOL_RELEASE_COMMIT={"a" * 40}' in result
+    assert f'TELEGRAM_KOL_RELEASE_MANIFEST_SHA256={"b" * 64}' in result
+    assert "ReadOnlyPaths=/opt/telegram-kol-releases/old" in result
+
+
+@pytest.mark.parametrize("malformation", ("duplicate", "unterminated"))
+def test_installer_refuses_ambiguous_retired_monitor_release_keys(
+    tmp_path: Path,
+    malformation: str,
+) -> None:
+    dropin = tmp_path / "10-telegram-kol-release.conf"
+    if malformation == "duplicate":
+        retired = 'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH=/old"\n' * 2
+    else:
+        retired = 'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH=/old\n'
+    original = "[Service]\n" + retired
+    dropin.write_text(original, encoding="utf-8")
+    dropin.chmod(0o644)
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-", str(dropin), str(os.getuid())],
+        input=_release_dropin_cleanup_program(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert dropin.read_text(encoding="utf-8") == original
 
 
 def test_installer_repairs_existing_state_metadata_without_replacing_content():
