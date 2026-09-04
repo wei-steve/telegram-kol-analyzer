@@ -42,6 +42,12 @@ from telegram_kol_research.entry_revision_exchange_authority import (
 from telegram_kol_research.deployment_entry_freeze import (
     deployment_entry_admission_frozen,
 )
+from telegram_kol_research.entry_price_geometry import (
+    validate_order_draft_price_geometry,
+)
+from telegram_kol_research.execution_events import (
+    enqueue_entry_price_geometry_rejection_notification,
+)
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
@@ -477,6 +483,18 @@ def execute_entry_revision(
         return EntryRevisionExecutionResult("disabled", int(batch_id))
     if rollout_mode == "shadow":
         return EntryRevisionExecutionResult("shadow_planned", int(batch_id))
+    geometry_rejection = _entry_revision_geometry_rejection(
+        session_factory,
+        batch_id=int(batch_id),
+        checked_at=now,
+    )
+    if geometry_rejection is not None:
+        return _mark_recovery(
+            session_factory,
+            batch_id=int(batch_id),
+            reason=geometry_rejection,
+            now=now,
+        )
     authority = acquire_entry_revision_exchange_authority(
         session_factory,
         owner_kind="entry_revision_worker",
@@ -524,6 +542,77 @@ def execute_entry_revision(
             or "entry_revision_exchange_authority_release_failed",
         )
     return result
+
+
+def _entry_revision_geometry_rejection(
+    session_factory: sessionmaker,
+    *,
+    batch_id: int,
+    checked_at: datetime,
+) -> str | None:
+    """Validate the complete replacement domain before claiming write authority."""
+
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, int(batch_id))
+        if batch is None or batch.revision_kind != "entry_sizing":
+            raise LookupError("entry revision batch not found")
+        binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
+        if binding is None:
+            return "entry_price_geometry_required_value_missing"
+        try:
+            replacement = json.loads(batch.replacement_json or "{}")
+        except (TypeError, ValueError):
+            replacement = {}
+        if not isinstance(replacement, dict):
+            replacement = {}
+        raw_message_id = int(batch.raw_message_id)
+        chat_id = int(binding.chat_id)
+        symbol = str(binding.symbol or "").upper()
+        side = str(binding.side or "").lower()
+    raw_legs = replacement.get("order_legs")
+    if raw_legs == []:
+        return None
+    geometry_legs = []
+    for raw_leg in raw_legs if isinstance(raw_legs, list) else []:
+        if not isinstance(raw_leg, dict):
+            geometry_legs.append(raw_leg)
+            continue
+        geometry_leg = dict(raw_leg)
+        geometry_leg.setdefault("position_side", side)
+        geometry_leg.setdefault("side", "buy" if side == "long" else "sell")
+        geometry_legs.append(geometry_leg)
+    raw_take_profit_legs = replacement.get("take_profit_legs")
+    geometry_draft = {
+        "order_legs": geometry_legs,
+        "stop_loss": replacement.get("stop_loss"),
+        "take_profit_legs": (
+            [] if raw_take_profit_legs is None else raw_take_profit_legs
+        ),
+        "contract_spec": replacement.get("contract_spec"),
+        "position_side": replacement.get("position_side"),
+        "open_side": replacement.get("open_side"),
+        "side": replacement.get("side"),
+    }
+    geometry = validate_order_draft_price_geometry(
+        geometry_draft,
+        expected_position_side=side,
+    )
+    if geometry.passed:
+        return None
+    enqueue_entry_price_geometry_rejection_notification(
+        session_factory,
+        raw_message_id=raw_message_id,
+        candidate_id=None,
+        chat_id=chat_id,
+        symbol=symbol,
+        side=side,
+        parse_source="entry_revision_draft",
+        authoritative_generation=None,
+        geometry=geometry.bounded_evidence(),
+        execution_source_id=f"revision_batch:{int(batch_id)}",
+        created_at=checked_at,
+    )
+    return str(geometry.reason_code or "entry_price_geometry_ambiguous")
 
 
 @serialized_position_authority_mutation

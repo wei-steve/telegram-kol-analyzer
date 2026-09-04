@@ -1,6 +1,8 @@
 import json
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.entry_revision_exchange_authority import (
     seed_entry_revision_exchange_authority,
@@ -132,6 +134,13 @@ def _planned_batch(session_factory, *, mode="live"):
             "instrument_id": "BTC-USDT-SWAP",
             "stop_loss": 65000,
             "risk_budget_usdt": 10,
+            "contract_spec": {
+                "instrument_id": "BTC-USDT-SWAP",
+                "contract_value": 0.001,
+                "quantity_step": 1,
+                "min_quantity": 1,
+                "price_tick": 0.1,
+            },
             "order_legs": [
                 {
                     "price": 64000,
@@ -370,6 +379,98 @@ def test_entry_revision_cancels_reads_back_then_rebuilds(tmp_path):
     assert {leg.client_order_id for leg in legs[:2]}.isdisjoint(
         {leg.client_order_id for leg in legs[2:]}
     )
+
+
+def test_entry_revision_wrong_geometry_is_rejected_before_authority_or_exchange(
+    tmp_path,
+):
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "geometry-reject.db")
+    batch_id = _planned_batch(session_factory)
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        replacement = json.loads(batch.replacement_json)
+        replacement["stop_loss"] = 63000
+        batch.replacement_json = json.dumps(replacement, sort_keys=True)
+        session.commit()
+    client = FakeRevisionClient()
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "entry_price_geometry_stop_side_invalid"
+    assert client.events == []
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        assert batch.status == "recovery_required"
+        assert batch.advance_claim_token is None
+
+
+def test_entry_revision_does_not_overwrite_conflicting_leg_direction(tmp_path):
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / "direction-conflict.db")
+    batch_id = _planned_batch(session_factory)
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        replacement = json.loads(batch.replacement_json)
+        replacement["order_legs"][0]["position_side"] = "long"
+        replacement["order_legs"][0]["side"] = "buy"
+        batch.replacement_json = json.dumps(replacement, sort_keys=True)
+        session.commit()
+    client = FakeRevisionClient()
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "entry_price_geometry_ambiguous"
+    assert client.events == []
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("take_profit_legs", {}),
+        ("position_side", "long"),
+        ("open_side", "buy"),
+    ],
+)
+def test_entry_revision_rejects_malformed_tp_or_conflicting_top_direction(
+    tmp_path, field, value
+):
+    from telegram_kol_research.entry_revision_executor import execute_entry_revision
+
+    session_factory = create_session_factory(tmp_path / f"revision-{field}.db")
+    batch_id = _planned_batch(session_factory)
+    with session_factory() as session:
+        batch = session.get(StrategyRevisionBatch, batch_id)
+        replacement = json.loads(batch.replacement_json)
+        replacement[field] = value
+        batch.replacement_json = json.dumps(replacement, sort_keys=True)
+        session.commit()
+    client = FakeRevisionClient()
+
+    result = execute_entry_revision(
+        session_factory,
+        batch_id=batch_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "entry_price_geometry_ambiguous"
+    assert client.events == []
 
 
 def test_entry_revision_worker_advances_durable_live_batch(tmp_path):

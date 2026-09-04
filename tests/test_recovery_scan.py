@@ -15,7 +15,7 @@ from telegram_kol_research.recovery_scan import (
 from telegram_kol_research.trading_decision import ActivePosition
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig, TrackedSenderConfig
-from telegram_kol_research.models import RawMessage, SignalCandidate, Source
+from telegram_kol_research.models import ExecutionEvent, RawMessage, SignalCandidate, Source
 
 
 def _signal(**overrides):
@@ -198,6 +198,60 @@ def test_load_recovery_signals_from_db_uses_auto_trade_group_chat_id(tmp_path):
     assert signals[0].entry_range == (68000.0, 68200.0)
     assert signals[0].max_loss_usdt == 50.0
     assert signals[0].symbol_whitelist == ["BTC"]
+
+
+def test_recovery_loader_actively_alerts_wrong_geometry_candidate(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recovery-geometry.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=11767,
+            posted_at=datetime(2026, 6, 12, 8, 0),
+            text="redacted fixture",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="BTC",
+                side="short",
+                event_type="entry_signal",
+                entry_text="69900",
+                stop_loss_text="61600",
+                take_profit_text="67900 / 66600",
+                parse_source="mimo_authoritative",
+                recognition_generation="generation-7",
+                confidence=0.9,
+                review_status="confirmed",
+            )
+        )
+        session.commit()
+
+    signals = load_recovery_signals_from_db(
+        session_factory,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="VIP BTC Room",
+                    chat_id=9001,
+                    trading_mode="auto_trade",
+                    symbol_whitelist=["BTC"],
+                )
+            ]
+        ),
+        start_at=datetime(2026, 6, 10, 8, 0),
+        end_at=datetime(2026, 6, 12, 18, 0),
+    )
+
+    assert len(signals) == 1
+    with session_factory() as session:
+        event = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .one()
+        )
+    assert event.notification_status == "pending"
 
 
 def test_load_recovery_signals_from_db_uses_symbol_specific_group_risk(tmp_path):

@@ -1997,6 +1997,25 @@ def claim_next_strategy_management_notification(
 
 def format_terminal_entry_cleanup_notification(event) -> str:
     payload = _decode_mapping(event.response_json)
+    if event.action == "entry_price_geometry_rejected":
+        entry_domain = payload.get("entry_domain")
+        if not isinstance(entry_domain, list) or len(entry_domain) != 2:
+            entry_domain = ["unknown", "unknown"]
+        return (
+            "【入场方向/价格几何拒绝】\n"
+            f"Raw message: {payload.get('raw_message_id')}\n"
+            f"Candidate: {payload.get('candidate_id')}\n"
+            f"Chat: {payload.get('chat_id')}\n"
+            f"标的/方向: {_safe_management_text(payload.get('symbol'), limit=64)} / "
+            f"{_safe_management_text(payload.get('side'), limit=16)}\n"
+            f"入场价格域: {entry_domain[0]} - {entry_domain[1]}\n"
+            f"冲突字段/值: {_safe_management_text(payload.get('offending_field'), limit=64)} / "
+            f"{_safe_management_text(payload.get('offending_value'), limit=64)}\n"
+            f"原因: {_safe_management_text(payload.get('reason_code'), limit=64)}\n"
+            f"识别来源/代: {_safe_management_text(payload.get('parse_source'), limit=32)} / "
+            f"{_safe_management_text(payload.get('authoritative_generation'), limit=64)}\n"
+            "自动执行: 已 fail-closed，需人工复核"
+        )[:1200]
     if event.action == "source_message_deletion_outcome":
         state_labels = {
             "cancelling_entries": "正在撤销原策略入场单",
@@ -2069,6 +2088,7 @@ def claim_next_terminal_entry_cleanup_notification(
             (
                 "terminal_entry_cleanup_outcome",
                 "source_message_deletion_outcome",
+                "entry_price_geometry_rejected",
             )
         ),
         ExecutionEvent.notification_attempts
@@ -2240,6 +2260,21 @@ async def deliver_terminal_entry_cleanup_notifications(
                     )
                 )
                 session.commit()
+            if event.action == "entry_price_geometry_rejected":
+                from telegram_kol_research.runtime_incident_adapters import (
+                    capture_notification_failure,
+                    capture_runtime_incident_best_effort,
+                )
+
+                capture_runtime_incident_best_effort(
+                    capture_notification_failure,
+                    session_factory,
+                    source_kind="entry_price_geometry_notification",
+                    source_record_id=str(event.id),
+                    error_type=type(exc).__name__,
+                    occurred_at=operation_now,
+                    severity="high",
+                )
             break
         with session_factory() as session:
             result = session.execute(

@@ -40,12 +40,20 @@ from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
 from telegram_kol_research.execution_bindings import upsert_execution_binding
 from telegram_kol_research.execution_bindings import upsert_execution_order_leg
 from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import (
+    enqueue_entry_price_geometry_rejection_notification,
+)
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.entry_price_geometry import (
+    validate_order_draft_price_geometry,
+)
 from telegram_kol_research.models import EntryStrategyAssembly
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.models import InstructionExecutionContract
+from telegram_kol_research.models import RawMessage
+from telegram_kol_research.models import SignalCandidate
 from telegram_kol_research.models import StrategyRevisionBatch
 from telegram_kol_research.models import StrategyRevisionLeg
 from telegram_kol_research.models import StrategyLifecycle
@@ -479,6 +487,11 @@ def submit_strategy_revision_replacement_live(
         raise RecoveryLiveSubmitError(capability.reason)
     validated_draft = attach_contract_spec_evidence(dict(draft), capability)
     validated_draft["_entry_leg_index_offset"] = max_leg_index
+    _require_final_entry_price_geometry(
+        validated_draft,
+        session_factory=session_factory,
+        execution_source_id=f"revision_batch:{int(batch_id)}",
+    )
     trade_signal = load_or_create_trade_signal(
         session_factory,
         venue="deepcoin",
@@ -924,6 +937,28 @@ def process_trade_signal_live(
         raise RecoveryLiveSubmitError("deployment_entry_frozen")
 
     now = processed_at or datetime.now(UTC)
+    pending_signal = load_trade_signal(session_factory, int(signal_id))
+    if pending_signal.action == "open_position":
+        try:
+            _require_synchronized_finalized_entry_assembly(
+                session_factory,
+                trade_signal=pending_signal,
+            )
+        except RecoveryLiveSubmitError:
+            # Preserve the existing claimed-and-failed assembly-drift contract;
+            # the same check runs again immediately after the claim below.
+            pass
+        else:
+            pending_draft = (
+                pending_signal.payload.get("deepcoin_order_draft")
+                if isinstance(pending_signal.payload, dict)
+                else None
+            )
+            _require_final_entry_price_geometry(
+                pending_draft,
+                session_factory=session_factory,
+                trade_signal=pending_signal,
+            )
     try:
         trade_signal = claim_pending_trade_signal(
             session_factory,
@@ -992,6 +1027,7 @@ def process_trade_signal_live(
                 session_factory,
                 trade_signal=trade_signal,
                 deepcoin_client=deepcoin_client,
+                contract_spec_provider=contract_spec_provider,
                 executed_at=now,
             )
     except Exception as exc:
@@ -1266,6 +1302,11 @@ def _submit_recovery_signal_direct(
             queued_draft=queued_draft,
         )
         draft = queued_draft
+    _require_final_entry_price_geometry(
+        draft,
+        session_factory=session_factory,
+        trade_signal=trade_signal,
+    )
     order_legs = draft.get("order_legs")
     if not isinstance(order_legs, list) or not order_legs:
         raise RecoveryLiveSubmitError("missing_order_legs")
@@ -3264,6 +3305,105 @@ def _load_matching_position_ids(
         if pos_id:
             result.add(pos_id)
     return result
+
+
+def _require_final_entry_price_geometry(
+    draft: Any,
+    *,
+    session_factory: sessionmaker | None = None,
+    trade_signal: TradeSignalRecord | None = None,
+    execution_source_id: str | None = None,
+) -> None:
+    """Reject an incomplete or inconsistent final draft before any venue write."""
+
+    geometry = validate_order_draft_price_geometry(
+        draft,
+        expected_position_side=(
+            trade_signal.side if trade_signal is not None else None
+        ),
+    )
+    if geometry.passed:
+        return
+    if session_factory is not None:
+        source = draft.get("source") if isinstance(draft, dict) else None
+        source = source if isinstance(source, dict) else {}
+        chat_id = int(
+            source.get("chat_id")
+            or (trade_signal.chat_id if trade_signal is not None else 0)
+        )
+        message_id = int(
+            source.get("message_id")
+            or (trade_signal.message_id if trade_signal is not None else 0)
+        )
+        symbol = str(
+            (draft.get("symbol") if isinstance(draft, dict) else None)
+            or (trade_signal.symbol if trade_signal is not None else "")
+        ).upper()
+        side = str(
+            (trade_signal.side if trade_signal is not None else "")
+            or _draft_position_side(draft)
+        ).lower()
+        raw_message_id = None
+        candidate = None
+        if chat_id and message_id:
+            with session_factory() as session:
+                raw_rows = (
+                    session.query(RawMessage)
+                    .filter(
+                        RawMessage.chat_id == chat_id,
+                        RawMessage.message_id == message_id,
+                    )
+                    .all()
+                )
+                if len(raw_rows) == 1:
+                    raw_message_id = int(raw_rows[0].id)
+                    candidates = (
+                        session.query(SignalCandidate)
+                        .filter(
+                            SignalCandidate.raw_message_id == raw_message_id,
+                            SignalCandidate.event_type == "entry_signal",
+                            SignalCandidate.symbol == symbol,
+                            SignalCandidate.side == side,
+                        )
+                        .all()
+                    )
+                    if len(candidates) == 1:
+                        candidate = candidates[0]
+        enqueue_entry_price_geometry_rejection_notification(
+            session_factory,
+            raw_message_id=raw_message_id,
+            candidate_id=int(candidate.id) if candidate is not None else None,
+            chat_id=chat_id,
+            symbol=symbol,
+            side=side,
+            parse_source=(
+                str(candidate.parse_source) if candidate is not None else "execution_draft"
+            ),
+            authoritative_generation=(
+                candidate.recognition_generation if candidate is not None else None
+            ),
+            geometry=geometry.bounded_evidence(),
+            execution_source_id=(
+                execution_source_id
+                or (
+                    f"trade_signal:{int(trade_signal.id)}"
+                    if trade_signal is not None
+                    else "execution_draft:unknown"
+                )
+            ),
+        )
+    raise RecoveryLiveSubmitError(
+        str(geometry.reason_code or "entry_price_geometry_ambiguous")
+    )
+
+
+def _draft_position_side(draft: Any) -> str:
+    if not isinstance(draft, dict):
+        return ""
+    legs = draft.get("order_legs")
+    if not isinstance(legs, list) or not legs or not isinstance(legs[0], dict):
+        return ""
+    return str(legs[0].get("position_side") or "")
 
 
 def _select_matching_position(

@@ -23,7 +23,14 @@ from telegram_kol_research.deepcoin_execution_actions import (
 )
 from telegram_kol_research.deepcoin_order_builder import build_deepcoin_order_draft
 from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import (
+    enqueue_entry_price_geometry_rejection_notification,
+)
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.entry_price_geometry import (
+    EntryPriceGeometryResult,
+    validate_candidate_entry_price_geometry,
+)
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
 from telegram_kol_research.entry_strategy_assembly import (
     assemble_adjacent_entry_strategy,
@@ -647,6 +654,21 @@ def _auto_process_single_message_trade_signal(
     if loaded is None:
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
+    candidate_geometry = validate_candidate_entry_price_geometry(
+        side=candidate.side,
+        entry_text=candidate.entry_text,
+        stop_loss_text=candidate.stop_loss_text,
+        take_profit_text=candidate.take_profit_text,
+        symbol=candidate.symbol,
+    )
+    if not candidate_geometry.passed:
+        _enqueue_entry_geometry_rejection(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            geometry=candidate_geometry,
+            created_at=now,
+        )
     if candidate.parse_source == "mimo_symbol_review":
         return _record_entry_auto_trade_skip(
             session_factory,
@@ -876,6 +898,32 @@ def _auto_process_single_message_trade_signal(
             candidate=candidate,
             reason="missing_entry_range",
             runtime_kol_id=str(runtime_config.get("kol_id") or ""),
+            processed_at=now,
+            message_instruction_item_id=message_instruction_item_id,
+            execution_contract_mode=execution_contract_mode,
+        )
+    geometry = candidate_geometry
+    if geometry.passed:
+        geometry = validate_candidate_entry_price_geometry(
+            side=side,
+            entry_text=candidate.entry_text,
+            stop_loss_text=candidate.stop_loss_text,
+            take_profit_text=candidate.take_profit_text,
+            symbol=symbol,
+            reference_price=reference_price,
+            resolved_entry_prices=entry_range,
+            price_tick=(
+                capability.contract_spec.price_tick
+                if capability.contract_spec is not None
+                else None
+            ),
+        )
+    if not geometry.passed:
+        return _record_entry_geometry_rejection(
+            session_factory,
+            raw_message=raw_message,
+            candidate=candidate,
+            geometry=geometry,
             processed_at=now,
             message_instruction_item_id=message_instruction_item_id,
             execution_contract_mode=execution_contract_mode,
@@ -1358,6 +1406,80 @@ def _record_entry_auto_trade_skip(
     if extra:
         result.update(extra)
     return result
+
+
+def _record_entry_geometry_rejection(
+    session_factory: sessionmaker,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    geometry: EntryPriceGeometryResult,
+    processed_at: datetime,
+    message_instruction_item_id: int | None,
+    execution_contract_mode: str,
+) -> dict[str, Any]:
+    """Durably alert and refuse one candidate without copying message text."""
+
+    reason = str(geometry.reason_code or "entry_price_geometry_ambiguous")
+    evidence = geometry.bounded_evidence()
+    event_id = _enqueue_entry_geometry_rejection(
+        session_factory,
+        raw_message=raw_message,
+        candidate=candidate,
+        geometry=geometry,
+        created_at=processed_at,
+    )
+    if message_instruction_item_id is not None:
+        from telegram_kol_research.instruction_execution_entry_adapter import (
+            project_entry_refusal_contract,
+        )
+
+        try:
+            project_entry_refusal_contract(
+                session_factory,
+                message_instruction_item_id=message_instruction_item_id,
+                reason_code=reason,
+                evidence_refs=[
+                    {
+                        "kind": "entry_price_geometry_rejection",
+                        "execution_event_id": int(event_id),
+                        "candidate_id": int(candidate.id),
+                    }
+                ],
+                projected_at=processed_at,
+                mode=execution_contract_mode,
+            )
+        except Exception:
+            if execution_contract_mode == "live":
+                raise
+    return {
+        "status": "skipped",
+        "reason": reason,
+        "geometry": evidence,
+        "execution_event_id": int(event_id),
+    }
+
+
+def _enqueue_entry_geometry_rejection(
+    session_factory: sessionmaker,
+    *,
+    raw_message: RawMessage,
+    candidate: SignalCandidate,
+    geometry: EntryPriceGeometryResult,
+    created_at: datetime,
+) -> int:
+    return enqueue_entry_price_geometry_rejection_notification(
+        session_factory,
+        raw_message_id=int(raw_message.id),
+        candidate_id=int(candidate.id),
+        chat_id=int(raw_message.chat_id),
+        symbol=str(candidate.symbol or ""),
+        side=str(candidate.side or ""),
+        parse_source=str(candidate.parse_source or "unknown"),
+        authoritative_generation=candidate.recognition_generation,
+        geometry=geometry.bounded_evidence(),
+        created_at=created_at,
+    )
 
 
 def disabled_management_message_needs_no_client(

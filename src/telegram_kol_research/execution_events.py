@@ -226,6 +226,112 @@ def enqueue_terminal_entry_cleanup_notification(
         return int(row.id)
 
 
+def enqueue_entry_price_geometry_rejection_notification(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int | None,
+    candidate_id: int | None,
+    chat_id: int,
+    symbol: str,
+    side: str,
+    parse_source: str,
+    authoritative_generation: str | None,
+    geometry: dict[str, Any],
+    execution_source_id: str | None = None,
+    created_at: datetime | None = None,
+) -> int:
+    """Persist one redacted, deduplicated operator alert for a safety rejection."""
+
+    reason_code = str(geometry.get("reason_code") or "")[:64]
+    normalized_geometry = {
+        "entry_domain": list(geometry.get("entry_domain") or [])[:2],
+        "entry_prices": list(geometry.get("entry_prices") or [])[:16],
+        "stop_loss": geometry.get("stop_loss"),
+        "take_profit_prices": list(
+            geometry.get("take_profit_prices") or []
+        )[:16],
+        "explicit_average_entry": geometry.get("explicit_average_entry"),
+        "offending_field": geometry.get("offending_field"),
+        "offending_value": geometry.get("offending_value"),
+        "geometry_status": geometry.get("geometry_status"),
+    }
+    fingerprint_payload = {
+        "candidate_identity": (
+            {"candidate_id": int(candidate_id)}
+            if candidate_id is not None
+            else {"execution_source_id": str(execution_source_id or "")[:128]}
+        ),
+        "authoritative_generation": str(authoritative_generation or "unknown")[:64],
+        "geometry": normalized_geometry,
+        "reason_code": reason_code,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    payload = {
+        "raw_message_id": (
+            int(raw_message_id) if raw_message_id is not None else None
+        ),
+        "candidate_id": int(candidate_id) if candidate_id is not None else None,
+        "chat_id": int(chat_id),
+        "symbol": str(symbol or "")[:64].upper(),
+        "side": str(side or "")[:16].lower(),
+        "parse_source": str(parse_source or "unknown")[:32],
+        "authoritative_generation": str(
+            authoritative_generation or "unknown"
+        )[:64],
+        "execution_source_id": str(execution_source_id or "")[:128] or None,
+        "reason_code": reason_code,
+        **normalized_geometry,
+        "notification_policy_version": "entry-price-geometry-v1",
+    }
+    now = created_at or datetime.now(UTC)
+    with session_factory() as session:
+        existing = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.notification_fingerprint == fingerprint)
+            .one_or_none()
+        )
+        if existing is not None:
+            return int(existing.id)
+        row = ExecutionEvent(
+            venue="deepcoin",
+            action="entry_price_geometry_rejected",
+            status="manual_review",
+            chat_id=int(chat_id),
+            source_message_id=(
+                int(raw_message_id) if raw_message_id is not None else None
+            ),
+            symbol=str(symbol or "")[:64].upper() or None,
+            side=str(side or "")[:16].lower() or None,
+            reason=reason_code,
+            response_json=json.dumps(payload, ensure_ascii=False, sort_keys=True),
+            notification_status="pending",
+            notification_fingerprint=fingerprint,
+            notification_attempts=0,
+            created_at=now,
+        )
+        session.add(row)
+        try:
+            session.commit()
+        except IntegrityError:
+            session.rollback()
+            existing = (
+                session.query(ExecutionEvent)
+                .filter(ExecutionEvent.notification_fingerprint == fingerprint)
+                .one_or_none()
+            )
+            if existing is None:
+                raise
+            return int(existing.id)
+        return int(row.id)
+
+
 def _upgrade_cleanup_notification_payload_version(
     event: ExecutionEvent,
     versioned_payload: dict[str, Any],

@@ -810,6 +810,7 @@ def _persist_candidate(
     parse_source=None,
     chat_id=100,
     message_id=55,
+    recognition_generation=None,
 ):
     with session_factory() as session:
         raw = RawMessage(
@@ -832,6 +833,7 @@ def _persist_candidate(
                 entry_text=entry_text,
                 stop_loss_text=stop_loss_text,
                 take_profit_text=take_profit_text,
+                recognition_generation=recognition_generation,
                 parse_source=parse_source or ("mimo_direct" if with_media else "text_ai"),
                 confidence=confidence,
             )
@@ -846,6 +848,117 @@ def _persist_candidate(
             )
         session.commit()
         return raw.id
+
+
+@pytest.mark.parametrize(
+    ("message_id", "entry_text", "stop_loss_text", "take_profit_text"),
+    [
+        (11767, "69900", "61600", "67900 / 66600"),
+        (
+            14785,
+            "79500-76500区域附近分批做空，均价78000附近",
+            "76000",
+            "81500-83000-85000",
+        ),
+    ],
+)
+def test_wrong_geometry_candidate_is_rejected_and_alerted_without_exchange_write(
+    tmp_path,
+    message_id,
+    entry_text,
+    stop_loss_text,
+    take_profit_text,
+):
+    session_factory = create_session_factory(tmp_path / f"geometry-{message_id}.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="redacted fixture",
+        entry_text=entry_text,
+        stop_loss_text=stop_loss_text,
+        take_profit_text=take_profit_text,
+        side="short",
+        message_id=message_id,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-7",
+    )
+    save_trading_settings(
+        session_factory,
+        {"auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"]},
+    )
+    client = _FakeDeepcoinClient()
+
+    first = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+    second = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+    )
+
+    assert first["status"] == "skipped"
+    assert first["reason"] == "entry_price_geometry_stop_side_invalid"
+    assert second == first
+    assert client.orders == []
+    assert client.trigger_orders == []
+    assert client.protections == []
+    with session_factory() as session:
+        events = session.query(ExecutionEvent).all()
+        candidate = session.query(SignalCandidate).one()
+    assert len(events) == 1
+    assert events[0].action == "entry_price_geometry_rejected"
+    assert events[0].notification_status == "pending"
+    assert events[0].notification_fingerprint
+    payload = json.loads(events[0].response_json)
+    assert payload["raw_message_id"] == raw_message_id
+    assert payload["candidate_id"] == candidate.id
+    assert payload["authoritative_generation"] == "generation-7"
+    assert payload["entry_domain"]
+    assert "entry_text" not in payload
+    assert "stop_loss_text" not in payload
+    assert "take_profit_text" not in payload
+    assert "redacted fixture" not in events[0].response_json
+
+
+def test_wrong_geometry_candidate_alerts_even_when_entry_submission_is_disabled(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "geometry-disabled.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="redacted fixture",
+        entry_text="69900",
+        stop_loss_text="61600",
+        take_profit_text="67900 / 66600",
+        side="short",
+        message_id=11767,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-7",
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": False})
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+    )
+
+    assert result["reason"] == "auto_trade_disabled"
+    with session_factory() as session:
+        geometry_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .all()
+        )
+    assert len(geometry_events) == 1
+    assert geometry_events[0].notification_status == "pending"
 
 
 def _persist_half_risk_preamble_before(session_factory, *, strategy_raw_message_id):
@@ -2346,7 +2459,7 @@ def test_auto_market_draft_uses_immutable_signal_enqueue(tmp_path, monkeypatch):
     raw_message_id = _persist_candidate(
         session_factory,
         text="BTC long market SL 67500 TP 69000/70000",
-        entry_text="market",
+        entry_text="68000",
     )
     save_trading_settings(
         session_factory,
@@ -3276,7 +3389,7 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     raw_message_id = _persist_candidate(
         session_factory,
         text="BTC 现价开多 SL 67500 TP 69000",
-        entry_text="现价入场",
+        entry_text="68000",
     )
     save_trading_settings(
         session_factory,
@@ -3338,7 +3451,7 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
     raw_message_id = _persist_candidate(
         session_factory,
         text="ETH 现价开多 SL 1788 TP 1955",
-        entry_text="现价入场",
+        entry_text="1844",
         stop_loss_text="1788",
         take_profit_text="1955",
         symbol="ETH",
@@ -3396,7 +3509,7 @@ def test_auto_process_message_trade_signal_records_response_anchored_primary_sto
     raw_message_id = _persist_candidate(
         session_factory,
         text="ETH 现价开多 SL 1788 TP 1955",
-        entry_text="现价入场",
+        entry_text="1844",
         stop_loss_text="1788",
         take_profit_text="1955",
         symbol="ETH",
@@ -3464,7 +3577,7 @@ def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_p
     raw_message_id = _persist_candidate(
         session_factory,
         text="ETH 现价开多 SL 1788 TP 1955",
-        entry_text="现价入场",
+        entry_text="1844",
         stop_loss_text="1788",
         take_profit_text="1955",
         symbol="ETH",
@@ -3524,7 +3637,7 @@ def test_auto_process_message_trade_signal_records_combined_entry_protection(tmp
     raw_message_id = _persist_candidate(
         session_factory,
         text="ETH 现价开多 SL 1788 TP 1955",
-        entry_text="现价入场",
+        entry_text="1844",
         stop_loss_text="1788",
         take_profit_text="1955",
         symbol="ETH",
@@ -3574,6 +3687,8 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
         session_factory,
         text="BTC短线做多 进场点位：59500附近 止损点位：58100 止盈点位：61800",
         entry_text="59500附近",
+        stop_loss_text="58100",
+        take_profit_text="61800",
     )
     save_trading_settings(
         session_factory,
@@ -3607,6 +3722,8 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
         session_factory,
         text="米娅BTC短线合约交易策略 做多 进场点位：59600附近 止损点位：58100 止盈点位：61800",
         entry_text="59600附近",
+        stop_loss_text="58100",
+        take_profit_text="61800",
     )
     save_trading_settings(
         session_factory,
@@ -3654,6 +3771,8 @@ def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path
         session_factory,
         text="米娅BTC短线合约交易策略 做多 进场点位：59600附近 止损点位：58100 止盈点位：61800",
         entry_text="59600附近",
+        stop_loss_text="58100",
+        take_profit_text="61800",
     )
     save_trading_settings(
         session_factory,

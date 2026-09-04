@@ -1,3 +1,5 @@
+import pytest
+
 from telegram_kol_research.trading_decision import (
     ActivePosition,
     TradingDecisionInput,
@@ -58,6 +60,41 @@ def test_auto_enabled_btc_signal_with_stop_loss_is_eligible_for_auto_trade():
     assert decision.action == "eligible_for_auto_trade"
     assert decision.reason_codes == ["risk_checks_passed"]
     assert decision.max_loss_usdt == 20.0
+
+
+@pytest.mark.parametrize(
+    "signal",
+    [
+        _signal(
+            side="short",
+            entry_text="69900",
+            stop_loss_text="61600",
+            take_profit_text="67900 / 66600",
+        ),
+        _signal(
+            side="short",
+            entry_text="79500-76500区域附近分批做空，均价78000附近",
+            stop_loss_text="76000",
+            take_profit_text="81500-83000-85000",
+        ),
+    ],
+)
+def test_real_wrong_geometry_candidates_require_manual_review(signal):
+    decision = evaluate_trading_decision(signal)
+
+    assert decision.action == "manual_review"
+    assert decision.reason_codes == [
+        "entry_price_geometry_stop_side_invalid"
+    ]
+
+
+def test_indeterminate_candidate_geometry_requires_manual_review():
+    decision = evaluate_trading_decision(
+        _signal(entry_text="现价入场", stop_loss_text="止损 2%")
+    )
+
+    assert decision.action == "manual_review"
+    assert decision.reason_codes == ["entry_price_geometry_ambiguous"]
 
 
 def test_existing_same_kol_position_requires_manual_review():

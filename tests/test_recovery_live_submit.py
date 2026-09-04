@@ -447,6 +447,81 @@ def test_live_submit_revalidates_capability_before_exchange_or_binding_write(tmp
         assert session.query(ExecutionBinding).count() == 0
 
 
+@pytest.mark.parametrize(
+    ("stop_loss", "position_side", "leg_side", "expected_reason"),
+    [
+        (61600.0, "short", "sell", "entry_price_geometry_stop_side_invalid"),
+        (71000.0, "short", "buy", "entry_price_geometry_ambiguous"),
+        (71000.0, "short", None, "entry_price_geometry_ambiguous"),
+        (71000.0, None, "sell", "entry_price_geometry_ambiguous"),
+    ],
+)
+def test_final_order_draft_geometry_gate_precedes_claim_and_all_exchange_calls(
+    tmp_path, stop_loss, position_side, leg_side, expected_reason
+):
+    session_factory = create_session_factory(tmp_path / "final-geometry-gate.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    signal = enqueue_trade_signal(
+        session_factory,
+        venue="deepcoin",
+        source_type="recovery",
+        kol_id="alice",
+        chat_id=100,
+        message_id=11767,
+        symbol="BTC",
+        side="short",
+        action="open_position",
+        payload={
+            "deepcoin_order_draft": {
+                "symbol": "BTC",
+                "instrument_id": "BTC-USDT-SWAP",
+                "stop_loss": stop_loss,
+                "take_profit_legs": [
+                    {"price": 67900.0},
+                    {"price": 66600.0},
+                ],
+                "order_legs": [
+                    {
+                        "position_side": position_side,
+                        "side": leg_side,
+                        "order_type": "limit",
+                        "price": 69900.0,
+                        "quantity": 1.0,
+                    }
+                ],
+                "contract_spec": {
+                    "price_tick": 0.1,
+                    "quantity_step": 1.0,
+                    "min_quantity": 1.0,
+                },
+            }
+        },
+    )
+    client = _FakeDeepcoinClient()
+
+    with pytest.raises(
+        RecoveryLiveSubmitError,
+        match=expected_reason,
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.payloads == []
+    assert client.trigger_payloads == []
+    assert client.position_protection_payloads == []
+    with session_factory() as session:
+        persisted = session.get(TradeSignal, signal.id)
+        assert persisted.status == "pending"
+        assert session.query(ExecutionBinding).count() == 0
+        alert = session.query(ExecutionEvent).one()
+        assert alert.action == "entry_price_geometry_rejected"
+        assert alert.notification_status == "pending"
+
+
 def test_shadow_entry_contract_observes_writer_without_changing_calls(tmp_path):
     session_factory = create_session_factory(tmp_path / "entry-contract-shadow.db")
     _persist_ready_item(session_factory)

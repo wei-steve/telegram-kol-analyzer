@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from telegram_kol_research.entry_price_geometry import (
+    validate_candidate_entry_price_geometry,
+)
+
 
 DEFAULT_SYMBOL_WHITELIST = ["BTC", "ETH"]
 
@@ -70,6 +74,16 @@ def evaluate_trading_decision(
         reason_codes.append("vision_requires_review")
     if _has_duplicate_active_position(signal, active_positions or []):
         reason_codes.append("duplicate_active_position")
+    if symbol is not None and side in {"long", "short"}:
+        geometry = validate_candidate_entry_price_geometry(
+            side=side,
+            entry_text=signal.entry_text,
+            stop_loss_text=signal.stop_loss_text,
+            take_profit_text=signal.take_profit_text,
+            symbol=symbol,
+        )
+        if not geometry.passed and geometry.reason_code not in reason_codes:
+            reason_codes.append(str(geometry.reason_code))
 
     if reason_codes:
         return TradingDecision(

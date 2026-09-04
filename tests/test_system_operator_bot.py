@@ -313,6 +313,166 @@ def test_source_deletion_operator_alert_is_exact_and_redacted():
     assert "API" not in rendered
 
 
+def test_entry_geometry_operator_alert_is_bounded_and_redacted():
+    rendered = operator_bot_module.format_terminal_entry_cleanup_notification(
+        SimpleNamespace(
+            id=10,
+            action="entry_price_geometry_rejected",
+            status="manual_review",
+            response_json=json.dumps(
+                {
+                    "raw_message_id": 11767,
+                    "candidate_id": 1895,
+                    "chat_id": 100,
+                    "symbol": "BTC",
+                    "side": "short",
+                    "entry_domain": ["69900", "69900"],
+                    "offending_field": "stop_loss",
+                    "offending_value": "61600",
+                    "reason_code": "entry_price_geometry_stop_side_invalid",
+                    "parse_source": "mimo_authoritative",
+                    "authoritative_generation": "generation-7",
+                }
+            ),
+        )
+    )
+
+    assert "入场方向/价格几何拒绝" in rendered
+    assert "11767" in rendered
+    assert "1895" in rendered
+    assert "61600" in rendered
+    assert "entry_price_geometry_stop_side_invalid" in rendered
+    assert "entry_text" not in rendered
+    assert "API" not in rendered
+
+
+def test_entry_geometry_alert_is_actively_delivered_by_durable_outbox(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.execution_events import (
+        enqueue_entry_price_geometry_rejection_notification,
+    )
+    from telegram_kol_research.models import ExecutionEvent
+
+    session_factory = create_session_factory(tmp_path / "geometry-alert.db")
+    event_id = enqueue_entry_price_geometry_rejection_notification(
+        session_factory,
+        raw_message_id=11767,
+        candidate_id=1895,
+        chat_id=100,
+        symbol="BTC",
+        side="short",
+        parse_source="mimo_authoritative",
+        authoritative_generation="generation-7",
+        geometry={
+            "geometry_status": "invalid",
+            "reason_code": "entry_price_geometry_stop_side_invalid",
+            "entry_domain": ["69900", "69900"],
+            "entry_prices": ["69900"],
+            "stop_loss": "61600",
+            "take_profit_prices": ["67900", "66600"],
+            "explicit_average_entry": None,
+            "offending_field": "stop_loss",
+            "offending_value": "61600",
+        },
+        created_at=NOW,
+    )
+    sent = []
+
+    async def fake_send(**kwargs):
+        sent.append(kwargs["text"])
+        return 9911
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fake_send
+    )
+    delivered = asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig(bot_token="token", chat_id="chat"),
+            delivered_at=NOW + timedelta(seconds=1),
+        )
+    )
+
+    assert delivered == 1
+    assert len(sent) == 1
+    assert "入场方向/价格几何拒绝" in sent[0]
+    assert "11767" in sent[0]
+    with session_factory() as session:
+        event = session.get(ExecutionEvent, event_id)
+        assert event.notification_status == "delivered"
+        assert event.notification_message_id == "9911"
+
+
+def test_entry_geometry_alert_delivery_failure_records_incident_and_stays_blocked(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research import runtime_incident_adapters
+    from telegram_kol_research.execution_events import (
+        enqueue_entry_price_geometry_rejection_notification,
+    )
+    from telegram_kol_research.models import ExecutionEvent
+
+    session_factory = create_session_factory(tmp_path / "geometry-alert-failure.db")
+    event_id = enqueue_entry_price_geometry_rejection_notification(
+        session_factory,
+        raw_message_id=14785,
+        candidate_id=2187,
+        chat_id=100,
+        symbol="BTC",
+        side="short",
+        parse_source="mimo_authoritative",
+        authoritative_generation="generation-8",
+        geometry={
+            "geometry_status": "invalid",
+            "reason_code": "entry_price_geometry_stop_side_invalid",
+            "entry_domain": ["76500", "79500"],
+            "entry_prices": ["79500", "76500"],
+            "stop_loss": "76000",
+            "take_profit_prices": ["81500", "83000", "85000"],
+            "explicit_average_entry": "78000",
+            "offending_field": "stop_loss",
+            "offending_value": "76000",
+        },
+        created_at=NOW,
+    )
+    incident_calls = []
+
+    async def fail_send(**_kwargs):
+        raise RuntimeError("delivery unavailable")
+
+    def capture(*args, **kwargs):
+        incident_calls.append((args, kwargs))
+
+    monkeypatch.setattr(
+        operator_bot_module, "send_system_operator_bot_message", fail_send
+    )
+    monkeypatch.setattr(
+        runtime_incident_adapters,
+        "capture_runtime_incident_best_effort",
+        capture,
+    )
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_terminal_entry_cleanup_notifications(
+            session_factory,
+            config=SystemOperatorBotConfig(bot_token="token", chat_id="chat"),
+            delivered_at=NOW + timedelta(seconds=1),
+        )
+    )
+
+    assert delivered == 0
+    assert len(incident_calls) == 1
+    assert incident_calls[0][1]["source_kind"] == (
+        "entry_price_geometry_notification"
+    )
+    assert incident_calls[0][1]["source_record_id"] == str(event_id)
+    with session_factory() as session:
+        event = session.get(ExecutionEvent, event_id)
+        assert event.status == "manual_review"
+        assert event.notification_status == "failed"
+
+
 def _record_runtime_incident(session_factory, **overrides):
     values = {
         "source_kind": "context_resolution_attempt",

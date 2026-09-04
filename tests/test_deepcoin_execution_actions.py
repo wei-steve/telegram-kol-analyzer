@@ -7,6 +7,7 @@ import pytest
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpec
 from telegram_kol_research.deepcoin_execution_actions import DeepcoinExecutionActionError
 from telegram_kol_research.deepcoin_execution_actions import adjust_position_tpsl
 from telegram_kol_research.deepcoin_execution_actions import close_bound_position_market
@@ -34,6 +35,17 @@ from telegram_kol_research.models import (
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
 from telegram_kol_research.strategy_threads import create_strategy_thread_for_lifecycle
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
+
+
+class _StaticContractSpecProvider:
+    def get_contract_spec(self, instrument_id):
+        return DeepcoinContractSpec(
+            instrument_id=instrument_id,
+            contract_value=0.1,
+            quantity_step=0.1,
+            min_quantity=0.1,
+            price_tick=0.01,
+        )
 
 
 def test_cancel_revision_entry_leg_requires_exact_readback_confirmation(tmp_path):
@@ -2883,8 +2895,8 @@ def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_on
             "instId": "ETH-USDT-SWAP",
             "side": "buy",
             "posSide": "long",
-            "price": "1000",
-            "triggerPrice": "1000",
+            "price": "1585",
+            "triggerPrice": "1585",
             "sz": "0.1",
             "tpTriggerPx": "1605.6",
             "slTriggerPx": "1567.52",
@@ -2895,10 +2907,11 @@ def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_on
         session_factory,
         signal_id=trade_signal.id,
         deepcoin_client=client,
+        contract_spec_provider=_StaticContractSpecProvider(),
     )
 
     assert client.cancel_trigger_payloads == [{"instId": "ETH-USDT-SWAP", "ordId": "trigger-old"}]
-    assert client.trigger_payloads[0]["price"] == "1000"
+    assert client.trigger_payloads[0]["price"] == "1585"
     assert client.trigger_payloads[0]["slTriggerPx"] == "1577.04"
     assert client.trigger_payloads[0]["slTriggerPxType"] == "last"
     assert client.trigger_payloads[0]["slOrdPx"] == "-1"
@@ -2914,6 +2927,122 @@ def test_process_trade_signal_live_recreates_trigger_entry_with_embedded_stop_on
     assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
         (1, "trigger-new", "client-new", "open")
     ]
+
+
+def test_recreated_trigger_entry_wrong_geometry_is_rejected_before_cancel(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "recreate-geometry.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory, order_id="trigger-old", pos_id=None, status="open"
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_trigger_entry_tpsl",
+        payload={"binding_id": binding_id, "stop_loss": 1600},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": "buy",
+            "posSide": "long",
+            "price": "1585",
+            "triggerPrice": "1585",
+            "sz": "0.1",
+            "slTriggerPx": "1567.52",
+        }
+    ]
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="entry_price_geometry_stop_side_invalid",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.trigger_payloads == []
+
+
+@pytest.mark.parametrize(
+    ("old_side", "old_position_side"),
+    [("sell", "long"), (None, "long"), ("buy", None)],
+)
+def test_recreated_trigger_entry_rejects_old_order_direction_conflict_before_cancel(
+    tmp_path, old_side, old_position_side
+):
+    session_factory = create_session_factory(tmp_path / "recreate-direction.db")
+    save_trading_settings(session_factory, {"auto_trade_enabled": True})
+    binding_id = _binding(
+        session_factory, order_id="trigger-old", pos_id=None, status="open"
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            strategy_instance_id="deepcoin:100:55:ETH:long",
+            leg_index=1,
+            purpose="entry",
+            order_kind="trigger_limit",
+            order_id="trigger-old",
+            client_order_id="client-old",
+            status="open",
+        ),
+    )
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_trigger_entry_tpsl",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending = [
+        {
+            "triggerOrderType": "NORMAL",
+            "ordId": "trigger-old",
+            "instId": "ETH-USDT-SWAP",
+            "side": old_side,
+            "posSide": old_position_side,
+            "price": "1585",
+            "triggerPrice": "1585",
+            "sz": "0.1",
+            "slTriggerPx": "1567.52",
+        }
+    ]
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="entry_price_geometry_ambiguous",
+    ):
+        process_trade_signal_live(
+            session_factory,
+            signal_id=trade_signal.id,
+            deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
+        )
+
+    assert client.cancel_trigger_payloads == []
+    assert client.trigger_payloads == []
 
 
 def test_deployment_entry_freeze_blocks_trigger_recreation_before_cancel(
@@ -3079,8 +3208,8 @@ def test_recreated_pending_entry_requires_exact_exchange_response_order_id(
             "instId": "ETH-USDT-SWAP",
             "side": "buy",
             "posSide": "long",
-            "price": "1000",
-            "triggerPrice": "1000",
+            "price": "1585",
+            "triggerPrice": "1585",
             "sz": "0.1",
             "slTriggerPx": "1567.52",
         }
@@ -3100,6 +3229,7 @@ def test_recreated_pending_entry_requires_exact_exchange_response_order_id(
             session_factory,
             signal_id=trade_signal.id,
             deepcoin_client=client,
+            contract_spec_provider=_StaticContractSpecProvider(),
         )
 
     with session_factory() as session:

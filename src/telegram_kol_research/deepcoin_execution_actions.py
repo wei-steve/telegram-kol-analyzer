@@ -31,7 +31,13 @@ from telegram_kol_research.deepcoin_order_matching import (
     extract_pending_protection_orders,
 )
 from telegram_kol_research.execution_events import ExecutionEventRecord
+from telegram_kol_research.execution_events import (
+    enqueue_entry_price_geometry_rejection_notification,
+)
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.entry_price_geometry import (
+    validate_order_draft_price_geometry,
+)
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
@@ -312,6 +318,7 @@ def execute_deepcoin_management_signal(
     *,
     trade_signal: TradeSignalRecord,
     deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider=None,
     executed_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Execute one non-entry Deepcoin trade signal from the durable queue."""
@@ -360,6 +367,7 @@ def execute_deepcoin_management_signal(
             session_factory,
             trade_signal=trade_signal,
             deepcoin_client=deepcoin_client,
+            contract_spec_provider=contract_spec_provider,
             executed_at=executed_at,
         )
     raise DeepcoinExecutionActionError(f"unsupported_trade_signal_action:{trade_signal.action}")
@@ -1661,6 +1669,7 @@ def recreate_trigger_entry_tpsl(
     *,
     trade_signal: TradeSignalRecord,
     deepcoin_client: DeepcoinTradingClientProtocol,
+    contract_spec_provider=None,
     executed_at: datetime | None = None,
 ) -> dict[str, Any]:
     """Adjust an unfilled trigger-limit entry by canceling and recreating it."""
@@ -1698,8 +1707,6 @@ def recreate_trigger_entry_tpsl(
     if deployment_entry_admission_frozen():
         raise DeepcoinExecutionActionError("deployment_entry_frozen")
 
-    cancel_payload = {"instId": inst_id, "ordId": old_order_id}
-    cancel_response = deepcoin_client.cancel_trigger_order(cancel_payload)
     create_payload = _build_trigger_entry_payload_from_existing(
         binding=binding,
         old_order=old_order,
@@ -1707,6 +1714,59 @@ def recreate_trigger_entry_tpsl(
         after=after,
         payload=trade_signal.payload,
     )
+    try:
+        contract_spec = (
+            contract_spec_provider.get_contract_spec(inst_id)
+            if contract_spec_provider is not None
+            else None
+        )
+    except Exception:
+        contract_spec = None
+    if not (
+        isinstance(contract_spec, DeepcoinContractSpec)
+        and str(contract_spec.instrument_id).strip().upper() == inst_id
+    ):
+        contract_spec = None
+    geometry = validate_order_draft_price_geometry(
+        {
+            "order_legs": [
+                {
+                    "position_side": old_order.get("posSide"),
+                    "side": old_order.get("side"),
+                    "price": create_payload.get("price"),
+                }
+            ],
+            "stop_loss": create_payload.get("slTriggerPx"),
+            "take_profit_legs": (
+                [{"price": after["take_profit"]}]
+                if after.get("take_profit") is not None
+                else []
+            ),
+            "contract_spec": (
+                contract_spec.to_dict() if contract_spec is not None else None
+            ),
+        },
+        expected_position_side=binding.side,
+    )
+    if not geometry.passed:
+        enqueue_entry_price_geometry_rejection_notification(
+            session_factory,
+            raw_message_id=None,
+            candidate_id=None,
+            chat_id=int(binding.chat_id),
+            symbol=str(binding.symbol),
+            side=str(binding.side),
+            parse_source="pending_entry_recreation",
+            authoritative_generation=None,
+            geometry=geometry.bounded_evidence(),
+            execution_source_id=f"trade_signal:{int(trade_signal.id)}",
+            created_at=now,
+        )
+        raise DeepcoinExecutionActionError(
+            str(geometry.reason_code or "entry_price_geometry_ambiguous")
+        )
+    cancel_payload = {"instId": inst_id, "ordId": old_order_id}
+    cancel_response = deepcoin_client.cancel_trigger_order(cancel_payload)
     create_response = deepcoin_client.trigger_order(create_payload)
     new_order_id = next(
         (

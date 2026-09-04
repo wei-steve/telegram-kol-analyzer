@@ -275,7 +275,7 @@ def _seed_repost(session_factory):
                 event_type="entry_signal",
                 recognition_generation="shuqin-3429",
                 parse_source="mimo_authoritative",
-                entry_text="市价",
+                entry_text="1800",
                 stop_loss_text="1795",
                 confidence=1.0,
             )

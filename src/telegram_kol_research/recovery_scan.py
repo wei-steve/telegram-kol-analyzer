@@ -8,6 +8,12 @@ from typing import Protocol
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.entry_price_geometry import (
+    validate_candidate_entry_price_geometry,
+)
+from telegram_kol_research.execution_events import (
+    enqueue_entry_price_geometry_rejection_notification,
+)
 from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig, TrackedSenderConfig
 from telegram_kol_research.models import RawMessage, SignalCandidate, Source
 from telegram_kol_research.price_normalization import extract_normalized_prices
@@ -207,6 +213,7 @@ def load_recovery_signals_from_db(
     normalized_start = _storage_utc_naive(start_at)
     normalized_end = _storage_utc_naive(end_at)
     signals: list[RecoverySignal] = []
+    geometry_alerts: list[dict[str, object]] = []
 
     with session_factory() as session:
         rows = (
@@ -228,6 +235,27 @@ def load_recovery_signals_from_db(
             )
             if runtime_config is None or runtime_config["trading_mode"] != "auto_trade":
                 continue
+
+            geometry = validate_candidate_entry_price_geometry(
+                side=candidate.side,
+                entry_text=candidate.entry_text,
+                stop_loss_text=candidate.stop_loss_text,
+                take_profit_text=candidate.take_profit_text,
+                symbol=candidate.symbol,
+            )
+            if not geometry.passed:
+                geometry_alerts.append(
+                    {
+                        "raw_message_id": int(raw_message.id),
+                        "candidate_id": int(candidate.id),
+                        "chat_id": int(raw_message.chat_id),
+                        "symbol": str(candidate.symbol or ""),
+                        "side": str(candidate.side or ""),
+                        "parse_source": str(candidate.parse_source or "unknown"),
+                        "authoritative_generation": candidate.recognition_generation,
+                        "geometry": geometry.bounded_evidence(),
+                    }
+                )
 
             signals.append(
                 RecoverySignal(
@@ -254,6 +282,11 @@ def load_recovery_signals_from_db(
                 )
             )
 
+    for alert in geometry_alerts:
+        enqueue_entry_price_geometry_rejection_notification(
+            session_factory,
+            **alert,
+        )
     return signals
 
 
