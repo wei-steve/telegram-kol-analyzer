@@ -12,10 +12,10 @@ pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063 # historical all-role main-recognition activation
 current_runtime_role_shas:
-  web: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
-  monitor: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
-  ingest: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
-  worker: 6a493d1588a2a4cdd34abfb2abd85580fc8f3b71
+  web: 877fbc33d783546ad2379b688c7648363a92c4a8
+  monitor: 877fbc33d783546ad2379b688c7648363a92c4a8
+  ingest: 877fbc33d783546ad2379b688c7648363a92c4a8
+  worker: 877fbc33d783546ad2379b688c7648363a92c4a8
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
@@ -36,6 +36,13 @@ auto_trade_enabled_expected: true
 entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
+
+## Trigger-protection lineage candidate activated — 2026-09-04T16:43:48Z
+
+- The standard immutable path activated `877fbc33d783546ad2379b688c7648363a92c4a8` for Web, monitor, ingest and worker with `schema_changed=false`; a new canonical v3 authorization bound each role's measured rollback to `6a493d1588a2a4cdd34abfb2abd85580fc8f3b71` and was consumed exactly once. Final runtime identities all report candidate manifest `92c0ca4aafc60f44b935c646d74d2e0cdcf2557ad0729a0918748826957e9242` with `loaded_artifact_verified=true`, stable PIDs and `NRestarts=0`.
+- The conservative freeze interval was `2026-09-04T16:10:04Z`–`16:12:55Z` (171 seconds). An initial thaw command used the wrong variable name and did not change the frozen processes; the exact `TELEGRAM_KOL_DEPLOYMENT_ENTRY_FROZEN` line was then removed and worker → Web → ingest restarted. No message arrived in the interval, no stale-expiry terminalization occurred, and the all-history stale-expiry count remained 420. Final entry admission is unfrozen and automatic trading remains enabled.
+- The full 30-minute L2 window received seven messages from one chat. All seven jobs and new lease attempts completed successfully without reaching the exchange boundary; five scanner cursors continued to advance. Attempts changed 93→100, wakeup executions 0→0, cursor rows 5→5, and legacy `execution_running`/`execution_uncertain` remained 30/3. The expected 30/2 baseline was already 30/3 before authorization creation, so no row was attributed to this activation.
+- The exchange remained empty and complete throughout. No real entry occurred, so the candidate's protection-lineage behavior and binding-to-`pos_id` path were not live-verified; the production lineage-attribution mode also remains `disabled`. The monitor's natural run verified the candidate identity but retained the two known historical business reason codes; after clearing that failed latch, the timer is enabled/active and the service is not failed. Full record: `docs/2026-09-04-trigger-protection-lineage-production-activation.md`. Root-owned evidence: `/var/lib/telegram-kol-cutover-evidence/877fbc33d783546ad2379b688c7648363a92c4a8/protection-lineage-activation-20260904T161004Z/summary.json`.
 
 ## Monitor identity convergence and recognition lease activation — 2026-09-04T12:26:29Z
 
