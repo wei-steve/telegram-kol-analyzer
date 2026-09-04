@@ -27,8 +27,8 @@ install-only procedure while the monitor units are inactive. The updated install
 3. install the three service units whose `ExecStart` directly invokes the production virtualenv
    CLI and therefore inherits the generic release `PYTHONPATH` from the release drop-in;
 4. remove only the three retired `TELEGRAM_KOL_MONITOR_RELEASE_*` assignments from existing
-   release drop-ins using a root-owned, single-link, atomic rewrite; malformed or duplicate
-   assignments fail closed;
+   release drop-ins using a root-owned, single-link, atomic rewrite; only an exact one-assignment
+   line is removable, while malformed, duplicate, or trailing same-line assignments fail closed;
 5. leave service start and authority activation to their existing bounded phases.
 
 No installer or unit change is executed in this implementation-only turn.
@@ -55,6 +55,11 @@ control. `SystemRuntimeAdapter` will query each of the three monitor services wi
 `systemctl show` output for `Environment`, `EnvironmentFiles`, `ExecStart`, `FragmentPath`, and
 `DropInPaths`.
 
+The candidate proof applies to every activation source mode containing monitor. Immutable mode
+also retains the observed rollback proof and fresh diagnostic; `stopped_legacy` has no live
+rollback identity to prove, but must still prove the prospective candidate main-process contract
+before a dry-run can return `validated` or a real activation can consume authorization.
+
 For each unit the proof must establish:
 
 - the current effective command directly invokes the expected virtualenv CLI and contains no
@@ -77,9 +82,16 @@ identity, or a mismatched prospective import path reports the conflicting source
 No secret or unrelated env value is included in the error.
 
 For a release key in `EnvironmentFile`, the dry-run error records the offending key and its value,
-the corresponding prospective drop-in value, and the requirement that the file contain no release
-identity. This makes the two conflicting sources explicit without exposing credentials or unrelated
+the corresponding *generic* prospective drop-in key and value, and the requirement that the file
+contain no release identity. For example, the retired monitor path is compared with prospective
+`PYTHONPATH=<candidate>/src`, not with a monitor-specific field that the new drop-in no longer
+writes. This makes the two conflicting sources explicit without exposing credentials or unrelated
 policy values.
+
+Under option A, “sources agree” means the effective generic identity and prospective generic
+drop-in agree while the policy/credential EnvironmentFile contains no release key. Even a retired
+monitor-specific key whose value happens to equal the candidate is rejected: accepting it would
+retain the second identity source that this design removes.
 
 ## Freeze-window message loss record
 

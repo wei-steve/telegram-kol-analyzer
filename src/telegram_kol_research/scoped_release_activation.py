@@ -345,13 +345,21 @@ def _runtime_support_digest(root: Path) -> str:
                 # PYTHONPATH from the per-role drop-in. Treat only the exact
                 # retired command prefix as the same rollback-compatible unit;
                 # every argument and sandbox byte remains significant.
-                if content.count(_LEGACY_MONITOR_EXECSTART_PREFIX) > 1:
+                lines = content.splitlines(keepends=True)
+                matching_lines = [
+                    index
+                    for index, line in enumerate(lines)
+                    if line.startswith(_LEGACY_MONITOR_EXECSTART_PREFIX)
+                ]
+                if len(matching_lines) > 1:
                     raise ActivationError("release scope validation failed")
-                content = content.replace(
-                    _LEGACY_MONITOR_EXECSTART_PREFIX,
-                    _CANONICAL_MONITOR_EXECSTART_PREFIX,
-                    1,
-                )
+                if matching_lines:
+                    index = matching_lines[0]
+                    lines[index] = (
+                        _CANONICAL_MONITOR_EXECSTART_PREFIX
+                        + lines[index][len(_LEGACY_MONITOR_EXECSTART_PREFIX) :]
+                    )
+                    content = b"".join(lines)
             encoded = relative.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
@@ -1106,11 +1114,12 @@ def activate_release(
         )
         if "monitor" in components:
             runtime.prove_monitor_rollback_release(rollback_releases["monitor"])
-            runtime.prove_monitor_candidate_release(candidate)
         preserve_entry_freeze = require_authority or any(
             identity.get("entry_admission_frozen") is True
             for identity in before_identities.values()
         )
+    if "monitor" in components:
+        runtime.prove_monitor_candidate_release(candidate)
     if require_authority and runtime.active_write_count(paths.database_path) != 0:
         raise ActivationError("active exchange write blocks activation")
 
@@ -1678,18 +1687,35 @@ class SystemRuntimeAdapter:
         )
         if forbidden:
             key = sorted(forbidden)[0]
-            candidate_values = {
-                "PYTHONPATH": str(release.release_path / "src"),
-                "TELEGRAM_KOL_RELEASE_COMMIT": release.commit,
-                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
-                "TELEGRAM_KOL_MONITOR_RELEASE_PATH": str(release.release_path),
-                "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT": release.commit,
-                "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256": release.manifest_sha256,
+            prospective_values = {
+                "PYTHONPATH": ("PYTHONPATH", str(release.release_path / "src")),
+                "TELEGRAM_KOL_RELEASE_COMMIT": (
+                    "TELEGRAM_KOL_RELEASE_COMMIT",
+                    release.commit,
+                ),
+                "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256": (
+                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256",
+                    release.manifest_sha256,
+                ),
+                "TELEGRAM_KOL_MONITOR_RELEASE_PATH": (
+                    "PYTHONPATH",
+                    str(release.release_path / "src"),
+                ),
+                "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT": (
+                    "TELEGRAM_KOL_RELEASE_COMMIT",
+                    release.commit,
+                ),
+                "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256": (
+                    "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256",
+                    release.manifest_sha256,
+                ),
             }
+            prospective_key, prospective_value = prospective_values[key]
             raise ActivationError(
                 "monitor candidate main import conflict: "
                 f"source=EnvironmentFile key={key} observed={assignments[key]} "
-                f"source=prospective_dropin observed={candidate_values[key]} "
+                "source=prospective_dropin "
+                f"key={prospective_key} observed={prospective_value} "
                 "expected_environment_file=absent"
             )
         return (path,), assignments

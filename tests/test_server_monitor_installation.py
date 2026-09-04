@@ -491,6 +491,30 @@ def test_installer_refuses_ambiguous_retired_monitor_release_keys(
     assert dropin.read_text(encoding="utf-8") == original
 
 
+def test_installer_refuses_retired_key_with_trailing_assignment(
+    tmp_path: Path,
+) -> None:
+    dropin = tmp_path / "10-telegram-kol-release.conf"
+    original = (
+        "[Service]\n"
+        'Environment="TELEGRAM_KOL_MONITOR_RELEASE_PATH=/old" '
+        '"TELEGRAM_KOL_RELEASE_COMMIT=' + "a" * 40 + '"\n'
+    )
+    dropin.write_text(original, encoding="utf-8")
+    dropin.chmod(0o644)
+
+    completed = subprocess.run(
+        [sys.executable, "-B", "-", str(dropin), str(os.getuid())],
+        input=_release_dropin_cleanup_program(),
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode != 0
+    assert dropin.read_text(encoding="utf-8") == original
+
+
 def test_installer_repairs_existing_state_metadata_without_replacing_content():
     installer = INSTALLER_PATH.read_text(encoding="utf-8")
 

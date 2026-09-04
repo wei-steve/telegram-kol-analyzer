@@ -119,7 +119,9 @@ def test_runtime_support_digest_allows_only_canonical_monitor_execstart_migratio
     legacy = tmp_path / "legacy"
     canonical = tmp_path / "canonical"
     changed = tmp_path / "changed"
-    for root in (legacy, canonical, changed):
+    comment_legacy = tmp_path / "comment-legacy"
+    comment_canonical = tmp_path / "comment-canonical"
+    for root in (legacy, canonical, changed, comment_legacy, comment_canonical):
         unit_dir = root / "deploy/systemd"
         unit_dir.mkdir(parents=True)
         (root / "config").mkdir()
@@ -146,6 +148,14 @@ def test_runtime_support_digest_allows_only_canonical_monitor_execstart_migratio
         "[Service]\n" + canonical_command + "NoNewPrivileges=false\n",
         encoding="utf-8",
     )
+    (comment_legacy / "deploy/systemd/telegram-kol-monitor.service").write_text(
+        "[Service]\n# " + legacy_command,
+        encoding="utf-8",
+    )
+    (comment_canonical / "deploy/systemd/telegram-kol-monitor.service").write_text(
+        "[Service]\n# " + canonical_command,
+        encoding="utf-8",
+    )
 
     assert scoped_activation._runtime_support_digest(
         legacy
@@ -153,6 +163,9 @@ def test_runtime_support_digest_allows_only_canonical_monitor_execstart_migratio
     assert scoped_activation._runtime_support_digest(
         canonical
     ) != scoped_activation._runtime_support_digest(changed)
+    assert scoped_activation._runtime_support_digest(
+        comment_legacy
+    ) != scoped_activation._runtime_support_digest(comment_canonical)
 
 
 @pytest.mark.parametrize(
@@ -480,7 +493,9 @@ def test_monitor_rollback_identity_fails_closed_on_incomplete_evidence(
     (
         ("clean", True),
         ("generic-current-matches-candidate", True),
-        ("retired-env-key", False),
+        ("retired-env-path", False),
+        ("retired-env-commit", False),
+        ("retired-env-manifest", False),
         ("missing-environment", False),
         ("missing-environment-files", False),
         ("missing-environment-file", False),
@@ -518,9 +533,30 @@ def test_monitor_candidate_main_import_proof_uses_effective_systemd_sources(
     environment_file = tmp_path / "telegram-kol-monitor.env"
     environment_file.write_text("MONITOR_POLICY=live\n", encoding="utf-8")
     environment_file.chmod(0o600)
-    if case == "retired-env-key":
+    retired_cases = {
+        "retired-env-path": (
+            "TELEGRAM_KOL_MONITOR_RELEASE_PATH",
+            str(current_path),
+            "PYTHONPATH",
+            f"{release_path}/src",
+        ),
+        "retired-env-commit": (
+            "TELEGRAM_KOL_MONITOR_RELEASE_COMMIT",
+            ROLLBACK,
+            "TELEGRAM_KOL_RELEASE_COMMIT",
+            CANDIDATE,
+        ),
+        "retired-env-manifest": (
+            "TELEGRAM_KOL_MONITOR_RELEASE_MANIFEST_SHA256",
+            "b" * 64,
+            "TELEGRAM_KOL_RELEASE_MANIFEST_SHA256",
+            "a" * 64,
+        ),
+    }
+    if case in retired_cases:
+        retired_key, retired_value, _, _ = retired_cases[case]
         environment_file.write_text(
-            f"TELEGRAM_KOL_MONITOR_RELEASE_PATH={current_path}\n",
+            f"{retired_key}={retired_value}\n",
             encoding="utf-8",
         )
     if case == "missing-environment-file":
@@ -554,8 +590,9 @@ def test_monitor_candidate_main_import_proof_uses_effective_systemd_sources(
                 for item in environment.split()
                 if not item.startswith("TELEGRAM_KOL_RELEASE_MANIFEST_SHA256=")
             )
-        if case == "retired-env-key":
-            environment += f" TELEGRAM_KOL_MONITOR_RELEASE_PATH={current_path}"
+        if case in retired_cases:
+            retired_key, retired_value, _, _ = retired_cases[case]
+            environment += f" {retired_key}={retired_value}"
         exec_start = (
             "{ path=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research ; "
             "argv[]=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research "
@@ -595,14 +632,17 @@ def test_monitor_candidate_main_import_proof_uses_effective_systemd_sources(
     else:
         with pytest.raises(ActivationError, match="monitor candidate main import") as error:
             runtime.prove_monitor_candidate_release(release)
-        if case == "retired-env-key":
+        if case in retired_cases:
+            retired_key, retired_value, prospective_key, prospective_value = (
+                retired_cases[case]
+            )
             assert (
                 "source=EnvironmentFile "
-                "key=TELEGRAM_KOL_MONITOR_RELEASE_PATH "
-                f"observed={current_path}"
+                f"key={retired_key} observed={retired_value}"
             ) in str(error.value)
             assert (
-                f"source=prospective_dropin observed={release_path}"
+                "source=prospective_dropin "
+                f"key={prospective_key} observed={prospective_value}"
                 in str(error.value)
             )
 
@@ -2150,6 +2190,48 @@ def test_stopped_legacy_activation_does_not_require_legacy_runtime_identity(
     assert "start:telegram-kol.service" not in runtime.events
     assert all(runtime.entry_frozen_by_role.values())
     assert runtime.maintenance_state_by_unit["telegram-kol-monitor.timer"][0] == "active"
+
+
+def test_stopped_legacy_dry_run_rejects_monitor_candidate_main_identity_conflict(
+    activation_harness,
+) -> None:
+    paths, runtime, manifest = activation_harness
+    _configure_worker_harness(paths, runtime, manifest)
+    _set_authorization_source_mode(paths, "stopped_legacy")
+    runtime.maintenance_state_by_unit = {
+        unit: ("inactive", "inhibited")
+        for unit in runtime.maintenance_state_by_unit
+    }
+
+    def reject_candidate_identity(release) -> dict:
+        raise ActivationError(
+            f"monitor candidate main import conflict: candidate={release.commit}"
+        )
+
+    runtime.prove_monitor_candidate_release = reject_candidate_identity
+
+    with pytest.raises(
+        ActivationError,
+        match=f"monitor candidate main import conflict: candidate={CANDIDATE}",
+    ):
+        activate_release(
+            expected_commit=CANDIDATE,
+            rollback_commit=ROLLBACK,
+            paths=paths,
+            runtime=runtime,
+            expected_uid=paths.release_root.stat().st_uid,
+            source_mode="stopped_legacy",
+            dry_run=True,
+        )
+
+    assert paths.authorization.exists()
+    assert not paths.authorization_consumed.exists()
+    assert "active-write" not in runtime.events
+    assert not any(
+        event.startswith(("unmask:", "start:", "stop:"))
+        or event == "daemon-reload"
+        for event in runtime.events
+    )
 
 
 def test_stopped_legacy_candidate_protection_failure_ends_maintenance_stopped(

@@ -402,9 +402,12 @@ kept = []
 for line in lines:
     matched = False
     for key in keys:
-        if line.startswith(b'Environment="' + key + b"=") and line.rstrip(
-            b"\r\n"
-        ).endswith(b'"'):
+        payload = line.rstrip(b"\r\n")
+        if (
+            payload.startswith(b'Environment="' + key + b"=")
+            and payload.endswith(b'"')
+            and payload.count(b'"') == 2
+        ):
             removed[key] += 1
             if removed[key] > 1:
                 raise SystemExit("Existing monitor release drop-in has duplicate identity.")

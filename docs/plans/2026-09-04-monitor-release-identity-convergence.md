@@ -34,7 +34,8 @@
    monitor release key is emitted by the installer.
 2. Remove the legacy command-local `PYTHONPATH` prefix and the three installer env writes.
 3. Add a fail-closed, exact cleanup of the three retired assignments from existing monitor release
-   drop-ins; preserve every other byte and reject malformed/duplicate identity lines.
+   drop-ins; preserve every other byte and reject malformed/duplicate identity lines or a retired
+   assignment sharing a line with any trailing token.
 4. Run the focused installation tests to GREEN.
 
 ### Task 3: Publish only the generic monitor identity
@@ -58,7 +59,8 @@
 2. Parse real `systemctl show` properties, validate the installed EnvironmentFile and effective
    command/environment, and overlay only the prospective generic candidate values.
 3. Invoke the proof after rollback identity proof but before the active-write gate and dry-run
-   return.
+   return. Apply it to immutable and `stopped_legacy` monitor activations; the latter skips only the
+   unavailable live rollback proof, not the prospective candidate proof.
 4. Cover matching sources, legacy conflict, missing Environment, missing/missing-file
    EnvironmentFile, each missing generic release field, and malformed ExecStart; assert zero
    service-control events. Conflict errors must include the EnvironmentFile value and the
