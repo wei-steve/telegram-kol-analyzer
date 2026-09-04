@@ -32,9 +32,16 @@ main_recognition_live_sample_verified: true
 source_mode: immutable
 entry_admission_frozen_expected: false
 auto_trade_enabled_expected: true
-entry_admission_frozen_observed: false
+entry_admission_frozen_observed: true
 auto_trade_enabled_observed: true
 ```
+
+## Recognition execution lease activation rolled back at monitor diagnostic — 2026-09-04T08:57:46Z
+
+- Candidate `792b34d79577356b3149aa67b92efcf3d662ad3c` entered the standard four-component immutable activation with per-role rollback Web→`5aa7ca077...` and monitor/ingest/worker→`0de19c1c...`. A new canonical v3 authorization was consumed once. Pre-activation active exchange writes were zero, all 35 retained releases passed full-tree validation, release bytecode pollution was zero, and the one live BTC position had two verified stops and fully allocated verified take profits.
+- Candidate monitor `ExecStartPre` identified exact candidate `792b34d7...`, but its diagnostic main process returned `loaded_artifact_verified=false` with null release/manifest identity and exited 1. The activator failed closed, completed per-role rollback, and returned `activation failed; rollback_complete`; no retry, bypass or manual service control followed.
+- Actual post-rollback identities remain Web=`5aa7ca077fa45728c0f3d8df93e0e90a33a4a262`, ingest/worker=`0de19c1cbb2089fd58b8940d9b01a65096f9a063`; monitor also returned to `0de19c1c...`. All runtime artifact checks are true, the timer is active, and post-attempt 35/35 full-tree validation again passed with zero bytecode paths. `current_runtime_role_shas` therefore remains unchanged.
+- Rollback intentionally retained `entry_admission_frozen=true`; `auto_trade_enabled=true`. The protected position and all four verified protection orders were unchanged after rollback. Existing `execution_running`/`execution_uncertain` counts remained 30/0; the two execution-attempt tables remained empty, while the briefly active scanner initialized five cursor rows. L2 observation did not start because the candidate did not remain active. Full record: `docs/2026-09-04-recognition-execution-lease-activation-rollback.md`.
 
 ## Recognition execution four-component activation stopped at uniform-rollback precondition — 2026-09-03T06:26:47Z
 
