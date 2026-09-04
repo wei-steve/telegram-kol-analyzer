@@ -142,6 +142,12 @@ class _ReadOnlyClient:
             raise self.pending_error
         return list(self.pending)
 
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
+
     def list_order_history(self, *, inst_id):
         return []
 

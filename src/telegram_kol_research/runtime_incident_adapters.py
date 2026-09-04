@@ -570,10 +570,21 @@ def capture_protection_state(
     current_health_status: str | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
-    if str(current_health_status or "").lower() == "resolved_by_verified_replacement":
+    if str(current_health_status or "").lower() in {
+        "resolved_by_verified_replacement",
+        "resolved_by_verified_attribution",
+    }:
         return None
     normalized_severity = str(severity).lower()
-    if normalized_severity not in {"high", "critical"}:
+    actionable_medium = bool(
+        normalized_severity == "medium"
+        and str(reason_code or "").lower()
+        in {
+            "native_stop_visible_ownership_unverified",
+            "native_stop_ownership_management_blocked",
+        }
+    )
+    if normalized_severity not in {"high", "critical"} and not actionable_medium:
         return None
     return _capture(
         session_factory,

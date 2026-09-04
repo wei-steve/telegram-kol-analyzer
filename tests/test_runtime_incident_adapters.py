@@ -843,7 +843,28 @@ def test_only_severe_protection_incidents_are_captured(tmp_path):
     assert high.incident_type == "severe_protection_incident"
 
 
-def test_recovered_protection_source_does_not_realert(tmp_path):
+def test_visible_unowned_stop_with_verified_backup_still_pushes_as_medium(tmp_path):
+    session_factory = create_session_factory(tmp_path / "protected-ownership-gap.db")
+
+    captured = capture_protection_state(
+        session_factory,
+        config=_enabled("severe_protection_incident"),
+        source_record_id="visible-unowned-1",
+        severity="medium",
+        reason_code="native_stop_visible_ownership_unverified",
+        occurred_at=NOW,
+    )
+
+    assert captured is not None
+    assert captured.severity == "medium"
+    assert captured.incident_type == "severe_protection_incident"
+
+
+@pytest.mark.parametrize(
+    "health_status",
+    ["resolved_by_verified_replacement", "resolved_by_verified_attribution"],
+)
+def test_recovered_protection_source_does_not_realert(tmp_path, health_status):
     captured = capture_protection_state(
         create_session_factory(tmp_path / "recovered-protection.db"),
         config=_enabled("severe_protection_incident"),
@@ -851,7 +872,7 @@ def test_recovered_protection_source_does_not_realert(tmp_path):
         severity="critical",
         reason_code="protection_missing",
         occurred_at=NOW,
-        current_health_status="resolved_by_verified_replacement",
+        current_health_status=health_status,
     )
 
     assert captured is None

@@ -369,6 +369,12 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
         def list_trigger_orders_pending(self, *, inst_id):
             return []
 
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {
+                "code": "0",
+                "data": self.list_trigger_orders_pending(inst_id=inst_id),
+            }
+
         def list_open_orders(self, *, inst_id):
             return list(self.open_orders)
 
@@ -540,6 +546,12 @@ def test_replay_executes_revision_cancel_and_late_fill_recovery_path(tmp_path):
 
         def list_trigger_orders_pending(self, *, inst_id):
             return []
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {
+                "code": "0",
+                "data": self.list_trigger_orders_pending(inst_id=inst_id),
+            }
 
         def list_order_history(self, *, inst_id):
             return []

@@ -10,6 +10,7 @@ import json
 from typing import Any
 
 from telegram_kol_research.models import (
+    ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     PositionProtectionLedger,
@@ -134,6 +135,7 @@ class TriggerProtectionLivePosition:
     pos_id: str
     instrument_id: str
     side: str
+    position_mode: str
     size_text: str
     created_at: datetime
     observed_at: datetime
@@ -155,6 +157,47 @@ class TriggerProtectionAssignmentContext:
     intent: TriggerProtectionIntent
     parent_event: ExecutionEvent
     live_position: TriggerProtectionLivePosition
+    binding: ExecutionBinding | None = None
+    child_fill_rows: tuple[dict[str, Any], ...] = ()
+    lineage_evidence_required: bool = False
+    lineage_authority: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionLineageAttestation:
+    binding_id: int
+    leg_id: int
+    event_id: int
+    intent_id: int
+    parent_trigger_order_id: str
+    client_order_id: str
+    child_regular_order_id: str
+    child_exchange_created_at: datetime
+    child_exchange_created_at_raw: str
+    pos_id: str
+    instrument_id: str
+    side: str
+    size_text: str
+    stop_price: str
+    request_fingerprint: str
+    owner_baseline_order_ids: tuple[str, ...]
+    owner_baseline_fingerprint: str
+    submission_attestation_fingerprint: str
+    intent_created_at: datetime
+    parent_ack_at: datetime
+    snapshot_observed_at: datetime
+    attached_submission_confirmed: bool
+    fingerprint: str
+
+
+@dataclass(frozen=True, slots=True)
+class TriggerProtectionLineageAttestationResult:
+    attestation: TriggerProtectionLineageAttestation | None = None
+    refusal: EntryProtectionLedgerRepairRefusal | None = None
+
+    def __post_init__(self) -> None:
+        if (self.attestation is None) == (self.refusal is None):
+            raise ValueError("lineage attestation result must have exactly one outcome")
 
 
 @dataclass(frozen=True, slots=True)
@@ -181,6 +224,471 @@ class EntryProtectionLedgerRepairResult:
     applied: int
 
 
+def build_trigger_protection_blocking_owner(
+    *, entry_leg: ExecutionOrderLeg, intent: TriggerProtectionIntent | None
+) -> ProtectionOwner | None:
+    """Keep an incomplete lineage owner in the account uniqueness graph."""
+
+    request = _loads_json(entry_leg.request_json)
+    expected_rows = _expected_protection_rows(request)
+    if {str(row.get("purpose") or "") for row in expected_rows} != {"stop_loss"}:
+        return None
+    instrument_id = _request_instrument_id(request)
+    side = _request_side(request)
+    size_text = _request_size_text(request)
+    pos_id = str(entry_leg.pos_id or "").strip()
+    instrument_aliases = {
+        value.upper()
+        for value in _request_aliases(
+            request, "instId", "instrument_id", "instrumentId"
+        )
+    }
+    side_aliases = {
+        value.lower() for value in _request_aliases(request, "posSide", "pos_side")
+    }
+    size_aliases = _request_aliases(request, "sz", "size", "orderSize")
+    stop_price = str(expected_rows[0].get("trigger_price") or "")
+    stop_aliases = _request_aliases(
+        request, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+    )
+    if (
+        not instrument_id
+        or instrument_aliases != {instrument_id.upper()}
+        or not side
+        or side_aliases != {side.lower()}
+        or not size_text
+        or not size_aliases
+        or any(not _same_numeric_text(value, size_text) for value in size_aliases)
+        or not stop_price
+        or not stop_aliases
+        or any(not _same_numeric_text(value, stop_price) for value in stop_aliases)
+        or not pos_id
+    ):
+        return None
+    baseline_ids = (
+        _baseline_order_ids(intent.pre_submit_tpsl_baseline_json) or set()
+        if intent is not None
+        else set()
+    )
+    return ProtectionOwner(
+        leg_id=int(entry_leg.id or 0),
+        binding_id=int(entry_leg.execution_binding_id or 0),
+        pos_id=pos_id,
+        instrument_id=instrument_id,
+        side=side,
+        size_text=size_text,
+        stop_price=stop_price,
+        position_created_at=(
+            _coerce_utc_naive(intent.created_at)
+            if intent is not None and isinstance(intent.created_at, datetime)
+            else datetime.min
+        ),
+        client_order_id=str(entry_leg.client_order_id or "").strip() or None,
+        intent_id=(
+            int(intent.id)
+            if intent is not None and intent.id is not None
+            else None
+        ),
+        parent_trigger_order_id=(
+            str(intent.parent_trigger_order_id or "") or None
+            if intent is not None
+            else str(entry_leg.order_id or "") or None
+        ),
+        owner_baseline_order_ids=tuple(sorted(baseline_ids)),
+        lineage_evidence_required=True,
+        direct_identity_permitted=False,
+    )
+
+
+def build_trigger_protection_lineage_attestation(
+    *,
+    binding: ExecutionBinding,
+    entry_leg: ExecutionOrderLeg,
+    intent: TriggerProtectionIntent,
+    parent_event: ExecutionEvent,
+    child_fill_rows: list[dict[str, Any]] | tuple[dict[str, Any], ...],
+    live_position: TriggerProtectionLivePosition,
+) -> TriggerProtectionLineageAttestationResult:
+    """Build complete attached-stop lineage evidence or return one closed refusal."""
+
+    binding_id = int(entry_leg.execution_binding_id or 0)
+    leg_id = int(entry_leg.id or 0)
+    event_id = int(parent_event.id or 0)
+    intent_id = int(intent.id or 0)
+    pos_id = str(entry_leg.pos_id or "").strip()
+    parent_order_id = str(intent.parent_trigger_order_id or "").strip()
+    client_order_id = str(entry_leg.client_order_id or "").strip()
+
+    def refuse(reason: str, evidence: dict[str, Any] | None = None):
+        return TriggerProtectionLineageAttestationResult(
+            refusal=EntryProtectionLedgerRepairRefusal(
+                event_id=event_id or None,
+                binding_id=binding_id or None,
+                pos_id=pos_id or None,
+                reason=reason,
+                evidence=evidence or {},
+            )
+        )
+
+    request = _loads_json(entry_leg.request_json)
+    event_request = _loads_json(parent_event.request_json)
+    binding_payload = _loads_json(binding.payload_json)
+    submitted_orders = (
+        binding_payload.get("submitted_orders")
+        if isinstance(binding_payload, dict)
+        else None
+    )
+    parent_submissions = [
+        row
+        for row in submitted_orders or []
+        if isinstance(row, dict)
+        and (
+            parent_order_id in _row_order_ids(row)
+            or client_order_id
+            in _string_aliases(
+                row, "client_order_id", "clientOrderId", "clOrdId"
+            )
+        )
+    ]
+    if not isinstance(submitted_orders, list) or not parent_submissions:
+        return refuse("trigger_protection_submission_attestation_missing")
+    if len(parent_submissions) != 1:
+        return refuse("trigger_protection_submission_attestation_conflict")
+    submission = parent_submissions[0]
+    if (
+        _row_order_ids(submission) != {parent_order_id}
+        or _string_aliases(
+            submission, "client_order_id", "clientOrderId", "clOrdId"
+        )
+        != {client_order_id}
+        or int(submission.get("leg_index") or 0) != int(entry_leg.leg_index or 0)
+    ):
+        return refuse("trigger_protection_submission_attestation_conflict")
+    submission_request = submission.get("request")
+    expected_rows = _expected_protection_rows(request)
+    instrument_id = _request_instrument_id(request)
+    side = _request_side(request)
+    size_text = _request_size_text(request)
+    stop_rows = [
+        row for row in expected_rows if str(row.get("purpose")) == "stop_loss"
+    ]
+    expected_stop = str(stop_rows[0].get("trigger_price") or "") if len(stop_rows) == 1 else ""
+    request_instruments = {
+        value.upper()
+        for value in _request_aliases(
+            request, "instId", "instrument_id", "instrumentId"
+        )
+    }
+    request_sides = {
+        value.lower() for value in _request_aliases(request, "posSide", "pos_side")
+    }
+    request_sizes = _request_aliases(request, "sz", "size", "orderSize")
+    request_stops = _request_aliases(
+        request, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+    )
+    if (
+        not binding_id
+        or not leg_id
+        or not event_id
+        or not intent_id
+        or int(binding.id or 0) != binding_id
+        or int(intent.execution_binding_id or 0) != binding_id
+        or int(intent.execution_order_leg_id or 0) != leg_id
+        or int(parent_event.execution_binding_id or 0) != binding_id
+        or str(binding.venue or "").lower() != "deepcoin"
+        or str(intent.venue or "").lower() != "deepcoin"
+        or str(entry_leg.venue or "").lower() != "deepcoin"
+        or str(parent_event.venue or "").lower() != "deepcoin"
+        or str(entry_leg.purpose or "") != "entry"
+        or str(entry_leg.order_kind or "") != "trigger_limit"
+        or str(entry_leg.status or "").lower() != "active"
+        or str(entry_leg.attribution_status or "").lower() != "verified"
+        or str(binding.position_mode or "").lower() != "split"
+        or parent_event.action != "create_trigger_entry"
+        or not parent_order_id
+        or not client_order_id
+        or not _same_nonempty_text(parent_order_id, entry_leg.order_id)
+        or not _same_nonempty_text(parent_order_id, parent_event.order_id)
+        or not _same_nonempty_text(client_order_id, parent_event.client_order_id)
+        or not pos_id
+        or not instrument_id
+        or not side
+        or not size_text
+        or len(stop_rows) != 1
+        or {str(row.get("purpose")) for row in expected_rows} != {"stop_loss"}
+        or request_instruments != {instrument_id.upper()}
+        or request_sides != {side.lower()}
+        or not request_sizes
+        or any(not _same_numeric_text(value, size_text) for value in request_sizes)
+        or not request_stops
+        or any(not _same_numeric_text(value, expected_stop) for value in request_stops)
+    ):
+        return refuse("trigger_protection_submission_attestation_conflict")
+    request_fingerprint = _trigger_protection_fingerprint(request)
+    if (
+        request_fingerprint != str(intent.request_fingerprint or "")
+        or _trigger_protection_fingerprint(event_request) != request_fingerprint
+        or _trigger_protection_fingerprint(submission_request) != request_fingerprint
+    ):
+        return refuse("trigger_protection_submission_attestation_conflict")
+    if not _parent_response_confirms(
+        _loads_json(parent_event.response_json), parent_order_id
+    ) or not _parent_response_confirms(submission.get("response"), parent_order_id):
+        return refuse("trigger_protection_parent_response_unconfirmed")
+    protection_request = submission.get("protection_request")
+    if not _exact_attached_stop_request(
+        protection_request,
+        expected_stop=expected_stop,
+    ):
+        return refuse("trigger_protection_submission_attestation_conflict")
+    protection_response = submission.get("protection_response")
+    if not (
+        isinstance(protection_response, dict)
+        and str(protection_response.get("code")) == "0"
+        and isinstance(protection_response.get("data"), dict)
+        and protection_response["data"].get("attached_on_trigger_order") is True
+    ):
+        return refuse("trigger_protection_submission_attestation_conflict")
+    baseline_ids = _baseline_order_ids(intent.pre_submit_tpsl_baseline_json)
+    if baseline_ids is None:
+        return refuse(
+            "trigger_protection_owner_baseline_invalid",
+            {"attached_submission_confirmed": True},
+        )
+    strict_baseline_ids = _strict_baseline_order_ids(
+        intent.pre_submit_tpsl_baseline_json,
+        instrument_id=instrument_id,
+    )
+    if strict_baseline_ids is None:
+        return refuse(
+            "trigger_protection_owner_baseline_unproven",
+            {"attached_submission_confirmed": True},
+        )
+    baseline_ids = strict_baseline_ids
+    if not isinstance(intent.created_at, datetime):
+        return refuse(
+            "trigger_protection_submission_attestation_conflict",
+            {"attached_submission_confirmed": True},
+        )
+    exact_children = [
+        row
+        for row in child_fill_rows
+        if isinstance(row, dict)
+        and str(row.get("source") or "") == "trigger_child_order"
+        and str(row.get("parent_trigger_order_id") or "").strip()
+        == parent_order_id
+        and str(row.get("client_order_id") or "").strip() == client_order_id
+        and str(row.get("state") or "").lower() == "filled"
+        and str(row.get("order_id") or "").strip() == pos_id
+        and str(row.get("pos_id") or "").strip() == pos_id
+        and str(row.get("instId") or "").upper() == instrument_id.upper()
+        and str(row.get("posSide") or "").lower() == side.lower()
+        and _same_numeric_text(row.get("sz"), size_text)
+        and _alias_tuple_matches(row, "order_id_aliases", pos_id)
+        and _optional_alias_tuple_matches(row, "pos_id_aliases", pos_id)
+        and _optional_alias_tuple_matches(
+            row, "parent_order_id_aliases", parent_order_id
+        )
+        and _optional_alias_tuple_matches(
+            row, "client_order_id_aliases", client_order_id
+        )
+        and _optional_alias_tuple_matches(
+            row, "instrument_id_aliases", instrument_id, uppercase=True
+        )
+        and _optional_alias_tuple_matches(
+            row, "side_aliases", side, lowercase=True
+        )
+        and _numeric_alias_tuple_matches(row, "size_aliases", size_text)
+    ]
+    if len(child_fill_rows) != 1 or len(exact_children) != 1:
+        return refuse(
+            "trigger_protection_child_lineage_not_unique",
+            {"attached_submission_confirmed": True},
+        )
+    child = exact_children[0]
+    child_created_at_raw = _raw_exchange_time_value(child.get("cTime"))
+    child_created_at = _parse_datetime(child_created_at_raw)
+    if child_created_at_raw is None or child_created_at is None:
+        return refuse(
+            "trigger_protection_child_time_unavailable",
+            {"attached_submission_confirmed": True},
+        )
+    if (
+        live_position.pos_id != pos_id
+        or live_position.instrument_id.upper() != instrument_id.upper()
+        or live_position.side.lower() != side.lower()
+        or live_position.position_mode.lower() != "split"
+        or not _same_numeric_text(live_position.size_text, size_text)
+        or not isinstance(live_position.observed_at, datetime)
+    ):
+        return refuse(
+            "trigger_protection_child_lineage_not_unique",
+            {"attached_submission_confirmed": True},
+        )
+    baseline_fingerprint = _bounded_json_fingerprint(
+        {"order_ids": sorted(baseline_ids)}
+    )
+    submission_fingerprint = _bounded_json_fingerprint(
+        {
+            "binding_id": binding_id,
+            "leg_id": leg_id,
+            "order_id": parent_order_id,
+            "client_order_id": client_order_id,
+            "request_fingerprint": request_fingerprint,
+            "protection_request": protection_request,
+            "attached": True,
+        }
+    )
+    bounded = {
+        "binding_id": binding_id,
+        "leg_id": leg_id,
+        "event_id": event_id,
+        "intent_id": intent_id,
+        "parent_trigger_order_id": parent_order_id,
+        "client_order_id": client_order_id,
+        "child_regular_order_id": pos_id,
+        "child_exchange_created_at": child_created_at.isoformat(),
+        "child_exchange_created_at_raw": child_created_at_raw,
+        "pos_id": pos_id,
+        "instrument_id": instrument_id,
+        "side": side,
+        "size_text": size_text,
+        "stop_price": expected_stop,
+        "request_fingerprint": request_fingerprint,
+        "owner_baseline_fingerprint": baseline_fingerprint,
+        "submission_attestation_fingerprint": submission_fingerprint,
+        "intent_created_at": _coerce_utc_naive(intent.created_at).isoformat(),
+        "parent_ack_at": _coerce_utc_naive(parent_event.created_at).isoformat(),
+        "attached_submission_confirmed": True,
+    }
+    return TriggerProtectionLineageAttestationResult(
+        attestation=TriggerProtectionLineageAttestation(
+            binding_id=binding_id,
+            leg_id=leg_id,
+            event_id=event_id,
+            intent_id=intent_id,
+            parent_trigger_order_id=parent_order_id,
+            client_order_id=client_order_id,
+            child_regular_order_id=pos_id,
+            child_exchange_created_at=child_created_at,
+            child_exchange_created_at_raw=child_created_at_raw,
+            pos_id=pos_id,
+            instrument_id=instrument_id,
+            side=side,
+            size_text=size_text,
+            stop_price=expected_stop,
+            request_fingerprint=request_fingerprint,
+            owner_baseline_order_ids=tuple(sorted(baseline_ids)),
+            owner_baseline_fingerprint=baseline_fingerprint,
+            submission_attestation_fingerprint=submission_fingerprint,
+            intent_created_at=_coerce_utc_naive(intent.created_at),
+            parent_ack_at=_coerce_utc_naive(parent_event.created_at),
+            snapshot_observed_at=_coerce_utc_naive(live_position.observed_at),
+            attached_submission_confirmed=True,
+            fingerprint=_bounded_json_fingerprint(bounded),
+        )
+    )
+
+
+def _parent_response_confirms(response: Any, parent_order_id: str) -> bool:
+    if not isinstance(response, dict) or str(response.get("code")) != "0":
+        return False
+    data = response.get("data")
+    rows = data if isinstance(data, list) else [data]
+    if len(rows) != 1 or not isinstance(rows[0], dict):
+        return False
+    row = rows[0]
+    return (
+        str(row.get("sCode")) == "0"
+        and _string_aliases(
+            row, "ordId", "orderId", "order_id", "id"
+        )
+        == {parent_order_id}
+    )
+
+
+def _exact_attached_stop_request(value: Any, *, expected_stop: str) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if _first_nonzero_text(
+        value,
+        "tpTriggerPx",
+        "tpTriggerPrice",
+        "closeTPTriggerPrice",
+    ) is not None:
+        return False
+    stops = _string_aliases(
+        value, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"
+    )
+    order_prices = _string_aliases(value, "slOrdPx", "slOrderPrice")
+    return (
+        bool(stops)
+        and all(_same_numeric_text(stop, expected_stop) for stop in stops)
+        and bool(order_prices)
+        and all(_same_numeric_text(price, "-1") for price in order_prices)
+    )
+
+
+def _bounded_json_fingerprint(value: Any) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            value,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+
+
+def _alias_tuple_matches(
+    row: dict[str, Any], key: str, expected: str, *, uppercase: bool = False,
+    lowercase: bool = False,
+) -> bool:
+    aliases = row.get(key)
+    if not isinstance(aliases, (list, tuple)):
+        aliases = (row.get("order_id"),) if key == "order_id_aliases" else ()
+    normalized = {
+        str(value).strip().upper()
+        if uppercase
+        else {"buy": "long", "sell": "short"}.get(
+            str(value).strip().lower(), str(value).strip().lower()
+        )
+        if lowercase
+        else str(value).strip()
+        for value in aliases
+        if str(value or "").strip()
+    }
+    expected_value = (
+        expected.upper()
+        if uppercase
+        else {"buy": "long", "sell": "short"}.get(
+            expected.lower(), expected.lower()
+        )
+        if lowercase
+        else expected
+    )
+    return normalized == {expected_value}
+
+
+def _optional_alias_tuple_matches(
+    row: dict[str, Any], key: str, expected: str, *, uppercase: bool = False,
+    lowercase: bool = False,
+) -> bool:
+    aliases = row.get(key)
+    if not aliases:
+        return True
+    return _alias_tuple_matches(
+        row, key, expected, uppercase=uppercase, lowercase=lowercase
+    )
+
+
+def _numeric_alias_tuple_matches(row: dict[str, Any], key: str, expected: str) -> bool:
+    aliases = row.get(key)
+    if not aliases:
+        return True
+    return all(_same_numeric_text(value, expected) for value in aliases)
+
+
 def build_trigger_protection_live_position(
     *,
     entry_leg: ExecutionOrderLeg,
@@ -195,12 +703,11 @@ def build_trigger_protection_live_position(
     instrument_id = str(_request_instrument_id(request) or "").upper()
     side = str(_request_side(request) or "").lower()
     expected_size = _request_size_text(request)
-    matching = [
+    rows_containing_pos_id = [
         row
         for row in position_rows
         if isinstance(row, dict)
-        and str(row.get("posId") or row.get("pos_id") or row.get("id") or "").strip()
-        == pos_id
+        and pos_id in _row_position_ids(row)
     ]
 
     def refuse(reason: str, evidence: dict[str, Any] | None = None):
@@ -214,6 +721,22 @@ def build_trigger_protection_live_position(
             )
         )
 
+    if any(_row_position_ids(row) != {pos_id} for row in rows_containing_pos_id):
+        return refuse(
+            "trigger_protection_position_identity_conflict",
+            {
+                "position_ids": sorted(
+                    {
+                        value
+                        for row in rows_containing_pos_id
+                        for value in _row_position_ids(row)
+                    }
+                )
+            },
+        )
+    matching = [
+        row for row in rows_containing_pos_id if _row_position_ids(row) == {pos_id}
+    ]
     if len(matching) == 0:
         return refuse("trigger_protection_position_not_live")
     if len(matching) != 1:
@@ -222,22 +745,49 @@ def build_trigger_protection_live_position(
             {"candidate_count": len(matching)},
         )
     row = matching[0]
+    current_sizes = _string_aliases(row, "pos", "size", "availPos", "avail_pos")
     current_size = _first_nonzero_text(row, "pos", "size", "availPos", "avail_pos")
-    if current_size is None:
+    if current_size is None or not current_sizes:
         return refuse("trigger_protection_position_not_live")
-    current_instrument = str(row.get("instId") or row.get("inst_id") or "").upper()
-    if not instrument_id or current_instrument != instrument_id:
+    instrument_aliases = {
+        value.upper()
+        for value in _string_aliases(
+            row, "instId", "inst_id", "instrument_id", "instrumentId"
+        )
+    }
+    current_instrument = next(iter(instrument_aliases)) if len(instrument_aliases) == 1 else ""
+    if not instrument_id or instrument_aliases != {instrument_id}:
         return refuse(
             "trigger_protection_position_instrument_conflict",
             {"instrument_id": current_instrument or None},
         )
-    current_side = str(row.get("posSide") or row.get("pos_side") or row.get("side") or "").lower()
-    if not side or current_side != side:
+    side_aliases = {
+        value.lower()
+        for value in _string_aliases(row, "posSide", "pos_side", "side")
+    }
+    current_side = next(iter(side_aliases)) if len(side_aliases) == 1 else ""
+    if not side or side_aliases != {side}:
         return refuse(
             "trigger_protection_position_side_conflict",
             {"side": current_side or None},
         )
-    if expected_size is None or not _same_numeric_text(current_size, expected_size):
+    position_modes = {
+        value.lower()
+        for value in _string_aliases(
+            row, "mrgPosition", "posMode", "position_mode"
+        )
+    }
+    position_mode = next(iter(position_modes)) if len(position_modes) == 1 else ""
+    if position_modes != {"split"}:
+        return refuse(
+            "trigger_protection_position_mode_conflict",
+            {"position_mode": position_mode or None},
+        )
+    if (
+        expected_size is None
+        or not current_sizes
+        or any(not _same_numeric_text(value, expected_size) for value in current_sizes)
+    ):
         return refuse(
             "trigger_protection_position_size_changed",
             {"current_size": current_size, "expected_size": expected_size},
@@ -250,6 +800,7 @@ def build_trigger_protection_live_position(
             pos_id=pos_id,
             instrument_id=instrument_id,
             side=side,
+            position_mode=position_mode,
             size_text=current_size,
             created_at=created_at,
             observed_at=observed_at,
@@ -307,6 +858,22 @@ def finalize_trigger_protection_adoption(
         or int(intent.execution_order_leg_id or 0) != int(action.leg_id)
     ):
         raise ValueError("trigger_protection_adoption_identity_invalid")
+    adopted_order_id = str(intent.adopted_order_id or "").strip()
+    if adopted_order_id and adopted_order_id != action.order_id:
+        raise ValueError("trigger_protection_adopted_order_conflict")
+    competing_intents = (
+        session.query(TriggerProtectionIntent)
+        .filter(TriggerProtectionIntent.venue == "deepcoin")
+        .filter(TriggerProtectionIntent.adopted_order_id == action.order_id)
+        .all()
+    )
+    if any(
+        intent.id is None
+        or row.id is None
+        or int(row.id) != int(intent.id)
+        for row in competing_intents
+    ):
+        raise ValueError("trigger_protection_intent_order_owned")
 
     from telegram_kol_research.models import PositionProtectionLeg
     from telegram_kol_research.position_protection_legs import (
@@ -559,10 +1126,11 @@ def apply_entry_protection_ledger_repair_plan(
         for action in plan.actions
         if action.action_id == str(action_id)
         and action.pos_id == str(pos_id)
-        and action.evidence.get("match") in {
-            "response_anchored_order",
-            "verified_filled_leg_unique_child",
-        }
+            and action.evidence.get("match") in {
+                "response_anchored_order",
+                "verified_filled_leg_unique_child",
+                "lineage_attested_attached_stop",
+            }
     ]
     if len(selected) != 1:
         raise ValueError("exactly one supported repair action is required")
@@ -1108,19 +1676,24 @@ def plan_trigger_protection_intent_assignments(
     pending_tpsl_rows: list[dict[str, Any]],
     existing_ledger_rows: list[PositionProtectionLedger],
     snapshot_complete: bool,
+    existing_intents: tuple[TriggerProtectionIntent, ...] = (),
+    blocking_owners: tuple[ProtectionOwner, ...] = (),
 ) -> TriggerProtectionAssignmentPlan:
     """Plan all anonymous stop-only adoptions from one coherent snapshot."""
 
-    owners: list[ProtectionOwner] = []
+    owners: list[ProtectionOwner] = list(blocking_owners)
     contexts_by_leg: dict[int, TriggerProtectionAssignmentContext] = {}
     refusals: dict[int, EntryProtectionLedgerRepairRefusal] = {}
-    baseline_order_ids: set[str] = set()
+    lineage_refusals: dict[int, EntryProtectionLedgerRepairRefusal] = {}
+    legacy_global_baseline_order_ids: set[str] = set()
+    owner_universe_bounded = True
     for context in sorted(contexts, key=lambda item: int(item.entry_leg.id or 0)):
         leg = context.entry_leg
         intent = context.intent
         event = context.parent_event
         live_position = context.live_position
         leg_id = int(leg.id or 0)
+        contexts_by_leg[leg_id] = context
         binding_id = int(leg.execution_binding_id or 0)
         pos_id = str(leg.pos_id or "").strip()
         request = _loads_json(leg.request_json)
@@ -1131,6 +1704,9 @@ def plan_trigger_protection_intent_assignments(
         side = _request_side(request)
         size_text = _request_size_text(request)
         expected_parent = str(intent.parent_trigger_order_id or "").strip()
+        lineage_required = (
+            context.lineage_evidence_required or context.binding is not None
+        )
         baseline_ids = _baseline_order_ids(intent.pre_submit_tpsl_baseline_json)
         if baseline_ids is None:
             refusals[leg_id] = _assignment_refusal(
@@ -1139,10 +1715,50 @@ def plan_trigger_protection_intent_assignments(
                 pos_id,
                 "trigger_protection_baseline_invalid",
             )
+            if lineage_required:
+                blocker = build_trigger_protection_blocking_owner(
+                    entry_leg=leg, intent=intent
+                )
+                if blocker is not None:
+                    owners.append(blocker)
+                else:
+                    owner_universe_bounded = False
             continue
-        baseline_order_ids.update(baseline_ids)
+        if lineage_required:
+            strict_baseline_ids = _strict_baseline_order_ids(
+                intent.pre_submit_tpsl_baseline_json,
+                instrument_id=instrument_id,
+            )
+            if strict_baseline_ids is None:
+                refusals[leg_id] = _assignment_refusal(
+                    event,
+                    binding_id,
+                    pos_id,
+                    "trigger_protection_owner_baseline_unproven",
+                )
+                blocker = build_trigger_protection_blocking_owner(
+                    entry_leg=leg, intent=intent
+                )
+                if blocker is not None:
+                    owners.append(blocker)
+                else:
+                    owner_universe_bounded = False
+                continue
+            baseline_ids = strict_baseline_ids
+        legacy_global_baseline_order_ids.update(baseline_ids)
         if expected_purposes != {"stop_loss"}:
+            if lineage_required:
+                refusals[leg_id] = _assignment_refusal(
+                    event,
+                    binding_id,
+                    pos_id,
+                    "trigger_protection_intent_identity_invalid",
+                )
+                owner_universe_bounded = False
             continue
+        request_owner = build_trigger_protection_blocking_owner(
+            entry_leg=leg, intent=intent
+        )
         if (
             not leg_id
             or not binding_id
@@ -1170,7 +1786,9 @@ def plan_trigger_protection_intent_assignments(
             or live_position.pos_id != pos_id
             or live_position.instrument_id.upper() != instrument_id.upper()
             or live_position.side.lower() != side.lower()
+            or live_position.position_mode.lower() != "split"
             or not _same_numeric_text(live_position.size_text, size_text)
+            or request_owner is None
         ):
             refusals[leg_id] = _assignment_refusal(
                 event,
@@ -1178,7 +1796,37 @@ def plan_trigger_protection_intent_assignments(
                 pos_id,
                 "trigger_protection_intent_identity_invalid",
             )
+            if lineage_required:
+                if request_owner is not None:
+                    owners.append(request_owner)
+                else:
+                    owner_universe_bounded = False
             continue
+        attestation = None
+        if lineage_required and context.binding is None:
+            lineage_refusals[leg_id] = _assignment_refusal(
+                event,
+                binding_id,
+                pos_id,
+                "trigger_protection_submission_attestation_missing",
+            )
+        elif context.binding is not None:
+            attestation_result = build_trigger_protection_lineage_attestation(
+                binding=context.binding,
+                entry_leg=leg,
+                intent=intent,
+                parent_event=event,
+                child_fill_rows=context.child_fill_rows,
+                live_position=live_position,
+            )
+            if attestation_result.attestation is not None:
+                attestation = attestation_result.attestation
+            else:
+                assert attestation_result.refusal is not None
+                lineage_refusals[leg_id] = attestation_result.refusal
+                # A lineage-gated owner must never degrade to the legacy time
+                # heuristic when any attestation element is missing/conflicted.
+                attestation = None
         owners.append(
             ProtectionOwner(
                 leg_id=leg_id,
@@ -1189,16 +1837,107 @@ def plan_trigger_protection_intent_assignments(
                 size_text=size_text,
                 stop_price=str(expected_rows[0]["trigger_price"]),
                 position_created_at=live_position.created_at,
+                client_order_id=str(leg.client_order_id or "").strip() or None,
+                intent_id=(int(intent.id) if intent.id is not None else None),
+                intent_created_at=(
+                    attestation.intent_created_at
+                    if attestation is not None
+                    else (
+                        _coerce_utc_naive(intent.created_at)
+                        if isinstance(intent.created_at, datetime)
+                        else None
+                    )
+                ),
+                snapshot_observed_at=(
+                    attestation.snapshot_observed_at
+                    if attestation is not None
+                    else (
+                        _coerce_utc_naive(live_position.observed_at)
+                        if isinstance(live_position.observed_at, datetime)
+                        else None
+                    )
+                ),
+                child_regular_order_id=(
+                    attestation.child_regular_order_id if attestation is not None else None
+                ),
+                child_exchange_created_at=(
+                    attestation.child_exchange_created_at if attestation is not None else None
+                ),
+                child_exchange_created_at_raw=(
+                    attestation.child_exchange_created_at_raw
+                    if attestation is not None
+                    else None
+                ),
+                parent_trigger_order_id=(
+                    attestation.parent_trigger_order_id
+                    if attestation is not None
+                    else expected_parent
+                ),
+                request_fingerprint=(
+                    attestation.request_fingerprint if attestation is not None else None
+                ),
+                owner_baseline_order_ids=(
+                    attestation.owner_baseline_order_ids
+                    if attestation is not None
+                    else tuple(sorted(baseline_ids))
+                ),
+                owner_baseline_fingerprint=(
+                    attestation.owner_baseline_fingerprint
+                    if attestation is not None
+                    else _bounded_json_fingerprint({"order_ids": sorted(baseline_ids)})
+                ),
+                lineage_attestation_fingerprint=(
+                    attestation.fingerprint if attestation is not None else None
+                ),
+                lineage_evidence_required=lineage_required,
+                direct_identity_permitted=not (
+                    lineage_required and context.binding is None
+                ),
             )
         )
-        contexts_by_leg[leg_id] = context
+
+    owners = [
+        (
+            owner
+            if owner.lineage_attestation_fingerprint or owner.lineage_evidence_required
+            else replace(
+                owner,
+                owner_baseline_order_ids=tuple(
+                    sorted(legacy_global_baseline_order_ids)
+                ),
+            )
+        )
+        for owner in owners
+    ]
 
     candidates: list[ProtectionOrderCandidate] = []
     candidate_rows: dict[str, dict[str, Any]] = {}
+    lineage_authority_present = any(
+        owner.lineage_evidence_required
+        or bool(owner.lineage_attestation_fingerprint)
+        for owner in owners
+    )
+    candidate_universe_bounded = True
     for row in pending_tpsl_rows:
         if not isinstance(row, dict):
+            if lineage_authority_present:
+                candidate_universe_bounded = False
             continue
-        order_id = _row_order_id(row)
+        order_type_aliases = _string_aliases(
+            row, "triggerOrderType", "trigger_order_type"
+        )
+        normalized_order_types = {
+            value.upper() for value in order_type_aliases
+        }
+        lineage_order_ids = _lineage_candidate_order_ids(row)
+        if lineage_authority_present and len(lineage_order_ids) != 1:
+            candidate_universe_bounded = False
+            continue
+        order_id = (
+            lineage_order_ids[0]
+            if lineage_authority_present
+            else _row_order_id(row)
+        )
         instrument_id = _request_instrument_id(row)
         side = _request_side(row)
         size_text = _row_size_text(row)
@@ -1214,29 +1953,115 @@ def plan_trigger_protection_intent_assignments(
             "tpTriggerPrice",
             "closeTPTriggerPrice",
         )
-        if (
-            not order_id
-            or order_id in baseline_order_ids
-            or str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL"
-            or not instrument_id
-            or not side
-            or not size_text
-            or not stop_price
-            or take_profit is not None
-        ):
+        if not order_id:
             continue
+        evidence_complete = bool(
+            normalized_order_types == {"TPSL"}
+            and instrument_id
+            and side
+            and size_text
+            and stop_price
+            and take_profit is None
+        )
         candidates.append(
             ProtectionOrderCandidate(
                 order_id=order_id,
-                instrument_id=instrument_id,
-                side=side,
-                size_text=size_text,
-                stop_price=stop_price,
+                instrument_id=instrument_id or "",
+                side=side or "",
+                size_text=size_text or "",
+                stop_price=stop_price or "",
                 created_at=_row_creation_time(row),
+                order_id_aliases=tuple(
+                    sorted(
+                        lineage_order_ids
+                        if lineage_authority_present
+                        else _row_order_ids(row)
+                    )
+                ),
+                instrument_id_aliases=tuple(
+                    sorted(
+                        _string_aliases(
+                            row, "instId", "instrument_id", "instrumentId"
+                        )
+                    )
+                ),
+                side_aliases=tuple(
+                    sorted(_string_aliases(row, "posSide", "pos_side", "side"))
+                ),
+                size_aliases=tuple(
+                    sorted(_string_aliases(row, "sz", "size", "orderSize"))
+                ),
+                stop_price_aliases=tuple(
+                    sorted(
+                        _string_aliases(
+                            row,
+                            "slTriggerPx",
+                            "slTriggerPrice",
+                            "closeSLTriggerPrice",
+                        )
+                    )
+                ),
+                order_type_aliases=tuple(sorted(order_type_aliases)),
+                evidence_complete=evidence_complete,
                 explicit_pos_ids=tuple(sorted(_row_position_ids(row))),
+                explicit_parent_order_ids=tuple(
+                    sorted(_row_parent_order_ids(row))
+                ),
+                explicit_client_order_ids=tuple(
+                    sorted(
+                        _string_aliases(
+                            row, "clOrdId", "clientOrderId", "client_order_id"
+                        )
+                    )
+                ),
+                created_at_raw=_raw_exchange_time_value(row.get("cTime")),
             )
         )
         candidate_rows[order_id] = row
+
+    for leg_id, refusal in tuple(lineage_refusals.items()):
+        if refusal.evidence.get("attached_submission_confirmed") is not True:
+            continue
+        context = contexts_by_leg[leg_id]
+        request = _loads_json(context.entry_leg.request_json)
+        instrument_id = _request_instrument_id(request)
+        side = _request_side(request)
+        size_text = _request_size_text(request)
+        stop_rows = [
+            row
+            for row in _expected_protection_rows(request)
+            if str(row.get("purpose")) == "stop_loss"
+        ]
+        if (
+            not instrument_id
+            or not side
+            or not size_text
+            or len(stop_rows) != 1
+        ):
+            continue
+        stop_price = str(stop_rows[0].get("trigger_price") or "")
+        visible_ids = sorted(
+            {
+                candidate.order_id
+                for candidate in candidates
+                if candidate.instrument_id.upper() == instrument_id.upper()
+                and candidate.side.lower() == side.lower()
+                and _same_numeric_text(candidate.size_text, size_text)
+                and _same_numeric_text(candidate.stop_price, stop_price)
+                and not candidate.explicit_pos_ids
+                and not candidate.explicit_parent_order_ids
+            }
+        )
+        if not visible_ids:
+            continue
+        lineage_refusals[leg_id] = replace(
+            refusal,
+            evidence={
+                **refusal.evidence,
+                "candidate_order_ids": visible_ids,
+                "native_stop_visible_ownership_unverified": True,
+            },
+        )
 
     existing_order_owners: dict[str, str] = {}
     conflicted_order_ids: set[str] = set()
@@ -1256,18 +2081,51 @@ def plan_trigger_protection_intent_assignments(
         existing_order_owners[order_id] = pos_id
     for order_id in conflicted_order_ids:
         existing_order_owners[order_id] = "__immutable_owner_conflict__"
+    context_pos_by_intent_id = {
+        int(context.intent.id): str(context.entry_leg.pos_id or "").strip()
+        for context in contexts
+        if context.intent.id is not None
+    }
+    for existing_intent in existing_intents:
+        order_id = str(existing_intent.adopted_order_id or "").strip()
+        if not order_id:
+            continue
+        owner_pos = context_pos_by_intent_id.get(
+            int(existing_intent.id or 0),
+            f"__intent_owner__:{int(existing_intent.id or 0)}",
+        )
+        previous = existing_order_owners.get(order_id)
+        if previous is not None and previous != owner_pos:
+            existing_order_owners[order_id] = "__immutable_owner_conflict__"
+        else:
+            existing_order_owners[order_id] = owner_pos
 
     assignment = assign_trigger_protection_orders(
         owners=tuple(owners),
         candidates=tuple(candidates),
         existing_order_owners=existing_order_owners,
-        snapshot_complete=snapshot_complete,
+        snapshot_complete=(
+            snapshot_complete
+            and owner_universe_bounded
+            and candidate_universe_bounded
+        ),
     )
     actions: dict[int, EntryProtectionLedgerRepairAction] = {}
     for leg_id, order_id in assignment.assignments.items():
         context = contexts_by_leg[leg_id]
         owner = next(owner for owner in owners if owner.leg_id == leg_id)
         row = candidate_rows[order_id]
+        assignment_evidence = dict(assignment.evidence_by_leg[leg_id])
+        assignment_match = str(assignment_evidence.pop("match_kind"))
+        action_match = (
+            "lineage_attested_attached_stop"
+            if assignment_match == "lineage_attested_attached_stop"
+            else (
+                "explicit_pos_id"
+                if assignment_match == "explicit_pos_id"
+                else "verified_filled_leg_unique_child"
+            )
+        )
         actions[leg_id] = EntryProtectionLedgerRepairAction(
             event_id=int(context.parent_event.id),
             binding_id=owner.binding_id,
@@ -1287,27 +2145,55 @@ def plan_trigger_protection_intent_assignments(
                     if context.intent.id is not None
                     else None
                 ),
-                "match": "verified_filled_leg_unique_child",
+                "match": action_match,
                 "parent_trigger_order_id": context.intent.parent_trigger_order_id,
                 "snapshot_fingerprint": assignment.snapshot_fingerprint,
                 "source": "pending",
+                **assignment_evidence,
             },
         )
     for conflict in assignment.conflicts:
         for leg_id in conflict.owner_leg_ids:
             context = contexts_by_leg.get(leg_id)
-            if context is None or leg_id in actions or leg_id in refusals:
+            if (
+                context is None
+                or leg_id in actions
+                or leg_id in refusals
+                or leg_id in lineage_refusals
+            ):
                 continue
+            owner = next(
+                (item for item in owners if item.leg_id == leg_id),
+                None,
+            )
+            reason_code = str(conflict.reason_code)
+            if reason_code.startswith("protection_"):
+                reason_code = f"trigger_{reason_code}"
+            elif not reason_code.startswith("trigger_protection_"):
+                reason_code = f"trigger_protection_{reason_code}"
             refusals[leg_id] = _assignment_refusal(
                 context.parent_event,
                 int(context.entry_leg.execution_binding_id),
                 str(context.entry_leg.pos_id),
-                f"trigger_{conflict.reason_code}",
+                reason_code,
                 list(conflict.candidate_order_ids),
                 extra_evidence={
-                    "snapshot_fingerprint": assignment.snapshot_fingerprint
+                    "snapshot_fingerprint": assignment.snapshot_fingerprint,
+                    "native_stop_visible_ownership_unverified": bool(
+                        owner is not None
+                        and owner.lineage_attestation_fingerprint
+                        and conflict.candidate_order_ids
+                    ),
+                    "lineage_attestation_fingerprint": (
+                        owner.lineage_attestation_fingerprint
+                        if owner is not None
+                        else None
+                    ),
                 },
             )
+    for leg_id, refusal in lineage_refusals.items():
+        if leg_id not in actions and leg_id not in refusals:
+            refusals[leg_id] = refusal
     return TriggerProtectionAssignmentPlan(
         actions=dict(sorted(actions.items())),
         refusals=dict(sorted(refusals.items())),
@@ -1689,9 +2575,23 @@ def _baseline_order_ids(value: str | None) -> set[str] | None:
     parsed = _loads_json(value)
     if not isinstance(parsed, (list, dict)):
         return None
-    if isinstance(parsed, dict) and set(parsed) != {"orders"}:
-        return None
-    rows = parsed if isinstance(parsed, list) else parsed.get("orders")
+    if isinstance(parsed, dict):
+        if set(parsed) == {"orders"}:
+            rows = parsed.get("orders")
+        elif set(parsed) == {"schema", "capture_proof", "orders"}:
+            proof = parsed.get("capture_proof")
+            if not isinstance(proof, dict):
+                return None
+            rows = parsed.get("orders")
+            instrument_id = str(proof.get("instrument_id") or "").strip().upper()
+            if _strict_baseline_order_ids(
+                value, instrument_id=instrument_id
+            ) is None:
+                return None
+        else:
+            return None
+    else:
+        rows = parsed
     if not isinstance(rows, list):
         return None
     order_ids: set[str] = set()
@@ -1701,6 +2601,67 @@ def _baseline_order_ids(value: str | None) -> set[str] | None:
             "take_profit_trigger_price", "stop_loss_trigger_price", "exchange_created_at",
             "exchange_updated_at",
         }:
+            return None
+        order_id = str(row.get("ord_id") or "").strip()
+        if not order_id:
+            return None
+        order_ids.add(order_id)
+    return order_ids
+
+
+def _strict_baseline_order_ids(
+    value: str | None, *, instrument_id: str
+) -> set[str] | None:
+    parsed = _loads_json(value)
+    if not isinstance(parsed, dict) or set(parsed) != {
+        "schema",
+        "capture_proof",
+        "orders",
+    }:
+        return None
+    proof = parsed.get("capture_proof")
+    rows = parsed.get("orders")
+    expected_instrument = str(instrument_id or "").strip().upper()
+    if (
+        parsed.get("schema") != "deepcoin_pending_tpsl_baseline_v2"
+        or not isinstance(proof, dict)
+        or set(proof) != {
+            "transport",
+            "response_code",
+            "complete",
+            "instrument_id",
+            "page_limit",
+            "snapshot_fingerprint",
+        }
+        or proof.get("transport") != "raw"
+        or str(proof.get("response_code")) != "0"
+        or proof.get("complete") is not True
+        or str(proof.get("instrument_id") or "").strip().upper()
+        != expected_instrument
+        or proof.get("page_limit") != 100
+        or not isinstance(rows, list)
+    ):
+        return None
+    fingerprint = _bounded_json_fingerprint(
+        {"instrument_id": expected_instrument, "orders": rows}
+    )
+    if str(proof.get("snapshot_fingerprint") or "") != fingerprint:
+        return None
+    order_ids: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict) or set(row) != {
+            "ord_id",
+            "instrument",
+            "side",
+            "trigger_order_type",
+            "size",
+            "take_profit_trigger_price",
+            "stop_loss_trigger_price",
+            "exchange_created_at",
+            "exchange_updated_at",
+        }:
+            return None
+        if str(row.get("instrument") or "").strip().upper() != expected_instrument:
             return None
         order_id = str(row.get("ord_id") or "").strip()
         if not order_id:
@@ -1751,6 +2712,27 @@ def _row_position_ids(row: dict[str, Any]) -> set[str]:
         for key in ("closePosId", "close_pos_id", "closePositionId", "posId", "pos_id", "positionId")
         if str(row.get(key) or "").strip()
     }
+
+
+def _row_parent_order_ids(row: dict[str, Any]) -> set[str]:
+    return {
+        str(row.get(key) or "").strip()
+        for key in (
+            "parentOrdId",
+            "parentOrderId",
+            "parent_order_id",
+            "triggerOrdId",
+            "triggerOrderId",
+        )
+        if str(row.get(key) or "").strip()
+    }
+
+
+def _raw_exchange_time_value(value: Any) -> str | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _anonymous_stop_request_key(request: dict[str, Any]) -> tuple[str, str, str, str] | None:
@@ -2148,6 +3130,37 @@ def _coerce_utc_naive(value: datetime) -> datetime:
 
 def _row_order_id(row: dict[str, Any]) -> str | None:
     return _first_nonzero_text(row, "ordId", "orderId", "order_id", "algoId", "triggerOrderId")
+
+
+def _row_order_ids(row: dict[str, Any]) -> set[str]:
+    return _string_aliases(
+        row, "ordId", "orderId", "order_id", "id", "algoId", "triggerOrderId"
+    )
+
+
+def _lineage_candidate_order_ids(row: dict[str, Any]) -> tuple[str, ...]:
+    """Return only aliases documented as the TPSL order's own identifier."""
+
+    return tuple(
+        sorted(_string_aliases(row, "ordId", "orderId", "order_id"))
+    )
+
+
+def _string_aliases(row: dict[str, Any], *keys: str) -> set[str]:
+    return {
+        str(row.get(key)).strip()
+        for key in keys
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
+
+
+def _request_aliases(request: Any, *keys: str) -> set[str]:
+    return {
+        value
+        for row in (request if isinstance(request, list) else [request])
+        if isinstance(row, dict)
+        for value in _string_aliases(row, *keys)
+    }
 
 
 def _row_size_text(row: dict[str, Any]) -> str | None:

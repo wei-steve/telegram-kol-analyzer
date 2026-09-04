@@ -1,6 +1,7 @@
 import json
 import hashlib
-from datetime import UTC, datetime
+from dataclasses import replace
+from datetime import UTC, datetime, timedelta
 
 import pytest
 
@@ -12,6 +13,7 @@ from telegram_kol_research.entry_protection_ledger_repair import (
     TriggerProtectionOwnerState,
     apply_entry_protection_ledger_repair_plan,
     build_entry_protection_ledger_repair_plan,
+    build_trigger_protection_lineage_attestation,
     finalize_trigger_protection_adoption,
     plan_trigger_protection_intent_adoption,
     plan_verified_trigger_entry_protection_adoption,
@@ -29,6 +31,53 @@ from telegram_kol_research.models import (
 from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
 
 
+def _strict_baseline_json(rows=(), *, instrument_id="BTC-USDT-SWAP"):
+    normalized_rows = list(rows)
+    fingerprint_payload = {
+        "instrument_id": instrument_id,
+        "orders": normalized_rows,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return json.dumps(
+        {
+            "schema": "deepcoin_pending_tpsl_baseline_v2",
+            "capture_proof": {
+                "transport": "raw",
+                "response_code": "0",
+                "complete": True,
+                "instrument_id": instrument_id,
+                "page_limit": 100,
+                "snapshot_fingerprint": fingerprint,
+            },
+            "orders": normalized_rows,
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+@pytest.mark.parametrize("parent_key", ["triggerOrderId", "triggerOrdId"])
+def test_lineage_candidate_id_never_uses_parent_alias(parent_key):
+    assert repair_module._lineage_candidate_order_ids(
+        {parent_key: "parent-trigger-123"}
+    ) == ()
+
+
+def test_lineage_candidate_id_requires_one_exact_child_order_alias():
+    assert repair_module._lineage_candidate_order_ids(
+        {"ordId": "child-1", "orderId": "child-2"}
+    ) == ("child-1", "child-2")
+
+
+
 class FakeDeepcoinClient:
     def __init__(self, rows, *, positions=None):
         self.rows = rows
@@ -41,6 +90,7 @@ class FakeDeepcoinClient:
                     "instId": "ETH-USDT-SWAP",
                     "posSide": "short",
                     "pos": "0.6",
+                    "mrgPosition": "split",
                     "cTime": "2026-08-02T00:05:10Z",
                 }
             ]
@@ -59,6 +109,706 @@ class FakeDeepcoinClient:
             for row in self.rows
             if str(row.get("instId") or "").upper() == inst_id
         ]
+
+
+def _lineage_attestation_inputs():
+    request = {
+        "clOrdId": "TKSJ1173E1",
+        "instId": "BTC-USDT-SWAP",
+        "orderType": "limit",
+        "posSide": "long",
+        "price": "78000",
+        "side": "buy",
+        "slOrdPx": "-1",
+        "slTriggerPx": "76300",
+        "sz": "21",
+        "tdMode": "cross",
+        "triggerPrice": "78000",
+    }
+    fingerprint = repair_module._trigger_protection_fingerprint(request)
+    parent_response = {
+        "code": "0",
+        "data": {"sCode": "0", "ordId": "1001125090052318"},
+    }
+    binding = ExecutionBinding(
+        id=324,
+        strategy_instance_id="fixture:1050",
+        kol_id="fixture-group",
+        chat_id=-1,
+        message_id=1,
+        symbol="BTC",
+        side="long",
+        venue="deepcoin",
+        position_mode="split",
+        status="active",
+        payload_json=json.dumps(
+            {
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "client_order_id": "TKSJ1173E1",
+                        "order_id": "1001125090052318",
+                        "request": request,
+                        "response": parent_response,
+                        "protection_request": {
+                            "slTriggerPx": "76300",
+                            "slOrdPx": "-1",
+                        },
+                        "protection_response": {
+                            "code": "0",
+                            "data": {"attached_on_trigger_order": True},
+                        },
+                    }
+                ]
+            }
+        ),
+    )
+    leg = ExecutionOrderLeg(
+        id=559,
+        execution_binding_id=324,
+        strategy_instance_id="fixture:1050",
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="1001125090052318",
+        client_order_id="TKSJ1173E1",
+        pos_id="1001125090080799",
+        venue="deepcoin",
+        attribution_status="verified",
+        status="active",
+        request_json=json.dumps(request),
+    )
+    event = ExecutionEvent(
+        id=3892,
+        execution_binding_id=324,
+        strategy_instance_id="fixture:1050",
+        venue="deepcoin",
+        action="create_trigger_entry",
+        status="submitted",
+        symbol="BTC",
+        side="long",
+        order_id="1001125090052318",
+        client_order_id="TKSJ1173E1",
+        request_json=json.dumps(request),
+        response_json=json.dumps(parent_response),
+        created_at=datetime(2026, 9, 2, 2, 33, 30, 866384),
+    )
+    intent = TriggerProtectionIntent(
+        id=163,
+        venue="deepcoin",
+        execution_binding_id=324,
+        execution_order_leg_id=559,
+        request_fingerprint=fingerprint,
+        pre_submit_tpsl_baseline_json=_strict_baseline_json(),
+        correlation_id="fixture-163",
+        parent_trigger_order_id="1001125090052318",
+        created_at=datetime(2026, 9, 2, 2, 33, 30, 714985),
+    )
+    live_position = repair_module.TriggerProtectionLivePosition(
+        pos_id="1001125090080799",
+        instrument_id="BTC-USDT-SWAP",
+        side="long",
+        position_mode="split",
+        size_text="21",
+        created_at=datetime(2026, 9, 2, 2, 36, 36),
+        observed_at=datetime(2026, 9, 2, 2, 36, 38, 252094, tzinfo=UTC),
+    )
+    child_fill_rows = [
+        {
+            "source": "trigger_child_order",
+            "parent_trigger_order_id": "1001125090052318",
+            "order_id": "1001125090080799",
+            "pos_id": "1001125090080799",
+            "client_order_id": "TKSJ1173E1",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "sz": "21",
+            "state": "filled",
+            "cTime": "1788316588000",
+        }
+    ]
+    return {
+        "binding": binding,
+        "entry_leg": leg,
+        "intent": intent,
+        "parent_event": event,
+        "child_fill_rows": child_fill_rows,
+        "live_position": live_position,
+    }
+
+
+def test_lineage_attestation_requires_the_complete_parent_child_position_chain():
+    result = build_trigger_protection_lineage_attestation(**_lineage_attestation_inputs())
+
+    assert result.refusal is None
+    assert result.attestation is not None
+    assert result.attestation.parent_trigger_order_id == "1001125090052318"
+    assert result.attestation.child_regular_order_id == "1001125090080799"
+    assert result.attestation.pos_id == "1001125090080799"
+    assert result.attestation.child_exchange_created_at == datetime(
+        2026, 9, 2, 2, 36, 28
+    )
+    assert len(result.attestation.fingerprint) == 64
+
+
+def test_lineage_attestation_fingerprint_is_stable_across_poll_times():
+    first_values = _lineage_attestation_inputs()
+    second_values = _lineage_attestation_inputs()
+    second_values["live_position"] = replace(
+        second_values["live_position"],
+        observed_at=second_values["live_position"].observed_at
+        + timedelta(minutes=1),
+    )
+
+    first = build_trigger_protection_lineage_attestation(**first_values)
+    second = build_trigger_protection_lineage_attestation(**second_values)
+
+    assert first.attestation is not None
+    assert second.attestation is not None
+    assert first.attestation.fingerprint == second.attestation.fingerprint
+
+
+def test_lineage_attestation_rejects_non_split_live_position():
+    values = _lineage_attestation_inputs()
+    values["live_position"] = repair_module.TriggerProtectionLivePosition(
+        pos_id=values["live_position"].pos_id,
+        instrument_id=values["live_position"].instrument_id,
+        side=values["live_position"].side,
+        position_mode="cross",
+        size_text=values["live_position"].size_text,
+        created_at=values["live_position"].created_at,
+        observed_at=values["live_position"].observed_at,
+    )
+
+    result = build_trigger_protection_lineage_attestation(**values)
+
+    assert result.attestation is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_child_lineage_not_unique"
+
+
+def test_live_position_builder_rejects_non_split_position_mode():
+    values = _lineage_attestation_inputs()
+    row = {
+        "posId": values["entry_leg"].pos_id,
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "pos": "21",
+        "mrgPosition": "cross",
+        "cTime": "1788316596000",
+    }
+
+    result = repair_module.build_trigger_protection_live_position(
+        entry_leg=values["entry_leg"],
+        position_rows=[row],
+        observed_at=datetime(2026, 9, 2, 2, 36, 38, tzinfo=UTC),
+    )
+
+    assert result.position is None
+    assert result.refusal is not None
+    assert result.refusal.reason == "trigger_protection_position_mode_conflict"
+
+
+@pytest.mark.parametrize(
+    ("mutation", "reason"),
+    [
+        ("missing_submission", "trigger_protection_submission_attestation_missing"),
+        ("duplicate_parent_submission", "trigger_protection_submission_attestation_conflict"),
+        ("duplicate_client_submission", "trigger_protection_submission_attestation_conflict"),
+        ("request_alias_conflict", "trigger_protection_submission_attestation_conflict"),
+        ("protection_request_alias_conflict", "trigger_protection_submission_attestation_conflict"),
+        ("protection_request_combined_alias", "trigger_protection_submission_attestation_conflict"),
+        ("attached_false", "trigger_protection_submission_attestation_conflict"),
+        ("parent_response_failed", "trigger_protection_parent_response_unconfirmed"),
+        ("event_parent_response_extra_row", "trigger_protection_parent_response_unconfirmed"),
+        ("submitted_parent_response_extra_row", "trigger_protection_parent_response_unconfirmed"),
+        ("event_parent_response_alias_conflict", "trigger_protection_parent_response_unconfirmed"),
+        ("submitted_parent_response_alias_conflict", "trigger_protection_parent_response_unconfirmed"),
+        ("child_absent", "trigger_protection_child_lineage_not_unique"),
+        ("child_multiple", "trigger_protection_child_lineage_not_unique"),
+        ("child_time_missing", "trigger_protection_child_time_unavailable"),
+        ("child_pos_conflict", "trigger_protection_child_lineage_not_unique"),
+        ("baseline_invalid", "trigger_protection_owner_baseline_invalid"),
+        ("baseline_legacy_unproven", "trigger_protection_owner_baseline_unproven"),
+    ],
+)
+def test_lineage_attestation_never_returns_partial_evidence(mutation, reason):
+    values = _lineage_attestation_inputs()
+    submitted = json.loads(values["binding"].payload_json)["submitted_orders"]
+    if mutation == "missing_submission":
+        values["binding"].payload_json = json.dumps({"submitted_orders": []})
+    elif mutation == "duplicate_parent_submission":
+        submitted.append({**submitted[0], "leg_index": 99})
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "duplicate_client_submission":
+        submitted.append({**submitted[0], "order_id": "other-parent"})
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "request_alias_conflict":
+        request = json.loads(values["entry_leg"].request_json)
+        request["size"] = "22"
+        values["entry_leg"].request_json = json.dumps(request)
+        values["parent_event"].request_json = json.dumps(request)
+        submitted[0]["request"] = request
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+        values["intent"].request_fingerprint = repair_module._trigger_protection_fingerprint(request)
+    elif mutation == "protection_request_alias_conflict":
+        submitted[0]["protection_request"]["slTriggerPrice"] = "99999"
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "protection_request_combined_alias":
+        submitted[0]["protection_request"]["closeTPTriggerPrice"] = "75000"
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "attached_false":
+        submitted[0]["protection_response"]["data"]["attached_on_trigger_order"] = False
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "parent_response_failed":
+        submitted[0]["response"]["code"] = "1"
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "event_parent_response_extra_row":
+        response = json.loads(values["parent_event"].response_json)
+        response["data"] = [
+            response["data"],
+            {"sCode": "1", "ordId": "other-parent"},
+        ]
+        values["parent_event"].response_json = json.dumps(response)
+    elif mutation == "submitted_parent_response_extra_row":
+        submitted[0]["response"]["data"] = [
+            submitted[0]["response"]["data"],
+            {"sCode": "1", "ordId": "other-parent"},
+        ]
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "event_parent_response_alias_conflict":
+        response = json.loads(values["parent_event"].response_json)
+        response["data"]["orderId"] = "other-parent"
+        values["parent_event"].response_json = json.dumps(response)
+    elif mutation == "submitted_parent_response_alias_conflict":
+        submitted[0]["response"]["data"]["orderId"] = "other-parent"
+        values["binding"].payload_json = json.dumps({"submitted_orders": submitted})
+    elif mutation == "child_absent":
+        values["child_fill_rows"] = []
+    elif mutation == "child_multiple":
+        values["child_fill_rows"] = [
+            *values["child_fill_rows"],
+            {**values["child_fill_rows"][0], "order_id": "other-child", "pos_id": "other-child"},
+        ]
+    elif mutation == "child_time_missing":
+        values["child_fill_rows"][0]["cTime"] = ""
+    elif mutation == "child_pos_conflict":
+        values["child_fill_rows"][0]["pos_id"] = "other-pos"
+    elif mutation == "baseline_invalid":
+        values["intent"].pre_submit_tpsl_baseline_json = "{}"
+    elif mutation == "baseline_legacy_unproven":
+        values["intent"].pre_submit_tpsl_baseline_json = "[]"
+
+    result = build_trigger_protection_lineage_attestation(**values)
+
+    assert result.attestation is None
+    assert result.refusal is not None
+    assert result.refusal.reason == reason
+
+
+def test_account_wide_plan_accepts_real_predating_candidate_only_with_attestation():
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "1001125090080798",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = ""
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert set(plan.actions) == {559}
+    assert plan.actions[559].order_id == "1001125090080798"
+    assert plan.actions[559].evidence["match"] == "lineage_attested_attached_stop"
+
+
+def test_account_wide_plan_keeps_parent_alias_separate_from_child_order_id():
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "1001125090080798",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate.update(
+        {
+            "posId": "",
+            "triggerOrderId": values["intent"].parent_trigger_order_id,
+        }
+    )
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert set(plan.actions) == {559}
+    assert plan.actions[559].order_id == "1001125090080798"
+
+
+def test_account_wide_plan_counts_non_tpsl_order_id_occupancy():
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "1001125090080798",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = ""
+    non_tpsl = {
+        "ordId": "1001125090080798",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "triggerOrderType": "TRIGGER",
+        "sz": "21",
+        "cTime": "1788316588000",
+    }
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate, non_tpsl],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+
+
+@pytest.mark.parametrize(
+    "conflicting_alias",
+    [
+        {"triggerOrderType": None},
+        {"orderId": "other-order"},
+        {"instrument_id": "ETH-USDT-SWAP"},
+        {"side": "short"},
+        {"size": "22"},
+        {"slTriggerPrice": "76299"},
+    ],
+)
+def test_account_wide_plan_rejects_conflicting_candidate_aliases(conflicting_alias):
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "1001125090080798",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = ""
+    candidate.update(conflicting_alias)
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+
+
+def test_account_wide_plan_never_falls_back_when_lineage_attestation_fails():
+    values = _lineage_attestation_inputs()
+    payload = json.loads(values["binding"].payload_json)
+    payload["submitted_orders"][0]["protection_response"]["data"][
+        "attached_on_trigger_order"
+    ] = False
+    values["binding"].payload_json = json.dumps(payload)
+    candidate = _pending_tpsl_row(
+        "candidate-after-position",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316600000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = ""
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+    assert plan.refusals[559].reason == (
+        "trigger_protection_submission_attestation_conflict"
+    )
+
+
+def test_direct_pos_id_remains_independent_of_attached_lineage_attestation():
+    values = _lineage_attestation_inputs()
+    payload = json.loads(values["binding"].payload_json)
+    payload["submitted_orders"][0]["protection_response"]["data"][
+        "attached_on_trigger_order"
+    ] = False
+    values["binding"].payload_json = json.dumps(payload)
+    candidate = _pending_tpsl_row(
+        "direct-stop",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = values["entry_leg"].pos_id
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=(),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert set(plan.actions) == {559}
+    assert plan.actions[559].order_id == "direct-stop"
+    assert plan.actions[559].evidence["match"] == "explicit_pos_id"
+    assert 559 not in plan.refusals
+
+
+def test_direct_pos_id_cannot_bypass_owner_request_alias_conflict():
+    values = _lineage_attestation_inputs()
+    request = json.loads(values["entry_leg"].request_json)
+    request["slTriggerPrice"] = "99999"
+    fingerprint = repair_module._trigger_protection_fingerprint(request)
+    values["entry_leg"].request_json = json.dumps(request)
+    values["parent_event"].request_json = json.dumps(request)
+    values["intent"].request_fingerprint = fingerprint
+    payload = json.loads(values["binding"].payload_json)
+    payload["submitted_orders"][0]["request"] = request
+    values["binding"].payload_json = json.dumps(payload)
+    candidate = _pending_tpsl_row(
+        "direct-stop",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = values["entry_leg"].pos_id
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+                lineage_evidence_required=True,
+                lineage_authority=True,
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+    assert plan.refusals[559].reason == "trigger_protection_intent_identity_invalid"
+
+
+def test_account_plan_rejects_order_adopted_by_other_intent():
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "direct-stop",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = values["entry_leg"].pos_id
+    other_intent = TriggerProtectionIntent(
+        id=999,
+        venue="deepcoin",
+        execution_binding_id=998,
+        execution_order_leg_id=997,
+        request_fingerprint="f" * 64,
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="other-intent",
+        recovery_state="adopted",
+        adopted_order_id="direct-stop",
+    )
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+                lineage_evidence_required=True,
+                lineage_authority=True,
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        existing_intents=(values["intent"], other_intent),
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+
+
+def test_lineage_required_context_without_binding_rejects_even_direct_pos_id():
+    values = _lineage_attestation_inputs()
+    candidate = _pending_tpsl_row(
+        "direct-stop",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316600000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = values["entry_leg"].pos_id
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=None,
+                lineage_evidence_required=True,
+                lineage_authority=True,
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    assert plan.actions == {}
+    assert plan.refusals[559].reason == (
+        "trigger_protection_submission_attestation_missing"
+    )
+
+
+def test_visible_exact_stop_alert_evidence_survives_child_lineage_ambiguity():
+    values = _lineage_attestation_inputs()
+    values["child_fill_rows"].append(
+        {
+            **values["child_fill_rows"][0],
+            "order_id": "other-child",
+            "pos_id": "other-child",
+        }
+    )
+    candidate = _pending_tpsl_row(
+        "visible-stop",
+        purpose="stop_loss",
+        price="76300",
+        ctime="1788316588000",
+        inst_id="BTC-USDT-SWAP",
+        side="long",
+        size="21",
+    )
+    candidate["posId"] = ""
+
+    plan = repair_module.plan_trigger_protection_intent_assignments(
+        contexts=(
+            repair_module.TriggerProtectionAssignmentContext(
+                entry_leg=values["entry_leg"],
+                intent=values["intent"],
+                parent_event=values["parent_event"],
+                live_position=values["live_position"],
+                binding=values["binding"],
+                child_fill_rows=tuple(values["child_fill_rows"]),
+            ),
+        ),
+        pending_tpsl_rows=[candidate],
+        existing_ledger_rows=[],
+        snapshot_complete=True,
+    )
+
+    refusal = plan.refusals[559]
+    assert refusal.reason == "trigger_protection_child_lineage_not_unique"
+    assert refusal.evidence["candidate_order_ids"] == ["visible-stop"]
+    assert refusal.evidence["native_stop_visible_ownership_unverified"] is True
 
 
 def _live_evidence_entry_leg(*, size="0.6"):
@@ -91,6 +841,7 @@ def _live_evidence_position(**updates):
         "instId": "ETH-USDT-SWAP",
         "posSide": "long",
         "pos": "0.6",
+        "mrgPosition": "split",
         "cTime": "1785609910000",
     }
     row.update(updates)
@@ -129,11 +880,27 @@ def test_trigger_protection_live_position_requires_exact_identity_and_size():
             "trigger_protection_position_instrument_conflict",
         ),
         (
+            [_live_evidence_position(instrument_id="BTC-USDT-SWAP")],
+            "trigger_protection_position_instrument_conflict",
+        ),
+        (
             [_live_evidence_position(posSide="short")],
             "trigger_protection_position_side_conflict",
         ),
         (
+            [_live_evidence_position(side="short")],
+            "trigger_protection_position_side_conflict",
+        ),
+        (
+            [_live_evidence_position(posId="pos-1", pos_id="other-pos")],
+            "trigger_protection_position_identity_conflict",
+        ),
+        (
             [_live_evidence_position(pos="0.5")],
+            "trigger_protection_position_size_changed",
+        ),
+        (
+            [_live_evidence_position(size="0.5")],
             "trigger_protection_position_size_changed",
         ),
         (
@@ -438,16 +1205,18 @@ def test_trigger_entry_repair_matches_unique_expected_protection_shape(tmp_path)
             {
                 "posId": "1001124219349221",
                 "instId": "ETH-USDT-SWAP",
-                "posSide": "short",
-                "pos": "4.4",
-                "cTime": "2026-07-20T00:11:12Z",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "mrgPosition": "split",
+                    "cTime": "2026-07-20T00:11:12Z",
             },
             {
                 "posId": "1001124219426042",
                 "instId": "ETH-USDT-SWAP",
-                "posSide": "short",
-                "pos": "6.2",
-                "cTime": "2026-07-20T00:13:13Z",
+                    "posSide": "short",
+                    "pos": "6.2",
+                    "mrgPosition": "split",
+                    "cTime": "2026-07-20T00:13:13Z",
             },
         ],
     )
@@ -522,9 +1291,10 @@ def test_failed_trigger_intent_repair_uses_verified_filled_leg_ownership(tmp_pat
                 {
                     "posId": "pos-1",
                     "instId": "ETH-USDT-SWAP",
-                    "posSide": "short",
-                    "pos": "0.5",
-                    "cTime": "2026-08-02T00:05:10Z",
+                        "posSide": "short",
+                        "pos": "0.5",
+                        "mrgPosition": "split",
+                        "cTime": "2026-08-02T00:05:10Z",
                 }
             ],
             "trigger_protection_position_size_changed",
@@ -727,6 +1497,60 @@ def test_trigger_protection_finalizer_refuses_order_bound_to_other_logical_leg(
     assert intent.recovery_state == "failed"
 
 
+def test_trigger_protection_finalizer_refuses_order_adopted_by_other_intent(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    filled_leg_id, sibling_leg_id = _seed_failed_trigger_intent_repair(
+        session_factory
+    )
+    plan = build_entry_protection_ledger_repair_plan(
+        session_factory,
+        deepcoin_client=FakeDeepcoinClient(
+            [_anonymous_stop_child("stop-child-1")]
+        ),
+        now=datetime(2026, 8, 2, 1, 0, tzinfo=UTC),
+        binding_id=152,
+        pos_id="pos-1",
+        include_trigger_entries=True,
+    )
+    action = plan.actions[0]
+    with session_factory() as session:
+        sibling_intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=sibling_leg_id
+        ).one()
+        sibling_intent.recovery_state = "adopted"
+        sibling_intent.adopted_order_id = "stop-child-1"
+        session.commit()
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        with pytest.raises(
+            ValueError, match="trigger_protection_intent_order_owned"
+        ):
+            finalize_trigger_protection_adoption(
+                session,
+                action=action,
+                intent=intent,
+                seen_at=datetime(2026, 8, 2, 1, 1, tzinfo=UTC),
+            )
+        session.rollback()
+
+    with session_factory() as session:
+        target = session.query(TriggerProtectionIntent).filter_by(
+            execution_order_leg_id=filled_leg_id
+        ).one()
+        primary = session.query(PositionProtectionLeg).filter_by(
+            execution_order_leg_id=filled_leg_id,
+            role="primary_stop",
+            leg_index=1,
+        ).one()
+    assert target.adopted_order_id is None
+    assert primary.exchange_order_id is None
+
+
 def test_failed_trigger_intent_repair_sibling_change_invalidates_fingerprint(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _, sibling_leg_id = _seed_failed_trigger_intent_repair(session_factory)
@@ -863,9 +1687,10 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
             {
                 "posId": "1001124219349221",
                 "instId": "ETH-USDT-SWAP",
-                "posSide": "short",
-                "pos": "4.4",
-                "cTime": "2026-07-20T00:11:12Z",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "mrgPosition": "split",
+                    "cTime": "2026-07-20T00:11:12Z",
             }
         ],
     )
@@ -942,6 +1767,7 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
                 pos_id="pos-1",
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
+                position_mode="split",
                 size_text="4.4",
                 created_at=datetime(2026, 7, 20, 0, 11, 12),
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
@@ -1003,6 +1829,7 @@ def test_intent_adoption_plans_one_new_exact_trigger_entry_protection(tmp_path):
                 pos_id="pos-1",
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
+                position_mode="split",
                 size_text="4.4",
                 created_at=datetime(2026, 7, 20, 0, 11, 12),
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
@@ -1584,6 +2411,7 @@ def _plan_intent_adoption(
                 pos_id="pos-1",
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
+                position_mode="split",
                 size_text=str(request.get("sz")),
                 created_at=live_position_created_at,
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
@@ -1670,6 +2498,7 @@ def test_adoption_refuses_generic_trigger_price_when_tp_and_sl_prices_are_equal(
                 pos_id="pos-1",
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
+                position_mode="split",
                 size_text="4.4",
                 created_at=datetime(2026, 7, 20, 0, 11, 12),
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
@@ -1816,9 +2645,10 @@ def test_trigger_entry_repair_refuses_duplicate_expected_protection_shape(tmp_pa
             {
                 "posId": "1001124219349221",
                 "instId": "ETH-USDT-SWAP",
-                "posSide": "short",
-                "pos": "4.4",
-                "cTime": "2026-07-20T00:11:12Z",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "mrgPosition": "split",
+                    "cTime": "2026-07-20T00:11:12Z",
             }
         ],
     )
@@ -2119,6 +2949,7 @@ def _plan_trigger_entry_adoption(
                 pos_id="pos-1",
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
+                position_mode="split",
                 size_text="4.4",
                 created_at=live_position_created_at,
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),

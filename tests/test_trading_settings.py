@@ -1091,6 +1091,70 @@ def test_position_management_liveness_v2_rejects_invalid_values(value):
         trading_settings_from_payload({"position_management_liveness_v2_mode": value})
 
 
+def test_trigger_protection_lineage_defaults_disabled_without_a_watermark():
+    settings = trading_settings_from_payload({})
+
+    assert settings.trigger_protection_lineage_attribution_mode == "disabled"
+    assert settings.trigger_protection_lineage_activation_after_intent_id is None
+    assert settings.effective_trigger_protection_lineage_attribution_mode == "disabled"
+
+
+def test_trigger_protection_lineage_live_requires_all_gates_and_watermark():
+    base = {
+        "trigger_protection_lineage_attribution_mode": "live",
+        "position_management_liveness_v2_mode": "live",
+        "management_execution_mode": "live",
+        "auto_trade_enabled": True,
+    }
+
+    missing_watermark = trading_settings_from_payload(base)
+    liveness_off = trading_settings_from_payload(
+        {**base, "trigger_protection_lineage_activation_after_intent_id": 177,
+         "position_management_liveness_v2_mode": "disabled"}
+    )
+    enabled = trading_settings_from_payload(
+        {**base, "trigger_protection_lineage_activation_after_intent_id": 177}
+    )
+
+    assert missing_watermark.effective_trigger_protection_lineage_attribution_mode == "disabled"
+    assert liveness_off.effective_trigger_protection_lineage_attribution_mode == "disabled"
+    assert enabled.effective_trigger_protection_lineage_attribution_mode == "live"
+
+
+def test_trigger_protection_lineage_shadow_requires_existing_liveness_gate():
+    disabled = trading_settings_from_payload(
+        {"trigger_protection_lineage_attribution_mode": "shadow"}
+    )
+    enabled = trading_settings_from_payload(
+        {
+            "trigger_protection_lineage_attribution_mode": "shadow",
+            "position_management_liveness_v2_mode": "shadow",
+        }
+    )
+
+    assert disabled.effective_trigger_protection_lineage_attribution_mode == "disabled"
+    assert enabled.effective_trigger_protection_lineage_attribution_mode == "shadow"
+
+
+@pytest.mark.parametrize("value", [True, False, "unsafe", [], {}, 1, None])
+def test_trigger_protection_lineage_rejects_invalid_modes(value):
+    with pytest.raises(ValueError, match="trigger_protection_lineage_attribution_mode"):
+        trading_settings_from_payload(
+            {"trigger_protection_lineage_attribution_mode": value}
+        )
+
+
+@pytest.mark.parametrize("value", [True, False, -1, "1", 1.5, [], {}])
+def test_trigger_protection_lineage_rejects_invalid_watermarks(value):
+    with pytest.raises(
+        ValueError,
+        match="trigger_protection_lineage_activation_after_intent_id",
+    ):
+        trading_settings_from_payload(
+            {"trigger_protection_lineage_activation_after_intent_id": value}
+        )
+
+
 def test_live_trigger_protection_stop_rescue_requires_both_execution_gates():
     disabled_globally = trading_settings_from_payload(
         {

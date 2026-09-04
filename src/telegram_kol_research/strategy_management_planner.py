@@ -917,10 +917,8 @@ def _plan_strategy_management_batch_locked(
             evidence_available=True,
             exact_order_position_ids=exact_order_position_ids,
         )
-        global_protection_order_id_counts = Counter(
-            order_id
-            for row in tpsl_orders
-            if (order_id := _exact_protection_order_id(row)) is not None
+        global_protection_order_id_counts = _protection_order_id_counts(
+            tpsl_orders
         )
         seen_protection_order_ids: set[str] = set()
         for position in economics:
@@ -2148,12 +2146,93 @@ def _persist_blocked(
             visibility_retry_attempts=(1 if reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS else 0),
             visibility_next_attempt_at=(planned_at + timedelta(seconds=5) if reason_code in _TEMPORARY_PROTECTION_VISIBILITY_REASONS else None),
         )
+    if reason_code == "protection_missing_cancellable_order_id":
+        _record_native_stop_management_blocked_transition(
+            session_factory,
+            identity=identity,
+            batch_id=int(existing.id),
+            created_at=planned_at,
+        )
     return ManagementPlanningResult(
         status="blocked",
         reason_code=reason_code,
         batch=existing,
         target_lifecycle_id=lifecycle.id,
     )
+
+
+def _record_native_stop_management_blocked_transition(
+    session_factory: sessionmaker,
+    *,
+    identity: _PlanningIdentity,
+    batch_id: int,
+    created_at: datetime,
+) -> None:
+    """Project a deduplicated transition only for a known ownership gap."""
+
+    with session_factory() as session:
+        for leg in identity.entry_legs:
+            leg_id = int(leg.id or 0)
+            pos_id = str(leg.pos_id or "").strip()
+            if not leg_id or not pos_id:
+                continue
+            prior = (
+                session.query(PositionProtectionIncident)
+                .filter(
+                    PositionProtectionIncident.execution_binding_id
+                    == int(identity.binding.id),
+                    PositionProtectionIncident.execution_order_leg_id == leg_id,
+                    PositionProtectionIncident.pos_id == pos_id,
+                    PositionProtectionIncident.incident_type
+                    == "native_stop_visible_ownership_unverified",
+                )
+                .order_by(PositionProtectionIncident.id.desc())
+                .first()
+            )
+            if prior is None:
+                continue
+            bounded = {
+                "state": "native_stop_ownership_management_blocked",
+                "management_batch_id": int(batch_id),
+                "prior_incident_id": int(prior.id),
+                "reason_code": "protection_missing_cancellable_order_id",
+            }
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "binding_id": int(identity.binding.id),
+                        "leg_id": leg_id,
+                        "pos_id": pos_id,
+                        **bounded,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            ).hexdigest()
+            exists = (
+                session.query(PositionProtectionIncident.id)
+                .filter(PositionProtectionIncident.fingerprint == fingerprint)
+                .first()
+            )
+            if exists is not None:
+                continue
+            session.add(
+                PositionProtectionIncident(
+                    venue=str(identity.binding.venue or "deepcoin"),
+                    execution_binding_id=int(identity.binding.id),
+                    execution_order_leg_id=leg_id,
+                    pos_id=pos_id,
+                    incident_type="native_stop_ownership_management_blocked",
+                    fingerprint=fingerprint,
+                    evidence_json=json.dumps(
+                        bounded, sort_keys=True, separators=(",", ":")
+                    ),
+                    delivery_status="pending",
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+        session.commit()
 
 
 def _retryable_preflight_blocked_batch(
@@ -2225,15 +2304,19 @@ _TEMPORARY_PROTECTION_VISIBILITY_REASONS = frozenset(
 
 
 def _pending_tpsl_snapshot_complete(snapshot, *, instrument_id: str) -> bool:
-    """Fail closed if this instrument's pending-TPSL response was incomplete."""
+    """Require a complete, account-coherent pending-TPSL snapshot."""
 
-    observations = getattr(snapshot, "pending_tpsl_observations", ())
+    observations = tuple(getattr(snapshot, "pending_tpsl_observations", ()))
     normalized_instrument = str(instrument_id).upper()
-    for observation in reversed(list(observations)):
-        if str(observation.get("instrument_id") or "").upper() != normalized_instrument:
-            continue
-        return bool(observation.get("complete"))
-    return True
+    target_observations = tuple(
+        observation
+        for observation in observations
+        if str(observation.get("instrument_id") or "").upper()
+        == normalized_instrument
+    )
+    return bool(target_observations) and all(
+        bool(observation.get("complete")) for observation in observations
+    )
 
 
 def _replace_retryable_preflight_blocked_batch_in_session(
@@ -2856,7 +2939,32 @@ def _ledger_row_matches_current_protection(
     *,
     position: dict[str, Any],
 ) -> bool:
-    if str(row.get("triggerOrderType") or "TPSL").upper() != "TPSL":
+    order_types = {
+        value.upper()
+        for value in _protection_alias_values(
+            row, "triggerOrderType", "trigger_order_type"
+        )
+    }
+    if order_types != {"TPSL"}:
+        return False
+    explicit_pos_ids = _protection_alias_values(
+        row, "posId", "pos_id", "positionId", "closePosId"
+    )
+    if explicit_pos_ids and explicit_pos_ids != {str(ledger.pos_id or "")}:
+        return False
+    instrument_aliases = {
+        value.upper()
+        for value in _protection_alias_values(
+            row, "instId", "instrument_id", "instrumentId"
+        )
+    }
+    if instrument_aliases != {str(ledger.instrument_id or "").upper()}:
+        return False
+    side_aliases = {
+        {"buy": "long", "sell": "short"}.get(value.lower(), value.lower())
+        for value in _protection_alias_values(row, "posSide", "pos_side", "side")
+    }
+    if side_aliases != {str(ledger.side or "").lower()}:
         return False
     if _instrument_id(row) != str(ledger.instrument_id or "").upper():
         return False
@@ -2868,14 +2976,30 @@ def _ledger_row_matches_current_protection(
         return False
     ledger_price = _to_float(ledger.trigger_price)
     if ledger_price is not None:
-        current_price = _protection_price(row, str(ledger.purpose or ""))
-        if current_price is None or current_price != ledger_price:
+        price_keys = (
+            ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
+            if str(ledger.purpose or "") in {"stop_loss", "sl", "loss"}
+            else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+        )
+        price_aliases = _protection_alias_values(row, *price_keys)
+        parsed_prices = {_to_float(value) for value in price_aliases}
+        if not price_aliases or None in parsed_prices or parsed_prices != {ledger_price}:
             return False
     ledger_size = _to_float(ledger.size_text)
-    row_size = _to_float(row.get("sz") or row.get("size"))
-    if ledger_size is not None and row_size is not None and row_size != ledger_size:
-        return False
+    row_size_aliases = _protection_alias_values(row, "sz", "size", "orderSize")
+    if ledger_size is not None:
+        parsed_sizes = {_to_float(value) for value in row_size_aliases}
+        if not row_size_aliases or None in parsed_sizes or parsed_sizes != {ledger_size}:
+            return False
     return True
+
+
+def _protection_alias_values(row: dict[str, Any], *keys: str) -> set[str]:
+    return {
+        str(row.get(key)).strip()
+        for key in keys
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
 
 
 def _instrument_id(row: dict[str, Any]) -> str:
@@ -2916,11 +3040,19 @@ def _unique_float_values(values: list[float]) -> list[float]:
 
 
 def _exact_protection_order_id(row: dict[str, Any]) -> str | None:
-    for key in ("ordId", "orderId", "order_id"):
-        value = str(row.get(key) or "").strip()
-        if value:
-            return value
-    return None
+    aliases = _protection_alias_values(row, "ordId", "orderId", "order_id")
+    return next(iter(aliases)) if len(aliases) == 1 else None
+
+
+def _protection_order_id_counts(rows: list[dict[str, Any]]) -> Counter:
+    return Counter(
+        order_id
+        for row in rows
+        if isinstance(row, dict)
+        for order_id in _protection_alias_values(
+            row, "ordId", "orderId", "order_id"
+        )
+    )
 
 
 def _pending_order_ids_by_pos(rows: Any) -> dict[str, set[str]]:

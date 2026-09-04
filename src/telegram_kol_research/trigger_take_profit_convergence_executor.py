@@ -10,7 +10,10 @@ from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+from telegram_kol_research.deepcoin_client import (
+    DeepcoinDefiniteRejection,
+    DeepcoinRequestOutcomeUnknown,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -36,6 +39,9 @@ from telegram_kol_research.position_take_profit_orders import (
 )
 from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_snapshot import (
+    read_complete_pending_tpsl_snapshot,
+)
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.native_tpsl import (
@@ -53,6 +59,7 @@ class TriggerTakeProfitConvergencePlan:
     reason_code: str | None = None
     cancel_order_ids: tuple[str, ...] = ()
     payloads: tuple[dict[str, str], ...] = ()
+    position_size_text: str | None = None
 
 
 def plan_trigger_take_profit_convergence(
@@ -100,10 +107,13 @@ def plan_trigger_take_profit_convergence(
                 convergence.updated_at = planned_at
             session.commit()
             return TriggerTakeProfitConvergencePlan(convergence.status, prepared)
-        cancel_order_ids, payloads = prepared
+        cancel_order_ids, payloads, position_size_text = prepared
         session.commit()
         return TriggerTakeProfitConvergencePlan(
-            "ready", cancel_order_ids=tuple(cancel_order_ids), payloads=tuple(payloads)
+            "ready",
+            cancel_order_ids=tuple(cancel_order_ids),
+            payloads=tuple(payloads),
+            position_size_text=position_size_text,
         )
 
 
@@ -150,6 +160,20 @@ def execute_trigger_take_profit_convergence(
         session.commit()
 
     for payload_index, payload in enumerate(plan.payloads):
+        prewrite_reason = _revalidate_take_profit_write(
+            session_factory,
+            convergence_id=convergence_id,
+            deepcoin_client=deepcoin_client,
+            payload=payload,
+            expected_position_size=plan.position_size_text,
+        )
+        if prewrite_reason is not None:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                prewrite_reason,
+            )
         try:
             response = submit_exact_position_sltp(
                 session_factory=session_factory,
@@ -165,6 +189,7 @@ def execute_trigger_take_profit_convergence(
                     session_factory, pos_id=target_pos_id
                 ),
                 now_provider=lambda: now,
+                require_readback=True,
             )
         except DeepcoinDefiniteRejection as exc:
             return _freeze(
@@ -172,6 +197,14 @@ def execute_trigger_take_profit_convergence(
                 convergence_id,
                 now,
                 "convergence_submit_rejected",
+                error=exc,
+            )
+        except DeepcoinRequestOutcomeUnknown as exc:
+            return _freeze(
+                session_factory,
+                convergence_id,
+                now,
+                "convergence_take_profit_submit_unknown",
                 error=exc,
             )
         except Exception as exc:
@@ -187,7 +220,10 @@ def execute_trigger_take_profit_convergence(
                 inst_id=str(payload["instId"]),
                 side=str(payload["posSide"]),
             )
-            pending = list(deepcoin_client.list_trigger_orders_pending(inst_id=str(payload["instId"])))
+            pending = read_complete_pending_tpsl_snapshot(
+                deepcoin_client,
+                instrument_id=str(payload["instId"]),
+            )
             verified = _verified_native_take_profit(
                 position=exact_position,
                 open_positions=open_positions,
@@ -448,20 +484,29 @@ def _prepare_plan(
     inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP"
     try:
         positions = deepcoin_client.list_positions(inst_id=inst_id)
-        pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
+        pending = read_complete_pending_tpsl_snapshot(
+            deepcoin_client,
+            instrument_id=inst_id,
+        )
     except Exception:
         return "convergence_exchange_preflight_unavailable"
-    matches = [
-        row for row in positions if isinstance(row, dict)
-        and str(row.get("instId") or "").upper() == inst_id
-        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and str(row.get("posSide") or row.get("pos_side") or "").lower() == str(binding.side).lower()
-        and str(row.get("mrgPosition") or row.get("posMode") or "").lower() == "split"
-        and _positive_decimal(row.get("pos")) is not None
-    ]
-    if len(matches) != 1:
+    try:
+        position = _exact_live_position(
+            [row for row in positions if isinstance(row, dict)],
+            pos_id=pos_id,
+            inst_id=inst_id,
+            side=str(binding.side).lower(),
+        )
+    except Exception:
         return "convergence_exact_live_position_not_verified"
-    size = _positive_decimal(matches[0].get("pos"))
+    if any(
+        _row_has_protection_fields(row)
+        and not _native_tpsl_aliases_consistent(row)
+        for row in pending
+        if isinstance(row, dict)
+    ):
+        return "convergence_pending_alias_conflict"
+    size = _positive_decimal(position.get("pos") or position.get("size"))
     assert size is not None
     stop_rows = (
         session.query(PositionProtectionLedger)
@@ -474,7 +519,7 @@ def _prepare_plan(
     )
     verified_primary = _verified_native_primary_stop_row(
         stop_rows=stop_rows,
-        position=matches[0],
+        position=position,
         open_positions=positions,
         pending=pending,
         position_size=size,
@@ -487,7 +532,7 @@ def _prepare_plan(
         inst_id=inst_id,
         side=str(binding.side).lower(),
         pending=pending,
-        position=matches[0],
+        position=position,
         open_positions=positions,
     )
     if verified_primary is None and not has_backup:
@@ -592,7 +637,7 @@ def _prepare_plan(
         if payload is None or str(order.size_text or "") != payload["sz"]:
             return "convergence_owned_take_profit_mismatch"
         verified_take_profit = _verified_native_take_profit(
-            position=matches[0],
+            position=position,
             open_positions=positions,
             pending=pending,
             order_id=str(order.order_id),
@@ -667,7 +712,97 @@ def _prepare_plan(
             return "convergence_protection_leg_conflict"
     if not missing_payloads:
         return "convergence_take_profit_already_converged"
-    return [], missing_payloads
+    return [], missing_payloads, _decimal_text(size)
+
+
+def _revalidate_take_profit_write(
+    session_factory,
+    *,
+    convergence_id: int,
+    deepcoin_client,
+    payload: dict[str, str],
+    expected_position_size: str | None,
+) -> str | None:
+    """Re-prove the exact position and protection absence before every TP write."""
+
+    try:
+        positions = list(deepcoin_client.list_positions(inst_id=payload["instId"]))
+        position = _exact_live_position(
+            positions,
+            pos_id=payload["posId"],
+            inst_id=payload["instId"],
+            side=payload["posSide"],
+        )
+        pending = read_complete_pending_tpsl_snapshot(
+            deepcoin_client,
+            instrument_id=payload["instId"],
+        )
+    except Exception:
+        return "convergence_exchange_prewrite_snapshot_incomplete"
+    if any(
+        _row_has_protection_fields(row)
+        and not _native_tpsl_aliases_consistent(row)
+        for row in pending
+        if isinstance(row, dict)
+    ):
+        return "convergence_pending_alias_conflict_before_write"
+    if _positive_decimal(position.get("pos")) != _positive_decimal(
+        expected_position_size
+    ):
+        return "convergence_position_size_changed_before_write"
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        if convergence is None or str(convergence.status) != "reserved":
+            return "convergence_reservation_lost_before_write"
+        if block_reason := protection_write_block_reason(
+            session, pos_id=str(convergence.pos_id)
+        ):
+            return f"convergence_{block_reason}"
+        active_orders = (
+            session.query(PositionTakeProfitOrder)
+            .filter(PositionTakeProfitOrder.venue == "deepcoin")
+            .filter(
+                PositionTakeProfitOrder.execution_binding_id
+                == convergence.execution_binding_id
+            )
+            .filter(
+                PositionTakeProfitOrder.execution_order_leg_id
+                == convergence.execution_order_leg_id
+            )
+            .filter(PositionTakeProfitOrder.pos_id == convergence.pos_id)
+            .filter(PositionTakeProfitOrder.status == "active")
+            .all()
+        )
+        owned_order_ids = {
+            str(order.order_id)
+            for order in active_orders
+            if str(order.order_id or "").strip()
+        }
+        known_order_position_ids = {
+            str(row.order_id): str(row.pos_id)
+            for row in session.query(PositionProtectionLedger)
+            .filter(PositionProtectionLedger.venue == "deepcoin")
+            .filter(PositionProtectionLedger.status == "verified")
+            .filter(PositionProtectionLedger.order_id.is_not(None))
+            .all()
+            if str(row.order_id or "").strip() and str(row.pos_id or "").strip()
+        }
+        if _unowned_pending_take_profit_present(
+            pending=pending,
+            inst_id=payload["instId"],
+            side=payload["posSide"],
+            pos_id=payload["posId"],
+            owned_order_ids=owned_order_ids,
+            known_order_position_ids=known_order_position_ids,
+        ):
+            return "convergence_unowned_take_profit_before_write"
+        if any(
+            str(order.trigger_price) == payload["tpTriggerPx"]
+            and str(order.size_text or "") == payload["sz"]
+            for order in active_orders
+        ):
+            return "convergence_target_already_present_before_write"
+    return None
 
 
 def has_verified_exact_backup_stop(
@@ -696,10 +831,8 @@ def has_verified_exact_backup_stop(
         .order_by(PositionBackupStopOrder.id.asc())
         .all()
     )
-    if (
-        str(position.get("instId") or "").upper() != inst_id
-        or str(position.get("posId") or position.get("pos_id") or "") != pos_id
-        or str(position.get("posSide") or position.get("side") or "").lower() != side
+    if not _live_position_aliases_match(
+        position, pos_id=pos_id, inst_id=inst_id, side=side
     ):
         return False
     for row in rows:
@@ -726,22 +859,43 @@ def has_verified_exact_backup_stop(
             item
             for item in pending
             if isinstance(item, dict)
-            and str(item.get("ordId") or item.get("orderId") or "")
-            == str(row.order_id)
+            and _native_tpsl_aliases_consistent(item)
+            and _text_alias_values(
+                item, "ordId", "orderId", "order_id", "id"
+            )
+            == {str(row.order_id)}
         ]
         if len(same_order_pending) != 1:
             continue
         pending_match = same_order_pending[0]
         if not (
-            str(pending_match.get("instId") or "").upper() == inst_id
-            and str(pending_match.get("posId") or "") == pos_id
-            and str(pending_match.get("posSide") or "").lower() == side
-            and _positive_decimal(
-                pending_match.get("slTriggerPx")
-                or pending_match.get("slTriggerPrice")
-                or pending_match.get("triggerPrice")
+            _text_alias_values(
+                pending_match,
+                "instId",
+                "instrument_id",
+                "instrumentId",
+                transform=str.upper,
             )
-            == _positive_decimal(row.trigger_price)
+            == {inst_id}
+            and _text_alias_values(
+                pending_match, "posId", "pos_id", "closePosId"
+            )
+            == {pos_id}
+            and _text_alias_values(
+                pending_match,
+                "posSide",
+                "pos_side",
+                "side",
+                transform=_normalize_position_side_alias,
+            )
+            == {_normalize_position_side_alias(side)}
+            and _numeric_alias_values(
+                pending_match,
+                "slTriggerPx",
+                "slTriggerPrice",
+                "closeSLTriggerPrice",
+            )
+            == {_positive_decimal(row.trigger_price)}
             and _native_stop_loss_is_market(pending_match)
         ):
             continue
@@ -842,6 +996,8 @@ def exact_owned_stop_evidence_fingerprint(
     for raw in pending:
         if not isinstance(raw, dict):
             continue
+        if not _native_tpsl_aliases_consistent(raw):
+            continue
         order_id = str(raw.get("ordId") or raw.get("orderId") or "")
         if order_id not in owned_order_ids:
             continue
@@ -899,7 +1055,12 @@ def _verified_native_primary_stop_row(
         for size in (position_size, Decimal("0")):
             match = match_native_tpsl_order(
                 position,
-                [item for item in pending if isinstance(item, dict)],
+                [
+                    item
+                    for item in pending
+                    if isinstance(item, dict)
+                    and _native_tpsl_aliases_consistent(item)
+                ],
                 NativeTpslExpectation(
                     purpose="stop_loss",
                     trigger_price=str(row.trigger_price),
@@ -923,7 +1084,12 @@ def _verified_native_take_profit(
 ) -> NativeTpslOrder | None:
     match = match_native_tpsl_order(
         position,
-        [item for item in pending if isinstance(item, dict)],
+        [
+            item
+            for item in pending
+            if isinstance(item, dict)
+            and _native_tpsl_aliases_consistent(item)
+        ],
         NativeTpslExpectation(
             purpose="take_profit",
             trigger_price=payload["tpTriggerPx"], size=payload["sz"], ord_id=order_id,
@@ -951,13 +1117,45 @@ def _unowned_pending_take_profit_present(
     for raw in pending:
         if not isinstance(raw, dict):
             continue
-        order = normalize_native_tpsl(raw)
+        if not _row_has_take_profit_fields(raw):
+            continue
+        order_types = _text_alias_values(
+            raw, "triggerOrderType", "trigger_order_type", transform=str.upper
+        )
+        if order_types and order_types != {"TPSL"}:
+            if len(order_types) == 1:
+                continue
+            return True
         if (
-            order is None
-            or order.take_profit_trigger_price is None
-            or order.inst_id != inst_id
-            or order.pos_side != side
+            order_types != {"TPSL"}
+            or not _native_tpsl_aliases_consistent(raw)
         ):
+            return True
+        instrument_ids = _text_alias_values(
+            raw,
+            "instId",
+            "instrument_id",
+            "instrumentId",
+            transform=str.upper,
+        )
+        sides = _text_alias_values(
+            raw,
+            "posSide",
+            "pos_side",
+            "side",
+            transform=_normalize_position_side_alias,
+        )
+        if len(instrument_ids) != 1 or len(sides) != 1:
+            return True
+        if (
+            instrument_ids != {inst_id.upper()}
+            or sides != {_normalize_position_side_alias(side)}
+        ):
+            continue
+        order = normalize_native_tpsl(raw)
+        if order is None or order.take_profit_trigger_price is None:
+            return True
+        if order.inst_id != inst_id or order.pos_side != side:
             continue
         if order.pos_id is not None and order.pos_id != pos_id:
             continue
@@ -978,18 +1176,164 @@ def _exact_live_position(
     inst_id: str,
     side: str,
 ) -> dict[str, object]:
+    if any(
+        not _live_position_aliases_consistent(row)
+        for row in positions
+        if isinstance(row, dict)
+    ):
+        raise RuntimeError("live_position_snapshot_alias_conflict")
     matches = [
         row for row in positions
         if isinstance(row, dict)
-        and str(row.get("posId") or row.get("pos_id") or "") == pos_id
-        and str(row.get("instId") or "").upper() == inst_id.upper()
-        and str(row.get("posSide") or row.get("side") or "").lower() == side.lower()
-        and str(row.get("mrgPosition") or row.get("posMode") or "").lower() == "split"
-        and _positive_decimal(row.get("pos") or row.get("size")) is not None
+        and _live_position_aliases_match(
+            row, pos_id=pos_id, inst_id=inst_id, side=side
+        )
     ]
     if len(matches) != 1:
         raise RuntimeError("live_position_snapshot_not_unique_or_mismatched")
     return matches[0]
+
+
+def _live_position_aliases_match(
+    row: dict[str, object], *, pos_id: str, inst_id: str, side: str
+) -> bool:
+    return (
+        _live_position_aliases_consistent(row)
+        and
+        _text_alias_values(row, "posId", "pos_id") == {str(pos_id)}
+        and _text_alias_values(
+            row, "instId", "instrument_id", "instrumentId", transform=str.upper
+        )
+        == {str(inst_id).upper()}
+        and _text_alias_values(
+            row,
+            "posSide",
+            "pos_side",
+            "side",
+            transform=_normalize_position_side_alias,
+        )
+        == {_normalize_position_side_alias(side)}
+        and _text_alias_values(
+            row,
+            "mrgPosition",
+            "posMode",
+            "positionMode",
+            transform=str.lower,
+        )
+        == {"split"}
+    )
+
+
+def _live_position_aliases_consistent(row: dict[str, object]) -> bool:
+    size_values = _numeric_alias_values(row, "pos", "size", "sz")
+    return (
+        len(_text_alias_values(row, "posId", "pos_id")) == 1
+        and len(
+            _text_alias_values(
+                row,
+                "instId",
+                "instrument_id",
+                "instrumentId",
+                transform=str.upper,
+            )
+        )
+        == 1
+        and len(
+            _text_alias_values(
+                row,
+                "posSide",
+                "pos_side",
+                "side",
+                transform=_normalize_position_side_alias,
+            )
+        )
+        == 1
+        and _text_alias_values(
+            row,
+            "mrgPosition",
+            "posMode",
+            "positionMode",
+            transform=str.lower,
+        )
+        == {"split"}
+        and len(size_values) == 1
+        and next(iter(size_values)) > 0
+    )
+
+
+def _native_tpsl_aliases_consistent(row: dict[str, object]) -> bool:
+    text_groups = (
+        (("ordId", "orderId", "order_id", "id"), str),
+        (("instId", "instrument_id", "instrumentId"), str.upper),
+        (("posId", "pos_id", "closePosId"), str),
+        (("posSide", "pos_side", "side"), _normalize_position_side_alias),
+        (("triggerOrderType", "trigger_order_type"), str.upper),
+    )
+    numeric_groups = (
+        ("sz", "size", "orderSize"),
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"),
+        ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"),
+        ("slOrdPx", "slOrderPrice"),
+        ("tpOrdPx", "tpOrderPrice"),
+    )
+    return all(
+        len(_text_alias_values(row, *keys, transform=transform)) <= 1
+        for keys, transform in text_groups
+    ) and all(len(_numeric_alias_values(row, *keys)) <= 1 for keys in numeric_groups)
+
+
+def _normalize_position_side_alias(value: str) -> str:
+    normalized = str(value).strip().lower()
+    return {"buy": "long", "sell": "short"}.get(normalized, normalized)
+
+
+def _row_has_protection_fields(row: dict[str, object]) -> bool:
+    return any(
+        row.get(key) not in (None, "")
+        for key in (
+            "slTriggerPx",
+            "slTriggerPrice",
+            "closeSLTriggerPrice",
+            "tpTriggerPx",
+            "tpTriggerPrice",
+            "closeTPTriggerPrice",
+        )
+    )
+
+
+def _row_has_take_profit_fields(row: dict[str, object]) -> bool:
+    return any(
+        row.get(key) not in (None, "")
+        for key in (
+            "tpTriggerPx",
+            "tpTriggerPrice",
+            "closeTPTriggerPrice",
+        )
+    )
+
+
+def _text_alias_values(
+    row: dict[str, object], *keys: str, transform=lambda value: value
+) -> set[str]:
+    return {
+        transform(str(row[key]).strip())
+        for key in keys
+        if row.get(key) is not None and str(row[key]).strip()
+    }
+
+
+def _numeric_alias_values(
+    row: dict[str, object], *keys: str
+) -> set[Decimal]:
+    values: set[Decimal] = set()
+    for key in keys:
+        if row.get(key) in (None, ""):
+            continue
+        parsed = _decimal(row[key])
+        if parsed is None:
+            return {Decimal("0"), Decimal("1")}
+        values.add(parsed)
+    return values
 
 
 def _targets(value: str):

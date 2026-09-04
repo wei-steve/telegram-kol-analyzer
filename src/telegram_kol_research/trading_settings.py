@@ -73,6 +73,10 @@ class TradingSettings:
     position_management_liveness_v2_mode: Literal[
         "disabled", "shadow", "live"
     ] = "disabled"
+    trigger_protection_lineage_attribution_mode: Literal[
+        "disabled", "shadow", "live"
+    ] = "disabled"
+    trigger_protection_lineage_activation_after_intent_id: int | None = None
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
     entry_message_assembly_v2_mode: Literal[
         "disabled", "shadow", "live"
@@ -198,6 +202,26 @@ class TradingSettings:
             self.position_management_liveness_v2_mode == "live"
             and self.auto_trade_enabled
             and self.management_execution_mode == "live"
+        ):
+            return "live"
+        return "disabled"
+
+    @property
+    def effective_trigger_protection_lineage_attribution_mode(
+        self,
+    ) -> Literal["disabled", "shadow", "live"]:
+        liveness_mode = self.effective_position_management_liveness_v2_mode
+        if (
+            self.trigger_protection_lineage_attribution_mode == "shadow"
+            and liveness_mode in {"shadow", "live"}
+        ):
+            return "shadow"
+        if (
+            self.trigger_protection_lineage_attribution_mode == "live"
+            and liveness_mode == "live"
+            and type(self.trigger_protection_lineage_activation_after_intent_id)
+            is int
+            and self.trigger_protection_lineage_activation_after_intent_id >= 0
         ):
             return "live"
         return "disabled"
@@ -460,6 +484,22 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         field_name="position_management_liveness_v2_mode",
     )
+    trigger_protection_lineage_attribution_mode = _rollout_mode(
+        raw.get(
+            "trigger_protection_lineage_attribution_mode",
+            defaults.trigger_protection_lineage_attribution_mode,
+        ),
+        field_name="trigger_protection_lineage_attribution_mode",
+    )
+    trigger_protection_lineage_activation_after_intent_id = (
+        _optional_nonnegative_int_setting(
+            raw.get(
+                "trigger_protection_lineage_activation_after_intent_id",
+                defaults.trigger_protection_lineage_activation_after_intent_id,
+            ),
+            field_name="trigger_protection_lineage_activation_after_intent_id",
+        )
+    )
     entry_preamble_mode = _entry_preamble_mode(
         raw.get("entry_preamble_mode", defaults.entry_preamble_mode)
     )
@@ -559,6 +599,12 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         composite_management_v2_mode=composite_management_v2_mode,
         trigger_protection_stop_rescue_mode=trigger_protection_stop_rescue_mode,
         position_management_liveness_v2_mode=position_management_liveness_v2_mode,
+        trigger_protection_lineage_attribution_mode=(
+            trigger_protection_lineage_attribution_mode
+        ),
+        trigger_protection_lineage_activation_after_intent_id=(
+            trigger_protection_lineage_activation_after_intent_id
+        ),
         entry_preamble_mode=entry_preamble_mode,
         entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,
         entry_revision_v2_mode=entry_revision_v2_mode,
@@ -798,6 +844,16 @@ def _nonnegative_int_setting(value: Any, *, field_name: str) -> int:
     if type(value) is not int or value < 0:
         raise ValueError(f"{field_name} must be a nonnegative integer")
     return value
+
+
+def _optional_nonnegative_int_setting(
+    value: Any,
+    *,
+    field_name: str,
+) -> int | None:
+    if value is None:
+        return None
+    return _nonnegative_int_setting(value, field_name=field_name)
 
 
 def _bounded_int_setting(

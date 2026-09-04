@@ -111,6 +111,9 @@ class DeepcoinTradingClientProtocol(Protocol):
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return historical regular orders, optionally filtered by instrument."""
 
+    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        """Return raw regular-order history for completeness auditing."""
+
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         """Return recent trade fills, optionally filtered by instrument."""
 
@@ -130,6 +133,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_trigger_order_history(self, *, inst_id: str) -> list[dict[str, Any]]:
         """Return historical trigger / TPSL orders for one instrument."""
+
+    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+        """Return raw trigger-order history for completeness auditing."""
 
     def list_trigger_order_history_by_order_id(
         self,
@@ -436,6 +442,15 @@ class DeepcoinRestClient:
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_HISTORY_PATH)
 
+    def read_order_history(self, *, inst_id: str | None = None) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id, "limit": 100},
+            ),
+        )
+
     def list_trade_fills(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(
             "GET",
@@ -500,6 +515,15 @@ class DeepcoinRestClient:
             ),
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
+
+    def read_trigger_order_history(self, *, inst_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            _path_with_query(
+                DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH,
+                {"instType": "SWAP", "instId": inst_id, "limit": 100},
+            ),
+        )
 
     def list_trigger_order_history_by_order_id(
         self,

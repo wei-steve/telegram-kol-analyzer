@@ -28,7 +28,13 @@ from telegram_kol_research.position_protection_legs import (
     bind_verified_exchange_order,
     protection_write_block_reason,
 )
-from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.protection_ledger import (
+    load_account_protection_ownership,
+    upsert_protection_ledger_row,
+)
+from telegram_kol_research.protection_snapshot import (
+    read_complete_pending_tpsl_snapshot,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.trigger_backup_stop import BackupStopError
 from telegram_kol_research.trigger_backup_stop import build_backup_stop_trigger_payload
@@ -66,8 +72,8 @@ def submit_verified_trigger_backup_stops(
     """
 
     list_positions = getattr(client, "list_positions", None)
-    list_pending = getattr(client, "list_trigger_orders_pending", None)
-    if not callable(list_positions) or not callable(list_pending):
+    read_pending = getattr(client, "read_trigger_orders_pending", None)
+    if not callable(list_positions) or not callable(read_pending):
         return 0
     settings = load_trading_settings(session_factory)
     backup_stop_buffer_bps = settings.trigger_backup_stop_buffer_bps
@@ -161,14 +167,19 @@ def submit_verified_trigger_backup_stops(
             instrument_id = row.instrument_id
         try:
             post_submit_positions = list(client.list_positions())
-            exact_post_submit = [
-                row for row in post_submit_positions if isinstance(row, dict)
-                and str(row.get("posId") or row.get("pos_id") or "") == plan.pos_id
-            ]
-            if len(exact_post_submit) != 1 or not _live_position_matches_plan(
-                exact_post_submit[0],
-                plan,
+            if any(
+                not _live_position_aliases_consistent(row)
+                for row in post_submit_positions
+                if isinstance(row, dict)
             ):
+                raise RuntimeError("live_position_snapshot_alias_conflict")
+            exact_post_submit = [
+                row
+                for row in post_submit_positions
+                if isinstance(row, dict)
+                and _live_position_matches_plan(row, plan)
+            ]
+            if len(exact_post_submit) != 1:
                 raise RuntimeError("live_position_snapshot_not_unique_or_mismatched")
             pending = _read_pending_trigger_orders(client, instrument_id=instrument_id)
             primary_is_still_verified = _pending_matches_primary(
@@ -371,16 +382,28 @@ def _plan_submission(
             status="exchange_unavailable", reason_code="live_position_snapshot_unavailable",
             binding_id=binding_id, leg_id=leg_id, pos_id=pos_id,
         )
-    exact = [row for row in positions if isinstance(row, dict) and str(row.get("posId") or row.get("pos_id") or "") == pos_id]
+    if any(
+        not _live_position_aliases_consistent(row)
+        for row in positions
+        if isinstance(row, dict)
+    ):
+        return _blocked_plan(
+            binding_id, leg_id, pos_id, "live_position_alias_conflict"
+        )
+    exact = [
+        row
+        for row in positions
+        if isinstance(row, dict)
+        and _live_position_aliases_match(
+            row,
+            pos_id=pos_id,
+            instrument_id=instrument_id,
+            side=str(binding.side).lower(),
+        )
+    ]
     if len(exact) != 1:
         return _blocked_plan(binding_id, leg_id, pos_id, "live_position_not_unique")
     position = exact[0]
-    if str(position.get("instId") or "").upper() != instrument_id:
-        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_instrument_mismatch")
-    if str(position.get("posSide") or position.get("side") or "").lower() != str(binding.side).lower():
-        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_side_mismatch")
-    if str(position.get("mrgPosition") or position.get("posMode") or "split").lower() != "split":
-        return _blocked_plan(binding_id, leg_id, pos_id, "live_position_mode_not_split")
     try:
         pending_before_submit = _read_pending_trigger_orders(client, instrument_id=instrument_id)
     except Exception:
@@ -399,6 +422,26 @@ def _plan_submission(
         open_positions=tuple(row for row in positions if isinstance(row, dict)),
     ):
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_missing_on_exchange")
+    ownership = load_account_protection_ownership(
+        session,
+        live_pos_ids={
+            next(iter(_text_alias_values(row, "posId", "pos_id")))
+            for row in positions
+            if isinstance(row, dict)
+            and _live_position_aliases_consistent(row)
+        },
+    )
+    if _unowned_pending_stop_can_affect_position(
+        pending=pending_before_submit,
+        instrument_id=instrument_id,
+        side=str(binding.side).lower(),
+        pos_id=pos_id,
+        primary_order_id=primary_order_id,
+        ownership=ownership,
+    ):
+        return _blocked_plan(
+            binding_id, leg_id, pos_id, "unowned_pending_stop_present"
+        )
     liquidation = position.get("liqPx") or position.get("liquidationPrice")
     if liquidation in (None, "", "0"):
         return _blocked_plan(binding_id, leg_id, pos_id, "liquidation_price_unavailable")
@@ -570,22 +613,75 @@ def _response_order_id(response: Any) -> str | None:
     rows = data if isinstance(data, list) else [data, response]
     for row in rows:
         if isinstance(row, dict):
-            value = row.get("ordId") or row.get("orderId") or row.get("id")
-            if value:
-                return str(value)
+            aliases = _text_alias_values(
+                row, "ordId", "orderId", "order_id", "id"
+            )
+            if len(aliases) == 1:
+                return next(iter(aliases))
     return None
 
 
 def _read_pending_trigger_orders(client: Any, *, instrument_id: str) -> list[dict[str, Any]]:
-    reader = getattr(client, "list_trigger_orders_pending", None)
-    if not callable(reader):
-        raise RuntimeError("pending trigger order readback unavailable")
-    response = reader(inst_id=instrument_id)
-    if isinstance(response, dict):
-        response = response.get("data", [])
-    if not isinstance(response, list):
-        raise RuntimeError("pending trigger order response malformed")
-    return [row for row in response if isinstance(row, dict)]
+    return read_complete_pending_tpsl_snapshot(
+        client,
+        instrument_id=instrument_id,
+    )
+
+
+def _unowned_pending_stop_can_affect_position(
+    *, pending, instrument_id, side, pos_id, primary_order_id, ownership
+) -> bool:
+    for raw in pending:
+        if not _row_has_stop_fields(raw):
+            continue
+        order_types = _text_alias_values(
+            raw, "triggerOrderType", "trigger_order_type", transform=str.upper
+        )
+        if order_types and order_types != {"TPSL"}:
+            if len(order_types) == 1:
+                continue
+            return True
+        if order_types != {"TPSL"} or not _native_tpsl_aliases_consistent(raw):
+            return True
+        instrument_ids = _text_alias_values(
+            raw,
+            "instId",
+            "instrument_id",
+            "instrumentId",
+            transform=str.upper,
+        )
+        sides = _text_alias_values(
+            raw,
+            "posSide",
+            "pos_side",
+            "side",
+            transform=_normalize_position_side_alias,
+        )
+        if len(instrument_ids) != 1 or len(sides) != 1:
+            return True
+        if (
+            instrument_ids != {instrument_id.upper()}
+            or sides != {_normalize_position_side_alias(side)}
+        ):
+            continue
+        order = normalize_native_tpsl(raw)
+        if order is None:
+            return True
+        if (
+            order.stop_loss_trigger_price is None
+            or order.inst_id != instrument_id
+            or order.pos_side != side
+            or order.ord_id == primary_order_id
+        ):
+            continue
+        if order.pos_id is not None and order.pos_id != pos_id:
+            continue
+        known_owner = ownership.owner_for_order(order.ord_id)
+        if known_owner is not None and known_owner.pos_id != pos_id:
+            continue
+        if known_owner is None:
+            return True
+    return False
 
 
 def _pending_matches_backup(
@@ -600,7 +696,11 @@ def _pending_matches_backup(
         return None
     match = match_native_tpsl_order(
         position,
-        pending,
+        [
+            row
+            for row in pending
+            if _native_tpsl_aliases_consistent(row)
+        ],
         NativeTpslExpectation(
             purpose="stop_loss",
             trigger_price=payload["slTriggerPx"],
@@ -629,13 +729,19 @@ def _pending_matches_primary(
     exact = [
         order
         for raw in pending
-        if (order := normalize_native_tpsl(raw)) is not None and order.ord_id == order_id
+        if _native_tpsl_aliases_consistent(raw)
+        and (order := normalize_native_tpsl(raw)) is not None
+        and order.ord_id == order_id
     ]
     if len(exact) != 1 or exact[0].size is None:
         return False
     match = match_native_tpsl_order(
         position,
-        pending,
+        [
+            row
+            for row in pending
+            if _native_tpsl_aliases_consistent(row)
+        ],
         NativeTpslExpectation(
             purpose="stop_loss",
             trigger_price=trigger_price,
@@ -650,13 +756,137 @@ def _pending_matches_primary(
 def _live_position_matches_plan(position: dict[str, Any], plan: BackupStopPlan) -> bool:
     if plan.pos_id is None or plan.payload is None:
         return False
-    return (
-        str(position.get("posId") or position.get("pos_id") or "") == plan.pos_id
-        and str(position.get("instId") or "").upper() == plan.payload["instId"]
-        and str(position.get("posSide") or position.get("side") or "").lower()
-        == plan.payload["posSide"]
-        and str(position.get("mrgPosition") or position.get("posMode") or "").lower() == "split"
+    return _live_position_aliases_match(
+        position,
+        pos_id=plan.pos_id,
+        instrument_id=plan.payload["instId"],
+        side=plan.payload["posSide"],
     )
+
+
+def _live_position_aliases_match(
+    row: dict[str, Any], *, pos_id: str, instrument_id: str, side: str
+) -> bool:
+    return (
+        _live_position_aliases_consistent(row)
+        and _text_alias_values(row, "posId", "pos_id") == {str(pos_id)}
+        and _text_alias_values(
+            row,
+            "instId",
+            "instrument_id",
+            "instrumentId",
+            transform=str.upper,
+        )
+        == {str(instrument_id).upper()}
+        and _text_alias_values(
+            row,
+            "posSide",
+            "pos_side",
+            "side",
+            transform=_normalize_position_side_alias,
+        )
+        == {_normalize_position_side_alias(side)}
+    )
+
+
+def _live_position_aliases_consistent(row: dict[str, Any]) -> bool:
+    size_values = _numeric_alias_values(row, "pos", "size", "sz")
+    return (
+        len(_text_alias_values(row, "posId", "pos_id")) == 1
+        and len(
+            _text_alias_values(
+                row,
+                "instId",
+                "instrument_id",
+                "instrumentId",
+                transform=str.upper,
+            )
+        )
+        == 1
+        and len(
+            _text_alias_values(
+                row,
+                "posSide",
+                "pos_side",
+                "side",
+                transform=_normalize_position_side_alias,
+            )
+        )
+        == 1
+        and _text_alias_values(
+            row,
+            "mrgPosition",
+            "posMode",
+            "positionMode",
+            transform=str.lower,
+        )
+        == {"split"}
+        and len(size_values) == 1
+        and next(iter(size_values)) > 0
+        and len(_numeric_alias_values(row, "liqPx", "liquidationPrice")) <= 1
+    )
+
+
+def _native_tpsl_aliases_consistent(row: dict[str, Any]) -> bool:
+    text_groups = (
+        (("ordId", "orderId", "order_id", "id"), str),
+        (("instId", "instrument_id", "instrumentId"), str.upper),
+        (("posId", "pos_id", "closePosId"), str),
+        (("posSide", "pos_side", "side"), _normalize_position_side_alias),
+        (("triggerOrderType", "trigger_order_type"), str.upper),
+    )
+    numeric_groups = (
+        ("sz", "size", "orderSize"),
+        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"),
+        ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"),
+        ("slOrdPx", "slOrderPrice"),
+        ("tpOrdPx", "tpOrderPrice"),
+    )
+    return all(
+        len(_text_alias_values(row, *keys, transform=transform)) <= 1
+        for keys, transform in text_groups
+    ) and all(len(_numeric_alias_values(row, *keys)) <= 1 for keys in numeric_groups)
+
+
+def _normalize_position_side_alias(value: str) -> str:
+    normalized = str(value).strip().lower()
+    return {"buy": "long", "sell": "short"}.get(normalized, normalized)
+
+
+def _row_has_stop_fields(row: dict[str, Any]) -> bool:
+    return any(
+        row.get(key) not in (None, "")
+        for key in (
+            "slTriggerPx",
+            "slTriggerPrice",
+            "closeSLTriggerPrice",
+        )
+    )
+
+
+def _text_alias_values(
+    row: dict[str, Any], *keys: str, transform=lambda value: value
+) -> set[str]:
+    return {
+        transform(str(row[key]).strip())
+        for key in keys
+        if row.get(key) is not None and str(row[key]).strip()
+    }
+
+
+def _numeric_alias_values(row: dict[str, Any], *keys: str) -> set[float]:
+    values: set[float] = set()
+    for key in keys:
+        if row.get(key) in (None, ""):
+            continue
+        try:
+            parsed = float(row[key])
+        except (TypeError, ValueError):
+            return {0.0, 1.0}
+        if parsed != parsed or parsed in {float("inf"), float("-inf")}:
+            return {0.0, 1.0}
+        values.add(parsed)
+    return values
 
 
 def _primary_stop_price(row: PositionProtectionLedger | None) -> str | None:

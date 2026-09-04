@@ -59,6 +59,7 @@ from telegram_kol_research.position_mutation_gateway import (
     exact_position_write_gate,
     submit_exact_position_sltp,
 )
+from telegram_kol_research.protection_snapshot import observe_pending_tpsl
 from telegram_kol_research.protection_revisions import activate_protection_revision
 from telegram_kol_research.trigger_protection_intents import (
     create_or_get_trigger_protection_intent,
@@ -1707,9 +1708,13 @@ def _submit_trigger_with_protection_intent(
         inst_id=inst_id,
         side=side,
     ):
-        baseline_json = _normalized_pending_tpsl_baseline(
+        lineage_mode = load_trading_settings(
+            session_factory
+        ).effective_trigger_protection_lineage_attribution_mode
+        baseline_json = _capture_pending_tpsl_baseline(
             deepcoin_client,
             inst_id=inst_id,
+            lineage_mode=lineage_mode,
         )
         execution_order_leg_id = _prepare_trigger_protection_intent(
             session_factory,
@@ -1870,26 +1875,140 @@ def _protection_legs_for_entry(session, *, execution_order_leg_id: int):
 
 
 def _normalized_pending_tpsl_baseline(
-    deepcoin_client: DeepcoinTradingClientProtocol, *, inst_id: str
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    inst_id: str,
+    require_complete_lineage: bool = False,
 ) -> str:
-    method = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if not require_complete_lineage:
+        method = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+        if method is None:
+            raise RecoveryLiveSubmitError("trigger_protection_baseline_unavailable")
+        try:
+            rows = method(inst_id=inst_id)
+        except Exception as exc:
+            raise RecoveryLiveSubmitError(
+                "trigger_protection_baseline_unavailable"
+            ) from exc
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+        normalized = [
+            _legacy_normalized_tpsl_row(row)
+            for row in rows
+            if str(row.get("triggerOrderType") or "").upper() == "TPSL"
+        ]
+        normalized.sort(
+            key=lambda row: (row["ord_id"] or "", row["exchange_created_at"] or "")
+        )
+        return json.dumps(
+            normalized,
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    method = getattr(deepcoin_client, "read_trigger_orders_pending", None)
     if method is None:
         raise RecoveryLiveSubmitError("trigger_protection_baseline_unavailable")
     try:
-        rows = method(inst_id=inst_id)
+        response = method(inst_id=inst_id)
     except Exception as exc:
         raise RecoveryLiveSubmitError("trigger_protection_baseline_unavailable") from exc
+    if not isinstance(response, dict) or str(response.get("code")) != "0":
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+    observation = observe_pending_tpsl(
+        instrument_id=inst_id,
+        response=response,
+        page_limit=100,
+        require_success_code=True,
+    )
+    if observation.get("complete") is not True:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_incomplete")
+    rows = response.get("data")
     if not isinstance(rows, list):
         raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
     normalized: list[dict[str, str | None]] = []
     for row in rows:
         if not isinstance(row, dict):
             raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
-        if str(row.get("triggerOrderType") or "").upper() != "TPSL":
+        row_instrument = _required_unique_snapshot_text(
+            row,
+            "instId",
+            "instrument_id",
+            "instrumentId",
+            normalize=lambda value: value.upper(),
+        )
+        if row_instrument != inst_id.upper():
+            raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+        order_type = _required_unique_snapshot_text(
+            row,
+            "triggerOrderType",
+            "trigger_order_type",
+            normalize=lambda value: value.upper(),
+        )
+        if order_type != "TPSL":
             continue
         normalized.append(_normalized_tpsl_row(row))
     normalized.sort(key=lambda row: (row["ord_id"] or "", row["exchange_created_at"] or ""))
-    return json.dumps(normalized, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    fingerprint_payload = {
+        "instrument_id": inst_id.upper(),
+        "orders": normalized,
+    }
+    snapshot_fingerprint = hashlib.sha256(
+        json.dumps(
+            fingerprint_payload,
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    envelope = {
+        "schema": "deepcoin_pending_tpsl_baseline_v2",
+        "capture_proof": {
+            "transport": "raw",
+            "response_code": "0",
+            "complete": True,
+            "instrument_id": inst_id.upper(),
+            "page_limit": 100,
+            "snapshot_fingerprint": snapshot_fingerprint,
+        },
+        "orders": normalized,
+    }
+    return json.dumps(
+        envelope,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _capture_pending_tpsl_baseline(
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    *,
+    inst_id: str,
+    lineage_mode: str,
+) -> str:
+    """Capture strict proof for new authority without making shadow authoritative."""
+
+    if lineage_mode == "live":
+        return _normalized_pending_tpsl_baseline(
+            deepcoin_client,
+            inst_id=inst_id,
+            require_complete_lineage=True,
+        )
+    if lineage_mode == "shadow":
+        try:
+            return _normalized_pending_tpsl_baseline(
+                deepcoin_client,
+                inst_id=inst_id,
+                require_complete_lineage=True,
+            )
+        except RecoveryLiveSubmitError:
+            pass
+    return _normalized_pending_tpsl_baseline(
+        deepcoin_client,
+        inst_id=inst_id,
+        require_complete_lineage=False,
+    )
 
 
 def _trigger_protection_request_fingerprint(order_payload: dict[str, Any]) -> str:
@@ -1909,6 +2028,36 @@ def _trigger_protection_request_fingerprint(order_payload: dict[str, Any]) -> st
 
 
 def _normalized_tpsl_row(row: dict[str, Any]) -> dict[str, str | None]:
+    ord_id = _required_unique_snapshot_text(
+        row, "ordId", "orderId", "order_id", "algoId"
+    )
+    instrument = _required_unique_snapshot_text(
+        row, "instId", "instrument_id", "instrumentId",
+        normalize=lambda value: value.upper(),
+    )
+    side = _required_unique_snapshot_text(
+        row,
+        "posSide",
+        "pos_side",
+        "side",
+        normalize=lambda value: {"buy": "long", "sell": "short"}.get(
+            value.lower(), value.lower()
+        ),
+    )
+    return {
+        "ord_id": ord_id,
+        "instrument": instrument.upper(),
+        "side": side,
+        "trigger_order_type": "TPSL",
+        "size": _optional_unique_snapshot_text(row, "sz", "size", "quantity"),
+        "take_profit_trigger_price": _optional_unique_snapshot_text(row, "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"),
+        "stop_loss_trigger_price": _optional_unique_snapshot_text(row, "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice"),
+        "exchange_created_at": _optional_unique_snapshot_text(row, "cTime", "createdAt", "created_at", "createdTime"),
+        "exchange_updated_at": _optional_unique_snapshot_text(row, "uTime", "updatedAt", "updated_at", "updatedTime"),
+    }
+
+
+def _legacy_normalized_tpsl_row(row: dict[str, Any]) -> dict[str, str | None]:
     ord_id = _required_snapshot_text(row, "ordId", "orderId", "order_id", "algoId")
     instrument = _required_snapshot_text(row, "instId", "instrumentId")
     side = _required_snapshot_text(row, "posSide", "side").lower()
@@ -1923,6 +2072,28 @@ def _normalized_tpsl_row(row: dict[str, Any]) -> dict[str, str | None]:
         "exchange_created_at": _optional_snapshot_text(row, "cTime", "createdAt", "created_at", "createdTime"),
         "exchange_updated_at": _optional_snapshot_text(row, "uTime", "updatedAt", "updated_at", "updatedTime"),
     }
+
+
+def _required_unique_snapshot_text(
+    row: dict[str, Any], *keys: str, normalize=lambda value: value
+) -> str:
+    value = _optional_unique_snapshot_text(row, *keys, normalize=normalize)
+    if value is None:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+    return value
+
+
+def _optional_unique_snapshot_text(
+    row: dict[str, Any], *keys: str, normalize=lambda value: value
+) -> str | None:
+    values = {
+        normalize(str(row.get(key)).strip())
+        for key in keys
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
+    if len(values) > 1:
+        raise RecoveryLiveSubmitError("trigger_protection_baseline_malformed")
+    return next(iter(values)) if values else None
 
 
 def _required_snapshot_text(row: dict[str, Any], *keys: str) -> str:

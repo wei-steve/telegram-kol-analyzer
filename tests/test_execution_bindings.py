@@ -4,6 +4,7 @@ import sqlite3
 from datetime import datetime, timedelta
 
 import pytest
+from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
 import telegram_kol_research.execution_bindings as execution_bindings_module
@@ -55,6 +56,34 @@ from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
+
+
+def _strict_empty_pending_baseline(*, instrument_id: str) -> str:
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {"instrument_id": instrument_id, "orders": []},
+            ensure_ascii=True,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return json.dumps(
+        {
+            "schema": "deepcoin_pending_tpsl_baseline_v2",
+            "capture_proof": {
+                "transport": "raw",
+                "response_code": "0",
+                "complete": True,
+                "instrument_id": instrument_id,
+                "page_limit": 100,
+                "snapshot_fingerprint": fingerprint,
+            },
+            "orders": [],
+        },
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
 
 
 def _binding(**overrides):
@@ -475,6 +504,12 @@ class _ProtectionAdoptionReconciliationClient:
             raise self.pending_error
         return self.pending_rows
 
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
+
     def list_order_history(self, *, inst_id=None):
         if self.order_history_rows is not None:
             return list(self.order_history_rows)
@@ -492,11 +527,20 @@ class _ProtectionAdoptionReconciliationClient:
             }
         ]
 
+    def read_order_history(self, *, inst_id=None):
+        return {"code": "0", "data": self.list_order_history(inst_id=inst_id)}
+
     def list_trade_fills(self, *, inst_id=None):
         return []
 
     def list_trigger_order_history(self, *, inst_id=None):
         return self.history_rows
+
+    def read_trigger_order_history(self, *, inst_id=None):
+        return {
+            "code": "0",
+            "data": self.list_trigger_order_history(inst_id=inst_id),
+        }
 
 
 class _BackupStopSubmissionClient:
@@ -539,6 +583,12 @@ class _BackupStopSubmissionClient:
 
     def list_trigger_orders_pending(self, *, inst_id):
         return [row for row in self.pending_rows if row.get("instId") == inst_id]
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
 
 
 def _backup_stop_provider():
@@ -627,7 +677,7 @@ def test_reconcile_persists_raw_pending_tpsl_completeness_evidence(tmp_path):
             assert inst_id == "ETH-USDT-SWAP"
             return {
                 "code": "0",
-                "data": [{"ordId": "tp-raw"}],
+                "data": [{"ordId": "tp-raw", "instId": "ETH-USDT-SWAP"}],
                 "nextCursor": "unhandled-page",
             }
 
@@ -644,6 +694,117 @@ def test_reconcile_persists_raw_pending_tpsl_completeness_evidence(tmp_path):
     assert observation.order_ids_json == '["tp-raw"]'
     assert observation.complete is False
     assert observation.reason == "pagination_metadata_unsupported"
+
+
+def test_list_only_pending_tpsl_reader_cannot_claim_complete_snapshot():
+    class ListOnlyClient:
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [_anonymous_stop("stop-1", "1784512860000")]
+
+    observations = []
+    rows = execution_bindings_module._read_pending_trigger_snapshot_rows(
+        ListOnlyClient(),
+        source="pending_trigger_orders",
+        instruments={"ETH-USDT-SWAP"},
+        errors={},
+        observations=observations,
+    )
+
+    assert len(rows) == 1
+    assert observations == [
+        {
+            "instrument_id": "ETH-USDT-SWAP",
+            "complete": False,
+            "reason": "raw_snapshot_unavailable",
+            "response_count": 1,
+            "order_ids": ["stop-1"],
+            "expected_order_ids_visible": False,
+        }
+    ]
+
+
+def test_full_history_page_cannot_claim_complete_snapshot():
+    class FullPageClient:
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def read_order_history(self, *, inst_id=None):
+            return {
+                "code": "0",
+                "data": [{"ordId": f"child-{index}"} for index in range(100)],
+            }
+
+    completeness = {}
+    rows = execution_bindings_module._read_instrument_snapshot_rows(
+        FullPageClient(),
+        method_name="list_order_history",
+        raw_method_name="read_order_history",
+        source="order_history",
+        instruments={"ETH-USDT-SWAP"},
+        errors={},
+        completeness=completeness,
+    )
+
+    assert len(rows) == 100
+    assert completeness == {"order_history:ETH-USDT-SWAP": False}
+
+
+def test_pending_snapshot_wrong_instrument_row_is_retained_but_incomplete():
+    class WrongInstrumentClient:
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {
+                "code": "0",
+                "data": [
+                    {
+                        **_anonymous_stop("stop-1", "1784512860000"),
+                        "instId": "BTC-USDT-SWAP",
+                    }
+                ],
+            }
+
+    observations = []
+    rows = execution_bindings_module._read_pending_trigger_snapshot_rows(
+        WrongInstrumentClient(),
+        source="pending_trigger_orders",
+        instruments={"ETH-USDT-SWAP"},
+        errors={},
+        observations=observations,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["instId"] == "BTC-USDT-SWAP"
+    assert observations[0]["complete"] is False
+    assert observations[0]["reason"] == "instrument_scope_mismatch"
+
+
+def test_history_wrong_instrument_row_is_retained_but_incomplete():
+    class WrongInstrumentClient:
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def read_order_history(self, *, inst_id=None):
+            return {
+                "code": "0",
+                "data": [{"ordId": "child-1", "instId": "BTC-USDT-SWAP"}],
+            }
+
+    completeness = {}
+    rows = execution_bindings_module._read_instrument_snapshot_rows(
+        WrongInstrumentClient(),
+        method_name="list_order_history",
+        raw_method_name="read_order_history",
+        source="order_history",
+        instruments={"ETH-USDT-SWAP"},
+        errors={},
+        completeness=completeness,
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["instId"] == "BTC-USDT-SWAP"
+    assert completeness == {"order_history:ETH-USDT-SWAP": False}
 
 
 def _pending_combined_tpsl(order_id):
@@ -835,6 +996,7 @@ def test_reconcile_assigns_second_identical_split_stop_globally(tmp_path):
             "posId": "first-pos",
             "posSide": "short",
             "pos": "3.4",
+            "mrgPosition": "split",
             "cTime": "2026-08-05T17:40:00Z",
         },
         {
@@ -842,6 +1004,7 @@ def test_reconcile_assigns_second_identical_split_stop_globally(tmp_path):
             "posId": "second-pos",
             "posSide": "short",
             "pos": "3.4",
+            "mrgPosition": "split",
             "cTime": "2026-08-05T18:00:00Z",
         },
     ]
@@ -892,9 +1055,10 @@ def test_reconcile_keeps_true_anonymous_stop_ambiguity_recoverable(tmp_path):
         {
             "instId": "ETH-USDT-SWAP",
             "posId": pos_id,
-            "posSide": "short",
-            "pos": "3.4",
-            "cTime": "2026-08-05T17:40:00Z",
+                "posSide": "short",
+                "pos": "3.4",
+                "mrgPosition": "split",
+                "cTime": "2026-08-05T17:40:00Z",
         }
         for pos_id in ("first-pos", "second-pos")
     ]
@@ -929,6 +1093,246 @@ def test_reconcile_keeps_true_anonymous_stop_ambiguity_recoverable(tmp_path):
     assert {intent.recovery_disposition for intent in intents} == {"exact_backup"}
 
 
+def test_account_assignment_includes_not_due_and_failed_live_owners(tmp_path):
+    session_factory = create_session_factory(tmp_path / "all-live-owners.db")
+    _enable_liveness_live(session_factory)
+    _seed_identical_filled_stop_intents(
+        session_factory,
+        first_already_owned=False,
+    )
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).order_by(
+            TriggerProtectionIntent.execution_order_leg_id.asc()
+        ).all()
+        intents[0].recovery_state = "failed"
+        intents[0].recovery_disposition = "manual_review"
+        intents[1].next_attempt_at = None
+        session.commit()
+    positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": pos_id,
+            "posSide": "short",
+            "pos": "3.4",
+            "mrgPosition": "split",
+            "cTime": "2026-08-05T17:40:00Z",
+        }
+        for pos_id in ("first-pos", "second-pos")
+    ]
+
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [_anonymous_stop("shared-stop", "2026-08-05T17:40:25Z")],
+            positions=positions,
+            order_history_rows=[
+                _filled_entry_history(
+                    "first", "first-pos", "2026-08-05T17:40:00Z"
+                ),
+                _filled_entry_history(
+                    "second", "second-pos", "2026-08-05T17:40:00Z"
+                ),
+            ],
+        ),
+        recovered_at=datetime(2026, 8, 5, 18, 1),
+    )
+
+    with session_factory() as session:
+        intents = session.query(TriggerProtectionIntent).order_by(
+            TriggerProtectionIntent.execution_order_leg_id.asc()
+        ).all()
+        ledgers = session.query(PositionProtectionLedger).all()
+    assert result.protection_adopted == 0
+    assert ledgers == []
+    assert intents[0].recovery_state == "failed"
+    assert intents[1].recovery_state == "retrying"
+    assert intents[1].last_reason_code == (
+        "trigger_protection_assignment_not_mutual_unique"
+    )
+
+
+def test_owner_universe_keeps_active_verified_trigger_leg_without_intent():
+    leg = ExecutionOrderLeg(
+        id=10,
+        execution_binding_id=20,
+        purpose="entry",
+        order_kind="trigger_limit",
+        attribution_status="verified",
+        status="active",
+        pos_id="pos-10",
+    )
+
+    potential, consistent = execution_bindings_module._trigger_protection_owner_sets(
+        [], {10: leg}
+    )
+
+    assert potential == ((None, leg),)
+    assert consistent == ()
+
+    from telegram_kol_research.entry_protection_ledger_repair import (
+        build_trigger_protection_blocking_owner,
+    )
+
+    leg.request_json = json.dumps(
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "short",
+            "sz": "3.4",
+            "slTriggerPx": "1935",
+            "slOrdPx": -1,
+        }
+    )
+    leg.order_id = "entry-10"
+    owner = build_trigger_protection_blocking_owner(entry_leg=leg, intent=None)
+    assert owner is not None
+    assert owner.leg_id == 10
+    assert owner.parent_trigger_order_id == "entry-10"
+    assert owner.direct_identity_permitted is False
+
+
+def test_owner_universe_treats_duplicate_intents_as_blocking_only():
+    leg = ExecutionOrderLeg(
+        id=10,
+        execution_binding_id=20,
+        purpose="entry",
+        order_kind="trigger_limit",
+        attribution_status="verified",
+        status="active",
+        pos_id="pos-10",
+    )
+    first = TriggerProtectionIntent(
+        id=1,
+        venue="deepcoin",
+        execution_binding_id=20,
+        execution_order_leg_id=10,
+        request_fingerprint="a" * 64,
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="first",
+    )
+    second = TriggerProtectionIntent(
+        id=2,
+        venue="deepcoin",
+        execution_binding_id=20,
+        execution_order_leg_id=10,
+        request_fingerprint="b" * 64,
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="second",
+    )
+
+    potential, consistent = execution_bindings_module._trigger_protection_owner_sets(
+        [first, second], {10: leg}
+    )
+
+    assert potential == ((None, leg),)
+    assert consistent == ()
+
+
+def test_account_assignment_keeps_binding_conflict_owner_as_blocker(
+    tmp_path, monkeypatch
+):
+    import telegram_kol_research.entry_protection_ledger_repair as repair_module
+
+    session_factory = create_session_factory(tmp_path / "binding-conflict-owner.db")
+    _enable_liveness_live(session_factory)
+    leg_ids = _seed_identical_filled_stop_intents(
+        session_factory,
+        first_already_owned=False,
+    )
+    conflicting_binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            chat_id=101,
+            message_id=56,
+            symbol="ETH",
+            side="short",
+            order_id="unrelated-entry",
+            client_order_id="unrelated-client",
+            status="active",
+        ),
+    )
+    with session_factory() as session:
+        first_intent = (
+            session.query(TriggerProtectionIntent)
+            .filter(
+                TriggerProtectionIntent.execution_order_leg_id == leg_ids[0]
+            )
+            .one()
+        )
+        first_intent.execution_binding_id = conflicting_binding_id
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "trigger_protection_lineage_attribution_mode": "live",
+            "trigger_protection_lineage_activation_after_intent_id": 0,
+        },
+    )
+    captured_blocking_leg_ids = set()
+    original_planner = repair_module.plan_trigger_protection_intent_assignments
+
+    def capture_blockers(**kwargs):
+        captured_blocking_leg_ids.update(
+            owner.leg_id for owner in kwargs.get("blocking_owners", ())
+        )
+        return original_planner(**kwargs)
+
+    monkeypatch.setattr(
+        repair_module,
+        "plan_trigger_protection_intent_assignments",
+        capture_blockers,
+    )
+    positions = [
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": pos_id,
+            "posSide": "short",
+            "pos": "3.4",
+            "mrgPosition": "split",
+            "cTime": "2026-08-05T17:40:00Z",
+        }
+        for pos_id in ("first-pos", "second-pos")
+    ]
+    history = [
+        _filled_entry_history("first", "first-pos", "2026-08-05T17:40:00Z"),
+        _filled_entry_history("second", "second-pos", "2026-08-05T17:40:00Z"),
+    ]
+
+    with session_factory() as session:
+        legs = session.query(ExecutionOrderLeg).order_by(
+            ExecutionOrderLeg.id.asc()
+        ).all()
+        snapshot = execution_bindings_module._ReconcileSnapshot(
+            positions=positions,
+            pending_trigger_orders=[
+                _anonymous_stop("shared-stop", "2026-08-05T17:40:00Z")
+            ],
+            order_history=history,
+            trigger_history=history,
+            pending_tpsl_observations=[
+                {"instrument_id": "ETH-USDT-SWAP", "complete": True}
+            ],
+            lineage_history_completeness={
+                "order_history:ETH-USDT-SWAP": True,
+                "trigger_history:ETH-USDT-SWAP": True,
+            },
+        )
+        result = execution_bindings_module.ExecutionReconciliationResult()
+        execution_bindings_module._reconcile_saved_trigger_protection_intents(
+            session,
+            legs=legs,
+            snapshot=snapshot,
+            recovered_at=datetime(2026, 8, 5, 18, 1),
+            result=result,
+            liveness_rollout_mode="live",
+            lineage_rollout_mode="live",
+            lineage_activation_after_intent_id=0,
+        )
+        ledgers = session.query(PositionProtectionLedger).all()
+    assert result.protection_adopted == 0
+    assert ledgers == []
+    assert leg_ids[0] in captured_blocking_leg_ids
+
+
 def test_shadow_global_assignment_is_evidence_only_and_not_authoritative(tmp_path):
     session_factory = create_session_factory(tmp_path / "assignment-shadow.db")
     save_trading_settings(session_factory, {
@@ -940,12 +1344,12 @@ def test_shadow_global_assignment_is_evidence_only_and_not_authoritative(tmp_pat
     positions = [
         {
             "instId": "ETH-USDT-SWAP", "posId": "first-pos",
-            "posSide": "short", "pos": "3.4",
+            "posSide": "short", "pos": "3.4", "mrgPosition": "split",
             "cTime": "2026-08-05T17:40:00Z",
         },
         {
             "instId": "ETH-USDT-SWAP", "posId": "second-pos",
-            "posSide": "short", "pos": "3.4",
+            "posSide": "short", "pos": "3.4", "mrgPosition": "split",
             "cTime": "2026-08-05T18:00:00Z",
         },
     ]
@@ -1299,6 +1703,207 @@ def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     with session_factory() as session:
         row = session.query(PositionBackupStopOrder).one()
     assert (row.pos_id, row.order_id, row.status) == ("pos-1", "backup-1", "active")
+
+
+def test_backup_submission_blocks_unowned_stop_that_can_affect_position(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unowned-backup.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "pos": "4.4",
+            "liqPx": "2000",
+            "mrgPosition": "split",
+        }
+    ])
+    client.pending_rows.append(
+        {
+            "ordId": "unowned-backup",
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "sz": "0",
+            "slTriggerPx": "1904",
+            "slOrdPx": "-1",
+        }
+    )
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.sltp_payloads == []
+
+
+def test_backup_submission_blocks_primary_order_alias_conflict(tmp_path):
+    session_factory = create_session_factory(tmp_path / "backup-primary-alias.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "pos": "4.4",
+            "liqPx": "2000",
+            "mrgPosition": "split",
+        }
+    ])
+    client.pending_rows[0]["orderId"] = "other-primary"
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.sltp_payloads == []
+
+
+@pytest.mark.parametrize(
+    "conflicting_alias",
+    [
+        {"pos_id": "other-pos"},
+        {"instrument_id": "BTC-USDT-SWAP"},
+        {"side": "long"},
+    ],
+)
+def test_backup_submission_blocks_live_position_alias_conflict(
+    tmp_path, conflicting_alias
+):
+    session_factory = create_session_factory(tmp_path / "backup-position-alias.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    position = {
+        "instId": "ETH-USDT-SWAP",
+        "posId": "pos-1",
+        "posSide": "short",
+        "pos": "4.4",
+        "liqPx": "2000",
+        "mrgPosition": "split",
+        **conflicting_alias,
+    }
+    client = _BackupStopSubmissionClient([position])
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.sltp_payloads == []
+
+
+def test_backup_submission_accepts_equivalent_buy_sell_side_aliases(tmp_path):
+    session_factory = create_session_factory(tmp_path / "backup-equivalent-side.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "side": "sell",
+            "pos": "4.4",
+            "liqPx": "2000",
+            "mrgPosition": "split",
+        }
+    ])
+    for row in client.pending_rows:
+        row["side"] = "sell"
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 1
+    assert len(client.sltp_payloads) == 1
+
+
+@pytest.mark.parametrize("missing_field", ["triggerOrderType", "instId", "posSide"])
+def test_backup_submission_blocks_incomplete_stop_scope(tmp_path, missing_field):
+    session_factory = create_session_factory(tmp_path / "backup-incomplete-stop.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    client = _BackupStopSubmissionClient([
+        {
+            "instId": "ETH-USDT-SWAP",
+            "posId": "pos-1",
+            "posSide": "short",
+            "pos": "4.4",
+            "liqPx": "2000",
+            "mrgPosition": "split",
+        }
+    ])
+    incomplete = {
+        "ordId": "mystery-stop",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "sz": "0",
+        "slTriggerPx": "1904",
+        "slOrdPx": "-1",
+    }
+    incomplete.pop(missing_field)
+    client.pending_rows.append(incomplete)
+    client.read_trigger_orders_pending = lambda *, inst_id: {
+        "code": "0",
+        "data": list(client.pending_rows),
+    }
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.sltp_payloads == []
+
+
+def test_backup_submission_blocks_second_malformed_same_position_row(tmp_path):
+    session_factory = create_session_factory(tmp_path / "backup-duplicate-position.db")
+    _seed_exact_backup_candidate(session_factory, order_kind="market")
+    exact = {
+        "instId": "ETH-USDT-SWAP",
+        "posId": "pos-1",
+        "posSide": "short",
+        "pos": "4.4",
+        "liqPx": "2000",
+        "mrgPosition": "split",
+    }
+    malformed = dict(exact)
+    malformed.pop("posSide")
+    client = _BackupStopSubmissionClient([exact])
+    client.positions.append(
+        {
+            "avgPx": "1883",
+            "mgnMode": "cross",
+            "posMode": "split",
+            **malformed,
+        }
+    )
+
+    submitted = submit_verified_trigger_backup_stops(
+        session_factory,
+        client=client,
+        contract_spec_provider=_backup_stop_provider(),
+        submitted_at=datetime(2026, 7, 20, 8, 5),
+    )
+
+    assert submitted == 0
+    assert client.sltp_payloads == []
 
 
 def test_backup_submission_refuses_success_when_native_backup_replaces_primary_stop(tmp_path):
@@ -1743,6 +2348,1104 @@ def test_reconcile_adopts_saved_trigger_protection_intent_once(tmp_path):
     assert rows[0].evidence_source == "reconciliation_trigger_protection_intent"
     assert result.protection_adopted == 1
     assert duplicate.protection_adopted == 0
+
+
+@pytest.mark.parametrize(
+    (
+        "lineage_mode",
+        "expected_adoptions",
+        "pending_snapshot_incomplete",
+        "history_snapshot_incomplete",
+    ),
+    [
+        ("live", 1, False, False),
+        ("shadow", 0, False, False),
+        ("live", 0, True, False),
+        ("live", 0, False, True),
+    ],
+)
+def test_reconcile_attached_stop_lineage_respects_its_own_authority_gate(
+    tmp_path,
+    lineage_mode,
+    expected_adoptions,
+    pending_snapshot_incomplete,
+    history_snapshot_incomplete,
+):
+    session_factory = create_session_factory(tmp_path / "lineage-live.db")
+    _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        event = session.query(ExecutionEvent).one()
+        request = json.loads(leg.request_json)
+        request.pop("tpTriggerPx", None)
+        request.pop("tpOrdPx", None)
+        leg.request_json = json.dumps(request)
+        event.request_json = json.dumps(request)
+        parent_response = {
+            "code": "0",
+            "data": {"sCode": "0", "ordId": "entry-1"},
+        }
+        event.response_json = json.dumps(parent_response)
+        binding.payload_json = json.dumps(
+            {
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "client_order_id": "entry-client-1",
+                        "order_id": "entry-1",
+                        "request": request,
+                        "response": parent_response,
+                        "protection_request": {
+                            "slTriggerPx": "1900",
+                            "slOrdPx": -1,
+                        },
+                        "protection_response": {
+                            "code": "0",
+                            "data": {"attached_on_trigger_order": True},
+                        },
+                    }
+                ]
+            }
+        )
+        session.commit()
+    _save_trigger_protection_intent(session_factory)
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        intent.created_at = datetime(2026, 7, 20, 2, 0)
+        intent.pre_submit_tpsl_baseline_json = _strict_empty_pending_baseline(
+            instrument_id="ETH-USDT-SWAP"
+        )
+        binding.pos_id = "pos-1"
+        binding.status = "active"
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.add(
+            PositionAttributionAudit(
+                execution_binding_id=int(binding.id),
+                execution_order_leg_id=int(leg.id),
+                venue="deepcoin",
+                pos_id="pos-1",
+                event_type="ownership_verified",
+                prior_state="unassigned",
+                new_state="verified",
+                fingerprint="lineage-prior-" + "a" * 50,
+                evidence_json=json.dumps(
+                    {"policy_version": 2, "evidence_type": "trigger_child_order"}
+                ),
+                notification_status="not_needed",
+            )
+        )
+        session.commit()
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+            "trigger_protection_lineage_attribution_mode": lineage_mode,
+            "trigger_protection_lineage_activation_after_intent_id": 0,
+        },
+    )
+    attached_stop = _pending_combined_tpsl("attached-stop")
+    attached_stop.update(
+        {"posId": "", "cTime": "1784512860000", "uTime": "1784512860000"}
+    )
+    attached_stop.pop("tpTriggerPx")
+    trigger_parent = {
+        "instId": "ETH-USDT-SWAP",
+        "ordId": "entry-1",
+        "clOrdId": "entry-client-1",
+        "state": "filled",
+        "posSide": "short",
+        "sz": "4.4",
+        "px": "1883",
+        "triggerTime": "1784512860000",
+        "cTime": "1784512860000",
+        "errorCode": "0",
+    }
+    child = {
+        "instId": "ETH-USDT-SWAP",
+        "ordId": "pos-1",
+        "state": "filled",
+        "posSide": "short",
+        "fillSz": "4.4",
+        "avgPx": "1883",
+        "fillTime": "1784512860000",
+        "cTime": "1784512860000",
+    }
+    client = _ProtectionAdoptionReconciliationClient(
+        [attached_stop],
+        history_rows=[trigger_parent],
+        order_history_rows=[child],
+        positions=[
+            {
+                "instId": "ETH-USDT-SWAP",
+                "posId": "pos-1",
+                "posSide": "short",
+                "pos": "4.4",
+                "avgPx": "1883",
+                "mgnMode": "cross",
+                "mrgPosition": "split",
+                "cTime": "1784512865000",
+            }
+        ],
+    )
+    if pending_snapshot_incomplete:
+        client.read_trigger_orders_pending = lambda *, inst_id: {
+            "code": "0",
+            "data": [attached_stop],
+            "nextCursor": "more",
+        }
+    if history_snapshot_incomplete:
+        client.read_order_history = lambda *, inst_id=None: {
+            "code": "0",
+            "data": [child],
+            "nextCursor": "more",
+        }
+
+    first = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 2, 5),
+    )
+    second = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=client,
+        recovered_at=datetime(2026, 7, 20, 2, 10),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        ledgers = session.query(PositionProtectionLedger).all()
+        primary = session.query(PositionProtectionLeg).filter_by(
+            role="primary_stop"
+        ).one()
+    assert first.protection_adopted == expected_adoptions
+    assert second.protection_adopted == 0
+    if (
+        lineage_mode == "live"
+        and not pending_snapshot_incomplete
+        and not history_snapshot_incomplete
+    ):
+        assert intent.recovery_state == "adopted"
+        assert intent.adopted_order_id == "attached-stop"
+        assert len(ledgers) == 1
+        assert ledgers[0].order_id == "attached-stop"
+        assert primary.exchange_order_id == "attached-stop"
+    elif lineage_mode == "shadow":
+        assert intent.recovery_state != "adopted"
+        assert intent.adopted_order_id is None
+        assert ledgers == []
+        assert primary.exchange_order_id is None
+    else:
+        assert intent.recovery_state == "retrying"
+        assert intent.last_reason_code == "snapshot_incomplete"
+        assert intent.retry_attempts == 0
+        assert intent.adopted_order_id is None
+        assert ledgers == []
+        assert primary.exchange_order_id is None
+
+
+def test_conflicted_duplicate_position_owners_block_third_lineage_adoption(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "duplicate-owner-block.db")
+    _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        event = session.query(ExecutionEvent).one()
+        request = json.loads(leg.request_json)
+        request.pop("tpTriggerPx", None)
+        request.pop("tpOrdPx", None)
+        leg.request_json = json.dumps(request)
+        event.request_json = json.dumps(request)
+        parent_response = {
+            "code": "0",
+            "data": {"sCode": "0", "ordId": "entry-1"},
+        }
+        event.response_json = json.dumps(parent_response)
+        binding.payload_json = json.dumps(
+            {
+                "submitted_orders": [
+                    {
+                        "leg_index": 1,
+                        "execution_type": "trigger_limit",
+                        "client_order_id": "entry-client-1",
+                        "order_id": "entry-1",
+                        "request": request,
+                        "response": parent_response,
+                        "protection_request": {
+                            "slTriggerPx": "1900",
+                            "slOrdPx": -1,
+                        },
+                        "protection_response": {
+                            "code": "0",
+                            "data": {"attached_on_trigger_order": True},
+                        },
+                    }
+                ]
+            }
+        )
+        session.commit()
+    _save_trigger_protection_intent(session_factory)
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).one()
+        intent.created_at = datetime(2026, 7, 20, 2, 0)
+        intent.pre_submit_tpsl_baseline_json = _strict_empty_pending_baseline(
+            instrument_id="ETH-USDT-SWAP"
+        )
+        binding.pos_id = "pos-1"
+        binding.status = "active"
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.commit()
+
+    blocker_request = {
+        "instId": "ETH-USDT-SWAP",
+        "orderType": "limit",
+        "posSide": "short",
+        "price": "1883",
+        "side": "sell",
+        "slOrdPx": -1,
+        "slTriggerPx": "1900",
+        "sz": "4.4",
+        "tdMode": "cross",
+        "triggerPrice": "1883",
+    }
+    with session_factory() as session:
+        session.execute(text("DROP INDEX uq_execution_order_legs_venue_pos"))
+        session.commit()
+    blocker_leg_ids = []
+    for index in (1, 2):
+        binding_id = upsert_execution_binding(
+            session_factory,
+            _binding(
+                kol_id=f"blocker-{index}",
+                chat_id=200 + index,
+                message_id=300 + index,
+                symbol="ETH",
+                side="short",
+                order_id=f"blocker-entry-{index}",
+                client_order_id=f"blocker-client-{index}",
+                pos_id="duplicate-pos",
+                status="active",
+            ),
+        )
+        blocker_leg_ids.append(
+            upsert_execution_order_leg(
+                session_factory,
+                ExecutionOrderLegRecord(
+                    execution_binding_id=binding_id,
+                    leg_index=1,
+                    order_kind="trigger_limit",
+                    strategy_instance_id=(
+                        f"deepcoin:{200 + index}:{300 + index}:ETH:short"
+                    ),
+                    order_id=f"blocker-entry-{index}",
+                    client_order_id=f"blocker-client-{index}",
+                    pos_id="duplicate-pos",
+                    status="active",
+                    attribution_status="verified",
+                    attribution_evidence={"evidence_type": "test_exact_position"},
+                    request={
+                        **blocker_request,
+                        "clOrdId": f"blocker-client-{index}",
+                    },
+                ),
+            )
+        )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "management_execution_mode": "live",
+            "position_management_liveness_v2_mode": "live",
+            "trigger_protection_lineage_attribution_mode": "live",
+            "trigger_protection_lineage_activation_after_intent_id": 0,
+        },
+    )
+    attached_stop = _pending_combined_tpsl("attached-stop")
+    attached_stop.update(
+        {"posId": "", "cTime": "1784512860000", "uTime": "1784512860000"}
+    )
+    attached_stop.pop("tpTriggerPx")
+    result = reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=_ProtectionAdoptionReconciliationClient(
+            [attached_stop],
+            history_rows=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "entry-1",
+                    "clOrdId": "entry-client-1",
+                    "state": "filled",
+                    "posSide": "short",
+                    "sz": "4.4",
+                    "px": "1883",
+                    "triggerTime": "1784512860000",
+                    "cTime": "1784512860000",
+                    "errorCode": "0",
+                }
+            ],
+            order_history_rows=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "ordId": "pos-1",
+                    "state": "filled",
+                    "posSide": "short",
+                    "fillSz": "4.4",
+                    "avgPx": "1883",
+                    "fillTime": "1784512860000",
+                    "cTime": "1784512860000",
+                }
+            ],
+            positions=[
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "pos-1",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "avgPx": "1883",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1784512865000",
+                },
+                {
+                    "instId": "ETH-USDT-SWAP",
+                    "posId": "duplicate-pos",
+                    "posSide": "short",
+                    "pos": "4.4",
+                    "avgPx": "1883",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                    "cTime": "1784512865000",
+                },
+            ],
+        ),
+        recovered_at=datetime(2026, 7, 20, 2, 5),
+    )
+
+    with session_factory() as session:
+        intent = session.query(TriggerProtectionIntent).one()
+        blocker_legs = (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.id.in_(blocker_leg_ids))
+            .all()
+        )
+        ledgers = session.query(PositionProtectionLedger).all()
+    assert {leg.attribution_status for leg in blocker_legs} == {
+        "attribution_conflict"
+    }
+    assert result.protection_adopted == 0
+    assert intent.recovery_state != "adopted"
+    assert ledgers == []
+
+
+def test_first_visible_unowned_native_stop_refusal_creates_durable_push_source(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "lineage-alert.db")
+    _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        refusal = type(
+            "Refusal",
+            (),
+            {
+                "reason": "trigger_protection_candidate_child_time_mismatch",
+                "evidence": {
+                    "candidate_order_ids": ["attached-stop"],
+                    "native_stop_visible_ownership_unverified": True,
+                    "snapshot_fingerprint": "a" * 64,
+                },
+            },
+        )()
+
+        execution_bindings_module._record_protection_adoption_refusal(
+            session,
+            leg=leg,
+            refusal=refusal,
+            created_at=datetime(2026, 7, 20, 2, 5),
+        )
+        execution_bindings_module._record_protection_adoption_refusal(
+            session,
+            leg=leg,
+            refusal=refusal,
+            created_at=datetime(2026, 7, 20, 2, 6),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        incidents = session.query(PositionProtectionIncident).all()
+    assert len(incidents) == 1
+    assert incidents[0].incident_type == "native_stop_visible_ownership_unverified"
+    assert incidents[0].delivery_status == "pending"
+    evidence = json.loads(incidents[0].evidence_json)
+    assert evidence["candidate_order_ids"] == ["attached-stop"]
+    assert "exchange_payload" not in evidence
+
+
+def test_verified_adoption_records_one_ownership_recovered_transition(tmp_path):
+    session_factory = create_session_factory(tmp_path / "lineage-recovered.db")
+    _seed_trigger_protection_adoption(session_factory)
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).one()
+        leg.pos_id = "pos-1"
+        leg.status = "active"
+        leg.attribution_status = "verified"
+        session.add(
+            PositionProtectionIncident(
+                venue="deepcoin",
+                execution_binding_id=int(leg.execution_binding_id),
+                execution_order_leg_id=int(leg.id),
+                pos_id="pos-1",
+                incident_type="native_stop_visible_ownership_unverified",
+                fingerprint="u" * 64,
+                evidence_json="{}",
+                delivery_status="pending",
+            )
+        )
+        session.flush()
+        execution_bindings_module._record_protection_ownership_recovered(
+            session,
+            leg=leg,
+            adopted_order_id="attached-stop",
+            created_at=datetime(2026, 7, 20, 2, 6),
+        )
+        execution_bindings_module._record_protection_ownership_recovered(
+            session,
+            leg=leg,
+            adopted_order_id="attached-stop",
+            created_at=datetime(2026, 7, 20, 2, 7),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        rows = session.query(PositionProtectionIncident).order_by(
+            PositionProtectionIncident.id.asc()
+        ).all()
+    assert [row.incident_type for row in rows] == [
+        "native_stop_visible_ownership_unverified",
+        "ownership_recovered",
+    ]
+
+
+def test_lineage_rollout_watermark_is_strictly_future_only():
+    intent = TriggerProtectionIntent(
+        id=177,
+        venue="deepcoin",
+        execution_binding_id=1,
+        execution_order_leg_id=1,
+        request_fingerprint="a" * 64,
+        pre_submit_tpsl_baseline_json="[]",
+        correlation_id="watermark",
+    )
+
+    assert execution_bindings_module._lineage_mode_applies_to_intent(
+        "live", 177, intent
+    ) is False
+    assert execution_bindings_module._lineage_mode_applies_to_intent(
+        "live", 176, intent
+    ) is True
+    assert execution_bindings_module._lineage_mode_applies_to_intent(
+        "shadow", None, intent
+    ) is True
+    assert execution_bindings_module._lineage_mode_applies_to_intent(
+        "disabled", 0, intent
+    ) is False
+    assert execution_bindings_module._lineage_evidence_enabled("live") is True
+    assert execution_bindings_module._lineage_evidence_enabled("shadow") is True
+
+    assert execution_bindings_module._lineage_authority_enabled_for_intent(
+        "shadow", None, intent
+    ) is False
+    assert execution_bindings_module._lineage_authority_enabled_for_intent(
+        "live", 177, intent
+    ) is False
+    assert execution_bindings_module._lineage_authority_enabled_for_intent(
+        "live", 176, intent
+    ) is True
+    assert execution_bindings_module._lineage_evidence_enabled("disabled") is False
+
+
+def test_lineage_child_evidence_preserves_exchange_identity_aliases():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[
+            {
+                "ordId": "parent-1",
+                "clOrdId": "client-1",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "state": "filled",
+                "errorCode": "0",
+                "px": "1900",
+                "triggerTime": "1784512860000",
+            }
+        ],
+        order_history=[
+            {
+                "ordId": "child-1",
+                "orderId": "conflicting-child-order",
+                "posId": "conflicting-pos",
+                "pos_id": "other-conflicting-pos",
+                "parentOrdId": "parent-1",
+                "triggerOrdId": "conflicting-parent",
+                "clOrdId": "client-1",
+                "clientOrderId": "conflicting-client",
+                "instId": "ETH-USDT-SWAP",
+                "posSide": "short",
+                "state": "filled",
+                "avgPx": "1900",
+                "fillSz": "4.4",
+                "cTime": "1784512860000",
+            }
+        ],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 1
+    assert rows[0]["pos_id"] == "conflicting-pos"
+    assert rows[0]["parent_trigger_order_id"] == "parent-1"
+    assert rows[0]["client_order_id"] == "client-1"
+    assert rows[0]["order_id_aliases"] == (
+        "child-1",
+        "conflicting-child-order",
+    )
+    assert rows[0]["pos_id_aliases"] == (
+        "conflicting-pos",
+        "other-conflicting-pos",
+    )
+    assert rows[0]["parent_order_id_aliases"] == (
+        "conflicting-parent",
+        "parent-1",
+    )
+    assert rows[0]["client_order_id_aliases"] == (
+        "client-1",
+        "conflicting-client",
+    )
+
+
+def test_lineage_child_explicit_parent_shape_conflict_cannot_be_filtered_out():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    explicit_but_conflicting = {
+        "ordId": "child-explicit",
+        "triggerOrdId": "parent-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1901",
+        "fillSz": "4.4",
+        "cTime": "1784512860001",
+    }
+    anonymous_shape_match = {
+        "ordId": "child-anonymous",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[explicit_but_conflicting, anonymous_shape_match],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert {row["order_id"] for row in rows} == {
+        "child-explicit",
+        "child-anonymous",
+    }
+
+
+def test_lineage_child_explicit_parent_missing_child_id_remains_blocking():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    explicit_missing_child_id = {
+        "triggerOrdId": "parent-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    anonymous_shape_match = {
+        "ordId": "child-anonymous",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[explicit_missing_child_id, anonymous_shape_match],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+    assert {row["order_id"] for row in rows} == {"", "child-anonymous"}
+
+
+def test_anonymous_child_matching_two_parents_remains_non_unique():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    competing_parent = {
+        **parent,
+        "ordId": "parent-2",
+        "clOrdId": "client-2",
+    }
+    anonymous_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent, competing_parent],
+        order_history=[anonymous_child],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+    assert {row["order_id"] for row in rows} == {"child-1"}
+
+
+def test_anonymous_child_unknown_competing_parent_remains_non_unique():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    unknown_competitor = {
+        **parent,
+        "ordId": "parent-2",
+        "clOrdId": "client-2",
+    }
+    unknown_competitor.pop("errorCode")
+    anonymous_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent, unknown_competitor],
+        order_history=[anonymous_child],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+
+
+def test_unknown_anonymous_competing_child_blocks_child_uniqueness():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    filled_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    unknown_child = {
+        **filled_child,
+        "ordId": "child-2",
+    }
+    unknown_child.pop("state")
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[filled_child, unknown_child],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+    assert {row["order_id"] for row in rows} == {"child-1", "child-2"}
+
+
+def test_filled_child_with_error_code_conflict_blocks_child_uniqueness():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    filled_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    contradictory_competitor = {
+        **filled_child,
+        "ordId": "child-2",
+        "errorCode": "203",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[filled_child, contradictory_competitor],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+    assert {row["order_id"] for row in rows} == {"child-1", "child-2"}
+
+
+def test_failed_child_with_error_code_is_explicitly_unfillable():
+    assert execution_bindings_module._exchange_row_explicitly_cannot_fill(
+        {"state": "failed", "errorCode": "203"}
+    )
+
+
+@pytest.mark.parametrize("missing_field", ["ordId", "cTime"])
+def test_malformed_anonymous_competing_child_blocks_child_uniqueness(
+    missing_field,
+):
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    filled_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    malformed_child = {
+        **filled_child,
+        "ordId": "child-2",
+    }
+    malformed_child.pop(missing_field)
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[filled_child, malformed_child],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+
+
+def test_filtered_child_row_with_same_order_id_blocks_child_uniqueness():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "errorCode": "0",
+        "px": "1900",
+        "triggerTime": "1784512860000",
+    }
+    matching_child = {
+        "ordId": "child-1",
+        "instId": "ETH-USDT-SWAP",
+        "posSide": "short",
+        "state": "filled",
+        "avgPx": "1900",
+        "fillSz": "4.4",
+        "cTime": "1784512860000",
+    }
+    conflicting_child = {
+        **matching_child,
+        "parentOrdId": "other-parent",
+        "clOrdId": "other-client",
+        "avgPx": "2000",
+        "cTime": "1784512869999",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[parent],
+        order_history=[matching_child, conflicting_child],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert len(rows) == 2
+    assert {row["order_id"] for row in rows} == {"child-1"}
+
+
+def test_lineage_parent_history_alias_pollution_fails_closed():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=1,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+        status="active",
+        attribution_status="verified",
+    )
+    exact_parent = {
+        "ordId": "parent-1",
+        "clOrdId": "client-1",
+        "state": "filled",
+        "errorCode": "0",
+    }
+    polluted_parent = {
+        "ordId": "other-parent",
+        "orderId": "parent-1",
+        "clOrdId": "other-client",
+        "state": "filled",
+        "errorCode": "0",
+    }
+    snapshot = execution_bindings_module._ReconcileSnapshot(
+        trigger_history=[exact_parent, polluted_parent],
+        order_history=[],
+    )
+
+    rows = execution_bindings_module._trigger_protection_child_fill_rows(
+        leg, snapshot=snapshot
+    )
+
+    assert rows == ()
+
+
+def test_lineage_parent_events_include_duplicate_client_identity():
+    leg = ExecutionOrderLeg(
+        id=1,
+        execution_binding_id=7,
+        leg_index=1,
+        purpose="entry",
+        order_kind="trigger_limit",
+        order_id="parent-1",
+        client_order_id="client-1",
+        venue="deepcoin",
+    )
+    exact = ExecutionEvent(
+        id=1,
+        execution_binding_id=7,
+        action="create_trigger_entry",
+        order_id="parent-1",
+        client_order_id="client-1",
+    )
+    duplicate_client = ExecutionEvent(
+        id=2,
+        execution_binding_id=7,
+        action="create_trigger_entry",
+        order_id="other-parent",
+        client_order_id="client-1",
+    )
+
+    strict = execution_bindings_module._parent_trigger_events_for_leg(
+        [exact, duplicate_client], leg=leg, strict_identity=True
+    )
+    legacy = execution_bindings_module._parent_trigger_events_for_leg(
+        [exact, duplicate_client], leg=leg, strict_identity=False
+    )
+
+    assert [event.id for event in strict] == [1, 2]
+    assert [event.id for event in legacy] == [1]
 
 
 def test_reconcile_saved_trigger_protection_requires_live_position(tmp_path):
@@ -6614,6 +8317,12 @@ def test_reconcile_records_complete_owned_position_observation(tmp_path):
                 "sz": "3",
                 "triggerPx": "65000",
             }]
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {
+                "code": "0",
+                "data": self.list_trigger_orders_pending(inst_id=inst_id),
+            }
 
         def list_order_history(self, *, inst_id=None):
             return []

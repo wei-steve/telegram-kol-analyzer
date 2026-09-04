@@ -1,4 +1,5 @@
-﻿import json
+﻿import hashlib
+import json
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
@@ -27,6 +28,8 @@ from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.message_instruction_items import create_message_instruction_items_in_session
 from telegram_kol_research.models import EntryPreamble, EntryStrategyAssembly, EntryStrategyFragment, ExecutionBinding, ExecutionEvent, ExecutionOrderLeg, InstructionExecutionContract, MediaAsset, MessageEvidenceExtractionClaim, MessageEvidenceVersion, MessageInstructionItem, PositionProtectionLeg, PositionProtectionLedger, RawMessage, RecoveryDecisionRecord, SignalCandidate, StrategyLifecycle, StrategyManagementBatch, TradeSignal, TriggerProtectionIntent, TriggerTakeProfitConvergence
 from telegram_kol_research.recovery_live_submit import RecoveryLiveSubmitError
+from telegram_kol_research.recovery_live_submit import _capture_pending_tpsl_baseline
+from telegram_kol_research.recovery_live_submit import _normalized_pending_tpsl_baseline
 from telegram_kol_research.recovery_live_submit import _trigger_protection_lock_key
 from telegram_kol_research.recovery_live_submit import _trigger_protection_request_fingerprint
 from telegram_kol_research.trading_settings import load_trading_settings
@@ -190,6 +193,9 @@ class _FakeDeepcoinClient:
 
     def list_trigger_orders_pending(self, *, inst_id):
         return self.trigger_pending
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {"code": "0", "data": list(self.trigger_pending)}
 
     def list_open_orders(self, *, inst_id=None):
         return self.open_orders
@@ -2577,6 +2583,120 @@ def test_trigger_limit_entry_defers_when_tpsl_snapshot_is_malformed(tmp_path):
         assert session.query(TradeSignal).one().status == "failed"
         assert session.query(ExecutionBinding).count() == 0
         assert session.query(ExecutionOrderLeg).count() == 0
+
+
+@pytest.mark.parametrize(
+    ("response", "reason"),
+    [
+        (
+            {"code": "0", "data": [], "nextCursor": "more"},
+            "trigger_protection_baseline_incomplete",
+        ),
+        (
+            {"code": "0", "data": [{} for _ in range(100)]},
+            "trigger_protection_baseline_incomplete",
+        ),
+        (
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "instId": "ETH-USDT-SWAP",
+                        "triggerOrderType": "OTHER",
+                    }
+                ],
+            },
+            "trigger_protection_baseline_malformed",
+        ),
+        (
+            {
+                "code": "0",
+                "data": [
+                    {
+                        "triggerOrderType": "TPSL",
+                        "ordId": "stop-a",
+                        "orderId": "stop-b",
+                        "instId": "BTC-USDT-SWAP",
+                        "posSide": "long",
+                    }
+                ],
+            },
+            "trigger_protection_baseline_malformed",
+        ),
+    ],
+)
+def test_trigger_protection_baseline_requires_complete_raw_unique_evidence(
+    response, reason
+):
+    class _BaselineClient:
+        def read_trigger_orders_pending(self, *, inst_id):
+            return response
+
+    with pytest.raises(RecoveryLiveSubmitError, match=reason):
+        _normalized_pending_tpsl_baseline(
+            _BaselineClient(),
+            inst_id="BTC-USDT-SWAP",
+            require_complete_lineage=True,
+        )
+
+
+def test_strict_trigger_protection_baseline_persists_verifiable_provenance():
+    class _BaselineClient:
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": []}
+
+    baseline = json.loads(
+        _normalized_pending_tpsl_baseline(
+            _BaselineClient(),
+            inst_id="BTC-USDT-SWAP",
+            require_complete_lineage=True,
+        )
+    )
+
+    assert baseline["schema"] == "deepcoin_pending_tpsl_baseline_v2"
+    assert baseline["orders"] == []
+    assert baseline["capture_proof"] == {
+        "transport": "raw",
+        "response_code": "0",
+        "complete": True,
+        "instrument_id": "BTC-USDT-SWAP",
+        "page_limit": 100,
+        "snapshot_fingerprint": hashlib.sha256(
+            b'{"instrument_id":"BTC-USDT-SWAP","orders":[]}'
+        ).hexdigest(),
+    }
+
+
+def test_shadow_baseline_capture_is_strict_when_available_and_legacy_on_failure():
+    class _BaselineClient:
+        def __init__(self, *, raw_fails=False):
+            self.raw_fails = raw_fails
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            if self.raw_fails:
+                raise RuntimeError("raw unavailable")
+            return {"code": "0", "data": []}
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+    strict = json.loads(
+        _capture_pending_tpsl_baseline(
+            _BaselineClient(),
+            inst_id="BTC-USDT-SWAP",
+            lineage_mode="shadow",
+        )
+    )
+    fallback = json.loads(
+        _capture_pending_tpsl_baseline(
+            _BaselineClient(raw_fails=True),
+            inst_id="BTC-USDT-SWAP",
+            lineage_mode="shadow",
+        )
+    )
+
+    assert strict["schema"] == "deepcoin_pending_tpsl_baseline_v2"
+    assert fallback == []
 
 
 def test_trigger_limit_entry_rejects_alias_parent_id_without_persisting_it(tmp_path):

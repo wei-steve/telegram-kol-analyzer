@@ -378,6 +378,19 @@
             </select>
           </label>
           <label>
+            触发保护血缘归属模式
+            <select name="trigger_protection_lineage_attribution_mode">
+              <option value="disabled" {% if trading_settings.trigger_protection_lineage_attribution_mode == 'disabled' %}selected{% endif %}>禁用：沿用旧归属判据</option>
+              <option value="shadow" {% if trading_settings.trigger_protection_lineage_attribution_mode == 'shadow' %}selected{% endif %}>影子：只记录血缘建议，不写归属</option>
+              <option value="live" {% if trading_settings.trigger_protection_lineage_attribution_mode == 'live' %}selected{% endif %}>实盘：仅处理水位之后的新 intent</option>
+            </select>
+          </label>
+          <label>
+            血缘归属 future-only intent 水位
+            <input name="trigger_protection_lineage_activation_after_intent_id" type="number" min="0" step="1" value="{{ trading_settings.trigger_protection_lineage_activation_after_intent_id if trading_settings.trigger_protection_lineage_activation_after_intent_id is not none else '' }}" placeholder="live 模式必须填写" />
+            <small>仅处理水位之后的新 intent；空值会让 live 有效模式保持禁用。</small>
+          </label>
+          <label>
             前置仓位指令组装模式
             <select name="entry_preamble_mode">
               <option value="disabled" {% if trading_settings.entry_preamble_mode == 'disabled' %}selected{% endif %}>关闭：不使用之前的仓位提示</option>

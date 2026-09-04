@@ -173,6 +173,7 @@ class _ReconcileSnapshot:
     trade_fills: list[dict[str, Any]] = field(default_factory=list)
     trigger_history: list[dict[str, Any]] = field(default_factory=list)
     pending_tpsl_observations: list[dict[str, Any]] = field(default_factory=list)
+    lineage_history_completeness: dict[str, bool] = field(default_factory=dict)
     errors: dict[str, str] = field(default_factory=dict)
 
 
@@ -563,6 +564,8 @@ def _load_reconcile_snapshot(
         source="order_history",
         instruments=instruments,
         errors=snapshot.errors,
+        raw_method_name="read_order_history",
+        completeness=snapshot.lineage_history_completeness,
     )
     snapshot.trade_fills = _read_instrument_snapshot_rows(
         client,
@@ -577,6 +580,8 @@ def _load_reconcile_snapshot(
         source="trigger_history",
         instruments=instruments,
         errors=snapshot.errors,
+        raw_method_name="read_trigger_order_history",
+        completeness=snapshot.lineage_history_completeness,
     )
     return snapshot
 
@@ -609,7 +614,10 @@ def _read_instrument_snapshot_rows(
     source: str,
     instruments: set[str],
     errors: dict[str, str],
+    raw_method_name: str | None = None,
+    completeness: dict[str, bool] | None = None,
 ) -> list[dict[str, Any]]:
+    raw_method = getattr(client, raw_method_name, None) if raw_method_name else None
     method = getattr(client, method_name, None)
     if method is None:
         return []
@@ -617,18 +625,44 @@ def _read_instrument_snapshot_rows(
     called_without_instrument = False
     for instrument_id in sorted(instruments):
         try:
-            rows = method(inst_id=instrument_id)
+            if raw_method is not None:
+                response = raw_method(inst_id=instrument_id)
+                observation = observe_pending_tpsl(
+                    instrument_id=instrument_id,
+                    response=response,
+                    page_limit=100,
+                    require_success_code=True,
+                )
+                if completeness is not None:
+                    completeness[f"{source}:{instrument_id}"] = bool(
+                        isinstance(response, dict)
+                        and str(response.get("code")) == "0"
+                        and observation.get("complete")
+                        and _snapshot_rows_match_instrument_scope(
+                            rows=response.get("data"),
+                            instrument_id=instrument_id,
+                        )
+                    )
+                rows = response.get("data") if isinstance(response, dict) else None
+            else:
+                rows = method(inst_id=instrument_id)
+                if completeness is not None:
+                    completeness[f"{source}:{instrument_id}"] = False
         except TypeError:
             if called_without_instrument:
                 continue
             called_without_instrument = True
             try:
                 rows = method()
+                if completeness is not None:
+                    completeness[f"{source}:{instrument_id}"] = False
             except Exception as exc:
                 errors[source] = str(exc)
                 return result
         except Exception as exc:
             errors[f"{source}:{instrument_id}"] = str(exc)
+            if completeness is not None:
+                completeness[f"{source}:{instrument_id}"] = False
             continue
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
             errors[f"{source}:{instrument_id}"] = "invalid list response schema"
@@ -653,6 +687,7 @@ def _read_pending_trigger_snapshot_rows(
     list_reader = getattr(client, "list_trigger_orders_pending", None)
     result: list[dict[str, Any]] = []
     for instrument_id in sorted(instruments):
+        used_raw_reader = raw_reader is not None
         try:
             if raw_reader is not None:
                 response = raw_reader(inst_id=instrument_id)
@@ -677,7 +712,25 @@ def _read_pending_trigger_snapshot_rows(
         observation = observe_pending_tpsl(
             instrument_id=instrument_id,
             response=response,
+            page_limit=100,
+            require_success_code=used_raw_reader,
         )
+        if not used_raw_reader:
+            observation = {
+                **observation,
+                "complete": False,
+                "reason": "raw_snapshot_unavailable",
+                "expected_order_ids_visible": False,
+            }
+        elif not _snapshot_rows_match_instrument_scope(
+            rows=response.get("data"), instrument_id=instrument_id
+        ):
+            observation = {
+                **observation,
+                "complete": False,
+                "reason": "instrument_scope_mismatch",
+                "expected_order_ids_visible": False,
+            }
         observations.append(observation)
         rows = response.get("data")
         if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
@@ -685,6 +738,24 @@ def _read_pending_trigger_snapshot_rows(
             continue
         result.extend(rows)
     return _deduplicate_exchange_rows(result)
+
+
+def _snapshot_rows_match_instrument_scope(
+    *, rows: Any, instrument_id: str
+) -> bool:
+    if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+        return False
+    expected = str(instrument_id or "").strip().upper()
+    return bool(expected) and all(
+        {
+            value.upper()
+            for value in _exchange_string_aliases(
+                row, "instId", "instrument_id", "instrumentId"
+            )
+        }
+        == {expected}
+        for row in rows
+    )
 
 
 def _deduplicate_exchange_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -747,9 +818,16 @@ def _apply_reconcile_snapshot(
     recovered_at: datetime,
 ) -> ExecutionReconciliationResult:
     result = ExecutionReconciliationResult()
-    liveness_rollout_mode = load_trading_settings(
-        session_factory
-    ).effective_position_management_liveness_v2_mode
+    trading_settings = load_trading_settings(session_factory)
+    liveness_rollout_mode = (
+        trading_settings.effective_position_management_liveness_v2_mode
+    )
+    lineage_rollout_mode = (
+        trading_settings.effective_trigger_protection_lineage_attribution_mode
+    )
+    lineage_activation_after_intent_id = (
+        trading_settings.trigger_protection_lineage_activation_after_intent_id
+    )
     active_positions = [row for row in snapshot.positions if _has_nonzero_size(row)]
     live_position_ids = {
         pos_id for row in active_positions for pos_id in _position_identity_ids(row)
@@ -1044,6 +1122,10 @@ def _apply_reconcile_snapshot(
             recovered_at=recovered_at,
             result=result,
             liveness_rollout_mode=liveness_rollout_mode,
+            lineage_rollout_mode=lineage_rollout_mode,
+            lineage_activation_after_intent_id=(
+                lineage_activation_after_intent_id
+            ),
         )
         _ready_verified_trigger_take_profit_convergences(
             session, legs=legs, snapshot=snapshot, recovered_at=recovered_at
@@ -1353,6 +1435,8 @@ def _adopt_verified_trigger_entry_protection(
     recovered_at: datetime,
     result: ExecutionReconciliationResult,
     liveness_rollout_mode: str,
+    lineage_rollout_mode: str,
+    lineage_activation_after_intent_id: int | None,
 ) -> None:
     """Adopt strict trigger-entry protection from the bounded read snapshot."""
 
@@ -1384,6 +1468,8 @@ def _adopt_verified_trigger_entry_protection(
     intent_leg_ids = _reconcile_saved_trigger_protection_intents(
         session, legs=legs, snapshot=snapshot, recovered_at=recovered_at,
         result=result, liveness_rollout_mode=liveness_rollout_mode,
+        lineage_rollout_mode=lineage_rollout_mode,
+        lineage_activation_after_intent_id=lineage_activation_after_intent_id,
     )
 
     eligible_legs = [
@@ -1545,7 +1631,7 @@ def _adopt_verified_trigger_entry_protection(
 
 _TRIGGER_PROTECTION_RETRY_LIMIT = 5
 _TRIGGER_PROTECTION_SNAPSHOT_SOURCES = frozenset(
-    {"pending_trigger_orders", "trigger_history"}
+    {"pending_trigger_orders", "trigger_history", "order_history"}
 )
 
 
@@ -1750,14 +1836,333 @@ def _retry_saved_trigger_protection_intents_for_unavailable_snapshot(
         )
 
 
+def _lineage_mode_applies_to_intent(
+    mode: str,
+    activation_after_intent_id: int | None,
+    intent: TriggerProtectionIntent,
+) -> bool:
+    if mode == "shadow":
+        return True
+    return (
+        mode == "live"
+        and type(activation_after_intent_id) is int
+        and activation_after_intent_id >= 0
+        and int(intent.id or 0) > activation_after_intent_id
+    )
+
+
+def _lineage_evidence_enabled(mode: str) -> bool:
+    return mode in {"shadow", "live"}
+
+
+def _lineage_authority_enabled_for_intent(
+    mode: str,
+    activation_after_intent_id: int | None,
+    intent: TriggerProtectionIntent,
+) -> bool:
+    return bool(
+        mode == "live"
+        and _lineage_mode_applies_to_intent(
+            mode, activation_after_intent_id, intent
+        )
+    )
+
+
+def _trigger_protection_child_fill_rows(
+    leg: ExecutionOrderLeg,
+    *,
+    snapshot: _ReconcileSnapshot,
+) -> tuple[dict[str, Any], ...]:
+    """Return every exact parent-linked filled child; the builder requires one."""
+
+    expected_parent_order_id = str(leg.order_id or "").strip()
+    expected_client_order_id = str(leg.client_order_id or "").strip()
+    parent_identity_rows = [
+        row
+        for row in snapshot.trigger_history
+        if isinstance(row, dict)
+        and (
+            expected_parent_order_id
+            in _exchange_string_aliases(
+                row, "ordId", "orderId", "order_id", "id"
+            )
+            or expected_client_order_id
+            in _exchange_string_aliases(
+                row, "clOrdId", "clientOrderId", "client_order_id"
+            )
+        )
+    ]
+    if len(parent_identity_rows) != 1:
+        return ()
+    parent = parent_identity_rows[0]
+    if (
+        _exchange_string_aliases(parent, "ordId", "orderId", "order_id", "id")
+        != {expected_parent_order_id}
+        or _exchange_string_aliases(
+            parent, "clOrdId", "clientOrderId", "client_order_id"
+        )
+        != {expected_client_order_id}
+        or not is_fill_evidence({**parent, "_evidence_source": "trigger_fill"})
+    ):
+        return ()
+    parent_rows = [parent]
+    bounded: list[dict[str, Any]] = []
+    for parent in parent_rows:
+        parent_order_id = _first_string(
+            parent, "ordId", "orderId", "order_id", "id"
+        )
+        for child in _trigger_protection_candidate_child_rows(
+            parent,
+            rows=snapshot.order_history,
+            all_parent_rows=snapshot.trigger_history,
+            expected_parent_order_id=expected_parent_order_id,
+            expected_client_order_id=expected_client_order_id,
+        ):
+            child_order_id = _first_string(
+                child, "ordId", "orderId", "order_id", "id"
+            )
+            if not parent_order_id:
+                continue
+            reported_pos_id = _first_string(
+                child, "posId", "pos_id", "closePosId"
+            )
+            reported_parent_order_id = _first_string(
+                child,
+                "parentOrdId",
+                "parentOrderId",
+                "parent_order_id",
+                "triggerOrdId",
+                "triggerOrderId",
+            )
+            reported_client_order_id = _first_string(
+                child, "clOrdId", "clientOrderId", "client_order_id"
+            )
+            order_id_aliases = _exchange_string_aliases(
+                child, "ordId", "orderId", "order_id", "id"
+            )
+            pos_id_aliases = _exchange_string_aliases(
+                child, "posId", "pos_id", "closePosId"
+            )
+            parent_order_id_aliases = _exchange_string_aliases(
+                child,
+                "parentOrdId",
+                "parentOrderId",
+                "parent_order_id",
+                "triggerOrdId",
+                "triggerOrderId",
+            )
+            client_order_id_aliases = _exchange_string_aliases(
+                child, "clOrdId", "clientOrderId", "client_order_id"
+            )
+            bounded.append(
+                {
+                    "source": "trigger_child_order",
+                    "parent_trigger_order_id": (
+                        reported_parent_order_id or parent_order_id
+                    ),
+                    "order_id": child_order_id or "",
+                    # Deepcoin's established trigger-child attribution invariant
+                    # is child regular order ID == posId. An explicit exchange
+                    # alias takes precedence so a conflict reaches the builder.
+                    "pos_id": reported_pos_id or child_order_id or "",
+                    "client_order_id": (
+                        reported_client_order_id
+                        or str(leg.client_order_id or "")
+                    ),
+                    "order_id_aliases": tuple(sorted(order_id_aliases)),
+                    "pos_id_aliases": tuple(sorted(pos_id_aliases)),
+                    "parent_order_id_aliases": tuple(
+                        sorted(parent_order_id_aliases)
+                    ),
+                    "client_order_id_aliases": tuple(
+                        sorted(client_order_id_aliases)
+                    ),
+                    "instrument_id_aliases": tuple(
+                        sorted(
+                            _exchange_string_aliases(
+                                child, "instId", "instrument_id", "instrumentId"
+                            )
+                        )
+                    ),
+                    "side_aliases": tuple(
+                        sorted(
+                            _exchange_string_aliases(
+                                child, "posSide", "pos_side", "side"
+                            )
+                        )
+                    ),
+                    "size_aliases": tuple(
+                        sorted(
+                            _exchange_string_aliases(
+                                child, "fillSz", "accFillSz", "sz", "size"
+                            )
+                        )
+                    ),
+                    "instId": str(child.get("instId") or parent.get("instId") or ""),
+                    "posSide": _normalize_position_side(
+                        str(
+                            child.get("posSide")
+                            or child.get("side")
+                            or parent.get("posSide")
+                            or parent.get("side")
+                            or ""
+                        )
+                    ),
+                    "sz": _order_row_size(child),
+                    "state": classify_leg_exchange_state(child),
+                    "cTime": child.get("cTime"),
+                }
+            )
+    return tuple(bounded)
+
+
+def _trigger_protection_candidate_child_rows(
+    parent: dict[str, Any],
+    *,
+    rows: list[dict[str, Any]],
+    all_parent_rows: list[dict[str, Any]],
+    expected_parent_order_id: str,
+    expected_client_order_id: str,
+) -> tuple[dict[str, Any], ...]:
+    """Keep explicit lineage conflicts visible; shape-match only anonymous rows."""
+
+    candidates: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        parent_aliases = _exchange_string_aliases(
+            row,
+            "parentOrdId",
+            "parentOrderId",
+            "parent_order_id",
+            "triggerOrdId",
+            "triggerOrderId",
+        )
+        client_aliases = _exchange_string_aliases(
+            row, "clOrdId", "clientOrderId", "client_order_id"
+        )
+        explicitly_linked = (
+            expected_parent_order_id in parent_aliases
+            or expected_client_order_id in client_aliases
+        )
+        if explicitly_linked:
+            candidates.extend(
+                [row] * _child_order_id_occupancy(row, all_rows=rows)
+            )
+            continue
+        if parent_aliases or client_aliases:
+            continue
+        if _trigger_child_order_potentially_matches(parent, row):
+            matching_parent_count = sum(
+                1
+                for candidate_parent in all_parent_rows
+                if isinstance(candidate_parent, dict)
+                and _trigger_parent_potentially_filled(candidate_parent)
+                and _trigger_child_order_potentially_matches(candidate_parent, row)
+            )
+            candidates.extend(
+                [row]
+                * max(
+                    1,
+                    matching_parent_count,
+                    _child_order_id_occupancy(row, all_rows=rows),
+                )
+            )
+    return tuple(candidates)
+
+
+def _child_order_id_occupancy(
+    row: dict[str, Any], *, all_rows: list[dict[str, Any]]
+) -> int:
+    aliases = _exchange_string_aliases(
+        row, "ordId", "orderId", "order_id", "id"
+    )
+    if not aliases:
+        return 1
+    return max(
+        1,
+        sum(
+            1
+            for other in all_rows
+            if isinstance(other, dict)
+            and aliases
+            & _exchange_string_aliases(
+                other, "ordId", "orderId", "order_id", "id"
+            )
+        ),
+    )
+
+
+def _exchange_string_aliases(row: dict[str, Any], *keys: str) -> set[str]:
+    return {
+        str(row.get(key)).strip()
+        for key in keys
+        if row.get(key) is not None and str(row.get(key)).strip()
+    }
+
+
+def _trigger_protection_owner_sets(saved_intents, legs_by_id):
+    """Return all shape-bounded live owners and the identity-consistent subset."""
+
+    intents_by_leg_id: dict[int, list[TriggerProtectionIntent]] = {}
+    for intent in saved_intents:
+        intents_by_leg_id.setdefault(int(intent.execution_order_leg_id), []).append(intent)
+    potential_owners = []
+    consistent_owners = []
+    for leg_id in sorted(legs_by_id):
+        leg = legs_by_id[leg_id]
+        if (
+            str(leg.purpose or "") != "entry"
+            or str(leg.order_kind or "") != "trigger_limit"
+            or str(leg.status or "").lower() != "active"
+            or not str(leg.pos_id or "").strip()
+        ):
+            continue
+        intents = intents_by_leg_id.get(leg_id, [])
+        if len(intents) != 1:
+            potential_owners.append((None, leg))
+            continue
+        intent = intents[0]
+        pair = (intent, leg)
+        potential_owners.append(pair)
+        if (
+            str(leg.attribution_status or "") == "verified"
+            and int(intent.execution_binding_id)
+            == int(leg.execution_binding_id)
+        ):
+            consistent_owners.append(pair)
+    return tuple(potential_owners), tuple(consistent_owners)
+
+
+def _parent_trigger_events_for_leg(
+    events, *, leg: ExecutionOrderLeg, strict_identity: bool
+):
+    """Keep every local parent event that claims either strict identity alias."""
+
+    return [
+        event
+        for event in events
+        if int(event.execution_binding_id or 0) == int(leg.execution_binding_id)
+        and (
+            _same_present_text(event.order_id, leg.order_id)
+            or (
+                strict_identity
+                and _same_present_text(event.client_order_id, leg.client_order_id)
+            )
+        )
+    ]
+
+
 def _reconcile_saved_trigger_protection_intents(
-    session, *, legs, snapshot, recovered_at, result, liveness_rollout_mode
+    session, *, legs, snapshot, recovered_at, result, liveness_rollout_mode,
+    lineage_rollout_mode, lineage_activation_after_intent_id
 ) -> set[int]:
     """Apply saved trigger intents using only this bounded, read-only snapshot."""
     from telegram_kol_research.entry_protection_ledger_repair import (
         EntryProtectionLedgerRepairRefusal,
         TriggerProtectionAssignmentContext,
         TriggerProtectionOwnerState,
+        build_trigger_protection_blocking_owner,
         build_trigger_protection_live_position,
         finalize_trigger_protection_adoption,
         plan_trigger_protection_intent_adoption,
@@ -1778,21 +2183,29 @@ def _reconcile_saved_trigger_protection_intents(
         for intent in saved_intents
         if int(intent.execution_order_leg_id) in legs_by_id
     }
-    intents = [
-        intent
-        for intent in saved_intents
+    potential_owners, candidate_owners = _trigger_protection_owner_sets(
+        saved_intents, legs_by_id
+    )
+    eligible = [
+        (intent, leg)
+        for intent, leg in candidate_owners
         if intent.recovery_state in {"pending", "retrying"}
     ]
-    eligible = [
-        (intent, legs_by_id[int(intent.execution_order_leg_id)]) for intent in intents
-        if int(intent.execution_order_leg_id) in legs_by_id
-        and int(intent.execution_binding_id) == int(legs_by_id[int(intent.execution_order_leg_id)].execution_binding_id)
-        and str(legs_by_id[int(intent.execution_order_leg_id)].purpose or "") == "entry"
-        and str(legs_by_id[int(intent.execution_order_leg_id)].order_kind or "") == "trigger_limit"
-        and str(legs_by_id[int(intent.execution_order_leg_id)].attribution_status or "") == "verified"
-        and str(legs_by_id[int(intent.execution_order_leg_id)].status or "").lower() == "active"
-        and bool(str(legs_by_id[int(intent.execution_order_leg_id)].pos_id or "").strip())
-    ]
+    processable_due_leg_ids = {
+        int(leg.id)
+        for intent, leg in eligible
+        if _trigger_intent_due(intent, recovered_at)
+    }
+    lineage_authority_leg_ids = {
+        int(leg.id)
+        for intent, leg in candidate_owners
+        if lineage_rollout_mode == "live"
+        and _lineage_mode_applies_to_intent(
+            lineage_rollout_mode,
+            lineage_activation_after_intent_id,
+            intent,
+        )
+    }
     errors = sorted(
         key for key in snapshot.errors
         if key == "pending_trigger_orders" or key.startswith("pending_trigger_orders:")
@@ -1818,6 +2231,21 @@ def _reconcile_saved_trigger_protection_intents(
                 last_evidence={"snapshot_sources": errors},
             )
         return handled
+    lineage_history_errors = sorted(
+        key
+        for key in snapshot.errors
+        if key == "order_history" or key.startswith("order_history:")
+    )
+    if _lineage_evidence_enabled(lineage_rollout_mode):
+        lineage_history_errors.extend(
+            key
+            for key, complete in snapshot.lineage_history_completeness.items()
+            if not complete
+        )
+        lineage_history_errors = sorted(set(lineage_history_errors))
+    lineage_snapshot_unavailable_leg_ids = (
+        set(lineage_authority_leg_ids) if lineage_history_errors else set()
+    )
 
     existing_ledger_rows = session.query(PositionProtectionLedger).all()
     all_intents = saved_intents
@@ -1844,18 +2272,15 @@ def _reconcile_saved_trigger_protection_intents(
         ExecutionEvent.venue == "deepcoin", ExecutionEvent.action == "create_trigger_entry"
     ).order_by(ExecutionEvent.id.asc()).all()
     assignment_contexts: list[TriggerProtectionAssignmentContext] = []
-    for intent, leg in eligible:
-        if not _trigger_intent_due(intent, recovered_at):
-            continue
-        parent_events = [
-            event
-            for event in events
-            if int(event.execution_binding_id or 0)
-            == int(leg.execution_binding_id)
-            and _same_present_text(event.order_id, leg.order_id)
-            and _same_present_text(event.client_order_id, leg.client_order_id)
-        ]
-        if len(parent_events) != 1:
+    for intent, leg in candidate_owners:
+        parent_events = _parent_trigger_events_for_leg(
+            events,
+            leg=leg,
+            strict_identity=_lineage_evidence_enabled(lineage_rollout_mode),
+        )
+        if len(parent_events) != 1 or not _same_present_text(
+            parent_events[0].client_order_id, leg.client_order_id
+        ):
             continue
         live_position_result = build_trigger_protection_live_position(
             entry_leg=leg,
@@ -1864,29 +2289,99 @@ def _reconcile_saved_trigger_protection_intents(
         )
         if live_position_result.position is None:
             continue
+        lineage_history_complete = bool(
+            snapshot.lineage_history_completeness
+        ) and all(snapshot.lineage_history_completeness.values())
+        if (
+            _lineage_evidence_enabled(lineage_rollout_mode)
+            and not lineage_history_complete
+            and int(leg.id) in lineage_authority_leg_ids
+        ):
+            lineage_snapshot_unavailable_leg_ids.add(int(leg.id))
+            for source in ("trigger_history", "order_history"):
+                key = f"{source}:{live_position_result.position.instrument_id.upper()}"
+                if not snapshot.lineage_history_completeness.get(key, False):
+                    lineage_history_errors.append(key)
         assignment_contexts.append(
             TriggerProtectionAssignmentContext(
                 entry_leg=leg,
                 intent=intent,
                 parent_event=parent_events[0],
                 live_position=live_position_result.position,
+                binding=(
+                    session.get(ExecutionBinding, int(leg.execution_binding_id))
+                    if _lineage_evidence_enabled(lineage_rollout_mode)
+                    else None
+                ),
+                child_fill_rows=(
+                    _trigger_protection_child_fill_rows(leg, snapshot=snapshot)
+                    if _lineage_evidence_enabled(lineage_rollout_mode)
+                    and lineage_history_complete
+                    else ()
+                ),
+                lineage_evidence_required=_lineage_evidence_enabled(
+                    lineage_rollout_mode
+                ),
+                lineage_authority=(
+                    _lineage_authority_enabled_for_intent(
+                        lineage_rollout_mode,
+                        lineage_activation_after_intent_id,
+                        intent,
+                    )
+                ),
             )
         )
+    lineage_history_errors = sorted(set(lineage_history_errors))
+    context_leg_ids = {int(context.entry_leg.id) for context in assignment_contexts}
+    missing_lineage_owners = [
+        (intent, leg)
+        for intent, leg in potential_owners
+        if int(leg.id) not in context_leg_ids
+        and _lineage_evidence_enabled(lineage_rollout_mode)
+    ]
+    blocking_owners = tuple(
+        owner
+        for intent, leg in missing_lineage_owners
+        if (owner := build_trigger_protection_blocking_owner(
+            entry_leg=leg, intent=intent
+        )) is not None
+    )
+    owner_universe_bounded = len(blocking_owners) == len(missing_lineage_owners)
+    pending_completeness = _pending_tpsl_snapshot_completeness(
+        snapshot.pending_tpsl_observations
+    )
+    account_pending_complete = bool(pending_completeness) and all(
+        pending_completeness.values()
+    )
+    assignment_snapshot_complete = bool(assignment_contexts) and all(
+        pending_completeness.get(
+            context.live_position.instrument_id.upper(), False
+        )
+        for context in assignment_contexts
+    ) and (
+        not _lineage_evidence_enabled(lineage_rollout_mode)
+        or account_pending_complete
+    )
     global_plan = (
         plan_trigger_protection_intent_assignments(
             contexts=tuple(assignment_contexts),
             pending_tpsl_rows=snapshot.pending_trigger_orders,
             existing_ledger_rows=existing_ledger_rows,
-            snapshot_complete=True,
+            snapshot_complete=assignment_snapshot_complete,
+            existing_intents=tuple(all_intents),
+            blocking_owners=blocking_owners,
         )
         if liveness_rollout_mode in {"shadow", "live"}
+        and owner_universe_bounded
         else None
     )
     globally_processed_leg_ids: set[int] = set()
     contexts_by_leg = {
         int(context.entry_leg.id): context for context in assignment_contexts
     }
-    if global_plan is not None and liveness_rollout_mode == "shadow":
+    if global_plan is not None and (
+        liveness_rollout_mode == "shadow" or lineage_rollout_mode == "shadow"
+    ):
         _record_trigger_assignment_shadow_plan(
             session,
             global_plan=global_plan,
@@ -1896,20 +2391,46 @@ def _reconcile_saved_trigger_protection_intents(
     if global_plan is not None and liveness_rollout_mode == "live":
         for leg_id, action in global_plan.actions.items():
             context = contexts_by_leg[leg_id]
+            if leg_id not in processable_due_leg_ids:
+                continue
+            if context.lineage_evidence_required and not context.lineage_authority:
+                continue
             row = finalize_trigger_protection_adoption(
                 session,
                 action=action,
                 intent=context.intent,
                 seen_at=recovered_at,
             )
+            _record_protection_ownership_recovered(
+                session,
+                leg=context.entry_leg,
+                adopted_order_id=action.order_id,
+                created_at=recovered_at,
+            )
             existing_ledger_rows.append(row)
             result.protection_adopted += 1
             globally_processed_leg_ids.add(leg_id)
         for leg_id, refusal in global_plan.refusals.items():
-            if refusal.reason != "trigger_protection_assignment_not_mutual_unique":
-                continue
             context = contexts_by_leg[leg_id]
-            result.protection_adoption_deferred += 1
+            if leg_id not in processable_due_leg_ids:
+                continue
+            if context.lineage_evidence_required and not context.lineage_authority:
+                continue
+            snapshot_refusal = (
+                refusal.reason == "trigger_protection_snapshot_incomplete"
+                or leg_id in lineage_snapshot_unavailable_leg_ids
+            )
+            if snapshot_refusal:
+                result.protection_snapshot_unavailable += 1
+                refusal = EntryProtectionLedgerRepairRefusal(
+                    event_id=refusal.event_id,
+                    binding_id=refusal.binding_id,
+                    pos_id=refusal.pos_id,
+                    reason="trigger_protection_snapshot_unavailable",
+                    evidence={"snapshot_sources": lineage_history_errors},
+                )
+            else:
+                result.protection_adoption_deferred += 1
             _record_protection_adoption_refusal(
                 session,
                 leg=context.entry_leg,
@@ -1921,8 +2442,57 @@ def _reconcile_saved_trigger_protection_intents(
                 context.intent,
                 recovered_at,
                 transition_trigger_protection_intent,
-                recovery_disposition="exact_backup",
-                last_reason_code="protection_assignment_not_mutual_unique",
+                consume_attempt=not snapshot_refusal,
+                recovery_disposition=("wait" if snapshot_refusal else "exact_backup"),
+                last_reason_code=(
+                    "snapshot_incomplete" if snapshot_refusal else str(refusal.reason)
+                ),
+                last_evidence=refusal.evidence,
+            )
+            globally_processed_leg_ids.add(leg_id)
+    if liveness_rollout_mode == "live":
+        for intent, leg in eligible:
+            leg_id = int(leg.id)
+            if (
+                leg_id not in lineage_authority_leg_ids
+                or leg_id not in processable_due_leg_ids
+                or leg_id in globally_processed_leg_ids
+            ):
+                continue
+            snapshot_refusal = leg_id in lineage_snapshot_unavailable_leg_ids
+            if snapshot_refusal:
+                result.protection_snapshot_unavailable += 1
+            else:
+                result.protection_adoption_deferred += 1
+            refusal = EntryProtectionLedgerRepairRefusal(
+                event_id=None,
+                binding_id=int(leg.execution_binding_id),
+                pos_id=str(leg.pos_id),
+                reason=(
+                    "trigger_protection_snapshot_unavailable"
+                    if snapshot_refusal
+                    else "trigger_protection_lineage_not_safely_attributed"
+                ),
+                evidence={
+                    "lineage_authority": True,
+                    "snapshot_sources": (
+                        lineage_history_errors if snapshot_refusal else []
+                    ),
+                },
+            )
+            _record_protection_adoption_refusal(
+                session, leg=leg, refusal=refusal, created_at=recovered_at
+            )
+            _schedule_trigger_intent_retry(
+                session,
+                intent,
+                recovered_at,
+                transition_trigger_protection_intent,
+                consume_attempt=not snapshot_refusal,
+                recovery_disposition=("wait" if snapshot_refusal else "exact_backup"),
+                last_reason_code=(
+                    "snapshot_incomplete" if snapshot_refusal else refusal.reason
+                ),
                 last_evidence=refusal.evidence,
             )
             globally_processed_leg_ids.add(leg_id)
@@ -1931,10 +2501,18 @@ def _reconcile_saved_trigger_protection_intents(
             continue
         if int(leg.id) in globally_processed_leg_ids:
             continue
-        parent_events = [event for event in events if int(event.execution_binding_id or 0) == int(leg.execution_binding_id)
-                         and _same_present_text(event.order_id, leg.order_id)
-                         and _same_present_text(event.client_order_id, leg.client_order_id)]
-        if len(parent_events) != 1:
+        parent_events = _parent_trigger_events_for_leg(
+            events,
+            leg=leg,
+            strict_identity=_lineage_authority_enabled_for_intent(
+                lineage_rollout_mode,
+                lineage_activation_after_intent_id,
+                intent,
+            ),
+        )
+        if len(parent_events) != 1 or not _same_present_text(
+            parent_events[0].client_order_id, leg.client_order_id
+        ):
             _refuse_trigger_intent(session, leg, intent, EntryProtectionLedgerRepairRefusal(
                 event_id=None, binding_id=int(leg.execution_binding_id), pos_id=str(leg.pos_id),
                 reason="trigger_protection_parent_event_not_unique", evidence={"candidate_event_count": len(parent_events)},
@@ -1975,6 +2553,12 @@ def _reconcile_saved_trigger_protection_intents(
                 action=adoption.action,
                 intent=intent,
                 seen_at=recovered_at,
+            )
+            _record_protection_ownership_recovered(
+                session,
+                leg=leg,
+                adopted_order_id=adoption.action.order_id,
+                created_at=recovered_at,
             )
             existing_ledger_rows.append(row)
             result.protection_adopted += 1
@@ -2092,10 +2676,9 @@ def _record_protection_adoption_refusal(
         .filter(PositionAttributionAudit.fingerprint == fingerprint)
         .first()
     )
-    if exists is not None:
-        return
-    session.add(
-        PositionAttributionAudit(
+    if exists is None:
+        session.add(
+            PositionAttributionAudit(
             execution_binding_id=int(leg.execution_binding_id),
             execution_order_leg_id=int(leg.id),
             venue=str(leg.venue or "deepcoin"),
@@ -2112,8 +2695,148 @@ def _record_protection_adoption_refusal(
             ),
             notification_status="pending",
             created_at=created_at,
+            )
+        )
+        session.flush()
+    if evidence.get("native_stop_visible_ownership_unverified") is True:
+        _record_visible_unowned_native_stop_incident(
+            session,
+            leg=leg,
+            evidence=evidence,
+            created_at=created_at,
+        )
+
+
+def _record_visible_unowned_native_stop_incident(
+    session,
+    *,
+    leg: ExecutionOrderLeg,
+    evidence: dict[str, Any],
+    created_at: datetime,
+) -> None:
+    candidate_ids = evidence.get("candidate_order_ids")
+    if not isinstance(candidate_ids, list) or not candidate_ids:
+        return
+    bounded = {
+        "state": "native_stop_visible_ownership_unverified",
+        "message": (
+            "交易所已看到止损，但系统未验证归属；改止损、止盈或部分平仓可能被阻断"
+        ),
+        "reason_code": str(evidence.get("reason") or "unknown")[:128],
+        "candidate_order_ids": sorted(
+            {str(value)[:255] for value in candidate_ids if str(value).strip()}
+        )[:20],
+        "snapshot_fingerprint": str(
+            evidence.get("snapshot_fingerprint") or ""
+        )[:64]
+        or None,
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "binding_id": int(leg.execution_binding_id),
+                "leg_id": int(leg.id),
+                "pos_id": str(leg.pos_id or ""),
+                **bounded,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = (
+        session.query(PositionProtectionIncident)
+        .filter(PositionProtectionIncident.fingerprint == fingerprint)
+        .one_or_none()
+    )
+    if existing is not None:
+        existing.updated_at = created_at
+        return
+    session.add(
+        PositionProtectionIncident(
+            venue=str(leg.venue or "deepcoin"),
+            execution_binding_id=int(leg.execution_binding_id),
+            execution_order_leg_id=int(leg.id),
+            pos_id=str(leg.pos_id or ""),
+            incident_type="native_stop_visible_ownership_unverified",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                bounded,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            delivery_status="pending",
+            created_at=created_at,
+            updated_at=created_at,
         )
     )
+    session.flush()
+
+
+def _record_protection_ownership_recovered(
+    session,
+    *,
+    leg: ExecutionOrderLeg,
+    adopted_order_id: str,
+    created_at: datetime,
+) -> None:
+    prior = (
+        session.query(PositionProtectionIncident)
+        .filter(
+            PositionProtectionIncident.execution_binding_id
+            == int(leg.execution_binding_id),
+            PositionProtectionIncident.execution_order_leg_id == int(leg.id),
+            PositionProtectionIncident.pos_id == str(leg.pos_id or ""),
+            PositionProtectionIncident.incident_type
+            == "native_stop_visible_ownership_unverified",
+        )
+        .order_by(PositionProtectionIncident.id.desc())
+        .first()
+    )
+    if prior is None:
+        return
+    bounded = {
+        "state": "ownership_recovered",
+        "prior_incident_id": int(prior.id),
+        "order_id": str(adopted_order_id)[:255],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "binding_id": int(leg.execution_binding_id),
+                "leg_id": int(leg.id),
+                "pos_id": str(leg.pos_id or ""),
+                **bounded,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    existing = (
+        session.query(PositionProtectionIncident.id)
+        .filter(PositionProtectionIncident.fingerprint == fingerprint)
+        .first()
+    )
+    if existing is not None:
+        return
+    session.add(
+        PositionProtectionIncident(
+            venue=str(leg.venue or "deepcoin"),
+            execution_binding_id=int(leg.execution_binding_id),
+            execution_order_leg_id=int(leg.id),
+            pos_id=str(leg.pos_id or ""),
+            incident_type="ownership_recovered",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                bounded, sort_keys=True, separators=(",", ":")
+            ),
+            delivery_status="not_required",
+            created_at=created_at,
+            updated_at=created_at,
+        )
+    )
+    session.flush()
 
 
 def _bounded_protection_refusal_evidence(refusal: Any) -> dict[str, Any]:
@@ -2124,6 +2847,11 @@ def _bounded_protection_refusal_evidence(refusal: Any) -> dict[str, Any]:
         evidence["candidate_order_ids"] = sorted(
             {str(item)[:255] for item in candidate_order_ids if str(item or "").strip()}
         )[:20]
+    if raw.get("native_stop_visible_ownership_unverified") is True:
+        evidence["native_stop_visible_ownership_unverified"] = True
+    snapshot_fingerprint = str(raw.get("snapshot_fingerprint") or "")
+    if len(snapshot_fingerprint) == 64:
+        evidence["snapshot_fingerprint"] = snapshot_fingerprint
     for key, limit in (
         ("trigger_entry_order_id", 255),
         ("size_text", 64),
@@ -2591,14 +3319,16 @@ def _append_trigger_child_order_fill_evidence(
         ]
         if len(matching_legs) != 1:
             continue
-        child_rows = [
-            row
-            for row in snapshot.order_history
-            if _trigger_child_order_matches(trigger_row, row)
-        ]
+        leg = matching_legs[0]
+        child_rows = _trigger_protection_candidate_child_rows(
+            trigger_row,
+            rows=snapshot.order_history,
+            all_parent_rows=snapshot.trigger_history,
+            expected_parent_order_id=str(leg.order_id or "").strip(),
+            expected_client_order_id=str(leg.client_order_id or "").strip(),
+        )
         if len(child_rows) != 1:
             continue
-        leg = matching_legs[0]
         binding = bindings_by_id[int(leg.execution_binding_id)]
         child_row = child_rows[0]
         child_order_id = _first_string(child_row, "ordId", "orderId", "order_id", "id")
@@ -2639,6 +3369,88 @@ def _trigger_child_order_matches(
     child_state = classify_leg_exchange_state(child_row)
     if child_state not in {"filled", "partially_filled"}:
         return False
+    return _trigger_child_shape_and_time_matches(trigger_row, child_row)
+
+
+def _trigger_child_order_potentially_matches(
+    trigger_row: dict[str, Any], child_row: dict[str, Any]
+) -> bool:
+    if _exchange_row_explicitly_cannot_fill(child_row):
+        return False
+    child_order_id = _first_string(
+        child_row, "ordId", "orderId", "order_id", "id"
+    )
+    trigger_order_id = _first_string(
+        trigger_row, "ordId", "orderId", "order_id", "id"
+    )
+    if child_order_id and child_order_id == trigger_order_id:
+        return False
+    trigger_inst = str(trigger_row.get("instId") or "").upper()
+    child_inst = str(child_row.get("instId") or "").upper()
+    if trigger_inst and child_inst and trigger_inst != child_inst:
+        return False
+    trigger_side = _normalize_position_side(
+        str(trigger_row.get("posSide") or trigger_row.get("side") or "")
+    )
+    child_side = _normalize_position_side(
+        str(child_row.get("posSide") or child_row.get("side") or "")
+    )
+    if trigger_side and child_side and trigger_side != child_side:
+        return False
+    trigger_price = _order_row_price(trigger_row)
+    child_price = _order_row_price(child_row)
+    if (
+        trigger_price is not None
+        and child_price is not None
+        and not _numbers_equal(trigger_price, child_price)
+    ):
+        return False
+    trigger_times = _timestamp_ms_values(
+        trigger_row, "triggerTime", "fillTime", "cTime", "uTime", "ts"
+    )
+    child_times = _timestamp_ms_values(
+        child_row, "fillTime", "cTime", "uTime", "ts"
+    )
+    if trigger_times and child_times and not trigger_times & child_times:
+        return False
+    # Missing identity/shape/time cannot prove that an anonymous history row
+    # is unrelated.  Keep it in the candidate universe as a blocking row.
+    return True
+
+
+def _trigger_parent_potentially_filled(row: dict[str, Any]) -> bool:
+    return not _exchange_row_explicitly_cannot_fill(row)
+
+
+def _exchange_row_explicitly_cannot_fill(row: dict[str, Any]) -> bool:
+    raw_states = {
+        value.lower()
+        for value in _exchange_string_aliases(row, "state", "status")
+    }
+    classified_states = {
+        classify_leg_exchange_state({"state": value}) for value in raw_states
+    }
+    # A positive fill assertion and any disagreeing state aliases are
+    # conflicting evidence, not proof that the row is safely ignorable.
+    if classified_states & {"filled", "partially_filled"}:
+        return False
+    if len(raw_states) > 1:
+        return False
+    if classified_states & {"manually_cancelled", "exchange_cancelled"}:
+        return True
+    if raw_states & {"failed", "failure", "error"}:
+        return True
+    if raw_states:
+        return False
+    error_codes = _exchange_string_aliases(
+        row, "errorCode", "error_code", "sCode", "s_code"
+    )
+    return len(error_codes) == 1 and error_codes != {"0"}
+
+
+def _trigger_child_shape_and_time_matches(
+    trigger_row: dict[str, Any], child_row: dict[str, Any]
+) -> bool:
     child_order_id = _first_string(child_row, "ordId", "orderId", "order_id", "id")
     trigger_order_id = _first_string(trigger_row, "ordId", "orderId", "order_id", "id")
     if not child_order_id or child_order_id == trigger_order_id:

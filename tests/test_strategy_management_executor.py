@@ -558,6 +558,12 @@ class _ProtectionClient:
         self.pending_reads += 1
         return [dict(row) for row in self.pending]
 
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
+
     def get_ticker_quote(self, *, inst_id):
         self.quote_reads.append(inst_id)
         return None if self.quote is None else dict(self.quote)

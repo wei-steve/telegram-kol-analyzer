@@ -858,6 +858,102 @@ def test_verified_position_with_recoverable_stop_ambiguity_keeps_risk_reduction_
     )
 
 
+def test_visible_unowned_native_stop_is_distinguished_from_missing_stop(tmp_path):
+    session_factory = create_session_factory(tmp_path / "visible-unowned-stop.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add(
+            PositionProtectionIncident(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-adopted",
+                incident_type="native_stop_visible_ownership_unverified",
+                fingerprint="v" * 64,
+                evidence_json=json.dumps(
+                    {
+                        "candidate_order_ids": ["native-stop-1"],
+                        "reason_code": "trigger_protection_candidate_child_time_mismatch",
+                    }
+                ),
+                delivery_status="pending",
+            )
+        )
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    state = detail["execution"]["protection_states"][0]
+    assert state["operator_message"] == (
+        "交易所已看到止损，但系统未验证归属；改止损、止盈或部分平仓可能被阻断"
+    )
+
+
+def test_ownership_recovered_transition_clears_stale_unverified_message(tmp_path):
+    session_factory = create_session_factory(tmp_path / "recovered-stop-owner.db")
+    with session_factory() as session:
+        binding, lifecycle, leg = _seed_trigger_entry_strategy(session)
+        session.add_all(
+            [
+                PositionProtectionIncident(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    pos_id="pos-adopted",
+                    incident_type="native_stop_visible_ownership_unverified",
+                    fingerprint="v" * 64,
+                    evidence_json="{}",
+                    delivery_status="pending",
+                    created_at=NOW,
+                    updated_at=NOW,
+                ),
+                PositionProtectionIncident(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    pos_id="pos-adopted",
+                    incident_type="ownership_recovered",
+                    fingerprint="r" * 64,
+                    evidence_json='{"order_id":"native-stop-1"}',
+                    delivery_status="not_required",
+                    created_at=NOW + timedelta(seconds=1),
+                    updated_at=NOW + timedelta(seconds=1),
+                ),
+                PositionProtectionLedger(
+                    venue="deepcoin",
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    strategy_instance_id=leg.strategy_instance_id,
+                    pos_id="pos-adopted",
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id="native-stop-1",
+                    purpose="stop_loss",
+                    status="verified",
+                    evidence_source="reconciliation_trigger_protection_intent",
+                ),
+            ]
+        )
+        session.commit()
+        lifecycle_id = int(lifecycle.id)
+
+    detail = load_strategy_record_detail(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        group_labels_by_chat_id={},
+    )
+
+    state = detail["execution"]["protection_states"][0]
+    assert state["primary_stop_status"] == "verified"
+    assert state["backup_stop_blocker"] is None
+    assert "系统未验证归属" not in state["operator_message"]
+
+
 def test_strategy_detail_marks_ambiguous_trigger_protection_refusal_actionable(tmp_path):
     session_factory = create_session_factory(tmp_path / "refused-protection.db")
     with session_factory() as session:

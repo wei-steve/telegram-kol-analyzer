@@ -482,6 +482,8 @@ def observe_pending_tpsl(
     instrument_id: str,
     response: dict[str, Any],
     expected_order_ids: Iterable[str] = (),
+    page_limit: int | None = None,
+    require_success_code: bool = False,
 ) -> dict[str, Any]:
     """Return safe evidence; never infer that an incomplete list means absent TPSL."""
 
@@ -496,16 +498,66 @@ def observe_pending_tpsl(
             "order_ids": [],
             "expected_order_ids_visible": False,
         }
+    page_limit_reached = (
+        type(page_limit) is int and page_limit > 0 and len(data) >= page_limit
+    )
+    response_success = (
+        not require_success_code or str(response.get("code")) == "0"
+    )
+    incomplete = not response_success or unknown_pagination or page_limit_reached
     order_ids = sorted({str(row.get("ordId") or row.get("orderId") or "").strip() for row in data} - {""})
     expected = {str(value).strip() for value in expected_order_ids if str(value).strip()}
     return {
         "instrument_id": str(instrument_id).upper(),
-        "complete": not unknown_pagination,
-        "reason": "pagination_metadata_unsupported" if unknown_pagination else None,
+        "complete": not incomplete,
+        "reason": (
+            "response_code_not_success"
+            if not response_success
+            else "pagination_metadata_unsupported" if unknown_pagination
+            else "page_limit_reached" if page_limit_reached else None
+        ),
         "response_count": len(data),
         "order_ids": order_ids,
-        "expected_order_ids_visible": expected.issubset(set(order_ids)) and not unknown_pagination,
+        "expected_order_ids_visible": expected.issubset(set(order_ids)) and not incomplete,
     }
+
+
+def read_complete_pending_tpsl_snapshot(
+    client: Any,
+    *,
+    instrument_id: str,
+    page_limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Read one raw pending-TPSL page only when absence is provably complete."""
+
+    reader = getattr(client, "read_trigger_orders_pending", None)
+    if not callable(reader):
+        raise RuntimeError("pending_tpsl_raw_reader_unavailable")
+    response = reader(inst_id=instrument_id)
+    if not isinstance(response, dict):
+        raise RuntimeError("pending_tpsl_raw_response_malformed")
+    observation = observe_pending_tpsl(
+        instrument_id=instrument_id,
+        response=response,
+        page_limit=page_limit,
+        require_success_code=True,
+    )
+    if not observation.get("complete"):
+        raise RuntimeError(
+            str(observation.get("reason") or "pending_tpsl_snapshot_incomplete")
+        )
+    rows = response.get("data")
+    assert isinstance(rows, list)
+    expected = str(instrument_id or "").strip().upper()
+    for row in rows:
+        aliases = {
+            str(row.get(key)).strip().upper()
+            for key in ("instId", "instrument_id", "instrumentId")
+            if row.get(key) is not None and str(row.get(key)).strip()
+        }
+        if aliases != {expected}:
+            raise RuntimeError("pending_tpsl_instrument_scope_mismatch")
+    return list(rows)
 
 
 def record_pending_tpsl_observation(

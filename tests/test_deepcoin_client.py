@@ -212,6 +212,23 @@ def test_pending_trigger_read_exposes_raw_response_for_completeness_audit():
     assert "limit=100" in http_client.requests[0]["request_path"]
 
 
+def test_lineage_history_raw_reads_use_explicit_page_limit_without_changing_lists():
+    http_client = _CapturingHttpClient({"code": "0", "data": []})
+    client = DeepcoinRestClient(
+        DeepcoinCredentials(api_key="key", api_secret="secret", passphrase="pass"),
+        http_client=http_client,
+        timestamp_factory=lambda: "2026-07-15T09:00:00.000Z",
+    )
+
+    client.read_order_history(inst_id="BTC-USDT-SWAP")
+    client.read_trigger_order_history(inst_id="BTC-USDT-SWAP")
+
+    assert [request["request_path"] for request in http_client.requests] == [
+        "/deepcoin/trade/orders-history?instType=SWAP&instId=BTC-USDT-SWAP&limit=100",
+        "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=BTC-USDT-SWAP&limit=100",
+    ]
+
+
 def test_cancel_position_sltp_uses_official_contract_and_shared_write_limiter():
     clock = _FakeMonotonicClock(0.0)
     http_client = _CapturingHttpClient(
@@ -448,8 +465,8 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
         request["request_path"]
         for request in http_client.requests
     ] == [
-        "/deepcoin/trade/orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
-        "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
+            "/deepcoin/trade/orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
+            "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP&ordId=order-1",
         "/deepcoin/trade/orders-pending?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP",

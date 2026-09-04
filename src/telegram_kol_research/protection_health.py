@@ -370,6 +370,50 @@ def current_protection_incident_health_status(
 ) -> str:
     """Resolve an old incident only from a newer, exact, complete projection."""
 
+    if str(incident.incident_type) in {
+        "native_stop_visible_ownership_unverified",
+        "native_stop_ownership_management_blocked",
+    }:
+        recovered = (
+            session.query(PositionProtectionIncident)
+            .filter(
+                PositionProtectionIncident.venue == str(incident.venue).lower(),
+                PositionProtectionIncident.execution_binding_id
+                == int(incident.execution_binding_id),
+                PositionProtectionIncident.execution_order_leg_id
+                == int(incident.execution_order_leg_id),
+                PositionProtectionIncident.pos_id == str(incident.pos_id),
+                PositionProtectionIncident.incident_type == "ownership_recovered",
+                PositionProtectionIncident.created_at > incident.created_at,
+            )
+            .order_by(PositionProtectionIncident.created_at.desc())
+            .first()
+        )
+        if recovered is not None:
+            try:
+                recovered_evidence = json.loads(recovered.evidence_json)
+            except (TypeError, ValueError):
+                recovered_evidence = {}
+            recovered_order_id = str(
+                recovered_evidence.get("order_id") or ""
+            ).strip()
+            verified = (
+                session.query(PositionProtectionLedger.id)
+                .filter(
+                    PositionProtectionLedger.venue == str(incident.venue).lower(),
+                    PositionProtectionLedger.execution_binding_id
+                    == int(incident.execution_binding_id),
+                    PositionProtectionLedger.execution_order_leg_id
+                    == int(incident.execution_order_leg_id),
+                    PositionProtectionLedger.pos_id == str(incident.pos_id),
+                    PositionProtectionLedger.order_id == recovered_order_id,
+                    PositionProtectionLedger.status == "verified",
+                )
+                .first()
+            )
+            if recovered_order_id and verified is not None:
+                return "resolved_by_verified_attribution"
+
     revision = (
         session.query(PositionProtectionRevision)
         .filter(

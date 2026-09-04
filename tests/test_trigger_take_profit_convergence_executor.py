@@ -48,6 +48,12 @@ class _Client:
     def list_trigger_orders_pending(self, *, inst_id):
         return list(self.pending)
 
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
+
     def cancel_trigger_order(self, payload):
         self.cancel_calls.append(dict(payload))
         return {"code": "0", "data": {"ordId": payload["ordId"]}}
@@ -1004,6 +1010,210 @@ def test_plan_never_adopts_take_profit_order_from_other_venue(tmp_path):
     )
 
 
+def test_existing_take_profit_order_alias_conflict_blocks_missing_tier_write(
+    tmp_path,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import PositionTakeProfitOrder
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "tp-order-alias-conflict.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=True,
+        desired_take_profits=[
+            {"price": "64500", "allocation_pct": "50"},
+            {"price": "63800", "allocation_pct": "50"},
+        ],
+    )
+    with session_factory() as session:
+        existing = session.query(PositionTakeProfitOrder).one()
+        existing.size_text = "5"
+        session.commit()
+    client = _Client()
+    client.pending.append(
+        {
+            "ordId": "tp-old-1",
+            "orderId": "other-order",
+            "instId": "BTC-USDT-SWAP",
+            "posId": "pos-10",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPx": "64500",
+            "tpOrdPx": "-1",
+            "tpPrice": "0",
+            "sz": "5",
+        }
+    )
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert client.submit_calls == []
+
+
+@pytest.mark.parametrize(
+    "conflicting_alias",
+    [
+        {"pos_id": "other-pos"},
+        {"instrument_id": "ETH-USDT-SWAP"},
+        {"side": "long"},
+    ],
+)
+def test_live_position_alias_conflict_blocks_take_profit_write(
+    tmp_path, conflicting_alias
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class ConflictingPositionClient(_Client):
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0].update(conflicting_alias)
+            return rows
+
+    session_factory = create_session_factory(tmp_path / "tp-position-alias-conflict.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = ConflictingPositionClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert client.submit_calls == []
+
+
+def test_equivalent_buy_sell_side_aliases_do_not_block_take_profit_write(
+    tmp_path,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class EquivalentSideClient(_Client):
+        def list_positions(self, *, inst_id=None):
+            rows = super().list_positions(inst_id=inst_id)
+            rows[0]["side"] = "sell"
+            return rows
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            response = super().read_trigger_orders_pending(inst_id=inst_id)
+            for row in response["data"]:
+                row["side"] = "sell"
+            return response
+
+    session_factory = create_session_factory(tmp_path / "tp-equivalent-side.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = EquivalentSideClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "submitted"
+    assert [payload["sz"] for payload in client.submit_calls] == ["5", "3", "2"]
+
+
+@pytest.mark.parametrize("missing_field", ["triggerOrderType", "instId", "posSide"])
+def test_incomplete_take_profit_row_blocks_preplan_write(tmp_path, missing_field):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "tp-incomplete-row.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = _Client()
+    incomplete = {
+        "ordId": "mystery-tp",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "short",
+        "triggerOrderType": "TPSL",
+        "tpTriggerPx": "63800",
+        "tpOrdPx": "-1",
+        "sz": "3",
+    }
+    incomplete.pop(missing_field)
+    client.pending.append(incomplete)
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert client.submit_calls == []
+
+
+def test_incomplete_take_profit_row_appearing_between_tiers_blocks_next_write(
+    tmp_path,
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class InterleavedIncompleteClient(_Client):
+        def __init__(self):
+            super().__init__()
+            self.injected = False
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            response = super().read_trigger_orders_pending(inst_id=inst_id)
+            if len(self.submit_calls) == 1 and not self.injected:
+                self.pending.append(
+                    {
+                        "ordId": "mystery-next-tier",
+                        "tpTriggerPx": "63800",
+                        "tpOrdPx": "-1",
+                        "sz": "3",
+                    }
+                )
+                self.injected = True
+            return response
+
+    session_factory = create_session_factory(tmp_path / "tp-interleaved-incomplete.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = InterleavedIncompleteClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert len(client.submit_calls) == 1
+
+
 def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import PositionTakeProfitOrder, TriggerTakeProfitConvergence
@@ -1030,6 +1240,79 @@ def test_execution_submits_initial_take_profits_without_cancelling_any_order(tmp
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
     assert [row.status for row in new] == ["active", "active", "active"]
     assert convergence.status == "submitted"
+
+
+def test_execution_blocks_incomplete_pending_snapshot_before_tp_write(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class IncompleteClient(_Client):
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {
+                "code": "0",
+                "data": self.list_trigger_orders_pending(inst_id=inst_id),
+                "nextCursor": "more",
+            }
+
+    session_factory = create_session_factory(tmp_path / "incomplete-pending.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = IncompleteClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert client.submit_calls == []
+
+
+def test_each_tp_write_rechecks_for_new_unowned_pending_order(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class InterleavedClient(_Client):
+        def set_position_sltp(self, payload):
+            response = super().set_position_sltp(payload)
+            if len(self.submit_calls) == 1:
+                self.pending.append(
+                    {
+                        "ordId": "external-next-tier",
+                        "instId": payload["instId"],
+                        "posId": payload["posId"],
+                        "posSide": payload["posSide"],
+                        "triggerOrderType": "TPSL",
+                        "tpTriggerPx": "63800",
+                        "tpOrdPx": "-1",
+                        "tpPrice": "0",
+                        "sz": "3",
+                    }
+                )
+            return response
+
+    session_factory = create_session_factory(tmp_path / "interleaved-tp.db")
+    convergence_id = _ready_convergence(
+        session_factory, existing_take_profit=False
+    )
+    client = InterleavedClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert len(client.submit_calls) == 1
 
 
 def test_execution_binds_logical_take_profit_with_equivalent_decimal_price(tmp_path):
@@ -1303,7 +1586,7 @@ def test_execution_freezes_unknown_when_post_write_readback_raises(tmp_path):
 
         def list_trigger_orders_pending(self, *, inst_id):
             self.pending_reads += 1
-            if self.pending_reads > 1:
+            if self.pending_reads > 2:
                 raise RuntimeError("simulated post-write readback failure")
             return super().list_trigger_orders_pending(inst_id=inst_id)
 

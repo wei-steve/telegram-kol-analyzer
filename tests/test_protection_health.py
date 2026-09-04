@@ -1,5 +1,5 @@
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
@@ -13,6 +13,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.protection_health import (
     classify_current_position_protection_health,
+    current_protection_incident_health_status,
     record_position_protection_health_observation,
 )
 from telegram_kol_research.protection_ledger import (
@@ -217,6 +218,34 @@ def test_incomplete_snapshot_is_evidence_insufficient(tmp_path):
 
     assert result.classification == "evidence_insufficient"
     assert result.reason_codes == ("target_protection_snapshot_incomplete",)
+
+
+def test_verified_ownership_recovery_resolves_prior_unowned_native_stop(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding, leg, incident = _healthy_scope(session)
+        incident.incident_type = "native_stop_visible_ownership_unverified"
+        session.add(
+            PositionProtectionIncident(
+                venue="deepcoin",
+                execution_binding_id=binding.id,
+                execution_order_leg_id=leg.id,
+                pos_id=leg.pos_id,
+                incident_type="ownership_recovered",
+                fingerprint="r" * 64,
+                evidence_json='{"order_id":"primary-order"}',
+                delivery_status="not_required",
+                created_at=NOW + timedelta(seconds=1),
+                updated_at=NOW + timedelta(seconds=1),
+            )
+        )
+        session.commit()
+
+        status = current_protection_incident_health_status(
+            session, incident=incident
+        )
+
+    assert status == "resolved_by_verified_attribution"
 
 
 def test_complete_snapshot_with_missing_take_profit_requires_recovery(tmp_path):

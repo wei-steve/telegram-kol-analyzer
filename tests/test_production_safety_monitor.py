@@ -4302,6 +4302,14 @@ def test_protection_incident_classification_distinguishes_recoverable_and_termin
     assert classify_protection_incident(
         "position_owner_unverified", exact_backup_verified=False
     ) == "critical"
+    assert classify_protection_incident(
+        "native_stop_visible_ownership_unverified",
+        exact_backup_verified=False,
+    ) == "critical"
+    assert classify_protection_incident(
+        "native_stop_visible_ownership_unverified",
+        exact_backup_verified=True,
+    ) == "warning"
 
 
 def test_monitor_notification_failure_is_adapted_without_changing_outcome(tmp_path):

@@ -3403,6 +3403,7 @@ def classify_protection_incident(
         "take_profit_convergence_ready",
         "take_profit_convergence_completed",
         "trigger_protection_assignment_shadow_plan",
+        "ownership_recovered",
     }:
         return "healthy"
     if normalized in {
@@ -3417,9 +3418,16 @@ def classify_protection_incident(
         "trigger_protection_assignment_not_mutual_unique",
         "backup_stop_blocked",
         "native_stop_assignment_pending",
+        "native_stop_visible_ownership_unverified",
+        "native_stop_ownership_management_blocked",
         "stop_trigger_failed",
     }:
         return "warning"
+    if normalized in {
+        "native_stop_visible_ownership_unverified",
+        "native_stop_ownership_management_blocked",
+    }:
+        return "critical"
     return "critical"
 
 

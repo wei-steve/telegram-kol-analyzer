@@ -1630,6 +1630,24 @@ def _protection_state_detail(
             row for row in incidents
             if int(row.execution_order_leg_id) == leg_id and str(row.pos_id) == pos_id
         ]
+        latest_ownership_transition = next(
+            (
+                row
+                for row in reversed(matching_incidents)
+                if str(row.incident_type)
+                in {
+                    "native_stop_visible_ownership_unverified",
+                    "native_stop_ownership_management_blocked",
+                    "ownership_recovered",
+                }
+            ),
+            None,
+        )
+        native_stop_visible_ownership_unverified = bool(
+            latest_ownership_transition is not None
+            and str(latest_ownership_transition.incident_type)
+            != "ownership_recovered"
+        )
         matching_intents = [
             row for row in intents if int(row.execution_order_leg_id) == leg_id
         ]
@@ -1711,16 +1729,36 @@ def _protection_state_detail(
                 or capabilities.may_close_exact_position
             )
         )
+        resolved_ownership_incident_types = (
+            {
+                "native_stop_visible_ownership_unverified",
+                "native_stop_ownership_management_blocked",
+            }
+            if latest_ownership_transition is not None
+            and str(latest_ownership_transition.incident_type)
+            == "ownership_recovered"
+            else set()
+        )
         blocker = next(
             (
                 str(row.incident_type)
                 for row in reversed(matching_incidents)
-                if str(row.incident_type) != "stop_trigger_failed"
+                if str(row.incident_type)
+                not in {
+                    "stop_trigger_failed",
+                    "ownership_recovered",
+                    *resolved_ownership_incident_types,
+                }
             ),
             None,
         )
         if not position_owner_verified:
             message = "持仓归属未验证"
+        elif native_stop_visible_ownership_unverified:
+            message = (
+                "交易所已看到止损，但系统未验证归属；"
+                "改止损、止盈或部分平仓可能被阻断"
+            )
         elif manual_review_required:
             message = "仓位管理需要人工复核"
         elif native_stop_assignment_pending and risk_reduction_capability_available:

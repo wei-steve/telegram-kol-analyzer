@@ -44,6 +44,12 @@ class _Client:
     def list_trigger_orders_pending(self, *, inst_id):
         return [row for row in self.pending_rows if row["instId"] == inst_id]
 
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
+
     def set_position_sltp(self, payload):
         self.set_position_sltp_payloads.append(dict(payload))
         if self.verify_after_submit:

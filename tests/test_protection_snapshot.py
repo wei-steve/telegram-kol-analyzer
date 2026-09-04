@@ -5,6 +5,7 @@ from telegram_kol_research.models import PendingTpslSnapshotObservation
 from telegram_kol_research.protection_snapshot import (
     build_position_protection_audit,
     observe_pending_tpsl,
+    read_complete_pending_tpsl_snapshot,
     record_pending_tpsl_observation,
 )
 from telegram_kol_research.protection_ledger import (
@@ -23,6 +24,17 @@ def test_observation_marks_unknown_pagination_as_incomplete():
     assert observation["reason"] == "pagination_metadata_unsupported"
 
 
+def test_observation_rejects_unsuccessful_business_response():
+    observation = observe_pending_tpsl(
+        instrument_id="BTC-USDT-SWAP",
+        response={"code": "500", "data": [{"ordId": "tp-1"}]},
+        require_success_code=True,
+    )
+
+    assert observation["complete"] is False
+    assert observation["reason"] == "response_code_not_success"
+
+
 def test_observation_proves_expected_exact_order_ids_visible():
     observation = observe_pending_tpsl(
         instrument_id="BTC-USDT-SWAP",
@@ -32,6 +44,78 @@ def test_observation_proves_expected_exact_order_ids_visible():
 
     assert observation["complete"] is True
     assert observation["expected_order_ids_visible"] is True
+
+
+def test_complete_pending_reader_rejects_list_only_client():
+    class Client:
+        def list_trigger_orders_pending(self, *, inst_id):
+            return []
+
+    try:
+        read_complete_pending_tpsl_snapshot(
+            Client(), instrument_id="BTC-USDT-SWAP"
+        )
+    except RuntimeError as exc:
+        assert str(exc) == "pending_tpsl_raw_reader_unavailable"
+    else:
+        raise AssertionError("list-only reader must not prove completeness")
+
+
+def test_complete_pending_reader_rejects_pagination_and_scope_mismatch():
+    class Client:
+        def __init__(self, response):
+            self.response = response
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return self.response
+
+    for response in (
+        {"code": "0", "data": [], "nextCursor": "more"},
+        {
+            "code": "0",
+            "data": [
+                {
+                    "ordId": "other",
+                    "instId": "ETH-USDT-SWAP",
+                }
+            ],
+        },
+    ):
+        try:
+            read_complete_pending_tpsl_snapshot(
+                Client(response), instrument_id="BTC-USDT-SWAP"
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("incomplete account view must be rejected")
+
+
+def test_complete_pending_reader_returns_only_exact_raw_scope():
+    rows = [{"ordId": "tp-1", "instId": "BTC-USDT-SWAP"}]
+
+    class Client:
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": rows}
+
+    assert read_complete_pending_tpsl_snapshot(
+        Client(), instrument_id="BTC-USDT-SWAP"
+    ) == rows
+
+
+def test_observation_marks_a_full_api_page_as_incomplete():
+    observation = observe_pending_tpsl(
+        instrument_id="BTC-USDT-SWAP",
+        response={
+            "code": "0",
+            "data": [{"ordId": f"tp-{index}"} for index in range(100)],
+        },
+        page_limit=100,
+    )
+
+    assert observation["complete"] is False
+    assert observation["response_count"] == 100
+    assert observation["reason"] == "page_limit_reached"
 
 
 def test_observation_is_persisted_append_only(tmp_path):

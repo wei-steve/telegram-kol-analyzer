@@ -3497,6 +3497,11 @@ function bindTradingSettingsForm() {
       management_execution_mode: String(formData.get('management_execution_mode') || 'disabled'),
       composite_management_v2_mode: String(formData.get('composite_management_v2_mode') || 'disabled'),
       position_management_liveness_v2_mode: String(formData.get('position_management_liveness_v2_mode') || 'disabled'),
+      trigger_protection_lineage_attribution_mode: String(formData.get('trigger_protection_lineage_attribution_mode') || 'disabled'),
+      trigger_protection_lineage_activation_after_intent_id: (() => {
+        const rawValue = String(formData.get('trigger_protection_lineage_activation_after_intent_id') || '').trim();
+        return rawValue === '' ? null : Number(rawValue);
+      })(),
       entry_preamble_mode: String(formData.get('entry_preamble_mode') || 'disabled'),
       entry_message_assembly_v2_mode: String(formData.get('entry_message_assembly_v2_mode') || 'disabled'),
       entry_revision_v2_mode: String(formData.get('entry_revision_v2_mode') || 'disabled'),

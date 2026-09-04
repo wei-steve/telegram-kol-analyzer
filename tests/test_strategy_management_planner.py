@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import json
+from collections import Counter
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -18,6 +19,7 @@ from telegram_kol_research.models import (
     PositionBackupStopOrder,
     PositionProtectionHealthObservation,
     PositionProtectionIncident,
+    PositionProtectionLedger,
     PositionMutationIntent,
     PositionTakeProfitOrder,
     RawMessage,
@@ -38,6 +40,188 @@ from telegram_kol_research.strategy_management_contracts import (
     serialize_management_contract,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
+
+
+@pytest.mark.parametrize(
+    "current_row",
+    [
+        {
+            "ordId": "owned-stop",
+            "posId": "other-pos",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000",
+            "sz": "2",
+        },
+        {
+            "ordId": "owned-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "slTriggerPx": "63000",
+            "sz": "2",
+        },
+        {
+            "ordId": "owned-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "trigger_order_type": "OTHER",
+            "slTriggerPx": "63000",
+            "sz": "2",
+        },
+        {
+            "ordId": "owned-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000",
+        },
+        {
+            "ordId": "owned-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000",
+            "slTriggerPrice": "63001",
+            "sz": "2",
+        },
+    ],
+)
+def test_ledger_current_protection_rejects_identity_conflict_or_missing_size(current_row):
+    planner = _planner()
+    binding = ExecutionBinding(id=10, strategy_instance_id="strategy-1")
+    leg = ExecutionOrderLeg(id=20, execution_binding_id=10, strategy_instance_id="strategy-1")
+    ledger = PositionProtectionLedger(
+        execution_binding_id=10,
+        execution_order_leg_id=20,
+        strategy_instance_id="strategy-1",
+        pos_id="pos-b",
+        instrument_id="BTC-USDT-SWAP",
+        side="short",
+        order_id="owned-stop",
+        purpose="stop_loss",
+        trigger_price="63000",
+        size_text="2",
+        status="verified",
+    )
+
+    result = planner._ledger_confirmed_position_protection(
+        position={
+            "pos_id": "pos-b",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+        },
+        entry_leg=leg,
+        binding=binding,
+        tpsl_orders=[current_row],
+        ledger_rows=[ledger],
+        global_order_id_counts=Counter({"owned-stop": 1}),
+    )
+
+    assert result is None
+
+
+def test_pending_tpsl_snapshot_without_target_observation_is_incomplete():
+    planner = _planner()
+    snapshot = type(
+        "Snapshot",
+        (),
+        {"pending_tpsl_observations": ()},
+    )()
+
+    assert (
+        planner._pending_tpsl_snapshot_complete(
+            snapshot,
+            instrument_id="BTC-USDT-SWAP",
+        )
+        is False
+    )
+
+
+def test_pending_tpsl_snapshot_rejects_account_scope_pollution():
+    planner = _planner()
+    snapshot = type(
+        "Snapshot",
+        (),
+        {
+            "pending_tpsl_observations": (
+                {
+                    "instrument_id": "BTC-USDT-SWAP",
+                    "complete": False,
+                    "reason": "instrument_scope_mismatch",
+                },
+                {
+                    "instrument_id": "ETH-USDT-SWAP",
+                    "complete": True,
+                    "reason": "complete",
+                },
+            )
+        },
+    )()
+
+    assert (
+        planner._pending_tpsl_snapshot_complete(
+            snapshot,
+            instrument_id="ETH-USDT-SWAP",
+        )
+        is False
+    )
+
+
+def test_management_order_alias_conflict_pollutes_account_wide_order_id_count():
+    planner = _planner()
+    rows = [
+        {
+            "ordId": "other-stop",
+            "orderId": "owned-stop",
+            "triggerOrderType": "TPSL",
+        },
+        {
+            "ordId": "owned-stop",
+            "orderId": "owned-stop",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "triggerOrderType": "TPSL",
+            "slTriggerPx": "63000",
+            "sz": "2",
+        },
+    ]
+
+    counts = planner._protection_order_id_counts(rows)
+    binding = ExecutionBinding(id=10, strategy_instance_id="strategy-1")
+    leg = ExecutionOrderLeg(
+        id=20, execution_binding_id=10, strategy_instance_id="strategy-1"
+    )
+    ledger = PositionProtectionLedger(
+        execution_binding_id=10,
+        execution_order_leg_id=20,
+        strategy_instance_id="strategy-1",
+        pos_id="pos-b",
+        instrument_id="BTC-USDT-SWAP",
+        side="short",
+        order_id="owned-stop",
+        purpose="stop_loss",
+        trigger_price="63000",
+        size_text="2",
+        status="verified",
+    )
+
+    result = planner._ledger_confirmed_position_protection(
+        position={
+            "pos_id": "pos-b",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+        },
+        entry_leg=leg,
+        binding=binding,
+        tpsl_orders=rows,
+        ledger_rows=[ledger],
+        global_order_id_counts=counts,
+    )
+
+    assert counts["owned-stop"] == 2
+    assert result is None
 
 
 PLANNED_AT = datetime(2026, 7, 15, 8, 0, tzinfo=UTC)
@@ -296,6 +480,12 @@ class _ReadOnlyDeepcoin:
     def list_trigger_orders_pending(self, *, inst_id):
         self.tpsl_reads.append(inst_id)
         return [row for row in self.tpsl_orders if row.get("instId") == inst_id]
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        return {
+            "code": "0",
+            "data": self.list_trigger_orders_pending(inst_id=inst_id),
+        }
 
     def get_ticker_quote(self, *, inst_id):
         self.ticker_reads.append(inst_id)
@@ -2378,6 +2568,20 @@ def test_ledger_backed_protection_requires_current_order_id(monkeypatch, tmp_pat
             evidence={"match": "exact_written_order"},
             seen_at=PLANNED_AT,
         )
+        session.add(
+            PositionProtectionIncident(
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                pos_id="pos-b",
+                incident_type="native_stop_visible_ownership_unverified",
+                fingerprint="u" * 64,
+                evidence_json="{}",
+                delivery_status="pending",
+                created_at=PLANNED_AT - timedelta(seconds=1),
+                updated_at=PLANNED_AT - timedelta(seconds=1),
+            )
+        )
         session.commit()
 
     result = planner.plan_strategy_management_batch(
@@ -2391,6 +2595,11 @@ def test_ledger_backed_protection_requires_current_order_id(monkeypatch, tmp_pat
 
     assert result.status == "blocked"
     assert result.reason_code == "protection_missing_cancellable_order_id"
+    with session_factory() as session:
+        transitions = session.query(PositionProtectionIncident).filter_by(
+            incident_type="native_stop_ownership_management_blocked"
+        ).all()
+    assert len(transitions) == 1
 
 
 def test_incomplete_pending_tpsl_snapshot_blocks_without_planning_legs(monkeypatch, tmp_path):
@@ -2504,6 +2713,26 @@ def test_visibility_recovery_cannot_become_ready_at_five_minute_deadline(monkeyp
     assert blocked.status == "blocked"
     assert deadline.status == "blocked"
     assert deadline.reason_code == "protection_missing_cancellable_order_id"
+
+
+def test_historical_visibility_retry_expired_batch_152_is_never_replayed():
+    planner = _planner()
+    batch = type(
+        "HistoricalBatch152",
+        (),
+        {
+            "id": 152,
+            "status": "failed",
+            "reason_code": "protection_visibility_retry_expired",
+        },
+    )()
+
+    assert planner._retryable_preflight_blocked_batch(
+        batch,
+        session_factory=None,
+        entry_legs=(),
+        now=PLANNED_AT,
+    ) is False
 
 
 def test_ledger_backed_protection_requires_matching_price(monkeypatch, tmp_path):
