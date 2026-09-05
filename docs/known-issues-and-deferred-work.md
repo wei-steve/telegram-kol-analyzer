@@ -4,6 +4,13 @@
 
 ## 影响实际交易
 
+2026-09-05 补录观察结果（优先于下表较早的 100% 召回描述）：
+已提交日志 `0e00a6bb` 的 2026-09-04 窗口出现 shadow attempt 4700 / raw 14889
+漏失实质管理决策，累计 55/56（98.21%），不满足权威切换的 100% 门槛，必须重新评估。
+主识别实测 6.375M token/日、增加 56.03%；两次 usage 可得率不同（99.53% / 72.32%），
+下次需区分消息流量、单条消耗与记录完整率变化，不能直接断言成本或流量增长。
+来源、窗口及限制见 `docs/2026-09-05-batch153-history-recovery-dry-run.md`。
+
 | 事项 | 当前影响 | 发现来源 | 建议处理时机 | 处理前必须确认 |
 |---|---|---|---|---|
 | **7 条历史 trigger protection intent 命中 `trigger_protection_candidate_predates_fill` 后仍未处置。** 已确认它们对应的实盘仓位均已不存在，目前只剩历史 `failed/manual_review` 记录；本次保护归属修复不回放、不改写这些记录。 | 不存在已证实的当前实盘敞口，但历史终态仍会留在 intent/事故/人工复核口径中；不得因新血缘代码上线而自动重开或重放。 | `docs/2026-09-04-trigger-protection-lineage-read-only-validation.md`；`docs/2026-09-04-trigger-protection-lineage-attribution-implementation-evidence.md`。 | 如需清理历史状态，单独设计并授权存量处置；不与未来的 disabled/shadow/live 激活合并。 | 重新冻结 7 条精确清单；通过 worker `127.0.0.1:8002` 完整 GET 快照再次确认无对应活仓；明确只处理历史投影的状态语义、备份、单事务和回滚边界，且不产生任何交易所写入。 |
@@ -14,6 +21,12 @@
 | **系统主动冻结超过 15 分钟会把冻结期消息静默结算为 stale expiry。** `2026-09-04T08:56:33Z` 至 `09:21:02Z` 的失败激活冻结窗口内，raw `14795`、`14796` 均以 `attempt_count=0` 进入 `expired_stale_instruction`；其中 `14795` 是 active lifecycle `1074` 的止盈相关管理消息。 | 失败部署会延长冻结时间；目前冻结期到达与其他停滞共用 15 分钟超龄终态，queue 路径又不通知，因此可能静默漏掉管理语义。不得通过放宽超龄阈值修复，否则会增加执行陈旧指令的风险。 | `docs/plans/2026-09-04-monitor-release-identity-convergence-design.md`：**Freeze-window message loss record**；本次失败激活证据。 | 单独设计“系统主动冻结”归因、解冻清单和所有者处置流程时；本轮只记录，不补跑消息。 | 以持久化 freeze interval ID、开始/结束时间及部署证据绑定消息的 `posted_at`、job `enqueued_at/completed_at/status`；解冻时明确枚举因此超龄的消息并通知所有者决定。现有时间字段只能做事后关联，不能可靠证明某条 expiry 属于哪次冻结，因此需要新增冻结区间记录或等价的签名部署证据引用。 |
 
 ## 影响运维与部署
+
+2026-09-05T06:26:40Z：batch 153 既有 recovery dry-run 返回 ready / terminal_no_submission；
+尚未授权 apply。预计只终结 batch 与 leg 135、新增恢复事件，component 25/26/27 不改写；
+monitor 将因父 batch resolved 不再计该 stalled 来源。Preamble 14/15 仍需单独 L3 授权，
+因此不能承诺仅处理 batch 后整体 healthy。精确指纹、变更计划与 preamble 清单见
+`docs/2026-09-05-batch153-history-recovery-dry-run.md`。
 
 2026-09-05 部署收尾复验：已安装的三个 monitor service 均已无 legacy 前缀，
 `9501a5f3`、`877fbc33`、`6a493d15` 的严格 runtime-support digest 一致。
