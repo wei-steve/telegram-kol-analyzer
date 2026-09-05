@@ -1,0 +1,528 @@
+{
+  "observed_date_utc": "2026-09-05",
+  "scope": [
+    "/var/lib/telegram-kol-cutover-evidence",
+    "/var/lib/telegram-kol-maintenance-evidence",
+    "/var/lib/telegram-kol-monitor",
+    "/opt/telegram-kol-analyzer/data/evidence",
+    "/opt/telegram-kol-analyzer/data/backups",
+    "/opt/telegram-kol-analyzer/data/research.db.*"
+  ],
+  "method": "SQLite magic header census (files >=1 MiB), direct data-root research.db.* census and compressed archive census; streaming SHA-256, before/after stat. No live DB copied or modified.",
+  "count": 54,
+  "total_bytes": 22898968730,
+  "duplicates_count": 4,
+  "duplicates_bytes": 844906496,
+  "zero_byte_placeholder": {
+    "path": "/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/transaction-backup.db",
+    "bytes": 0,
+    "classification": "invalid_historical_placeholder_retained_not_a_backup"
+  },
+  "rows": [
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/phase6c-task15-0cd474a-20260823T160740Z/production-final-backup.db",
+      "bytes": 683347968,
+      "mtime_utc": "2026-08-23T16:08:47.234357+00:00",
+      "sha256": "e2482ffb12730e5952710a9c112039a134d3b9417b817761ddc13a252a5903ce",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-action-08837cb6e198c3e65b2b-c252d4d.db",
+      "bytes": 76255232,
+      "mtime_utc": "2026-07-26T14:34:28.850274+00:00",
+      "sha256": "c42f6aa7e7e15189982681342e5686710ee996b8052ecbc0452e7f0d0d16d97c",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-action-2626a1fca469b2fc9415-c252d4d.db",
+      "bytes": 76218368,
+      "mtime_utc": "2026-07-26T14:29:17.289026+00:00",
+      "sha256": "53105e37d22a9a6f571b054ebdde6d0dc07c23d51d586afa10fc238614a8dd96",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-action-b6ac6d1bf188066eccbe-c252d4d.db",
+      "bytes": 76251136,
+      "mtime_utc": "2026-07-26T14:32:21.672546+00:00",
+      "sha256": "bbae7ce45cb953ae4d7fef6096065025fd44e6bde03e826551426e536f0cb792",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-action-d36f799af58319310ab4-b441a6c.db",
+      "bytes": 76419072,
+      "mtime_utc": "2026-07-26T14:55:48.799220+00:00",
+      "sha256": "bfc9a98cae4e738efdf4648f254139c0ea3927329bf5de39bfd91c6de8cb830f",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-action4-live-9f913a2.db",
+      "bytes": 76394496,
+      "mtime_utc": "2026-07-26T14:48:03.875310+00:00",
+      "sha256": "1719d358326e1e06d3c0421d780275382bc94a63ef5e23089afdc3d3ed9d3ce5",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-batch55-recovery-c252d4d.db",
+      "bytes": 76218368,
+      "mtime_utc": "2026-07-26T14:24:34.639793+00:00",
+      "sha256": "99cbaddc67b1df2b91ba789442c93b2318aefbdbfe5c2abe86dd4e20067effd0",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-obsolete-tpsl-cleanup-1001124333585860.db",
+      "bytes": 76263424,
+      "mtime_utc": "2026-07-26T14:38:08.636761+00:00",
+      "sha256": "8446fbe95e8a00131bc46cd38b94e60e890ffe77f87549ce6b036f907f125065",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/backups/research-before-sequential-shadow-fbb8983.db",
+      "bytes": 76021760,
+      "mtime_utc": "2026-07-26T13:51:50.584767+00:00",
+      "sha256": "5b807f6149a1b729e2a3e0cac8b272550d9cadc20a0231c657c4ded3ec64db1e",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/batch150-postcommit-worker-regression-copy-retry-20260825T130427Z/research-online-backup.db",
+      "bytes": 730525696,
+      "mtime_utc": "2026-08-25T13:04:29.916627+00:00",
+      "sha256": "2bc1dff8fdecd58de14b9130d2975fb93260ff660e8ce5ddf11578160f933399",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/batch150-production-cas-retry-744996e-20260825T110406Z/research-online-backup.db",
+      "bytes": 728444928,
+      "mtime_utc": "2026-08-25T11:04:32.885022+00:00",
+      "sha256": "9e998a91d5685f96ff7884580e76599fe71c6775faa9d829259453f7a96e216d",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/batch150-production-terminalization-cdfe1b7-20260825T092154Z/research-before.db",
+      "bytes": 726077440,
+      "mtime_utc": "2026-08-25T09:23:57.230832+00:00",
+      "sha256": "b1cc78b2555242f27c9346a17fe110f9a5f5d499e4f8775f7f531980c18300c8",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/batch150-worker-race-tool-refresh-20260825T102840Z/research-online-backup.db",
+      "bytes": 727982080,
+      "mtime_utc": "2026-08-25T10:28:44.656260+00:00",
+      "sha256": "08df69f78500114376d9aff47d3b849cff51b4d1a2090e18c110ebfb81a9dd44",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/trigger-protection-deploy-cdfe1b7-20260825T045048Z/research-before.db",
+      "bytes": 719441920,
+      "mtime_utc": "2026-08-25T04:51:18.226423+00:00",
+      "sha256": "aed34d9e8d24dc4ebdf0708658a8210787a357a263db8de6f6cede8778648c60",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/evidence/trigger-protection-stale-wait-rehearsal-20260825T025238Z/research-online-backup.db",
+      "bytes": 716435456,
+      "mtime_utc": "2026-08-25T02:52:55.882714+00:00",
+      "sha256": "de4926231f0c608028abd74ea9575b4448109ef307f0122477714baccfd27fe3",
+      "stable": true,
+      "classification": "historical_rehearsal_not_current_runtime_rollback",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.20260715-053809.bak",
+      "bytes": 22528000,
+      "mtime_utc": "2026-07-14T21:38:09.722454+00:00",
+      "sha256": "e319733bf6ef2f09305da4fdf819a2e60128e20b0edf64410144f57dd1ffe0a5",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.20260715-123243.historical-cleanup.bak",
+      "bytes": 22528000,
+      "mtime_utc": "2026-07-15T04:32:43.088006+00:00",
+      "sha256": "c6dfa9eba14628a0ac8d1de3453b09f0d3d34913a02cead640c316a5e56c3c6f",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.20260718-185238.archive-unbound-holdings.bak",
+      "bytes": 24641536,
+      "mtime_utc": "2026-07-18T10:52:38.059956+00:00",
+      "sha256": "8263f80bab20d43724dce3f5dc1fcf75eef57c9f64e4e45c5f8b0780cdab5548",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-20260626142734",
+      "bytes": 22528000,
+      "mtime_utc": "2026-06-26T06:26:55.350915+00:00",
+      "sha256": "3a6d05a5c10091e0f4ef00740fc020bdf0ced23fabafec4fd3ad584ec2e77ad1",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-chenge-correction-20260622234903",
+      "bytes": 8015872,
+      "mtime_utc": "2026-06-22T15:50:38.520784+00:00",
+      "sha256": "1863055a6a3d8b3786bd476b2c2017341c7d2d1a2ba3638c1c70353f87d806bf",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "duplicate_pending_owner_approval",
+      "successor": "/opt/telegram-kol-analyzer/data/research.db.bak-before-chenge-correction-20260622235053"
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-chenge-correction-20260622235053",
+      "bytes": 8015872,
+      "mtime_utc": "2026-06-22T15:50:57.432739+00:00",
+      "sha256": "1863055a6a3d8b3786bd476b2c2017341c7d2d1a2ba3638c1c70353f87d806bf",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-dedupe-194-20260622144854",
+      "bytes": 7868416,
+      "mtime_utc": "2026-06-22T14:21:38.280872+00:00",
+      "sha256": "1fbeb0ebbf9139b07c5d8a80b9c323c91339040bf35a4365a560e661b878a7d0",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-ouyang-entered-at-fix-20260623003450",
+      "bytes": 8085504,
+      "mtime_utc": "2026-06-22T16:34:55.644733+00:00",
+      "sha256": "d061b5c46112a0bdccfbc3f5625cfcf252e9bb638cfb5b6e58c886b1525434bd",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "duplicate_pending_owner_approval",
+      "successor": "/opt/telegram-kol-analyzer/data/research.db.bak-before-ouyang-protective-exit-20260623004223"
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-ouyang-protective-exit-20260623004223",
+      "bytes": 8085504,
+      "mtime_utc": "2026-06-22T16:42:27.683604+00:00",
+      "sha256": "d061b5c46112a0bdccfbc3f5625cfcf252e9bb638cfb5b6e58c886b1525434bd",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-before-ouyang-restore-20260623000624",
+      "bytes": 8032256,
+      "mtime_utc": "2026-06-22T16:06:29.262301+00:00",
+      "sha256": "dfb0928aa24e7be2b1a0642205d9e4c3ed4fe931e558da4fb62a826a2999f93f",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.bak-binding-repair-",
+      "bytes": 22528000,
+      "mtime_utc": "2026-07-01T06:55:20.567911+00:00",
+      "sha256": "063ee011d4ebc4bb3a7730369837eab595f92afe6665a700b1461c8e57315d33",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.before-pingjiacang-20260717-112116.bak",
+      "bytes": 23465984,
+      "mtime_utc": "2026-07-17T11:21:16.874379+00:00",
+      "sha256": "fe12da1daecc26379659543a931d75c19ada88417b24a8befc3b5e525b86c673",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-audit-recovery-reconcile-20260717-200632.bak",
+      "bytes": 23597056,
+      "mtime_utc": "2026-07-17T12:06:32.658705+00:00",
+      "sha256": "f2b6633248db709234796e8278b3e6902c0f5b077595b27071fe11845f80bc92",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-equivalent-attribution-20260715-095509.bak",
+      "bytes": 22528000,
+      "mtime_utc": "2026-07-15T01:53:51.291088+00:00",
+      "sha256": "d146659283eeb110ed2ef0078d1f2d23c948f24f738a7ece6a9baadfebb72240",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-historical-repair-20260810T031110Z.bak",
+      "bytes": 283439104,
+      "mtime_utc": "2026-08-10T03:11:26.066467+00:00",
+      "sha256": "8fe84e9eea9a87b0014d0855b12bab1ae798b81e75bc34a7f10d3c6d17471d37",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-miya-9503-20260806T0027.bak",
+      "bytes": 222453760,
+      "mtime_utc": "2026-08-05T16:26:53.929958+00:00",
+      "sha256": "1fc971c046bfd1da50f97461185c1546c7ed047f77b898635292df817e01dd78",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-partial-close-reconcile-20260717-200226.bak",
+      "bytes": 23597056,
+      "mtime_utc": "2026-07-17T12:02:26.191298+00:00",
+      "sha256": "f2b6633248db709234796e8278b3e6902c0f5b077595b27071fe11845f80bc92",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "duplicate_pending_owner_approval",
+      "successor": "/opt/telegram-kol-analyzer/data/research.db.pre-audit-recovery-reconcile-20260717-200632.bak"
+    },
+    {
+      "path": "/opt/telegram-kol-analyzer/data/research.db.pre-split-leg-sync-20260717-201355.bak",
+      "bytes": 23601152,
+      "mtime_utc": "2026-07-17T12:13:55.597659+00:00",
+      "sha256": "c80acab14f29d58cc2aeec75c993561d095009c49cdb837ba38590e8cf01ed6a",
+      "stable": true,
+      "type": "sqlite_database",
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/migration-rehearsal-success.db",
+      "bytes": 819150848,
+      "mtime_utc": "2026-08-31T23:25:35.883235+00:00",
+      "sha256": "29d79b5b93a93ecaef4d8421e3a862fafc4498b9caffd8130e91ea4858a78b21",
+      "stable": true,
+      "classification": "historical_rehearsal_not_current_runtime_rollback",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/pre-activation.db",
+      "bytes": 819150848,
+      "mtime_utc": "2026-08-31T23:21:47.824811+00:00",
+      "sha256": "a9f94e7a4578d776d68ab4f43936a872e9003da675b181513d08f3fb25b430b5",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/preamble13-expire-20260831T005721Z-1846228/research-before-preamble13.db",
+      "bytes": 805408768,
+      "mtime_utc": "2026-08-31T00:57:44.887045+00:00",
+      "sha256": "1f4601ae22eba9dc1d443b60e49cbcebdb7f12e73cc1ff5b6c6b97629f5446c8",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/21314fc44fd4f7a05d3bbbd4842e73a825523fee/attempt-2/transaction-backup.db",
+      "bytes": 805208064,
+      "mtime_utc": "2026-08-30T08:10:33.088535+00:00",
+      "sha256": "eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af",
+      "stable": true,
+      "classification": "duplicate_pending_owner_approval",
+      "successor": "/var/lib/telegram-kol-cutover-evidence/7af12a535a786d33c1338e4f6d41d66aff088618/attempt-3/transaction-backup.db"
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/287daacf8dbf2d44e56f311800ee85b83579e307/attempt-1/preflight.db",
+      "bytes": 813518848,
+      "mtime_utc": "2026-08-30T00:36:35.567293+00:00",
+      "sha256": "6a87ab9579217c7f1d96aea6c01cb9598707eba2dea34196b86a726678175b37",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/3205b074642436ed0f6aa35fefef7941a4f3f62f/ai-context-shadow-20260901T132208Z/pre-shadow-schema.db",
+      "bytes": 817557504,
+      "mtime_utc": "2026-09-01T13:22:29.165385+00:00",
+      "sha256": "a07882a2b88539050a40487a13ee2488a1c1299a9ac751d50ceee833f814ec23",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/392a74730d5406d23e2080324e472fcdfdb1ea67/recognition-execution-lease-rehearsal-20260903T044159Z/pre-recognition-execution-schema.db",
+      "bytes": 853778432,
+      "mtime_utc": "2026-09-03T04:42:43.966740+00:00",
+      "sha256": "525124a0a3623f9f586b5b52ddda981ac7660034fb56fc43d7fdd694c4407414",
+      "stable": true,
+      "classification": "pinned_explicitly_retained_rehearsal_backup",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/392a74730d5406d23e2080324e472fcdfdb1ea67/recognition-execution-production-schema-20260903T050629Z/pre-recognition-execution-production-schema.db.zst",
+      "bytes": 56150170,
+      "mtime_utc": "2026-09-03T05:08:15.218725+00:00",
+      "sha256": "b765ae2585ef92cd65d705e2d2536de706c7dd86cbc36b931a324683b0dedca7",
+      "stable": true,
+      "type": "zstd_database",
+      "classification": "pinned_current_schema_rollback",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z/pre-r1-schema.db",
+      "bytes": 812068864,
+      "mtime_utc": "2026-09-01T03:07:21.575330+00:00",
+      "sha256": "da30f56e45ccc9d185d83c2d713ad5f2e3bf54cba8ff5ecedfd48aba5b78ea05",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/7af12a535a786d33c1338e4f6d41d66aff088618/attempt-3/transaction-backup.db",
+      "bytes": 805208064,
+      "mtime_utc": "2026-08-30T08:31:15.397376+00:00",
+      "sha256": "eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db",
+      "bytes": 814260224,
+      "mtime_utc": "2026-08-30T01:55:22.992363+00:00",
+      "sha256": "f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/preflight.db",
+      "bytes": 813080576,
+      "mtime_utc": "2026-08-29T22:39:36.230859+00:00",
+      "sha256": "4216d9828284f4885370f793525bc3402e79bb8651120050f0cce313c57b0e45",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/b3137ed6c0f67c62ce8c3e35a52a0fdf68bac1f7/main-recognition-observability-20260901T161900Z/pre-main-recognition-schema.db",
+      "bytes": 819408896,
+      "mtime_utc": "2026-09-01T16:19:30.805159+00:00",
+      "sha256": "50c5f537c00b6220ecb20a9f3fe70eaee320a1dbdc020625812303afc69caa04",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/b78f16098c591978fe764e15c9b793182fc97f5b/message-recognition-labels-20260902T104316Z/pre-message-recognition-labels-schema.db",
+      "bytes": 840634368,
+      "mtime_utc": "2026-09-02T10:43:44.511891+00:00",
+      "sha256": "789c5b1b11fdf0874d6ae5f3657c88be6dec76ff7f45f21360a186eb3f64060a",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/b78f16098c591978fe764e15c9b793182fc97f5b/message-recognition-labels-20260902T104316Z/rehearsal.db",
+      "bytes": 840650752,
+      "mtime_utc": "2026-09-02T10:45:27.330628+00:00",
+      "sha256": "42f2fc28968bda25d6f5eac9f553cc325cb4d1bc1d5299e580ace78bf14fd955",
+      "stable": true,
+      "classification": "historical_rehearsal_not_current_runtime_rollback",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/preflight-production-copy.db",
+      "bytes": 812896256,
+      "mtime_utc": "2026-08-29T21:41:10.831989+00:00",
+      "sha256": "bd869faf6b57862d50c58d1fd1a26c496b92883cca22c799337f0e0810048559",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/recognition-execution-lease-rehearsal-20260902T005943Z/artifacts/production-backup.db",
+      "bytes": 850968576,
+      "mtime_utc": "2026-09-03T01:00:09.090717+00:00",
+      "sha256": "b5991883ddf0290e100699999ed8f8b303f93567a1fd36d654937cb7c47d2598",
+      "stable": true,
+      "classification": "historical_rehearsal_not_current_runtime_rollback",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-cutover-evidence/recognition-execution-lease-rehearsal-20260902T005943Z/artifacts/schema-rehearsal.db",
+      "bytes": 850993152,
+      "mtime_utc": "2026-09-03T01:01:29.770498+00:00",
+      "sha256": "f3ec176624dfcc5ba61569245718abc78a28d31cfd5bce1202d1ba3782d6a395",
+      "stable": true,
+      "classification": "historical_rehearsal_not_current_runtime_rollback",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z/research-before.db",
+      "bytes": 806084608,
+      "mtime_utc": "2026-08-31T07:16:12.207611+00:00",
+      "sha256": "f244d67bfce2f6f9c4e134b30d1bf2173d81f41ecca682b05adb8311a6e701af",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z/research-before.db",
+      "bytes": 807387136,
+      "mtime_utc": "2026-08-31T12:55:00.559543+00:00",
+      "sha256": "18c03d5152084256b814a0c2639d9a5b9a38ff4409fc26c73e1b2b32be8dbabd",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    },
+    {
+      "path": "/var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z/research-before.db",
+      "bytes": 807567360,
+      "mtime_utc": "2026-08-31T14:33:59.011789+00:00",
+      "sha256": "d8b1ebd73da9bb2da2af10e1094adad1a0d19d0311a74b1f6d21b5b8eca96a27",
+      "stable": true,
+      "classification": "historical_operation_backup_not_proven_retired",
+      "successor": null
+    }
+  ]
+}

@@ -15,6 +15,17 @@
 
 ## 影响运维与部署
 
+2026-09-05 部署收尾复验：已安装的三个 monitor service 均已无 legacy 前缀，
+`9501a5f3`、`877fbc33`、`6a493d15` 的严格 runtime-support digest 一致。
+但仍保留且通过全树校验的历史 rollback `0de19c1c`、`5aa7ca07` 仍依赖该规范化；
+移除后其 digest 与新式 release 不同，且尚未找到明确退役记录。
+因此按所有者的回滚兼容门禁暂停移除，下面的迁移豁免条目仍未处理；
+需要先明确有效回滚集合，不能自行取消旧目标资格。
+同轮确认 `/run/telegram-kol-update.lock` 只是保留的空文件，无持锁进程；
+标准锁函数可获取/释放/再次获取，已有 finally 关闭 descriptor，不属于未清理锁故障。
+备份精确盘点与四项重复副本待批准清单见
+`docs/2026-09-05-deployment-closeout-read-only-report.md` 及配套 JSON；本轮未删除。
+
 | 事项 | 当前影响 | 发现来源 | 建议处理时机 | 处理前必须确认 |
 |---|---|---|---|---|
 | **Monitor runtime-support digest 对 legacy `ExecStart` 前缀的规范化是迁移专用豁免。** 当前激活器仅对三个 monitor service 中精确的旧前缀 `/usr/bin/env PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src` 做规范化，以允许从旧 unit 迁移到已消除双身份源的新 unit；其他命令、变量或路径差异仍 fail-closed。 | 新 unit 完成生产迁移后，旧前缀不应再出现在任何有效 monitor unit 中；若长期保留该规范化，会把一次性迁移例外固化为安全检查的永久豁免。 | `docs/plans/2026-09-04-monitor-release-identity-convergence-design.md`；`docs/2026-09-04-monitor-release-identity-convergence-implementation.md`。 | monitor 身份收敛候选完成真实激活并通过观察后，单独授权移除该规范化。 | 先证明所有有效 monitor base unit、drop-in 与 rollback 目标均已不再依赖 legacy 前缀；移除后重跑 runtime-support digest 正反向测试和完整 dry-run，不得扩大可忽略差异的范围。 |
