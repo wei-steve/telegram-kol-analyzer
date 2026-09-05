@@ -22,11 +22,11 @@
 
 ## 影响运维与部署
 
-2026-09-05T06:26:40Z：batch 153 既有 recovery dry-run 返回 ready / terminal_no_submission；
-尚未授权 apply。预计只终结 batch 与 leg 135、新增恢复事件，component 25/26/27 不改写；
-monitor 将因父 batch resolved 不再计该 stalled 来源。Preamble 14/15 仍需单独 L3 授权，
-因此不能承诺仅处理 batch 后整体 healthy。精确指纹、变更计划与 preamble 清单见
-`docs/2026-09-05-batch153-history-recovery-dry-run.md`。
+2026-09-05T06:46:09Z：经所有者批准并完成 L3 备份、副本演练及两个独立生产事务，
+batch 153 已 resolved、leg 135 已 failed、恢复事件 3984 已记录，preamble 14/15 已 invalidated。
+component 25/26/27 原样保留。一次按授权触发的正常 monitor 运行已 healthy=true、reason_codes=[]；
+主 service 无 failed，timer enabled/active。旧 44/44 窗口不改写；新取 journal 的末尾
+连续不健康由 73 次降至 0。处置与证据见 `docs/2026-09-05-monitor-history-l3-recovery-completed.md`。
 
 2026-09-05 部署收尾复验：已安装的三个 monitor service 均已无 legacy 前缀，
 `9501a5f3`、`877fbc33`、`6a493d15` 的严格 runtime-support digest 一致。
@@ -49,7 +49,6 @@ monitor 将因父 batch resolved 不再计该 stalled 来源。Preamble 14/15 �
 | 事项 | 当前影响 | 发现来源 | 建议处理时机 | 处理前必须确认 |
 |---|---|---|---|---|
 | **Monitor runtime-support digest 对 legacy `ExecStart` 前缀的规范化是迁移专用豁免。** 当前激活器仅对三个 monitor service 中精确的旧前缀 `/usr/bin/env PYTHONPATH=${TELEGRAM_KOL_MONITOR_RELEASE_PATH}/src` 做规范化，以允许从旧 unit 迁移到已消除双身份源的新 unit；其他命令、变量或路径差异仍 fail-closed。 | 新 unit 完成生产迁移后，旧前缀不应再出现在任何有效 monitor unit 中；若长期保留该规范化，会把一次性迁移例外固化为安全检查的永久豁免。 | `docs/plans/2026-09-04-monitor-release-identity-convergence-design.md`；`docs/2026-09-04-monitor-release-identity-convergence-implementation.md`。 | monitor 身份收敛候选完成真实激活并通过观察后，单独授权移除该规范化。 | 先证明所有有效 monitor base unit、drop-in 与 rollback 目标均已不再依赖 legacy 前缀；移除后重跑 runtime-support digest 正反向测试和完整 dry-run，不得扩大可忽略差异的范围。 |
-| **四条 monitor 业务残留会使自然 diagnostic 报告不健康，但已失去当前业务意义。** `entry_preambles` 14、15 已超过 entry assembly 的 30 分钟消费窗口且未被消费；composite components 26、27 属于 batch 153，目标 lifecycle 1054 / 历史仓位 `1001125090990141`，两条 attempt 均为 0、从未启动，目标仓位已不在交易所。 | 只读核查时，四条记录均未关联当时的实盘仓位或正在进行的管理动作；它们仍持续触发 `stale_entry_preamble_unresolved` / `stalled_composite_component`，会降低业务健康告警的可读性。不得把它们当作 monitor 身份失败，也不得未经授权清理。 | 2026-09-04 monitor business-reason read-only diagnosis；`/var/lib/telegram-kol-cutover-evidence/6a493d1588a2a4cdd34abfb2abd85580fc8f3b71/monitor-identity-install-20260904T111802Z/diagnostic-result.json`。 | 与本次身份收敛部署分开，分别作为精确数据修复与 management-history recovery 单独授权。 | preamble 14/15 需要带备份、逐行谓词、前后计数和回滚的 L3 精确数据修复；components 26/27 需先 dry-run 并单独授权既有 `recover-management-history --batch-id 153` 路径，重新确认无当前仓位、无在途管理动作且不会触发交易所写。 |
 | **`ExecStartPre` 身份验证通过具有误导性。** 预检查和主 `ExecStart` 的环境/变量展开路径不同，曾出现预检查加载候选而主诊断加载旧 release。 | 单看绿色预检查可能错误放行旧代码；目前真正的兜底仍是主诊断的 `loaded_artifact_verified` fail-closed 结果及主进程实际导入路径。 | `docs/deepcoin-contract-cache-ownership-repair-status.md`：**Read-only diagnosis of the monitor code actually loaded**；`docs/ai-context-resolution-optimization-status.md`：**R1 activation identity root cause — read-only diagnosis**。 | 下一次重构 monitor unit/env 安装或身份门禁时；日常部署仍必须保留主诊断身份校验。 | 复现并固定 systemd `EnvironmentFile`、drop-in `Environment` 和 `ExecStart` 展开的优先级；验证主进程模块路径；不得以修复预检查为由削弱 `_loaded_release_evidence`。 |
 | **Lifecycle 缺少直接 candidate 外键。** 已记录的 lifecycle 中 `signal_candidate_id` 为空，candidate → lifecycle 只能反查 `(chat_id, message_id)` 并结合 binding。 | 不改变既有交易结论，但增加事故追溯、订单来源证明和自动审计的复杂度；若 chat/message 不能唯一对应，影响尚需进一步确认。 | `docs/plans/2026-08-31-ai-context-resolution-analysis.md`：**12.4 真实消息到执行的链路**；`docs/ai-context-resolution-optimization-status.md`：**Read-only live-position protection audit and P0 checkpoint / Source lineage and non-replay proof**。 | 新增自动化 lineage 审计、历史回填或调整 lifecycle schema 之前。 | 先统计 NULL 范围和 `(chat_id, message_id)` 唯一性；证明确定性 candidate 映射；确认历史回填不会覆盖已有非 NULL 关系，并设计冲突时 fail-closed。 |
 | **日常管理审计仍受两张大表放大。** `context_resolution_attempts` 曾约 334 MB，`pending_tpsl_snapshot_observations` 曾约 282 MB；审计构造整库快照时出现约 1.2 GB 峰值。两表当前的增长率和 `pending_tpsl_snapshot_observations` 是否已有独立清理作业，文档不足，**需进一步确认**。 | 持续增长会增加备份、审计快照、页缓存和维护窗口成本；不能按表占比直接推算 RSS，但完整复制字节会被确定放大。 | `docs/deepcoin-contract-cache-ownership-repair-status.md`：**Monitor diagnostic timeout attribution and activation-gate subtraction**；`docs/plans/2026-08-31-ai-context-resolution-analysis.md`：**8.3 与日常管理审计 1.2 GB 内存峰值的关系**、**10.2 需要代码/schema/运维数据政策的选项**。 | 在数据库继续显著增长、审计接近 cgroup 限额或规划下一次存储维护窗口前。 | 重新量测两表当前体积、时间分布、增长率和全部读取方；明确业务/审计保留要求；在生产副本演练归档、重写和峰值内存，不能把逻辑删除量直接当成物理回收量。 |
