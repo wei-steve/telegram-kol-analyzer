@@ -45,6 +45,9 @@ from telegram_kol_research.protection_snapshot import (
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.native_tpsl import (
+    native_tpsl_order_id_is_unique,
+    protection_order_position_sides,
+    protection_order_sides_consistent,
     NativeTpslExpectation,
     NativeTpslOrder,
     match_native_tpsl_order,
@@ -855,6 +858,8 @@ def has_verified_exact_backup_stop(
             != _positive_decimal(row.trigger_price)
         ):
             continue
+        if not native_tpsl_order_id_is_unique(pending, str(row.order_id)):
+            continue
         same_order_pending = [
             item
             for item in pending
@@ -881,13 +886,7 @@ def has_verified_exact_backup_stop(
                 pending_match, "posId", "pos_id", "closePosId"
             )
             == {pos_id}
-            and _text_alias_values(
-                pending_match,
-                "posSide",
-                "pos_side",
-                "side",
-                transform=_normalize_position_side_alias,
-            )
+            and protection_order_position_sides(pending_match)
             == {_normalize_position_side_alias(side)}
             and _numeric_alias_values(
                 pending_match,
@@ -1052,6 +1051,8 @@ def _verified_native_primary_stop_row(
     for row in stop_rows:
         if not row.order_id or row.trigger_price is None:
             continue
+        if not native_tpsl_order_id_is_unique(pending, str(row.order_id)):
+            continue
         for size in (position_size, Decimal("0")):
             match = match_native_tpsl_order(
                 position,
@@ -1082,6 +1083,8 @@ def _verified_native_take_profit(
     order_id: str,
     payload: dict[str, str],
 ) -> NativeTpslOrder | None:
+    if not native_tpsl_order_id_is_unique(pending, order_id):
+        return None
     match = match_native_tpsl_order(
         position,
         [
@@ -1138,13 +1141,7 @@ def _unowned_pending_take_profit_present(
             "instrumentId",
             transform=str.upper,
         )
-        sides = _text_alias_values(
-            raw,
-            "posSide",
-            "pos_side",
-            "side",
-            transform=_normalize_position_side_alias,
-        )
+        sides = protection_order_position_sides(raw)
         if len(instrument_ids) != 1 or len(sides) != 1:
             return True
         if (
@@ -1266,7 +1263,7 @@ def _native_tpsl_aliases_consistent(row: dict[str, object]) -> bool:
         (("ordId", "orderId", "order_id", "id"), str),
         (("instId", "instrument_id", "instrumentId"), str.upper),
         (("posId", "pos_id", "closePosId"), str),
-        (("posSide", "pos_side", "side"), _normalize_position_side_alias),
+        (("posSide", "pos_side"), _normalize_position_side_alias),
         (("triggerOrderType", "trigger_order_type"), str.upper),
     )
     numeric_groups = (
@@ -1276,7 +1273,7 @@ def _native_tpsl_aliases_consistent(row: dict[str, object]) -> bool:
         ("slOrdPx", "slOrderPrice"),
         ("tpOrdPx", "tpOrderPrice"),
     )
-    return all(
+    return protection_order_sides_consistent(row) and all(
         len(_text_alias_values(row, *keys, transform=transform)) <= 1
         for keys, transform in text_groups
     ) and all(len(_numeric_alias_values(row, *keys)) <= 1 for keys in numeric_groups)

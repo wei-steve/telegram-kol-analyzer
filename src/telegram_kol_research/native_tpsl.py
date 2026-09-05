@@ -57,6 +57,47 @@ class NativeTpslMatch:
     order: NativeTpslOrder | None
 
 
+def protection_order_position_sides(payload: dict[str, Any]) -> set[str]:
+    """Position-direction aliases only; an order's buy/sell is not an alias."""
+    return {
+        _normalize_side(str(payload[key]).strip())
+        for key in ("posSide", "pos_side")
+        if payload.get(key) is not None and str(payload[key]).strip()
+    }
+
+
+def protection_order_sides_consistent(payload: dict[str, Any]) -> bool:
+    """Check protective close direction without inferring position ownership.
+
+    Order side is optional in existing TPSL responses. When supplied it must
+    be buy/sell opposite one explicit position direction, never a substitute
+    for that direction. Call only for protection orders, not entry or position
+    rows, whose side has a different meaning.
+    """
+    positions = protection_order_position_sides(payload)
+    if len(positions) > 1 or not positions.issubset({"long", "short"}):
+        return False
+    value = payload.get("side")
+    order_side = "" if value is None else str(value).strip().lower()
+    if not order_side:
+        return True
+    return len(positions) == 1 and order_side == {
+        "long": "sell", "short": "buy",
+    }[next(iter(positions))]
+
+
+def native_tpsl_order_id_is_unique(rows, order_id: str | None) -> bool:
+    """Count exact identity claims BEFORE filtering malformed protective rows."""
+    if not order_id:
+        return False
+    keys = ("OrderSysID", "ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id")
+    return sum(
+        any(str(row[key]).strip() == str(order_id) for key in keys
+            if row.get(key) is not None)
+        for row in rows if isinstance(row, dict)
+    ) == 1
+
+
 def normalize_native_tpsl(payload: dict[str, Any]) -> NativeTpslOrder | None:
     """Return a normalized order only for DeepCoin's native ``TPSL`` records."""
 

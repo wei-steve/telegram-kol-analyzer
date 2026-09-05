@@ -22,6 +22,9 @@ from telegram_kol_research.models import PositionProtectionLeg
 from telegram_kol_research.native_tpsl import NativeTpslExpectation
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
+from telegram_kol_research.native_tpsl import protection_order_sides_consistent
+from telegram_kol_research.native_tpsl import protection_order_position_sides
+from telegram_kol_research.native_tpsl import native_tpsl_order_id_is_unique
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_mutation_gateway import submit_exact_position_sltp
 from telegram_kol_research.position_protection_legs import (
@@ -650,13 +653,7 @@ def _unowned_pending_stop_can_affect_position(
             "instrumentId",
             transform=str.upper,
         )
-        sides = _text_alias_values(
-            raw,
-            "posSide",
-            "pos_side",
-            "side",
-            transform=_normalize_position_side_alias,
-        )
+        sides = protection_order_position_sides(raw)
         if len(instrument_ids) != 1 or len(sides) != 1:
             return True
         if (
@@ -694,6 +691,8 @@ def _pending_matches_backup(
 ) -> str | None:
     if not order_id or position is None or not open_positions:
         return None
+    if not native_tpsl_order_id_is_unique(pending, order_id):
+        return None
     match = match_native_tpsl_order(
         position,
         [
@@ -725,6 +724,8 @@ def _pending_matches_primary(
     """Verify the pre-existing native stop survived a second-stop submission."""
 
     if not order_id or not trigger_price or position is None or not open_positions:
+        return False
+    if not native_tpsl_order_id_is_unique(pending, order_id):
         return False
     exact = [
         order
@@ -832,7 +833,7 @@ def _native_tpsl_aliases_consistent(row: dict[str, Any]) -> bool:
         (("ordId", "orderId", "order_id", "id"), str),
         (("instId", "instrument_id", "instrumentId"), str.upper),
         (("posId", "pos_id", "closePosId"), str),
-        (("posSide", "pos_side", "side"), _normalize_position_side_alias),
+        (("posSide", "pos_side"), _normalize_position_side_alias),
         (("triggerOrderType", "trigger_order_type"), str.upper),
     )
     numeric_groups = (
@@ -842,7 +843,7 @@ def _native_tpsl_aliases_consistent(row: dict[str, Any]) -> bool:
         ("slOrdPx", "slOrderPrice"),
         ("tpOrdPx", "tpOrderPrice"),
     )
-    return all(
+    return protection_order_sides_consistent(row) and all(
         len(_text_alias_values(row, *keys, transform=transform)) <= 1
         for keys, transform in text_groups
     ) and all(len(_numeric_alias_values(row, *keys)) <= 1 for keys in numeric_groups)
