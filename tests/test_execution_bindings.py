@@ -1803,7 +1803,8 @@ def test_backup_submission_blocks_live_position_alias_conflict(
     assert client.sltp_payloads == []
 
 
-def test_backup_submission_accepts_equivalent_buy_sell_side_aliases(tmp_path):
+@pytest.mark.parametrize("close_side,expected_submissions", [("buy", 1), ("sell", 0)])
+def test_backup_submission_distinguishes_position_alias_from_close_side(tmp_path, close_side, expected_submissions):
     session_factory = create_session_factory(tmp_path / "backup-equivalent-side.db")
     _seed_exact_backup_candidate(session_factory, order_kind="market")
     client = _BackupStopSubmissionClient([
@@ -1818,7 +1819,7 @@ def test_backup_submission_accepts_equivalent_buy_sell_side_aliases(tmp_path):
         }
     ])
     for row in client.pending_rows:
-        row["side"] = "sell"
+        row["side"] = close_side
 
     submitted = submit_verified_trigger_backup_stops(
         session_factory,
@@ -1827,8 +1828,8 @@ def test_backup_submission_accepts_equivalent_buy_sell_side_aliases(tmp_path):
         submitted_at=datetime(2026, 7, 20, 8, 5),
     )
 
-    assert submitted == 1
-    assert len(client.sltp_payloads) == 1
+    assert submitted == expected_submissions
+    assert len(client.sltp_payloads) == expected_submissions
 
 
 @pytest.mark.parametrize("missing_field", ["triggerOrderType", "instId", "posSide"])

@@ -407,7 +407,8 @@ def test_lineage_attestation_never_returns_partial_evidence(mutation, reason):
     assert result.refusal.reason == reason
 
 
-def test_account_wide_plan_accepts_real_predating_candidate_only_with_attestation():
+@pytest.mark.parametrize("close_side", [None, "sell", "buy", "competing_bad_side"])
+def test_account_wide_plan_accepts_real_predating_candidate_only_with_attestation(close_side):
     values = _lineage_attestation_inputs()
     candidate = _pending_tpsl_row(
         "1001125090080798",
@@ -420,6 +421,12 @@ def test_account_wide_plan_accepts_real_predating_candidate_only_with_attestatio
     )
     candidate["posId"] = ""
 
+    if close_side not in (None, "competing_bad_side"):
+        candidate["side"] = close_side
+    pending = [candidate]
+    if close_side == "competing_bad_side":
+        pending.append({**candidate, "ordId": "competing-order", "side": "buy"})
+
     plan = repair_module.plan_trigger_protection_intent_assignments(
         contexts=(
             repair_module.TriggerProtectionAssignmentContext(
@@ -431,11 +438,14 @@ def test_account_wide_plan_accepts_real_predating_candidate_only_with_attestatio
                 child_fill_rows=tuple(values["child_fill_rows"]),
             ),
         ),
-        pending_tpsl_rows=[candidate],
+        pending_tpsl_rows=pending,
         existing_ledger_rows=[],
         snapshot_complete=True,
     )
 
+    if close_side in ("buy", "competing_bad_side"):
+        assert plan.actions == {}
+        return
     assert set(plan.actions) == {559}
     assert plan.actions[559].order_id == "1001125090080798"
     assert plan.actions[559].evidence["match"] == "lineage_attested_attached_stop"
@@ -1722,7 +1732,8 @@ def test_entry_protection_repair_skips_already_repaired_trigger_entry(tmp_path):
     assert followup_plan.refusals == ()
 
 
-def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write(tmp_path):
+@pytest.mark.parametrize("bad_competing", [False, True])
+def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write(tmp_path, bad_competing):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_trigger_entry_fill(
         session_factory,
@@ -1753,6 +1764,9 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
     ]
     pending_rows[0]["posId"] = "pos-1"
 
+    if bad_competing:
+        pending_rows.append({**pending_rows[0], "ordId": "tpsl-b", "side": "sell"})
+
     with session_factory() as session:
         entry_leg = session.get(ExecutionOrderLeg, 289)
         entry_event = session.query(ExecutionEvent).one()
@@ -1773,6 +1787,11 @@ def test_adoption_plans_one_exact_trigger_entry_protection_without_session_write
                 observed_at=datetime(2026, 7, 20, 0, 12, tzinfo=UTC),
             ),
         )
+        if bad_competing:
+            assert result.action is None
+            assert result.refusal.reason == "trigger_protection_candidate_side_conflict"
+            assert session.query(PositionProtectionLedger).count() == 0
+            return
         assert result.action is not None
         assert result.action.pos_id == "pos-1"
         assert result.action.order_id == "tpsl-1"
@@ -2355,6 +2374,21 @@ def test_intent_adoption_refuses_one_sided_attached_protection(tmp_path):
     assert result.action is None
     assert result.refusal is not None
     assert result.refusal.reason == "trigger_protection_candidate_protection_conflict"
+
+
+@pytest.mark.parametrize("competing", [False, True])
+def test_legacy_intent_rejects_bad_close_side_without_hiding_competition(tmp_path, competing):
+    bad = _pending_tpsl_row("bad-tpsl", purpose="combined", price="1860", stop_price="1900",
+        ctime="2026-07-20T00:11:13Z", inst_id="ETH-USDT-SWAP", side="short", size="4.4")
+    bad.update(posId="pos-1", side="sell")
+    rows = [bad]
+    if competing:
+        good = dict(bad, ordId="good-tpsl")
+        good.pop("side")
+        rows.insert(0, good)
+    result = _plan_intent_adoption(tmp_path, pending_rows=rows)
+    assert result.action is None
+    assert result.refusal is not None
 
 
 def _plan_intent_adoption(

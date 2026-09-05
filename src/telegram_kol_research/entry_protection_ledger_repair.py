@@ -17,6 +17,10 @@ from telegram_kol_research.models import (
     TriggerProtectionIntent,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.native_tpsl import (
+    native_tpsl_order_id_is_unique,
+    protection_order_sides_consistent,
+)
 from telegram_kol_research.trigger_protection_assignment import (
     ProtectionAssignmentResult,
     ProtectionOrderCandidate,
@@ -1218,6 +1222,13 @@ def _plan_event_repair(
     pending_rows = _cached_pending_tpsl_rows(
         pending_cache, deepcoin_client=deepcoin_client, inst_id=instrument_id
     )
+    if any(
+        not native_tpsl_order_id_is_unique(pending_rows, order_id)
+        or any(not protection_order_sides_consistent(row)
+               for row in pending_rows if order_id in _row_order_ids(row))
+        for order_id in response_order_ids
+    ):
+        return [], _refusal(event, "returned_order_not_pending", {"response_order_ids": response_order_ids})
     pending_by_order_id = {
         order_id: row
         for row in pending_rows
@@ -1574,6 +1585,11 @@ def plan_verified_trigger_entry_protection_adoption(
         and _same_size_text(_row_size_text(row), _request_size_text(request))
     ]
     for candidate in candidates:
+        if not protection_order_sides_consistent(candidate):
+            return EntryProtectionLedgerRepairAdoptionResult(
+                refusal=_refusal(event, "trigger_protection_candidate_side_conflict",
+                                 {"candidate_order_ids": [_row_order_id(candidate)]})
+            )
         candidate_created_at = _row_creation_time(candidate)
         if candidate_created_at is None:
             return EntryProtectionLedgerRepairAdoptionResult(
@@ -1957,6 +1973,7 @@ def plan_trigger_protection_intent_assignments(
             continue
         evidence_complete = bool(
             normalized_order_types == {"TPSL"}
+            and protection_order_sides_consistent(row)
             and instrument_id
             and side
             and size_text
@@ -1986,7 +2003,7 @@ def plan_trigger_protection_intent_assignments(
                     )
                 ),
                 side_aliases=tuple(
-                    sorted(_string_aliases(row, "posSide", "pos_side", "side"))
+                    sorted(_string_aliases(row, "posSide", "pos_side"))
                 ),
                 size_aliases=tuple(
                     sorted(_string_aliases(row, "sz", "size", "orderSize"))
@@ -2354,6 +2371,11 @@ def plan_trigger_protection_intent_adoption(
                 _row_matches_instrument_side(row, instrument_id=instrument_id, side=side)
                 and _same_size_text(_row_size_text(row), _request_size_text(request))
             ):
+                if not protection_order_sides_consistent(row):
+                    return _intent_refusal(
+                        parent_event, binding_id, pos_id,
+                        "trigger_protection_candidate_side_conflict", [_row_order_id(row)],
+                    )
                 candidate_pos_id = _canonical_row_pos_id(row)
                 if candidate_pos_id == pos_id and not _row_matches_expected_protection_set(
                     row, expected_rows

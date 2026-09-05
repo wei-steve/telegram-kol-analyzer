@@ -184,7 +184,8 @@ def _remove_native_primary_ownership(session_factory):
         session.commit()
 
 
-def test_exact_backup_allows_tp_without_native_primary_ownership(tmp_path):
+@pytest.mark.parametrize("close_side", [None, "buy"])
+def test_exact_backup_allows_tp_without_native_primary_ownership(tmp_path, close_side):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         plan_trigger_take_profit_convergence,
@@ -202,10 +203,13 @@ def test_exact_backup_allows_tp_without_native_primary_ownership(tmp_path):
     )
     _remove_native_primary_ownership(session_factory)
 
+    client = _ExactBackupOnlyClient()
+    if close_side is not None:
+        client.pending[0]["side"] = close_side
     plan = plan_trigger_take_profit_convergence(
         session_factory,
         convergence_id=convergence_id,
-        deepcoin_client=_ExactBackupOnlyClient(),
+        deepcoin_client=client,
         planned_at=NOW,
     )
 
@@ -1098,7 +1102,7 @@ def test_live_position_alias_conflict_blocks_take_profit_write(
     assert client.submit_calls == []
 
 
-def test_equivalent_buy_sell_side_aliases_do_not_block_take_profit_write(
+def test_position_alias_and_opposite_protective_order_side_do_not_block_take_profit_write(
     tmp_path,
 ):
     from telegram_kol_research.db import create_session_factory
@@ -1115,7 +1119,7 @@ def test_equivalent_buy_sell_side_aliases_do_not_block_take_profit_write(
         def read_trigger_orders_pending(self, *, inst_id):
             response = super().read_trigger_orders_pending(inst_id=inst_id)
             for row in response["data"]:
-                row["side"] = "sell"
+                row["side"] = "buy"  # Closing short is a buy, unlike the position alias above.
             return response
 
     session_factory = create_session_factory(tmp_path / "tp-equivalent-side.db")
