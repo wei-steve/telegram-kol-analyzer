@@ -20,6 +20,16 @@
 | **29 条 legacy execution_running 已生产终结，剩余 1 running + 3 uncertain 仍受保护。** 2026-09-05T12:57:55Z 经单独批准、新鲜备份与逐条复验，单事务精确 UPDATE 29 行为 completed / failed / authoritative_execution_abandoned_before_side_effect。生产 running 30→1、uncertain 3→3，前后 quick_check=ok、FK=0 行、关键表计数不变。raw 14214 因 candidate 2129 / instruction 909 存在继续排除；其已记录结果为 skipped / kol_or_group_auto_trade_disabled，仍保留 running。该行与三条 uncertain 全字段未变。 | 剩余 running 14214 与 uncertain 14825/14843/14889 仍阻止相应 authoritative overwrite，backlog expiry 的状态保护仍因这四条而生效；**不得表述为阻塞已解除**。没有执行积压过期或重跑消息。 | `docs/2026-09-05-legacy-execution-running-production-completed.md`；逐条核验与副本演练见 `docs/2026-09-05-legacy-execution-running-rehearsal.md`。 | 合格 29 条已完成；excluded 与三条 uncertain 需独立 reconciliation、风险判断和另行授权，不能混入安全弃置批次。 | 任何后续处置都需新鲜逐行证据、备份与精确事务/回滚边界；不能用全库备份覆盖在线生产，也不能为维护放行而削弱 running/uncertain 保护。 |
 | **系统主动冻结超过 15 分钟会把冻结期消息静默结算为 stale expiry。** `2026-09-04T08:56:33Z` 至 `09:21:02Z` 的失败激活冻结窗口内，raw `14795`、`14796` 均以 `attempt_count=0` 进入 `expired_stale_instruction`；其中 `14795` 是 active lifecycle `1074` 的止盈相关管理消息。 | 失败部署会延长冻结时间；目前冻结期到达与其他停滞共用 15 分钟超龄终态，queue 路径又不通知，因此可能静默漏掉管理语义。不得通过放宽超龄阈值修复，否则会增加执行陈旧指令的风险。 | `docs/plans/2026-09-04-monitor-release-identity-convergence-design.md`：**Freeze-window message loss record**；本次失败激活证据。 | 单独设计“系统主动冻结”归因、解冻清单和所有者处置流程时；本轮只记录，不补跑消息。 | 以持久化 freeze interval ID、开始/结束时间及部署证据绑定消息的 `posted_at`、job `enqueued_at/completed_at/status`；解冻时明确枚举因此超龄的消息并通知所有者决定。现有时间字段只能做事后关联，不能可靠证明某条 expiry 属于哪次冻结，因此需要新增冻结区间记录或等价的签名部署证据引用。 |
 
+2026-09-05 raw 14214 尾项只读核查：结论为甲（其系统路径未跨交易所写边界），
+不是仅凭 binding 缺失。candidate 2129 属旧 generation，instruction 909 在
+05:39:13.550Z 已以 skipped / kol_or_group_auto_trade_disabled 终结，当前 running
+generation 在 05:39:19.684Z 才 claim；旧执行器仅认领 pending，不会再次执行该终态 item。
+扩展到 target lifecycle 1040 的保护/变更全链仍为空，唯一根入场 event 3883 也是
+auto_trade_skipped，不能把本地 entered 当实盘成交。具体导致 finalize 缺失的栈未取到，
+不能确定异常种类或归因重启。现仅给精确 L3 单行终结计划，**raw 14214 与三条 uncertain
+均未修改，仍为 1 running / 3 uncertain**。详见
+`docs/2026-09-05-raw14214-write-boundary-read-only-audit.md`；生产处置须另行授权。
+
 ## 影响运维与部署
 
 2026-09-05T06:46:09Z：经所有者批准并完成 L3 备份、副本演练及两个独立生产事务，
