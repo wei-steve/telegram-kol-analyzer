@@ -84,6 +84,9 @@ class ManagementInstructionContract:
         if self.stop_mode == "explicit_price":
             if self.stop_price is None:
                 raise ValueError("explicit_price requires stop_price")
+            # Necessary origin evidence only: QQ/phone numbers and timestamps
+            # also occur in text. The position-aware management stop gate must
+            # independently validate meaning, direction and price deviation.
             if (
                 self.stop_price_source != "current_message_text"
                 or not str(self.current_message_text or "").strip()

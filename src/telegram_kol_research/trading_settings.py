@@ -101,6 +101,8 @@ class TradingSettings:
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
+    max_management_stop_deviation_pct: float = 10.0
+    management_stop_quote_max_age_seconds: float = 30.0
     max_market_entry_deviation_pct: float = 0.15
     nearby_entry_market_deviation_pct: float = 0.15
     min_ai_confidence: float = 0.75
@@ -649,6 +651,14 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         max_concurrent_positions=max(
             1,
             int(_positive_float(raw.get("max_concurrent_positions"), defaults.max_concurrent_positions)),
+        ),
+        max_management_stop_deviation_pct=_positive_float(
+            raw.get("max_management_stop_deviation_pct"),
+            defaults.max_management_stop_deviation_pct,
+        ),
+        management_stop_quote_max_age_seconds=_positive_float(
+            raw.get("management_stop_quote_max_age_seconds"),
+            defaults.management_stop_quote_max_age_seconds,
         ),
         max_market_entry_deviation_pct=_positive_float(
             raw.get("max_market_entry_deviation_pct"),

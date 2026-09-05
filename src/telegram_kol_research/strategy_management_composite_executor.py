@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import Any, Callable
 
+from telegram_kol_research.management_stop_price_gate import validate_batch_stops, reject_execution_stop
+
 from telegram_kol_research.models import (
     PositionProtectionLedger,
     RawMessage,
@@ -95,6 +97,12 @@ def execute_composite_management_batch(
         and batch.components
     ):
         raise ValueError("management_contract_requires_component_executor")
+    if batch.status in {"ready", "executing"}:
+        now = now_provider()
+        stop_gate = validate_batch_stops(session_factory, batch=batch, client=deepcoin_client, now=now)
+        if stop_gate is not None:
+            reject_execution_stop(session_factory, batch=batch, result=stop_gate, now=now)
+            return load_management_batch(session_factory, batch.id)
     if not _composite_component_topology_is_exact(batch):
         _freeze_composite_batch(
             session_factory, batch.id, now_provider(),

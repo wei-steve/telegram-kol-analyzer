@@ -42,6 +42,12 @@ from telegram_kol_research.strategy_management_contracts import (
 from telegram_kol_research.trading_settings import save_trading_settings
 
 
+@pytest.fixture(autouse=True)
+def _fixed_stop_gate_check_clock(monkeypatch):
+    from telegram_kol_research import management_stop_price_gate as gate
+    monkeypatch.setattr(gate, "_stop_check_now", lambda: PLANNED_AT)
+
+
 @pytest.mark.parametrize(
     "current_row",
     [
@@ -2085,10 +2091,10 @@ def test_explicit_break_even_stop_must_tighten_exact_live_position(
     )
 
     assert result.status == "blocked"
-    assert result.reason_code == "explicit_break_even_stop_not_risk_tightening"
+    assert result.reason_code == "management_stop_action_conflict"
 
 
-def test_safe_explicit_break_even_stop_is_carried_to_market_execution(
+def test_even_safe_explicit_break_even_stop_is_rejected_as_conflict(
     monkeypatch, tmp_path
 ):
     planner = _planner()
@@ -2120,17 +2126,15 @@ def test_safe_explicit_break_even_stop_is_carried_to_market_execution(
         planned_at=PLANNED_AT,
     )
 
-    assert result.status == "ready"
-    assert result.batch.legs[0].planned_tpsl == {
-        "intent": "move_stop_to_break_even",
-        "stop_loss_text": "64000",
-        "stop_price_source": "current_message_text",
-    }
+    assert result.status == "blocked"
+    assert result.reason_code == "management_stop_action_conflict"
+    assert result.batch.legs == ()
 
 
-def test_explicit_stop_adjustment_that_loosens_risk_is_blocked_not_closed(
+@pytest.mark.parametrize("stop,expected_status", [("61900", "blocked"), ("62700", "ready")])
+def test_explicit_stop_adjustment_preserves_tightening_and_accepts_reasonable_stop(
     monkeypatch,
-    tmp_path,
+    tmp_path, stop, expected_status,
 ):
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "explicit-adjust-stop.db")
@@ -2139,10 +2143,14 @@ def test_explicit_stop_adjustment_that_loosens_risk_is_blocked_not_closed(
         intent="adjust_stop_loss",
         side="long",
         current_stop_loss=62400,
-        requested_stop_loss="61900",
+        requested_stop_loss=stop,
         stop_price_source="current_message_text",
         management_text="BTC市价62600附近，止损下移动500点，调整61900。",
     )
+    monkeypatch.setattr(_ReadOnlyDeepcoin, "get_ticker_quote", lambda self, **kwargs: {
+        "instrument_id": "BTC-USDT-SWAP", "price": "63000", "price_field": "last",
+        "observed_at": PLANNED_AT.isoformat(),
+    })
     _disable_reconciliation(monkeypatch, planner)
     with session_factory() as session:
         entry_leg = session.query(ExecutionOrderLeg).filter_by(
@@ -2190,7 +2198,11 @@ def test_explicit_stop_adjustment_that_loosens_risk_is_blocked_not_closed(
         planned_at=PLANNED_AT,
     )
 
-    assert result.status == "blocked"
+    assert result.status == expected_status
+    if expected_status == "ready":
+        assert result.batch.target_snapshot["stop_price_gate"]["reference_price"] == "63000"
+        assert result.batch.target_snapshot["stop_price_gate"]["entry_prices"] == ["63695"]
+        return
     assert result.reason_code == "explicit_stop_adjustment_not_risk_tightening"
     assert result.batch.intent == "adjust_stop_loss"
     assert result.batch.effective_action == "adjust_stop_loss"
@@ -4216,3 +4228,59 @@ def test_final_competing_owner_error_returns_blocked_without_leaking(
     assert result.status == "blocked"
     assert result.reason_code == "target_identity_changed_during_planning"
     assert result.batch is None
+
+
+@pytest.mark.parametrize("intent,stop,side,expected", [
+    ("adjust_stop_loss", "158241758", "long", "management_stop_deviation_exceeded"),
+    ("adjust_stop_loss", "81000", "long", "management_stop_direction_invalid"),
+    ("adjust_stop_loss", "NaN", "long", "management_stop_price_invalid"),
+    ("adjust_stop_loss", "79000.01", "long", "management_stop_tick_invalid"),
+    ("adjust_stop_loss", "79000", "short", "management_stop_direction_invalid"),
+    ("partial_then_break_even", "158241758", "long", "management_stop_action_conflict"),
+    ("move_stop_to_break_even", "79519", "long", "management_stop_action_conflict"),
+])
+def test_stop_gate_blocks_before_components_and_records_incident(monkeypatch, tmp_path, intent, stop, side, expected):
+    from telegram_kol_research.models import RuntimeIncident
+    planner = _planner()
+    factory = create_session_factory(tmp_path / "stop-gate.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        factory, intent=intent, side=side, requested_stop_loss=stop,
+        stop_price_source="current_message_text", management_text="及时移动止损 QQ:158241758",
+        composite_contract=intent == "partial_then_break_even", management_fraction=None,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position(side=side, avg_px="79519")])
+    client.get_ticker_quote = lambda **kwargs: dict(
+        instrument_id="BTC-USDT-SWAP", price="80000", price_field="last", observed_at=PLANNED_AT.isoformat()
+    )
+    result = planner.plan_strategy_management_batch(
+        factory, raw_message_id=raw_id, deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT,
+    )
+    assert result.reason_code == expected
+    assert result.status == "blocked"
+    assert result.batch.legs == ()
+    assert client.write_calls == []
+    with factory() as session:
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "management_stop_rejected"
+        assert expected in incident.redacted_summary
+        assert session.query(StrategyManagementComponent).count() == 0
+
+
+def test_stop_provenance_rejection_has_runtime_incident(monkeypatch, tmp_path):
+    from telegram_kol_research.models import RuntimeIncident
+    planner = _planner()
+    factory = create_session_factory(tmp_path / "provenance-gate.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        factory, intent="adjust_stop_loss", side="long", requested_stop_loss="79000",
+        stop_price_source="recognition_context", management_text="移动止损",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position(side="long", avg_px="79519")])
+    result = planner.plan_strategy_management_batch(factory, raw_message_id=raw_id,
+        deepcoin_client=client, contract_spec_provider=_ContractSpecs(), planned_at=PLANNED_AT)
+    assert result.reason_code == "management_stop_provenance_invalid"
+    assert client.write_calls == []
+    with factory() as session:
+        assert "management_stop_provenance_invalid" in session.query(RuntimeIncident).one().redacted_summary

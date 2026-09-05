@@ -27,6 +27,9 @@ from telegram_kol_research.execution_events import (
     record_execution_event,
 )
 from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
+from telegram_kol_research.management_stop_price_gate import (
+    validate_batch_stops, reject_execution_stop, stop_gate_clock, read_stop_quote,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -1266,7 +1269,13 @@ def execute_management_batch(
     """Submit close legs by durable batch ID; exchange truth closes positions later."""
 
     now = executed_at or datetime.now(UTC)
+    stop_checked_at = stop_gate_clock(now)
     batch = load_management_batch(session_factory, int(batch_id))
+    if batch.status in {"ready", "protection_ready", "executing"}:
+        stop_gate = validate_batch_stops(session_factory, batch=batch, client=deepcoin_client, now=now, now_provider=stop_checked_at)
+        if stop_gate is not None:
+            reject_execution_stop(session_factory, batch=batch, result=stop_gate, now=now)
+            raise ManagementBatchExecutionError(stop_gate.reason_code)
     if batch.management_contract_json or batch.management_contract_fingerprint:
         raise ManagementBatchExecutionError(
             "management_contract_requires_component_executor"
@@ -1323,6 +1332,7 @@ def execute_management_batch(
     ):
         return _execute_protection_batch(
             session_factory,
+            stop_gate_now=stop_checked_at,
             batch=batch,
             deepcoin_client=deepcoin_client,
             executed_at=now,
@@ -1659,6 +1669,7 @@ def _execute_protection_batch(
     batch: ManagementBatchRecord,
     deepcoin_client: DeepcoinTradingClientProtocol,
     executed_at: datetime,
+    stop_gate_now=None,
 ) -> dict[str, Any]:
     """Replace every exact position's complete TPSL set, compensating per leg."""
 
@@ -1816,6 +1827,8 @@ def _execute_protection_batch(
             skip_old_cancel = True
         if batch.effective_action == "adjust_stop_loss":
             _require_explicit_stop_write_boundary(
+                session_factory=session_factory, now=executed_at,
+                stop_gate_now=stop_gate_now,
                 batch=batch,
                 binding=binding,
                 deepcoin_client=deepcoin_client,
@@ -1853,7 +1866,9 @@ def _execute_protection_batch(
                     skip_old_cancel,
                 )
             )
-    except ManagementBatchExecutionError:
+    except ManagementBatchExecutionError as exc:
+        if str(exc).startswith("management_stop_"):
+            raise
         transition_batch(
             session_factory,
             batch.id,
@@ -3406,18 +3421,21 @@ def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
 
 def _require_explicit_stop_write_boundary(
     *,
+    session_factory, now, stop_gate_now,
     batch: ManagementBatchRecord,
     binding: ExecutionBinding,
     deepcoin_client: DeepcoinTradingClientProtocol,
     inst_id: str,
     current_rows_by_pos_id: dict[str, list[dict[str, Any]]],
 ) -> None:
-    try:
-        quote = deepcoin_client.get_ticker_quote(inst_id=inst_id)
-    except Exception as exc:
-        raise ManagementBatchExecutionError(
-            "explicit_stop_market_quote_unavailable"
-        ) from exc
+    quote = read_stop_quote(deepcoin_client, inst_id)
+    stop_gate = validate_batch_stops(
+        session_factory, batch=batch, client=deepcoin_client, now=now,
+        now_provider=stop_gate_now, quote=quote if quote is not None else {},
+    )
+    if stop_gate is not None:
+        reject_execution_stop(session_factory, batch=batch, result=stop_gate, now=now)
+        raise ManagementBatchExecutionError(stop_gate.reason_code)
     if (
         not isinstance(quote, dict)
         or str(quote.get("instrument_id") or "").upper() != inst_id.upper()

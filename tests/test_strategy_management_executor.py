@@ -373,7 +373,7 @@ def _persist_protection_batch(
                 }
             )
             leg.planned_tpsl_json = json.dumps(
-                {"intent": action, "stop_loss_text": stop_loss}
+                {"intent": action, "stop_loss_text": stop_loss, "stop_price_source": "current_message_text"}
             )
             for row in rows:
                 purpose = (
@@ -544,6 +544,7 @@ class _ProtectionClient:
             "instrument_id": "BTC-USDT-SWAP",
             "price": "64200",
             "price_field": "last",
+            "observed_at": NOW.isoformat(),
         }
         self.quote_reads = []
         self.trigger_pending = []
@@ -699,6 +700,12 @@ def test_break_even_market_reservation_persists_mixed_per_position_actions(
     assert client.quote_reads == ["BTC-USDT-SWAP"]
     assert client.pending_reads == 1
     assert client.call_log == []
+
+
+@pytest.fixture(autouse=True)
+def _fixed_stop_gate_check_clock(monkeypatch):
+    from telegram_kol_research import management_stop_price_gate as gate
+    monkeypatch.setattr(gate, "_stop_check_now", lambda: NOW)
 
 
 @pytest.mark.parametrize("quote", [None, {"instrument_id": "ETH-USDT-SWAP", "price": "64200", "price_field": "last"}])
@@ -3618,7 +3625,7 @@ def test_break_even_uses_each_positions_own_average_entry(tmp_path):
     ]
 
 
-def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_side(
+def test_partial_then_break_even_uses_entry_stop_and_ignores_zero_combined_side(
     tmp_path,
 ):
     from telegram_kol_research.strategy_management_executor import execute_management_batch
@@ -3630,7 +3637,7 @@ def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_si
     batch, rows_by_pos = _persist_protection_batch(
         session_factory,
         action="partial_then_break_even",
-        stop_loss="64100",
+        stop_loss=None,
         keep_close_plan=True,
     )
     rows_by_pos["pos-1"] = [
@@ -3802,9 +3809,9 @@ def test_partial_then_break_even_uses_explicit_stop_and_ignores_zero_combined_si
         for row in client.set_calls
         if row["posId"] == "pos-1"
     ] == [
-        ("pos-1", None, "64100", None),
+        ("pos-1", None, "64103.8", None),
     ]
-    assert all(row.get("slTriggerPx") != "64103.8" for row in client.set_calls)
+    assert all(row.get("slTriggerPx") != "0" for row in client.set_calls)
 
 
 def test_second_partial_promoted_to_full_exit_never_creates_new_stop(tmp_path):
@@ -5575,7 +5582,7 @@ def test_explicit_stop_on_triggered_market_side_blocks_before_any_write(tmp_path
 
     with pytest.raises(
         ManagementBatchExecutionError,
-        match="explicit_stop_market_side_invalid",
+        match="management_stop_direction_invalid",
     ):
         execute_management_batch(
             session_factory,
@@ -7153,3 +7160,65 @@ def test_composite_restart_resumes_after_old_cancel_is_exchange_confirmed(tmp_pa
     assert reconciled.recoverable == 1
     assert second.status == "confirmed"
     assert client._set_count == set_writes
+
+
+@pytest.mark.parametrize("action,stop,reason", [
+    ("adjust_stop_loss", "158241758", "management_stop_deviation_exceeded"),
+    ("partial_then_break_even", "64100", "management_stop_action_conflict"),
+])
+def test_execution_stop_gate_rejects_old_batch_before_any_write(tmp_path, action, stop, reason):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch, ManagementBatchExecutionError
+    from telegram_kol_research.models import RuntimeIncident
+    factory = create_session_factory(tmp_path / "old-batch-gate.db")
+    batch, rows = _persist_protection_batch(factory, action=action, stop_loss=stop, keep_close_plan=True)
+    with factory() as session:
+        for leg in session.query(StrategyManagementLeg).filter_by(management_batch_id=batch.id):
+            payload = json.loads(leg.planned_tpsl_json)
+            payload["stop_price_source"] = "current_message_text"
+            leg.planned_tpsl_json = json.dumps(payload)
+        session.commit()
+    client = _ProtectionClient(factory, rows)
+    client.quote["observed_at"] = NOW.isoformat()
+    with pytest.raises(ManagementBatchExecutionError, match=reason):
+        execute_management_batch(factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW)
+    assert client.cancel_calls == client.set_calls == client.close_calls == []
+    assert load_management_batch(factory, batch.id).reason_code == reason
+    with factory() as session:
+        assert session.query(RuntimeIncident).filter_by(incident_type="management_stop_rejected").one()
+
+
+def test_composite_conflict_rejected_before_first_component(tmp_path):
+    from telegram_kol_research.strategy_management_composite_executor import execute_composite_management_batch
+    from telegram_kol_research.strategy_management_contracts import load_management_contract, management_contract_fingerprint
+    from telegram_kol_research.models import RuntimeIncident
+    factory = create_session_factory(tmp_path / "composite-stop-conflict.db")
+    batch_id, _ = _persist_composite_consumption_component(factory)
+    with factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        payload = json.loads(batch.management_contract_json)
+        payload.update(stop_mode="explicit_price", stop_price="158241758", stop_price_source="current_message_text")
+        batch.management_contract_json = json.dumps(payload)
+        batch.management_contract_fingerprint = management_contract_fingerprint(load_management_contract(batch.management_contract_json))
+        session.commit()
+    client = _CompositeConsumptionClient()
+    result = execute_composite_management_batch(
+        factory, batch_id=batch_id, deepcoin_client=client, contract_spec_provider=None,
+        live_execution_gate=lambda: True, now_provider=lambda: NOW,
+    )
+    assert result.reason_code == "management_stop_action_conflict"
+    assert client.cancel_calls == client.close_calls == []
+    with factory() as session:
+        assert session.query(RuntimeIncident).filter_by(incident_type="management_stop_rejected").one()
+
+
+def test_stop_gate_rechecks_changed_market_at_cancel_boundary(tmp_path):
+    from telegram_kol_research.strategy_management_executor import execute_management_batch, ManagementBatchExecutionError
+    factory = create_session_factory(tmp_path / "changed-market.db")
+    batch, rows = _persist_protection_batch(factory)
+    client = _ProtectionClient(factory, rows)
+    quotes = iter([dict(client.quote), {**client.quote, "price": "1000"}])
+    client.get_ticker_quote = lambda **kwargs: next(quotes)
+    with pytest.raises(ManagementBatchExecutionError, match="management_stop_deviation_exceeded"):
+        execute_management_batch(factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW)
+    assert client.cancel_calls == client.set_calls == client.close_calls == []
+    assert load_management_batch(factory, batch.id).reason_code == "management_stop_deviation_exceeded"

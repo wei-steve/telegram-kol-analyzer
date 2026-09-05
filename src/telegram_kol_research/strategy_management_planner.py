@@ -87,6 +87,10 @@ from telegram_kol_research.strategy_management_sizing import (
     allocate_close_sizes,
     effective_action,
 )
+from telegram_kol_research.management_stop_price_gate import (
+    StopGateResult, stop_action_conflicts, validate_management_stop,
+    read_stop_quote, record_stop_gate_rejection, stop_gate_clock,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -230,6 +234,7 @@ def plan_strategy_management_batch(
     """Reconcile, reload, validate, and persist one immutable exact target."""
 
     now = planned_at or datetime.now(UTC)
+    checked_at = stop_gate_clock(now)
     resolved_execution_mode = (
         execution_mode if execution_mode in {"disabled", "shadow", "live"}
         else ("shadow" if shadow_only else "live")
@@ -256,6 +261,8 @@ def plan_strategy_management_batch(
             raw_message_id=raw_message_id,
             candidate_id=candidate_id,
             reconciliation_snapshot=reconciliation_snapshot,
+            deepcoin_client=deepcoin_client,
+            stop_gate_now=checked_at,
             contract_spec_provider=contract_spec_provider,
             planned_at=now,
             execution_mode=resolved_execution_mode,
@@ -454,10 +461,13 @@ def _plan_strategy_management_batch_locked(
     candidate_id: int | None,
     reconciliation_snapshot,
     contract_spec_provider,
+    deepcoin_client=None,
+    stop_gate_now=None,
     planned_at: datetime,
     execution_mode: str = "live",
 ) -> ManagementPlanningResult:
     now = planned_at
+    checked_at = stop_gate_now or stop_gate_clock(now)
     liveness_rollout_mode = load_trading_settings(
         session_factory
     ).effective_position_management_liveness_v2_mode
@@ -483,6 +493,18 @@ def _plan_strategy_management_batch_locked(
             reason_code="management_intent_not_supported",
             planned_at=now,
             execution_mode=execution_mode,
+        )
+    contract_payload = _json_dict(candidate.management_contract_json)
+    if stop_action_conflicts(intent, contract_payload.get("stop_mode"),
+                             contract_payload.get("stop_price") or candidate.stop_loss_text):
+        gate = StopGateResult("management_stop_action_conflict", {
+            "action": intent, "stop_mode": contract_payload.get("stop_mode"),
+            "stop_price": contract_payload.get("stop_price") or candidate.stop_loss_text,
+            "reference_price_source": "not_used_semantic_conflict",
+        })
+        return _persist_stop_gate_rejection(
+            session_factory, identity=identity, raw_message_id=raw_message_id,
+            intent=intent, gate=gate, planned_at=now, execution_mode=execution_mode,
         )
     try:
         composite_contract = _validated_candidate_composite_contract(
@@ -782,93 +804,35 @@ def _plan_strategy_management_batch_locked(
     else:
         effective_action_name, effective_fraction = intent, None
 
-    if (
-        intent in {"move_stop_to_break_even", "partial_then_break_even"}
-        and candidate.stop_loss_text not in (None, "")
-    ):
-        if candidate.stop_price_source != "current_message_text":
-            candidate.stop_loss_text = None
-        else:
-            try:
-                explicit_stop = Decimal(str(candidate.stop_loss_text))
-                price_tick = Decimal(str(contract_spec.price_tick))
-            except (InvalidOperation, TypeError, ValueError):
-                explicit_stop = Decimal("0")
-                price_tick = Decimal("0")
-            exact_tick = (
-                explicit_stop > 0
-                and price_tick > 0
-                and explicit_stop % price_tick == 0
-            )
-            live_entry_prices = [
-                Decimal(str(position["avg_entry_price"]))
-                for position in economics
-            ]
-            current_stop = (
-                Decimal(str(lifecycle.stop_loss))
-                if lifecycle.stop_loss is not None
-                else None
-            )
-            if str(lifecycle.side).lower() == "long":
-                tightens = (
-                    exact_tick
-                    and all(explicit_stop >= price for price in live_entry_prices)
-                    and (
-                        current_stop is None
-                        or explicit_stop >= current_stop
-                    )
-                )
-            else:
-                tightens = (
-                    exact_tick
-                    and all(explicit_stop <= price for price in live_entry_prices)
-                    and (
-                        current_stop is None
-                        or explicit_stop <= current_stop
-                    )
-                )
-            if not tightens:
-                return _persist_blocked(
-                    session_factory,
-                    identity=identity,
-                    raw_message_id=raw_message_id,
-                    intent=intent,
-                    reason_code="explicit_break_even_stop_not_risk_tightening",
-                    planned_at=now,
-                    execution_mode=execution_mode,
-                )
-
+    stop_gate_evidence = None
     if intent == "adjust_stop_loss" and candidate.stop_loss_text not in (None, ""):
-        if candidate.stop_price_source != "current_message_text":
-            return _persist_blocked(
-                session_factory,
-                identity=identity,
-                raw_message_id=raw_message_id,
-                intent=intent,
-                reason_code="explicit_stop_adjustment_source_unverified",
-                planned_at=now,
-                execution_mode=execution_mode,
+        gate = validate_management_stop(
+            action=intent, stop_mode="explicit_price", stop_price=candidate.stop_loss_text,
+            stop_price_source=candidate.stop_price_source,
+            current_message_text=identity.raw_message.text,
+            side=str(lifecycle.side).lower(),
+            entry_prices=[position["avg_entry_price"] for position in economics],
+            instrument_id=instrument_id,
+            quote=read_stop_quote(deepcoin_client, instrument_id),
+            settings=load_trading_settings(session_factory), now=checked_at(),
+        )
+        if gate.reason_code:
+            return _persist_stop_gate_rejection(
+                session_factory, identity=identity, raw_message_id=raw_message_id,
+                intent=intent, gate=gate, planned_at=now, execution_mode=execution_mode,
             )
+        stop_gate_evidence = gate.evidence
         try:
             explicit_stop = Decimal(str(candidate.stop_loss_text))
             price_tick = Decimal(str(contract_spec.price_tick))
+            exact_tick = price_tick.is_finite() and price_tick > 0 and explicit_stop % price_tick == 0
         except (InvalidOperation, TypeError, ValueError):
-            explicit_stop = Decimal("0")
-            price_tick = Decimal("0")
-        exact_tick = (
-            explicit_stop > 0
-            and price_tick > 0
-            and explicit_stop % price_tick == 0
-        )
+            exact_tick = False
         if not exact_tick:
-            return _persist_blocked(
-                session_factory,
-                identity=identity,
-                raw_message_id=raw_message_id,
-                intent=intent,
-                reason_code="explicit_stop_adjustment_not_risk_tightening",
-                planned_at=now,
-                execution_mode=execution_mode,
+            return _persist_stop_gate_rejection(
+                session_factory, identity=identity, raw_message_id=raw_message_id,
+                intent=intent, gate=StopGateResult("management_stop_tick_invalid", gate.evidence),
+                planned_at=now, execution_mode=execution_mode,
             )
 
     protection_by_pos_id: dict[str, dict[str, Any]] = {}
@@ -1261,6 +1225,8 @@ def _plan_strategy_management_batch_locked(
         "protection": protection_by_pos_id,
         "management_capabilities": management_capabilities,
     }
+    if stop_gate_evidence is not None:
+        target_snapshot["stop_price_gate"] = stop_gate_evidence
     if contract_spec_resolution.snapshot is not None:
         target_snapshot["contract_spec_snapshot"] = (
             contract_spec_resolution.snapshot
@@ -2072,6 +2038,20 @@ def _leg_state(leg: ExecutionOrderLeg) -> tuple[Any, ...]:
     )
 
 
+def _persist_stop_gate_rejection(session_factory, *, identity, raw_message_id,
+                                 intent, gate, planned_at, execution_mode):
+    result = _persist_blocked(
+        session_factory, identity=identity, raw_message_id=raw_message_id,
+        intent=intent, reason_code=gate.reason_code, planned_at=planned_at,
+        execution_mode=execution_mode, stop_gate_evidence=gate.evidence,
+    )
+    record_stop_gate_rejection(
+        session_factory, batch_id=result.batch_id, raw_message_id=raw_message_id,
+        result=gate, now=planned_at,
+    )
+    return result
+
+
 def _persist_blocked(
     session_factory: sessionmaker,
     *,
@@ -2081,6 +2061,7 @@ def _persist_blocked(
     reason_code: str,
     planned_at: datetime,
     execution_mode: str = "live",
+    stop_gate_evidence: dict | None = None,
 ) -> ManagementPlanningResult:
     candidate = identity.candidate
     binding = identity.binding
@@ -2121,6 +2102,8 @@ def _persist_blocked(
             "positions": [],
             "blocked_reason": reason_code,
         }
+        if stop_gate_evidence is not None:
+            target_snapshot["stop_price_gate"] = stop_gate_evidence
         existing = create_management_batch(
             session_factory,
             idempotency_fingerprint=idempotency_fingerprint,
