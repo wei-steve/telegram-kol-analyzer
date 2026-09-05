@@ -12,10 +12,10 @@ pushed_sha: 0de19c1cbb2089fd58b8940d9b01a65096f9a063
 production_sha_before: 6e2321cecbb3adf61d7a5972d391e662d4aea300
 production_sha_after: 0de19c1cbb2089fd58b8940d9b01a65096f9a063 # historical all-role main-recognition activation
 current_runtime_role_shas:
-  web: 877fbc33d783546ad2379b688c7648363a92c4a8
-  monitor: 877fbc33d783546ad2379b688c7648363a92c4a8
-  ingest: 877fbc33d783546ad2379b688c7648363a92c4a8
-  worker: 877fbc33d783546ad2379b688c7648363a92c4a8
+  web: af8676dca5ce83acfc060a8b856ccf3884f25150
+  monitor: af8676dca5ce83acfc060a8b856ccf3884f25150
+  ingest: af8676dca5ce83acfc060a8b856ccf3884f25150
+  worker: af8676dca5ce83acfc060a8b856ccf3884f25150
 r1_base_sha: 51abb3177892c0ee0c8dd1cd249a083aa27d9abe
 r1_code_sha: 5c0ca501825163049da5062693fb46e5297e9e77
 r1_production_sha: 4284d1a61226eb16812407c4f2489a207241db4c
@@ -36,6 +36,37 @@ auto_trade_enabled_expected: true
 entry_admission_frozen_observed: false
 auto_trade_enabled_observed: true
 ```
+
+## Protection-order side semantics activated; L2 found a new uncertain management outcome — 2026-09-05T17:03:53Z
+
+- The standard immutable helper activated
+  `af8676dca5ce83acfc060a8b856ccf3884f25150` on Web, monitor, ingest and worker
+  with `schema_changed=false` and measured per-role rollback
+  `9501a5f39f0c5f196cc29f24f3e3b8786267126b`. All three runtime endpoints and
+  monitor diagnostics loaded manifest
+  `5ae834ad537676e849b0be58c128fc9721ebf52f5ba993b84e329f4c68a97b28`;
+  full-tree validation passed 39/39 before and after activation with zero
+  bytecode pollution. The effective freeze lasted about 78 seconds, no message
+  arrived in it, and stale expiry remained 420.
+- The target BTC long position retained primary stop
+  `1001125135694875 @ 77500`; runtime also added verified backup stop
+  `1001125143685194 @ 77345`. Take-profit convergence 227 did not submit any TP
+  and ended `conflicted / convergence_pending_alias_conflict`. Current cached
+  rows for both stops pass the deployed `long/sell` semantics, so the transient
+  offending row cannot be reconstructed from the convergence row.
+- The 31-minute bounded observation received three messages from two chats,
+  below the five-message target. Attempts 198 and 200 completed safely before
+  the exchange boundary. Raw 15013 produced new attempt 199 as
+  `uncertain / outcome_unknown / partial_failed`; its management batch had
+  already stopped `protection_price_or_size_mismatch`, and the current position
+  remained six contracts with both stops, but the durable unknown outcome is
+  not reinterpreted. The original four uncertain attempts remained exactly
+  unchanged, while total uncertain counts increased 4→5 and
+  `execution_running` stayed zero.
+- The timer remains enabled/active; its main oneshot continues to exit 1 only
+  for the authorized pre-existing preamble 16 false-positive business finding.
+  Full evidence and the concurrent unrelated protected ETH probe are recorded
+  in `docs/2026-09-05-protection-order-side-semantics-production-activation.md`.
 
 ## Trigger-protection lineage candidate activated — 2026-09-04T16:43:48Z
 
