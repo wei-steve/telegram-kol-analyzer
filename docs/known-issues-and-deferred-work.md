@@ -17,7 +17,7 @@
 | **平仓后的保护投影与本地 lifecycle 状态可能残留。** 文档分别记录了陈旧的 `position_protection_legs` 753–755、平仓后仍为 `verified` 的 protection-ledger 598–601，以及 lifecycle `1043`、`1044`、`1051`、`1053` 本地仍为 `entered`、但 binding/order leg/protection leg/protection ledger 均为 0 且交易所无对应仓位。准确目标行范围在修复前需重新确认。 | 这些记录不是已证实的裸仓，但本地状态与交易所事实不一致；陈旧投影曾误伤部署门禁，未来管理/归属逻辑还可能阻塞或错误选择目标。 | `docs/ai-context-resolution-optimization-status.md`：**Read-only live-position protection audit and P0 checkpoint / Exchange position and current protection**、**R1 activation stopped at the fresh protection-ledger gate**；`docs/2026-09-02-recognition-exposure-and-expiry-read-only-audit.md`。 | 下一次依赖本地 lifecycle/保护簿记的部署门禁之前；或下一次真实持仓进入管理/保护替换前。 | 新鲜且完整的交易所持仓/普通单/逐合约触发单快照；确认当前权威表和准确目标行；定义无实盘仓位时 lifecycle 与保护投影的既有终结语义；数据库备份、单事务和回滚边界。 |
 | **Shadow 收紧判据仍不能接管权威。** 历史回放虽召回 25/25 个关键漏失和 474/474 次实质改变，生产也已有少量真实 shadow 行，但证据量仍不足。 | 现状不影响交易，因为旧判据仍是唯一权威；若过早切换，可能漏掉加仓、平仓、移动止损或保护利润等管理语义。 | `docs/plans/2026-08-31-ai-context-resolution-analysis.md`：**18.7 推荐与证据门槛**；`docs/ai-context-resolution-optimization-status.md`：**Main-recognition observability deployed and live-verified**。 | 持续积累生产 shadow 样本后，再单独评审是否进入权威切换设计；在此之前不实施节省。 | 固定词表后进行未参与选词的留出回放；人工标注关键样本；生产 shadow 对动作族、目标 thread、适用性和风险收缩保持 100% 一致；实质改变召回必须为 100%。 |
 | **47 条不同 raw message 尚待人工标注。** 它们对应联合反事实会漏失的 53 个 attempt，需要区分“纠正第一层漏识别”“仅改变目标”和“风险收缩”。现已有带标注时快照与 provenance 的所有者标注入口，但这 47 条积压本身仍未清理。 | 缺少领域人工标签会使词表覆盖与收紧规则的安全结论依赖同一批历史数据自证，不能据此改变交易判据。 | `docs/plans/2026-08-31-ai-context-resolution-analysis.md`：**17.5 B 与联合规则的全部漏失样本**、**17.6 结论与上线证据门槛**。 | 在任何 shadow 判据权威化、词表收紧或 prompt 精简之前。 | 冻结这 47 条的确切清单与标注口径；由所有者/领域人工完成标注；保留原始消息、图片证据、第一层与上下文后结论，避免用模型输出代替人工真值。 |
-| **29 条 legacy execution_running 已生产终结，剩余 1 running + 3 uncertain 仍受保护。** 2026-09-05T12:57:55Z 经单独批准、新鲜备份与逐条复验，单事务精确 UPDATE 29 行为 completed / failed / authoritative_execution_abandoned_before_side_effect。生产 running 30→1、uncertain 3→3，前后 quick_check=ok、FK=0 行、关键表计数不变。raw 14214 因 candidate 2129 / instruction 909 存在继续排除；其已记录结果为 skipped / kol_or_group_auto_trade_disabled，仍保留 running。该行与三条 uncertain 全字段未变。 | 剩余 running 14214 与 uncertain 14825/14843/14889 仍阻止相应 authoritative overwrite，backlog expiry 的状态保护仍因这四条而生效；**不得表述为阻塞已解除**。没有执行积压过期或重跑消息。 | `docs/2026-09-05-legacy-execution-running-production-completed.md`；逐条核验与副本演练见 `docs/2026-09-05-legacy-execution-running-rehearsal.md`。 | 合格 29 条已完成；excluded 与三条 uncertain 需独立 reconciliation、风险判断和另行授权，不能混入安全弃置批次。 | 任何后续处置都需新鲜逐行证据、备份与精确事务/回滚边界；不能用全库备份覆盖在线生产，也不能为维护放行而削弱 running/uncertain 保护。 |
+| **29+1 条 legacy execution_running 已全部生产终结，剩余 3 条 uncertain。** 首批 29 条于 2026-09-05T12:57:55Z 完成；raw 14214 经独立写边界核查、单独授权、新鲜备份及副本演练，于 13:39:33.541219Z 精确终结为 completed / failed / authoritative_execution_abandoned_before_side_effect。running 1→0、uncertain 3→3；前后 quick_check=ok、FK=0 行，关键表计数不变。candidate 2129 / instruction 909 及三条 uncertain 全字段未变。 | uncertain 14825/14843/14889 仍阻止相应 authoritative overwrite，backlog expiry 的状态保护仍因这三条而生效；**不得表述为阻塞已解除**。没有执行积压过期或重跑消息。 | `docs/2026-09-05-legacy-execution-running-production-completed.md`；`docs/2026-09-05-raw14214-terminalization-production-completed.md`；尾项证据见 `docs/2026-09-05-raw14214-write-boundary-read-only-audit.md`。 | legacy 29+1 已完成；剩余三条 uncertain 需独立 reconciliation 与人工授权，不在安全弃置批次内。 | 任何后续处置都需新鲜证据、备份与精确事务/回滚边界；不能用全库备份覆盖在线生产，也不能为维护放行而削弱 uncertain 保护。原卡死具体异常仍未确定，不因处置完成而宣称已查明。 |
 | **系统主动冻结超过 15 分钟会把冻结期消息静默结算为 stale expiry。** `2026-09-04T08:56:33Z` 至 `09:21:02Z` 的失败激活冻结窗口内，raw `14795`、`14796` 均以 `attempt_count=0` 进入 `expired_stale_instruction`；其中 `14795` 是 active lifecycle `1074` 的止盈相关管理消息。 | 失败部署会延长冻结时间；目前冻结期到达与其他停滞共用 15 分钟超龄终态，queue 路径又不通知，因此可能静默漏掉管理语义。不得通过放宽超龄阈值修复，否则会增加执行陈旧指令的风险。 | `docs/plans/2026-09-04-monitor-release-identity-convergence-design.md`：**Freeze-window message loss record**；本次失败激活证据。 | 单独设计“系统主动冻结”归因、解冻清单和所有者处置流程时；本轮只记录，不补跑消息。 | 以持久化 freeze interval ID、开始/结束时间及部署证据绑定消息的 `posted_at`、job `enqueued_at/completed_at/status`；解冻时明确枚举因此超龄的消息并通知所有者决定。现有时间字段只能做事后关联，不能可靠证明某条 expiry 属于哪次冻结，因此需要新增冻结区间记录或等价的签名部署证据引用。 |
 
 2026-09-05 raw 14214 尾项只读核查：结论为甲（其系统路径未跨交易所写边界），
@@ -26,9 +26,12 @@
 generation 在 05:39:19.684Z 才 claim；旧执行器仅认领 pending，不会再次执行该终态 item。
 扩展到 target lifecycle 1040 的保护/变更全链仍为空，唯一根入场 event 3883 也是
 auto_trade_skipped，不能把本地 entered 当实盘成交。具体导致 finalize 缺失的栈未取到，
-不能确定异常种类或归因重启。现仅给精确 L3 单行终结计划，**raw 14214 与三条 uncertain
-均未修改，仍为 1 running / 3 uncertain**。详见
-`docs/2026-09-05-raw14214-write-boundary-read-only-audit.md`；生产处置须另行授权。
+不能确定异常种类；无 traceback、PID 未变，不能归因重启。
+其后经单独批准已按同一 L3 终结语义处置 raw 14214；
+2026-09-05T13:40:11.399364Z 复核为 **0 running / 3 uncertain**，
+三条 uncertain 与 candidate/instruction/job/关联记录全字段未变。
+历史只读结论见 `docs/2026-09-05-raw14214-write-boundary-read-only-audit.md`，
+生产处置见 `docs/2026-09-05-raw14214-terminalization-production-completed.md`。
 
 ## 影响运维与部署
 
