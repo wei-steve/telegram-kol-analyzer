@@ -15,8 +15,8 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 1
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-1-ws-inbox.md
-phase_status: planned             # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+phase_status: claimed             # planned | claimed | in_progress | completed | blocked
+claimed_by: local_3d228d16-7b51-4871-a635-1f6e9ba64f41
 last_completed_phase: 0
 last_completed_commit: null
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
