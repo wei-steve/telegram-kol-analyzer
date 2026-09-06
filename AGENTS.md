@@ -23,6 +23,9 @@
   irreversible action was not included. Exact SHAs, action manifests, fresh
   evidence, backup/rollback boundaries, and fail-closed handling remain
   technical requirements rather than separate conversational approval gates.
+- **Never run `git add -A` in this repository.** Multiple sessions share this
+  checkout, so `-A` commits other sessions' unfinished work. Stage explicit
+  paths and verify with `git diff --cached --name-only` before committing.
 - Send no Telegram notifications during active work. Concise in-app commentary
   is allowed at meaningful milestones, state changes, or blockers; do not stream
   repetitive polling or unchanged status. Send exactly one Telegram notification
