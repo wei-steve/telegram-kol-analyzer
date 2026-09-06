@@ -265,6 +265,20 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 ## 证据记录
 
 - phase-2-open-ended-observation (2026-09-06, 用户在指挥会话 local_858790fe 明确授权): 两次 30 分钟观察均因夜间零消息停止，代码侧无待办。用户决定阶段 2 的收尾观察改为开放式：服务器端后台监视器每分钟采样，直到出现一个完整的 30 分钟窗口满足 ≥5 条真实消息、尽量 2 个群且全部健康检查通过为止，自行停止；会话按定时查看结果。AGENTS.md L2 已加入该例外条款。
+- phase-2-open-observer-started (2026-09-06, 会话 local_a6d6d24f, **只读**): 按上一条的用户授权启动服务器端开放式监视器。
+  只读核实：生产 HEAD `0371fc9f`（分支 `live`）、三单元 active/NRestarts=0、ws-health `healthy` / `open_gap_count=0`。
+  本阶段要求的那一次 worker 重启：`2026-09-06T17:58:05Z`（MainPID 2345403→2362557），缺口行 id=20 `process_start`
+  2.427 秒闭合，五步重同步 931/3/0/813/1 ms `converged`，`17:58:11Z` 回 `healthy`。**合格窗口必须整段落在该重启之后。**
+  起点 fingerprint `283091021fc8391834efb3c2b49c968fd576940d4a8d01b91c3c287a4b79d70b`
+  （`complete=true, position_count=1, open_order_count=0`，与前两次观察逐字节一致）存于
+  `rest-ws-phase-2/exchange-snapshot-open-start.json`。
+  监视器 `rest-ws-phase-2/open-observer.sh`，**PID 2363944**，`2026-09-06T18:01:57Z` 起每 60 秒采样一次写
+  `open-observer.jsonl`；只做 curl 本机 ws-health、`systemctl show`、`sqlite3 ?mode=ro` 三件事，不写库不碰交易所。
+  停止条件：某次采样近 30 分钟消息 ≥5 且群数 ≥2，且最近 30 个采样点全部健康（三单元 active、NRestarts=0、
+  state 恒 healthy、open_gap_count 恒 0、last_resync_outcome 恒 converged、unparsed_count 恒 1 无新增、
+  unprocessed=0）；消息 ≥5 但仅 1 群持续超 2 小时亦接受并在 summary 标注。上限 24 小时写 TIMEOUT。
+  健康项不通过不停止，记 anomaly 后健康窗口从下一次通过重新累计。
+
 - phase-2-approval (2026-09-06, 用户在指挥会话 local_858790fe 明确批准): 阶段 2（去重、乱序保护、心跳、断线状态机、REST 重同步，L2；若加列则该提交按 L3）获批领取。用户强调硬性规则第 12 条是本阶段的核心验收。
 - identity-note (2026-09-06, 指挥会话核实): 生产 `deployment-identity` 的 `loaded_artifact_verified=false` 与 capabilities 全 false 是门禁退役后 `/etc/telegram-kol-worker.env` 不再设置 `TELEGRAM_KOL_RELEASE_COMMIT` / `_MANIFEST_SHA256` 的结构性结果。代码核实：这些标志的唯一消费者是已退役的 `scoped_release_activation.py` 和已停用的 monitor 命令，不门控任何交易路径。各阶段文件的前置判据已改为“worker 各 loop 存活 + authority_evidence 新鲜”。可选后续：让 tg-deploy 写入 release commit 让身份端点恢复有意义。
 - phase-1-approval (2026-09-06, 用户在指挥会话 local_858790fe 明确批准): 阶段 1（新表 `deepcoin_ws_events` + `websockets` 依赖，L3）获批领取。同轮用户告知已自行处理掉交易所上三张 2026-09-03 的历史条件入场单，当前无挂单；阶段 3/4 的比对基线不再需要为它们建模。用户同时提出硬性要求第 12 条（断线/重启后重新对齐）。
