@@ -1074,14 +1074,17 @@ class DeepcoinPrivateWsInbox:
                 else str(raw)
             )
             self.state_machine.mark_frame_received()
-            await asyncio.to_thread(
+            # The expiry check rides along with the write so that a frame is
+            # parsed once, in the worker thread, rather than a second time on
+            # the event loop -- frames may be up to two megabytes.
+            expired = await asyncio.to_thread(
                 self._persist_frame,
                 raw_payload,
                 received_at,
                 received_ms,
             )
-            if is_listen_key_expiry_notice(raw_payload):
-                # Persist first, then act: the notice is evidence too.
+            if expired:
+                # Persisted first, then acted on: the notice is evidence too.
                 logger.info(
                     "Deepcoin private WS listen key expired; reconnecting with a "
                     "fresh key"
@@ -1093,7 +1096,9 @@ class DeepcoinPrivateWsInbox:
         raw_payload: str,
         received_at: datetime,
         received_ms: int,
-    ) -> None:
+    ) -> bool:
+        """Persist one frame; report whether it announced a listen-key expiry."""
+
         try:
             rows = persist_ws_frame_rows(
                 self._session_factory,
@@ -1103,9 +1108,9 @@ class DeepcoinPrivateWsInbox:
             )
         except Exception:
             logger.exception("Failed to persist Deepcoin private WS frame")
-            return
+            return False
         if not rows:
-            return
+            return False
         self.events_persisted += len(rows)
         self.last_event_id = int(rows[-1]["event_id"])
         self.last_event_received_ms = received_ms
@@ -1120,6 +1125,7 @@ class DeepcoinPrivateWsInbox:
             mark_events_processed(self._session_factory, fresh_ids)
         except Exception:
             logger.exception("Failed to mark Deepcoin WS events processed")
+        return is_listen_key_expiry_notice(raw_payload)
 
 
 async def run_deepcoin_private_ws_loop(
