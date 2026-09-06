@@ -1144,3 +1144,40 @@ def test_the_expiry_notice_is_persisted_before_it_triggers_the_reconnect(tmp_pat
     assert inbox.state_machine.consecutive_failures == 0
     assert inbox.state_machine.state == WS_STATE_DISCONNECTED
     assert inbox.permits_new_entry()[0] is False
+
+
+def test_a_newly_listed_contract_triggers_one_forced_map_rebuild():
+    """A stale map must not lock the stream out of ``healthy`` forever."""
+
+    stub = _RestStub(instruments=[{"instId": "ETH-USDT-SWAP"}])
+    coordinator = _coordinator(stub)
+    # The map was built before ETH-USDT-SWAP appeared on it.
+    coordinator.instrument_map.build([{"instId": "BTC-USDT-SWAP"}])
+    coordinator.instrument_map.mark_built(now_ms=NOW_MS)
+
+    outcome = coordinator.run(
+        tracker=WsEntityStateTracker(),
+        replay_unprocessed=lambda _t, _l: 0,
+        subscribe=lambda: None,
+        stream_instruments=["ETHUSDT"],
+    )
+
+    assert stub.calls.count("instruments") == 1, "exactly one forced rebuild"
+    assert "step1_rest_snapshot_retry" in outcome.step_durations_ms
+    assert outcome.converged is True
+
+
+def test_a_contract_the_exchange_does_not_list_stays_blocked():
+    stub = _RestStub(instruments=[{"instId": "ETH-USDT-SWAP"}])
+    coordinator = _coordinator(stub)
+
+    outcome = coordinator.run(
+        tracker=WsEntityStateTracker(),
+        replay_unprocessed=lambda _t, _l: 0,
+        subscribe=lambda: None,
+        stream_instruments=["DOGEUSDT"],
+    )
+
+    assert outcome.converged is False
+    assert outcome.reason == "unresolved_instrument"
+    assert outcome.unresolved_instruments == ("DOGEUSDT",)

@@ -404,6 +404,18 @@ class DeepcoinWsResyncCoordinator:
             "step1_rest_snapshot",
             lambda: self.rest_snapshot(stream_instruments=stream_instruments),
         )
+        if before.unresolved_instruments:
+            # A contract listed after the map was last built would otherwise
+            # fail closed forever, and a permanently unconverged resync leaves
+            # the entry-permission hook denying for good. One forced rebuild
+            # distinguishes "the map is stale" from "this contract does not
+            # exist"; if it still does not resolve, the resync stays blocked,
+            # which is the correct outcome.
+            self.refresh_instrument_map(force=True)
+            before = _step(
+                "step1_rest_snapshot_retry",
+                lambda: self.rest_snapshot(stream_instruments=stream_instruments),
+            )
 
         # Step 2 -- replay whatever the inbox persisted but never folded in.
         replayed: int = _step(
