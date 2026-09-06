@@ -661,9 +661,10 @@ class LifecycleMonitor:
                     "occurred_at": now,
                 })
             # Each scheduled event runs a ContextResolutionAttempt JOIN RawMessage
-            # query and then writes, so N transitions plus M chats used to mean
-            # N+M database round trips on the event loop. Submitted as one batch
-            # because the originals ran back to back with nothing between them.
+            # query and then writes, so N transitions plus M chats would be N+M
+            # database round trips on the event loop. They are submitted as one
+            # batch to the management worker instead; nothing runs between the
+            # individual events, so batching them changes no ordering.
             if scheduled_events:
                 await run_on_management_worker(
                     _run_context_resolution_scheduler_batch,

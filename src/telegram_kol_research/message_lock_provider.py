@@ -1,19 +1,18 @@
 """Resolve the message-processing lock per chat, honoring a live settings flag.
 
-`handle_new_message` used to hold one process-wide `asyncio.Lock` across the
-whole processing chain, so a slow message in one chat delayed every other
-chat. `trading_settings.message_lock_mode` controls whether that stays true:
+`trading_settings.message_lock_mode` decides how much of the message-processing
+chain serializes:
 
-- ``"global"`` (the default): every chat gets the same shared lock, which is
-  byte-for-byte the pre-Phase-2 behavior.
+- ``"global"`` (the default, and the only mode production runs): every chat
+  gets the same shared lock, so a slow message in one chat delays every other
+  chat.
 - ``"per_chat"``: each chat gets its own lock from a
-  ``KeyedAsyncLockRegistry``, so unrelated chats no longer serialize on one
+  ``KeyedAsyncLockRegistry``, so unrelated chats do not serialize on one
   another. Cross-chat operations (a manual refresh, a reconcile pass in
   per-chat mode) use :meth:`MessageLockProvider.lock_all` instead.
 
-The mode is read fresh from the database on every call, not cached at
-startup, so operators can flip it with no restart and no deploy - the
-rollback path Phase 2 depends on.
+The mode is read fresh from the database on every call, not cached at startup,
+so operators can flip it in either direction with no restart and no deploy.
 """
 
 from __future__ import annotations
@@ -50,8 +49,8 @@ class MessageLockProvider:
         """Return the lock to hold while processing one message from ``chat_id``.
 
         In "global" mode this is always the same shared lock, so calling it
-        with different ``chat_id`` values still serializes every chat against
-        every other, identical to the pre-Phase-2 behavior.
+        with different ``chat_id`` values serializes every chat against every
+        other.
         """
 
         return self._operation_context(chat_id)

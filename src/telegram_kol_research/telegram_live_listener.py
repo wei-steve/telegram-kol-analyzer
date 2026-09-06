@@ -1153,10 +1153,9 @@ async def recover_missing_authoritative_decisions(
 
     Performs **no Telegram network calls** of any kind - ``chat_titles_by_id``
     is supplied entirely by the caller, from local configuration or the
-    database, never from ``discover_dialogs``. This is exactly the recovery
-    logic ``run_reconcile_once`` used to run inline; calling it from there
-    keeps that function's observable behavior unchanged, and it is also what
-    lets :func:`run_authoritative_gap_recovery_loop` run it on its own fast
+    database, never from ``discover_dialogs``. Two callers share this one
+    implementation: ``run_reconcile_once`` invokes it as part of its own pass,
+    and :func:`run_authoritative_gap_recovery_loop` runs it on a separate fast
     cadence, independent of the (slow, Telegram-coupled) periodic reconcile
     pass.
 
@@ -1909,8 +1908,9 @@ async def run_authoritative_gap_recovery_loop(
 ) -> None:
     """Recover missing authoritative decisions on a fast, network-free cadence.
 
-    This is the Phase 3 Task 1 compensator: independent of the slow,
-    Telegram-fetch-coupled periodic reconcile pass, it resolves
+    This loop runs in the ``worker`` role as the ``authoritative_gap_recovery_loop``
+    singleton task. Independent of the slow, Telegram-fetch-coupled periodic
+    reconcile pass in the ``ingest`` role, it resolves
     ``chat_titles_by_id`` on every tick via ``chat_titles_by_id_provider`` -
     local configuration or the database, **never** ``discover_dialogs`` - so
     a stalled or unhealthy Telegram session cannot also block recovery of
