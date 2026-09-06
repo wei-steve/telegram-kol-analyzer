@@ -59,31 +59,29 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
 
 | 设置 | 生产值 | 代码默认值（`src/telegram_kol_research/trading_settings.py`） |
 |---|---|---|
-| `message_pipeline_mode` | `queue` | `queue`（`Literal["inline", "shadow", "queue"]`） |
-| `worker_command_mode` | `queue` | `queue`（`Literal["inline", "shadow", "queue"]`） |
+| `message_pipeline_mode` | `queue` | `queue`（`Literal["queue"]`） |
+| `worker_command_mode` | `queue` | `queue`（`Literal["queue"]`） |
 | `message_lock_mode` | `global` | `global`（`Literal["global", "per_chat"]`） |
 
 **代码默认值与生产一致**：三个设置的默认值都等于生产值，数据库里没有对应行时读到的就是生产模式。
-`inline` 和 `shadow` 仍是合法取值，但只有显式写进数据库才会生效。
-`message_lock_mode=per_chat` 从未在生产启用。
+`message_pipeline_mode` 与 `worker_command_mode` 现在只有 `queue` 一种行为；
+生产数据库里遗留的 `inline` / `shadow` 值仍然读得回来——解析器记一条 warning 后按 `queue` 处理，
+从不抛错。`message_lock_mode=per_chat` 从未在生产启用。
 
 ## 4. queue 模式下一条消息的路径
 
 以 `telegram_live_listener.py`、`message_processing_worker.py`、`web_app.py` 为准：
 
 1. **ingest 落库 + 入队，不做处理。**
-   Telethon 回调进入 `telegram_live_listener.persist_live_message_event`。它先读
-   `message_pipeline_mode`，并设置 `run_post_persist_processing = (pipeline_mode != "queue")`。
-   在 `queue` 模式下这个标志为 `False`，所以 ingest **不会**在回调里调用
-   `process_message_job`；它只把原始行写进 `raw_messages`，然后通过
-   `shadow_enqueue_hook` → `_try_enqueue_shadow_processing_jobs` 幂等地在
+   Telethon 回调进入 `telegram_live_listener.persist_live_message_event`。它把原始行写进
+   `raw_messages`，然后通过 `enqueue_hook` → `_try_enqueue_processing_jobs` 幂等地在
    `message_processing_jobs` 里建一条 job（`last_reason="queue_enqueued"`）。
-   ingest 的 `reconcile`（拉取补齐）路径同样在 `queue` 模式下补入队，
-   reason 为 `recovery_enqueued`。
+   ingest 回调里没有任何识别或执行调用。
+   ingest 的 `reconcile`（拉取补齐）路径同样只补入队，
+   reason 为 `recovery_enqueued`（缺口恢复）或 `history_reconcile_enqueued`（历史补齐）。
 
 2. **worker 消费并做全部业务决定。**
-   `message_processing_worker.run_message_processing_loop` 只在
-   `message_pipeline_mode == "queue"` 时消费；模式一旦不再是 `queue`，它把在飞任务收干净后返回。
+   `message_processing_worker.run_message_processing_loop` 无条件消费，直到被取消。
    每轮按 `message_processing_max_parallel_chats` 上限
    `claim_message_processing_jobs` 认领作业，每条作业交给
    `run_message_processing_worker_tick` → `process_message_job`。
@@ -107,7 +105,6 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
    | `process_next_trade_signal` | `_execute_process_next` |
 
    其他 `command_type` 一律 fail-closed（`unsupported_worker_command_type`）。
-   `worker_command_executor` 同样以 `worker_command_mode != "queue"` 作为不消费的条件。
 
 ## 5. 模块分类（粗分，待步骤 5 核实）
 
@@ -153,8 +150,9 @@ tpsl_ledger_backfill.py                  recovery_scan.py
 
 - 改任何东西之前，先看上面第 3 节的模式表：**生产和代码默认值都跑 queue**。
   运行时真值仍以数据库里的设置行为准，不要只看默认值就下结论。
-- 代码里的 `inline` 和 `shadow` 分支是迁移期的历史路径，正在被删除
-  （清理方案步骤 3）。**不要在这些分支里加功能**，也不要为了让它们"对称"而扩展它们。
+- 代码里已经没有 `inline` / `shadow` 分支了（清理方案步骤 3 删除）。消息与命令路径各只有一条，
+  **不要重新引入模式开关**来做灰度或回滚。`message_processing_jobs.shadow` 列还在表上，
+  新行恒为 `0`，worker 认领时用 `shadow = 0` 过滤掉历史行；删列是以后的 L3 工作。
 - `web` 角色没有执行权限。任何需要写交易所或改仓位的动作，必须经 `worker_command_jobs`
   走那四条命令之一，不要在 web 进程里直接调交易所客户端。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动

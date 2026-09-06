@@ -703,7 +703,7 @@ async def run_message_processing_worker_loop(
     activity: MessageProcessingActivity | None = None,
     **tick_kwargs,
 ) -> None:
-    """Consume queue jobs only while the dynamic pipeline mode is ``queue``."""
+    """Consume queue jobs until the loop is cancelled."""
 
     lane_activity = activity or MessageProcessingActivity()
     in_flight: set[asyncio.Task[MessageProcessingWorkerResult]] = set()
@@ -716,11 +716,6 @@ async def run_message_processing_worker_loop(
             )
             cap = settings.message_processing_max_parallel_chats
             lane_activity.apply_limit(cap, applied_at=observed_at)
-
-            if settings.message_pipeline_mode != "queue":
-                if in_flight:
-                    await asyncio.gather(*in_flight)
-                return
 
             available = max(0, cap - len(in_flight))
             claims: list[MessageProcessingClaim] = []

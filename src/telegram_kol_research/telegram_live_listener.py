@@ -20,11 +20,7 @@ from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, loa
 from telegram_kol_research.contextual_message_window import (
     fetch_missing_reply_target,
 )
-from telegram_kol_research.message_recognition import (
-    filter_records_by_inserted_message_keys,
-)
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.message_processing_worker import process_message_job
 from telegram_kol_research.message_lock_provider import (
     resolve_lock_context,
     resolve_message_lock_mode,
@@ -35,7 +31,6 @@ from telegram_kol_research.models import (
     MessageRecognition,
     RawMessage,
     RecognitionDecision,
-    SignalCandidate,
     utc_now,
 )
 from telegram_kol_research.raw_ingest import normalize_message_payload, persist_normalized_messages
@@ -69,7 +64,6 @@ from telegram_kol_research.telegram_client import (
     is_usable_image_file,
     maybe_await,
 )
-from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -121,23 +115,15 @@ async def _deliver_authoritative_instruction_summary(
     )
 
 
-def _enqueue_shadow_processing_jobs(
+def _enqueue_processing_jobs(
     session_factory,
     *,
     message_keys: list[tuple[int, int]] | None = None,
     raw_message_ids: list[int] | None = None,
     last_reason: str,
-    pipeline_mode_override: str | None = None,
 ) -> list[int]:
-    """Idempotently create shadow or authoritative queue jobs by mode."""
+    """Idempotently create queue jobs for the given messages."""
 
-    pipeline_mode = (
-        pipeline_mode_override
-        or load_trading_settings(session_factory).message_pipeline_mode
-    )
-    if pipeline_mode not in {"shadow", "queue"}:
-        return []
-    is_shadow = pipeline_mode == "shadow"
     with session_factory() as session:
         query = session.query(RawMessage.id, RawMessage.chat_id)
         if raw_message_ids is not None:
@@ -168,149 +154,60 @@ def _enqueue_shadow_processing_jobs(
                     "attempt_count": 0,
                     "last_reason": last_reason,
                     "enqueued_at": utc_now(),
-                    "shadow": is_shadow,
+                    "shadow": False,
                 }
                 for row in rows
             ]
         )
-        if is_shadow:
-            statement = insert_statement.on_conflict_do_update(
-                index_elements=["raw_message_id"],
-                set_={
-                    "chat_id": insert_statement.excluded.chat_id,
-                    "status": "pending",
-                    "next_attempt_at": None,
-                    "claim_token": None,
-                    "claimed_at": None,
-                    "last_reason": last_reason,
-                    "enqueued_at": insert_statement.excluded.enqueued_at,
-                    "completed_at": None,
-                    "shadow": True,
-                },
-                where=or_(
-                    MessageProcessingJob.shadow.is_(True),
+        # Rows left behind by the retired shadow pipeline are adopted only once
+        # they are terminal, or once a pending one has sat unclaimed long enough
+        # to prove no consumer owns it.
+        statement = insert_statement.on_conflict_do_update(
+            index_elements=["raw_message_id"],
+            set_={
+                "chat_id": insert_statement.excluded.chat_id,
+                "status": "pending",
+                "attempt_count": 0,
+                "next_attempt_at": None,
+                "claim_token": None,
+                "claimed_at": None,
+                "last_reason": last_reason,
+                "enqueued_at": insert_statement.excluded.enqueued_at,
+                "completed_at": None,
+                "shadow": False,
+            },
+            where=and_(
+                MessageProcessingJob.shadow.is_(True),
+                or_(
+                    MessageProcessingJob.status.in_(
+                        ("succeeded", "failed", "expired")
+                    ),
                     and_(
-                        MessageProcessingJob.shadow.is_(False),
                         MessageProcessingJob.status == "pending",
-                        MessageProcessingJob.claim_token.is_(None),
-                        MessageProcessingJob.claimed_at.is_(None),
+                        MessageProcessingJob.enqueued_at
+                        <= utc_now() - timedelta(minutes=5),
                     ),
                 ),
-            )
-        else:
-            # Queue authority may adopt a terminal Phase-4 shadow row only when
-            # recovery has proved the message still lacks a decision. A pending
-            # shadow row can be inline work in flight at the mode boundary and
-            # must never be promoted or consumed.
-            statement = insert_statement.on_conflict_do_update(
-                index_elements=["raw_message_id"],
-                set_={
-                    "chat_id": insert_statement.excluded.chat_id,
-                    "status": "pending",
-                    "attempt_count": 0,
-                    "next_attempt_at": None,
-                    "claim_token": None,
-                    "claimed_at": None,
-                    "last_reason": last_reason,
-                    "enqueued_at": insert_statement.excluded.enqueued_at,
-                    "completed_at": None,
-                    "shadow": False,
-                },
-                where=and_(
-                    MessageProcessingJob.shadow.is_(True),
-                    or_(
-                        MessageProcessingJob.status.in_(
-                            ("succeeded", "failed", "expired")
-                        ),
-                        and_(
-                            MessageProcessingJob.status == "pending",
-                            MessageProcessingJob.enqueued_at
-                            <= utc_now() - timedelta(minutes=5),
-                        ),
-                    ),
-                ),
-            )
+            ),
+        )
         session.execute(statement)
         session.commit()
-        if is_shadow:
-            admitted_ids = {
-                int(raw_message_id)
-                for (raw_message_id,) in session.query(
-                    MessageProcessingJob.raw_message_id
-                )
-                .filter(
-                    MessageProcessingJob.raw_message_id.in_(
-                        [int(row.id) for row in rows]
-                    ),
-                    MessageProcessingJob.shadow.is_(True),
-                )
-                .all()
-            }
-            return [int(row.id) for row in rows if int(row.id) in admitted_ids]
         return [int(row.id) for row in rows]
 
 
-def _mark_shadow_processing_jobs_terminal(
-    session_factory,
-    *,
-    raw_message_ids: list[int],
-    status: str,
-    last_reason: str,
-) -> None:
-    if not raw_message_ids:
-        return
-    with session_factory() as session:
-        session.query(MessageProcessingJob).filter(
-            MessageProcessingJob.raw_message_id.in_(raw_message_ids),
-            MessageProcessingJob.shadow.is_(True),
-        ).update(
-            {
-                MessageProcessingJob.status: status,
-                MessageProcessingJob.last_reason: last_reason,
-                MessageProcessingJob.completed_at: utc_now(),
-            },
-            synchronize_session=False,
-        )
-        session.commit()
-
-
-async def _try_enqueue_shadow_processing_jobs(
+async def _try_enqueue_processing_jobs(
     session_factory,
     **kwargs,
 ) -> list[int]:
     try:
         return await asyncio.to_thread(
-            _enqueue_shadow_processing_jobs,
+            _enqueue_processing_jobs,
             session_factory,
             **kwargs,
         )
     except Exception:
-        logger.exception("message processing shadow enqueue failed")
+        logger.exception("message processing enqueue failed")
         return []
-
-
-async def _try_mark_shadow_processing_jobs_terminal(
-    session_factory,
-    *,
-    raw_message_ids: list[int],
-    status: str,
-    last_reason: str,
-) -> None:
-    if not raw_message_ids:
-        return
-    try:
-        await asyncio.to_thread(
-            _mark_shadow_processing_jobs_terminal,
-            session_factory,
-            raw_message_ids=raw_message_ids,
-            status=status,
-            last_reason=last_reason,
-        )
-    except Exception:
-        logger.exception(
-            "message processing shadow terminal update failed: status=%s",
-            status,
-        )
 
 
 async def _persist_live_message_event_inline(
@@ -337,10 +234,9 @@ async def _persist_live_message_event_inline(
     system_operator_bot_config: Any | None = None,
     notification_bot_config: Any | None = None,
     system_operator_conflict_sender=send_ai_recognition_conflict_review,
-    shadow_enqueue_hook: (
+    enqueue_hook: (
         Callable[[list[tuple[int, int]]], Awaitable[None]] | None
     ) = None,
-    run_post_persist_processing: bool = True,
 ) -> dict[str, int]:
     """Normalize and persist one live Telegram event into the existing raw ingest flow.
 
@@ -441,89 +337,28 @@ async def _persist_live_message_event_inline(
                     chat_id,
                     reply_to_message_id,
                 )
-    if shadow_enqueue_hook is not None:
-        await shadow_enqueue_hook(inserted_keys)
-    with session_factory() as session:
-        raw_message_id = (
-            session.query(RawMessage.id)
-            .filter(
-                RawMessage.chat_id == int(record.chat_id),
-                RawMessage.message_id == int(record.message_id),
-            )
-            .scalar()
-        )
-    if raw_message_id is not None and run_post_persist_processing:
-        await process_message_job(
-            session_factory,
-            raw_message_id=int(raw_message_id),
-            chat_title=chat_title,
-            record=record,
-            recognition_enabled=bool(inserted_keys and live_ai_config is not None),
-            strategy_alert_config=strategy_alert_config,
-            strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-            strategy_alert_processor=strategy_alert_processor,
-            authoritative_processor=authoritative_processor,
-            context_resolution_scheduler=context_resolution_scheduler,
-            context_resolution_worker=context_resolution_worker,
-            authoritative_failure_retry_delay_seconds=(
-                authoritative_failure_retry_delay_seconds
-            ),
-            system_operator_bot_config=system_operator_bot_config,
-            notification_bot_config=notification_bot_config,
-            system_operator_conflict_sender=system_operator_conflict_sender,
-        )
-        if inserted_keys and live_ai_config is not None and authoritative_processor is None:
-            stats["recognition_status"] = "authoritative_processor_required"
+    if enqueue_hook is not None:
+        await enqueue_hook(inserted_keys)
     return stats
 
 
 @wraps(_persist_live_message_event_inline)
 async def persist_live_message_event(*args, **kwargs) -> dict[str, int]:
-    """Persist once, then select exactly one inline or queue authority."""
+    """Persist the event, then hand the message to the queue consumer."""
 
     session_factory = kwargs.get("session_factory")
-    pipeline_mode = (
-        await asyncio.to_thread(load_trading_settings, session_factory)
-    ).message_pipeline_mode
-    shadow_raw_message_ids: list[int] = []
 
     async def enqueue_after_persist(
         inserted_keys: list[tuple[int, int]],
     ) -> None:
-        shadow_raw_message_ids.extend(
-            await _try_enqueue_shadow_processing_jobs(
-                session_factory,
-                message_keys=inserted_keys,
-                last_reason=(
-                    "queue_enqueued"
-                    if pipeline_mode == "queue"
-                    else "inline_enqueued"
-                ),
-                pipeline_mode_override=pipeline_mode,
-            )
+        await _try_enqueue_processing_jobs(
+            session_factory,
+            message_keys=inserted_keys,
+            last_reason="queue_enqueued",
         )
 
-    kwargs["shadow_enqueue_hook"] = enqueue_after_persist
-    kwargs["run_post_persist_processing"] = pipeline_mode != "queue"
-    try:
-        result = await _persist_live_message_event_inline(*args, **kwargs)
-    except BaseException as exc:
-        if pipeline_mode == "shadow":
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=shadow_raw_message_ids,
-                status="failed",
-                last_reason=f"inline_error:{type(exc).__name__}",
-            )
-        raise
-    if pipeline_mode == "shadow":
-        await _try_mark_shadow_processing_jobs_terminal(
-            session_factory,
-            raw_message_ids=shadow_raw_message_ids,
-            status="succeeded",
-            last_reason="inline_completed",
-        )
-    return result
+    kwargs["enqueue_hook"] = enqueue_after_persist
+    return await _persist_live_message_event_inline(*args, **kwargs)
 
 
 def _build_authoritative_notification_payload(
@@ -1149,7 +984,7 @@ async def recover_missing_authoritative_decisions(
     ),
     now_provider: Callable[[], datetime] = utc_now,
 ) -> dict[str, int]:
-    """Recover authoritative decisions for messages with no decision row yet.
+    """Enqueue messages that still have no authoritative decision row.
 
     Performs **no Telegram network calls** of any kind - ``chat_titles_by_id``
     is supplied entirely by the caller, from local configuration or the
@@ -1159,23 +994,15 @@ async def recover_missing_authoritative_decisions(
     cadence, independent of the (slow, Telegram-coupled) periodic reconcile
     pass.
 
-    ``chat_operation_lock``, when given, is a callable resolving a per-chat
-    lock context manager (``message_lock_mode="per_chat"`` only), held around
-    each recovered message's processing chain individually - identical to
-    what ``run_reconcile_once``'s own recovery loop already does. In every
-    other mode this stays ``None``; the caller is responsible for any lock it
-    wants held around the call as a whole (both ``run_reconcile_once`` and
-    ``run_authoritative_gap_recovery_loop`` follow the same
-    ``resolve_message_lock_mode``/``resolve_lock_context`` convention for
-    that).
+    This function makes no business decision itself. It selects the candidates
+    and hands them to ``message_processing_jobs``; the ``worker`` role then
+    recognises them, and classifies and records the ones that have expired.
+    The returned counters therefore stay at zero and exist only so callers
+    that report them keep their response shape.
 
-    Expiry classification (Task 2) uses ``loop_lag_snapshot_provider``, a
-    zero-argument callable returning a
-    :class:`~telegram_kol_research.runtime_loop_health.LoopLagMonitor`
-    snapshot, when supplied. Messages classified
-    :data:`EXPIRED_AFTER_SYSTEM_STALL` never trigger more than one aggregate
-    notification per ``expiry_notification_rate_limiter`` window, no matter
-    how many expire in this pass.
+    ``authoritative_processor`` is still read as the gate that says recognition
+    authority is configured at all: with no processor there is nothing for the
+    queue to run, so nothing is enqueued.
     """
 
     result: dict[str, int] = {
@@ -1195,185 +1022,22 @@ async def recover_missing_authoritative_decisions(
         now=now,
         message_limit=message_limit,
     )
-    pipeline_mode = load_trading_settings(
-        session_factory
-    ).message_pipeline_mode
-    if pipeline_mode == "queue":
-        await _try_enqueue_shadow_processing_jobs(
-            session_factory,
-            raw_message_ids=[
-                int(raw_message.id)
-                for raw_message in [
-                    *missing_decision_messages,
-                    *expired_messages,
-                ]
-            ],
-            last_reason="recovery_enqueued",
-            pipeline_mode_override="queue",
-        )
-        return result
-
-    async def _process_recovery_candidate(raw_message) -> None:
-        shadow_raw_message_ids = await _try_enqueue_shadow_processing_jobs(
-            session_factory,
-            raw_message_ids=[int(raw_message.id)],
-            last_reason="recovery_enqueued",
-        )
-        if (
-            pipeline_mode == "shadow"
-            and int(raw_message.id) not in shadow_raw_message_ids
-        ):
-            return
-        try:
-            processing_result = await asyncio.to_thread(
-                authoritative_processor,
-                raw_message.id,
-            )
-        except Exception as exc:
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=shadow_raw_message_ids,
-                status="failed",
-                last_reason=f"recovery_error:{type(exc).__name__}",
-            )
-            logger.exception(
-                "authoritative recognition recovery failed: raw_message_id=%s",
-                raw_message.id,
-            )
-            return
-        try:
-            notification_payload = _build_authoritative_notification_payload(
-                raw_message=raw_message,
-                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
-                processing_result=processing_result,
-            )
-            if notification_payload is not None and system_operator_bot_enabled(
-                system_operator_bot_config
-            ):
-                _handle_authoritative_failure_notification(
-                    session_factory=session_factory,
-                    raw_message_id=raw_message.id,
-                    sender=system_operator_conflict_sender,
-                    config=system_operator_bot_config,
-                    payload=notification_payload,
-                    retry_processor=authoritative_processor,
-                    retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                )
-            await _deliver_authoritative_instruction_summary(
-                processing_result=processing_result,
-                session_factory=session_factory,
-                raw_message_id=raw_message.id,
-                chat_title=chat_titles_by_id.get(raw_message.chat_id, ""),
-                notification_bot_config=notification_bot_config,
-            )
-        except BaseException as exc:
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=shadow_raw_message_ids,
-                status="failed",
-                last_reason=f"recovery_error:{type(exc).__name__}",
-            )
-            raise
-        await _try_mark_shadow_processing_jobs_terminal(
-            session_factory,
-            raw_message_ids=shadow_raw_message_ids,
-            status="succeeded",
-            last_reason="recovery_completed",
-        )
-        result["recovered_messages"] += 1
-
-    for raw_message in missing_decision_messages:
-        if chat_operation_lock is not None:
-            async with chat_operation_lock(int(raw_message.chat_id)):
-                await _process_recovery_candidate(raw_message)
-        else:
-            await _process_recovery_candidate(raw_message)
-
-    stall_expired: list[RawMessage] = []
-    loop_lag_snapshot = (
-        loop_lag_snapshot_provider() if loop_lag_snapshot_provider is not None else None
+    await _try_enqueue_processing_jobs(
+        session_factory,
+        raw_message_ids=[
+            int(raw_message.id)
+            for raw_message in [
+                *missing_decision_messages,
+                *expired_messages,
+            ]
+        ],
+        last_reason="recovery_enqueued",
     )
-    for raw_message in expired_messages:
-        shadow_raw_message_ids = await _try_enqueue_shadow_processing_jobs(
-            session_factory,
-            raw_message_ids=[int(raw_message.id)],
-            last_reason="recovery_enqueued",
-        )
-        if (
-            pipeline_mode == "shadow"
-            and int(raw_message.id) not in shadow_raw_message_ids
-        ):
-            continue
-        try:
-            classification = _classify_expired_authoritative_recovery_gap(
-                raw_message=raw_message,
-                now=now,
-                loop_lag_snapshot=loop_lag_snapshot,
-            )
-            await asyncio.to_thread(
-                _record_expired_authoritative_recovery_gap,
-                session_factory,
-                raw_message=raw_message,
-                classification=classification,
-            )
-        except BaseException as exc:
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=shadow_raw_message_ids,
-                status="failed",
-                last_reason=f"recovery_error:{type(exc).__name__}",
-            )
-            raise
-        await _try_mark_shadow_processing_jobs_terminal(
-            session_factory,
-            raw_message_ids=shadow_raw_message_ids,
-            status="expired",
-            last_reason=f"recovery_expired:{classification}",
-        )
-        result["expired_recovery_messages"] += 1
-        result[classification] += 1
-        if classification == EXPIRED_AFTER_SYSTEM_STALL:
-            stall_expired.append(raw_message)
-
-    if (
-        stall_expired
-        and stall_expiry_notification_sender is not None
-        and system_operator_bot_enabled(system_operator_bot_config)
-    ):
-        rate_limiter = (
-            expiry_notification_rate_limiter
-            or _STALL_EXPIRY_NOTIFICATION_RATE_LIMITER
-        )
-        if rate_limiter.should_notify():
-            try:
-                await stall_expiry_notification_sender(
-                    config=system_operator_bot_config,
-                    payload={
-                        "expired_count": len(stall_expired),
-                        "raw_message_ids": [
-                            message.id for message in stall_expired
-                        ],
-                        "chat_titles": sorted(
-                            {
-                                chat_titles_by_id.get(message.chat_id, "")
-                                for message in stall_expired
-                                if chat_titles_by_id.get(message.chat_id)
-                            }
-                        ),
-                        "occurred_at": now,
-                    },
-                )
-            except Exception:
-                logger.exception(
-                    "stall-induced authoritative gap expiry notification failed"
-                )
-
     return result
 
 
-def _load_reconcile_pipeline_mode(session_factory) -> str:
+def _repair_reconcile_history_checkpoints(session_factory) -> None:
     repair_history_checkpoints(session_factory)
-    return load_trading_settings(session_factory).message_pipeline_mode
 
 
 class _CancellableReconcileDatabaseUnit:
@@ -1495,29 +1159,6 @@ def _persist_history_reconcile_records(
     )
 
 
-def _load_authoritative_reconcile_projection(
-    session_factory,
-    *,
-    inserted_keys: list[tuple[int, int]],
-) -> tuple[list[RawMessage], int]:
-    with session_factory() as session:
-        raw_messages = (
-            session.query(RawMessage)
-            .filter(
-                tuple_(RawMessage.chat_id, RawMessage.message_id).in_(inserted_keys)
-            )
-            .all()
-            if inserted_keys
-            else []
-        )
-        return raw_messages, session.query(SignalCandidate).count()
-
-
-def _count_signal_candidates(session_factory) -> int:
-    with session_factory() as session:
-        return int(session.query(SignalCandidate).count())
-
-
 async def run_reconcile_once(
     *,
     client: Any,
@@ -1555,8 +1196,8 @@ async def run_reconcile_once(
     lock instead, exactly as it did before this parameter existed.
     """
 
-    pipeline_mode = await _run_reconcile_database_slice(
-        _load_reconcile_pipeline_mode,
+    await _run_reconcile_database_slice(
+        _repair_reconcile_history_checkpoints,
         session_factory,
     )
     if system_operator_bot_enabled(notification_bot_config):
@@ -1605,13 +1246,7 @@ async def run_reconcile_once(
     inserted_messages = 0
     inserted_candidates = 0
     inserted_trade_ideas = 0
-    recognition_status = (
-        "queued"
-        if pipeline_mode == "queue"
-        else "authoritative"
-        if authoritative_processor is not None
-        else "authoritative_processor_required"
-    )
+    recognition_status = "queued"
 
     for dialog in matched_dialogs:
         checkpoint_message_id = history_checkpoints.get(int(dialog.get("id") or 0), 0)
@@ -1659,126 +1294,16 @@ async def run_reconcile_once(
         )
         inserted_messages += stats["inserted_messages"]
         inserted_keys = stats.get("inserted_message_keys") or []
-        history_shadow_raw_message_ids = (
-            await _try_enqueue_shadow_processing_jobs(
-                session_factory,
-                message_keys=inserted_keys,
-                last_reason="history_reconcile_enqueued",
-                pipeline_mode_override=pipeline_mode,
-            )
+        await _try_enqueue_processing_jobs(
+            session_factory,
+            message_keys=inserted_keys,
+            last_reason="history_reconcile_enqueued",
         )
-        inserted_records = filter_records_by_inserted_message_keys(records, stats)
-        recognition_by_key: dict[tuple[int, int], Any] = {}
-        if authoritative_processor is not None and pipeline_mode != "queue":
-            raw_messages, candidate_count_before = (
-                await _run_reconcile_database_slice(
-                    _load_authoritative_reconcile_projection,
-                    session_factory,
-                    inserted_keys=inserted_keys,
-                )
-            )
-            async def _process_dialog_raw_message(raw_message) -> None:
-                processing_result = await asyncio.to_thread(
-                    authoritative_processor,
-                    raw_message.id,
-                )
-                key = (raw_message.chat_id, raw_message.message_id)
-                recognition_by_key[key] = processing_result.recognition
-                notification_payload = _build_authoritative_notification_payload(
-                    raw_message=raw_message,
-                    chat_title=str(dialog.get("title") or ""),
-                    processing_result=processing_result,
-                )
-                if notification_payload is not None and system_operator_bot_enabled(
-                    system_operator_bot_config
-                ):
-                    _handle_authoritative_failure_notification(
-                        session_factory=session_factory,
-                        raw_message_id=raw_message.id,
-                        sender=system_operator_conflict_sender,
-                        config=system_operator_bot_config,
-                        payload=notification_payload,
-                        retry_processor=authoritative_processor,
-                        retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                    )
-                await _deliver_authoritative_instruction_summary(
-                    processing_result=processing_result,
-                    session_factory=session_factory,
-                    raw_message_id=raw_message.id,
-                    chat_title=str(dialog.get("title") or ""),
-                    notification_bot_config=notification_bot_config,
-                )
-
-            try:
-                for raw_message in raw_messages:
-                    if chat_operation_lock is not None:
-                        async with chat_operation_lock(int(raw_message.chat_id)):
-                            await _process_dialog_raw_message(raw_message)
-                    else:
-                        await _process_dialog_raw_message(raw_message)
-                candidate_count_after = await _run_reconcile_database_slice(
-                    _count_signal_candidates,
-                    session_factory,
-                )
-                inserted_candidates += max(
-                    0,
-                    candidate_count_after - candidate_count_before,
-                )
-            except BaseException as exc:
-                await _try_mark_shadow_processing_jobs_terminal(
-                    session_factory,
-                    raw_message_ids=history_shadow_raw_message_ids,
-                    status="failed",
-                    last_reason=(
-                        f"history_reconcile_error:{type(exc).__name__}"
-                    ),
-                )
-                raise
-        elif authoritative_processor is None:
+        if authoritative_processor is None:
             logger.error(
                 "history recognition authority unavailable "
                 "reason=authoritative_processor_required"
             )
-        try:
-            if authoritative_processor is not None and pipeline_mode != "queue":
-                trade_stats = await _run_reconcile_database_slice(
-                    persist_trade_ideas_from_candidates,
-                    session_factory,
-                )
-                inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
-            dialog_title = str(dialog.get("title") or "")
-            if (
-                pipeline_mode != "queue"
-                and strategy_alert_config is not None
-                and (
-                    strategy_alert_enabled_for_title is None
-                    or strategy_alert_enabled_for_title(dialog_title)
-                )
-            ):
-                for record in inserted_records:
-                    await strategy_alert_processor(
-                        session_factory=session_factory,
-                        record=record,
-                        chat_title=dialog_title,
-                        config=strategy_alert_config,
-                        recognition_result=recognition_by_key.get(
-                            (record.chat_id, record.message_id)
-                        ),
-                    )
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=history_shadow_raw_message_ids,
-                status="succeeded",
-                last_reason="history_reconcile_completed",
-            )
-        except BaseException as exc:
-            await _try_mark_shadow_processing_jobs_terminal(
-                session_factory,
-                raw_message_ids=history_shadow_raw_message_ids,
-                status="failed",
-                last_reason=f"history_reconcile_error:{type(exc).__name__}",
-            )
-            raise
 
     return {
         "matched_dialogs": len(matched_dialogs),
