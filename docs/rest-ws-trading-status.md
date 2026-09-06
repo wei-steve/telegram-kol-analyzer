@@ -13,12 +13,12 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 2
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
-phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by: local_a6d6d24f-92c3-4691-8caf-24c36e822bfa   # 阶段 2 开放式观察会话（只读监视器），phase_status 保持 in_progress
-last_completed_phase: 1
-last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
+current_phase: 3
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-3-wake-reconciliation.md
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
+claimed_by:
+last_completed_phase: 2
+last_completed_commit: 0371fc9f4fc41c588fab1534f8e33419aef4d6cf
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
 ```
 
@@ -265,6 +265,51 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 ## 证据记录
 
 - phase-2-open-ended-observation (2026-09-06, 用户在指挥会话 local_858790fe 明确授权): 两次 30 分钟观察均因夜间零消息停止，代码侧无待办。用户决定阶段 2 的收尾观察改为开放式：服务器端后台监视器每分钟采样，直到出现一个完整的 30 分钟窗口满足 ≥5 条真实消息、尽量 2 个群且全部健康检查通过为止，自行停止；会话按定时查看结果。AGENTS.md L2 已加入该例外条款。
+- phase-2-completed (2026-09-06, 会话 local_a6d6d24f, **开放式观察达标，阶段 2 完成**):
+  只读观察收尾，**未改代码、未部署、未做任何交易所写入**；生产 HEAD 全程
+  `0371fc9f4fc41c588fab1534f8e33419aef4d6cf`（分支 `live`）。
+  监视器 `open-observer.sh`（PID 2363944）自 `18:01:57Z` 每 60 秒采样，共 **310 个采样点 / 5 小时 9 分**
+  （`18:01:57Z ~ 23:11:19Z`），自行判定达标后写 `DONE` 退出。
+  **合格窗口 `2026-09-06T22:42:17Z ~ 23:11:19Z`（30 个连续健康采样点），整段落在本会话那次
+  worker 重启（`17:58:05Z`）之后。** 窗口末次采样的近 30 分钟回看区间内
+  **真实消息 9 条 / 2 个群**（`-1002282384698` 5 条 23:07:33~23:09:09Z、
+  `-1002409877375` 4 条 23:10:28~23:11:06Z），首次满足 L2 的 ≥5 条 ≥2 群目标。
+  窗口内逐项恒定：三单元 30/30 `active`、NRestarts 全程 0；`state` 恒 `healthy`、
+  `connected` 与 `permits_new_entry` 恒 true、`open_gap_count` 恒 0、
+  `last_resync_outcome` 恒 `converged`、`unparsed_count` 恒 1（零新增，仍是阶段 2 部署前那条
+  listen key 过期帧）、`processed=6 / unprocessed=0 / duplicate=0` 无积压。
+  窗口内 3 次 `silence_timeout` 计划内重连（缺口 id 49/50/51，2.81/3.44/2.94 秒）全部闭合，
+  每个采样点看到的都是 `open_gap_count=0`。
+  交易所首尾 fingerprint **逐字节一致**
+  `283091021fc8391834efb3c2b49c968fd576940d4a8d01b91c3c287a4b79d70b`
+  （`complete=true, position_count=1, open_order_count=0`），**零新增写入、零差异**，
+  与前两次观察也完全相同；那一个仓位仍是生产自动交易 15:28:19Z 自己开的。
+  **基线仍未取到真值**：`events_last_hour` 在全部 310 个采样点上恒为 0，WS 事件表整期零新增
+  （`processed` 恒 6）。因此 `duplicate_rate_1h=0.0`、`out_of_order_count_1h=0` **依旧是零流量
+  地板值，不是实测速率**——达标的是 Telegram 消息流量，账户在这 5 小时内没有任何交易活动，
+  所以没有业务帧可去重、可乱序。真基线要等第一个有真实 WS 业务帧的窗口，阶段 3 应顺带取到。
+  **异常 1 条（采样点口径），日志口径实为 4 次断线 5 条记录**：`20:09:06Z` 采样抓到
+  `state=disconnected` / `open_gap_count=1` / `last_resync_outcome=not_converged:incomplete_rest_read`
+  / `permits_new_entry=False`。日志显示完整经过：`20:09:01Z` 静默 600s 触发计划内重连 →
+  `20:09:04Z` 五步重同步第一轮 REST 读不完整，**拒绝收敛**并关闭新入场 →
+  `20:09:09Z` 重试收敛回 `healthy`，缺口 id=33 共 8.054 秒闭合。
+  全期扫日志：31 次 `silence_timeout` 重连里有 **4 次**首轮出现 `incomplete_rest_read`
+  （`18:58:32Z` 与 `18:58:35Z` 属同一次断线的连续两轮、`20:09:04Z`、`20:59:26Z`、`22:19:57Z`），
+  约 13%；每次都 fail-closed 后数秒内重试收敛，**没有一次把读失败当成"零"**，
+  32 条缺口（1 条 `process_start` + 31 条 `silence_timeout`）全部闭合、零未闭合、
+  `deepcoin_private_ws` 零 ERROR 零 traceback。这正是硬性禁止第 4 条要的行为。
+  **401 复现，不再是孤例**：`18:31:55Z` 又一次
+  `GET /deepcoin/trade/trigger-orders-pending?instId=ETH-USDT-SWAP` 返回 `401 Unauthorized`
+  （既有 `web_app._load_deepcoin_pending_tpsl_orders` 路径，抛 `DeepcoinClientError`、
+  置 `evidence_available=False` 后 `continue`，语义正确）。加上 `phase-2-observation-2` 记的
+  `17:04:07Z` 那次，这是**间歇性可复现**现象而非偶发。
+  遗留 (c)：`incomplete_rest_read` 的日志只有结论没有细节，无法直接判定它是否与这个间歇 401 同源
+  （时间上不重合，但两者都指向同一批 Deepcoin GET）。阶段 3 让 WS 事件唤醒 REST 核验时，
+  应把失败的具体调用与 HTTP 状态一起记进重同步结果，否则这类 incomplete 无法归因。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-2/`
+  （`open-observer.sh`、`open-observer.jsonl` 311 行、`open-observer-summary.json`、`DONE`、
+  `exchange-snapshot-open-start.json`、`exchange-snapshot-open-end.json`）。
+
 - phase-2-open-observer-started (2026-09-06, 会话 local_a6d6d24f, **只读**): 按上一条的用户授权启动服务器端开放式监视器。
   只读核实：生产 HEAD `0371fc9f`（分支 `live`）、三单元 active/NRestarts=0、ws-health `healthy` / `open_gap_count=0`。
   本阶段要求的那一次 worker 重启：`2026-09-06T17:58:05Z`（MainPID 2345403→2362557），缺口行 id=20 `process_start`
