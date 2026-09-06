@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
@@ -16,6 +17,7 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import TargetGroupConfig
 from telegram_kol_research.models import TradingSetting
 
+logger = logging.getLogger(__name__)
 
 TRADING_SETTINGS_KEY = "global"
 ENTRY_REVISION_ACTIVATION_KEY = "entry_revision_v2_activation"
@@ -93,8 +95,8 @@ class TradingSettings:
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_lock_mode: Literal["global", "per_chat"] = "global"
     message_processing_max_parallel_chats: int = 20
-    message_pipeline_mode: Literal["inline", "shadow", "queue"] = "queue"
-    worker_command_mode: Literal["inline", "shadow", "queue"] = "queue"
+    message_pipeline_mode: Literal["queue"] = "queue"
+    worker_command_mode: Literal["queue"] = "queue"
     semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     mimo_v2_activation_after_raw_message_id: int = 0
@@ -808,22 +810,38 @@ def _message_lock_mode(value: Any) -> Literal["global", "per_chat"]:
     return normalized
 
 
-def _message_pipeline_mode(value: Any) -> Literal["inline", "shadow", "queue"]:
+_RETIRED_RUNTIME_MODES = {"inline", "shadow"}
+
+
+def _runtime_queue_mode(value: Any, *, field: str) -> Literal["queue"]:
+    """Accept ``queue`` and coerce the retired ``inline``/``shadow`` values.
+
+    Production databases still hold rows written before the queue became the
+    only pipeline. Those rows must stay readable, so a retired value is
+    logged once per read and treated as ``queue`` rather than raising.
+    """
+
     if not isinstance(value, str):
-        raise ValueError("message_pipeline_mode must be inline, shadow, or queue")
+        raise ValueError(f"{field} must be queue")
     normalized = value.strip().lower()
-    if normalized not in {"inline", "shadow", "queue"}:
-        raise ValueError("message_pipeline_mode must be inline, shadow, or queue")
+    if normalized in _RETIRED_RUNTIME_MODES:
+        logger.warning(
+            "%s=%s is retired; reading it as queue",
+            field,
+            normalized,
+        )
+        return "queue"
+    if normalized != "queue":
+        raise ValueError(f"{field} must be queue")
     return normalized
 
 
-def _worker_command_mode(value: Any) -> Literal["inline", "shadow", "queue"]:
-    if not isinstance(value, str):
-        raise ValueError("worker_command_mode must be inline, shadow, or queue")
-    normalized = value.strip().lower()
-    if normalized not in {"inline", "shadow", "queue"}:
-        raise ValueError("worker_command_mode must be inline, shadow, or queue")
-    return normalized
+def _message_pipeline_mode(value: Any) -> Literal["queue"]:
+    return _runtime_queue_mode(value, field="message_pipeline_mode")
+
+
+def _worker_command_mode(value: Any) -> Literal["queue"]:
+    return _runtime_queue_mode(value, field="worker_command_mode")
 
 
 def _entry_preamble_mode(

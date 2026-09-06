@@ -274,7 +274,6 @@ from telegram_kol_research.worker_command_jobs import (
 from telegram_kol_research.worker_command_executor import (
     ENTRY_SUBMISSION_COMMAND_TYPES,
     WorkerCommandDependencies,
-    require_worker_command_mode_transition_safe,
     supervise_worker_command_mode,
 )
 from telegram_kol_research.context_resolution import resolve_contextual_strategy
@@ -4756,13 +4755,6 @@ async def _prepare_web_worker_command(
             status_code=503,
             detail={"code": "deployment_entry_frozen"},
         )
-    settings = await asyncio.to_thread(load_trading_settings, app.state.session_factory)
-    mode = settings.worker_command_mode
-    if mode != "queue":
-        raise HTTPException(
-            status_code=503,
-            detail={"code": "worker_command_mode_invalid"},
-        )
     try:
         snapshot = await asyncio.to_thread(
             enqueue_worker_command,
@@ -5904,9 +5896,6 @@ def create_web_app(
             return
         if app.state.deployment_entry_frozen:
             return
-        mode = load_trading_settings(
-            app.state.session_factory
-        ).message_pipeline_mode
         task = app.state.message_processing_worker_task
         if task is not None and task.done():
             try:
@@ -5917,7 +5906,7 @@ def create_web_app(
                 logger.exception("message processing worker task failed")
             app.state.message_processing_worker_task = None
             task = None
-        if mode != "queue" or task is not None:
+        if task is not None:
             return
 
         async def notify_terminal_failure(claim, reason) -> None:
@@ -6193,7 +6182,6 @@ def create_web_app(
         pipeline_mode = load_trading_settings(
             app.state.session_factory
         ).message_pipeline_mode
-        observed_shadow = pipeline_mode != "queue"
         with app.state.session_factory() as session:
             recent_raw_rows = (
                 session.query(RawMessage.id)
@@ -6216,7 +6204,7 @@ def create_web_app(
                     .filter(
                         MessageProcessingJob.raw_message_id >= window_start,
                         MessageProcessingJob.raw_message_id <= window_end,
-                        MessageProcessingJob.shadow.is_(observed_shadow),
+                        MessageProcessingJob.shadow.is_(False),
                     )
                     .order_by(MessageProcessingJob.raw_message_id.desc())
                     .limit(limit + 1)
@@ -6248,7 +6236,7 @@ def create_web_app(
             "window_end_raw_message_id": window_end,
             "raw_messages": len(raw_ids),
             "pipeline_mode": pipeline_mode,
-            "observed_job_kind": "shadow" if observed_shadow else "queue",
+            "observed_job_kind": "queue",
             "jobs": len(job_rows),
             "shadow_jobs": sum(1 for job in job_rows if job.shadow),
             "queue_jobs": sum(1 for job in job_rows if not job.shadow),
@@ -8371,11 +8359,6 @@ def create_web_app(
             candidate = trading_settings_from_payload(
                 {**current.to_dict(), **payload_for_local_save}
             )
-            require_worker_command_mode_transition_safe(
-                app.state.session_factory,
-                current_mode=current.worker_command_mode,
-                candidate_mode=candidate.worker_command_mode,
-            )
             mimo_contract_change = (
                 candidate.mimo_contract_mode != current.mimo_contract_mode
                 or candidate.mimo_v2_activation_after_raw_message_id
@@ -8388,11 +8371,6 @@ def create_web_app(
                     )
                     locked_candidate = trading_settings_from_payload(
                         {**locked_current.to_dict(), **payload_for_local_save}
-                    )
-                    require_worker_command_mode_transition_safe(
-                        app.state.session_factory,
-                        current_mode=locked_current.worker_command_mode,
-                        candidate_mode=locked_candidate.worker_command_mode,
                     )
                     locked_mimo_change = (
                         locked_candidate.mimo_contract_mode

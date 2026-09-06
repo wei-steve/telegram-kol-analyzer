@@ -966,11 +966,6 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
         database_path=tmp_path / "research.db",
         now_provider=lambda: now,
     )
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(
-        app.state.session_factory,
-        {"message_pipeline_mode": "inline"},
-    )
     with app.state.session_factory() as session:
         raw_messages = [
             RawMessage(
@@ -993,14 +988,14 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
                     status="succeeded",
                     enqueued_at=now - timedelta(minutes=4),
                     completed_at=now - timedelta(minutes=3),
-                    shadow=True,
+                    shadow=False,
                 ),
                 MessageProcessingJob(
                     raw_message_id=raw_messages[1].id,
                     chat_id=100,
                     status="pending",
                     enqueued_at=now - timedelta(minutes=10),
-                    shadow=True,
+                    shadow=False,
                 ),
                 MessageProcessingJob(
                     raw_message_id=raw_messages[2].id,
@@ -1008,7 +1003,7 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
                     status="failed",
                     enqueued_at=now - timedelta(minutes=2),
                     completed_at=now - timedelta(minutes=1),
-                    shadow=True,
+                    shadow=False,
                 ),
                 MessageProcessingJob(
                     raw_message_id=raw_messages[3].id,
@@ -1016,7 +1011,7 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
                     status="succeeded",
                     enqueued_at=now - timedelta(minutes=2),
                     completed_at=now - timedelta(minutes=1),
-                    shadow=True,
+                    shadow=False,
                 ),
             ]
         )
@@ -1039,11 +1034,11 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
         "window_start_raw_message_id": raw_message_ids[0],
         "window_end_raw_message_id": raw_message_ids[4],
         "raw_messages": 4,
-        "pipeline_mode": "inline",
-        "observed_job_kind": "shadow",
+        "pipeline_mode": "queue",
+        "observed_job_kind": "queue",
         "jobs": 4,
-        "shadow_jobs": 4,
-        "queue_jobs": 0,
+        "shadow_jobs": 0,
+        "queue_jobs": 4,
         "missing_job_count": 1,
         "orphan_job_count": 1,
         "stuck_pending_count": 1,
@@ -1434,44 +1429,6 @@ def test_source_deletion_worker_lifespan_starts_dormant_runner_and_stops(tmp_pat
 
     assert stopped.wait(timeout=1)
     assert app.state.source_message_deletion_worker_task is None
-
-
-def test_queue_mode_api_starts_and_shadow_stops_message_worker_without_restart(
-    tmp_path,
-):
-    app = create_web_app(
-        database_path=tmp_path / "pipeline-mode-switch.db",
-        message_processing_worker_interval_seconds=0.01,
-    )
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(
-        app.state.session_factory,
-        {"message_pipeline_mode": "inline"},
-    )
-
-    with TestClient(app) as client:
-        assert app.state.message_processing_worker_task is None
-        queue_response = client.post(
-            "/api/trading-settings",
-            json={"message_pipeline_mode": "queue"},
-        )
-        assert queue_response.status_code == 200
-        assert queue_response.json()["message_pipeline_mode"] == "queue"
-        assert queue_response.json()["message_lock_mode"] == "global"
-        assert app.state.message_processing_worker_task is not None
-
-        shadow_response = client.post(
-            "/api/trading-settings",
-            json={"message_pipeline_mode": "shadow"},
-        )
-        assert shadow_response.status_code == 200
-        deadline = time.monotonic() + 1
-        while (
-            app.state.message_processing_worker_task is not None
-            and time.monotonic() < deadline
-        ):
-            time.sleep(0.01)
-        assert app.state.message_processing_worker_task is None
 
 
 def test_lifespan_disconnects_shared_telegram_client_before_stopping_listener(tmp_path):
@@ -1934,13 +1891,13 @@ def test_worker_command_mode_api_round_trips_without_changing_message_modes(
     client = TestClient(app)
 
     response = client.post(
-        "/api/trading-settings", json={"worker_command_mode": "shadow"}
+        "/api/trading-settings", json={"worker_command_mode": "queue"}
     )
     reloaded = client.get("/api/trading-settings")
 
     assert response.status_code == 200
-    assert response.json()["worker_command_mode"] == "shadow"
-    assert reloaded.json()["worker_command_mode"] == "shadow"
+    assert response.json()["worker_command_mode"] == "queue"
+    assert reloaded.json()["worker_command_mode"] == "queue"
     assert reloaded.json()["message_lock_mode"] == "global"
     assert reloaded.json()["message_pipeline_mode"] == "queue"
 
@@ -1954,7 +1911,7 @@ def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
         {
             "message_lock_mode": "global",
             "message_pipeline_mode": "queue",
-            "worker_command_mode": "shadow",
+            "worker_command_mode": "queue",
         },
     )
     client = TestClient(app)
@@ -1971,7 +1928,7 @@ def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
     assert reloaded.json()["semantic_review_enabled"] is True
     assert reloaded.json()["message_lock_mode"] == "global"
     assert reloaded.json()["message_pipeline_mode"] == "queue"
-    assert reloaded.json()["worker_command_mode"] == "shadow"
+    assert reloaded.json()["worker_command_mode"] == "queue"
 
 
 def test_semantic_review_enabled_api_rejects_non_boolean_without_changing_state(
@@ -7723,78 +7680,6 @@ def test_worker_command_queue_routes_enqueue_wait_and_never_call_web_authority(
     assert enqueues[0][1]["idempotency_key"] == "action-7"
 
 
-@pytest.mark.parametrize("mode", ["inline", "shadow"])
-@pytest.mark.parametrize(
-    ("path", "payload", "target", "domain_result"),
-    [
-        (
-            "/api/execution/sync-deepcoin",
-            None,
-            "sync_manual_closed_deepcoin_positions",
-            SimpleNamespace(
-                checked=0,
-                manually_closed=0,
-                skipped_without_pos_id=0,
-            ),
-        ),
-        (
-            "/api/execution/close-bound-position",
-            {"pos_id": "position-7"},
-            "close_bound_position_market",
-            {"submitted": True},
-        ),
-        (
-            "/api/recovery-live-submit",
-            {"chat_id": 100, "message_id": 55, "symbol": "BTC", "side": "long"},
-            "submit_recovery_order_live",
-            {"submitted": True},
-        ),
-        (
-            "/api/trade-signals/process-next",
-            None,
-            "process_next_trade_signal_live",
-            {"signal_id": 7},
-        ),
-    ],
-)
-def test_worker_command_hardened_refuses_legacy_modes_before_web_authority(
-    tmp_path,
-    monkeypatch,
-    mode,
-    path,
-    payload,
-    target,
-    domain_result,
-):
-    domain_calls = []
-
-    def fake_domain(*_args, **_kwargs):
-        domain_calls.append(target)
-        return domain_result
-
-    monkeypatch.setattr(web_app_module, target, fake_domain, raising=False)
-    app = create_web_app(
-        database_path=tmp_path / f"hardened-{mode}-{target}.db",
-        deepcoin_client_factory=lambda: domain_calls.append("client") or object(),
-    )
-    save_trading_settings(app.state.session_factory, {"worker_command_mode": mode})
-    client = TestClient(app, raise_server_exceptions=False)
-
-    response = (
-        client.post(path, json=payload)
-        if payload is not None
-        else client.post(path)
-    )
-
-    assert response.status_code == 503
-    assert response.json() == {
-        "detail": {"code": "worker_command_mode_invalid"}
-    }
-    assert domain_calls == []
-    with app.state.session_factory() as session:
-        assert session.query(WorkerCommandJob).count() == 0
-
-
 def test_worker_command_hardened_rejects_removed_sync_probe_before_enqueue(
     tmp_path,
     monkeypatch,
@@ -7999,33 +7884,6 @@ def test_worker_command_monolith_lifespan_owns_one_consumer_task(tmp_path):
 
     assert stopped == [True]
     assert app.state.worker_command_worker_task is None
-
-
-def test_worker_command_mode_api_refuses_rollback_with_executing_job(tmp_path):
-    app = create_web_app(tmp_path / "worker-mode-guard.db")
-    save_trading_settings(app.state.session_factory, {"worker_command_mode": "queue"})
-    with app.state.session_factory() as session:
-        session.add(
-            WorkerCommandJob(
-                command_id="executing-command",
-                command_type="sync_deepcoin_execution",
-                request_json="{}",
-                request_fingerprint="f" * 64,
-                status="executing",
-                attempt_count=1,
-                side_effect_started_at=datetime(2026, 8, 22, 12, 0),
-                result_schema_version=1,
-                created_at=datetime(2026, 8, 22, 12, 0),
-            )
-        )
-        session.commit()
-
-    response = TestClient(app).post(
-        "/api/trading-settings", json={"worker_command_mode": "inline"}
-    )
-
-    assert response.status_code == 422
-    assert "claimed=0 executing=1" in response.json()["detail"]
 
 
 def test_runtime_agent_exchange_snapshot_endpoint_is_bounded_and_redacted(
