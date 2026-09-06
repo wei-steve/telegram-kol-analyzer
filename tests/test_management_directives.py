@@ -490,3 +490,70 @@ def test_conflicting_explicit_partial_fractions_are_rejected() -> None:
                 "side": "long",
             },
         )
+
+
+@pytest.mark.parametrize("value", [0, -0.2, "150%", "1.5", "50", "oops", "NaN", "inf", False, [], {}])
+def test_supplied_invalid_fraction_is_not_defaulted(value):
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text="减仓", lifecycle_event={
+            "event_type": "position_update", "management_action": "partial_take_profit",
+            "management_fraction": value,
+        })
+
+
+@pytest.mark.parametrize("text", ["减仓0%", "减仓-20%", "平仓150%", "保留150%",
+    "剩余-20%", "留0%", "保留100%", "止盈abc%", "减仓1..5%", "减仓%"])
+def test_invalid_body_percentage_is_not_dropped(text):
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text=text, lifecycle_event={
+            "event_type": "position_update", "management_action": "partial_take_profit",
+        })
+
+
+@pytest.mark.parametrize("missing", [None, "", "  "])
+def test_only_missing_fraction_keeps_half_default(missing):
+    result = resolve_management_directive(text="减仓", lifecycle_event={
+        "event_type": "position_update", "management_action": "partial_take_profit",
+        "management_fraction": missing,
+    })
+    assert result.fraction == 0.5
+
+
+def test_invalid_field_cannot_be_hidden_by_valid_field_or_half_text():
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text="减半", lifecycle_event={
+            "management_action": "partial_take_profit", "fraction": "bad", "close_fraction": 0.5,
+        })
+
+
+@pytest.mark.parametrize("text", ["减仓 - 10%", "减仓 − 10%", "减仓 -\t10%", "减仓，比例120%", "减仓1,5%", "保留，比例150%"])
+def test_percentage_separators_never_hide_invalid_content(text):
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text=text, lifecycle_event={"management_action": "partial_take_profit"})
+
+
+def test_extreme_percent_is_normalized_to_fraction_rejection():
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text="减仓", lifecycle_event={"management_action": "partial_take_profit", "fraction": "1e9999999%"})
+
+
+@pytest.mark.parametrize("text", ["减仓\n150%", "减仓；比例120%", "保留\n-20%", "减仓（150）%", "减仓 -\n10%"])
+def test_multiline_or_punctuated_invalid_percent_does_not_become_missing(text):
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text=text, lifecycle_event={"management_action": "partial_take_profit"})
+
+
+def test_percentage_is_bound_to_nearest_quantity_verb():
+    result = resolve_management_directive(text="止盈位还差10点，减仓20%", lifecycle_event={"management_action": "partial_take_profit"})
+    assert result.fraction == 0.2
+
+
+@pytest.mark.parametrize("text", ["减仓10%%", "减仓20%至120%", "减仓比例20%/120%", "保留80%/150%"])
+def test_malformed_continued_percentage_is_rejected(text):
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(text=text, lifecycle_event={"management_action": "partial_take_profit"})
+
+
+def test_unrelated_market_percentage_does_not_change_close_fraction():
+    result = resolve_management_directive(text="减仓20%，行情涨了150%", lifecycle_event={"management_action": "partial_take_profit"})
+    assert result.fraction == 0.2

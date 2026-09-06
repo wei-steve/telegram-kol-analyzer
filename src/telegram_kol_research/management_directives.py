@@ -14,6 +14,17 @@ from telegram_kol_research.strategy_management_contracts import (
 )
 
 
+class ManagementFractionInvalid(ValueError):
+    """A supplied value is invalid, not absent; it must never select a default."""
+
+    reason_code = "management_fraction_invalid"
+
+    def __init__(self, classification="invalid_format", source="fraction"):
+        super().__init__(self.reason_code)
+        self.classification = classification
+        self.source = source
+
+
 DEFAULT_PARTIAL_CLOSE_FRACTION = 0.50
 DEFAULT_TAIL_CLOSE_FRACTION = 0.80
 FULL_EXIT_ACTIONS = frozenset({"exit_full", "full_exit", "close_position"})
@@ -138,6 +149,7 @@ def resolve_management_directive(
 ) -> ManagementDirective:
     """Convert one authoritative lifecycle event into deterministic policy."""
 
+    validate_management_fraction_inputs(lifecycle_event, str(text or ""))
     normalized_text = str(text or "").strip().lower()
     event_type = str(lifecycle_event.get("event_type") or "").strip().lower()
     raw_action = str(lifecycle_event.get("management_action") or "").strip().lower()
@@ -505,45 +517,88 @@ def _management_fraction(
     return None
 
 
+def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
+    # Keep the entire percentage token, including signs/malformed content.
+    # The old nondigit prefix swallowed '-' and silently discarded >100%.
+    values = []
+    previous_quantity = False
+    for percent in re.finditer(r"([^%％]*)[%％]", text):
+        matches = list(re.finditer(rf"(?:{verbs})", percent.group(1), flags=re.IGNORECASE))
+        if not matches:
+            # A repeated percent or connected range is supplied content, not
+            # a missing quantity. Do not silently execute its first endpoint.
+            if previous_quantity and re.match(r"^\s*(?:[/／~～\-—至到]|$)", percent.group(1)):
+                raise ManagementFractionInvalid("invalid_format", source)
+            previous_quantity = False
+            continue
+        previous_quantity = True
+        # Bind to the nearest quantity verb, not an earlier price discussion.
+        clause = percent.group(1)[matches[-1].end():]
+        token = re.search(r"([+\-−－\d.a-zA-Z].*)$", clause.strip(), flags=re.DOTALL)
+        raw_value = token.group(1) if token else clause.strip()
+        try:
+            value = _fraction_value(f"{raw_value}%")
+            if value is None:
+                raise ManagementFractionInvalid()
+        except ManagementFractionInvalid as exc:
+            exc.source = source
+            raise
+        values.append(value)
+    return values
+
+
 def _close_percentage_values(text: str) -> list[float]:
-    values = re.findall(
-        r"(?:止盈|减仓|平仓|平掉|出掉|出局)[^\d%％]{0,12}"
-        r"(\d+(?:\.\d+)?)\s*[%％]",
-        text,
-    )
-    return [
-        fraction
-        for value in values
-        if (fraction := _fraction_value(f"{value}%")) is not None
-    ]
+    return _percentage_values(text, "止盈|减仓|平仓|平掉|出掉|出局", source="close_percentage")
 
 
 def _retained_percentage_values(text: str) -> list[float]:
-    values = re.findall(
-        r"(?:保留|剩余|留下|留)[^\d%％]{0,12}(\d+(?:\.\d+)?)\s*[%％]",
-        text,
-    )
-    return [
-        fraction
-        for value in values
-        if (fraction := _fraction_value(f"{value}%")) is not None
-    ]
+    values = _percentage_values(text, "保留|剩余|留下|留", source="retained_percentage")
+    if any(value == 1 for value in values):
+        # Retaining 100% implies a zero close: refuse instead of inventing a trade.
+        raise ManagementFractionInvalid("zero_close_fraction", "retained_percentage")
+    return values
 
 
 def _fraction_value(value: Any) -> float | None:
-    if value in (None, ""):
+    # Three distinct outcomes: valid float, genuinely absent None, or an
+    # explicit error. Returning None for invalid content would activate 50%.
+    if value is None or (isinstance(value, str) and not value.strip()):
         return None
-    text = str(value).strip()
+    if isinstance(value, bool) or not isinstance(value, (str, int, float, Decimal)):
+        raise ManagementFractionInvalid()
+    text = str(value).strip().replace("−", "-").replace("－", "-")
     is_percent = text.endswith(("%", "％"))
     if is_percent:
         text = text[:-1].strip()
     try:
-        numeric = float(text)
-    except (TypeError, ValueError):
-        return None
-    if is_percent or numeric > 1:
+        numeric = Decimal(text)
+    except (InvalidOperation, TypeError, ValueError) as exc:
+        raise ManagementFractionInvalid() from exc
+    if not numeric.is_finite():
+        raise ManagementFractionInvalid("nonfinite")
+    if is_percent:
+        if not 0 < numeric <= 100:
+            raise ManagementFractionInvalid("out_of_range")
         numeric /= 100
-    return numeric if 0 < numeric <= 1 else None
+    # Bare values are fractions, not implicit percentages: 50 != "50%".
+    if not 0 < numeric <= 1:
+        raise ManagementFractionInvalid("out_of_range")
+    result = float(numeric)
+    if result == 0:
+        raise ManagementFractionInvalid("underflow")
+    return result
+
+
+def validate_management_fraction_inputs(event: Mapping[str, Any], text: str) -> None:
+    """Validate supplied inputs even if an earlier action branch would ignore them."""
+    for key in ("management_fraction", "close_fraction", "fraction"):
+        try:
+            _fraction_value(event.get(key))
+        except ManagementFractionInvalid as exc:
+            exc.source = key
+            raise
+    _close_percentage_values(text)
+    _retained_percentage_values(text)
 
 
 def _normalized_optional(value: Any, *, upper: bool) -> str | None:

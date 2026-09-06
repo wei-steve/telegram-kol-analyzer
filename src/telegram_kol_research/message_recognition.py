@@ -54,9 +54,14 @@ from telegram_kol_research.message_instruction_items import (
 )
 from telegram_kol_research.management_directives import (
     FULL_EXIT_ACTIONS,
+    ManagementFractionInvalid,
     build_management_instruction_contract,
     multi_target_action_policy,
     resolve_management_directive,
+)
+from telegram_kol_research.management_fraction_gate import (
+    record_fraction_rejection,
+    validate_management_fraction_payload,
 )
 from telegram_kol_research.management_scope import (
     ManagementScopeError,
@@ -253,6 +258,8 @@ def recognize_message_now(
             if ai_event_result is not None:
                 _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
                 session.commit()
+                if ai_event_result.reason == "management_fraction_invalid":
+                    record_fraction_rejection(session_factory, raw_message_id=raw_message.id)
                 return ai_event_result
             if _apply_lifecycle_transition_signal_if_matched(session, raw_message, text):
                 result = MessageRecognitionResult(
@@ -848,6 +855,13 @@ def _apply_ai_lifecycle_event_if_matched(
     except Exception:
         return None
 
+    try:
+        validate_management_fraction_payload({"lifecycle_event": decision}, raw_message.text or "")
+    except ManagementFractionInvalid as exc:
+        return MessageRecognitionResult(
+            raw_message_id=raw_message.id, status="识别失败", reason=exc.reason_code,
+            parse_source="lifecycle_ai",
+        )
     if not _apply_lifecycle_event_decision(session, raw_message, decision):
         return None
 
@@ -1474,59 +1488,18 @@ def normalize_management_intent(
 
 
 def _explicit_management_fraction(
-    decision: Mapping[str, Any],
-    combined_text: str,
+    decision: Mapping[str, Any], combined_text: str,
 ) -> float | None:
-    explicit_close_fractions: list[float] = []
-    for key in ("management_fraction", "close_fraction", "fraction"):
-        normalized = _fraction_value(decision.get(key))
-        if normalized is not None:
-            explicit_close_fractions.append(normalized)
+    from telegram_kol_research.management_directives import _management_fraction
 
-    close_percentages = re.findall(
-        r"(?:止盈|减仓|平仓|平掉|出掉|出局)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
-        combined_text,
-    )
-    explicit_close_fractions.extend(
-        fraction
-        for value in close_percentages
-        if (fraction := _fraction_value(f"{value}%")) is not None
-    )
-    retained_percentages = re.findall(
-        r"(?:保留|剩余|留下|留)[^\d%\uff05]{0,12}(\d+(?:\.\d+)?)\s*[%\uff05]",
-        combined_text,
-    )
-    explicit_close_fractions.extend(
-        1.0 - retained
-        for value in retained_percentages
-        if (retained := _fraction_value(f"{value}%")) is not None
-    )
-    if explicit_close_fractions:
-        first = explicit_close_fractions[0]
-        if any(abs(value - first) > 1e-9 for value in explicit_close_fractions[1:]):
-            raise ValueError("management_fraction_ambiguous")
-        return first
-    if any(term in combined_text for term in ("一半", "半仓", "half")):
-        return 0.5
-    return None
+    value = _management_fraction(decision, combined_text)
+    return 0.5 if value is None and "half" in combined_text else value
 
 
 def _fraction_value(value: Any) -> float | None:
-    if value in (None, ""):
-        return None
-    text = str(value).strip()
-    is_percent = text.endswith(("%", "％"))
-    if is_percent:
-        text = text[:-1].strip()
-    try:
-        numeric = float(text)
-    except (TypeError, ValueError):
-        return None
-    if is_percent or numeric > 1:
-        numeric /= 100
-    if 0 < numeric <= 1:
-        return numeric
-    return None
+    from telegram_kol_research.management_directives import _fraction_value as parse_fraction
+
+    return parse_fraction(value)
 
 
 def _exit_decision_looks_like_management_update(
@@ -2873,6 +2846,26 @@ def apply_authoritative_mimo_payload(
                 accepted_candidate_ids=accepted_candidate_ids,
             )
             session.commit()
+            return result
+
+        try:
+            validate_management_fraction_payload(
+                payload, _authoritative_current_message_text(raw_message.text, payload),
+            )
+        except ManagementFractionInvalid as exc:
+            result = MessageRecognitionResult(
+                raw_message_id=raw_message_id, status="识别失败",
+                reason=exc.reason_code, ai_payload=payload, parse_source="mimo_authoritative",
+            )
+            _upsert_recognition(session, result, engine=model)
+            _project_authoritative_instruction_items(
+                session, raw_message_id=raw_message_id, accepted_candidate_ids=set(),
+            )
+            session.commit()
+            record_fraction_rejection(
+                session_factory, raw_message_id=raw_message_id, error=exc,
+                authoritative_generation=authoritative_generation,
+            )
             return result
 
         rollout_active = (

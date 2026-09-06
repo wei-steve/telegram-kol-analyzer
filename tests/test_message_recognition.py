@@ -5651,3 +5651,120 @@ def test_sanjie_composite_message_persists_complete_contract(tmp_path, monkeypat
         expected_stop_mode="actual_entry_price",
         expected_stop_price=None,
     )
+
+
+@pytest.mark.parametrize("fraction,text", [(0, "减仓"), (-0.2, "减仓"), ("150%", "减仓"),
+    ("bad", "减仓"), (None, "减仓150%"), (None, "保留-20%")])
+def test_invalid_management_fraction_records_incident_without_instruction(tmp_path, fraction, text):
+    factory = create_session_factory(tmp_path / "invalid-fraction.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=9821, message_id=7, text=text)
+        target = StrategyLifecycle(chat_id=9821, message_id=6, symbol="BTC", side="long",
+                                   lifecycle_status="entered", signal_at=datetime(2026, 9, 5, tzinfo=UTC))
+        session.add_all([raw, target])
+        session.commit()
+        raw_id, target_id = raw.id, target.id
+    result = apply_authoritative_mimo_payload(factory, raw_message_id=raw_id, model="mimo", payload={
+        "recognition_result": "非策略", "confidence": 0.95,
+        "lifecycle_event": {"event_type": "position_update", "management_action": "partial_take_profit",
+            "management_fraction": fraction, "target_lifecycle_id": target_id,
+            "symbol": "BTC", "side": "long", "confidence": 0.95},
+    })
+    assert result.reason == "management_fraction_invalid"
+    assert result.status == "识别失败"
+    with factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+        incident = session.query(RuntimeIncident).one()
+        assert incident.incident_type == "management_fraction_rejected"
+        assert "management_fraction_invalid" in incident.redacted_summary
+        assert session.get(StrategyLifecycle, target_id).lifecycle_status == "entered"
+
+
+@pytest.mark.parametrize("fraction", [None, "", "  "])
+def test_missing_fraction_projects_half_management_instruction(tmp_path, fraction):
+    factory = create_session_factory(tmp_path / "missing-fraction.db")
+    with factory() as session:
+        target = _add_exact_live_lifecycle(session, chat_id=8822, message_id=1, symbol="BTC", side="long")
+        raw = RawMessage(chat_id=8822, message_id=2, text="BTC多单减仓一部分")
+        session.add(raw)
+        session.commit()
+        raw_id, target_id = raw.id, target.id
+    result = apply_authoritative_mimo_payload(factory, raw_message_id=raw_id, model="mimo", payload={
+        "recognition_result": "非策略",
+        "lifecycle_event": {"event_type": "position_update", "management_action": "partial_take_profit",
+            "management_fraction": fraction, "target_lifecycle_id": target_id,
+            "symbol": "BTC", "side": "long", "confidence": 0.95},
+    })
+    assert result.status == "非策略"
+    with factory() as session:
+        candidate = session.query(SignalCandidate).one()
+        assert candidate.management_fraction == 0.5
+        assert session.query(MessageInstructionItem).one().signal_candidate_id == candidate.id
+        assert session.query(RuntimeIncident).count() == 0
+
+
+def test_unsupported_target_fraction_rejects_without_relaxing_target_schema(tmp_path):
+    factory = create_session_factory(tmp_path / "multi-fraction.db")
+    with factory() as session:
+        good = _add_exact_live_lifecycle(session, chat_id=8822, message_id=1, symbol="BTC", side="long")
+        bad = _add_exact_live_lifecycle(session, chat_id=8822, message_id=2, symbol="SOL", side="short")
+        raw = RawMessage(chat_id=8822, message_id=3, text="BTC SOL减仓一部分")
+        session.add(raw)
+        session.commit()
+        raw_id, good_id, bad_id = raw.id, good.id, bad.id
+    result = apply_authoritative_mimo_payload(factory, raw_message_id=raw_id, model="mimo", payload={
+        "recognition_result": "非策略",
+        "lifecycle_event": {"event_type": "position_update", "management_action": "partial_take_profit", "confidence": 0.95,
+            "targets": [
+                {"target_lifecycle_id": good_id, "symbol": "BTC", "side": "long", "management_fraction": 0.5},
+                {"target_lifecycle_id": bad_id, "symbol": "SOL", "side": "short", "management_fraction": 0},
+            ]},
+    }, multi_target_management_config=config_module.MultiTargetManagementConfig(
+        projection_enabled=True, shadow_only=False, live_actions=frozenset({"partial_take_profit"})))
+    assert result.reason == "management_fraction_invalid"
+    with factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+        assert session.query(RuntimeIncident).one().incident_type == "management_fraction_rejected"
+
+
+def test_instruction_array_invalid_fraction_has_dedicated_incident(tmp_path):
+    factory = create_session_factory(tmp_path / "instruction-fraction.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=8822, message_id=1, text="减仓")
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+    result = apply_authoritative_mimo_payload(factory, raw_message_id=raw_id, model="mimo", payload={
+        "recognition_result": "非策略", "lifecycle_event": {"event_type": "none"},
+        "instructions": [{"kind": "partial_take_profit", "parameters": {"management_fraction": "bad"}}],
+    })
+    assert result.reason == "management_fraction_invalid"
+    with factory() as session:
+        assert session.query(RuntimeIncident).one().incident_type == "management_fraction_rejected"
+        assert session.query(MessageInstructionItem).count() == 0
+
+
+def test_v1_fraction_rejection_is_reported_without_falling_through(tmp_path, monkeypatch):
+    factory = create_session_factory(tmp_path / "v1-fraction.db")
+    with factory() as session:
+        target = _add_exact_live_lifecycle(session, chat_id=8822, message_id=1, symbol="BTC", side="long")
+        raw = RawMessage(chat_id=8822, message_id=2, text="BTC减仓",
+            posted_at=datetime(2026, 7, 20, 12, 5, tzinfo=UTC))
+        session.add(raw)
+        session.commit()
+        raw_id, target_id = raw.id, target.id
+    _mock_deepseek_lifecycle_event(monkeypatch, {
+        "event_type": "position_update", "management_action": "partial_take_profit",
+        "management_fraction": "bad", "target_lifecycle_id": target_id,
+        "symbol": "BTC", "side": "long", "confidence": 0.95,
+    })
+    result = recognize_message_now(factory, raw_message_id=raw_id,
+        ai_recognition_config=AiRecognitionConfig(text_provider=type("Provider", (), {
+            "is_configured": True, "base_url": "http://deepseek.test", "api_key": "",
+            "model": "deepseek-chat", "timeout_seconds": 10})()))
+    assert result.reason == "management_fraction_invalid"
+    with factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(RuntimeIncident).one().incident_type == "management_fraction_rejected"
