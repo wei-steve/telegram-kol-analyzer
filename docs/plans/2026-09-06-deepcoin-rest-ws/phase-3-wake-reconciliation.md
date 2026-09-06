@@ -99,6 +99,11 @@
   `deepcoin_ws_stream_state.py` 及本阶段新文件里，对 `positions` / `open_orders` /
   `trigger_orders` / `fills` 的访问前必须有对 `complete` 的判断（用 AST 或最简单的
   行序检查都可以，目的是把纪律变成测试）。
+- 真实风险信号：2026-09-06 17:04:07Z 生产的 `GET /deepcoin/trade/trigger-orders-pending`
+  出现过一次 401 Unauthorized（24 小时内仅此一次）。唤醒触发的 REST 核验遇到这类偶发
+  失败必须记为 unknown / incomplete 并让下一次轮询重试，绝不能降级成"零"或"无"，
+  也不能因为一次 401 就把连接状态机推到 `disconnected`（那是 REST 的事，不是 WS 的事）。
+  为它加一个离线测试。
 ## 禁止
 
 - 禁止修改 reconcile 内部任何判据、阈值、退避、认领条件或状态转移。
