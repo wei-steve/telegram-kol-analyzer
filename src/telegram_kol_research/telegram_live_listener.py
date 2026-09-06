@@ -49,7 +49,6 @@ from telegram_kol_research.recognition_decisions import (
     _save_terminal_authoritative_decision_in_session,
     _update_recognition_execution_outcome_in_session,
     claim_authoritative_failure_notification,
-    save_terminal_authoritative_decision,
     update_recognition_execution_outcome,
 )
 from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
@@ -76,12 +75,6 @@ from telegram_kol_research.trading_settings import load_trading_settings
 
 logger = logging.getLogger(__name__)
 AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS = 60.0
-# Phase 3: superseded as the effective value by
-# TradingSettings.authoritative_gap_recovery_max_age_minutes (default 15.0,
-# read fresh on every recovery pass via _load_gap_recovery_candidates). Kept
-# as a literal 15-minute reference point; no code path reads this constant
-# anymore.
-AUTHORITATIVE_GAP_RECOVERY_MAX_AGE = timedelta(minutes=15)
 DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS = 20.0
 DEFAULT_STALL_EXPIRY_NOTIFICATION_MIN_INTERVAL_SECONDS = 300.0
 

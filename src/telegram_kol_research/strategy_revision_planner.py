@@ -21,7 +21,6 @@ from telegram_kol_research.models import (
     StrategyRevisionBatch,
     StrategyRevisionLeg,
     StrategyThread,
-    utc_now,
 )
 
 

@@ -11,7 +11,6 @@ import re
 import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1919,7 +1918,6 @@ def enqueue_strategy_management_notifications(session_factory, *, group_labels=N
     """Persist immutable alert identities; duplicate ticks are harmless."""
 
     from telegram_kol_research.models import StrategyManagementBatch
-    from telegram_kol_research.models import StrategyManagementNotification
 
     with session_factory() as session:
         batch_ids = [

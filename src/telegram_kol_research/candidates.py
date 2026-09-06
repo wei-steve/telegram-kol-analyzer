@@ -7,7 +7,7 @@ from typing import Iterable
 
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.models import MediaAsset, RawMessage, SignalCandidate, Source
+from telegram_kol_research.models import RawMessage, SignalCandidate, Source
 from telegram_kol_research.parsing.text_parser import parse_signal_text
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
 

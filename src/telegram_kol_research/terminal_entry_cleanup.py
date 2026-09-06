@@ -25,7 +25,6 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     StrategyLifecycle,
 )
-from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )

@@ -14,7 +14,7 @@ from telegram_kol_research.entry_price_geometry import (
 from telegram_kol_research.execution_events import (
     enqueue_entry_price_geometry_rejection_notification,
 )
-from telegram_kol_research.group_config import GroupConfig, TargetGroupConfig, TrackedSenderConfig
+from telegram_kol_research.group_config import GroupConfig, TrackedSenderConfig
 from telegram_kol_research.models import RawMessage, SignalCandidate, Source
 from telegram_kol_research.price_normalization import extract_normalized_prices
 from telegram_kol_research.time_utils import normalize_to_utc_naive

@@ -662,7 +662,7 @@ def prove_release_runtime(
                 return identities, releases
             try:
                 validate_runtime_authority_scope(identities)
-            except ValueError as exc:
+            except ValueError:
                 raise ActivationError("authority proof failed")
             return identities, releases
         except ActivationError as exc:
