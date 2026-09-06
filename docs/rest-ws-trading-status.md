@@ -16,7 +16,7 @@ production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipelin
 current_phase: 2
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
 phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by: local_cf4e65e6-a966-4eaf-9de4-fe4486f4496c
+claimed_by: local_cf4e65e6-a966-4eaf-9de4-fe4486f4496c   # 阶段 2 因流量不足留 in_progress，见证据区
 last_completed_phase: 1
 last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
@@ -270,6 +270,61 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - defect-out-of-scope (2026-09-06): `trigger_take_profit_convergence_executor.py:506-511` 对未过滤的 pending 原始行逐行调用只适用于保护单的 `_native_tpsl_aliases_consistent`，入场条件单会触发 `convergence_pending_alias_conflict` 全局否决。不属于本项目范围，需单独立项：先写复现测试，再把否决范围收窄到保护单行。
 
 执行会话在此追加，格式：`- phase-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
+
+- phase-2 (2026-09-06, 会话 local_cf4e65e6, **流量不足留 `in_progress`**):
+  提交 `0371fc9f4fc41c588fab1534f8e33419aef4d6cf`（6 个提交），
+  部署 `tg-deploy 0371fc9f…`，回滚 SHA `f555ad864855f3f6433258a581c13b04656a0fc9`。
+  **无 schema 变更**：复用既有 `deepcoin_ws_events.processed_state` 列与
+  `deepcoin_ws_connection_gaps` 表，本阶段按纯 L2 执行，未做 L3 副本演练；
+  依赖未变（服务器 venv 已有 `websockets 17.1`，未跑 pip）。
+  实现：四状态机（`connecting`/`healthy`/`disconnected`/`resyncing`，
+  `healthy` 只能经收敛的重同步到达——交接链路里的 `connecting → healthy`
+  被拆成 `connecting → resyncing → healthy`，因为硬性禁止 12 要求重启也重新对齐，
+  这是同样四个状态名下更严格的路径，没有新增状态）；
+  去重键 `(channel, payload_hash, exchange_time_ms)`，重复帧标
+  `processed_state='duplicate'` 绝不删行、幂等；
+  按实体身份的乱序保护，`TriggerOrder.TU` 从 posId 回 `default` 单独拦截；
+  五步 REST 重同步（第 4 步二次快照保留），只用既有 `list_*` GET 方法，
+  读失败记 incomplete 并阻断收敛，绝不当作"零"；
+  从 `list_swap_instruments` 建的显式双向合约名映射表（生产 266 条），
+  未知合约 fail-closed，另加一次强制重建重试以免新上市合约永久卡死；
+  指数退避带抖动（1s 起、60s 上限）、应用层静默计时器（600s）、
+  listenkey 轮换（2700s）；`ws_observation_permits_new_entry` 只暴露不接线
+  （静态测试守护它只被本模块与状态机模块引用）；健康端点扩展九个字段。
+  **生产实测两个新事实**（阶段 1 未记录）：
+  (1) listen key 是**硬 60 分钟**而非滑动一小时——13:56:25Z 订阅的连接在
+  14:56:31Z 收到 `{"code":"50118","event":"error","msg":"listen key expired,
+  connection closing"}` 后断开，盲区 5.57 秒；45 分钟轮换有 15 分钟余量。
+  (2) 该错误帧在阶段 1 被记成 `unparsed`，会耗尽"解码器不认识"这个信号；
+  现解码为独立 `control` 频道并在收到后立即计划内重连。
+  验证：focused 79 passed；全量 **7504 passed / 4 skipped / 0 failed**。
+  补测项 5 用阶段 1 实验采集的 7 条真实帧（`tests/fixtures/
+  deepcoin_ws_recorded_frames.jsonl`，来源
+  `eth-rest-ws-tpsl-short-no-clordid-test-20260905/live-ab734b3900f6/ws-events.jsonl`），
+  含真实的 `TU: default → posId` 翻转。
+  补测项 4 离线覆盖成交前/成交中/成交后三个断线时点。
+  观察 15:31:06Z~16:01:06Z 共 31 个采样点：状态 healthy 29 / resyncing 1 /
+  connecting 1（正好抓到重启瞬间的转移）；重启 worker 一次
+  （PID 2314160→2319390），缺口 2.47 秒闭合，五步耗时
+  975/3/1/800/1 ms，`last_resync_outcome=converged`；
+  7 条缺口行全部闭合、窗口结束 `open_gap_count=0`；
+  `processed=6 / unprocessed=0 / duplicate=0` 无积压；零 error 日志；
+  交易所首尾 fingerprint 完全一致 `28309102…`（**零新增写入**；
+  窗口内那一个仓位是生产自动交易 15:28:19Z 自己开的，早于本次部署）。
+  **未达标项：窗口内真实消息 0 条 / 0 群**（部署前 30 分钟曾有 8 条 / 5 群，
+  属正常安静而非摄入故障，ingest 全程 active 且零错误）。按 AGENTS.md L2
+  规则停止而不延长，阶段保持 `in_progress`，`current_phase` 不推进。
+  基线 `duplicate_rate_1h=0.0`、`out_of_order_count_1h=0` 是**零流量下的地板值**，
+  不是实测速率，首个有真实帧流量的窗口才会给出真基线。
+  遗留：(a) 重同步第 1/4 步的 REST 快照结果没有种进进程内乱序 tracker，
+  重启后 tracker 为空直到新帧到达；阶段 2 里 tracker 不驱动任何决定所以不阻塞，
+  但阶段 3 让 WS 事件唤醒 REST 核验时应把快照种进去，否则重连后的旧帧拦不住。
+  (b) 静默计时器在空闲账户上每 10 分钟制造一次计划内重连（生产已实测两次，
+  各约 3 秒），代价是每次几个 GET；若阶段 3 觉得吵可以调阈值，但不要为了安静
+  而删掉它——协议层 pong 存活不等于业务流存活。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-2/`
+  （`deployment.md`、`observation-summary.md`、`observation.jsonl`、
+  两份 `exchange-snapshot-window-*.json`）。
 
 - phase-0 (2026-09-06, 设计会话): 提交 `17a662f9` 保存 codex 交接材料 25 个文件并修
   `scripts/deepcoin_*.py` 的 umask 未还原；本文件与
