@@ -22,7 +22,7 @@ payload**落进新的数据库收件箱表。此外什么都不做。
 - 上一阶段：无（本项目第一个执行阶段）。
 - 读完 `docs/rest-ws-trading-status.md` 的"阶段 0 只读核对结论"第 3、5、6、7 条。
 - 确认生产 worker 正常：`GET http://127.0.0.1:8002/api/runtime/deployment-identity`
-  返回 `loaded_artifact_verified=true`。
+  返回的 worker 各 loop 存活且 `authority_evidence` 新鲜、successful（`loaded_artifact_verified` 自 2026-09-06 门禁退役后结构性为 false，不再作为判据）。
 - 准备好生产数据库副本用于 schema 演练（L3 要求）。
 
 ## 任务

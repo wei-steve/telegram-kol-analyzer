@@ -46,7 +46,10 @@
   hard-resets the server checkout (branch `live`) to that SHA, clears bytecode,
   and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
   Record the pre-deploy production HEAD as the rollback SHA; rollback is
-  `tg-deploy <that-sha>`. The former stage/activate helper
+  `tg-deploy <that-sha>`. tg-deploy does not install Python dependencies: when
+  `pyproject.toml` dependencies change, `pip install` them into
+  `/opt/telegram-kol-analyzer/.venv` on the server before running tg-deploy.
+  The former stage/activate helper
   (`scripts/server_git_update.*`, `deploy/telegram-kol-stage|activate`) and
   `docs/deployment-action-gates.md` describe the retired immutable-release
   flow; do not use them unless the gates are reinstated.
