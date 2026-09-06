@@ -47,6 +47,24 @@ last_completed_commit: 61c3ed43
 - 不动 `~/.codex/worktrees/*`、`/Users/steven/Documents/telegram获取消息-*`、`/private/tmp/*` 这些外部工作树，只允许列出并报告。
 - 不 push，不部署，不改生产设置，不重启服务。
 
+## 后续建议（2026-09-06 指挥会话，用户已确认"先记下来，后面再处理"）
+
+按优先级：
+
+1. 修 `entry_protection_ledger_repair.py` 与 `recovery_live_submit.py` 的拷贝分叉（保护账本路径，先写复现测试再改）。
+2. 在 worker 侧补回"系统停顿导致消息过期"的聚合 Telegram 通知，或明确决定不要它。
+3. 做一次生产 `GET /api/trading-settings` 只读快照存进 docs，作为开关收敛与文档准确性的基线；之后每次部署前更新。
+4. 让 codex 在其未跟踪脚本 `scripts/deepcoin_*.py` 里还原 `os.umask(0o077)`。
+5. 灰度开关按依赖链自上而下一次收一个，从 `auto_trade_enabled` 开始，每个开关一个独立步骤。
+
+流程规则（建议写进 AGENTS.md）：
+
+- 停用或替换任何机制的同一提交必须更新 AGENTS.md 与 docs/ARCHITECTURE.md。
+- 新增三态灰度开关必须在字段注释里写预计收敛日期，到期删除 shadow/disabled 分支。
+- 一次性修复代码只进 `src/telegram_kol_research/one_off/` 或 `scripts/archive/`，守护测试 `tests/test_one_off_isolation.py` 已就位。
+
+缓做：monitor 重新启用要先改封闭白名单模型（见 `docs/2026-09-05-codex-handover-closeout.md` 第七节），否则会重现每日 8 条误报。
+
 ## 证据记录
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
