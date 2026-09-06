@@ -12,8 +12,8 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 本地部署�
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; message_lock_mode 设置已删除（ingest 固定按 chat_id 加锁）"
 current_step: 6
 current_step_file: docs/plans/2026-09-06-post-migration-cleanup/step-6-integrate-and-deploy.md
-step_status: planned              # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+step_status: claimed              # planned | claimed | in_progress | completed | blocked
+claimed_by: local_3d9720ea-9f2e-494d-961e-a2cd43bfb862
 last_completed_step: 5
 last_completed_commit: ceac4951
 ```
