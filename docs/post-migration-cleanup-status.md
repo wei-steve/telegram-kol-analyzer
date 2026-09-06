@@ -12,8 +12,8 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 本地部署�
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; message_lock_mode=global (per_chat 从未启用)"
 current_step: 1
 current_step_file: docs/plans/2026-09-06-post-migration-cleanup/step-1-workspace-and-docs.md
-step_status: planned          # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+step_status: claimed          # planned | claimed | in_progress | completed | blocked
+claimed_by: local_a288ae52-d04b-43c3-afa6-70eb62636341
 last_completed_step: 0
 last_completed_commit: null
 ```
