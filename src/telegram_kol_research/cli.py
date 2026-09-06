@@ -5822,6 +5822,11 @@ def web(
         "all",
         "--runtime-role",
         envvar="TELEGRAM_KOL_RUNTIME_ROLE",
+        help=(
+            "Runtime role for this process. Production runs three separate "
+            "processes: web, ingest, and worker. 'all' collapses every role "
+            "into one process and is only for local development."
+        ),
     ),
     ingest_refresh_url: str = typer.Option(
         DEFAULT_INGEST_REFRESH_URL,

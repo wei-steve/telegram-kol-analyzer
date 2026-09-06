@@ -59,9 +59,46 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.mimo_contract_mode == "v1"
     assert settings.mimo_v2_activation_after_raw_message_id == 0
     assert settings.message_lock_mode == "global"
-    assert settings.worker_command_mode == "inline"
+    assert settings.worker_command_mode == "queue"
     assert settings.semantic_review_enabled is False
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
+
+
+def test_runtime_pipeline_modes_default_to_queue_when_fields_are_absent(tmp_path):
+    session_factory = create_session_factory(tmp_path / "absent-modes.db")
+
+    settings = load_trading_settings(session_factory)
+
+    assert settings.message_pipeline_mode == "queue"
+    assert settings.worker_command_mode == "queue"
+
+    from_empty_payload = trading_settings_from_payload({})
+
+    assert from_empty_payload.message_pipeline_mode == "queue"
+    assert from_empty_payload.worker_command_mode == "queue"
+
+
+def test_runtime_pipeline_modes_keep_explicit_inline_over_the_queue_default(tmp_path):
+    session_factory = create_session_factory(tmp_path / "explicit-inline-modes.db")
+
+    # inline path: scheduled for removal in cleanup step 3
+    saved = save_trading_settings(
+        session_factory,
+        {"message_pipeline_mode": "inline", "worker_command_mode": "inline"},
+    )
+    reloaded = load_trading_settings(session_factory)
+
+    assert saved.message_pipeline_mode == "inline"
+    assert saved.worker_command_mode == "inline"
+    assert reloaded.message_pipeline_mode == "inline"
+    assert reloaded.worker_command_mode == "inline"
+
+    from_payload = trading_settings_from_payload(
+        {"message_pipeline_mode": "inline", "worker_command_mode": "inline"}
+    )
+
+    assert from_payload.message_pipeline_mode == "inline"
+    assert from_payload.worker_command_mode == "inline"
 
 
 @pytest.mark.parametrize("mode", ["inline", "shadow", "queue"])

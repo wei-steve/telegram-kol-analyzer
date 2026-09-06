@@ -59,12 +59,12 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
 
 | 设置 | 生产值 | 代码默认值（`src/telegram_kol_research/trading_settings.py`） |
 |---|---|---|
-| `message_pipeline_mode` | `queue` | `inline`（`Literal["inline", "shadow", "queue"]`） |
-| `worker_command_mode` | `queue` | `inline`（`Literal["inline", "shadow", "queue"]`） |
+| `message_pipeline_mode` | `queue` | `queue`（`Literal["inline", "shadow", "queue"]`） |
+| `worker_command_mode` | `queue` | `queue`（`Literal["inline", "shadow", "queue"]`） |
 | `message_lock_mode` | `global` | `global`（`Literal["global", "per_chat"]`） |
 
-**代码默认值目前与生产不一致**：`message_pipeline_mode` 和 `worker_command_mode`
-的默认值仍是 `inline`，生产靠数据库里的动态设置跑在 `queue`。清理方案的步骤 2 会翻转这两个默认值。
+**代码默认值与生产一致**：三个设置的默认值都等于生产值，数据库里没有对应行时读到的就是生产模式。
+`inline` 和 `shadow` 仍是合法取值，但只有显式写进数据库才会生效。
 `message_lock_mode=per_chat` 从未在生产启用。
 
 ## 4. queue 模式下一条消息的路径
@@ -151,8 +151,8 @@ tpsl_ledger_backfill.py                  recovery_scan.py
 
 ## 6. AI 协作提示
 
-- 改任何东西之前，先看上面第 3 节的模式表：**生产跑 queue，代码默认值还是 inline**。
-  不要根据默认值推断运行时行为。
+- 改任何东西之前，先看上面第 3 节的模式表：**生产和代码默认值都跑 queue**。
+  运行时真值仍以数据库里的设置行为准，不要只看默认值就下结论。
 - 代码里的 `inline` 和 `shadow` 分支是迁移期的历史路径，正在被删除
   （清理方案步骤 3）。**不要在这些分支里加功能**，也不要为了让它们"对称"而扩展它们。
 - `web` 角色没有执行权限。任何需要写交易所或改仓位的动作，必须经 `worker_command_jobs`

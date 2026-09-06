@@ -966,6 +966,11 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
         database_path=tmp_path / "research.db",
         now_provider=lambda: now,
     )
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "inline"},
+    )
     with app.state.session_factory() as session:
         raw_messages = [
             RawMessage(
@@ -1437,6 +1442,11 @@ def test_queue_mode_api_starts_and_shadow_stops_message_worker_without_restart(
     app = create_web_app(
         database_path=tmp_path / "pipeline-mode-switch.db",
         message_processing_worker_interval_seconds=0.01,
+    )
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "inline"},
     )
 
     with TestClient(app) as client:

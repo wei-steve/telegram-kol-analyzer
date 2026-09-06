@@ -93,8 +93,8 @@ class TradingSettings:
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_lock_mode: Literal["global", "per_chat"] = "global"
     message_processing_max_parallel_chats: int = 20
-    message_pipeline_mode: Literal["inline", "shadow", "queue"] = "inline"
-    worker_command_mode: Literal["inline", "shadow", "queue"] = "inline"
+    message_pipeline_mode: Literal["inline", "shadow", "queue"] = "queue"
+    worker_command_mode: Literal["inline", "shadow", "queue"] = "queue"
     semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     mimo_v2_activation_after_raw_message_id: int = 0
