@@ -16,7 +16,7 @@ production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipelin
 current_phase: 2
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
 phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by:                          # 阶段 2 第二次观察仍流量不足，留 in_progress，见证据区
+claimed_by: local_a6d6d24f-92c3-4691-8caf-24c36e822bfa   # 阶段 2 开放式观察会话（只读监视器），phase_status 保持 in_progress
 last_completed_phase: 1
 last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
