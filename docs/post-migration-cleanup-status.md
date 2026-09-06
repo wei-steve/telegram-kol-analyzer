@@ -12,7 +12,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 本地部署�
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; message_lock_mode=global (per_chat 从未启用)"
 current_step: 3
 current_step_file: docs/plans/2026-09-06-post-migration-cleanup/step-3-delete-inline-shadow-paths.md
-step_status: claimed              # planned | claimed | in_progress | completed | blocked
+step_status: in_progress              # planned | claimed | in_progress | completed | blocked
 claimed_by: local_54ee9d81-eec6-4363-989a-d5de14b3c034
 last_completed_step: 2
 last_completed_commit: d0292216
