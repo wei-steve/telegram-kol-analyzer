@@ -5489,6 +5489,10 @@ def test_loopback_settings_disable_environment_proxy_trust(monkeypatch):
         **_snapshot().settings,
         "entry_message_assembly_v2_mode": None,
         "entry_revision_v2_mode": None,
+        # The fixture payload carries no auto-trade scope, which must project
+        # to None so the monitor degrades instead of reading it as "no group
+        # trades".
+        "auto_trade_chat_ids": None,
     }
     assert calls == [
         (

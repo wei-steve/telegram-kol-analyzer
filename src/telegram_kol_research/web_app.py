@@ -8265,7 +8265,17 @@ def create_web_app(
 
     @app.get("/api/trading-settings")
     def get_trading_settings():
-        return _trading_settings_response(app.state.session_factory)
+        payload = _trading_settings_response(app.state.session_factory)
+        # Group trading modes live in the YAML group config, which the monitor
+        # role deliberately cannot read.  Exposing only the auto-trade chat ids
+        # lets the monitor scope its preamble invariants without widening any
+        # credential boundary; no group content or secret is carried here.
+        payload["auto_trade_chat_ids"] = sorted(
+            int(group.chat_id)
+            for group in app.state.group_config.groups
+            if group.chat_id is not None and group.trading_mode == "auto_trade"
+        )
+        return payload
 
     @app.get("/api/trading-settings/symbols")
     async def list_trading_setting_symbols():

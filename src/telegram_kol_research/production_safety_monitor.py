@@ -393,6 +393,7 @@ _FINGERPRINT_DETAIL_KEYS_BY_REASON = {
     "stalled_composite_component": ("composite_invariant_codes",),
     "stale_entry_preamble_unresolved": ("entry_preamble_invariant_codes",),
     "entry_preamble_ambiguous": ("entry_preamble_invariant_codes",),
+    "entry_preamble_scope_unavailable": ("entry_preamble_invariant_codes",),
     "live_entry_preamble_binding_evidence_missing": (
         "entry_preamble_invariant_codes",
     ),
@@ -625,9 +626,23 @@ class ProductionSafetyAdapters:
         )
 
     def read_entry_preamble_invariants(self, *, now: datetime) -> tuple[str, ...]:
+        try:
+            auto_trade_chat_ids = read_loopback_settings(self.settings_url).get(
+                "auto_trade_chat_ids"
+            )
+        except Exception:
+            # Fail closed rather than losing the whole check: an unknown scope
+            # keeps full detection and surfaces its own degradation code.
+            auto_trade_chat_ids = None
         return tuple(
             sorted(
-                set(read_entry_preamble_invariants(self.database_path, now=now))
+                set(
+                    read_entry_preamble_invariants(
+                        self.database_path,
+                        now=now,
+                        auto_trade_chat_ids=auto_trade_chat_ids,
+                    )
+                )
                 | set(read_adjacent_entry_invariants(self.database_path, now=now))
             )
         )
@@ -1801,14 +1816,50 @@ def _has_exact_legacy_finalized_entry_fingerprint_reconciliation(
     )
 
 
+class _ScopeNotRequested:
+    """Marker for callers that never asked for auto-trade scoping.
+
+    It must stay distinct from ``None``.  ``None`` means a caller tried to read
+    the scope and failed, which is a degraded state worth reporting; omitting
+    the argument merely means the caller wants the unscoped reading and must not
+    raise a false degradation alarm.
+    """
+
+    __slots__ = ()
+
+
+_SCOPE_NOT_REQUESTED = _ScopeNotRequested()
+
+
 def read_entry_preamble_invariants(
     database_path: str | Path,
     *,
     now: datetime,
     stale_after: timedelta = timedelta(hours=6),
     connect=sqlite3.connect,
+    auto_trade_chat_ids: Sequence[int] | None | _ScopeNotRequested = (
+        _SCOPE_NOT_REQUESTED
+    ),
 ) -> tuple[str, ...]:
-    """Read bounded preamble/strategy evidence invariants without write access."""
+    """Read bounded preamble/strategy evidence invariants without write access.
+
+    ``auto_trade_chat_ids`` scopes the preamble invariants to groups that can
+    actually place orders.  A ``notify_only`` group never trades, so an
+    unresolved preamble there carries no execution consequence; reporting it as
+    a health failure keeps the monitor permanently red and hides real findings.
+    Such findings are still surfaced through the observation code rather than
+    discarded.
+
+    Passing ``None`` means the scope could not be determined.  That case fails
+    closed: the full unscoped detection is retained and an explicit degradation
+    code is emitted, because silently treating every group as out of scope
+    would disable the check altogether.
+
+    Omitting the argument entirely is different from passing ``None``: it keeps
+    the historical unscoped behaviour without raising a degradation alarm.
+    Production always passes a value explicitly, so a wiring mistake still
+    surfaces rather than hiding behind this default.
+    """
 
     checked_at = _require_aware_datetime(now).astimezone(UTC).replace(tzinfo=None)
     stale_before = checked_at - stale_after
@@ -1851,19 +1902,33 @@ def read_entry_preamble_invariants(
                   )
               )
         """
-        stale = connection.execute(
-            "SELECT 1 " + eligibility + " AND p.created_at < ? LIMIT 1",
+        if isinstance(auto_trade_chat_ids, _ScopeNotRequested):
+            in_scope: set[int] | None = None
+        elif auto_trade_chat_ids is None:
+            reasons.add("entry_preamble_scope_unavailable")
+            in_scope = None
+        else:
+            in_scope = {int(chat_id) for chat_id in auto_trade_chat_ids}
+
+        def _record(chat_id: object, code: str) -> None:
+            # An unscoped run (in_scope is None) keeps the original behaviour so
+            # a missing scope can never hide a genuine auto-trade failure.
+            if in_scope is None or int(chat_id) in in_scope:
+                reasons.add(code)
+            else:
+                reasons.add("entry_preamble_unresolved_notify_only")
+
+        for row in connection.execute(
+            "SELECT DISTINCT p.chat_id " + eligibility + " AND p.created_at < ?",
             (stale_before.isoformat(sep=" "),),
-        ).fetchone()
-        if stale:
-            reasons.add("stale_entry_preamble_unresolved")
-        ambiguous = connection.execute(
-            "SELECT 1 "
+        ).fetchall():
+            _record(row[0], "stale_entry_preamble_unresolved")
+        for row in connection.execute(
+            "SELECT p.chat_id "
             + eligibility
-            + " GROUP BY p.chat_id, p.symbol, p.side HAVING COUNT(*) > 1 LIMIT 1"
-        ).fetchone()
-        if ambiguous:
-            reasons.add("entry_preamble_ambiguous")
+            + " GROUP BY p.chat_id, p.symbol, p.side HAVING COUNT(*) > 1"
+        ).fetchall():
+            _record(row[0], "entry_preamble_ambiguous")
         assembly_columns = {
             str(row[1])
             for row in connection.execute(
@@ -2449,7 +2514,30 @@ def read_loopback_settings(
             "entry_message_assembly_v2_mode"
         ),
         "entry_revision_v2_mode": payload.get("entry_revision_v2_mode"),
+        "auto_trade_chat_ids": _projected_auto_trade_chat_ids(
+            payload.get("auto_trade_chat_ids")
+        ),
     }
+
+
+def _projected_auto_trade_chat_ids(value: object) -> tuple[int, ...] | None:
+    """Return the auto-trade chat ids, or ``None`` when they are unusable.
+
+    ``None`` is a deliberate signal, not an empty result: callers must fail
+    closed on it.  An older web release that predates this field, or a payload
+    we cannot trust, must never be read as "no group trades".
+    """
+
+    if not isinstance(value, Sequence) or isinstance(
+        value, (str, bytes, bytearray)
+    ):
+        return None
+    chat_ids: list[int] = []
+    for entry in value:
+        if isinstance(entry, bool) or not isinstance(entry, int):
+            return None
+        chat_ids.append(entry)
+    return tuple(sorted(set(chat_ids)))
 
 
 def read_monitor_live_position_sizes(
@@ -4128,6 +4216,17 @@ _ENTRY_PREAMBLE_INVARIANT_CODES = frozenset(
         "entry_revision_replacement_before_old_terminal",
         "live_entry_revision_protection_unverified",
         "adjacent_entry_invariant_scan_incomplete",
+        "entry_preamble_scope_unavailable",
+    }
+)
+
+
+# Codes recorded for visibility only.  They describe preamble invariants firing
+# in groups that never place orders, so they must stay observable without
+# flipping ``healthy`` — narrowing a safety check must not cost observability.
+_ENTRY_PREAMBLE_OBSERVATION_CODES = frozenset(
+    {
+        "entry_preamble_unresolved_notify_only",
     }
 )
 
@@ -4143,7 +4242,11 @@ def _evaluate_entry_preamble_invariants(
         reasons.add("malformed_snapshot")
         return
     observed: set[str] = set()
+    observations: set[str] = set()
     for value in values:
+        if value in _ENTRY_PREAMBLE_OBSERVATION_CODES:
+            observations.add(value)
+            continue
         if value not in _ENTRY_PREAMBLE_INVARIANT_CODES:
             reasons.add("malformed_snapshot")
             continue
@@ -4151,6 +4254,8 @@ def _evaluate_entry_preamble_invariants(
     reasons.update(observed)
     if observed:
         details["entry_preamble_invariant_codes"] = tuple(sorted(observed))
+    if observations:
+        details["entry_preamble_observations"] = tuple(sorted(observations))
 
 
 def _evaluate_settings(
