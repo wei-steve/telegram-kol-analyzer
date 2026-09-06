@@ -140,9 +140,13 @@ stall / stale）在 worker 的 `_classify_claim_expiry`，两个循环都不做�
 不要为了"保险"再引入一把进程内的全局锁：它在三进程拓扑下保护不了任何跨进程的东西，只会把同一个
 进程里本可以并行的活动串起来。
 
-## 5. 模块分类（粗分，待步骤 5 核实）
+## 5. 模块分类（已核实）
 
-`src/telegram_kol_research/` 共 240 个 Python 模块。
+`src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见
+`docs/plans/2026-09-06-post-migration-cleanup/step-5-inventory.md`：用 AST 建全包 import 图，
+从 `web_app.py`（它 import 了 `RUNTIME_ROLE_SINGLETON_TASKS` 里全部 loop 函数）、
+`message_processing_worker.py`、`strategy_management_worker.py` 三个根做传递闭包。
+**243 个 `.py` 里有 188 个落在这个在线闭包里。**
 
 **在线主路径（每条消息/每笔交易都可能走到）：**
 
@@ -155,30 +159,57 @@ stall / stale）在 worker 的 `_classify_claim_expiry`，两个循环都不做�
 - 通知与运维：`system_operator_bot.py`、`telegram_bot*.py`、
   `runtime_incident_*.py`、`runtime_deployment_identity.py`
 
-**一次性修复 / 历史迁移候选**（按文件名含
-`repair`/`recovery`/`reconcile`/`terminalization`/`legacy`/`migration`/`backfill`/`alignment`
-粗筛，**尚未核实是否仍在线**，步骤 5 逐个判定）：
+**名字像一次性修复、实际在线的模块。** 下面这些文件名含
+`repair`/`recovery`/`reconcil`/`convergence`/`rescue`/`cleanup`/`remediation`，
+但都在在线闭包里，**不要按名字判断可删**：
 
 ```
-backfill.py                              legacy_backup_reconciliation.py
-backup_stop_repair.py                    legacy_conditional_cancel.py
-batch150_management_terminalization.py   management_history_recovery.py
-context_analysis_backfill.py             native_tpsl_migration.py
-current_protection_backfill.py           position_attribution_repair.py
-entry_admission_reconciler.py            position_management_liveness_recovery.py
-entry_assembly_fingerprint_repair.py     reconcile.py
-entry_protection_ledger_repair.py        recovery_decisions.py
-evidence_backfill.py                     recovery_execution_queue.py
-frozen_exchange_empty_state_alignment.py recovery_live_submit.py
-historical_management_terminalization.py recovery_live_submit_gate.py
-historical_state_repair.py               recovery_order_confirmation.py
-repair_confirmation.py                   recovery_order_confirmations.py
-take_profit_protection_leg_repair.py     recovery_runner.py
-tpsl_ledger_backfill.py                  recovery_scan.py
+break_even_convergence_executor.py       recovery_live_submit.py
+break_even_convergence_planner.py        recovery_live_submit_gate.py
+break_even_convergence_worker.py         recovery_order_confirmation.py
+entry_admission_reconciler.py            recovery_order_confirmations.py
+entry_assembly_fingerprint_repair.py     recovery_runner.py
+entry_protection_ledger_repair.py        recovery_scan.py
+instruction_execution_reconciliation.py  remediation_snapshot.py
+position_reconciliation_observations.py  repair_confirmation.py
+recovery_decisions.py                    strategy_management_composite_reconciliation.py
+recovery_execution_queue.py              strategy_management_reconciliation.py
+terminal_entry_cleanup.py                trigger_protection_rescue_worker.py
+trigger_take_profit_convergence.py       trigger_take_profit_convergence_executor.py
 ```
 
-注意：这批里至少 `reconcile.py`（ingest 单例任务）、`recovery_execution_queue.py`、
-`recovery_live_submit.py`（四条权威命令之一）**确实在线**，名字命中不等于可删。
+**只由 `cli.py` 可达的运维修复工具。** 不在任何角色进程的路径上，由操作者手工按
+`docs/runbook.md` 的 dry-run → apply 流程调用。它们是**常备**工具，不是一次性残留：
+
+```
+backfill.py (sync)                        management_history_recovery.py
+backup_stop_repair.py                     position_attribution_repair.py
+evidence_backfill.py                      position_management_liveness_recovery.py
+historical_attribution_cleanup.py         protection_incident_convergence.py
+                                          tpsl_ledger_backfill.py
+                                          worker_command_reconciliation.py
+```
+
+**一次性修复，已归档。** `one_off/` 子包（步骤 5 建立）：目标数据已处置完毕、文档把工具本身
+标为 evidence-only、代码上零在线引用。`tests/test_one_off_isolation.py` 静态守护它不被
+`cli.py` 以外的任何模块 import。当前只有 `one_off/historical_management_terminalization.py`。
+
+**造好但从未在生产 apply 的一次性工具（`unsure`，仍在包根目录）。** 它们是**在建工作**而不是
+残留，删或移都会丢东西：
+
+```
+batch150_management_terminalization.py   legacy_backup_reconciliation.py
+context_analysis_backfill.py             legacy_conditional_cancel.py
+current_protection_backfill.py           manual_pending_entry_reconciliation.py
+frozen_exchange_empty_state_alignment.py native_tpsl_migration.py
+historical_state_repair.py               position_management_remediation.py
+                                         take_profit_protection_leg_repair.py
+```
+
+**注意 `reconcile.py` 不是 ingest 的单例任务。** `RUNTIME_ROLE_SINGLETON_TASKS["ingest"]` 里那个
+名叫 `"reconcile"` 的任务是 `telegram_live_listener.run_periodic_reconcile`
+（`web_app.py:5214` 创建 `app.state.reconcile_task`）。模块 `reconcile.py` 本身只有一个纯函数
+`build_reconcile_window`，生产代码零引用，只有 `tests/test_reconcile.py` 还 import 它。
 
 ## 6. AI 协作提示
 

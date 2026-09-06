@@ -12,8 +12,9 @@ import pytest
 
 
 SCRIPT_PATH = (
-    Path(__file__).resolve().parents[1]
+    Path(__file__).resolve().parents[2]
     / "scripts"
+    / "archive"
     / "per_chat_phase7_observer.py"
 )
 SPEC = importlib.util.spec_from_file_location("per_chat_phase7_observer", SCRIPT_PATH)

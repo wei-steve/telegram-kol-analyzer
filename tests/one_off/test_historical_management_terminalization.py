@@ -343,7 +343,7 @@ def _complete_exchange_evidence():
 
 def test_build_plan_has_exact_47_action_matrix(tmp_path):
     try:
-        from telegram_kol_research.historical_management_terminalization import (
+        from telegram_kol_research.one_off.historical_management_terminalization import (
             build_terminalization_plan,
         )
     except ImportError as exc:  # expected RED before implementation exists
@@ -387,7 +387,7 @@ def test_build_plan_has_exact_47_action_matrix(tmp_path):
 
 
 def test_plan_refuses_wrong_exact_exchange_instrument(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         HistoricalManagementTerminalizationRefused,
         build_terminalization_plan,
     )
@@ -438,7 +438,7 @@ def _database_digest(path):
 
 
 def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         apply_terminalization_plan,
         build_terminalization_plan,
         rollback_terminalization_plan,
@@ -492,7 +492,7 @@ def test_apply_is_cas_idempotent_and_rollback_restores_exact_rows(tmp_path):
 
 
 def test_apply_refuses_drift_before_any_write(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         HistoricalManagementTerminalizationRefused,
         apply_terminalization_plan,
         build_terminalization_plan,
@@ -529,7 +529,7 @@ def test_apply_refuses_drift_before_any_write(tmp_path):
 
 
 def test_plan_json_round_trip_and_rollback_sql_are_exact(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         apply_terminalization_plan,
         build_terminalization_plan,
         load_terminalization_plan,
@@ -625,7 +625,7 @@ def test_plan_json_round_trip_and_rollback_sql_are_exact(tmp_path):
     ],
 )
 def test_plan_refuses_incomplete_or_changed_external_state(tmp_path, mutate, reason):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         HistoricalManagementTerminalizationRefused,
         build_terminalization_plan,
     )
@@ -676,7 +676,7 @@ def test_plan_refuses_incomplete_or_changed_external_state(tmp_path, mutate, rea
     ],
 )
 def test_plan_refuses_local_target_or_identity_drift(tmp_path, statement, reason):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         HistoricalManagementTerminalizationRefused,
         build_terminalization_plan,
     )
@@ -700,7 +700,7 @@ def test_plan_refuses_local_target_or_identity_drift(tmp_path, statement, reason
 
 
 def test_v2_evidence_directory_normalizes_terminal_sibling(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         load_exchange_evidence_directory,
     )
 
@@ -869,7 +869,7 @@ def test_v2_evidence_directory_normalizes_terminal_sibling(tmp_path):
 
 
 def test_load_fresh_normalized_exchange_evidence_requires_exact_private_hash(tmp_path):
-    from telegram_kol_research.historical_management_terminalization import (
+    from telegram_kol_research.one_off.historical_management_terminalization import (
         HistoricalManagementTerminalizationRefused,
         load_fresh_normalized_exchange_evidence,
     )
