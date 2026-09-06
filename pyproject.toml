@@ -32,6 +32,21 @@ markers = [
 ]
 pythonpath = ["src"]
 testpaths = ["tests"]
+# tests/archive holds retired acceptance tooling kept only for traceability
+# (cleanup step 5); it must not run in the normal suite. Setting this key
+# replaces pytest's default patterns, so they are restated verbatim here.
+norecursedirs = [
+  "*.egg",
+  ".*",
+  "_darcs",
+  "build",
+  "CVS",
+  "dist",
+  "node_modules",
+  "venv",
+  "{arch}",
+  "tests/archive",
+]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

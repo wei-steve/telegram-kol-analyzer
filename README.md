@@ -23,7 +23,7 @@ If your local Python packaging environment is unstable, use the working project
 venv that has been verified during implementation:
 
 ```bash
-source .venv313b/bin/activate
+source .venv/bin/activate
 ```
 
 Run the CLI help:

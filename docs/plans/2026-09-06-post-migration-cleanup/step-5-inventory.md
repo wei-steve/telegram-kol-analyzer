@@ -14,7 +14,7 @@ terminalization / legacy / migration / alignment` 的模块，2026-09-06 实测 
 - `message_processing_worker.py`；
 - `strategy_management_worker.py`。
 
-242 个模块中 **188 个** 落在这个在线闭包里。落在闭包里 = 在线，一律 `keep-online`，不再看其他列。
+全包 243 个 `.py`（240 个业务模块 + 3 个 `__init__.py`）中，**188 个** 落在这个在线闭包里。落在闭包里 = 在线，一律 `keep-online`，不再看其他列。
 
 **「仅 CLI 可达」** — 反向 import 表里只出现 `cli`（或只出现同样仅 CLI 可达的模块）。
 
