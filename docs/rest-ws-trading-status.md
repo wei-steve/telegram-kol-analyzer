@@ -16,7 +16,7 @@ production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipelin
 current_phase: 2
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
 phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by: local_471e9727-d844-4bc3-be94-3eb847719753   # 阶段 2 观察补做会话；phase_status 仍为 in_progress
+claimed_by:                          # 阶段 2 第二次观察仍流量不足，留 in_progress，见证据区
 last_completed_phase: 1
 last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
@@ -325,6 +325,44 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-2/`
   （`deployment.md`、`observation-summary.md`、`observation.jsonl`、
   两份 `exchange-snapshot-window-*.json`）。
+
+- phase-2-observation-2 (2026-09-06, 会话 local_471e9727, **第二次观察仍流量不足，
+  阶段继续留 `in_progress`**):
+  只读观察补做，**未改代码、未部署、未做任何交易所写入**；生产 HEAD 仍是
+  `0371fc9f4fc41c588fab1534f8e33419aef4d6cf`（分支 `live`），三单元 active。
+  窗口 `2026-09-06T16:56:51Z ~ 17:26:59Z`（30 分钟，31 个采样点，每分钟 1 次）。
+  通过项：三单元 31/31 采样点 active、NRestarts 全程 0；ws-health `state` 31/31
+  恒 `healthy`、`open_gap_count` 恒 0、`last_resync_outcome` 恒 `converged`、
+  `connected` 与 `permits_new_entry` 恒 true、`instrument_map_size` 恒 266；
+  `processed=6 / unprocessed=0 / duplicate=0` 无积压。
+  重启 worker 一次（17:05:06Z，PID 2319390→2345403），缺口行 id=14
+  `process_start` 2.738 秒闭合，17:05:26Z 已回 `healthy`，五步耗时
+  953/2/1/818/1 ms，重启期间的空观测没有被写成"零"（事件表前后同为 6 行、
+  仓位数前后同为 1）。窗口内另两条缺口 id=15/16 都是遗留项 (b) 的
+  `silence_timeout` 计划内重连（3.36s / 3.49s），全部闭合。
+  交易所首尾 fingerprint 逐字节一致
+  `283091021fc8391834efb3c2b49c968fd576940d4a8d01b91c3c287a4b79d70b`
+  （`complete=true, position_count=1, open_order_count=0`），**零新增写入**；
+  那一个仓位仍是生产自动交易 15:28:19Z 自己开的，早于本窗口。
+  **未达标项：窗口内真实消息 0 条 / 0 群**（门槛 ≥5 条、尽量 2 群；窗口内最后一条
+  消息 16:42:47Z 早于起点，近 6 小时全局 34 条 / 10 群，ingest 全程 active 且窗口内
+  零 error，属正常安静而非摄入故障）。按 AGENTS.md L2 规则停止而不延长。
+  因此 `duplicate_rate_1h=0.0`、`out_of_order_count_1h=0`、
+  `out_of_order_count_total=0`、`events_last_hour=0` **仍是零流量地板值，不是实测基线**；
+  WS 事件表整窗零新增，真基线仍待首个有真实业务帧的窗口。
+  `unparsed_count` 全程恒为 1、窗口内零新增——该 1 行是 14:56:31Z 的 listen key
+  过期帧（阶段 2 部署前记录），这个字段是累计计数而非窗口计数，后续窗口应按
+  "无新增"而非"等于 0"来判读。
+  **新发现异常**：17:04:07Z 一次 Deepcoin `GET /deepcoin/trade/trigger-orders-pending`
+  返回 `401 Unauthorized`，在既有 `web_app._load_deepcoin_pending_tpsl_orders`
+  里抛 `DeepcoinClientError`。24 小时内仅此一次、未复发；语义正确
+  （该函数置 `evidence_available=False` 并 `continue`，没有把读失败当成"没有挂单"，
+  符合硬性禁止第 4 条）；发生在既有 REST 对账路径而非五步重同步内，当时
+  state 恒 `healthy`。但它是阶段 3 的真实风险信号：WS 唤醒的 REST 核验必须能把
+  偶发 401 记成 unknown/incomplete，绝不能降级成"零"。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-2/`
+  （`observation-2.jsonl`、`observation-2-summary.md`、
+  `exchange-snapshot-obs2-start.json`、`exchange-snapshot-obs2-end.json`）。
 
 - phase-0 (2026-09-06, 设计会话): 提交 `17a662f9` 保存 codex 交接材料 25 个文件并修
   `scripts/deepcoin_*.py` 的 umask 未还原；本文件与
