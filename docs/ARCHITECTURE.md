@@ -66,7 +66,7 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
 两者现在都只有 `queue` 一种行为；生产数据库里遗留的 `inline` / `shadow` 值仍然读得回来——解析器记一条
 warning 后按 `queue` 处理，从不抛错。
 
-`message_lock_mode` 这个设置已经不存在了（`per_chat` 从未在生产启用）。生产数据库的设置行里可能还留着
+`message_lock_mode` 这个设置已经不存在了。删除前生产实际运行在 `per_chat`（2026-09-06 部署前只读核实 API 返回值），删除后 ingest 固定按 chat_id 加锁，行为等价。生产数据库的设置行里可能还留着
 `message_lock_mode` / `message_lock_expected_mode` 两个键，读的时候当作未知键静默忽略，下一次写设置时自然
 消失；`/api/trading-settings` 收到这两个键也不会报错。锁的现状见第 4.5 节。
 

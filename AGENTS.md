@@ -39,22 +39,17 @@
   as the fallback and clearly report the Telegram failure in the final response.
   If both notification methods are unavailable, state that clearly in the final
   response.
-- When the approved phase includes staging or activation, use the explicit
-  helper and exact reviewed manifests below. Stage and activate remain distinct
-  commands and evidence boundaries; neither action enables trading:
-
-```powershell
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
-  -Action stage -ActionManifest .\stage-action.json `
-  -ExpectedCommit <reviewed-40-character-sha>
-
-powershell -ExecutionPolicy Bypass -File .\scripts\server_git_update.ps1 `
-  -Action activate -ActionManifest .\activate-action.json `
-  -ExpectedCommit <candidate-40-character-sha> `
-  -RollbackCommit <control-release-40-character-sha> `
-  -ActivationAuthorization /run/path/to/authorization.json `
-  -ActivationAuthorizationConsumed /run/path/to/authorization.consumed
-```
+- Deployment path (since 2026-09-06, when the deployment gates were retired;
+  see `docs/2026-09-05-codex-handover-closeout.md` section 7): push the exact
+  reviewed commit to `origin/codex/deepcoin-auto-trading-v1` first, then run
+  `/usr/local/bin/tg-deploy <full-40-character-sha>` on the server. It fetches,
+  hard-resets the server checkout (branch `live`) to that SHA, clears bytecode,
+  and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
+  Record the pre-deploy production HEAD as the rollback SHA; rollback is
+  `tg-deploy <that-sha>`. The former stage/activate helper
+  (`scripts/server_git_update.*`, `deploy/telegram-kol-stage|activate`) and
+  `docs/deployment-action-gates.md` describe the retired immutable-release
+  flow; do not use them unless the gates are reinstated.
 
 # Risk-Adaptive Verification
 
