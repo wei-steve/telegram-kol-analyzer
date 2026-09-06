@@ -813,58 +813,18 @@ def test_worker_tick_cancellation_leaves_executing_for_uncertain_sweeper(tmp_pat
     assert swept == executor.WorkerCommandWorkerResult(uncertain=1)
 
 
-@pytest.mark.parametrize("mode", ["inline", "shadow"])
-def test_worker_tick_is_dormant_outside_queue_mode(tmp_path, mode):
-    import telegram_kol_research.worker_command_executor as executor
-    from telegram_kol_research.trading_settings import save_trading_settings
-    from telegram_kol_research.worker_command_jobs import enqueue_worker_command
-
-    session_factory = create_session_factory(tmp_path / f"dormant-{mode}.db")
-    save_trading_settings(session_factory, {"worker_command_mode": mode})
-    enqueue_worker_command(
-        session_factory,
-        command_type="sync_deepcoin_execution",
-        request={},
-        created_at=NOW,
-    )
-
-    result = asyncio.run(
-        executor.run_worker_command_tick(
-            session_factory,
-            dependencies=executor.WorkerCommandDependencies(
-                session_factory=session_factory,
-                deepcoin_client_factory=lambda: pytest.fail(
-                    "client must stay dormant"
-                ),
-                contract_spec_provider="contract-provider",
-                now_provider=lambda: NOW,
-            ),
-            now=NOW,
-        )
-    )
-
-    assert result == executor.WorkerCommandWorkerResult()
-    with session_factory() as session:
-        assert session.query(WorkerCommandJob).one().status == "pending"
-
-
-def test_worker_loop_runs_queue_ticks_and_stops_when_mode_changes(
-    tmp_path, monkeypatch
-):
+def test_worker_loop_runs_queue_ticks_until_cancelled(tmp_path, monkeypatch):
     import telegram_kol_research.worker_command_executor as executor
     from telegram_kol_research.trading_settings import save_trading_settings
 
     session_factory = create_session_factory(tmp_path / "worker-loop.db")
     save_trading_settings(session_factory, {"worker_command_mode": "queue"})
     ticks = []
+    ticked = asyncio.Event()
 
     async def fake_tick(*args, **kwargs):
         ticks.append((args, kwargs))
-        await asyncio.to_thread(
-            save_trading_settings,
-            session_factory,
-            {"worker_command_mode": "inline"},
-        )
+        ticked.set()
         return executor.WorkerCommandWorkerResult()
 
     monkeypatch.setattr(executor, "run_worker_command_tick", fake_tick)
@@ -875,14 +835,21 @@ def test_worker_loop_runs_queue_ticks_and_stops_when_mode_changes(
         now_provider=lambda: NOW,
     )
 
-    asyncio.run(
-        executor.run_worker_command_loop(
-            session_factory,
-            dependencies=dependencies,
-            interval_seconds=0.01,
+    async def scenario():
+        task = asyncio.create_task(
+            executor.run_worker_command_loop(
+                session_factory,
+                dependencies=dependencies,
+                interval_seconds=0.01,
+            )
         )
-    )
+        await asyncio.wait_for(ticked.wait(), timeout=5.0)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
 
-    assert len(ticks) == 1
+    asyncio.run(scenario())
+
+    assert ticks
     assert ticks[0][0] == (session_factory,)
     assert ticks[0][1]["dependencies"] is dependencies

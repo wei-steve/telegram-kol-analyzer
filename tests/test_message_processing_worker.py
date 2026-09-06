@@ -25,6 +25,10 @@ from telegram_kol_research.message_processing_worker import (
     run_message_processing_worker_loop,
     run_message_processing_worker_tick,
 )
+from telegram_kol_research.telegram_live_listener import (
+    EXPIRED_AFTER_SYSTEM_STALL,
+    EXPIRED_STALE_INSTRUCTION,
+)
 from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
@@ -448,11 +452,9 @@ def test_worker_loop_never_exceeds_three_active_chat_lanes(tmp_path):
             assert _claimed_job_count(session_factory) == 3
             assert peak == 3
         finally:
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
             release_all.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -524,13 +526,11 @@ def test_slow_lane_does_not_prevent_two_free_slots_from_refilling(tmp_path):
             assert not release_slow.is_set()
             assert peak == 3
         finally:
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
             release_slow.set()
             release_initial_fast.set()
             release_later.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -585,11 +585,9 @@ def test_worker_loop_reloads_parallel_limit_before_each_refill(tmp_path):
             )
             await asyncio.wait_for(all_started.wait(), timeout=5.0)
         finally:
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
             release_all.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -659,12 +657,10 @@ def test_lowered_limit_stops_new_claims_without_cancelling_inflight(tmp_path):
             await asyncio.wait_for(next_started.wait(), timeout=5.0)
             assert len([chat for chat in started if chat in {4, 5}]) == 1
         finally:
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
             for gate in release.values():
                 gate.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -776,14 +772,11 @@ def test_lowered_limit_prevents_unclaimed_old_slots_from_exceeding_new_cap(
             assert snapshot["active_chat_lanes"] <= 1
             assert peak <= 1
         finally:
-            save_trading_settings(
-                session_factory,
-                {"message_pipeline_mode": "inline"},
-            )
             release_first_claim.set()
             release_pending_claims.set()
             release_processing.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -833,11 +826,9 @@ def test_live_claim_blocks_later_same_chat_job_while_other_chats_progress(tmp_pa
             release_first.set()
             await asyncio.wait_for(second_started.wait(), timeout=5.0)
         finally:
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
             release_first.set()
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
 
     asyncio.run(scenario())
 
@@ -887,10 +878,8 @@ def test_retry_not_due_blocks_later_same_chat_job_while_other_chats_progress(
         )
         try:
             await asyncio.wait_for(other_finished.wait(), timeout=5.0)
-            save_trading_settings(
-                session_factory, {"message_pipeline_mode": "inline"}
-            )
-            await asyncio.wait_for(loop_task, timeout=5.0)
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
         finally:
             if not loop_task.done():
                 loop_task.cancel()
@@ -1368,6 +1357,84 @@ def test_expired_job_is_never_executed(tmp_path):
         job = session.query(MessageProcessingJob).one()
     assert job.status == "expired"
     assert job.last_reason == "expired_stale_instruction"
+
+
+def test_expired_job_records_the_stale_instruction_audit_row(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-stale-audit.db")
+    raw_message_id = _add_job(
+        session_factory,
+        chat_id=1,
+        message_id=1,
+        posted_at=NOW - timedelta(minutes=20),
+    )
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            job_processor=lambda *_args, **_kwargs: pytest.fail("must not execute"),
+            loop_lag_snapshot_provider=lambda: {"last_stall_at": None},
+        )
+    )
+
+    assert result.expired == 1
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+        decision = (
+            session.query(RecognitionDecision)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .one()
+        )
+    assert job.last_reason == EXPIRED_STALE_INSTRUCTION
+    assert decision.automation_reason == "authoritative_gap_recovery_expired"
+    assert decision.automation_status == "skipped"
+
+
+def test_expired_job_is_classified_as_stalled_when_a_stall_overlaps(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-stalled.db")
+    _add_job(
+        session_factory,
+        chat_id=1,
+        message_id=1,
+        posted_at=NOW - timedelta(minutes=20),
+    )
+    stall_at = (NOW - timedelta(minutes=18)).isoformat()
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            job_processor=lambda *_args, **_kwargs: pytest.fail("must not execute"),
+            loop_lag_snapshot_provider=lambda: {"last_stall_at": stall_at},
+        )
+    )
+
+    assert result.expired == 1
+    with session_factory() as session:
+        job = session.query(MessageProcessingJob).one()
+    assert job.last_reason == EXPIRED_AFTER_SYSTEM_STALL
+
+
+def test_job_without_posted_at_is_never_classified_as_expired(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expired-no-posted-at.db")
+    _add_job(session_factory, chat_id=1, message_id=1, posted_at=None)
+    processed = []
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=NOW,
+            job_processor=lambda *_args, **kwargs: asyncio.sleep(
+                0, result=processed.append(kwargs["raw_message_id"])
+            ),
+            loop_lag_snapshot_provider=lambda: {
+                "last_stall_at": (NOW - timedelta(minutes=1)).isoformat()
+            },
+        )
+    )
+
+    assert result.expired == 0
+    assert len(processed) == 1
 
 
 def test_consumer_never_claims_dormant_shadow_rows(tmp_path):

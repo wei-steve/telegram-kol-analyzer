@@ -8,18 +8,19 @@ from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import (
     ExecutionEvent,
     MessageInstructionItem,
+    MessageProcessingJob,
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
     TradeSignal,
 )
+from telegram_kol_research.message_processing_worker import process_message_job
 from telegram_kol_research.message_recognition import MessageRecognitionResult
 from telegram_kol_research.recognition_decisions import (
     RecognitionDecisionRecord,
     save_terminal_authoritative_decision,
 )
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
-from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.telegram_live_listener import (
     _schedule_authoritative_notification,
     persist_live_message_event,
@@ -254,6 +255,41 @@ class _FakeDeletedEvent:
         self.deleted_ids = deleted_ids
 
 
+async def _persist_then_process(**kwargs):
+    """Persist through ingest, then run the worker's post-persist chain.
+
+    The queue pipeline splits what used to be one call: ``ingest`` persists and
+    enqueues, and ``worker`` runs recognition, alerting and notification. Tests
+    that assert on the second half go through this helper so they exercise the
+    same chain the worker runs, with the same arguments.
+    """
+
+    persist_kwargs = {
+        key: kwargs.pop(key)
+        for key in ("event", "session_factory", "broker", "media_root")
+        if key in kwargs
+    }
+    kwargs.pop("ai_recognition_config", None)
+    session_factory = persist_kwargs["session_factory"]
+    event = persist_kwargs["event"]
+    stats = await persist_live_message_event(**persist_kwargs)
+    with session_factory() as session:
+        raw_message_id = (
+            session.query(RawMessage.id)
+            .filter(
+                RawMessage.chat_id == int(event.chat_id),
+                RawMessage.message_id == int(event.message.id),
+            )
+            .scalar()
+        )
+    await process_message_job(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+        **kwargs,
+    )
+    return stats
+
+
 def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
@@ -277,14 +313,13 @@ def test_persist_live_message_event_writes_db_and_broker_event(tmp_path):
     assert broker.published_events[-1]["message_id"] == 42
 
 
-def test_live_intake_requires_authoritative_processor_when_ai_enabled(
-    tmp_path,
-):
+def test_live_intake_makes_no_decision_of_its_own(tmp_path):
+    """Ingest persists and enqueues; nothing downstream of it runs here."""
+
     session_factory = create_session_factory(tmp_path / "authority-required.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     auto_trade_calls: list[int] = []
+    authoritative_calls: list[int] = []
 
     stats = asyncio.run(
         persist_live_message_event(
@@ -293,15 +328,17 @@ def test_live_intake_requires_authoritative_processor_when_ai_enabled(
             broker=broker,
             media_root=tmp_path / "media",
             ai_recognition_config=AiRecognitionConfig(),
-            authoritative_processor=None,
+            authoritative_processor=authoritative_calls.append,
             auto_trade_executor=auto_trade_calls.append,
         )
     )
 
     assert stats["inserted_messages"] == 1
-    assert stats["recognition_status"] == "authoritative_processor_required"
+    assert authoritative_calls == []
     assert auto_trade_calls == []
     with session_factory() as session:
+        assert session.query(MessageProcessingJob).one().status == "pending"
+        assert session.query(RecognitionDecision).count() == 0
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0
         assert session.query(TradeSignal).count() == 0
@@ -440,8 +477,6 @@ def test_live_listener_does_not_target_deletion_without_chat_id(
 
 def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     processed = []
 
@@ -450,7 +485,7 @@ def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
         return {"status": "sent"}
 
     asyncio.run(
-        persist_live_message_event(
+        _persist_then_process(
             event=_FakeEvent(),
             session_factory=session_factory,
             broker=broker,
@@ -472,8 +507,6 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     events: list[str] = []
     reviewer_started = asyncio.Event()
@@ -514,7 +547,7 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
         await semantic_review_blocker.wait()
 
     async def scenario():
-        await persist_live_message_event(
+        await _persist_then_process(
             event=_FakeEvent(),
             session_factory=session_factory,
             broker=broker,
@@ -534,13 +567,11 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
     asyncio.run(scenario())
 
 
-def test_authoritative_live_path_fetches_missing_reply_before_processing(
+def test_live_intake_fetches_a_missing_reply_target_before_enqueueing(
     tmp_path,
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "reply-recovery.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     events: list[str] = []
     event = _FakeEvent("取消上面这单")
@@ -616,7 +647,9 @@ def test_authoritative_live_path_fetches_missing_reply_before_processing(
         )
     )
 
-    assert events == ["fetch_reply", "reply_evidence", "authoritative"]
+    # Ingest recovers the reply target and its evidence before enqueueing;
+    # the authoritative processor itself runs in the worker, not here.
+    assert events == ["fetch_reply", "reply_evidence"]
 
 
 def test_authoritative_live_path_delivers_instruction_summary_once_after_completion(
@@ -624,8 +657,6 @@ def test_authoritative_live_path_delivers_instruction_summary_once_after_complet
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "instruction-summary.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     deliveries: list[dict] = []
 
@@ -674,7 +705,7 @@ def test_authoritative_live_path_delivers_instruction_summary_once_after_complet
         )
 
     asyncio.run(
-        persist_live_message_event(
+        _persist_then_process(
             event=_FakeEvent(),
             session_factory=session_factory,
             broker=broker,
@@ -704,8 +735,6 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     alert_started = asyncio.Event()
     release_alert = asyncio.Event()
@@ -746,7 +775,7 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
         await release_alert.wait()
 
     async def scenario():
-        await persist_live_message_event(
+        await _persist_then_process(
             event=_FakeEvent(),
             session_factory=session_factory,
             broker=broker,
@@ -772,8 +801,6 @@ def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -813,7 +840,7 @@ def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
 
     text = "美光MU 800出头比如810附近还能再吃一次，850和880分批走。"
     asyncio.run(
-        persist_live_message_event(
+        _persist_then_process(
             event=_FakeEvent(text=text),
             session_factory=session_factory,
             broker=broker,
@@ -841,8 +868,6 @@ def test_authoritative_mimo_failure_suppresses_empty_input_noise(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -878,7 +903,7 @@ def test_authoritative_mimo_failure_suppresses_empty_input_noise(
     )
 
     asyncio.run(
-        persist_live_message_event(
+        _persist_then_process(
             event=_FakeEvent(text=""),
             session_factory=session_factory,
             broker=broker,
@@ -906,8 +931,6 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -952,7 +975,7 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
 
     text = "移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情"
     async def scenario():
-        await persist_live_message_event(
+        await _persist_then_process(
             event=_FakeEvent(text=text),
             session_factory=session_factory,
             broker=broker,
@@ -986,8 +1009,6 @@ def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
-    # inline path: scheduled for removal in cleanup step 3
-    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     calls: list[int] = []
     sent: list[dict] = []
@@ -1053,7 +1074,7 @@ def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
         sent.append(kwargs)
 
     async def scenario():
-        await persist_live_message_event(
+        await _persist_then_process(
             event=_FakeEvent(text="移动保本损 剩余30%挂65000全部止盈"),
             session_factory=session_factory,
             broker=broker,

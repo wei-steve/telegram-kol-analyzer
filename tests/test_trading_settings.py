@@ -1,6 +1,7 @@
 from decimal import Decimal
 from datetime import UTC, datetime, timedelta
 import json
+import logging
 import threading
 
 import pytest
@@ -17,6 +18,7 @@ from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.trading_settings import TradingSettings
 from telegram_kol_research.trading_settings import trading_settings_from_payload
 from telegram_kol_research.trading_settings import ENTRY_REVISION_ACTIVATION_KEY
+from telegram_kol_research.trading_settings import TRADING_SETTINGS_KEY
 from telegram_kol_research.models import TradingSetting
 
 
@@ -78,44 +80,68 @@ def test_runtime_pipeline_modes_default_to_queue_when_fields_are_absent(tmp_path
     assert from_empty_payload.worker_command_mode == "queue"
 
 
-def test_runtime_pipeline_modes_keep_explicit_inline_over_the_queue_default(tmp_path):
-    session_factory = create_session_factory(tmp_path / "explicit-inline-modes.db")
+class _CapturingHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
 
-    # inline path: scheduled for removal in cleanup step 3
-    saved = save_trading_settings(
-        session_factory,
-        {"message_pipeline_mode": "inline", "worker_command_mode": "inline"},
-    )
-    reloaded = load_trading_settings(session_factory)
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
 
-    assert saved.message_pipeline_mode == "inline"
-    assert saved.worker_command_mode == "inline"
-    assert reloaded.message_pipeline_mode == "inline"
-    assert reloaded.worker_command_mode == "inline"
+
+@pytest.mark.parametrize("retired", ["inline", "shadow"])
+def test_retired_runtime_modes_are_read_as_queue_without_raising(tmp_path, retired):
+    """A database written before the queue became the only pipeline stays readable."""
+
+    session_factory = create_session_factory(tmp_path / "retired-modes.db")
+    with session_factory() as session:
+        session.add(
+            TradingSetting(
+                key=TRADING_SETTINGS_KEY,
+                value_json=json.dumps(
+                    {
+                        "message_pipeline_mode": retired,
+                        "worker_command_mode": retired,
+                    }
+                ),
+                updated_at=datetime(2026, 9, 1, tzinfo=UTC),
+            )
+        )
+        session.commit()
+
+    handler = _CapturingHandler()
+    module_logger = logging.getLogger(trading_settings_module.__name__)
+    module_logger.addHandler(handler)
+    try:
+        reloaded = load_trading_settings(session_factory)
+    finally:
+        module_logger.removeHandler(handler)
+
+    assert reloaded.message_pipeline_mode == "queue"
+    assert reloaded.worker_command_mode == "queue"
+    assert f"message_pipeline_mode={retired} is retired" in "\n".join(handler.messages)
+    assert f"worker_command_mode={retired} is retired" in "\n".join(handler.messages)
 
     from_payload = trading_settings_from_payload(
-        {"message_pipeline_mode": "inline", "worker_command_mode": "inline"}
+        {"message_pipeline_mode": retired, "worker_command_mode": retired}
     )
 
-    assert from_payload.message_pipeline_mode == "inline"
-    assert from_payload.worker_command_mode == "inline"
+    assert from_payload.message_pipeline_mode == "queue"
+    assert from_payload.worker_command_mode == "queue"
 
 
-@pytest.mark.parametrize("mode", ["inline", "shadow", "queue"])
-def test_worker_command_mode_round_trips_without_changing_message_modes(
-    tmp_path, mode
-):
+def test_worker_command_mode_round_trips_without_changing_message_modes(tmp_path):
     session_factory = create_session_factory(tmp_path / "worker-command-settings.db")
     save_trading_settings(
         session_factory,
         {"message_lock_mode": "global", "message_pipeline_mode": "queue"},
     )
 
-    saved = save_trading_settings(session_factory, {"worker_command_mode": mode})
+    saved = save_trading_settings(session_factory, {"worker_command_mode": "queue"})
     reloaded = load_trading_settings(session_factory)
 
-    assert saved.worker_command_mode == mode
-    assert reloaded.worker_command_mode == mode
+    assert saved.worker_command_mode == "queue"
+    assert reloaded.worker_command_mode == "queue"
     assert reloaded.message_lock_mode == "global"
     assert reloaded.message_pipeline_mode == "queue"
 
@@ -135,7 +161,7 @@ def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_
         {
             "message_lock_mode": "global",
             "message_pipeline_mode": "queue",
-            "worker_command_mode": "shadow",
+            "worker_command_mode": "queue",
         },
     )
 
@@ -148,7 +174,7 @@ def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_
     assert reloaded.semantic_review_enabled is True
     assert reloaded.message_lock_mode == "global"
     assert reloaded.message_pipeline_mode == "queue"
-    assert reloaded.worker_command_mode == "shadow"
+    assert reloaded.worker_command_mode == "queue"
 
 
 @pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
