@@ -72,16 +72,14 @@
   trading protection.
 - **L2 — authority cutover, durable consumer, recovery, or process separation:**
   run focused concurrency/recovery/rollback tests while developing and one full
-  suite on the final code candidate. Observe 30 continuous minutes and at least
-  5 real messages; try to cover 2 chats. If 5 messages do not arrive within the
-  30-minute window, stop rather than extending the observation indefinitely,
-  leave the phase `in_progress`, and record the limited traffic. Exception:
-  when the owner explicitly authorizes an open-ended observation for a phase,
-  run a quiet server-side background monitor that samples every minute and
-  stops itself once one full 30-minute window meets the traffic and health
-  criteria; the session then checks the monitor's result on a timer instead
-  of polling by hand, and the authorization is recorded in that phase's status
-  file. Restart once
+  suite on the final code candidate. The observation target is one continuous
+  30-minute window containing at least 5 real messages, preferably from 2
+  chats. Message traffic is outside anyone's control, so a quiet window is not
+  a failure: run a read-only server-side monitor that samples every minute and
+  stops itself once a full window meets the target with every health check
+  passing, and let the session check its result on a timer rather than sit and
+  poll. Cap the wait at 24 hours; if traffic still never arrives, record that
+  and leave the phase `in_progress`. Restart once
   only when restart recovery or process lifecycle is part of the phase's core
   claim. Check backlog, duplicate processing, and direct exchange history when
   the path can affect execution.
