@@ -675,8 +675,10 @@ def test_deployment_docs_keep_both_workstation_helpers_visible():
     assert "server_git_update.sh activate" in deployment
     assert "server_git_update.sh stage" in handoff
     assert "one-command" in handoff
-    assert '-Action stage' in agents
-    assert '-Action activate' in agents
+    # AGENTS.md documents the current tg-deploy path and names the retired
+    # stage/activate helper only as history (gates retired 2026-09-06).
+    assert "tg-deploy" in agents
+    assert "server_git_update" in agents
 
 
 def test_action_gate_policy_documents_split_helpers_and_legacy_removal():
