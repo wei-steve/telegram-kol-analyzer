@@ -13,12 +13,12 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 1
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-1-ws-inbox.md
-phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by: local_3d228d16-7b51-4871-a635-1f6e9ba64f41
-last_completed_phase: 0
-last_completed_commit: null
+current_phase: 2
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
+phase_status: planned             # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_phase: 1
+last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
 user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
 ```
 
@@ -277,3 +277,37 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   在本会话之前即已存在（断言 AGENTS.md 含 `-Action stage`，而 `408e68c4` 已把
   AGENTS.md 改写为 tg-deploy 路径），与本会话改动无交集。
   遗留：上文第 2 条的止盈收敛全局否决缺陷；该失败测试与 AGENTS.md 的不一致。
+
+- phase-1 (2026-09-06, 会话 local_3d228d16): 提交 `f555ad864855f3f6433258a581c13b04656a0fc9`。
+  worker 内新增常驻私有 WebSocket 采集：`websockets>=16.0` 依赖、
+  `DeepcoinRestClient.acquire_listen_key()`（复用 `_request` 与既有签名）、
+  新表 `deepcoin_ws_events`（原样落帧，`payload_hash` 不加唯一约束）与
+  `deepcoin_ws_connection_gaps`（硬性禁止第 12 条的缺口记录）、
+  新模块 `deepcoin_private_ws.py`（asyncio 客户端、固定 5 秒重连、不可解析帧记
+  `channel='unparsed'` 绝不丢帧、只读 `OS`/`TU`/`PI`/`I` 短键不做长键兜底）、
+  worker 单例任务 + deployment-identity 观察位 + shutdown 序列、
+  localhost-only 只读端点 `GET /api/runtime/deepcoin-ws-health`。
+  缺口记录选用独立小表而非往事件表插行：事件表是阶段 2 要逐行去重解码的原始帧收件箱，
+  生命周期行没有 `raw_payload`/`payload_hash`，混在一起会逼所有后续读取方反复过滤。
+  验证：schema 演练在生产库副本上跑 `init_db`，`quick_check` 前后均 `ok`，
+  五张关键表行数完全不变（339/660/183/197/15125），表数 88→90，
+  516 个既有 sqlite_master 对象逐个比对零变更；
+  focused 31 passed；全量 7459 passed / 4 skipped / **0 failed**
+  （阶段文件提到的既有失败 `test_deployment_docs_keep_both_workstation_helpers_visible`
+  已由 `d3a6a850` 修复，本次全量已无失败）。
+  部署 `tg-deploy f555ad86…`，回滚 SHA `61c3ed43a4dca1db9d71bbdda42c91ec37c42e48`
+  （回滚保留新表不删）；生产 venv `websockets 17.1`。
+  观察 13:45:56Z~14:16:01Z 共 31 个采样点：`connected` 恒为 true、任务恒存活、
+  `unparsed_count=0`、既有任务零 error 零 traceback。
+  事件数 0，按阶段文件记为**流量不足**（窗口内账户 0 仓位 0 挂单），未延长窗口。
+  重启 worker 一次（PID 2280349→2284211）任务重新拉起并在 1 秒内重新订阅。
+  缺口表两行均为 `process_start` 且均已闭合（1.16s / 0.58s），窗口内无非计划断线。
+  交易所零新增写入：前后 fingerprint 完全一致 `e0f66201…`。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-1/`
+  （`schema-rehearsal.md`、`observation-summary.md`、`observation.jsonl`）。
+  遗留：生产 `deployment-identity` 的 `loaded_artifact_verified=false`、
+  全部 capability 标志为 false——因 2026-09-06 退役不可变发布流程后
+  `TELEGRAM_KOL_RELEASE_COMMIT` / `_MANIFEST_SHA256` 两个环境变量不再设置，
+  属本阶段之前既有状态，与本次改动无关；阶段 1 文件的前置条件
+  “返回 `loaded_artifact_verified=true`”已过时，后续阶段文件应改用
+  “worker 各 loop 存活且 authority_evidence 新鲜”作为前置判据。
