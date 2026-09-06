@@ -15,7 +15,7 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 2
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-2-dedup-and-resync.md
-phase_status: claimed             # planned | claimed | in_progress | completed | blocked
+phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
 claimed_by: local_cf4e65e6-a966-4eaf-9de4-fe4486f4496c
 last_completed_phase: 1
 last_completed_commit: f555ad864855f3f6433258a581c13b04656a0fc9
