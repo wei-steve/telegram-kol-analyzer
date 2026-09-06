@@ -10,12 +10,12 @@ brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，
 brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地部署分支；每步完成后由指挥会话本地合并，不 push
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; message_lock_mode=global (per_chat 从未启用)"
-current_step: 1
-current_step_file: docs/plans/2026-09-06-post-migration-cleanup/step-1-workspace-and-docs.md
-step_status: planned          # planned | claimed | in_progress | completed | blocked
+current_step: 2
+current_step_file: docs/plans/2026-09-06-post-migration-cleanup/step-2-defaults-and-dead-code.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
 claimed_by: null
-last_completed_step: 0
-last_completed_commit: null
+last_completed_step: 1
+last_completed_commit: 3f88aafa
 ```
 
 ## 步骤总览
@@ -50,4 +50,6 @@ last_completed_commit: null
 ## 证据记录
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
+
+- step-1 (2026-09-06, local_a288ae52-d04b-43c3-afa6-70eb62636341): 分支 `cleanup/step-1-workspace-and-docs`，提交 4f9ca4c5（归档 385 份 docs/plans）+ 3f88aafa（AGENTS.md 修剪 + 新增 docs/ARCHITECTURE.md）。工作树：仓库内 `.worktrees/` 删除 8 个（干净且相对 origin 无领先提交），`git branch -d` 删除 7 个已合并分支，保留 6 个（chen-management-consistency 领先 13 提交；partial-close-protection 领先 1；context-hold-owner-alert 有 9 项改动；entry-candidate-direction-price-geometry / historical-attribution-cleanup / protection-order-side-semantics 各 1 项未跟踪文件）；`semantic-ai-disagreement-review` 不是本仓库工作树而是独立 git 克隆，未处理。外部工作树（~/.codex/worktrees/*、telegram获取消息-*、/private/tmp/*）按规定只列出未动。虚拟环境：`.venv`（77M，Python 3.12.12，唯一装有 console script 的可用环境）与 `.venv313b`（89M，被 README.md 引用）保留；`.venv313`（26M）与 `.venv313a`（12M）除 .gitignore 外无任何引用且 bin/python 已失效，但它们是主检出目录的未跟踪文件，按硬性禁止条款未删，留待用户决定。文档：docs/plans 441 份 → 保留 56 份、归档 385 份到 docs/archive/plans/（保结构）。AGENTS.md 删除 Runtime Serialization Remediation 整节（其状态文件 current_phase: done）；Runtime Incident AI Agent 一节保留（状态文件仍有 next_phase_after_8r_6a: 8R.6B 与 waiting_for_natural_update）。验证：`pytest tests/test_position_authority_boundary_coverage.py -q` → `7 passed in 0.25s`；`pytest --collect-only -q` → 7462（基线 02e68df7 同为 7462，未减少）。遗留：(1) 删除 Runtime Serialization Remediation 一节同时移走了 AGENTS.md 里“Never run `git add -A` in this repository”这条通用禁令，建议后续步骤把它并入 Project Workflow；(2) `.venv313` / `.venv313a` 待用户裁决；(3) `.worktrees/semantic-ai-disagreement-review` 独立克隆（44M）待用户裁决。
 
