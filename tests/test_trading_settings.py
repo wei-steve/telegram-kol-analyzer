@@ -60,8 +60,8 @@ def test_load_trading_settings_returns_safe_defaults(tmp_path):
     assert settings.deepcoin_contract_specs_mode == "static"
     assert settings.mimo_contract_mode == "v1"
     assert settings.mimo_v2_activation_after_raw_message_id == 0
-    assert settings.message_lock_mode == "global"
     assert settings.worker_command_mode == "queue"
+    assert not hasattr(settings, "message_lock_mode")
     assert settings.semantic_review_enabled is False
     assert not hasattr(settings, "entry_preamble_live_chat_ids")
 
@@ -134,7 +134,7 @@ def test_worker_command_mode_round_trips_without_changing_message_modes(tmp_path
     session_factory = create_session_factory(tmp_path / "worker-command-settings.db")
     save_trading_settings(
         session_factory,
-        {"message_lock_mode": "global", "message_pipeline_mode": "queue"},
+        {"message_pipeline_mode": "queue"},
     )
 
     saved = save_trading_settings(session_factory, {"worker_command_mode": "queue"})
@@ -142,7 +142,6 @@ def test_worker_command_mode_round_trips_without_changing_message_modes(tmp_path
 
     assert saved.worker_command_mode == "queue"
     assert reloaded.worker_command_mode == "queue"
-    assert reloaded.message_lock_mode == "global"
     assert reloaded.message_pipeline_mode == "queue"
 
 
@@ -159,7 +158,6 @@ def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_
     save_trading_settings(
         session_factory,
         {
-            "message_lock_mode": "global",
             "message_pipeline_mode": "queue",
             "worker_command_mode": "queue",
         },
@@ -172,7 +170,6 @@ def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_
 
     assert enabled.semantic_review_enabled is True
     assert reloaded.semantic_review_enabled is True
-    assert reloaded.message_lock_mode == "global"
     assert reloaded.message_pipeline_mode == "queue"
     assert reloaded.worker_command_mode == "queue"
 
@@ -298,22 +295,31 @@ def test_mimo_contract_mode_fails_closed(value):
         trading_settings_from_payload({"mimo_contract_mode": value})
 
 
-@pytest.mark.parametrize("mode", ["global", "per_chat"])
-def test_message_lock_mode_round_trips_and_defaults_to_global(tmp_path, mode):
-    session_factory = create_session_factory(tmp_path / "message-lock-settings.db")
+@pytest.mark.parametrize(
+    "retired_key", ["message_lock_mode", "message_lock_expected_mode"]
+)
+@pytest.mark.parametrize("value", ["global", "per_chat", "nonsense", True, None])
+def test_retired_message_lock_keys_are_ignored_not_rejected(retired_key, value):
+    """Rows written before the lock layer was removed must stay readable."""
 
-    assert load_trading_settings(session_factory).message_lock_mode == "global"
+    settings = trading_settings_from_payload({retired_key: value})
 
-    saved = save_trading_settings(session_factory, {"message_lock_mode": mode})
-
-    assert saved.message_lock_mode == mode
-    assert load_trading_settings(session_factory).message_lock_mode == mode
+    assert not hasattr(settings, "message_lock_mode")
+    assert retired_key not in settings.to_dict()
 
 
-@pytest.mark.parametrize("value", ["shadow", "per-chat", True, [], {}, 1, None])
-def test_message_lock_mode_fails_closed(value):
-    with pytest.raises(ValueError, match="message_lock_mode"):
-        trading_settings_from_payload({"message_lock_mode": value})
+def test_retired_message_lock_key_is_dropped_from_the_persisted_row(tmp_path):
+    session_factory = create_session_factory(tmp_path / "retired-lock-key.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {"message_lock_mode": "per_chat", "message_processing_max_parallel_chats": 3},
+    )
+
+    assert saved.message_processing_max_parallel_chats == 3
+    assert "message_lock_mode" not in saved.to_dict()
+    reloaded = load_trading_settings(session_factory)
+    assert reloaded.message_processing_max_parallel_chats == 3
 
 
 def test_message_parallel_chat_limit_defaults_to_compatibility_twenty(tmp_path):
@@ -349,14 +355,11 @@ def test_message_parallel_chat_limit_rejects_invalid_values(value):
         )
 
 
-def test_unrelated_save_preserves_message_parallel_chat_limit_and_lock_mode(tmp_path):
+def test_unrelated_save_preserves_message_parallel_chat_limit(tmp_path):
     session_factory = create_session_factory(tmp_path / "parallel-chat-preserve.db")
     save_trading_settings(
         session_factory,
-        {
-            "message_lock_mode": "per_chat",
-            "message_processing_max_parallel_chats": 3,
-        },
+        {"message_processing_max_parallel_chats": 3},
     )
 
     saved = save_trading_settings(
@@ -364,10 +367,8 @@ def test_unrelated_save_preserves_message_parallel_chat_limit_and_lock_mode(tmp_
         {"semantic_review_enabled": False},
     )
 
-    assert saved.message_lock_mode == "per_chat"
     assert saved.message_processing_max_parallel_chats == 3
     reloaded = load_trading_settings(session_factory)
-    assert reloaded.message_lock_mode == "per_chat"
     assert reloaded.message_processing_max_parallel_chats == 3
 
 
@@ -381,7 +382,6 @@ def test_unrelated_settings_save_cannot_restore_stale_concurrency_tuple(
     save_trading_settings(
         unrelated_factory,
         {
-            "message_lock_mode": "global",
             "message_processing_max_parallel_chats": 20,
             "default_max_loss_usdt": 20,
         },
@@ -422,9 +422,7 @@ def test_unrelated_settings_save_cannot_restore_stale_concurrency_tuple(
             _transition_concurrency(
                 transition_factory,
                 {
-                    "message_lock_expected_mode": "global",
                     "message_processing_expected_max_parallel_chats": 20,
-                    "message_lock_mode": "per_chat",
                     "message_processing_max_parallel_chats": 3,
                 },
             )
@@ -461,10 +459,7 @@ def test_unrelated_settings_save_cannot_restore_stale_concurrency_tuple(
     assert errors == []
     final = load_trading_settings(transition_factory)
     assert final.default_max_loss_usdt == 25
-    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
-        "per_chat",
-        3,
-    )
+    assert final.message_processing_max_parallel_chats == 3
 
 
 def _transition_concurrency(session_factory, payload):
@@ -475,51 +470,38 @@ def _transition_concurrency(session_factory, payload):
     )
 
 
-def test_concurrency_transition_writes_mode_and_cap_in_one_transaction(tmp_path):
+def test_concurrency_transition_writes_the_cap_in_one_transaction(tmp_path):
     database_path = tmp_path / "atomic-concurrency.db"
     writer_factory = create_session_factory(database_path)
     reader_factory = create_session_factory(database_path)
     save_trading_settings(
         writer_factory,
-        {
-            "message_lock_mode": "global",
-            "message_processing_max_parallel_chats": 20,
-        },
+        {"message_processing_max_parallel_chats": 20},
     )
-    observed: list[tuple[str, int]] = []
+    observed: list[int] = []
     ready = threading.Event()
     stop = threading.Event()
 
     def reader():
         while not stop.is_set():
             settings = load_trading_settings(reader_factory)
-            observed.append(
-                (
-                    settings.message_lock_mode,
-                    settings.message_processing_max_parallel_chats,
-                )
-            )
+            observed.append(settings.message_processing_max_parallel_chats)
             ready.set()
 
     thread = threading.Thread(target=reader)
     thread.start()
     assert ready.wait(timeout=2.0)
     try:
-        expected_mode = "global"
         expected_cap = 20
         for _ in range(10):
-            target_mode = "per_chat" if expected_mode == "global" else "global"
             target_cap = 3 if expected_cap == 20 else 20
             _transition_concurrency(
                 writer_factory,
                 {
-                    "message_lock_expected_mode": expected_mode,
                     "message_processing_expected_max_parallel_chats": expected_cap,
-                    "message_lock_mode": target_mode,
                     "message_processing_max_parallel_chats": target_cap,
                 },
             )
-            expected_mode = target_mode
             expected_cap = target_cap
     finally:
         stop.set()
@@ -527,42 +509,32 @@ def test_concurrency_transition_writes_mode_and_cap_in_one_transaction(tmp_path)
 
     assert not thread.is_alive()
     assert observed
-    assert set(observed) <= {("global", 20), ("per_chat", 3)}
+    assert set(observed) <= {20, 3}
     final = load_trading_settings(reader_factory)
-    assert (
-        final.message_lock_mode,
-        final.message_processing_max_parallel_chats,
-    ) == ("global", 20)
+    assert final.message_processing_max_parallel_chats == 20
 
 
-def test_concurrency_transition_rejects_expected_mode_mismatch_without_write(
-    tmp_path,
-):
-    session_factory = create_session_factory(tmp_path / "expected-mode.db")
+def test_concurrency_transition_ignores_the_retired_lock_keys(tmp_path):
+    """A stale caller still sending the lock keys must not fail the cap swap."""
+
+    session_factory = create_session_factory(tmp_path / "retired-lock-keys.db")
     save_trading_settings(
         session_factory,
+        {"message_processing_max_parallel_chats": 20},
+    )
+
+    saved = _transition_concurrency(
+        session_factory,
         {
-            "message_lock_mode": "global",
-            "message_processing_max_parallel_chats": 20,
+            "message_lock_expected_mode": "global",
+            "message_lock_mode": "per_chat",
+            "message_processing_expected_max_parallel_chats": 20,
+            "message_processing_max_parallel_chats": 3,
         },
     )
 
-    with pytest.raises(ValueError, match="expected message lock mode"):
-        _transition_concurrency(
-            session_factory,
-            {
-                "message_lock_expected_mode": "per_chat",
-                "message_processing_expected_max_parallel_chats": 20,
-                "message_lock_mode": "per_chat",
-                "message_processing_max_parallel_chats": 3,
-            },
-        )
-
-    settings = load_trading_settings(session_factory)
-    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
-        "global",
-        20,
-    )
+    assert saved.message_processing_max_parallel_chats == 3
+    assert "message_lock_mode" not in saved.to_dict()
 
 
 def test_concurrency_transition_rejects_expected_cap_mismatch_without_write(
@@ -571,129 +543,48 @@ def test_concurrency_transition_rejects_expected_cap_mismatch_without_write(
     session_factory = create_session_factory(tmp_path / "expected-cap.db")
     save_trading_settings(
         session_factory,
-        {
-            "message_lock_mode": "global",
-            "message_processing_max_parallel_chats": 20,
-        },
+        {"message_processing_max_parallel_chats": 20},
     )
 
     with pytest.raises(ValueError, match="expected parallel chat limit"):
         _transition_concurrency(
             session_factory,
             {
-                "message_lock_expected_mode": "global",
                 "message_processing_expected_max_parallel_chats": 3,
-                "message_lock_mode": "per_chat",
                 "message_processing_max_parallel_chats": 3,
             },
         )
 
     settings = load_trading_settings(session_factory)
-    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
-        "global",
-        20,
-    )
+    assert settings.message_processing_max_parallel_chats == 20
 
 
-def test_global_to_per_chat_requires_both_target_and_expected_fields(tmp_path):
-    session_factory = create_session_factory(tmp_path / "required-transition.db")
-    complete = {
-        "message_lock_expected_mode": "global",
-        "message_processing_expected_max_parallel_chats": 20,
-        "message_lock_mode": "per_chat",
-        "message_processing_max_parallel_chats": 3,
-    }
-
-    for missing in (
-        "message_processing_max_parallel_chats",
-        "message_lock_expected_mode",
-        "message_processing_expected_max_parallel_chats",
-    ):
-        payload = dict(complete)
-        payload.pop(missing)
-        with pytest.raises(ValueError, match="global to per_chat"):
-            _transition_concurrency(session_factory, payload)
-        settings = load_trading_settings(session_factory)
-        assert (
-            settings.message_lock_mode,
-            settings.message_processing_max_parallel_chats,
-        ) == ("global", 20)
-
-
-@pytest.mark.parametrize(
-    ("expected_field", "expected_value", "target_field"),
-    [
-        ("message_lock_expected_mode", "global", "message_lock_mode"),
-        (
-            "message_processing_expected_max_parallel_chats",
-            20,
-            "message_processing_max_parallel_chats",
-        ),
-    ],
-)
-def test_expected_concurrency_field_requires_matching_target(
-    tmp_path,
-    expected_field,
-    expected_value,
-    target_field,
-):
-    session_factory = create_session_factory(tmp_path / f"unpaired-{target_field}.db")
+def test_expected_cap_requires_the_matching_target_field(tmp_path):
+    session_factory = create_session_factory(tmp_path / "unpaired-cap.db")
 
     with pytest.raises(ValueError, match="requires the matching target field"):
         _transition_concurrency(
             session_factory,
-            {expected_field: expected_value},
+            {"message_processing_expected_max_parallel_chats": 20},
         )
 
 
-def test_global_rollback_can_keep_cap_three(tmp_path):
-    session_factory = create_session_factory(tmp_path / "rollback-keep-cap.db")
-    save_trading_settings(
-        session_factory,
-        {
-            "message_lock_mode": "per_chat",
-            "message_processing_max_parallel_chats": 3,
-        },
-    )
-
-    saved = _transition_concurrency(
-        session_factory,
-        {
-            "message_lock_expected_mode": "per_chat",
-            "message_lock_mode": "global",
-        },
-    )
-
-    assert (saved.message_lock_mode, saved.message_processing_max_parallel_chats) == (
-        "global",
-        3,
-    )
-
-
-def test_fail_closed_rollback_can_set_global_and_cap_one_atomically(tmp_path):
+def test_fail_closed_rollback_can_set_cap_one(tmp_path):
     session_factory = create_session_factory(tmp_path / "rollback-cap-one.db")
     save_trading_settings(
         session_factory,
-        {
-            "message_lock_mode": "per_chat",
-            "message_processing_max_parallel_chats": 3,
-        },
+        {"message_processing_max_parallel_chats": 3},
     )
 
     saved = _transition_concurrency(
         session_factory,
         {
-            "message_lock_expected_mode": "per_chat",
             "message_processing_expected_max_parallel_chats": 3,
-            "message_lock_mode": "global",
             "message_processing_max_parallel_chats": 1,
         },
     )
 
-    assert (saved.message_lock_mode, saved.message_processing_max_parallel_chats) == (
-        "global",
-        1,
-    )
+    assert saved.message_processing_max_parallel_chats == 1
 
 
 def test_authoritative_gap_recovery_max_age_minutes_defaults_and_round_trips(tmp_path):

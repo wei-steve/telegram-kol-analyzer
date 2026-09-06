@@ -207,7 +207,6 @@ def test_recovery_enqueues_expired_candidates_without_executing(tmp_path):
             chat_titles_by_id={9001: "VIP BTC Room"},
             authoritative_processor=processed.append,
             now_provider=lambda: BASE_NOW,
-            loop_lag_snapshot_provider=lambda: {"last_stall_at": None},
         )
     )
 

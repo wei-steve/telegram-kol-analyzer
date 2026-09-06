@@ -7,6 +7,8 @@ import inspect
 import logging
 import threading
 import time
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
@@ -20,11 +22,8 @@ from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, loa
 from telegram_kol_research.contextual_message_window import (
     fetch_missing_reply_target,
 )
+from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.message_lock_provider import (
-    resolve_lock_context,
-    resolve_message_lock_mode,
-)
 from telegram_kol_research.models import (
     MediaAsset,
     MessageProcessingJob,
@@ -46,13 +45,10 @@ from telegram_kol_research.recognition_decisions import (
     claim_authoritative_failure_notification,
     update_recognition_execution_outcome,
 )
-from telegram_kol_research.strategy_alerts import process_strategy_alert_for_record
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.system_operator_bot import (
     deliver_message_instruction_summary_notification,
     deliver_pending_message_instruction_summaries,
-    send_ai_recognition_conflict_review,
-    send_stall_induced_expiry_notification,
     system_operator_bot_enabled,
 )
 from telegram_kol_research.telegram_client import (
@@ -216,24 +212,11 @@ async def _persist_live_message_event_inline(
     session_factory,
     broker,
     media_root: str | Path = "data/media",
-    chat_title: str | None = None,
-    strategy_alert_config: Any | None = None,
-    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
-    strategy_alert_processor=process_strategy_alert_for_record,
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
-    lifecycle_monitor: Any | None = None,
-    auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
-    context_resolution_worker: Callable[[], Any] | None = None,
-    authoritative_failure_retry_delay_seconds: float = (
-        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
-    ),
-    system_operator_bot_config: Any | None = None,
-    notification_bot_config: Any | None = None,
-    system_operator_conflict_sender=send_ai_recognition_conflict_review,
     enqueue_hook: (
         Callable[[list[tuple[int, int]]], Awaitable[None]] | None
     ) = None,
@@ -714,22 +697,22 @@ async def run_live_listener(
     broker,
     target_titles: set[str],
     media_root: str | Path = "data/media",
-    strategy_alert_config: Any | None = None,
-    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
-    lifecycle_monitor: Any | None = None,
-    auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
-    context_resolution_worker: Callable[[], Any] | None = None,
-    system_operator_bot_config: Any | None = None,
-    notification_bot_config: Any | None = None,
-    operation_lock: Any | None = None,
+    operation_lock: KeyedAsyncLockRegistry | None = None,
     source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> None:
-    """Attach Telethon source-message handlers and keep the client alive."""
+    """Attach Telethon source-message handlers and keep the client alive.
+
+    ``operation_lock`` is the ``ingest`` process's
+    :class:`~telegram_kol_research.keyed_async_locks.KeyedAsyncLockRegistry`.
+    Every handler takes only its own chat's lock, so messages from one chat
+    stay in arrival order while unrelated chats proceed concurrently. ``None``
+    means no locking and is a test-only opt-out.
+    """
 
     try:
         from telethon import events
@@ -750,25 +733,16 @@ async def run_live_listener(
             "session_factory": session_factory,
             "broker": broker,
             "media_root": media_root,
-            "chat_title": title,
-            "strategy_alert_config": strategy_alert_config,
-            "strategy_alert_enabled_for_title": strategy_alert_enabled_for_title,
             "ai_recognition_config": ai_recognition_config,
             "ai_recognition_config_path": ai_recognition_config_path,
-            "lifecycle_monitor": lifecycle_monitor,
-            "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
             "reply_evidence_processor": reply_evidence_processor,
             "context_resolution_scheduler": context_resolution_scheduler,
-            "context_resolution_worker": context_resolution_worker,
-            "system_operator_bot_config": system_operator_bot_config,
-            "notification_bot_config": notification_bot_config,
         }
-        lock_cm = resolve_lock_context(operation_lock, chat_id)
-        if lock_cm is None:
+        if operation_lock is None:
             await persist_live_message_event(**persist_kwargs)
         else:
-            async with lock_cm:
+            async with operation_lock.lock(chat_id):
                 await persist_live_message_event(**persist_kwargs)
 
     async def handle_deleted_message(event: Any) -> None:
@@ -802,11 +776,10 @@ async def run_live_listener(
                     )
                 )
 
-        lock_cm = resolve_lock_context(operation_lock, int(chat_id))
-        if lock_cm is None:
+        if operation_lock is None:
             await persist_deletions()
         else:
-            async with lock_cm:
+            async with operation_lock.lock(int(chat_id)):
                 await persist_deletions()
 
     add_event_handler = getattr(client, "add_event_handler", None)
@@ -832,19 +805,12 @@ def launch_live_listener_task(
     broker,
     target_titles: set[str],
     media_root: str | Path,
-    strategy_alert_config: Any | None = None,
-    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
     ai_recognition_config: AiRecognitionConfig | None = None,
     ai_recognition_config_path: str | Path | None = None,
-    lifecycle_monitor: Any | None = None,
-    auto_trade_executor: Callable[[int], Any] | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
     reply_evidence_processor: Callable[[int], Any] | None = None,
     context_resolution_scheduler: Callable[..., int] | None = None,
-    context_resolution_worker: Callable[[], Any] | None = None,
-    system_operator_bot_config: Any | None = None,
-    notification_bot_config: Any | None = None,
-    operation_lock: Any | None = None,
+    operation_lock: KeyedAsyncLockRegistry | None = None,
     source_deletion_recorder: Callable[..., Any] | None = None,
 ) -> asyncio.Task[None]:
     """Schedule the realtime listener in the current event loop."""
@@ -857,18 +823,11 @@ def launch_live_listener_task(
             "broker": broker,
             "target_titles": target_titles,
             "media_root": media_root,
-            "strategy_alert_config": strategy_alert_config,
-            "strategy_alert_enabled_for_title": strategy_alert_enabled_for_title,
             "ai_recognition_config": ai_recognition_config,
             "ai_recognition_config_path": ai_recognition_config_path,
-            "lifecycle_monitor": lifecycle_monitor,
-            "auto_trade_executor": auto_trade_executor,
             "authoritative_processor": authoritative_processor,
             "reply_evidence_processor": reply_evidence_processor,
             "context_resolution_scheduler": context_resolution_scheduler,
-            "context_resolution_worker": context_resolution_worker,
-            "system_operator_bot_config": system_operator_bot_config,
-            "notification_bot_config": notification_bot_config,
             "operation_lock": operation_lock,
             "source_deletion_recorder": source_deletion_recorder,
         },
@@ -970,29 +929,18 @@ async def recover_missing_authoritative_decisions(
     chat_titles_by_id: dict[int, str],
     authoritative_processor: Callable[[int], Any] | None,
     message_limit: int = 50,
-    system_operator_bot_config: Any | None = None,
-    notification_bot_config: Any | None = None,
-    system_operator_conflict_sender=send_ai_recognition_conflict_review,
-    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
-    authoritative_failure_retry_delay_seconds: float = (
-        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
-    ),
-    chat_operation_lock: Callable[[int], Any] | None = None,
-    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
-    expiry_notification_rate_limiter: "StallExpiryNotificationRateLimiter | None" = (
-        None
-    ),
     now_provider: Callable[[], datetime] = utc_now,
 ) -> dict[str, int]:
     """Enqueue messages that still have no authoritative decision row.
 
     Performs **no Telegram network calls** of any kind - ``chat_titles_by_id``
     is supplied entirely by the caller, from local configuration or the
-    database, never from ``discover_dialogs``. Two callers share this one
-    implementation: ``run_reconcile_once`` invokes it as part of its own pass,
-    and :func:`run_authoritative_gap_recovery_loop` runs it on a separate fast
-    cadence, independent of the (slow, Telegram-coupled) periodic reconcile
-    pass.
+    database, never from ``discover_dialogs``. Its only caller is
+    :func:`run_authoritative_gap_recovery_loop`, the ``worker`` role's fast
+    DB-only compensator. The ``ingest`` role's periodic reconcile does not
+    call it: reconcile compares against Telegram history to find messages that
+    were never persisted, this compares against the database to find persisted
+    messages that were never processed.
 
     This function makes no business decision itself. It selects the candidates
     and hands them to ``message_processing_jobs``; the ``worker`` role then
@@ -1159,6 +1107,20 @@ def _persist_history_reconcile_records(
     )
 
 
+@asynccontextmanager
+async def _chat_write_lock(
+    registry: KeyedAsyncLockRegistry | None,
+    chat_id: int,
+) -> AsyncIterator[None]:
+    """Hold ``chat_id``'s lock, or nothing when no registry is wired."""
+
+    if registry is None:
+        yield
+        return
+    async with registry.lock(chat_id):
+        yield
+
+
 async def run_reconcile_once(
     *,
     client: Any,
@@ -1168,32 +1130,27 @@ async def run_reconcile_once(
     media_root: str | Path = "data/media",
     message_limit: int = 50,
     checkpoint_overlap: int = 5,
-    strategy_alert_config: Any | None = None,
-    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
-    strategy_alert_processor=process_strategy_alert_for_record,
     authoritative_processor: Callable[[int], Any] | None = None,
-    system_operator_bot_config: Any | None = None,
     notification_bot_config: Any | None = None,
-    system_operator_conflict_sender=send_ai_recognition_conflict_review,
-    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
-    authoritative_failure_retry_delay_seconds: float = (
-        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
-    ),
     discover_dialogs_fn=discover_dialogs,
     fetch_dialog_messages_fn=fetch_dialog_messages,
-    chat_operation_lock: Callable[[int], Any] | None = None,
-    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
+    chat_operation_lock: KeyedAsyncLockRegistry | None = None,
 ) -> dict[str, int]:
     """Fetch a recent overlap window and persist only messages newer than the history checkpoint.
 
-    ``chat_operation_lock``, when given, is a callable resolving a per-chat
-    lock context manager (``message_lock_mode="per_chat"`` only). It is held
-    around each message's recognition/execution chain individually, never
-    around dialog discovery or the Telegram fetch calls, which is what lets a
-    reconcile pass stop blocking live traffic for its entire duration. In
-    every other mode this stays ``None`` and nothing here changes: the caller,
-    ``run_periodic_reconcile``, wraps the whole function call in the global
-    lock instead, exactly as it did before this parameter existed.
+    This is the ``ingest`` role's compensator against **Telegram**: it replays
+    a small recent history window to find messages the live listener never
+    received, persists them, and enqueues them. Finding *persisted* messages
+    that were never processed is the ``worker`` role's job
+    (:func:`run_authoritative_gap_recovery_loop`), not this one.
+
+    ``chat_operation_lock``, when given, is the ``ingest`` process's
+    :class:`~telegram_kol_research.keyed_async_locks.KeyedAsyncLockRegistry`.
+    Only the per-dialog persist-and-enqueue slice runs under that dialog's own
+    lock, never dialog discovery or the Telegram fetch calls. That keeps a
+    reconcile pass from blocking live traffic for its whole duration while
+    still serializing writes to ``raw_messages`` for one chat against the live
+    handler for that same chat.
     """
 
     await _run_reconcile_database_slice(
@@ -1211,32 +1168,6 @@ async def run_reconcile_once(
     )
     dialogs = await discover_dialogs_fn(client, **discovery_kwargs)
     matched_dialogs = filter_target_dialogs(dialogs, target_titles)
-
-    recovered_messages = 0
-    expired_recovery_messages = 0
-    if authoritative_processor is not None:
-        chat_titles_by_id = {
-            int(dialog["id"]): str(dialog.get("title") or "")
-            for dialog in matched_dialogs
-            if dialog.get("id") is not None
-        }
-        recovery_result = await recover_missing_authoritative_decisions(
-            session_factory,
-            chat_titles_by_id=chat_titles_by_id,
-            authoritative_processor=authoritative_processor,
-            message_limit=message_limit,
-            system_operator_bot_config=system_operator_bot_config,
-            notification_bot_config=notification_bot_config,
-            system_operator_conflict_sender=system_operator_conflict_sender,
-            stall_expiry_notification_sender=stall_expiry_notification_sender,
-            authoritative_failure_retry_delay_seconds=(
-                authoritative_failure_retry_delay_seconds
-            ),
-            chat_operation_lock=chat_operation_lock,
-            loop_lag_snapshot_provider=loop_lag_snapshot_provider,
-        )
-        recovered_messages = recovery_result["recovered_messages"]
-        expired_recovery_messages = recovery_result["expired_recovery_messages"]
 
     history_checkpoints = await _run_reconcile_database_slice(
         _load_history_checkpoint_projection,
@@ -1286,19 +1217,24 @@ async def run_reconcile_once(
         if not records:
             continue
 
-        stats = await _run_reconcile_database_slice(
-            _persist_history_reconcile_records,
-            session_factory,
-            records=records,
-            broker=broker,
-        )
-        inserted_messages += stats["inserted_messages"]
-        inserted_keys = stats.get("inserted_message_keys") or []
-        await _try_enqueue_processing_jobs(
-            session_factory,
-            message_keys=inserted_keys,
-            last_reason="history_reconcile_enqueued",
-        )
+        # Only this slice takes the chat's lock: it is the one place where a
+        # reconcile pass and the live handler for the same chat both write
+        # raw_messages, and raw_messages has no unique key on
+        # (chat_id, message_id) to fall back on.
+        async with _chat_write_lock(chat_operation_lock, dialog_id):
+            stats = await _run_reconcile_database_slice(
+                _persist_history_reconcile_records,
+                session_factory,
+                records=records,
+                broker=broker,
+            )
+            inserted_messages += stats["inserted_messages"]
+            inserted_keys = stats.get("inserted_message_keys") or []
+            await _try_enqueue_processing_jobs(
+                session_factory,
+                message_keys=inserted_keys,
+                last_reason="history_reconcile_enqueued",
+            )
         if authoritative_processor is None:
             logger.error(
                 "history recognition authority unavailable "
@@ -1310,8 +1246,6 @@ async def run_reconcile_once(
         "inserted_messages": inserted_messages,
         "inserted_candidates": inserted_candidates,
         "inserted_trade_ideas": inserted_trade_ideas,
-        "recovered_messages": recovered_messages,
-        "expired_recovery_messages": expired_recovery_messages,
         "recognition_status": recognition_status,
     }
 
@@ -1325,92 +1259,38 @@ async def run_periodic_reconcile(
     media_root: str | Path = "data/media",
     interval_seconds: int = 300,
     message_limit: int = 50,
-    operation_lock: Any | None = None,
-    strategy_alert_config: Any | None = None,
-    strategy_alert_enabled_for_title: Callable[[str], bool] | None = None,
+    operation_lock: KeyedAsyncLockRegistry | None = None,
     authoritative_processor: Callable[[int], Any] | None = None,
-    system_operator_bot_config: Any | None = None,
     notification_bot_config: Any | None = None,
-    authoritative_failure_retry_delay_seconds: float = (
-        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
-    ),
-    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """Periodically replay a small recent history window for missed-message recovery.
 
-    ``operation_lock=None`` and the "global" mode of a
-    :class:`~telegram_kol_research.message_lock_provider.MessageLockProvider`
-    both wrap the *entire* reconcile pass in one lock exactly as before this
-    parameter existed - the reconcile duration, however long, blocks live
-    traffic. Only "per_chat" mode changes shape: no lock is held around the
-    call itself, and ``run_reconcile_once`` instead takes a per-chat lock
-    around each message's own processing chain, so the reconcile pass no
-    longer freezes chats it is not currently touching.
+    This is the ``ingest`` role's ``reconcile`` singleton task. It compares
+    against **Telegram history** and exists for exactly one failure: a message
+    the live listener never received at all. Messages that were persisted but
+    never processed are the ``worker`` role's
+    :func:`run_authoritative_gap_recovery_loop`, on a much faster cadence.
 
-    ``loop_lag_snapshot_provider`` is forwarded to ``run_reconcile_once`` so
-    that if this slow, Telegram-coupled pass is ever the one that observes an
-    expiry (normally the fast ``run_authoritative_gap_recovery_loop`` catches
-    it first), the stall-vs-stale classification is available here too, not
-    only on the fast path.
+    ``operation_lock`` is the ``ingest`` process's
+    :class:`~telegram_kol_research.keyed_async_locks.KeyedAsyncLockRegistry`,
+    handed straight to ``run_reconcile_once``. The pass as a whole holds no
+    lock, so however long a Telegram fetch takes it never blocks live traffic;
+    only the per-chat persist slice serializes against that chat's live
+    handler.
     """
 
     while True:
-        # Off the loop: resolve_message_lock_mode reads trading_settings from
-        # the database, and this runs every iteration of an unconditional
-        # while-loop - exactly the shape the event-loop blocking census
-        # exists to catch.
-        mode = await asyncio.to_thread(resolve_message_lock_mode, operation_lock)
-        if mode == "per_chat":
-            await run_reconcile_once(
-                client=client,
-                session_factory=session_factory,
-                broker=broker,
-                target_titles=target_titles,
-                media_root=media_root,
-                message_limit=message_limit,
-                strategy_alert_config=strategy_alert_config,
-                strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-                authoritative_processor=authoritative_processor,
-                system_operator_bot_config=system_operator_bot_config,
-                notification_bot_config=notification_bot_config,
-                authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                chat_operation_lock=operation_lock,
-                loop_lag_snapshot_provider=loop_lag_snapshot_provider,
-            )
-        elif mode == "none":
-            await run_reconcile_once(
-                client=client,
-                session_factory=session_factory,
-                broker=broker,
-                target_titles=target_titles,
-                media_root=media_root,
-                message_limit=message_limit,
-                strategy_alert_config=strategy_alert_config,
-                strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-                authoritative_processor=authoritative_processor,
-                system_operator_bot_config=system_operator_bot_config,
-                notification_bot_config=notification_bot_config,
-                authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                loop_lag_snapshot_provider=loop_lag_snapshot_provider,
-            )
-        else:
-            lock_cm = await asyncio.to_thread(resolve_lock_context, operation_lock, None)
-            async with lock_cm:
-                await run_reconcile_once(
-                    client=client,
-                    session_factory=session_factory,
-                    broker=broker,
-                    target_titles=target_titles,
-                    media_root=media_root,
-                    message_limit=message_limit,
-                    strategy_alert_config=strategy_alert_config,
-                    strategy_alert_enabled_for_title=strategy_alert_enabled_for_title,
-                    authoritative_processor=authoritative_processor,
-                    system_operator_bot_config=system_operator_bot_config,
-                    notification_bot_config=notification_bot_config,
-                    authoritative_failure_retry_delay_seconds=authoritative_failure_retry_delay_seconds,
-                    loop_lag_snapshot_provider=loop_lag_snapshot_provider,
-                )
+        await run_reconcile_once(
+            client=client,
+            session_factory=session_factory,
+            broker=broker,
+            target_titles=target_titles,
+            media_root=media_root,
+            message_limit=message_limit,
+            authoritative_processor=authoritative_processor,
+            notification_bot_config=notification_bot_config,
+            chat_operation_lock=operation_lock,
+        )
         await asyncio.sleep(interval_seconds)
 
 
@@ -1421,63 +1301,31 @@ async def run_authoritative_gap_recovery_loop(
     chat_titles_by_id_provider: Callable[[], dict[int, str]],
     interval_seconds: float = DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS,
     message_limit: int = 50,
-    operation_lock: Any | None = None,
-    system_operator_bot_config: Any | None = None,
-    notification_bot_config: Any | None = None,
-    system_operator_conflict_sender=send_ai_recognition_conflict_review,
-    stall_expiry_notification_sender=send_stall_induced_expiry_notification,
-    authoritative_failure_retry_delay_seconds: float = (
-        AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS
-    ),
-    loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
 ) -> None:
     """Recover missing authoritative decisions on a fast, network-free cadence.
 
     This loop runs in the ``worker`` role as the ``authoritative_gap_recovery_loop``
-    singleton task. Independent of the slow, Telegram-fetch-coupled periodic
-    reconcile pass in the ``ingest`` role, it resolves
-    ``chat_titles_by_id`` on every tick via ``chat_titles_by_id_provider`` -
-    local configuration or the database, **never** ``discover_dialogs`` - so
-    a stalled or unhealthy Telegram session cannot also block recovery of
-    already-persisted local messages. ``chat_titles_by_id_provider`` is
-    called through ``asyncio.to_thread`` so that even a database-backed
-    provider cannot block the loop; the actual recovery work
-    (:func:`recover_missing_authoritative_decisions`) already offloads its
-    own synchronous work the same way.
+    singleton task and compares against the **database**: it finds messages
+    that were persisted but still have no authoritative decision and enqueues
+    them. Finding messages that were never persisted at all is the ``ingest``
+    role's ``run_periodic_reconcile``, which is the only one of the two that
+    talks to Telegram.
 
-    Lock wiring matches ``run_periodic_reconcile`` exactly, using the same
-    ``resolve_message_lock_mode``/``resolve_lock_context`` helpers rather
-    than inventing a new convention: ``operation_lock=None`` is unlocked
-    (test opt-out only); a plain lock-like object is "global" mode and is
-    held around the *entire* recovery call, exactly like
-    ``run_periodic_reconcile`` wraps ``run_reconcile_once``; a
-    :class:`~telegram_kol_research.message_lock_provider.MessageLockProvider`
-    in "per_chat" mode is instead threaded through as ``chat_operation_lock``
-    so each recovered message's chain takes its own chat's lock - never
-    lock-free when a lock is configured, since this loop invokes the same
-    ``authoritative_processor`` as the live path.
+    It resolves ``chat_titles_by_id`` on every tick via
+    ``chat_titles_by_id_provider`` - local configuration or the database,
+    **never** ``discover_dialogs`` - so a stalled or unhealthy Telegram
+    session cannot also block recovery of already-persisted local messages.
+    ``chat_titles_by_id_provider`` is called through ``asyncio.to_thread`` so
+    that even a database-backed provider cannot block the loop; the actual
+    recovery work (:func:`recover_missing_authoritative_decisions`) already
+    offloads its own synchronous work the same way.
+
+    No lock is taken. This loop only inserts into ``message_processing_jobs``,
+    idempotently, and it runs in the ``worker`` process, which holds neither
+    the Telegram session nor the ``ingest`` process's lock registry. The
+    execution-side mutual exclusion that does matter lives in
+    :mod:`telegram_kol_research.position_authority_lock`.
     """
-
-    async def _run_once(
-        chat_titles_by_id: dict[int, str],
-        *,
-        chat_operation_lock: Callable[[int], Any] | None,
-    ) -> None:
-        await recover_missing_authoritative_decisions(
-            session_factory,
-            chat_titles_by_id=chat_titles_by_id,
-            authoritative_processor=authoritative_processor,
-            message_limit=message_limit,
-            system_operator_bot_config=system_operator_bot_config,
-            notification_bot_config=notification_bot_config,
-            system_operator_conflict_sender=system_operator_conflict_sender,
-            stall_expiry_notification_sender=stall_expiry_notification_sender,
-            authoritative_failure_retry_delay_seconds=(
-                authoritative_failure_retry_delay_seconds
-            ),
-            chat_operation_lock=chat_operation_lock,
-            loop_lag_snapshot_provider=loop_lag_snapshot_provider,
-        )
 
     while True:
         try:
@@ -1490,28 +1338,12 @@ async def run_authoritative_gap_recovery_loop(
                     chat_titles_by_id_provider
                 )
                 if chat_titles_by_id:
-                    mode = await asyncio.to_thread(
-                        resolve_message_lock_mode, operation_lock
+                    await recover_missing_authoritative_decisions(
+                        session_factory,
+                        chat_titles_by_id=chat_titles_by_id,
+                        authoritative_processor=authoritative_processor,
+                        message_limit=message_limit,
                     )
-                    if mode == "per_chat":
-                        await _run_once(
-                            chat_titles_by_id,
-                            chat_operation_lock=operation_lock,
-                        )
-                    elif mode == "none":
-                        await _run_once(
-                            chat_titles_by_id,
-                            chat_operation_lock=None,
-                        )
-                    else:
-                        lock_cm = await asyncio.to_thread(
-                            resolve_lock_context, operation_lock, None
-                        )
-                        async with lock_cm:
-                            await _run_once(
-                                chat_titles_by_id,
-                                chat_operation_lock=None,
-                            )
         except asyncio.CancelledError:
             raise
         except Exception:

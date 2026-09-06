@@ -80,7 +80,6 @@ def test_completed_at_is_not_used_as_processing_overlap_boundary():
 def runtime(
     *,
     elapsed=0.25,
-    lock_mode="per_chat",
     cap=3,
     new_limit=True,
     complete=True,
@@ -88,7 +87,7 @@ def runtime(
     active_lanes=0,
     peak_lanes=0,
 ):
-    state = observer.ExpectedRuntimeState(lock_mode, cap, "queue", "queue")
+    state = observer.ExpectedRuntimeState(cap, "queue", "queue")
     return observer.RuntimeObservation(
         elapsed_seconds=elapsed,
         complete=complete,
@@ -107,7 +106,7 @@ def runtime(
 
 def convergence_tracker():
     return observer.ConvergenceTracker(
-        target=observer.ExpectedRuntimeState("per_chat", 3, "queue", "queue"),
+        target=observer.ExpectedRuntimeState(3, "queue", "queue"),
         expected_pids=observer.AuthorityPids(101, 102, 103),
         required_consecutive=3,
         deadline_seconds=5.0,
@@ -154,13 +153,13 @@ def test_cutover_rejects_invalid_role_evidence():
 
 def test_rollback_confirmation_ignores_prior_acceptance_failure():
     rollback = observer.RollbackConvergenceTracker(
-        target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
+        target=observer.ExpectedRuntimeState(1, "queue", "queue"),
         expected_pids=observer.AuthorityPids(101, 102, 103),
         required_consecutive=1,
     )
 
     result = rollback.observe(
-        runtime(lock_mode="global", cap=1, new_limit=False)
+        runtime(cap=1, new_limit=False)
     )
 
     assert result.passed is True
@@ -168,12 +167,12 @@ def test_rollback_confirmation_ignores_prior_acceptance_failure():
 
 def test_rollback_rejects_invalid_role_evidence():
     rollback = observer.RollbackConvergenceTracker(
-        target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
+        target=observer.ExpectedRuntimeState(1, "queue", "queue"),
         expected_pids=observer.AuthorityPids(101, 102, 103),
         required_consecutive=1,
     )
     sample = observer.replace(
-        runtime(lock_mode="global", cap=1, new_limit=False),
+        runtime(cap=1, new_limit=False),
         role_evidence_valid=False,
     )
 
@@ -185,9 +184,7 @@ def test_rollback_rejects_invalid_role_evidence():
 
 def acceptance_tracker():
     return observer.AcceptanceTracker(
-        expected_state=observer.ExpectedRuntimeState(
-            "per_chat", 3, "queue", "queue"
-        ),
+        expected_state=observer.ExpectedRuntimeState(3, "queue", "queue"),
         expected_pids=observer.AuthorityPids(101, 102, 103),
     )
 
@@ -239,7 +236,7 @@ def database_snapshot(
     claimed_count = sum(row.status == "claimed" for row in jobs)
     pending_count = sum(row.status == "pending" for row in jobs)
     return observer.DatabaseObservation(
-        state=observer.ExpectedRuntimeState("per_chat", 3, "queue", "queue"),
+        state=observer.ExpectedRuntimeState(3, "queue", "queue"),
         semantic_review_enabled=False,
         query_only=1,
         journal_mode="wal",
@@ -292,9 +289,7 @@ def test_same_chat_double_claim_fails_with_scheduler_l2_rollback():
     )
 
     assert result.reason == "same_chat_multiple_claims"
-    assert result.rollback_target == observer.ExpectedRuntimeState(
-        "global", 1, "queue", "queue"
-    )
+    assert result.rollback_target == observer.ExpectedRuntimeState(1, "queue", "queue")
 
 
 def test_two_claimed_chats_establish_cross_chat_progress():
@@ -406,9 +401,7 @@ def test_ingest_anomaly_uses_global_cap_three_rollback():
     )
 
     assert result.reason == "ingest_anomaly"
-    assert result.rollback_target == observer.ExpectedRuntimeState(
-        "global", 3, "queue", "queue"
-    )
+    assert result.rollback_target == observer.ExpectedRuntimeState(3, "queue", "queue")
 
 
 @pytest.mark.parametrize("role", ["ingest", "worker"])
@@ -424,9 +417,7 @@ def test_ingest_and_worker_business_stalls_fail_closed_by_role(role):
 
     assert result.failed is True
     assert result.reason == f"{role}_event_loop_stall_captured_business_blocker"
-    assert result.rollback_target == observer.ExpectedRuntimeState(
-        "global", 1, "queue", "queue"
-    )
+    assert result.rollback_target == observer.ExpectedRuntimeState(1, "queue", "queue")
 
 
 def test_sparse_runtime_sample_preserves_unattributed_worker_stall_failure():
@@ -448,9 +439,7 @@ def test_sparse_runtime_sample_preserves_unattributed_worker_stall_failure():
     assert result.reason == (
         "worker_event_loop_stall_idle_or_post_recovery_selector_capture"
     )
-    assert result.rollback_target == observer.ExpectedRuntimeState(
-        "global", 1, "queue", "queue"
-    )
+    assert result.rollback_target == observer.ExpectedRuntimeState(1, "queue", "queue")
 
 
 def test_web_business_blocker_fails_closed_with_explicit_attribution():
@@ -495,9 +484,7 @@ def test_web_unattributed_stall_fails_closed_without_scheduler_blame(
     assert result.reason == reason
     assert "scheduler" not in result.reason
     assert "worker" not in result.reason
-    assert result.rollback_target == observer.ExpectedRuntimeState(
-        "global", 1, "queue", "queue"
-    )
+    assert result.rollback_target == observer.ExpectedRuntimeState(1, "queue", "queue")
 
 
 def test_loop_stall_count_without_role_attribution_fails_closed_as_incomplete():
@@ -543,7 +530,7 @@ def test_invalid_loop_stall_role_or_attribution_fails_closed(event):
 
 
 def test_tuple_drift_fails_acceptance():
-    drifted = runtime(lock_mode="global", cap=3)
+    drifted = runtime(cap=1)
 
     result = acceptance_tracker().observe(
         acceptance_snapshot(runtime_sample=drifted)
@@ -623,7 +610,6 @@ def create_observer_database(path):
         """
     )
     settings = {
-        "message_lock_mode": "per_chat",
         "message_processing_max_parallel_chats": 3,
         "message_pipeline_mode": "queue",
         "worker_command_mode": "queue",
@@ -676,9 +662,7 @@ def test_database_collector_reads_nonshadow_jobs_and_tuple(tmp_path):
         baseline_job_id=10,
     )
 
-    assert result.state == observer.ExpectedRuntimeState(
-        "per_chat", 3, "queue", "queue"
-    )
+    assert result.state == observer.ExpectedRuntimeState(3, "queue", "queue")
     assert result.query_only == 1
     assert result.total_changes == 0
     assert [row.job_id for row in result.jobs] == [11, 12]
@@ -825,7 +809,6 @@ def test_runtime_collector_reads_three_roles_with_get_reader(tmp_path):
         requested.append((url, timeout_seconds))
         if url.endswith("/api/trading-settings"):
             return {
-                "message_lock_mode": "per_chat",
                 "message_processing_max_parallel_chats": 3,
                 "message_pipeline_mode": "queue",
                 "worker_command_mode": "queue",
@@ -934,7 +917,6 @@ def acceptance_args(
         database_poll_interval=database_poll_interval,
         runtime_poll_interval=runtime_poll_interval,
         guard_counters_file=Path("unused-guards.json"),
-        target_lock_mode="per_chat",
         target_cap=3,
         ingest_pid=101,
         worker_pid=102,
@@ -1375,7 +1357,6 @@ def test_acceptance_orchestration_reports_failure_without_rollback_write():
     assert rows[-1]["kind"] == "acceptance_failed"
     assert rows[-1]["reason"] == "same_chat_multiple_claims"
     assert rows[-1]["rollback_target"] == {
-        "lock_mode": "global",
         "max_parallel_chats": 1,
         "pipeline_mode": "queue",
         "worker_command_mode": "queue",
@@ -1414,13 +1395,13 @@ def test_rollback_orchestration_is_independent_after_acceptance_failure():
     )
     output = io.StringIO()
     rollback_tracker = observer.RollbackConvergenceTracker(
-        target=observer.ExpectedRuntimeState("global", 1, "queue", "queue"),
+        target=observer.ExpectedRuntimeState(1, "queue", "queue"),
         expected_pids=observer.AuthorityPids(101, 102, 103),
         required_consecutive=1,
     )
 
     exit_code = observer.run_rollback_samples(
-        [runtime(lock_mode="global", cap=1, new_limit=False)],
+        [runtime(cap=1, new_limit=False)],
         rollback_tracker,
         output=output,
         now_provider=lambda: "2026-08-26T10:00:00Z",

@@ -90,7 +90,6 @@ from telegram_kol_research.runtime_agent_production_audit import (
     run_bounded_production_audit_command,
 )
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
-from telegram_kol_research.message_lock_provider import MessageLockProvider
 from telegram_kol_research.message_recognition_labels import (
     load_message_recognition_label,
     save_message_recognition_label,
@@ -4992,14 +4991,6 @@ def create_web_app(
                         interval_seconds=(
                             app.state.authoritative_gap_recovery_interval_seconds
                         ),
-                        operation_lock=app.state.message_lock_provider,
-                        system_operator_bot_config=(
-                            app.state.system_operator_bot_config
-                        ),
-                        notification_bot_config=app.state.notification_bot_config,
-                        loop_lag_snapshot_provider=(
-                            app.state.loop_lag_monitor.snapshot
-                        ),
                     )
                 )
                 app.state.authoritative_gap_recovery_loop_task.add_done_callback(
@@ -5213,18 +5204,11 @@ def create_web_app(
                     broker=app.state.live_update_broker,
                     target_titles=app.state.live_target_titles,
                     media_root=app.state.media_root,
-                    strategy_alert_config=app.state.strategy_alert_config,
-                    strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                     ai_recognition_config_path=app.state.ai_recognition_config_path,
-                    lifecycle_monitor=app.state.lifecycle_monitor,
-                    auto_trade_executor=app.state.auto_trade_executor,
                     authoritative_processor=app.state.authoritative_processor,
                     reply_evidence_processor=app.state.reply_evidence_processor,
                     context_resolution_scheduler=app.state.context_resolution_scheduler,
-                    context_resolution_worker=app.state.context_resolution_worker,
-                    system_operator_bot_config=app.state.system_operator_bot_config,
-                    notification_bot_config=app.state.notification_bot_config,
-                    operation_lock=app.state.message_lock_provider,
+                    operation_lock=app.state.message_lock_registry,
                     source_deletion_recorder=app.state.source_deletion_recorder,
                 )
                 app.state.reconcile_task = asyncio.create_task(
@@ -5236,14 +5220,10 @@ def create_web_app(
                         target_titles=app.state.live_target_titles,
                         media_root=app.state.media_root,
                         interval_seconds=app.state.reconcile_interval_seconds,
-                        operation_lock=app.state.message_lock_provider,
-                        strategy_alert_config=app.state.strategy_alert_config,
-                        strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                        operation_lock=app.state.message_lock_registry,
                         authoritative_processor=app.state.authoritative_processor,
-                        system_operator_bot_config=app.state.system_operator_bot_config,
                         notification_bot_config=app.state.notification_bot_config,
                         startup_delay_seconds=app.state.reconcile_startup_delay_seconds,
-                        loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                     )
                 )
             if (
@@ -5864,13 +5844,16 @@ def create_web_app(
     app.state.telegram_client_factory = create_telegram_client
     app.state.reconcile_once_runner = run_reconcile_once
     app.state.telegram_session_lock_factory = acquire_telegram_session_lock
-    app.state.telegram_operation_lock = asyncio.Lock()
+    # The ingest process's only in-process lock: one asyncio.Lock per chat_id,
+    # taken by the live listener handlers and by the per-chat write slice of a
+    # reconcile pass. There is no process-wide lock here, and no lock of any
+    # kind reaches another process; cross-process mutual exclusion is DB state.
     app.state.message_lock_registry = KeyedAsyncLockRegistry()
-    app.state.message_lock_provider = MessageLockProvider(
-        session_factory=app.state.session_factory,
-        global_lock=app.state.telegram_operation_lock,
-        registry=app.state.message_lock_registry,
-    )
+    # Single-flight for the manual /api/refresh reconcile pass only. It is not
+    # a message lock: the live listener never takes it, so holding it cannot
+    # delay a single incoming message. It only stops two overlapping manual
+    # refreshes from doing the same Telegram fetch twice.
+    app.state.refresh_single_flight_lock = asyncio.Lock()
     app.state.asset_version = _static_asset_version()
 
     @app.middleware("http")
@@ -6002,18 +5985,11 @@ def create_web_app(
                 broker=app.state.live_update_broker,
                 target_titles=app.state.live_target_titles,
                 media_root=app.state.media_root,
-                strategy_alert_config=app.state.strategy_alert_config,
-                strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
                 ai_recognition_config_path=app.state.ai_recognition_config_path,
-                lifecycle_monitor=app.state.lifecycle_monitor,
-                auto_trade_executor=app.state.auto_trade_executor,
                 authoritative_processor=app.state.authoritative_processor,
                 reply_evidence_processor=app.state.reply_evidence_processor,
                 context_resolution_scheduler=app.state.context_resolution_scheduler,
-                context_resolution_worker=app.state.context_resolution_worker,
-                system_operator_bot_config=app.state.system_operator_bot_config,
-                notification_bot_config=app.state.notification_bot_config,
-                operation_lock=app.state.message_lock_provider,
+                operation_lock=app.state.message_lock_registry,
                 source_deletion_recorder=app.state.source_deletion_recorder,
             )
         reconcile_task = app.state.reconcile_task
@@ -6027,14 +6003,10 @@ def create_web_app(
                     target_titles=app.state.live_target_titles,
                     media_root=app.state.media_root,
                     interval_seconds=app.state.reconcile_interval_seconds,
-                    operation_lock=app.state.message_lock_provider,
-                    strategy_alert_config=app.state.strategy_alert_config,
-                    strategy_alert_enabled_for_title=app.state.strategy_alert_enabled_for_title,
+                    operation_lock=app.state.message_lock_registry,
                     authoritative_processor=app.state.authoritative_processor,
-                    system_operator_bot_config=app.state.system_operator_bot_config,
                     notification_bot_config=app.state.notification_bot_config,
                     startup_delay_seconds=0,
-                    loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                 )
             )
 
@@ -8313,16 +8285,11 @@ def create_web_app(
         except ValueError as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         concurrency_change = (
-            candidate.message_lock_mode != current.message_lock_mode
-            or candidate.message_processing_max_parallel_chats
+            candidate.message_processing_max_parallel_chats
             != current.message_processing_max_parallel_chats
         )
-        explicit_concurrency_request = concurrency_change or any(
-            key in payload
-            for key in (
-                "message_lock_expected_mode",
-                "message_processing_expected_max_parallel_chats",
-            )
+        explicit_concurrency_request = concurrency_change or (
+            "message_processing_expected_max_parallel_chats" in payload
         )
         if explicit_concurrency_request and app.state.runtime_role == "web":
             return await proxy_ingest_trading_settings_once(
@@ -8340,9 +8307,7 @@ def create_web_app(
         payload_for_local_save = dict(payload)
         if not explicit_concurrency_request:
             for concurrency_key in (
-                "message_lock_mode",
                 "message_processing_max_parallel_chats",
-                "message_lock_expected_mode",
                 "message_processing_expected_max_parallel_chats",
             ):
                 payload_for_local_save.pop(concurrency_key, None)
@@ -8365,40 +8330,42 @@ def create_web_app(
                 != current.mimo_v2_activation_after_raw_message_id
             )
             if mimo_contract_change or explicit_concurrency_request:
-                async with app.state.message_lock_provider.lock_all():
-                    locked_current = load_trading_settings(
-                        app.state.session_factory
+                # No process-local lock is taken here. Neither setting is read
+                # by this process's message path (the worker consumes both),
+                # so an ingest-side lock would have quiesced nothing. The
+                # compare-and-swap that does hold is the BEGIN IMMEDIATE plus
+                # expected-value guard inside the two writers below.
+                locked_current = load_trading_settings(app.state.session_factory)
+                locked_candidate = trading_settings_from_payload(
+                    {**locked_current.to_dict(), **payload_for_local_save}
+                )
+                locked_mimo_change = (
+                    locked_candidate.mimo_contract_mode
+                    != locked_current.mimo_contract_mode
+                    or locked_candidate.mimo_v2_activation_after_raw_message_id
+                    != locked_current.mimo_v2_activation_after_raw_message_id
+                )
+                if locked_mimo_change:
+                    _require_expected_mimo_contract_state(
+                        locked_current,
+                        payload=payload_for_local_save,
                     )
-                    locked_candidate = trading_settings_from_payload(
-                        {**locked_current.to_dict(), **payload_for_local_save}
+                    _validate_mimo_contract_activation(
+                        app.state.session_factory,
+                        payload=payload_for_local_save,
                     )
-                    locked_mimo_change = (
-                        locked_candidate.mimo_contract_mode
-                        != locked_current.mimo_contract_mode
-                        or locked_candidate.mimo_v2_activation_after_raw_message_id
-                        != locked_current.mimo_v2_activation_after_raw_message_id
-                    )
-                    if locked_mimo_change:
-                        _require_expected_mimo_contract_state(
-                            locked_current,
-                            payload=payload_for_local_save,
-                        )
-                        _validate_mimo_contract_activation(
-                            app.state.session_factory,
-                            payload=payload_for_local_save,
-                        )
-                    if explicit_concurrency_request:
-                        response = transition_message_concurrency_settings(
-                            app.state.session_factory,
-                            payload_for_local_save,
-                            updated_at=app.state.now_provider(),
-                        ).to_dict()
-                    else:
-                        response = save_trading_settings(
-                            app.state.session_factory,
-                            payload_for_local_save,
-                            updated_at=app.state.now_provider(),
-                        ).to_dict()
+                if explicit_concurrency_request:
+                    response = transition_message_concurrency_settings(
+                        app.state.session_factory,
+                        payload_for_local_save,
+                        updated_at=app.state.now_provider(),
+                    ).to_dict()
+                else:
+                    response = save_trading_settings(
+                        app.state.session_factory,
+                        payload_for_local_save,
+                        updated_at=app.state.now_provider(),
+                    ).to_dict()
             else:
                 payload_without_unchanged_mimo = dict(payload_for_local_save)
                 payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
@@ -9138,34 +9105,40 @@ def create_web_app(
             raise HTTPException(status_code=503, detail=str(exc)) from exc
 
         async def run_refresh():
-            async with app.state.message_lock_provider.lock_all():
-                await maybe_await(getattr(telegram_client, "connect", lambda: None)())
-                try:
-                    reconcile_kwargs = _filter_callable_kwargs(
-                        app.state.reconcile_once_runner,
-                        {
-                            "client": telegram_client,
-                            "session_factory": app.state.session_factory,
-                            "broker": app.state.live_update_broker,
-                            "target_titles": set(app.state.live_target_titles),
-                            "media_root": app.state.media_root,
-                            "strategy_alert_config": app.state.strategy_alert_config,
-                            "strategy_alert_enabled_for_title": app.state.strategy_alert_enabled_for_title,
-                            "authoritative_processor": app.state.authoritative_processor,
-                            "system_operator_bot_config": app.state.system_operator_bot_config,
-                            "notification_bot_config": app.state.notification_bot_config,
-                        },
-                    )
-                    return await asyncio.wait_for(
-                        app.state.reconcile_once_runner(
-                            **reconcile_kwargs,
-                        ),
-                        timeout=REFRESH_TIMEOUT_SECONDS,
-                    )
-                finally:
-                    disconnect = getattr(telegram_client, "disconnect", None)
-                    if callable(disconnect) and not shared_client:
-                        await maybe_await(disconnect())
+            # The single-flight lock keeps two manual refreshes from
+            # overlapping; it does not touch live traffic. The message
+            # registry is handed down separately, so only the per-chat
+            # persist slice serializes against the live handler for that
+            # same chat - the Telegram fetch itself blocks nothing.
+            async with app.state.refresh_single_flight_lock:
+                return await run_refresh_pass()
+
+        async def run_refresh_pass():
+            await maybe_await(getattr(telegram_client, "connect", lambda: None)())
+            try:
+                reconcile_kwargs = _filter_callable_kwargs(
+                    app.state.reconcile_once_runner,
+                    {
+                        "client": telegram_client,
+                        "session_factory": app.state.session_factory,
+                        "broker": app.state.live_update_broker,
+                        "target_titles": set(app.state.live_target_titles),
+                        "media_root": app.state.media_root,
+                        "authoritative_processor": app.state.authoritative_processor,
+                        "notification_bot_config": app.state.notification_bot_config,
+                        "chat_operation_lock": app.state.message_lock_registry,
+                    },
+                )
+                return await asyncio.wait_for(
+                    app.state.reconcile_once_runner(
+                        **reconcile_kwargs,
+                    ),
+                    timeout=REFRESH_TIMEOUT_SECONDS,
+                )
+            finally:
+                disconnect = getattr(telegram_client, "disconnect", None)
+                if callable(disconnect) and not shared_client:
+                    await maybe_await(disconnect())
 
         try:
             return await run_refresh()

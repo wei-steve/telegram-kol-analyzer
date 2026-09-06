@@ -93,7 +93,6 @@ class TradingSettings:
     instruction_execution_management_after_item_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
     mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
-    message_lock_mode: Literal["global", "per_chat"] = "global"
     message_processing_max_parallel_chats: int = 20
     message_pipeline_mode: Literal["queue"] = "queue"
     worker_command_mode: Literal["queue"] = "queue"
@@ -338,63 +337,45 @@ def save_trading_settings(
     return settings
 
 
+# Retired with the process-local message lock layer. Rows written before the
+# removal still carry these keys; readers ignore them and writers drop them
+# instead of failing.
+_RETIRED_MESSAGE_LOCK_KEYS = ("message_lock_mode", "message_lock_expected_mode")
+
+
 def transition_message_concurrency_settings(
     session_factory: sessionmaker,
     payload: dict[str, Any],
     *,
     updated_at: datetime | None = None,
 ) -> TradingSettings:
-    """Atomically compare and replace the message concurrency tuple."""
+    """Atomically compare and replace the message concurrency setting.
 
-    expected_mode_key = "message_lock_expected_mode"
+    Only ``message_processing_max_parallel_chats`` is left in the tuple: the
+    retired ``message_lock_mode`` key is dropped from ``payload`` without an
+    error so a stale caller cannot fail the whole transition.
+    """
+
     expected_cap_key = "message_processing_expected_max_parallel_chats"
-    target_mode_key = "message_lock_mode"
     target_cap_key = "message_processing_max_parallel_chats"
     with session_factory() as session:
         session.execute(text("BEGIN IMMEDIATE"))
         row, persisted_payload = _settings_row_and_payload_in_session(session)
         current = trading_settings_from_payload(persisted_payload)
 
-        if (
-            current.message_lock_mode == "global"
-            and payload.get(target_mode_key) == "per_chat"
-        ):
-            required = {
-                expected_mode_key,
-                expected_cap_key,
-                target_mode_key,
-                target_cap_key,
-            }
-            if not required.issubset(payload):
-                raise ValueError(
-                    "global to per_chat requires both target and expected fields"
-                )
-
-        for expected_key, target_key in (
-            (expected_mode_key, target_mode_key),
-            (expected_cap_key, target_cap_key),
-        ):
-            if expected_key in payload and target_key not in payload:
-                raise ValueError(
-                    f"{expected_key} requires the matching target field {target_key}"
-                )
+        if expected_cap_key in payload and target_cap_key not in payload:
+            raise ValueError(
+                f"{expected_cap_key} requires the matching target field "
+                f"{target_cap_key}"
+            )
 
         candidate_payload = dict(payload)
-        candidate_payload.pop(expected_mode_key, None)
         candidate_payload.pop(expected_cap_key, None)
+        for retired_key in _RETIRED_MESSAGE_LOCK_KEYS:
+            candidate_payload.pop(retired_key, None)
         candidate = trading_settings_from_payload(
             {**current.to_dict(), **candidate_payload}
         )
-        if target_mode_key in payload:
-            if expected_mode_key not in payload:
-                raise ValueError(
-                    "message lock changes require the expected message lock mode"
-                )
-            expected_mode = _message_lock_mode(payload[expected_mode_key])
-            if expected_mode != current.message_lock_mode:
-                raise TradingSettingsConcurrencyConflict(
-                    "expected message lock mode does not match persisted settings"
-                )
         if target_cap_key in payload:
             if expected_cap_key not in payload:
                 raise ValueError(
@@ -559,9 +540,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
     mimo_contract_mode = _mimo_contract_mode(
         raw.get("mimo_contract_mode", defaults.mimo_contract_mode)
     )
-    message_lock_mode = _message_lock_mode(
-        raw.get("message_lock_mode", defaults.message_lock_mode)
-    )
     message_processing_max_parallel_chats = _bounded_int_setting(
         raw.get(
             "message_processing_max_parallel_chats",
@@ -628,7 +606,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         mimo_v2_activation_after_raw_message_id=(
             mimo_v2_activation_after_raw_message_id
         ),
-        message_lock_mode=message_lock_mode,
         message_processing_max_parallel_chats=(
             message_processing_max_parallel_chats
         ),
@@ -798,15 +775,6 @@ def _mimo_contract_mode(
     normalized = value.strip().lower()
     if normalized not in {"v1", "v2_live_adapter"}:
         raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
-    return normalized
-
-
-def _message_lock_mode(value: Any) -> Literal["global", "per_chat"]:
-    if not isinstance(value, str):
-        raise ValueError("message_lock_mode must be global or per_chat")
-    normalized = value.strip().lower()
-    if normalized not in {"global", "per_chat"}:
-        raise ValueError("message_lock_mode must be global or per_chat")
     return normalized
 
 

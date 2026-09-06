@@ -6065,17 +6065,8 @@ def alerts(
                         broker=broker,
                         target_titles=target_titles,
                         media_root=media_root,
-                        strategy_alert_config=alert_config,
-                        strategy_alert_enabled_for_title=lambda title: any(
-                            group.enabled
-                            and group.ai_strategy_enabled
-                            and group.chat_title == title
-                            for group in group_config.groups
-                        ),
                         ai_recognition_config_path=ai_recognition_config_path,
                         authoritative_processor=authoritative_processor,
-                        system_operator_bot_config=system_operator_bot_config,
-                        notification_bot_config=notification_bot_config,
                     )
                 )
             finally:

@@ -4,8 +4,10 @@ Message ordering only needs to be preserved *within* a chat, so a single
 process-wide ``asyncio.Lock`` across every chat is stricter than required.
 This registry creates one lock per key on first use, so unrelated keys can
 proceed concurrently while same-key work stays serialized, in arrival order.
-It backs ``message_lock_mode="per_chat"`` in
-:mod:`telegram_kol_research.message_lock_provider`.
+It is the ``ingest`` process's only message lock: the live listener handlers
+and the per-chat write slice of a reconcile pass both take ``lock(chat_id)``.
+It is process-local, so it never provides mutual exclusion against the
+``worker`` or ``web`` processes.
 
 ``lock_all()`` is an admission barrier rather than a snapshot of known keys:
 once a cross-key caller announces intent, new per-key callers wait until it has

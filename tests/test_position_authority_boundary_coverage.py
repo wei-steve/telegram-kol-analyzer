@@ -9,7 +9,8 @@ position/protection state is already serialized by `position_authority_lock()`
 
 Phase 2's own Task 1 found this false: two live call chains wrote
 exchange/position state under a different lock, or under no lock at all. That
-is why `message_lock_mode` defaulted to, and stayed at, "global". Phase 2f
+is why the message lock stayed process-wide for as long as it existed at all.
+Phase 2f
 (docs/plans/2026-08-18-runtime-serialization-remediation/phase-2f-close-
 position-authority-coverage-gaps.md) closed both gaps: `recovery_live_submit.
 _submit_recovery_signal_direct` now also holds `position_authority_lock` (in
@@ -26,9 +27,9 @@ This test encodes that finding as a regression guard, mirroring how
 tests/test_runtime_event_loop_blocking_census.py holds an explicit allowlist:
 if a covered leaf loses its lock, that is a signal worth catching rather than
 a green suite silently drifting out of sync with the documented finding.
-`message_lock_mode` still stays "global" in production - closing this gap
-makes per-chat sharding's prerequisite true, it does not itself enable
-per-chat sharding, which remains a separate, explicit decision.
+The message-lock setting itself is gone (cleanup step 4): the ingest process
+now always shards per chat, and this boundary is what makes that safe. The
+guard below is unchanged and still the thing that has to keep holding.
 """
 
 from __future__ import annotations
@@ -105,9 +106,11 @@ def test_no_known_uncovered_leaves_remain():
 
     assert KNOWN_UNCOVERED_LEAVES == [], (
         "KNOWN_UNCOVERED_LEAVES is no longer empty - a new position-authority "
-        "coverage gap was recorded. Re-run the Task 1 trace, do not enable "
-        "message_lock_mode=per_chat, and update docs/runtime-serialization-"
-        "remediation-status.md before treating this as routine."
+        "coverage gap was recorded. Re-run the Task 1 trace and update "
+        "docs/runtime-serialization-remediation-status.md before treating "
+        "this as routine; ingest shards per chat unconditionally now, so this "
+        "boundary is the only thing standing between two chats and the same "
+        "position."
     )
 
 
@@ -117,14 +120,12 @@ def test_per_chat_sharding_prerequisite_gap_is_closed():
     Per the phase file: "if any exchange mutation path reachable from two
     different chats concurrently is not covered by position_authority_lock,
     do not enable per-chat sharding in this phase... record the gap, and
-    stop." Both gaps Phase 2 recorded are now closed (Phase 2f). This makes
-    the PREREQUISITE for message_lock_mode=per_chat true - it does NOT
-    enable per_chat itself. message_lock_mode must stay "global" in
-    production until a separate, explicit session decision re-verifies this
-    boundary end to end and turns the flag on deliberately.
+    stop." Both gaps Phase 2 recorded are now closed (Phase 2f), which is
+    what made per-chat sharding safe to adopt unconditionally in cleanup
+    step 4.
     """
 
     assert KNOWN_UNCOVERED_LEAVES == [], (
-        "The decision gate is not met: KNOWN_UNCOVERED_LEAVES is non-empty. "
-        "Do not enable message_lock_mode=per_chat."
+        "The decision gate is not met: KNOWN_UNCOVERED_LEAVES is non-empty, "
+        "while ingest already shards message handling per chat."
     )

@@ -57,7 +57,6 @@ class SameChatEvaluation:
 
 @dataclass(frozen=True)
 class ExpectedRuntimeState:
-    lock_mode: str
     max_parallel_chats: int
     pipeline_mode: str
     worker_command_mode: str
@@ -237,7 +236,6 @@ def collect_database_observation(
             raise ValueError("global trading settings row is missing")
         settings = json.loads(settings_row["value_json"])
         state = ExpectedRuntimeState(
-            lock_mode=str(settings["message_lock_mode"]),
             max_parallel_chats=int(
                 settings["message_processing_max_parallel_chats"]
             ),
@@ -406,7 +404,6 @@ def read_json_url(url: str, *, timeout_seconds: float) -> dict[str, object]:
 
 def _state_from_settings(payload: dict[str, object]) -> ExpectedRuntimeState:
     return ExpectedRuntimeState(
-        lock_mode=str(payload["message_lock_mode"]),
         max_parallel_chats=int(payload["message_processing_max_parallel_chats"]),
         pipeline_mode=str(payload["message_pipeline_mode"]),
         worker_command_mode=str(payload["worker_command_mode"]),
@@ -807,9 +804,7 @@ class AcceptanceTracker:
             passed=False,
             failed=True,
             reason=reason,
-            rollback_target=ExpectedRuntimeState(
-                "global", cap, "queue", "queue"
-            ),
+            rollback_target=ExpectedRuntimeState(cap, "queue", "queue"),
         )
         return self._failure
 
@@ -1056,9 +1051,6 @@ def _add_common_observation_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--web-pid", type=int, required=True)
     parser.add_argument("--poll-interval", type=float, default=0.25)
     parser.add_argument("--http-timeout", type=float, default=1.0)
-    parser.add_argument(
-        "--target-lock-mode", choices=("global", "per_chat"), required=True
-    )
     parser.add_argument("--target-cap", type=int, required=True)
 
 
@@ -1137,7 +1129,6 @@ def _expected_pids_from_args(args: argparse.Namespace) -> AuthorityPids:
 
 def _target_from_args(args: argparse.Namespace) -> ExpectedRuntimeState:
     return ExpectedRuntimeState(
-        args.target_lock_mode,
         args.target_cap,
         "queue",
         "queue",
