@@ -268,7 +268,7 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - phase-2-open-observer-started (2026-09-06, 会话 local_a6d6d24f, **只读**): 按上一条的用户授权启动服务器端开放式监视器。
   只读核实：生产 HEAD `0371fc9f`（分支 `live`）、三单元 active/NRestarts=0、ws-health `healthy` / `open_gap_count=0`。
   本阶段要求的那一次 worker 重启：`2026-09-06T17:58:05Z`（MainPID 2345403→2362557），缺口行 id=20 `process_start`
-  2.427 秒闭合，五步重同步 931/3/0/813/1 ms `converged`，`17:58:11Z` 回 `healthy`。**合格窗口必须整段落在该重启之后。**
+  2.427 秒闭合，五步重同步 931/3/0/813/0 ms `converged`，`17:58:11Z` 回 `healthy`。**合格窗口必须整段落在该重启之后。**
   起点 fingerprint `283091021fc8391834efb3c2b49c968fd576940d4a8d01b91c3c287a4b79d70b`
   （`complete=true, position_count=1, open_order_count=0`，与前两次观察逐字节一致）存于
   `rest-ws-phase-2/exchange-snapshot-open-start.json`。
