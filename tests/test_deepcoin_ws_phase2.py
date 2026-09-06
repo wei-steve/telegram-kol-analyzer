@@ -1063,3 +1063,84 @@ def test_unparsed_frames_never_corrupt_the_entity_view(tmp_path):
     assert tracker.entity_count() == 0
     assert tracker.unidentified_count == 1
     assert len(_rows(session_factory)) == 1, "an unusable frame is still kept"
+
+
+# --------------------------------------------------------------------------
+# The listen-key expiry notice, as the exchange actually sends it
+# --------------------------------------------------------------------------
+
+# Captured verbatim from production on 2026-09-06 at 14:56:31Z, exactly sixty
+# minutes after that stream subscribed. The key is a hard hour, not a sliding
+# window, and the exchange says so before closing the socket.
+LISTEN_KEY_EXPIRED_FRAME = (
+    '{"code":"50118","event":"error","msg":"listen key expired, connection closing"}'
+)
+
+
+def test_a_control_frame_is_classified_apart_from_an_undecodable_one():
+    from telegram_kol_research.deepcoin_private_ws import CONTROL_CHANNEL
+
+    control = decode_ws_frame(
+        LISTEN_KEY_EXPIRED_FRAME, received_at=NOW, received_ms=NOW_MS
+    )
+    garbage = decode_ws_frame("not json", received_at=NOW, received_ms=NOW_MS)
+
+    assert len(control) == 1
+    assert control[0]["channel"] == CONTROL_CHANNEL
+    assert control[0]["action"] == "error"
+    assert control[0]["raw_payload"] == LISTEN_KEY_EXPIRED_FRAME
+    assert garbage[0]["channel"] == "unparsed"
+
+
+def test_the_expiry_notice_is_recognised_by_code_not_by_wording():
+    from telegram_kol_research.deepcoin_private_ws import (
+        is_listen_key_expiry_notice,
+    )
+
+    assert is_listen_key_expiry_notice(LISTEN_KEY_EXPIRED_FRAME) is True
+    assert is_listen_key_expiry_notice('{"code":"50118","event":"error"}') is True
+    assert (
+        is_listen_key_expiry_notice(
+            '{"event":"error","msg":"Listen Key Expired, closing"}'
+        )
+        is True
+    )
+    assert is_listen_key_expiry_notice('{"event":"error","msg":"rate limited"}') is False
+    assert is_listen_key_expiry_notice(recorded_frames()[0]["raw"]) is False
+    assert is_listen_key_expiry_notice("not json") is False
+
+
+def test_the_expiry_notice_is_persisted_before_it_triggers_the_reconnect(tmp_path):
+    session_factory = create_session_factory(tmp_path / "ws.db")
+    first = _ScriptedConnection([LISTEN_KEY_EXPIRED_FRAME])
+    inbox = _offline_inbox(
+        session_factory, connections=[first, _ScriptedConnection([])]
+    )
+
+    async def _sleep(_seconds):
+        raise asyncio.CancelledError
+
+    inbox._sleep = _sleep
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(inbox.run_forever())
+
+    rows = _rows(session_factory)
+    assert [row.raw_payload for row in rows] == [LISTEN_KEY_EXPIRED_FRAME], (
+        "the notice is evidence and must be kept, not consumed"
+    )
+
+    from telegram_kol_research.models import DeepcoinWsConnectionGap
+
+    with session_factory() as session:
+        reasons = [
+            gap.reason
+            for gap in session.execute(
+                select(DeepcoinWsConnectionGap).order_by(DeepcoinWsConnectionGap.id)
+            ).scalars()
+        ]
+    assert reasons == ["process_start", "listen_key_renewal"]
+    # A planned rotation, so no failure escalation.
+    assert inbox.state_machine.consecutive_failures == 0
+    assert inbox.state_machine.state == WS_STATE_DISCONNECTED
+    assert inbox.permits_new_entry()[0] is False

@@ -80,17 +80,32 @@ DEEPCOIN_WS_SUBSCRIBE_TIMEOUT_SECONDS = 15.0
 # every later phase read "no orders" when it means "no idea".
 DEEPCOIN_WS_SILENCE_TIMEOUT_SECONDS = 600.0
 
-# Deepcoin documents the listen key as a sliding hour but publishes no renewal
-# endpoint, and this program does not invent request paths. "Renewal" is
-# therefore implemented as a planned reconnect with a freshly acquired key well
-# before the hour is up. A failed acquisition is handled exactly like a
+# Deepcoin publishes no listen-key renewal endpoint, and this program does not
+# invent request paths. "Renewal" is therefore a planned reconnect with a
+# freshly acquired key. A failed acquisition is handled exactly like a
 # disconnect: gap recorded, backoff, acquire again.
+#
+# Measured in production on 2026-09-06: the key is a hard sixty minutes, not a
+# sliding window. A stream subscribed at 13:56:25Z received
+# ``{"code":"50118","event":"error","msg":"listen key expired, connection
+# closing"}`` at 14:56:31Z and the socket closed. Forty-five minutes leaves a
+# fifteen-minute margin for a slow acquisition or a slow resync.
 DEEPCOIN_WS_LISTEN_KEY_TTL_SECONDS = 2700.0
+
+# The control-frame code the exchange sends just before it closes an expired
+# stream. Observed in production; matched on the code rather than the message
+# text so that a wording change does not silently disable the early reconnect.
+DEEPCOIN_WS_LISTEN_KEY_EXPIRED_CODE = "50118"
 
 DEEPCOIN_WS_BACKOFF_BASE_SECONDS = 1.0
 DEEPCOIN_WS_BACKOFF_CAP_SECONDS = 60.0
 
 UNPARSED_CHANNEL = "unparsed"
+# Frames the exchange sends about the connection itself rather than about an
+# order, trade or position. They are decoded as their own channel so that
+# ``unparsed`` keeps its one meaning -- "a frame shape the decoder does not
+# recognise" -- and stays usable as a decoder-defect signal.
+CONTROL_CHANNEL = "control"
 UNKNOWN_ACTION = "unknown"
 
 PROCESSED_STATE_UNPROCESSED = "unprocessed"
@@ -217,6 +232,22 @@ def decode_ws_frame(
 
     action = _short_text(payload, "action", limit=64) or UNKNOWN_ACTION
     result = payload.get("result")
+    if result is None and "event" in payload:
+        # e.g. {"code":"50118","event":"error","msg":"listen key expired, ..."}
+        # Stored whole like every other frame; only its classification differs.
+        return [
+            {
+                **base,
+                "channel": CONTROL_CHANNEL,
+                "action": (_short_text(payload, "event", limit=64) or UNKNOWN_ACTION),
+                "order_sys_id": None,
+                "trade_unit_id": None,
+                "position_id": None,
+                "instrument_raw": None,
+                "exchange_time_ms": None,
+                "exchange_time_source": None,
+            }
+        ]
     # A single-object ``result`` is a shape the recorded experiment actually
     # observed; treating it as a one-item list is a shape fix, not a filter.
     if isinstance(result, dict):
@@ -249,6 +280,27 @@ def decode_ws_frame(
             }
         )
     return rows or _unparsed()
+
+
+def is_listen_key_expiry_notice(raw_payload: str) -> bool:
+    """Does this frame say the exchange is about to close an expired stream?
+
+    The exchange announces the expiry before dropping the socket. Acting on the
+    announcement reconnects immediately instead of waiting for a read to fail,
+    which is the difference between a gap of milliseconds and a gap of seconds.
+    """
+
+    try:
+        payload = json.loads(raw_payload)
+    except (TypeError, ValueError):
+        return False
+    if not isinstance(payload, dict):
+        return False
+    if str(payload.get("code") or "").strip() == DEEPCOIN_WS_LISTEN_KEY_EXPIRED_CODE:
+        return True
+    if str(payload.get("event") or "").strip().lower() != "error":
+        return False
+    return "listen key expired" in str(payload.get("msg") or "").lower()
 
 
 def _dedup_key(row: dict[str, Any]) -> tuple[str, str, int | None]:
@@ -645,6 +697,7 @@ def build_deepcoin_ws_health(
         "counts_by_channel": counts_by_channel,
         "counts_by_processed_state": counts_by_processed_state,
         "unparsed_count": counts_by_channel.get(UNPARSED_CHANNEL, 0),
+        "control_count": counts_by_channel.get(CONTROL_CHANNEL, 0),
         "open_gap_count": open_gaps,
         "gap_count": total_gaps,
         "instrument_map_size": int(getattr(inbox, "instrument_map_size", 0) or 0),
@@ -1027,6 +1080,13 @@ class DeepcoinPrivateWsInbox:
                 received_at,
                 received_ms,
             )
+            if is_listen_key_expiry_notice(raw_payload):
+                # Persist first, then act: the notice is evidence too.
+                logger.info(
+                    "Deepcoin private WS listen key expired; reconnecting with a "
+                    "fresh key"
+                )
+                raise DeepcoinWsListenKeyExpiring()
 
     def _persist_frame(
         self,
