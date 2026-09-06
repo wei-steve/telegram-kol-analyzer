@@ -7,6 +7,7 @@ from typing import Optional
 from uuid import uuid4
 
 from sqlalchemy import (
+    BigInteger,
     Boolean,
     CheckConstraint,
     DateTime,
@@ -4339,3 +4340,121 @@ class StrategyLifecycle(Base):
 
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
+
+
+class DeepcoinWsEvent(Base):
+    """Write-only inbox of raw Deepcoin private WebSocket frames.
+
+    Phase 1 of the REST+WebSocket program. Every frame received is persisted
+    verbatim: no de-duplication, no filtering, no merging, no normalisation.
+    ``instrument_raw`` keeps the exchange's own contract spelling (``ETHUSDT``),
+    which differs from the REST spelling (``ETH-USDT-SWAP``); reconciling the
+    two is phase 2's job, not this table's.
+
+    One frame carrying N result rows produces N rows here, all sharing the same
+    ``raw_payload`` and ``payload_hash`` so frame boundaries stay recoverable.
+    There is deliberately no unique constraint on ``payload_hash``: real pushes
+    repeat, and the repeat rate is data phase 2 needs.
+
+    Nothing reads this table in phase 1 except the write path itself and the
+    localhost-only health endpoint.
+    """
+
+    __tablename__ = "deepcoin_ws_events"
+    __table_args__ = (
+        Index("ix_deepcoin_ws_events_channel_received_ms", "channel", "received_ms"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="deepcoin",
+        server_default=sql_text("'deepcoin'"),
+    )
+    channel: Mapped[str] = mapped_column(String(32), nullable=False)
+    action: Mapped[str] = mapped_column(String(64), nullable=False)
+    order_sys_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    trade_unit_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    position_id: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    instrument_raw: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    exchange_time_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    exchange_time_source: Mapped[Optional[str]] = mapped_column(
+        String(8), nullable=True
+    )
+    received_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    received_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    raw_payload: Mapped[str] = mapped_column(Text, nullable=False)
+    payload_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    processed_state: Mapped[str] = mapped_column(
+        String(32),
+        nullable=False,
+        default="unprocessed",
+        server_default=sql_text("'unprocessed'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class DeepcoinWsConnectionGap(Base):
+    """One row per interval in which the private stream was not delivering.
+
+    Required by hard rule 12 of ``docs/rest-ws-trading-status.md``: a
+    disconnect, a network outage, or a process restart must leave an auditable
+    record of when delivery stopped, when it resumed, and the last inbox
+    watermark seen before the gap. A gap row never means "no orders" or "no
+    positions" -- it means the stream is unknown for that interval.
+
+    Kept separate from ``deepcoin_ws_events`` on purpose: that table is the raw
+    frame inbox that phase 2 de-duplicates and decodes row by row, and lifecycle
+    rows have no frame, no ``raw_payload`` and no ``payload_hash``. Mixing them
+    in would force every later reader to filter them back out.
+
+    ``detail`` holds an exception *type* name only. Exception text can embed the
+    stream URL, which carries the listen key, so it is never stored.
+    """
+
+    __tablename__ = "deepcoin_ws_connection_gaps"
+    __table_args__ = (
+        Index(
+            "ix_deepcoin_ws_connection_gaps_open",
+            "reconnected_at",
+            "disconnected_ms",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="deepcoin",
+        server_default=sql_text("'deepcoin'"),
+    )
+    reason: Mapped[str] = mapped_column(String(64), nullable=False)
+    detail: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    disconnected_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    disconnected_ms: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    reconnected_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    reconnected_ms: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    last_event_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    last_event_received_ms: Mapped[Optional[int]] = mapped_column(
+        BigInteger, nullable=True
+    )
+    events_persisted_before_gap: Mapped[int] = mapped_column(
+        BigInteger,
+        nullable=False,
+        default=0,
+        server_default=sql_text("'0'"),
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )

@@ -40,6 +40,7 @@ DEEPCOIN_ACCOUNT_POSITIONS_PATH = "/deepcoin/account/positions"
 DEEPCOIN_ACCOUNT_POSITIONS_HISTORY_PATH = "/deepcoin/account/positions-history"
 DEEPCOIN_MARKET_INSTRUMENTS_PATH = "/deepcoin/market/instruments"
 DEEPCOIN_MARKET_TICKERS_PATH = "/deepcoin/market/tickers"
+DEEPCOIN_LISTENKEY_ACQUIRE_PATH = "/deepcoin/listenkey/acquire"
 
 
 class DeepcoinClientError(RuntimeError):
@@ -156,6 +157,9 @@ class DeepcoinTradingClientProtocol(Protocol):
 
     def list_swap_instruments(self) -> list[dict[str, Any]]:
         """Return raw SWAP product information for contract-spec validation."""
+
+    def acquire_listen_key(self) -> str:
+        """Return one private WebSocket listen key. The value is a credential."""
 
 
 def load_deepcoin_credentials(
@@ -635,6 +639,42 @@ class DeepcoinRestClient:
             "GET", f"{DEEPCOIN_MARKET_INSTRUMENTS_PATH}?instType=SWAP"
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_MARKET_INSTRUMENTS_PATH)
+
+    def acquire_listen_key(self) -> str:
+        """Return one private WebSocket listen key.
+
+        The returned value is a credential: it authenticates the private stream
+        on its own. Never log it, never persist it, and never include it (or the
+        stream URL built from it) in exception text or evidence files.
+
+        Deepcoin returns ``data`` either as an object or as a single-element
+        list; both shapes carry ``listenkey``.
+
+        Phase 2 hook: the key slides on a one-hour window, so a renewal /
+        rotation loop belongs here. Phase 1 acquires it once per connection
+        attempt and does not renew.
+        """
+
+        payload = self._request("GET", DEEPCOIN_LISTENKEY_ACQUIRE_PATH)
+        data = payload.get("data")
+        if isinstance(data, list):
+            if len(data) != 1:
+                raise DeepcoinClientError(
+                    "invalid listenkey response schema: "
+                    f"{DEEPCOIN_LISTENKEY_ACQUIRE_PATH}"
+                )
+            data = data[0]
+        if not isinstance(data, dict):
+            raise DeepcoinClientError(
+                f"invalid listenkey response schema: {DEEPCOIN_LISTENKEY_ACQUIRE_PATH}"
+            )
+        listen_key = str(data.get("listenkey") or "").strip()
+        if not listen_key:
+            # Deliberately does not echo the response body: it holds the key.
+            raise DeepcoinClientError(
+                f"listenkey missing from response: {DEEPCOIN_LISTENKEY_ACQUIRE_PATH}"
+            )
+        return listen_key
 
     def _request(
         self,

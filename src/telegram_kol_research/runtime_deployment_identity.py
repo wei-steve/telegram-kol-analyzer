@@ -440,6 +440,9 @@ def build_runtime_deployment_identity(
             "ingest_reconcile": _task_running(tasks.get("reconcile")),
             "worker_command": _task_running(tasks.get("worker_command_worker")),
             "message_processing": message_processing_running,
+            # Observation only. The private WebSocket inbox holds no authority,
+            # so it must never feed the capability flags below.
+            "deepcoin_private_ws": _task_running(tasks.get("deepcoin_private_ws")),
         },
         "capabilities": {
             "global_exchange_authority": worker_owner,

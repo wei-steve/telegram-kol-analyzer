@@ -280,6 +280,7 @@ def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
         "authoritative_gap_recovery_loop",
         "break_even_convergence_worker",
         "contract_spec_refresh",
+        "deepcoin_private_ws",
         "deepcoin_reconcile",
         "lifecycle_monitor",
         "message_operation_supervisor",
@@ -318,6 +319,7 @@ def test_non_worker_lifespans_do_not_start_worker_singletons(role, tmp_path):
         assert app.state.lifecycle_monitor_task is None
         assert app.state.authoritative_gap_recovery_loop_task is None
         assert app.state.deepcoin_reconcile_task is None
+        assert app.state.deepcoin_private_ws_task is None
         assert app.state.strategy_management_worker_task is None
         assert app.state.break_even_convergence_worker_task is None
         assert app.state.source_message_deletion_worker_task is None

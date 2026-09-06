@@ -72,6 +72,10 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
 )
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_private_ws import (
+    build_deepcoin_ws_health,
+    run_deepcoin_private_ws_loop,
+)
 from telegram_kol_research.execution_boundary import (
     ExecutionBoundaryTracker,
     TrackedDeepcoinClient,
@@ -363,6 +367,7 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "authoritative_gap_recovery_loop",
             "break_even_convergence_worker",
             "contract_spec_refresh",
+            "deepcoin_private_ws",
             "deepcoin_reconcile",
             "lifecycle_monitor",
             "message_operation_supervisor",
@@ -425,6 +430,7 @@ def build_runtime_deployment_identity_for_app(app: FastAPI) -> dict[str, Any]:
             "strategy_management_worker": app.state.strategy_management_worker_task,
             "break_even_convergence_worker": app.state.break_even_convergence_worker_task,
             "deepcoin_reconcile": app.state.deepcoin_reconcile_task,
+            "deepcoin_private_ws": app.state.deepcoin_private_ws_task,
             "lifecycle_monitor": app.state.lifecycle_monitor_task,
             "message_processing_worker": app.state.message_processing_worker_task,
             "worker_command_worker": app.state.worker_command_worker_task,
@@ -948,6 +954,15 @@ def _log_background_task_result(task_name: str):
             logger.exception("Background task %s exited with error", task_name, exc_info=exc)
 
     return _callback
+
+
+def _set_deepcoin_private_ws_inbox(app: FastAPI):
+    """Return a sink that publishes the live inbox for the health endpoint."""
+
+    def _sink(inbox) -> None:
+        app.state.deepcoin_private_ws_inbox = inbox
+
+    return _sink
 
 
 def _build_semantic_review_notifier(app: FastAPI):
@@ -4824,6 +4839,7 @@ def create_web_app(
     ai_recognition_config_path: str | Path | None = None,
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
+    deepcoin_private_ws_runner=None,
     strategy_management_worker_runner=None,
     entry_revision_risk_reduction_executor=None,
     strategy_management_worker_interval_seconds: float = 5.0,
@@ -4997,6 +5013,23 @@ def create_web_app(
                     _log_background_task_result(
                         "authoritative_gap_recovery_loop_task"
                     )
+                )
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "deepcoin_private_ws"
+                )
+                and app.state.deepcoin_private_ws_task is None
+            ):
+                app.state.deepcoin_private_ws_task = asyncio.create_task(
+                    app.state.deepcoin_private_ws_runner(
+                        session_factory=app.state.session_factory,
+                        deepcoin_client_factory=app.state.deepcoin_client_factory,
+                        inbox_sink=_set_deepcoin_private_ws_inbox(app),
+                        now_provider=app.state.now_provider,
+                    )
+                )
+                app.state.deepcoin_private_ws_task.add_done_callback(
+                    _log_background_task_result("deepcoin_private_ws_task")
                 )
             if runtime_role_starts_singleton_task(
                 app.state.runtime_role, "deepcoin_reconcile"
@@ -5415,6 +5448,17 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.source_message_deletion_worker_task = None
+            deepcoin_private_ws_task = app.state.deepcoin_private_ws_task
+            if deepcoin_private_ws_task is not None:
+                deepcoin_private_ws_task.cancel()
+                try:
+                    await deepcoin_private_ws_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.deepcoin_private_ws_task = None
+                app.state.deepcoin_private_ws_inbox = None
             deepcoin_reconcile_task = app.state.deepcoin_reconcile_task
             if deepcoin_reconcile_task is not None:
                 deepcoin_reconcile_task.cancel()
@@ -5825,6 +5869,11 @@ def create_web_app(
     )
     app.state.authoritative_gap_recovery_loop_task = None
     app.state.deepcoin_reconcile_task = None
+    app.state.deepcoin_private_ws_task = None
+    app.state.deepcoin_private_ws_inbox = None
+    app.state.deepcoin_private_ws_runner = (
+        deepcoin_private_ws_runner or run_deepcoin_private_ws_loop
+    )
     app.state.lifecycle_monitor = None
     app.state.lifecycle_monitor_http = None
     app.state.lifecycle_monitor_task = None
@@ -6224,6 +6273,20 @@ def create_web_app(
             "stuck_after_seconds": stuck_after_seconds,
             "now": now.isoformat(),
         }
+
+    @app.get("/api/runtime/deepcoin-ws-health")
+    def api_runtime_deepcoin_ws_health(request: Request):
+        client_host = request.client.host if request.client is not None else ""
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+        return build_deepcoin_ws_health(
+            session_factory=app.state.session_factory,
+            inbox=app.state.deepcoin_private_ws_inbox,
+            now=app.state.now_provider(),
+        )
 
     @app.get("/api/runtime-agent/read-only-exchange-snapshot")
     def api_runtime_agent_read_only_exchange_snapshot(request: Request):
