@@ -2,13 +2,12 @@ import asyncio
 
 from fastapi.testclient import TestClient
 
-from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.web_app import create_web_app
 
 
 def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
-    calls: list[tuple[object, set[str], str]] = []
-    reconcile_calls: list[tuple[object, set[str], str, int]] = []
+    calls: list[tuple[object, set[str], str, object]] = []
+    reconcile_calls: list[tuple[object, set[str], str, int, object]] = []
     fake_client = object()
 
     async def fake_live_listener_runner(
@@ -18,20 +17,10 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         broker,
         target_titles,
         media_root,
-        strategy_alert_config=None,
-        strategy_alert_enabled_for_title=None,
-        system_operator_bot_config=None,
-        notification_bot_config=None,
+        operation_lock=None,
     ):
         calls.append(
-            (
-                client,
-                set(target_titles),
-                str(media_root),
-                strategy_alert_config,
-                system_operator_bot_config,
-                notification_bot_config,
-            )
+            (client, set(target_titles), str(media_root), operation_lock)
         )
 
     async def fake_reconcile_runner(
@@ -43,10 +32,16 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         media_root,
         interval_seconds,
         operation_lock=None,
-        strategy_alert_config=None,
-        strategy_alert_enabled_for_title=None,
     ):
-        reconcile_calls.append((client, set(target_titles), str(media_root), interval_seconds))
+        reconcile_calls.append(
+            (
+                client,
+                set(target_titles),
+                str(media_root),
+                interval_seconds,
+                operation_lock,
+            )
+        )
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -56,32 +51,28 @@ def test_web_app_starts_live_listener_when_targets_are_configured(tmp_path):
         reconcile_startup_delay_seconds=0,
         telegram_client=fake_client,
     )
-    app.state.strategy_alert_config = object()
-    app.state.system_operator_bot_config = SystemOperatorBotConfig(
-        bot_token="system-token",
-        chat_id="system-chat",
-    )
-    app.state.notification_bot_config = SystemOperatorBotConfig(
-        bot_token="notification-token",
-        chat_id="system-chat",
-    )
 
     with TestClient(app) as client:
         response = client.get("/")
 
     assert response.status_code == 200
+    # Both ingest tasks get the one process-local registry, and nothing else.
     assert calls == [
         (
             fake_client,
             {"Demo Group"},
             str((tmp_path / "media").resolve()),
-            app.state.strategy_alert_config,
-            app.state.system_operator_bot_config,
-            app.state.notification_bot_config,
+            app.state.message_lock_registry,
         )
     ]
     assert reconcile_calls == [
-        (fake_client, {"Demo Group"}, str((tmp_path / "media").resolve()), 300)
+        (
+            fake_client,
+            {"Demo Group"},
+            str((tmp_path / "media").resolve()),
+            300,
+            app.state.message_lock_registry,
+        )
     ]
 
 

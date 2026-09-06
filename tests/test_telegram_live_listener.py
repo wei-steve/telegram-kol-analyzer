@@ -1,9 +1,11 @@
 import asyncio
+import inspect
 from datetime import UTC, datetime
 from types import SimpleNamespace
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.models import (
     ExecutionEvent,
@@ -318,8 +320,12 @@ def test_live_intake_makes_no_decision_of_its_own(tmp_path):
 
     session_factory = create_session_factory(tmp_path / "authority-required.db")
     broker = LiveUpdateBroker()
-    auto_trade_calls: list[int] = []
     authoritative_calls: list[int] = []
+
+    # The ingest persist path has no execution parameter left to pass.
+    signature = inspect.signature(persist_live_message_event)
+    assert "auto_trade_executor" not in signature.parameters
+    assert "strategy_alert_processor" not in signature.parameters
 
     stats = asyncio.run(
         persist_live_message_event(
@@ -329,13 +335,11 @@ def test_live_intake_makes_no_decision_of_its_own(tmp_path):
             media_root=tmp_path / "media",
             ai_recognition_config=AiRecognitionConfig(),
             authoritative_processor=authoritative_calls.append,
-            auto_trade_executor=auto_trade_calls.append,
         )
     )
 
     assert stats["inserted_messages"] == 1
     assert authoritative_calls == []
-    assert auto_trade_calls == []
     with session_factory() as session:
         assert session.query(MessageProcessingJob).one().status == "pending"
         assert session.query(RecognitionDecision).count() == 0
@@ -396,7 +400,7 @@ def test_live_listener_registers_and_records_each_deleted_message(tmp_path):
     assert all(item["telegram_event"]["deleted_ids"] == [7, 8] for item in recorded)
 
 
-def test_live_listener_deletion_waits_for_operation_lock(tmp_path):
+def test_live_listener_deletion_waits_for_its_own_chat_lock(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         session.add(
@@ -412,28 +416,37 @@ def test_live_listener_deletion_waits_for_operation_lock(tmp_path):
     recorded = []
 
     async def scenario():
-        operation_lock = asyncio.Lock()
+        registry = KeyedAsyncLockRegistry()
         await run_live_listener(
             client=client,
             session_factory=session_factory,
             broker=None,
             target_titles={"VIP"},
             source_deletion_recorder=lambda _factory, **kwargs: recorded.append(kwargs),
-            operation_lock=operation_lock,
+            operation_lock=registry,
         )
         deleted_handler = next(
             handler
             for handler, event_filter in client.handlers
             if type(event_filter).__name__ == "MessageDeleted"
         )
-        await operation_lock.acquire()
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_chat_123():
+            async with registry.lock(123):
+                holder_entered.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_chat_123())
+        await holder_entered.wait()
         task = asyncio.create_task(
             deleted_handler(_FakeDeletedEvent(chat_id=123, deleted_ids=[7]))
         )
         await asyncio.sleep(0)
         assert recorded == []
-        operation_lock.release()
-        await task
+        release_holder.set()
+        await asyncio.wait_for(asyncio.gather(holder, task), timeout=5.0)
 
     asyncio.run(scenario())
     assert [item["message_id"] for item in recorded] == [7]

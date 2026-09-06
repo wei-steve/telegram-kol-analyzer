@@ -204,7 +204,6 @@ def test_expired_message_is_enqueued_without_being_executed_or_recorded(tmp_path
             chat_titles_by_id={9001: "VIP BTC Room"},
             authoritative_processor=processed.append,
             now_provider=lambda: BASE_NOW,
-            loop_lag_snapshot_provider=lambda: {"last_stall_at": None},
         )
     )
 
@@ -231,17 +230,46 @@ def test_rate_limiter_allows_a_second_notification_after_the_window():
     assert limiter.should_notify() is True
 
 
-# ── 5. run_reconcile_once enqueues both kinds of candidate ──
+# ── 5. this loop, not run_reconcile_once, owns the database-side gap ──
 
 
-def test_run_reconcile_once_enqueues_recoverable_and_expired_candidates(tmp_path):
-    session_factory = create_session_factory(tmp_path / "reconcile.db")
+def test_this_loop_enqueues_recoverable_and_expired_candidates(tmp_path):
+    session_factory = create_session_factory(tmp_path / "gap-both-kinds.db")
     recoverable_id = _add_raw_message(
         session_factory,
         message_id=1,
         posted_at=utc_now(),
     )
     expired_id = _add_raw_message(
+        session_factory,
+        message_id=2,
+        posted_at=datetime(2026, 4, 10, 9, 0),
+    )
+
+    processed: list[int] = []
+
+    asyncio.run(
+        recover_missing_authoritative_decisions(
+            session_factory,
+            chat_titles_by_id={9001: "VIP BTC Room"},
+            authoritative_processor=processed.append,
+        )
+    )
+
+    assert processed == []
+    jobs = _jobs(session_factory)
+    assert [job.raw_message_id for job in jobs] == [recoverable_id, expired_id]
+    assert {job.last_reason for job in jobs} == {"recovery_enqueued"}
+    with session_factory() as session:
+        assert session.query(RecognitionDecision).count() == 0
+
+
+def test_run_reconcile_once_no_longer_duplicates_this_loop(tmp_path):
+    """The ingest reconcile pass must not re-do the worker's database sweep."""
+
+    session_factory = create_session_factory(tmp_path / "reconcile.db")
+    _add_raw_message(session_factory, message_id=1, posted_at=utc_now())
+    _add_raw_message(
         session_factory,
         message_id=2,
         posted_at=datetime(2026, 4, 10, 9, 0),
@@ -263,8 +291,5 @@ def test_run_reconcile_once_enqueues_recoverable_and_expired_candidates(tmp_path
 
     assert processed == []
     assert result["recognition_status"] == "queued"
-    jobs = _jobs(session_factory)
-    assert [job.raw_message_id for job in jobs] == [recoverable_id, expired_id]
-    assert {job.last_reason for job in jobs} == {"recovery_enqueued"}
-    with session_factory() as session:
-        assert session.query(RecognitionDecision).count() == 0
+    assert "recovered_messages" not in result
+    assert _jobs(session_factory) == []

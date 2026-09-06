@@ -759,14 +759,11 @@ def test_authoritative_gap_recovery_loop_lifespan_starts_and_is_cancelled(tmp_pa
         assert calls[0]["session_factory"] is app.state.session_factory
         assert calls[0]["authoritative_processor"] is app.state.authoritative_processor
         assert calls[0]["interval_seconds"] == 7
-        assert calls[0]["operation_lock"] is app.state.message_lock_provider
-        assert calls[0]["system_operator_bot_config"] is (
-            app.state.system_operator_bot_config
-        )
-        assert calls[0]["notification_bot_config"] is app.state.notification_bot_config
-        assert calls[0]["loop_lag_snapshot_provider"] == (
-            app.state.loop_lag_monitor.snapshot
-        )
+        # The worker's DB-only compensator takes no lock and needs no bot
+        # configuration: it inserts queue rows and nothing else.
+        assert "operation_lock" not in calls[0]
+        assert "system_operator_bot_config" not in calls[0]
+        assert "notification_bot_config" not in calls[0]
         assert callable(calls[0]["chat_titles_by_id_provider"])
         assert app.state.authoritative_gap_recovery_loop_task is not None
 
@@ -962,9 +959,12 @@ def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
     tmp_path,
 ):
     now = datetime(2026, 8, 20, 12, 0, tzinfo=UTC)
+    # The "web" role starts no singleton tasks, so the seeded pending job
+    # cannot be claimed out from under the assertion by a worker loop.
     app = create_web_app(
         database_path=tmp_path / "research.db",
         now_provider=lambda: now,
+        runtime_role="web",
     )
     with app.state.session_factory() as session:
         raw_messages = [
@@ -1886,7 +1886,7 @@ def test_worker_command_mode_api_round_trips_without_changing_message_modes(
     app = create_web_app(database_path=tmp_path / "research.db")
     save_trading_settings(
         app.state.session_factory,
-        {"message_lock_mode": "global", "message_pipeline_mode": "queue"},
+        {"message_pipeline_mode": "queue"},
     )
     client = TestClient(app)
 
@@ -1898,7 +1898,6 @@ def test_worker_command_mode_api_round_trips_without_changing_message_modes(
     assert response.status_code == 200
     assert response.json()["worker_command_mode"] == "queue"
     assert reloaded.json()["worker_command_mode"] == "queue"
-    assert reloaded.json()["message_lock_mode"] == "global"
     assert reloaded.json()["message_pipeline_mode"] == "queue"
 
 
@@ -1909,7 +1908,6 @@ def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
     save_trading_settings(
         app.state.session_factory,
         {
-            "message_lock_mode": "global",
             "message_pipeline_mode": "queue",
             "worker_command_mode": "queue",
         },
@@ -1926,7 +1924,6 @@ def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
     assert default.json()["semantic_review_enabled"] is False
     assert enabled.status_code == 200
     assert reloaded.json()["semantic_review_enabled"] is True
-    assert reloaded.json()["message_lock_mode"] == "global"
     assert reloaded.json()["message_pipeline_mode"] == "queue"
     assert reloaded.json()["worker_command_mode"] == "queue"
 
@@ -1976,7 +1973,20 @@ def test_trading_settings_api_round_trips_mimo_v2_future_activation(tmp_path):
     )
 
 
-def test_trading_settings_activation_holds_telegram_operation_lock(
+def test_web_app_state_has_no_process_wide_message_lock(tmp_path):
+    """The ingest registry is the only in-process message lock left."""
+
+    app = create_web_app(database_path=tmp_path / "research.db")
+
+    assert not hasattr(app.state, "telegram_operation_lock")
+    assert not hasattr(app.state, "message_lock_provider")
+    assert isinstance(
+        app.state.message_lock_registry,
+        web_app_module.KeyedAsyncLockRegistry,
+    )
+
+
+def test_mimo_activation_still_validates_without_a_process_wide_lock(
     tmp_path,
     monkeypatch,
 ):
@@ -1984,11 +1994,11 @@ def test_trading_settings_activation_holds_telegram_operation_lock(
 
     app = create_web_app(database_path=tmp_path / "research.db")
     real_save = web_module.save_trading_settings
-    observed: list[bool] = []
+    saved: list[dict] = []
 
-    def guarded_save(*args, **kwargs):
-        observed.append(app.state.telegram_operation_lock.locked())
-        return real_save(*args, **kwargs)
+    def guarded_save(session_factory, payload, **kwargs):
+        saved.append(dict(payload))
+        return real_save(session_factory, payload, **kwargs)
 
     monkeypatch.setattr(web_module, "save_trading_settings", guarded_save)
 
@@ -2003,32 +2013,8 @@ def test_trading_settings_activation_holds_telegram_operation_lock(
     )
 
     assert response.status_code == 200
-    assert observed == [True]
-
-
-def test_unrelated_trading_settings_save_does_not_take_telegram_operation_lock(
-    tmp_path,
-    monkeypatch,
-):
-    import telegram_kol_research.web_app as web_module
-
-    app = create_web_app(database_path=tmp_path / "research.db")
-    real_save = web_module.save_trading_settings
-    observed: list[bool] = []
-
-    def guarded_save(*args, **kwargs):
-        observed.append(app.state.telegram_operation_lock.locked())
-        return real_save(*args, **kwargs)
-
-    monkeypatch.setattr(web_module, "save_trading_settings", guarded_save)
-
-    response = TestClient(app).post(
-        "/api/trading-settings",
-        json={"default_max_loss_usdt": 25},
-    )
-
-    assert response.status_code == 200
-    assert observed == [False]
+    assert response.json()["mimo_contract_mode"] == "v2_live_adapter"
+    assert len(saved) == 1
 
 
 def _trading_settings_endpoint(app):
@@ -2040,30 +2026,23 @@ def _trading_settings_endpoint(app):
     )
 
 
-def _per_chat_three_transition_payload():
+def _cap_three_transition_payload():
     return {
-        "message_lock_expected_mode": "global",
         "message_processing_expected_max_parallel_chats": 20,
-        "message_lock_mode": "per_chat",
         "message_processing_max_parallel_chats": 3,
     }
 
 
-def _explicit_noop_concurrency_payload(*, expected_mode="global", expected_cap=20):
+def _explicit_noop_concurrency_payload(*, expected_cap=20):
     return {
-        "message_lock_expected_mode": expected_mode,
         "message_processing_expected_max_parallel_chats": expected_cap,
-        "message_lock_mode": "global",
         "message_processing_max_parallel_chats": 20,
     }
 
 
 def test_web_role_routes_explicit_noop_concurrency_transition_to_ingest(tmp_path):
     calls = []
-    payload = _explicit_noop_concurrency_payload(
-        expected_mode="per_chat",
-        expected_cap=3,
-    )
+    payload = _explicit_noop_concurrency_payload(expected_cap=3)
 
     async def requester(url, *, payload, timeout_seconds):
         calls.append((url, payload, timeout_seconds))
@@ -2114,18 +2093,12 @@ def test_explicit_noop_concurrency_transition_rejects_stale_expected_state(
 
     response = TestClient(app).post(
         "/api/trading-settings",
-        json=_explicit_noop_concurrency_payload(
-            expected_mode="per_chat",
-            expected_cap=3,
-        ),
+        json=_explicit_noop_concurrency_payload(expected_cap=3),
     )
 
     assert response.status_code == 409
     settings = web_app_module.load_trading_settings(app.state.session_factory)
-    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
-        "global",
-        20,
-    )
+    assert settings.message_processing_max_parallel_chats == 20
 
 
 def test_unrelated_full_settings_payload_cannot_reverse_concurrent_transition(
@@ -2144,9 +2117,7 @@ def test_unrelated_full_settings_payload_cannot_reverse_concurrent_transition(
             web_app_module.transition_message_concurrency_settings(
                 session_factory,
                 {
-                    "message_lock_expected_mode": "global",
                     "message_processing_expected_max_parallel_chats": 20,
-                    "message_lock_mode": "per_chat",
                     "message_processing_max_parallel_chats": 3,
                 },
             )
@@ -2163,7 +2134,6 @@ def test_unrelated_full_settings_payload_cannot_reverse_concurrent_transition(
         "/api/trading-settings",
         json={
             "default_max_loss_usdt": 25,
-            "message_lock_mode": "global",
             "message_processing_max_parallel_chats": 20,
         },
     )
@@ -2172,10 +2142,7 @@ def test_unrelated_full_settings_payload_cannot_reverse_concurrent_transition(
     assert interleavings == ["cutover_committed"]
     final = web_app_module.load_trading_settings(app.state.session_factory)
     assert final.default_max_loss_usdt == 25
-    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
-        "per_chat",
-        3,
-    )
+    assert final.message_processing_max_parallel_chats == 3
 
 
 def test_mimo_full_settings_payload_cannot_reverse_concurrent_ingest_transition(
@@ -2194,9 +2161,7 @@ def test_mimo_full_settings_payload_cannot_reverse_concurrent_ingest_transition(
             web_app_module.transition_message_concurrency_settings(
                 session_factory,
                 {
-                    "message_lock_expected_mode": "global",
                     "message_processing_expected_max_parallel_chats": 20,
-                    "message_lock_mode": "per_chat",
                     "message_processing_max_parallel_chats": 3,
                 },
             )
@@ -2216,7 +2181,6 @@ def test_mimo_full_settings_payload_cannot_reverse_concurrent_ingest_transition(
             "mimo_v2_activation_after_raw_message_id": 7,
             "mimo_contract_expected_mode": "v1",
             "mimo_contract_expected_watermark": 0,
-            "message_lock_mode": "global",
             "message_processing_max_parallel_chats": 20,
         },
     )
@@ -2228,10 +2192,7 @@ def test_mimo_full_settings_payload_cannot_reverse_concurrent_ingest_transition(
         final.mimo_contract_mode,
         final.mimo_v2_activation_after_raw_message_id,
     ) == ("v2_live_adapter", 7)
-    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
-        "per_chat",
-        3,
-    )
+    assert final.message_processing_max_parallel_chats == 3
 
 
 def test_web_full_settings_payload_remains_unrelated_when_cutover_precedes_second_read(
@@ -2260,9 +2221,7 @@ def test_web_full_settings_payload_remains_unrelated_when_cutover_precedes_secon
             web_app_module.transition_message_concurrency_settings(
                 session_factory,
                 {
-                    "message_lock_expected_mode": "global",
                     "message_processing_expected_max_parallel_chats": 20,
-                    "message_lock_mode": "per_chat",
                     "message_processing_max_parallel_chats": 3,
                 },
             )
@@ -2279,7 +2238,6 @@ def test_web_full_settings_payload_remains_unrelated_when_cutover_precedes_secon
         "/api/trading-settings",
         json={
             "default_max_loss_usdt": 25,
-            "message_lock_mode": "global",
             "message_processing_max_parallel_chats": 20,
         },
     )
@@ -2289,10 +2247,7 @@ def test_web_full_settings_payload_remains_unrelated_when_cutover_precedes_secon
     assert proxy_calls == []
     final = real_load(app.state.session_factory)
     assert final.default_max_loss_usdt == 25
-    assert (final.message_lock_mode, final.message_processing_max_parallel_chats) == (
-        "per_chat",
-        3,
-    )
+    assert final.message_processing_max_parallel_chats == 3
 
 
 def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
@@ -2310,10 +2265,7 @@ def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
         )
         return httpx.Response(
             200,
-            json={
-                "message_lock_mode": "per_chat",
-                "message_processing_max_parallel_chats": 3,
-            },
+            json={"message_processing_max_parallel_chats": 3},
         )
 
     app = create_web_app(
@@ -2323,91 +2275,68 @@ def test_web_role_proxies_concurrency_transition_to_ingest_without_local_save(
     )
     response = TestClient(app).post(
         "/api/trading-settings",
-        json=_per_chat_three_transition_payload(),
+        json=_cap_three_transition_payload(),
     )
 
     assert response.status_code == 200
-    assert response.json()["message_lock_mode"] == "per_chat"
     assert response.json()["message_processing_max_parallel_chats"] == 3
     assert calls == [
         {
             "url": "http://127.0.0.1:8001/api/trading-settings",
-            "payload": _per_chat_three_transition_payload(),
+            "payload": _cap_three_transition_payload(),
             "timeout_seconds": web_app_module.TRADING_SETTINGS_TIMEOUT_SECONDS,
         }
     ]
     local = web_app_module.load_trading_settings(app.state.session_factory)
-    assert (local.message_lock_mode, local.message_processing_max_parallel_chats) == (
-        "global",
-        20,
-    )
+    assert local.message_processing_max_parallel_chats == 20
 
 
-def test_ingest_role_holds_exclusive_message_admission_during_transition(
-    tmp_path,
-):
+def test_ingest_transition_does_not_freeze_message_admission(tmp_path):
+    """The cap lives in the worker; an ingest-side quiesce protected nothing.
+
+    The transition is still atomic - ``BEGIN IMMEDIATE`` plus the expected-cap
+    compare-and-swap - but it no longer takes exclusive admission on the ingest
+    registry, so live chats keep flowing while it commits.
+    """
+
     app = create_web_app(
         database_path=tmp_path / "ingest-transition.db",
         runtime_role="ingest",
     )
     endpoint = _trading_settings_endpoint(app)
-    old_entered = asyncio.Event()
-    release_old = asyncio.Event()
-    future_attempted = asyncio.Event()
-    future_entered = asyncio.Event()
-    future_tuple = []
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    concurrent_chat_ran = asyncio.Event()
 
-    async def old_operation():
-        async with app.state.message_lock_provider(101):
-            old_entered.set()
-            await release_old.wait()
+    async def holding_chat():
+        async with app.state.message_lock_registry.lock(101):
+            entered.set()
+            await release.wait()
 
-    async def future_operation():
-        future_attempted.set()
-        async with app.state.message_lock_provider(202):
-            settings = web_app_module.load_trading_settings(
-                app.state.session_factory
-            )
-            future_tuple.append(
-                (
-                    settings.message_lock_mode,
-                    settings.message_processing_max_parallel_chats,
-                )
-            )
-            future_entered.set()
-
-    async def wait_for_writer():
-        for _ in range(200):
-            if app.state.message_lock_registry.snapshot()[
-                "waiting_exclusive_admissions"
-            ] == 1:
-                return
-            await asyncio.sleep(0)
-        raise AssertionError("settings transition never requested exclusive admission")
+    async def other_chat():
+        async with app.state.message_lock_registry.lock(202):
+            concurrent_chat_ran.set()
 
     async def scenario():
-        old_task = asyncio.create_task(old_operation())
-        await old_entered.wait()
-        transition_task = asyncio.create_task(
-            endpoint(_per_chat_three_transition_payload())
+        holder = asyncio.create_task(holding_chat())
+        await entered.wait()
+        response = await asyncio.wait_for(
+            endpoint(_cap_three_transition_payload()), timeout=5.0
         )
-        await wait_for_writer()
-        future_task = asyncio.create_task(future_operation())
-        await future_attempted.wait()
-        await asyncio.sleep(0)
-        assert not future_entered.is_set()
-
-        release_old.set()
-        response = await asyncio.wait_for(transition_task, timeout=5.0)
-        assert response["message_lock_mode"] == "per_chat"
         assert response["message_processing_max_parallel_chats"] == 3
-        await asyncio.wait_for(
-            asyncio.gather(old_task, future_task), timeout=5.0
-        )
+        # Neither the held chat nor a fresh one was ever blocked by the write.
+        await asyncio.wait_for(other_chat(), timeout=5.0)
+        assert concurrent_chat_ran.is_set()
+        assert app.state.message_lock_registry.snapshot()[
+            "waiting_exclusive_admissions"
+        ] == 0
+        release.set()
+        await asyncio.wait_for(holder, timeout=5.0)
 
     asyncio.run(scenario())
 
-    assert future_tuple == [("per_chat", 3)]
+    settings = web_app_module.load_trading_settings(app.state.session_factory)
+    assert settings.message_processing_max_parallel_chats == 3
 
 
 def test_worker_role_refuses_direct_concurrency_transition(tmp_path):
@@ -2418,7 +2347,7 @@ def test_worker_role_refuses_direct_concurrency_transition(tmp_path):
 
     response = TestClient(app).post(
         "/api/trading-settings",
-        json=_per_chat_three_transition_payload(),
+        json=_cap_three_transition_payload(),
     )
 
     assert response.status_code == 503
@@ -2426,10 +2355,7 @@ def test_worker_role_refuses_direct_concurrency_transition(tmp_path):
         "code": "concurrency_transition_not_owned_by_runtime_role"
     }
     settings = web_app_module.load_trading_settings(app.state.session_factory)
-    assert (settings.message_lock_mode, settings.message_processing_max_parallel_chats) == (
-        "global",
-        20,
-    )
+    assert settings.message_processing_max_parallel_chats == 20
 
 
 def test_transition_unknown_outcome_does_not_blindly_retry(tmp_path):
@@ -2446,7 +2372,7 @@ def test_transition_unknown_outcome_does_not_blindly_retry(tmp_path):
     )
     response = TestClient(app).post(
         "/api/trading-settings",
-        json=_per_chat_three_transition_payload(),
+        json=_cap_three_transition_payload(),
     )
 
     assert response.status_code == 503
@@ -2457,27 +2383,20 @@ def test_transition_unknown_outcome_does_not_blindly_retry(tmp_path):
     assert len(calls) == 1
 
 
-def test_unrelated_settings_save_does_not_take_exclusive_admission(
-    tmp_path,
-    monkeypatch,
-):
+def test_settings_save_never_takes_exclusive_admission(tmp_path):
     app = create_web_app(database_path=tmp_path / "unrelated-admission.db")
-    real_lock_all = app.state.message_lock_provider.lock_all
-    calls = []
+    client = TestClient(app)
 
-    def tracking_lock_all():
-        calls.append("exclusive")
-        return real_lock_all()
+    for payload in (
+        {"default_max_loss_usdt": 25},
+        _cap_three_transition_payload(),
+    ):
+        response = client.post("/api/trading-settings", json=payload)
+        assert response.status_code == 200
 
-    monkeypatch.setattr(app.state.message_lock_provider, "lock_all", tracking_lock_all)
-
-    response = TestClient(app).post(
-        "/api/trading-settings",
-        json={"default_max_loss_usdt": 25},
-    )
-
-    assert response.status_code == 200
-    assert calls == []
+    snapshot = app.state.message_lock_registry.snapshot()
+    assert snapshot["waiting_exclusive_admissions"] == 0
+    assert snapshot["exclusive_admission_active"] is False
 
 
 @pytest.mark.parametrize("mode", ["shadow", "v2", "live"])

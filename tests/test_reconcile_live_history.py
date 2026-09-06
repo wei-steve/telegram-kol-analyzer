@@ -4,6 +4,7 @@ from types import SimpleNamespace
 
 from PIL import Image
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
@@ -19,6 +20,7 @@ from telegram_kol_research.models import (
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 from telegram_kol_research.telegram_live_listener import (
     _is_usable_downloaded_media_path,
+    recover_missing_authoritative_decisions,
     run_live_listener,
     run_reconcile_once,
 )
@@ -204,7 +206,17 @@ def test_reconcile_enqueues_each_new_message_exactly_once(tmp_path):
     assert {job.last_reason for job in jobs} == {"history_reconcile_enqueued"}
 
 
-def test_reconcile_enqueues_a_persisted_message_without_a_decision_once(tmp_path):
+def test_reconcile_leaves_persisted_messages_without_a_decision_to_the_worker(
+    tmp_path,
+):
+    """Reconcile compares against Telegram, not against the database.
+
+    A message that is already persisted but has no authoritative decision is
+    the worker's ``run_authoritative_gap_recovery_loop`` to find, on a 20s
+    cadence, without any Telegram call. Reconcile must not enqueue it a second
+    time from its own 300s Telegram-coupled pass.
+    """
+
     session_factory = create_session_factory(tmp_path / "recovery-gap.db")
     with session_factory() as session:
         raw_message = RawMessage(
@@ -239,12 +251,25 @@ def test_reconcile_enqueues_a_persisted_message_without_a_decision_once(tmp_path
     assert processed == []
     with session_factory() as session:
         jobs = session.query(MessageProcessingJob).all()
+    assert jobs == []
+
+    asyncio.run(
+        recover_missing_authoritative_decisions(
+            session_factory,
+            chat_titles_by_id={9001: "VIP BTC Room"},
+            authoritative_processor=processed.append,
+        )
+    )
+
+    assert processed == []
+    with session_factory() as session:
+        jobs = session.query(MessageProcessingJob).all()
     assert [job.raw_message_id for job in jobs] == [raw_message_id]
     assert jobs[0].status == "pending"
     assert jobs[0].last_reason == "recovery_enqueued"
 
 
-def test_live_listener_waits_for_shared_telegram_operation_lock(monkeypatch):
+def test_live_listener_waits_for_its_own_chat_lock(monkeypatch):
     client = _FakeListenerClient()
     processed: list[object] = []
 
@@ -254,6 +279,7 @@ def test_live_listener_waits_for_shared_telegram_operation_lock(monkeypatch):
 
     class Event:
         message = object()
+        chat_id = 555
 
         async def get_chat(self):
             return SimpleNamespace(title="VIP BTC Room")
@@ -264,21 +290,30 @@ def test_live_listener_waits_for_shared_telegram_operation_lock(monkeypatch):
     )
 
     async def scenario():
-        operation_lock = asyncio.Lock()
+        registry = KeyedAsyncLockRegistry()
         await run_live_listener(
             client=client,
             session_factory=None,
             broker=None,
             target_titles={"VIP BTC Room"},
-            operation_lock=operation_lock,
+            operation_lock=registry,
         )
         handler, _ = client.handlers[0]
-        await operation_lock.acquire()
+        holder_entered = asyncio.Event()
+        release_holder = asyncio.Event()
+
+        async def hold_chat():
+            async with registry.lock(555):
+                holder_entered.set()
+                await release_holder.wait()
+
+        holder = asyncio.create_task(hold_chat())
+        await holder_entered.wait()
         task = asyncio.create_task(handler(Event()))
         await asyncio.sleep(0)
         assert processed == []
-        operation_lock.release()
-        await task
+        release_holder.set()
+        await asyncio.wait_for(asyncio.gather(holder, task), timeout=5.0)
 
     asyncio.run(scenario())
 
