@@ -1,10 +1,11 @@
 """Per-key asyncio locks with writer-preference cross-key admission.
 
-The message-processing chain used to hold one process-wide ``asyncio.Lock``
-across every chat, so a slow message in one chat delayed every other chat.
-Ordering only ever needed to be preserved *within* a chat. This registry
-creates one lock per key on first use, so unrelated keys can proceed
-concurrently while same-key work stays serialized, in arrival order.
+Message ordering only needs to be preserved *within* a chat, so a single
+process-wide ``asyncio.Lock`` across every chat is stricter than required.
+This registry creates one lock per key on first use, so unrelated keys can
+proceed concurrently while same-key work stays serialized, in arrival order.
+It backs ``message_lock_mode="per_chat"`` in
+:mod:`telegram_kol_research.message_lock_provider`.
 
 ``lock_all()`` is an admission barrier rather than a snapshot of known keys:
 once a cross-key caller announces intent, new per-key callers wait until it has

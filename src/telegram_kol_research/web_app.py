@@ -138,9 +138,7 @@ from telegram_kol_research.models import (
     MediaAsset,
     MessageEvidenceVersion,
     MessageProcessingJob,
-    PositionBackupStopOrder,
     PositionProtectionLedger,
-    RecognitionDecision,
     StrategyManagementBatch,
     StrategyManagementLeg,
 )
@@ -193,9 +191,7 @@ from telegram_kol_research.protection_attribution import match_position_protecti
 from telegram_kol_research.protection_ledger import (
     build_account_protection_ownership,
 )
-from telegram_kol_research.protection_snapshot import build_position_protection_audit
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
-from telegram_kol_research.recovery_decisions import list_recovery_decisions
 from telegram_kol_research.recovery_execution_queue import list_recovery_execution_previews
 from telegram_kol_research.recovery_live_submit_gate import validate_recovery_live_submit_gate
 from telegram_kol_research.recovery_order_confirmation import confirm_recovery_order_dry_run
@@ -306,8 +302,6 @@ from telegram_kol_research.web_queries import (
     list_holding_strategies,
     mark_strategy_lifecycle_manual_close,
     list_pending_strategies,
-    load_messages_in_time_window,
-    load_selected_messages,
 )
 from telegram_kol_research.lifecycle_monitor import (
     LifecycleMonitor,
@@ -1524,24 +1518,6 @@ def _load_deepcoin_live_position_rows(
         )
         if unattributed_protection_rows is not None:
             unattributed_protection_rows.extend(pending_unattributed_rows)
-        backup_by_leg_id = {
-            int(row.execution_order_leg_id): row
-            for row in (
-                session.query(PositionBackupStopOrder)
-                .filter(PositionBackupStopOrder.venue == "deepcoin")
-                .filter(
-                    PositionBackupStopOrder.execution_order_leg_id.in_(verified_live_leg_ids)
-                )
-                .order_by(PositionBackupStopOrder.id.asc())
-                .all()
-                if verified_live_leg_ids
-                else []
-            )
-            if (
-                (leg := legs_by_pos_id.get(str(row.pos_id))) is not None
-                and int(leg.id) == int(row.execution_order_leg_id)
-            )
-        }
         protection_match = match_position_protection(
             active_positions,
             tpsl_orders,

@@ -96,7 +96,7 @@ def run_break_even_convergence_worker_tick(
             deepcoin_client=client,
             executed_at=now,
         )
-    except Exception as exc:
+    except Exception:
         logger.exception("automatic break-even convergence %s failed", convergence_id)
         with session_factory() as session:
             row = session.get(StrategyBreakEvenConvergence, convergence_id)

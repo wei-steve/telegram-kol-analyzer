@@ -81,10 +81,10 @@ def _add_raw_message(
 
 
 @pytest.mark.parametrize("mode", ["inline", "shadow", "queue"])
-def test_message_pipeline_mode_round_trips_and_defaults_to_inline(tmp_path, mode):
+def test_message_pipeline_mode_round_trips_and_defaults_to_queue(tmp_path, mode):
     session_factory = create_session_factory(tmp_path / "settings.db")
 
-    assert load_trading_settings(session_factory).message_pipeline_mode == "inline"
+    assert load_trading_settings(session_factory).message_pipeline_mode == "queue"
 
     saved = save_trading_settings(session_factory, {"message_pipeline_mode": mode})
 
@@ -98,8 +98,10 @@ def test_message_pipeline_mode_rejects_values_that_could_enable_a_consumer(value
         trading_settings_from_payload({"message_pipeline_mode": value})
 
 
-def test_inline_default_writes_no_job_rows(tmp_path):
+def test_inline_mode_writes_no_job_rows(tmp_path):
     session_factory = create_session_factory(tmp_path / "inline.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
 
     asyncio.run(
         persist_live_message_event(

@@ -428,6 +428,8 @@ def test_per_chat_reconcile_pass_does_not_block_a_live_message_in_another_chat(
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     provider = _make_provider(session_factory, mode="per_chat")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         session.add(
             RawMessage(

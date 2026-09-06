@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import RawMessage, RecognitionDecision, utc_now
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.telegram_live_listener import (
     EXPIRED_AFTER_SYSTEM_STALL,
     EXPIRED_STALE_INSTRUCTION,
@@ -96,6 +97,8 @@ def test_recover_missing_authoritative_decisions_has_no_client_parameter():
 
 def test_gap_recovery_runs_without_any_telegram_client(tmp_path):
     session_factory = create_session_factory(tmp_path / "no-client.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     raw_message_id = _add_raw_message(session_factory, posted_at=BASE_NOW - timedelta(minutes=1))
 
     processed: list[int] = []
@@ -124,6 +127,8 @@ def test_gap_recovery_runs_without_any_telegram_client(tmp_path):
 
 def test_message_recovered_within_one_fast_loop_interval(tmp_path):
     session_factory = create_session_factory(tmp_path / "fast-loop.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     # run_authoritative_gap_recovery_loop has no now_provider of its own - it
     # always resolves recover_missing_authoritative_decisions's real-clock
     # default, so the fixture message must be recent by wall-clock time, not
@@ -171,6 +176,8 @@ def test_message_recovered_within_one_fast_loop_interval(tmp_path):
 
 def test_recovery_is_bounded_per_pass(tmp_path):
     session_factory = create_session_factory(tmp_path / "bounded.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     for index in range(5):
         _add_raw_message(
             session_factory,
@@ -204,6 +211,8 @@ def test_recovery_is_bounded_per_pass(tmp_path):
 
 def test_expired_message_classified_stale_when_no_stall_recorded(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-healthy.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     raw_message_id = _add_raw_message(
         session_factory, posted_at=BASE_NOW - timedelta(minutes=20)
     )
@@ -237,6 +246,8 @@ def test_expired_message_classified_stale_when_no_stall_recorded(tmp_path):
 
 def test_expired_message_classified_stall_when_stall_overlaps_window(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-stalled.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     _add_raw_message(session_factory, posted_at=BASE_NOW - timedelta(minutes=20))
 
     processed: list[int] = []
@@ -260,6 +271,8 @@ def test_expired_message_classified_stall_when_stall_overlaps_window(tmp_path):
 
 def test_expired_message_with_no_posted_at_defaults_to_stale(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-no-posted-at.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     _add_raw_message(session_factory, posted_at=None)
     stall_at = (BASE_NOW - timedelta(minutes=1)).isoformat()
 
@@ -283,6 +296,8 @@ def test_expired_message_with_no_posted_at_defaults_to_stale(tmp_path):
 
 def test_stall_expiry_notifications_bounded_within_one_pass(tmp_path):
     session_factory = create_session_factory(tmp_path / "notify-bounded.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     for index in range(4):
         _add_raw_message(
             session_factory,
@@ -327,6 +342,8 @@ def test_stall_expiry_notifications_rate_limited_across_passes(tmp_path):
     """
 
     session_factory = create_session_factory(tmp_path / "notify-rate-limited.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     _add_raw_message(session_factory, message_id=1, posted_at=BASE_NOW - timedelta(minutes=20))
 
     sent: list[dict] = []
@@ -398,6 +415,8 @@ def test_rate_limiter_allows_a_second_notification_after_the_window():
 
 def test_run_reconcile_once_behavior_unchanged_by_extraction(tmp_path):
     session_factory = create_session_factory(tmp_path / "reconcile-unchanged.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     recoverable_id = _add_raw_message(
         session_factory,
         message_id=1,

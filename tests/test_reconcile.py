@@ -10,6 +10,7 @@ from telegram_kol_research import telegram_live_listener as live_listener
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.reconcile import build_reconcile_window
+from telegram_kol_research.trading_settings import save_trading_settings
 
 
 def test_build_reconcile_window_replays_small_safety_window_after_checkpoint():
@@ -179,6 +180,8 @@ def test_non_queue_reconcile_database_projection_leaves_loop_responsive(
     tmp_path,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     block_seconds = 0.25
     heartbeat_interval = 0.01
 

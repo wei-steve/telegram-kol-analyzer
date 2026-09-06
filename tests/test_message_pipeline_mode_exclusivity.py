@@ -146,6 +146,11 @@ def test_worker_lifespan_exists_only_when_queue_mode_is_active(tmp_path):
         database_path=tmp_path / "inline-research.db",
         message_processing_worker_runner=forbidden_worker,
     )
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(
+        inline_app.state.session_factory,
+        {"message_pipeline_mode": "inline"},
+    )
     with TestClient(inline_app):
         assert inline_app.state.message_processing_worker_task is None
     assert not inline_started.is_set()

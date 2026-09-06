@@ -7,7 +7,6 @@ from typing import Any
 
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
-    DeepcoinRequestOutcomeUnknown,
 )
 
 

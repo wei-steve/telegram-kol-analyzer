@@ -16,6 +16,7 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.telegram_live_listener import (
     _is_usable_downloaded_media_path,
     run_live_listener,
@@ -144,6 +145,8 @@ def test_run_reconcile_once_bounds_dialog_discovery_to_archived_folder(tmp_path)
 
 def test_history_reconcile_without_authority_persists_raw_only(tmp_path):
     session_factory = create_session_factory(tmp_path / "authority-required.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
 
     stats = asyncio.run(
         run_reconcile_once(
@@ -167,6 +170,8 @@ def test_history_reconcile_without_authority_persists_raw_only(tmp_path):
 
 def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     processed: list[int] = []
 
     def authoritative_processor(raw_message_id):
@@ -238,6 +243,8 @@ def test_reconcile_processes_each_new_message_authoritatively_exactly_once(tmp_p
 
 def test_reconcile_recovers_persisted_message_without_authoritative_decision(tmp_path):
     session_factory = create_session_factory(tmp_path / "recovery-gap.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         now = utc_now()
         raw_message = RawMessage(
@@ -314,6 +321,8 @@ def test_reconcile_recovers_persisted_message_without_authoritative_decision(tmp
 
 def test_reconcile_does_not_recover_old_missing_authoritative_decision(tmp_path):
     session_factory = create_session_factory(tmp_path / "old-recovery-gap.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         session.add(
             RawMessage(
@@ -351,6 +360,8 @@ def test_reconcile_does_not_recover_old_missing_authoritative_decision(tmp_path)
 
 def test_reconcile_suppresses_operator_notification_for_expired_gap(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-notification.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         session.add(
             RawMessage(
@@ -400,6 +411,8 @@ def test_reconcile_suppresses_operator_notification_for_expired_gap(tmp_path):
 
 def test_reconcile_keeps_expired_gap_notification_suppressed_on_second_pass(tmp_path):
     session_factory = create_session_factory(tmp_path / "expired-notification-repeat.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         session.add(
             RawMessage(
@@ -448,6 +461,8 @@ def test_reconcile_keeps_expired_gap_notification_suppressed_on_second_pass(tmp_
 
 def test_reconcile_continues_after_one_missing_decision_recovery_fails(tmp_path):
     session_factory = create_session_factory(tmp_path / "recovery-failure.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         now = utc_now()
         session.add_all(
@@ -568,6 +583,8 @@ def test_live_listener_waits_for_shared_telegram_operation_lock(monkeypatch):
 
 def test_reconcile_delivers_completed_instruction_summaries(tmp_path, monkeypatch):
     session_factory = create_session_factory(tmp_path / "summary.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     delivered: list[int] = []
 
     def authoritative_processor(raw_message_id):
@@ -776,6 +793,8 @@ def test_run_reconcile_once_retries_zero_byte_media_within_overlap(tmp_path):
 
 def test_run_reconcile_once_does_not_expand_window_for_old_missing_media(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     with session_factory() as session:
         old_message = RawMessage(
             chat_id=9001,
@@ -855,6 +874,8 @@ def test_run_reconcile_once_does_not_expand_window_for_old_missing_media(tmp_pat
 
 def test_run_reconcile_once_triggers_strategy_alert_processor_for_fresh_messages(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     processed = []
 
     async def fake_strategy_alert_processor(**kwargs):

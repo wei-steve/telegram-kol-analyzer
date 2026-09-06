@@ -10,7 +10,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -5138,7 +5138,6 @@ def list_active_positions(
     from telegram_kol_research.models import (
         TradeIdea, SignalCandidate, RawMessage, TradeUpdate,
     )
-    from sqlalchemy import and_
 
     results: list[dict[str, object]] = []
 

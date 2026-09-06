@@ -19,6 +19,7 @@ from telegram_kol_research.recognition_decisions import (
     save_terminal_authoritative_decision,
 )
 from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
+from telegram_kol_research.trading_settings import save_trading_settings
 from telegram_kol_research.telegram_live_listener import (
     _schedule_authoritative_notification,
     persist_live_message_event,
@@ -280,6 +281,8 @@ def test_live_intake_requires_authoritative_processor_when_ai_enabled(
     tmp_path,
 ):
     session_factory = create_session_factory(tmp_path / "authority-required.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     auto_trade_calls: list[int] = []
 
@@ -437,6 +440,8 @@ def test_live_listener_does_not_target_deletion_without_chat_id(
 
 def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     processed = []
 
@@ -467,6 +472,8 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     events: list[str] = []
     reviewer_started = asyncio.Event()
@@ -532,6 +539,8 @@ def test_authoritative_live_path_fetches_missing_reply_before_processing(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "reply-recovery.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     events: list[str] = []
     event = _FakeEvent("取消上面这单")
@@ -615,6 +624,8 @@ def test_authoritative_live_path_delivers_instruction_summary_once_after_complet
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "instruction-summary.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     deliveries: list[dict] = []
 
@@ -693,6 +704,8 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     alert_started = asyncio.Event()
     release_alert = asyncio.Event()
@@ -759,6 +772,8 @@ def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -826,6 +841,8 @@ def test_authoritative_mimo_failure_suppresses_empty_input_noise(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -889,6 +906,8 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     sent: list[dict] = []
     audit: list[dict] = []
@@ -967,6 +986,8 @@ def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
+    # inline path: scheduled for removal in cleanup step 3
+    save_trading_settings(session_factory, {"message_pipeline_mode": "inline"})
     broker = LiveUpdateBroker()
     calls: list[int] = []
     sent: list[dict] = []
