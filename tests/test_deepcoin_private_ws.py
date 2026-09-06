@@ -21,9 +21,11 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinCredentials,
     DeepcoinRestClient,
 )
+from websockets.exceptions import ConnectionClosedOK
+
 from telegram_kol_research.deepcoin_private_ws import (
     DEEPCOIN_PRIVATE_WS_URL,
-    DEEPCOIN_WS_RECONNECT_INTERVAL_SECONDS,
+    DEEPCOIN_WS_BACKOFF_BASE_SECONDS,
     DeepcoinPrivateWsInbox,
     build_deepcoin_ws_health,
     build_subscribe_frame,
@@ -261,9 +263,18 @@ def test_health_reports_counts_only_and_never_payload_content(tmp_path):
 
 
 class _FakeConnection:
-    def __init__(self, frames, *, raise_on_exit=None):
+    """Stands in for a ``websockets`` client connection.
+
+    ``recv`` is what phase 2 reads: the read loop wraps it in the
+    application-level silence timer, so an iterator would not exercise the code
+    under test. Exhausting the frames closes the socket the way the real library
+    does, which is what makes the caller record a gap rather than a zero.
+    """
+
+    def __init__(self, frames, *, raise_on_exit=None, hang_after=False):
         self._frames = list(frames)
         self._raise_on_exit = raise_on_exit
+        self._hang_after = hang_after
         self.sent: list[str] = []
 
     async def __aenter__(self):
@@ -275,38 +286,67 @@ class _FakeConnection:
     async def send(self, payload):
         self.sent.append(payload)
 
-    def __aiter__(self):
-        async def _iter():
-            for frame in self._frames:
-                yield frame
-            if self._raise_on_exit is not None:
-                raise self._raise_on_exit
-
-        return _iter()
+    async def recv(self):
+        if self._frames:
+            return self._frames.pop(0)
+        if self._raise_on_exit is not None:
+            raise self._raise_on_exit
+        if self._hang_after:
+            await asyncio.Event().wait()
+        raise ConnectionClosedOK(None, None)
 
 
 class _FakeClient:
-    def __init__(self, listen_key="SECRET-LISTEN-KEY"):
+    """Read-only Deepcoin client. Every method here is a GET equivalent."""
+
+    def __init__(self, listen_key="SECRET-LISTEN-KEY", *, instruments=None):
         self.listen_key = listen_key
         self.closed = False
+        self.reads: list[str] = []
+        self._instruments = (
+            [{"instId": "ETH-USDT-SWAP"}, {"instId": "BTC-USDT-SWAP"}]
+            if instruments is None
+            else list(instruments)
+        )
 
     def acquire_listen_key(self):
         return self.listen_key
+
+    def list_swap_instruments(self):
+        self.reads.append("instruments")
+        return list(self._instruments)
+
+    def list_positions(self, **kwargs):
+        self.reads.append("positions")
+        return []
+
+    def list_open_orders(self, **kwargs):
+        self.reads.append("open_orders")
+        return []
+
+    def list_trade_fills(self, **kwargs):
+        self.reads.append("fills")
+        return []
+
+    def list_trigger_orders_pending(self, **kwargs):
+        self.reads.append("trigger_orders")
+        return []
 
     def close(self):
         self.closed = True
 
 
-def _inbox(session_factory, connections, **kwargs):
+def _inbox(session_factory, connections, *, client=None, **kwargs):
     calls = []
 
     def _connect(url, **connect_kwargs):
         calls.append(url)
         return connections.pop(0)
 
+    kwargs.setdefault("rng", lambda: 0.5)  # jitter factor 0: deterministic delay
     inbox = DeepcoinPrivateWsInbox(
         session_factory=session_factory,
-        deepcoin_client_factory=lambda: _FakeClient(),
+        deepcoin_client_factory=(lambda: _FakeClient()) if client is None else (lambda: client),
         connect_factory=_connect,
         now_provider=lambda: NOW,
         monotonic_ms_provider=lambda: NOW_MS,
@@ -351,7 +391,7 @@ def test_process_start_opens_a_gap_that_closes_only_once_subscribed(tmp_path):
     assert gaps[0].last_event_id == 1
     assert gaps[0].last_event_received_ms == NOW_MS
     assert gaps[1].reconnected_at is None
-    assert slept == [DEEPCOIN_WS_RECONNECT_INTERVAL_SECONDS]
+    assert slept == [DEEPCOIN_WS_BACKOFF_BASE_SECONDS]
 
 
 def test_connection_error_records_a_gap_carrying_no_exception_text(tmp_path):
@@ -372,6 +412,7 @@ def test_connection_error_records_a_gap_carrying_no_exception_text(tmp_path):
         connect_factory=_connect,
         now_provider=lambda: NOW,
         monotonic_ms_provider=lambda: NOW_MS,
+        rng=lambda: 0.5,
     )
     inbox._sleep = _sleep
 
@@ -387,7 +428,7 @@ def test_connection_error_records_a_gap_carrying_no_exception_text(tmp_path):
         assert "SECRET-LISTEN-KEY" not in json.dumps(
             {"reason": gap.reason, "detail": gap.detail}
         )
-    assert slept == [DEEPCOIN_WS_RECONNECT_INTERVAL_SECONDS]
+    assert slept == [DEEPCOIN_WS_BACKOFF_BASE_SECONDS]
 
 
 def test_reconnect_closes_the_open_gap_and_keeps_the_watermark(tmp_path):

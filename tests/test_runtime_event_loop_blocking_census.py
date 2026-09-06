@@ -27,6 +27,10 @@ KNOWN_BLOCKING_CALLS = frozenset(
         # ── pure helpers: no I/O, microseconds, safe on the loop ──
         # Kept because the matcher cannot prove purity statically. Reviewed by
         # hand in Phase 1d; none touches a session, a client, or the network.
+        # Exponential backoff with jitter: arithmetic plus one ``random()``
+        # draw, no session, no client, no network. Reviewed for the phase 2
+        # REST+WebSocket work.
+        "deepcoin_private_ws.run_forever -> compute_backoff_delay",
         "lifecycle_monitor._fetch_candles_full -> _candle_from_payload",
         "lifecycle_monitor._scan_contract -> _utc_naive",
         "semantic_disagreement_review.run_semantic_review_loop -> utc_now",
