@@ -16,6 +16,9 @@
    `DeepcoinRequestOutcomeUnknown` 语义。
 2. 读限流器：照 `DeepcoinTpslWriteLimiter` 的模式加进程内读限流（令牌桶，5/s，留 1 个余量给写入），
    所有 GET 经过它。三进程各自独立限流，因此把每进程配额设为 2/s，并在 ARCHITECTURE.md 记录理由。
+   **限流器按物理 HTTP 请求计数，不按逻辑调用计数**：`list_open_orders` 切 V2 后一次逻辑读会展开成
+   N 页 N 次请求（limit=100，每满一页多一次），每一页都要从令牌桶取一个令牌；否则限流器会低估真实速率
+   （阶段 5a 裁定第 4 条）。
 3. 合并同轮重复读：worker 的一轮 `deepcoin_reconcile` 内，同一 `instId` 的 `positions` / `trigger-orders-pending` /
    `orders-pending` 只读一次（轮内缓存，轮结束即失效；不跨轮缓存）。
 4. 健康端点加 `rate_limited_last_hour`、`retry_after_waits_last_hour`。
