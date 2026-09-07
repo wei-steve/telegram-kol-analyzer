@@ -13,12 +13,12 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 3
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-3-wake-reconciliation.md
-phase_status: in_progress                 # planned | claimed | in_progress | completed | blocked
-claimed_by: local_c8d0dc4e-8d6c-4478-acef-cd51785b2793
-last_completed_phase: 2
-last_completed_commit: 0371fc9f4fc41c588fab1534f8e33419aef4d6cf
+current_phase: 4
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-4-shadow-binding.md
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
+claimed_by:
+last_completed_phase: 3
+last_completed_commit: 4bdc6ba6c43dfadb393ac905a66104d65b651d2b
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
 ```
 
@@ -330,6 +330,98 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - defect-out-of-scope (2026-09-06): `trigger_take_profit_convergence_executor.py:506-511` 对未过滤的 pending 原始行逐行调用只适用于保护单的 `_native_tpsl_aliases_consistent`，入场条件单会触发 `convergence_pending_alias_conflict` 全局否决。不属于本项目范围，需单独立项：先写复现测试，再把否决范围收窄到保护单行。
 
 执行会话在此追加，格式：`- phase-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
+
+- phase-3 (2026-09-07, 会话 local_c8d0dc4e, **完成**):
+  提交 `4bdc6ba6c43dfadb393ac905a66104d65b651d2b`（部署的就是它），
+  部署 `tg-deploy 4bdc6ba6…`，回滚 SHA `0371fc9f4fc41c588fab1534f8e33419aef4d6cf`。
+  部署后另有一个**只加测试、不改生产代码**的提交 `e4f0116f`（断言两个 worker 任务
+  拿到的是同一个唤醒信号对象），生产运行的始终是 `4bdc6ba6`，四个改动文件与提交逐字节一致。
+  **无 schema 变更、无依赖变更**：新增的 `Or`/`TS`/`Po` 只在进程内存里，
+  入库行改为按显式列白名单构造（有测试盯着白名单与表定义一致），按纯 L2 执行。
+  实现：worker 的 `deepcoin_reconcile` 从"固定 30 秒轮询"变成
+  "固定 30 秒轮询 + 相关事件到达立刻跑一轮"，**只改什么时候跑**；
+  判据、账本、结论一个字未动（等价性测试逐调用逐库比对唤醒轮与定时轮）。
+  唤醒用进程内 `asyncio.Event`（两端同在 worker 进程，非跨进程锁），
+  最小间隔 2 秒、间隔内合并、每分钟硬上限 20 次、超限退回纯轮询并暴露 `wake_throttled`；
+  定时那一半用绝对 deadline，所以任何唤醒/去抖/节流都推不动原来的 30 秒节奏；
+  `wake_signal=None` 时行为与阶段 3 之前**完全一致**。
+  只让相关帧唤醒：`Trade` 任何帧、`Order` 的 `Or` 变化、`TriggerOrder` 的 `TS`/`TU` 变化、
+  `Position` 的 `Po` 变化，判据全部来自阶段 2 的已知最新状态，不多查一次库；
+  重复帧与乱序帧一律不唤醒。
+  **补掉阶段 2 遗留 (a)**：重同步第 4 步后用二次快照把 Order/TriggerOrder/Position
+  的身份与交易所时间种进乱序 tracker（只在 `complete=True` 时种，不完整快照什么都不种；
+  只种身份与时间不种状态——REST 的状态词汇与 WS 短键不是一回事，翻译就是本项目要消灭的推断）。
+  **补掉阶段 2 遗留 (c)**：每一次 REST 读失败现在记调用名、异常类型、HTTP 状态码
+  （不记响应体、不记凭据），进 `RestSnapshot` / `ResyncOutcome` / 健康端点；
+  `compare_forward_only` 改为先看 `complete` 再读集合，并加 AST 静态守护测试
+  盯住四个流模块里"先读集合后看 complete"的写法。
+  健康端点新增 `wakes_last_hour`、`wakes_throttled_last_hour`、`last_wake_at`、
+  `last_wake_channel`、`wake_throttled`、`wake_requests_seen`、
+  `reconcile_runs_last_hour{by_timer,by_wake}`、`reconcile_failures_last_hour`、
+  `last_reconcile_failure`、`seeded_entity_count`、`last_resync_read_failures`。
+  验证：focused 48 passed（新文件 `tests/test_deepcoin_ws_phase3.py`）；
+  全量 **7552 passed / 4 skipped / 0 failed**（部署候选那次是 7551，差的 1 条是事后加的测试）；
+  `tests/test_runtime_event_loop_blocking_census.py` 通过——新增的
+  `_record_reconcile_failure` 是纯内存记账，按既有格式登记进允许清单并写明理由。
+  **专门重启 worker 一次**：`02:28:13Z`，MainPID 2525953 → 2526485，
+  重启前 `active_write_count=0`、无 planned/executing/reconciling 批次；
+  重启后立刻 `tracked_entity_count=7 / seeded_entity_count=7`——
+  阶段 2 的"重启后 tracker 为 0 直到新帧到达"**已消除**。
+  观察窗口 `02:30:09Z ~ 02:59:11Z`（30 个连续采样点，监视器自判达标写 DONE，
+  等待总时长 29 分钟，`anomaly_count=0`）：真实消息单次回看最少 5 条 / 最多 14 条、
+  最多 6 个群，**首次一次性达标**；三单元 30/30 active、NRestarts 全程 0；
+  `state` 恒 healthy、`open_gap_count` 恒 0、`last_resync_outcome` 恒 converged、
+  `unparsed_count` 恒 1 零新增、无积压。
+  **唤醒在生产上被真实成交触发**：`02:38:38Z` 一次真实成交推 3 帧
+  （Trade/Order/Position）+ `02:38:39Z`、`02:38:52Z` 两帧 TriggerOrder，
+  5 帧全部命中唤醒条件（`wake_requests_seen=5`），经去抖**合并成 2 次**唤醒式 reconcile；
+  `by_timer` 3 → 42、`by_wake` 0 → 2，`wakes_throttled_last_hour` 全程 0、
+  `wake_throttled` 全程 false，离每分钟 20 次上限极远。
+  第二次唤醒比第三帧晚 13 秒，是因为第一轮还在跑——唤醒被合并而不是叠一轮，
+  正是"不重入"的设计行为。
+  **真基线首次取到**：窗口内有 5 条真实业务帧，`duplicate_rate_1h=0.0`、
+  `out_of_order_count_1h=0`、`out_of_order_count_total=0` 是**实测值**而非阶段 2 的
+  零流量地板值（样本仍只有 5 帧，不足以谈长期速率）。
+  **交易所写入恰好 3 条，全部来自生产自动交易同一条信号**
+  （`raw_message_id=15186` → binding 342 ETH long）：
+  `open_market_position` 02:38:34Z、`set_position_tpsl` 02:38:34Z、
+  `create_backup_stop` 02:38:46Z；交易所侧仓位 2→3、条件单 5→7 完全对得上，
+  fingerprint `4efeed96…` → `0952faf4…`，**零条无法解释的写入**。
+  账本增量（bindings 341→342、legs 587→588、protection_ledger 664→666、
+  protection_legs 881→884、mutation_intents 640→642）全部属于这一笔。
+  **新增 uncertain 1 条可归因**：id=360 / `raw_message_id=15186` /
+  `ExecutionBoundaryOutcomeUnknown` / `in_progress` / 02:33:46Z，
+  与既有 6 条同一形态（最近一条 2026-09-06 15:23:12Z，早于本次部署），
+  且已收敛（同一笔 02:38:38Z 达到 `position_ownership_verified`）；
+  阶段 3 根本没接入入场路径。
+  **补测项 7 只有离线证据**：观察前后两次只读扫描 `non_binding_count` 都是 0——
+  交易所上不存在任何不属于系统账本的订单/条件单/仓位，留给阶段 5 的受控实验，
+  未为制造基线下任何手工单。离线侧已构造"存在非 binding 条件单"的场景，
+  断言唤醒轮与定时轮的调用序列与整库指纹完全一致、且客户端连写方法都不存在。
+  **扫描口径的一个真实教训**：第一版归属判定只查 `execution_bindings` /
+  `execution_order_legs`，把 4 张系统自己下的 TPSL 止损单判成"不属于任何 binding"
+  （保护单的交易所单号本来就写在保护账本里而不是 binding 行上）。扩到全部保护账本后归 0。
+  在一项"不许碰别人的单"的检查里，这个方向的错误最危险，故记录在案。
+  遗留：(a) **401 又复发一次**，累计第 3 次：`02:27:57Z`
+  `GET /deepcoin/trade/trigger-orders-pending?instType=SWAP&instId=ETH-USDT-SWAP&limit=100`
+  返回 401。它发生在**既有**的 `web_app._load_deepcoin_pending_tpsl_orders` 路径，
+  不在五步重同步内也不在 reconcile 循环的异常处理内，所以本阶段新增的归因字段**覆盖不到它**；
+  该路径语义正确（`evidence_available=False` 后 continue，没有降级成"没有挂单"）。
+  三次都落在 `trigger-orders-pending` 同一个端点，仍无法判定是签名时间戳容差还是限流。
+  (b) 窗口内**没有出现任何 incomplete 重同步读**，所以新增的归因字段没取到样本，
+  阶段 2 遗留 (c) 的能力已就位但尚未被真实失败验证过。
+  (c) reconcile 循环不打每轮日志，所以"唤醒比定时早多少秒"无法逐事件精确测量；
+  只能说成交推送比交易所写入晚 4 秒（02:38:34 写、02:38:38 推），
+  而 binding 342 的归属核验就盖在 02:38:38——与帧同一秒。窗口内实测的定时周期约 43 秒
+  （30 秒等待 + 约 13 秒一轮），所以纯轮询会晚 0–43 秒。阶段 4 若要精确数字，
+  需要给 reconcile 加一行每轮日志。
+  (d) 节流参数无需调整：一轮 reconcile 本身约 13 秒，唤醒式轮次的天然上限就在 4–5 次/分，
+  每分钟 20 次的硬上限实际上永远不会绑定；真正的串行化来自"单任务不重入"而不是节流器。
+  2 秒最小间隔同理，但都建议**保留**——它们是 WS 异常放量时的兜底，不是常态调节旋钮。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-3/`
+  （`deployment.md`、`observation-summary.md`、`open-observer.sh`、
+  `open-observer.jsonl` 31 行、`open-observer-summary.json`、`DONE`、
+  三份 `exchange-snapshot-*.json`、三份 `non-binding-*.json`、`nonbinding_scan.py`）。
 
 - phase-2 (2026-09-06, 会话 local_cf4e65e6, **流量不足留 `in_progress`**):
   提交 `0371fc9f4fc41c588fab1534f8e33419aef4d6cf`（6 个提交），
