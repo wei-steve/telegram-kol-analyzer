@@ -362,6 +362,7 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   `window-end-snapshot.json`、`observer-samples.jsonl` 167 行）。
   **未做**：未合并、未改阶段 5 迁移本体（分支 `rest-ws/phase-5-order-entry` 仍未部署未合并），
   未碰 `execution_bindings.py` / `trigger_take_profit_convergence_executor.py` / `native_tpsl.py`（A 线在用）。
+- followup-bind-live-position (2026-09-07, 指挥会话记录): `web_app.bind_live_position` 是 async 端点却同步调用 `list_positions()`（既有 15s 同步网络调用），5b 后最多再多等约 3 秒令牌与重试；人工触发、极少发生。列为 B-5c 的一部分（把该调用放进工作线程），不单独立项。
 - phase-5b-ruling-2 (2026-09-07, 指挥会话裁定): 选 (A) 接受现状收窗。实测 worker 真实读需求约 145 次/周期（reconcile 本体只占 17 次），单线程 runtime_worker_executor 串行叠加约 49% 的等令牌时间，任何正确的限流都会把轮间隔拉到约 62s；提高配额只是把延迟换回 401。5b 目标（401 清零、零回退）已达成。后续独立项 **B-5c 读放大归因与降需求**：按端点/调用点计量每周期读次数，找出 145 次里的大头，用 WS 收件箱状态替代轮询读、或合并跨循环的重复快照读，目标把周期读次数降到 3/s 以下且不靠限流等待；在阶段 5 之后排期。保护反应面的补充说明：阶段 3 起真实成交由 WS 唤醒立即触发 reconcile，62s 只是无事件时的兜底轮询间隔。
 - phase-5b-ruling (2026-09-07, 指挥会话裁定): 读限流配额按角色分配而非按进程平均——worker 3/s、web 1/s、ingest 1/s，合计不超过账户 5/s。理由：worker 是唯一有持续读循环的角色（实测原速率约 4.5/s，2/s 使 reconcile 轮间隔 44s → 65s，保护反应最坏多等 20 秒）；web/ingest 只在人工调用与断线重同步时读。阶段 5 上线后 V2 分页会放大 worker 请求量，届时按实测重新评估配额。要求重新部署并重新计窗。
 - phase-5a-rulings (2026-09-07, 指挥会话裁定，用户要求由指挥会话判断): (1) 观察窗只覆盖 1 群——接受，5a 是只读端点切换、零交易所写入、指纹逐字节不变，不为群数再等一轮；(2) 护栏零实战命中——接受，首次实战验证推迟到阶段 5，不为造样本下单；(3) 护栏严格度——保持严格，只认 execution_order_legs 里 order_kind 为普通 order 且由本系统记录的 ordId，缺 leg 时记事故并停手，不放宽到 execution_bindings；(4) 5b 限流器必须按物理 HTTP 请求计数（V2 分页每页一次），不按逻辑调用计数，已写入 phase-5b 文件。5a 维持 completed，代码保持在线。
