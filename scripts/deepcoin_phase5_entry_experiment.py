@@ -831,17 +831,97 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
     return 0 if summary["status"] == "submitted_and_observed" else 1
 
 
+def cancel_exact(root: Path, order_id: str, *, execute: bool) -> int:
+    """Cancel exactly one order id the operator names.  Never scans for targets.
+
+    Needed because ``GET /deepcoin/trade/orders-pending`` is blind to a live
+    ordinary limit order (cell 11, 2026-09-07): a run whose response was lost
+    can leave an order that no listing endpoint will ever show, so the id has to
+    come from the operator, be read back by exact id, and be verified unfilled
+    before anything is cancelled.
+    """
+
+    if not order_id.isdigit():
+        raise ValueError("order id must be numeric")
+    out = root / ("manual-cancel-" + order_id)
+    out.mkdir(mode=0o700, parents=True, exist_ok=False)
+    set_raw_log(out / "raw.jsonl")
+    summary = {"order_id": order_id, "started_at": utc(), "status": "preflight"}
+    try:
+        summary["worker"] = load_worker_credentials()
+        rows = signed_get("/deepcoin/trade/order", {"instId": INST, "ordId": order_id})
+        summary["order_before"] = [
+            {key: row.get(key) for key in ("ordId", "state", "accFillSz", "px", "sz", "side", "posSide")}
+            for row in rows
+        ]
+        if len(rows) != 1:
+            raise ValueError("exact order read did not return exactly one row")
+        state = str(rows[0].get("state") or "")
+        filled = Decimal(str(rows[0].get("accFillSz") or "0"))
+        if state != "live":
+            raise ValueError(f"order is not live (state={state}); nothing cancelled")
+        if filled != 0:
+            raise ValueError(f"order already has fills (accFillSz={filled}); refusing to cancel")
+        base = {"instType": "SWAP", "instId": INST}
+        summary["tpsl_before"] = [
+            {key: row.get(key) for key in ("ordId", "side", "posSide", "sz",
+                                           "tpTriggerPrice", "slTriggerPrice")}
+            for row in signed_get("/deepcoin/trade/trigger-orders-pending", {**base, "limit": 100})
+        ]
+        if not execute:
+            summary["status"] = "dry_run"
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
+            print("\nNothing cancelled. Re-run with --execute.")
+            return 0
+        summary["cancel"] = write_once(
+            {"method": "POST", "path": CANCEL_PATH,
+             "body": {"instId": INST, "ordId": order_id, "mrgPosition": "split"}},
+            out, "cancel-" + order_id, timeout=15.0,
+        )
+        time.sleep(2)
+        summary["order_after"] = [
+            {key: row.get(key) for key in ("ordId", "state", "accFillSz")}
+            for row in signed_get("/deepcoin/trade/order", {"instId": INST, "ordId": order_id})
+        ]
+        summary["tpsl_after"] = [
+            {key: row.get(key) for key in ("ordId", "side", "posSide", "sz",
+                                           "tpTriggerPrice", "slTriggerPrice")}
+            for row in signed_get("/deepcoin/trade/trigger-orders-pending", {**base, "limit": 100})
+        ]
+        summary["status"] = (
+            "cancelled"
+            if summary["cancel"]["outcome"] == "accepted"
+            and all(str(row.get("state")) == "canceled" for row in summary["order_after"])
+            else "cancel_unresolved_manual_review"
+        )
+    except Exception as exc:
+        summary["status"] = "stopped"
+        summary["error_type"] = type(exc).__name__
+        summary["reason"] = str(exc)
+    finally:
+        summary["finished_at"] = utc()
+        durable_json(out / "manual-cancel-summary.json", summary)
+        print(json.dumps(summary, ensure_ascii=False, indent=2))
+    return 0 if summary["status"] in {"cancelled", "dry_run"} else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--cell", required=True, choices=sorted(CELLS))
+    parser.add_argument("--cell", choices=sorted(CELLS))
+    parser.add_argument("--cancel-exact", metavar="ORDID",
+                        help="cancel exactly this order id and nothing else")
     parser.add_argument("--execute", action="store_true",
                         help="submit for real; without it nothing is sent")
     parser.add_argument("--confirm-cancel-candidate", action="store_true",
                         help="cell 11 only: allow cancelling the single recovery candidate")
     parser.add_argument("--root", default=str(Path(__file__).resolve().parent))
     args = parser.parse_args()
+    if bool(args.cell) == bool(args.cancel_exact):
+        parser.error("pass exactly one of --cell or --cancel-exact")
     previous_umask = os.umask(0o077)
     try:
+        if args.cancel_exact:
+            return cancel_exact(Path(args.root), args.cancel_exact, execute=args.execute)
         return run_cell(
             Path(args.root), args.cell,
             execute=args.execute,

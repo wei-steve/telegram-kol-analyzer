@@ -237,3 +237,36 @@ def test_harness_never_closes_a_position_and_writes_nowhere_else(harness):
                       "/deepcoin/trade/cancel-trigger-order"):
         assert forbidden not in source, f"{forbidden} must not appear in the experiment harness"
     assert harness.WRITE_PATHS == frozenset({harness.ORDER_PATH, harness.CANCEL_PATH})
+
+
+def test_cancel_exact_requires_a_numeric_id_and_never_scans(harness, tmp_path):
+    with pytest.raises(ValueError):
+        harness.cancel_exact(tmp_path, "not-an-id", execute=False)
+    source = SCRIPT.read_text(encoding="utf-8")
+    body = source[source.index("def cancel_exact("):source.index("def main()")]
+    # The target may only come from the operator, never from a listing.
+    # (trigger-orders-pending is read for evidence, not to pick a target.)
+    assert '"/deepcoin/trade/orders-pending"' not in body
+    assert "orders-history" not in body
+    assert "recovery_candidates" not in body
+
+
+def test_cancel_exact_refuses_anything_that_is_not_a_live_unfilled_order(harness, tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "load_worker_credentials", lambda: {"worker_pid": "1"})
+    calls = []
+    monkeypatch.setattr(harness, "write_once",
+                        lambda *a, **k: calls.append(a) or {"outcome": "accepted"})
+
+    def reader(rows):
+        return lambda path, params=None, **kw: rows if path == "/deepcoin/trade/order" else []
+
+    monkeypatch.setattr(harness, "signed_get", reader([{"ordId": "1", "state": "filled", "accFillSz": "0.1"}]))
+    assert harness.cancel_exact(tmp_path / "a", "1", execute=True) == 1
+    monkeypatch.setattr(harness, "signed_get", reader([{"ordId": "1", "state": "live", "accFillSz": "0.1"}]))
+    assert harness.cancel_exact(tmp_path / "b", "1", execute=True) == 1
+    monkeypatch.setattr(harness, "signed_get", reader([
+        {"ordId": "1", "state": "live", "accFillSz": "0"},
+        {"ordId": "1", "state": "live", "accFillSz": "0"},
+    ]))
+    assert harness.cancel_exact(tmp_path / "c", "1", execute=True) == 1
+    assert calls == [], "no cancel may be sent for a non-live, partly filled or ambiguous read"
