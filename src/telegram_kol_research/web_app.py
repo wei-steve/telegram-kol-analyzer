@@ -9654,6 +9654,14 @@ async def run_deepcoin_execution_reconcile_loop(
 
 DEEPCOIN_RECONCILE_ROUND_LOG_PREFIX = "deepcoin_reconcile_round"
 
+# How many binding ids one round log line will name. A reconcile pass refreshes
+# ``updated_at`` on most non-terminal bindings, so production rounds "touch"
+# roughly 180 of them and listing every id twice a minute fills the journal
+# without telling anyone anything. The count is always reported; the ids are
+# reported when there are few enough for the list itself to be the answer,
+# which is the case for the wake-driven rounds this log exists to explain.
+DEEPCOIN_RECONCILE_ROUND_LOG_MAX_BINDING_IDS = 25
+
 
 def _touched_binding_ids(session_factory, *, since: datetime) -> list[int]:
     """Binding ids whose ledger rows moved during this reconcile round.
@@ -9719,8 +9727,12 @@ def _build_deepcoin_reconcile_round_log(
         "duration_seconds": round(
             (round_finished_at - round_started_at).total_seconds(), 3
         ),
-        "touched_binding_ids": touched,
+        "touched_binding_count": len(touched),
     }
+    if len(touched) <= DEEPCOIN_RECONCILE_ROUND_LOG_MAX_BINDING_IDS:
+        payload["touched_binding_ids"] = touched
+    else:
+        payload["touched_binding_ids_truncated"] = True
     if shadow_summary is not None:
         payload["shadow"] = shadow_summary
     return payload

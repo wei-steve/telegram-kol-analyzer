@@ -1071,6 +1071,7 @@ def test_the_round_log_names_its_trigger_times_and_touched_bindings(tmp_path):
     assert payload["wake_to_round_start_seconds"] == 4.0
     assert payload["duration_seconds"] == 13.0
     assert payload["touched_binding_ids"] == [binding_id]
+    assert payload["touched_binding_count"] == 1
     assert payload["shadow"] == {"evaluated": 1}
     # Ids only. No symbol, side, size or price may appear in an operational log.
     serialized = json.dumps(payload)
@@ -1096,6 +1097,7 @@ def test_the_round_log_reports_a_timer_round_with_no_wake_time(tmp_path):
     assert payload["wake_frame_received_at"] is None
     assert payload["wake_to_round_start_seconds"] is None
     assert payload["touched_binding_ids"] == []
+    assert payload["touched_binding_count"] == 0
     assert "shadow" not in payload
 
 
@@ -1364,3 +1366,48 @@ def test_a_lead_is_only_reported_when_both_sides_are_first_discovery_times(tmp_p
     assert report["timing_only_count"] == 2
     assert report["timing_only_sample_size"] == 1
     assert report["timing_only_median_lead_seconds"] == pytest.approx(41.0, abs=0.2)
+
+
+def test_the_round_log_reports_a_count_not_a_wall_of_ids(tmp_path):
+    """A production round touches ~180 bindings; the line must stay readable.
+
+    The ids are what make a wake-driven round explainable, and those rounds
+    touch few. A timer round that refreshes everything gets a count instead --
+    the same information, without two kilobytes of journal per pass.
+    """
+
+    from telegram_kol_research.web_app import (
+        DEEPCOIN_RECONCILE_ROUND_LOG_MAX_BINDING_IDS,
+        _build_deepcoin_reconcile_round_log,
+    )
+
+    session_factory = create_session_factory(tmp_path / "round.db")
+    with session_factory() as session:
+        for index in range(DEEPCOIN_RECONCILE_ROUND_LOG_MAX_BINDING_IDS + 5):
+            session.add(
+                ExecutionBinding(
+                    kol_id="kol",
+                    chat_id=-1,
+                    message_id=index,
+                    symbol="ETH",
+                    side="long",
+                    created_at=BASE_TIME,
+                    updated_at=BASE_TIME,
+                )
+            )
+        session.commit()
+
+    payload = _build_deepcoin_reconcile_round_log(
+        session_factory,
+        trigger="by_timer",
+        round_started_at=BASE_TIME - timedelta(seconds=1),
+        round_finished_at=BASE_TIME + timedelta(seconds=1),
+        wake_requested_at=None,
+        shadow_summary=None,
+    )
+
+    assert payload["touched_binding_count"] == (
+        DEEPCOIN_RECONCILE_ROUND_LOG_MAX_BINDING_IDS + 5
+    )
+    assert payload["touched_binding_ids_truncated"] is True
+    assert "touched_binding_ids" not in payload
