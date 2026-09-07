@@ -100,8 +100,10 @@ REFUSAL_REASONS = frozenset(
         "no_trade_frame_for_main_ord_id",
         # criterion 2
         "rest_read_incomplete",
+        "no_rest_order_response_for_main_ord_id",
         "no_rest_pos_id_for_main_ord_id",
         "rest_pos_id_not_unique",
+        "rest_pos_id_not_confirmed_by_rest",
         "rest_pos_side_missing",
         "rest_pos_side_mismatch",
         # criterion 3
@@ -173,6 +175,76 @@ def _normalize_position_side(value: Any) -> str | None:
     return None
 
 
+def rest_pos_id_from_order_response(
+    response: dict[str, Any] | None, *, main_ord_id: str
+) -> tuple[str | None, str | None]:
+    """Return the split posId Deepcoin returned when it accepted this order.
+
+    **This is the only REST source of the ordId -> posId link that exists.**
+    Verified read-only against production on 2026-09-07 across every read
+    endpoint the client has: ``list_trade_fills`` and
+    ``list_trade_fills_by_order_id`` return no ``posId`` field at all; neither
+    does ``list_order_history`` / ``get_order_history_by_id``;
+    ``list_positions`` and ``list_position_history`` carry ``posId`` but no
+    order id; and ``list_trigger_orders_pending`` /
+    ``list_trigger_order_history`` carry neither. The link appears exactly once,
+    in the body of ``POST /deepcoin/trade/order``::
+
+        {"code":"0","data":{"ordId":"1001125164628529","sCode":"0",...},
+         "msg":"","posId":"1001125164628529"}
+
+    ``posId`` sits at the top level, beside ``data`` rather than inside it.
+    Production already treats it as tier-0 evidence
+    (``evidence_type='direct_order_position_id'``), so this is the same fact the
+    existing ledger uses, read from the same place.
+
+    Two consequences worth stating plainly rather than discovering later:
+
+    * The shadow chain cannot *re-derive* this. The response exists only at
+      submission time, and re-issuing the POST would place another order. So in
+      shadow mode the response is read back from what was recorded when the
+      order was submitted. That makes criterion 2 the one step whose evidence
+      travels through this system's own storage, and it means a ``shadow_only``
+      finding at the posId level is structurally impossible: an entry nobody
+      recorded has no response to read. Phase 5 does not inherit this -- there
+      the new binding holds the response as it arrives.
+    * The observed values have ``posId == ordId``. That is **not** what is used
+      here. The value is read from its own field; if the exchange ever returns a
+      different one, this returns the different one. Deriving the posId from the
+      ordId would be exactly the allocation-pattern inference this program
+      exists to remove.
+
+    Returns ``(pos_id, None)`` or ``(None, refusal_reason)``.
+    """
+
+    if not isinstance(response, dict):
+        return None, "no_rest_order_response_for_main_ord_id"
+    data = response.get("data")
+    if isinstance(data, dict):
+        rows = [data]
+    elif isinstance(data, list):
+        rows = [row for row in data if isinstance(row, dict)]
+    else:
+        rows = []
+    if not any(
+        _text(row.get("ordId")) == main_ord_id
+        or _text(row.get("orderId")) == main_ord_id
+        for row in rows
+    ):
+        # A response that does not name this order says nothing about it.
+        return None, "no_rest_order_response_for_main_ord_id"
+
+    candidates = {value for row in rows if (value := _text(row.get("posId")))}
+    top_level = _text(response.get("posId"))
+    if top_level is not None:
+        candidates.add(top_level)
+    if not candidates:
+        return None, "no_rest_pos_id_for_main_ord_id"
+    if len(candidates) > 1:
+        return None, "rest_pos_id_not_unique"
+    return next(iter(candidates)), None
+
+
 @dataclass
 class ShadowChainInputs:
     """Everything one chain evaluation is allowed to look at.
@@ -189,8 +261,13 @@ class ShadowChainInputs:
     order_frames: list[dict[str, Any]] = field(default_factory=list)
     trigger_frames: list[dict[str, Any]] = field(default_factory=list)
     position_frames: list[dict[str, Any]] = field(default_factory=list)
+    # The exchange's own response to ``POST /deepcoin/trade/order``, as it was
+    # received. See :func:`rest_pos_id_from_order_response` for why this, and
+    # not any read endpoint, is where the posId comes from.
+    rest_order_response: dict[str, Any] | None = None
     rest_fills: list[dict[str, Any]] = field(default_factory=list)
     rest_positions: list[dict[str, Any]] = field(default_factory=list)
+    rest_position_history: list[dict[str, Any]] = field(default_factory=list)
     rest_trigger_orders: list[dict[str, Any]] = field(default_factory=list)
     rest_complete: bool = True
     rest_read_failures: tuple[str, ...] = ()
@@ -354,43 +431,49 @@ def evaluate_shadow_chain(inputs: ShadowChainInputs) -> ShadowChainResult:
         if _text(row.get("ordId")) == inputs.main_ord_id
         or _text(row.get("orderId")) == inputs.main_ord_id
     ]
-    pos_ids = sorted(
-        {
-            value
-            for row in fill_rows
-            if (value := _text(row.get("posId") or row.get("positionId")))
-        }
-    )
     evidence["rest_fill_count"] = len(fill_rows)
-    evidence["rest_pos_id_candidates"] = pos_ids
     filled_size = sum(
         (_decimal(row.get("fillSz") or row.get("sz")) or Decimal(0))
         for row in fill_rows
     )
     evidence["rest_filled_size"] = str(filled_size)
-    if not pos_ids:
-        return refuse("no_rest_pos_id_for_main_ord_id", STAGE_FILLED)
-    if len(pos_ids) > 1:
-        return refuse("rest_pos_id_not_unique", STAGE_FILLED)
-    pos_id = pos_ids[0]
+
+    pos_id, response_reason = rest_pos_id_from_order_response(
+        inputs.rest_order_response, main_ord_id=inputs.main_ord_id
+    )
+    evidence["rest_pos_id_source"] = "order_submission_response"
+    if pos_id is None:
+        return refuse(response_reason or "no_rest_pos_id_for_main_ord_id", STAGE_FILLED)
     evidence["pos_id"] = pos_id
+
+    # The response says which position the order opened. Whether that position
+    # exists, and in which direction, is asked of the exchange now -- so a stale
+    # or malformed recorded response cannot carry the chain on its own.
+    position_rows = [
+        row
+        for row in inputs.rest_positions
+        if _text(row.get("posId") or row.get("positionId")) == pos_id
+    ]
+    history_rows = [
+        row
+        for row in inputs.rest_position_history
+        if _text(row.get("posId") or row.get("positionId")) == pos_id
+    ]
+    evidence["rest_position_row_count"] = len(position_rows)
+    evidence["rest_position_history_row_count"] = len(history_rows)
+    if not position_rows and not history_rows:
+        return refuse("rest_pos_id_not_confirmed_by_rest", STAGE_FILLED)
 
     fill_sides = {
         side
         for row in fill_rows
         if (side := _normalize_position_side(row.get("posSide") or row.get("side")))
     }
-    position_rows = [
-        row
-        for row in inputs.rest_positions
-        if _text(row.get("posId") or row.get("positionId")) == pos_id
-    ]
     position_sides = {
         side
-        for row in position_rows
+        for row in position_rows + history_rows
         if (side := _normalize_position_side(row.get("posSide")))
     }
-    evidence["rest_position_row_count"] = len(position_rows)
     observed_sides = fill_sides | position_sides
     if not observed_sides:
         return refuse("rest_pos_side_missing", STAGE_POSITION_BOUND)
@@ -773,16 +856,32 @@ def _needs_reevaluation(
     return (now - last_seen_at).total_seconds() >= SHADOW_UNVERIFIED_RETRY_SECONDS
 
 
-def _ledger_entry_order_ids(
-    session_factory: Callable[[], Any], *, since: datetime
-) -> dict[str, int]:
-    """Entry order ids production recorded, mapped to their binding id.
+@dataclass
+class LedgerEntryRecord:
+    """One recorded entry submission: its binding id and the exchange's reply."""
 
-    This is a *candidate source*, never a verdict: the shadow chain still has to
-    prove every one of the five criteria from the stream and REST. Including it
-    is what makes ``ledger_only`` observable at all -- an entry the ledger holds
-    and the deterministic chain could not confirm would otherwise never be
-    looked at.
+    execution_binding_id: int
+    order_response: dict[str, Any] | None
+
+
+def _ledger_entry_records(
+    session_factory: Callable[[], Any], *, since: datetime
+) -> dict[str, LedgerEntryRecord]:
+    """Entry order ids production recorded, with the exchange's own response.
+
+    Two different things are taken from here, and they are worth telling apart.
+
+    The order id is a *candidate source*: it says "look at this chain", never
+    "this chain is bound". Including it is what makes ``ledger_only`` observable
+    at all, because an entry the deterministic chain cannot confirm would
+    otherwise never be examined.
+
+    ``response_json`` is something else: it is the verbatim body Deepcoin
+    returned to ``POST /deepcoin/trade/order``, and it is the only place the
+    ordId -> posId link exists at all (see
+    :func:`rest_pos_id_from_order_response`). Reading it back is reading a REST
+    response, not trusting a ledger conclusion -- the ledger's own ``pos_id``
+    column is deliberately not read here.
     """
 
     from sqlalchemy import select
@@ -794,17 +893,26 @@ def _ledger_entry_order_ids(
             select(
                 ExecutionOrderLeg.order_id,
                 ExecutionOrderLeg.execution_binding_id,
+                ExecutionOrderLeg.response_json,
             ).where(
                 ExecutionOrderLeg.purpose == "entry",
                 ExecutionOrderLeg.order_id.is_not(None),
                 ExecutionOrderLeg.created_at >= since,
             )
         ).all()
-    result: dict[str, int] = {}
-    for order_id, binding_id in rows:
+    result: dict[str, LedgerEntryRecord] = {}
+    for order_id, binding_id, response_json in rows:
         text = _text(order_id)
-        if text is not None:
-            result.setdefault(text, int(binding_id))
+        if text is None or text in result:
+            continue
+        try:
+            response = json.loads(response_json or "null")
+        except (TypeError, ValueError):
+            response = None
+        result[text] = LedgerEntryRecord(
+            execution_binding_id=int(binding_id),
+            order_response=response if isinstance(response, dict) else None,
+        )
     return result
 
 
@@ -814,6 +922,7 @@ class _RestReader:
     def __init__(self, client: Any) -> None:
         self._client = client
         self._positions: dict[str, list[dict[str, Any]]] = {}
+        self._position_history: dict[str, list[dict[str, Any]]] = {}
         self._triggers: dict[str, list[dict[str, Any]]] = {}
         self._fills: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.failures: list[str] = []
@@ -842,6 +951,19 @@ class _RestReader:
                 return None
             self._positions[inst_id] = rows
         return self._positions[inst_id]
+
+    def position_history(self, inst_id: str) -> list[dict[str, Any]] | None:
+        """Closed positions. Read only when the live list does not hold the id."""
+
+        if inst_id not in self._position_history:
+            rows = self._read(
+                f"list_position_history[{inst_id}]",
+                lambda: self._client.list_position_history(inst_id=inst_id),
+            )
+            if rows is None:
+                return None
+            self._position_history[inst_id] = rows
+        return self._position_history[inst_id]
 
     def trigger_orders(self, inst_id: str) -> list[dict[str, Any]] | None:
         if inst_id not in self._triggers:
@@ -875,6 +997,7 @@ def collect_chain_inputs(
     frames_by_channel: dict[str, list[dict[str, Any]]],
     reader: _RestReader,
     instrument_map: Any,
+    order_response: dict[str, Any] | None = None,
 ) -> ShadowChainInputs:
     """Assemble one chain's inputs from the inbox and targeted REST reads."""
 
@@ -902,6 +1025,7 @@ def collect_chain_inputs(
 
     inputs = ShadowChainInputs(
         main_ord_id=main_ord_id,
+        rest_order_response=order_response,
         instrument_stream=instrument_stream,
         instrument_rest=instrument_rest,
         instrument_resolved=instrument_resolved,
@@ -923,6 +1047,23 @@ def collect_chain_inputs(
     inputs.rest_fills = fills
     inputs.rest_positions = positions
     inputs.rest_trigger_orders = triggers
+
+    # Closed positions are only consulted when the live list does not hold the
+    # posId. That read is rate-paced by the client, so it is worth not making
+    # it for every open chain on every pass.
+    pos_id, _reason = rest_pos_id_from_order_response(
+        order_response, main_ord_id=main_ord_id
+    )
+    if pos_id is not None and not any(
+        _text(row.get("posId") or row.get("positionId")) == pos_id
+        for row in positions
+    ):
+        history = reader.position_history(instrument_rest)
+        if history is None:
+            inputs.rest_complete = False
+            inputs.rest_read_failures = tuple(reader.failures)
+            return inputs
+        inputs.rest_position_history = history
     return inputs
 
 
@@ -1100,7 +1241,7 @@ def run_shadow_binding_pass(
     for frame in frames:
         frames_by_channel.setdefault(str(frame.get("channel")), []).append(frame)
 
-    ledger_entries = _ledger_entry_order_ids(session_factory, since=since)
+    ledger_entries = _ledger_entry_records(session_factory, since=since)
     stream_candidates = {
         value
         for frame in frames_by_channel.get("Trade", [])
@@ -1124,11 +1265,13 @@ def run_shadow_binding_pass(
     reader = _RestReader(client)
     written_ids: list[int] = []
     for main_ord_id in due[:max_candidates]:
+        record = ledger_entries.get(main_ord_id)
         inputs = collect_chain_inputs(
             main_ord_id,
             frames_by_channel=frames_by_channel,
             reader=reader,
             instrument_map=instrument_map,
+            order_response=None if record is None else record.order_response,
         )
         verdict = evaluate_shadow_chain(inputs)
         result.evaluated += 1
@@ -1141,7 +1284,9 @@ def run_shadow_binding_pass(
                 session_factory,
                 verdict,
                 now=now,
-                observed_execution_binding_id=ledger_entries.get(main_ord_id),
+                observed_execution_binding_id=(
+                    None if record is None else record.execution_binding_id
+                ),
             )
         )
     result.written = len(written_ids)

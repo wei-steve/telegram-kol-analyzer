@@ -129,11 +129,44 @@ def _inbox_rows(channel: str) -> list[dict]:
     return rows
 
 
+def _order_response(**overrides) -> dict:
+    """The body ``POST /deepcoin/trade/order`` really returns.
+
+    Copied field-for-field from a production submission on 2026-09-07: the
+    ``posId`` sits at the top level, beside ``data`` rather than inside it, and
+    it is the only place in the whole REST surface where an order id and a
+    position id appear together.
+    """
+
+    row = {
+        "code": "0",
+        "msg": "",
+        "data": {
+            "ordId": MAIN_ORD_ID,
+            "clOrdId": "TKFG9210E1",
+            "sCode": "0",
+            "sMsg": "",
+            "tag": "",
+        },
+        "posId": POS_ID,
+    }
+    row.update(overrides)
+    return row
+
+
 def _rest_fill(**overrides) -> dict:
+    """One ``list_trade_fills`` row, with the real field set.
+
+    Verified against production: the fills endpoint carries **no** ``posId``.
+    The fixture omits it deliberately -- a fixture richer than the exchange
+    would let criterion 2 pass in a test and refuse in production.
+    """
+
     row = {
         "instId": REST_INSTRUMENT,
         "ordId": MAIN_ORD_ID,
-        "posId": POS_ID,
+        "tradeId": "1000303910995812",
+        "side": "buy",
         "posSide": "long",
         "fillSz": "0.1",
         "fillPx": "2478.78",
@@ -181,6 +214,7 @@ def _instrument_map() -> DeepcoinInstrumentIdMap:
 def _complete_inputs(**overrides) -> ShadowChainInputs:
     inputs = ShadowChainInputs(
         main_ord_id=MAIN_ORD_ID,
+        rest_order_response=_order_response(),
         instrument_stream=STREAM_INSTRUMENT,
         instrument_rest=REST_INSTRUMENT,
         instrument_resolved=True,
@@ -224,18 +258,50 @@ def test_criterion_one_alone_missing_refuses_with_its_own_reason():
 
 
 def test_criterion_two_alone_missing_refuses_when_rest_posid_is_not_unique():
-    """REST returns two different posIds for the one entry order."""
+    """The order response names two different posIds for the one entry."""
 
-    result = evaluate_shadow_chain(
-        _complete_inputs(
-            rest_fills=[_rest_fill(), _rest_fill(posId="1001125145471999")]
-        )
-    )
+    response = _order_response()
+    response["data"] = {**response["data"], "posId": "1001125145471999"}
+    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=response))
 
     assert result.binding_confidence == CONFIDENCE_UNVERIFIED
     assert result.refusal_reason == "rest_pos_id_not_unique"
     assert result.criteria["trade_os_equals_main_ord_id"] is True
     assert result.criteria["rest_unique_directional_pos_id"] is False
+
+
+def test_criterion_two_refuses_when_no_order_response_was_ever_recorded():
+    """No response, no ordId -> posId link anywhere in the REST surface."""
+
+    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=None))
+
+    assert result.refusal_reason == "no_rest_order_response_for_main_ord_id"
+    assert result.pos_id is None
+
+
+def test_criterion_two_refuses_when_the_exchange_does_not_confirm_the_position():
+    """A recorded posId the exchange knows nothing about proves nothing."""
+
+    result = evaluate_shadow_chain(
+        _complete_inputs(rest_positions=[], rest_position_history=[])
+    )
+
+    assert result.refusal_reason == "rest_pos_id_not_confirmed_by_rest"
+
+
+def test_the_pos_id_is_read_from_its_own_field_not_derived_from_the_ord_id():
+    """``posId == ordId`` in production. The value must still come from ``posId``."""
+
+    response = _order_response(posId="9009009009009009")
+    result = evaluate_shadow_chain(
+        _complete_inputs(
+            rest_order_response=response,
+            rest_positions=[_rest_position(posId="9009009009009009")],
+        )
+    )
+
+    assert result.pos_id == "9009009009009009"
+    assert result.pos_id != MAIN_ORD_ID
 
 
 def test_criterion_three_alone_missing_refuses_when_tu_never_equals_posid():
@@ -325,10 +391,16 @@ def test_an_incomplete_rest_read_is_unknown_and_never_zero():
 
 
 def test_position_pi_is_recorded_as_support_and_never_satisfies_criterion_two():
-    """``PI`` names the posId, and the chain still refuses without the REST read."""
+    """``PI`` names the posId, and the chain still refuses without the REST link.
 
-    inputs = _complete_inputs(rest_fills=[])
-    result = evaluate_shadow_chain(inputs)
+    The stream has already said which position this is. Criterion 2 does not
+    care: without the exchange's own order response there is no REST-sourced
+    link, and an undocumented push field is not allowed to become one.
+    """
+
+    response = _order_response()
+    del response["posId"]
+    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=response))
 
     assert POS_ID in result.evidence["position_pi_seen_in_window"]
     assert result.binding_confidence == CONFIDENCE_UNVERIFIED
@@ -480,6 +552,9 @@ def _seed_ledger(
             venue="deepcoin",
             attribution_status="verified",
             last_verified_at=leg_verified_at or (BASE_TIME + timedelta(seconds=30)),
+            # The verbatim exchange response, which is where the shadow chain
+            # reads the posId from -- not from the ``pos_id`` column above.
+            response_json=json.dumps(_order_response(), ensure_ascii=False),
             created_at=created,
             updated_at=created,
         )
@@ -858,6 +933,10 @@ class _StubClient:
         self._maybe_fail("list_positions")
         return list(self._positions)
 
+    def list_position_history(self, *, inst_id, pos_id=None):
+        self._maybe_fail("list_position_history")
+        return []
+
     def list_trigger_orders_pending(self, *, inst_id):
         self._maybe_fail("list_trigger_orders_pending")
         return list(self._triggers)
@@ -1065,6 +1144,7 @@ def test_a_verified_chain_costs_no_further_rest_reads_without_a_new_frame(tmp_pa
     """Re-reading a settled chain every thirty seconds would be pure load."""
 
     session_factory = create_session_factory(tmp_path / "shadow.db")
+    _seed_ledger(session_factory)
     _seed_inbox(session_factory)
     now = datetime.fromtimestamp(1788636240089 / 1000, tz=UTC) + timedelta(minutes=1)
     client = _StubClient()
@@ -1161,3 +1241,40 @@ def test_a_ledger_entry_the_stream_never_saw_costs_no_rest_read(tmp_path):
             session.query(DeepcoinShadowBinding).one().refusal_reason
             == "instrument_unknown"
         )
+
+
+def test_no_rest_read_endpoint_can_supply_the_pos_id():
+    """The finding that shaped criterion 2, kept as an executable statement.
+
+    Verified read-only against production on 2026-09-07: fills, order history,
+    positions, position history and both trigger-order endpoints. Not one of
+    them returns an order id and a position id together. The link exists only in
+    the body of ``POST /deepcoin/trade/order``.
+
+    These fixtures carry the exact field sets those endpoints returned, so if a
+    future Deepcoin release starts publishing ``posId`` on a read, this test is
+    where that shows up.
+    """
+
+    assert "posId" not in _rest_fill()
+    # The real pending-TPSL row, verbatim from production.
+    real_pending_tpsl = {
+        "instType": "SWAP",
+        "instId": REST_INSTRUMENT,
+        "ordId": "1001125157891310",
+        "triggerPx": "0",
+        "sz": "0",
+        "side": "sell",
+        "posSide": "long",
+        "triggerOrderType": "TPSL",
+        "slTriggerPrice": "2430",
+        "closeSLTriggerPrice": "2430",
+        "tpTriggerPrice": "0",
+        "closeTPTriggerPrice": "0",
+    }
+    assert "posId" not in real_pending_tpsl
+
+    # And with every read available, no response means no posId.
+    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=None))
+    assert result.pos_id is None
+    assert result.refusal_reason == "no_rest_order_response_for_main_ord_id"
