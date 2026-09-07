@@ -82,6 +82,14 @@ from telegram_kol_research.deepcoin_reconcile_wake import (
 from telegram_kol_research.deepcoin_reconcile_wake import (
     DeepcoinReconcileWakeSignal,
 )
+from telegram_kol_research.deepcoin_shadow_binding import (
+    ShadowLedgerMutationError,
+    run_shadow_binding_pass,
+)
+from telegram_kol_research.deepcoin_shadow_diff import (
+    build_shadow_binding_report,
+    run_shadow_diff_pass,
+)
 from telegram_kol_research.deepcoin_ws_resync import http_status_from_exception
 from telegram_kol_research.execution_boundary import (
     ExecutionBoundaryTracker,
@@ -970,6 +978,27 @@ def _set_deepcoin_private_ws_inbox(app: FastAPI):
         app.state.deepcoin_private_ws_inbox = inbox
 
     return _sink
+
+
+def _deepcoin_shadow_instrument_map_provider(app: FastAPI):
+    """Return a getter for phase 2's explicit contract map, or ``None``.
+
+    The shadow chain compares a stream contract name (``ETHUSDT``) with a REST
+    one (``ETH-USDT-SWAP``), so it needs the authoritative map the resync
+    coordinator builds from ``list_swap_instruments``. Until the stream task has
+    started there is no map, and the provider returns ``None`` so the shadow
+    pass skips that round rather than guessing at a normalisation.
+    """
+
+    def _provider():
+        inbox = getattr(app.state, "deepcoin_private_ws_inbox", None)
+        coordinator = getattr(inbox, "resync_coordinator", None)
+        instrument_map = getattr(coordinator, "instrument_map", None)
+        if instrument_map is None or int(getattr(instrument_map, "size", 0) or 0) <= 0:
+            return None
+        return instrument_map
+
+    return _provider
 
 
 def _build_semantic_review_notifier(app: FastAPI):
@@ -5062,6 +5091,9 @@ def create_web_app(
                             app.state.runtime_authority_status.record_reconcile_failure
                         ),
                         wake_signal=app.state.deepcoin_reconcile_wake_signal,
+                        shadow_instrument_map_provider=(
+                            _deepcoin_shadow_instrument_map_provider(app)
+                        ),
                     )
                 )
             if runtime_role_starts_singleton_task(
@@ -6302,6 +6334,25 @@ def create_web_app(
             inbox=app.state.deepcoin_private_ws_inbox,
             now=app.state.now_provider(),
             wake_signal=app.state.deepcoin_reconcile_wake_signal,
+        )
+
+    @app.get("/api/runtime/deepcoin-shadow-binding-report")
+    def api_runtime_deepcoin_shadow_binding_report(request: Request):
+        """Counts only. Row detail belongs in a server-side evidence file.
+
+        The phase 4 exporter (``cli.py``) writes the per-chain detail; this
+        endpoint returns aggregates so that no order id, price or size ever
+        leaves the process over HTTP.
+        """
+
+        client_host = request.client.host if request.client is not None else ""
+        if (
+            client_host not in {"127.0.0.1", "::1"}
+            or "x-forwarded-for" in request.headers
+        ):
+            raise HTTPException(status_code=404, detail="not found")
+        return build_shadow_binding_report(
+            app.state.session_factory, now=app.state.now_provider()
         )
 
     @app.get("/api/runtime-agent/read-only-exchange-snapshot")
@@ -9494,6 +9545,7 @@ async def run_deepcoin_execution_reconcile_loop(
     authority_observer=None,
     authority_failure_observer=None,
     wake_signal=None,
+    shadow_instrument_map_provider=None,
 ) -> None:
     """Reconcile on a fixed timer, and additionally as soon as a frame lands.
 
@@ -9512,6 +9564,9 @@ async def run_deepcoin_execution_reconcile_loop(
     while True:
         if wake_signal is not None:
             wake_signal.record_reconcile_run(trigger)
+        round_started_at = (
+            now_provider() if now_provider is not None else datetime.now(UTC)
+        )
         try:
             client, synced_at = await run_on_management_worker(
                 _build_deepcoin_reconcile_client,
@@ -9570,10 +9625,221 @@ async def run_deepcoin_execution_reconcile_loop(
                         now_provider() if now_provider is not None else datetime.now(UTC)
                     )
                 )
+        # Phase 4 additions. Both are observation only and both are isolated
+        # from the reconcile they follow: a failure in either is logged and
+        # dropped, never allowed to skip or repeat a reconciliation.
+        shadow_summary = None
+        if shadow_instrument_map_provider is not None:
+            shadow_summary = await _run_deepcoin_shadow_observation_step(
+                session_factory=session_factory,
+                deepcoin_client_factory=deepcoin_client_factory,
+                instrument_map=shadow_instrument_map_provider(),
+                now_provider=now_provider,
+            )
+        await _log_deepcoin_reconcile_round_step(
+            session_factory=session_factory,
+            trigger=trigger,
+            round_started_at=round_started_at,
+            round_finished_at=(
+                now_provider() if now_provider is not None else datetime.now(UTC)
+            ),
+            wake_signal=wake_signal,
+            shadow_summary=shadow_summary,
+        )
         if wake_signal is None:
             await asyncio.sleep(interval_seconds)
         else:
             trigger = await wake_signal.wait_for_next_run(timeout=interval_seconds)
+
+
+DEEPCOIN_RECONCILE_ROUND_LOG_PREFIX = "deepcoin_reconcile_round"
+
+
+def _touched_binding_ids(session_factory, *, since: datetime) -> list[int]:
+    """Binding ids whose ledger rows moved during this reconcile round.
+
+    Read-only, and deliberately derived rather than reported by the reconcile
+    itself: phase 4 must not change what that function does or returns. Ids
+    only -- no symbol, no side, no size, no price.
+    """
+
+    from sqlalchemy import select
+
+    ids: set[int] = set()
+    with session_factory() as session:
+        for (binding_id,) in session.execute(
+            select(ExecutionBinding.id).where(ExecutionBinding.updated_at >= since)
+        ).all():
+            ids.add(int(binding_id))
+        for (binding_id,) in session.execute(
+            select(ExecutionOrderLeg.execution_binding_id).where(
+                ExecutionOrderLeg.updated_at >= since
+            )
+        ).all():
+            ids.add(int(binding_id))
+    return sorted(ids)
+
+
+def _build_deepcoin_reconcile_round_log(
+    session_factory,
+    *,
+    trigger: str,
+    round_started_at: datetime,
+    round_finished_at: datetime,
+    wake_requested_at: datetime | None,
+    shadow_summary: dict | None,
+) -> dict:
+    """Assemble the one structured line phase 4 adds per reconcile round.
+
+    Phase 3 could not say how far ahead a wake-driven round ran because the loop
+    logged nothing per round; the lead had to be estimated from the surrounding
+    timestamps. This line makes it measurable: trigger source, when the waking
+    frame was received, when the round started and finished, and which bindings
+    it touched.
+    """
+
+    try:
+        touched = _touched_binding_ids(session_factory, since=round_started_at)
+    except Exception:
+        logger.debug("Failed to collect touched binding ids for reconcile round log")
+        touched = []
+    wake_lead_seconds = None
+    if wake_requested_at is not None:
+        wake_lead_seconds = round(
+            (round_started_at - wake_requested_at).total_seconds(), 3
+        )
+    payload = {
+        "trigger": trigger,
+        "wake_frame_received_at": (
+            None if wake_requested_at is None else wake_requested_at.isoformat()
+        ),
+        "wake_to_round_start_seconds": wake_lead_seconds,
+        "started_at": round_started_at.isoformat(),
+        "finished_at": round_finished_at.isoformat(),
+        "duration_seconds": round(
+            (round_finished_at - round_started_at).total_seconds(), 3
+        ),
+        "touched_binding_ids": touched,
+    }
+    if shadow_summary is not None:
+        payload["shadow"] = shadow_summary
+    return payload
+
+
+async def _log_deepcoin_reconcile_round_step(
+    *,
+    session_factory,
+    trigger: str,
+    round_started_at: datetime,
+    round_finished_at: datetime,
+    wake_signal,
+    shadow_summary: dict | None,
+) -> None:
+    """Emit the per-round line. Never allowed to affect the reconcile loop."""
+
+    try:
+        payload = await run_on_management_worker(
+            _build_deepcoin_reconcile_round_log,
+            session_factory,
+            trigger=trigger,
+            round_started_at=round_started_at,
+            round_finished_at=round_finished_at,
+            wake_requested_at=getattr(wake_signal, "last_request_at", None),
+            shadow_summary=shadow_summary,
+        )
+    except Exception:
+        logger.debug("Failed to build Deepcoin reconcile round log")
+        return
+    logger.info(
+        "%s %s",
+        DEEPCOIN_RECONCILE_ROUND_LOG_PREFIX,
+        json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str),
+    )
+
+
+def _run_deepcoin_shadow_observation(
+    session_factory,
+    *,
+    deepcoin_client_factory,
+    instrument_map,
+    now: datetime,
+) -> dict:
+    """Build the shadow chains and re-derive their differences. Observation only.
+
+    Writes ``deepcoin_shadow_bindings`` and ``deepcoin_shadow_diffs`` and
+    nothing else -- the session guard in ``deepcoin_shadow_binding`` refuses any
+    other object before the flush. Every exchange call it makes is one of the
+    existing GET readers.
+    """
+
+    client = deepcoin_client_factory()
+    try:
+        pass_result = run_shadow_binding_pass(
+            session_factory,
+            client=client,
+            instrument_map=instrument_map,
+            now=now,
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("Deepcoin shadow observation client cleanup failed")
+    diff_result = run_shadow_diff_pass(
+        session_factory,
+        now=now,
+        shadow_binding_ids=pass_result.shadow_binding_ids,
+    )
+    return {
+        "candidates_seen": pass_result.candidates_seen,
+        "candidates_due": pass_result.candidates_due,
+        "evaluated": pass_result.evaluated,
+        "exact": pass_result.exact,
+        "unverified": pass_result.unverified,
+        "rest_read_failures": list(pass_result.rest_read_failures),
+        "diffs_seen": diff_result["diffs_seen"],
+        "counts_by_kind": diff_result["counts_by_kind"],
+    }
+
+
+async def _run_deepcoin_shadow_observation_step(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    instrument_map,
+    now_provider,
+) -> dict | None:
+    """Run one shadow pass off the event loop, swallowing every failure.
+
+    ``instrument_map is None`` means phase 2's explicit contract map is not
+    available in this process, so cross-source names could only be compared by
+    guessing. The shadow pass is skipped instead: fail closed, as the plan
+    requires, rather than normalise by string surgery.
+    """
+
+    if instrument_map is None:
+        return None
+    try:
+        return await run_on_management_worker(
+            _run_deepcoin_shadow_observation,
+            session_factory,
+            deepcoin_client_factory=deepcoin_client_factory,
+            instrument_map=instrument_map,
+            now=(now_provider() if now_provider is not None else datetime.now(UTC)),
+        )
+    except asyncio.CancelledError:
+        raise
+    except ShadowLedgerMutationError:
+        # The one failure worth shouting about: a shadow write reached outside
+        # the shadow tables. It was refused before the flush, so nothing was
+        # written, and the reconcile loop still must not be disturbed.
+        logger.exception("Deepcoin shadow observation attempted a ledger write")
+        return None
+    except Exception:
+        logger.warning("Deepcoin shadow observation failed", exc_info=True)
+        return None
 
 
 def _record_reconcile_failure(wake_signal, exc: BaseException) -> None:

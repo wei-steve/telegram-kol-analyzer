@@ -6621,6 +6621,176 @@ def recognition_execution_schema(
     typer.echo(json.dumps(evidence, ensure_ascii=False, sort_keys=True))
 
 
+@app.command("deepcoin-shadow-binding-export")
+def deepcoin_shadow_binding_export(
+    database_path: Path = typer.Option(
+        ..., "--database-path", help="Existing research database to read."
+    ),
+    output_path: Path = typer.Option(
+        ...,
+        "--output-path",
+        help="Server-side evidence file the per-chain detail is written to.",
+    ),
+    apply: bool = typer.Option(
+        False,
+        "--apply",
+        help=(
+            "Re-derive the difference rows before exporting. Without it the "
+            "export is a pure read of what the worker already recorded."
+        ),
+    ),
+) -> None:
+    """Export the phase 4 shadow-binding difference report as evidence.
+
+    Read-only against every existing ledger and against the exchange: this
+    command opens no exchange connection at all. ``--apply`` re-runs the
+    *comparison* over already-recorded shadow chains, which writes only
+    ``deepcoin_shadow_diffs``; it never builds a chain, never calls REST and
+    never touches a ledger row.
+
+    The detail lands in ``--output-path`` and the summary on stdout, which is
+    the split the phase requires: identifiers and prices belong in a server-side
+    evidence file, never in an HTTP response.
+    """
+
+    from telegram_kol_research.deepcoin_shadow_binding import guarded_ledger_counts
+    from telegram_kol_research.deepcoin_shadow_diff import (
+        build_shadow_binding_report,
+        load_ledger_chain_view,
+        run_shadow_diff_pass,
+    )
+    from telegram_kol_research.deepcoin_shadow_ownership import load_system_owned_ids
+    from telegram_kol_research.models import DeepcoinShadowBinding, DeepcoinShadowDiff
+
+    now = datetime.now(UTC)
+    session_factory = create_existing_session_factory(database_path)
+    ledger_counts_before = guarded_ledger_counts(session_factory)
+    recompute = None
+    if apply:
+        recompute = run_shadow_diff_pass(session_factory, now=now)
+    owned = load_system_owned_ids(session_factory)
+
+    with session_factory() as session:
+        chains = [
+            {
+                "id": int(row.id),
+                "main_ord_id": row.main_ord_id,
+                "instrument_rest": row.instrument_rest,
+                "instrument_stream": row.instrument_stream,
+                "side": row.side,
+                "stage": row.stage,
+                "pos_id": row.pos_id,
+                "protection_ord_id": row.protection_ord_id,
+                "protection_order_count": int(row.protection_order_count or 0),
+                "binding_confidence": row.binding_confidence,
+                "refusal_reason": row.refusal_reason,
+                "observed_execution_binding_id": row.observed_execution_binding_id,
+                "trade_os_seen_at": (
+                    None if row.trade_os_seen_at is None
+                    else row.trade_os_seen_at.isoformat()
+                ),
+                "tu_matched_at": (
+                    None if row.tu_matched_at is None
+                    else row.tu_matched_at.isoformat()
+                ),
+                "first_seen_at": row.first_seen_at.isoformat(),
+                "last_seen_at": row.last_seen_at.isoformat(),
+                "evidence": json.loads(row.evidence_json or "{}"),
+            }
+            for row in session.query(DeepcoinShadowBinding)
+            .order_by(DeepcoinShadowBinding.id)
+            .all()
+        ]
+        diffs = [
+            {
+                "id": int(row.id),
+                "shadow_binding_id": row.shadow_binding_id,
+                "diff_kind": row.diff_kind,
+                "subject": row.subject,
+                "shadow_value": row.shadow_value,
+                "ledger_value": row.ledger_value,
+                "lead_seconds": row.lead_seconds,
+                "detected_at": row.detected_at.isoformat(),
+                "evidence": json.loads(row.evidence_json or "{}"),
+            }
+            for row in session.query(DeepcoinShadowDiff)
+            .order_by(DeepcoinShadowDiff.id)
+            .all()
+        ]
+
+    # Every ``shadow_only`` and ``ledger_only`` row must carry an attribution,
+    # not just a count: those two kinds decide whether phases 5 and 6 may start.
+    # Ownership is asked of every ledger that stores an exchange id, which is
+    # the phase 3 lesson made mechanical.
+    attributions = []
+    for diff in diffs:
+        if diff["diff_kind"] not in {"shadow_only", "ledger_only"}:
+            continue
+        chain = next(
+            (item for item in chains if item["id"] == diff["shadow_binding_id"]), None
+        )
+        main_ord_id = None if chain is None else chain["main_ord_id"]
+        ledger_view = (
+            None if main_ord_id is None
+            else load_ledger_chain_view(session_factory, main_ord_id)
+        )
+        subject_id = (diff["shadow_value"] or diff["ledger_value"] or "").strip()
+        attributions.append(
+            {
+                "diff_id": diff["id"],
+                "diff_kind": diff["diff_kind"],
+                "subject": diff["subject"],
+                "main_ord_id": main_ord_id,
+                "shadow_confidence": None if chain is None else chain["binding_confidence"],
+                "shadow_refusal_reason": None if chain is None else chain["refusal_reason"],
+                "shadow_stage": None if chain is None else chain["stage"],
+                "ledger_has_entry_leg": bool(ledger_view is not None and ledger_view.exists),
+                "ledger_execution_binding_id": (
+                    None if ledger_view is None else ledger_view.execution_binding_id
+                ),
+                "subject_id_known_to_any_ledger": owned.owns_order(subject_id),
+                "subject_id_known_as_position": owned.owns_position(subject_id),
+            }
+        )
+
+    summary = build_shadow_binding_report(session_factory, now=now)
+    ledger_counts_after = guarded_ledger_counts(session_factory)
+    evidence = {
+        "generated_at": now.isoformat(),
+        "database_path": str(database_path),
+        "recomputed": recompute,
+        "summary": summary,
+        "ownership_tables_read": list(owned.tables_read),
+        "ownership_tables_missing": list(owned.tables_missing),
+        "guarded_ledger_counts_before": ledger_counts_before,
+        "guarded_ledger_counts_after": ledger_counts_after,
+        "guarded_ledger_counts_unchanged": ledger_counts_before == ledger_counts_after,
+        "chains": chains,
+        "diffs": diffs,
+        "shadow_only_and_ledger_only_attributions": attributions,
+    }
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_path, "w", encoding="utf-8") as handle:
+        json.dump(evidence, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    typer.echo(
+        json.dumps(
+            {
+                "output_path": str(output_path),
+                "summary": summary,
+                "attribution_count": len(attributions),
+                "guarded_ledger_counts_unchanged": (
+                    ledger_counts_before == ledger_counts_after
+                ),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    )
+
+
 def main() -> None:
     app()
 

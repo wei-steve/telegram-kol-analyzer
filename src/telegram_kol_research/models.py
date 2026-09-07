@@ -4458,3 +4458,125 @@ class DeepcoinWsConnectionGap(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utc_now
     )
+
+
+class DeepcoinShadowBinding(Base):
+    """One shadow attempt at the deterministic entry -> position -> protection chain.
+
+    Phase 4 of the REST+WebSocket program. Every row here is an *observation*:
+    nothing reads this table to make a decision, no existing ledger row is
+    changed because of it, and no exchange write is ever issued from it. Its
+    only purpose is to let the deterministic chain be compared, laid side by
+    side, against the inference-based attribution that production already runs.
+
+    ``binding_confidence`` is ``exact`` only when all five handoff criteria hold
+    at once (see ``deepcoin_shadow_binding.BINDING_CRITERIA``). Anything else is
+    ``unverified`` with a specific ``refusal_reason``: this table never carries
+    a guess. In particular the undocumented ``Position.PI`` short key may appear
+    in ``evidence_json`` as supporting evidence and may never stand in for one
+    of the five criteria.
+
+    ``protection_ord_id`` holds the *set* of protection order ids as a sorted
+    comma-joined text, because ``set-position-sltp`` produces more than one
+    protection order for a single posId (handoff supplementary check 8).
+    Comparisons against the ledger are set comparisons, never single-value ones.
+    """
+
+    __tablename__ = "deepcoin_shadow_bindings"
+    __table_args__ = (
+        UniqueConstraint(
+            "venue",
+            "main_ord_id",
+            name="uq_deepcoin_shadow_bindings_venue_main_order",
+        ),
+        Index("ix_deepcoin_shadow_bindings_pos", "venue", "pos_id"),
+        Index("ix_deepcoin_shadow_bindings_stage", "stage", "last_seen_at"),
+        Index(
+            "ix_deepcoin_shadow_bindings_observed",
+            "observed_execution_binding_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    venue: Mapped[str] = mapped_column(
+        String(64),
+        nullable=False,
+        default="deepcoin",
+        server_default=sql_text("'deepcoin'"),
+    )
+    main_ord_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    instrument_rest: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    instrument_stream: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    side: Mapped[Optional[str]] = mapped_column(String(16), nullable=True)
+    stage: Mapped[str] = mapped_column(String(32), nullable=False)
+    pos_id: Mapped[Optional[str]] = mapped_column(String(255), nullable=True, index=True)
+    protection_ord_id: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    protection_order_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("'0'")
+    )
+    trade_os_seen_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    tu_matched_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    binding_confidence: Mapped[str] = mapped_column(String(16), nullable=False)
+    refusal_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    observed_execution_binding_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    first_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    last_seen_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class DeepcoinShadowDiff(Base):
+    """One difference between a shadow chain and the ledgers production writes.
+
+    Phase 4. ``diff_kind`` is one of
+    ``deepcoin_shadow_diff.SHADOW_DIFF_KINDS``. ``timing_only`` is deliberately
+    its own kind: the shadow chain and the existing ledger reached the *same*
+    conclusion and only the discovery time differs, which is the benefit this
+    program is being built for rather than a defect.
+
+    Rows are append-only within one detection pass and are re-derived each pass,
+    so a difference that closes stops being reported rather than being edited in
+    place. Nothing here feeds a decision.
+    """
+
+    __tablename__ = "deepcoin_shadow_diffs"
+    __table_args__ = (
+        UniqueConstraint(
+            "shadow_binding_id",
+            "diff_kind",
+            "subject",
+            name="uq_deepcoin_shadow_diffs_binding_kind_subject",
+        ),
+        Index("ix_deepcoin_shadow_diffs_kind", "diff_kind", "detected_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    shadow_binding_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True, index=True
+    )
+    diff_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    subject: Mapped[str] = mapped_column(String(64), nullable=False)
+    shadow_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    ledger_value: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    lead_seconds: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    evidence_json: Mapped[str] = mapped_column(
+        Text, nullable=False, default="{}", server_default=sql_text("'{}'")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )

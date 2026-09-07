@@ -599,12 +599,30 @@ def test_health_endpoint_is_localhost_only_and_returns_no_payload(tmp_path):
         assert forwarded.status_code == 404
 
 
-def test_no_production_module_reads_the_phase_one_inbox_table():
-    """Phase 1 keeps ``deepcoin_ws_events`` write-only.
+# Modules allowed to touch the phase 1 inbox table, each with the reason.
+#
+# ``deepcoin_private_ws`` owns it: it writes the frames, keeps its own
+# watermark, and projects the health view. ``models`` defines it.
+# ``deepcoin_shadow_binding`` was added by phase 4 and reads it to build the
+# shadow chain -- which drives no decision, takes no authority and issues no
+# exchange write, so the property this test protects ("no exchange decision
+# depends on unverified push data") still holds. Any other reader would break
+# it, which is why this list is explicit rather than a pattern.
+_ALLOWED_INBOX_READERS = frozenset(
+    {
+        "deepcoin_private_ws.py",
+        "deepcoin_shadow_binding.py",
+        "models.py",
+    }
+)
 
-    The only readers allowed are the inbox module itself (its own watermark and
-    health projection) and the tests. Any other module reading it would make an
-    exchange decision depend on unverified push data.
+
+def test_no_production_module_reads_the_phase_one_inbox_table():
+    """Phase 1 keeps ``deepcoin_ws_events`` off every decision path.
+
+    Only the modules in :data:`_ALLOWED_INBOX_READERS` may touch it, and each
+    of them is listed there with the reason it may. Any other module reading it
+    would make an exchange decision depend on unverified push data.
     """
 
     import pathlib
@@ -616,7 +634,7 @@ def test_no_production_module_reads_the_phase_one_inbox_table():
         path.name
         for path in package.rglob("*.py")
         if "DeepcoinWsEvent" in path.read_text(encoding="utf-8")
-        and path.name not in {"deepcoin_private_ws.py", "models.py"}
+        and path.name not in _ALLOWED_INBOX_READERS
     )
 
     assert readers == []
