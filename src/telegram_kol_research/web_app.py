@@ -9573,38 +9573,55 @@ async def run_deepcoin_execution_reconcile_loop(
                 deepcoin_client_factory,
                 now_provider=now_provider,
             )
-            if hasattr(client, "list_open_orders"):
+            # Phase 5b: one round reads positions / trigger-orders-pending /
+            # orders-pending for the same instrument several times as it walks
+            # its ledgers. Inside this scope the first read of each goes to the
+            # exchange and the repeats reuse it; any write through this client
+            # drops the scope so no decision is ever made on a pre-write
+            # snapshot. The scope ends with the round -- nothing is carried
+            # into the next one. Resolved by name so that reconcile doubles
+            # which do not implement it keep working unchanged.
+            open_round_read_cache = getattr(client, "begin_round_read_cache", None)
+            close_round_read_cache = getattr(client, "end_round_read_cache", None)
+            round_read_cache_token = (
+                open_round_read_cache() if open_round_read_cache is not None else None
+            )
+            try:
+                if hasattr(client, "list_open_orders"):
+                    await run_on_management_worker(
+                        reconcile_deepcoin_execution_bindings,
+                        session_factory,
+                        client=client,
+                        recovered_at=synced_at,
+                        contract_spec_provider=contract_spec_provider,
+                    )
+                    if system_operator_bot_enabled(system_operator_bot_config):
+                        await deliver_pending_position_attribution_incidents(
+                            session_factory,
+                            config=system_operator_bot_config,
+                            delivered_at=synced_at,
+                        )
+                        await deliver_pending_position_protection_incidents(
+                            session_factory, config=system_operator_bot_config,
+                            delivered_at=synced_at,
+                        )
                 await run_on_management_worker(
-                    reconcile_deepcoin_execution_bindings,
+                    sync_manual_closed_deepcoin_positions,
                     session_factory,
                     client=client,
-                    recovered_at=synced_at,
-                    contract_spec_provider=contract_spec_provider,
+                    synced_at=synced_at,
                 )
-                if system_operator_bot_enabled(system_operator_bot_config):
-                    await deliver_pending_position_attribution_incidents(
+                if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
+                    await deliver_terminal_entry_cleanup_notifications(
                         session_factory,
-                        config=system_operator_bot_config,
+                        config=terminal_entry_cleanup_bot_config,
                         delivered_at=synced_at,
                     )
-                    await deliver_pending_position_protection_incidents(
-                        session_factory, config=system_operator_bot_config,
-                        delivered_at=synced_at,
-                    )
-            await run_on_management_worker(
-                sync_manual_closed_deepcoin_positions,
-                session_factory,
-                client=client,
-                synced_at=synced_at,
-            )
-            if system_operator_bot_enabled(terminal_entry_cleanup_bot_config):
-                await deliver_terminal_entry_cleanup_notifications(
-                    session_factory,
-                    config=terminal_entry_cleanup_bot_config,
-                    delivered_at=synced_at,
-                )
-            if authority_observer is not None:
-                authority_observer(observed_at=synced_at)
+                if authority_observer is not None:
+                    authority_observer(observed_at=synced_at)
+            finally:
+                if close_round_read_cache is not None:
+                    close_round_read_cache(round_read_cache_token)
         except asyncio.CancelledError:
             raise
         except DeepcoinClientError as exc:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import copy
 import hashlib
 import hmac
 import json
@@ -10,7 +11,8 @@ import os
 import time
 import threading
 from collections import deque
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from datetime import UTC, datetime
@@ -60,6 +62,78 @@ class DeepcoinRequestOutcomeUnknown(DeepcoinClientError):
 
 class DeepcoinDefiniteRejection(DeepcoinClientError):
     """Raised only when Deepcoin explicitly rejects a validated request."""
+
+
+class DeepcoinRateLimited(DeepcoinClientError):
+    """Raised when Deepcoin refused a read because the API quota was exhausted.
+
+    Deepcoin signals frequency limiting as HTTP ``401`` carrying the body
+    ``{"code":"50000","msg":"Trigger the api frequency limiting"}`` -- a status
+    that otherwise means authentication failure. ``50000`` is not in the
+    published error-code table; the pairing was measured in production on
+    2026-09-07 together with ``X-Ratelimit-Limit: 5 / Window: 1s /
+    Retry-After: 1``.
+
+    Only the ``401`` + ``50000`` pair is rate limiting. Every other ``401``
+    stays an ordinary failure so that a genuinely broken signature is never
+    silently retried as congestion.
+    """
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
+DEEPCOIN_RATE_LIMIT_HTTP_STATUS = 401
+DEEPCOIN_RATE_LIMIT_CODE = "50000"
+# Used when the exchange rate-limits without a parseable ``Retry-After``. The
+# measured window is one second, so waiting one second is the documented
+# behaviour rather than a guess.
+DEEPCOIN_RATE_LIMIT_DEFAULT_RETRY_AFTER_SECONDS = 1.0
+# Hard ceiling on how long one GET may wait before its single retry. A read
+# that cannot be served inside this budget is reported as unavailable, which is
+# "unknown", never "empty".
+DEEPCOIN_RATE_LIMIT_MAX_RETRY_WAIT_SECONDS = 2.0
+DEEPCOIN_RATE_LIMIT_MAX_RETRIES = 1
+
+
+def _rate_limit_retry_after_seconds(response: Any) -> float | None:
+    """Return the ``Retry-After`` a rate-limit response asked for, if any."""
+
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    for header_name in ("Retry-After", "X-Ratelimit-Retry-After"):
+        try:
+            raw = headers.get(header_name)
+        except Exception:
+            return None
+        if raw in (None, ""):
+            continue
+        try:
+            seconds = float(str(raw).strip())
+        except (TypeError, ValueError):
+            continue
+        if seconds >= 0:
+            return seconds
+    return None
+
+
+def _response_is_rate_limited(response: Any) -> bool:
+    """True only for the measured ``401`` + body ``code=50000`` pairing."""
+
+    if getattr(response, "status_code", None) != DEEPCOIN_RATE_LIMIT_HTTP_STATUS:
+        return False
+    try:
+        payload = response.json()
+    except Exception:
+        # A 401 whose body is not JSON is an authentication failure as far as
+        # anything here can tell. Guessing "rate limited" would turn a broken
+        # signature into a silent retry loop.
+        return False
+    if not isinstance(payload, dict):
+        return False
+    return str(payload.get("code", "")).strip() == DEEPCOIN_RATE_LIMIT_CODE
 
 
 def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[str, Any]]:
@@ -316,6 +390,151 @@ def _shared_tpsl_limiter(credentials: DeepcoinCredentials) -> DeepcoinTpslWriteL
         return limiter
 
 
+# Deepcoin allows 5 requests per second per API key, measured across the whole
+# account rather than per process. Three runtime roles run as three operating
+# system processes, so no in-process limiter can see the other two: the only
+# way a process-local limiter can keep the account under 5/s is to hold a
+# static share of it. 2/s x 3 roles = 6/s nominal, but `web` and `ingest` read
+# Deepcoin only on demand (a manual API call, a resync), while `worker` is the
+# only role with a continuous read loop, so the sustained account rate stays
+# under the ceiling with one request per second of headroom for writes.
+#
+# The rationale is repeated in docs/ARCHITECTURE.md; change both together.
+DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND = 2
+
+
+class DeepcoinReadRateLimiter:
+    """Thread-safe token bucket paced per *physical* Deepcoin GET request.
+
+    Same shape as :class:`DeepcoinTpslWriteLimiter` -- one process-wide
+    instance per credential scope, injectable clock and sleep for tests -- but
+    it counts HTTP requests rather than logical calls. That distinction is
+    load-bearing since ``list_open_orders`` moved to the paginated V2 endpoint:
+    one logical read expands into one request per page, and a limiter that
+    charged the call rather than the page would under-count the true rate by
+    exactly the page count.
+    """
+
+    def __init__(
+        self,
+        *,
+        monotonic_factory: Callable[[], float] = time.monotonic,
+        sleep_fn: Callable[[float], None] = time.sleep,
+        per_second: int = DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND,
+    ) -> None:
+        self._clock = monotonic_factory
+        self._sleep = sleep_fn
+        self._per_second = max(1, int(per_second))
+        self._capacity = float(self._per_second)
+        self._tokens = float(self._per_second)
+        self._refilled_at = monotonic_factory()
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        """Consume one token, sleeping until one is available."""
+
+        with self._lock:
+            while True:
+                now = self._clock()
+                elapsed = max(0.0, now - self._refilled_at)
+                self._refilled_at = now
+                self._tokens = min(
+                    self._capacity, self._tokens + elapsed * self._per_second
+                )
+                if self._tokens >= 1.0:
+                    self._tokens -= 1.0
+                    return
+                self._sleep((1.0 - self._tokens) / self._per_second)
+
+
+_READ_LIMITERS_LOCK = threading.Lock()
+_READ_LIMITERS: dict[tuple[str, str], DeepcoinReadRateLimiter] = {}
+
+
+def _shared_read_limiter(credentials: DeepcoinCredentials) -> DeepcoinReadRateLimiter:
+    """Return the process-wide read limiter for one API credential scope."""
+
+    key = (credentials.base_url.rstrip("/"), credentials.api_key)
+    with _READ_LIMITERS_LOCK:
+        limiter = _READ_LIMITERS.get(key)
+        if limiter is None:
+            limiter = DeepcoinReadRateLimiter()
+            _READ_LIMITERS[key] = limiter
+        return limiter
+
+
+_RATE_LIMIT_METRICS_WINDOW_SECONDS = 3600.0
+
+
+class DeepcoinRateLimitMetrics:
+    """Process-local rolling hour of rate-limit hits and the waits they caused.
+
+    Counters only -- no path, no instrument, no body. They answer "is this
+    process still being throttled, and how much wall time is it losing to it",
+    which is what the phase 5b health check compares before and after.
+    """
+
+    def __init__(self, *, wall_clock: Callable[[], float] = time.time) -> None:
+        self._wall_clock = wall_clock
+        self._rate_limited: deque[float] = deque()
+        self._retry_waits: deque[tuple[float, float]] = deque()
+        self._lock = threading.Lock()
+
+    def _prune(self, now: float) -> None:
+        cutoff = now - _RATE_LIMIT_METRICS_WINDOW_SECONDS
+        while self._rate_limited and self._rate_limited[0] < cutoff:
+            self._rate_limited.popleft()
+        while self._retry_waits and self._retry_waits[0][0] < cutoff:
+            self._retry_waits.popleft()
+
+    def record_rate_limited(self) -> None:
+        now = self._wall_clock()
+        with self._lock:
+            self._prune(now)
+            self._rate_limited.append(now)
+
+    def record_retry_after_wait(self, seconds: float) -> None:
+        now = self._wall_clock()
+        with self._lock:
+            self._prune(now)
+            self._retry_waits.append((now, max(0.0, float(seconds))))
+
+    def snapshot(self) -> dict[str, Any]:
+        now = self._wall_clock()
+        with self._lock:
+            self._prune(now)
+            waits = [seconds for _, seconds in self._retry_waits]
+            return {
+                "rate_limited_last_hour": len(self._rate_limited),
+                "retry_after_waits_last_hour": len(waits),
+                "retry_after_wait_seconds_last_hour": round(sum(waits), 3),
+            }
+
+
+_RATE_LIMIT_METRICS = DeepcoinRateLimitMetrics()
+
+
+def deepcoin_rate_limit_metrics() -> DeepcoinRateLimitMetrics:
+    """Return this process's rate-limit counters."""
+
+    return _RATE_LIMIT_METRICS
+
+
+# GET paths whose response one reconcile round may reuse. Deliberately short:
+# these three are the reads the round issues repeatedly for the same
+# instrument, and each is a whole-snapshot read whose meaning does not depend
+# on when inside the round it was taken. History and fills are excluded because
+# nothing re-reads them within a round, and every write path is excluded by
+# construction -- the cache lives on GET only.
+DEEPCOIN_ROUND_CACHEABLE_READ_PATHS: frozenset[str] = frozenset(
+    {
+        DEEPCOIN_ACCOUNT_POSITIONS_PATH,
+        DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH,
+        DEEPCOIN_ORDERS_PENDING_V2_PATH,
+    }
+)
+
+
 class DeepcoinRestClient:
     """Small authenticated Deepcoin REST client."""
 
@@ -329,6 +548,8 @@ class DeepcoinRestClient:
         sleep_fn: Callable[[float], None] | None = None,
         position_history_min_interval_seconds: float = 1.05,
         tpsl_rate_limiter: "DeepcoinTpslWriteLimiter | None" = None,
+        read_rate_limiter: "DeepcoinReadRateLimiter | None" = None,
+        rate_limit_metrics: "DeepcoinRateLimitMetrics | None" = None,
     ) -> None:
         self._credentials = credentials
         self._http_client = http_client
@@ -355,6 +576,67 @@ class DeepcoinRestClient:
             )
         else:
             self._tpsl_rate_limiter = _shared_tpsl_limiter(credentials)
+        if read_rate_limiter is not None:
+            self._read_rate_limiter = read_rate_limiter
+        elif monotonic_factory is not None or sleep_fn is not None:
+            # Same rule as the write limiter: an explicit clock is a test or
+            # integration scope and must stay deterministic and unshared.
+            self._read_rate_limiter = DeepcoinReadRateLimiter(
+                monotonic_factory=self._monotonic_factory,
+                sleep_fn=self._sleep_fn,
+            )
+        else:
+            self._read_rate_limiter = _shared_read_limiter(credentials)
+        self._rate_limit_metrics = rate_limit_metrics or _RATE_LIMIT_METRICS
+        # ``None`` means "no round is open"; reads then always go to the
+        # exchange. Only an explicit ``round_read_cache()`` scope opens one.
+        self._round_read_cache: dict[str, dict[str, Any]] | None = None
+        self._round_read_cache_lock = threading.Lock()
+
+    def begin_round_read_cache(self) -> Any:
+        """Open a round scope in which the three repeated reads are served once.
+
+        One ``deepcoin_reconcile`` round re-reads the same ``positions`` /
+        ``trigger-orders-pending`` / ``orders-pending`` snapshot several times
+        while it walks its ledgers, and every repeat spends a token and can
+        draw a 401. Inside a scope the first read of a given path goes to the
+        exchange and later identical reads reuse its response.
+
+        The scope is the round and nothing wider. It is discarded outright by
+        any write issued through this client, so a post-write re-read is never
+        served a pre-write snapshot, and :meth:`end_round_read_cache` drops it
+        whatever happened. Exchange state is never carried between rounds.
+
+        Returns an opaque token to hand back to :meth:`end_round_read_cache`.
+        """
+
+        with self._round_read_cache_lock:
+            previous = self._round_read_cache
+            self._round_read_cache = {}
+        return previous
+
+    def end_round_read_cache(self, token: Any = None) -> None:
+        """Close the scope opened by :meth:`begin_round_read_cache`."""
+
+        with self._round_read_cache_lock:
+            self._round_read_cache = token
+
+    @contextmanager
+    def round_read_cache(self) -> "Iterator[None]":
+        """Scope one round's repeated reads; see :meth:`begin_round_read_cache`."""
+
+        token = self.begin_round_read_cache()
+        try:
+            yield
+        finally:
+            self.end_round_read_cache(token)
+
+    def _invalidate_round_read_cache(self) -> None:
+        """Drop every cached read; called by every write through this client."""
+
+        with self._round_read_cache_lock:
+            if self._round_read_cache is not None:
+                self._round_read_cache = {}
 
     def close(self) -> None:
         """Release a lazily owned HTTP connection exactly once."""
@@ -789,6 +1071,81 @@ class DeepcoinRestClient:
         request_path: str,
         body_payload: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
+        """Issue one logical Deepcoin call: cache, limiter, then the request.
+
+        Order matters. A round-cache hit is served without touching the token
+        bucket because no HTTP request leaves the process; every physical
+        request that does leave -- including each page of a paginated read and
+        including the one retry -- charges exactly one token.
+        """
+
+        if method.upper() != "GET":
+            # Any write invalidates this client's round cache before it is
+            # issued, so a read racing the write cannot repopulate the cache
+            # with pre-write state.
+            self._invalidate_round_read_cache()
+            return self._request_with_rate_limit(method, request_path, body_payload)
+
+        cache = self._round_read_cache
+        cacheable = (
+            cache is not None
+            and request_path.split("?", 1)[0] in DEEPCOIN_ROUND_CACHEABLE_READ_PATHS
+        )
+        if cacheable:
+            hit = cache.get(request_path)
+            if hit is not None:
+                return copy.deepcopy(hit)
+        payload = self._request_with_rate_limit(method, request_path, body_payload)
+        if cacheable:
+            with self._round_read_cache_lock:
+                # Only store into the generation this read started in: a write
+                # that landed meanwhile has already replaced it, and this
+                # response predates that write.
+                if self._round_read_cache is cache:
+                    cache[request_path] = copy.deepcopy(payload)
+        return payload
+
+    def _request_with_rate_limit(
+        self,
+        method: str,
+        request_path: str,
+        body_payload: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        """Pace GETs and retry one rate-limited GET; never retry a write."""
+
+        is_read = method.upper() == "GET"
+        if not is_read:
+            return self._request_once(method, request_path, body_payload)
+
+        attempts = DEEPCOIN_RATE_LIMIT_MAX_RETRIES + 1
+        for attempt in range(attempts):
+            self._read_rate_limiter.acquire()
+            try:
+                return self._request_once(method, request_path, body_payload)
+            except DeepcoinRateLimited as exc:
+                if attempt == attempts - 1:
+                    raise
+                wait_seconds = exc.retry_after
+                if wait_seconds is None:
+                    wait_seconds = DEEPCOIN_RATE_LIMIT_DEFAULT_RETRY_AFTER_SECONDS
+                wait_seconds = min(
+                    max(0.0, float(wait_seconds)),
+                    DEEPCOIN_RATE_LIMIT_MAX_RETRY_WAIT_SECONDS,
+                )
+                self._rate_limit_metrics.record_retry_after_wait(wait_seconds)
+                if wait_seconds > 0:
+                    # This client is synchronous and every runtime caller
+                    # reaches it from a worker thread, so the wait never sits
+                    # on an event loop.
+                    self._sleep_fn(wait_seconds)
+        raise AssertionError("unreachable")  # pragma: no cover
+
+    def _request_once(
+        self,
+        method: str,
+        request_path: str,
+        body_payload: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         body = ""
         if body_payload is not None:
             body = json.dumps(body_payload, ensure_ascii=False, separators=(",", ":"))
@@ -822,9 +1179,20 @@ class DeepcoinRestClient:
                 ) from exc
             raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
         except httpx.HTTPStatusError as exc:
+            rate_limited = _response_is_rate_limited(exc.response)
+            if rate_limited:
+                self._rate_limit_metrics.record_rate_limited()
             if method.upper() == "POST":
+                # A throttled write is still a write whose outcome is unknown:
+                # the request may have been accepted before the limiter saw it.
+                # Never retried, never reclassified.
                 raise DeepcoinRequestOutcomeUnknown(
                     f"Deepcoin request outcome unknown after HTTP status: {exc}"
+                ) from exc
+            if rate_limited:
+                raise DeepcoinRateLimited(
+                    f"Deepcoin rate limited: {exc}",
+                    retry_after=_rate_limit_retry_after_seconds(exc.response),
                 ) from exc
             raise DeepcoinClientError(f"Deepcoin request failed: {exc}") from exc
         except json.JSONDecodeError as exc:

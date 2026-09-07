@@ -140,6 +140,37 @@ stall / stale）在 worker 的 `_classify_claim_expiry`，两个循环都不做�
 不要为了"保险"再引入一把进程内的全局锁：它在三进程拓扑下保护不了任何跨进程的东西，只会把同一个
 进程里本可以并行的活动串起来。
 
+## 4.6 Deepcoin 读限流：为什么每进程 2/s
+
+Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，不按进程计。超限的返回是
+`HTTP 401` + 响应体 `{"code":"50000","msg":"Trigger the api frequency limiting"}`，
+头部 `X-Ratelimit-Limit: 5 / Remaining: 0 / Window: 1s / Retry-After: 1`。
+`50000` 不在官方错误码表里，而 401 平时表示认证失败，所以**只有 401 与 code 50000 同时成立**
+才算限流（`DeepcoinRateLimited`）；其余 401 一律仍按认证失败处理，绝不重试。
+
+限流器是进程内的（`DeepcoinReadRateLimiter`，令牌桶），而生产是 web/ingest/worker 三个操作系统
+进程，任何一个都看不见另外两个的请求。进程内限流器唯一能保证账户不超限的办法，是**各自只持有配额的
+一份固定份额**：因此每进程 `2/s`（`DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND`）。
+2×3 = 6 名义上超过 5，但只有 `worker` 有持续读循环，`web` 与 `ingest` 只在人工 API 调用或断线
+重同步时读，所以稳态账户速率仍在 5 以下，并给写入留出约 1 次/秒余量。不要为了"提高吞吐"单独调高
+某一个进程的值——三个进程加起来才是账户的真实速率。
+
+**限流器按物理 HTTP 请求计数，不按逻辑调用计数。** `list_open_orders` 走 V2 分页后，一次逻辑读会
+展开成 N 页 N 次请求，每页各取一个令牌；一次限流重试也再取一个。按逻辑调用计数会把真实速率低估整整
+一个页数倍。
+
+**限流重试只对 GET，且最多一次**（等 `Retry-After`，上限 2 秒）。POST 一律不重试：被限流的写入
+仍然是"结果未知"的写入，沿用 `DeepcoinRequestOutcomeUnknown`（见硬性禁止第 2 条）。
+
+**轮内读缓存。** `worker` 的一轮 `deepcoin_reconcile` 会为同一个 instId 重复读
+`positions` / `trigger-orders-pending` / `orders-pending`。`DeepcoinRestClient.begin_round_read_cache()`
+在这一轮内让每条路径只真正请求一次。作用域严格等于一轮：**任何经同一 client 的写入立即整体作废
+缓存**（写后再读一定是新读），轮结束无条件丢弃，**绝不跨轮**。命中缓存不产生物理请求，因此也不取令牌。
+历史与成交（`orders-history` / `fills` / `trigger-orders-history`）不进缓存——一轮内没人重复读它们。
+
+健康端点 `/api/runtime/deepcoin-ws-health` 输出本进程的 `rate_limited_last_hour` 与
+`retry_after_waits_last_hour`；worker（8002）那一份才是有意义的那一份。
+
 ## 5. 模块分类（已核实）
 
 `src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见
@@ -220,6 +251,8 @@ historical_state_repair.py               position_management_remediation.py
   新行恒为 `0`，worker 认领时用 `shadow = 0` 过滤掉历史行；删列是以后的 L3 工作。
 - `web` 角色没有执行权限。任何需要写交易所或改仓位的动作，必须经 `worker_command_jobs`
   走那四条命令之一，不要在 web 进程里直接调交易所客户端。
+- Deepcoin 读限流是进程内的、按物理请求计数的（第 4.6 节）。加新的交易所读调用时不需要自己限速，
+  但**不要绕过 `DeepcoinRestClient` 直接发 HTTP**，那会让限流器和计数同时失明。
 - 锁只在自己进程里有效（第 4.5 节）。要跨进程排他就用数据库状态，不要新加进程内全局锁，
   也不要把 `KeyedAsyncLockRegistry` 当成跨进程的锁用。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
