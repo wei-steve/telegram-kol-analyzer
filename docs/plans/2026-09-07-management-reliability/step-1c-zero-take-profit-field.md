@@ -73,3 +73,27 @@ BTC-USDT-SWAP 当前 3 行 TPSL 保护单全部命中（2026-09-07 只读快照�
 更新状态文件到 `current_step: 2`、
 `current_step_file: docs/plans/2026-09-07-management-reliability/step-2-alerting.md`；
 `send_message` 给 `brain_session_id`：分支、SHA、部署与回滚 SHA、每张新建止盈单的逐笔核对结果。
+
+## 补充：收敛 230 已不在重试路径上（2026-09-07 A-1b 观察窗内发现）
+
+A-1b 部署后，230 被拉回并在 `ready` 上停留约 9 分钟，随后于 `17:36:36` 被
+`_prepare_plan` 写成 `conflicted / convergence_exact_leg_not_verified` 并固定下来。
+两次只读复算证明该判定依据的是一个已经消失的瞬时条件（现在同一判定返回
+`convergence_unowned_take_profit_present`）。
+
+`convergence_exact_leg_not_verified` **不在**重试白名单内，A-1b 也明确禁止把它加入。
+因此本步只修 `_row_has_take_profit_fields` **不足以**让 230 重新建出分档止盈——
+修好后没有任何路径会把它重新 `ready`。
+
+本步开始前需要用户就以下二选一给出决定，并把决定记进状态文件证据区：
+
+- **A**：本步范围扩展为「修判据 + 把 230 这一行复位到可重试状态」。复位是对生产账本的
+  定点数据修改（L3）：须有精确的改前/改后取值、备份、`PRAGMA quick_check`、
+  影响行数为 1 的证明，以及回滚脚本。**须用户单独批准。**
+- **B**：本步只修判据，230 留给 step 4（账本修复）一并处理。那 8 张 BTC 多单在
+  step 4 之前继续只有止损、没有止盈。
+
+另需注意：重试路径本身有「被拉回的行按每一轮即时状态重新判定，可能落到更严格终态」
+的性质（对原有三个白名单原因码同样成立）。若 A 方案复位 230，复位后它会重新进入这条
+路径，仍可能再次被某一轮的瞬时状态推走。是否要一并处理这个性质，属 step 5 主题，
+本步不动，只在此记录。
