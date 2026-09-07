@@ -468,7 +468,8 @@ def test_deepcoin_client_lists_order_and_trigger_history_with_swap_query():
             "/deepcoin/trade/orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
             "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/trigger-orders-history?instType=SWAP&instId=ETH-USDT-SWAP&ordId=order-1",
-        "/deepcoin/trade/orders-pending?instType=SWAP&instId=ETH-USDT-SWAP",
+        # Phase 5a: list_open_orders reads V2 with a 1-based page index.
+        "/deepcoin/trade/v2/orders-pending?instId=ETH-USDT-SWAP&index=1&limit=100",
         "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP",
         "/deepcoin/trade/fills?instType=SWAP&instId=ETH-USDT-SWAP&ordId=order-1",
     ]

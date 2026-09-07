@@ -29,7 +29,14 @@ DEEPCOIN_CANCEL_ORDER_PATH = "/deepcoin/trade/cancel-order"
 DEEPCOIN_CANCEL_TRIGGER_ORDER_PATH = "/deepcoin/trade/cancel-trigger-order"
 DEEPCOIN_REPLACE_ORDER_SLTP_PATH = "/deepcoin/trade/replace-order-sltp"
 DEEPCOIN_TRIGGER_ORDER_PATH = "/deepcoin/trade/trigger-order"
+# V1 is undocumented and returns an empty list for live regular limit orders
+# (phase 5 experiment, 2026-09-07). It is kept only to name the retired path.
 DEEPCOIN_ORDERS_PENDING_PATH = "/deepcoin/trade/orders-pending"
+DEEPCOIN_ORDERS_PENDING_V2_PATH = "/deepcoin/trade/v2/orders-pending"
+# Official "获取未成交订单列表": index is a 1-based page number, limit maxes at 100.
+DEEPCOIN_ORDERS_PENDING_V2_FIRST_PAGE_INDEX = 1
+DEEPCOIN_ORDERS_PENDING_V2_PAGE_LIMIT = 100
+DEEPCOIN_ORDERS_PENDING_V2_MAX_PAGES = 200
 DEEPCOIN_ORDERS_HISTORY_PATH = "/deepcoin/trade/orders-history"
 DEEPCOIN_TRADE_FILLS_PATH = "/deepcoin/trade/fills"
 DEEPCOIN_TRIGGER_ORDERS_PENDING_PATH = "/deepcoin/trade/trigger-orders-pending"
@@ -62,6 +69,68 @@ def _require_list_data(payload: dict[str, Any], *, endpoint: str) -> list[dict[s
     if not all(isinstance(row, dict) for row in data):
         raise DeepcoinClientError(f"invalid list row schema: {endpoint}")
     return data
+
+
+# Explicit V1 -> V2 field mapping for ``list_open_orders``.
+#
+# Every field the codebase reads off a pending regular-order row, mapped to the
+# field the documented V2 response carries.  The mapping is the identity on all
+# of them: V2 renames nothing that is consumed here, so rows are handed to
+# callers verbatim rather than rewritten.  The two real V1/V2 differences are
+# therefore both on the request side and are handled in ``list_open_orders``:
+#
+#   * V1 took ``instType=SWAP``; V2 has no ``instType`` request parameter and
+#     returns every product category when ``instId`` is omitted, so the SWAP
+#     restriction moves client-side (``_open_order_row_is_swap``).
+#   * V1 was unpaginated; V2 requires a 1-based ``index`` page number.
+#
+# V2 additionally carries ``category`` and ``source`` which V1 did not document.
+# They are passed through untouched; nothing here depends on them.
+DEEPCOIN_OPEN_ORDER_V1_TO_V2_FIELDS: dict[str, str] = {
+    "instType": "instType",
+    "instId": "instId",
+    "ordId": "ordId",
+    "clOrdId": "clOrdId",
+    "tag": "tag",
+    "px": "px",
+    "sz": "sz",
+    "ordType": "ordType",
+    "side": "side",
+    "posSide": "posSide",
+    "tdMode": "tdMode",
+    "accFillSz": "accFillSz",
+    "fillPx": "fillPx",
+    "fillSz": "fillSz",
+    "fillTime": "fillTime",
+    "avgPx": "avgPx",
+    "state": "state",
+    "lever": "lever",
+    "tpTriggerPx": "tpTriggerPx",
+    "tpOrdPx": "tpOrdPx",
+    "slTriggerPx": "slTriggerPx",
+    "slOrdPx": "slOrdPx",
+    "uTime": "uTime",
+    "cTime": "cTime",
+}
+
+
+def _open_order_row_is_swap(row: dict[str, Any]) -> bool:
+    """Reproduce V1's ``instType=SWAP`` request filter on the V2 response.
+
+    A row whose ``instType`` is absent or empty cannot be classified, so it is
+    kept: an unclassifiable row is unknown, and dropping it would silently
+    shrink a snapshot that callers read as "what is live on the exchange".
+    """
+
+    inst_type = str(row.get("instType") or "").strip()
+    return not inst_type or inst_type.upper() == "SWAP"
+
+
+def _open_order_page_identity(page: list[dict[str, Any]]) -> tuple[str, ...]:
+    return tuple(
+        f"{row.get('ordId') or ''}|{row.get('clOrdId') or ''}|{row.get('cTime') or ''}"
+        for row in page
+    )
 
 
 @dataclass(slots=True)
@@ -427,14 +496,52 @@ class DeepcoinRestClient:
         self._last_position_history_request_started_at = now
 
     def list_open_orders(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
-        payload = self._request(
-            "GET",
-            _path_with_query(
-                DEEPCOIN_ORDERS_PENDING_PATH,
-                {"instType": "SWAP", "instId": inst_id},
-            ),
-        )
-        return _require_list_data(payload, endpoint=DEEPCOIN_ORDERS_PENDING_PATH)
+        """Return every pending regular SWAP order, paging V2 until exhausted.
+
+        Fail-closed by construction: any page that raises leaves this method via
+        the exception, so a partial set of pages is never returned.  Incomplete
+        is unknown, not empty.
+        """
+
+        rows: list[dict[str, Any]] = []
+        previous_page_identity: tuple[str, ...] | None = None
+        index = DEEPCOIN_ORDERS_PENDING_V2_FIRST_PAGE_INDEX
+        while True:
+            payload = self._request(
+                "GET",
+                _path_with_query(
+                    DEEPCOIN_ORDERS_PENDING_V2_PATH,
+                    {
+                        "instId": inst_id,
+                        "index": index,
+                        "limit": DEEPCOIN_ORDERS_PENDING_V2_PAGE_LIMIT,
+                    },
+                ),
+            )
+            page = _require_list_data(
+                payload, endpoint=DEEPCOIN_ORDERS_PENDING_V2_PATH
+            )
+            page_identity = _open_order_page_identity(page)
+            if page and page_identity == previous_page_identity:
+                # The server ignored ``index``; treat a non-advancing cursor as
+                # an unusable read rather than looping or truncating silently.
+                raise DeepcoinClientError(
+                    "orders-pending v2 pagination did not advance: "
+                    f"{DEEPCOIN_ORDERS_PENDING_V2_PATH} index={index}"
+                )
+            previous_page_identity = page_identity
+            rows.extend(row for row in page if _open_order_row_is_swap(row))
+            if len(page) < DEEPCOIN_ORDERS_PENDING_V2_PAGE_LIMIT:
+                return rows
+            index += 1
+            if (
+                index - DEEPCOIN_ORDERS_PENDING_V2_FIRST_PAGE_INDEX
+                >= DEEPCOIN_ORDERS_PENDING_V2_MAX_PAGES
+            ):
+                raise DeepcoinClientError(
+                    "orders-pending v2 pagination exceeded "
+                    f"{DEEPCOIN_ORDERS_PENDING_V2_MAX_PAGES} pages"
+                )
 
     def list_order_history(self, *, inst_id: str | None = None) -> list[dict[str, Any]]:
         payload = self._request(

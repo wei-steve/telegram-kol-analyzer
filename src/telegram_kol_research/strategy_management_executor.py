@@ -30,6 +30,9 @@ from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
 from telegram_kol_research.management_stop_price_gate import (
     validate_batch_stops, reject_execution_stop, stop_gate_clock, read_stop_quote,
 )
+from telegram_kol_research.open_order_action_guard import (
+    is_regular_order_leg_kind,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -4181,6 +4184,10 @@ def _match_exact_deferred_exchange_orders(
         return []
     inst_id = normalize_deepcoin_swap_instrument(binding.symbol)
     trigger_orders = list(deepcoin_client.list_trigger_orders_pending(inst_id=inst_id))
+    # Phase 5a: V2 makes regular pending orders visible here for the first time.
+    # The read stays unconditional; the guard lives in the per-entry match below,
+    # so a leg the ledger does not record as a regular order can never claim a
+    # regular row and can never reach a cancel.
     regular_orders = list(deepcoin_client.list_open_orders(inst_id=inst_id))
     exchange_rows = [
         (cancel_type, index, order)
@@ -4198,6 +4205,10 @@ def _match_exact_deferred_exchange_orders(
         matches = []
         conflicts = []
         for cancel_type, index, order in exchange_rows:
+            if cancel_type == "regular" and not is_regular_order_leg_kind(
+                entry.order_kind
+            ):
+                continue
             order_id, client_order_id, conflict = _exchange_order_ownership(
                 order, entry
             )

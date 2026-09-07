@@ -38,6 +38,10 @@ from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.entry_price_geometry import (
     validate_order_draft_price_geometry,
 )
+from telegram_kol_research.open_order_action_guard import (
+    guard_regular_open_orders,
+    is_regular_order_leg_kind,
+)
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
@@ -1147,8 +1151,17 @@ def cancel_entry_order(
     )
     regular_orders: list[dict[str, Any]] = []
     if not trigger_orders:
+        # Phase 5a: V2 makes regular pending orders visible for the first time.
+        # Only legs this system submitted as regular orders may be cancelled.
+        guarded_regular = guard_regular_open_orders(
+            session_factory,
+            rows=list(deepcoin_client.list_open_orders(inst_id=inst_id)),
+            action="cancel_entry_order",
+            instrument_id=inst_id,
+            occurred_at=now,
+        )
         regular_orders = _select_bound_orders(
-            deepcoin_client.list_open_orders(inst_id=inst_id),
+            list(guarded_regular.allowed),
             binding=binding,
         )
     if not trigger_orders and not regular_orders:
@@ -1267,6 +1280,7 @@ def cancel_revision_entry_leg(
             or leg.pos_id not in (None, "")
         ):
             raise DeepcoinExecutionActionError("revision_entry_leg_identity_mismatch")
+        leg_order_kind = str(leg.order_kind or "")
         order_ids = {str(leg.order_id)} if leg.order_id else set()
         client_order_ids = (
             {str(leg.client_order_id)} if leg.client_order_id else set()
@@ -1290,10 +1304,16 @@ def cancel_revision_entry_leg(
         order_ids=order_ids,
         client_order_ids=client_order_ids,
     )
-    regular_rows = _select_orders_by_known_ids(
-        deepcoin_client.list_open_orders(inst_id=inst_id),
-        order_ids=order_ids,
-        client_order_ids=client_order_ids,
+    # Phase 5a: a revision leg may only be cancelled through the regular-order
+    # path when the ledger records it as a regular order.
+    regular_rows = (
+        _select_orders_by_known_ids(
+            deepcoin_client.list_open_orders(inst_id=inst_id),
+            order_ids=order_ids,
+            client_order_ids=client_order_ids,
+        )
+        if is_regular_order_leg_kind(leg_order_kind)
+        else []
     )
     if len(trigger_rows) + len(regular_rows) != 1:
         raise DeepcoinExecutionActionError(
@@ -1427,10 +1447,23 @@ def cancel_pending_entry_legs(
         raise DeepcoinExecutionActionError("pending_entry_leg_partially_filled")
 
     inst_id = _to_deepcoin_swap_instrument(binding.symbol)
+    # Phase 5a: pre-action visibility feeds the cancel loop, so foreign regular
+    # orders are recorded and dropped here rather than reaching a cancel. The
+    # read order is unchanged: trigger orders first, then regular orders.
+    pending_trigger_orders = deepcoin_client.list_trigger_orders_pending(
+        inst_id=inst_id
+    )
+    guarded_regular = guard_regular_open_orders(
+        session_factory,
+        rows=list(deepcoin_client.list_open_orders(inst_id=inst_id)),
+        action="cancel_pending_entry_legs",
+        instrument_id=inst_id,
+        occurred_at=now,
+    )
     visible_by_leg = _resolve_pending_entry_visibility(
         pending_legs,
-        trigger_orders=deepcoin_client.list_trigger_orders_pending(inst_id=inst_id),
-        regular_orders=deepcoin_client.list_open_orders(inst_id=inst_id),
+        trigger_orders=pending_trigger_orders,
+        regular_orders=list(guarded_regular.allowed),
     )
     position_reader = getattr(deepcoin_client, "list_positions", None)
     pre_position_rows = (
