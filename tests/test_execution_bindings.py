@@ -1799,6 +1799,31 @@ def test_alias_conflict_convergence_retries_while_other_conflicts_stay_frozen(
             )
         assert frozen_state == ("conflicted", reason_code, frozen_at)
 
+    # A retried alias-conflict row whose position is already gone falls back to
+    # waiting_backup_stop and never reaches a take-profit write.
+    closed_snapshot = _ReconcileSnapshot(
+        positions=[], pending_trigger_orders=snapshot.pending_trigger_orders
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_pending_alias_conflict"
+        convergence.pos_id = "pos-1"
+        convergence.updated_at = frozen_at
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.status = "manually_closed"
+        _ready_verified_trigger_take_profit_convergences(
+            session,
+            legs=[leg],
+            snapshot=closed_snapshot,
+            recovered_at=datetime(2026, 8, 6, 10, 6),
+        )
+        session.commit()
+        closed_state = (convergence.status, convergence.reason_code)
+    assert closed_state == (
+        "waiting_backup_stop", "convergence_waiting_backup_stop"
+    )
+
 
 def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
