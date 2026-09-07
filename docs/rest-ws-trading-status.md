@@ -15,7 +15,7 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 3
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-3-wake-reconciliation.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: in_progress                 # planned | claimed | in_progress | completed | blocked
 claimed_by: local_c8d0dc4e-8d6c-4478-acef-cd51785b2793
 last_completed_phase: 2
 last_completed_commit: 0371fc9f4fc41c588fab1534f8e33419aef4d6cf
