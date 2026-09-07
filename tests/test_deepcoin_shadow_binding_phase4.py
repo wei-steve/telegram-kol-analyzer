@@ -259,26 +259,52 @@ def test_criterion_one_alone_missing_refuses_with_its_own_reason():
     assert result.criteria["trade_os_equals_main_ord_id"] is False
 
 
-def test_criterion_two_alone_missing_refuses_when_rest_posid_is_not_unique():
-    """The order response names two different posIds for the one entry."""
+def test_criterion_two_refuses_when_the_stream_never_showed_the_position():
+    """Without a Position frame carrying this ordId as ``PI`` there is no chain."""
 
-    response = _order_response()
-    response["data"] = {**response["data"], "posId": "1001125145471999"}
-    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=response))
+    result = evaluate_shadow_chain(_complete_inputs(position_frames=[]))
 
     assert result.binding_confidence == CONFIDENCE_UNVERIFIED
-    assert result.refusal_reason == "rest_pos_id_not_unique"
+    assert result.refusal_reason == "no_ws_position_frame_for_pos_id"
     assert result.criteria["trade_os_equals_main_ord_id"] is True
     assert result.criteria["rest_unique_directional_pos_id"] is False
 
 
-def test_criterion_two_refuses_when_no_order_response_was_ever_recorded():
-    """No response, no ordId -> posId link anywhere in the REST surface."""
+def test_criterion_two_refuses_while_the_position_is_still_empty():
+    """``PI`` with ``Po=0`` is an allocated id, not an opened position.
+
+    Cells 3, 6a, 6c and v each produced exactly this frame for an order that
+    never filled.
+    """
+
+    frames = []
+    for row in _inbox_rows("Position"):
+        payload = json.loads(row["raw_payload"])
+        for item in payload.get("result", []):
+            if item.get("table") == "Position":
+                item["data"]["Po"] = 0
+        frames.append({**row, "raw_payload": json.dumps(payload, ensure_ascii=False)})
+    result = evaluate_shadow_chain(_complete_inputs(position_frames=frames))
+
+    assert result.refusal_reason == "ws_position_never_opened"
+    assert result.pos_id is None
+
+
+def test_the_order_response_is_recorded_but_never_supplies_the_pos_id():
+    """The response carries no posId at all; the chain must not depend on it.
+
+    Official field table for ``POST /deepcoin/trade/order``: ordId, clOrdId,
+    tag, sCode, sMsg. Verified against five raw limit responses and production's
+    raw market response on 2026-09-07.
+    """
 
     result = evaluate_shadow_chain(_complete_inputs(rest_order_response=None))
 
-    assert result.refusal_reason == "no_rest_order_response_for_main_ord_id"
-    assert result.pos_id is None
+    assert result.binding_confidence == CONFIDENCE_EXACT
+    assert result.pos_id == POS_ID
+    assert result.evidence["pos_id_source"] == (
+        "ordinary_order_identity_confirmed_by_ws_and_rest"
+    )
 
 
 def test_criterion_two_refuses_when_the_exchange_does_not_confirm_the_position():
@@ -291,19 +317,29 @@ def test_criterion_two_refuses_when_the_exchange_does_not_confirm_the_position()
     assert result.refusal_reason == "rest_pos_id_not_confirmed_by_rest"
 
 
-def test_the_pos_id_is_read_from_its_own_field_not_derived_from_the_ord_id():
-    """``posId == ordId`` in production. The value must still come from ``posId``."""
+def test_the_equation_holds_only_for_this_order_id():
+    """A position under some *other* id never binds this entry.
 
-    response = _order_response(posId="9009009009009009")
+    ``posId == ordId`` is an equation about ordinary orders, not a licence to
+    accept whatever position happens to be open. Point every REST row and every
+    Position frame at a different id and the chain must refuse.
+    """
+
+    other = "9009009009009009"
+    frames = [
+        {**row, "position_id": other} for row in _inbox_rows("Position")
+    ]
     result = evaluate_shadow_chain(
         _complete_inputs(
-            rest_order_response=response,
-            rest_positions=[_rest_position(posId="9009009009009009")],
+            position_frames=frames,
+            rest_positions=[_rest_position(posId=other)],
+            rest_position_history=[],
         )
     )
 
-    assert result.pos_id == "9009009009009009"
-    assert result.pos_id != MAIN_ORD_ID
+    assert result.binding_confidence == CONFIDENCE_UNVERIFIED
+    assert result.refusal_reason == "no_ws_position_frame_for_pos_id"
+    assert result.pos_id is None
 
 
 def test_criterion_three_alone_missing_refuses_when_tu_never_equals_posid():
@@ -351,7 +387,8 @@ def test_criterion_five_alone_missing_refuses_when_rest_and_stream_disagree():
 def test_every_refusal_reason_the_chain_can_emit_is_declared():
     for reason in (
         "no_trade_frame_for_main_ord_id",
-        "rest_pos_id_not_unique",
+        "no_ws_position_frame_for_pos_id",
+        "ws_position_never_opened",
         "no_trigger_frame_with_tu_equal_pos_id",
         "trigger_frame_without_own_ord_id",
         "protection_tp_sl_mismatch",
@@ -392,21 +429,16 @@ def test_an_incomplete_rest_read_is_unknown_and_never_zero():
     assert "rest_read_failures" in result.evidence
 
 
-def test_position_pi_is_recorded_as_support_and_never_satisfies_criterion_two():
-    """``PI`` names the posId, and the chain still refuses without the REST link.
+def test_position_pi_alone_never_satisfies_criterion_two():
+    """``PI`` says a position id exists. REST still has to confirm it."""
 
-    The stream has already said which position this is. Criterion 2 does not
-    care: without the exchange's own order response there is no REST-sourced
-    link, and an undocumented push field is not allowed to become one.
-    """
-
-    response = _order_response()
-    del response["posId"]
-    result = evaluate_shadow_chain(_complete_inputs(rest_order_response=response))
+    result = evaluate_shadow_chain(
+        _complete_inputs(rest_positions=[], rest_position_history=[])
+    )
 
     assert POS_ID in result.evidence["position_pi_seen_in_window"]
     assert result.binding_confidence == CONFIDENCE_UNVERIFIED
-    assert result.refusal_reason == "no_rest_pos_id_for_main_ord_id"
+    assert result.refusal_reason == "rest_pos_id_not_confirmed_by_rest"
     assert result.pos_id is None
 
 
@@ -1317,6 +1349,13 @@ def test_no_rest_read_endpoint_can_supply_the_pos_id():
     These fixtures carry the exact field sets those endpoints returned, so if a
     future Deepcoin release starts publishing ``posId`` on a read, this test is
     where that shows up.
+
+    Updated 2026-09-07: the order response does not carry it either. The
+    official field table for ``POST /deepcoin/trade/order`` is ordId, clOrdId,
+    tag, sCode, sMsg, matched by five raw limit responses and by production's
+    raw market response. There is no ordId -> posId link in REST at all, which
+    is why criterion 2 rests on the split-position identity equation confirmed
+    from both sides instead.
     """
 
     assert "posId" not in _rest_fill()
@@ -1337,10 +1376,21 @@ def test_no_rest_read_endpoint_can_supply_the_pos_id():
     }
     assert "posId" not in real_pending_tpsl
 
-    # And with every read available, no response means no posId.
+    # The raw bodies, exactly as captured. No posId on either order type.
+    raw_limit = {"code": "0", "msg": "", "data": {
+        "ordId": "1001125172457034", "clOrdId": "", "tag": "",
+        "sCode": "0", "sMsg": ""}}
+    raw_market = {"code": "0", "msg": "", "data": {
+        "clOrdId": "TKFG9210E1", "ordId": "1001125164628529", "sCode": "0",
+        "sMsg": "", "tag": ""}}
+    for body in (raw_limit, raw_market):
+        assert "posId" not in body
+        assert "posId" not in body["data"]
+
+    # So the chain must reach exact without ever consulting the response.
     result = evaluate_shadow_chain(_complete_inputs(rest_order_response=None))
-    assert result.pos_id is None
-    assert result.refusal_reason == "no_rest_order_response_for_main_ord_id"
+    assert result.pos_id == POS_ID
+    assert result.refusal_reason is None
 
 
 def test_a_difference_that_closes_stops_being_reported(tmp_path):

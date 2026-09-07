@@ -100,12 +100,13 @@ REFUSAL_REASONS = frozenset(
         "no_trade_frame_for_main_ord_id",
         # criterion 2
         "rest_read_incomplete",
-        "no_rest_order_response_for_main_ord_id",
+        "no_ws_position_frame_for_pos_id",
+        "ws_position_never_opened",
         "no_rest_pos_id_for_main_ord_id",
-        "rest_pos_id_not_unique",
         "rest_pos_id_not_confirmed_by_rest",
         "rest_pos_side_missing",
         "rest_pos_side_mismatch",
+        "position_size_disagrees_with_fills",
         # criterion 3
         "no_trigger_frame_with_tu_equal_pos_id",
         # criterion 4
@@ -179,74 +180,83 @@ def _normalize_position_side(value: Any) -> str | None:
     return None
 
 
-def rest_pos_id_from_order_response(
-    response: dict[str, Any] | None, *, main_ord_id: str
+def split_pos_id_for_ordinary_entry(
+    main_ord_id: str,
+    *,
+    position_frames: list[dict[str, Any]],
+    rest_positions: list[dict[str, Any]],
+    rest_position_history: list[dict[str, Any]],
 ) -> tuple[str | None, str | None]:
-    """Return the split posId Deepcoin returned when it accepted this order.
+    """Return the split posId this ordinary entry order opened.
 
-    **This is the only REST source of the ordId -> posId link that exists.**
-    Verified read-only against production on 2026-09-07 across every read
-    endpoint the client has: ``list_trade_fills`` and
-    ``list_trade_fills_by_order_id`` return no ``posId`` field at all; neither
-    does ``list_order_history`` / ``get_order_history_by_id``;
-    ``list_positions`` and ``list_position_history`` carry ``posId`` but no
-    order id; and ``list_trigger_orders_pending`` /
-    ``list_trigger_order_history`` carry neither. The link appears exactly once,
-    in the body of ``POST /deepcoin/trade/order``::
+    **There is no order-to-position reference field anywhere.** Checked against
+    the official documentation and against live responses on 2026-09-07:
 
-        {"code":"0","data":{"ordId":"1001125164628529","sCode":"0",...},
-         "msg":"","posId":"1001125164628529"}
+    * ``POST /deepcoin/trade/order`` documents exactly ``ordId``, ``clOrdId``,
+      ``tag``, ``sCode``, ``sMsg``. Five raw limit responses captured straight
+      off the socket, and the raw market response production stored in
+      ``execution_bindings.payload_json``, all match that field list. None
+      carries ``posId``.
+    * ``orderByID``, ``v2/orders-pending``, ``orders-history`` and ``fills``
+      name no position field; ``positions`` and ``positions-history`` carry
+      ``posId`` and no order id.
+    * On the stream, ``Order`` and ``Trade`` carry no position field, and
+      ``Position`` carries ``PI`` with no order field.
 
-    ``posId`` sits at the top level, beside ``data`` rather than inside it.
-    Production already treats it as tier-0 evidence
-    (``evidence_type='direct_order_position_id'``), so this is the same fact the
-    existing ledger uses, read from the same place.
+    So the bridge is an *equation*, not a foreign key: **in split mode the
+    position an ordinary order opens is identified by that order's own ordId.**
+    Because it is an equation rather than something the exchange returns, it is
+    never accepted on its own. All three of the following must hold, and each
+    can fail independently:
 
-    Two consequences worth stating plainly rather than discovering later:
+    1. the stream pushed a ``Position`` frame whose ``PI`` is this ordId, and
+       whose ``Po`` reached a non-zero size -- the position actually opened;
+    2. REST lists a position (or a closed one in history) under that exact
+       posId;
+    3. its direction is unambiguous (checked by the caller, together with the
+       fills).
 
-    * The shadow chain cannot *re-derive* this. The response exists only at
-      submission time, and re-issuing the POST would place another order. So in
-      shadow mode the response is read back from what was recorded when the
-      order was submitted. That makes criterion 2 the one step whose evidence
-      travels through this system's own storage, and it means a ``shadow_only``
-      finding at the posId level is structurally impossible: an entry nobody
-      recorded has no response to read. Phase 5 does not inherit this -- there
-      the new binding holds the response as it arrives.
-    * The observed values have ``posId == ordId``. That is **not** what is used
-      here. The value is read from its own field; if the exchange ever returns a
-      different one, this returns the different one. Deriving the posId from the
-      ordId would be exactly the allocation-pattern inference this program
-      exists to remove.
+    The equation holds for ordinary orders and **not** for trigger orders,
+    where the position is named after the child order the trigger spawns:
+    binding 341's trigger leg has ``order_id=1001125163581473`` against
+    ``pos_id=1001125167675481``. That is why only ordinary-order entries use
+    this chain.
+
+    An earlier version of this function read the posId out of a recorded
+    ``POST /trade/order`` response body. That was circular: production's own
+    :func:`recovery_live_submit._record_submitted_order_legs` writes
+    ``stored_response["posId"] = pos_id`` before persisting, so the value read
+    back was the ledger's own column -- itself produced by a symbol-and-side
+    scan -- wearing an exchange response's clothes. The phase 4 report's
+    ``exact`` verdicts were self-confirming as a result.
+    ``docs/2026-09-05-deepcoin-api-deterministic-link-research.md`` had warned
+    about exactly this.
 
     Returns ``(pos_id, None)`` or ``(None, refusal_reason)``.
     """
 
-    if not isinstance(response, dict):
-        return None, "no_rest_order_response_for_main_ord_id"
-    data = response.get("data")
-    if isinstance(data, dict):
-        rows = [data]
-    elif isinstance(data, list):
-        rows = [row for row in data if isinstance(row, dict)]
-    else:
-        rows = []
+    own_frames = [
+        frame
+        for frame in position_frames
+        if _text(frame.get("position_id")) == main_ord_id
+    ]
+    if not own_frames:
+        return None, "no_ws_position_frame_for_pos_id"
     if not any(
-        _text(row.get("ordId")) == main_ord_id
-        or _text(row.get("orderId")) == main_ord_id
-        for row in rows
+        (size := _decimal(_frame_payload(frame).get(_WS_POSITION_QTY_KEY))) is not None
+        and size != 0
+        for frame in own_frames
     ):
-        # A response that does not name this order says nothing about it.
-        return None, "no_rest_order_response_for_main_ord_id"
-
-    candidates = {value for row in rows if (value := _text(row.get("posId")))}
-    top_level = _text(response.get("posId"))
-    if top_level is not None:
-        candidates.add(top_level)
-    if not candidates:
-        return None, "no_rest_pos_id_for_main_ord_id"
-    if len(candidates) > 1:
-        return None, "rest_pos_id_not_unique"
-    return next(iter(candidates)), None
+        # PI alone says a position id was allocated; a non-zero Po is what says
+        # the position actually opened. Cells 3, 6a, 6c and v all produced a
+        # PI frame with Po=0 for an order that never filled.
+        return None, "ws_position_never_opened"
+    if not any(
+        _text(row.get("posId") or row.get("positionId")) == main_ord_id
+        for row in list(rest_positions) + list(rest_position_history)
+    ):
+        return None, "rest_pos_id_not_confirmed_by_rest"
+    return main_ord_id, None
 
 
 @dataclass
@@ -266,8 +276,9 @@ class ShadowChainInputs:
     trigger_frames: list[dict[str, Any]] = field(default_factory=list)
     position_frames: list[dict[str, Any]] = field(default_factory=list)
     # The exchange's own response to ``POST /deepcoin/trade/order``, as it was
-    # received. See :func:`rest_pos_id_from_order_response` for why this, and
-    # not any read endpoint, is where the posId comes from.
+    # The exchange's own response to ``POST /deepcoin/trade/order``. It is
+    # persisted verbatim and kept here for the record; it does **not** carry a
+    # posId -- see :func:`split_pos_id_for_ordinary_entry`.
     rest_order_response: dict[str, Any] | None = None
     # From the REST order-history row's documented ``reduceOnly`` field.
     # ``None`` means the row was not read, which is not the same as ``False``.
@@ -469,17 +480,19 @@ def evaluate_shadow_chain(inputs: ShadowChainInputs) -> ShadowChainResult:
     )
     evidence["rest_filled_size"] = str(filled_size)
 
-    pos_id, response_reason = rest_pos_id_from_order_response(
-        inputs.rest_order_response, main_ord_id=inputs.main_ord_id
+    pos_id, pos_id_reason = split_pos_id_for_ordinary_entry(
+        inputs.main_ord_id,
+        position_frames=inputs.position_frames,
+        rest_positions=inputs.rest_positions,
+        rest_position_history=inputs.rest_position_history,
     )
-    evidence["rest_pos_id_source"] = "order_submission_response"
+    evidence["pos_id_source"] = "ordinary_order_identity_confirmed_by_ws_and_rest"
     if pos_id is None:
-        return refuse(response_reason or "no_rest_pos_id_for_main_ord_id", STAGE_FILLED)
+        return refuse(pos_id_reason or "no_rest_pos_id_for_main_ord_id", STAGE_FILLED)
     evidence["pos_id"] = pos_id
 
-    # The response says which position the order opened. Whether that position
-    # exists, and in which direction, is asked of the exchange now -- so a stale
-    # or malformed recorded response cannot carry the chain on its own.
+    # Direction and size are asked of the exchange now, so the equation in
+    # split_pos_id_for_ordinary_entry never carries the chain on its own.
     position_rows = [
         row
         for row in inputs.rest_positions
@@ -915,12 +928,11 @@ def _ledger_entry_records(
     at all, because an entry the deterministic chain cannot confirm would
     otherwise never be examined.
 
-    ``response_json`` is something else: it is the verbatim body Deepcoin
-    returned to ``POST /deepcoin/trade/order``, and it is the only place the
-    ordId -> posId link exists at all (see
-    :func:`rest_pos_id_from_order_response`). Reading it back is reading a REST
-    response, not trusting a ledger conclusion -- the ledger's own ``pos_id``
-    column is deliberately not read here.
+    ``response_json`` is kept for the record only. It is **not** a source of
+    the posId: production's own ``_record_submitted_order_legs`` writes
+    ``stored_response["posId"] = pos_id`` before persisting, so reading a posId
+    back out of it would be reading the ledger's own column -- the circularity
+    :func:`split_pos_id_for_ordinary_entry` documents and no longer commits.
     """
 
     from sqlalchemy import select
@@ -1124,11 +1136,8 @@ def collect_chain_inputs(
     # Closed positions are only consulted when the live list does not hold the
     # posId. That read is rate-paced by the client, so it is worth not making
     # it for every open chain on every pass.
-    pos_id, _reason = rest_pos_id_from_order_response(
-        order_response, main_ord_id=main_ord_id
-    )
-    if pos_id is not None and not any(
-        _text(row.get("posId") or row.get("positionId")) == pos_id
+    if not any(
+        _text(row.get("posId") or row.get("positionId")) == main_ord_id
         for row in positions
     ):
         history = reader.position_history(instrument_rest)
