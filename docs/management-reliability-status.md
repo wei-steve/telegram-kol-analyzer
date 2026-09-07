@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 1b
-current_step_file: docs/plans/2026-09-07-management-reliability/step-1b-convergence-retry-whitelist.md
-step_status: blocked              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_16ec4b63-93bc-4cac-811c-a290343b49f9
-last_completed_step: 1
-last_completed_commit: b1c12213ad2740e08ac1ecdba39e843e55ce239f
+current_step: 1c
+current_step_file: docs/plans/2026-09-07-management-reliability/step-1c-zero-take-profit-field.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 1b
+last_completed_commit: 7c2fc797b6dd08686c93114fca14171010229eaf
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -61,7 +61,7 @@ user_decisions_2026_09_07:
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
 
 - step-1b-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 允许把 `convergence_pending_alias_conflict` 加入收敛重试白名单，让被误判冻结的止盈收敛（预期 230，BTC 多单 binding 341）按正常路径为当前持仓重建分档止盈；部署前须先只读列出会被拉回的记录出示给用户。
-- step-1b (2026-09-07, local_16ec4b63-93bc-4cac-811c-a290343b49f9): **blocked，等用户决定**。分支 `mgmt/step-1b-convergence-retry`，代码提交 `7c2fc797b6dd08686c93114fca14171010229eaf`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署）。回滚 SHA `b1c12213ad2740e08ac1ecdba39e843e55ce239f`。
+- step-1b (2026-09-07, local_16ec4b63-93bc-4cac-811c-a290343b49f9): **本步任务范围 completed，但验收目标未达成**（分档止盈未建成，原因见下；剩余目标移交 A-1c）。分支 `mgmt/step-1b-convergence-retry`，代码提交 `7c2fc797b6dd08686c93114fca14171010229eaf`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署）。回滚 SHA `b1c12213ad2740e08ac1ecdba39e843e55ce239f`。
   **做了什么**：`execution_bindings.py` 的 `conflicted` 收敛重试白名单只加入 `convergence_pending_alias_conflict` 一个原因码（未加 `convergence_exact_leg_not_verified` 或任何其他码），重试沿用原流程，未改止盈档位/数量/价格规则，未动止损，未新增写入方式。测试覆盖：该原因码被重新 ready；`convergence_exact_leg_not_verified` / `convergence_partial_position_unexplained` / `convergence_pending_alias_conflict_before_write` 三种仍原样冻结（status、reason_code、updated_at 均不动）；被拉回但仓位已平的行落到 `waiting_backup_stop` 且不产生写入。全量 `pytest -q` **7618 passed, 4 skipped, 0 failed**。
   **部署前只读清单**（证据 `/var/lib/telegram-kol-cutover-evidence/mgmt-step-1b/preflight-pullback-list.txt`）：全库 26 条 `conflicted` 收敛中，新白名单只拉回 **227 与 230** 两条，与预期一致（其余 22 条 `convergence_partial_position_unexplained` + 2 条 `convergence_exact_leg_not_verified` 仍被跳过）。227：binding 339 BTC long 已 closed、leg 583 `manually_closed`、pos 1001125135694798 已不在实时持仓。230：binding 341 BTC long active、leg 586 active/verified、pos 1001125163581280 在仓 **8 张**（avgPx 80118.3），desired 50%@80700 / 30%@81400 / 20%@82100，用生产合约规格（quantity_step=1、min=1）实算分档为 `80700@4 / 81400@2 / 82100@2`，合计 8 = 在仓量。部署前 `active_write_count=0`、无 planned/executing/reconciling 批次；基线 收敛 ≤235、止盈单 ≤197、mutation intent ≤642。
   **部署后结果**：227 按预期落到 `waiting_backup_stop`（仓位已平被实时校验挡下），**零写入**。230 被成功拉回并重新 `ready`，但执行器在计划期被**另一个判据**否决：`convergence_unowned_take_profit_present`，随后再被拉回（该原因码本就在白名单内），形成 `ready → conflicted → ready` 的循环。窗内 `position_take_profit_orders` 与 `position_mutation_intents` **零新增**（仍为 197 / 642），fail-closed 完整，无任何交易所写入。
@@ -81,6 +81,8 @@ user_decisions_2026_09_07:
   **这一性质不是 1b 引入的**：重试路径对原有三个白名单原因码同样成立——被拉回的行会按每一轮的即时状态重新判定，因而可能落到比原来更严格的终态。1b 只是让 230 进入了这条路径，于是撞上了它。
 
   **后果**：230 现在冻在 `convergence_exact_leg_not_verified`。该原因码不在重试白名单内，且 1b 的步骤文件明确禁止把它加入（"那些是真实的 fail-closed"）。因此**即使 A-1c 修好了 zero 止盈字段的误判，230 也不会自动被拉回重试**，pos `1001125163581280`（8 张 BTC 多单）会继续只有止损、没有分档止盈。让 230 恢复需要改这一行账本数据（L3），须用户单独批准，属 step 4 或 1c 的扩展范围，本步未动。
+
+  **收尾结论（交接给 A-1c）**：本步的任务范围（白名单只加一个原因码、测试、部署前只读清单、L2 观察窗）全部完成且证据齐备；**验收目标"为 pos `1001125163581280` 重建分档止盈"未达成**，`position_take_profit_orders` 仍为 197，无任何新建止盈单可供逐笔核对。未达成的两个原因按发生顺序是：(1) zero 止盈字段误判 → `convergence_unowned_take_profit_present`（A-1c 的主题）；(2) 随后 230 被瞬时状态推入 `convergence_exact_leg_not_verified`，该码不在白名单且本步禁止加入，**因此仅修 (1) 已不足以让 230 恢复**。230 的最终态是 (2) 而不是 (1)，A-1c 开始前须先就是否连带复位 230 取得用户决定（选项见 1c 计划文件末节）。
 
   **遗留问题**：修 `_row_has_take_profit_fields` 属于改动守护交易所写入的 fail-closed 判据，需要用户对该改动的单独批准，按"不得顺手修另一步的问题"本步未动。在它修好前，收敛 230 不会为 pos 1001125163581280（8 张 BTC 多单）建出分档止盈，该仓位目前只有止损保护。
 - step-1 (2026-09-07, local_912f7e68-19a2-43f3-bd62-62ff8d223a2a): 提交 `b1c12213ad2740e08ac1ecdba39e843e55ce239f`（分支 `mgmt/step-1-tp-veto-scope`，已 fast-forward 进 `codex/deepcoin-auto-trading-v1`）。
