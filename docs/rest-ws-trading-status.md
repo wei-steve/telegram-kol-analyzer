@@ -13,12 +13,12 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 4
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-4-shadow-binding.md
-phase_status: in_progress               # planned | claimed | in_progress | completed | blocked
-claimed_by: local_98b3dc80-ae04-4c3f-a5da-2d579cb21613
-last_completed_phase: 3
-last_completed_commit: 4bdc6ba6c43dfadb393ac905a66104d65b651d2b
+current_phase: 5
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5-order-entry-cutover.md
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
+claimed_by:
+last_completed_phase: 4
+last_completed_commit: 294bd54b2881b6a44e2d749d9ec479d453985d36
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
 ```
 
@@ -332,6 +332,103 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - defect-out-of-scope (2026-09-06): `trigger_take_profit_convergence_executor.py:506-511` 对未过滤的 pending 原始行逐行调用只适用于保护单的 `_native_tpsl_aliases_consistent`，入场条件单会触发 `convergence_pending_alias_conflict` 全局否决。不属于本项目范围，需单独立项：先写复现测试，再把否决范围收窄到保护单行。
 
 执行会话在此追加，格式：`- phase-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
+
+- phase-4 (2026-09-07, 会话 local_98b3dc80, **完成**):
+  提交 `294bd54b2881b6a44e2d749d9ec479d453985d36`（部署的就是它），
+  部署 `tg-deploy 294bd54b…`，回滚 SHA `4bdc6ba6c43dfadb393ac905a66104d65b651d2b`
+  （回滚保留影子表不删）。
+  **共 6 次部署**，每一次都是前一次在生产上暴露出错数字后的修正
+  （`da7ef255` → `9a9834bf` → `afcad2a2` → `59156895` → `d62d25f6` → `ddda43cb` → `294bd54b`）。
+  实现：两张影子表随 `init_db` 建；`deepcoin_shadow_binding.py` 按五条合取判据建链，
+  每条判据单独不满足时落到各自具名的 `refusal_reason`；
+  `deepcoin_shadow_diff.py` 产出八类差异与只读汇总；
+  `deepcoin_shadow_ownership.py` 把「这个对象属不属于系统」收敛成一处、覆盖 9 张账本
+  （含阶段 4 要求的 5 张，以及阶段 3 漏掉的 `position_take_profit_orders`）；
+  localhost-only 端点 `/api/runtime/deepcoin-shadow-binding-report` 只返回计数；
+  CLI 导出器 `deepcoin-shadow-binding-export` 把明细写服务器证据文件；
+  `deepcoin_reconcile` 每轮加一行结构化日志（触发来源、唤醒帧接收时间、起止时间、
+  触碰 binding 数）。
+  **影子写入用会话级守卫**：flush 前拒绝任何非影子表对象，配静态 import 守护测试。
+  schema 演练（生产库副本）：`quick_check` 前后均 `ok`，五张关键表行数完全不变
+  （342 / 666 / 184 / 197 / 15209），524 个既有 sqlite_master 对象
+  **removed 0、modified 0**，新增 11 个（2 表 + 9 索引），表数 90→92。
+  验证：focused 53 passed；全量 **7605 passed / 4 skipped / 0 failed**；
+  `tests/test_runtime_event_loop_blocking_census.py` 通过（新增调用都经
+  `run_on_management_worker`，未进允许清单）。
+  观察窗口 `06:50:04Z ~ 07:19:07Z`（30 个连续健康采样，监视器自判达标）：
+  真实消息 **8 条 / 3 个群**；`state` 恒 healthy、`open_gap_count` 恒 0、
+  `last_resync_outcome` 恒 converged、`unparsed_count` 恒 1 零新增、
+  `reconcile_failures` 恒 0；`by_wake` 恒 0（窗口内零业务帧，退回纯轮询，符合设计）。
+  异常 1 条且**在合格窗口之前**（`06:49:04Z` 空闲静默计时器的计划内重连，fail-closed 正确）。
+  交易所首尾 fingerprint 逐字节一致 `ddcaa6a0aae69c2f4fef9d224844a5e59d8b3260f79b3f27208e8acb2956effc`；
+  七张交易账本窗口前后**一行未动**，仅 `authoritative_execution_attempts` 412→418
+  由窗口内 8 条消息解释。
+
+  **差异报告关键数字（阶段 5 的批准以此为依据）：**
+  链总数 **5**；**exact 2 / unverified 3**（`exact_ratio` 0.40）。
+  stage：active 2 / order_live 1 / terminal 2。
+  八种 diff_kind：**shadow_only 0、ledger_only 2**、pos_id_mismatch 0、
+  protection_ord_id_mismatch 0、side_mismatch 0、size_mismatch 0、price_mismatch 0、
+  **timing_only 4**，提前量 -4.903 / -4.666 / -0.637 / +4.531 秒，
+  **中位提前量 -2.652 秒（负值＝既有账本先得出结论）**。
+  `exact_ratio` 的分母含两条本来就不可能 exact 的对象（一条未成交挂单、
+  一条系统外手工平仓）；**在「有成交帧的真实入场链」这个真正分母上是 2/2 全部 exact**。
+  `ledger_only` 两条均已逐条归因，无一指向影子链认错或漏认：
+  (1) `1001125163581473` = binding 341 的条件入场单，已提交在挂、尚未成交，
+  无 Trade 帧故判据 1 不成立，stage `order_live`；
+  (2) `1001125157891231` = binding 340 的入场，仓位在 `05:49:01Z` 被系统外手工平仓，
+  两张保护单同帧转 `TS=4` 后 REST 不再返回，stage `terminal`（此前它确实曾判为 exact）。
+  `shadow_only` 为 0 **且在当前架构下不可能非 0**，原因见下条发现 1。
+
+  **生产实测四个新事实（都是先看到错数字再查出来的，不是推理）：**
+  **(1) REST 没有任何「读」接口能把 ordId 关联到 posId。** 逐个只读查过：
+  `list_trade_fills*` / `list_order_history` / `get_order_history_by_id` 都没有 `posId` 字段；
+  `list_positions` / `list_position_history` 有 posId 但没有 ordId；
+  `list_trigger_orders_pending` / `list_trigger_order_history` 两者都没有。
+  唯一同时出现的位置是 `POST /deepcoin/trade/order` 的响应体**顶层** `posId`
+  （与 `data` 平级），生产账本本来就在用它（`direct_order_position_id`，evidence tier 0）。
+  判据 2 因此改为读这份响应、再要求交易所在 positions / position_history 里
+  确认该 posId 存在且方向一致。**对阶段 5 的硬性含义：新绑定必须在 `place_order`
+  返回的那一刻把整个响应体存下来，只存 ordId 就永久丢失唯一的确定性链接。**
+  **(2) REST 的 pending TPSL 行既无 `posId`、`sz` 也恒为 `"0"`。** 因此判据 3
+  （`TriggerOrder.TU == posId`）**只能**由 WS 证明，REST 无法佐证；判据 5 的
+  「数量一致」在 REST 侧拿不到可用数字。阶段 6 要用新绑定驱动 TPSL 修改/撤销时，
+  必须知道保护单归属的唯一确定性来源是 `TriggerOrder.TU`，而它只在 WS 上。
+  **(3) 补测项 12：重连后不重推。** 前提具备（3 个活仓、每个都带 `TU=posId` 的活 TPSL、
+  影子链判 exact）。专门重启 worker `05:15:29Z`（MainPID 2578954→2580000，
+  缺口 id=90 2.64 秒闭合，五步 1074/4/0/861/1 ms converged，seeded 10），
+  重新订阅后 **95 秒零帧**；当天另有 6 次本地断线重连（缺口 84–89），同样零推送。
+  **Deepcoin 私有流在（重新）订阅时不发快照，只推变化。** 这证实阶段 2 五步 REST
+  重同步是必需的，且「缺口期间暂停新入场」不能因「重连会补推」而放松。
+  **(4) 补测项 9 拿到真实数据。** `05:49:01Z` 一次平仓：仓位 `Po→0`，
+  **两张保护单在同一批帧里一起 `TS:"1"→"4"`**，没有单独撤单动作，随后 REST 不再返回。
+  触发平仓的不是这两张保护单（止损 2430 / 2425.14，成交价 2509.75）。
+  补测项 8：三条真实入场链**每条都挂 2 张**保护单，按集合比对通过。
+
+  **窗口内一笔系统外手工平仓，已完整归因。** ordId `1001125166582264`
+  （market / reduceOnly / clOrdId 为空 / +10.0099 USDT）对全库**逐表逐列扫描
+  不存在于本系统任何一张表**；系统既有路径正确处理（binding 340 → `closed`，
+  leg 585 → `manually_closed` / `manual_position_missing`）。
+  它暴露了归属扫描的真实缺口：**只查活对象的扫描看不见一笔立即成交的手工平仓**。
+  扫描已扩到 `list_trade_fills` + `list_order_history` 并按时间窗过滤，
+  窗口内未归属对象**恰好 1 个**，就是它，其余全部归属明确。
+  **阶段 5/6 必须采用扩展后的口径**：「这个对象属不属于系统」要查成交流水，不能只查活对象。
+
+  **本阶段代码零交易所写入**：直读交易所历史 `complete=true`、零 read failure、
+  `04:40Z` 起本系统零新增对象；影子模块只调用既有 `list_*` GET，且有静态测试
+  守护它不 import 任何账本写入模块。
+  遗留：(a) 间歇 401 本阶段**未复发**（前三次分别在 09-06 17:04Z、18:31Z、09-07 02:27Z），
+  仍未定位，不在本项目范围。
+  (b) `exact_ratio` 的分母包含 terminal / 非入场对象，读报告必须先看 `counts_by_stage`；
+  若阶段 5 需要单一指标，建议另出「有成交帧的入场链」口径。
+  (c) 空闲账户上静默计时器每 10 分钟一次计划内重连，会周期性打断健康采样连续段
+  （本次 49 个采样点里命中 1 次）；阶段 2 遗留 (b) 未处理，观察成本而非缺陷。
+  证据：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-4/`
+  （`deployment.md`、`findings.md`、`observation-summary.md`、`schema-rehearsal.json`、
+  `open-observer.sh`、`open-observer.jsonl` 50 行、`open-observer-summary.json`、`DONE`、
+  `shadow-report-baseline.json`、`shadow-report-final.json`、`final-numbers.json`、
+  `summarize.py`、`nonbinding_scan.py`、三份 `non-binding-*.json`、
+  三份 `exchange-snapshot-*.json`、`exchange-writes-since-phase-start.json`）。
 
 - phase-3 (2026-09-07, 会话 local_c8d0dc4e, **完成**):
   提交 `4bdc6ba6c43dfadb393ac905a66104d65b651d2b`（部署的就是它），
