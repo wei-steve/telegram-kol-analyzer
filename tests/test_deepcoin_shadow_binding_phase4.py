@@ -1540,3 +1540,39 @@ def test_a_closed_position_ends_terminal_rather_than_failing(tmp_path):
     assert closed.evidence["protection_ord_ids_absent_from_rest"] == [
         PROTECTION_ORD_ID
     ]
+
+
+def test_a_terminal_chain_stops_costing_rest_reads(tmp_path):
+    """Every close leaves chains whose verdict can never change again.
+
+    Without this each one is re-read every five minutes for the whole
+    forty-eight-hour lookback -- REST load that grows with trading volume and
+    tells nobody anything.
+    """
+
+    session_factory = create_session_factory(tmp_path / "shadow.db")
+    _seed_ledger(session_factory)
+    _seed_inbox(session_factory)
+    now = datetime.fromtimestamp(1788636240089 / 1000, tz=UTC) + timedelta(minutes=1)
+    client = _StubClient(
+        orders=[{"ordId": MAIN_ORD_ID, "reduceOnly": "true", "state": "filled"}]
+    )
+
+    first = run_shadow_binding_pass(
+        session_factory, client=client, instrument_map=_instrument_map(), now=now
+    )
+    calls_after_first = len(client.calls)
+    later = run_shadow_binding_pass(
+        session_factory,
+        client=client,
+        instrument_map=_instrument_map(),
+        now=now + timedelta(minutes=30),
+    )
+
+    assert first.unverified == 1
+    with session_factory() as session:
+        row = session.query(DeepcoinShadowBinding).one()
+        assert row.stage == "terminal"
+        assert row.refusal_reason == "not_an_entry_order"
+    assert later.candidates_due == 0
+    assert len(client.calls) == calls_after_first

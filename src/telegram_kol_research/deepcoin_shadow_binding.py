@@ -829,8 +829,8 @@ def _ws_frames_since(
 
 def _existing_shadow_rows(
     session_factory: Callable[[], Any], main_ord_ids: list[str]
-) -> dict[str, tuple[str, datetime]]:
-    """Return ``main_ord_id -> (confidence, last_seen_at)`` for known chains."""
+) -> dict[str, tuple[str, str, datetime]]:
+    """Return ``main_ord_id -> (confidence, stage, last_seen_at)`` per known chain."""
 
     from sqlalchemy import select
 
@@ -841,12 +841,13 @@ def _existing_shadow_rows(
             select(
                 DeepcoinShadowBinding.main_ord_id,
                 DeepcoinShadowBinding.binding_confidence,
+                DeepcoinShadowBinding.stage,
                 DeepcoinShadowBinding.last_seen_at,
             ).where(DeepcoinShadowBinding.main_ord_id.in_(main_ord_ids))
         ).all()
     return {
-        str(main_ord_id): (str(confidence), last_seen_at)
-        for main_ord_id, confidence, last_seen_at in rows
+        str(main_ord_id): (str(confidence), str(stage), last_seen_at)
+        for main_ord_id, confidence, stage, last_seen_at in rows
     }
 
 
@@ -861,23 +862,27 @@ def _latest_frame_ms(frames_by_channel: dict[str, list[dict[str, Any]]]) -> int:
 def _needs_reevaluation(
     main_ord_id: str,
     *,
-    known: dict[str, tuple[str, datetime]],
+    known: dict[str, tuple[str, str, datetime]],
     latest_frame_ms: int,
     now: datetime,
 ) -> bool:
     """Should this candidate cost REST reads on this pass?
 
-    A chain already proved ``exact`` is re-read only when a frame has landed
-    since it was last seen; nothing else can change its verdict, and re-reading
-    it every thirty seconds would add exchange load for no information. An
-    ``unverified`` chain is retried on any new frame and otherwise on a slow
-    timer, because its refusal really can resolve later.
+    Settled chains are re-read only when a frame has landed since they were last
+    seen. Two kinds are settled: one already proved ``exact``, and one at stage
+    ``terminal`` -- a closed position or an order that was never an entry. Their
+    verdicts cannot change, and without this every close leaves two chains being
+    re-read every five minutes for two days, which is unbounded REST load for no
+    information.
+
+    Everything else is retried on any new frame and otherwise on a slow timer,
+    because those refusals really can resolve later.
     """
 
     entry = known.get(main_ord_id)
     if entry is None:
         return True
-    confidence, last_seen_at = entry
+    confidence, stage, last_seen_at = entry
     if last_seen_at is None:
         return True
     if last_seen_at.tzinfo is None:
@@ -885,7 +890,7 @@ def _needs_reevaluation(
     last_seen_ms = int(last_seen_at.timestamp() * 1000)
     if latest_frame_ms > last_seen_ms:
         return True
-    if confidence == CONFIDENCE_EXACT:
+    if confidence == CONFIDENCE_EXACT or stage == STAGE_TERMINAL:
         return False
     return (now - last_seen_at).total_seconds() >= SHADOW_UNVERIFIED_RETRY_SECONDS
 
