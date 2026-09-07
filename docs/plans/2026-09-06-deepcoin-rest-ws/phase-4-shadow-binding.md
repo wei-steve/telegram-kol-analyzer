@@ -111,6 +111,29 @@ TriggerOrder.OS 是 TPSL 自己的 ordId
     不要为了凑这一项去下单。
   - 结论无论正负都要写进证据：这是决定阶段 2 的"暂停新入场"策略松紧的关键输入。
 
+### 5. reconcile 每轮日志（阶段 3 遗留）
+
+`deepcoin_reconcile` 循环目前不打每轮日志，阶段 3 因此无法逐事件量化唤醒的提前量。
+本阶段给每轮加一行结构化日志：触发来源（`by_timer` / `by_wake`）、唤醒帧的接收时间、
+本轮开始与结束时间、本轮触碰的 binding id 列表（只记 id）。`timing_only` 的中位提前量
+必须从这条日志和影子链的 `trade_os_seen_at` 算出来，而不是估算。
+
+### 6. "不属于系统的订单"扫描必须覆盖全部保护账本（阶段 3 教训）
+
+阶段 3 的第一版扫描只查 `execution_bindings` / `execution_order_legs`，把系统自己下的
+4 张 TPSL 止损单判成了"别人的单"，因为保护单的交易所单号写在保护账本里。本阶段任何
+"这个对象属不属于系统"的判断（包括 `shadow_only` / `ledger_only` 的归因）都必须同时
+查 `execution_bindings`、`execution_order_legs`、`position_protection_ledger`、
+`trigger_protection_intents`、`position_take_profit_orders`。阶段 3 证据目录里的
+`nonbinding_scan.py` 是已修正的版本，可直接复用。
+
+### 7. 影子链样本量要求
+
+差异报告只有在真实入场发生时才有内容。观察窗口除 5 条消息的门槛外，再加一个条件：
+影子表里至少出现 **3 条**由真实自动交易入场产生的影子链尝试（无论 `exact` 还是
+`unverified`）。监视器把这个计数也纳入停止条件，上限 48 小时；到上限仍不足 3 条就如实
+记录样本量，阶段留 `in_progress`。不要为了凑样本下单。
+
 ## 禁止
 
 - 禁止让影子表驱动任何决定。现有账本、reconcile、保护路径的行为必须完全不变。
