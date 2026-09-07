@@ -440,9 +440,33 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   任务 5 复核、全量套件、rebase 到最新、部署、30 分钟观察窗、重启 worker、状态收尾。
   **未部署；未观察。** 全量套件已在当前代码上跑过（见上）。
 
-  遗留：间歇 401 今天 **129 次**（全部 `trigger-orders-pending`，09-15 时每小时 12-25 次，
-  峰值早于本轮实验、与实验无关），已两次干扰实验收尾。不在本项目范围，
-  但阶段 5 的观察窗与绑定链 REST 回读几乎肯定会撞上，建议单独立项。
+  **间歇 401 已定性：就是 Deepcoin 的限流。** 只读探针 16:16:20Z / 16:17:41Z 抓到两次，
+  响应体均为 `{"code":"50000","msg":"Trigger the api frequency limiting"}`，
+  响应头 `X-Ratelimit-Limit: 5` / `Remaining: 0` / `Window: 1s` / `Retry-After: 1`，
+  与官方限频页一致（该端点 5 次/秒 150 次/分，全部端点最低档）。
+  **`code=50000` 不在官方错误码表里**（表内只有 50100–50115 的认证类），
+  限频页又没写超限返回什么，两页之间正好缺这一环，所以前三次排查都判不出来。
+  服务器时钟已排除（NTP 同步，偏移 0.000186 秒，与 Deepcoin `Date` 头差 376 毫秒）。
+  探针自身仅 0.1 次/秒，够不着限额——**是生产自己的流量在同一秒内用光配额**：
+  `list_trigger_orders_pending` 在线调用点众多且各自按合约循环
+  （`deepcoin_execution_actions` 8 处、`break_even_convergence_executor`、
+  `backup_stop_repair`、`web_app._load_deepcoin_pending_tpsl_orders`，
+  以及**阶段 4 新增的 `deepcoin_shadow_binding`**）。今日 129 次。
+  现状语义安全（记 `evidence_available=False` 后 continue，未降级成“没有挂单”），
+  代价是每天丢约 129 次保护快照证据。
+  修法建议（单独立项）：识别 401+50000 为限流而非认证；尊重 `Retry-After` 做一次有界重试
+  （读接口，无写入风险）；照 `DeepcoinTpslWriteLimiter` 加一个覆盖 5 次/秒读端点的限流器；
+  合并同轮内重复的 pending 快照读。证据 `findings-401.md`、`probe-401.jsonl`。
+  阶段 5 收尾必须带上限流识别与重试，否则 `rest_read_incomplete` 会周期性把
+  本可 exact 的链压成 unverified（本轮实验已被打断两次）。
+
+  **`orders-pending` 盲区可能是调用了错的接口。** 官方侧边栏“获取未成交订单列表”
+  指向 `/docs/zh/DeepCoinTrade/ordersPendingV2`，即 `GET /deepcoin/trade/v2/orders-pending`；
+  客户端在用的 V1 `/deepcoin/trade/orders-pending` **没有任何文档页**
+  （五个候选 slug 全 404，只在限频表里出现），疑为遗留接口。
+  V2 已只读调通（`index` 从 1 开始，`index=0` 被拒），支持 `ordId` 过滤。
+  cell v 的探测集已扩为 V1 四种参数 + V2 三种（含按精确 ordId 过滤），
+  待用 `--cell v --attempt 2` 在一笔活的限价单上取得定论。
 
 - phase-5-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 用户判断“只用 REST 拿不到确定性外键，不改源头修不完”，决定阶段 5 不再暂缓，与事故修复（docs/management-reliability-status.md）两线并行。阶段 5 收益定位改为“确定性替代推断式候选匹配”而非降低延迟。前置受控实验仍需逐笔由用户本人执行真实下单命令，执行会话只准备命令与分析证据。两条硬性约束写入阶段文件。
 - phase-5-hold (2026-09-07, 指挥会话): 阶段 5 暂不领取。原因一：用户报告两起管理指令未执行事故（峰哥止盈、大镖客保本），正在只读排查，实盘保护优先于改造；原因二：阶段 4 差异报告显示 WS 链在入场归属上没有延迟收益（timing_only 中位 -2.652 秒，市价入场的 posId 在下单响应里同步可得），阶段 5 的收益要重新定位为“确定性替代推断式候选匹配”，需用户就此达成共识后再批准。阶段 5 的两条硬性约束已确认：place_order 响应体必须整体持久化（posId 只在那一次出现）；保护单归属唯一确定性来源是 WS 的 TriggerOrder.TU，REST 无法佐证，重连不重推，缺口期间暂停新入场不能放松。
