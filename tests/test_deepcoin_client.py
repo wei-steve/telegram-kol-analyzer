@@ -8,6 +8,7 @@ import pytest
 
 from telegram_kol_research.deepcoin_client import DeepcoinClientError
 from telegram_kol_research.deepcoin_client import DeepcoinCredentials
+from telegram_kol_research.deepcoin_client import DeepcoinReadRateLimiter
 from telegram_kol_research.deepcoin_client import DeepcoinRestClient
 from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
 from telegram_kol_research.deepcoin_client import DeepcoinTpslWriteLimiter
@@ -596,6 +597,13 @@ def test_position_history_pacing_does_not_delay_other_endpoints():
         monotonic_factory=clock,
         sleep_fn=clock.sleep,
         position_history_min_interval_seconds=1.05,
+        # Given enough read tokens for both calls, so that any sleep observed
+        # here could only have come from the position-history pacing this test
+        # is about. Phase 5b's read limiter is covered on its own in
+        # tests/test_deepcoin_read_rate_limit.py.
+        read_rate_limiter=DeepcoinReadRateLimiter(
+            monotonic_factory=clock, sleep_fn=clock.sleep, per_second=2
+        ),
     )
 
     client.list_positions()

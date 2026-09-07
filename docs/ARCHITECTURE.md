@@ -140,7 +140,7 @@ stall / stale）在 worker 的 `_classify_claim_expiry`，两个循环都不做�
 不要为了"保险"再引入一把进程内的全局锁：它在三进程拓扑下保护不了任何跨进程的东西，只会把同一个
 进程里本可以并行的活动串起来。
 
-## 4.6 Deepcoin 读限流：为什么每进程 2/s
+## 4.6 Deepcoin 读限流：为什么按角色分配 3/1/1
 
 Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，不按进程计。超限的返回是
 `HTTP 401` + 响应体 `{"code":"50000","msg":"Trigger the api frequency limiting"}`，
@@ -150,10 +150,25 @@ Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，
 
 限流器是进程内的（`DeepcoinReadRateLimiter`，令牌桶），而生产是 web/ingest/worker 三个操作系统
 进程，任何一个都看不见另外两个的请求。进程内限流器唯一能保证账户不超限的办法，是**各自只持有配额的
-一份固定份额**：因此每进程 `2/s`（`DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND`）。
-2×3 = 6 名义上超过 5，但只有 `worker` 有持续读循环，`web` 与 `ingest` 只在人工 API 调用或断线
-重同步时读，所以稳态账户速率仍在 5 以下，并给写入留出约 1 次/秒余量。不要为了"提高吞吐"单独调高
-某一个进程的值——三个进程加起来才是账户的真实速率。
+一份固定份额**。份额**按角色分配，不是平均分**（`DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE`，
+由环境变量 `TELEGRAM_KOL_RUNTIME_ROLE` 解析）：
+
+| 角色 | 份额 | 为什么 |
+|---|---|---|
+| `worker` | **3/s** | 唯一有持续读循环的角色（`deepcoin_reconcile` + 阶段 4 影子 pass） |
+| `web` | **1/s** | 只在人工 API 调用时读 |
+| `ingest` | **1/s** | 只在断线重同步时读 |
+| `all` | 5/s | 本地单进程开发模式，一个进程跑三个角色的循环，所以持有三份 |
+| 其他（运维 CLI 工具、临时脚本） | 1/s | 它们是**在三个服务之外**多出来的进程，账户配额已经分完，只能拿最小份额 |
+
+3+1+1 = 5，正好用满，**没有给写入留余量**：写入稀疏且突发、走自己的限流器，真撞上天花板产生的
+401 按"结果未知、绝不重发"处理，语义本来就是对的。
+
+平均分（每进程 2/s）在 2026-09-07 实测过并被否决：worker 的 reconcile 轮时长从中位 13.8 秒
+变成 32–44 秒，轮间隔从约 44 秒变成约 65 秒——那是拿保护收敛延迟去换 web/ingest 根本用不到的余量。
+
+**不要单独调高某一个角色的值。** 这几个数只有作为一组才是安全的；调高一个而不调低另一个，就是账户
+超限的确切来路。也不要把它做成运行时开关（数据库设置、环境变量），常量是刻意的。
 
 **限流器按物理 HTTP 请求计数，不按逻辑调用计数。** `list_open_orders` 走 V2 分页后，一次逻辑读会
 展开成 N 页 N 次请求，每页各取一个令牌；一次限流重试也再取一个。按逻辑调用计数会把真实速率低估整整
@@ -168,8 +183,12 @@ Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，
 缓存**（写后再读一定是新读），轮结束无条件丢弃，**绝不跨轮**。命中缓存不产生物理请求，因此也不取令牌。
 历史与成交（`orders-history` / `fills` / `trigger-orders-history`）不进缓存——一轮内没人重复读它们。
 
-健康端点 `/api/runtime/deepcoin-ws-health` 输出本进程的 `rate_limited_last_hour` 与
-`retry_after_waits_last_hour`；worker（8002）那一份才是有意义的那一份。
+健康端点 `/api/runtime/deepcoin-ws-health` 输出本进程的 `read_limit_per_second`、
+`rate_limited_last_hour` 与 `retry_after_waits_last_hour`；worker（8002）那一份才是有意义的
+那一份。
+
+阶段 5 入场迁到普通 order 之后，V2 `orders-pending` 的分页会放大 worker 的请求量，届时要按实测
+重新评估这组份额。
 
 ## 5. 模块分类（已核实）
 

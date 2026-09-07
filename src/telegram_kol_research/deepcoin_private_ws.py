@@ -40,7 +40,10 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from telegram_kol_research.deepcoin_client import deepcoin_rate_limit_metrics
+from telegram_kol_research.deepcoin_client import (
+    deepcoin_rate_limit_metrics,
+    deepcoin_read_limit_per_second,
+)
 from telegram_kol_research.deepcoin_reconcile_wake import (
     wake_channel_for_result,
 )
@@ -775,7 +778,9 @@ def build_deepcoin_ws_health(
         # Phase 5b read-throttling counters for THIS process. Deepcoin's 5/s
         # quota is per API key across the whole account, but a limiter can only
         # see its own process, so each role reports its own share here and the
-        # worker's is the one that matters.
+        # worker's is the one that matters. The share itself is reported so a
+        # sample says which quota produced its counts.
+        "read_limit_per_second": deepcoin_read_limit_per_second(),
         **deepcoin_rate_limit_metrics().snapshot(),
         "now": now.isoformat(),
     }

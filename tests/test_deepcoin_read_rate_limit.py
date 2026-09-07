@@ -19,6 +19,8 @@ import pytest
 
 from telegram_kol_research.deepcoin_client import (
     DEEPCOIN_RATE_LIMIT_MAX_RETRY_WAIT_SECONDS,
+    DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE,
+    DEEPCOIN_RUNTIME_ROLE_ENV_VAR,
     DeepcoinClientError,
     DeepcoinCredentials,
     DeepcoinRateLimited,
@@ -26,6 +28,7 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinReadRateLimiter,
     DeepcoinRequestOutcomeUnknown,
     DeepcoinRestClient,
+    deepcoin_read_limit_per_second,
 )
 
 
@@ -461,3 +464,49 @@ def test_a_cached_row_cannot_be_mutated_through_a_later_reader():
         second = client.list_positions(inst_id="BTC-USDT-SWAP")
 
     assert second == [{"posId": "p1"}]
+
+
+# ── 5. the per-role share of the account quota ────────────────────────────────
+
+
+def test_the_three_service_roles_split_the_account_quota_exactly():
+    """3 + 1 + 1 = 5: the shares are only safe as a set."""
+
+    shares = DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE
+    assert shares["worker"] == 3
+    assert shares["web"] == 1
+    assert shares["ingest"] == 1
+    assert shares["worker"] + shares["web"] + shares["ingest"] == 5
+    # ``all`` is the single-process dev mode: one process, all three roles.
+    assert shares["all"] == shares["worker"] + shares["web"] + shares["ingest"]
+
+
+@pytest.mark.parametrize(
+    ("role", "expected"),
+    [
+        ("worker", 3),
+        ("web", 1),
+        ("ingest", 1),
+        ("all", 5),
+        ("WORKER", 3),
+        (" worker ", 3),
+        # An operator CLI runs alongside the three services, not instead of
+        # them, so it takes the smallest share rather than a worker's.
+        ("", 1),
+        ("monitor", 1),
+        (None, 1),
+    ],
+)
+def test_read_limit_is_resolved_from_the_runtime_role(role, expected, monkeypatch):
+    if role is None:
+        monkeypatch.delenv(DEEPCOIN_RUNTIME_ROLE_ENV_VAR, raising=False)
+        assert deepcoin_read_limit_per_second() == expected
+    else:
+        assert deepcoin_read_limit_per_second(role) == expected
+
+
+def test_a_limiter_built_without_an_explicit_rate_takes_its_role_share(monkeypatch):
+    monkeypatch.setenv(DEEPCOIN_RUNTIME_ROLE_ENV_VAR, "worker")
+    assert DeepcoinReadRateLimiter().per_second == 3
+    monkeypatch.setenv(DEEPCOIN_RUNTIME_ROLE_ENV_VAR, "web")
+    assert DeepcoinReadRateLimiter().per_second == 1

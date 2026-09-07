@@ -391,16 +391,56 @@ def _shared_tpsl_limiter(credentials: DeepcoinCredentials) -> DeepcoinTpslWriteL
 
 
 # Deepcoin allows 5 requests per second per API key, measured across the whole
-# account rather than per process. Three runtime roles run as three operating
-# system processes, so no in-process limiter can see the other two: the only
-# way a process-local limiter can keep the account under 5/s is to hold a
-# static share of it. 2/s x 3 roles = 6/s nominal, but `web` and `ingest` read
-# Deepcoin only on demand (a manual API call, a resync), while `worker` is the
-# only role with a continuous read loop, so the sustained account rate stays
-# under the ceiling with one request per second of headroom for writes.
+# account rather than per process. The three runtime roles are three operating
+# system processes and no in-process limiter can see the other two, so each one
+# can only hold a fixed share of the account quota.
 #
-# The rationale is repeated in docs/ARCHITECTURE.md; change both together.
-DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND = 2
+# The shares are split by role rather than evenly, because the read load is
+# nothing like even: `worker` is the only role with a continuous read loop
+# (deepcoin_reconcile plus the shadow pass), while `web` and `ingest` read only
+# on demand -- a manual API call, a resync after a dropped stream. An even 2/2/2
+# split was measured on 2026-09-07 to roughly halve the worker's throughput:
+# reconcile rounds went from a 13.8s median to 32-44s and the round-to-round
+# interval from ~44s to ~65s, which is protection-convergence latency paid for
+# headroom the other two roles were not using.
+#
+# 3 + 1 + 1 = 5 exactly. There is no spare request per second left for writes:
+# writes are rare and bursty and take their own limiter, and a write that does
+# collide with the ceiling is a 401 whose handling (unknown outcome, never
+# retried) is already correct.
+#
+# `all` is the local single-process development mode; it runs all three roles'
+# loops, so it holds all three shares. Anything else -- an operator CLI tool, an
+# ad-hoc script -- runs *alongside* the three services rather than instead of
+# them, so it takes the smallest share: its requests are added to an account
+# that is already fully allocated.
+#
+# The rationale is repeated in docs/ARCHITECTURE.md 4.6; change both together.
+DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE: dict[str, int] = {
+    "worker": 3,
+    "web": 1,
+    "ingest": 1,
+    "all": 5,
+}
+DEEPCOIN_READ_LIMIT_UNKNOWN_ROLE_PER_SECOND = 1
+DEEPCOIN_RUNTIME_ROLE_ENV_VAR = "TELEGRAM_KOL_RUNTIME_ROLE"
+
+
+def deepcoin_read_limit_per_second(role: str | None = None) -> int:
+    """Return this process's share of the account-wide 5 reads per second.
+
+    Fixed constants per role, resolved once when the limiter is built. There is
+    deliberately no runtime setting: the shares are only safe as a set, and a
+    per-process switch would let one role be raised without the others being
+    lowered, which is exactly how the account ceiling gets breached.
+    """
+
+    if role is None:
+        role = os.environ.get(DEEPCOIN_RUNTIME_ROLE_ENV_VAR, "")
+    return DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE.get(
+        str(role or "").strip().lower(),
+        DEEPCOIN_READ_LIMIT_UNKNOWN_ROLE_PER_SECOND,
+    )
 
 
 class DeepcoinReadRateLimiter:
@@ -420,15 +460,22 @@ class DeepcoinReadRateLimiter:
         *,
         monotonic_factory: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
-        per_second: int = DEEPCOIN_READ_LIMIT_PER_PROCESS_PER_SECOND,
+        per_second: int | None = None,
     ) -> None:
         self._clock = monotonic_factory
         self._sleep = sleep_fn
-        self._per_second = max(1, int(per_second))
+        self._per_second = max(
+            1,
+            int(deepcoin_read_limit_per_second() if per_second is None else per_second),
+        )
         self._capacity = float(self._per_second)
         self._tokens = float(self._per_second)
         self._refilled_at = monotonic_factory()
         self._lock = threading.Lock()
+
+    @property
+    def per_second(self) -> int:
+        return self._per_second
 
     def acquire(self) -> None:
         """Consume one token, sleeping until one is available."""
