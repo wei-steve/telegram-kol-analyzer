@@ -15,6 +15,7 @@
 | `position_take_profit_orders` 196 / 197、`position_protection_ledger` 止损行（leg 579） | active | 仓位已平，单据已消失 | cancelled / closed |
 | `strategy_lifecycles` 1081（峰哥幽灵） | entered，`execution_binding_id` NULL，来源 raw 14843 入场失败 | 无仓位 | cancelled（或项目等价终态） |
 | leg 580 的止盈 852/853/854 | `protection_recovery_pending`，从未建立 | 仓位已平 | cancelled |
+| `trigger_take_profit_convergences` 230（binding 341 / leg 586 / pos 1001125163581280）与 231（binding 342 / leg 588 / pos 1001125164628529） | conflicted / `convergence_exact_leg_not_verified`，由瞬时条件写成终态（1b/1c 证据） | 仓位活跃、leg verified、止损在、无分档止盈 | 若仓位仍活跃：复位为可重试（精确改前/改后、影响行数证明、回滚脚本），让修正后的判据重算；若仓位已平：closed |
 
 ## 方法
 
