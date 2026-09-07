@@ -52,6 +52,9 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
+from telegram_kol_research.deepcoin_execution_actions import (
+    DeepcoinExecutionActionError,
+)
 from telegram_kol_research.models import (
     MessageInstructionItem,
     RawMessage,
@@ -4259,6 +4262,19 @@ def test_process_expiry_expire_cancel_executes_deepcoin_cancel_when_client_is_av
         )
         session.add(binding)
         session.flush()
+        # Phase 5a: a regular order may only be cancelled when the ledger records
+        # it as a regular leg this system submitted.
+        session.add(
+            ExecutionOrderLeg(
+                execution_binding_id=binding.id,
+                leg_index=0,
+                purpose="entry",
+                order_kind="market",
+                order_id="order-1",
+                venue="deepcoin",
+                status="open",
+            )
+        )
         lifecycle = StrategyLifecycle(
             chat_id=88,
             message_id=442,
@@ -4293,6 +4309,78 @@ def test_process_expiry_expire_cancel_executes_deepcoin_cancel_when_client_is_av
     assert binding.status == "cancelled"
     assert lifecycle.lifecycle_status == "expired"
     assert lifecycle.management_action == "expiry_cancelled_and_expired"
+
+
+def test_process_expiry_expire_cancel_refuses_a_regular_order_without_a_system_leg(
+    tmp_path,
+):
+    """Phase 5a: V2 makes a regular order visible, but an unrecorded one is untouchable."""
+
+    class FakeDeepcoinClient:
+        def __init__(self):
+            self.cancel_payloads = []
+
+        def list_trigger_orders_pending(self, inst_id):
+            return []
+
+        def list_open_orders(self, inst_id):
+            return [{"instId": inst_id, "ordId": "order-1"}]
+
+        def cancel_order(self, cancel_payload):  # pragma: no cover - must not run
+            self.cancel_payloads.append(cancel_payload)
+            return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="mia",
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            venue="deepcoin",
+            status="open",
+            order_id="order-1",
+            position_mode="split",
+        )
+        session.add(binding)
+        session.flush()
+        # Deliberately no ExecutionOrderLeg: nothing records this ord id as a
+        # regular order this system submitted.
+        lifecycle = StrategyLifecycle(
+            chat_id=88,
+            message_id=442,
+            symbol="BTC",
+            side="short",
+            lifecycle_status="pending_entry",
+            signal_at=datetime(2026, 7, 2, 15, 14, tzinfo=UTC),
+            execution_binding_id=binding.id,
+            management_action="expiry_review_requested",
+        )
+        session.add(lifecycle)
+        session.commit()
+        lifecycle_id = lifecycle.id
+
+    fake_client = FakeDeepcoinClient()
+    # Same failure class the command already raises when the order is not there:
+    # the guard makes an unrecorded object indistinguishable from an absent one.
+    with pytest.raises(DeepcoinExecutionActionError, match="no_bound_pending_entry_order"):
+        process_system_operator_command(
+            session_factory,
+            f"/expiry_expire_cancel {lifecycle_id}",
+            now=datetime(2026, 7, 3, 0, 0, tzinfo=UTC),
+            deepcoin_client=fake_client,
+        )
+
+    assert fake_client.cancel_payloads == []
+    with session_factory() as session:
+        lifecycle = session.get(StrategyLifecycle, lifecycle_id)
+        assert lifecycle.lifecycle_status == "pending_entry"
+        incident_types = [
+            incident.incident_type
+            for incident in session.query(RuntimeIncident).all()
+        ]
+    assert "open_order_guard_blocked" in incident_types
 
 
 def test_process_expiry_expire_cancel_without_live_binding_marks_expired(tmp_path):
