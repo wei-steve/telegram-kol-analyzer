@@ -104,8 +104,11 @@ def test_far_cells_cannot_fill_and_protection_brackets_the_limit_price(harness):
         body = harness.build_manifest(cell, MARKET, run_id="run0000000")["requests"][0]["body"]
         price = float(body["px"])
         assert abs(price - last) / last >= float(harness.FAR_PRICE_MIN_DISTANCE)
-        if plan.get("attach_protection", True):
+        mode = plan.get("attach_protection", True)
+        if mode is True:
             assert float(body["slTriggerPx"]) < price < float(body["tpTriggerPx"])
+        elif mode == "stop_only":
+            assert float(body["slTriggerPx"]) < price and "tpTriggerPx" not in body
 
 
 def test_short_cell_protection_is_inverted(harness):
@@ -392,7 +395,24 @@ def test_the_visibility_cell_carries_no_protection_and_nothing_else_changes(harn
 
 def test_every_other_cell_still_attaches_protection(harness):
     for cell in harness.CELLS:
-        if cell == "v":
+        if cell in {"v", "s"}:
             continue
         body = harness.build_manifest(cell, MARKET, run_id="run0000000")["requests"][0]["body"]
         assert "tpTriggerPx" in body and "slTriggerPx" in body
+
+
+def test_the_stop_only_cell_sends_the_shape_production_will_send(harness):
+    body = harness.build_manifest("s", MARKET, run_id="run0000000")["requests"][0]["body"]
+    assert set(body) == {"instId", "tdMode", "mrgPosition", "side", "posSide",
+                         "ordType", "px", "sz", "slTriggerPx"}
+    assert float(body["slTriggerPx"]) < float(body["px"])
+    assert "tpTriggerPx" not in body and "clOrdId" not in body
+
+
+def test_the_three_protection_modes_differ_only_in_the_protection_fields(harness):
+    both = harness.build_manifest("6a", MARKET, run_id="run0000000")["requests"][0]["body"]
+    stop_only = harness.build_manifest("s", MARKET, run_id="run0000000")["requests"][0]["body"]
+    neither = harness.build_manifest("v", MARKET, run_id="run0000000")["requests"][0]["body"]
+    strip = lambda body: {k: v for k, v in body.items()
+                          if k not in {"px", "tpTriggerPx", "slTriggerPx"}}
+    assert strip(both) == strip(stop_only) == strip(neither)

@@ -85,6 +85,10 @@ CELLS: dict[str, dict] = {
            "contracts": "0.1", "side": "buy", "pos_side": "long", "observe_seconds": 20,
            "force_timeout_seconds": 0.05,
            "question": "REST response lost while the exchange may have accepted"},
+    "s": {"kind": "far", "orders": 1, "client_order_id": False, "px_factor": "0.93",
+          "contracts": "0.1", "side": "buy", "pos_side": "long", "observe_seconds": 30,
+          "attach_protection": "stop_only",
+          "question": "is a limit order with slTriggerPx but no tpTriggerPx accepted"},
     "v": {"kind": "far", "orders": 1, "client_order_id": False, "px_factor": "0.92",
           "contracts": "0.1", "side": "buy", "pos_side": "long", "observe_seconds": 30,
           "attach_protection": False,
@@ -557,12 +561,17 @@ def build_manifest(cell: str, market: dict, *, run_id: str,
     # exactly as the accepted 2026-09-05 short did.  Cell "v" omits them on
     # purpose: it isolates whether the orders-pending blindness found in cell 11
     # is caused by the attached protection or by the ordinary limit order itself.
+    # True = both prices (cells 3/6a/6c), False = neither (cell v),
+    # "stop_only" = the shape production will actually send, where the take
+    # profit waits for the exact posId after the fill.
     attach_protection = plan.get("attach_protection", True)
+    if attach_protection not in (True, False, "stop_only"):
+        raise ValueError("unsupported attach_protection mode")
     if plan["pos_side"] == "long":
         take_profit, stop_loss = price + 10, price - 10
     else:
         take_profit, stop_loss = price - 10, price + 10
-    if attach_protection and (stop_loss <= 0 or take_profit <= 0):
+    if attach_protection is not False and (stop_loss <= 0 or take_profit <= 0):
         raise ValueError("protection price is not positive")
 
     requests = []
@@ -577,8 +586,10 @@ def build_manifest(cell: str, market: dict, *, run_id: str,
             "px": f"{price:f}",
             "sz": f"{contracts:f}",
         }
-        if attach_protection:
+        if attach_protection is True:
             body["tpTriggerPx"] = f"{take_profit:f}"
+            body["slTriggerPx"] = f"{stop_loss:f}"
+        elif attach_protection == "stop_only":
             body["slTriggerPx"] = f"{stop_loss:f}"
         if plan["client_order_id"]:
             body["clOrdId"] = "P5" + run_id + chr(ord("A") + index)
