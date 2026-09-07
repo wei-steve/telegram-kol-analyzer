@@ -264,6 +264,7 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- phase-4-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 阶段 4（影子绑定链与差异报告，新表 `deepcoin_shadow_bindings` / `deepcoin_shadow_diffs`，L3）获批领取。附加门槛：影子表至少 3 条真实入场产生的链才算观察完成，上限 48 小时；不为凑样本下单。
 - out-of-scope-401 (2026-09-07, 指挥会话): `GET /deepcoin/trade/trigger-orders-pending` 间歇 401 Unauthorized 已在 2026-09-06 17:04Z、18:31Z、2026-09-07 02:27Z 复现三次，全部落在同一端点、同一既有路径 `web_app._load_deepcoin_pending_tpsl_orders`，语义正确（记为证据不可用，不降级为无挂单）。尚未判定是签名时间戳容差（服务器时钟漂移）还是限流。不在本项目范围，建议单独排查：先比对服务器 NTP 偏移与 Deepcoin 返回头里的时间，再看该端点的调用频率。
 - phase-2-open-ended-observation (2026-09-06, 用户在指挥会话 local_858790fe 明确授权): 两次 30 分钟观察均因夜间零消息停止，代码侧无待办。用户决定阶段 2 的收尾观察改为开放式：服务器端后台监视器每分钟采样，直到出现一个完整的 30 分钟窗口满足 ≥5 条真实消息、尽量 2 个群且全部健康检查通过为止，自行停止；会话按定时查看结果。AGENTS.md L2 已加入该例外条款。
 - phase-2-completed (2026-09-06, 会话 local_a6d6d24f, **开放式观察达标，阶段 2 完成**):
