@@ -281,6 +281,63 @@ monitor 的 48 次加载身份均为 verified release `0de19c1c...`；通知结�
 
 本轮只追加本日志。未修改计划文档、代码、settings、白名单、词表、阈值、prompt、schema、数据库或业务数据；未 stage、部署、激活、重启服务；未处理、识别或重放消息；未执行 Deepcoin 写入。ATTENTION 仅记录只读证据，没有让 shadow 影响实际决策。
 
+## 2026-09-07 — ATTENTION
+
+> **ATTENTION：本窗口有 37 条 `shadow_would_skip`，其中 raw `15187` 的 attempt `4856` 实质把第一层 `no_action[]` 解析为 `manage_thread[469]`；当前 worker 8002 还显示一笔 10 张 BTC 多仓的 TPSL 未命中保护 ledger，自动管理已冻结。** 三角色当前 loaded artifact identity 也都未验证；本轮只记录证据，shadow 未接管任何决策。
+
+### 固定窗口
+
+- 起点（开区间）：`2026-09-06T16:02:10Z`，承接上次记录的窗口截止；终点在任何生产查询前固定为 `2026-09-07T16:02:50Z`，时长 24 小时 40 秒（**1.00046** 日），整轮未滑动终点。
+- 新消息 151 条，ID `15166–15316`，`created_at` 为 `2026-09-07T00:04:23.471422Z–2026-09-07T15:55:18.791181Z`；没有把窗口起点及以前的行计入分母。生产 checkout（固定终点后读取）为 `b1c12213ad2740e08ac1ecdba39e843e55ce239f`。
+- 数据均为生产 `research.db` 的 URI `mode=ro`、`PRAGMA query_only=ON` 的只读事务、systemd/runtime 端点、monitor journal，以及 **worker `127.0.0.1:8002`** 的 GET-only 快照/持仓/当前委托；没有使用 Web 8000 获取交易所证据。
+
+### 异常优先
+
+1. **Shadow 实质改变第一层结论：是。** raw `15187` 的 would-skip attempt `4856` 为 `no_action[] -> manage_thread[469]`（confidence 0.7）；虽然权威路径实际仍执行，该候选 skip 若接管将改变决策。
+2. **持仓保护异常：是。** 当前 3 个持仓中，BTC long `posId=1001125167675481`（10 contracts）对应 TPSL `1001125167675480` 未命中 `position_protection_ledger`，界面明确为“保护归属未验证 / 自动管理已冻结”。因此无法证明保护方向、数量覆盖和 reduce-only/close-position 语义，按资金安全未知处理。
+3. **PID / SHA 漂移及加载身份：是。** 相对上次记录的 PID `2314171/2314197/2319390`，当前 web/ingest/worker 为 `2653810/2653857/2653779`；三端均 `release_commit=null`、`manifest_sha256=null`、`loaded_artifact_verified=false`。不以 checkout SHA 替代运行身份。
+4. **Monitor：异常。** 固定窗口内 journal 没有完整 monitor 周期记录；固定终点后 timer 为 `inactive/dead`、`disabled`，所以不能把缺失视为健康。
+5. **来源早于窗口的交易所写入：否。** 7 条 `submitted`（BTC 4、ETH 3）均直接或经 binding 指向窗口内 raw `15171` 或 `15186`。
+6. **交易所快照连续两次不完整：否。** worker bounded read-only snapshot 首次 `complete=true`，故未作第二次请求。
+7. **P0 首次达到 500：否。** 该里程碑已在早前窗口发生；至固定终点为 `1158/500`。
+8. **主识别日均 token 变化超过 50%：否。** 本窗口 `4.356M/日`，相对上次实测下界 `3.867M/日` 增加约 12.6%。
+
+### 1. Shadow 生产分歧
+
+- 窗口 context attempts 114：shadow 样本 114，`shadow_would_trigger=77`、`shadow_would_skip=37`、计算错误 0；权威 context 路径没有被 shadow 跳过。
+- 37 个 would-skip 中 36 个不改变第一层：均为 `no_action[] -> hold/unresolved[]`。唯一实质变化为 `4856/15187`：`no_action[] -> manage_thread[469]`。因此本轮实际决策未受影响，但候选判据不可上线。
+- 对截至固定终点所有具有 shadow 结果且可比较的历史行复算：135 条实质变化中 133 条被 shadow 保留，召回率 **98.52%（133/135）**，Wilson 95% CI **95.05%–99.25%**。已有 2 条漏失，距可上线没有有限的“再补多少成功样本”答案；必须形成新 gate 并完成零漏失复验。本轮不改 gate、词表或窗口。
+
+### 2. 主识别真实成本
+
+- 窗口 `mimo_recognition_attempts` 156 行：completed 153、`http_error` 3；实际 provider requests 154，真实 usage 154/154（**100%**）。prompt 4,099,411、completion 258,342、total **4,357,753 token**。
+- 单 request total token：中位数 **29,952.5**、P90 **40,333**、最大 **43,580**、平均 **28,297.10**。
+- 154 条可用组件记录的 request bytes 合计 23,514,095 B：当前消息文本 26,566 B（**0.113%**）、图片证据 9,665,571 B（**41.11%**）、直接 reply 1,268,430 B（**5.39%**，为 authoritative context 的嵌套子集，只计一次）、其余部分 13,821,958 B（**58.78%**）。
+- 按固定日长折算，主识别为 **4.356M token/日**、**28,859.29 token/窗口消息**。
+
+### 3. 成本对照
+
+- 上下文解析 114 attempts、117 provider requests，usage 117/117；prompt 2,685,981、completion 155,374、total **2,841,355 token**，即 **2.840M/日**、**18,816.92 token/窗口消息**（24,285.09/可得 request）。
+- 窗口直接实测中主识别占 **60.53%**、上下文解析占 **39.47%**；主识别高约 **1.516M token/日**。
+- 自主识别 telemetry 起点 `2026-09-01T22:25:52.941030Z` 至固定终点，964 条消息：主识别 1,060 requests（937 usage 可得）、26,033,584 token；上下文解析 615/615 requests、15,468,621 token。累计直接可得 token 占比 **62.73% / 37.27%**；优化主识别的绝对收益仍最大，但 usage 缺口及上述 shadow 漏失均不授权压缩 prompt 或改变权威路径。
+
+### 4. 常规 P0 与运行健康
+
+- 窗口消息 151；context attempts 114，状态 completed 109、exhausted 4、superseded 1；117 provider requests。114 个可比较 decision 中 27 个实质改变（**23.68%**，仅为本窗口描述值）。
+- 8 个触发器（非互斥）：`multiple_same_source_candidates=114`、`entered_holder_language=17`、`management_without_exact_target=9`、`revision_language=3`、`cancellation_language=1`、`text_image_conflict=1`、`reply_target_disagreement=0`、`apparent_entry_may_be_revision=0`。
+- 三个业务 unit 都为 `active/running`、`NRestarts=0`，且 `entry_admission_frozen=false`；web/ingest/worker event loop=true，p95 分别 1.599/1.722/6.079 ms。ingest listener/reconcile=true；worker command/message processing/private WS=true，管理、break-even、reconcile、close、TPSL、protection、rescue 均 fresh/successful。``auto_trade_enabled=true``、`worker_command_mode=queue`，但 worker 的 `global_exchange_authority=false` 且运行 artifact 均未验证，不将配置字段视作身份缺口的替代证据。
+- 固定窗口内 monitor 无周期证据；timer 当前 inactive/disabled，状态为未知/不健康而非零告警健康。
+
+### 5. 交易所只读快照（worker 8002）
+
+- `2026-09-07T16:06:06Z` worker bounded snapshot：`complete=true`、持仓 3、普通挂单 0，fingerprint `c4cd87ec9db6b3bf4d3a38ba1a858fb8e90a586c4836a6a51617016e5698e50a`。当前委托投影为 BTC 触发单 3、ETH 触发单 2、SOL 0。
+- BTC `posId=1001125163581280`（long 8 contracts）有两道已验证平多保护，均为全部剩余仓位、exact-posId ledger 已验证；ETH `posId=1001125164628529`（long 1.6 contracts）同样有两道已验证平多保护、全量覆盖。Deepcoin TPSL/close-position 投影不暴露字面 `reduceOnly` 布尔，因此只在已验证 native protection 语义下判定正确。
+- BTC `posId=1001125167675481`（long 10 contracts）对应一条未验证 TPSL；无法证明其覆盖/方向/归属或 reduce-only 语义，不能视为受保护。未人工归属、未执行任何交易所写入。
+
+### 本轮边界
+
+本轮只追加本日志。未修改计划文档、代码、settings、白名单、词表、阈值、prompt、schema、数据库或业务数据；未 stage、部署、激活、重启服务；未处理、识别或重放消息；未执行 Deepcoin 写入。ATTENTION 仅记录只读证据，没有让 shadow 影响实际决策。
+
 ## 2026-09-04 — ATTENTION
 
 > **ATTENTION：本窗口出现 1 条 `shadow_would_skip` 漏失实质管理决策，累计召回从 100% 降为 55/56；主识别实测日均 token 较上次记录增加 56.03%；44/44 个已记录 monitor 周期均不健康且全部含 `stalled_composite_component`；三角色与 monitor 均发生 release/PID 切换；一笔补保护写入的 binding 原始消息早于窗口起点。** Shadow 仍只旁路记录，未改变权威决策；worker 8002 首次 bounded exchange snapshot 完整，当前无持仓。
