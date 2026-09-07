@@ -339,3 +339,37 @@ def test_a_marketable_price_far_from_the_market_is_refused(harness):
     stale = {"spec": SPEC, "ticker": dict(TICKER, last="2000")}
     with pytest.raises(ValueError):
         harness.build_manifest("1", stale, run_id="run0000000", price_mode="marketable")
+
+
+def test_a_fully_filled_order_is_skipped_instead_of_cancelled(harness, tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(harness, "write_once", lambda *a, **k: sent.append(a[0]) or {"outcome": "accepted"})
+    monkeypatch.setattr(harness.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(
+        harness, "signed_get",
+        lambda path, params=None, **kw: [{"ordId": "1", "state": "filled", "accFillSz": "0.1"}],
+    )
+    results = harness.cancel_owned(tmp_path, {"1"}, timeout=15.0)
+    assert results[0]["outcome"] == "skipped_not_live"
+    assert sent == [], "a filled order must not receive a cancel"
+
+
+def test_a_partly_filled_live_order_still_gets_cancelled(harness, tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(harness, "write_once", lambda *a, **k: sent.append(a[0]) or {"outcome": "accepted"})
+    monkeypatch.setattr(harness.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(
+        harness, "signed_get",
+        lambda path, params=None, **kw: [{"ordId": "1", "state": "live", "accFillSz": "0.1"}],
+    )
+    harness.cancel_owned(tmp_path, {"1"}, timeout=15.0)
+    assert [request["body"]["ordId"] for request in sent] == ["1"]
+
+
+def test_an_unreadable_order_is_still_cancelled(harness, tmp_path, monkeypatch):
+    sent = []
+    monkeypatch.setattr(harness, "write_once", lambda *a, **k: sent.append(a[0]) or {"outcome": "accepted"})
+    monkeypatch.setattr(harness.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(harness, "signed_get", lambda path, params=None, **kw: [])
+    harness.cancel_owned(tmp_path, {"1"}, timeout=15.0)
+    assert len(sent) == 1, "an empty read must not be taken as 'already gone'"

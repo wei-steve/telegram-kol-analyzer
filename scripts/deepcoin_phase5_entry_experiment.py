@@ -619,8 +619,29 @@ def read_state(out: Path, owned: set[str], *, label: str) -> dict:
 
 
 def cancel_owned(out: Path, owned: set[str], *, timeout: float) -> list[dict]:
+    """Cancel the unfilled remainder of this run's orders, one exact id at a time.
+
+    An order that already left ``live`` is skipped rather than cancelled: the
+    exchange answers ``sCode=24 OrderNotFound`` for a fully filled order, which
+    is a pointless write and reads like a failure in the evidence.  An empty or
+    ambiguous read is *not* treated as "already gone" -- it still gets the
+    cancel, because not cancelling a live order is the worse error.
+    """
+
     results = []
     for order_id in sorted(owned):
+        rows = signed_get("/deepcoin/trade/order", {"instId": INST, "ordId": order_id})
+        if len(rows) == 1 and str(rows[0].get("state") or "") not in {"live", ""}:
+            results.append(
+                {
+                    "label": "skip-" + order_id,
+                    "outcome": "skipped_not_live",
+                    "ordId": order_id,
+                    "state": rows[0].get("state"),
+                    "accFillSz": rows[0].get("accFillSz"),
+                }
+            )
+            continue
         results.append(
             write_once(
                 {
@@ -814,7 +835,9 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
                 # Cancel only the ordIds this run received.  A filled position is
                 # never closed here; only an unfilled remainder can be cancelled.
                 summary["cancel_results"] = [
-                    {key: row.get(key) for key in ("label", "outcome", "ordId", "sCode", "sMsg")}
+                    {key: row.get(key) for key in
+                     ("label", "outcome", "ordId", "sCode", "sMsg", "state", "accFillSz")
+                     if key in row}
                     for row in cancel_owned(out, owned, timeout=15.0)
                 ]
                 after = read_state(out, owned, label="after-cancel")
