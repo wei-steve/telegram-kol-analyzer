@@ -14,7 +14,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 1
 current_step_file: docs/plans/2026-09-07-management-reliability/step-1-take-profit-veto-scope.md
-step_status: claimed          # planned | claimed | in_progress | completed | blocked
+step_status: in_progress          # planned | claimed | in_progress | completed | blocked
 claimed_by: local_912f7e68-19a2-43f3-bd62-62ff8d223a2a
 last_completed_step: 0
 last_completed_commit: null
