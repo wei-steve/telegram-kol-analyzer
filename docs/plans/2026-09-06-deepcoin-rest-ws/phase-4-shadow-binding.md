@@ -181,7 +181,7 @@ TriggerOrder.OS 是 TPSL 自己的 ordId
 ### 生产观察
 
 - [ ] 观察 30 分钟，覆盖至少 5 条真实消息、尽量 2 个群；
-      不足则停止、留 `in_progress`、记录流量不足。
+      不足不算失败：按 AGENTS.md L2 用服务器端只读后台监视器持续采样直到凑够（上限 24 小时），会话用 /loop 定时查看。
 - [ ] **差异报告是本阶段的主产出**，必须给出具体数字：
       `exact` / `unverified` 各多少、八种 `diff_kind` 各多少、
       `timing_only` 的中位提前量。
