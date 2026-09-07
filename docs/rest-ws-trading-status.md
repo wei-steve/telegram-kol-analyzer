@@ -15,7 +15,7 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 4
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-4-shadow-binding.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: in_progress               # planned | claimed | in_progress | completed | blocked
 claimed_by: local_98b3dc80-ae04-4c3f-a5da-2d579cb21613
 last_completed_phase: 3
 last_completed_commit: 4bdc6ba6c43dfadb393ac905a66104d65b651d2b
