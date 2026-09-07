@@ -1680,6 +1680,126 @@ def test_tp_convergence_readiness_accepts_exact_backup_without_native_primary(tm
     )
 
 
+def test_alias_conflict_convergence_retries_while_other_conflicts_stay_frozen(
+    tmp_path,
+):
+    """A-1b: only the alias-conflict misjudgement is pulled back for retry."""
+
+    from telegram_kol_research.execution_bindings import (
+        _ReconcileSnapshot,
+        _ready_verified_trigger_take_profit_convergences,
+    )
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence import (
+        create_or_get_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "alias-conflict-retry.db")
+    binding_id = _seed_exact_backup_candidate(
+        session_factory, order_kind="trigger_limit", with_primary=False
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-1"
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        convergence = create_or_get_trigger_take_profit_convergence(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            desired_take_profits=[
+                {"price": "1890", "allocation_pct": "50"},
+                {"price": "1860", "allocation_pct": "30"},
+                {"price": "1825", "allocation_pct": "20"},
+            ],
+        )
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=int(leg.id),
+            pos_id="pos-1",
+            instrument_id="ETH-USDT-SWAP",
+            side="short",
+            trigger_price="1903.8",
+            order_id="backup-1",
+            client_order_id="backup-client-1",
+            status="active",
+            request_json=json.dumps({
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1",
+                "posSide": "short", "slTriggerPx": "1903.8", "slOrdPx": "-1",
+            }),
+        ))
+        session.flush()
+        convergence_id = int(convergence.id)
+        leg_id = int(leg.id)
+        session.commit()
+
+    snapshot = _ReconcileSnapshot(
+        positions=[{
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "pos": "3.4", "avgPx": "1883", "mgnMode": "cross",
+            "mrgPosition": "split", "cTime": "1784512860000",
+        }],
+        pending_trigger_orders=[{
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "ordId": "backup-1", "triggerOrderType": "TPSL",
+            "slTriggerPx": "1903.8", "slOrdPx": "-1", "sz": "0",
+            "cTime": "1784512861000",
+        }],
+    )
+    frozen_at = datetime(2026, 8, 6, 9, 0)
+
+    # The alias-conflict freeze was a misjudgement: it is re-verified and
+    # released back to the normal convergence path.
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_pending_alias_conflict"
+        convergence.pos_id = "pos-1"
+        convergence.updated_at = frozen_at
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        _ready_verified_trigger_take_profit_convergences(
+            session,
+            legs=[leg],
+            snapshot=snapshot,
+            recovered_at=datetime(2026, 8, 6, 10, 0),
+        )
+        session.commit()
+        retried_state = (convergence.status, convergence.reason_code)
+        readiness = json.loads(convergence.request_json)["readiness"]
+    assert retried_state == ("ready", None)
+    assert readiness["pos_id"] == "pos-1"
+    assert len(readiness["owned_stop_evidence_fingerprint"]) == 64
+
+    # Every other conflict stays fail-closed and is not even touched.
+    for reason_code in (
+        "convergence_exact_leg_not_verified",
+        "convergence_partial_position_unexplained",
+        "convergence_pending_alias_conflict_before_write",
+    ):
+        with session_factory() as session:
+            convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+            convergence.status = "conflicted"
+            convergence.reason_code = reason_code
+            convergence.pos_id = "pos-1"
+            convergence.updated_at = frozen_at
+            leg = session.get(ExecutionOrderLeg, leg_id)
+            _ready_verified_trigger_take_profit_convergences(
+                session,
+                legs=[leg],
+                snapshot=snapshot,
+                recovered_at=datetime(2026, 8, 6, 10, 5),
+            )
+            session.commit()
+            frozen_state = (
+                convergence.status,
+                convergence.reason_code,
+                convergence.updated_at,
+            )
+        assert frozen_state == ("conflicted", reason_code, frozen_at)
+
+
 def test_backup_submission_creates_stop_for_verified_market_entry(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     _seed_exact_backup_candidate(session_factory, order_kind="market")

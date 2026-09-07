@@ -1325,12 +1325,19 @@ def _ready_verified_trigger_take_profit_convergences(
     for row in rows:
         # Earlier releases could terminalize a convergence for a full-position
         # (``sz=0``) primary stop or for legacy TPSLs whose exact ledger owner
-        # was not consulted. Both are now re-verified below; all other
-        # conflicts remain fail-closed.
+        # was not consulted. ``convergence_pending_alias_conflict`` joined them
+        # once the veto that produced it was found to misread non-protection
+        # rows (see ``native_tpsl.is_protection_order_row``): those rows were
+        # frozen by a defect, not by a real conflict, so the position they
+        # belong to still has no laddered take profit. All three are re-verified
+        # below against the live position and the exact owned stop evidence;
+        # every other conflict, including
+        # ``convergence_exact_leg_not_verified``, remains fail-closed.
         if str(row.status) == "conflicted" and str(row.reason_code) not in {
             "convergence_verified_stop_missing",
             "convergence_unowned_take_profit_present",
             "convergence_exchange_preflight_unavailable",
+            "convergence_pending_alias_conflict",
         }:
             continue
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
