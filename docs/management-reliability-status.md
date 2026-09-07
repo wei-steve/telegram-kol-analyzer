@@ -31,7 +31,7 @@ user_decisions_2026_09_07:
 |---|---|---|---|
 | 1 | 止盈收敛否决只作用于保护单行 | L2 | 否 |
 | 1b | 被误判冻结的止盈收敛允许重试（为当前持仓重建分档止盈） | L2 | 是 |
-| 1c | 止盈字段为字面量 `0` 不再被当作"存在未拥有的止盈单" | L2 | 是 |
+| 1c | 止盈字段为字面量 `0` 不再被当作"存在未拥有的止盈单"（方案 B：只修判据） | L2 | 否（指挥会话裁定） |
 | 2 | 告警补全：白名单三类、后台任务自愈、两条投递通道、健康端点 | L1 | 否 |
 | 3 | 被推迟指令的恢复与超时；29 条积压作废并通知 | L2（作废积压为 L3 数据变更） | 是（作废积压那一步） |
 | 4 | 账本修复：binding 337、批次 158、幽灵 1081、已成交仍活跃的止盈单 | L3 | 是 |
@@ -60,6 +60,7 @@ user_decisions_2026_09_07:
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
 
+- step-1c-decision (2026-09-07, 指挥会话裁定；用户在 1b 会话与指挥会话均表示“由总指挥判断”): 采用**方案 B**——A-1c 只修 `_row_has_take_profit_fields` 判据，不复位收敛 230，不做任何生产数据修改；230 留给 step 4 账本修复一并处理；“重试路径按即时状态重判、瞬时失败变终态”的性质列入 step 5。据此 1c 不再对当前活跃仓位产生任何交易所写入，只影响此后新建的收敛，因此**改判为无需单独批准**（与 A-1 同类）。用户被告知可自行在交易所为 pos 1001125163581280 手动挂止盈。
 - step-1b-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 允许把 `convergence_pending_alias_conflict` 加入收敛重试白名单，让被误判冻结的止盈收敛（预期 230，BTC 多单 binding 341）按正常路径为当前持仓重建分档止盈；部署前须先只读列出会被拉回的记录出示给用户。
 - step-1b (2026-09-07, local_16ec4b63-93bc-4cac-811c-a290343b49f9): **本步任务范围 completed，但验收目标未达成**（分档止盈未建成，原因见下；剩余目标移交 A-1c）。分支 `mgmt/step-1b-convergence-retry`，代码提交 `7c2fc797b6dd08686c93114fca14171010229eaf`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署）。回滚 SHA `b1c12213ad2740e08ac1ecdba39e843e55ce239f`。
   **做了什么**：`execution_bindings.py` 的 `conflicted` 收敛重试白名单只加入 `convergence_pending_alias_conflict` 一个原因码（未加 `convergence_exact_leg_not_verified` 或任何其他码），重试沿用原流程，未改止盈档位/数量/价格规则，未动止损，未新增写入方式。测试覆盖：该原因码被重新 ready；`convergence_exact_leg_not_verified` / `convergence_partial_position_unexplained` / `convergence_pending_alias_conflict_before_write` 三种仍原样冻结（status、reason_code、updated_at 均不动）；被拉回但仓位已平的行落到 `waiting_backup_stop` 且不产生写入。全量 `pytest -q` **7618 passed, 4 skipped, 0 failed**。
