@@ -73,6 +73,7 @@ from telegram_kol_research.models import (
     DeepcoinShadowDiff,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionAttributionAudit,
     PositionProtectionLedger,
 )
 
@@ -523,6 +524,7 @@ def _seed_ledger(
     ),
     leg_verified_at: datetime | None = None,
     protection_seen_at: datetime | None = None,
+    attribution_audit_at: datetime | None = None,
 ) -> tuple[int, int]:
     """Create one entry binding, its entry leg and its protection ledger rows."""
 
@@ -560,6 +562,22 @@ def _seed_ledger(
         )
         session.add(leg)
         session.flush()
+        if attribution_audit_at is not None:
+            # The ledger's own first-discovery record, which is the only
+            # timestamp a lead may be measured against.
+            session.add(
+                PositionAttributionAudit(
+                    execution_binding_id=binding.id,
+                    execution_order_leg_id=leg.id,
+                    venue="deepcoin",
+                    pos_id=pos_id,
+                    event_type="position_ownership_verified",
+                    new_state="verified",
+                    fingerprint=f"fp-{leg.id}",
+                    evidence_json="{}",
+                    created_at=attribution_audit_at,
+                )
+            )
         for order_id, trigger_price, size_text in protection:
             session.add(
                 PositionProtectionLedger(
@@ -811,6 +829,7 @@ def test_diff_kind_timing_only_is_a_benefit_measure_not_a_defect(tmp_path):
         session_factory,
         leg_verified_at=BASE_TIME + timedelta(seconds=41),
         protection_seen_at=BASE_TIME + timedelta(seconds=41),
+        attribution_audit_at=BASE_TIME + timedelta(seconds=41),
     )
     shadow_id = _store_chain(session_factory, evaluate_shadow_chain(_complete_inputs()))
     records = _compare(
@@ -819,6 +838,7 @@ def test_diff_kind_timing_only_is_a_benefit_measure_not_a_defect(tmp_path):
     )
 
     assert _kinds(records) == {DIFF_TIMING_ONLY}
+    assert {record.subject for record in records} == {"pos_id", "protection"}
     leads = sorted(record.lead_seconds for record in records)
     assert all(lead > 0 for lead in leads)
 
@@ -875,6 +895,7 @@ def test_the_report_returns_counts_only_and_no_identifier(tmp_path):
         session_factory,
         leg_verified_at=BASE_TIME + timedelta(seconds=41),
         protection_seen_at=BASE_TIME + timedelta(seconds=41),
+        attribution_audit_at=BASE_TIME + timedelta(seconds=41),
     )
     _store_chain(
         session_factory,
@@ -1278,3 +1299,68 @@ def test_no_rest_read_endpoint_can_supply_the_pos_id():
     result = evaluate_shadow_chain(_complete_inputs(rest_order_response=None))
     assert result.pos_id is None
     assert result.refusal_reason == "no_rest_order_response_for_main_ord_id"
+
+
+def test_a_difference_that_closes_stops_being_reported(tmp_path):
+    """A stale diff row is a wrong count, not history.
+
+    Production showed this directly: four ``ledger_only`` rows survived from a
+    pass where the chain could not be verified, and were still being counted
+    after the same chains became ``exact``.
+    """
+
+    session_factory = create_session_factory(tmp_path / "shadow.db")
+    _seed_ledger(session_factory)
+    unverified = evaluate_shadow_chain(_complete_inputs(trade_frames=[]))
+    shadow_id = _store_chain(session_factory, unverified)
+    first = run_shadow_diff_pass(session_factory, now=BASE_TIME)
+    assert first["counts_by_kind"][DIFF_LEDGER_ONLY] == 1
+
+    _store_chain(session_factory, evaluate_shadow_chain(_complete_inputs()))
+    second = run_shadow_diff_pass(session_factory, now=BASE_TIME + timedelta(minutes=1))
+
+    assert second["counts_by_kind"][DIFF_LEDGER_ONLY] == 0
+    assert second["diffs_removed"] == 1
+    report = build_shadow_binding_report(session_factory, now=BASE_TIME)
+    assert report["ledger_only_count"] == 0
+    assert report["exact_count"] == 1
+    with session_factory() as session:
+        kinds = {
+            row.diff_kind
+            for row in session.query(DeepcoinShadowDiff)
+            .filter(DeepcoinShadowDiff.shadow_binding_id == shadow_id)
+            .all()
+        }
+    assert DIFF_LEDGER_ONLY not in kinds
+
+
+def test_a_lead_is_only_reported_when_both_sides_are_first_discovery_times(tmp_path):
+    """``last_verified_at`` moves on every reconcile; it cannot measure a lead."""
+
+    session_factory = create_session_factory(tmp_path / "shadow.db")
+    _seed_ledger(
+        session_factory,
+        leg_verified_at=BASE_TIME + timedelta(hours=3),
+        protection_seen_at=BASE_TIME + timedelta(seconds=41),
+    )
+    _store_chain(session_factory, evaluate_shadow_chain(_complete_inputs()))
+    run_shadow_diff_pass(session_factory, now=BASE_TIME)
+
+    with session_factory() as session:
+        rows = {
+            row.subject: row
+            for row in session.query(DeepcoinShadowDiff)
+            .filter(DeepcoinShadowDiff.diff_kind == DIFF_TIMING_ONLY)
+            .all()
+        }
+
+    # No attribution audit exists, so the pos_id side is recorded without a
+    # number rather than reporting a three-hour "lead".
+    assert rows["pos_id"].lead_seconds is None
+    assert json.loads(rows["pos_id"].evidence_json)["lead_measurable"] is False
+    assert rows["protection"].lead_seconds == pytest.approx(41.0, abs=0.2)
+
+    report = build_shadow_binding_report(session_factory, now=BASE_TIME)
+    assert report["timing_only_count"] == 2
+    assert report["timing_only_sample_size"] == 1
+    assert report["timing_only_median_lead_seconds"] == pytest.approx(41.0, abs=0.2)

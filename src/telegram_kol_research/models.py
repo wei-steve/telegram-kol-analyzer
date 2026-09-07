@@ -4546,9 +4546,9 @@ class DeepcoinShadowDiff(Base):
     conclusion and only the discovery time differs, which is the benefit this
     program is being built for rather than a defect.
 
-    Rows are append-only within one detection pass and are re-derived each pass,
-    so a difference that closes stops being reported rather than being edited in
-    place. Nothing here feeds a decision.
+    Rows are re-derived from scratch on every comparison pass: a difference that
+    closes is deleted rather than left standing, because a stale row here is not
+    history, it is a wrong count. Nothing in this table feeds a decision.
     """
 
     __tablename__ = "deepcoin_shadow_diffs"

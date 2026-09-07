@@ -123,6 +123,11 @@ class LedgerChainView:
     protection_prices: dict[str, str] = field(default_factory=dict)
     protection_sizes: dict[str, str] = field(default_factory=dict)
     pos_id_known_at: datetime | None = None
+    # Where ``pos_id_known_at`` came from. Only ``attribution_audit`` is a real
+    # first-discovery time; ``leg_last_verified_at`` is a *last* verification and
+    # moves forward on every reconcile, so a lead computed from it would grow
+    # without bound. It is recorded but never turned into a number.
+    pos_id_known_at_source: str | None = None
     protection_known_at: datetime | None = None
 
     @property
@@ -148,11 +153,12 @@ def load_ledger_chain_view(
 ) -> LedgerChainView:
     """Read every ledger fact about one entry order id. Reads only."""
 
-    from sqlalchemy import select
+    from sqlalchemy import func, select
 
     from telegram_kol_research.models import (
         ExecutionBinding,
         ExecutionOrderLeg,
+        PositionAttributionAudit,
         PositionProtectionLedger,
         PositionProtectionLeg,
         PositionTakeProfitOrder,
@@ -178,7 +184,22 @@ def load_ledger_chain_view(
         view.execution_order_leg_id = int(leg.id)
         view.execution_binding_id = int(leg.execution_binding_id)
         view.pos_id = _text(leg.pos_id)
-        view.pos_id_known_at = leg.last_verified_at or leg.updated_at
+        # The append-only attribution audit is the only place the ledger records
+        # *when it first concluded* which position an entry opened.
+        first_audit = None
+        if view.pos_id is not None:
+            first_audit = session.execute(
+                select(func.min(PositionAttributionAudit.created_at)).where(
+                    PositionAttributionAudit.execution_order_leg_id == leg.id,
+                    PositionAttributionAudit.pos_id == view.pos_id,
+                )
+            ).scalar()
+        if first_audit is not None:
+            view.pos_id_known_at = first_audit
+            view.pos_id_known_at_source = "attribution_audit"
+        elif leg.last_verified_at is not None or leg.updated_at is not None:
+            view.pos_id_known_at = leg.last_verified_at or leg.updated_at
+            view.pos_id_known_at_source = "leg_last_verified_at"
         binding = session.get(ExecutionBinding, int(leg.execution_binding_id))
         if binding is not None:
             view.side = _normalize_side(binding.side)
@@ -481,12 +502,32 @@ def compare_chain(
     # Timing is measured only where the two paths agree. A lead reported next to
     # a disagreement would be meaningless -- they did not reach the same answer.
     if not diffs:
-        for subject, shadow_at, ledger_at in (
-            ("pos_id", shadow.trade_os_seen_at, ledger.pos_id_known_at),
-            ("protection", shadow.tu_matched_at, ledger.protection_known_at),
+        for subject, shadow_at, ledger_at, source in (
+            (
+                "pos_id",
+                shadow.trade_os_seen_at,
+                ledger.pos_id_known_at,
+                ledger.pos_id_known_at_source,
+            ),
+            (
+                "protection",
+                shadow.tu_matched_at,
+                ledger.protection_known_at,
+                "protection_ledger_first_seen_at",
+            ),
         ):
-            lead = _lead_seconds(shadow_at, ledger_at)
-            if lead is None or lead == 0:
+            if shadow_at is None or ledger_at is None:
+                continue
+            # A lead is only a number when both sides are first-discovery times.
+            # ``leg_last_verified_at`` is not one: it advances on every reconcile
+            # pass, so subtracting it would report a lead that grows with the age
+            # of the position rather than with anything the stream did.
+            reliable = source in {
+                "attribution_audit",
+                "protection_ledger_first_seen_at",
+            }
+            lead = _lead_seconds(shadow_at, ledger_at) if reliable else None
+            if reliable and (lead is None or lead == 0):
                 continue
             diffs.append(
                 ShadowDiffRecord(
@@ -498,6 +539,8 @@ def compare_chain(
                     lead_seconds=lead,
                     evidence={
                         "main_ord_id": shadow.main_ord_id,
+                        "ledger_time_source": source,
+                        "lead_measurable": reliable,
                         "note": (
                             "shadow ahead of ledger by lead_seconds; a negative "
                             "value means the ledger concluded first"
@@ -527,13 +570,44 @@ def persist_diffs(
     records: list[ShadowDiffRecord],
     *,
     detected_at: datetime,
-) -> int:
-    """Write difference rows through the shadow-only session guard."""
+    compared_shadow_binding_ids: tuple[int, ...] | None = None,
+) -> tuple[int, int]:
+    """Write difference rows, and drop the ones that no longer apply.
+
+    Returns ``(written, removed)``.
+
+    Removal is the point. Differences are re-derived from scratch on every pass,
+    so a row left behind from an earlier pass is not history, it is a wrong
+    answer: a chain that was ``ledger_only`` while the shadow could not verify
+    it, and is now ``exact``, must stop being counted as ``ledger_only``. The
+    first production pass showed exactly that -- four ``ledger_only`` rows still
+    reported alongside three ``exact`` chains.
+
+    Only rows belonging to the chains this pass actually compared are removed;
+    a partial pass never deletes another chain's findings.
+    """
 
     from sqlalchemy import select
 
     written = 0
+    removed = 0
     with shadow_only_session(session_factory) as session:
+        if compared_shadow_binding_ids:
+            current = {
+                (record.shadow_binding_id, record.diff_kind, record.subject)
+                for record in records
+            }
+            for stale in session.execute(
+                select(DeepcoinShadowDiff).where(
+                    DeepcoinShadowDiff.shadow_binding_id.in_(
+                        list(compared_shadow_binding_ids)
+                    )
+                )
+            ).scalars():
+                key = (stale.shadow_binding_id, stale.diff_kind, stale.subject)
+                if key not in current:
+                    session.delete(stale)
+                    removed += 1
         for record in records:
             existing = session.execute(
                 select(DeepcoinShadowDiff).where(
@@ -567,7 +641,7 @@ def persist_diffs(
                 existing.detected_at = detected_at
                 existing.evidence_json = evidence_json
         session.commit()
-    return written
+    return written, removed
 
 
 def run_shadow_diff_pass(
@@ -589,10 +663,18 @@ def run_shadow_diff_pass(
         session.expunge_all()
 
     records: list[ShadowDiffRecord] = []
+    compared_ids: list[int] = []
     for shadow in shadows:
         ledger = load_ledger_chain_view(session_factory, str(shadow.main_ord_id))
         records.extend(compare_chain(shadow, ledger, owned=owned))
-    written = persist_diffs(session_factory, records, detected_at=now)
+        if shadow.id is not None:
+            compared_ids.append(int(shadow.id))
+    written, removed = persist_diffs(
+        session_factory,
+        records,
+        detected_at=now,
+        compared_shadow_binding_ids=tuple(compared_ids),
+    )
     counts: dict[str, int] = {kind: 0 for kind in SHADOW_DIFF_KINDS}
     for record in records:
         counts[record.diff_kind] = counts.get(record.diff_kind, 0) + 1
@@ -600,6 +682,7 @@ def run_shadow_diff_pass(
         "chains_compared": len(shadows),
         "diffs_seen": len(records),
         "diffs_written": written,
+        "diffs_removed": removed,
         "counts_by_kind": counts,
         "ownership_tables_read": list(owned.tables_read),
         "ownership_tables_missing": list(owned.tables_missing),
