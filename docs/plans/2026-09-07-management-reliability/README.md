@@ -29,6 +29,7 @@
 ## 步骤文件
 
 1. `step-1-take-profit-veto-scope.md`
+1b. `step-1b-convergence-retry-whitelist.md`
 2. `step-2-alerting.md`
 3. `step-3-deferred-resume-and-backlog.md`
 4. `step-4-ledger-repair.md`

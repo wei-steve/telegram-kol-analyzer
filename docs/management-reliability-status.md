@@ -12,8 +12,8 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 2
-current_step_file: docs/plans/2026-09-07-management-reliability/step-2-alerting.md
+current_step: 1b
+current_step_file: docs/plans/2026-09-07-management-reliability/step-1b-convergence-retry-whitelist.md
 step_status: planned          # planned | claimed | in_progress | completed | blocked
 claimed_by: null
 last_completed_step: 1
@@ -30,6 +30,7 @@ user_decisions_2026_09_07:
 | 步 | 名称 | 风险 | 需用户单独批准 |
 |---|---|---|---|
 | 1 | 止盈收敛否决只作用于保护单行 | L2 | 否 |
+| 1b | 被误判冻结的止盈收敛允许重试（为当前持仓重建分档止盈） | L2 | 是 |
 | 2 | 告警补全：白名单三类、后台任务自愈、两条投递通道、健康端点 | L1 | 否 |
 | 3 | 被推迟指令的恢复与超时；29 条积压作废并通知 | L2（作废积压为 L3 数据变更） | 是（作废积压那一步） |
 | 4 | 账本修复：binding 337、批次 158、幽灵 1081、已成交仍活跃的止盈单 | L3 | 是 |
