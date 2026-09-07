@@ -464,9 +464,20 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   指向 `/docs/zh/DeepCoinTrade/ordersPendingV2`，即 `GET /deepcoin/trade/v2/orders-pending`；
   客户端在用的 V1 `/deepcoin/trade/orders-pending` **没有任何文档页**
   （五个候选 slug 全 404，只在限频表里出现），疑为遗留接口。
-  V2 已只读调通（`index` 从 1 开始，`index=0` 被拒），支持 `ordId` 过滤。
-  cell v 的探测集已扩为 V1 四种参数 + V2 三种（含按精确 ordId 过滤），
-  待用 `--cell v --attempt 2` 在一笔活的限价单上取得定论。
+  **cell v 第二次（16:21:49Z，ordId `1001125173133199`）取得定论：确实是接口用错了。**
+  同一笔 `state=live` 的普通限价单上：V1 四种参数全部 0 行、`contains_our_order=false`；
+  **V2 三种全部命中**（`index=1+instId`、`index=1` 无 instId、`index=1+ordId`），
+  各返回 1 行且就是本单。V2 还支持按精确 `ordId` 过滤，正是绑定链需要的查法。
+  限频上 V2 与 V1 同属「获取未成交订单列表」10 次/秒 / 300 次/分档，比 5 次/秒档宽松。
+
+  **含义：`orders-pending` 盲区不是端点层面的失明，是 `DeepcoinRestClient.list_open_orders`
+  在调用未文档化的 V1 遗留接口。** 改用 V2 即可一次性消除 20 个调用点的风险。
+  但这不是一行改动：V2 的 `index` 是必填分页参数（从 1 开始，`index=0` 被拒）、
+  `limit` 上限 100，必须翻页并在读不完整时 fail-closed；
+  更重要的是它把 `list_open_orders` 从「在本账户上恒返回空」变成「真的列出挂单」，
+  会激活此前从未被触发的代码路径（例如 `terminal_entry_cleanup` 会开始看见并撤销
+  它以前看不见的入场单）——这是有交易所写入后果的行为变化，
+  **必须单独做一遍逐调用点分析、测试与观察窗，不能顺手带进阶段 5 的提交。**
 
 - phase-5-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 用户判断“只用 REST 拿不到确定性外键，不改源头修不完”，决定阶段 5 不再暂缓，与事故修复（docs/management-reliability-status.md）两线并行。阶段 5 收益定位改为“确定性替代推断式候选匹配”而非降低延迟。前置受控实验仍需逐笔由用户本人执行真实下单命令，执行会话只准备命令与分析证据。两条硬性约束写入阶段文件。
 - phase-5-hold (2026-09-07, 指挥会话): 阶段 5 暂不领取。原因一：用户报告两起管理指令未执行事故（峰哥止盈、大镖客保本），正在只读排查，实盘保护优先于改造；原因二：阶段 4 差异报告显示 WS 链在入场归属上没有延迟收益（timing_only 中位 -2.652 秒，市价入场的 posId 在下单响应里同步可得），阶段 5 的收益要重新定位为“确定性替代推断式候选匹配”，需用户就此达成共识后再批准。阶段 5 的两条硬性约束已确认：place_order 响应体必须整体持久化（posId 只在那一次出现）；保护单归属唯一确定性来源是 WS 的 TriggerOrder.TU，REST 无法佐证，重连不重推，缺口期间暂停新入场不能放松。
