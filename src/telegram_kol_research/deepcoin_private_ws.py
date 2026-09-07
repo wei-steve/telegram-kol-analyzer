@@ -40,6 +40,9 @@ from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
+from telegram_kol_research.deepcoin_reconcile_wake import (
+    wake_channel_for_result,
+)
 from telegram_kol_research.deepcoin_ws_resync import (
     DeepcoinWsResyncCoordinator,
 )
@@ -112,12 +115,49 @@ PROCESSED_STATE_UNPROCESSED = "unprocessed"
 PROCESSED_STATE_DUPLICATE = "duplicate"
 PROCESSED_STATE_PROCESSED = "processed"
 
+# Exactly the columns of ``deepcoin_ws_events``, minus its autoincrement id.
+# A decoded row carries more than this -- phase 3 added in-memory-only fields --
+# so the model is built from this allowlist rather than from ``**row``. A test
+# holds the list against the table definition so the two cannot drift apart.
+DEEPCOIN_WS_EVENT_COLUMNS = (
+    "venue",
+    "channel",
+    "action",
+    "order_sys_id",
+    "trade_unit_id",
+    "position_id",
+    "instrument_raw",
+    "exchange_time_ms",
+    "exchange_time_source",
+    "raw_payload",
+    "payload_hash",
+    "received_at",
+    "received_ms",
+    "processed_state",
+)
+
+# Decoded-row keys that exist only in memory. They never reach the database.
+DEEPCOIN_WS_TRANSIENT_ROW_KEYS = (
+    "order_status",
+    "trigger_status",
+    "position_qty",
+)
+
 # Documented short keys. Phase 1 read these and nothing else: guessing at long
 # key spellings is exactly the inference this program exists to remove.
 _ORDER_SYS_ID_KEY = "OS"
 _TRADE_UNIT_ID_KEY = "TU"
 _POSITION_ID_KEY = "PI"
 _INSTRUMENT_KEY = "I"
+# Phase 3 change-detection keys, all three present verbatim in the recorded
+# experiment: ``Or`` moved "4" -> "1" as the entry filled, ``TS`` moved "0" ->
+# "1" as the trigger armed, ``Po`` moved 0 -> 0.1 as the position opened. They
+# are decoded but never persisted: the inbox columns are phase 1's schema and
+# adding one would make this an L3 change for a value only the live process
+# uses. Long-key spellings are still not guessed for them either.
+_ORDER_STATUS_KEY = "Or"
+_TRIGGER_STATUS_KEY = "TS"
+_POSITION_QTY_KEY = "Po"
 # UpdateMillTime is the only key documented in milliseconds; UpdateTime and
 # InsertTime are stored as received with their source recorded, never rescaled.
 _EXCHANGE_TIME_KEYS = ("UM", "U", "IT")
@@ -220,6 +260,9 @@ def decode_ws_frame(
                 "instrument_raw": None,
                 "exchange_time_ms": None,
                 "exchange_time_source": None,
+                "order_status": None,
+                "trigger_status": None,
+                "position_qty": None,
             }
         ]
 
@@ -246,6 +289,9 @@ def decode_ws_frame(
                 "instrument_raw": None,
                 "exchange_time_ms": None,
                 "exchange_time_source": None,
+                "order_status": None,
+                "trigger_status": None,
+                "position_qty": None,
             }
         ]
     # A single-object ``result`` is a shape the recorded experiment actually
@@ -277,6 +323,9 @@ def decode_ws_frame(
                 "instrument_raw": _short_text(data, _INSTRUMENT_KEY, limit=64),
                 "exchange_time_ms": exchange_time_ms,
                 "exchange_time_source": exchange_time_source,
+                "order_status": _short_text(data, _ORDER_STATUS_KEY, limit=32),
+                "trigger_status": _short_text(data, _TRIGGER_STATUS_KEY, limit=32),
+                "position_qty": _short_text(data, _POSITION_QTY_KEY, limit=64),
             }
         )
     return rows or _unparsed()
@@ -377,7 +426,12 @@ def persist_ws_frame_rows(
                 prepared.append({**row, "processed_state": PROCESSED_STATE_DUPLICATE})
             else:
                 prepared.append(dict(row))
-        models = [DeepcoinWsEvent(**row) for row in prepared]
+        models = [
+            DeepcoinWsEvent(
+                **{column: row[column] for column in DEEPCOIN_WS_EVENT_COLUMNS}
+            )
+            for row in prepared
+        ]
         session.add_all(models)
         session.commit()
         return [
@@ -577,6 +631,7 @@ def build_deepcoin_ws_health(
     session_factory: Callable[[], Any],
     inbox: Any | None,
     now: datetime,
+    wake_signal: Any | None = None,
 ) -> dict[str, Any]:
     """Return counts, states and times only. Never returns any payload content.
 
@@ -683,6 +738,7 @@ def build_deepcoin_ws_health(
             getattr(tracker, "out_of_order_count", 0) or 0
         ),
         "tracked_entity_count": (0 if tracker is None else tracker.entity_count()),
+        "seeded_entity_count": int(getattr(tracker, "seeded_count", 0) or 0),
         "last_resync_at": (
             machine.last_resync_at.isoformat()
             if machine is not None and machine.last_resync_at is not None
@@ -691,6 +747,19 @@ def build_deepcoin_ws_health(
         "last_resync_outcome": getattr(machine, "last_resync_outcome", None),
         "last_resync_step_durations_ms": dict(
             getattr(machine, "last_resync_step_durations_ms", {}) or {}
+        ),
+        # Attribution for phase 2's unexplained ``incomplete_rest_read``:
+        # which call, which HTTP status, which exception type. Never a body.
+        "last_resync_read_failures": [
+            {
+                "call": failure.call,
+                "exception_type": failure.exception_type,
+                "http_status": failure.http_status,
+            }
+            for failure in getattr(machine, "last_resync_read_failures", ()) or ()
+        ],
+        "last_resync_seeded_entities": int(
+            getattr(machine, "last_resync_seeded_entities", 0) or 0
         ),
         "permits_new_entry": permits,
         "permits_new_entry_reason": permit_reason,
@@ -701,8 +770,33 @@ def build_deepcoin_ws_health(
         "open_gap_count": open_gaps,
         "gap_count": total_gaps,
         "instrument_map_size": int(getattr(inbox, "instrument_map_size", 0) or 0),
+        **_wake_health(wake_signal or getattr(inbox, "wake_signal", None), now),
         "now": now.isoformat(),
     }
+
+
+def _wake_health(wake_signal: Any | None, now: datetime) -> dict[str, Any]:
+    """Phase 3 wake counters, or explicit zeros when no signal is installed.
+
+    Zeros here mean "this process wakes nothing", which is the truth for every
+    role but ``worker``. They never mean "the stream produced nothing": that
+    question is answered by ``events_last_hour`` and the state machine.
+    """
+
+    if wake_signal is None:
+        return {
+            "wakes_last_hour": 0,
+            "wakes_throttled_last_hour": 0,
+            "last_wake_at": None,
+            "last_wake_channel": None,
+            "wake_throttled": False,
+            "wake_requests_seen": 0,
+            "wake_signal_installed": False,
+            "reconcile_runs_last_hour": {"by_timer": 0, "by_wake": 0, "total": 0},
+            "reconcile_failures_last_hour": 0,
+            "last_reconcile_failure": None,
+        }
+    return {**wake_signal.health_snapshot(now=now), "wake_signal_installed": True}
 
 
 class DeepcoinPrivateWsInbox:
@@ -724,6 +818,7 @@ class DeepcoinPrivateWsInbox:
         sleep: Callable[[float], Any] = asyncio.sleep,
         rng: Callable[[], float] = random.random,
         resync_coordinator: Any | None = None,
+        wake_signal: Any | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._deepcoin_client_factory = deepcoin_client_factory
@@ -737,6 +832,9 @@ class DeepcoinPrivateWsInbox:
         self._now_ms = monotonic_ms_provider
         self._sleep = sleep
         self._rng = rng
+        # Optional on purpose: with no signal the inbox behaves exactly as it
+        # did in phase 2, which is also what a non-worker role would want.
+        self.wake_signal = wake_signal
         self.connected = False
         self.events_persisted = 0
         self.duplicates_persisted = 0
@@ -1115,12 +1213,21 @@ class DeepcoinPrivateWsInbox:
         self.last_event_id = int(rows[-1]["event_id"])
         self.last_event_received_ms = received_ms
         fresh_ids: list[int] = []
+        wake_channels: list[str] = []
         for row in rows:
             if row.get("processed_state") == PROCESSED_STATE_DUPLICATE:
                 self.duplicates_persisted += 1
                 continue
-            self.entity_tracker.apply(row)
+            applied = self.entity_tracker.apply(row)
+            wake_channel = wake_channel_for_result(applied)
+            if wake_channel is not None:
+                wake_channels.append(wake_channel)
             fresh_ids.append(int(row["event_id"]))
+        if wake_channels and self.wake_signal is not None:
+            # One request per frame, not per row: a frame is one delivery, and
+            # the debounce would merge the rows anyway. The first relevant
+            # channel names it, which keeps ``last_wake_channel`` deterministic.
+            self.wake_signal.request(channel=wake_channels[0])
         try:
             mark_events_processed(self._session_factory, fresh_ids)
         except Exception:
@@ -1136,6 +1243,7 @@ async def run_deepcoin_private_ws_loop(
     connect_factory: Callable[..., Any] | None = None,
     reconnect_interval_seconds: float = DEEPCOIN_WS_RECONNECT_INTERVAL_SECONDS,
     now_provider: Callable[[], datetime] = lambda: datetime.now(UTC),
+    wake_signal: Any | None = None,
 ) -> None:
     """Entry point registered as the ``deepcoin_private_ws`` worker singleton."""
 
@@ -1145,6 +1253,7 @@ async def run_deepcoin_private_ws_loop(
         connect_factory=connect_factory,
         reconnect_interval_seconds=reconnect_interval_seconds,
         now_provider=now_provider,
+        wake_signal=wake_signal,
     )
     if inbox_sink is not None:
         inbox_sink(inbox)

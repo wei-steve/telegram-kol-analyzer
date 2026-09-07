@@ -61,6 +61,18 @@ WS_STATE_TRANSITIONS: dict[str, frozenset[str]] = {
 
 TRIGGER_ORDER_DEFAULT_UNIT = "default"
 
+# The mutable fields phase 3 watches for change. They are the only inputs to
+# "did this frame actually change anything?", which is the question that decides
+# whether a frame wakes the REST reconciliation. Keeping them here -- next to
+# the newest-state view that already answers "is this frame newer?" -- is what
+# lets the wake decision be made without a second database read.
+WAKE_TRACKED_FIELDS = (
+    "order_status",
+    "trigger_status",
+    "trade_unit_id",
+    "position_qty",
+)
+
 _HOUR_MS = 3_600_000
 
 
@@ -161,6 +173,12 @@ class WsEntityState:
     trade_unit_id: str | None = None
     position_id: str | None = None
     instrument_raw: str | None = None
+    # Phase 3 change detection. Kept in memory only: no inbox column carries
+    # them, and adding one would make this an L3 schema change for a value that
+    # is meaningless once the process exits.
+    order_status: str | None = None
+    trigger_status: str | None = None
+    position_qty: str | None = None
     last_event_id: int | None = None
     update_count: int = 0
 
@@ -173,12 +191,20 @@ class WsEntityState:
 
 @dataclass
 class WsApplyResult:
-    """What :meth:`WsEntityStateTracker.apply` did with one row."""
+    """What :meth:`WsEntityStateTracker.apply` did with one row.
+
+    ``changed_fields`` names which of :data:`WAKE_TRACKED_FIELDS` this row moved
+    relative to the state already known. It is reported for every row, including
+    rows that were rejected as older, so that the reason a frame did or did not
+    wake anything is visible rather than inferred. Deciding what to *do* with it
+    is not this module's job: see ``deepcoin_reconcile_wake``.
+    """
 
     key: WsEntityKey | None
     applied: bool
     out_of_order: bool
     reason: str
+    changed_fields: frozenset[str] = frozenset()
 
 
 class WsEntityStateTracker:
@@ -196,6 +222,7 @@ class WsEntityStateTracker:
         self.applied_count = 0
         self.out_of_order_count = 0
         self.unidentified_count = 0
+        self.seeded_count = 0
 
     def state_for(self, key: WsEntityKey) -> WsEntityState | None:
         return self._states.get(key)
@@ -233,21 +260,85 @@ class WsEntityStateTracker:
         if known is None:
             state = WsEntityState(key=key)
             self._states[key] = state
-            self._write(state, row, exchange_time_ms, received_ms)
+            changed = self._write(state, row, exchange_time_ms, received_ms)
             self.applied_count += 1
-            return WsApplyResult(key, True, False, "first_observation")
+            return WsApplyResult(key, True, False, "first_observation", changed)
 
         if incoming_order < known.ordering_tuple():
             self.out_of_order_count += 1
             self._record_out_of_order(received_ms)
             # The stale frame still contributes its one-way fields, which is how
             # a late frame can add information without rolling anything back.
+            before = self._watched_values(known)
             self._merge_one_way_fields(known, row)
-            return WsApplyResult(key, False, True, "older_than_known_state")
+            changed = self._changed_since(before, known)
+            return WsApplyResult(
+                key, False, True, "older_than_known_state", changed
+            )
 
-        self._write(known, row, exchange_time_ms, received_ms)
+        changed = self._write(known, row, exchange_time_ms, received_ms)
         self.applied_count += 1
-        return WsApplyResult(key, True, False, "advanced")
+        return WsApplyResult(key, True, False, "advanced", changed)
+
+    def seed(self, row: dict[str, Any]) -> bool:
+        """Install REST-derived known state for one entity. Never a frame.
+
+        Used by resync step 4 so that a reconnect does not start with an empty
+        ordering view: without it, the first stale frame after a reconnect looks
+        like a first observation and overwrites nothing, because there is
+        nothing to overwrite.
+
+        Two things it deliberately does not do. It never counts as an
+        out-of-order frame -- a REST row that is older than what the stream
+        already knows is simply not news, not evidence of reordering. And it
+        never carries a status value: REST spells order and position state in a
+        different vocabulary from the stream's ``Or`` / ``TS`` / ``Po`` short
+        keys, and translating between the two would be exactly the inference
+        this program exists to remove. Ordering is decided by time and identity,
+        both of which REST does give directly.
+        """
+
+        key = entity_key_for_row(row)
+        if key is None:
+            return False
+        received_ms = int(row.get("received_ms") or 0)
+        exchange_time_ms = row.get("exchange_time_ms")
+        exchange_time_ms = None if exchange_time_ms is None else int(exchange_time_ms)
+        incoming_order = (
+            -1 if exchange_time_ms is None else exchange_time_ms,
+            received_ms,
+        )
+        known = self._states.get(key)
+        if known is not None and incoming_order <= known.ordering_tuple():
+            return False
+        state = known
+        if state is None:
+            state = WsEntityState(key=key)
+            self._states[key] = state
+        state.exchange_time_ms = exchange_time_ms
+        state.received_ms = received_ms
+        instrument = _clean(row.get("instrument_raw"))
+        if instrument is not None:
+            state.instrument_raw = instrument
+        position_id = _clean(row.get("position_id"))
+        if position_id is not None:
+            state.position_id = position_id
+        self.seeded_count += 1
+        return True
+
+    @staticmethod
+    def _watched_values(state: WsEntityState) -> dict[str, str | None]:
+        return {name: getattr(state, name) for name in WAKE_TRACKED_FIELDS}
+
+    @staticmethod
+    def _changed_since(
+        before: dict[str, str | None], state: WsEntityState
+    ) -> frozenset[str]:
+        return frozenset(
+            name
+            for name in WAKE_TRACKED_FIELDS
+            if getattr(state, name) != before.get(name)
+        )
 
     def _record_out_of_order(self, received_ms: int) -> None:
         self._out_of_order_events.append(received_ms)
@@ -263,7 +354,8 @@ class WsEntityStateTracker:
         row: dict[str, Any],
         exchange_time_ms: int | None,
         received_ms: int,
-    ) -> None:
+    ) -> frozenset[str]:
+        before = self._watched_values(state)
         state.exchange_time_ms = exchange_time_ms
         state.received_ms = received_ms
         state.update_count += 1
@@ -273,7 +365,15 @@ class WsEntityStateTracker:
         instrument = _clean(row.get("instrument_raw"))
         if instrument is not None:
             state.instrument_raw = instrument
+        for name in ("order_status", "trigger_status", "position_qty"):
+            # A frame that does not carry the field says nothing about it. Rows
+            # replayed out of the inbox never carry these, so absence must mean
+            # "unchanged", never "cleared".
+            incoming = _clean(row.get(name))
+            if incoming is not None:
+                setattr(state, name, incoming)
         self._merge_one_way_fields(state, row)
+        return self._changed_since(before, state)
 
     def _merge_one_way_fields(
         self, state: WsEntityState, row: dict[str, Any]
@@ -309,6 +409,28 @@ class WsEntityStateTracker:
         return incoming
 
 
+@dataclass(frozen=True)
+class RestReadFailure:
+    """One REST read that did not answer, described well enough to attribute.
+
+    Phase 2's open-ended observation left ``incomplete_rest_read`` as a bare
+    conclusion: 4 of 31 silent reconnects hit one, and there was no way to tell
+    whether they shared a cause with the intermittent
+    ``401 Unauthorized`` seen twice on ``trigger-orders-pending``. The three
+    fields here are exactly what that question needs and nothing more. The
+    response body is never recorded and neither is any credential: a status code
+    and an exception type cannot leak either.
+    """
+
+    call: str
+    exception_type: str
+    http_status: int | None = None
+
+    def as_text(self) -> str:
+        status = "-" if self.http_status is None else str(self.http_status)
+        return f"{self.call}:{self.exception_type}:{status}"
+
+
 @dataclass
 class ResyncOutcome:
     """Result of one five-step REST resync."""
@@ -324,6 +446,8 @@ class ResyncOutcome:
     advanced_entities: int = 0
     incomplete_reads: tuple[str, ...] = ()
     unresolved_instruments: tuple[str, ...] = ()
+    read_failures: tuple[RestReadFailure, ...] = ()
+    seeded_entities: int = 0
 
 
 class DeepcoinWsStreamStateMachine:
@@ -352,6 +476,8 @@ class DeepcoinWsStreamStateMachine:
         self.last_resync_at: datetime | None = None
         self.last_resync_outcome: str | None = None
         self.last_resync_step_durations_ms: dict[str, int] = {}
+        self.last_resync_read_failures: tuple[RestReadFailure, ...] = ()
+        self.last_resync_seeded_entities = 0
         self.transitions: list[tuple[str, str, str]] = []
 
     def transition(self, new_state: str, *, reason: str) -> None:
@@ -386,6 +512,8 @@ class DeepcoinWsStreamStateMachine:
             "converged" if outcome.converged else f"not_converged:{outcome.reason}"
         )
         self.last_resync_step_durations_ms = dict(outcome.step_durations_ms)
+        self.last_resync_read_failures = tuple(outcome.read_failures)
+        self.last_resync_seeded_entities = int(outcome.seeded_entities)
         if outcome.converged:
             self.consecutive_failures = 0
 

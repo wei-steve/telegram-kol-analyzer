@@ -37,6 +37,7 @@ from typing import Any
 
 from telegram_kol_research.deepcoin_ws_stream_state import (
     ResyncOutcome,
+    RestReadFailure,
     WsEntityStateTracker,
 )
 
@@ -146,6 +147,26 @@ class DeepcoinInstrumentIdMap:
         return self._rest_to_ws.get(str(inst_id).strip().upper())
 
 
+def http_status_from_exception(exc: BaseException | None) -> int | None:
+    """Dig the HTTP status out of a Deepcoin client error, or return ``None``.
+
+    ``DeepcoinRestClient`` wraps ``httpx.HTTPStatusError`` in its own exception
+    types and keeps the original as ``__cause__``, so the status is present but
+    one or two links down the chain. Reading it here rather than changing the
+    client keeps every write-path failure mapping untouched -- this is a
+    read-only accessor over an exception object.
+    """
+
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        status = getattr(getattr(exc, "response", None), "status_code", None)
+        if isinstance(status, int):
+            return status
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
 @dataclass
 class RestSnapshot:
     """One REST view of the account. ``complete`` is the only trustworthy flag.
@@ -163,6 +184,7 @@ class RestSnapshot:
     instruments_queried: tuple[str, ...] = ()
     incomplete_reads: tuple[str, ...] = ()
     unresolved_instruments: tuple[str, ...] = ()
+    read_failures: tuple[RestReadFailure, ...] = ()
 
     def object_count(self) -> int:
         return (
@@ -257,6 +279,7 @@ class DeepcoinWsResyncCoordinator:
         """
 
         incomplete: list[str] = []
+        failures: list[RestReadFailure] = []
         positions: list[dict[str, Any]] = []
         open_orders: list[dict[str, Any]] = []
         fills: list[dict[str, Any]] = []
@@ -267,7 +290,13 @@ class DeepcoinWsResyncCoordinator:
                 rows = self._with_client(work)
             except Exception as exc:
                 # Hard rule 4: a failed read is unknown, not zero.
-                incomplete.append(f"{label}:{type(exc).__name__}")
+                failure = RestReadFailure(
+                    call=label,
+                    exception_type=type(exc).__name__,
+                    http_status=http_status_from_exception(exc),
+                )
+                failures.append(failure)
+                incomplete.append(failure.as_text())
                 return []
             return [row for row in (rows or []) if isinstance(row, dict)]
 
@@ -309,7 +338,67 @@ class DeepcoinWsResyncCoordinator:
             instruments_queried=tuple(sorted(rest_ids)),
             incomplete_reads=tuple(incomplete),
             unresolved_instruments=tuple(unresolved),
+            read_failures=tuple(failures),
         )
+
+    # -------------------------------------------------------------- seeding
+
+    @staticmethod
+    def seed_tracker_from_snapshot(
+        tracker: WsEntityStateTracker,
+        snapshot: RestSnapshot,
+        *,
+        snapshot_ms: int,
+    ) -> int:
+        """Give the ordering tracker a starting point from a REST snapshot.
+
+        Phase 2 shipped without this and production showed the cost directly:
+        after every restart ``tracked_entity_count`` sat at 0 until a fresh
+        frame arrived, so the very first frame about an order the exchange had
+        already moved on from would have been accepted as news. Phase 2 could
+        afford that because nothing consumed the tracker; phase 3 cannot,
+        because the tracker now decides which frames wake a REST verification.
+
+        ``complete`` is checked **before any collection is touched**. An
+        incomplete snapshot seeds nothing at all: hard rule 4 makes it unknown,
+        and seeding "what it listed" would quietly turn unknown into a claim
+        that the unlisted entities do not exist.
+        """
+
+        if not snapshot.complete:
+            return 0
+        seeded = 0
+        groups = (
+            ("Position", snapshot.positions, ("posId", "positionId")),
+            ("Order", snapshot.open_orders, ("ordId", "orderId")),
+            ("TriggerOrder", snapshot.trigger_orders, ("ordId", "orderId")),
+        )
+        for channel, rows, id_keys in groups:
+            for row in rows:
+                identity = ""
+                for key in id_keys:
+                    value = str(row.get(key) or "").strip()
+                    if value:
+                        identity = value
+                        break
+                if not identity:
+                    continue
+                # The exchange's own time when it has one; the snapshot's time
+                # otherwise. Never a guess: a row with no timestamp is still
+                # newer than nothing, which is all seeding claims.
+                exchange_time_ms = _row_time_ms(row, _REST_TIME_KEYS)
+                seed_row: dict[str, Any] = {
+                    "channel": channel,
+                    "received_ms": snapshot_ms,
+                    "exchange_time_ms": exchange_time_ms,
+                }
+                if channel == "Position":
+                    seed_row["position_id"] = identity
+                else:
+                    seed_row["order_sys_id"] = identity
+                if tracker.seed(seed_row):
+                    seeded += 1
+        return seeded
 
     # ----------------------------------------------------------- comparison
 
@@ -328,6 +417,15 @@ class DeepcoinWsResyncCoordinator:
         zero -- but only when both snapshots were complete, which the caller
         has already checked.
         """
+
+        if not before.complete or not after.complete:
+            # Check ``complete`` before reading a single collection. An
+            # incomplete snapshot's lists are unknown, so "this object
+            # disappeared" cannot be told apart from "this read failed", and
+            # counting either as forward movement would be a fabricated number.
+            # ``run`` already reports incomplete reads as the reason, so this
+            # never changes a converged/not-converged verdict.
+            return 0, ["incomplete_snapshot"]
 
         reasons: list[str] = []
         advanced = 0
@@ -368,10 +466,10 @@ class DeepcoinWsResyncCoordinator:
             if after_ms > before_ms:
                 advanced += 1
         advanced += sum(1 for key in after_index if key not in before_index)
-        # The tracker is consulted only to confirm it holds no entity the second
-        # snapshot contradicts; it is never rolled back from REST.
-        if tracker.entity_count() and not after.complete:
-            reasons.append("stream_state_without_complete_rest")
+        # The "stream state without a complete REST view" case the phase 2
+        # version checked here is now handled by the guard above, which returns
+        # before any collection is read instead of after.
+        del tracker
         return advanced, reasons
 
     # ------------------------------------------------------------ sequence
@@ -436,6 +534,8 @@ class DeepcoinWsResyncCoordinator:
                 step_durations_ms=durations,
                 replayed_events=replayed,
                 rest_objects_before=before.object_count(),
+                incomplete_reads=tuple(before.incomplete_reads),
+                read_failures=tuple(before.read_failures),
             )
 
         # Step 4 -- the second snapshot. It closes the race window between the
@@ -446,6 +546,14 @@ class DeepcoinWsResyncCoordinator:
             lambda: self.rest_snapshot(stream_instruments=stream_instruments),
         )
 
+        # Seed the ordering view from the second snapshot. Deliberately not its
+        # own numbered step and deliberately not timed: the five steps are the
+        # handoff document's contract and this is a local bookkeeping detail
+        # inside step 4's result, not a sixth thing the exchange is asked about.
+        seeded = self.seed_tracker_from_snapshot(
+            tracker, after, snapshot_ms=self._now_ms()
+        )
+
         # Step 5 -- forward-only comparison.
         advanced, reasons = _step(
             "step5_compare",
@@ -453,6 +561,7 @@ class DeepcoinWsResyncCoordinator:
         )
 
         incomplete = tuple(before.incomplete_reads) + tuple(after.incomplete_reads)
+        read_failures = tuple(before.read_failures) + tuple(after.read_failures)
         unresolved = tuple(
             dict.fromkeys(
                 tuple(before.unresolved_instruments)
@@ -482,4 +591,6 @@ class DeepcoinWsResyncCoordinator:
             advanced_entities=advanced,
             incomplete_reads=incomplete,
             unresolved_instruments=unresolved,
+            read_failures=read_failures,
+            seeded_entities=seeded,
         )

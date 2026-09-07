@@ -76,6 +76,13 @@ from telegram_kol_research.deepcoin_private_ws import (
     build_deepcoin_ws_health,
     run_deepcoin_private_ws_loop,
 )
+from telegram_kol_research.deepcoin_reconcile_wake import (
+    TRIGGER_TIMER as DEEPCOIN_RECONCILE_TRIGGER_TIMER,
+)
+from telegram_kol_research.deepcoin_reconcile_wake import (
+    DeepcoinReconcileWakeSignal,
+)
+from telegram_kol_research.deepcoin_ws_resync import http_status_from_exception
 from telegram_kol_research.execution_boundary import (
     ExecutionBoundaryTracker,
     TrackedDeepcoinClient,
@@ -5026,6 +5033,7 @@ def create_web_app(
                         deepcoin_client_factory=app.state.deepcoin_client_factory,
                         inbox_sink=_set_deepcoin_private_ws_inbox(app),
                         now_provider=app.state.now_provider,
+                        wake_signal=app.state.deepcoin_reconcile_wake_signal,
                     )
                 )
                 app.state.deepcoin_private_ws_task.add_done_callback(
@@ -5053,6 +5061,7 @@ def create_web_app(
                         authority_failure_observer=(
                             app.state.runtime_authority_status.record_reconcile_failure
                         ),
+                        wake_signal=app.state.deepcoin_reconcile_wake_signal,
                     )
                 )
             if runtime_role_starts_singleton_task(
@@ -5757,6 +5766,12 @@ def create_web_app(
     app.state.deepcoin_reconcile_runner = (
         deepcoin_reconcile_runner or run_deepcoin_execution_reconcile_loop
     )
+    # One wake signal per process, shared by the stream reader and the reconcile
+    # loop. Built here rather than inside either task so that both get the same
+    # object: two instances would each wake nobody.
+    app.state.deepcoin_reconcile_wake_signal = DeepcoinReconcileWakeSignal(
+        now_provider=app.state.now_provider
+    )
     app.state.deepcoin_reconcile_interval_seconds = deepcoin_reconcile_interval_seconds
     app.state.deepcoin_reconcile_startup_delay_seconds = deepcoin_reconcile_startup_delay_seconds
     app.state.auto_trade_executor = lambda raw_message_id: _run_auto_trade_executor(
@@ -6286,6 +6301,7 @@ def create_web_app(
             session_factory=app.state.session_factory,
             inbox=app.state.deepcoin_private_ws_inbox,
             now=app.state.now_provider(),
+            wake_signal=app.state.deepcoin_reconcile_wake_signal,
         )
 
     @app.get("/api/runtime-agent/read-only-exchange-snapshot")
@@ -9477,8 +9493,25 @@ async def run_deepcoin_execution_reconcile_loop(
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     authority_observer=None,
     authority_failure_observer=None,
+    wake_signal=None,
 ) -> None:
+    """Reconcile on a fixed timer, and additionally as soon as a frame lands.
+
+    Phase 3 touches only the wait at the bottom of this loop. The body above it
+    is unchanged: same calls, same order, same criteria, same ledgers. A
+    wake-driven pass and a timer-driven pass are the same pass, which is the
+    property the phase's equivalence test asserts directly.
+
+    ``wake_signal=None`` restores the pre-phase-3 loop exactly -- a plain
+    thirty-second sleep -- which is what any caller that does not run the
+    private stream gets, and what the worker itself falls back to if the stream
+    never starts.
+    """
+
+    trigger = DEEPCOIN_RECONCILE_TRIGGER_TIMER
     while True:
+        if wake_signal is not None:
+            wake_signal.record_reconcile_run(trigger)
         try:
             client, synced_at = await run_on_management_worker(
                 _build_deepcoin_reconcile_client,
@@ -9521,21 +9554,47 @@ async def run_deepcoin_execution_reconcile_loop(
             raise
         except DeepcoinClientError as exc:
             logger.warning("Deepcoin execution reconcile skipped: %s", exc)
+            _record_reconcile_failure(wake_signal, exc)
             if authority_failure_observer is not None:
                 authority_failure_observer(
                     observed_at=(
                         now_provider() if now_provider is not None else datetime.now(UTC)
                     )
                 )
-        except Exception:
+        except Exception as exc:
             logger.exception("Deepcoin execution reconcile failed")
+            _record_reconcile_failure(wake_signal, exc)
             if authority_failure_observer is not None:
                 authority_failure_observer(
                     observed_at=(
                         now_provider() if now_provider is not None else datetime.now(UTC)
                     )
                 )
-        await asyncio.sleep(interval_seconds)
+        if wake_signal is None:
+            await asyncio.sleep(interval_seconds)
+        else:
+            trigger = await wake_signal.wait_for_next_run(timeout=interval_seconds)
+
+
+def _record_reconcile_failure(wake_signal, exc: BaseException) -> None:
+    """Attribute one failed reconciliation pass; never change its handling.
+
+    A failed REST read stays exactly what it was before phase 3: a skipped pass
+    that the next one retries. It is never downgraded to "there is nothing
+    there", and it never touches the WebSocket state machine -- an HTTP 401 on a
+    REST read says nothing about whether the stream is delivering.
+    """
+
+    if wake_signal is None:
+        return
+    try:
+        wake_signal.record_reconcile_failure(
+            exc,
+            call="deepcoin_execution_reconcile",
+            http_status=http_status_from_exception(exc),
+        )
+    except Exception:  # pragma: no cover - accounting must never break the loop
+        logger.debug("Failed to record Deepcoin reconcile failure attribution")
 
 
 async def _run_reconcile_after_startup_delay(

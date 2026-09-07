@@ -51,6 +51,11 @@ KNOWN_BLOCKING_CALLS = frozenset(
         "telegram_bot_commands.run_telegram_bot_command_loop -> split_telegram_message",
         "web_app._supervise_semantic_review_runner -> _build_semantic_review_notifier",
         "web_app.run_deepcoin_execution_reconcile_loop -> system_operator_bot_enabled",
+        # Phase 3 wake accounting: reads an exception's own attributes and
+        # appends one dict to an in-memory list. No session, no client, no
+        # network, and it runs only on the failure branch. Reviewed by hand for
+        # the phase 3 REST+WebSocket work.
+        "web_app.run_deepcoin_execution_reconcile_loop -> _record_reconcile_failure",
     }
 )
 
