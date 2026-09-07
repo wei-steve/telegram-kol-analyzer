@@ -1338,3 +1338,50 @@ def test_a_reconcile_failure_is_attributed_and_the_loop_keeps_its_cadence(tmp_pa
 
         binding = session.query(ExecutionBinding).one()
     assert binding.status == "open", "a failed read must never close a binding"
+
+
+def test_the_worker_hands_the_same_wake_signal_to_both_of_its_tasks(tmp_path):
+    """Two instances would each wake nobody, and nothing would say so.
+
+    The wake path is invisible in production until a real business frame
+    arrives, so "the stream reader and the reconcile loop hold the same object"
+    has to be a property of the wiring rather than something an idle production
+    window could confirm.
+    """
+
+    from fastapi.testclient import TestClient
+
+    from telegram_kol_research.web_app import create_web_app
+
+    ws_kwargs: dict = {}
+    reconcile_kwargs: dict = {}
+
+    async def _ws_runner(**kwargs):
+        ws_kwargs.update(kwargs)
+        await asyncio.sleep(3600)
+
+    async def _reconcile_runner(**kwargs):
+        reconcile_kwargs.update(kwargs)
+        await asyncio.sleep(3600)
+
+    class _FakeClient:
+        def list_open_orders(self):
+            return []
+
+    app = create_web_app(
+        database_path=tmp_path / "worker.db",
+        runtime_role="worker",
+        deepcoin_private_ws_runner=_ws_runner,
+        deepcoin_reconcile_runner=_reconcile_runner,
+        deepcoin_reconcile_startup_delay_seconds=0,
+        deepcoin_client_factory=_FakeClient,
+    )
+
+    with TestClient(app, client=("127.0.0.1", 50000)) as client:
+        health = client.get("/api/runtime/deepcoin-ws-health").json()
+
+    signal = app.state.deepcoin_reconcile_wake_signal
+    assert isinstance(signal, DeepcoinReconcileWakeSignal)
+    assert ws_kwargs["wake_signal"] is signal
+    assert reconcile_kwargs["wake_signal"] is signal
+    assert health["wake_signal_installed"] is True
