@@ -531,6 +531,26 @@ def test_every_physical_read_is_counted_with_the_time_the_quota_cost_it():
     assert snapshot["read_throttled_seconds_last_hour"] == pytest.approx(2.0)
 
 
+def test_time_spent_waiting_behind_another_thread_counts_as_quota_cost():
+    """The limiter serialises readers, so a blocked thread lost that time too.
+
+    Measuring only a thread's own sleep would report the quota as free while
+    it was in fact holding every other reader in the process.
+    """
+
+    clock = _FakeMonotonicClock(0.0)
+    metrics = DeepcoinRateLimitMetrics()
+    limiter = DeepcoinReadRateLimiter(
+        monotonic_factory=clock, sleep_fn=clock.sleep, per_second=1, metrics=metrics
+    )
+
+    limiter.acquire()          # free: the bucket starts full
+    limiter.acquire()          # waits a full second for the next token
+
+    per_request = [seconds for _, seconds in metrics._read_requests]
+    assert per_request == [pytest.approx(0.0), pytest.approx(1.0)]
+
+
 def test_an_unthrottled_read_still_counts_as_demand():
     clock = _FakeMonotonicClock(0.0)
     metrics = DeepcoinRateLimitMetrics()

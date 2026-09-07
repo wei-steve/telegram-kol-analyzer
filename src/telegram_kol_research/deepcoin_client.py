@@ -482,7 +482,12 @@ class DeepcoinReadRateLimiter:
     def acquire(self) -> None:
         """Consume one token, sleeping until one is available."""
 
-        slept = 0.0
+        # Timed around the lock, not just around the sleeps inside it. A thread
+        # that waits for another thread's sleep to finish has lost exactly as
+        # much wall time to the quota as one that slept itself, and counting
+        # only its own sleep would report a quota as free while it serialised
+        # every reader in the process.
+        started_at = self._clock()
         with self._lock:
             while True:
                 now = self._clock()
@@ -494,14 +499,12 @@ class DeepcoinReadRateLimiter:
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
                     break
-                delay = (1.0 - self._tokens) / self._per_second
-                slept += delay
-                self._sleep(delay)
+                self._sleep((1.0 - self._tokens) / self._per_second)
         # Recorded outside the lock: this is the only measurement that says
         # whether the quota is actually binding. Without it "reads are slower"
         # cannot be told apart from "the quota is not the bottleneck".
         if self._metrics is not None:
-            self._metrics.record_read_request(slept)
+            self._metrics.record_read_request(max(0.0, self._clock() - started_at))
 
 
 _READ_LIMITERS_LOCK = threading.Lock()
