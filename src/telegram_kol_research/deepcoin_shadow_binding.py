@@ -110,7 +110,11 @@ REFUSAL_REASONS = frozenset(
         "no_trigger_frame_with_tu_equal_pos_id",
         # criterion 4
         "trigger_frame_without_own_ord_id",
-        "protection_order_not_observed_in_stream",
+        # Named for what it is: the stream described these protection orders and
+        # REST no longer lists them. The old spelling said the opposite.
+        "protection_order_absent_from_rest",
+        # The candidate turned out not to be an entry at all.
+        "not_an_entry_order",
         # criterion 5
         "instrument_mismatch",
         "protection_side_mismatch",
@@ -265,6 +269,9 @@ class ShadowChainInputs:
     # received. See :func:`rest_pos_id_from_order_response` for why this, and
     # not any read endpoint, is where the posId comes from.
     rest_order_response: dict[str, Any] | None = None
+    # From the REST order-history row's documented ``reduceOnly`` field.
+    # ``None`` means the row was not read, which is not the same as ``False``.
+    reduce_only: bool | None = None
     rest_fills: list[dict[str, Any]] = field(default_factory=list)
     rest_positions: list[dict[str, Any]] = field(default_factory=list)
     rest_position_history: list[dict[str, Any]] = field(default_factory=list)
@@ -415,6 +422,16 @@ def evaluate_shadow_chain(inputs: ShadowChainInputs) -> ShadowChainResult:
     if inputs.instrument_rest is None:
         return refuse("instrument_unknown", STAGE_REST_ACCEPTED)
 
+    # A reduce-only fill is a close, not an entry. Without this the shadow opens
+    # a chain for every closing order, each of which then refuses for a missing
+    # entry response -- inflating ``unverified`` with objects that were never
+    # entries and distorting the one ratio phase 5 is judged on. ``reduceOnly``
+    # is a documented REST field; the undocumented ``OPT`` short key that also
+    # separates them is deliberately not used.
+    if inputs.reduce_only is True:
+        evidence["reduce_only"] = True
+        return refuse("not_an_entry_order", STAGE_TERMINAL)
+
     # ---- criterion 1: Trade.OS == REST main ordId -------------------------
     if not trade_frames:
         # ``order_live`` covers both shapes of a submitted, unfilled entry: a
@@ -553,13 +570,16 @@ def evaluate_shadow_chain(inputs: ShadowChainInputs) -> ShadowChainResult:
     ]
     if missing_in_rest:
         # The stream described a protection order REST does not currently list.
-        # That is unknown coverage, not a contradiction -- it is also exactly
-        # what a filled or cancelled protection order looks like -- so the
-        # chain stays unverified and says which ids were not corroborated.
+        # That is unknown coverage, not a contradiction -- and it is exactly what
+        # a closed position looks like: production showed both protection orders
+        # of one position moving to ``TS=4`` in the same frame batch as the
+        # closing fill, after which REST stops listing them. So the chain stays
+        # unverified, names the ids REST did not corroborate, and is marked
+        # ``terminal`` rather than ``protection_bound`` when the position is gone
+        # too -- a chain that has run its course is not a chain that failed.
         evidence["protection_ord_ids_absent_from_rest"] = missing_in_rest
-        return refuse(
-            "protection_order_not_observed_in_stream", STAGE_PROTECTION_BOUND
-        )
+        stage = STAGE_PROTECTION_BOUND if position_rows else STAGE_TERMINAL
+        return refuse("protection_order_absent_from_rest", stage)
 
     role_sizes: dict[str, Decimal] = {}
     # Per-order trigger prices, for the diff pass to compare against the
@@ -937,6 +957,7 @@ class _RestReader:
         self._client = client
         self._positions: dict[str, list[dict[str, Any]]] = {}
         self._position_history: dict[str, list[dict[str, Any]]] = {}
+        self._order_history: dict[str, list[dict[str, Any]]] = {}
         self._triggers: dict[str, list[dict[str, Any]]] = {}
         self._fills: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self.failures: list[str] = []
@@ -965,6 +986,19 @@ class _RestReader:
                 return None
             self._positions[inst_id] = rows
         return self._positions[inst_id]
+
+    def order_history(self, inst_id: str) -> list[dict[str, Any]] | None:
+        """Recent orders for one instrument, for the documented ``reduceOnly``."""
+
+        if inst_id not in self._order_history:
+            rows = self._read(
+                f"list_order_history[{inst_id}]",
+                lambda: self._client.list_order_history(inst_id=inst_id),
+            )
+            if rows is None:
+                return None
+            self._order_history[inst_id] = rows
+        return self._order_history[inst_id]
 
     def position_history(self, inst_id: str) -> list[dict[str, Any]] | None:
         """Closed positions. Read only when the live list does not hold the id."""
@@ -1064,10 +1098,20 @@ def collect_chain_inputs(
     fills = reader.fills(instrument_rest, main_ord_id)
     positions = reader.positions(instrument_rest)
     triggers = reader.trigger_orders(instrument_rest)
-    if fills is None or positions is None or triggers is None:
+    orders = reader.order_history(instrument_rest)
+    if fills is None or positions is None or triggers is None or orders is None:
         inputs.rest_complete = False
         inputs.rest_read_failures = tuple(reader.failures)
         return inputs
+    for row in orders:
+        if _text(row.get("ordId")) != main_ord_id:
+            continue
+        # Documented field, read as text because the API returns "true"/"false".
+        # Absent means unknown, and unknown must not become ``False``.
+        flag = _text(row.get("reduceOnly"))
+        if flag is not None:
+            inputs.reduce_only = flag.lower() == "true"
+        break
     inputs.rest_fills = fills
     inputs.rest_positions = positions
     inputs.rest_trigger_orders = triggers

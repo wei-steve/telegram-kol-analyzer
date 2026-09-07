@@ -951,6 +951,10 @@ class _RestReaderStub:
         self.calls.append("position_history")
         return []
 
+    def order_history(self, inst_id):
+        self.calls.append("order_history")
+        return []
+
     def trigger_orders(self, inst_id):
         self.calls.append("trigger_orders")
         return []
@@ -959,7 +963,14 @@ class _RestReaderStub:
 class _StubClient:
     """A read-only Deepcoin stand-in. It has no write method at all, on purpose."""
 
-    def __init__(self, *, fills=None, positions=None, triggers=None, fail=()):
+    def __init__(
+        self, *, fills=None, positions=None, triggers=None, orders=None, fail=()
+    ):
+        self._order_history = (
+            orders
+            if orders is not None
+            else [{"ordId": MAIN_ORD_ID, "reduceOnly": "false", "state": "filled"}]
+        )
         self._fills = fills if fills is not None else [_rest_fill()]
         self._positions = positions if positions is not None else [_rest_position()]
         self._triggers = triggers if triggers is not None else [_rest_trigger()]
@@ -974,6 +985,10 @@ class _StubClient:
     def list_trade_fills_by_order_id(self, *, inst_id, order_id):
         self._maybe_fail("list_trade_fills_by_order_id")
         return [row for row in self._fills if row.get("ordId") == order_id]
+
+    def list_order_history(self, *, inst_id=None):
+        self._maybe_fail("list_order_history")
+        return list(self._order_history)
 
     def list_positions(self, *, inst_id=None):
         self._maybe_fail("list_positions")
@@ -1467,3 +1482,61 @@ def test_an_unfilled_conditional_entry_is_order_live_not_instrument_unknown(tmp_
     assert result.stage == "order_live"
     assert result.evidence["own_trigger_frame_count"] == 1
     del session_factory
+
+
+def test_a_reduce_only_fill_is_a_close_not_a_failed_entry(tmp_path):
+    """Production's 05:49Z close opened a chain that then refused as an entry.
+
+    Every ``Trade.OS`` is a candidate, and closes produce fills too. Without
+    this the report counts each close as an ``unverified`` entry chain and the
+    ``exact`` ratio -- the number phase 5 is judged on -- drifts with how often
+    positions are closed.
+    """
+
+    result = evaluate_shadow_chain(_complete_inputs(reduce_only=True))
+
+    assert result.binding_confidence == CONFIDENCE_UNVERIFIED
+    assert result.refusal_reason == "not_an_entry_order"
+    assert result.stage == "terminal"
+    assert result.evidence["reduce_only"] is True
+
+
+def test_an_unread_reduce_only_flag_is_unknown_and_not_false(tmp_path):
+    """Absent is not ``false``: an unread flag must not assert "this is an entry"."""
+
+    inputs = _complete_inputs()
+    assert inputs.reduce_only is None
+    assert evaluate_shadow_chain(inputs).binding_confidence == CONFIDENCE_EXACT
+
+    result = evaluate_shadow_chain(_complete_inputs(reduce_only=False))
+    assert result.binding_confidence == CONFIDENCE_EXACT
+
+
+def test_a_closed_position_ends_terminal_rather_than_failing(tmp_path):
+    """Both protection orders vanish from REST when the position closes.
+
+    Verified in production at 2026-09-07T05:49:01Z: the closing fill and the two
+    protection orders' ``TS`` moving to ``4`` arrived in the same frame batch,
+    and REST stopped listing them. A chain that has run its course is not a
+    chain that failed, so it is marked ``terminal``.
+    """
+
+    result = evaluate_shadow_chain(
+        _complete_inputs(rest_trigger_orders=[], rest_positions=[])
+    )
+
+    assert result.refusal_reason == "rest_pos_id_not_confirmed_by_rest"
+
+    # Position still confirmable through history, but protection is gone.
+    closed = evaluate_shadow_chain(
+        _complete_inputs(
+            rest_positions=[],
+            rest_position_history=[_rest_position(closePos="0.1")],
+            rest_trigger_orders=[],
+        )
+    )
+    assert closed.refusal_reason == "protection_order_absent_from_rest"
+    assert closed.stage == "terminal"
+    assert closed.evidence["protection_ord_ids_absent_from_rest"] == [
+        PROTECTION_ORD_ID
+    ]
