@@ -13,8 +13,8 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 5
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5-order-entry-cutover.md
+current_phase: 5a
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5a-open-orders-v2.md
 phase_status: planned                 # planned | claimed | in_progress | completed | blocked
 claimed_by:
 last_completed_phase: 4
@@ -264,6 +264,9 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- phase-5-checkpoint (2026-09-07, 指挥会话，依据阶段 5 会话 local_ad007c43 汇报): 前置受控实验 10 格全部由用户本人执行完成，实验前后交易所 fingerprint 一致，零非计划写入。结论：限价 order 可用字段组合 = instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx (+可选 tpTriggerPx)，**不含 clOrdId**（判重键就是 clOrdId 字段存在本身）；市价腿继续带 clOrdId 不动；撤未成交入场单时附带 TPSL 同帧消失，无需额外清理。迁移本体代码在分支 rest-ws/phase-5-order-entry（94dc4632，17 提交）**未部署、未合并**，任务 1/3/4 未完成，阶段留 in_progress。
+  **两项影响判断依据的发现**：(a) 阶段 4 判据 2 是循环论证——_ledger_entry_records 读的 response_json 里的 posId 是 _record_submitted_order_legs 写入的、来自 symbol+side 扫描的值，所以阶段 4 的"2/2 exact"不成立；官方 POST /trade/order 响应无 posId，任何读接口都不同时给出 ordId 与 posId。判据 2 已经用户在该会话批准改为"分仓身份等式（普通 order 的 posId == ordId）+ 三重确认（WS Position.PI == ordId 且 Po 非零、REST 该 posId 存在、方向与数量一致）"，任一不成立即 unverified；该等式对条件单不成立，只适用普通 order 入场。阶段 4 差异报告数字作废，待阶段 5 上线后用真实普通 order 入场重取。(b) 间歇 401 = 限流（code 50000，5 次/秒），且 list_open_orders 调的 V1 orders-pending 对普通限价单恒返回空，V2 才命中。
+  **指挥会话决定**：在阶段 5 迁移本体部署前插入两个前置阶段——5a list_open_orders 切 V2（L3，会激活从未触发的撤单路径，需用户单独批准）、5b 读限流与 50000 识别（L2）。阶段 5 分支保留，5a/5b 完成后 rebase 继续。
 - phase-5-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 用户判断“只用 REST 拿不到确定性外键，不改源头修不完”，决定阶段 5 不再暂缓，与事故修复（docs/management-reliability-status.md）两线并行。阶段 5 收益定位改为“确定性替代推断式候选匹配”而非降低延迟。前置受控实验仍需逐笔由用户本人执行真实下单命令，执行会话只准备命令与分析证据。两条硬性约束写入阶段文件。
 - phase-5-hold (2026-09-07, 指挥会话): 阶段 5 暂不领取。原因一：用户报告两起管理指令未执行事故（峰哥止盈、大镖客保本），正在只读排查，实盘保护优先于改造；原因二：阶段 4 差异报告显示 WS 链在入场归属上没有延迟收益（timing_only 中位 -2.652 秒，市价入场的 posId 在下单响应里同步可得），阶段 5 的收益要重新定位为“确定性替代推断式候选匹配”，需用户就此达成共识后再批准。阶段 5 的两条硬性约束已确认：place_order 响应体必须整体持久化（posId 只在那一次出现）；保护单归属唯一确定性来源是 WS 的 TriggerOrder.TU，REST 无法佐证，重连不重推，缺口期间暂停新入场不能放松。
 - phase-4-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 阶段 4（影子绑定链与差异报告，新表 `deepcoin_shadow_bindings` / `deepcoin_shadow_diffs`，L3）获批领取。附加门槛：影子表至少 3 条真实入场产生的链才算观察完成，上限 48 小时；不为凑样本下单。
