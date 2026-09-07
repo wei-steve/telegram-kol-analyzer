@@ -431,13 +431,14 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   `src/telegram_kol_research/deepcoin_limit_entry.py` 新限价 payload 与迁移判据
   （30 项测试，含用真实 draft builder 产出的腿断言今天所有限价腿都可迁）；
   `deepcoin_shadow_binding.py` 判据 2 重写 + 6 项阶段 4 测试改写（54 项通过）。
-  相关测试 308 passed。
+  相关测试 308 passed；**全量 7670 passed / 4 skipped / 0 failed**
+  （跑的是判据 2 重写之后的最终代码候选；若后续再改生产代码需重跑）。
 
   **剩余工作**：任务 1 的接线（`recovery_live_submit` limit 分支改走 `place_order`）、
   任务 3（判据转正写真实绑定）、任务 4（`ws_observation_permits_new_entry` 接入入场路径，
   需改 `web_app` 暴露 inbox 与那个守护它只被两模块引用的静态测试）、
   任务 5 复核、全量套件、rebase 到最新、部署、30 分钟观察窗、重启 worker、状态收尾。
-  **未跑全量套件；未部署；未观察。**
+  **未部署；未观察。** 全量套件已在当前代码上跑过（见上）。
 
   遗留：间歇 401 今天 **129 次**（全部 `trigger-orders-pending`，09-15 时每小时 12-25 次，
   峰值早于本轮实验、与实验无关），已两次干扰实验收尾。不在本项目范围，
