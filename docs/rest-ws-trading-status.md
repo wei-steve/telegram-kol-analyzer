@@ -371,6 +371,78 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - phase-5-checkpoint (2026-09-07, 指挥会话，依据阶段 5 会话 local_ad007c43 汇报): 前置受控实验 10 格全部由用户本人执行完成，实验前后交易所 fingerprint 一致，零非计划写入。结论：限价 order 可用字段组合 = instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx (+可选 tpTriggerPx)，**不含 clOrdId**（判重键就是 clOrdId 字段存在本身）；市价腿继续带 clOrdId 不动；撤未成交入场单时附带 TPSL 同帧消失，无需额外清理。迁移本体代码在分支 rest-ws/phase-5-order-entry（94dc4632，17 提交）**未部署、未合并**，任务 1/3/4 未完成，阶段留 in_progress。
   **两项影响判断依据的发现**：(a) 阶段 4 判据 2 是循环论证——_ledger_entry_records 读的 response_json 里的 posId 是 _record_submitted_order_legs 写入的、来自 symbol+side 扫描的值，所以阶段 4 的"2/2 exact"不成立；官方 POST /trade/order 响应无 posId，任何读接口都不同时给出 ordId 与 posId。判据 2 已经用户在该会话批准改为"分仓身份等式（普通 order 的 posId == ordId）+ 三重确认（WS Position.PI == ordId 且 Po 非零、REST 该 posId 存在、方向与数量一致）"，任一不成立即 unverified；该等式对条件单不成立，只适用普通 order 入场。阶段 4 差异报告数字作废，待阶段 5 上线后用真实普通 order 入场重取。(b) 间歇 401 = 限流（code 50000，5 次/秒），且 list_open_orders 调的 V1 orders-pending 对普通限价单恒返回空，V2 才命中。
   **指挥会话决定**：在阶段 5 迁移本体部署前插入两个前置阶段——5a list_open_orders 切 V2（L3，会激活从未触发的撤单路径，需用户单独批准）、5b 读限流与 50000 识别（L2）。阶段 5 分支保留，5a/5b 完成后 rebase 继续。
+- phase-5-progress (2026-09-07, 会话 local_ad007c43, **前置实验完成，代码进行中，阶段留 in_progress**):
+  分支 `rest-ws/phase-5-order-entry`（工作树 `.worktrees/rest-ws-phase-5`），起点 `5c8c2682`。
+  **未部署**，生产 HEAD 仍是 A 线的 `b1c12213`。
+  **前置受控实验全部完成**，10 格全部由用户本人执行，证据在服务器
+  `/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-5/`
+  （`findings-final.md`、`findings-retest6.md`、`findings-retest-1-3-11.md`、
+  `findings-posid-link.md`、各 `cell-*/live-*/`）。
+  实验前后交易所 fingerprint 逐字节一致 `c4cd87ec9db6b3bf4d3a38ba1a858fb8e90a586c4836a6a51617016e5698e50a`。
+  共提交 12 笔（9 接受 3 拒绝）、撤销 6 笔、成交 2 笔，零非计划写入；
+  两个成交仓位由自己的附带保护平掉（一止损一止盈，净约 -0.02 USDT），
+  证明附带保护确实会执行。
+
+  **可用字段组合（补测 6，四组单变量对照）**：
+  `instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx`
+  （+ 可选 `tpTriggerPx`），**不含 clOrdId**。判重键就是 clOrdId 字段的存在本身，
+  与并发无关、与订单经济属性无关、与取值无关、逐笔判定。
+  生产市价单一直带 clOrdId 且 149 次全成功，市价腿不要去掉。
+  只带 slTriggerPx 的形状（生产将要发的）由 cell s 单独实测接受。
+
+  **补测 3**：撤未成交入场单，附带 TPSL 同帧 `TS:0→4` 并从 pending 消失，无需额外清理。
+  **补测 1**：cell 1 第二次（可成交限价）拿到完整链条与 `TU: default→posId` 翻转。
+  **补测 2**：最小规模下**不可产生**部分成交（触价挂单量 1687 张 vs 我们 0.2 张），
+  一次全量成交，如实记录，未放大规模。
+  **补测 11**：`unknown_exchange_outcome` 正确、零重发；但 REST 认不出这笔单。
+
+  **三条改变设计的发现：**
+  (1) **`GET /trade/orders-pending` 对活着的普通限价单整体失明**——带保护（cell 11）
+  与不带保护（cell v）在四种参数下一律 0 行，而 `GET /trade/order?ordId=` 同刻为 `live`。
+  今天没暴露是因为生产限价腿走 trigger-order、市价腿瞬间成交，从无普通活挂单。
+  **迁移后 `list_open_orders` 的 20 个调用点会对新入场单读到"没有挂单"**
+  （含 `deepcoin_ws_resync` 五步重同步、`execution_bindings`、`terminal_entry_cleanup`、
+  `entry_revision_executor`、`runtime_agent_exchange_snapshot`）。绑定链只能按精确 ordId 回读。
+  **这一条是阶段 5 剩余工作的已知风险，必须在收尾前处理或明确记录。**
+  (2) 精确 ID 回读在状态变更瞬间**短暂返回空**（撤单后立刻读为 `[]`，几秒后为 `canceled`）。
+  空回读必须当 unknown 重读，不得判终态。
+  (3) 响应丢失后只有 WS 能认出订单，"缺口期间暂停新入场"是硬需求。
+
+  **修掉一个已部署的缺陷：阶段 4 判据 2 是循环论证。**
+  `_ledger_entry_records` 读 `ExecutionOrderLeg.response_json` 当作交易所原文，
+  但 `_record_submitted_order_legs` 先写了 `stored_response["posId"] = pos_id`，
+  而该 pos_id 在响应无 posId 时来自 `_find_open_position_id` 的 symbol+side 扫描。
+  **阶段 4 报告的 exact 是自我确认的**（影子链不写交易所、不写业务账本，属报告口径缺陷）。
+  官方文档核对确认：`POST /trade/order` 响应字段就是 ordId/clOrdId/tag/sCode/sMsg，
+  五笔限价原始回包与生产市价原始回包全部一致，**无 posId**；
+  任何读接口都不同时给出 ordId 与 posId；WS 的 Order/Trade 不带仓位字段、
+  Position 带 PI 不带订单字段。唯一同时返回二者的是 `POST /trade/increase-position`，
+  但 posId 必填、只能加仓。
+  判据 2 已改为**分仓身份等式**：普通 order 开出的仓位其 posId 等于该 order 的 ordId，
+  且必须三重确认（WS Position 帧 PI 等于该 ordId 且 Po 非零、REST 该 posId 存在、
+  方向与数量一致），任一不成立即 unverified。该等式对条件单**不成立**
+  （binding 341 的 trigger 腿 order_id `…581473` vs pos_id `…675481`），
+  所以只有普通 order 入场能用这条链。用户 2026-09-07 明确批准该形式。
+  官方 `close-position-by-ids` 请求用 `positionIds`、错误项用 `tradeUnitId`，
+  为 WS 的 `TriggerOrder.TU` 提供了官方命名佐证。
+
+  **已完成的代码**（本地提交，未部署）：
+  `scripts/deepcoin_phase5_entry_experiment.py` 实验工具（34 项离线测试）；
+  `src/telegram_kol_research/deepcoin_limit_entry.py` 新限价 payload 与迁移判据
+  （30 项测试，含用真实 draft builder 产出的腿断言今天所有限价腿都可迁）；
+  `deepcoin_shadow_binding.py` 判据 2 重写 + 6 项阶段 4 测试改写（54 项通过）。
+  相关测试 308 passed。
+
+  **剩余工作**：任务 1 的接线（`recovery_live_submit` limit 分支改走 `place_order`）、
+  任务 3（判据转正写真实绑定）、任务 4（`ws_observation_permits_new_entry` 接入入场路径，
+  需改 `web_app` 暴露 inbox 与那个守护它只被两模块引用的静态测试）、
+  任务 5 复核、全量套件、rebase 到最新、部署、30 分钟观察窗、重启 worker、状态收尾。
+  **未跑全量套件；未部署；未观察。**
+
+  遗留：间歇 401 今天 **129 次**（全部 `trigger-orders-pending`，09-15 时每小时 12-25 次，
+  峰值早于本轮实验、与实验无关），已两次干扰实验收尾。不在本项目范围，
+  但阶段 5 的观察窗与绑定链 REST 回读几乎肯定会撞上，建议单独立项。
+
 - phase-5-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 用户判断“只用 REST 拿不到确定性外键，不改源头修不完”，决定阶段 5 不再暂缓，与事故修复（docs/management-reliability-status.md）两线并行。阶段 5 收益定位改为“确定性替代推断式候选匹配”而非降低延迟。前置受控实验仍需逐笔由用户本人执行真实下单命令，执行会话只准备命令与分析证据。两条硬性约束写入阶段文件。
 - phase-5-hold (2026-09-07, 指挥会话): 阶段 5 暂不领取。原因一：用户报告两起管理指令未执行事故（峰哥止盈、大镖客保本），正在只读排查，实盘保护优先于改造；原因二：阶段 4 差异报告显示 WS 链在入场归属上没有延迟收益（timing_only 中位 -2.652 秒，市价入场的 posId 在下单响应里同步可得），阶段 5 的收益要重新定位为“确定性替代推断式候选匹配”，需用户就此达成共识后再批准。阶段 5 的两条硬性约束已确认：place_order 响应体必须整体持久化（posId 只在那一次出现）；保护单归属唯一确定性来源是 WS 的 TriggerOrder.TU，REST 无法佐证，重连不重推，缺口期间暂停新入场不能放松。
 - phase-4-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 阶段 4（影子绑定链与差异报告，新表 `deepcoin_shadow_bindings` / `deepcoin_shadow_diffs`，L3）获批领取。附加门槛：影子表至少 3 条真实入场产生的链才算观察完成，上限 48 小时；不为凑样本下单。
