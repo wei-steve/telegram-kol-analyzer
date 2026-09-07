@@ -510,3 +510,36 @@ def test_a_limiter_built_without_an_explicit_rate_takes_its_role_share(monkeypat
     assert DeepcoinReadRateLimiter().per_second == 3
     monkeypatch.setenv(DEEPCOIN_RUNTIME_ROLE_ENV_VAR, "web")
     assert DeepcoinReadRateLimiter().per_second == 1
+
+
+# ── 6. demand and cost accounting ─────────────────────────────────────────────
+
+
+def test_every_physical_read_is_counted_with_the_time_the_quota_cost_it():
+    clock = _FakeMonotonicClock(0.0)
+    metrics = DeepcoinRateLimitMetrics()
+    limiter = DeepcoinReadRateLimiter(
+        monotonic_factory=clock, sleep_fn=clock.sleep, per_second=2, metrics=metrics
+    )
+
+    for _ in range(6):
+        limiter.acquire()
+
+    snapshot = metrics.snapshot()
+    assert snapshot["read_requests_last_hour"] == 6
+    # Capacity 2 free, then four waits of half a second each.
+    assert snapshot["read_throttled_seconds_last_hour"] == pytest.approx(2.0)
+
+
+def test_an_unthrottled_read_still_counts_as_demand():
+    clock = _FakeMonotonicClock(0.0)
+    metrics = DeepcoinRateLimitMetrics()
+    limiter = DeepcoinReadRateLimiter(
+        monotonic_factory=clock, sleep_fn=clock.sleep, per_second=3, metrics=metrics
+    )
+
+    limiter.acquire()
+
+    snapshot = metrics.snapshot()
+    assert snapshot["read_requests_last_hour"] == 1
+    assert snapshot["read_throttled_seconds_last_hour"] == 0

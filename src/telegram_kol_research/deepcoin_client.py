@@ -461,6 +461,7 @@ class DeepcoinReadRateLimiter:
         monotonic_factory: Callable[[], float] = time.monotonic,
         sleep_fn: Callable[[float], None] = time.sleep,
         per_second: int | None = None,
+        metrics: "DeepcoinRateLimitMetrics | None" = None,
     ) -> None:
         self._clock = monotonic_factory
         self._sleep = sleep_fn
@@ -472,6 +473,7 @@ class DeepcoinReadRateLimiter:
         self._tokens = float(self._per_second)
         self._refilled_at = monotonic_factory()
         self._lock = threading.Lock()
+        self._metrics = metrics
 
     @property
     def per_second(self) -> int:
@@ -480,6 +482,7 @@ class DeepcoinReadRateLimiter:
     def acquire(self) -> None:
         """Consume one token, sleeping until one is available."""
 
+        slept = 0.0
         with self._lock:
             while True:
                 now = self._clock()
@@ -490,8 +493,15 @@ class DeepcoinReadRateLimiter:
                 )
                 if self._tokens >= 1.0:
                     self._tokens -= 1.0
-                    return
-                self._sleep((1.0 - self._tokens) / self._per_second)
+                    break
+                delay = (1.0 - self._tokens) / self._per_second
+                slept += delay
+                self._sleep(delay)
+        # Recorded outside the lock: this is the only measurement that says
+        # whether the quota is actually binding. Without it "reads are slower"
+        # cannot be told apart from "the quota is not the bottleneck".
+        if self._metrics is not None:
+            self._metrics.record_read_request(slept)
 
 
 _READ_LIMITERS_LOCK = threading.Lock()
@@ -505,7 +515,7 @@ def _shared_read_limiter(credentials: DeepcoinCredentials) -> DeepcoinReadRateLi
     with _READ_LIMITERS_LOCK:
         limiter = _READ_LIMITERS.get(key)
         if limiter is None:
-            limiter = DeepcoinReadRateLimiter()
+            limiter = DeepcoinReadRateLimiter(metrics=_RATE_LIMIT_METRICS)
             _READ_LIMITERS[key] = limiter
         return limiter
 
@@ -525,6 +535,7 @@ class DeepcoinRateLimitMetrics:
         self._wall_clock = wall_clock
         self._rate_limited: deque[float] = deque()
         self._retry_waits: deque[tuple[float, float]] = deque()
+        self._read_requests: deque[tuple[float, float]] = deque()
         self._lock = threading.Lock()
 
     def _prune(self, now: float) -> None:
@@ -533,6 +544,16 @@ class DeepcoinRateLimitMetrics:
             self._rate_limited.popleft()
         while self._retry_waits and self._retry_waits[0][0] < cutoff:
             self._retry_waits.popleft()
+        while self._read_requests and self._read_requests[0][0] < cutoff:
+            self._read_requests.popleft()
+
+    def record_read_request(self, throttled_seconds: float) -> None:
+        """One physical GET took a token, after waiting this long for it."""
+
+        now = self._wall_clock()
+        with self._lock:
+            self._prune(now)
+            self._read_requests.append((now, max(0.0, float(throttled_seconds))))
 
     def record_rate_limited(self) -> None:
         now = self._wall_clock()
@@ -551,10 +572,17 @@ class DeepcoinRateLimitMetrics:
         with self._lock:
             self._prune(now)
             waits = [seconds for _, seconds in self._retry_waits]
+            throttles = [seconds for _, seconds in self._read_requests]
             return {
                 "rate_limited_last_hour": len(self._rate_limited),
                 "retry_after_waits_last_hour": len(waits),
                 "retry_after_wait_seconds_last_hour": round(sum(waits), 3),
+                # Demand and cost. ``read_requests`` is what this process
+                # actually asked the exchange for; ``throttled_seconds`` is the
+                # wall time the quota made it wait. A near-zero throttle with a
+                # slow loop means the quota is not the bottleneck.
+                "read_requests_last_hour": len(throttles),
+                "read_throttled_seconds_last_hour": round(sum(throttles), 3),
             }
 
 
