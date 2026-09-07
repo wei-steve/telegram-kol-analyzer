@@ -19,7 +19,7 @@ phase_status: planned                 # planned | claimed | in_progress | comple
 claimed_by:
 last_completed_phase: 2
 last_completed_commit: 0371fc9f4fc41c588fab1534f8e33419aef4d6cf
-user_approval_required_for: [1, 2, 5, 6]   # 见"用户批准门"
+user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
 ```
 
 ## 阶段总览
