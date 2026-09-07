@@ -1361,14 +1361,32 @@ def _row_has_protection_fields(row: dict[str, object]) -> bool:
 
 
 def _row_has_take_profit_fields(row: dict[str, object]) -> bool:
-    return any(
-        row.get(key) not in (None, "")
-        for key in (
-            "tpTriggerPx",
-            "tpTriggerPrice",
-            "closeTPTriggerPrice",
-        )
-    )
+    """Report whether a row actually carries a take-profit trigger price.
+
+    DeepCoin returns a stop-only ``TPSL`` with its take-profit aliases present
+    but zeroed (``tpTriggerPrice="0"``, ``closeTPTriggerPrice="0"``), which is
+    the exchange saying "no take profit" rather than "a take profit I cannot
+    read".  Treating that literal ``0`` as a present field made
+    ``_unowned_pending_take_profit_present`` reject every convergence on an
+    instrument that merely had a stop attached: ``normalize_native_tpsl``
+    resolves the same aliases through ``_first_positive_decimal`` and returns
+    ``None`` for ``0``, so the caller concluded an unreadable take profit was
+    live.  The two now agree that only a positive value is a take-profit price.
+
+    A value that cannot be parsed at all still counts as present, so an
+    unrecognized payload keeps failing closed instead of being waved through.
+    """
+
+    for key in ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"):
+        value = row.get(key)
+        if value in (None, ""):
+            continue
+        parsed = _decimal(value)
+        if parsed is None:
+            return True
+        if parsed > 0:
+            return True
+    return False
 
 
 def _text_alias_values(

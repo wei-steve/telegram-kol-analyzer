@@ -969,6 +969,145 @@ def test_shadow_plan_never_adopts_existing_order_onto_failed_logical_leg(tmp_pat
         assert logical_leg.exchange_order_id is None
 
 
+def test_zero_valued_take_profit_aliases_do_not_block_the_convergence(tmp_path):
+    """A-1c: a stop-only TPSL zeroes its TP aliases; that is 'no take profit'."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "zero-tp-aliases.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    client = _Client()
+    # The shape DeepCoin returned for the production stop-only rows on
+    # BTC-USDT-SWAP: every take-profit alias present and zeroed.
+    for row in client.pending:
+        row.update({
+            "tpPrice": "0",
+            "tpTriggerPrice": "0",
+            "closeTPPrice": "0",
+            "closeTPTriggerPrice": "0",
+        })
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert plan.reason_code != "convergence_unowned_take_profit_present"
+    assert plan.status != "conflicted"
+
+
+def test_positive_unowned_take_profit_still_blocks_the_convergence(tmp_path):
+    """A-1c must not weaken the veto for a real, unowned take profit."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "positive-unowned-tp.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+    )
+    client = _Client()
+    client.pending.append({
+        "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
+        "ordId": "tp-not-ours", "triggerOrderType": "TPSL",
+        "tpTriggerPx": "63900", "tpOrdPx": "-1", "tpPrice": "0", "sz": "10",
+    })
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        planned_at=NOW,
+    )
+
+    assert (plan.status, plan.reason_code) == (
+        "conflicted", "convergence_unowned_take_profit_present"
+    )
+
+
+def test_unparsable_take_profit_alias_still_fails_closed(tmp_path):
+    """A-1c only excuses a value that parses to zero, never an unreadable one."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    for label, value in (
+        ("garbage", "not-a-number"),
+        ("nan", "NaN"),
+    ):
+        session_factory = create_session_factory(tmp_path / f"unparsable-{label}.db")
+        convergence_id = _ready_convergence(
+            session_factory,
+            existing_take_profit=False,
+            desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+        )
+        client = _Client()
+        client.pending.append({
+            "instId": "BTC-USDT-SWAP", "posId": "pos-10", "posSide": "short",
+            "ordId": f"tp-unreadable-{label}", "triggerOrderType": "TPSL",
+            "tpTriggerPrice": value, "tpOrdPx": "-1", "sz": "10",
+        })
+
+        plan = plan_trigger_take_profit_convergence(
+            session_factory,
+            convergence_id=convergence_id,
+            deepcoin_client=client,
+            planned_at=NOW,
+        )
+
+        # An unreadable take-profit value must never be waved through. Which
+        # veto catches it first is not the claim; that it is caught is.
+        assert plan.status == "conflicted", label
+        assert plan.reason_code.startswith("convergence_"), label
+
+
+def test_row_has_take_profit_fields_branches():
+    """A-1c: the predicate agrees with normalize_native_tpsl on what a price is."""
+
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        _row_has_take_profit_fields,
+    )
+
+    # absent
+    assert _row_has_take_profit_fields({}) is False
+    assert _row_has_take_profit_fields({"tpTriggerPrice": None}) is False
+    assert _row_has_take_profit_fields({"tpTriggerPrice": ""}) is False
+    # parses to zero or below -> the exchange saying "no take profit"
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "0"}) is False
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "0.0"}) is False
+    assert _row_has_take_profit_fields({"closeTPTriggerPrice": "0"}) is False
+    assert _row_has_take_profit_fields({"tpTriggerPx": "-1"}) is False
+    assert _row_has_take_profit_fields(
+        {"tpTriggerPrice": "0", "closeTPTriggerPrice": "0", "tpTriggerPx": ""}
+    ) is False
+    # a real price
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "63900"}) is True
+    assert _row_has_take_profit_fields({"tpTriggerPx": "0.5"}) is True
+    assert _row_has_take_profit_fields(
+        {"tpTriggerPrice": "0", "closeTPTriggerPrice": "63900"}
+    ) is True
+    # unreadable -> still present, so the caller keeps failing closed
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "not-a-number"}) is True
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "NaN"}) is True
+    assert _row_has_take_profit_fields({"tpTriggerPrice": "Infinity"}) is True
+    assert _row_has_take_profit_fields({"tpTriggerPrice": object()}) is True
+
+
 def test_plan_never_adopts_take_profit_order_from_other_venue(tmp_path):
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.models import PositionTakeProfitOrder
