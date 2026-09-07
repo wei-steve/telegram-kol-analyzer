@@ -13,12 +13,12 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 5a
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5a-open-orders-v2.md
-phase_status: in_progress                 # planned | claimed | in_progress | completed | blocked
-claimed_by: local_32e174b0-dd02-4db7-9a83-29d4b816e6c8
-last_completed_phase: 4
-last_completed_commit: 294bd54b2881b6a44e2d749d9ec479d453985d36
+current_phase: 5b
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5b-rate-limiter.md
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
+claimed_by:
+last_completed_phase: 5a
+last_completed_commit: 86825b8915377574b6c7fed7d98ab3d2e792ac4e
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
 ```
 
@@ -266,6 +266,48 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- phase-5a-completed (2026-09-07, 会话 local_32e174b0, **阶段 5a 完成**):
+  分支 `rest-ws/phase-5a-open-orders-v2`，提交 `86825b8915377574b6c7fed7d98ab3d2e792ac4e`
+  （rebase 到 A 线 `af6f2515` 之后），已 `tg-deploy` 上线；**回滚 SHA
+  `7c2fc797b6dd08686c93114fca14171010229eaf`**（部署前生产 HEAD）。
+  **分页语义**：官方「获取未成交订单列表」只写 `index` 是「页码」，未写起点；由官方示例仓库
+  `deepcoinapi/openapi_python_example` 的 `rest/trade/get_orders_pending.py`
+  （`index='1'`，`deepcoin_api.get_orders_pending` 的 uri 正是 `/deepcoin/trade/v2/orders-pending`）
+  确定 **index 从 1 开始**，`limit` 上限 100，翻到不足一页为止。任何一页失败、畸形或业务错一律抛
+  `DeepcoinClientError`，结构上不返回部分结果；服务器忽略 `index`（相邻页身份重复）同样抛。
+  **字段映射**：V2 在消费方读取的 20 个字段上与 V1 恒等（`DEEPCOIN_OPEN_ORDER_V1_TO_V2_FIELDS` +
+  测试守护），行原样返回。真正的差异在请求侧：V2 **没有** `instType` 参数，V1 的 `instType=SWAP`
+  过滤移到客户端；`instType` 缺失的行**保留**（不可分类是未知，不是不存在）。
+  **调用点**：`docs/plans/2026-09-06-deepcoin-rest-ws/phase-5a-callsites.md`，
+  生产源码 16 处 `list_open_orders(`（3 定义 + 13 调用）+ 6 处按方法名的间接调用逐条判定。
+  可能对现有对象写入的 **4 处**（`cancel_entry_order`、`cancel_revision_entry_leg`、
+  `cancel_pending_entry_legs`、`_match_exact_deferred_exchange_orders`）全部加护栏
+  `open_order_action_guard.py`：只允许 `execution_order_legs` 里 `venue=deepcoin`、
+  `order_kind ∈ {market, limit}` 且 ordId/clOrdId 由本系统记录的对象动作，其余记日志 +
+  `runtime_incidents`（`open_order_guard_blocked`, severity high）后丢弃。
+  **撤单后的 2 处确认读刻意不加护栏**——在那里丢行会把外来对象的存在读成「撤单已确认」。
+  **部署前只读**（worker 凭据）：V2 全量挂单 **0 行**，V1 同为 0，**无不可归属对象**，本阶段无需
+  也未撤任何单。**部署后直读**证明生产真的走 V2：`?index=1&limit=100` 与
+  `?instId=ETH-USDT-SWAP&index=1&limit=100`，均 0 行、无异常。
+  **测试**：focused 17 项（分页、失败即抛、字段映射、护栏）通过；全量 **7635 passed / 0 failed**。
+  **观察窗口 `2026-09-07T17:42:13Z ~ 20:29:35Z`，167 个连续健康采样点（2 小时 47 分）**，
+  全程恒定：HEAD 恒为部署 SHA、三单元 30/30 `active`、NRestarts 全程 0、
+  `complete` 恒 true、交易所指纹逐字节恒为
+  `c4cd87ec9db6b3bf4d3a38ba1a858fb8e90a586c4836a6a51617016e5698e50a`
+  （`position_count=3, open_order_count=0`）、`open_order_count` 恒 0、
+  **护栏命中恒 0**、近 30 分钟撤单恒 0、执行事件恒 0。
+  末次采样的近 30 分钟回看区间内**真实消息 5 条 / 1 个群**，满足 L2 的 ≥5 条门槛；
+  **未达到 L2「尽量 2 个群」的偏好项**（窗口内只有 1 个群有流量，属流量而非代码问题）。
+  部署至今 `execution_events` **零新增**，即窗口内零撤单、零非预期交易所写入。
+  **日志**：V2 `orders-pending` 零错误、零 401；`open_order_guard` 零行。
+  仍在的 401 全部落在**未改动的** `trigger-orders-pending`（22 次 / 2h48m；部署前等长窗口 16 次，
+  逐小时 8/4/6/18/0/6 波动明显，含部署与重启的那一小时是 18、随后一小时是 0），
+  即既有 `out-of-scope-401`，正是阶段 5b 的对象；本次改动未增加请求量（0 挂单时 V2 与 V1 均为 1 次请求/调用）。
+  证据目录：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-5a/`
+  （`pre-deploy-v2-orders-pending.json`、`post-deploy-v2-live-path.json`、
+  `window-end-snapshot.json`、`observer-samples.jsonl` 167 行）。
+  **未做**：未合并、未改阶段 5 迁移本体（分支 `rest-ws/phase-5-order-entry` 仍未部署未合并），
+  未碰 `execution_bindings.py` / `trigger_take_profit_convergence_executor.py` / `native_tpsl.py`（A 线在用）。
 - phase-5a-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 阶段 5a（list_open_orders 切 V2 orders-pending，含分页、fail-closed、逐调用点分析与护栏，L3）获批领取；部署前须只读拉一次生产当前挂单，确认为空或逐条可归属，不能归属的对象只出示不动作。
 - phase-5-checkpoint (2026-09-07, 指挥会话，依据阶段 5 会话 local_ad007c43 汇报): 前置受控实验 10 格全部由用户本人执行完成，实验前后交易所 fingerprint 一致，零非计划写入。结论：限价 order 可用字段组合 = instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx (+可选 tpTriggerPx)，**不含 clOrdId**（判重键就是 clOrdId 字段存在本身）；市价腿继续带 clOrdId 不动；撤未成交入场单时附带 TPSL 同帧消失，无需额外清理。迁移本体代码在分支 rest-ws/phase-5-order-entry（94dc4632，17 提交）**未部署、未合并**，任务 1/3/4 未完成，阶段留 in_progress。
   **两项影响判断依据的发现**：(a) 阶段 4 判据 2 是循环论证——_ledger_entry_records 读的 response_json 里的 posId 是 _record_submitted_order_legs 写入的、来自 symbol+side 扫描的值，所以阶段 4 的"2/2 exact"不成立；官方 POST /trade/order 响应无 posId，任何读接口都不同时给出 ordId 与 posId。判据 2 已经用户在该会话批准改为"分仓身份等式（普通 order 的 posId == ordId）+ 三重确认（WS Position.PI == ordId 且 Po 非零、REST 该 posId 存在、方向与数量一致）"，任一不成立即 unverified；该等式对条件单不成立，只适用普通 order 入场。阶段 4 差异报告数字作废，待阶段 5 上线后用真实普通 order 入场重取。(b) 间歇 401 = 限流（code 50000，5 次/秒），且 list_open_orders 调的 V1 orders-pending 对普通限价单恒返回空，V2 才命中。
