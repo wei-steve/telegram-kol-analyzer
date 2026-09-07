@@ -6734,12 +6734,25 @@ def deepcoin_shadow_binding_export(
             None if main_ord_id is None
             else load_ledger_chain_view(session_factory, main_ord_id)
         )
-        subject_id = (diff["shadow_value"] or diff["ledger_value"] or "").strip()
+        # The identifier this row is about. For a whole-chain row that is the
+        # entry order id -- ``shadow_value`` there is a refusal reason, and
+        # asking the ownership index whether it owns the string
+        # "instrument_unknown" is how a real attribution turns into a
+        # meaningless ``false``.
+        subject = str(diff["subject"])
+        if subject == "binding":
+            subject_id = str(main_ord_id or "")
+        elif ":" in subject:
+            subject_id = subject.split(":", 1)[1]
+        else:
+            subject_id = str(diff["shadow_value"] or diff["ledger_value"] or "")
+        subject_id = subject_id.strip()
         attributions.append(
             {
                 "diff_id": diff["id"],
                 "diff_kind": diff["diff_kind"],
                 "subject": diff["subject"],
+                "subject_id": subject_id,
                 "main_ord_id": main_ord_id,
                 "shadow_confidence": None if chain is None else chain["binding_confidence"],
                 "shadow_refusal_reason": None if chain is None else chain["refusal_reason"],

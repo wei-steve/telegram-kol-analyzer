@@ -32,6 +32,7 @@ import pytest
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_shadow_binding import (
     BINDING_CRITERIA,
+    collect_chain_inputs,
     CONFIDENCE_EXACT,
     CONFIDENCE_UNVERIFIED,
     REFUSAL_REASONS,
@@ -931,6 +932,30 @@ def test_re_running_the_diff_pass_is_idempotent(tmp_path):
         assert session.query(DeepcoinShadowDiff).count() == first["diffs_written"]
 
 
+class _RestReaderStub:
+    """Stands in for the REST reader when a case must not reach the exchange."""
+
+    def __init__(self) -> None:
+        self.calls: list[str] = []
+        self.failures: list[str] = []
+
+    def fills(self, inst_id, order_id):
+        self.calls.append("fills")
+        return []
+
+    def positions(self, inst_id):
+        self.calls.append("positions")
+        return []
+
+    def position_history(self, inst_id):
+        self.calls.append("position_history")
+        return []
+
+    def trigger_orders(self, inst_id):
+        self.calls.append("trigger_orders")
+        return []
+
+
 class _StubClient:
     """A read-only Deepcoin stand-in. It has no write method at all, on purpose."""
 
@@ -1411,3 +1436,34 @@ def test_the_round_log_reports_a_count_not_a_wall_of_ids(tmp_path):
     )
     assert payload["touched_binding_ids_truncated"] is True
     assert "touched_binding_ids" not in payload
+
+
+def test_an_unfilled_conditional_entry_is_order_live_not_instrument_unknown(tmp_path):
+    """Production reported ``instrument_unknown`` for an order the stream described.
+
+    A conditional entry that has not triggered produces only a ``TriggerOrder``
+    frame carrying its own ``OS`` -- no ``Trade``, no ``Order``. Refusing it for
+    an unknown contract hides the useful answer, which is that the entry is
+    live and unfilled.
+    """
+
+    session_factory = create_session_factory(tmp_path / "shadow.db")
+    conditional_ord_id = "1001125163581473"
+    frame = _trigger_frame(conditional_ord_id, sl=2400.0)
+    frame["trade_unit_id"] = "default"
+    reader_inputs = collect_chain_inputs(
+        conditional_ord_id,
+        frames_by_channel={"TriggerOrder": [frame]},
+        reader=_RestReaderStub(),
+        instrument_map=_instrument_map(),
+        order_response=None,
+    )
+
+    assert reader_inputs.instrument_stream == STREAM_INSTRUMENT
+    assert reader_inputs.instrument_rest == REST_INSTRUMENT
+
+    result = evaluate_shadow_chain(reader_inputs)
+    assert result.refusal_reason == "no_trade_frame_for_main_ord_id"
+    assert result.stage == "order_live"
+    assert result.evidence["own_trigger_frame_count"] == 1
+    del session_factory

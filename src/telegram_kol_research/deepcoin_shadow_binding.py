@@ -417,7 +417,21 @@ def evaluate_shadow_chain(inputs: ShadowChainInputs) -> ShadowChainResult:
 
     # ---- criterion 1: Trade.OS == REST main ordId -------------------------
     if not trade_frames:
-        stage = STAGE_ORDER_LIVE if order_frames else STAGE_REST_ACCEPTED
+        # ``order_live`` covers both shapes of a submitted, unfilled entry: a
+        # regular order the stream has acknowledged, and a conditional order
+        # still waiting on its trigger.
+        own_trigger_frames = [
+            frame
+            for frame in inputs.trigger_frames
+            if _text(frame.get("order_sys_id")) == inputs.main_ord_id
+        ]
+        stage = (
+            STAGE_ORDER_LIVE
+            if order_frames or own_trigger_frames
+            else STAGE_REST_ACCEPTED
+        )
+        if own_trigger_frames:
+            evidence["own_trigger_frame_count"] = len(own_trigger_frames)
         return refuse("no_trade_frame_for_main_ord_id", stage)
     criteria["trade_os_equals_main_ord_id"] = True
     evidence["trade_frame_count"] = len(trade_frames)
@@ -1011,8 +1025,18 @@ def collect_chain_inputs(
         for frame in frames_by_channel.get("Order", [])
         if _text(frame.get("order_sys_id")) == main_ord_id
     ]
+    # A conditional entry that has not triggered yet appears only as a
+    # ``TriggerOrder`` frame carrying its own ``OS``. Without this the chain
+    # reports ``instrument_unknown`` -- "we never saw the contract" -- for an
+    # order the stream described perfectly well, and the far more useful truth
+    # (the entry is live and unfilled) is lost.
+    own_trigger_frames = [
+        frame
+        for frame in frames_by_channel.get("TriggerOrder", [])
+        if _text(frame.get("order_sys_id")) == main_ord_id
+    ]
     instrument_stream = None
-    for frame in trade_frames + order_frames:
+    for frame in trade_frames + order_frames + own_trigger_frames:
         instrument_stream = _text(frame.get("instrument_raw"))
         if instrument_stream is not None:
             break
