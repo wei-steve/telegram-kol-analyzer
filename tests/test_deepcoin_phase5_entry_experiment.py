@@ -315,3 +315,27 @@ def test_a_confirmed_canceled_read_back_is_success(harness, tmp_path, monkeypatc
         lambda path, params=None, **kw: next(reads) if path == "/deepcoin/trade/order" else [],
     )
     assert harness.cancel_exact(tmp_path, "1", execute=True) == 0
+
+
+def test_marketable_mode_crosses_the_book_and_stays_near_the_market(harness):
+    body = harness.build_manifest(
+        "1", MARKET, run_id="run0000000", price_mode="marketable"
+    )["requests"][0]["body"]
+    price = float(body["px"])
+    assert body["side"] == "buy"
+    assert price >= float(TICKER["askPx"]), "a marketable buy must cross the ask"
+    assert abs(price - float(TICKER["last"])) / float(TICKER["last"]) <= 0.005
+    assert float(body["slTriggerPx"]) < price < float(body["tpTriggerPx"])
+    assert "clOrdId" not in body
+
+
+def test_marketable_mode_is_refused_for_a_non_filling_cell(harness):
+    for cell in ("3", "6a", "6b", "6c", "6d", "11"):
+        with pytest.raises(ValueError):
+            harness.build_manifest(cell, MARKET, run_id="run0000000", price_mode="marketable")
+
+
+def test_a_marketable_price_far_from_the_market_is_refused(harness):
+    stale = {"spec": SPEC, "ticker": dict(TICKER, last="2000")}
+    with pytest.raises(ValueError):
+        harness.build_manifest("1", stale, run_id="run0000000", price_mode="marketable")

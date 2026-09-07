@@ -493,8 +493,15 @@ def read_market() -> dict:
     return {"spec": specs[0], "ticker": tickers[0]}
 
 
-def build_manifest(cell: str, market: dict, *, run_id: str) -> dict:
+def build_manifest(cell: str, market: dict, *, run_id: str,
+                   price_mode: str | None = None) -> dict:
     plan = CELLS[cell]
+    if price_mode is not None:
+        if cell not in FILLING_CELLS:
+            raise ValueError("price mode may only be overridden for a filling cell")
+        if price_mode not in {"passive", "marketable", "front_of_book"}:
+            raise ValueError("unsupported price mode")
+        plan = dict(plan, kind="passive_fill" if price_mode == "passive" else price_mode)
     spec, ticker = market["spec"], market["ticker"]
     tick = Decimal(str(spec["tickSz"]))
     lot = Decimal(str(spec["lotSz"]))
@@ -520,6 +527,16 @@ def build_manifest(cell: str, market: dict, *, run_id: str) -> dict:
             raise ValueError("passive fill price would cross the book")
         if abs(price - last) / last > Decimal("0.02"):
             raise ValueError("passive fill price is too far from the market to fill")
+    elif plan["kind"] == "marketable":
+        # Deliberately crosses the book so the fill is certain instead of left to
+        # the market: cell 1 attempt 1 rested 1 USDT below last for 300s and
+        # never filled, so the TU transition was never observed.
+        price = quantize(ask + tick if plan["side"] == "buy" else bid - tick, tick)
+        fills = price >= ask if plan["side"] == "buy" else price <= bid
+        if not fills:
+            raise ValueError("marketable price does not cross the book")
+        if abs(price - last) / last > Decimal("0.005"):
+            raise ValueError("marketable price is too far from the market")
     else:  # front_of_book
         price = ask - tick if plan["side"] == "sell" else bid + tick
         price = quantize(price, tick)
@@ -646,7 +663,8 @@ def recovery_candidates(rows: list[dict], *, body: dict, baseline: set[str]) -> 
 # --------------------------------------------------------------------------
 
 
-def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: bool) -> int:
+def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: bool,
+             attempt: int = 1, price_mode: str | None = None) -> int:
     plan = CELLS[cell]
     cell_root = root / ("cell-" + cell)
     cell_root.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -654,21 +672,26 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
     run_id = uuid.uuid4().hex[:10]
 
     if not execute:
-        manifest = build_manifest(cell, market, run_id="DRYRUN0000")
+        manifest = build_manifest(cell, market, run_id="DRYRUN0000", price_mode=price_mode)
         print(json.dumps({"event": "DRY_RUN", "manifest": manifest}, ensure_ascii=False, indent=2))
         print("\nNo order submitted. Re-run with --execute to submit for real.")
         return 0
 
-    lock = cell_root / "LIVE-ATTEMPT.json"
-    if lock.exists():
+    # One lock per attempt: it exists to stop an accidentally repeated paste,
+    # not to forbid a deliberate retry after an attempt that did not fill.
+    lock = cell_root / f"LIVE-ATTEMPT-{attempt}.json"
+    if lock.exists() or (attempt == 1 and (cell_root / "LIVE-ATTEMPT.json").exists()):
         raise ValueError(
-            f"cell {cell} has already been attempted; inspect its evidence instead of repeating it"
+            f"cell {cell} attempt {attempt} has already been run; inspect its evidence, "
+            "or pass a higher --attempt for a deliberate retry"
         )
     out = cell_root / ("live-" + run_id)
     out.mkdir(mode=0o700)
     set_raw_log(out / "raw.jsonl")
     summary: dict = {
         "cell": cell,
+        "attempt": attempt,
+        "price_mode": price_mode,
         "question": plan["question"],
         "run_id": run_id,
         "output": str(out),
@@ -694,7 +717,8 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
         durable_json(out / "baseline-ids.json", sorted(baseline))
         read_state(out, set(), label="baseline")
 
-        manifest = build_manifest(cell, market, run_id=run_id)
+        manifest = build_manifest(cell, market, run_id=run_id, price_mode=price_mode)
+        manifest["attempt"] = attempt
         durable_json(out / "manifest.json", manifest)
 
         listen_key = acquire_listen_key()
@@ -710,7 +734,8 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
 
         print(json.dumps({"event": "SUBMITTING", "cell": cell,
                           "requests": manifest["requests"]}, ensure_ascii=False), flush=True)
-        durable_json(lock, {"cell": cell, "run_id": run_id, "claimed_at": utc(),
+        durable_json(lock, {"cell": cell, "attempt": attempt, "run_id": run_id,
+                            "claimed_at": utc(), "price_mode": price_mode,
                             "notice": "Do not remove or rerun automatically."}, exclusive=True)
         submitted = True
         submission_ms = time.time_ns() // 1_000_000
@@ -918,6 +943,10 @@ def main() -> int:
                         help="cancel exactly this order id and nothing else")
     parser.add_argument("--execute", action="store_true",
                         help="submit for real; without it nothing is sent")
+    parser.add_argument("--attempt", type=int, default=1,
+                        help="deliberate retry number for a cell that did not fill")
+    parser.add_argument("--price-mode", choices=("passive", "marketable", "front_of_book"),
+                        help="filling cells only: how to price against the book")
     parser.add_argument("--confirm-cancel-candidate", action="store_true",
                         help="cell 11 only: allow cancelling the single recovery candidate")
     parser.add_argument("--root", default=str(Path(__file__).resolve().parent))
@@ -932,6 +961,8 @@ def main() -> int:
             Path(args.root), args.cell,
             execute=args.execute,
             confirm_cancel_candidate=args.confirm_cancel_candidate,
+            attempt=args.attempt,
+            price_mode=args.price_mode,
         )
     finally:
         os.umask(previous_umask)
