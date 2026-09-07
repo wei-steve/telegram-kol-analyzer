@@ -843,7 +843,8 @@ def cancel_exact(root: Path, order_id: str, *, execute: bool) -> int:
 
     if not order_id.isdigit():
         raise ValueError("order id must be numeric")
-    out = root / ("manual-cancel-" + order_id)
+    # One directory per invocation, so a dry run never blocks the real one.
+    out = root / ("manual-cancel-" + order_id + "-" + uuid.uuid4().hex[:8])
     out.mkdir(mode=0o700, parents=True, exist_ok=False)
     set_raw_log(out / "raw.jsonl")
     summary = {"order_id": order_id, "started_at": utc(), "status": "preflight"}

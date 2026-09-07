@@ -270,3 +270,18 @@ def test_cancel_exact_refuses_anything_that_is_not_a_live_unfilled_order(harness
     ]))
     assert harness.cancel_exact(tmp_path / "c", "1", execute=True) == 1
     assert calls == [], "no cancel may be sent for a non-live, partly filled or ambiguous read"
+
+
+def test_a_dry_run_cancel_does_not_block_the_real_one(harness, tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "load_worker_credentials", lambda: {"worker_pid": "1"})
+    monkeypatch.setattr(
+        harness, "signed_get",
+        lambda path, params=None, **kw: (
+            [{"ordId": "1", "state": "live", "accFillSz": "0"}]
+            if path == "/deepcoin/trade/order" else []
+        ),
+    )
+    assert harness.cancel_exact(tmp_path, "1", execute=False) == 0
+    # The second call must not collide with the first call's evidence directory.
+    assert harness.cancel_exact(tmp_path, "1", execute=False) == 0
+    assert len(list(tmp_path.glob("manual-cancel-1-*"))) == 2
