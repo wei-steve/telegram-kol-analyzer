@@ -14,7 +14,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 1c
 current_step_file: docs/plans/2026-09-07-management-reliability/step-1c-zero-take-profit-field.md
-step_status: claimed              # planned | claimed | in_progress | completed | blocked
+step_status: in_progress          # planned | claimed | in_progress | completed | blocked
 claimed_by: local_16ec4b63-93bc-4cac-811c-a290343b49f9
 last_completed_step: 1b
 last_completed_commit: 7c2fc797b6dd08686c93114fca14171010229eaf
