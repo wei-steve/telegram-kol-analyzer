@@ -85,6 +85,10 @@ CELLS: dict[str, dict] = {
            "contracts": "0.1", "side": "buy", "pos_side": "long", "observe_seconds": 20,
            "force_timeout_seconds": 0.05,
            "question": "REST response lost while the exchange may have accepted"},
+    "v": {"kind": "far", "orders": 1, "client_order_id": False, "px_factor": "0.92",
+          "contracts": "0.1", "side": "buy", "pos_side": "long", "observe_seconds": 30,
+          "attach_protection": False,
+          "question": "is a live ordinary limit order WITHOUT attached TP/SL visible in orders-pending"},
     "1": {"kind": "passive_fill", "orders": 1, "client_order_id": False,
           "px_offset": "-1", "contracts": "0.1", "side": "buy", "pos_side": "long",
           "observe_seconds": 300,
@@ -550,12 +554,15 @@ def build_manifest(cell: str, market: dict, *, run_id: str,
         raise ValueError(f"notional {notional} exceeds the agreed cap")
 
     # TP and SL are anchored on the submitted limit price, 10 USDT either way,
-    # exactly as the accepted 2026-09-05 short did.
+    # exactly as the accepted 2026-09-05 short did.  Cell "v" omits them on
+    # purpose: it isolates whether the orders-pending blindness found in cell 11
+    # is caused by the attached protection or by the ordinary limit order itself.
+    attach_protection = plan.get("attach_protection", True)
     if plan["pos_side"] == "long":
         take_profit, stop_loss = price + 10, price - 10
     else:
         take_profit, stop_loss = price - 10, price + 10
-    if stop_loss <= 0 or take_profit <= 0:
+    if attach_protection and (stop_loss <= 0 or take_profit <= 0):
         raise ValueError("protection price is not positive")
 
     requests = []
@@ -569,9 +576,10 @@ def build_manifest(cell: str, market: dict, *, run_id: str,
             "ordType": "limit",
             "px": f"{price:f}",
             "sz": f"{contracts:f}",
-            "tpTriggerPx": f"{take_profit:f}",
-            "slTriggerPx": f"{stop_loss:f}",
         }
+        if attach_protection:
+            body["tpTriggerPx"] = f"{take_profit:f}"
+            body["slTriggerPx"] = f"{stop_loss:f}"
         if plan["client_order_id"]:
             body["clOrdId"] = "P5" + run_id + chr(ord("A") + index)
         requests.append(
@@ -584,6 +592,7 @@ def build_manifest(cell: str, market: dict, *, run_id: str,
         "built_at": utc(),
         "instrument_spec": spec,
         "ticker": ticker,
+        "attaches_protection": attach_protection,
         "eth_each": f"{contracts * contract_value:f}",
         "notional_usdt_each": f"{notional:f}",
         "requests": requests,
@@ -801,6 +810,36 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
             )
             if len(candidates) == 1 and confirm_cancel_candidate:
                 owned.add(str(candidates[0]["ordId"]))
+
+        if cell == "v" and owned:
+            # Cell 11 found orders-pending empty for a live limit order under
+            # every parameter variant.  Repeat that probe here, where the only
+            # difference is that this order carries no attached protection.
+            probes = {}
+            for label, params in (
+                ("instType+instId", {"instType": "SWAP", "instId": INST}),
+                ("instType+instId+limit", {"instType": "SWAP", "instId": INST, "limit": 100}),
+                ("instType only", {"instType": "SWAP"}),
+                ("instType+instId+mrgPosition", {"instType": "SWAP", "instId": INST,
+                                                 "mrgPosition": "split"}),
+            ):
+                try:
+                    rows = signed_get("/deepcoin/trade/orders-pending", params)
+                    probes[label] = {
+                        "row_count": len(rows),
+                        "contains_our_order": any(str(row.get("ordId")) in owned for row in rows),
+                        "ord_ids": [str(row.get("ordId")) for row in rows],
+                    }
+                except Exception as exc:
+                    probes[label] = {"error_type": type(exc).__name__, "reason": str(exc)}
+            summary["orders_pending_probe"] = probes
+            summary["exact_id_read"] = [
+                {key: row.get(key) for key in ("ordId", "state", "accFillSz")}
+                for order_id in sorted(owned)
+                for row in signed_get("/deepcoin/trade/order", {"instId": INST, "ordId": order_id})
+            ]
+            durable_json(out / "orders-pending-probe.json",
+                         {"probes": probes, "exact_id_read": summary["exact_id_read"]})
 
         deadline = time.monotonic() + float(plan["observe_seconds"])
         while time.monotonic() < deadline:

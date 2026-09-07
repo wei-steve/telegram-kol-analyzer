@@ -104,7 +104,8 @@ def test_far_cells_cannot_fill_and_protection_brackets_the_limit_price(harness):
         body = harness.build_manifest(cell, MARKET, run_id="run0000000")["requests"][0]["body"]
         price = float(body["px"])
         assert abs(price - last) / last >= float(harness.FAR_PRICE_MIN_DISTANCE)
-        assert float(body["slTriggerPx"]) < price < float(body["tpTriggerPx"])
+        if plan.get("attach_protection", True):
+            assert float(body["slTriggerPx"]) < price < float(body["tpTriggerPx"])
 
 
 def test_short_cell_protection_is_inverted(harness):
@@ -373,3 +374,25 @@ def test_an_unreadable_order_is_still_cancelled(harness, tmp_path, monkeypatch):
     monkeypatch.setattr(harness, "signed_get", lambda path, params=None, **kw: [])
     harness.cancel_owned(tmp_path, {"1"}, timeout=15.0)
     assert len(sent) == 1, "an empty read must not be taken as 'already gone'"
+
+
+def test_the_visibility_cell_carries_no_protection_and_nothing_else_changes(harness):
+    plain = harness.build_manifest("v", MARKET, run_id="run0000000")
+    body = plain["requests"][0]["body"]
+    assert plain["attaches_protection"] is False
+    assert set(body) == {"instId", "tdMode", "mrgPosition", "side", "posSide",
+                         "ordType", "px", "sz"}
+    protected = harness.build_manifest("6a", MARKET, run_id="run0000000")["requests"][0]["body"]
+    # Only the protection fields and the price may differ from the accepted cell.
+    assert {key: value for key, value in body.items() if key != "px"} == {
+        key: value for key, value in protected.items()
+        if key not in {"px", "tpTriggerPx", "slTriggerPx"}
+    }
+
+
+def test_every_other_cell_still_attaches_protection(harness):
+    for cell in harness.CELLS:
+        if cell == "v":
+            continue
+        body = harness.build_manifest(cell, MARKET, run_id="run0000000")["requests"][0]["body"]
+        assert "tpTriggerPx" in body and "slTriggerPx" in body
