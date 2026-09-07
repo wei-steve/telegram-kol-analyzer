@@ -416,3 +416,14 @@ def test_the_three_protection_modes_differ_only_in_the_protection_fields(harness
     strip = lambda body: {k: v for k, v in body.items()
                           if k not in {"px", "tpTriggerPx", "slTriggerPx"}}
     assert strip(both) == strip(stop_only) == strip(neither)
+
+
+def test_the_visibility_probe_covers_both_pending_endpoints(harness):
+    source = SCRIPT.read_text(encoding="utf-8")
+    probe = source[source.index("our_id = sorted(owned)[0]"):source.index("summary[\"orders_pending_probe\"]")]
+    assert probe.count("ORDERS_PENDING_V1") == 4
+    assert probe.count("ORDERS_PENDING_V2") == 3
+    # The exact-id filter is what a binding chain would actually use.
+    assert '"ordId": our_id' in probe
+    assert harness.ORDERS_PENDING_V1 == "/deepcoin/trade/orders-pending"
+    assert harness.ORDERS_PENDING_V2 == "/deepcoin/trade/v2/orders-pending"

@@ -53,6 +53,8 @@ BASE = "https://api.deepcoin.com"
 INST = "ETH-USDT-SWAP"
 ORDER_PATH = "/deepcoin/trade/order"
 CANCEL_PATH = "/deepcoin/trade/cancel-order"
+ORDERS_PENDING_V1 = "/deepcoin/trade/orders-pending"
+ORDERS_PENDING_V2 = "/deepcoin/trade/v2/orders-pending"
 LISTENKEY_PATH = "/deepcoin/listenkey/acquire"
 WS_URL = "wss://stream.deepcoin.com/v1/private"
 WS_TABLES = ("Order", "Trade", "Position", "TriggerOrder")
@@ -826,16 +828,28 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
             # Cell 11 found orders-pending empty for a live limit order under
             # every parameter variant.  Repeat that probe here, where the only
             # difference is that this order carries no attached protection.
+            # V1 /trade/orders-pending has no documentation page at all -- every
+            # candidate slug 404s and the sidebar's "get pending orders" entry
+            # points at V2 -- so the endpoint production calls may simply be the
+            # wrong one. Probe both, with the exact ordId as a filter too.
             probes = {}
-            for label, params in (
-                ("instType+instId", {"instType": "SWAP", "instId": INST}),
-                ("instType+instId+limit", {"instType": "SWAP", "instId": INST, "limit": 100}),
-                ("instType only", {"instType": "SWAP"}),
-                ("instType+instId+mrgPosition", {"instType": "SWAP", "instId": INST,
-                                                 "mrgPosition": "split"}),
+            our_id = sorted(owned)[0]
+            for label, path, params in (
+                ("v1 instType+instId", ORDERS_PENDING_V1,
+                 {"instType": "SWAP", "instId": INST}),
+                ("v1 instType+instId+limit", ORDERS_PENDING_V1,
+                 {"instType": "SWAP", "instId": INST, "limit": 100}),
+                ("v1 instType only", ORDERS_PENDING_V1, {"instType": "SWAP"}),
+                ("v1 +mrgPosition", ORDERS_PENDING_V1,
+                 {"instType": "SWAP", "instId": INST, "mrgPosition": "split"}),
+                ("v2 index=1 +instId", ORDERS_PENDING_V2,
+                 {"index": 1, "instId": INST, "limit": 100}),
+                ("v2 index=1 no instId", ORDERS_PENDING_V2, {"index": 1, "limit": 100}),
+                ("v2 index=1 by ordId", ORDERS_PENDING_V2,
+                 {"index": 1, "ordId": our_id, "limit": 100}),
             ):
                 try:
-                    rows = signed_get("/deepcoin/trade/orders-pending", params)
+                    rows = signed_get(path, params)
                     probes[label] = {
                         "row_count": len(rows),
                         "contains_our_order": any(str(row.get("ordId")) in owned for row in rows),
