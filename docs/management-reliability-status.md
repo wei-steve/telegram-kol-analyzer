@@ -14,8 +14,8 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 1b
 current_step_file: docs/plans/2026-09-07-management-reliability/step-1b-convergence-retry-whitelist.md
-step_status: planned          # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+step_status: claimed          # planned | claimed | in_progress | completed | blocked
+claimed_by: local_16ec4b63-93bc-4cac-811c-a290343b49f9
 last_completed_step: 1
 last_completed_commit: b1c12213ad2740e08ac1ecdba39e843e55ce239f
 user_decisions_2026_09_07:
