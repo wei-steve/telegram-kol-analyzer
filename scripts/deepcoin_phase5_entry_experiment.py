@@ -889,10 +889,15 @@ def cancel_exact(root: Path, order_id: str, *, execute: bool) -> int:
                                            "tpTriggerPrice", "slTriggerPrice")}
             for row in signed_get("/deepcoin/trade/trigger-orders-pending", {**base, "limit": 100})
         ]
+        # An empty read-back is unknown, never "gone": the exact-id read is
+        # transiently empty for a few seconds right after a state change
+        # (observed 2026-09-07 on ordId 1001125169392530).
+        after = summary["order_after"]
         summary["status"] = (
             "cancelled"
             if summary["cancel"]["outcome"] == "accepted"
-            and all(str(row.get("state")) == "canceled" for row in summary["order_after"])
+            and len(after) == 1
+            and str(after[0].get("state")) == "canceled"
             else "cancel_unresolved_manual_review"
         )
     except Exception as exc:

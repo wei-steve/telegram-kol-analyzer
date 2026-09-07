@@ -285,3 +285,33 @@ def test_a_dry_run_cancel_does_not_block_the_real_one(harness, tmp_path, monkeyp
     # The second call must not collide with the first call's evidence directory.
     assert harness.cancel_exact(tmp_path, "1", execute=False) == 0
     assert len(list(tmp_path.glob("manual-cancel-1-*"))) == 2
+
+
+def test_an_empty_read_back_after_cancel_is_unresolved_not_success(harness, tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "load_worker_credentials", lambda: {"worker_pid": "1"})
+    monkeypatch.setattr(harness, "write_once",
+                        lambda *a, **k: {"outcome": "accepted", "ordId": "1"})
+    monkeypatch.setattr(harness.time, "sleep", lambda *a: None)
+    reads = iter([[{"ordId": "1", "state": "live", "accFillSz": "0"}], [], [], []])
+    monkeypatch.setattr(
+        harness, "signed_get",
+        lambda path, params=None, **kw: next(reads) if path == "/deepcoin/trade/order" else [],
+    )
+    # The exact-id read is transiently empty right after a state change.
+    assert harness.cancel_exact(tmp_path, "1", execute=True) == 1
+
+
+def test_a_confirmed_canceled_read_back_is_success(harness, tmp_path, monkeypatch):
+    monkeypatch.setattr(harness, "load_worker_credentials", lambda: {"worker_pid": "1"})
+    monkeypatch.setattr(harness, "write_once",
+                        lambda *a, **k: {"outcome": "accepted", "ordId": "1"})
+    monkeypatch.setattr(harness.time, "sleep", lambda *a: None)
+    reads = iter([
+        [{"ordId": "1", "state": "live", "accFillSz": "0"}],
+        [{"ordId": "1", "state": "canceled", "accFillSz": "0"}],
+    ])
+    monkeypatch.setattr(
+        harness, "signed_get",
+        lambda path, params=None, **kw: next(reads) if path == "/deepcoin/trade/order" else [],
+    )
+    assert harness.cancel_exact(tmp_path, "1", execute=True) == 0
