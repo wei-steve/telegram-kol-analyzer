@@ -13,12 +13,16 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 5b
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5b-rate-limiter.md
+current_phase: 5
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5-order-entry-cutover.md
 phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-claimed_by: local_3a8d3395-5c93-41e9-a40b-deb460fbc7a1
-last_completed_phase: 5a
-last_completed_commit: 86825b8915377574b6c7fed7d98ab3d2e792ac4e
+                                      # 阶段 5 本体续做：迁移代码在分支 rest-ws/phase-5-order-entry
+                                      # （94dc4632，17 提交，未部署未合并），须先 rebase 到
+                                      # codex/deepcoin-auto-trading-v1 最新（已含 5a + 5b）再继续；
+                                      # 任务 1/3/4 未完成。阶段 5 改交易所写入语义，需用户单独批准。
+claimed_by:
+last_completed_phase: 5b
+last_completed_commit: 230ba1cc8097d30ed89c860608467f17680a14ca
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
 ```
 
@@ -266,6 +270,56 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- phase-5b-completed (2026-09-07, 会话 local_3a8d3395, **阶段 5b 完成**):
+  分支 `rest-ws/phase-5b-rate-limiter`，提交 `230ba1cc8097d30ed89c860608467f17680a14ca`
+  （rebase 到 A 线 `e402692c` 之后），已 `tg-deploy` 上线；**回滚 SHA
+  `e402692c149e8d7ac0a993cf73e17e8b3c330156`**（部署前生产 HEAD）。
+  **识别**：只有 `HTTP 401` 且响应体 `code=50000` 才是 `DeepcoinRateLimited`（`DeepcoinClientError`
+  子类，带 `retry_after`）；其余 401（含非 JSON body）仍按认证失败处理，绝不因此重试——否则一个坏签名
+  会变成静默重试循环。**重试只对 GET、最多 1 次**（等 `Retry-After`，无则按实测 1 秒，上限 2 秒）；
+  **POST 一律不重试**，被限流的写入仍是"结果未知"，沿用 `DeepcoinRequestOutcomeUnknown`（硬性禁止第 2 条）。
+  **配额按角色分配，不是平均分**（`DEEPCOIN_READ_LIMIT_PER_SECOND_BY_ROLE`，由
+  `TELEGRAM_KOL_RUNTIME_ROLE` 解析）：worker 3/s、web 1/s、ingest 1/s，合计正好 5；`all`（本地单进程）
+  持三份=5；其余进程（运维 CLI、临时脚本）取最小份额 1/s。**先按 2/2/2 上线（618a8524）并实测否决**：
+  轮时长中位 13.8s → 32–44s，轮间隔 44s → 65s，是拿保护收敛延迟换 web/ingest 用不到的余量；指挥会话
+  裁定改 3/1/1（见 phase-5b-ruling）。做成常量而非运行时开关是刻意的——这组数只有作为一组才安全。
+  **按物理 HTTP 请求计数**：V2 分页每页一个令牌，重试再取一个，缓存命中不取（5a 裁定第 4 条）。
+  **轮内缓存**：`begin_round_read_cache()` / `end_round_read_cache()` 在 `_request` 层按请求路径缓存
+  positions / trigger-orders-pending / orders-pending（因此 `list_` 与 `read_` 两个读法自动共用一份）。
+  **经同一 client 的任何写入立即整体作废缓存**，写后再读一定是新读；轮结束无条件丢弃，绝不跨轮。
+  离线按生产 3 个 instId 精确计数：安静轮 15 → 14 次 GET，一轮加载两次快照且中间无写入 29 → 23
+  （三个可缓存端点 11 → 5），**真实"有写入"工作轮 29 → 28**——正确性优先于省请求，这是设计如此。
+  **健康端点**新增 `read_limit_per_second`、`rate_limited_last_hour`、`retry_after_waits_last_hour`
+  以及供后续项用的 `read_requests_last_hour` / `read_throttled_seconds_last_hour`。
+  **测试**：focused 34 项通过；全量 **7674 passed / 0 failed / 4 skipped**；
+  `tests/test_runtime_event_loop_blocking_census.py` 通过（重试等待在管理工作线程，不在事件循环）。
+  **观察窗口 `2026-09-07T22:48:06Z ~ 23:39:08Z`，51 个连续健康采样点，零不健康**：HEAD 恒为部署 SHA、
+  三单元 51/51 active、NRestarts 全程 0、`complete` 恒 true、交易所指纹逐字节恒为
+  `c4cd87ec9db6b3bf4d3a38ba1a858fb8e90a586c4836a6a51617016e5698e50a`（position_count=3,
+  open_order_count=0）、WS state 恒 healthy、open_gap 恒 0、`reconcile_failures_last_hour` 恒 0。
+  末次采样近 30 分钟**真实消息 5 条 / 3 个群**——满足 ≥5 条门槛，**并且达到了 L2「尽量 2 个群」的偏好项**
+  （5a 未达到）。**`rate_limited_last_hour` 与 `retry_after_waits_last_hour` 51 个采样点全为 0，
+  journal 401 自部署起 0 次**（部署前基线 3 小时 14 次 / 1 小时 6 次，全在 worker 的
+  trigger-orders-pending）。`execution_events` 与 `runtime_incidents` 自部署起均为 0，即零撤单、
+  零非预期交易所写入；reconcile 结论与部署前一致（bindings 恒 174、shadow candidates_seen 恒 14）。
+  **重要发现（B-5c 基线）**：401 不是偶发突刺。worker 的持续读需求实测 **8747 次/小时 = 2.43 次/秒**，
+  顶满 3/s 份额，**49.5% 的墙钟时间在等令牌**（180 秒抽样复核：437 次 / 89.1 秒，同为 2.43/s、49%）。
+  部署前它无节制地跑在约 4.5 次/秒，持续贴着账户 5/s 天花板——这才是 401 的成因。一个周期全进程约
+  145 次物理 GET，其中 reconcile 本体只占约 17 次，而 `runtime_worker_executor` 是 `max_workers=1`
+  的单线程执行器，所有管理循环共用，那 49% 的等待被串行叠加进每个循环——**这才是轮次变慢的真实机制，
+  不是 reconcile 自己的读多**。因此 2/s → 3/s 几乎没有改善（需求远在两者之上），**没有哪个配额取值能
+  同时拿到零 401 和原来的时延**；降需求是独立后续项 B-5c，不是调参。轮间隔 62s 只是**无事件时的兜底**，
+  阶段 3 起真实成交由 WS 唤醒立即触发 reconcile，保护面不依赖它。事件循环停顿无回归（部署后 3 小时
+  1 次，部署前等长窗口 1 次；阻塞在管理工作线程而非事件循环）。
+  证据目录：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-5b/`
+  （`window-summary.txt`、`observer-samples.jsonl` 51 行、`window-end-snapshot.json`、
+  以及被否决/中间版本的 `observer-samples-2ps-superseded.jsonl`、
+  `observer-samples-323b98b4-superseded.jsonl`）。
+  **未做**：未合并；未改阶段 5 迁移本体（分支 `rest-ws/phase-5-order-entry` 仍未部署未合并）；
+  未碰 `execution_bindings.py` / `trigger_take_profit_convergence_executor.py` / `native_tpsl.py`（A 线在用）。
+  **遗留观察（未处理，未来某阶段可考虑）**：`web_app.bind_live_position` 是 async 端点却直接同步调
+  `list_positions()`，本阶段让它在事件循环上最多多等约 1 秒令牌 + 2 秒重试。属既有问题（那里本来就有
+  15 秒超时的同步网络调用），人工触发、极少发生，未改以免动到权威路径。
 - phase-5a-completed (2026-09-07, 会话 local_32e174b0, **阶段 5a 完成**):
   分支 `rest-ws/phase-5a-open-orders-v2`，提交 `86825b8915377574b6c7fed7d98ab3d2e792ac4e`
   （rebase 到 A 线 `af6f2515` 之后），已 `tg-deploy` 上线；**回滚 SHA
