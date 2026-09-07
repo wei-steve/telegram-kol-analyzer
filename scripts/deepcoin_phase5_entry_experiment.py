@@ -782,10 +782,8 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
         summary["error_type"] = type(exc).__name__
         summary["reason"] = str(exc)
     finally:
-        if capture is not None:
-            capture.stop()
-            summary["ws_frames"] = capture.frames
-            summary["ws_error_type"] = capture.error_type
+        # The WebSocket stays subscribed through cleanup: cancelling an entry
+        # also moves its attached TPSL, and those frames are evidence too.
         if submitted:
             try:
                 # Cancel only the ordIds this run received.  A filled position is
@@ -820,6 +818,13 @@ def run_cell(root: Path, cell: str, *, execute: bool, confirm_cancel_candidate: 
             summary["notice"] = (
                 "只撤销本次收到 ordId 的未成交挂单；已成交仓位与其 TP/SL 不自动平仓、不自动撤销。"
             )
+        if capture is not None:
+            # Give the cancellation frames a moment to arrive before closing.
+            time.sleep(3)
+            capture.stop()
+            summary["ws_frames"] = capture.frames
+            summary["ws_error_type"] = capture.error_type
+            summary["ws_rows_total"] = len(read_ws_rows(out))
         summary["finished_at"] = utc()
         durable_json(out / "cell-summary.json", summary)
         print(json.dumps(summary, ensure_ascii=False, indent=2), flush=True)
