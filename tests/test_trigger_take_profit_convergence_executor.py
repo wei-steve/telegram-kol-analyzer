@@ -2746,3 +2746,127 @@ def test_terminal_entry_leg_conflicts_on_mismatched_take_profit_owner(tmp_path):
     assert convergence.status == "conflicted"
     assert convergence.reason_code == "convergence_take_profit_ownership_mismatch"
     assert order.status == "active"
+
+
+# The 2026-09-07 incident row, verbatim from
+# docs/2026-09-07-management-instruction-incident-read-only-diagnosis.md section 4.2:
+# a Conditional *entry* leg whose own side is the entry direction, carrying the
+# stop it will attach once it fills.  It is not a protection order and must not
+# be held to protective-close side invariants.
+_ENTRY_CONDITIONAL_ROW = {
+    "instId": "BTC-USDT-SWAP",
+    "ordId": "1001125163581473",
+    "triggerOrderType": "Conditional",
+    "side": "buy",
+    "posSide": "long",
+    "sz": "10",
+    "triggerPx": "79190",
+    "ordPx": "79190",
+    "closeSLTriggerPrice": "78500",
+}
+
+
+def test_entry_conditional_row_does_not_veto_take_profit_convergence(tmp_path):
+    """An unfilled entry trigger order must not veto staged take-profit writes."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "tp-entry-conditional.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _Client()
+    client.pending.append(dict(_ENTRY_CONDITIONAL_ROW))
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["reason"] != "convergence_pending_alias_conflict"
+    assert result["status"] == "submitted"
+    assert [payload["sz"] for payload in client.submit_calls] == ["5", "3", "2"]
+
+
+def test_entry_conditional_row_appearing_between_tiers_does_not_veto_next_write(
+    tmp_path,
+):
+    """The same narrowing applies to the pre-write revalidation snapshot."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    class LateEntryLegClient(_Client):
+        def read_trigger_orders_pending(self, *, inst_id):
+            response = super().read_trigger_orders_pending(inst_id=inst_id)
+            if self.submit_calls:
+                response["data"].append(dict(_ENTRY_CONDITIONAL_ROW))
+            return response
+
+    session_factory = create_session_factory(tmp_path / "tp-late-entry-conditional.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = LateEntryLegClient()
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["reason"] != "convergence_pending_alias_conflict_before_write"
+    assert result["status"] == "submitted"
+    assert [payload["sz"] for payload in client.submit_calls] == ["5", "3", "2"]
+
+
+def test_inconsistent_protection_row_still_vetoes_with_attributable_detail(tmp_path):
+    """A genuine protection row keeps the veto, and records the deciding fields."""
+
+    import json
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        execute_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "tp-protection-conflict.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _Client()
+    client.pending.append(
+        {
+            "instId": "BTC-USDT-SWAP",
+            "ordId": "sl-conflicted",
+            "triggerOrderType": "TPSL",
+            "side": "sell",  # Closing a short is a buy; this row contradicts itself.
+            "posSide": "short",
+            "sz": "10",
+            "slTriggerPx": "67200",
+            "closeSLTriggerPrice": "67200",
+        }
+    )
+
+    result = execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "conflicted"
+    assert result["reason"] == "convergence_pending_alias_conflict"
+    assert client.submit_calls == []
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        detail = json.loads(convergence.error_json)
+    assert detail["reason_code"] == "convergence_pending_alias_conflict"
+    rows = detail["refusal_detail"]["conflicting_rows"]
+    assert [row["ordId"] for row in rows] == ["sl-conflicted"]
+    assert rows[0]["side"] == "sell"
+    assert rows[0]["posSide"] == "short"
+    assert rows[0]["triggerOrderType"] == "TPSL"

@@ -20,6 +20,7 @@ from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionProtectionLeg
 from telegram_kol_research.native_tpsl import NativeTpslExpectation
+from telegram_kol_research.native_tpsl import is_protection_order_row
 from telegram_kol_research.native_tpsl import match_native_tpsl_order
 from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.native_tpsl import protection_order_sides_consistent
@@ -640,10 +641,10 @@ def _unowned_pending_stop_can_affect_position(
         order_types = _text_alias_values(
             raw, "triggerOrderType", "trigger_order_type", transform=str.upper
         )
-        if order_types and order_types != {"TPSL"}:
-            if len(order_types) == 1:
-                continue
-            return True
+        if not is_protection_order_row(raw):
+            # An entry trigger order carries the stop it will attach on fill;
+            # its own side opens the position and cannot affect this one yet.
+            continue
         if order_types != {"TPSL"} or not _native_tpsl_aliases_consistent(raw):
             return True
         instrument_ids = _text_alias_values(
@@ -698,7 +699,7 @@ def _pending_matches_backup(
         [
             row
             for row in pending
-            if _native_tpsl_aliases_consistent(row)
+            if is_protection_order_row(row) and _native_tpsl_aliases_consistent(row)
         ],
         NativeTpslExpectation(
             purpose="stop_loss",
@@ -730,7 +731,8 @@ def _pending_matches_primary(
     exact = [
         order
         for raw in pending
-        if _native_tpsl_aliases_consistent(raw)
+        if is_protection_order_row(raw)
+        and _native_tpsl_aliases_consistent(raw)
         and (order := normalize_native_tpsl(raw)) is not None
         and order.ord_id == order_id
     ]
@@ -741,7 +743,7 @@ def _pending_matches_primary(
         [
             row
             for row in pending
-            if _native_tpsl_aliases_consistent(row)
+            if is_protection_order_row(row) and _native_tpsl_aliases_consistent(row)
         ],
         NativeTpslExpectation(
             purpose="stop_loss",

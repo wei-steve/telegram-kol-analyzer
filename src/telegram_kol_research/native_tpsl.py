@@ -66,6 +66,38 @@ def protection_order_position_sides(payload: dict[str, Any]) -> set[str]:
     }
 
 
+def native_tpsl_row_order_types(payload: dict[str, Any]) -> set[str]:
+    """Uppercased order-type aliases DeepCoin returns for one trigger-order row."""
+    return {
+        str(payload[key]).strip().upper()
+        for key in ("triggerOrderType", "trigger_order_type")
+        if payload.get(key) is not None and str(payload[key]).strip()
+    }
+
+
+def is_protection_order_row(payload: dict[str, Any]) -> bool:
+    """Structurally decide whether one pending row is a protection (TPSL) order.
+
+    ``GET /deepcoin/trade/trigger-orders-pending`` types every row with
+    ``triggerOrderType``.  Observed values are ``TPSL`` for position protection
+    and ``Conditional`` for a price-triggered *entry* order, which carries
+    ``closeSLTriggerPrice`` for the stop it will attach once it fills.  The two
+    kinds differ in what ``side`` means: a protection row closes the position
+    (side opposite ``posSide``), an entry row opens it (side same as
+    ``posSide``).  See ``docs/2026-09-05-deepcoin-order-vs-trigger-order.md``
+    (the trigger-order type field is ``orderType``/``triggerOrderType``, and the
+    entry trigger price lives only on trigger orders) and the observed rows in
+    ``docs/2026-09-07-management-instruction-incident-read-only-diagnosis.md``
+    section 4.2.
+
+    The type field, never a price or a size, is the only classifier used here.
+    A row whose type is absent or self-contradictory is treated as a protection
+    row so malformed protective state still fails closed.
+    """
+    order_types = native_tpsl_row_order_types(payload)
+    return len(order_types) != 1 or order_types == {"TPSL"}
+
+
 def protection_order_sides_consistent(payload: dict[str, Any]) -> bool:
     """Check protective close direction without inferring position ownership.
 

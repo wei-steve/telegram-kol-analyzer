@@ -45,6 +45,7 @@ from telegram_kol_research.protection_snapshot import (
 from telegram_kol_research.take_profit_plan import TakeProfitPlanError, build_take_profit_plan
 from telegram_kol_research.trading_settings import load_trading_settings
 from telegram_kol_research.native_tpsl import (
+    is_protection_order_row,
     native_tpsl_order_id_is_unique,
     protection_order_position_sides,
     protection_order_sides_consistent,
@@ -54,6 +55,31 @@ from telegram_kol_research.native_tpsl import (
     native_tpsl_take_profit_is_market,
     normalize_native_tpsl,
 )
+
+
+class _RefusalReason(str):
+    """A refusal reason code that also carries the row fields that produced it.
+
+    Refusals travel through this module as plain reason-code strings.  Keeping
+    the deciding field values attached to the same value lets the caller persist
+    attributable evidence without changing any control flow or adding a column.
+    """
+
+    __slots__ = ("refusal_detail",)
+
+    def __new__(cls, reason: str, refusal_detail: dict[str, object]):
+        instance = super().__new__(cls, reason)
+        instance.refusal_detail = refusal_detail
+        return instance
+
+
+def _refusal_detail_json(reason: object) -> str | None:
+    detail = getattr(reason, "refusal_detail", None)
+    if not detail:
+        return None
+    return json.dumps(
+        {"reason_code": str(reason), "refusal_detail": detail}, ensure_ascii=False
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,7 +131,8 @@ def plan_trigger_take_profit_convergence(
                 if prepared == "convergence_waiting_backup_stop"
                 else "conflicted" if prepared.startswith("convergence_") else "blocked"
             )
-            convergence.reason_code = prepared
+            convergence.reason_code = str(prepared)
+            convergence.error_json = _refusal_detail_json(prepared)
             if planned_at is not None:
                 convergence.updated_at = planned_at
             session.commit()
@@ -418,10 +445,10 @@ def _freeze(session_factory, convergence_id: int, now: datetime, reason: str, er
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
         if convergence is not None and convergence.status in {"ready", "reserved"}:
             convergence.status = "submit_unknown" if reason.endswith("unknown") else "conflicted"
-            convergence.reason_code = reason
+            convergence.reason_code = str(reason)
             convergence.error_json = (
                 json.dumps({"type": type(error).__name__, "message": str(error)[:512]}, ensure_ascii=False)
-                if error is not None else None
+                if error is not None else _refusal_detail_json(reason)
             )
             convergence.completed_at = now
             convergence.updated_at = now
@@ -502,13 +529,8 @@ def _prepare_plan(
         )
     except Exception:
         return "convergence_exact_live_position_not_verified"
-    if any(
-        _row_has_protection_fields(row)
-        and not _native_tpsl_aliases_consistent(row)
-        for row in pending
-        if isinstance(row, dict)
-    ):
-        return "convergence_pending_alias_conflict"
+    if detail := _pending_alias_conflict_detail(pending):
+        return _RefusalReason("convergence_pending_alias_conflict", detail)
     size = _positive_decimal(position.get("pos") or position.get("size"))
     assert size is not None
     stop_rows = (
@@ -742,13 +764,10 @@ def _revalidate_take_profit_write(
         )
     except Exception:
         return "convergence_exchange_prewrite_snapshot_incomplete"
-    if any(
-        _row_has_protection_fields(row)
-        and not _native_tpsl_aliases_consistent(row)
-        for row in pending
-        if isinstance(row, dict)
-    ):
-        return "convergence_pending_alias_conflict_before_write"
+    if detail := _pending_alias_conflict_detail(pending):
+        return _RefusalReason(
+            "convergence_pending_alias_conflict_before_write", detail
+        )
     if _positive_decimal(position.get("pos")) != _positive_decimal(
         expected_position_size
     ):
@@ -1282,6 +1301,49 @@ def _native_tpsl_aliases_consistent(row: dict[str, object]) -> bool:
 def _normalize_position_side_alias(value: str) -> str:
     normalized = str(value).strip().lower()
     return {"buy": "long", "sell": "short"}.get(normalized, normalized)
+
+
+# Every field the pending-row alias check reads, so a refusal can quote the
+# exact payload text it decided on rather than only the conclusion.
+_ALIAS_DECISION_KEYS = (
+    "ordId", "orderId", "order_id", "id",
+    "instId", "instrument_id", "instrumentId",
+    "posId", "pos_id", "closePosId",
+    "posSide", "pos_side", "side",
+    "triggerOrderType", "trigger_order_type",
+    "sz", "size", "orderSize",
+    "slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice",
+    "tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice",
+    "slOrdPx", "slOrderPrice", "tpOrdPx", "tpOrderPrice",
+)
+
+
+def _pending_alias_conflict_detail(pending) -> dict[str, object] | None:
+    """Veto only on protection rows whose own aliases disagree with each other.
+
+    An unfilled entry trigger order carries ``closeSLTriggerPrice`` for the stop
+    it will attach on fill, and its ``side`` opens rather than closes the
+    position, so protective-close invariants do not apply to it.
+    ``is_protection_order_row`` decides that structurally, from the order-type
+    field alone.
+    """
+
+    conflicts = [
+        row
+        for row in pending
+        if isinstance(row, dict)
+        and is_protection_order_row(row)
+        and _row_has_protection_fields(row)
+        and not _native_tpsl_aliases_consistent(row)
+    ]
+    if not conflicts:
+        return None
+    return {
+        "conflicting_rows": [
+            {key: row[key] for key in _ALIAS_DECISION_KEYS if key in row}
+            for row in conflicts
+        ]
+    }
 
 
 def _row_has_protection_fields(row: dict[str, object]) -> bool:
