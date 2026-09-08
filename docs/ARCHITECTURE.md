@@ -351,6 +351,11 @@ historical_state_repair.py               position_management_remediation.py
   只看仓位行会得出"裸仓"的错误结论，进而做出错误的补挂动作。
   **判据只有一个**：读 `trigger-orders-pending`，筛 `triggerOrderType == "TPSL"`
   且 `posSide` 与仓位一致的行，看 `slTriggerPrice`。
+  **字段名也不要想当然**：这个端点上叫 `slTriggerPrice` / `tpTriggerPrice`（另有
+  `closeSLTriggerPrice` / `closeTPTriggerPrice`），**不是**仓位行上的 `slTriggerPx` /
+  `tpTriggerPx`。取一个不存在的键得到 `None`，读起来和"交易所没有这张单"一模一样——
+  A-5b 因此两次把有止损的仓位判成裸仓，其中一次差点让人去手动补挂。
+  排查这类问题时先原样打印整行 JSON，再挑字段。
   同一份返回里 `triggerOrderType == "Conditional"` 的行是**挂单入场**（开仓方向的
   `side`），不是保护单，别把它算进保护里。
 - **这台机器的本地时区是 UTC+8，而数据库里所有时间戳是 UTC。** 两者差 8 小时，
