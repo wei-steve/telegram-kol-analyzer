@@ -19,6 +19,9 @@ from sqlalchemy import tuple_
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig, load_ai_recognition_config
+from telegram_kol_research.deferred_instruction_recovery import (
+    expire_stale_deferred_instructions,
+)
 from telegram_kol_research.contextual_message_window import (
     fetch_missing_reply_target,
 )
@@ -117,8 +120,17 @@ def _enqueue_processing_jobs(
     message_keys: list[tuple[int, int]] | None = None,
     raw_message_ids: list[int] | None = None,
     last_reason: str,
+    resume_terminal_jobs: bool = False,
 ) -> list[int]:
-    """Idempotently create queue jobs for the given messages."""
+    """Idempotently create queue jobs for the given messages.
+
+    ``resume_terminal_jobs`` widens the upsert to also re-arm a **settled**
+    non-shadow job. A-3 needs it: a message deferred behind a source-deletion
+    exit already owns a ``succeeded`` job row, so without this the upsert is a
+    no-op and the deferral is never revisited. The widening deliberately stops
+    at terminal statuses -- a ``pending`` or ``claimed`` row means a consumer
+    already owns the message, and resetting it would cancel that claim.
+    """
 
     with session_factory() as session:
         query = session.query(RawMessage.id, RawMessage.chat_id)
@@ -141,6 +153,35 @@ def _enqueue_processing_jobs(
             )
         if not rows:
             return []
+        # Rows left behind by the retired shadow pipeline are adopted only once
+        # they are terminal, or once a pending one has sat unclaimed long enough
+        # to prove no consumer owns it.
+        adoption_condition = and_(
+            MessageProcessingJob.shadow.is_(True),
+            or_(
+                MessageProcessingJob.status.in_(
+                    ("succeeded", "failed", "expired")
+                ),
+                and_(
+                    MessageProcessingJob.status == "pending",
+                    MessageProcessingJob.enqueued_at
+                    <= utc_now() - timedelta(minutes=5),
+                ),
+            ),
+        )
+        # A-3 resume: re-arm a settled live job so a deferral can be revisited.
+        # Restricted to terminal statuses so an in-flight claim is never reset,
+        # which is also what makes a repeated resume land exactly once.
+        resume_condition = (
+            and_(
+                MessageProcessingJob.shadow.is_(False),
+                MessageProcessingJob.status.in_(
+                    ("succeeded", "failed", "expired")
+                ),
+            )
+            if resume_terminal_jobs
+            else None
+        )
         insert_statement = sqlite_insert(MessageProcessingJob).values(
             [
                 {
@@ -155,9 +196,6 @@ def _enqueue_processing_jobs(
                 for row in rows
             ]
         )
-        # Rows left behind by the retired shadow pipeline are adopted only once
-        # they are terminal, or once a pending one has sat unclaimed long enough
-        # to prove no consumer owns it.
         statement = insert_statement.on_conflict_do_update(
             index_elements=["raw_message_id"],
             set_={
@@ -172,18 +210,10 @@ def _enqueue_processing_jobs(
                 "completed_at": None,
                 "shadow": False,
             },
-            where=and_(
-                MessageProcessingJob.shadow.is_(True),
-                or_(
-                    MessageProcessingJob.status.in_(
-                        ("succeeded", "failed", "expired")
-                    ),
-                    and_(
-                        MessageProcessingJob.status == "pending",
-                        MessageProcessingJob.enqueued_at
-                        <= utc_now() - timedelta(minutes=5),
-                    ),
-                ),
+            where=(
+                or_(adoption_condition, resume_condition)
+                if resume_condition is not None
+                else adoption_condition
             ),
         )
         session.execute(statement)
@@ -1344,6 +1374,14 @@ async def run_authoritative_gap_recovery_loop(
                         authoritative_processor=authoritative_processor,
                         message_limit=message_limit,
                     )
+            # A-3, unconditional: a deferral that outlived its timeout must be
+            # reported even when recognition authority is absent, because
+            # nothing else in the system will ever look at it again. Pure
+            # database work, so it goes off the loop like everything else here.
+            await asyncio.to_thread(
+                expire_stale_deferred_instructions,
+                session_factory,
+            )
         except asyncio.CancelledError:
             raise
         except Exception:

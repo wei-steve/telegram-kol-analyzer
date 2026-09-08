@@ -607,6 +607,35 @@ def test_authoritative_gap_recovery_max_age_minutes_defaults_and_round_trips(tmp
     )
 
 
+def test_deferred_resume_timeout_minutes_defaults_and_round_trips(tmp_path):
+    """A-3. How long a deferral behind a source-deletion exit may stay open."""
+
+    session_factory = create_session_factory(tmp_path / "deferred-resume.db")
+
+    assert (
+        load_trading_settings(session_factory).deferred_resume_timeout_minutes
+        == 30.0
+    )
+
+    saved = save_trading_settings(
+        session_factory, {"deferred_resume_timeout_minutes": 90.0}
+    )
+
+    assert saved.deferred_resume_timeout_minutes == 90.0
+    assert (
+        load_trading_settings(session_factory).deferred_resume_timeout_minutes
+        == 90.0
+    )
+
+
+@pytest.mark.parametrize("value", [0, -5, "not-a-number", None])
+def test_deferred_resume_timeout_minutes_fails_open_to_default(value):
+    settings = trading_settings_from_payload(
+        {"deferred_resume_timeout_minutes": value}
+    )
+    assert settings.deferred_resume_timeout_minutes == 30.0
+
+
 @pytest.mark.parametrize("value", [0, -5, "not-a-number", None])
 def test_authoritative_gap_recovery_max_age_minutes_fails_open_to_default(value):
     """Invalid values fail OPEN to the safe 15-minute default, not raise -

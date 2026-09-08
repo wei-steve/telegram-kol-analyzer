@@ -98,6 +98,7 @@ class TradingSettings:
     worker_command_mode: Literal["queue"] = "queue"
     semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
+    deferred_resume_timeout_minutes: float = 30.0
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -559,6 +560,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("authoritative_gap_recovery_max_age_minutes"),
         defaults.authoritative_gap_recovery_max_age_minutes,
     )
+    deferred_resume_timeout_minutes = _positive_float(
+        raw.get("deferred_resume_timeout_minutes"),
+        defaults.deferred_resume_timeout_minutes,
+    )
     mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
         raw.get(
             "mimo_v2_activation_after_raw_message_id",
@@ -619,6 +624,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         authoritative_gap_recovery_max_age_minutes=(
             authoritative_gap_recovery_max_age_minutes
         ),
+        deferred_resume_timeout_minutes=deferred_resume_timeout_minutes,
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,

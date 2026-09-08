@@ -469,6 +469,51 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_deferred_instruction_expired(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    deferred_minutes: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture an instruction that outlived its source-deletion deferral.
+
+    The message was recognised, its instruction items were created, and then
+    the barrier held it and nothing ever came back. It has a decision row, so
+    the authoritative gap recovery does not consider it missing; before A-3
+    that produced exactly zero events and zero alerts for 29 items, the oldest
+    from 2026-07-22. The instruction is never executed late, so this incident
+    is the entire operator-facing outcome.
+    """
+
+    if not config.captures("deferred_instruction_expired"):
+        return None
+    fixed = {
+        "component": "deferred_instruction",
+        "source_status": "expired",
+        "reason_code": "waiting_source_deletion_exit",
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="recognition_decision",
+        source_record_id=str(int(raw_message_id)),
+        incident_type="deferred_instruction_expired",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact=_safe_label(f"deferred_over_{int(deferred_minutes)}_minutes"),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_background_task_restart_exhausted(
     session_factory: sessionmaker,
     *,

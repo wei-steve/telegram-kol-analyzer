@@ -181,6 +181,15 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # A-2: a supervised background task gave up restarting, which means the
         # loop stays down until the process does.
         "background_task_restart_exhausted",
+        # A-3: a management stop was refused by the price gate. Production's
+        # first one (incident 2069, 2026-09-08 06:26:24Z, high) was never
+        # delivered, so a rejected stop looked exactly like an accepted one.
+        "management_stop_rejected",
+        # A-3: an instruction deferred behind a source-deletion exit sat past
+        # ``deferred_resume_timeout_minutes`` and is never executed. Nothing
+        # else reports it: the message already has a decision row, so gap
+        # recovery does not see it as missing.
+        "deferred_instruction_expired",
     }
 )
 

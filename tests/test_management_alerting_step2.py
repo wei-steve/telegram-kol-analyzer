@@ -58,6 +58,10 @@ def test_management_failure_types_are_folded_into_a_configured_whitelist():
         "context_worker_exhausted",
         "authoritative_execution_uncertain",
         "background_task_restart_exhausted",
+        # A-3 additions: a stop the price gate refused, and an instruction that
+        # expired behind a source-deletion deferral.
+        "management_stop_rejected",
+        "deferred_instruction_expired",
     ):
         assert config.notifies(incident_type) is True, incident_type
         assert config.captures(incident_type) is True, incident_type

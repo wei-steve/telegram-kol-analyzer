@@ -24,6 +24,7 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
     StrategyLifecycle,
+    utc_now,
 )
 
 
@@ -114,6 +115,10 @@ def create_message_instruction_items_in_session(
                         strategy_instance_id=strategy_instance_id,
                         idempotency_key=idempotency_key,
                         status="pending",
+                        # A-3: every status change stamps this, starting here.
+                        # A null one now means nothing has ever moved the item,
+                        # which is the shape all 29 stuck items had.
+                        last_progress_at=utc_now(),
                     )
                     session.add(item)
                     session.flush()
@@ -203,7 +208,7 @@ def claim_next_message_instruction_item(
                     MessageInstructionItem.visibility_next_attempt_at <= now,
                 ),
             )
-            .values(status="executing", updated_at=now)
+            .values(status="executing", updated_at=now, last_progress_at=now)
             .returning(MessageInstructionItem.id)
         )
         if item_id is None:
@@ -270,6 +275,7 @@ def defer_message_instruction_item_for_visibility(
             item.summary_notification_claim_token = None
             item.summary_notification_claimed_at = None
             item.updated_at = now
+            item.last_progress_at = now
             _update_linked_target_state_in_session(
                 session,
                 item_id=item.id,
@@ -290,6 +296,7 @@ def defer_message_instruction_item_for_visibility(
         item.visibility_retry_attempts = attempts
         item.visibility_next_attempt_at = now + timedelta(seconds=delay)
         item.updated_at = now
+        item.last_progress_at = now
         _update_linked_target_state_in_session(
             session,
             item_id=item.id,
@@ -344,6 +351,8 @@ def claim_next_visibility_retry_instruction_item(
                 summary_notification_claim_token=None,
                 summary_notification_claimed_at=None,
                 updated_at=now,
+                last_progress_at=now,
+                escalation_state="expired",
             )
         )
         session.flush()
@@ -406,7 +415,7 @@ def claim_next_visibility_retry_instruction_item(
                     ),
                 ),
             )
-            .values(status="executing", updated_at=now)
+            .values(status="executing", updated_at=now, last_progress_at=now)
             .returning(MessageInstructionItem.id)
         )
         if item_id is None:
@@ -499,6 +508,7 @@ def finish_message_instruction_item(
                 payload_json if effective_status in ERROR_STATUSES else None
             ),
             "updated_at": now,
+            "last_progress_at": now,
         }
         contract_guard = (
             _instruction_contract_mirror_guard(

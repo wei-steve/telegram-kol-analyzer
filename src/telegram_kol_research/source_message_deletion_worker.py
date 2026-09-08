@@ -530,7 +530,62 @@ def run_source_message_deletion_worker_tick(
         )
         counts["cancelled"] += 1
 
+    _resume_instructions_behind_finished_exits(
+        session_factory,
+        exit_ids=processed_exit_ids,
+        now=now,
+    )
     return SourceMessageDeletionWorkerResult(**counts)
+
+
+def _resume_instructions_behind_finished_exits(
+    session_factory,
+    *,
+    exit_ids: set[int],
+    now: datetime,
+) -> None:
+    """A-3: wake the messages an exit was holding, once it stops running.
+
+    Before A-3 a finished exit only enqueued its own notification, so a message
+    the barrier had answered ``hold`` for stayed ``deferred`` forever -- it
+    already owned a decision row, so the authoritative gap recovery never
+    counted it as missing either. The resume runs once per exit, in the tick
+    that took it out of ``_ACTIVE_STATES``: a terminal exit is never claimed
+    again, and the enqueue itself only re-arms a settled job, so a message
+    cannot be enqueued twice for the same release.
+
+    Best-effort by design. This is a compensation step appended after every
+    deletion-exit outcome is already committed, and a failure here must never
+    turn a completed exit back into an exception.
+    """
+
+    if not exit_ids:
+        return
+    from telegram_kol_research.deferred_instruction_recovery import (
+        resume_instructions_deferred_by_exit,
+    )
+
+    with session_factory() as session:
+        finished = [
+            int(exit_id)
+            for (exit_id,) in session.query(SourceMessageDeletionExit.id)
+            .filter(
+                SourceMessageDeletionExit.id.in_(tuple(sorted(exit_ids))),
+                SourceMessageDeletionExit.state.not_in(_ACTIVE_STATES),
+            )
+            .all()
+        ]
+    for exit_id in finished:
+        try:
+            resume_instructions_deferred_by_exit(
+                session_factory,
+                deletion_exit_id=exit_id,
+                now=now,
+            )
+        except Exception:
+            logger.exception(
+                "deferred instruction resume failed exit_id=%s", exit_id
+            )
 
 
 def _observe_source_deletion_management_contract(
