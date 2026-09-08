@@ -328,5 +328,11 @@ historical_state_repair.py               position_management_remediation.py
   但**不要绕过 `DeepcoinRestClient` 直接发 HTTP**，那会让限流器和计数同时失明。
 - 锁只在自己进程里有效（第 4.5 节）。要跨进程排他就用数据库状态，不要新加进程内全局锁，
   也不要把 `KeyedAsyncLockRegistry` 当成跨进程的锁用。
+- **运行时事件的告警类型有一组代码基线，env 只能加不能减**
+  （`config.MANDATORY_RUNTIME_INCIDENT_TYPES`）。`TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES`
+  与 `..._CAPTURE_TYPES` 只要**非空**，加载时就会与这组基线取并集：管理指令失败、权威执行落
+  uncertain、后台任务放弃重启这几类，不能因为运维改错了一行 env 就静音。两个关断位仍然有效：
+  键**缺席**等于"全类型"，键为**空串**等于"一条都不发"。要单独关掉基线里的某一类，只能改代码，
+  这是刻意的代价。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
   都是读错了需求，停下来问。

@@ -81,6 +81,10 @@ MANDATORY_RUNTIME_INCIDENT_TYPES = frozenset(
         "context_worker_exhausted",
         "management_recovery_required",
         "management_submit_unknown",
+        # Added for the REST+WebSocket line's phase 5 (critical). Both lines
+        # share one baseline on purpose: a rebase conflict here resolves as the
+        # union of the two sides, never as either side alone.
+        "market_fill_attribution_unverified",
     }
 )
 

@@ -305,6 +305,81 @@ def test_uncertain_authoritative_execution_records_a_high_incident(
     ).notifies("authoritative_execution_uncertain") is True
 
 
+def test_new_summary_fields_only_ever_carry_integers_or_safe_labels(tmp_path):
+    """The summary field set is closed on purpose; A-2 widened it by five keys.
+
+    Widening a redaction contract is only safe while every value going through
+    the new keys is either an integer or a ``_safe_label`` result. This drives
+    both new adapters with hostile input and checks what actually lands.
+    """
+
+    import re
+
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_authoritative_execution_uncertain,
+        capture_background_task_restart_exhausted,
+    )
+
+    session_factory = create_session_factory(tmp_path / "redaction.db")
+    config = RuntimeIncidentConfig(
+        capture_types=frozenset(
+            {
+                "authoritative_execution_uncertain",
+                "background_task_restart_exhausted",
+            }
+        )
+    )
+    capture_authoritative_execution_uncertain(
+        session_factory,
+        config=config,
+        attempt_id=372,
+        raw_message_id=15201,
+        occurred_at=NOW,
+        error_class="DeepcoinRequestOutcomeUnknown",
+        error_summary="Authorization: bearer sk-live-abcdef0123456789 leaked",
+    )
+    capture_background_task_restart_exhausted(
+        session_factory,
+        config=config,
+        task_name="system operator/bot command\u0000task",
+        consecutive_failures=10,
+        error_type="ReadTimeout",
+        occurred_at=NOW,
+    )
+
+    safe_label = re.compile(r"[A-Za-z0-9._-]*\Z")
+    new_keys = {
+        "attempt_id",
+        "consecutive_failures",
+        "error_summary",
+        "raw_message_id",
+        "task_name",
+    }
+    seen: set[str] = set()
+    with session_factory() as session:
+        rows = session.query(RuntimeIncident).all()
+        assert len(rows) == 2
+        for row in rows:
+            summary = json.loads(row.redacted_summary)
+            for key in new_keys & set(summary):
+                seen.add(key)
+                value = summary[key]
+                if isinstance(value, bool) or not isinstance(value, int):
+                    assert isinstance(value, str), (key, value)
+                    assert safe_label.fullmatch(value), (key, value)
+                    assert len(value) <= 256, (key, value)
+
+    assert seen == new_keys
+    # The credential in the error summary must not have survived at all.
+    with session_factory() as session:
+        blob = " ".join(
+            row.redacted_summary
+            for row in session.query(RuntimeIncident).all()
+        )
+    assert "bearer" not in blob.lower()
+    assert "sk-live" not in blob
+
+
 def test_uncertain_freeze_still_commits_when_capture_is_disabled(tmp_path):
     """Capture is opt-in; the freeze itself must not depend on it."""
 
