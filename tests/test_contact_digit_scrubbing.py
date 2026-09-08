@@ -209,6 +209,45 @@ def test_line_breaks_survive_a_separator_that_reaches_across_one():
     assert _extract_labeled_entry_text("入场\n微信：\n2484.67") is None
 
 
+def test_a_distance_in_points_never_becomes_an_explicit_stop_price():
+    """raw 13632, found by the 30-day replay. Locks the safe end state.
+
+    With the signature gone, the second extraction pattern reaches ``只差2点``
+    and reads the distance ``2`` as a price. That defect predates this change
+    -- the signature merely won the race for it in this group -- and belongs
+    with the relative-unit handling in ``entry_price_geometry``, not with a
+    special case here. What must never regress is the outcome: two independent
+    guards keep the ``2`` from becoming an explicit stop, and this pins that.
+    """
+
+    text = (
+        "大镖客·Andy\n"
+        "刚才2503，只差2点到第一止盈，注意锁定利润，及时移动止损！\n"
+        "@Tarderfengge QQ:158241758"
+    )
+    event = {
+        "event_type": "position_update",
+        "management_action": "partial_take_profit",
+        "stop_loss": "2.0",
+        "symbol": "ETH",
+        "side": "short",
+    }
+
+    # The QQ number is gone, which is what this step is for.
+    assert _extract_explicit_stop_loss_from_management_text(text) != 158241758.0
+
+    # The distance never earns current-message provenance, so no explicit
+    # price reaches the contract or the gate.
+    directive = resolve_management_directive(text=text, lifecycle_event=event)
+    assert directive.stop_loss is None
+    assert directive.stop_price_source is None
+    contract = build_management_instruction_contract(
+        text=text, lifecycle_event=event
+    )
+    assert contract.stop_mode == "actual_entry_price"
+    assert contract.stop_price is None
+
+
 def test_the_profile_cleaner_uses_the_shared_rule():
     cleaned = _clean_bitcoin_junzhang_text(
         "ETH 现价开一层空 止损 2530\n@Tarderfengge QQ:158241758"
