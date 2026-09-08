@@ -504,3 +504,39 @@ def test_the_rollback_target_s_behaviour_is_still_reachable_for_conditional_legs
     assert "slOrdPx" not in migrated
     assert migrated["ordType"] == "limit"
     assert migrated["px"] == "1800.0"
+
+
+# --------------------------------------------------------------------------
+# The phase 5a guard has to recognise what phase 5 submits
+# --------------------------------------------------------------------------
+
+
+def test_the_open_order_guard_recognises_the_new_limit_entry_as_ours(tmp_path):
+    """Phase 5a's guard was written before this order existed; it has to fit.
+
+    ``list_open_orders`` sees a live regular order for the first time now, and
+    the guard only lets a cancellation reach a row this system recorded as a
+    regular order. A migrated entry is recorded with ``order_kind='limit'`` and
+    its exchange ``ordId``, and it carries no ``clOrdId`` at all -- so the match
+    has to come from the order id alone, and a stranger's row must still be
+    refused rather than swept in by the shared empty client id.
+    """
+
+    from telegram_kol_research.open_order_action_guard import guard_regular_open_orders
+
+    session_factory = create_session_factory(tmp_path / "guard.db")
+    _leg(session_factory, attribution_status="unassigned", pos_id=None)
+
+    guarded = guard_regular_open_orders(
+        session_factory,
+        rows=[
+            {"ordId": ORD_ID, "instId": INST_ID, "state": "live"},
+            {"ordId": "someone-elses-order", "instId": INST_ID, "state": "live"},
+            {"ordId": "", "clOrdId": "", "instId": INST_ID, "state": "live"},
+        ],
+        action="cancel_entry_order",
+        instrument_id=INST_ID,
+    )
+
+    assert [row["ordId"] for row in guarded.allowed] == [ORD_ID]
+    assert {row["ordId"] for row in guarded.blocked} == {"someone-elses-order", ""}
