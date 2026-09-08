@@ -49,6 +49,19 @@ What is being repaired, and why each row is stuck:
 Every write is a compare-and-set against the value recorded when the manifest
 was approved, so this module can only ever act on those exact rows in that
 exact state. Run it once; a second run reports zero changes.
+
+**What actually happened on 2026-09-08T15:28:38Z.** 22 of the 26 rows were
+applied here. The other four -- binding 337, legs 579 and 580, and lifecycle
+1074 -- were moved by production itself in the ninety seconds beforehand, once
+``recover-management-history`` resolved batch 158 and stopped holding the
+binding's reconciliation open: the binding went to ``closed /
+entry_legs_terminal``, both legs to ``manually_closed /
+manual_position_missing``, and lifecycle 1074 to ``exited`` by the management
+path. The compare-and-set guard refused all four rather than overwriting what
+the system had just decided, which is exactly what it is for. Lifecycle 1074's
+``exit_reason`` came out ``kol_signal`` rather than the ``stop_loss`` this
+manifest names -- see the step-4 evidence entry in
+``docs/management-reliability-status.md``.
 """
 
 from __future__ import annotations
@@ -68,6 +81,8 @@ from telegram_kol_research.models import (
     PositionTakeProfitOrder,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementNotification,
     TriggerTakeProfitConvergence,
 )
 
@@ -75,6 +90,11 @@ from telegram_kol_research.models import (
 REPAIR_TAG = "repair_2026_09_08"
 #: Where the read-only exchange evidence for this repair lives on the server.
 EVIDENCE_PATH = "/root/evidence/step4"
+
+#: Stands in for "the moment this repair ran" inside a manifest that has to
+#: be a module-level constant. Only terminal states that the online path
+#: also stamps with a completion time use it.
+APPLIED_AT = object()
 
 #: Exchange-confirmed moments, from ``position-history`` /
 #: ``trigger-orders-history``. Stored as naive UTC, like every other datetime
@@ -109,6 +129,7 @@ _MODELS = {
     "position_protection_legs": PositionProtectionLeg,
     "source_message_deletion_exits": SourceMessageDeletionExit,
     "trigger_take_profit_convergences": TriggerTakeProfitConvergence,
+    "strategy_management_batches": StrategyManagementBatch,
 }
 
 
@@ -221,18 +242,59 @@ ROW_SPECS: tuple[RowSpec, ...] = (
         execution_order_leg_id=579,
         pos_id="1001125123045253",
     ),
-    RowSpec(
-        table="position_protection_ledger",
-        row_id=652,
-        before={"status": "verified"},
-        after={"status": "cancelled"},
-        note=(
-            "stop 1001125123045252 triggerTime=1788527258 (filled at "
-            "2026-09-04T13:07:38Z); size_text stays '10' as the historical fact"
-        ),
-        execution_binding_id=337,
-        execution_order_leg_id=579,
-        pos_id="1001125123045253",
+    # The six protection ledger rows of the two closed positions. There is no
+    # existing path that terminalizes these: ``protection_health`` only walks
+    # ledgers whose ``pos_id`` is in the live position set, so once a position
+    # closes its rows are never revisited and stay ``verified`` forever. The
+    # only precedent for a terminal ledger status in this repository is
+    # ``deepcoin_execution_actions`` writing ``cancelled`` for a TPSL we
+    # ourselves cancelled, so ``cancelled`` is what these get, with the real
+    # reason recorded per row in the audit evidence. Ledger 654 (TP1) is left
+    # alone: it is already ``protection_missing``.
+    *(
+        RowSpec(
+            table="position_protection_ledger",
+            row_id=ledger_id,
+            before={"status": "verified"},
+            after={"status": "cancelled"},
+            note=note,
+            execution_binding_id=337,
+            execution_order_leg_id=leg_id,
+            pos_id=pos_id,
+        )
+        for ledger_id, leg_id, pos_id, note in (
+            (
+                652, 579, "1001125123045253",
+                "primary stop 1001125123045252 triggerTime=1788527258: it "
+                "triggered and closed the position at 2026-09-04T13:07:38Z; "
+                "size_text stays '10' as the historical fact",
+            ),
+            (
+                653, 579, "1001125123045253",
+                "backup stop 1001125123048630 triggerTime=0: never triggered, "
+                "removed when the position closed (position_terminal_order_absent)",
+            ),
+            (
+                655, 579, "1001125123045253",
+                "TP2 1001125123049649 triggerTime=0: never triggered, removed "
+                "when the position closed (position_terminal_order_absent)",
+            ),
+            (
+                656, 579, "1001125123045253",
+                "TP3 1001125123049805 triggerTime=0: never triggered, removed "
+                "when the position closed (position_terminal_order_absent)",
+            ),
+            (
+                657, 580, "1001125126414222",
+                "primary stop 1001125126414221 triggerTime=1788527258: it "
+                "triggered and closed the position at 2026-09-04T13:07:38Z",
+            ),
+            (
+                658, 580, "1001125126414222",
+                "backup stop 1001125126416266 triggerTime=0: never triggered, "
+                "removed when the position closed (position_terminal_order_absent)",
+            ),
+        )
     ),
     *(
         RowSpec(
@@ -261,6 +323,10 @@ ROW_SPECS: tuple[RowSpec, ...] = (
         after={
             "status": "completed",
             "reason_code": "convergence_position_terminal",
+            # The online path stamps a completion time whenever it writes this
+            # reason code; a terminal convergence without one reads as still
+            # running.
+            "completed_at": APPLIED_AT,
         },
         note=(
             "pos 1001125163581280 closePos=8 closeAvgPx=78500 "
@@ -339,6 +405,53 @@ DELETION_EXIT_SPECS: tuple[dict[str, object], ...] = (
         "target_lifecycle_id": 1079,
         "raw_message_id": 14780,
         "blocking_execution_event_id": 3967,
+    },
+)
+
+
+#: ``strategy_management_notifications`` has no ``superseded`` status (its
+#: vocabulary is ``blocked`` / ``partial_failed`` / ``recovery_required`` for
+#: state and ``delivered`` / ``pending`` for status), and inventing one would
+#: put a value in a column no reader understands. Row 94 therefore keeps its
+#: state and status -- delivery is step 5's problem -- and only gains a marker
+#: in its payload saying its batch has since been resolved.
+SUPERSEDED_NOTIFICATION_ID = 94
+SUPERSEDED_NOTIFICATION_BEFORE = {"state": "recovery_required", "status": "pending"}
+
+#: Rows repaired by an existing CLI command rather than by this module:
+#: ``recover-management-history --batch-id 158`` and
+#: ``archive-unbound-holdings --lifecycle-id 1081``. Neither command writes an
+#: audit row, so this module writes one for each -- but only after seeing the
+#: row already in the state that command produces, so it can never claim an
+#: audit for a change that did not happen.
+EXTERNAL_TOOL_AUDITS: tuple[dict[str, object], ...] = (
+    {
+        "table": "strategy_management_batches",
+        "row_id": 158,
+        "tool": "cli recover-management-history --batch-id 158 --apply",
+        "before": {"status": "recovery_required", "reason_code": "close_final_preflight_failed"},
+        "after": {"status": "resolved", "reason_code": "history_no_submission_confirmed"},
+        "execution_binding_id": 337,
+        "note": (
+            "the command's own decision was terminal_no_submission; its reason "
+            "code is used rather than the plan's wording"
+        ),
+    },
+    {
+        "table": "strategy_lifecycles",
+        "row_id": 1081,
+        "tool": "cli archive-unbound-holdings --lifecycle-id 1081 --apply",
+        "before": {"lifecycle_status": "entered", "exit_reason": None},
+        "after": {"lifecycle_status": "invalidated", "exit_reason": "context_invalidated"},
+        "execution_binding_id": None,
+        "note": (
+            "entered on paper after a failed entry, execution_binding_id NULL, "
+            "no legs and no exchange exposure. A-3's "
+            "one_off/stale_pending_instruction_void.py moved the same shape "
+            "(lifecycles 1096 and 1107) to 'cancelled'; both are terminal "
+            "lifecycle states, and this row takes the one the existing command "
+            "writes"
+        ),
     },
 )
 
@@ -432,7 +545,11 @@ def plan_management_ledger_repair(
                     table=spec.table,
                     row_id=spec.row_id,
                     changes=tuple(
-                        (name, getattr(row, name, None), value)
+                        (
+                            name,
+                            getattr(row, name, None),
+                            "<applied_at>" if value is APPLIED_AT else value,
+                        )
                         for name, value in spec.after.items()
                     ),
                     note=spec.note,
@@ -481,7 +598,123 @@ def plan_management_ledger_repair(
                     ),
                 )
             )
+
+        notification = session.get(
+            StrategyManagementNotification, SUPERSEDED_NOTIFICATION_ID
+        )
+        if notification is None:
+            skipped.append(
+                {
+                    "table": "strategy_management_notifications",
+                    "row_id": SUPERSEDED_NOTIFICATION_ID,
+                    "reason": "row_missing",
+                }
+            )
+        elif not _matches_before(notification, SUPERSEDED_NOTIFICATION_BEFORE):
+            skipped.append(
+                {
+                    "table": "strategy_management_notifications",
+                    "row_id": SUPERSEDED_NOTIFICATION_ID,
+                    "reason": "before_state_changed",
+                    "expected": dict(SUPERSEDED_NOTIFICATION_BEFORE),
+                    "found": _current(notification, SUPERSEDED_NOTIFICATION_BEFORE),
+                }
+            )
+        elif _superseded_payload(notification) is None:
+            skipped.append(
+                {
+                    "table": "strategy_management_notifications",
+                    "row_id": SUPERSEDED_NOTIFICATION_ID,
+                    "reason": "already_marked",
+                }
+            )
+        else:
+            actions.append(
+                RepairAction(
+                    table="strategy_management_notifications",
+                    row_id=SUPERSEDED_NOTIFICATION_ID,
+                    changes=(("payload_json.superseded_by", None, REPAIR_TAG),),
+                    note=(
+                        "state and status unchanged: this table has no "
+                        "'superseded' value and delivery belongs to step 5"
+                    ),
+                )
+            )
+
+        for audit_spec in EXTERNAL_TOOL_AUDITS:
+            model = _MODELS[str(audit_spec["table"])]
+            row = session.get(model, int(audit_spec["row_id"]))
+            after = dict(audit_spec["after"])  # type: ignore[arg-type]
+            if row is None:
+                skipped.append(
+                    {
+                        "table": audit_spec["table"],
+                        "row_id": audit_spec["row_id"],
+                        "reason": "row_missing",
+                    }
+                )
+                continue
+            if not _matches_before(row, after):
+                skipped.append(
+                    {
+                        "table": audit_spec["table"],
+                        "row_id": audit_spec["row_id"],
+                        "reason": "external_tool_not_applied_yet",
+                        "expected": after,
+                        "found": _current(row, after),
+                    }
+                )
+                continue
+            # These rows stay in their after-state forever, so the audit row
+            # itself is what makes this entry idempotent.
+            already_audited = (
+                session.query(PositionAttributionAudit.id)
+                .filter(
+                    PositionAttributionAudit.fingerprint
+                    == _audit_fingerprint(
+                        str(audit_spec["table"]), int(audit_spec["row_id"])
+                    )
+                )
+                .first()
+            )
+            if already_audited is not None:
+                skipped.append(
+                    {
+                        "table": audit_spec["table"],
+                        "row_id": audit_spec["row_id"],
+                        "reason": "already_audited",
+                    }
+                )
+                continue
+            actions.append(
+                RepairAction(
+                    table=str(audit_spec["table"]),
+                    row_id=int(audit_spec["row_id"]),
+                    changes=tuple(
+                        (name, dict(audit_spec["before"]).get(name), value)  # type: ignore[arg-type]
+                        for name, value in after.items()
+                    ),
+                    note=f"{audit_spec['tool']}: {audit_spec['note']}",
+                )
+            )
     return RepairPlan(actions=tuple(actions), skipped=tuple(skipped))
+
+
+def _superseded_payload(notification) -> str | None:
+    """Return the payload row 94 should carry, or ``None`` if already marked."""
+
+    try:
+        payload = json.loads(notification.payload_json or "{}")
+    except json.JSONDecodeError:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {"original_payload": notification.payload_json}
+    if payload.get("superseded_by") == REPAIR_TAG:
+        return None
+    payload["superseded_by"] = REPAIR_TAG
+    payload["superseded_batch_status"] = "resolved"
+    payload["superseded_evidence_path"] = EVIDENCE_PATH
+    return json.dumps(payload, ensure_ascii=False, sort_keys=True)
 
 
 def apply_management_ledger_repair(
@@ -518,7 +751,35 @@ def apply_management_ledger_repair(
 
     with session_factory() as session:
         for action in plan.actions:
-            if action.table == "source_message_deletion_exits":
+            if action.table == "strategy_management_notifications":
+                row = session.get(
+                    StrategyManagementNotification, SUPERSEDED_NOTIFICATION_ID
+                )
+                payload = None if row is None else _superseded_payload(row)
+                if row is None or payload is None:
+                    continue
+                row.payload_json = payload
+                row.updated_at = moment
+                evidence_binding = 337
+                evidence_leg = None
+                evidence_pos = None
+            elif action.table in {
+                spec["table"] for spec in EXTERNAL_TOOL_AUDITS
+            } and (action.table, action.row_id) in {
+                (spec["table"], spec["row_id"]) for spec in EXTERNAL_TOOL_AUDITS
+            }:
+                # Audit only: the row was already moved by an existing command,
+                # and re-verified above. Nothing here writes to it.
+                audit_spec = next(
+                    spec
+                    for spec in EXTERNAL_TOOL_AUDITS
+                    if (spec["table"], spec["row_id"])
+                    == (action.table, action.row_id)
+                )
+                evidence_binding = audit_spec["execution_binding_id"]
+                evidence_leg = None
+                evidence_pos = None
+            elif action.table == "source_message_deletion_exits":
                 exit_spec = exit_by_id[action.row_id]
                 row = session.get(SourceMessageDeletionExit, action.row_id)
                 if row is None or row.state != "recovery_required":
@@ -563,7 +824,7 @@ def apply_management_ledger_repair(
                 if row is None or not _matches_before(row, spec.before):
                     continue
                 for name, value in spec.after.items():
-                    setattr(row, name, value)
+                    setattr(row, name, moment if value is APPLIED_AT else value)
                 if hasattr(row, "updated_at"):
                     row.updated_at = moment
                 evidence_binding = spec.execution_binding_id

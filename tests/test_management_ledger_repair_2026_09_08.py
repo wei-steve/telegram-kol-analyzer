@@ -17,14 +17,19 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionAttributionAudit,
+    PositionProtectionLedger,
+    PositionProtectionLeg,
     PositionTakeProfitOrder,
     SourceMessageDeletionExit,
     StrategyLifecycle,
+    StrategyManagementBatch,
+    StrategyManagementNotification,
     TelegramSourceMessageEvent,
     TriggerTakeProfitConvergence,
 )
 from telegram_kol_research.one_off.management_ledger_repair_2026_09_08 import (
     DELETION_EXIT_RELEASE_REASON,
+    SUPERSEDED_NOTIFICATION_ID,
     EVIDENCE_PATH,
     POSITIONS_CLOSED_AT,
     REPAIR_TAG,
@@ -158,6 +163,91 @@ def _fixture(tmp_path):
                 pos_id="1001125164628529",
             )
         )
+        for ledger_id, leg_id, pos_id, order_id, purpose, status in (
+            (652, 579, "1001125123045253", "1001125123045252", "stop_loss", "verified"),
+            (653, 579, "1001125123045253", "1001125123048630", "stop_loss", "verified"),
+            # TP1's ledger row is already terminal and is deliberately not on
+            # the manifest; it must survive untouched.
+            (654, 579, "1001125123045253", "1001125123049529", "take_profit",
+             "protection_missing"),
+            (655, 579, "1001125123045253", "1001125123049649", "take_profit", "verified"),
+            (656, 579, "1001125123045253", "1001125123049805", "take_profit", "verified"),
+            (657, 580, "1001125126414222", "1001125126414221", "stop_loss", "verified"),
+            (658, 580, "1001125126414222", "1001125126416266", "stop_loss", "verified"),
+        ):
+            session.add(
+                PositionProtectionLedger(
+                    id=ledger_id,
+                    execution_binding_id=337,
+                    execution_order_leg_id=leg_id,
+                    pos_id=pos_id,
+                    instrument_id="BTC-USDT-SWAP",
+                    side="long",
+                    order_id=order_id,
+                    purpose=purpose,
+                    status=status,
+                    evidence_source="position_mutation_intent_readback",
+                )
+            )
+        for protection_leg_id, leg_index in ((852, 1), (853, 2), (854, 3)):
+            session.add(
+                PositionProtectionLeg(
+                    id=protection_leg_id,
+                    execution_binding_id=337,
+                    execution_order_leg_id=580,
+                    role="take_profit",
+                    leg_index=leg_index,
+                    status="protection_recovery_pending",
+                    pos_id="1001125126414222",
+                )
+            )
+        # Already moved by ``recover-management-history``: this module only
+        # writes the audit row for it.
+        session.add(
+            StrategyManagementBatch(
+                id=158,
+                idempotency_fingerprint="f" * 64,
+                raw_message_id=14797,
+                recognition_decision_id=14794,
+                recognition_generation="d" * 32,
+                strategy_instance_id="deepcoin:-1003048800035:4495:BTC:long",
+                requested_fraction=0.5,
+                effective_fraction=0.5,
+                target_fingerprint="c" * 64,
+                target_lifecycle_id=1074,
+                execution_binding_id=337,
+                intent="partial_take_profit",
+                effective_action="partial_close",
+                execution_mode="live",
+                status="resolved",
+                reason_code="history_no_submission_confirmed",
+            )
+        )
+        session.flush()
+        session.add(
+            StrategyManagementNotification(
+                id=SUPERSEDED_NOTIFICATION_ID,
+                management_batch_id=158,
+                state="recovery_required",
+                status="pending",
+                payload_fingerprint="e" * 64,
+                payload_json=json.dumps({"batch_id": 158, "reason": "x"}),
+            )
+        )
+        # Already moved by ``archive-unbound-holdings``.
+        session.add(
+            StrategyLifecycle(
+                id=1081,
+                chat_id=-1002409877375,
+                message_id=9181,
+                symbol="ETH",
+                side="long",
+                lifecycle_status="invalidated",
+                exit_reason="context_invalidated",
+                signal_at=datetime(2026, 9, 4, 12, 48, 55),
+                filled_tp_index=0,
+            )
+        )
         session.add(
             TelegramSourceMessageEvent(
                 id=201,
@@ -195,8 +285,20 @@ FIXTURE_KEYS = {
     ("position_take_profit_orders", 195),
     ("position_take_profit_orders", 196),
     ("position_take_profit_orders", 197),
+    ("position_protection_ledger", 652),
+    ("position_protection_ledger", 653),
+    ("position_protection_ledger", 655),
+    ("position_protection_ledger", 656),
+    ("position_protection_ledger", 657),
+    ("position_protection_ledger", 658),
+    ("position_protection_legs", 852),
+    ("position_protection_legs", 853),
+    ("position_protection_legs", 854),
     ("trigger_take_profit_convergences", 231),
     ("source_message_deletion_exits", 201),
+    ("strategy_management_notifications", SUPERSEDED_NOTIFICATION_ID),
+    ("strategy_management_batches", 158),
+    ("strategy_lifecycles", 1081),
 }
 
 
@@ -356,3 +458,126 @@ def test_every_change_leaves_an_audit_row_carrying_the_repair_tag(tmp_path):
             assert evidence["changes"]
             # An audit nobody can trace back to a row is not an audit.
             assert (evidence["table"], evidence["row_id"]) in FIXTURE_KEYS
+
+
+def test_every_protection_row_of_a_closed_position_ends_up_consistent(tmp_path):
+    """The whole position, not just the stop: a half-terminalized position is
+    exactly the inconsistency this repair exists to remove."""
+
+    session_factory = _fixture(tmp_path)
+    plan = plan_management_ledger_repair(session_factory)
+
+    apply_management_ledger_repair(
+        session_factory, expected_action_count=plan.action_count, now=NOW
+    )
+
+    with session_factory() as session:
+        for ledger_id in (652, 653, 655, 656, 657, 658):
+            assert session.get(PositionProtectionLedger, ledger_id).status == "cancelled"
+        # TP1's row was already terminal before this repair and is not on the
+        # manifest; leaving it alone is the point.
+        assert (
+            session.get(PositionProtectionLedger, 654).status == "protection_missing"
+        )
+        for protection_leg_id in (852, 853, 854):
+            leg = session.get(PositionProtectionLeg, protection_leg_id)
+            assert leg.status == "cancelled"
+            # These were never created on the exchange, and nothing here
+            # invents an order id for them.
+            assert leg.exchange_order_id is None
+
+
+def test_notification_94_is_marked_without_inventing_a_status(tmp_path):
+    session_factory = _fixture(tmp_path)
+    plan = plan_management_ledger_repair(session_factory)
+
+    apply_management_ledger_repair(
+        session_factory, expected_action_count=plan.action_count, now=NOW
+    )
+
+    with session_factory() as session:
+        row = session.get(StrategyManagementNotification, SUPERSEDED_NOTIFICATION_ID)
+        assert (row.state, row.status) == ("recovery_required", "pending")
+        payload = json.loads(row.payload_json)
+        assert payload["superseded_by"] == REPAIR_TAG
+        assert payload["superseded_batch_status"] == "resolved"
+        # The original payload survives intact.
+        assert payload["batch_id"] == 158
+
+
+def test_rows_moved_by_an_existing_command_get_an_audit_but_no_write(tmp_path):
+    session_factory = _fixture(tmp_path)
+    plan = plan_management_ledger_repair(session_factory)
+
+    apply_management_ledger_repair(
+        session_factory, expected_action_count=plan.action_count, now=NOW
+    )
+
+    with session_factory() as session:
+        # Untouched by this module: the CLI command already moved them.
+        batch = session.get(StrategyManagementBatch, 158)
+        assert (batch.status, batch.reason_code) == (
+            "resolved",
+            "history_no_submission_confirmed",
+        )
+        ghost = session.get(StrategyLifecycle, 1081)
+        assert ghost.lifecycle_status == "invalidated"
+        audited = {
+            (json.loads(audit.evidence_json)["table"],
+             json.loads(audit.evidence_json)["row_id"])
+            for audit in session.query(PositionAttributionAudit).all()
+        }
+        assert ("strategy_management_batches", 158) in audited
+        assert ("strategy_lifecycles", 1081) in audited
+
+
+def test_no_audit_is_claimed_for_a_command_that_was_not_run(tmp_path):
+    session_factory = _fixture(tmp_path)
+    with session_factory() as session:
+        session.get(StrategyManagementBatch, 158).status = "recovery_required"
+        session.commit()
+
+    plan = plan_management_ledger_repair(session_factory)
+
+    assert ("strategy_management_batches", 158) not in _planned_keys(plan)
+    pending = [
+        row
+        for row in plan.skipped
+        if row["table"] == "strategy_management_batches" and row["row_id"] == 158
+    ]
+    assert pending and pending[0]["reason"] == "external_tool_not_applied_yet"
+
+
+def test_a_terminalized_convergence_carries_a_completion_time(tmp_path):
+    """A convergence in a terminal state with no ``completed_at`` reads as one
+    that is still running; the online path always stamps one."""
+
+    session_factory = _fixture(tmp_path)
+    with session_factory() as session:
+        session.add(
+            TriggerTakeProfitConvergence(
+                id=230,
+                execution_binding_id=337,
+                execution_order_leg_id=579,
+                desired_take_profits_json=json.dumps(
+                    [{"allocation_pct": "50", "price": "80700"}]
+                ),
+                status="conflicted",
+                reason_code="convergence_exact_leg_not_verified",
+                pos_id="1001125163581280",
+            )
+        )
+        session.commit()
+
+    plan = plan_management_ledger_repair(session_factory)
+    apply_management_ledger_repair(
+        session_factory, expected_action_count=plan.action_count, now=NOW
+    )
+
+    with session_factory() as session:
+        terminal = session.get(TriggerTakeProfitConvergence, 230)
+        assert terminal.status == "completed"
+        assert terminal.reason_code == "convergence_position_terminal"
+        assert terminal.completed_at == NOW.replace(tzinfo=None)
+        # The one that was only reset stays open: nothing has completed there.
+        assert session.get(TriggerTakeProfitConvergence, 231).completed_at is None
