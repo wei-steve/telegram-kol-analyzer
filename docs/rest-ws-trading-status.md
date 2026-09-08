@@ -20,7 +20,7 @@ phase_status: in_progress             # planned | claimed | in_progress | comple
                                       # （94dc4632，17 提交，未部署未合并），须先 rebase 到
                                       # codex/deepcoin-auto-trading-v1 最新（已含 5a + 5b）再继续；
                                       # 任务 1/3/4 未完成。阶段 5 改交易所写入语义，需用户单独批准。
-claimed_by:
+claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
 last_completed_phase: 5b
 last_completed_commit: 230ba1cc8097d30ed89c860608467f17680a14ca
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
