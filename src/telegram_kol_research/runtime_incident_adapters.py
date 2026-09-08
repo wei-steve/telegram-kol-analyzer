@@ -348,6 +348,82 @@ def capture_context_worker_state(
     )
 
 
+def capture_authoritative_execution_uncertain(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    attempt_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    error_class: str | None,
+    error_summary: str | None,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture an attempt frozen past the side-effect boundary.
+
+    ``uncertain`` is the one authoritative outcome that is never replayed: the
+    exchange may or may not have acted, so only a human can settle it. Before
+    A-2 the freeze left no incident at all, so raw 15006 and 15204 sat unknown
+    with nobody told.
+    """
+
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind="authoritative_execution_attempt",
+        source_record_id=str(int(attempt_id)),
+        incident_type="authoritative_execution_uncertain",
+        severity="high",
+        redacted_summary=_summary(
+            component="authoritative_execution",
+            source_status="uncertain",
+            operation=f"raw_message_{int(raw_message_id)}",
+            raw_message_id=int(raw_message_id),
+            attempt_id=int(attempt_id),
+            error_type=_safe_label(error_class),
+            error_summary=_safe_label(error_summary, limit=256),
+        ),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_background_task_restart_exhausted(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    task_name: str,
+    consecutive_failures: int,
+    error_type: str | None,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a supervised task that gave up restarting.
+
+    Reached only after the backoff ladder failed ``consecutive_failures`` times
+    in a row, which means the task is now permanently down until the process is
+    restarted -- exactly the 6h48m silence of 2026-09-06.
+    """
+
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind="background_task",
+        source_record_id=_safe_label(task_name, limit=255),
+        incident_type="background_task_restart_exhausted",
+        severity="critical",
+        redacted_summary=_summary(
+            component="background_task_supervisor",
+            source_status="restart_exhausted",
+            task_name=_safe_label(task_name),
+            consecutive_failures=int(consecutive_failures),
+            error_type=_safe_label(error_type),
+        ),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_provider_failure(
     session_factory: sessionmaker,
     *,

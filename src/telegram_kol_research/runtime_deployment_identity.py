@@ -373,6 +373,8 @@ def build_runtime_deployment_identity(
     authority_evidence: Mapping[str, Any] | None = None,
     process_start_ticks: int | None = None,
     entry_admission_frozen: bool = False,
+    last_runtime_incident_notified_at: str | None = None,
+    background_task_supervision: Mapping[str, Any] | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     verified, release_commit, manifest_sha = _loaded_release_evidence(
@@ -443,6 +445,17 @@ def build_runtime_deployment_identity(
             # Observation only. The private WebSocket inbox holds no authority,
             # so it must never feed the capability flags below.
             "deepcoin_private_ws": _task_running(tasks.get("deepcoin_private_ws")),
+            # A-2 alerting observability. Both are notification-path tasks with
+            # no authority, so like the WebSocket entry above they are reported
+            # but never allowed to feed the capability flags.
+            "runtime_incident_notification": _task_running(
+                tasks.get("runtime_incident_notification")
+            ),
+            "system_operator_bot_command": _task_running(
+                tasks.get("system_operator_bot_command")
+            ),
+            "runtime_incident_last_notified_at": last_runtime_incident_notified_at,
+            "background_task_supervision": dict(background_task_supervision or {}),
         },
         "capabilities": {
             "global_exchange_authority": worker_owner,

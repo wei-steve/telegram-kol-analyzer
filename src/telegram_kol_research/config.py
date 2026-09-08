@@ -63,6 +63,33 @@ RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
     }
 )
 
+# A-2: incident types whose alerting must not depend on operator env drift.
+#
+# The delivery selector and the capture selector are both operator-provided
+# lists. Before this baseline, a management instruction could fail durably
+# without ever reaching an operator, because the deployed list simply did not
+# name the failure's type. These five types are the ones whose silence was the
+# incident, so the loader folds them into any *non-empty* operator list.
+#
+# The two "off" positions are deliberately preserved: an absent key still means
+# "every type" (already a superset of this baseline) and an explicitly empty key
+# still means "nothing", so an operator retains a complete kill switch.
+MANDATORY_RUNTIME_INCIDENT_TYPES = frozenset(
+    {
+        "authoritative_execution_uncertain",
+        "background_task_restart_exhausted",
+        "context_worker_exhausted",
+        "management_recovery_required",
+        "management_submit_unknown",
+    }
+)
+
+# ``context_worker_exhausted`` is also raised by bulk backfill and scanner
+# operations; 1466 of those had accumulated by 2026-09-07. Only the per-message
+# ones describe a real instruction that was dropped, so delivery is restricted
+# to that operation prefix. Capture is unrestricted -- the ledger keeps them all.
+CONTEXT_WORKER_EXHAUSTED_DELIVERED_OPERATION_PREFIX = "raw_message_"
+
 
 @dataclass(slots=True)
 class AppConfig:
@@ -371,6 +398,20 @@ def _deployed_code_version(env: dict[str, str]) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else "unknown"
 
 
+def _with_mandatory_incident_types(
+    selected: frozenset[str],
+) -> frozenset[str]:
+    """Fold the A-2 baseline into a non-empty operator selector.
+
+    An empty selector is returned untouched: that is the operator's kill
+    switch, and this baseline must not silently re-arm it.
+    """
+
+    if not selected:
+        return selected
+    return selected | MANDATORY_RUNTIME_INCIDENT_TYPES
+
+
 def load_runtime_incident_config(
     environ: dict[str, str] | None = None,
     env_file_paths: list[str | os.PathLike[str]] | None = None,
@@ -399,12 +440,14 @@ def load_runtime_incident_config(
             else {}
         )
     env.update(active_environment)
-    capture_types = frozenset(
-        item.strip().lower()
-        for item in env.get(
-            "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES", ""
-        ).split(",")
-        if item.strip()
+    capture_types = _with_mandatory_incident_types(
+        frozenset(
+            item.strip().lower()
+            for item in env.get(
+                "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES", ""
+            ).split(",")
+            if item.strip()
+        )
     )
     telegram_types_key = "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES"
     configured_notification_types = frozenset(
@@ -415,10 +458,13 @@ def load_runtime_incident_config(
     telegram_notification_types = (
         # An empty list is capture-only: someone typed the key and left it
         # blank, which says "notify nothing" and is honoured as written. A list
-        # with entries in it is a filter someone maintains by hand, and the
-        # always-notified types are added to it so that forgetting one cannot
-        # turn a critical alert into silence.
-        (configured_notification_types | ALWAYS_NOTIFIED_INCIDENT_TYPES)
+        # with entries in it is a filter someone maintains by hand, and both
+        # baselines are added to it so that forgetting one cannot turn a
+        # critical alert into silence.
+        (
+            _with_mandatory_incident_types(configured_notification_types)
+            | ALWAYS_NOTIFIED_INCIDENT_TYPES
+        )
         if configured_notification_types
         else (frozenset() if telegram_types_key in env else None)
     )

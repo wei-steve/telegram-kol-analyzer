@@ -122,6 +122,7 @@ from telegram_kol_research.message_processing_worker import (
     run_message_processing_worker_loop,
 )
 from telegram_kol_research.runtime_incident_adapters import (
+    capture_background_task_restart_exhausted,
     capture_monitor_state,
     capture_notification_failure,
     capture_recognition_execution_state,
@@ -434,8 +435,44 @@ def runtime_role_starts_process_monitor(value: str, task_name: str) -> bool:
     return task_name == "loop_lag_monitor"
 
 
+def latest_runtime_incident_notified_at(session_factory) -> str | None:
+    """Read the newest delivered runtime-incident notification timestamp.
+
+    The only durable record of "the alerting path last actually spoke" is this
+    column; there is no in-process counter that survives a restart, which is
+    what made the 6h48m outage invisible. Failures return ``None`` rather than
+    propagating: this is a health projection, not an authority decision.
+    """
+
+    from telegram_kol_research.models import RuntimeIncident
+
+    try:
+        with session_factory() as session:
+            value = (
+                session.query(func.max(RuntimeIncident.notified_at))
+                .filter(RuntimeIncident.notification_status == "delivered")
+                .scalar()
+            )
+    except Exception as exc:
+        logger.warning(
+            "Runtime incident last-notified probe failed open: error=%s",
+            type(exc).__name__,
+        )
+        return None
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=UTC)
+    return value.astimezone(UTC).isoformat()
+
+
 def build_runtime_deployment_identity_for_app(app: FastAPI) -> dict[str, Any]:
-    """Project process-local loaded-code and authority evidence without I/O."""
+    """Project process-local loaded-code and authority evidence without I/O.
+
+    The last-notified timestamp is deliberately read from process state rather
+    than the ledger: this endpoint must stay database-free, so the value is
+    seeded once at startup and refreshed by the notification loop itself.
+    """
 
     observed_now = app.state.now_provider()
     return build_runtime_deployment_identity(
@@ -455,6 +492,21 @@ def build_runtime_deployment_identity_for_app(app: FastAPI) -> dict[str, Any]:
             "worker_command_worker": app.state.worker_command_worker_task,
             "live_listener": app.state.live_listener_task,
             "reconcile": app.state.reconcile_task,
+            "runtime_incident_notification": (
+                app.state.runtime_incident_notification_task
+            ),
+            "system_operator_bot_command": (
+                app.state.system_operator_bot_command_task
+            ),
+        },
+        last_runtime_incident_notified_at=getattr(
+            app.state, "runtime_incident_last_notified_at", None
+        ),
+        background_task_supervision={
+            name: record.snapshot()
+            for name, record in sorted(
+                getattr(app.state, "background_task_supervision", {}).items()
+            )
         },
         authority_snapshot=app.state.runtime_authority_status.snapshot(
             now=observed_now
@@ -973,6 +1025,180 @@ def _log_background_task_result(task_name: str):
             logger.exception("Background task %s exited with error", task_name, exc_info=exc)
 
     return _callback
+
+
+# A-2 supervision constants. ``system_operator_bot_command_task`` died on a
+# single httpx long-poll network error at 2026-09-06T19:38:39Z and stayed dead
+# for 6h48m, because ``_log_background_task_result`` logs and stops there.
+_SUPERVISED_RESTART_INITIAL_DELAY_SECONDS = 1.0
+_SUPERVISED_RESTART_MAX_DELAY_SECONDS = 60.0
+_SUPERVISED_RESTART_MAX_CONSECUTIVE_FAILURES = 10
+# A run that survived this long is treated as a recovery, so the ladder and the
+# consecutive counter both reset. Without it a task that blips once every few
+# days would still be retired permanently after the tenth blip, which is the
+# opposite of what supervision is for.
+_SUPERVISED_RESTART_HEALTHY_RUN_SECONDS = 300.0
+
+
+class BackgroundTaskSupervision:
+    """In-process restart accounting for one supervised background task."""
+
+    __slots__ = (
+        "task_name",
+        "restarts",
+        "consecutive_failures",
+        "last_failure_at",
+        "last_restart_at",
+        "stopped_at",
+        "last_error_type",
+    )
+
+    def __init__(self, task_name: str) -> None:
+        self.task_name = task_name
+        self.restarts = 0
+        self.consecutive_failures = 0
+        self.last_failure_at: str | None = None
+        self.last_restart_at: str | None = None
+        self.stopped_at: str | None = None
+        self.last_error_type: str | None = None
+
+    def snapshot(self) -> dict[str, Any]:
+        return {
+            "restarts": self.restarts,
+            "consecutive_failures": self.consecutive_failures,
+            "last_failure_at": self.last_failure_at,
+            "last_restart_at": self.last_restart_at,
+            "restart_exhausted_at": self.stopped_at,
+            "last_error_type": self.last_error_type,
+        }
+
+
+def _observe_runtime_incident_delivery(app: FastAPI):
+    """Return a sink recording when the alerting path last actually spoke."""
+
+    def _sink(delivered_at: datetime) -> None:
+        app.state.runtime_incident_last_notified_at = delivered_at.astimezone(
+            UTC
+        ).isoformat()
+
+    return _sink
+
+
+def _task_supervision(app: FastAPI, task_name: str) -> BackgroundTaskSupervision:
+    """Return this process's supervision record for one task, creating it once."""
+
+    registry = getattr(app.state, "background_task_supervision", None)
+    if registry is None:
+        registry = {}
+        app.state.background_task_supervision = registry
+    record = registry.get(task_name)
+    if record is None:
+        record = BackgroundTaskSupervision(task_name)
+        registry[task_name] = record
+    return record
+
+
+async def _supervise_restartable_background_task(
+    task_name: str,
+    runner_factory: Callable[[], Any],
+    *,
+    session_factory=None,
+    runtime_config=None,
+    supervision: BackgroundTaskSupervision,
+) -> None:
+    """Run one background loop, restarting it with capped exponential backoff.
+
+    Cancellation propagates untouched so shutdown still stops the task at once.
+    A clean return is treated as a deliberate exit and is not restarted; only
+    an exception is. After
+    ``_SUPERVISED_RESTART_MAX_CONSECUTIVE_FAILURES`` consecutive failures the
+    supervisor stops and records a critical incident, because at that point the
+    fault is not transient and silent retrying would hide it.
+    """
+
+    delay = _SUPERVISED_RESTART_INITIAL_DELAY_SECONDS
+    while True:
+        started_at = time.monotonic()
+        try:
+            await runner_factory()
+            logger.info(
+                "Supervised background task %s returned; not restarting",
+                task_name,
+            )
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            ran_for = time.monotonic() - started_at
+            if ran_for >= _SUPERVISED_RESTART_HEALTHY_RUN_SECONDS:
+                supervision.consecutive_failures = 0
+                delay = _SUPERVISED_RESTART_INITIAL_DELAY_SECONDS
+            supervision.consecutive_failures += 1
+            supervision.last_error_type = type(exc).__name__
+            supervision.last_failure_at = datetime.now(UTC).isoformat()
+            logger.warning(
+                "Supervised background task %s failed (%s); "
+                "consecutive_failures=%d ran_for=%.1fs restarts=%d",
+                task_name,
+                type(exc).__name__,
+                supervision.consecutive_failures,
+                ran_for,
+                supervision.restarts,
+                exc_info=exc,
+            )
+            if (
+                supervision.consecutive_failures
+                >= _SUPERVISED_RESTART_MAX_CONSECUTIVE_FAILURES
+            ):
+                supervision.stopped_at = datetime.now(UTC).isoformat()
+                logger.error(
+                    "Supervised background task %s exhausted %d restarts; "
+                    "stopping until the process restarts",
+                    task_name,
+                    supervision.consecutive_failures,
+                )
+                await _record_background_task_restart_exhausted(
+                    session_factory,
+                    runtime_config=runtime_config,
+                    task_name=task_name,
+                    consecutive_failures=supervision.consecutive_failures,
+                    error_type=type(exc).__name__,
+                )
+                return
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, _SUPERVISED_RESTART_MAX_DELAY_SECONDS)
+            supervision.restarts += 1
+            supervision.last_restart_at = datetime.now(UTC).isoformat()
+
+
+async def _record_background_task_restart_exhausted(
+    session_factory,
+    *,
+    runtime_config,
+    task_name: str,
+    consecutive_failures: int,
+    error_type: str | None,
+) -> None:
+    """Persist the give-up as a critical incident, off the event loop."""
+
+    if session_factory is None or runtime_config is None:
+        return
+    try:
+        await asyncio.to_thread(
+            capture_background_task_restart_exhausted,
+            session_factory,
+            config=runtime_config,
+            task_name=task_name,
+            consecutive_failures=consecutive_failures,
+            error_type=error_type,
+            occurred_at=datetime.now(UTC),
+        )
+    except Exception as exc:
+        logger.warning(
+            "Restart-exhausted incident capture failed open: task=%s error=%s",
+            task_name,
+            type(exc).__name__,
+        )
 
 
 def _set_deepcoin_private_ws_inbox(app: FastAPI):
@@ -5191,11 +5417,22 @@ def create_web_app(
                 and isinstance(app.state.strategy_alert_config, StrategyAlertConfig)
             ):
                 app.state.telegram_bot_command_task = asyncio.create_task(
-                    run_telegram_bot_command_loop(
-                        config=app.state.strategy_alert_config,
+                    _supervise_restartable_background_task(
+                        "telegram_bot_command_task",
+                        lambda: run_telegram_bot_command_loop(
+                            config=app.state.strategy_alert_config,
+                            session_factory=app.state.session_factory,
+                            group_config=app.state.group_config,
+                        ),
                         session_factory=app.state.session_factory,
-                        group_config=app.state.group_config,
+                        runtime_config=app.state.runtime_incident_config,
+                        supervision=_task_supervision(
+                            app, "telegram_bot_command_task"
+                        ),
                     )
+                )
+                app.state.telegram_bot_command_task.add_done_callback(
+                    _log_background_task_result("telegram_bot_command_task")
                 )
             if (
                 runtime_role_starts_singleton_task(
@@ -5228,12 +5465,33 @@ def create_web_app(
                         or app.state.runtime_incident_config.message_operation_stage1_enabled
                     )
                 ):
+                    app.state.runtime_incident_last_notified_at = (
+                        await asyncio.to_thread(
+                            latest_runtime_incident_notified_at,
+                            app.state.session_factory,
+                        )
+                    )
                     app.state.runtime_incident_notification_task = (
                         asyncio.create_task(
-                            run_runtime_incident_notification_loop(
+                            _supervise_restartable_background_task(
+                                "runtime_incident_notification_task",
+                                lambda: run_runtime_incident_notification_loop(
+                                    session_factory=app.state.session_factory,
+                                    config=(
+                                        app.state.system_operator_bot_config
+                                    ),
+                                    runtime_config=(
+                                        app.state.runtime_incident_config
+                                    ),
+                                    delivery_observer=(
+                                        _observe_runtime_incident_delivery(app)
+                                    ),
+                                ),
                                 session_factory=app.state.session_factory,
-                                config=app.state.system_operator_bot_config,
                                 runtime_config=app.state.runtime_incident_config,
+                                supervision=_task_supervision(
+                                    app, "runtime_incident_notification_task"
+                                ),
                             )
                         )
                     )
@@ -5246,10 +5504,20 @@ def create_web_app(
                     app.state.runtime_role, "system_operator_bot_command"
                 ):
                     app.state.system_operator_bot_command_task = asyncio.create_task(
-                        run_system_operator_bot_command_loop(
-                            config=app.state.system_operator_bot_config,
+                        _supervise_restartable_background_task(
+                            "system_operator_bot_command_task",
+                            lambda: run_system_operator_bot_command_loop(
+                                config=app.state.system_operator_bot_config,
+                                session_factory=app.state.session_factory,
+                                deepcoin_client_factory=(
+                                    app.state.deepcoin_client_factory
+                                ),
+                            ),
                             session_factory=app.state.session_factory,
-                            deepcoin_client_factory=app.state.deepcoin_client_factory,
+                            runtime_config=app.state.runtime_incident_config,
+                            supervision=_task_supervision(
+                                app, "system_operator_bot_command_task"
+                            ),
                         )
                     )
                     app.state.system_operator_bot_command_task.add_done_callback(
@@ -5946,6 +6214,8 @@ def create_web_app(
     app.state.system_operator_bot_command_task = None
     app.state.strategy_management_notification_task = None
     app.state.runtime_incident_notification_task = None
+    app.state.background_task_supervision = {}
+    app.state.runtime_incident_last_notified_at = None
     app.state.position_snapshot_startup_task = None
     app.state.position_snapshot_refresh_task = None
     app.state.loop_lag_monitor = LoopLagMonitor(now_provider=app.state.now_provider)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 import uuid
 from dataclasses import dataclass
@@ -20,6 +21,8 @@ from telegram_kol_research.models import (
     RecognitionDecision,
 )
 
+
+logger = logging.getLogger(__name__)
 
 _SECRET_PATTERN = re.compile(
     r"(?i)(dc-access-(?:key|sign|passphrase)|api[_-]?key|authorization|password|secret)"
@@ -394,8 +397,56 @@ def mark_authoritative_execution_uncertain(
         row.uncertain_at = uncertain_at
         row.completed_at = uncertain_at
         row.updated_at = uncertain_at
+        raw_message_id = int(row.raw_message_id)
         session.commit()
-        return True
+    _capture_uncertain_incident(
+        session_factory,
+        attempt_id=int(attempt_id),
+        raw_message_id=raw_message_id,
+        occurred_at=uncertain_at,
+        error_class=error_class,
+        error_summary=error_summary,
+    )
+    return True
+
+
+def _capture_uncertain_incident(
+    session_factory,
+    *,
+    attempt_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    error_class: str | None,
+    error_summary: str | None,
+) -> None:
+    """Record the freeze as a runtime incident, never failing the freeze itself.
+
+    The freeze is already committed when this runs. An incident ledger problem
+    must not turn a settled ``uncertain`` back into an exception at the call
+    site, so every failure here is swallowed after a warning.
+    """
+
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_authoritative_execution_uncertain,
+        )
+
+        capture_authoritative_execution_uncertain(
+            session_factory,
+            config=load_runtime_incident_config(),
+            attempt_id=attempt_id,
+            raw_message_id=raw_message_id,
+            occurred_at=occurred_at,
+            error_class=error_class,
+            error_summary=error_summary,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Uncertain-attempt incident capture failed open: attempt=%s error=%s",
+            attempt_id,
+            type(exc).__name__,
+        )
 
 
 def finalize_recorded_authoritative_execution(

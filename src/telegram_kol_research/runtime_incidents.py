@@ -79,6 +79,16 @@ _SUMMARY_FIELDS = frozenset(
         "retry_count",
         "source_status",
         "worker_kind",
+        # A-2. An operator reading an alert has to be able to act on it without
+        # a database session, so the identifiers that name the affected work
+        # belong in the summary itself. Every one is either an integer or a
+        # value already passed through ``_safe_label``, and the redaction scan
+        # below still runs over the assembled JSON.
+        "attempt_id",
+        "consecutive_failures",
+        "error_summary",
+        "raw_message_id",
+        "task_name",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

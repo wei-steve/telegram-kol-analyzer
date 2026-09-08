@@ -6,6 +6,7 @@ import pytest
 
 from telegram_kol_research.config import (
     MULTI_TARGET_CAPTURE_PROFILE,
+    MANDATORY_RUNTIME_INCIDENT_TYPES,
     READ_ONLY_CAPTURE_PROFILE,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
@@ -343,7 +344,9 @@ def test_capture_and_telegram_type_allowlists_are_independent():
         env_file_paths=[],
     )
 
-    assert config.capture_types == READ_ONLY_CAPTURE_PROFILE
+    assert config.capture_types == (
+        READ_ONLY_CAPTURE_PROFILE | MANDATORY_RUNTIME_INCIDENT_TYPES
+    )
     assert config.notifies("management_partial_failed") is True
     assert config.notifies("monitor_adapter_failure") is False
     assert config.diagnoses("management_partial_failed") is True
@@ -644,8 +647,9 @@ def test_runtime_incident_flags_are_dormant_by_default_and_parse_allowlist():
     assert default.telegram_notifications_enabled is False
     assert default.agent_enabled is False
     assert default.agent_token_budget_enabled is False
-    assert enabled.capture_types == frozenset(
-        {"context_worker_exhausted", "monitor_audit_incomplete"}
+    assert enabled.capture_types == (
+        frozenset({"context_worker_exhausted", "monitor_audit_incomplete"})
+        | MANDATORY_RUNTIME_INCIDENT_TYPES
     )
     assert enabled.telegram_notifications_enabled is True
     assert enabled.agent_enabled is True

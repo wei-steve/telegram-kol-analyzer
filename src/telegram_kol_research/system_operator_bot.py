@@ -19,6 +19,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import aliased
 
 from telegram_kol_research.config import (
+    CONTEXT_WORKER_EXHAUSTED_DELIVERED_OPERATION_PREFIX,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
@@ -2299,6 +2300,32 @@ async def deliver_terminal_entry_cleanup_notifications(
     return delivered
 
 
+def runtime_incident_payload_is_deliverable(incident) -> bool:
+    """Report whether a type-eligible incident's payload also earns a message.
+
+    Type alone is too coarse for ``context_worker_exhausted``: the same type is
+    raised by backfills and scanners, which produced 1466 rows by 2026-09-07.
+    Only the ``raw_message_*`` operations describe a real inbound instruction
+    whose processing was abandoned, so only those are delivered.
+
+    Unreadable or absent payloads fail closed towards delivering: an operator
+    reading one spurious report is cheaper than a dropped instruction.
+    """
+
+    incident_type = str(getattr(incident, "incident_type", "") or "")
+    if incident_type != "context_worker_exhausted":
+        return True
+    try:
+        summary = json.loads(getattr(incident, "redacted_summary", "") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return True
+    if not isinstance(summary, dict) or "operation" not in summary:
+        return True
+    return str(summary.get("operation") or "").startswith(
+        CONTEXT_WORKER_EXHAUSTED_DELIVERED_OPERATION_PREFIX
+    )
+
+
 def claim_next_runtime_incident_notification(
     session_factory,
     *,
@@ -2477,6 +2504,25 @@ async def deliver_runtime_incident_notifications(
             break
         incident = claim["incident"]
         token = claim["claim_token"]
+        if not runtime_incident_payload_is_deliverable(incident):
+            suppressed_at = operation_now
+            with session_factory() as session:
+                session.execute(
+                    update(RuntimeIncident)
+                    .where(
+                        RuntimeIncident.id == incident.id,
+                        RuntimeIncident.notification_status == "delivering",
+                        RuntimeIncident.notification_claim_token == token,
+                    )
+                    .values(
+                        notification_status="suppressed",
+                        notification_claim_token=None,
+                        notification_claimed_at=suppressed_at,
+                        updated_at=suppressed_at,
+                    )
+                )
+                session.commit()
+            continue
         try:
             await send_system_operator_bot_message(
                 config=config,
@@ -2687,8 +2733,14 @@ async def run_runtime_incident_notification_loop(
     interval_seconds: float = 5.0,
     runtime_config: RuntimeIncidentConfig | None = None,
     deepcoin_client_factory=None,
+    delivery_observer=None,
 ) -> None:
-    """Poll the Phase 2 outbox through the dedicated system operator bot."""
+    """Poll the Phase 2 outbox through the dedicated system operator bot.
+
+    ``delivery_observer`` is called with the UTC instant of a round that
+    actually sent something, so a health endpoint can report when alerting last
+    spoke without querying the ledger on the request path.
+    """
 
     if runtime_config is None:
         try:
@@ -2709,11 +2761,13 @@ async def run_runtime_incident_notification_loop(
         except Exception:
             pass
         try:
-            await deliver_runtime_incident_notifications(
+            delivered = await deliver_runtime_incident_notifications(
                 session_factory,
                 config=config,
                 runtime_config=feature_config,
             )
+            if delivered and delivery_observer is not None:
+                delivery_observer(datetime.now(UTC))
         except asyncio.CancelledError:
             raise
         except Exception:
