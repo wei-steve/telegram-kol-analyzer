@@ -14,7 +14,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 5
 current_step_file: docs/plans/2026-09-07-management-reliability/step-5-protection-resize-and-batch-timeout.md
-step_status: claimed              # planned | claimed | in_progress | completed | blocked
+step_status: in_progress              # planned | claimed | in_progress | completed | blocked
 claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
 last_completed_step: 3d
 last_completed_commit: 04a5643c7b3bdbed630e51ecdfd79413e33cff57
