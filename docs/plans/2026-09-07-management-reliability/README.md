@@ -38,6 +38,7 @@
 4. `step-4-ledger-repair.md`
 5. `step-5-protection-resize-and-batch-timeout.md`
 5b. `step-5b-frozen-convergence-backlog.md`
+5c. `step-5c-partial-fill-evidence-from-order-history.md`
 6. `step-6-rejection-semantics-and-frozen-bypass.md`
 7. `step-7-target-resolution-and-ghost-lifecycles.md`
 

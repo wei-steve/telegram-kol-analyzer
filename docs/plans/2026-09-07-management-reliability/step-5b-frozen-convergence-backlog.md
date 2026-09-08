@@ -26,5 +26,5 @@
 
 ## 完成条件
 
-更新状态文件到 `current_step: 6`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-6-rejection-semantics-and-frozen-bypass.md`；
+更新状态文件到 `current_step: 5c`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-5c-partial-fill-evidence-from-order-history.md`；
 `send_message` 给 `brain_session_id`：备份路径、29 条逐行处置、复位后系统建单的逐笔核对。
