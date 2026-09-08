@@ -219,6 +219,16 @@ payload 字段组合是 2026-09-07 受控实盘实验的结论，白名单在
 
 任一不成立即 `attribution_status='unverified'`，而 `== 'verified'` 是本仓库每一处自动修改、
 撤销、认领的前置条件，所以 unverified 就是自动动作全部止步。
+
+**迁移后的限价腿在 order 上自带 `slTriggerPx`，止损从成交那一刻起就由交易所持有，与归属无关；
+市价腿不同**——它的 payload 不带止损，止损靠成交后 `set_position_tpsl` 写，而那道写入门要求
+verified。所以「市价成交但归属 unverified」是唯一一种仓位可能裸奔的情形，必须让人立刻知道：
+生成 `market_fill_attribution_unverified`（severity **critical**，来源 `deepcoin_entry_order:<ordId>`，
+`impact` 里带 instId / side / sz / 候选 posId），并且**无论环境变量的投递白名单列了什么都会送达**
+（`config.ALWAYS_NOTIFIED_INCIDENT_TYPES`；`telegram_notifications_enabled` 仍是唯一的总开关）。
+详细 summary 万一被越界检查拒绝，会退回一份不含插值的最小 summary 重记一次——少说一点的告警
+远胜于没有告警。旧代码在这里会用 symbol+side 扫描认领并标 verified；在 split 模式多仓并存时
+那可能把止损挂到别人的仓位上，所以认不出是谁的仓位就不动作。裸仓安全网是独立后续项 B-5d。
 **这条等式只对普通 order 成立**：2026-09-07 只读核对生产 `execution_order_legs`，
 market 入场腿两个 id 齐全的 153 条 **153 条**满足，trigger_limit 的 204 条**一条都不满足**
 （条件单的仓位以它派生的子单命名）。所以条件单那条链原样不动。

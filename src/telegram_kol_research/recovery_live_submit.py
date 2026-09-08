@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import time
 import hashlib
@@ -58,6 +59,7 @@ from telegram_kol_research.execution_events import (
     enqueue_entry_price_geometry_rejection_notification,
 )
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.runtime_incidents import record_runtime_incident
 from telegram_kol_research.entry_price_geometry import (
     validate_order_draft_price_geometry,
 )
@@ -121,6 +123,9 @@ from telegram_kol_research.take_profit_plan import build_take_profit_plan
 
 class RecoveryLiveSubmitError(RuntimeError):
     """Raised when a live recovery order cannot be submitted safely."""
+
+
+_LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -1453,9 +1458,19 @@ def _submit_recovery_signal_direct(
                     attribution_evidence["protection_pos_id_source"] = (
                         "new_position_snapshot_difference"
                     )
-                    warnings.append(
-                        "entry_position_attribution_unverified:" + attribution_reason
-                    )
+                warnings.append(
+                    "entry_position_attribution_unverified:" + attribution_reason
+                )
+                _record_market_fill_attribution_incident(
+                    session_factory,
+                    order_id=order_id,
+                    candidate_pos_id=pos_id,
+                    inst_id=str(draft.get("instrument_id") or ""),
+                    position_side=str(leg.get("position_side") or ""),
+                    size=leg.get("quantity"),
+                    reason=attribution_reason,
+                    occurred_at=now,
+                )
             provisional_order = {
                 "leg_index": index,
                 "execution_type": "market",
@@ -1829,6 +1844,96 @@ def _submission_source_leg_indices(
             raise RecoveryLiveSubmitError("invalid_coalesced_entry_leg_indices")
         mapped.append(int(selected_indices[local_position - 1]))
     return mapped
+
+
+MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE = "market_fill_attribution_unverified"
+MARKET_FILL_ATTRIBUTION_POLICY_VERSION = "phase-5-ordinary-entry-attribution-v1"
+
+
+def _record_market_fill_attribution_incident(
+    session_factory: sessionmaker,
+    *,
+    order_id: str,
+    candidate_pos_id: str | None,
+    inst_id: str,
+    position_side: str,
+    size: Any,
+    reason: str,
+    occurred_at: datetime,
+) -> None:
+    """Say out loud that a market order may have filled into an unheld position.
+
+    A market entry carries no stop in its own payload -- the stop is written
+    afterwards against an exact ``posId`` -- so when the identity equation
+    cannot say which position this order opened, the protection write gate
+    refuses, and a position that did fill is sitting there with nothing bounding
+    its loss but the liquidation price. It has never happened: 153 of 153
+    production market entry legs satisfy the equation. If it ever does, a person
+    has to hear about it in seconds, so this type is delivered whatever the
+    environment's notification whitelist happens to list
+    (``config.ALWAYS_NOTIFIED_INCIDENT_TYPES``).
+
+    Recording evidence never breaks the submission path. The order has already
+    reached the exchange by this point, so raising here would replace a reported
+    problem with an unreported one.
+    """
+
+    # ``redacted_summary`` has one closed field vocabulary shared by every
+    # incident type, and widening it for one type would weaken the check that
+    # keeps sensitive material out of all of them. The identifiers go where they
+    # are already rendered into the Telegram message instead: the order id is
+    # the incident's own source record, and the rest ride in ``impact``, which
+    # the formatter prints. Nobody should have to run a query to learn which
+    # position to look at.
+    # Short space-separated tokens on purpose: the bounds checker treats a long
+    # unbroken mixed-character run as a possible opaque secret, and a rejected
+    # summary would mean no alert at all.
+    detail = (
+        f"market_entry_may_be_filled_without_stop inst={inst_id} "
+        f"side={position_side} sz={size} pos={candidate_pos_id or 'none'}"
+    )
+    full = {
+        "component": "recovery_live_submit",
+        "reason_code": reason or "attribution_unverified",
+        "impact": detail,
+        "containment": "protection_not_attached_position_unverified",
+    }
+    # If the detailed summary is refused for any reason, fall back to one that
+    # cannot be: an alert that says less is worth incomparably more than no
+    # alert, and the order id travels in ``source_record_id`` either way.
+    minimal = {
+        "component": "recovery_live_submit",
+        "reason_code": reason or "attribution_unverified",
+        "impact": "market_entry_may_be_filled_without_stop",
+        "containment": "protection_not_attached_position_unverified",
+    }
+    for summary in (full, minimal):
+        try:
+            record_runtime_incident(
+                session_factory,
+                source_kind="deepcoin_entry_order",
+                source_record_id=str(order_id),
+                incident_type=MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE,
+                severity="critical",
+                fingerprint=hashlib.sha256(
+                    f"{MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE}:{order_id}".encode()
+                ).hexdigest(),
+                redacted_summary=json.dumps(
+                    summary, ensure_ascii=False, sort_keys=True
+                ),
+                occurred_at=occurred_at,
+                feature_policy_version=MARKET_FILL_ATTRIBUTION_POLICY_VERSION,
+                prompt_version="none",
+                tool_policy_version="no-exchange-write",
+                evidence_refs_json=json.dumps(
+                    [f"deepcoin_entry_order:{order_id}"]
+                ),
+            )
+            return
+        except Exception:  # pragma: no cover - evidence must never break the entry
+            _LOGGER.exception(
+                "market_fill_attribution_incident_record_failed ord_id=%s", order_id
+            )
 
 
 def _attribute_ordinary_entry(

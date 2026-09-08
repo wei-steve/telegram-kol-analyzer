@@ -270,6 +270,13 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- followup-b5d-naked-market-fill (2026-09-08, 指挥会话立项，**不在阶段 5 部署范围**): **B-5d 市价成交裸仓安全网。**
+  阶段 5 收紧归属后，市价腿的止损靠成交后 `set_position_tpsl` 写，而写入门要求 `attribution_status='verified'`，
+  所以「市价成交且 posId != ordId」时仓位会裸奔（历史 153/153 满足等式、零反例，该分支从未发生）。
+  本次部署先补告警（`market_fill_attribution_unverified`，severity critical，进代码级默认投递白名单）。
+  安全网本身留作独立项：归属 unverified 超过 N 秒、且该 instId+side 上恰有**一个**无人认领、数量等于成交量的
+  活跃仓位时，**只挂止损不挂止盈、不认领所有权**、标 `attribution=unverified_sl_by_unique_candidate` 并告警。
+  阶段 6 之前完成，**需用户单独批准**。
 - phase-5b-completed (2026-09-07, 会话 local_3a8d3395, **阶段 5b 完成**):
   分支 `rest-ws/phase-5b-rate-limiter`，提交 `230ba1cc8097d30ed89c860608467f17680a14ca`
   （rebase 到 A 线 `e402692c` 之后），已 `tg-deploy` 上线；**回滚 SHA

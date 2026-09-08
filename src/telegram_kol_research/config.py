@@ -114,6 +114,9 @@ class RuntimeIncidentConfig:
         return incident_type in self.capture_types
 
     def notifies(self, incident_type: str) -> bool:
+        # ``telegram_notification_types`` already carries the always-notified
+        # set when a non-empty whitelist was configured, so this stays a plain
+        # membership test and capture-only keeps meaning capture-only.
         return self.telegram_notifications_enabled and (
             self.telegram_notification_types is None
             or incident_type in self.telegram_notification_types
@@ -124,6 +127,28 @@ class RuntimeIncidentConfig:
             self.agent_incident_types is None
             or incident_type in self.agent_incident_types
         )
+
+
+#: Incident types that reach Telegram whatever the environment's whitelist says.
+#:
+#: The whitelist is a filter on noise, and these are not noise: each one means a
+#: real position may be sitting on the exchange without the protection that
+#: bounds its loss. Leaving one out of the environment's list -- which is edited
+#: by hand, on a server, months after the reason for it was written down -- would
+#: turn that into silence.
+#:
+#: Two deliberate ways to say "send nothing" survive, because both are stated
+#: rather than forgotten: ``telegram_notifications_enabled`` off, and the
+#: whitelist key present but empty (capture-only).
+ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
+    {
+        # Phase 5: a market entry was submitted, its position could not be
+        # attributed by the identity equation, and the protection write gate
+        # therefore refused. The summary carries the order id and the candidate
+        # position id so a person can look at the exchange immediately.
+        "market_fill_attribution_unverified",
+    }
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -382,14 +407,20 @@ def load_runtime_incident_config(
         if item.strip()
     )
     telegram_types_key = "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES"
+    configured_notification_types = frozenset(
+        item.strip().lower()
+        for item in env.get(telegram_types_key, "").split(",")
+        if item.strip()
+    )
     telegram_notification_types = (
-        frozenset(
-            item.strip().lower()
-            for item in env.get(telegram_types_key, "").split(",")
-            if item.strip()
-        )
-        if telegram_types_key in env
-        else None
+        # An empty list is capture-only: someone typed the key and left it
+        # blank, which says "notify nothing" and is honoured as written. A list
+        # with entries in it is a filter someone maintains by hand, and the
+        # always-notified types are added to it so that forgetting one cannot
+        # turn a critical alert into silence.
+        (configured_notification_types | ALWAYS_NOTIFIED_INCIDENT_TYPES)
+        if configured_notification_types
+        else (frozenset() if telegram_types_key in env else None)
     )
     agent_shadow_playbooks = frozenset(
         item.strip().lower()

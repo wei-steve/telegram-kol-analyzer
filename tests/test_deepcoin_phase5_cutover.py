@@ -52,6 +52,7 @@ from telegram_kol_research.position_attribution import (
     require_verified_position_ownership,
 )
 from telegram_kol_research.recovery_live_submit import (
+    MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE,
     _require_ws_observation_or_raise,
     build_deepcoin_trigger_order_payload,
 )
@@ -540,3 +541,186 @@ def test_the_open_order_guard_recognises_the_new_limit_entry_as_ours(tmp_path):
 
     assert [row["ordId"] for row in guarded.allowed] == [ORD_ID]
     assert {row["ordId"] for row in guarded.blocked} == {"someone-elses-order", ""}
+
+
+# --------------------------------------------------------------------------
+# A market fill nobody can attribute has to be heard about, not just recorded
+# --------------------------------------------------------------------------
+
+
+def test_the_unverified_market_fill_type_survives_a_hand_edited_whitelist():
+    """The environment's whitelist may not silence this one.
+
+    Production's ``TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES`` is a hand-kept
+    comma list on a server. A type that means "a position may be sitting there
+    with no stop" cannot depend on someone having remembered to add it.
+    ``telegram_notifications_enabled`` is still the one deliberate way to send
+    nothing.
+    """
+
+    from telegram_kol_research.config import (
+        ALWAYS_NOTIFIED_INCIDENT_TYPES,
+        load_runtime_incident_config,
+    )
+
+    assert MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE in ALWAYS_NOTIFIED_INCIDENT_TYPES
+
+    config = load_runtime_incident_config(
+        {
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": (
+                "management_partial_failed,severe_protection_incident"
+            ),
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "1",
+        },
+        environment_only=True,
+    )
+    assert MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE in config.telegram_notification_types
+    # And the types that were listed are still there.
+    assert "management_partial_failed" in config.telegram_notification_types
+
+    # Absent key keeps meaning "every type", not "only this one".
+    assert (
+        load_runtime_incident_config({}, environment_only=True)
+        .telegram_notification_types
+        is None
+    )
+    # And the key present but empty keeps meaning capture-only. That is someone
+    # typing "notify nothing", not someone forgetting a type, so it is honoured
+    # as written -- the guarantee here is against omission, not against choice.
+    assert (
+        load_runtime_incident_config(
+            {"TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": ""},
+            environment_only=True,
+        ).telegram_notification_types
+        == frozenset()
+    )
+
+
+def test_an_unattributable_market_fill_records_a_critical_incident(tmp_path):
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.recovery_live_submit import (
+        _record_market_fill_attribution_incident,
+    )
+
+    session_factory = create_session_factory(tmp_path / "incident.db")
+
+    _record_market_fill_attribution_incident(
+        session_factory,
+        order_id=ORD_ID,
+        candidate_pos_id="candidate-pos-9",
+        inst_id=INST_ID,
+        position_side="long",
+        size=0.2,
+        reason="rest_pos_id_not_confirmed_by_rest",
+        occurred_at=datetime(2026, 9, 7, 12, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        incident = session.query(RuntimeIncident).one()
+    assert incident.incident_type == MARKET_FILL_ATTRIBUTION_INCIDENT_TYPE
+    assert incident.severity == "critical"
+    summary = json.loads(incident.redacted_summary)
+    assert summary["reason_code"] == "rest_pos_id_not_confirmed_by_rest"
+    assert summary["containment"] == "protection_not_attached_position_unverified"
+
+    # Everything a person needs to open the exchange and look has to be in the
+    # message they receive, not behind a query they would have to know to run.
+    # The order id is the incident's own source record; the rest ride in
+    # ``impact``, and both are fields the notification formatter prints.
+    from telegram_kol_research.system_operator_bot import (
+        format_runtime_incident_notification,
+    )
+
+    text = format_runtime_incident_notification(incident)
+    assert f"deepcoin_entry_order:{ORD_ID}" in text
+    assert "pos=candidate-pos-9" in text
+    assert f"inst={INST_ID}" in text
+    assert "side=long" in text
+    assert "sz=0.2" in text
+    assert "market_entry_may_be_filled_without_stop" in text
+    assert "critical" in text
+
+
+def test_the_same_unattributable_order_does_not_become_a_second_incident(tmp_path):
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.recovery_live_submit import (
+        _record_market_fill_attribution_incident,
+    )
+
+    session_factory = create_session_factory(tmp_path / "incident-twice.db")
+    for _ in range(2):
+        _record_market_fill_attribution_incident(
+            session_factory,
+            order_id=ORD_ID,
+            candidate_pos_id=None,
+            inst_id=INST_ID,
+            position_side="long",
+            size=0.2,
+            reason="no_ws_position_frame_for_pos_id",
+            occurred_at=datetime(2026, 9, 7, 12, 0, tzinfo=UTC),
+        )
+
+    with session_factory() as session:
+        rows = session.query(RuntimeIncident).all()
+    # One order, one alert. Coalescing is what keeps a repeated pass from
+    # burying the operator, and the fingerprint is the order id for that reason.
+    assert len(rows) == 1
+
+
+def test_recording_the_incident_never_breaks_an_entry_that_already_reached_the_exchange():
+    from telegram_kol_research.recovery_live_submit import (
+        _record_market_fill_attribution_incident,
+    )
+
+    def _broken_session_factory():
+        raise RuntimeError("database unavailable")
+
+    # No exception escapes: the order is already on the exchange, and raising
+    # here would replace a reported problem with an unreported one.
+    _record_market_fill_attribution_incident(
+        _broken_session_factory,
+        order_id=ORD_ID,
+        candidate_pos_id=None,
+        inst_id=INST_ID,
+        position_side="long",
+        size=0.2,
+        reason="rest_positions_unreadable",
+        occurred_at=datetime(2026, 9, 7, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_a_summary_the_bounds_checker_refuses_still_produces_an_alert(tmp_path):
+    """The alert must not be lost to a formatting rule.
+
+    ``redacted_summary`` is checked for anything that looks like leaked secret
+    material, and a long unbroken identifier can trip that heuristic. If the
+    detailed summary is ever refused, the fallback one -- which carries no
+    interpolated values at all -- still records the incident, and the order id
+    is in ``source_record_id`` regardless.
+    """
+
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.recovery_live_submit import (
+        _record_market_fill_attribution_incident,
+    )
+
+    session_factory = create_session_factory(tmp_path / "bounds-fallback.db")
+    _record_market_fill_attribution_incident(
+        session_factory,
+        order_id=ORD_ID,
+        # An id long and mixed enough to read as an opaque secret.
+        candidate_pos_id="Ab3" + "xY7z_9Q2-K4mN8pR" * 3,
+        inst_id=INST_ID,
+        position_side="long",
+        size=0.2,
+        reason="rest_pos_side_mismatch",
+        occurred_at=datetime(2026, 9, 7, 12, 0, tzinfo=UTC),
+    )
+
+    with session_factory() as session:
+        incident = session.query(RuntimeIncident).one()
+    assert incident.severity == "critical"
+    assert incident.source_record_id == ORD_ID
+    summary = json.loads(incident.redacted_summary)
+    assert summary["impact"] == "market_entry_may_be_filled_without_stop"
+    assert summary["reason_code"] == "rest_pos_side_mismatch"
