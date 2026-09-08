@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 3b
-current_step_file: docs/plans/2026-09-07-management-reliability/step-3b-contact-digits-not-prices.md
-step_status: in_progress              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 3
-last_completed_commit: 1c132f7c991cade3ef4169ca0860836ef801d4ac
+current_step: 4
+current_step_file: docs/plans/2026-09-07-management-reliability/step-4-ledger-repair.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 3b
+last_completed_commit: 992a0b5d71c27e79be0b5771801ded45475a4edd
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -61,6 +61,18 @@ user_decisions_2026_09_07:
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
 
+- step-3b (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**。分支 `mgmt/step-3b-contact-digits`，代码提交 `992a0b5d71c27e79be0b5771801ded45475a4edd`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署，2026-09-08T12:11Z）。部署前生产 HEAD `1c132f7c991cade3ef4169ca0860836ef801d4ac` 为回滚参考；部署前 `active_write_count=0`、在途管理批次 0。其后 `21cb1c29`/`279940c4` 两个提交只含测试与文档，**生产代码与 992a0b5d 完全一致，不需要重新部署**。
+  **根因是两条彼此独立的注入路径，任务 1 同时堵住**：(1) `message_recognition._extract_explicit_stop_loss_from_management_text` 的第一条正则允许 `止损` 与数字之间隔 20 个非数字字符，而 `！\n@Tarderfengge QQ:` 正好 19 个；(2) `management_directives._text_contains_explicit_stop_value` 用"数字前 32 字符内出现止损词"确认模型给的值，同一签名同样成立——**文本 provenance 能证明数字来自哪里，永远不能证明它是什么**。只堵一条另一条仍会复发，两条各有独立回归用例（指挥会话要求）。
+  **做法**：新模块 `contact_digit_scrubbing.py`，在**抽取输入**上脱除 QQ／扣扣／微信·VX·weixin·wechat·v信／电话·手机／`@handle`／≥9 位纯数字串；**不改保存的原文，不影响识别的其他字段**。脱除是**等长替换**（每个被脱字符变一个空格，**换行保留**）——下游有 20 字符邻近窗口、32 字符 provenance 窗口和按行抽取，等长且保行才能保证幸存数字与标签的距离一分不差。刻意的两条边界：`QQQ`/`QQQUSDT` 是真实标的，第三个 Q 即否决匹配（生产文本里实有 `qqqusdt现在的价格是：718.6`）；`@2530` 是带 at 号的价格而非 handle，因 Telegram 用户名不能以数字开头而被保留。接入点：上述两条路径 + `_extract_entry_confirmation_price` + `_extract_labeled_entry_text` + 数量抽取 `_percentage_values`；`_clean_bitcoin_junzhang_text` 原本自带一份同规则的私有副本，改为复用同一实现。
+  **任务 2（量级校验，指挥裁定方案 A）**：新模块 `management_price_plausibility.py`，在 `strategy_management_planner` 里于闸门之前把"与该合约 last 价相差超过 10 倍"的显式价格当作**未提供**，记 `management_price_implausible`（已进 `ALWAYS_NOTIFIED_INCIDENT_TYPES`，生产 env 下 `notifies()` 实测为 True，水位线 AFTER_ID=2069 < 当前 max id 2074，不会被压制）。**只作用于隐式止损类动作**（`partial_then_break_even` / `move_stop_to_break_even` / `break_even_by_market`）——那里"存在任何显式价格"本身就是语义冲突、会否决整条指令，所以一个不是价格的数字会同时吃掉减仓和保护；`adjust_stop_loss` **刻意不纳入**：那里价格就是指令本身，闸门已经拿同一个市价比过，拒绝才是对的，绝不替消息发明一个止损价。**闸门一行未改**。**读不到 quote 就完全不校验**、按现状走闸门（不放宽）；没有显式价格时**根本不发起市价读取**（有回归测试锁住）。净化做成**只读的候选视图**：`signal_candidates` 行原样保留原值作证据，而批次的 `management_contract_json`（含重算后的指纹）与 `planned_tpsl` 都取净化值，因此执行期 `validate_batch_stops` 复检看到的与规划期一致，一次脱除对后续每一个决定都成立。
+  **`take_profit_text` 未纳入（与裁定文字的差异，特此说明）**：只读核实全仓库该字段的读取方只有入场路径 `auto_trade_execution.py`，以及 `management_message_targets.py` 里**仅用于拼目标身份指纹**（不是当价格执行，改它会改指纹、破坏身份匹配）。管理执行路径根本不读它，加上去就是死代码，故与 `entry_price` 一并归入遗留。
+  **验证**：全量 **7881 passed / 4 skipped / 0 failed**；`tests/test_runtime_event_loop_blocking_census.py` 通过。
+  **30 天只读重放**（大镖客群 `-1003048800035`，2026-08-09 起，`mode=ro` + `PRAGMA query_only=ON`，零写入）：309 条消息，**带联系方式片段 300 条**；止损抽取修复前命中 30 条、修复后 6 条，**变化 25 条**，全部是同一个签名 `@Tarderfengge QQ:158241758`——24 条从 `158241758` 变为"未提供"，1 条见下。候选行确认路径 30 天内**没有任何真实止损价被误伤**（旧逻辑确认数 0、新逻辑 0、丢失 0）。25 条 raw id 清单与逐条明细在服务器 `/root/evidence/step3b-replay-30d-summary.md` 与 `step3b-replay-30d.json`。
+  **观察（L2）**：后台只读监视器每分钟采样，`2026-09-08T12:21:19Z` 起取得**连续 2524 秒（42 分钟）、5 条真实消息、2 个群**的健康窗口，全程 worker/web/ingest 三端点 200、生产 HEAD 恒为 992a0b5d、真实 backlog 0、窗内新增 `management_stop_rejected` 0、`management_price_implausible` 0。日志 `/root/evidence/step3b-observation.log`。**窗内大镖客群没有管理消息（dachong=0）**，所以"逐条确认 stop_price 不再是签名数字"这项没有实时样本；按 L2"消息流量不受任何人控制"的规则不算失败，该群的核实由上面 30 天重放的 25 条承担。
+  **事故批次未被本步改变**：batch 160（raw 15402）仍为 `blocked / management_stop_action_conflict`，batch 159（raw 15013）仍为 `blocked / protection_price_or_size_mismatch`。本步的修复**只对此后的消息生效**，这两条积压属 step 4 账本修复范围。
+  **遗留 1（指挥裁定归入 step 7 的识别修正范围）**：raw 13632（`刚才2503，只差2点到第一止盈…`）是 25 条里唯一"变成另一个数"的——签名让路后，抽取器的**第二条**正则 `([0-9]+)[^0-9]{0,8}(?:附近)?[^0-9]{0,12}(?:止损|损位|保护价)` 够到"只差**2**点"，把相对距离读成价格。该缺陷**早于本次改动**（旧代码只是被 QQ 号先抢到而盖住），修法方向是**复用 `entry_price_geometry` 已成体系的 `_RELATIVE_MARKERS` / `_RELATIVE_UNIT_RE`** 识别"N 点／N 个点"这类相对距离，而不是在止损抽取器里加特例。**实测无执行风险**：`_is_plausible_management_stop_loss` 会以生命周期参考价丢弃 2.0，且它拿不到 current_message_text provenance，合约保持 `actual_entry_price`。已加回归测试锁住这个安全终态，防止后来的人把它"修"成显式价格。
+  **遗留 2（指挥裁定，等 B 线阶段 5 结项后作为独立小项）**：`entry_price` 的量级校验不在本步——落点在 `auto_trade_execution` 与 `recovery_live_submit`，后者是 B 线阶段 5 的锁定文件；入场侧已有 `_detect_strategy_symbol_price_scale_conflict` 与 `entry_price_geometry` 两道防线，且任务 1 的脱除已把联系方式数字挡在入场抽取之外。
+  **遗留 3（本步新发现的生产缺陷，与 A-3b 无关，请指挥安排归属）**：worker 反复抛 `PermissionError: [Errno 13] Permission denied: 'config/telegram.env'`，使 `message_processing_worker` 的作业失败、权威执行落 `authoritative_execution_outcome_unknown`（窗内 raw 15449/15450 各失败多次，并生成 incident 2075 `context_worker_exhausted`）。**不是本次部署造成的**：日志中最早一次为 **2026-09-04 12:45 UTC**，早于本次部署四天；该文件未被 git 跟踪（`-rw------- root root`，mtime 8-08），tg-deploy 的 hard reset 根本碰不到它。根因是服务以 `User=telegram-kol-worker` 运行却读不了 root 的 0600 文件，而 `telegram_client._load_env_file_values` **只判断 `exists()` 与 `is_file()`、不判断可读性**，`read_text` 抛出的 `PermissionError` 一路向上冒穿权威执行。修法有两面：代码侧让该加载器对不可读文件 fail-open（env 变量本来就优先于文件），运维侧修正该文件的属组／权限——后者属于系统权限变更，需用户决定，本会话未做任何改动。
 - step-2 (2026-09-08, local_bc413965-dc4a-4e5c-b471-dad8cf6c80bf): **completed**。分支 `mgmt/step-2-alerting`，代码提交 `ca66a2d5c095c22313d6009b9a61048840a88800`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署，2026-09-08T06:41Z）。部署前生产 HEAD `7a4d852a31708515aa92e58313a941c206f5637c`（B 线阶段 5）为回滚参考。
   **做了什么（六个任务）**：
   (1) **白名单**：不再依赖"代码默认值"——生产 env 显式设了 `TELEGRAM_TYPES`，改默认值在生产为零效果。改为**代码强制基线与非空 env 选择器取并集**，capture 与 telegram 两处共用**一个集合、一个并集函数**（与 B 线阶段 5 的 `ALWAYS_NOTIFIED_INCIDENT_TYPES` 合并，A-2 五类并入，`_with_always_notified_types`）。两个关断位原样保留：键**缺席**=全类型，键为**空串**=capture-only。`context_worker_exhausted` 的 `operation` 前缀过滤在**投递侧**：认领后不合格的行落 `notification_status="suppressed"`（终态、不再认领），payload 读不出或无 `operation` 字段时仍投递（fail-closed 朝多发一条）。
