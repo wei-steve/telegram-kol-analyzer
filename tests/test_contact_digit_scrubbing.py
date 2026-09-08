@@ -7,6 +7,7 @@ from telegram_kol_research.contact_digit_scrubbing import (
     text_carries_contact_identifier,
 )
 from telegram_kol_research.management_directives import (
+    _text_contains_explicit_stop_value,
     build_management_instruction_contract,
     resolve_management_directive,
 )
@@ -37,7 +38,38 @@ SIGNATURE_DIGITS = "158241758"
 
 @pytest.mark.parametrize("text", [RAW_15402, RAW_15013])
 def test_signature_digits_are_not_read_as_a_stop_price(text):
+    """Path one: the extractor's 20-character window.
+
+    ``！\n@Tarderfengge QQ:`` is 19 non-digit characters, so ``止损`` reached
+    the signature's digits and returned them as the stop price.
+    """
+
     assert _extract_explicit_stop_loss_from_management_text(text) is None
+
+
+# The two injection paths are independent and each is covered on its own: the
+# extractor reads a number out of the text, the provenance check endorses a
+# number the model supplied. Blocking one would have left the other open.
+
+
+@pytest.mark.parametrize("text", [RAW_15402, RAW_15013])
+def test_provenance_no_longer_endorses_a_signature_number(text):
+    """Path two: ``_text_contains_explicit_stop_value``'s 32-character window.
+
+    The QQ number really is in the message and really does sit within 32
+    characters of ``止损``, so the window used to endorse it as coming from the
+    current message -- which is exactly the evidence the contract requires
+    before a stop counts as explicit.
+    """
+
+    lowered = text.strip().lower()
+
+    assert _text_contains_explicit_stop_value(lowered, SIGNATURE_DIGITS) is False
+    # The check still does its job for a price the message really names.
+    assert (
+        _text_contains_explicit_stop_value("eth 空单，止损上移到 2530", "2530")
+        is True
+    )
 
 
 @pytest.mark.parametrize("text", [RAW_15402, RAW_15013])
