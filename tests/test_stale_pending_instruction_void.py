@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
 )
 from telegram_kol_research.one_off.stale_pending_instruction_void import (
     DEFERRED_EXPIRED_REASON,
+    build_void_notification,
     DEFERRED_HOLD_REASON,
     STALE_PENDING_ITEM_IDS,
     UNBOUND_LIFECYCLE_IDS,
@@ -219,3 +220,43 @@ def test_the_copied_reason_literals_match_the_online_constants():
 
     assert DEFERRED_HOLD_REASON == online.DEFERRED_HOLD_REASON
     assert DEFERRED_EXPIRED_REASON == online.DEFERRED_EXPIRED_REASON
+
+
+def test_the_notification_is_one_message_grouped_by_chat():
+    """One aggregated message, not 33: it is a single operator decision."""
+
+    rows = [
+        {
+            "item_id": 988,
+            "instruction_kind": "entry",
+            "raw_message_id": 15169,
+            "chat_title": "陈哥",
+            "posted_at": "2026-09-07 00:35",
+            "automation_reason": DEFERRED_HOLD_REASON,
+        },
+        {
+            "item_id": 1014,
+            "instruction_kind": "entry",
+            "raw_message_id": 15372,
+            "chat_title": "飞扬",
+            "posted_at": "2026-09-08 02:52",
+            "automation_reason": DEFERRED_HOLD_REASON,
+        },
+        {
+            "item_id": 1012,
+            "instruction_kind": "management",
+            "raw_message_id": 15339,
+            "chat_title": "飞扬",
+            "posted_at": "2026-09-07 23:27",
+            "automation_reason": DEFERRED_HOLD_REASON,
+        },
+    ]
+
+    text = build_void_notification(rows)
+
+    assert text.count("【") == 2
+    assert "【飞扬】2 条" in text
+    assert "· item 988 entry raw 15169 2026-09-07 00:35" in text
+    assert "不补执行" in text
+    # Telegram refuses a message over 4096 characters; a 33-row batch must fit.
+    assert len(build_void_notification(rows * 11)) < 4000

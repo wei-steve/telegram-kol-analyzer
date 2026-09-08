@@ -124,20 +124,34 @@ def plan_stale_pending_void(
     )
 
 
-def build_void_notification(row: dict[str, object]) -> str:
-    """One Telegram message per voided item, in the operator's language."""
+def build_void_notification(rows: list[dict[str, object]]) -> str:
+    """One aggregated Telegram message for the whole batch, grouped by chat.
 
-    return (
-        "⚠️ 积压指令已作废（不补执行）\n"
-        f"指令项：{row['item_id']}（{row['instruction_kind']}）\n"
-        f"消息：raw {row['raw_message_id']}\n"
-        f"群：{row['chat_title']}\n"
-        f"策略：{row['strategy_instance_id'] or '—'}\n"
-        f"发布时间：{row['posted_at']}\n"
-        f"原状态：pending，卡住原因 {row['automation_reason'] or '—'}\n"
-        f"处置：标记为 failed，理由 {VOID_REASON}。"
-        "该指令永不补执行；如仍需操作请人工下单。"
-    )
+    One message rather than 33: the batch is a single operator decision taken
+    at one moment, and 33 separate alerts would bury the one fact that matters
+    -- these instructions are dead and will not be executed.
+    """
+
+    by_chat: dict[str, list[dict[str, object]]] = {}
+    for row in rows:
+        by_chat.setdefault(str(row.get("chat_title") or row.get("chat_id")), []).append(row)
+    lines = [
+        f"⚠️ 积压指令项已作废（{len(rows)} 条，不补执行）",
+        f"理由：{VOID_REASON}",
+        "处置：状态 pending → failed；对应无交易所敞口的生命周期改为 cancelled。",
+        "这些指令永不补执行；如仍需操作请人工下单。",
+    ]
+    for chat_title in sorted(by_chat):
+        chat_rows = sorted(by_chat[chat_title], key=lambda row: int(row["item_id"]))
+        lines.append("")
+        lines.append(f"【{chat_title}】{len(chat_rows)} 条")
+        for row in chat_rows:
+            lines.append(
+                f"· item {row['item_id']} {row['instruction_kind']} "
+                f"raw {row['raw_message_id']} {row['posted_at']} "
+                f"{row.get('automation_reason') or '—'}"
+            )
+    return "\n".join(lines)
 
 
 def apply_stale_pending_void(
