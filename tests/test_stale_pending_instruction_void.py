@@ -6,10 +6,13 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     MessageInstructionItem,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
     StrategyLifecycle,
 )
 from telegram_kol_research.one_off.stale_pending_instruction_void import (
+    DEFERRED_EXPIRED_REASON,
+    DEFERRED_HOLD_REASON,
     STALE_PENDING_ITEM_IDS,
     UNBOUND_LIFECYCLE_IDS,
     VOID_REASON,
@@ -95,7 +98,22 @@ def _fixture(tmp_path):
             signal_at=NOW.replace(tzinfo=None),
         )
         session.add_all(
-            [listed, bystander, listed_lifecycle, bystander_lifecycle]
+            [
+                listed,
+                bystander,
+                listed_lifecycle,
+                bystander_lifecycle,
+                RecognitionDecision(
+                    raw_message_id=raw.id,
+                    input_kind="text",
+                    authoritative_model="mimo",
+                    authoritative_status="是策略",
+                    authoritative_payload_json="{}",
+                    agreement_status="agreed",
+                    automation_status="deferred",
+                    automation_reason=DEFERRED_HOLD_REASON,
+                ),
+            ]
         )
         session.commit()
     return session_factory
@@ -178,3 +196,26 @@ def test_the_plan_is_read_only(tmp_path):
             ).status
             == "pending"
         )
+
+
+def test_the_void_closes_out_the_decision_so_the_new_expiry_stays_quiet(tmp_path):
+    """Otherwise deploying the A-3 loop alerts on rows just voided by hand."""
+
+    session_factory = _fixture(tmp_path)
+
+    result = apply_stale_pending_void(session_factory, now=NOW)
+
+    assert result.expired_decision_raw_message_ids == (1,)
+    with session_factory() as session:
+        decision = session.query(RecognitionDecision).one()
+        assert decision.automation_status == "deferred"
+        assert decision.automation_reason == DEFERRED_EXPIRED_REASON
+
+
+def test_the_copied_reason_literals_match_the_online_constants():
+    """The tool copies them so it can run pre-deploy; they must not drift."""
+
+    from telegram_kol_research import deferred_instruction_recovery as online
+
+    assert DEFERRED_HOLD_REASON == online.DEFERRED_HOLD_REASON
+    assert DEFERRED_EXPIRED_REASON == online.DEFERRED_EXPIRED_REASON

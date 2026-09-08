@@ -25,13 +25,14 @@ once; a second run reports zero changes rather than touching anything.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import (
     MessageInstructionItem,
+    RecognitionDecision,
     StrategyLifecycle,
 )
 
@@ -54,6 +55,12 @@ UNBOUND_LIFECYCLE_IDS: tuple[int, ...] = (1096, 1107)
 #: lifecycle states (``_TERMINAL_LIFECYCLE_STATES``).
 VOIDABLE_LIFECYCLE_STATES: tuple[str, ...] = ("entered", "pending_entry")
 TERMINAL_LIFECYCLE_STATE = "cancelled"
+#: Copied literals rather than imports of the online constants: this tool has
+#: to run against the production checkout **before** the A-3 code is deployed,
+#: so it must not depend on a module that is not there yet. A test asserts the
+#: two stay equal to their online originals.
+DEFERRED_HOLD_REASON = "waiting_source_deletion_exit"
+DEFERRED_EXPIRED_REASON = "deferred_expired"
 VOID_REASON = "stale_pending_voided_2026_09_07"
 VOID_ERROR_JSON = json.dumps({"reason": VOID_REASON}, separators=(",", ":"))
 
@@ -72,7 +79,7 @@ class VoidPlan:
 class VoidResult:
     voided_item_ids: tuple[int, ...] = ()
     terminalized_lifecycle_ids: tuple[int, ...] = ()
-    notifications: tuple[dict[str, object], ...] = field(default=())
+    expired_decision_raw_message_ids: tuple[int, ...] = ()
 
 
 def plan_stale_pending_void(
@@ -176,6 +183,35 @@ def apply_stale_pending_void(
             .order_by(StrategyLifecycle.id.asc())
             .all()
         )
+        # The decision rows behind the voided items are closed out with the
+        # same reason the new expiry path uses. Without this, deploying the
+        # A-3 loop over an untouched backlog would immediately raise one
+        # incident per stale row -- for instructions that were just voided by
+        # hand and individually notified. Compare-and-set on the exact hold
+        # reason, so only rows still waiting are moved.
+        expired_decisions: list[int] = []
+        for raw_message_id in sorted(
+            {int(item.raw_message_id) for item in items}
+        ):
+            moved = (
+                session.query(RecognitionDecision)
+                .filter(
+                    RecognitionDecision.raw_message_id == int(raw_message_id),
+                    RecognitionDecision.automation_status == "deferred",
+                    RecognitionDecision.automation_reason == DEFERRED_HOLD_REASON,
+                )
+                .update(
+                    {
+                        RecognitionDecision.automation_reason: (
+                            DEFERRED_EXPIRED_REASON
+                        ),
+                        RecognitionDecision.updated_at: moment,
+                    },
+                    synchronize_session=False,
+                )
+            )
+            if moved:
+                expired_decisions.append(int(raw_message_id))
         terminalized: list[int] = []
         for lifecycle in lifecycles:
             lifecycle.lifecycle_status = TERMINAL_LIFECYCLE_STATE
@@ -191,4 +227,5 @@ def apply_stale_pending_void(
     return VoidResult(
         voided_item_ids=tuple(voided),
         terminalized_lifecycle_ids=tuple(terminalized),
+        expired_decision_raw_message_ids=tuple(expired_decisions),
     )
