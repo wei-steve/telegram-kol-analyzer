@@ -1944,8 +1944,38 @@ def enqueue_strategy_management_notifications(session_factory, *, group_labels=N
     return created
 
 
+_DELIVERY_GATE_UNSET = object()
+
+
+def resolve_delivery_after_id(
+    session_factory,
+    *,
+    field_name: str,
+    supplied: object = _DELIVERY_GATE_UNSET,
+) -> int | None:
+    """The id a channel may start delivering *after*, or ``None`` for "off".
+
+    A-5 task 6. Three channels accumulated large pending backlogs while
+    ``TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID`` was empty -- 399 protection
+    incidents, 67 management notifications, 2834 attribution audits. Turning
+    the chat id on without a gate would send every one of them, which is both
+    useless and a good way to get the bot rate-limited into silence.
+
+    ``None`` means the gate has not been set, and a channel with no gate does
+    not deliver at all. That is the deliberate ordering: the gate lands first,
+    the chat id second.
+    """
+
+    if supplied is not _DELIVERY_GATE_UNSET:
+        return None if supplied is None else int(supplied)
+    from telegram_kol_research.trading_settings import load_trading_settings
+
+    return getattr(load_trading_settings(session_factory), field_name)
+
+
 def claim_next_strategy_management_notification(
-    session_factory, *, claimed_at: datetime | None = None, lease_seconds: float = 120.0
+    session_factory, *, claimed_at: datetime | None = None, lease_seconds: float = 120.0,
+    after_id: int | None = None,
 ):
     """CAS one pending/failed delivery; concurrent notifiers have one winner."""
 
@@ -1964,10 +1994,11 @@ def claim_next_strategy_management_notification(
         ),
     )
     with session_factory() as session:
+        query = session.query(StrategyManagementNotification.id).filter(claimable)
+        if after_id is not None:
+            query = query.filter(StrategyManagementNotification.id > int(after_id))
         row_id = (
-            session.query(StrategyManagementNotification.id)
-            .filter(claimable)
-            .order_by(StrategyManagementNotification.id.asc()).limit(1).scalar()
+            query.order_by(StrategyManagementNotification.id.asc()).limit(1).scalar()
         )
     if row_id is None:
         return None
@@ -2589,6 +2620,7 @@ async def deliver_runtime_incident_notifications(
 async def deliver_strategy_management_notifications(
     session_factory, *, config: SystemOperatorBotConfig, group_labels=None, limit: int = 20,
     claimed_at: datetime | None = None, lease_seconds: float = 120.0,
+    delivery_after_id: object = _DELIVERY_GATE_UNSET,
 ) -> int:
     """Deliver with a durable lease and at-least-once crash semantics.
 
@@ -2599,11 +2631,23 @@ async def deliver_strategy_management_notifications(
     """
     from telegram_kol_research.models import StrategyManagementNotification
 
+    after_id = resolve_delivery_after_id(
+        session_factory,
+        field_name="strategy_management_notification_delivery_after_id",
+        supplied=delivery_after_id,
+    )
+    # Enqueue regardless of the gate: the rows are the durable ledger and must
+    # keep being written whether or not anyone is listening yet.
     enqueue_strategy_management_notifications(session_factory, group_labels=group_labels)
+    if after_id is None:
+        return 0
     delivered = 0
     for _ in range(max(1, min(int(limit), 100))):
         claim = claim_next_strategy_management_notification(
-            session_factory, claimed_at=claimed_at, lease_seconds=lease_seconds
+            session_factory,
+            claimed_at=claimed_at,
+            lease_seconds=lease_seconds,
+            after_id=after_id,
         )
         if claim is None:
             break
@@ -3163,11 +3207,19 @@ async def deliver_pending_position_attribution_incidents(
     config: SystemOperatorBotConfig,
     delivered_at: datetime | None = None,
     limit: int = 20,
+    delivery_after_id: object = _DELIVERY_GATE_UNSET,
 ) -> int:
     """Claim and deliver new attribution incidents without mutating ownership."""
 
     from telegram_kol_research.models import PositionAttributionAudit
 
+    after_id = resolve_delivery_after_id(
+        session_factory,
+        field_name="position_attribution_audit_delivery_after_id",
+        supplied=delivery_after_id,
+    )
+    if after_id is None:
+        return 0
     now = delivered_at or datetime.now(UTC)
     with session_factory() as session:
         candidate_ids = [
@@ -3175,6 +3227,7 @@ async def deliver_pending_position_attribution_incidents(
             for (row_id,) in (
                 session.query(PositionAttributionAudit.id)
             .filter(PositionAttributionAudit.notification_status == "pending")
+            .filter(PositionAttributionAudit.id > after_id)
             .order_by(PositionAttributionAudit.id.asc())
             .limit(max(1, int(limit)))
             .all()
@@ -3249,15 +3302,24 @@ async def deliver_pending_position_protection_incidents(
     config: SystemOperatorBotConfig,
     delivered_at: datetime | None = None,
     limit: int = 20,
+    delivery_after_id: object = _DELIVERY_GATE_UNSET,
 ) -> int:
     """Deliver each fingerprinted protection incident once, without trade I/O."""
 
     from telegram_kol_research.models import PositionProtectionIncident
 
+    after_id = resolve_delivery_after_id(
+        session_factory,
+        field_name="position_protection_incident_delivery_after_id",
+        supplied=delivery_after_id,
+    )
+    if after_id is None:
+        return 0
     now = delivered_at or datetime.now(UTC)
     with session_factory() as session:
         ids = [int(item[0]) for item in session.query(PositionProtectionIncident.id)
                .filter(PositionProtectionIncident.delivery_status == "pending")
+               .filter(PositionProtectionIncident.id > after_id)
                .order_by(PositionProtectionIncident.id.asc()).limit(max(1, int(limit))).all()]
     delivered = 0
     for incident_id in ids:

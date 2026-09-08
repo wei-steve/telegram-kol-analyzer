@@ -30,6 +30,10 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergence,
     StrategyBreakEvenConvergenceLeg,
 )
+from telegram_kol_research.stop_loss_size_convergence import (
+    execute_stop_loss_resize,
+    plan_stop_loss_resizes,
+)
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
@@ -53,6 +57,7 @@ class BreakEvenConvergenceWorkerResult:
     alerted: int = 0
     skipped: int = 0
     failed: int = 0
+    resized: int = 0
 
 
 def run_break_even_convergence_worker_tick(
@@ -62,11 +67,18 @@ def run_break_even_convergence_worker_tick(
     executor: Callable[..., Any] = execute_break_even_convergence,
     processed_at: datetime | None = None,
     lease_seconds: int = 120,
+    position_loader: Callable[[Any], Any] | None = None,
 ) -> BreakEvenConvergenceWorkerResult:
     """Claim at most one task; shadow/disabled paths never construct a client."""
 
     now = processed_at or datetime.now(UTC)
     _plan_proven_tp1_fills(session_factory, planned_at=now)
+    resized = converge_stop_loss_sizes(
+        session_factory,
+        deepcoin_client_factory=deepcoin_client_factory,
+        now=now,
+        position_loader=position_loader,
+    )
     alerted = _enqueue_pending_alerts(session_factory, created_at=now)
     claimed = _claim_one(
         session_factory,
@@ -74,7 +86,7 @@ def run_break_even_convergence_worker_tick(
         lease_seconds=max(1, int(lease_seconds)),
     )
     if claimed is None:
-        return BreakEvenConvergenceWorkerResult(alerted=alerted)
+        return BreakEvenConvergenceWorkerResult(alerted=alerted, resized=resized)
     convergence_id, execution_mode = claimed
     if execution_mode == "disabled":
         with session_factory() as session:
@@ -85,7 +97,7 @@ def run_break_even_convergence_worker_tick(
                 row.updated_at = now
                 session.commit()
         return BreakEvenConvergenceWorkerResult(
-            discovered=1, alerted=alerted, skipped=1
+            discovered=1, alerted=alerted, skipped=1, resized=resized
         )
 
     client = deepcoin_client_factory()
@@ -107,7 +119,7 @@ def run_break_even_convergence_worker_tick(
                 session.commit()
         alerted += _enqueue_pending_alerts(session_factory, created_at=now)
         return BreakEvenConvergenceWorkerResult(
-            discovered=1, alerted=alerted, failed=1
+            discovered=1, alerted=alerted, failed=1, resized=resized
         )
 
     status = str(getattr(result, "status", "") or "")
@@ -126,7 +138,77 @@ def run_break_even_convergence_worker_tick(
         shadowed=1 if status == "shadow_planned" else 0,
         alerted=alerted,
         failed=1 if status in _ALERT_STATUSES else 0,
+        resized=resized,
     )
+
+
+def converge_stop_loss_sizes(
+    session_factory,
+    *,
+    deepcoin_client_factory: Callable[[], Any],
+    now: datetime,
+    position_loader: Callable[[Any], Any] | None = None,
+) -> int:
+    """Shrink owned main stops down to the size their position actually has.
+
+    This lives in the break-even worker because it is the same trigger and the
+    same subject: a staged take-profit filled, and the main stop for that
+    position now has to move. Break-even moves its price; this moves its size.
+    Neither ever moves a take-profit order.
+
+    The exchange is not read at all unless the ledger already holds at least
+    one explained partial fill, so the ordinary quiet tick still constructs no
+    client -- the property the disabled/shadow paths depend on.
+    """
+
+    settings = load_trading_settings(session_factory)
+    if not settings.live_management_execution_enabled:
+        return 0
+    if not _has_explained_partial_take_profit_fill(session_factory):
+        return 0
+    client = deepcoin_client_factory()
+    try:
+        loader = position_loader or (lambda item: item.list_positions())
+        positions = loader(client)
+    except Exception:
+        # An unreadable position list is unknown, never "nothing to do": the
+        # next tick tries again and no write happens on a guess.
+        logger.warning("stop-loss size convergence could not read positions", exc_info=True)
+        return 0
+    plans = plan_stop_loss_resizes(session_factory, positions=positions)
+    resized = 0
+    for plan in plans:
+        result = execute_stop_loss_resize(
+            session_factory,
+            plan=plan,
+            deepcoin_client=client,
+            executed_at=now,
+        )
+        if result.status == "succeeded":
+            resized += 1
+        else:
+            logger.warning(
+                "stop-loss resize not applied pos_id=%s status=%s reason=%s",
+                plan.pos_id,
+                result.status,
+                result.reason_code,
+            )
+    return resized
+
+
+def _has_explained_partial_take_profit_fill(session_factory) -> bool:
+    with session_factory() as session:
+        row = (
+            session.query(PositionTakeProfitOrder.id)
+            .filter(PositionTakeProfitOrder.status == "completed")
+            .filter(
+                PositionTakeProfitOrder.evidence_json.like(
+                    "%partial_take_profit_fill%"
+                )
+            )
+            .first()
+        )
+    return row is not None
 
 
 def _plan_proven_tp1_fills(session_factory, *, planned_at: datetime) -> int:

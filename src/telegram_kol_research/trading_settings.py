@@ -99,6 +99,23 @@ class TradingSettings:
     semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     deferred_resume_timeout_minutes: float = 30.0
+    # A-5 task 3: a management batch parked in ``recovery_required`` used to
+    # hold its lifecycle's freeze forever -- batch 158 held one strategy for
+    # three days. After this many minutes the batch is blocked (never
+    # re-run) so the freeze lifts and a person decides what happens next.
+    management_recovery_timeout_minutes: float = 60.0
+    # A-5 task 7: the same shape for a source-deletion exit, which holds a
+    # whole chat+symbol+side lane rather than one strategy, so it gets a
+    # longer rope before the alert fires.
+    source_deletion_exit_timeout_minutes: float = 120.0
+    # A-5 task 6: three notification channels have large pending backlogs
+    # (399 / 67 / 2834 rows) accumulated while delivery was disabled.
+    # ``None`` means the gate has not landed and the channel stays off; a
+    # value means deliver strictly newer rows only. Fail-closed on purpose:
+    # enabling a channel without a gate would replay the whole backlog.
+    position_protection_incident_delivery_after_id: int | None = None
+    strategy_management_notification_delivery_after_id: int | None = None
+    position_attribution_audit_delivery_after_id: int | None = None
     mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
@@ -564,6 +581,41 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("deferred_resume_timeout_minutes"),
         defaults.deferred_resume_timeout_minutes,
     )
+    management_recovery_timeout_minutes = _positive_float(
+        raw.get("management_recovery_timeout_minutes"),
+        defaults.management_recovery_timeout_minutes,
+    )
+    source_deletion_exit_timeout_minutes = _positive_float(
+        raw.get("source_deletion_exit_timeout_minutes"),
+        defaults.source_deletion_exit_timeout_minutes,
+    )
+    position_protection_incident_delivery_after_id = (
+        _optional_nonnegative_int_setting(
+            raw.get(
+                "position_protection_incident_delivery_after_id",
+                defaults.position_protection_incident_delivery_after_id,
+            ),
+            field_name="position_protection_incident_delivery_after_id",
+        )
+    )
+    strategy_management_notification_delivery_after_id = (
+        _optional_nonnegative_int_setting(
+            raw.get(
+                "strategy_management_notification_delivery_after_id",
+                defaults.strategy_management_notification_delivery_after_id,
+            ),
+            field_name="strategy_management_notification_delivery_after_id",
+        )
+    )
+    position_attribution_audit_delivery_after_id = (
+        _optional_nonnegative_int_setting(
+            raw.get(
+                "position_attribution_audit_delivery_after_id",
+                defaults.position_attribution_audit_delivery_after_id,
+            ),
+            field_name="position_attribution_audit_delivery_after_id",
+        )
+    )
     mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
         raw.get(
             "mimo_v2_activation_after_raw_message_id",
@@ -625,6 +677,17 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             authoritative_gap_recovery_max_age_minutes
         ),
         deferred_resume_timeout_minutes=deferred_resume_timeout_minutes,
+        management_recovery_timeout_minutes=management_recovery_timeout_minutes,
+        source_deletion_exit_timeout_minutes=source_deletion_exit_timeout_minutes,
+        position_protection_incident_delivery_after_id=(
+            position_protection_incident_delivery_after_id
+        ),
+        strategy_management_notification_delivery_after_id=(
+            strategy_management_notification_delivery_after_id
+        ),
+        position_attribution_audit_delivery_after_id=(
+            position_attribution_audit_delivery_after_id
+        ),
         default_max_loss_usdt=_positive_float(
             raw.get("default_max_loss_usdt"),
             defaults.default_max_loss_usdt,

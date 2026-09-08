@@ -1441,6 +1441,50 @@ def _allocate_sizes(
     quantity_step: object,
     minimum_quantity: object,
 ):
+    """Stage as many take-profit tiers as the position can actually pay for.
+
+    A-5 task 5, user decision ``small_position_tiering_shrink_to_allocatable``
+    (2026-09-08). Position 1001125178552543 held three lots against a
+    50/30/20 plan: 1.5/0.9/0.6 lots, two tiers under the one-lot minimum, so
+    the whole convergence failed closed with
+    ``convergence_target_size_below_minimum`` and the position ended up with a
+    stop and no take-profit at all. Neither half of that was wrong on its own
+    -- three tiers really are impossible -- but "no take-profit" was never the
+    intended answer.
+
+    So the tier *count* shrinks until the position can fill it, down to a
+    single tier, and the shares of the surviving tiers are renormalised to
+    100%. The caller zips the returned sizes against its ordered targets, so
+    the tiers that survive are always the nearest ones. Only a
+    below-minimum failure is retried this way: a step or plan error says the
+    inputs are wrong and fewer tiers would not make them right.
+    """
+
+    outcome = "convergence_target_size_below_minimum"
+    for count in range(len(allocations), 0, -1):
+        scaled = _rescale_allocations(allocations[:count])
+        if scaled is None:
+            continue
+        outcome = _allocate_exact_sizes(
+            size,
+            scaled,
+            quantity_step=quantity_step,
+            minimum_quantity=minimum_quantity,
+        )
+        if not isinstance(outcome, str):
+            return outcome
+        if outcome != "convergence_target_size_below_minimum":
+            return outcome
+    return outcome
+
+
+def _allocate_exact_sizes(
+    size: Decimal,
+    allocations: list[Decimal],
+    *,
+    quantity_step: object,
+    minimum_quantity: object,
+):
     try:
         plan = build_take_profit_plan(
             prices=range(1, len(allocations) + 1),
@@ -1456,6 +1500,33 @@ def _allocate_sizes(
         return "convergence_target_size_step_unverified"
     quantities = [Decimal(str(leg.quantity)) for leg in plan.legs]
     return quantities if all(quantity > 0 for quantity in quantities) else "convergence_target_size_invalid"
+
+
+def _rescale_allocations(allocations: list[Decimal]) -> list[Decimal] | None:
+    """Renormalise a prefix of the plan's shares to exactly 100.
+
+    Exactly, not approximately: ``build_take_profit_plan`` silently replaces a
+    set of shares that does not sum to 100 with its own defaults, so a rounding
+    remainder here would quietly change the trader's requested distribution.
+    The remainder is therefore carried by the last surviving tier.
+    """
+
+    if not allocations:
+        return None
+    total = sum(allocations, Decimal("0"))
+    if total <= 0:
+        return None
+    if total == Decimal("100"):
+        return list(allocations)
+    scaled = [
+        (value * Decimal("100") / total).quantize(Decimal("0.000001"))
+        for value in allocations[:-1]
+    ]
+    remainder = Decimal("100") - sum(scaled, Decimal("0"))
+    if remainder <= 0:
+        return None
+    scaled.append(remainder)
+    return scaled
 
 
 def _positive_decimal(value: object) -> Decimal | None:

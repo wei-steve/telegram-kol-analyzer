@@ -203,6 +203,15 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # complete silence -- the ``incidents`` counter on the reconciler's
         # result had never been incremented by anything.
         "entry_admission_expired",
+        # A-5 task 3: a management batch sat in ``recovery_required`` past
+        # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
+        # freeze it held is now lifted, so the alert is the whole handover to
+        # a person -- batch 158 held one strategy silently for three days.
+        "management_recovery_timeout",
+        # A-5 task 7: a source-deletion exit stuck in ``recovery_required``.
+        # It is never re-claimed but keeps holding its chat+symbol+side lane,
+        # so five of them silently blocked 28 instructions (A-3 evidence).
+        "source_deletion_exit_stuck",
     }
 )
 

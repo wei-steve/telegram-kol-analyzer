@@ -1943,7 +1943,15 @@ def test_plan_freezes_when_contract_quantity_spec_is_unavailable(tmp_path):
     assert client.submit_calls == []
 
 
-def test_plan_freezes_when_a_take_profit_stage_is_below_contract_minimum(tmp_path):
+def test_plan_shrinks_tier_count_when_a_stage_is_below_contract_minimum(tmp_path):
+    """A-5 task 5: fewer tiers, nearest prices -- not "no take-profit at all".
+
+    Ten lots against 50/30/20 with a three-lot minimum cannot fill the third
+    tier (5/3/2). Before A-5 the whole convergence froze and the position was
+    left with a stop and nothing else. Now the plan drops to two tiers at the
+    two nearest prices, renormalised to 62.5/37.5.
+    """
+
     from telegram_kol_research.db import create_session_factory
     from telegram_kol_research.trigger_take_profit_convergence_executor import (
         plan_trigger_take_profit_convergence,
@@ -1953,6 +1961,31 @@ def test_plan_freezes_when_a_take_profit_stage_is_below_contract_minimum(tmp_pat
     convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
     client = _Client()
     client.contract_spec_provider = _ContractSpecProvider(quantity_step="1", min_quantity="3")
+
+    plan = plan_trigger_take_profit_convergence(
+        session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW
+    )
+
+    assert (plan.status, plan.reason_code) == ("ready", None)
+    assert [
+        (payload["tpTriggerPx"], payload["sz"]) for payload in plan.payloads
+    ] == [("64500", "6"), ("63800", "4")]
+
+
+def test_plan_freezes_when_even_one_take_profit_stage_is_below_minimum(tmp_path):
+    """The shrink bottoms out at one tier; below that it still fails closed."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.trigger_take_profit_convergence_executor import (
+        plan_trigger_take_profit_convergence,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence_id = _ready_convergence(session_factory, existing_take_profit=False)
+    client = _Client()
+    client.contract_spec_provider = _ContractSpecProvider(
+        quantity_step="1", min_quantity="25"
+    )
 
     plan = plan_trigger_take_profit_convergence(
         session_factory, convergence_id=convergence_id, deepcoin_client=client, planned_at=NOW

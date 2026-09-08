@@ -566,6 +566,110 @@ def capture_entry_admission_expired(
     )
 
 
+def capture_management_recovery_timeout(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    management_batch_id: int,
+    strategy_instance_id: str,
+    target_lifecycle_id: int,
+    effective_action: str,
+    recovery_reason_code: str | None,
+    timeout_minutes: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a management batch that outlived ``recovery_required``.
+
+    ``recovery_required`` is an active batch status, so the batch kept holding
+    its strategy's freeze and nothing ever came back for it: batch 158 froze
+    one strategy from 2026-09-04 to 2026-09-07 without a single event. The
+    timeout blocks the batch -- it is never re-run -- which lifts the freeze,
+    so this incident is the entire operator-facing outcome of that decision.
+    """
+
+    if not config.captures("management_recovery_timeout"):
+        return None
+    fixed = {
+        "component": "strategy_management_batch",
+        "source_status": "recovery_timeout",
+        "reason_code": _safe_label(recovery_reason_code or "recovery_required"),
+        "operation": f"management_batch_{int(management_batch_id)}",
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="strategy_management_batch",
+        source_record_id=str(int(management_batch_id)),
+        incident_type="management_recovery_timeout",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            strategy_instance_id=_safe_label(strategy_instance_id),
+            lifecycle_id=int(target_lifecycle_id),
+            effective_action=_safe_label(effective_action),
+            impact=_safe_label(
+                f"blocked_after_{int(timeout_minutes)}_minutes_freeze_released"
+            ),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_source_deletion_exit_stuck(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    deletion_exit_id: int,
+    state: str,
+    reason_code: str | None,
+    timeout_minutes: int,
+    lane_released: bool,
+    release_reason: str | None,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a source-deletion exit parked in ``recovery_required``.
+
+    The worker never re-claims that state, but the barrier keeps reading the
+    exit as a live hold, so the whole chat+symbol+side lane stays sealed. A-3
+    found five of them holding 28 instructions, the oldest since 2026-08-14.
+    ``lane_released`` says whether the exchange proved the position and orders
+    were already gone -- when it did not, the lane is still held on purpose and
+    only a person can settle it.
+    """
+
+    if not config.captures("source_deletion_exit_stuck"):
+        return None
+    fixed = {
+        "component": "source_message_deletion_exit",
+        "source_status": _safe_label(state),
+        "reason_code": _safe_label(reason_code or "recovery_required"),
+        "operation": f"deletion_exit_{int(deletion_exit_id)}",
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="source_message_deletion_exit",
+        source_record_id=str(int(deletion_exit_id)),
+        incident_type="source_deletion_exit_stuck",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact=_safe_label(
+                f"lane_{'released' if lane_released else 'still_held'}"
+                f"_after_{int(timeout_minutes)}_minutes"
+            ),
+            release_reason=_safe_label(release_reason or "not_released"),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def _deadline_label(deadline_at: datetime | None) -> str:
     """A bare minute-resolution instant, carried in its own summary field.
 

@@ -2423,13 +2423,19 @@ def test_management_notification_dedup_retry_and_concurrent_claim(tmp_path, monk
     monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fail_once)
     config = operator_bot_module.SystemOperatorBotConfig("token", "chat")
     assert operator_bot_module.asyncio.run(
-        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+        operator_bot_module.deliver_strategy_management_notifications(
+            sf, config=config, delivery_after_id=0
+        )
     ) == 0
     assert operator_bot_module.asyncio.run(
-        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+        operator_bot_module.deliver_strategy_management_notifications(
+            sf, config=config, delivery_after_id=0
+        )
     ) == 1
     assert operator_bot_module.asyncio.run(
-        operator_bot_module.deliver_strategy_management_notifications(sf, config=config)
+        operator_bot_module.deliver_strategy_management_notifications(
+            sf, config=config, delivery_after_id=0
+        )
     ) == 0
 
     with sf() as session:
@@ -2514,7 +2520,7 @@ def test_cancelled_management_delivery_is_reclaimable_only_after_lease(
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(operator_bot_module.deliver_strategy_management_notifications(
             sf, config=SystemOperatorBotConfig("token", "chat"),
-            claimed_at=NOW, lease_seconds=30,
+            claimed_at=NOW, lease_seconds=30, delivery_after_id=0,
         ))
     assert operator_bot_module.claim_next_strategy_management_notification(
         sf, claimed_at=NOW + timedelta(seconds=29), lease_seconds=30
@@ -2565,6 +2571,7 @@ def test_management_submit_unknown_outbox_survives_disabled_bot_and_later_succes
     monkeypatch.setattr(operator_bot_module, "send_system_operator_bot_message", fake_send)
     delivered = asyncio.run(operator_bot_module.deliver_strategy_management_notifications(
         sf, config=operator_bot_module.SystemOperatorBotConfig("token", "chat"),
+        delivery_after_id=0,
         group_labels={-909: "峰哥群"},
     ))
     assert delivered == 1
@@ -2770,6 +2777,7 @@ def test_position_attribution_incident_delivery_is_deduplicated_and_durable(
         deliver_pending_position_attribution_incidents(
             session_factory,
             config=config,
+            delivery_after_id=0,
             delivered_at=datetime(2026, 7, 14, 12, 0, tzinfo=UTC),
         )
     ) == 1
@@ -2777,6 +2785,7 @@ def test_position_attribution_incident_delivery_is_deduplicated_and_durable(
         deliver_pending_position_attribution_incidents(
             session_factory,
             config=config,
+            delivery_after_id=0,
             delivered_at=datetime(2026, 7, 14, 12, 1, tzinfo=UTC),
         )
     ) == 0
@@ -2802,6 +2811,7 @@ def test_position_attribution_incident_delivery_is_deduplicated_and_durable(
         deliver_pending_position_attribution_incidents(
             session_factory,
             config=config,
+            delivery_after_id=0,
             delivered_at=datetime(2026, 7, 14, 12, 2, tzinfo=UTC),
         )
     ) == 1

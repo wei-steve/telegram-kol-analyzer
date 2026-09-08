@@ -37,6 +37,16 @@ from telegram_kol_research.terminal_entry_cleanup import (
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
+from telegram_kol_research.execution_events import (
+    NON_EXCHANGE_WRITING_EXECUTION_ACTIONS,
+    execution_event_has_exchange_identity,
+)
+from telegram_kol_research.source_deletion_exit_timeout import (
+    build_exchange_absence_reader,
+    expire_stuck_source_deletion_exits,
+)
+
+
 _ACTIVE_STATES = (
     "pending",
     "cancelling_entries",
@@ -149,6 +159,22 @@ def run_source_message_deletion_worker_tick(
         if client is None:
             client = deepcoin_client_factory()
         return client
+
+    # A-5 task 7. Runs first so a lane released this tick is already open for
+    # the jobs claimed below. ``expire_stuck_source_deletion_exits`` looks for
+    # candidates before it touches the reader, so a tick with no stuck exit --
+    # the normal case -- still builds no client here.
+    try:
+        expire_stuck_source_deletion_exits(
+            session_factory,
+            now=now,
+            exchange_reader=build_exchange_absence_reader(
+                positions_loader=lambda: get_client().list_positions(),
+                resting_orders_loader=lambda: get_client().list_open_orders(),
+            ),
+        )
+    except Exception:
+        logger.exception("source deletion exit timeout pass failed")
 
     for _ in range(max(0, int(max_jobs))):
         claim = _claim_next_job(
@@ -756,6 +782,17 @@ def finalize_source_message_deletion_exit(
                         if event is not None
                         else None
                     )
+                    # A-5 task 8. ``request_json``/``response_json`` alone used
+                    # to make an event hazardous, and every
+                    # ``auto_trade_skipped`` row carries a request payload --
+                    # so four *decisions not to trade* (execution_events
+                    # 3501/3589/3796/3967, all status ``skipped`` with null
+                    # order/client-order/position ids) permanently froze exits
+                    # 109/128/201/231 as ``identity_unverified``. An event is
+                    # hazardous when it carries an exchange identity, or when
+                    # its action is one that writes to the exchange. Unknown
+                    # actions stay hazardous: only the explicitly non-writing
+                    # ones are excused.
                     hazardous_event = (
                         session.query(ExecutionEvent.id)
                         .filter(
@@ -768,11 +805,10 @@ def finalize_source_message_deletion_exit(
                                 }
                             ),
                             or_(
-                                ExecutionEvent.order_id.is_not(None),
-                                ExecutionEvent.client_order_id.is_not(None),
-                                ExecutionEvent.pos_id.is_not(None),
-                                ExecutionEvent.request_json.is_not(None),
-                                ExecutionEvent.response_json.is_not(None),
+                                execution_event_has_exchange_identity(),
+                                ExecutionEvent.action.not_in(
+                                    NON_EXCHANGE_WRITING_EXECUTION_ACTIONS
+                                ),
                             ),
                         )
                         .first()

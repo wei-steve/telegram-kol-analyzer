@@ -69,6 +69,54 @@ class ExecutionEventView:
     created_at: datetime
 
 
+# A-5 task 8. Actions that provably never reach the exchange. Everything else
+# is treated as an exchange write, so a new action added later is hazardous
+# until someone deliberately lists it here -- the fail-closed direction.
+#
+# Verified against the whole production ``execution_events`` table on
+# 2026-09-08: each of these has NULL ``order_id``, ``client_order_id`` and
+# ``pos_id`` on every one of its rows, and each records a decision *not* to
+# act (``skipped``, ``manual_review``) or a ledger-only repair (``resolved``,
+# ``completed``). Every action that does write -- ``set_position_tpsl`` (2233
+# rows), ``create_trigger_entry`` (419), ``open_market_position`` (149) and
+# the rest -- carries ``order_id`` on 100% of its rows, so it is caught by the
+# identity test without needing to be listed anywhere.
+NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
+    {
+        # The auto-trade path decided not to submit anything at all. These are
+        # the rows that froze source-deletion exits 109/128/201/231.
+        "auto_trade_skipped",
+        "management_auto_trade_skipped",
+        # A recognised entry whose price geometry was refused before submission.
+        "entry_price_geometry_rejected",
+        # Ledger-only repairs: they rewrite local rows from exchange history
+        # that already exists, and issue no request of their own.
+        "management_history_recovery",
+        "historical_state_convergence_repair",
+        "entry_assembly_fingerprint_reconciled",
+    }
+)
+
+
+def execution_event_has_exchange_identity():
+    """SQL predicate: this event names an order, client order, or position.
+
+    Written as a predicate rather than a Python test because the only caller
+    needs it inside a query that must not load the rows it is filtering.
+    """
+
+    from sqlalchemy import and_, or_
+
+    return or_(
+        and_(ExecutionEvent.order_id.is_not(None), ExecutionEvent.order_id != ""),
+        and_(
+            ExecutionEvent.client_order_id.is_not(None),
+            ExecutionEvent.client_order_id != "",
+        ),
+        and_(ExecutionEvent.pos_id.is_not(None), ExecutionEvent.pos_id != ""),
+    )
+
+
 def record_execution_event(
     session_factory: sessionmaker,
     record: ExecutionEventRecord,

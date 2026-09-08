@@ -17,6 +17,9 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.runtime_worker_executor import (
     run_on_management_worker,
 )
+from telegram_kol_research.management_recovery_timeout import (
+    expire_stuck_management_recoveries,
+)
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     ManagementBatchRecord,
@@ -195,6 +198,18 @@ def run_strategy_management_worker_tick(
         if snapshot is None:
             snapshot = snapshot_loader(session_factory, client=get_client())
         return snapshot
+
+    # A-5 task 3. Runs before any batch is listed so a batch whose freeze the
+    # timeout just released is visible to this same tick. The client is only
+    # built when there is actually a timed-out batch to judge.
+    try:
+        expire_stuck_management_recoveries(
+            session_factory,
+            now=now,
+            position_loader=lambda: get_client().list_positions(),
+        )
+    except Exception:
+        logger.exception("management recovery timeout pass failed")
 
     should_reconcile_composite = (
         composite_reconciler is not reconcile_composite_management_components

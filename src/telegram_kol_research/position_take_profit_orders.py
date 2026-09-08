@@ -19,6 +19,10 @@ from telegram_kol_research.models import (
     utc_now,
 )
 from telegram_kol_research.native_tpsl import native_tpsl_take_profit_is_market
+from telegram_kol_research.partial_take_profit_explanation import (
+    PARTIAL_TAKE_PROFIT_FILLED,
+    explain_partial_position_reduction,
+)
 from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 
 
@@ -377,8 +381,58 @@ def reconcile_trigger_take_profit_order_history(
         planned_size = sum((_decimal_or_zero(row.size_text) for row in orders), Decimal("0"))
         terminal_fills = any(row.status == "filled" for row in orders)
         if live_size < planned_size and not terminal_fills:
+            # A-5 task 1. Reductions this binding has already named as its own
+            # take-profit fills are subtracted first, so a second staged fill is
+            # judged against what is still outstanding rather than against the
+            # original plan. With nothing explained yet this is arithmetically
+            # identical to the pre-A-5 comparison.
+            explained_size = sum(
+                (
+                    _decimal_or_zero(row.size_text)
+                    for row in orders
+                    if _take_profit_order_is_explained_fill(row)
+                ),
+                Decimal("0"),
+            )
+            outstanding_size = planned_size - explained_size
+            if live_size >= outstanding_size:
+                continue
+            explanation = explain_partial_position_reduction(
+                execution_binding_id=int(convergence.execution_binding_id),
+                pos_id=str(convergence.pos_id),
+                planned_size=outstanding_size,
+                live_size=live_size,
+                take_profit_orders=[
+                    row
+                    for row in orders
+                    if not _take_profit_order_is_explained_fill(row)
+                ],
+                trigger_history=trigger_history,
+            )
+            if explanation.explained:
+                _record_explained_partial_take_profit_fill(
+                    session=session,
+                    convergence=convergence,
+                    orders=orders,
+                    explanation=explanation,
+                    observed_at=now,
+                )
+                continue
+            # Fail closed, but never on the conclusion alone: the freeze carries
+            # the live size, the outstanding protection size, and every owned
+            # order id the judgement looked at (A-5 task 4).
             convergence.status = "conflicted"
             convergence.reason_code = "convergence_partial_position_unexplained"
+            convergence.error_json = _json(
+                {
+                    **_load_evidence(convergence.error_json),
+                    "partial_position_unexplained": {
+                        "reason_code": explanation.reason_code,
+                        "observed_at": now.isoformat(),
+                        **explanation.evidence,
+                    },
+                }
+            )
             convergence.completed_at = now
             convergence.updated_at = now
     session.flush()
@@ -542,6 +596,61 @@ def _record_proven_tp1_fill(
         evidence=evidence["tp1_fill"],
         completed_at=observed_at,
     )
+
+
+def _take_profit_order_is_explained_fill(row: PositionTakeProfitOrder) -> bool:
+    """True only for a row this binding already proved was its own TP fill."""
+
+    if str(row.status or "") != "completed":
+        return False
+    evidence = _load_evidence(row.evidence_json).get("partial_take_profit_fill")
+    return isinstance(evidence, dict) and bool(evidence.get("order_id"))
+
+
+def _record_explained_partial_take_profit_fill(
+    *,
+    session: Session,
+    convergence: TriggerTakeProfitConvergence,
+    orders: list[PositionTakeProfitOrder],
+    explanation,
+    observed_at: datetime,
+) -> None:
+    """Name the reduction on the exact order, and leave the plan alone.
+
+    The take-profit row becomes ``completed`` -- it did its job -- and carries
+    the whole judgement. The convergence itself is *not* terminalized: the
+    remaining staged orders are still live and still owned, which is the state
+    the stop-loss resize (A-5 task 2) then converges the protection size to.
+    """
+
+    for row in orders:
+        if str(row.order_id or "").strip() != str(explanation.order_id):
+            continue
+        evidence = _load_evidence(row.evidence_json)
+        evidence["partial_take_profit_fill"] = {
+            "reason_code": PARTIAL_TAKE_PROFIT_FILLED,
+            "observed_at": observed_at.isoformat(),
+            "filled_size": explanation.filled_size,
+            "remaining_position_size": explanation.remaining_size,
+            **explanation.evidence,
+        }
+        row.status = "completed"
+        row.evidence_json = _json(evidence)
+        row.completed_at = observed_at
+        row.updated_at = observed_at
+        break
+    convergence.error_json = _json(
+        {
+            **_load_evidence(convergence.error_json),
+            "partial_take_profit_filled": {
+                "order_id": explanation.order_id,
+                "observed_at": observed_at.isoformat(),
+                "filled_size": explanation.filled_size,
+                "remaining_position_size": explanation.remaining_size,
+            },
+        }
+    )
+    convergence.updated_at = observed_at
 
 
 def _load_evidence(value: str | None) -> dict[str, object]:
