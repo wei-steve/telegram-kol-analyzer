@@ -199,3 +199,81 @@ A-4 刚刚归档的"峰哥幽灵" lifecycle 1081 正是这条消息的 lifecycle
   全是自动交易群，全程零告警。只补重试而不补告警，下一次仍然没人知道。
 
 **本评估未做任何写入、未部署。等裁定后再动代码。**
+
+---
+
+## 附录：任务 2/3 的实施（2026-09-08，指挥会话裁定选项 b + 告警后）
+
+**代码提交 `04a5643c7b3bdbed630e51ecdfd79413e33cff57`**（含 A-4 的 one_off，随本次一起上线）。
+部署前生产 HEAD `a6869acf559776c43b608437eb68a88eeadb9874` 为回滚参考（回滚即
+`tg-deploy a6869acf559776c43b608437eb68a88eeadb9874`）。部署前 `active_write_count=0`、在途管理批次 0。
+全量 **7923 passed / 4 skipped / 0 failed**。
+
+### 改了什么
+
+1. **门控对齐**：`entry_admission_reconciler.reconcile_due_entry_admissions` 的门由
+   `execution_contract_mode != "live"` 改为 `== "disabled"`，与它的超时孪生
+   （`instruction_execution_reconciliation`）同门。`#9` 耐久镜像收敛、`#10` fail-closed 合约投影、
+   `#11` 终态写入 CAS 守卫**一字未动**，仍只在 `live` 生效。
+2. **过期不再静默**：新增 `capture_entry_admission_expired`（severity `high`，
+   `source_kind=message_instruction_item`），summary 含 item id（`operation`）、`raw_message_id`、
+   `chat_id`、推迟原因（`reason_code`）与 `deadline_at`；加入 `ALWAYS_NOTIFIED_INCIDENT_TYPES`。
+   `EntryAdmissionReconcileResult.incidents` 这个此前从未被 +1 过的计数器现在真的计数。
+   告警失败（抛异常或被拒）**不回滚已提交的过期**，只是不计数——账本变更先提交且是耐久事实。
+3. **两个封闭字段集的扩项（本步唯一一处扩大既有边界，需备案）**：
+   `runtime_incidents._SUMMARY_FIELDS` 增加 `chat_id` 与 `deadline_at`。理由与 A-2 当初加入
+   `raw_message_id` / `attempt_id` / `task_name` 完全相同——操作者必须能在不开数据库的情况下
+   知道这条告警属于哪个群、什么时候到期。**deadline 必须是独立字段而不是 `impact` 的一部分**：
+   `record_runtime_incident` 的不透明串启发式会把嵌进长标签的时间戳读成一个高熵 token，
+   实测 **400 个不同 deadline 的复合形式全部（400/400）被拒**、整条详细 summary 退回最小版；
+   独立字段下同样 400 个全部通过。这条实测被写成回归测试
+   （`test_the_deadline_never_costs_us_the_detailed_summary`）锁住。
+4. **A-3 作废工具增加可选参数 `void_reason`（默认值不变）**：见下节。默认仍是
+   `stale_pending_voided_2026_09_07`，归档那次运行逐字节可复现；调用方可传自己的日期。
+
+### 测试
+
+`tests/test_entry_admission_reconciler.py` 由 14 条增至 **22 条**，**既有 14 条一条未改、未削弱**。
+新增：shadow 下释放到期项、`disabled` 仍然惰性（门从 live 移到 disabled 后这一条才有意义）、
+过期产生告警且字段齐全、告警抛异常不撤销过期、告警被拒计为未上报、
+默认路径（不注入替身）真的写出一行 `runtime_incidents`、
+`entry_admission_expired` 在 always-notified 基线内、400 个 deadline 的 summary 契约回归。
+**变异检验**：把门改回 `!= "live"`，4 条新测试转红；改回后 22 条全绿。
+`tests/test_stale_pending_instruction_void.py` 由 7 条增至 9 条（自带日期的 reason、默认仍是归档值）。
+
+### 部署前的一次性作废（指挥会话要求）
+
+item **1029**（raw 15496，峰哥群 message 9227，14:09:25Z 推迟，deadline 20:09:25Z）在部署时刻
+仍 `pending` 且未过 deadline。它承载的是 **6 小时前**的入场意图（ETH 多，约 2460），
+恢复器一上线就会按这个过时意图放行下单，因此先作废。
+
+- **动手前只读核实零交易所敞口**：`execution_bindings` 0 行、`execution_order_legs` 0 行、
+  `execution_events` 0 行、`position_protection_ledger` 0 行。
+- 备份 `/root/evidence/step3d/research-backup-20260908T160550Z.db`
+  （sha256 `1211db3521448276a255452136ad7d8f46cda078053efd8bd34203ab8f08426b`，quick_check ok），
+  从备份复制一份完整演练后再对生产执行，**两者逐字段一致**。
+- **改前 → 改后**：item 1029 `pending` → `failed`，
+  `error_json={"reason":"stale_pending_voided_2026_09_08"}`，`escalation_state='expired'`，
+  盖 `last_progress_at`；lifecycle 1121 `entered` → `cancelled`，
+  `exit_reason='stale_pending_voided_2026_09_08'`，
+  `management_action='stale_pending_instruction_voided'`。
+- **全库行数只动了这两处**：指令项 `pending 3→2`、`failed 143→144`；
+  lifecycle `entered 11→10`、`cancelled 8→9`；其余状态一字未动。执行后 `PRAGMA quick_check` = ok。
+- **通知**：一条 SYSTEM bot 消息，`message_id=4067`，430 字符，写明作废的行、推迟原因、deadline、
+  为什么现在作废、以及"如仍需这笔入场请人工下单"。
+- **为什么给 A-3 的工具加参数而不是直接复用**：该工具的 `VOID_REASON` 写死为
+  `stale_pending_voided_2026_09_07`。给一个 09-08 的决定盖 09-07 的标签，会让这两行唯一的
+  审计痕迹记错日期。新增的 `void_reason` 参数默认值就是原常量，归档那次运行的行为一字未变。
+- **一处遗留**：被作废的是**指令项**，它的合约 327 仍是 `deferred`，会在 20:09Z 由超时孪生
+  判成 `execution_contract_deadline_elapsed`。这不会触发本步的新告警（新告警只从恢复器发出），
+  也不会再被恢复器碰到（恢复器只选 `status='pending'` 的指令项，而它已是 `failed`）。
+
+### 生产侧的告警可达性（部署后只读核实）
+
+用 **worker 进程的真实环境**（`/proc/<pid>/environ`，含 systemd 的
+`EnvironmentFile=/etc/telegram-kol-worker.env`）加载 `load_runtime_incident_config(environment_only=True)`：
+`captures("entry_admission_expired") = True`、`notifies(...) = True`、`telegram_notifications_enabled = True`。
+生产 env 的两个白名单都非空，因而按设计与代码基线取并集，新类型自动在内。
+**一处过程教训**：第一次核实时只喂了 `systemctl show -p Environment` 的内容（只有
+`TELEGRAM_KOL_RUNTIME_ROLE`），漏掉了 `EnvironmentFile`，得到 `captures=False` 的错误结论。
+在这台机器上判断"进程实际看到什么环境变量"，只有 `/proc/<pid>/environ` 是可信的。
