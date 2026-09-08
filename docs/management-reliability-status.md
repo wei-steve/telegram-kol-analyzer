@@ -12,8 +12,8 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 4
-current_step_file: docs/plans/2026-09-07-management-reliability/step-4-ledger-repair.md
+current_step: 3c
+current_step_file: docs/plans/2026-09-07-management-reliability/step-3c-unreadable-env-file.md
 step_status: planned              # planned | claimed | in_progress | completed | blocked
 claimed_by: null
 last_completed_step: 3b
@@ -35,6 +35,7 @@ user_decisions_2026_09_07:
 | 2 | 告警补全：白名单三类、后台任务自愈、两条投递通道、健康端点 | L1 | 否 |
 | 3 | 被推迟指令的恢复与超时；29 条积压作废并通知 | L2（作废积压为 L3 数据变更） | 是（作废积压那一步） |
 | 3b | 联系方式里的数字串不得被解析为价格（大镖客 QQ 号被当止损价，2026-09-08 复发） | L2 | 否 |
+| 3c | 不可读的 env 文件不得让消息处理失败（worker 读 root 0600 的 config/telegram.env 抛 PermissionError，09-04 起） | L1 热修 | 否 |
 | 4 | 账本修复：binding 337、批次 158、幽灵 1081、已成交仍活跃的止盈单 | L3 | 是 |
 | 5 | 部分止盈成交后自动收敛止损数量；待恢复批次超时告警，不永久冻结 | L2 | 否 |
 | 6 | 确定性拒绝不升级为结果未知；降风险指令绕过冻结 | L2（改交易语义） | 是 |
@@ -102,6 +103,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- hotfix-3c (2026-09-08, A-3b 发现，指挥会话安排): worker 自 2026-09-04 12:45Z 起反复因读不到 root 0600 的 config/telegram.env 抛 PermissionError，消息处理作业失败、权威执行落 outcome_unknown（raw 15449/15450，incident 2075）。插入 step 3c 在代码里 fail-open 并按角色传显式 env 路径；不改服务器文件权限。A-3b 遗留：take_profit_text 无管理执行读取方，不实现，归入 entry_price 量级校验的遗留项。
 - lane-blocking-root-cause (2026-09-08, A-3 发现，指挥会话记录): 5 条 `source_message_deletion_exits` 卡在 `recovery_required`（109 飞扬 BTC/short 08-14、128 所长 ETH/short 08-19、201 陈哥 BTC/long 08-29、209 三马哥 ETH/long 09-02、231 飞扬 ZEC/short 09-04）永久 hold 各自泳道，33 条积压里 28 条由此产生；陈哥群（auto_trade）BTC 多头泳道自 08-29 起被封，是该群入场静默丢失的直接原因。已纳入 step 4（逐条核实后解封）与 step 5（卡住超时告警与自动解封）。在 step 4 之前，这 4 个群相关泳道的新消息会持续产生 `deferred_instruction_expired` 告警，属预期。
 - incident-2026-09-08 (A-2 只读取证，指挥会话记录): raw 15402 大镖客 06:25:30Z“第一止盈位已过，锁定利润，移动止损”被识别为 partial_then_break_even，但签名 QQ:158241758 被解析为显式止损价，止损价闸门正确拒绝（batch 160 management_stop_action_conflict），减仓 50% 与移止损均未执行，incident 2069 无人收到，attempt 581 落 uncertain 无事件。仓位 binding 345 ETH 空单入场约 2484.67，止损仍在 2530 / 2535.06（亏损侧），TP1 2470 疑已成交。新增 step 3b 修上游识别；step 3 完成后先做 3b 再做 4。
 - step-2-rulings (2026-09-07, 指挥会话裁定): (1) 白名单在生产由 env 显式设定，代码默认值无效——采用“代码强制基线集合与 env 集合取并集”（capture 与 telegram 两处），基线含 management_recovery_required / management_submit_unknown / context_worker_exhausted（raw_message_ 前缀过滤）/ authoritative_execution_uncertain / background_task_restart_exhausted / market_fill_attribution_unverified（B 线阶段 5 新增）；部署只改 env 的 AFTER_ID。(2) position_protection_incidents（delivered 0，pending 399）与 strategy_management_notifications（pending 67）以及 position_attribution_audits（pending 2834）停投的共同根因是 TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID 为空使 notification_bot_config 恒为 None，两条通道整体禁用；不在本步做路由回落（会一次性放出约 3300 条积压），交 step 5：先加各通道 AFTER 门槛，再由用户决定补 chat_id 或改路由。(3) 后台任务自愈的连续失败计数在存活超过 300 秒后重置。

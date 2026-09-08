@@ -33,6 +33,7 @@
 2. `step-2-alerting.md`
 3. `step-3-deferred-resume-and-backlog.md`
 3b. `step-3b-contact-digits-not-prices.md`
+3c. `step-3c-unreadable-env-file.md`
 4. `step-4-ledger-repair.md`
 5. `step-5-protection-resize-and-batch-timeout.md`
 6. `step-6-rejection-semantics-and-frozen-bypass.md`
