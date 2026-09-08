@@ -26,6 +26,9 @@
    生产库先 `sqlite3 .backup`，记录 before/after 行数与 `PRAGMA quick_check`。
 4. 时间戳：指令项每次状态变化更新 `last_progress_at`；`escalation_state` 在超时时置 `expired`。
 
+5. （step 2 遗留，指挥会话裁定）把 `management_stop_rejected` 加进 `config.ALWAYS_NOTIFIED_INCIDENT_TYPES`
+   （生产首例 incident 2069，2026-09-08 06:26:24Z，high，累计零投递）。一行加一条测试，随本步一起部署。
+
 ## 禁止
 
 - 不补执行任何过期入场或管理指令。
