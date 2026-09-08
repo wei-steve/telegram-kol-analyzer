@@ -45,5 +45,5 @@
 
 ## 完成条件
 
-更新状态文件到 `current_step: 5`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-5-protection-resize-and-batch-timeout.md`；
+更新状态文件到 `current_step: 3d`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-3d-entry-admission-reconciler-disabled.md`；
 `send_message` 给 `brain_session_id`：备份路径、每一行 before/after、审计记录 id、复核时发现的任何不符。

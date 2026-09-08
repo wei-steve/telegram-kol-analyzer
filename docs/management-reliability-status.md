@@ -36,6 +36,7 @@ user_decisions_2026_09_07:
 | 3 | 被推迟指令的恢复与超时；29 条积压作废并通知 | L2（作废积压为 L3 数据变更） | 是（作废积压那一步） |
 | 3b | 联系方式里的数字串不得被解析为价格（大镖客 QQ 号被当止损价，2026-09-08 复发） | L2 | 否 |
 | 3c | 不可读的 env 文件不得让消息处理失败（worker 读 root 0600 的 config/telegram.env 抛 PermissionError，09-04 起） | L1 热修 | 否 |
+| 3d | 入场准入恢复器因 instruction_execution_contract_mode=shadow 空转（先只读评估） | 评估 L0 / 改动 L2–L3 | 视方案 |
 | 4 | 账本修复：binding 337、批次 158、幽灵 1081、已成交仍活跃的止盈单 | L3 | 是 |
 | 5 | 部分止盈成交后自动收敛止损数量；待恢复批次超时告警，不永久冻结 | L2 | 否 |
 | 6 | 确定性拒绝不升级为结果未知；降风险指令绕过冻结 | L2（改交易语义） | 是 |
@@ -115,6 +116,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- raw-15496-finding (2026-09-08, B 线阶段 5 会话只读追查，指挥会话记录): 峰哥群 14:07Z 的 ETH 多入场在准入层被 adjacent_entry_context_pending 推迟，从未调用 place_order（五路核对零交易所接触），边界按词表把 in_progress 冻成 outcome_unknown；本应到点重试的 entry_admission_reconciler 因生产 instruction_execution_contract_mode=shadow 直接 return，指令项将静默过期。这是 auto_trade 群入场丢失的又一条路径。新增 step 3d（先只读评估该开关的门控范围再裁定），在 step 4 之后执行；outcome_unknown 分类归 step 6；lifecycle 1121 entered/NULL 归 step 7。uncertain 积压 20 行，扫描器每轮按 ERROR 重打，归 step 6。
 - step-4-rulings (2026-09-08, 指挥会话): 230 的仓位已于当日 06:00Z 被 78500 止损全平，走 completed/convergence_position_terminal，1b/1c 追的那个分档止盈目标不再存在；231（ETH 多 1.6 张）仍活跃，复位为 waiting_backup_stop 由生产代码自行判断。5 条 exit 冻结的代码根因（auto_trade_skipped 事件被判为危险动作）并入 step 5 任务 8。终态词表按项目实际（filled / expired+position_terminal_order_absent / invalidated），扩到同一仓位全部保护行以保持自洽，审计复用 historical_cleanup 且 notification_status=not_needed，notification 94 只加 payload 标记。其余 10 条 binding 为 NULL 的 entered lifecycle 交 step 7。raw 15496（09-08 14:07Z 峰哥群入场落 outcome_unknown，lifecycle 1121）由 B 线阶段 5 会话只读追查。
 - step-4-approval (2026-09-08, 指挥会话依据用户授权批准): 用户 2026-09-07/08 明确授权“由总指挥判断”并同意由指挥会话接力驱动；据此批准 step 4 领取。范围以 step-4 文件的表为准（binding 337 / legs 579-580 / lifecycle 1074 / batch 158 / notification 94 / tp_orders 195-197 / lifecycle 1081 / legs 852-854 / 5 条 source_message_deletion_exits / convergences 230-231），每一行先交易所直读复核，事实不符的行不修只报告；任何一行的处置若与表不符，先 send_message 给指挥会话。生产库备份、副本演练、quick_check、before/after 逐行值、审计记录、回滚脚本缺一不可。用户可随时以“停止第 4 步”否决。
 - hotfix-3c (2026-09-08, A-3b 发现，指挥会话安排): worker 自 2026-09-04 12:45Z 起反复因读不到 root 0600 的 config/telegram.env 抛 PermissionError，消息处理作业失败、权威执行落 outcome_unknown（raw 15449/15450，incident 2075）。插入 step 3c 在代码里 fail-open 并按角色传显式 env 路径；不改服务器文件权限。A-3b 遗留：take_profit_text 无管理执行读取方，不实现，归入 entry_price 量级校验的遗留项。
