@@ -29,6 +29,7 @@ from telegram_kol_research.config import (
     MultiTargetManagementConfig,
     load_multi_target_management_config,
 )
+from telegram_kol_research.contact_digit_scrubbing import scrub_contact_identifiers
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -1689,7 +1690,9 @@ def _protective_stop_price(lifecycle: StrategyLifecycle) -> float | None:
 def _extract_explicit_stop_loss_from_management_text(text: str | None) -> float | None:
     if not text:
         return None
-    normalized = str(text)
+    # A signature sits within the 20-character window below, so ``及时移动止损！
+    # \n@Tarderfengge QQ:`` used to put a QQ number where a stop price belongs.
+    normalized = scrub_contact_identifiers(text)
     lowered = normalized.lower()
     has_stop_term = (
         any(term in normalized for term in ("止损", "损位", "保护价"))
@@ -2600,7 +2603,7 @@ def _extract_labeled_entry_text(text: str) -> str | None:
         r"(?:\s*[-~/]\s*\d+(?:\.\d+)?)*"
         r"(?:\s*(?:\u9644\u8fd1|\u5de6\u53f3|\u4e00\u7ebf|nearby|around))?)"
     )
-    for line in text.splitlines():
+    for line in scrub_contact_identifiers(text).splitlines():
         match = re.search(
             rf"{label_pattern}\s*[:\uff1a\-]?\s*{price_pattern}",
             line,
@@ -3655,9 +3658,9 @@ def _clean_bitcoin_junzhang_text(text: str) -> str:
             continue
         lines.append(line.strip("💰 "))
     compact = " ".join(lines).strip()
-    compact = re.sub(r"@\S+", "", compact)
-    compact = re.sub(r"QQ[:：]?\s*\d+", "", compact, flags=re.IGNORECASE)
-    return " ".join(compact.split())
+    # One profile used to carry its own copy of this rule. It is the same rule
+    # every other extraction site now runs, so it shares the same implementation.
+    return " ".join(scrub_contact_identifiers(compact).split())
 
 
 def _parse_bitcoin_junzhang_entry(text: str) -> dict[str, Any] | None:
@@ -4638,7 +4641,12 @@ def _parse_explicit_entry_confirmation_signal(
 
 
 def _extract_entry_confirmation_price(text: str, symbol: str | None) -> float | None:
-    values = [float(value) for value in re.findall(r"\d+(?:\.\d+)?", text)]
+    values = [
+        float(value)
+        for value in re.findall(
+            r"\d+(?:\.\d+)?", scrub_contact_identifiers(text)
+        )
+    ]
     if not values:
         return None
     for value in values:

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from telegram_kol_research.contact_digit_scrubbing import scrub_contact_identifiers
 from telegram_kol_research.strategy_management_contracts import (
     COMPOSITE_MANAGEMENT_CONTRACT_VERSION,
     ManagementInstructionContract,
@@ -522,7 +523,8 @@ def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
     # The old nondigit prefix swallowed '-' and silently discarded >100%.
     values = []
     previous_quantity = False
-    for percent in re.finditer(r"([^%％]*)[%％]", text):
+    # Quantity extraction runs on the same scrubbed input as price extraction.
+    for percent in re.finditer(r"([^%％]*)[%％]", scrub_contact_identifiers(text)):
         matches = list(re.finditer(rf"(?:{verbs})", percent.group(1), flags=re.IGNORECASE))
         if not matches:
             # A repeated percent or connected range is supplied content, not
@@ -617,6 +619,9 @@ def _text_contains_explicit_stop_value(text: str, value: str) -> bool:
         return False
     if not expected.is_finite() or expected <= 0:
         return False
+    # A signature number is genuinely present in the message, so the provenance
+    # window below would endorse it. Remove contact spans before looking.
+    text = scrub_contact_identifiers(text)
     for match in re.finditer(
         r"(?<![\d.])\d+(?:,\d{3})*(?:\.\d+)?(?![\d.])",
         text,

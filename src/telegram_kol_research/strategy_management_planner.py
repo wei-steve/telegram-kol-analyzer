@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from math import isfinite
@@ -87,9 +87,14 @@ from telegram_kol_research.strategy_management_sizing import (
     allocate_close_sizes,
     effective_action,
 )
+from telegram_kol_research.management_price_plausibility import (
+    record_price_implausible,
+    sanitize_management_prices,
+)
 from telegram_kol_research.management_stop_price_gate import (
-    StopGateResult, stop_action_conflicts, validate_management_stop,
-    read_stop_quote, record_stop_gate_rejection, stop_gate_clock,
+    IMPLICIT_STOP_ACTIONS, StopGateResult, stop_action_conflicts,
+    validate_management_stop, read_stop_quote, record_stop_gate_rejection,
+    stop_gate_clock,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
 
@@ -494,6 +499,14 @@ def _plan_strategy_management_batch_locked(
             planned_at=now,
             execution_mode=execution_mode,
         )
+    identity, price_plausibility = _identity_without_implausible_prices(
+        session_factory,
+        identity=identity,
+        intent=intent,
+        deepcoin_client=deepcoin_client,
+        now=now,
+    )
+    candidate = identity.candidate
     contract_payload = _json_dict(candidate.management_contract_json)
     if stop_action_conflicts(intent, contract_payload.get("stop_mode"),
                              contract_payload.get("stop_price") or candidate.stop_loss_text):
@@ -1227,6 +1240,8 @@ def _plan_strategy_management_batch_locked(
     }
     if stop_gate_evidence is not None:
         target_snapshot["stop_price_gate"] = stop_gate_evidence
+    if price_plausibility is not None:
+        target_snapshot["price_plausibility"] = price_plausibility.as_evidence()
     if contract_spec_resolution.snapshot is not None:
         target_snapshot["contract_spec_snapshot"] = (
             contract_spec_resolution.snapshot
@@ -1505,6 +1520,97 @@ def management_target_fingerprint(target_snapshot: Any) -> str:
 def _decimal_text(value: Decimal) -> str:
     normalized = format(value.normalize(), "f")
     return "0" if normalized in {"", "-0"} else normalized
+
+
+class _PriceSanitizedCandidate:
+    """Read-only candidate view that presents an implausible price as absent.
+
+    The stored row keeps what recognition produced, so the evidence for why a
+    batch looks the way it does survives.  Planning, the batch it writes, and
+    the execution-time recheck all read this view, so one removal holds for
+    every later decision instead of having to be repeated at each of them.
+    """
+
+    __slots__ = ("_candidate", "_overrides")
+
+    def __init__(self, candidate: SignalCandidate, **overrides: Any) -> None:
+        self._candidate = candidate
+        self._overrides = overrides
+
+    def __getattr__(self, name: str) -> Any:
+        overrides = object.__getattribute__(self, "_overrides")
+        if name in overrides:
+            return overrides[name]
+        return getattr(object.__getattribute__(self, "_candidate"), name)
+
+
+def _identity_without_implausible_prices(
+    session_factory: sessionmaker,
+    *,
+    identity: _PlanningIdentity,
+    intent: str,
+    deepcoin_client,
+    now: datetime,
+):
+    """Drop explicit prices the instrument's own market contradicts.
+
+    Only the implicit-stop actions are in scope.  For those, any explicit price
+    at all is a semantic conflict that refuses the whole instruction, so a
+    number that is not a price silently costs the KOL both the reduction and
+    the protection they asked for.  ``adjust_stop_loss`` is deliberately left
+    to the stop gate: there the price *is* the instruction, the gate already
+    compares it against the same market, and refusing is the right answer --
+    never invent a stop the message did not name.
+
+    Returns the identity planning should use and, when something was removed,
+    the evidence to record on the batch.  No explicit price means no market
+    read at all, and an unusable quote leaves every value exactly as it was.
+    """
+
+    if intent not in IMPLICIT_STOP_ACTIONS:
+        return identity, None
+    candidate = identity.candidate
+    contract_payload = _json_dict(candidate.management_contract_json)
+    has_explicit_price = (
+        contract_payload.get("stop_mode") == "explicit_price"
+        and contract_payload.get("stop_price") not in (None, "")
+    ) or candidate.stop_loss_text not in (None, "")
+    if not has_explicit_price:
+        return identity, None
+    instrument_id = f"{str(identity.lifecycle.symbol).upper()}-USDT-SWAP"
+    sanitized = sanitize_management_prices(
+        stop_loss_text=candidate.stop_loss_text,
+        stop_price_source=candidate.stop_price_source,
+        management_contract_json=candidate.management_contract_json,
+        management_contract_fingerprint_value=(
+            candidate.management_contract_fingerprint
+        ),
+        quote=read_stop_quote(deepcoin_client, instrument_id),
+    )
+    if not sanitized.changed:
+        return identity, None
+    record_price_implausible(
+        session_factory,
+        raw_message_id=int(identity.raw_message.id),
+        candidate_id=int(candidate.id),
+        sanitized=sanitized,
+        now=now,
+    )
+    return (
+        replace(
+            identity,
+            candidate=_PriceSanitizedCandidate(
+                candidate,
+                stop_loss_text=sanitized.stop_loss_text,
+                stop_price_source=sanitized.stop_price_source,
+                management_contract_json=sanitized.management_contract_json,
+                management_contract_fingerprint=(
+                    sanitized.management_contract_fingerprint
+                ),
+            ),
+        ),
+        sanitized,
+    )
 
 
 def _validated_candidate_composite_contract(

@@ -36,6 +36,7 @@ from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.source_message_deletion import record_source_message_deleted
 from telegram_kol_research.strategy_management_contracts import (
     ManagementInstructionContract,
+    load_management_contract,
     management_contract_fingerprint,
     serialize_management_contract,
 )
@@ -4236,7 +4237,13 @@ def test_final_competing_owner_error_returns_blocked_without_leaking(
     ("adjust_stop_loss", "NaN", "long", "management_stop_price_invalid"),
     ("adjust_stop_loss", "79000.01", "long", "management_stop_tick_invalid"),
     ("adjust_stop_loss", "79000", "short", "management_stop_direction_invalid"),
-    ("partial_then_break_even", "158241758", "long", "management_stop_action_conflict"),
+    # A-3b removed the ``partial_then_break_even`` + QQ-number row from this
+    # table: an implausible price on an implicit-stop action is now dropped
+    # before the gate sees it, so the conflict no longer arises. That path is
+    # asserted end to end by
+    # ``test_implausible_composite_stop_is_dropped_instead_of_refusing_the_batch``.
+    # ``adjust_stop_loss`` is deliberately unchanged -- there the price is the
+    # instruction, and refusing it is the correct answer.
     ("move_stop_to_break_even", "79519", "long", "management_stop_action_conflict"),
 ])
 def test_stop_gate_blocks_before_components_and_records_incident(monkeypatch, tmp_path, intent, stop, side, expected):
@@ -4266,6 +4273,218 @@ def test_stop_gate_blocks_before_components_and_records_incident(monkeypatch, tm
         assert incident.incident_type == "management_stop_rejected"
         assert expected in incident.redacted_summary
         assert session.query(StrategyManagementComponent).count() == 0
+
+
+def test_implausible_composite_stop_is_dropped_instead_of_refusing_the_batch(
+    monkeypatch, tmp_path
+):
+    """The 2026-09-08 incident, end to end (raw 15402, batch 160).
+
+    A signature's QQ number reached the contract as an explicit stop price. On
+    an implicit-stop action any explicit price is a semantic conflict, so the
+    gate refused the whole instruction and the KOL's 50% reduction and stop
+    move were both lost. The magnitude check now removes the price first, and
+    the instruction plans exactly as it would have with no stop named at all.
+    """
+
+    from telegram_kol_research.models import RuntimeIncident
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "implausible-stop.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+        composite_contract=True,
+        requested_stop_loss="158241758",
+        stop_price_source="current_message_text",
+        management_text="第一止盈位已过，及时移动止损！ @Tarderfengge QQ:158241758",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id="pos-b")
+            .one()
+        )
+        for order_id, purpose, trigger_price, size_text in (
+            ("tp-old", "take_profit", "61000", "10"),
+            ("sl-old", "stop_loss", "63000", "0"),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id="pos-b",
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
+        original_contract_json = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .one()
+            .management_contract_json
+        )
+    tpsl = [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "tpTriggerPx": "61000",
+            "sz": "10",
+            "cTime": "1721000000000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": "pos-b",
+            "slTriggerPx": "63000",
+            "sz": "0",
+            "cTime": "1721000000000",
+        },
+    ]
+    client = _ReadOnlyDeepcoin([_position()], tpsl_orders=tpsl)
+    # The one market read this adds: an implicit-stop action that nonetheless
+    # carries an explicit price. The gate already reads the same ticker on the
+    # ``adjust_stop_loss`` path, so this is the same cost in a rarer case.
+    client.get_ticker_quote = lambda **kwargs: {
+        "instrument_id": "BTC-USDT-SWAP",
+        "price": "62000",
+        "price_field": "last",
+        "observed_at": PLANNED_AT.isoformat(),
+    }
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.reason_code is None
+    assert result.batch.intent == "partial_then_break_even"
+    assert result.batch.effective_fraction == 0.5
+    assert result.batch.legs[0].planned_close_size == "5"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "partial_then_break_even",
+        "stop_loss_text": None,
+    }
+    assert client.write_calls == []
+
+    batch_contract = load_management_contract(
+        result.batch.management_contract_json
+    )
+    assert batch_contract.stop_mode == "actual_entry_price"
+    assert batch_contract.stop_price is None
+    assert batch_contract.stop_price_source is None
+    assert result.batch.management_contract_fingerprint == (
+        management_contract_fingerprint(batch_contract)
+    )
+    # The batch carries the sanitized contract, so the execution-time recheck
+    # in ``validate_batch_stops`` sees the same removal planning did.
+    assert result.batch.management_contract_json != original_contract_json
+
+    with session_factory() as session:
+        candidate = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_id)
+            .one()
+        )
+        incident = session.query(RuntimeIncident).one()
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+    # The recognized row is evidence and is never rewritten.
+    assert candidate.management_contract_json == original_contract_json
+    assert candidate.stop_loss_text == "158241758"
+    assert incident.incident_type == "management_price_implausible"
+    assert incident.severity == "high"
+    assert f'"raw_message_id":{raw_id}' in incident.redacted_summary
+    removed = json.loads(incident.diagnosis_json)["observed_state"]["removed"]
+    assert {row["field"] for row in removed} == {
+        "contract_stop_price",
+        "stop_loss_text",
+    }
+    assert all(row["value"] == "158241758" for row in removed)
+    # The same removal is durable on the batch, independent of the ledger row.
+    snapshot = json.loads(batch.target_snapshot_json)
+    assert snapshot["price_plausibility"]["reference_price"] == "62000"
+    assert snapshot["price_plausibility"]["max_ratio"] == "10"
+
+
+def test_plausible_composite_stop_still_conflicts_and_reads_no_ticker(
+    monkeypatch, tmp_path
+):
+    """Magnitude is the only thing this check judges; the gate keeps the rest."""
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "plausible-stop.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+        composite_contract=True,
+        requested_stop_loss="63000",
+        stop_price_source="current_message_text",
+        management_text="减仓一半，止损移到 63000",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position()])
+    client.get_ticker_quote = lambda **kwargs: {
+        "instrument_id": "BTC-USDT-SWAP",
+        "price": "62000",
+        "price_field": "last",
+        "observed_at": PLANNED_AT.isoformat(),
+    }
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.reason_code == "management_stop_action_conflict"
+
+
+def test_no_explicit_price_reads_no_ticker_at_all(monkeypatch, tmp_path):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "no-explicit-stop.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+        composite_contract=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    # The stub's own ``get_ticker_quote`` fails the test if it is ever called.
+    client = _ReadOnlyDeepcoin([_position()])
+
+    planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert client.ticker_reads == []
 
 
 def test_stop_provenance_rejection_has_runtime_incident(monkeypatch, tmp_path):

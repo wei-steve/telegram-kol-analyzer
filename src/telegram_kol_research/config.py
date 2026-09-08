@@ -190,6 +190,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # else reports it: the message already has a decision row, so gap
         # recovery does not see it as missing.
         "deferred_instruction_expired",
+        # A-3b: an explicit management price ten times away from the
+        # instrument's last trade was read out of the message and then dropped.
+        # Nothing downstream reports it, because dropping it makes the
+        # instruction succeed -- which is exactly why a person has to see that
+        # the message named a price the system refused to believe.
+        "management_price_implausible",
     }
 )
 
