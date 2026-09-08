@@ -260,3 +260,52 @@ def test_the_notification_is_one_message_grouped_by_chat():
     assert "不补执行" in text
     # Telegram refuses a message over 4096 characters; a 33-row batch must fit.
     assert len(build_void_notification(rows * 11)) < 4000
+
+
+def test_a_later_operation_stamps_its_own_dated_reason(tmp_path):
+    """Reusing this tool must not misdate the rows it touches.
+
+    A-3d voids one entry item of its own before deploying. Stamping it with the
+    2026-09-07 batch's reason would put the wrong date on the only audit trail
+    that row gets, and the default keeps the archived run reproducible.
+    """
+
+    session_factory = _fixture(tmp_path)
+    later_reason = "stale_pending_voided_2026_09_08"
+
+    apply_stale_pending_void(
+        session_factory,
+        now=NOW,
+        item_ids=(STALE_PENDING_ITEM_IDS[0],),
+        lifecycle_ids=(UNBOUND_LIFECYCLE_IDS[0],),
+        void_reason=later_reason,
+    )
+
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, STALE_PENDING_ITEM_IDS[0])
+        assert item.error_json == f'{{"reason":"{later_reason}"}}'
+        lifecycle = session.get(StrategyLifecycle, UNBOUND_LIFECYCLE_IDS[0])
+        assert lifecycle.exit_reason == later_reason
+    assert f"理由：{later_reason}" in build_void_notification(
+        [
+            {
+                "item_id": STALE_PENDING_ITEM_IDS[0],
+                "instruction_kind": "entry",
+                "raw_message_id": 1,
+                "posted_at": "2026-09-08",
+                "chat_id": -1,
+            }
+        ],
+        void_reason=later_reason,
+    )
+
+
+def test_the_default_reason_is_still_the_archived_one(tmp_path):
+    session_factory = _fixture(tmp_path)
+
+    apply_stale_pending_void(session_factory, now=NOW)
+
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, STALE_PENDING_ITEM_IDS[0])
+        assert item.error_json == f'{{"reason":"{VOID_REASON}"}}'
+    assert VOID_REASON == "stale_pending_voided_2026_09_07"

@@ -196,6 +196,13 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # instruction succeed -- which is exactly why a person has to see that
         # the message named a price the system refused to believe.
         "management_price_implausible",
+        # A-3d: a deferred entry reached its execution deadline without ever
+        # being submitted. The timeout half of that mechanism ran under
+        # ``shadow`` while the retry half was gated to ``live``, so seven
+        # auto-trade entries between 2026-08-17 and 2026-09-04 expired in
+        # complete silence -- the ``incidents`` counter on the reconciler's
+        # result had never been incremented by anything.
+        "entry_admission_expired",
     }
 )
 

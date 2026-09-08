@@ -89,6 +89,17 @@ _SUMMARY_FIELDS = frozenset(
         "error_summary",
         "raw_message_id",
         "task_name",
+        # A-3d, same rationale as the A-2 identifiers above: an entry that
+        # expired without submitting is only actionable if the operator can see
+        # which group it belonged to and when the deadline was. Both are their
+        # own fields rather than parts of ``impact`` because the opaque-secret
+        # heuristic below reads a timestamp welded into a longer label as one
+        # high-entropy token and refuses the whole summary -- 400 spread-out
+        # deadlines were checked in composite form and every one tripped. A
+        # chat id is an integer and a bare ISO-8601 instant is low entropy, so
+        # both pass the scan that still runs over the assembled JSON.
+        "chat_id",
+        "deadline_at",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

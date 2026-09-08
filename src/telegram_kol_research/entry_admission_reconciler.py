@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Callable
 
 from sqlalchemy import and_, update
 from sqlalchemy.exc import IntegrityError
@@ -20,8 +22,11 @@ from telegram_kol_research.models import (
     InstructionExecutionContract,
     InstructionExecutionTransition,
     MessageInstructionItem,
+    RawMessage,
 )
 
+
+logger = logging.getLogger(__name__)
 
 ENTRY_ADMISSION_RECHECK_DELAY = timedelta(seconds=5)
 
@@ -41,10 +46,23 @@ def reconcile_due_entry_admissions(
     limit: int = 20,
     execution_contract_mode: str = "disabled",
     entry_after_item_id: int = 0,
+    incident_reporter: Callable[..., object] | None = None,
 ) -> EntryAdmissionReconcileResult:
-    """Release or expire due attempts without invoking any exchange writer."""
+    """Release or expire due attempts without invoking any exchange writer.
 
-    if execution_contract_mode != "live":
+    The gate is ``disabled``, not ``live``, and that is the whole of A-3d. This
+    loop is the timer-driven half of a pair whose other half --
+    ``instruction_execution_reconciliation``, which expires a deferred contract
+    once its deadline passes -- gates on ``disabled`` and therefore runs under
+    ``shadow``. Production has been on ``shadow`` since 2026-09-04, so it has
+    been expiring deferred entries while never retrying them: seven auto-trade
+    entries died that way between 2026-08-17 and 2026-09-04. Nothing here
+    depends on the enforcement semantics that ``live`` switches on (the durable
+    mirror convergence, fail-closed contract projection, the terminal-write
+    compare-and-set); those stay gated on ``live`` exactly as they were.
+    """
+
+    if execution_contract_mode == "disabled":
         return EntryAdmissionReconcileResult()
     bounded_limit = max(0, min(int(limit), 100))
     if bounded_limit == 0:
@@ -126,6 +144,17 @@ def reconcile_due_entry_admissions(
                 now=now,
             ):
                 counts["expired"] += 1
+                # An entry that was recognised, admitted, held and then timed
+                # out is invisible everywhere else: the item just reads
+                # ``failed``. This alert is the entire operator-facing outcome.
+                if _report_entry_admission_expired(
+                    session_factory,
+                    item=item,
+                    deadline_at=deadline,
+                    now=now,
+                    incident_reporter=incident_reporter,
+                ):
+                    counts["incidents"] += 1
             continue
 
         decision = assess_entry_assembly_admission(
@@ -168,6 +197,72 @@ def reconcile_due_entry_admissions(
             counts["released"] += 1
 
     return EntryAdmissionReconcileResult(**counts)
+
+
+def _report_entry_admission_expired(
+    session_factory,
+    *,
+    item,
+    deadline_at: datetime,
+    now: datetime,
+    incident_reporter: Callable[..., object] | None,
+) -> bool:
+    """Alert on one expired entry. Never lets a failed alert undo the expiry.
+
+    ``item`` is the detached snapshot taken before the expiry wrote
+    ``result_json`` away, so the defer reason it was holding is still readable
+    here and nowhere else afterwards.
+    """
+
+    reason_code = _defer_reason_code(item.result_json)
+    with session_factory() as session:
+        chat_id = (
+            session.query(RawMessage.chat_id)
+            .filter(RawMessage.id == int(item.raw_message_id))
+            .scalar()
+        )
+    if incident_reporter is None:
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_entry_admission_expired,
+            capture_runtime_incident_best_effort,
+        )
+
+        def incident_reporter(**kwargs):
+            return capture_runtime_incident_best_effort(
+                capture_entry_admission_expired,
+                session_factory,
+                **kwargs,
+            )
+
+    try:
+        recorded = incident_reporter(
+            message_instruction_item_id=int(item.id),
+            raw_message_id=int(item.raw_message_id),
+            chat_id=int(chat_id or 0),
+            defer_reason_code=reason_code,
+            deadline_at=deadline_at,
+            occurred_at=now,
+        )
+    except Exception:
+        # The expiry is already committed and is the durable fact. An alert
+        # that raises must not make the loop retry an expiry it already did.
+        logger.warning(
+            "entry admission expiry incident capture raised item_id=%s",
+            int(item.id),
+            exc_info=True,
+        )
+        return False
+    return recorded is not None
+
+
+def _defer_reason_code(result_json: str | None) -> str:
+    try:
+        result = json.loads(result_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return "unknown"
+    if not isinstance(result, dict):
+        return "unknown"
+    return str(result.get("reason") or "unknown")
 
 
 def _load_attempt_snapshot(session_factory, *, attempt_id: int):

@@ -514,6 +514,73 @@ def capture_deferred_instruction_expired(
     )
 
 
+def capture_entry_admission_expired(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    message_instruction_item_id: int,
+    raw_message_id: int,
+    chat_id: int,
+    defer_reason_code: str,
+    deadline_at: datetime | None,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture an entry that reached its execution deadline without submitting.
+
+    The entry was recognised and admitted, then held because its adjacent
+    context was still incomplete, and then the deadline passed. Nothing else
+    reports it: the message has a decision row and an instruction item, so gap
+    recovery does not see it as missing, and the item's own terminal state is
+    ``failed`` with no operator-facing consequence. Seven of these expired
+    between 2026-08-17 and 2026-09-04 -- all in ``auto_trade`` groups, all
+    silent, one of them the entry behind a lifecycle that still read
+    ``entered`` on the dashboard.
+    """
+
+    if not config.captures("entry_admission_expired"):
+        return None
+    fixed = {
+        "component": "entry_admission",
+        "source_status": "expired",
+        "reason_code": _safe_label(defer_reason_code),
+        "operation": f"instruction_item_{int(message_instruction_item_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_instruction_item",
+        source_record_id=str(int(message_instruction_item_id)),
+        incident_type="entry_admission_expired",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            chat_id=int(chat_id),
+            deadline_at=_deadline_label(deadline_at),
+            impact="entry_never_submitted",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def _deadline_label(deadline_at: datetime | None) -> str:
+    """A bare minute-resolution instant, carried in its own summary field.
+
+    It must stay bare. ``record_runtime_incident`` runs an opaque-secret
+    heuristic over every summary string, and this instant welded into a longer
+    label reads to it as one high-entropy token: 400 spread-out deadlines were
+    checked in composite form and every one of them got the whole detailed
+    summary refused. Alone it is ordinary date text and passes.
+    """
+
+    if deadline_at is None:
+        return "unset"
+    return f"{deadline_at.strftime('%Y-%m-%dT%H:%M')}Z"
+
+
 def capture_background_task_restart_exhausted(
     session_factory: sessionmaker,
     *,

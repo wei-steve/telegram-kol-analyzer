@@ -496,3 +496,203 @@ def test_failed_release_cas_keeps_attempt_pending_for_next_tick(tmp_path, monkey
     assert result.released == 0
     with session_factory() as session:
         assert session.query(EntryAssemblyAttempt).one().status == "pending"
+
+
+# --- A-3d: the retry half now runs wherever its timeout twin runs -------------
+#
+# ``instruction_execution_reconciliation`` expires a deferred contract whenever
+# the mode is not ``disabled``, so under ``shadow`` production was timing these
+# entries out while never retrying them. These tests pin the two halves to the
+# same gate, and pin the alert that makes an expiry visible at all.
+
+
+def test_shadow_releases_a_due_deferred_entry(tmp_path):
+    session_factory = create_session_factory(tmp_path / "shadow-release.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+        execution_contract_mode="shadow",
+    )
+
+    assert result.released == 1
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        # Cleared, so the entry is immediately claimable again -- the same
+        # state the event-driven wakeup produces, which already runs in shadow.
+        assert item.visibility_next_attempt_at is None
+        assert session.query(EntryAssemblyAttempt).one().status == "woken"
+
+
+def test_disabled_still_releases_nothing(tmp_path):
+    """The gate moved from ``live`` to ``disabled``; ``disabled`` stays inert."""
+
+    session_factory = create_session_factory(tmp_path / "disabled-release.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+        execution_contract_mode="disabled",
+    )
+
+    assert result == reconciler_module.EntryAdmissionReconcileResult()
+    with session_factory() as session:
+        assert session.query(EntryAssemblyAttempt).one().status == "pending"
+        assert (
+            session.get(MessageInstructionItem, item_id).visibility_next_attempt_at
+            is not None
+        )
+
+
+def _expire_under(session_factory, *, mode, item_id, reporter=None):
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        item.execution_deadline_at = NOW + timedelta(seconds=5)
+        session.commit()
+    return reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+        execution_contract_mode=mode,
+        incident_reporter=reporter,
+    )
+
+
+def test_an_expired_entry_reports_an_incident_instead_of_dying_silently(tmp_path):
+    session_factory = create_session_factory(tmp_path / "expiry-alert.db")
+    raw_id, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+    captured = []
+
+    result = _expire_under(
+        session_factory,
+        mode="shadow",
+        item_id=item_id,
+        reporter=lambda **kwargs: captured.append(kwargs) or object(),
+    )
+
+    assert (result.expired, result.incidents) == (1, 1)
+    assert len(captured) == 1
+    alert = captured[0]
+    assert alert["message_instruction_item_id"] == item_id
+    assert alert["raw_message_id"] == raw_id
+    assert alert["chat_id"] == 100
+    # Read from the snapshot taken before the expiry blanked ``result_json``:
+    # afterwards this reason exists nowhere else.
+    assert alert["defer_reason_code"] == "adjacent_entry_context_pending"
+    assert alert["deadline_at"] == NOW + timedelta(seconds=5)
+
+
+def test_a_failing_alert_never_undoes_the_expiry(tmp_path):
+    """The ledger change is committed first and is the durable fact."""
+
+    session_factory = create_session_factory(tmp_path / "expiry-alert-raises.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+
+    def raising(**_kwargs):
+        raise RuntimeError("notification channel down")
+
+    result = _expire_under(
+        session_factory, mode="shadow", item_id=item_id, reporter=raising
+    )
+
+    assert result.expired == 1
+    assert result.incidents == 0
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, item_id).status == "failed"
+        assert session.query(EntryAssemblyAttempt).one().status == "expired"
+
+
+def test_a_refused_alert_is_counted_as_not_reported(tmp_path):
+    """A capture that returns ``None`` was refused; it must not read as sent."""
+
+    session_factory = create_session_factory(tmp_path / "expiry-alert-refused.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+
+    result = _expire_under(
+        session_factory, mode="shadow", item_id=item_id, reporter=lambda **_: None
+    )
+
+    assert result.expired == 1
+    assert result.incidents == 0
+
+
+def test_entry_admission_expired_is_always_notified(tmp_path):
+    """A whitelist edit must not be able to silence this one."""
+
+    from telegram_kol_research.config import ALWAYS_NOTIFIED_INCIDENT_TYPES
+
+    assert "entry_admission_expired" in ALWAYS_NOTIFIED_INCIDENT_TYPES
+
+
+def test_the_default_path_writes_a_real_incident_row(tmp_path, monkeypatch):
+    """Exercise the wiring production actually uses, not an injected double."""
+
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.models import RuntimeIncident
+    import telegram_kol_research.runtime_incident_adapters as adapters
+
+    session_factory = create_session_factory(tmp_path / "expiry-alert-real.db")
+    raw_id, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+    monkeypatch.setattr(
+        adapters,
+        "load_runtime_incident_config",
+        lambda **_kwargs: RuntimeIncidentConfig(
+            capture_types=frozenset({"entry_admission_expired"})
+        ),
+    )
+
+    result = _expire_under(session_factory, mode="shadow", item_id=item_id)
+
+    assert (result.expired, result.incidents) == (1, 1)
+    with session_factory() as session:
+        incident = (
+            session.query(RuntimeIncident)
+            .filter(RuntimeIncident.incident_type == "entry_admission_expired")
+            .one()
+        )
+        assert incident.severity == "high"
+        assert incident.source_kind == "message_instruction_item"
+        assert incident.source_record_id == str(item_id)
+        summary = json.loads(incident.redacted_summary)
+        assert summary["component"] == "entry_admission"
+        assert summary["reason_code"] == "adjacent_entry_context_pending"
+        assert summary["raw_message_id"] == raw_id
+        assert summary["chat_id"] == 100
+        assert summary["operation"] == f"instruction_item_{item_id}"
+        assert summary["impact"] == "entry_never_submitted"
+        assert summary["deadline_at"] == "2026-08-10T12:00Z"
+
+
+def test_the_deadline_never_costs_us_the_detailed_summary():
+    """A refused detailed summary silently drops the group and the deadline.
+
+    The composite form of this label tripped the opaque-secret heuristic on
+    every one of these instants, which is why the deadline is its own field.
+    """
+
+    from telegram_kol_research.runtime_incident_adapters import _deadline_label, _summary
+    from telegram_kol_research.runtime_incidents import (
+        _validate_redacted_json_contract,
+    )
+
+    moment = datetime(2026, 1, 1, 0, 0)
+    for step in range(400):
+        deadline = moment + timedelta(hours=step * 8 + step)
+        summary = _summary(
+            component="entry_admission",
+            source_status="expired",
+            reason_code="adjacent_entry_context_pending",
+            operation="instruction_item_5",
+            raw_message_id=1,
+            chat_id=-1002409877375,
+            deadline_at=_deadline_label(deadline),
+            impact="entry_never_submitted",
+        )
+        _validate_redacted_json_contract("redacted_summary", summary)

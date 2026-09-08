@@ -65,6 +65,10 @@ VOID_REASON = "stale_pending_voided_2026_09_07"
 VOID_ERROR_JSON = json.dumps({"reason": VOID_REASON}, separators=(",", ":"))
 
 
+def _void_error_json(void_reason: str) -> str:
+    return json.dumps({"reason": void_reason}, separators=(",", ":"))
+
+
 @dataclass(frozen=True, slots=True)
 class VoidPlan:
     """Read-only: exactly which frozen rows are still in a voidable state."""
@@ -124,7 +128,11 @@ def plan_stale_pending_void(
     )
 
 
-def build_void_notification(rows: list[dict[str, object]]) -> str:
+def build_void_notification(
+    rows: list[dict[str, object]],
+    *,
+    void_reason: str = VOID_REASON,
+) -> str:
     """One aggregated Telegram message for the whole batch, grouped by chat.
 
     One message rather than 33: the batch is a single operator decision taken
@@ -137,7 +145,7 @@ def build_void_notification(rows: list[dict[str, object]]) -> str:
         by_chat.setdefault(str(row.get("chat_title") or row.get("chat_id")), []).append(row)
     lines = [
         f"⚠️ 积压指令项已作废（{len(rows)} 条，不补执行）",
-        f"理由：{VOID_REASON}",
+        f"理由：{void_reason}",
         "处置：状态 pending → failed；对应无交易所敞口的生命周期改为 cancelled。",
         "这些指令永不补执行；如仍需操作请人工下单。",
     ]
@@ -160,8 +168,16 @@ def apply_stale_pending_void(
     now: datetime | None = None,
     item_ids: tuple[int, ...] = STALE_PENDING_ITEM_IDS,
     lifecycle_ids: tuple[int, ...] = UNBOUND_LIFECYCLE_IDS,
+    void_reason: str = VOID_REASON,
 ) -> VoidResult:
-    """Void exactly the frozen rows that are still voidable, and nothing else."""
+    """Void exactly the frozen rows that are still voidable, and nothing else.
+
+    ``void_reason`` defaults to the 2026-09-07 batch's reason, so the archived
+    run is reproducible byte for byte. A later operation that reuses this tool
+    for its own rows passes its own dated reason instead: stamping a 2026-09-08
+    decision with the 09-07 label would misdate the only audit trail those rows
+    get. A-3d does exactly that for one row.
+    """
 
     moment = now or datetime.now(UTC)
     if moment.tzinfo is not None:
@@ -181,7 +197,7 @@ def apply_stale_pending_void(
         voided: list[int] = []
         for item in items:
             item.status = "failed"
-            item.error_json = VOID_ERROR_JSON
+            item.error_json = _void_error_json(void_reason)
             item.result_json = None
             item.last_progress_at = moment
             item.escalation_state = "expired"
@@ -229,7 +245,7 @@ def apply_stale_pending_void(
         terminalized: list[int] = []
         for lifecycle in lifecycles:
             lifecycle.lifecycle_status = TERMINAL_LIFECYCLE_STATE
-            lifecycle.exit_reason = VOID_REASON
+            lifecycle.exit_reason = void_reason
             lifecycle.management_action = "stale_pending_instruction_voided"
             lifecycle.management_note = (
                 "Instruction voided with no exchange exposure; never executed"
