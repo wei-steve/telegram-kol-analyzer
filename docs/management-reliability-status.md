@@ -14,7 +14,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 3c
 current_step_file: docs/plans/2026-09-07-management-reliability/step-3c-unreadable-env-file.md
-step_status: claimed              # planned | claimed | in_progress | completed | blocked
+step_status: in_progress              # planned | claimed | in_progress | completed | blocked
 claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
 last_completed_step: 3b
 last_completed_commit: 992a0b5d71c27e79be0b5771801ded45475a4edd
