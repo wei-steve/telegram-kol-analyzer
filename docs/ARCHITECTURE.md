@@ -334,5 +334,14 @@ historical_state_repair.py               position_management_remediation.py
   uncertain、后台任务放弃重启、市价成交无法归属这几类，不能因为运维改错了一行 env 就静音。两个关断位仍然有效：
   键**缺席**等于"全类型"，键为**空串**等于"一条都不发"。要单独关掉基线里的某一类，只能改代码，
   这是刻意的代价。
+- **要判断某个服务进程实际看到什么环境变量，只有 `/proc/<pid>/environ` 可信。**
+  三个 unit 的变量来自 `EnvironmentFile=/etc/telegram-kol-<role>.env`，而
+  `systemctl show <unit> -p Environment` **只列 unit 文件里内联的 `Environment=`**，
+  不含 EnvironmentFile 的内容——在这台机器上它只会回一个 `TELEGRAM_KOL_RUNTIME_ROLE`。
+  拿它当进程环境去复算配置，会得到"告警不会被捕获""密钥没配"这类完全错误的结论
+  （A-3d 只读核实 `entry_admission_expired` 可达性时踩过一次，`captures` 假阴性）。
+  正确做法：`PID=$(systemctl show <unit> -p MainPID --value)`，再解析
+  `/proc/$PID/environ`（`\0` 分隔）喂给 `load_*_config(environ=..., environment_only=True)`。
+  注意那份 environ 里含 bot token 等凭据，**只用不打印**。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
   都是读错了需求，停下来问。
