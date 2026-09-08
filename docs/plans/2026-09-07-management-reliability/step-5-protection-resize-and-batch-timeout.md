@@ -33,6 +33,13 @@ pos 1001125178552543 在仓 3 张，desired 50%/30%/20% 按 quantity_step=1 得 
 但需要一个明确策略。候选：按可分配张数缩减档位数（3 张 → 两档 2/1 或一档 3），最少一档；或保持现状只挂止损。
 **这是交易语义，须用户在本步领取前单独决定并记进证据区。**
 
+### 6. 两条停投通道的门槛与路由（step 2 遗留，需用户决定路由）
+
+`position_protection_incidents`（pending 399，历史 delivered 0）、`strategy_management_notifications`（pending 67）、
+`position_attribution_audits`（pending 2834）因 `TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID` 为空而整体禁用。本步先给这三条
+通道各加一个 AFTER 门槛（只投递门槛之后的新行），再由用户二选一：在服务器 env 补 `NOTIFICATION_BOT_CHAT_ID`（推荐与
+系统机器人同一个群），或在代码里回落到 `system_operator_bot_config`。门槛未落地前不得启用任一通道。
+
 ## 禁止
 
 - 不改止盈单价格或数量；只改主止损单数量且只能改小到等于在仓量。
