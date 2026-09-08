@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 5b
-current_step_file: docs/plans/2026-09-07-management-reliability/step-5b-frozen-convergence-backlog.md
-step_status: in_progress              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 5
-last_completed_commit: eddd79c49c95b6124c99861fe8ee73934acf3ce4
+current_step: 5c
+current_step_file: docs/plans/2026-09-07-management-reliability/step-5c-partial-fill-evidence-from-order-history.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 5b
+last_completed_commit: 85d3c4ea
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -236,3 +236,13 @@ user_decisions_2026_09_07:
   **磁盘清理（用户同意、指挥会话裁定 A–F 六组全删）**：删除 **42 个文件、清单字节合计 9.14 GiB**，**可用空间 2.8G → 9.2G（使用率 95% → 82%）**；回收的可用空间 6.4G 与清单字节的差额来自文件系统保留块与生产库期间的正常增长。删前防呆 grep 两份保留备份、生产库及其 -wal/-shm、`/root/data/`，命中即中止（结果 NONE）；删后逐条核实 42 项全部不存在，两份保留备份与生产库本体字节数未变，同目录 JSON/md/脚本全部保留。清单含路径、字节、mtime、sha256 前 12 位，在 `/root/evidence/step5/disk-cleanup.md`。**重要更正：`tg-deploy` 全文只做 fetch / reset --hard / 清 pycache / 重启三个 unit，不做任何数据库备份**，所以"保留最新一份部署前备份"没有对应实体。保留规矩已写进 `docs/ARCHITECTURE.md` 第 6 节。
   **两个排查陷阱已写进 `docs/ARCHITECTURE.md` 第 6 节**：(a) 本机本地时区是 UTC+8 而数据库时间戳是 UTC，`journalctl --since "裸时间戳"` 按本地时间解析——查部署后日志会查回 8 小时前旧 worker 的日志，我第一次就把早已不存在的 PID 3218007 的历史 ERROR 当成本次部署引入的问题，正确写法是 `--since "@$(date -u -d "<UTC 时刻> UTC" +%s)"`；反向的坑是 sqlite 里比 `created_at` 必须用 UTC。(b) `trading_settings` 是 key/value 表，但全局设置全在 `key='global'` 那一行的 JSON 里，按键名 `LIKE '%_delivery_after_id'` 查会得到空集，然后误判"设置没写进去"。
   **遗留问题**：(1) 生产有 **29 条** `convergence_partial_position_unexplained` 的收敛全部是 `conflicted`，而收敛审计只在 `status='submitted'` 时走判据，`conflicted` 直接 `continue`——**本步只防将来、不追既往，包括 222 本身**；已由指挥会话立为 step 5b。(2) 若同一仓位在一次缩量之后又发生第二次分档成交，已解释量会被正确扣除并独立判定；但若两张止盈单数量相同，判定为 `partial_reduction_take_profit_ambiguous` 并冻结，这是刻意的 fail-closed。(3) 三通道"只投门槛之后的新行"这一半窗内没有实盘样本（门槛之后暂无新行），要等用户填 chat_id 且产生新事件后才能观察到投递。
+
+- step-5b (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L3 生产数据变更，指挥会话逐条裁定）。分支 `mgmt/step-5b-frozen-convergences`，修复工具提交 `85d3c4ea`（`src/telegram_kol_research/one_off/frozen_convergence_backlog_2026_09_09.py` + 7 个用例）。**不需要部署**：`one_off` 不在任何在线路径上（`tests/test_one_off_isolation.py` 静态守护），生产数据变更已直接执行完毕；模块随 A-5c 的正常部署入 release。全量 **7969 passed / 4 skipped / 0 failed**。
+  **只读盘点**：29 条 `conflicted / convergence_partial_position_unexplained`，交易所 `list_positions` 直读确认 **28 条仓位已平**（binding 全 `closed`，最早 2026-07-24 最晚 09-04），**1 条仍活跃**（conv **237**，pos `1001125179691393`，ETH 空）。根因与 A-4 记录一致：`reconcile_trigger_take_profit_order_history` 只访问 `submitted` 的收敛，`conflicted` 的直接 `continue`，所以这 29 条连同 66 条仍 `active` 的止盈单永远够不着。
+  **备份与演练**：备份 `/root/evidence/step5b/research-backup-20260908T233015Z.db`（964,063,232 字节，`sqlite3 .backup` 一致性快照），`PRAGMA quick_check` = ok；按保留规矩删掉 step-4 那份，现存 step3d 与本次两份。生产库副本上演练：dry-run 95 个动作 → apply 95 行 / 95 审计 / 0 跳过 → 再 apply 只剩 1 行（仍冻结的 237）且 **0 审计**（指纹去重）→ 副本 quick_check ok → 副本用完即删（sha256 记在 `/root/evidence/step5/disk-cleanup.md`）。
+  **生产执行**：执行前 `active_write_count=0 global_authority_state=idle`；结果 **applied_rows=95、audits=95、skipped=0**，与演练逐项一致，生产 `PRAGMA quick_check` = ok。逐行 before/after 全文在 `/root/evidence/step5b/plan-production.json`。**28 条 → `completed / convergence_position_terminal`**；**66 条仍 active 的止盈单 → `expired` + `evidence_json.terminalization.reason_code = position_terminal_order_absent`**（与在线路径对终态仓位的写法逐字段相同）；222 的 1 filled + 2 expired 与 93 的 1 cancelled 已是终态，只补收敛行。**审计 95 条，id 3845–3939，全部 `historical_cleanup` / `not_needed`**，全部晚于 A-5 落下的归属审计门槛 3844。修复期间 `position_protection_ledger` 0 行变动、`position_mutation_intents` 0 条、`execution_events` 0 条、除一次只读 `list_positions` 外无任何交易所请求。
+  **conv 237 按裁定保持冻结（选项 a）**：`conflicted / convergence_partial_position_unexplained` 不变、`completed_at` 不变、三条止盈单不动，只把判定现场写进 `error_json`（2357 字节）。现场包含：入场 2.1、计划 2.1、在仓 0.5、减少 1.6、三档 ordId/数量/触发价/账本状态、失败码 `partial_reduction_trigger_history_missing`、以及**旁证**——`orders-history` 里两笔精确对应的平仓单（`1001125181469680` buy 1 @2470.03 filled 06:02:29Z、`1001125186263340` buy 0.6 @2450 filled 13:39:12Z，与 TP1/TP2 的数量与触发价逐项相等）、三次仓位观测（2.1 → 1.1 → 1.1→0.5）、以及"不是本系统干的"的证明（binding 345 的管理批次 160/161 均 `blocked / management_stop_action_conflict` 从未执行，入场那 5 条 `set_position_sltp` 意图之后再无写入意图与执行事件）。旁证只是旁证，不是判据。
+  **"复位后系统建单的逐笔核对"不适用**：该项前提是把活跃仓位的收敛复位为 `waiting_backup_stop` 让生产代码重建止盈；按裁定 237 保持冻结，本步未复位任何收敛，系统不会也不应建出任何止盈单。这是裁定的直接结果，不是遗漏。
+  **本步发现并交给 A-5c 的缺口**：A-5 判据三（`trigger-orders-history` 显示该止盈单已触发）在当前交易所行为下**拿不到证据**。核实过程：ETH/BTC 两条 `trigger-orders-history` 的最新一条分别停在 `1001125172457033` / `1001125172997119`（约 09-08 01:23Z），此后创建的 TPSL 单一张都没进过；用 `before=<最新 id>` 查回 0 行证明**不是分页假象**；`ordId` 查询参数交易所直接返回 0 行，即 `list_trigger_order_history_by_order_id` 实际失效。对照组成立：222 的 TP1 `1001125123049529` **在**历史表里，`triggerTime=1788510883`（正是 2026-09-04T08:34:43Z 事故那一刻）、`errorCode=0`。所以判据本身没写错，是覆盖不全。**推论：A-5 任务 1 在生产上目前基本不会触发**——A-5 观察窗记的"无样本"更可能是判据三拿不到证据，而不是没赶上。
+  **另一个已写进 `docs/ARCHITECTURE.md` 第 6 节的排查陷阱**：仓位行的 `slTriggerPx` / `tpTriggerPx` 不能用来判断"有没有止损"。pos `1001125179691393` 的仓位行 `slTriggerPx` 是空串，而 `trigger-orders-pending` 里挂着**两张** `triggerOrderType=TPSL`、`sz=0`（全仓）、`slTriggerPrice` 为 2530 与 2535.06 的止损单，与账本两条 `stop_loss/verified` 行逐字段一致——**该仓位受保护，不需要人工补挂**。同一份返回里 `triggerOrderType=Conditional` 的行是挂单入场，不是保护单。另一活仓 `1001125178552543`（BTC 空 3）同样有保护（sl 83000 sz=3、sl 83166 sz=0）。
+  **遗留问题**：(1) 判据三的覆盖缺口 → A-5c。(2) 第三个活仓 `1001125164628529`（ETH 多 1.6）只读到 tp 2595、未见任何 sl 行，可能确实裸着；它属于 A-4 裁定里"231 复位为 `waiting_backup_stop` 由生产代码自行判断"那一条，不在 5b 范围，**本步只报不动**，是否单独处理待裁定。(3) 修复模块尚未进入部署的 release，随 A-5c 部署入库；已核实运行时未在 release 的 `src/` 下产生 `__pycache__`，release 摘要未被污染，仍可作回滚目标。
