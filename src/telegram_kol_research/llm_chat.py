@@ -13,6 +13,9 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from telegram_kol_research.env_file_readability import (
+    note_unreadable_config_file,
+)
 from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentFinalResponseError,
 )
@@ -214,7 +217,7 @@ def _load_env_file_values(
         if not os.path.isfile(path):
             continue
         if not os.access(path, os.R_OK):
-            logger.warning("skipping unreadable env file: %s", path)
+            note_unreadable_config_file(path, logger)
             continue
         try:
             with open(path, encoding="utf-8") as handle:
@@ -230,8 +233,8 @@ def _load_env_file_values(
                     values[key.strip()] = value.strip().strip('"').strip("'")
         except OSError:
             # The access check can race, and unreadable is not the only way a
-            # path can refuse to open. Only the path is logged, never content.
-            logger.warning("skipping unreadable env file: %s", path)
+            # path can refuse to open. Only the path is recorded, never content.
+            note_unreadable_config_file(path, logger)
     return values
 
 

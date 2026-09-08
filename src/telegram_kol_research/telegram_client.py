@@ -12,6 +12,10 @@ from pathlib import Path
 from typing import Any
 
 
+from telegram_kol_research.env_file_readability import (
+    note_unreadable_config_file,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -92,14 +96,14 @@ def _load_env_file_values(
         if not path.exists() or not path.is_file():
             continue
         if not os.access(path, os.R_OK):
-            logger.warning("skipping unreadable env file: %s", path)
+            note_unreadable_config_file(path, logger)
             continue
         try:
             content = path.read_text(encoding="utf-8")
         except OSError:
             # The access check can race, and unreadable is not the only way a
-            # path can refuse to open. Only the path is logged, never content.
-            logger.warning("skipping unreadable env file: %s", path)
+            # path can refuse to open. Only the path is recorded, never content.
+            note_unreadable_config_file(path, logger)
             continue
         for line in content.splitlines():
             stripped = line.strip()

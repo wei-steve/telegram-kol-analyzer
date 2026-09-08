@@ -10,6 +10,8 @@ import re
 import threading
 from typing import Any, Mapping
 
+from telegram_kol_research.env_file_readability import unreadable_config_files
+
 
 _SHA1_RE = re.compile(r"^[0-9a-f]{40}$")
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
@@ -456,6 +458,12 @@ def build_runtime_deployment_identity(
             ),
             "runtime_incident_last_notified_at": last_runtime_incident_notified_at,
             "background_task_supervision": dict(background_task_supervision or {}),
+            # A-3c. A config file this process cannot read is skipped rather
+            # than raised, so nothing fails -- and nothing would say so either.
+            # Reporting the paths here keeps the permission mistake visible
+            # without an exception in a per-message path. Reading the set is a
+            # memory read, so this endpoint stays I/O-free.
+            "unreadable_config_files": list(unreadable_config_files()),
         },
         "capabilities": {
             "global_exchange_authority": worker_owner,

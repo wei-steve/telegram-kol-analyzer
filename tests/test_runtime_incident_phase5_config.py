@@ -1,7 +1,29 @@
+import logging
+
 import pytest
 
 from telegram_kol_research import config as config_module
 from telegram_kol_research.config import load_runtime_incident_config
+from telegram_kol_research.env_file_readability import (
+    reset_unreadable_config_files,
+    unreadable_config_files,
+)
+
+
+class _CollectingHandler(logging.Handler):
+    """Listen on the module logger itself.
+
+    ``configure_application_logging`` sets ``propagate = False`` on the package
+    logger for the life of the process, so ``caplog`` -- which listens on the
+    root logger -- sees nothing from this package once any test has called it.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.WARNING)
+        self.messages: list[str] = []
+
+    def emit(self, record):
+        self.messages.append(record.getMessage())
 
 
 def test_multi_target_projection_defaults_dormant():
@@ -138,8 +160,24 @@ def test_runtime_config_does_not_hide_unreadable_non_secret_config(
     tmp_path,
     monkeypatch,
 ):
+    """The principle is kept; the mechanism that carried it is not.
+
+    This used to require ``PermissionError`` to propagate, so that an
+    unreadable non-secret config could never be silently ignored. The
+    principle stands -- an operator must find out -- but raising was the wrong
+    carrier for it. These loaders run once per message, so from 2026-09-04 the
+    worker (running as ``telegram-kol-worker``, against a ``root`` 0600
+    ``config/telegram.env``) failed the message instead of reporting the
+    permission mistake: the job failed and its attempt landed
+    ``authoritative_execution_outcome_unknown``.
+
+    Visibility now rides on two carriers that cost a message nothing: one
+    warning per path per process, and the path in the deployment-identity
+    health endpoint as ``unreadable_config_files``. Loading continues.
+    """
+
     config_file = tmp_path / "telegram.env"
-    config_file.write_text("unreadable=true\n", encoding="utf-8")
+    config_file.write_text("SECRET_KEY=must-not-be-read\n", encoding="utf-8")
     original_open = open
 
     def guarded_open(path, *args, **kwargs):
@@ -148,12 +186,30 @@ def test_runtime_config_does_not_hide_unreadable_non_secret_config(
         return original_open(path, *args, **kwargs)
 
     monkeypatch.setattr("builtins.open", guarded_open)
+    reset_unreadable_config_files()
+    handler = _CollectingHandler()
+    logger = logging.getLogger("telegram_kol_research.llm_chat")
+    logger.addHandler(handler)
 
-    with pytest.raises(PermissionError):
-        load_runtime_incident_config(
+    try:
+        # Loading continues rather than raising.
+        config = load_runtime_incident_config(
             environ={},
             env_file_paths=[config_file],
         )
+        # Once per path per process, not once per message.
+        load_runtime_incident_config(environ={}, env_file_paths=[config_file])
+    finally:
+        logger.removeHandler(handler)
+        reset_unreadable_config_files_after = unreadable_config_files()
+
+    assert config is not None
+    assert [str(config_file)] == list(reset_unreadable_config_files_after)
+    warnings = [
+        message for message in handler.messages if str(config_file) in message
+    ]
+    assert len(warnings) == 1
+    assert not any("must-not-be-read" in message for message in handler.messages)
 
 
 def test_runtime_config_prefers_complete_systemd_environment_over_unreadable_defaults(

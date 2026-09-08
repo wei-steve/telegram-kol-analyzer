@@ -16,6 +16,22 @@ import pytest
 from telegram_kol_research import config as config_module
 from telegram_kol_research import llm_chat, telegram_client
 from telegram_kol_research import web_app as web_app_module
+from telegram_kol_research.env_file_readability import (
+    reset_unreadable_config_files,
+    unreadable_config_files,
+)
+from telegram_kol_research.runtime_deployment_identity import (
+    build_runtime_deployment_identity,
+)
+
+
+@pytest.fixture(autouse=True)
+def _clean_readability_record():
+    """The record is process-local, so each case has to start from empty."""
+
+    reset_unreadable_config_files()
+    yield
+    reset_unreadable_config_files()
 
 # The repository holds two independent loaders with the same name and the same
 # job. Both are covered here, because fixing one leaves the other raising.
@@ -201,3 +217,60 @@ def test_reanalyze_hands_down_the_config_startup_already_resolved():
     reanalyze = reanalyze[: reanalyze.index("    def is_eligible(")]
 
     assert "multi_target_management_config=" in reanalyze
+
+
+def test_the_warning_fires_once_per_path_no_matter_how_many_messages(tmp_path):
+    """These loaders run once per message; warning every time buries the fact."""
+
+    unreadable = _write_unreadable(tmp_path / "telegram.env")
+    handler, logger = _warnings_from(llm_chat)
+
+    try:
+        for _ in range(5):
+            llm_chat._load_env_file_values([unreadable])
+    finally:
+        logger.removeHandler(handler)
+
+    assert len([m for m in handler.messages if str(unreadable) in m]) == 1
+
+
+def test_health_reports_every_unreadable_path_it_skipped(tmp_path):
+    """Not raising must not become not telling anyone.
+
+    The deployment-identity endpoint is contractually I/O-free, so the paths
+    ride in a process-local set that costs a memory read to report.
+    """
+
+    first = _write_unreadable(tmp_path / "telegram.env")
+    second = _write_unreadable(tmp_path / "llm.env")
+
+    llm_chat._load_env_file_values([first])
+    telegram_client._load_env_file_values([second])
+
+    assert unreadable_config_files() == tuple(sorted([str(first), str(second)]))
+    identity = build_runtime_deployment_identity(
+        runtime_role="worker",
+        module_path=__file__,
+        expected_commit="",
+        expected_manifest_sha256="",
+        tasks={},
+    )
+    assert identity["health"]["unreadable_config_files"] == [
+        *sorted([str(first), str(second)])
+    ]
+
+
+def test_health_reports_nothing_when_every_file_was_readable(tmp_path):
+    readable = tmp_path / "readable.env"
+    readable.write_text("A=1\n", encoding="utf-8")
+
+    llm_chat._load_env_file_values([readable])
+
+    identity = build_runtime_deployment_identity(
+        runtime_role="worker",
+        module_path=__file__,
+        expected_commit="",
+        expected_manifest_sha256="",
+        tasks={},
+    )
+    assert identity["health"]["unreadable_config_files"] == []
