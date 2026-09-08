@@ -2303,10 +2303,12 @@ async def deliver_terminal_entry_cleanup_notifications(
 def runtime_incident_payload_is_deliverable(incident) -> bool:
     """Report whether a type-eligible incident's payload also earns a message.
 
-    Type alone is too coarse for ``context_worker_exhausted``: the same type is
-    raised by backfills and scanners, which produced 1466 rows by 2026-09-07.
-    Only the ``raw_message_*`` operations describe a real inbound instruction
-    whose processing was abandoned, so only those are delivered.
+    Type alone is too coarse for ``context_worker_exhausted``: everything that
+    resolves context raises it, not only inbound-message processing. Only the
+    ``raw_message_*`` operations describe a real instruction whose processing
+    was abandoned, so only those are delivered. This guards future rows; the
+    existing backlog is held back by the ``AFTER_ID`` watermark instead, every
+    row of it having a ``raw_message_*`` operation.
 
     Unreadable or absent payloads fail closed towards delivering: an operator
     reading one spurious report is cheaper than a dropped instruction.

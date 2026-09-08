@@ -63,10 +63,16 @@ RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
     }
 )
 
-# ``context_worker_exhausted`` is also raised by bulk backfill and scanner
-# operations; 1466 of those had accumulated by 2026-09-07. Only the per-message
-# ones describe a real instruction that was dropped, so delivery is restricted
-# to that operation prefix. Capture is unrestricted -- the ledger keeps them all.
+# ``context_worker_exhausted`` is raised by anything that resolves context, not
+# only by inbound-message processing. Only the per-message operations describe a
+# real instruction that was dropped, so delivery is restricted to that prefix
+# while capture stays unrestricted -- the ledger keeps them all.
+#
+# This is a forward guard, not a backlog filter. Measured on production
+# 2026-09-08: all 1464 pending rows above the old watermark carry a
+# ``raw_message_*`` operation, so this prefix suppresses none of them. What
+# keeps that backlog from being sent at once is the ``AFTER_ID`` watermark,
+# raised to the current maximum incident id at deploy time.
 CONTEXT_WORKER_EXHAUSTED_DELIVERED_OPERATION_PREFIX = "raw_message_"
 
 
@@ -147,9 +153,12 @@ class RuntimeIncidentConfig:
 #: rather than forgotten: ``telegram_notifications_enabled`` off, and the
 #: whitelist key present but empty (capture-only).
 #:
-#: The same set is folded into a non-empty ``..._CAPTURE_TYPES``. A type that is
-#: never captured can never be delivered either, so guaranteeing delivery means
-#: guaranteeing capture first.
+#: The same set is folded into a non-empty ``..._CAPTURE_TYPES``, for the types
+#: that are raised through the capture adapters: those pass ``captures()`` before
+#: anything is written, so for them guaranteeing delivery means guaranteeing
+#: capture first. It is inert -- neither needed nor harmful -- for a type whose
+#: producer calls ``record_runtime_incident`` directly, as the phase 5 one does.
+#: Delivery itself never consults this selector.
 ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
     {
         # Phase 5: a market entry was submitted, its position could not be
