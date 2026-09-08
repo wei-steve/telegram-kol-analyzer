@@ -48,6 +48,15 @@ pos 1001125178552543 在仓 3 张，desired 50%/30%/20% 按 quantity_step=1 得 
 `runtime_incidents`（类型 `source_deletion_exit_stuck`，ALWAYS_NOTIFIED）；若交易所直读确认该退出对应的仓位与
 订单已不存在 → 自动改 `succeeded`（reason `position_gone_confirmed`）解封泳道；否则只告警不解封。
 
+### 8. 源消息删除退出把"没下单"当成"下过单"（A-4 复核发现）
+
+`source_message_deletion_worker.py` 726–789 行：`execution_binding_id is None` 的分支里，只要该 chat/message 有一条
+`execution_events` 且 `request_json` 或 `response_json` 非空（排除两种 action），就判 `identity_invalid` →
+永久 `frozen_ledger_identity_unverified`。exit 109/128/201/231 命中的四条 execution_events（3501/3589/3796/3967）
+action 全是 `auto_trade_skipped`、status=skipped、order_id/client_order_id/pos_id 全 NULL——是"系统决定不下单"的记录。
+修法：`hazardous_event` 判据必须要求事件带交易所身份（order_id 或 client_order_id 或 pos_id 非空）或 action 属于
+写入类白名单；`auto_trade_skipped` 及其他 skipped/blocked 类 action 不算危险。加以 3501/3589/3796/3967 为固定用例的回归测试。
+
 ## 禁止
 
 - 不改止盈单价格或数量；只改主止损单数量且只能改小到等于在仓量。
