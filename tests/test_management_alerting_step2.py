@@ -291,7 +291,7 @@ def test_uncertain_authoritative_execution_records_a_high_incident(
         summary = json.loads(row.redacted_summary)
         assert summary["raw_message_id"] == raw_id
         assert summary["attempt_id"] == claim.attempt_id
-        assert summary["error_summary"] == "read_timed_out_after_submit"
+        assert summary["error_summary"] == "read timed out after submit"
         assert summary["operation"] == f"raw_message_{raw_id}"
     # The type is in the baseline, so a configured whitelist delivers it.
     assert load_runtime_incident_config(
@@ -348,6 +348,9 @@ def test_new_summary_fields_only_ever_carry_integers_or_safe_labels(tmp_path):
     )
 
     safe_label = re.compile(r"[A-Za-z0-9._-]*\Z")
+    # error_summary goes through _safe_sentence, which keeps word breaks as
+    # spaces so an ordinary message is not mistaken for one opaque token.
+    safe_sentence = re.compile(r"[A-Za-z0-9._ -]*\Z")
     new_keys = {
         "attempt_id",
         "consecutive_failures",
@@ -366,7 +369,10 @@ def test_new_summary_fields_only_ever_carry_integers_or_safe_labels(tmp_path):
                 value = summary[key]
                 if isinstance(value, bool) or not isinstance(value, int):
                     assert isinstance(value, str), (key, value)
-                    assert safe_label.fullmatch(value), (key, value)
+                    pattern = (
+                        safe_sentence if key == "error_summary" else safe_label
+                    )
+                    assert pattern.fullmatch(value), (key, value)
                     assert len(value) <= 256, (key, value)
 
     assert seen == new_keys
@@ -378,6 +384,95 @@ def test_new_summary_fields_only_ever_carry_integers_or_safe_labels(tmp_path):
         )
     assert "bearer" not in blob.lower()
     assert "sk-live" not in blob
+
+
+@pytest.mark.parametrize(
+    "error_summary",
+    [
+        "Deepcoin returned sCode 51004 for ordId 1001125163581378",
+        "httpx.ReadTimeout: read timed out while awaiting response headers",
+        "DeepcoinRequestOutcomeUnknown: POST /deepcoin/trade/order timed out",
+        "ConnectionResetError errno 104 reset by peer during set_position_sltp",
+    ],
+)
+def test_a_realistic_error_summary_still_produces_an_incident(
+    tmp_path, error_summary
+):
+    """The apparent-secret heuristic must not swallow ordinary error text.
+
+    ``_safe_label`` used to join every word with an underscore, which made a
+    normal message look like one long mixed-class token -- the exact shape
+    ``runtime_incidents`` rejects. ``_capture`` swallows that rejection, so the
+    alert would silently never exist.
+    """
+
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_authoritative_execution_uncertain,
+    )
+
+    session_factory = create_session_factory(tmp_path / "opaque.db")
+    capture_authoritative_execution_uncertain(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"authoritative_execution_uncertain"})
+        ),
+        attempt_id=372,
+        raw_message_id=15201,
+        occurred_at=NOW,
+        error_class="DeepcoinRequestOutcomeUnknown",
+        error_summary=error_summary,
+    )
+
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        summary = json.loads(row.redacted_summary)
+        assert summary["error_summary"], summary
+        assert summary["raw_message_id"] == 15201
+
+
+def test_a_refused_detailed_summary_falls_back_to_a_fixed_label_one(tmp_path):
+    """An incident that cannot describe itself is still better than silence."""
+
+    from telegram_kol_research import runtime_incident_adapters as adapters
+
+    session_factory = create_session_factory(tmp_path / "fallback.db")
+    calls: list[str] = []
+
+    def recorder(factory, **kwargs):
+        calls.append(kwargs["redacted_summary"])
+        if "error_summary" in kwargs["redacted_summary"]:
+            raise adapters_bounds_error("refused")
+        from telegram_kol_research.runtime_incidents import (
+            record_runtime_incident,
+        )
+
+        return record_runtime_incident(factory, **kwargs)
+
+    from telegram_kol_research.runtime_incidents import (
+        RuntimeIncidentBoundsError as adapters_bounds_error,
+    )
+
+    adapters.capture_authoritative_execution_uncertain(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"authoritative_execution_uncertain"})
+        ),
+        attempt_id=372,
+        raw_message_id=15201,
+        occurred_at=NOW,
+        error_class="DeepcoinRequestOutcomeUnknown",
+        error_summary="anything at all",
+        recorder=recorder,
+    )
+
+    assert len(calls) == 2
+    with session_factory() as session:
+        row = session.query(RuntimeIncident).one()
+        summary = json.loads(row.redacted_summary)
+        assert "error_summary" not in summary
+        assert summary["raw_message_id"] == 15201
+        assert summary["attempt_id"] == 372
+        assert summary["operation"] == "raw_message_15201"
 
 
 def test_uncertain_freeze_still_commits_when_capture_is_disabled(tmp_path):

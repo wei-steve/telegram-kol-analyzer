@@ -148,6 +148,26 @@ def _safe_label(value: Any, *, fallback: str = "unknown", limit: int = 128) -> s
     return (normalized or fallback)[:limit]
 
 
+def _safe_sentence(value: Any, *, limit: int = 256) -> str:
+    """Redact and bound free-form text while keeping word breaks as spaces.
+
+    ``_safe_label`` joins every run of punctuation and whitespace with an
+    underscore, which turns an ordinary error message into a single 60-character
+    mixed-class token. That is exactly the shape ``runtime_incidents`` rejects
+    as an apparent opaque secret, and the rejection is swallowed by ``_capture``
+    -- so the incident would silently never exist, which is the failure this
+    step is here to remove. Spaces keep each word its own short token, while a
+    real credential blob has no spaces and stays one long token, so the
+    heuristic still catches what it is for.
+    """
+
+    text = str(value or "").strip()
+    if any(marker in text.lower() for marker in _SENSITIVE_MARKERS):
+        return "redacted"
+    normalized = " ".join(_SAFE_LABEL.sub(" ", text).split())
+    return (normalized or "unknown")[:limit]
+
+
 def _summary(**values: Any) -> str:
     return json.dumps(
         {
@@ -348,6 +368,61 @@ def capture_context_worker_state(
     )
 
 
+def _capture_with_minimal_fallback(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    source_kind: str,
+    source_record_id: str,
+    incident_type: str,
+    severity: str,
+    detailed_summary: str,
+    minimal_summary: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None,
+):
+    """Record the detailed summary, or a fixed-label one if it is refused.
+
+    ``record_runtime_incident`` enforces a closed field set, a length bound and
+    an apparent-secret heuristic, and ``_capture`` swallows every rejection. For
+    an alert whose whole purpose is to break a silence, "the summary was too
+    interesting so nothing was recorded" is the worst possible outcome. The
+    fallback carries only fixed labels and integers, so it cannot trip any of
+    those checks, and an operator still learns the incident happened.
+    """
+
+    recorded = _capture(
+        session_factory,
+        config=config,
+        source_kind=source_kind,
+        source_record_id=source_record_id,
+        incident_type=incident_type,
+        severity=severity,
+        redacted_summary=detailed_summary,
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+    if recorded is not None or minimal_summary == detailed_summary:
+        return recorded
+    logger.warning(
+        "Runtime incident detailed summary refused; retrying minimal: "
+        "type=%s source=%s",
+        incident_type,
+        source_kind,
+    )
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind=source_kind,
+        source_record_id=source_record_id,
+        incident_type=incident_type,
+        severity=severity,
+        redacted_summary=minimal_summary,
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_authoritative_execution_uncertain(
     session_factory: sessionmaker,
     *,
@@ -367,22 +442,28 @@ def capture_authoritative_execution_uncertain(
     with nobody told.
     """
 
-    return _capture(
+    if not config.captures("authoritative_execution_uncertain"):
+        return None
+    fixed = {
+        "component": "authoritative_execution",
+        "source_status": "uncertain",
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+        "attempt_id": int(attempt_id),
+    }
+    return _capture_with_minimal_fallback(
         session_factory,
         config=config,
         source_kind="authoritative_execution_attempt",
         source_record_id=str(int(attempt_id)),
         incident_type="authoritative_execution_uncertain",
         severity="high",
-        redacted_summary=_summary(
-            component="authoritative_execution",
-            source_status="uncertain",
-            operation=f"raw_message_{int(raw_message_id)}",
-            raw_message_id=int(raw_message_id),
-            attempt_id=int(attempt_id),
+        detailed_summary=_summary(
+            **fixed,
             error_type=_safe_label(error_class),
-            error_summary=_safe_label(error_summary, limit=256),
+            error_summary=_safe_sentence(error_summary),
         ),
+        minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,
         recorder=recorder,
     )
@@ -405,20 +486,26 @@ def capture_background_task_restart_exhausted(
     restarted -- exactly the 6h48m silence of 2026-09-06.
     """
 
-    return _capture(
+    if not config.captures("background_task_restart_exhausted"):
+        return None
+    fixed = {
+        "component": "background_task_supervisor",
+        "source_status": "restart_exhausted",
+        "consecutive_failures": int(consecutive_failures),
+    }
+    return _capture_with_minimal_fallback(
         session_factory,
         config=config,
         source_kind="background_task",
         source_record_id=_safe_label(task_name, limit=255),
         incident_type="background_task_restart_exhausted",
         severity="critical",
-        redacted_summary=_summary(
-            component="background_task_supervisor",
-            source_status="restart_exhausted",
+        detailed_summary=_summary(
+            **fixed,
             task_name=_safe_label(task_name),
-            consecutive_failures=int(consecutive_failures),
             error_type=_safe_label(error_type),
         ),
+        minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,
         recorder=recorder,
     )
