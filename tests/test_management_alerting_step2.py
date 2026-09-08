@@ -18,7 +18,7 @@ import pytest
 from telegram_kol_research import web_app as web_app_module
 from telegram_kol_research import system_operator_bot as operator_bot_module
 from telegram_kol_research.config import (
-    MANDATORY_RUNTIME_INCIDENT_TYPES,
+    ALWAYS_NOTIFIED_INCIDENT_TYPES,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
@@ -77,7 +77,7 @@ def test_an_explicitly_empty_selector_stays_a_complete_kill_switch():
 
     assert config.telegram_notification_types == frozenset()
     assert config.capture_types == frozenset()
-    for incident_type in sorted(MANDATORY_RUNTIME_INCIDENT_TYPES):
+    for incident_type in sorted(ALWAYS_NOTIFIED_INCIDENT_TYPES):
         assert config.notifies(incident_type) is False
         assert config.captures(incident_type) is False
 

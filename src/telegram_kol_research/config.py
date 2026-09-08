@@ -63,31 +63,6 @@ RUNTIME_SCANNER_DEPLOYABLE_RULE_IDS = frozenset(
     }
 )
 
-# A-2: incident types whose alerting must not depend on operator env drift.
-#
-# The delivery selector and the capture selector are both operator-provided
-# lists. Before this baseline, a management instruction could fail durably
-# without ever reaching an operator, because the deployed list simply did not
-# name the failure's type. These five types are the ones whose silence was the
-# incident, so the loader folds them into any *non-empty* operator list.
-#
-# The two "off" positions are deliberately preserved: an absent key still means
-# "every type" (already a superset of this baseline) and an explicitly empty key
-# still means "nothing", so an operator retains a complete kill switch.
-MANDATORY_RUNTIME_INCIDENT_TYPES = frozenset(
-    {
-        "authoritative_execution_uncertain",
-        "background_task_restart_exhausted",
-        "context_worker_exhausted",
-        "management_recovery_required",
-        "management_submit_unknown",
-        # Added for the REST+WebSocket line's phase 5 (critical). Both lines
-        # share one baseline on purpose: a rebase conflict here resolves as the
-        # union of the two sides, never as either side alone.
-        "market_fill_attribution_unverified",
-    }
-)
-
 # ``context_worker_exhausted`` is also raised by bulk backfill and scanner
 # operations; 1466 of those had accumulated by 2026-09-07. Only the per-message
 # ones describe a real instruction that was dropped, so delivery is restricted
@@ -171,6 +146,10 @@ class RuntimeIncidentConfig:
 #: Two deliberate ways to say "send nothing" survive, because both are stated
 #: rather than forgotten: ``telegram_notifications_enabled`` off, and the
 #: whitelist key present but empty (capture-only).
+#:
+#: The same set is folded into a non-empty ``..._CAPTURE_TYPES``. A type that is
+#: never captured can never be delivered either, so guaranteeing delivery means
+#: guaranteeing capture first.
 ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
     {
         # Phase 5: a market entry was submitted, its position could not be
@@ -178,6 +157,21 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # therefore refused. The summary carries the order id and the candidate
         # position id so a person can look at the exchange immediately.
         "market_fill_attribution_unverified",
+        # A-2: the management-instruction failures. Production's hand-edited
+        # list named none of these, so a durably failed instruction left a
+        # ledger row and no message for weeks. Delivery of
+        # ``context_worker_exhausted`` is narrowed further by operation prefix
+        # at the delivery site, not here.
+        "context_worker_exhausted",
+        "management_recovery_required",
+        "management_submit_unknown",
+        # A-2: an authoritative execution frozen past the side-effect boundary.
+        # The exchange may or may not have acted, and it is never replayed, so
+        # only a person can settle it.
+        "authoritative_execution_uncertain",
+        # A-2: a supervised background task gave up restarting, which means the
+        # loop stays down until the process does.
+        "background_task_restart_exhausted",
     }
 )
 
@@ -402,18 +396,17 @@ def _deployed_code_version(env: dict[str, str]) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else "unknown"
 
 
-def _with_mandatory_incident_types(
-    selected: frozenset[str],
-) -> frozenset[str]:
-    """Fold the A-2 baseline into a non-empty operator selector.
+def _with_always_notified_types(selected: frozenset[str]) -> frozenset[str]:
+    """Fold the always-notified baseline into a non-empty operator selector.
 
-    An empty selector is returned untouched: that is the operator's kill
-    switch, and this baseline must not silently re-arm it.
+    An empty selector is returned untouched. Someone typed the key and left it
+    blank, which states "nothing"; a baseline whose job is to survive
+    forgetfulness must not override a choice that was actually made.
     """
 
     if not selected:
         return selected
-    return selected | MANDATORY_RUNTIME_INCIDENT_TYPES
+    return selected | ALWAYS_NOTIFIED_INCIDENT_TYPES
 
 
 def load_runtime_incident_config(
@@ -444,7 +437,7 @@ def load_runtime_incident_config(
             else {}
         )
     env.update(active_environment)
-    capture_types = _with_mandatory_incident_types(
+    capture_types = _with_always_notified_types(
         frozenset(
             item.strip().lower()
             for item in env.get(
@@ -462,13 +455,10 @@ def load_runtime_incident_config(
     telegram_notification_types = (
         # An empty list is capture-only: someone typed the key and left it
         # blank, which says "notify nothing" and is honoured as written. A list
-        # with entries in it is a filter someone maintains by hand, and both
-        # baselines are added to it so that forgetting one cannot turn a
-        # critical alert into silence.
-        (
-            _with_mandatory_incident_types(configured_notification_types)
-            | ALWAYS_NOTIFIED_INCIDENT_TYPES
-        )
+        # with entries in it is a filter someone maintains by hand, and the
+        # always-notified types are added to it so that forgetting one cannot
+        # turn a critical alert into silence.
+        _with_always_notified_types(configured_notification_types)
         if configured_notification_types
         else (frozenset() if telegram_types_key in env else None)
     )
