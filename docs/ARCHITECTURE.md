@@ -343,6 +343,16 @@ historical_state_repair.py               position_management_remediation.py
   正确做法：`PID=$(systemctl show <unit> -p MainPID --value)`，再解析
   `/proc/$PID/environ`（`\0` 分隔）喂给 `load_*_config(environ=..., environment_only=True)`。
   注意那份 environ 里含 bot token 等凭据，**只用不打印**。
+- **仓位行的 `slTriggerPx` / `tpTriggerPx` 不能用来判断"这个仓位有没有止损"。**
+  A-4 已经发现它只反映最近一对 TPSL，A-5b 又撞了一次：pos `1001125179691393`
+  的仓位行 `slTriggerPx` 是空串，而 `trigger-orders-pending` 里明明挂着**两张**
+  `triggerOrderType=TPSL`、`sz=0`（sz 为 0 表示全仓）、`slTriggerPrice` 分别是
+  2530 与 2535.06 的止损单，账本里那两条 `stop_loss/verified` 行与它们逐字段一致。
+  只看仓位行会得出"裸仓"的错误结论，进而做出错误的补挂动作。
+  **判据只有一个**：读 `trigger-orders-pending`，筛 `triggerOrderType == "TPSL"`
+  且 `posSide` 与仓位一致的行，看 `slTriggerPrice`。
+  同一份返回里 `triggerOrderType == "Conditional"` 的行是**挂单入场**（开仓方向的
+  `side`），不是保护单，别把它算进保护里。
 - **这台机器的本地时区是 UTC+8，而数据库里所有时间戳是 UTC。** 两者差 8 小时，
   两条最容易踩的线：
   `journalctl --since "2026-09-08 22:05"` 把裸时间戳按**本地**时间解析，所以传一个 UTC
