@@ -343,6 +343,21 @@ historical_state_repair.py               position_management_remediation.py
   正确做法：`PID=$(systemctl show <unit> -p MainPID --value)`，再解析
   `/proc/$PID/environ`（`\0` 分隔）喂给 `load_*_config(environ=..., environment_only=True)`。
   注意那份 environ 里含 bot token 等凭据，**只用不打印**。
+- **这台机器的本地时区是 UTC+8，而数据库里所有时间戳是 UTC。** 两者差 8 小时，
+  两条最容易踩的线：
+  `journalctl --since "2026-09-08 22:05"` 把裸时间戳按**本地**时间解析，所以传一个 UTC
+  时刻进去，实际查的是 8 小时之前——查部署后日志会查回上一个 worker 进程的日志，
+  把早已不存在的 PID 的历史报错当成本次部署引入的问题（A-5 部署核实时踩过一次）。
+  正确写法是锚在 epoch 上：`journalctl -u <unit> --since "@$(date -u -d "<UTC 时刻> UTC" +%s)"`。
+  反过来，`sqlite3` 查 `created_at >= '<时刻>'` 里的时刻必须是 **UTC**，因为
+  `models.utc_now()` 写进去的就是 UTC；用本地时间去比会多算 8 小时的数据。
+  判断某个时间戳是哪一边：`date -u`、`date`、`SELECT MAX(created_at) FROM raw_messages` 三个一起看。
+- **`trading_settings` 是 key/value 表，但全局设置全在 `key='global'` 那一行的 JSON 里**，
+  不是一个设置一行。`SELECT ... WHERE key LIKE '%_delivery_after_id'` 会查出空集，
+  然后让人误以为设置没写进去。要看某个字段：
+  `sqlite3 -readonly <db> "SELECT value_json FROM trading_settings WHERE key='global';"` 再解 JSON，
+  或者直接 `curl -s http://127.0.0.1:8000/api/trading-settings`。
+  写入走 `POST /api/trading-settings`（只带要改的键，服务端与现有值合并）。
 - **备份与演练副本有保留上限，磁盘不是无限的。** 生产库现在接近 1G，一份整库副本就是 1G。
   2026-09-08 盘点时 50G 的盘只剩 2.8G，其中 9G 是历史备份与演练副本：`data/evidence/` 下六份
   08-25 的整库快照、`data/backups/` 下 07-26 的八份、`data/manual-reconciliation-backups/` 两份、
