@@ -301,6 +301,70 @@ def test_resize_is_not_planned_when_the_ledger_already_matches(tmp_path):
     assert plans == []
 
 
+def test_resize_is_not_replanned_from_the_pre_resize_ledger_row(tmp_path):
+    """``set-position-sltp`` answers with a new order id, so both rows exist.
+
+    Without judging per position, the stale ten-lot row would keep proposing
+    the same shrink round after round.
+    """
+
+    session_factory = _binding_fixture(tmp_path)
+    with session_factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=337,
+                execution_order_leg_id=555,
+                strategy_instance_id="strategy-222",
+                pos_id="pos-222",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="stop-2",
+                purpose="stop_loss",
+                trigger_price="78500",
+                size_text="5",
+                status="verified",
+                evidence_source="position_mutation_intent_readback",
+            )
+        )
+        session.commit()
+
+    plans = plan_stop_loss_resizes(
+        session_factory, positions=[{"posId": "pos-222", "pos": "5"}]
+    )
+
+    assert plans == []
+
+
+def test_resize_is_skipped_when_two_verified_stops_disagree(tmp_path):
+    session_factory = _binding_fixture(tmp_path)
+    with session_factory() as session:
+        session.add(
+            PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=337,
+                execution_order_leg_id=555,
+                strategy_instance_id="strategy-222",
+                pos_id="pos-222",
+                instrument_id="BTC-USDT-SWAP",
+                side="long",
+                order_id="stop-3",
+                purpose="stop_loss",
+                trigger_price="78000",
+                size_text="8",
+                status="verified",
+                evidence_source="test",
+            )
+        )
+        session.commit()
+
+    plans = plan_stop_loss_resizes(
+        session_factory, positions=[{"posId": "pos-222", "pos": "5"}]
+    )
+
+    assert plans == []
+
+
 def test_resize_never_grows_the_stop(tmp_path):
     session_factory = _binding_fixture(tmp_path, ledger_size="4")
 

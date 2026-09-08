@@ -105,9 +105,25 @@ def plan_stop_loss_resizes(
             .order_by(PositionProtectionLedger.id.asc())
             .all()
         )
-        for row in rows:
-            pos_id = str(row.pos_id or "").strip()
+        # ``set-position-sltp`` answers with a *new* order id, so a completed
+        # resize leaves the pre-resize row in the ledger until the reconcile
+        # retires it. Judge per position rather than per row: if any verified
+        # stop already carries the live size the position is converged, and if
+        # several disagree the owner is ambiguous and nothing is written.
+        for pos_id, group in _rows_by_position(rows).items():
             live_size = live_sizes.get(pos_id)
+            if live_size is None:
+                continue
+            if any(_decimal(item.size_text) == live_size for item in group):
+                continue
+            if len(group) != 1:
+                logger.warning(
+                    "stop-loss resize skipped: %s verified stops disagree pos_id=%s",
+                    len(group),
+                    pos_id,
+                )
+                continue
+            row = group[0]
             ledger_size = _decimal(row.size_text)
             trigger_price = str(row.trigger_price or "").strip()
             order_id = str(row.order_id or "").strip()
@@ -230,6 +246,15 @@ def execute_stop_loss_resize(
         )
         return StopLossResizeResult(plan, "failed", "resize_failed")
     return StopLossResizeResult(plan, "succeeded", None)
+
+
+def _rows_by_position(rows) -> dict[str, list]:
+    grouped: dict[str, list] = {}
+    for row in rows:
+        pos_id = str(row.pos_id or "").strip()
+        if pos_id:
+            grouped.setdefault(pos_id, []).append(row)
+    return grouped
 
 
 def _explained_take_profit_size(
