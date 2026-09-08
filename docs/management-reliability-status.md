@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 4
-current_step_file: docs/plans/2026-09-07-management-reliability/step-4-ledger-repair.md
-step_status: in_progress              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 3c
-last_completed_commit: a6869acf559776c43b608437eb68a88eeadb9874
+current_step: 3d
+current_step_file: docs/plans/2026-09-07-management-reliability/step-3d-entry-admission-reconciler-disabled.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 4
+last_completed_commit: e4d5d49d2a60363937d722f123903c14cb4c6920
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -62,6 +62,23 @@ user_decisions_2026_09_07:
 ## 证据记录
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
+
+- step-4 (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L3 生产数据修复）。分支 `mgmt/step-4-ledger-repair`，代码提交 e4d5d49d2a60363937d722f123903c14cb4c6920（只含 `one_off/management_ledger_repair_2026_09_08.py` 与其测试，**无在线代码改动，未部署**）。全量 **7913 passed / 4 skipped / 0 failed**。执行前闸门：`active_write_count=0`、在途管理批次 0。
+  **备份**：`/root/evidence/step4/research-backup-20260908T150735Z.db`（sha256 `ba1c411b8d8c920728d727834f4cb925aa78ad411925d041e5dcce4e02cf5db1`，quick_check ok）。回滚脚本 `/root/evidence/step4/rollback.sql`，由该备份逐行生成、每条 UPDATE 以修复写入的值为 CAS 守卫、含 `updated_at`；已在副本上实测**逐字段还原到备份状态**（`diff` 全等）。证据目录 `/root/evidence/step4/`（20 份交易所原始 JSON、before/after 账本快照与行数、演练与生产的 plan/apply JSON）。
+  **副本演练**：从备份复制一份跑完整三步，26 个动作零跳过，`PRAGMA quick_check` ok，schema 指纹三次不变（`6a54f7d0…5bb5`，证明 `archive-unbound-holdings` 的 `create_session_factory` → `init_db` 对当前 schema 是空操作），除 `position_attribution_audits` +26 外**所有表行数不变**；第二次跑 0 动作。
+  **只读复核推翻了步骤文件表里的 4 处事实**（指挥会话已逐条裁定）：
+  (1) **收敛 230 的仓位已平**——pos 1001125163581280 `closePos=8 closeAvgPx=78500 uTime=2026-09-08T06:00:24Z`，被 78500 止损全平；binding 341 已 `closed`、leg 586 已 `manually_closed`。1b/1c 追了两步要为它重建的分档止盈**目标本身消失**，按表的条件分支走 `completed / convergence_position_terminal`。
+  (2) **收敛 231 的仓位仍活跃**，可复位（结果见下）。
+  (3) **5 条 deletion exit 的冻结根因不是"仓位还在"，是判据缺陷**：`source_message_deletion_worker` 第 726-789 行 `execution_binding_id is None` 分支的 `hazardous_event` 只要该 chat/message 有一条 `execution_events` 且 `request_json` 非空就判 `identity_invalid`；命中的四条是 **execution_events 3501/3589/3796/3967，`action='auto_trade_skipped'`、`status='skipped'`、order/client/pos id 全 NULL**——**"系统决定不下单"的记录被读成"下过单"**。三重印证从无仓位：目标 lifecycle 838/886/1031/1079 的 `execution_binding_id` 全 NULL、按 strategy_instance_id 与 chat+message 两种查法 `execution_bindings` 零行、因而 leg 与保护账本零行。泳道机制经 `source_message_deletion.source_execution_barrier`（89-180 行）确认：hold 键是 **(chat_id, symbol, side)**，条件正是 `state != 'succeeded'`。**代码缺陷本步未改，指挥会话并入 step 5。**
+  (4) **两条验收判据按字面达不成**，指挥会话改判：大镖客群只剩 1113；峰哥群不再有 1081（1100 为真实持仓、1121 为当日在途，均不在本步范围）；"无 binding 为 NULL 的 entered lifecycle" 改为"本步表内的行已终态"，其余 10 条（1091、1102、1105、1108、1112、1114、1116、1119、1120、1121）记入证据交 step 7。
+  **术语裁定（C/E）**：步骤文件写的 `completed`(tp195) / `cancelled`(tp196,197) / `closed`(保护账本) 都不在这三张表的实际词表里，按项目自己的写法改为 **195→`filled`**（`_record_proven_tp1_fill` 的写法）、**196/197→`expired`** 并在 evidence 记 `position_terminal_order_absent`（`reconcile` 对"仓位终结、单据消失"的写法）。保护账本行**查无既有先例**——`protection_health.reconcile_position_protection_health` 只遍历**活跃**仓位（`live_ids` 为空即 return 0），仓位一平这些行再无路径回访，全仓库唯一的终态写入是 `deepcoin_execution_actions:2884` 的 `cancelled`——故按兜底规则用 `cancelled`，逐行在 evidence 区分"已触发成交"与"未触发被撤"。范围按裁定 E 扩到 653/655/656/657/658（654 已是 `protection_missing` 未动）。
+  **逐行结果（26 行全部到位）**：binding 337 `closed`；leg 579/580 `manually_closed / manual_position_missing`；lifecycle 1074 `exited`；lifecycle 1081 `invalidated / context_invalidated`（`archive-unbound-holdings`；A-3 对同形状的 1096/1107 用的是 `cancelled`，两者同为终态，已记入审计 evidence）；batch 158 `resolved / history_no_submission_confirmed`（`recover-management-history`，其自身决策为 `terminal_no_submission`）；notification 94 **state/status 不动**、仅 payload 加 `superseded_by=repair_2026_09_08`（该表无 `superseded` 值，投递归 step 5）；tp 195 `filled`(completed_at 2026-09-04 08:34:43)、196/197 `expired`(2026-09-04 13:07:38)；保护账本 652/653/655/656/657/658 `cancelled`；保护腿 852/853/854 `cancelled`；5 条 deletion exit `succeeded / repair_2026_09_08_position_gone`（flat_proof_json 写入三重佐证与证据路径）；conv 230 `completed / convergence_position_terminal`、conv 231 复位。lifecycle 1074 的 `exit_price_actual` **按裁定 F 保持 NULL**（两条 leg 的 closeAvgPx 分别是 80149.8 与 79200，编一个混合价是造事实，两值写进 evidence）。
+  **审计**：`position_attribution_audits` **3818–3839 共 22 条**，`event_type=historical_cleanup`（裁定 G，复用现有词表）、`notification_status=not_needed`（裁定 H，避免给 step 5 的 2840 条积压再加行）、`evidence_json` 带 `repair_2026_09_08`、证据路径与逐字段 before/after。指纹是 `sha256(tag:table:row_id)`，故重跑不会重复写。
+  **⚠ 执行期间生产自己动了 4 行，CAS 守卫全部拦下，未被覆盖。** 时间线：`15:27:06` 我的 `recover-management-history` 解掉 batch 158（execution_events 4048）→ `15:27:19` **管理路径**把 lifecycle 1074 判为 `exited`（`management_action=exit_requested`，来源是"求稳可以保本离场观望一下"那条指令，`exit_reason=kol_signal`，`exited_at=2026-09-08 15:27:19`）→ `15:27:45` reconciler 把 binding 337 收敛到 `closed / entry_legs_terminal` 并清空 pos_id、legs 579/580 变 `manually_closed / manual_position_missing` → `15:28:38` 我的一次性脚本对剩下 22 行 apply。**即：解掉 batch 158 之后，系统自己完成了 binding 337 整条链的终态收敛**，四行都到了表要求的**同一类**终态，只是措辞不同。**唯一的事实偏差留给后续步骤**：lifecycle 1074 现在记的是 `kol_signal`、`exited_at=2026-09-08`，而交易所事实是 `stop_loss`、`2026-09-04T13:07:38Z`；该行已不匹配清单，本步按"事实不符不修"未改，交指挥会话裁定。
+  **收敛 231 复位后系统自己建出了止盈（本项目近期第一次成功收敛）**：`15:28:45` 收敛 231 → `submitted`，`position_mutation_intents` 649（`set_position_sltp`，幂等键 `tp-convergence:231:set:0`，`confirmed`），`position_take_profit_orders` 201 与 `position_protection_ledger` 674。**交易所逐笔核对通过**：`ordId=1001125187578248 triggerOrderType=TPSL side=sell posSide=long sz=1.6 tpTriggerPrice=2595 closeTPTriggerPrice=2595`——方向为多单的平仓方向、**数量 1.6 等于在仓量 1.6**、价格与账本 desired（100% @2595）一致；两张全仓止损（2435、2430.13）ordId 与 cTime 均未变。**这是本步唯一的交易所写入，由系统既有收敛路径自己发出，本会话未对交易所做任何写入。**
+  **修复后核实**：`PRAGMA quick_check` ok；schema 指纹与备份一致；`lifecycle_monitor` 自 `15:28` 起 **0 次**打印 `binding_id=337`（此前 40 分钟 74 次），只剩 1113/binding 345 属正常；大镖客群只剩 1113；峰哥群 1081 已终态；**`source_message_deletion_exits` 中 `recovery_required` 归零**，5 条泳道全部解封。生产库行数除 `position_attribution_audits` +22（我的）+2（生产自身的 3816/3817 `evidence_unavailable`）外，`position_protection_ledger` +1、`position_take_profit_orders` +1 均为上述新建止盈，`raw_messages` +4 为窗口内正常消息；**零删除行**。
+  **新发现（本步未处置，交后续步骤）**：(a) 上面 (3) 的 `auto_trade_skipped` 判据缺陷（step 5）；(b) lifecycle 1074 的 `kol_signal` / 今日时间戳与交易所事实不符；(c) 建出止盈后，仓位行的 `slTriggerPx` 由 `2430.13` 变为空、`tpTriggerPx` 变为 `2595`，而两张全仓止损单在 `trigger-orders-pending` 里**原样存在**——保护本身没丢，但仓位行只显示最近一次挂上的那一对，值得 B 线确认是显示语义还是位级替换；(d) 10 条 binding 为 NULL 的 entered lifecycle 交 step 7；(e) lifecycle 1121（raw 15496）本会话按指挥会话要求**未碰**；B 线阶段 5 已另行只读追清（见证据区 `raw-15496-finding`），本步只补一条独立佐证：修复窗内只读 `list_positions` 确认**无无主 ETH 多头裸仓**。
+  **未部署**：本步无在线代码改动；`one_off` 模块只经 `cli` 可达，且当前有在途的 `outcome_unknown` 入场（1121），按 AGENTS.md"不在活跃时敏策略操作期间重启"未做 tg-deploy，代码一致性部署交指挥会话安排。
 
 - step-3c (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（热修，L1）。分支 `mgmt/step-3c-unreadable-env`，代码提交 `a6869acf559776c43b608437eb68a88eeadb9874`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署，2026-09-08T13:42Z）。部署前生产 HEAD `992a0b5d71c27e79be0b5771801ded45475a4edd`（A-3b）为回滚参考；部署前 `active_write_count=0`、在途管理批次 0。全量 **7900 passed / 4 skipped / 0 failed**。
   **步骤文件的诊断在三处被执行时的只读核实推翻，指挥会话已全部接受并改写了步骤文件**：
