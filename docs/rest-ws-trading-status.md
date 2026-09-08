@@ -16,10 +16,13 @@ production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipelin
 current_phase: 5
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-5-order-entry-cutover.md
 phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
-                                      # 阶段 5 本体续做：迁移代码在分支 rest-ws/phase-5-order-entry
-                                      # （94dc4632，17 提交，未部署未合并），须先 rebase 到
-                                      # codex/deepcoin-auto-trading-v1 最新（已含 5a + 5b）再继续；
-                                      # 任务 1/3/4 未完成。阶段 5 改交易所写入语义，需用户单独批准。
+                                      # 阶段 5 迁移本体**已部署**（7a4d852a，2026-09-08T04:34Z），
+                                      # 30 分钟健康窗口已过（104 个连续健康样本、9 条真实消息 / 5 个群），
+                                      # 重启恢复已确认，零交易所写入、零事故。
+                                      # **但窗口内没有发生真实新入场**，切换本身的实盘断言仍未被验证，
+                                      # 按阶段文件"生产观察"最后一条留 in_progress。
+                                      # 结项只差一条能通过自动交易过滤器的真实入场信号；
+                                      # 禁止为凑样本下单。详见证据区 phase-5-deployed-observed。
 claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
 last_completed_phase: 5b
 last_completed_commit: 230ba1cc8097d30ed89c860608467f17680a14ca
@@ -270,6 +273,64 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 
 ## 证据记录
 
+- phase-5-deployed-observed (2026-09-08, 会话 local_4a6676b0, **已部署已观察，阶段仍 in_progress**):
+  分支 `rest-ws/phase-5-order-entry`，提交 **`7a4d852a31708515aa92e58313a941c206f5637c`**，已 `tg-deploy` 上线
+  （2026-09-08T04:34:31Z–04:34:43Z）；**回滚 SHA `230ba1cc8097d30ed89c860608467f17680a14ca`**（部署前生产 HEAD）。
+  用户对阶段 5 的批准见 phase-5-approval，部署由指挥会话依该批准放行。
+  **迁移判据**（`deepcoin_limit_entry.limit_leg_requires_trigger_order`，逐腿判定）：只迁 `triggerPrice`
+  恒等于 `price`、无任何触发语义的入场限价腿——即今天 draft builder 产出的每一条，因为
+  `build_deepcoin_trigger_order_payload` 一直无条件把 `triggerPrice` 设成限价。带真实突破/回落条件、
+  或选了 `last`/`mark`/`index` 价格来源的腿继续走 trigger-order，**没见过的腿形状拒绝迁移而不是默认迁**。
+  **payload 白名单**（多一个字段就抛错）：`instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz,
+  slTriggerPx`（`tpTriggerPx` 可选但生产不发，止盈仍等确切成交 posId）。**不含 `clOrdId`**；本地幂等键仍落
+  `execution_order_legs.client_order_id`，只是不发交易所、不作所有权证明。
+  **归属转正**：普通 order 开出的仓位其 posId 等于该 order 的 ordId，且必须三重确认
+  （WS `Position.PI == ordId` 且 `Po` 非零、REST 该 posId 存在、方向一致且数量非零不大于下单量）。
+  任一不成立即 `attribution_status='unverified'`，而 `== 'verified'` 是全仓库自动修改/撤销/认领的前置条件。
+  部署前只读核对生产 `execution_order_legs`：market 入场腿两 id 齐全的 **153/153 满足等式、零反例**；
+  trigger_limit 的 **204 条一条都不满足**（条件单的仓位以派生子单命名）。同时**去掉了**旧代码把自家
+  pos_id 写进 `response_json` 的做法——那正是阶段 4 判据 2 循环论证的来源。
+  **入场准入门**：`deepcoin_entry_admission` 是唯一判定入口，worker/all 角色须有活 inbox 且
+  `ws_observation_permits_new_entry()` 放行，否则 `RecoveryLiveSubmitError("ws_observation_blocked_new_entry:<原因码>")`
+  ——**不提交，不是提交后撤**。角色由 web 启动时显式登记，不读环境变量（role 来自只是默认取环境变量的 CLI 选项）。
+  **裸仓告警**（指挥会话部署前追加的硬性条件）：市价腿归属 unverified 时记
+  `market_fill_attribution_unverified`（severity **critical**，来源 `deepcoin_entry_order:<ordId>`，
+  `impact` 带 instId/side/sz/候选 posId），并进代码级默认投递白名单 `config.ALWAYS_NOTIFIED_INCIDENT_TYPES`
+  ——**非空白名单才并入**，空白名单仍是 capture-only（那是明确表达"什么都别发"，不是遗漏）。
+  详细 summary 若被越界检查拒绝，退回不含插值的最小 summary 再记一次。生产实测投递通道可用：
+  `TELEGRAM_INCIDENT_ENABLED=true`、水位线 `AFTER_ID=272` 低于当前最大 id、事故走
+  `TELEGRAM_KOL_SYSTEM_BOT_*`（两项均已设置，与 A-2 关注的那个空 `NOTIFICATION_BOT_CHAT_ID` 不是同一条通道），
+  且 id>2000 的 `severe_protection_incident` 有 31 条 delivered。
+  **测试**：focused `tests/test_deepcoin_phase5_cutover.py` 31 项 + `tests/test_deepcoin_limit_entry.py` 30 项；
+  全量 **7771 passed / 0 failed / 4 skipped**；`tests/test_runtime_event_loop_blocking_census.py` 通过。
+  **重启恢复已确认**：worker 重启一次（pid 3034800 → 3036911），三单元 active、NRestarts 0，
+  WS 重新 healthy、`open_gap_count=0`、`last_resync_outcome=converged`，**7 个权威循环全部 fresh+successful**。
+  **观察窗 `2026-09-08T04:43:42Z ~ 06:24:53Z`，104 个连续健康样本，零不健康**：HEAD 恒为部署 SHA、
+  三单元恒 active、NRestarts 全程 0、WS 恒 healthy、`open_gap_count` 恒 0、`permits_new_entry` 恒 true、
+  `reconcile_failures_last_hour` 恒 0、`rate_limited_last_hour` 恒 0（窗口内零 401/50000）。
+  真实消息 **9 条 / 5 个群**，满足 L2 的 ≥5 条门槛并达到"尽量 2 个群"的偏好项。
+  **零交易所写入**：`execution_events` 自部署起 2 条，**都是 `auto_trade_skipped`**
+  （4042 ZEC short、4043 SNDK short，原因 `kol_or_group_auto_trade_disabled`）——真实信号被识别并在任何
+  交易所写入之前正确拒绝；`execution_order_legs` 自部署起新增 **0** 行；`uncertain` 尝试 **0**；
+  五张业务表行数与部署前基线完全一致（345 / 594 / 673 / 189 / 200）；`runtime_incidents` 自基线 id 2068 起 **0** 条。
+  **窗口结束交易所直读**：`position_count=3, open_order_count=0`，指纹
+  `949673250cd5438bfa4d22e570a1324803fa86ff954e5ed4174b27b783965e61`。与 5a/5b 的 `c4cd87ec…` 不同，
+  **原因不是本次切换**：三个仓位的 `cTime` 全部早于部署（ETH long 09-07T02:38:38Z、BTC short 09-08T01:23:07Z、
+  ETH short 09-08T03:11:20Z），后两笔落在 5b 窗口结束（09-07T23:39Z）到本次部署之间、跑的是切换前的代码。
+  **窗口内零新开仓。** 顺带这三个仓位是判据的一次实盘复证：两个普通 order 仓位 `pos_id == order_id`，
+  trigger_limit 那个不成立（order_id `1001125172997005` vs pos_id `1001125178552543`）。
+  **日志**：窗口内无新错误族；两类既有错误频次与等长的部署前窗口持平或更低
+  （`trade_merge` `MultipleResultsFound` 6 → 2；`recognition observe_uncertain` 770 → 784，属 A 线积压）；
+  `ws_observation_blocked_new_entry` / `market_fill_attribution` / `open_order_guard` / 401 / 50000 全部 0 次。
+  证据目录：`/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-5/`
+  （`window-summary-final.txt`、`window-summary.txt`、`observer-samples.jsonl` 104 行、
+  `observer-samples-prerestart.jsonl`、`window-end-exchange-read.json`、`phase5_observer.py`、`phase5_exchange_check.py`）。
+  **未完成，也是阶段留 in_progress 的唯一原因**：**窗口内没有发生真实新入场**，所以切换本身的实盘断言
+  （限价腿真的走 order 并被接受、附带 slTriggerPx 成交即由交易所持有、市价腿按三重确认归属并挂上止损、
+  5a 护栏认得新普通单、WS 缺口时准入门真的拒绝）**全部只有离线测试覆盖，未经实盘**。
+  结项只差**一条能通过自动交易过滤器的真实入场信号**；按阶段文件禁止为凑样本下单。
+  **未做**：未合并到 main 之外的分支；未推进阶段 6；未碰
+  `execution_bindings.py` / `trigger_take_profit_convergence_executor.py` / `native_tpsl.py`（A 线在用）。
 - followup-b5d-naked-market-fill (2026-09-08, 指挥会话立项，**不在阶段 5 部署范围**): **B-5d 市价成交裸仓安全网。**
   阶段 5 收紧归属后，市价腿的止损靠成交后 `set_position_tpsl` 写，而写入门要求 `attribution_status='verified'`，
   所以「市价成交且 posId != ordId」时仓位会裸奔（历史 153/153 满足等式、零反例，该分支从未发生）。
