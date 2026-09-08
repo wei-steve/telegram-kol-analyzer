@@ -343,5 +343,14 @@ historical_state_repair.py               position_management_remediation.py
   正确做法：`PID=$(systemctl show <unit> -p MainPID --value)`，再解析
   `/proc/$PID/environ`（`\0` 分隔）喂给 `load_*_config(environ=..., environment_only=True)`。
   注意那份 environ 里含 bot token 等凭据，**只用不打印**。
+- **备份与演练副本有保留上限，磁盘不是无限的。** 生产库现在接近 1G，一份整库副本就是 1G。
+  2026-09-08 盘点时 50G 的盘只剩 2.8G，其中 9G 是历史备份与演练副本：`data/evidence/` 下六份
+  08-25 的整库快照、`data/backups/` 下 07-26 的八份、`data/manual-reconciliation-backups/` 两份、
+  `data/` 顶层十几份 `.bak`，以及 A-3 作废积压时留下的两份 `rehearsal*.db`。
+  规矩：**演练副本用完即删**（演练结束、结论写进证据文件那一刻就删，`rehearsal-report.json`
+  这类结论文件保留）；**修复备份只保留最近两份**，更早的在下一次修复开始前删掉。
+  证据目录里的 JSON / md / 脚本一律保留——占地的是 `.db`，不是它们。
+  清理前把路径、大小、sha256 前 12 位写进当步的证据文件，清理后记 `df`
+  （范例：`/root/evidence/step5/disk-cleanup.md`）。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
   都是读错了需求，停下来问。
