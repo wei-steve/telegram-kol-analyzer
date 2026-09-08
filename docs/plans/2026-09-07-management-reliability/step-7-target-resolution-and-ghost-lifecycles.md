@@ -29,6 +29,12 @@
 4. **只通知群跳过用独立状态**：notify_only 群的管理指令记 `automation_status=skipped`、
    `automation_reason=notify_only_group`，`message_recognitions.status` 保持识别结果（是策略/非策略），不再写“识别失败”。
 
+### 5. 账本整理（step 4 遗留）
+
+- lifecycle 1074：exit_reason 改回 `stop_loss`、exited_at 改为 `2026-09-04 13:07:38`（交易所 position-history 事实），审计记录引用 step 4 证据。
+- 10 条 binding 为 NULL 的 entered lifecycle（1091、1102、1105、1108、1112、1114、1116、1119、1120、1121）：notify_only 群的按设计保留但标注
+  `simulated_only`；auto_trade 群的按任务 3 的新规则改为 `entry_failed`（或项目等价终态），逐条交易所直读确认无仓位后再改。
+
 ## 禁止
 
 - 不自动把指令改指向另一个仓位。
