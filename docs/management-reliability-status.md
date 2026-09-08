@@ -14,8 +14,8 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 5b
 current_step_file: docs/plans/2026-09-07-management-reliability/step-5b-frozen-convergence-backlog.md
-step_status: planned              # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+step_status: claimed              # planned | claimed | in_progress | completed | blocked
+claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
 last_completed_step: 5
 last_completed_commit: eddd79c49c95b6124c99861fe8ee73934acf3ce4
 user_decisions_2026_09_07:
