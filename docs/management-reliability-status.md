@@ -23,6 +23,8 @@ user_decisions_2026_09_07:
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
   stale_pending_items_void_and_notify: true  # 29 条积压指令项全部作废并逐条通知，不补执行
   rest_ws_phase5_continues_in_parallel: true
+  small_position_tiering_shrink_to_allocatable: true   # 2026-09-08 按推荐：档位数按可分配张数缩减，最少一档，取最靠前的档位价格
+  notification_bot_chat_id_fill_after_gates: true      # 2026-09-08 按推荐：三条通道先加只投新事件的门槛，再由用户在服务器填 NOTIFICATION_BOT_CHAT_ID=系统机器人同一私聊
 ```
 
 ## 步骤总览
@@ -147,6 +149,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- step-5-decisions (2026-09-08, 用户在指挥会话按推荐确认): 小仓位分档按可分配张数缩减档位数（3 张→2/1，2 张→1/1，1 张→一档），最少一档，价格取最靠前的档位；通知通道先加各自 AFTER 门槛，再由用户在服务器填 TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID 为系统机器人同一私聊，不改代码路由。
 - step-3d-ruling (2026-09-08, 指挥会话): 评估结论——同一机制两条腿两个门：超时侧（instruction_execution_reconciliation:103）shadow 下跑，重试侧（entry_admission_reconciler:47）只在 live 跑；入场提交本身不受该开关门控，翻 live 不开新写入路径但会连带 fail-closed 与 CAS 守卫（无测试覆盖）。30 天 7 条相邻上下文推迟全部静默过期、全在 auto_trade 群（含 A-4 归档的峰哥幽灵 1081 = raw 14843）。裁定：选项 b——重试门改为 == disabled 才返回，与超时同门；实现 entry_admission_expired 告警进基线；不翻开关，原方案任务 19 的翻档另行评审。部署前若 item 1029 仍 pending 且未过 deadline，先作废再部署，避免释放 6 小时前的旧意图。管理侧水位线为 int64 上限，管理指令在该开关下恒 disabled，记入开关清单。
 - step-4-followups (2026-09-08, 指挥会话): (1) lifecycle 1074 被生产管理路径在解封后自行写成 exited/kol_signal/2026-09-08 15:27，与交易所事实（止损，09-04 13:07:38Z）不符，属账面精度问题，并入 step 7 的账本整理一并改回；(2) step 4 的 one_off 代码不单独部署，随 step 3d 的改动一起上线；(3) 建出止盈后仓位行 slTriggerPx 变空而两张全仓止损单仍在 trigger-orders-pending，交 B 线阶段 6 确认是显示语义还是位级替换；(4) 09-04 的保本离场指令在仓位消失 4 天后才执行成账面离场，属 step 5 指令超时范畴。
 - raw-15496-finding (2026-09-08, B 线阶段 5 会话只读追查，指挥会话记录): 峰哥群 14:07Z 的 ETH 多入场在准入层被 adjacent_entry_context_pending 推迟，从未调用 place_order（五路核对零交易所接触），边界按词表把 in_progress 冻成 outcome_unknown；本应到点重试的 entry_admission_reconciler 因生产 instruction_execution_contract_mode=shadow 直接 return，指令项将静默过期。这是 auto_trade 群入场丢失的又一条路径。新增 step 3d（先只读评估该开关的门控范围再裁定），在 step 4 之后执行；outcome_unknown 分类归 step 6；lifecycle 1121 entered/NULL 归 step 7。uncertain 积压 20 行，扫描器每轮按 ERROR 重打，归 step 6。
