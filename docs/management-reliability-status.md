@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 3d
-current_step_file: docs/plans/2026-09-07-management-reliability/step-3d-entry-admission-reconciler-disabled.md
-step_status: in_progress              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 4
-last_completed_commit: e4d5d49d2a60363937d722f123903c14cb4c6920
+current_step: 5
+current_step_file: docs/plans/2026-09-07-management-reliability/step-5-protection-resize-and-batch-timeout.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 3d
+last_completed_commit: 04a5643c7b3bdbed630e51ecdfd79413e33cff57
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -63,7 +63,7 @@ user_decisions_2026_09_07:
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
 
-- step-3d (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **in_progress —— 代码已部署并核实，L2 观察窗仍在等真实消息**。分支 `mgmt/step-3d-entry-admission-reconciler`，评估 `4badb4a7`、实现 `04a5643c7b3bdbed630e51ecdfd79413e33cff57`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并于 2026-09-08T16:10Z 部署，**A-4 的 one_off 随本次一起上线**）。部署前生产 HEAD `a6869acf559776c43b608437eb68a88eeadb9874` 为回滚参考。部署前 `active_write_count=0`、在途管理批次 0。全量 **7923 passed / 4 skipped / 0 failed**。评估全文见 `docs/plans/2026-09-07-management-reliability/step-3d-assessment.md`（含 12 个门控点的逐处对照表与实施附录）。
+- step-3d (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L2）。分支 `mgmt/step-3d-entry-admission-reconciler`，评估 `4badb4a7`、实现 `04a5643c7b3bdbed630e51ecdfd79413e33cff57`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并于 2026-09-08T16:10Z 部署，**A-4 的 one_off 随本次一起上线**）。部署前生产 HEAD `a6869acf559776c43b608437eb68a88eeadb9874` 为回滚参考。部署前 `active_write_count=0`、在途管理批次 0。全量 **7923 passed / 4 skipped / 0 failed**。评估全文见 `docs/plans/2026-09-07-management-reliability/step-3d-assessment.md`（含 12 个门控点的逐处对照表与实施附录）。
   **根因（任务 1 的结论，指挥会话裁定选项 b）**：`entry_admission_reconciler` 的门是 `mode != "live"`，而它的**超时孪生** `instruction_execution_reconciliation` 的门是 `mode == "disabled"`。生产自 2026-09-04 起是 `shadow`，于是**只让被推迟的入场超时、从不让它重试**。过去 30 天 **7 条入场**因此静默失效（峰哥 3、陈哥 2、舒琴 2，全是 `auto_trade` 群），合约原因码全部是超时腿写的 `execution_contract_deadline_elapsed`，**没有一条**是恢复器的 `entry_admission_deadline_expired`——这是它从未生效过的直接证据。其中 item 969（raw 14843，峰哥 message 9181）正是 A-4 归档的幽灵 lifecycle 1081 的来源消息。
   **另两条只读结论**：(a) 生产 `instruction_execution_management_after_item_id = 9223372036854775807`（int64 上限），**管理侧被水位线整个关死**，即便翻开关也一行不变，受影响的只有 id > 483 的 entry；(b) 原方案任务 19（翻 entry 到 live）**从未执行**，仓库里没有观察窗评审、没有 `live_promotion` preflight、没有用户批准——"为何停在 shadow"的答案是没人做，不是评估后决定不做。
   **改了什么**：恢复器的门改为 `== "disabled"`，与超时孪生同门；`#9` 耐久镜像收敛、`#10` fail-closed 合约投影、`#11` 终态写入 CAS 守卫**一字未动**，仍只在 `live` 生效（这三处恰恰是仓库里唯一没有测试覆盖其 live 行为的地方，也是不建议翻开关的理由）。新增 `entry_admission_expired`（severity high，summary 含 item id / raw_message_id / chat_id / 推迟原因 / deadline）并进 `ALWAYS_NOTIFIED_INCIDENT_TYPES`；`EntryAdmissionReconcileResult.incidents` 这个**此前从未被 +1 过**的计数器现在真的计数；告警抛异常或被拒都不回滚已提交的过期。
@@ -72,7 +72,10 @@ user_decisions_2026_09_07:
   **部署前的一次性作废（指挥会话要求，L3）**：item **1029**（raw 15496，峰哥群 message 9227，14:09:25Z 推迟，deadline 20:09:25Z）部署时仍 `pending` 且未过期，承载的是 6 小时前的入场意图（ETH 多约 2460），恢复器一上线就会按过时意图放行。动手前只读核实**零交易所敞口**（binding / leg / execution_event / 保护账本各 0 行）；备份 `/root/evidence/step3d/research-backup-20260908T160550Z.db`（sha256 `1211db35…8426b`，quick_check ok）→ 副本演练 → 生产执行，两者逐字段一致。**改前→改后**：item 1029 `pending`→`failed`（`{"reason":"stale_pending_voided_2026_09_08"}`、`escalation_state='expired'`）；lifecycle 1121 `entered`→`cancelled`（同 reason，`management_action='stale_pending_instruction_voided'`）。**全库只动这两处**：指令项 `pending 3→2`、`failed 143→144`；lifecycle `entered 11→10`、`cancelled 8→9`。执行后 quick_check ok。**通知**：一条 SYSTEM bot 消息 `message_id=4067`（430 字符）。**给 A-3 的作废工具加了可选参数 `void_reason`（默认值不变，归档那次运行逐字节可复现）**——给 09-08 的决定盖 09-07 的标签会让这两行唯一的审计痕迹记错日期。**遗留**：被作废的是指令项，其合约 327 仍 `deferred`，会在 20:09Z 由超时孪生判 `execution_contract_deadline_elapsed`；不会触发新告警（新告警只从恢复器发出），也不会再被恢复器碰到（它只选 `status='pending'` 的项）。
   **部署后已核实**：三角色 200、HEAD 恒为 `04a5643c`、worker err 级 journal 行 0；直读部署后的生产源码确认新门在位；用 **worker 进程的真实环境**（`/proc/<pid>/environ`，含 systemd `EnvironmentFile`）加载配置，`captures("entry_admission_expired")=True`、`notifies(...)=True`。**交易所直读零非预期写入**：持仓与全部 pending 条件单与部署前快照逐字段一致（`ordId`/`sz`/触发价/`cTime` 全等），只有 `lastPx`/`liqPx`/未实现盈亏这些市价派生字段在动。
   **一处过程教训**：第一次核实告警可达性时只喂了 `systemctl show -p Environment`（只有 `TELEGRAM_KOL_RUNTIME_ROLE`），漏掉 `EnvironmentFile`，得出 `captures=False` 的错误结论。在这台机器上判断"进程实际看到什么环境变量"，只有 `/proc/<pid>/environ` 可信。
-  **未完成的部分（本步保持 in_progress）**：L2 观察窗自 `16:11Z` 起连续运行，**34 分钟、零异常、三角色全程 200**，但窗内只有 **1 条真实消息 / 1 个群**，未达"≥5 条"的门槛。按 AGENTS.md「消息流量不在任何人控制之内，安静的窗口不算失败」，监视器（`/root/evidence/step3d/observe3d.sh`，日志 `/root/evidence/step3d/observe.jsonl`）每分钟采样、凑满即自停、24 小时封顶，本会话不坐等轮询。**核心验收项因此仍缺实盘样本**：窗内没有出现新的 `adjacent_entry_context_pending` 推迟，所以"到点被重试"与"到期产生 `entry_admission_expired` 且送达"两条都只有测试级证据（含一条不注入替身、真的写出 incident 行的用例）。窗口达标后需补记结果并把状态推进到 step 5。
+  **L2 观察窗（合格）**：`2026-09-08T16:14:20Z`–`20:57:08Z`，**283 个采样、4 小时 43 分、anomaly_count=0**；窗内 **5 条真实消息 / 2 个群**（`-1002344190971` 2 条、三马哥 `-1002199068560` 3 条），达到 L2 门槛。全程 `head_ok` 恒为 `04a5643c`、三角色 HTTP 恒 `200/200/200`、worker err 级 journal 行**每分钟都是 0**。日志 `/root/evidence/step3d/observe.jsonl`。
+  **窗内账本零变化**：`entry_assembly_attempts` 恒 `pending 8 / woken 4`、`position_take_profit_orders` 201、`position_mutation_intents` 649、`execution_bindings` 345、`execution_order_legs` 594、`position_protection_ledger` 674，`runtime_incidents` 窗内**新增 0 条**（任何类型）。**交易所直读零非预期写入**：窗口首尾快照对 posId / 数量 / 均价 / 止损止盈触发价、以及全部 pending 条件单的 ordId / sz / 触发价 / cTime **逐字段全等**。
+  **核心验收项没有实盘样本，这是事实而不是通过**：窗内 `entry_assembly_attempts` **零新增**、`adjacent_entry_context_pending` 合约**零新增**，所以"到点被重试"与"到期产生 `entry_admission_expired` 且送达"两条**没有生产样本**。它们的证据是：22 条 focused 测试（含一条**不注入替身、走默认路径真的写出一行 `runtime_incidents`** 的用例）、门改回 `!= "live"` 后 4 条转红的变异检验、以及部署后用 worker 真实环境复算的 `captures=True / notifies=True`。按 AGENTS.md「流量不在任何人控制之内，安静的窗口不算失败」，指挥会话据此裁定推进。
+  **窗内唯一的状态变化，恰好印证了上面那条遗留的推断**：合约 327（被作废的 item 1029 的那一份）在 `20:09:39Z` 由**超时孪生**判成 `expired / execution_contract_deadline_elapsed`，**没有**产生 `entry_admission_expired`——正如部署前所述，新告警只从恢复器发出，而恢复器只选 `status='pending'` 的指令项，1029 已是 `failed`。`deferred_contracts` 由 1 归 0 就是这一刻。
 
 - step-4 (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L3 生产数据修复）。分支 `mgmt/step-4-ledger-repair`，代码提交 e4d5d49d2a60363937d722f123903c14cb4c6920（只含 `one_off/management_ledger_repair_2026_09_08.py` 与其测试，**无在线代码改动，未部署**）。全量 **7913 passed / 4 skipped / 0 failed**。执行前闸门：`active_write_count=0`、在途管理批次 0。
   **备份**：`/root/evidence/step4/research-backup-20260908T150735Z.db`（sha256 `ba1c411b8d8c920728d727834f4cb925aa78ad411925d041e5dcce4e02cf5db1`，quick_check ok）。回滚脚本 `/root/evidence/step4/rollback.sql`，由该备份逐行生成、每条 UPDATE 以修复写入的值为 CAS 守卫、含 `updated_at`；已在副本上实测**逐字段还原到备份状态**（`diff` 全等）。证据目录 `/root/evidence/step4/`（20 份交易所原始 JSON、before/after 账本快照与行数、演练与生产的 plan/apply JSON）。
