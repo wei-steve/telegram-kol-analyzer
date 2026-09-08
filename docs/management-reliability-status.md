@@ -34,6 +34,7 @@ user_decisions_2026_09_07:
 | 1c | 止盈字段为字面量 `0` 不再被当作"存在未拥有的止盈单"（方案 B：只修判据） | L2 | 否（指挥会话裁定） |
 | 2 | 告警补全：白名单三类、后台任务自愈、两条投递通道、健康端点 | L1 | 否 |
 | 3 | 被推迟指令的恢复与超时；29 条积压作废并通知 | L2（作废积压为 L3 数据变更） | 是（作废积压那一步） |
+| 3b | 联系方式里的数字串不得被解析为价格（大镖客 QQ 号被当止损价，2026-09-08 复发） | L2 | 否 |
 | 4 | 账本修复：binding 337、批次 158、幽灵 1081、已成交仍活跃的止盈单 | L3 | 是 |
 | 5 | 部分止盈成交后自动收敛止损数量；待恢复批次超时告警，不永久冻结 | L2 | 否 |
 | 6 | 确定性拒绝不升级为结果未知；降风险指令绕过冻结 | L2（改交易语义） | 是 |
@@ -89,6 +90,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- incident-2026-09-08 (A-2 只读取证，指挥会话记录): raw 15402 大镖客 06:25:30Z“第一止盈位已过，锁定利润，移动止损”被识别为 partial_then_break_even，但签名 QQ:158241758 被解析为显式止损价，止损价闸门正确拒绝（batch 160 management_stop_action_conflict），减仓 50% 与移止损均未执行，incident 2069 无人收到，attempt 581 落 uncertain 无事件。仓位 binding 345 ETH 空单入场约 2484.67，止损仍在 2530 / 2535.06（亏损侧），TP1 2470 疑已成交。新增 step 3b 修上游识别；step 3 完成后先做 3b 再做 4。
 - step-2-rulings (2026-09-07, 指挥会话裁定): (1) 白名单在生产由 env 显式设定，代码默认值无效——采用“代码强制基线集合与 env 集合取并集”（capture 与 telegram 两处），基线含 management_recovery_required / management_submit_unknown / context_worker_exhausted（raw_message_ 前缀过滤）/ authoritative_execution_uncertain / background_task_restart_exhausted / market_fill_attribution_unverified（B 线阶段 5 新增）；部署只改 env 的 AFTER_ID。(2) position_protection_incidents（delivered 0，pending 399）与 strategy_management_notifications（pending 67）以及 position_attribution_audits（pending 2834）停投的共同根因是 TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID 为空使 notification_bot_config 恒为 None，两条通道整体禁用；不在本步做路由回落（会一次性放出约 3300 条积压），交 step 5：先加各通道 AFTER 门槛，再由用户决定补 chat_id 或改路由。(3) 后台任务自愈的连续失败计数在存活超过 300 秒后重置。
 - step-1c-deploy-ruling (2026-09-07, 指挥会话): 确认按计划部署 1c。执行会话只读预演发现收敛 231（binding 342 / leg 588 / pos 1001125164628529，ETH 多单）与 230 同样冻在 convergence_exact_leg_not_verified，方案 B 下两者都不会被本步触发；231 已补进 step 4 范围。用户已被告知 BTC 与 ETH 两个活跃仓位目前都只有止损、没有分档止盈，可自行手动挂。
 - step-1c-decision (2026-09-07, 指挥会话裁定；用户在 1b 会话与指挥会话均表示“由总指挥判断”): 采用**方案 B**——A-1c 只修 `_row_has_take_profit_fields` 判据，不复位收敛 230，不做任何生产数据修改；230 留给 step 4 账本修复一并处理；“重试路径按即时状态重判、瞬时失败变终态”的性质列入 step 5。据此 1c **不追溯作用于当前被冻结的收敛（230、231）**；它撤掉的是一个误判否决，部署后此后正常 ready 的收敛会照系统设计把止盈挂到交易所，这与 A-1 同一类（收窄误判、恢复正常挂止盈），因此**改判为无需单独批准**。回滚路径：生产 HEAD 已含 B 线 5a，撤销本步须在最新 HEAD 上 revert 1c 的代码提交后重新部署，不能 tg-deploy 退回旧 SHA。用户被告知可自行在交易所为 pos 1001125163581280 手动挂止盈。

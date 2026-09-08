@@ -45,5 +45,5 @@
 
 ## 完成条件
 
-更新状态文件到 `current_step: 4`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-4-ledger-repair.md`；
+更新状态文件到 `current_step: 3b`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-3b-contact-digits-not-prices.md`；
 `send_message` 给 `brain_session_id`：分支、SHA、部署与回滚 SHA、恢复与超时的测试结论、作废清单与通知结果。
