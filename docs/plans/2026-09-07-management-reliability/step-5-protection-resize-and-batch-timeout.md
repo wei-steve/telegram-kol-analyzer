@@ -40,6 +40,14 @@ pos 1001125178552543 在仓 3 张，desired 50%/30%/20% 按 quantity_step=1 得 
 通道各加一个 AFTER 门槛（只投递门槛之后的新行），再由用户二选一：在服务器 env 补 `NOTIFICATION_BOT_CHAT_ID`（推荐与
 系统机器人同一个群），或在代码里回落到 `system_operator_bot_config`。门槛未落地前不得启用任一通道。
 
+### 7. 卡住的源消息删除退出要告警并解封（A-3 发现）
+
+`source_message_deletion_exits` 落在 `recovery_required` 后永不再认领，却持续作为 barrier 的 hold 依据，
+把「群 + symbol/side」泳道永久封死（A-3 证据：5 条 exit 封了 28 条指令）。本步与批次超时同构处理：
+`recovery_required` 超过 `source_deletion_exit_timeout_minutes`（新字段，默认 120）→ 生成
+`runtime_incidents`（类型 `source_deletion_exit_stuck`，ALWAYS_NOTIFIED）；若交易所直读确认该退出对应的仓位与
+订单已不存在 → 自动改 `succeeded`（reason `position_gone_confirmed`）解封泳道；否则只告警不解封。
+
 ## 禁止
 
 - 不改止盈单价格或数量；只改主止损单数量且只能改小到等于在仓量。

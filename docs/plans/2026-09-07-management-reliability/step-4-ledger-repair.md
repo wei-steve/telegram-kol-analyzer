@@ -15,6 +15,7 @@
 | `position_take_profit_orders` 196 / 197、`position_protection_ledger` 止损行（leg 579） | active | 仓位已平，单据已消失 | cancelled / closed |
 | `strategy_lifecycles` 1081（峰哥幽灵） | entered，`execution_binding_id` NULL，来源 raw 14843 入场失败 | 无仓位 | cancelled（或项目等价终态） |
 | leg 580 的止盈 852/853/854 | `protection_recovery_pending`，从未建立 | 仓位已平 | cancelled |
+| `source_message_deletion_exits` 109（飞扬 BTC/short，08-14）、128（所长 ETH/short，08-19）、201（陈哥 BTC/long，08-29）、209（三马哥 ETH/long，09-02）、231（飞扬 ZEC/short，09-04） | `recovery_required`（终态，永不再认领），4 条 `frozen_ledger_identity_unverified`、1 条 `exact_lifecycle_missing`；barrier 以 `state != succeeded` 判 hold，这 5 条把各自「群 + symbol/side」泳道永久钉死，33 条积压里 28 条落在这些泳道上 | 逐条用交易所 position-history / 订单历史核实该退出对应的仓位与订单是否已经不存在 | 事实为“已不存在”的改 `succeeded`（reason `repair_2026_09_08_position_gone`）；事实不清的保持并记录，交人工 |
 | `trigger_take_profit_convergences` 230（binding 341 / leg 586 / pos 1001125163581280）与 231（binding 342 / leg 588 / pos 1001125164628529） | conflicted / `convergence_exact_leg_not_verified`，由瞬时条件写成终态（1b/1c 证据） | 仓位活跃、leg verified、止损在、无分档止盈 | 若仓位仍活跃：复位为可重试（精确改前/改后、影响行数证明、回滚脚本），让修正后的判据重算；若仓位已平：closed |
 
 ## 方法
