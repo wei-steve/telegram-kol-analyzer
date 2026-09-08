@@ -78,5 +78,5 @@ action 全是 `auto_trade_skipped`、status=skipped、order_id/client_order_id/p
 
 ## 完成条件
 
-更新状态文件到 `current_step: 6`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-6-rejection-semantics-and-frozen-bypass.md`；
+更新状态文件到 `current_step: 5b`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-5b-frozen-convergence-backlog.md`；
 `send_message` 给 `brain_session_id`：分支、SHA、部署与回滚 SHA、测试结论、窗口内止损缩量逐笔记录或“无样本”、超时转 blocked 的批次清单。
