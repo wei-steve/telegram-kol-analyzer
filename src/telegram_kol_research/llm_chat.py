@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ import httpx
 from telegram_kol_research.runtime_agent_contracts import (
     RuntimeAgentFinalResponseError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -121,14 +124,7 @@ def load_runtime_agent_llm_config(
     if all(str(active_environment.get(name, "")).strip() for name in dedicated_names):
         env: dict[str, str] = {}
     else:
-        env = dict(
-            _load_env_file_values(
-                paths,
-                ignore_unreadable_names=frozenset(
-                    {"runtime_incident_agent.env"}
-                ),
-            )
-        )
+        env = dict(_load_env_file_values(paths))
     env.update(active_environment)
     base_url = env.get(
         "TELEGRAM_KOL_RUNTIME_AGENT_LLM_BASE_URL", ""
@@ -188,9 +184,22 @@ def _build_runtime_agent_http_client(
 
 def _load_env_file_values(
     env_file_paths: list[str | os.PathLike[str]] | None = None,
-    *,
-    ignore_unreadable_names: frozenset[str] = frozenset(),
 ) -> dict[str, str]:
+    """Read whatever candidate files this process can actually read.
+
+    An env file this process cannot read is treated exactly like one that is
+    not there.  Environment variables already take precedence over every file
+    here, so a deployment that supplies its values through systemd loses
+    nothing -- while a file it is not allowed to read used to raise straight
+    through recognition and fail the message.
+
+    Production ran that failure from 2026-09-04: the worker runs as
+    ``telegram-kol-worker`` and ``config/telegram.env`` is ``root`` 0600, so
+    every authoritative message that reached ``load_multi_target_management_
+    config`` died on ``PermissionError`` and its attempt landed
+    ``authoritative_execution_outcome_unknown``.
+    """
+
     values: dict[str, str] = {}
     candidate_paths = (
         [
@@ -204,6 +213,9 @@ def _load_env_file_values(
         path = os.fspath(raw_path)
         if not os.path.isfile(path):
             continue
+        if not os.access(path, os.R_OK):
+            logger.warning("skipping unreadable env file: %s", path)
+            continue
         try:
             with open(path, encoding="utf-8") as handle:
                 for line in handle:
@@ -216,9 +228,10 @@ def _load_env_file_values(
                         continue
                     key, value = stripped.split("=", 1)
                     values[key.strip()] = value.strip().strip('"').strip("'")
-        except PermissionError:
-            if os.path.basename(path) not in ignore_unreadable_names:
-                raise
+        except OSError:
+            # The access check can race, and unreadable is not the only way a
+            # path can refuse to open. Only the path is logged, never content.
+            logger.warning("skipping unreadable env file: %s", path)
     return values
 
 

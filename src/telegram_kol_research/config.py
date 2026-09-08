@@ -450,16 +450,7 @@ def load_runtime_incident_config(
     if environment_only:
         env: dict[str, str] = {}
     else:
-        env = dict(
-            _load_env_file_values(
-                paths,
-                ignore_unreadable_names=frozenset(
-                    {"runtime_incident_agent.env"}
-                ),
-            )
-            if paths
-            else {}
-        )
+        env = dict(_load_env_file_values(paths) if paths else {})
     env.update(active_environment)
     capture_types = _with_always_notified_types(
         frozenset(

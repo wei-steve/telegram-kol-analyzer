@@ -4634,6 +4634,14 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
             ),
             reuse_current_evidence=True,
             resume_completed_execution=retrying,
+            # Same role-aware config ``_run_authoritative_processor`` passes.
+            # Omitting it made ``apply_authoritative_mimo_payload`` fall back to
+            # ``load_multi_target_management_config()``'s default paths, so this
+            # path re-read ``config/telegram.env`` once per message -- the file
+            # the worker is not allowed to read.
+            multi_target_management_config=(
+                app.state.multi_target_management_config
+            ),
             execution_owner=app.state.recognition_execution_owner,
             execution_registry=app.state.recognition_execution_registry,
         )

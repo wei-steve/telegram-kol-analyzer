@@ -68,6 +68,16 @@ def load_telegram_auth_config(
 def _load_env_file_values(
     env_file_paths: list[str | Path] | None = None,
 ) -> dict[str, str]:
+    """Read whatever candidate files this process can actually read.
+
+    Existence was never the question a reader needs answered. A file that is
+    present but unreadable used to raise ``PermissionError`` out of
+    ``read_text`` and take its caller down with it; it is now treated exactly
+    like a file that is not there. Environment variables already take
+    precedence over these files, so nothing that supplies its values through
+    systemd loses anything. See the twin loader in ``llm_chat``.
+    """
+
     values: dict[str, str] = {}
     candidate_paths = (
         [
@@ -81,7 +91,17 @@ def _load_env_file_values(
         path = Path(raw_path).expanduser()
         if not path.exists() or not path.is_file():
             continue
-        for line in path.read_text(encoding="utf-8").splitlines():
+        if not os.access(path, os.R_OK):
+            logger.warning("skipping unreadable env file: %s", path)
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except OSError:
+            # The access check can race, and unreadable is not the only way a
+            # path can refuse to open. Only the path is logged, never content.
+            logger.warning("skipping unreadable env file: %s", path)
+            continue
+        for line in content.splitlines():
             stripped = line.strip()
             if not stripped or stripped.startswith("#") or "=" not in stripped:
                 continue
