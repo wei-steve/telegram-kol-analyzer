@@ -48,7 +48,13 @@ class _ContractSpecs:
 
 
 class _ShuqinExchange:
-    def __init__(self):
+    def __init__(self, session_factory=None):
+        # The exchange names an ordinary order's split position after that
+        # order and returns no posId of its own, and the stream separately
+        # pushes the Position frame that says the position opened. Phase 5
+        # attributes the entry from exactly those two facts, so the fake has to
+        # produce both.
+        self.session_factory = session_factory
         self.pending = {
             "old-entry-1828": {
                 "ordId": "old-entry-1828",
@@ -101,7 +107,7 @@ class _ShuqinExchange:
             return [
                 {
                     "instId": "ETH-USDT-SWAP",
-                    "posId": "new-pos-3429",
+                    "posId": "new-entry-3429",
                     "posSide": "long",
                     "pos": "4",
                     "avgPx": "1800",
@@ -130,10 +136,42 @@ class _ShuqinExchange:
 
     def place_order(self, payload):
         self.orders.append(payload)
-        return {
-            "code": "0",
-            "data": {"ordId": "new-entry-3429", "posId": "new-pos-3429"},
-        }
+        self._push_position_frame("new-entry-3429", payload)
+        return {"code": "0", "data": {"ordId": "new-entry-3429"}}
+
+    def _push_position_frame(self, order_id, payload):
+        if self.session_factory is None:
+            return
+        import hashlib
+        import json
+
+        from telegram_kol_research.models import DeepcoinWsEvent
+
+        frame = json.dumps(
+            {
+                "result": [
+                    {
+                        "table": "Position",
+                        "data": {"PI": order_id, "Po": str(payload.get("sz") or "0")},
+                    }
+                ]
+            },
+            sort_keys=True,
+        )
+        with self.session_factory() as session:
+            session.add(
+                DeepcoinWsEvent(
+                    venue="deepcoin",
+                    channel="Position",
+                    action="PushPosition",
+                    position_id=order_id,
+                    received_at=NOW.replace(tzinfo=None),
+                    received_ms=1_780_000_000_000,
+                    raw_payload=frame,
+                    payload_hash=hashlib.sha256(frame.encode("utf-8")).hexdigest(),
+                )
+            )
+            session.commit()
 
     def set_position_sltp(self, payload):
         self.protections.append(payload)
@@ -346,7 +384,7 @@ def test_shuqin_deleted_strategy_exits_before_repost_can_own_new_orders(tmp_path
         message_id=3428,
         deleted_at=NOW,
     )
-    exchange = _ShuqinExchange()
+    exchange = _ShuqinExchange(session_factory)
 
     cancelled = run_source_message_deletion_worker_tick(
         session_factory,
@@ -465,12 +503,12 @@ def test_shuqin_deleted_strategy_exits_before_repost_can_own_new_orders(tmp_path
         assert all(leg.terminal_reason for leg in old_legs)
         assert new_protection_ids == {"new-stop-1795"}
         assert {leg.order_id for leg in new_legs} == {"new-entry-3429"}
-        assert {leg.pos_id for leg in new_legs} == {"new-pos-3429"}
+        assert {leg.pos_id for leg in new_legs} == {"new-entry-3429"}
         assert all(leg.attribution_status == "verified" for leg in new_legs)
         assert old_protection_ids == {"old-stop-1695"}
         assert old_protection_states == {"cancelled"}
         assert {leg.order_id for leg in old_legs}.isdisjoint({"new-entry-3429"})
         assert {leg.pos_id for leg in old_legs if leg.pos_id}.isdisjoint(
-            {"new-pos-3429"}
+            {"new-entry-3429"}
         )
         assert old_raw_id != new_raw_id

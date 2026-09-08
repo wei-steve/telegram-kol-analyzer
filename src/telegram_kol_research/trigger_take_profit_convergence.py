@@ -16,6 +16,14 @@ from telegram_kol_research.models import (
 )
 
 
+# The entry leg kinds this system submits automatically. ``limit`` joined the
+# set in phase 5, when the plain entry limit leg moved from
+# ``POST /trade/trigger-order`` to ``POST /trade/order``; ``trigger_limit`` stays
+# because every leg carrying a real trigger condition still goes there. A staged
+# take profit belongs to the entry, not to the endpoint that placed it.
+AUTOMATIC_ENTRY_ORDER_KINDS = frozenset({"trigger_limit", "limit", "market"})
+
+
 def create_or_get_trigger_take_profit_convergence(
     session: Session,
     *,
@@ -44,7 +52,7 @@ def create_or_get_trigger_take_profit_convergence(
     leg = session.get(ExecutionOrderLeg, execution_order_leg_id)
     if leg is None:
         raise ValueError("execution order leg does not exist")
-    if str(leg.purpose) != "entry" or str(leg.order_kind) not in {"trigger_limit", "market"}:
+    if str(leg.purpose) != "entry" or str(leg.order_kind) not in AUTOMATIC_ENTRY_ORDER_KINDS:
         raise ValueError("staged take-profit convergence requires an automatic entry leg")
     if str(leg.venue).lower() != normalized_venue:
         raise ValueError("execution order leg venue differs from convergence venue")
@@ -80,7 +88,7 @@ def mark_trigger_take_profit_convergence_ready(
         or binding is None
         or int(leg.execution_binding_id) != int(binding.id)
         or str(leg.purpose) != "entry"
-        or str(leg.order_kind) not in {"trigger_limit", "market"}
+        or str(leg.order_kind) not in AUTOMATIC_ENTRY_ORDER_KINDS
         or str(leg.status).lower() != "active"
         or str(leg.attribution_status) != "verified"
         or not str(leg.pos_id or "").strip()

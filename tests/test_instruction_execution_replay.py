@@ -90,23 +90,32 @@ class _RecordingWriter:
         return {"code": "0", "data": {"ordId": order_id}}
 
     def place_order(self, order_payload):
-        self.submit(order_payload["clOrdId"])
-        self.entry_rows.append(
-            {
-                "instId": order_payload["instId"],
-                "clOrdId": order_payload["clOrdId"],
-                "ordId": f"market-{len(self.client_order_ids)}",
-                "posId": "replay-position-1",
-                "state": "active",
-            }
+        # Since phase 5 an ordinary limit entry carries no ``clOrdId`` at all --
+        # the field's presence is what the exchange rejects -- so a write is
+        # counted by its own position in the sequence when there is no client
+        # id to count it by. The reply never carries a ``posId`` either; the
+        # split position an ordinary order opens is named after that order.
+        write_id = order_payload.get("clOrdId") or f"order-write-{len(self.client_order_ids) + 1}"
+        self.submit(write_id)
+        is_market = str(order_payload.get("ordType") or "") == "market"
+        order_id = (
+            f"market-{len(self.client_order_ids)}"
+            if is_market
+            else f"order-{len(self.client_order_ids)}"
         )
-        return {
-            "code": "0",
-            "data": {
-                "ordId": f"market-{len(self.client_order_ids)}",
-                "posId": "replay-position-1",
-            },
+        row = {
+            "instId": order_payload["instId"],
+            "ordId": order_id,
+            "state": "active" if is_market else "open",
         }
+        if order_payload.get("clOrdId"):
+            row["clOrdId"] = order_payload["clOrdId"]
+        if is_market:
+            row["posId"] = order_id
+            row["posSide"] = order_payload.get("posSide")
+            row["pos"] = str(order_payload.get("sz") or "0")
+        self.entry_rows.append(row)
+        return {"code": "0", "data": {"ordId": order_id}}
 
     def list_positions(self, *, inst_id=None):
         return [row for row in self.entry_rows if row.get("posId")]

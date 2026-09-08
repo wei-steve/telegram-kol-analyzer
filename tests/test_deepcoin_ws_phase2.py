@@ -436,8 +436,15 @@ def test_permits_new_entry_defaults_to_false_everywhere_but_converged_healthy():
     assert machine.permits_new_entry(open_gap_count=0) == (True, "")
 
 
-def test_permission_hook_is_not_wired_into_any_entry_path():
-    """Phase 2 only exposes it. Wiring it in is phase 5."""
+def test_permission_hook_reaches_the_entry_path_through_exactly_one_module():
+    """Phase 2 exposed it; phase 5 wired it in, through one seam only.
+
+    The hook is not free to spread: everything that consults it has to go
+    through ``deepcoin_entry_admission``, which is the single place that decides
+    what "this process may enter now" means and fails closed. Listing the
+    modules keeps a future caller from reaching past it into the state machine
+    and re-deciding that question somewhere else.
+    """
 
     package = pathlib.Path(
         __import__("telegram_kol_research").__file__
@@ -448,8 +455,10 @@ def test_permission_hook_is_not_wired_into_any_entry_path():
         if "permits_new_entry" in path.read_text(encoding="utf-8")
     )
     assert callers == [
+        "deepcoin_entry_admission.py",
         "deepcoin_private_ws.py",
         "deepcoin_ws_stream_state.py",
+        "recovery_live_submit.py",
     ]
 
 

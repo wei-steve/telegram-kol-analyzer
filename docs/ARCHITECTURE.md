@@ -190,6 +190,50 @@ Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，
 阶段 5 入场迁到普通 order 之后，V2 `orders-pending` 的分页会放大 worker 的请求量，届时要按实测
 重新评估这组份额。
 
+## 4.7 入场腿走哪个端点，以及一笔入场归到哪个仓位
+
+**普通入场限价腿走 `POST /deepcoin/trade/order`（`ordType=limit`），不再走 trigger-order。**
+迁移判据在 `deepcoin_limit_entry.limit_leg_requires_trigger_order()`，逐腿判定：只有
+`triggerPrice` 恒等于 `price`、不带任何触发语义的腿才迁；带真实突破/回落条件或
+`last`/`mark`/`index` 价格来源选择的腿**继续走 trigger-order**，并保留原来的父子归属流程。
+认不出的腿形状一律留在 trigger-order——判据不明确就不迁。
+
+payload 字段组合是 2026-09-07 受控实盘实验的结论，白名单在
+`deepcoin_limit_entry.LIMIT_ENTRY_PAYLOAD_FIELDS`，多一个字段就报错：
+`instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx`
+（`tpTriggerPx` 可选，生产是止损单发，止盈仍等确切成交 posId）。
+**不带 `clOrdId`**：四组单变量对照证明**这个字段存在本身**就会被 `sCode=14 DuplicateAction`
+拒绝，与并发、与订单经济属性、与取值都无关。市价腿一直带 `clOrdId` 且 149 次全成功，
+**不要**把它去掉。本地生成的幂等键仍然落 `execution_order_legs.client_order_id`，
+但**不发给交易所、也不作为交易所所有权证明**——成交回包里的 `ordId` 才是订单身份。
+
+**一笔普通 order 开出的仓位，其 posId 等于该 order 的 ordId。** 这是一条**等式**，不是外键：
+`POST /trade/order` 的响应字段只有 `ordId/clOrdId/tag/sCode/sMsg`，没有 `posId`；没有任何
+读接口同时给出 ordId 与 posId；流上 `Order`/`Trade` 不带仓位字段，`Position` 带 `PI` 不带订单字段。
+因为是等式而不是交易所给的值，**绝不单独采信**，必须三重确认同时成立
+（`deepcoin_ordinary_entry_binding.resolve_ordinary_entry_attribution()`）：
+
+1. 流上推过 `PI` 等于该 ordId 且 `Po` 非零的 `Position` 帧（仓位真的开了）；
+2. REST 在该 posId 下确实列出一个仓位；
+3. 方向一致，且仓位数量非零、不大于下单量（部分成交仍是本单的仓位，更大就不是）。
+
+任一不成立即 `attribution_status='unverified'`，而 `== 'verified'` 是本仓库每一处自动修改、
+撤销、认领的前置条件，所以 unverified 就是自动动作全部止步。
+**这条等式只对普通 order 成立**：2026-09-07 只读核对生产 `execution_order_legs`，
+market 入场腿两个 id 齐全的 153 条 **153 条**满足，trigger_limit 的 204 条**一条都不满足**
+（条件单的仓位以它派生的子单命名）。所以条件单那条链原样不动。
+
+**新入场在 WS 观测不完整时不提交。** `deepcoin_entry_admission` 是唯一的判定入口：
+worker（与本地 `all`）角色必须有活的 inbox 且 `ws_observation_permits_new_entry()` 放行，
+否则 `RecoveryLiveSubmitError("ws_observation_blocked_new_entry:<原因码>")`——
+**是"不提交"，不是"提交后再撤"**，原因码随失败落库而不是被静默吞掉。
+理由是阶段 4 补测 12：Deepcoin 私有流**重连不重推**，只推变化；错过
+`TU: default → posId` 那一帧就没有第二次机会，REST 也补不回来。角色由 web 启动时
+显式登记（`set_entry_admission_runtime_role`），不读环境变量——角色来自一个只是
+**默认取**环境变量的 CLI 选项，环境变量不是它的权威来源。
+
+回退就是 `tg-deploy <上一个 SHA>`，**没有运行时模式开关**，也不需要回滚任何状态。
+
 ## 5. 模块分类（已核实）
 
 `src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见

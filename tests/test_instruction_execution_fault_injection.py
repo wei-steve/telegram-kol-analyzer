@@ -441,8 +441,8 @@ def test_crash_after_http_send_before_response_is_quarantined_by_real_writer(
     from test_recovery_live_submit import _FakeDeepcoinClient
 
     class _LostResponseClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
             raise DeepcoinRequestOutcomeUnknown("response lost after HTTP send")
 
     session_factory = create_session_factory(tmp_path / "lost-response.db")
@@ -468,7 +468,10 @@ def test_crash_after_http_send_before_response_is_quarantined_by_real_writer(
         provider=provider,
         call_count=1,
     )
-    assert len({row["clOrdId"] for row in client.trigger_payloads}) == 1
+    # One write, and no client order id on it: the payload the exchange
+    # rejects when the field is merely present.
+    assert len(client.payloads) == 1
+    assert all("clOrdId" not in row for row in client.payloads)
 
 
 @pytest.mark.parametrize(
@@ -531,8 +534,10 @@ def test_post_accept_crashes_do_not_resubmit_real_entry_writer(
         provider=provider,
         call_count=expected_calls,
     )
-    client_ids = [row["clOrdId"] for row in client.trigger_payloads]
-    assert len(client_ids) == len(set(client_ids)) == expected_calls
+    # The crash must not turn into a second write, and the surviving one still
+    # carries no client order id.
+    assert len(client.payloads) == expected_calls
+    assert all("clOrdId" not in row for row in client.payloads)
 
 
 def test_position_created_before_protection_ledger_commit_is_not_reentered(

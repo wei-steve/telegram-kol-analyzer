@@ -42,6 +42,9 @@ from telegram_kol_research.recovery_live_submit import build_deepcoin_market_ord
 from telegram_kol_research.recovery_live_submit import build_deepcoin_place_order_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_position_sltp_payload
 from telegram_kol_research.recovery_live_submit import build_deepcoin_position_sltp_payloads
+from telegram_kol_research.deepcoin_limit_entry import (
+    build_deepcoin_limit_entry_payload,
+)
 from telegram_kol_research.recovery_live_submit import build_deepcoin_trigger_order_payload
 from telegram_kol_research.recovery_live_submit import enqueue_recovery_trade_signal
 from telegram_kol_research.recovery_live_submit import process_next_trade_signal_live
@@ -340,6 +343,51 @@ class _DelayedFilledPositionDeepcoinClient(_OrderProtectionFailingDeepcoinClient
         ]
 
 
+def _persist_ws_position_frame(session_factory, *, pos_id, size="9", instrument="BTCUSDT"):
+    """Record the ``Position`` frame the identity equation needs as evidence.
+
+    Phase 5 will not call a position ours on the strength of the equation alone:
+    the stream has to have said the position opened (``PI`` equal to the order's
+    own id, with a non-zero ``Po``). Tests that expect a *verified* attribution
+    therefore have to provide that frame, exactly as the live stream would.
+    """
+
+    import hashlib as _hashlib
+
+    from telegram_kol_research.models import DeepcoinWsEvent
+
+    payload = json.dumps(
+        {
+            "result": [
+                {
+                    "table": "Position",
+                    "data": {
+                        "PI": str(pos_id),
+                        "Po": str(size),
+                        "InstrumentID": instrument,
+                    },
+                }
+            ]
+        },
+        sort_keys=True,
+    )
+    with session_factory() as session:
+        session.add(
+            DeepcoinWsEvent(
+                venue="deepcoin",
+                channel="Position",
+                action="push",
+                position_id=str(pos_id),
+                instrument_raw=instrument,
+                received_at=datetime(2026, 6, 30, 8, 3, tzinfo=UTC).replace(tzinfo=None),
+                received_ms=1_780_000_000_000,
+                raw_payload=payload,
+                payload_hash=_hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+            )
+        )
+        session.commit()
+
+
 def _persist_ready_item(session_factory):
     with session_factory() as session:
         raw = RawMessage(
@@ -562,7 +610,7 @@ def test_shadow_entry_contract_observes_writer_without_changing_calls(tmp_path):
     )
 
     assert result["order_count"] == expected_calls
-    assert len(client.trigger_payloads) == expected_calls
+    assert len(client.payloads) == expected_calls
     with session_factory() as session:
         contract = session.query(InstructionExecutionContract).one()
         assert contract.state == "verified"
@@ -1448,20 +1496,25 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
 
     assert result["submitted"] is True
     assert result["order_count"] == 2
-    assert fake_client.payloads == []
+    # Phase 5: the plain entry limit leg is an ordinary order now. Nothing about
+    # it carries trigger semantics, so nothing about it goes to trigger-order.
+    assert fake_client.trigger_payloads == []
     assert fake_client.protection_payloads == []
-    assert fake_client.trigger_payloads[0]["tdMode"] == "cross"
-    assert fake_client.trigger_payloads[0]["mrgPosition"] == "split"
-    assert fake_client.trigger_payloads[0]["orderType"] == "limit"
-    assert [payload["triggerPrice"] for payload in fake_client.trigger_payloads] == [
-        "68290.0",
-        "68090.0",
-    ]
-    assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
-    assert fake_client.trigger_payloads[0]["slTriggerPxType"] == "last"
-    assert fake_client.trigger_payloads[0]["slOrdPx"] == "-1"
-    assert "posId" not in fake_client.trigger_payloads[0]
+    assert fake_client.payloads[0]["tdMode"] == "cross"
+    assert fake_client.payloads[0]["mrgPosition"] == "split"
+    assert fake_client.payloads[0]["ordType"] == "limit"
+    assert [payload["px"] for payload in fake_client.payloads] == ["68290.0", "68090.0"]
+    assert all(
+        not any(key.startswith("tp") for key in payload)
+        for payload in fake_client.payloads
+    )
+    assert fake_client.payloads[0]["slTriggerPx"] == "67500.0"
+    # The experiment's dedupe finding, enforced on the live payload: the field's
+    # presence is the rejection, so it is not sent at all.
+    assert all("clOrdId" not in payload for payload in fake_client.payloads)
+    assert all("triggerPrice" not in payload for payload in fake_client.payloads)
+    assert all("slOrdPx" not in payload for payload in fake_client.payloads)
+    assert "posId" not in fake_client.payloads[0]
     assert fake_client.position_protection_payloads == []
     assert result["warnings"] == []
     with session_factory() as session:
@@ -1470,21 +1523,30 @@ def test_submit_recovery_order_live_places_orders_and_persists_binding(tmp_path)
         legs = session.query(ExecutionOrderLeg).order_by(ExecutionOrderLeg.leg_index.asc()).all()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.order_id == "order-1,order-2"
     assert binding.client_order_id == "TK649760E806ACF61,TK729D11F4739D2A2"
     assert binding.strategy_instance_id == "deepcoin:100:55:BTC:long"
     assert lifecycle.execution_binding_id == binding.id
     assert [event.action for event in events] == [
-        "create_trigger_entry",
-        "create_trigger_entry",
+        "create_limit_entry",
+        "create_limit_entry",
     ]
     assert events[0].execution_binding_id == binding.id
     assert events[0].trade_signal_id == result["signal_id"]
-    assert events[0].order_id == "trigger-1"
-    assert [(leg.leg_index, leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
-        (1, "trigger-1", "TK649760E806ACF61", "open"),
-        (2, "trigger-2", "TK729D11F4739D2A2", "open"),
+    assert events[0].order_id == "order-1"
+    # The locally generated key stays in the ledger as this system's own
+    # idempotency key; what changed is that it is no longer sent to the exchange
+    # and is no longer treated as proof the exchange knows this order.
+    assert [
+        (leg.leg_index, leg.order_kind, leg.order_id, leg.client_order_id, leg.status)
+        for leg in legs
+    ] == [
+        (1, "limit", "order-1", "TK649760E806ACF61", "open"),
+        (2, "limit", "order-2", "TK729D11F4739D2A2", "open"),
     ]
+    # An unfilled entry has opened no position, so there is nothing to attribute
+    # and nothing may act on it.
+    assert {leg.attribution_status for leg in legs} == {"unassigned"}
     assert {leg.execution_binding_id for leg in legs} == {binding.id}
     assert {leg.strategy_instance_id for leg in legs} == {"deepcoin:100:55:BTC:long"}
 
@@ -1498,12 +1560,12 @@ def test_entry_submit_rechecks_source_after_planning_before_exchange_write(
     _persist_lifecycle(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _FakeDeepcoinClient()
-    original_builder = build_deepcoin_trigger_order_payload
+    original_builder = build_deepcoin_limit_entry_payload
     deleted = False
 
-    def delete_after_planning(draft, leg):
+    def delete_after_planning(draft, leg, **kwargs):
         nonlocal deleted
-        payload = original_builder(draft, leg)
+        payload = original_builder(draft, leg, **kwargs)
         if not deleted:
             deleted = True
             record_source_message_deleted(
@@ -1514,7 +1576,7 @@ def test_entry_submit_rechecks_source_after_planning_before_exchange_write(
         return payload
 
     monkeypatch.setattr(
-        "telegram_kol_research.recovery_live_submit.build_deepcoin_trigger_order_payload",
+        "telegram_kol_research.recovery_live_submit.build_deepcoin_limit_entry_payload",
         delete_after_planning,
     )
 
@@ -1546,9 +1608,9 @@ def test_source_deletion_waits_until_exchange_identity_is_durably_ledgered(
     deletion_thread = None
 
     class Client(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
+        def place_order(self, order_payload):
             nonlocal deletion_thread
-            self.trigger_payloads.append(order_payload)
+            self.payloads.append(order_payload)
             if deletion_thread is None:
                 def delete_source():
                     deletion_started.set()
@@ -1564,20 +1626,20 @@ def test_source_deletion_waits_until_exchange_identity_is_durably_ledgered(
                 assert deletion_started.wait(timeout=1)
             return {
                 "code": "0",
-                "data": {"ordId": f"trigger-{len(self.trigger_payloads)}"},
+                "data": {"ordId": f"order-{len(self.payloads)}"},
             }
 
     original_normalize = __import__(
         "telegram_kol_research.recovery_live_submit",
-        fromlist=["_normalized_trigger_order_id"],
-    )._normalized_trigger_order_id
+        fromlist=["_normalized_entry_order_id"],
+    )._normalized_entry_order_id
 
-    def assert_deletion_is_still_serialized(response):
+    def assert_deletion_is_still_serialized(response, *, order_kind):
         assert not deletion_finished.wait(timeout=0.05)
-        return original_normalize(response)
+        return original_normalize(response, order_kind=order_kind)
 
     monkeypatch.setattr(
-        "telegram_kol_research.recovery_live_submit._normalized_trigger_order_id",
+        "telegram_kol_research.recovery_live_submit._normalized_entry_order_id",
         assert_deletion_is_still_serialized,
     )
 
@@ -1627,9 +1689,9 @@ def test_submit_recovery_signal_direct_is_covered_by_position_authority_lock(
         assert release_mutation.wait(timeout=2)
 
     class Client(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
+        def place_order(self, order_payload):
             exchange_write_reached.set()
-            return super().trigger_order(order_payload)
+            return super().place_order(order_payload)
 
     mutation_thread = Thread(target=simulated_exchange_mutation)
     mutation_thread.start()
@@ -1740,7 +1802,7 @@ def test_two_workers_atomically_claim_one_finalized_entry_signal(tmp_path):
     assert len(errors) == 1
     assert isinstance(errors[0], RecoveryLiveSubmitError)
     assert str(errors[0]).startswith("trade_signal_claim_failed:")
-    assert len(client.trigger_payloads) == 2
+    assert len(client.payloads) == 2
     with session_factory() as session:
         assert session.get(TradeSignal, signal.id).status == "submitted"
         assert session.query(ExecutionBinding).count() == 1
@@ -1844,8 +1906,8 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
     _persist_finalized_signal_evidence(session_factory, signal, finalized)
 
     class _UnknownFirstWriteClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
             raise DeepcoinRequestOutcomeUnknown("first leg outcome unknown")
 
     client = _UnknownFirstWriteClient()
@@ -1857,7 +1919,7 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
     with session_factory() as session:
         row = session.get(TradeSignal, signal.id)
         assert row.status == "unknown_exchange_outcome"
@@ -1877,7 +1939,7 @@ def test_v2_unknown_first_exchange_write_is_quarantined_without_retry(tmp_path):
             deepcoin_client=client,
             contract_spec_provider=_StaticContractSpecProvider(),
         )
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
 
 
 def test_v2_generic_post_call_error_is_unknown_and_not_retried(tmp_path):
@@ -1896,12 +1958,12 @@ def test_v2_generic_post_call_error_is_unknown_and_not_retried(tmp_path):
     _persist_finalized_signal_evidence(session_factory, signal, finalized)
 
     class _GenericPostCallErrorClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
-            raise DeepcoinClientError("transport failed after trigger call")
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
+            raise DeepcoinClientError("transport failed after order call")
 
     client = _GenericPostCallErrorClient()
-    with pytest.raises(DeepcoinClientError, match="transport failed after trigger call"):
+    with pytest.raises(DeepcoinClientError, match="transport failed after order call"):
         process_trade_signal_live(
             session_factory,
             signal_id=signal.id,
@@ -1921,7 +1983,7 @@ def test_v2_generic_post_call_error_is_unknown_and_not_retried(tmp_path):
             deepcoin_client=client,
             contract_spec_provider=_StaticContractSpecProvider(),
         )
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
 
 
 def test_v2_embedded_trigger_missing_parent_identity_is_unknown_and_not_retried(
@@ -1942,14 +2004,17 @@ def test_v2_embedded_trigger_missing_parent_identity_is_unknown_and_not_retried(
     _persist_finalized_signal_evidence(session_factory, signal, finalized)
 
     class _MissingParentIdentityClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
             return {"code": "0", "data": {"id": "generic-parent-id"}}
 
     client = _MissingParentIdentityClient()
+    # An accepted-looking reply with no ``ordId`` is the shape hard rule 5 names:
+    # the write may well have reached the exchange, so it is an unknown outcome
+    # and is never resent.
     with pytest.raises(
-        DeepcoinClientError,
-        match="Deepcoin trigger order response missing order id",
+        DeepcoinRequestOutcomeUnknown,
+        match="limit order response missing exact order id",
     ):
         process_trade_signal_live(
             session_factory,
@@ -1970,7 +2035,7 @@ def test_v2_embedded_trigger_missing_parent_identity_is_unknown_and_not_retried(
             deepcoin_client=client,
             contract_spec_provider=_StaticContractSpecProvider(),
         )
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
 
 
 @pytest.mark.parametrize("ambiguous_id_field", ["id", "algoId", "triggerOrderId"])
@@ -2075,8 +2140,8 @@ def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_pat
     batch_id, draft = _persist_reserved_revision_batch(session_factory)
 
     class _GenericRevisionErrorClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
             raise DeepcoinClientError("revision write transport failed")
 
     client = _GenericRevisionErrorClient()
@@ -2105,7 +2170,7 @@ def test_revision_first_generic_write_error_is_unknown_and_never_retried(tmp_pat
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
         assert signal.payload_json == original_payload_json
@@ -2126,13 +2191,15 @@ def test_revision_writer_submits_only_authorized_original_leg_index(tmp_path):
     )
 
     assert result["order_count"] == 1
-    assert len(client.trigger_payloads) == 1
-    assert client.trigger_payloads[0]["clOrdId"] == draft["order_legs"][1][
-        "client_order_id"
-    ]
+    assert len(client.payloads) == 1
+    # The migrated payload carries no client order id at all; the authorized leg
+    # is identified by its price and size, and by the local key on the ledger row.
+    assert "clOrdId" not in client.payloads[0]
+    assert client.payloads[0]["px"] == str(draft["order_legs"][1]["price"])
     with session_factory() as session:
         leg = session.query(ExecutionOrderLeg).one()
         assert leg.leg_index == 2
+        assert leg.client_order_id == draft["order_legs"][1]["client_order_id"]
 
 
 def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
@@ -2142,9 +2209,9 @@ def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
     batch_id, draft = _persist_reserved_revision_batch(session_factory)
 
     class _PartialRevisionClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
-            if len(self.trigger_payloads) == 1:
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
+            if len(self.payloads) == 1:
                 return {"code": "0", "data": {"ordId": "revision-leg-1"}}
             raise DeepcoinClientError("revision second write failed")
 
@@ -2174,7 +2241,7 @@ def test_revision_confirmed_first_leg_then_error_is_partial_and_never_retried(
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert len(client.trigger_payloads) == 2
+    assert len(client.payloads) == 2
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
         assert signal.payload_json == original_payload_json
@@ -2185,8 +2252,8 @@ def test_revision_definite_first_rejection_is_failed_but_never_auto_revived(tmp_
     batch_id, draft = _persist_reserved_revision_batch(session_factory)
 
     class _RejectedRevisionClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_payloads.append(order_payload)
+        def place_order(self, order_payload):
+            self.payloads.append(order_payload)
             raise DeepcoinDefiniteRejection("revision explicitly rejected")
 
     client = _RejectedRevisionClient()
@@ -2215,7 +2282,7 @@ def test_revision_definite_first_rejection_is_failed_but_never_auto_revived(tmp_
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
     with session_factory() as session:
         signal = session.query(TradeSignal).filter_by(source_type="strategy_revision").one()
         assert signal.payload_json == original_payload_json
@@ -2258,7 +2325,7 @@ def test_v2_submission_uses_durable_selected_legs_not_external_maximum(tmp_path)
     )
 
     assert result["order_count"] == 2
-    assert len(client.trigger_payloads) == 2
+    assert len(client.payloads) == 2
 
 
 def test_new_entry_authority_covers_every_leg_and_releases_after_success(
@@ -2283,7 +2350,7 @@ def test_new_entry_authority_covers_every_leg_and_releases_after_success(
             super().__init__()
             self.probes = []
 
-        def trigger_order(self, order_payload):
+        def place_order(self, order_payload):
             self.probes.append(
                 acquire_entry_revision_exchange_authority(
                     session_factory,
@@ -2292,7 +2359,7 @@ def test_new_entry_authority_covers_every_leg_and_releases_after_success(
                     acquired_at=datetime(2026, 8, 27, 20, 0, tzinfo=UTC),
                 )
             )
-            return super().trigger_order(order_payload)
+            return super().place_order(order_payload)
 
     client = _AuthorityProbingClient()
     result = process_trade_signal_live(
@@ -2339,7 +2406,7 @@ def test_legacy_shadow_metadata_does_not_override_maximum_order_legs(tmp_path):
     )
 
     assert result["order_count"] == 1
-    assert len(client.trigger_payloads) == 1
+    assert len(client.payloads) == 1
 
 
 def test_process_next_rejects_declared_v2_evidence_without_matching_assembly(
@@ -3127,11 +3194,11 @@ def test_process_live_coalesces_equivalent_legacy_trigger_legs_before_submission
     )
 
     assert result["order_count"] == 1
-    assert len(fake_client.trigger_payloads) == 1
-    assert fake_client.trigger_payloads[0]["sz"] == str(
+    assert len(fake_client.payloads) == 1
+    assert fake_client.payloads[0]["sz"] == str(
         first_leg["quantity"] + first_leg["quantity"]
     )
-    assert "merged_from_leg_indices" not in fake_client.trigger_payloads[0]
+    assert "merged_from_leg_indices" not in fake_client.payloads[0]
     assert result["deepcoin_order_draft"] == queued_draft
     assert len(result["deepcoin_order_draft"]["order_legs"]) == 2
     with session_factory() as session:
@@ -3184,11 +3251,11 @@ def test_process_live_preserves_distinct_price_legacy_trigger_legs(tmp_path):
     )
 
     assert result["order_count"] == 2
-    assert [payload["triggerPrice"] for payload in fake_client.trigger_payloads] == [
+    assert [payload["px"] for payload in fake_client.payloads] == [
         str(first_leg["price"]),
         str(second_leg["price"]),
     ]
-    assert [payload["sz"] for payload in fake_client.trigger_payloads] == [
+    assert [payload["sz"] for payload in fake_client.payloads] == [
         "63.0",
         "84.0",
     ]
@@ -3238,10 +3305,14 @@ def test_market_submit_defers_take_profit_until_verified_backup_stop(tmp_path):
     _persist_lifecycle(session_factory, chat_id=200, message_id=66, symbol="BTC", side="short")
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
     fake_client = _FakeDeepcoinClient()
+    # The exchange names the position after the order that opened it, and the
+    # reply itself carries no posId -- the shape confirmed against the creation
+    # contract and against 153 of 153 production market entries.
     fake_client.positions = [{
-        "posId": "pos-market-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "9",
+        "posId": "order-market-1", "instId": "BTC-USDT-SWAP", "posSide": "short", "pos": "9",
     }]
-    fake_client.place_order = lambda payload: {"code": "0", "data": {"ordId": "order-market-1", "posId": "pos-market-1"}}
+    fake_client.place_order = lambda payload: {"code": "0", "data": {"ordId": "order-market-1"}}
+    _persist_ws_position_frame(session_factory, pos_id="order-market-1")
 
     result = submit_recovery_order_live(
         session_factory, chat_id=200, message_id=66, symbol="BTC", side="short",
@@ -3250,13 +3321,19 @@ def test_market_submit_defers_take_profit_until_verified_backup_stop(tmp_path):
     )
 
     assert result["submitted"] is True
+    assert result["warnings"] == []
     assert len(fake_client.position_protection_payloads) == 1
     payload = fake_client.position_protection_payloads[0]
+    assert payload["posId"] == "order-market-1"
     assert "slTriggerPx" in payload
     assert "tpTriggerPx" not in payload
     with session_factory() as session:
         convergence = session.query(TriggerTakeProfitConvergence).one()
+        leg = session.query(ExecutionOrderLeg).filter_by(purpose="entry").one()
     assert convergence.status == "waiting_position"
+    # Verified because all three confirmations held, not because a position of
+    # the right symbol and side happened to be there.
+    assert (leg.pos_id, leg.attribution_status) == ("order-market-1", "verified")
 
 
 def test_market_submit_failure_invalidates_lifecycle(tmp_path):
@@ -3319,22 +3396,27 @@ def test_limit_submit_uses_stop_only_trigger_protection(tmp_path):
 
     assert result["submitted"] is True
     assert "order_protection_failed_after_entry_submitted" not in result["warnings"]
-    assert fake_client.payloads == []
+    assert fake_client.trigger_payloads == []
     assert fake_client.protection_payloads == []
-    assert fake_client.trigger_payloads[0]["orderType"] == "limit"
-    assert all(not any(key.startswith("tp") for key in payload) for payload in fake_client.trigger_payloads)
-    assert fake_client.trigger_payloads[0]["slTriggerPx"] == "67500.0"
+    assert fake_client.payloads[0]["ordType"] == "limit"
+    # Stop-only, exactly as before the cutover: the take profit still waits for
+    # an exact filled posId. What changed is the endpoint, not that policy.
+    assert all(
+        not any(key.startswith("tp") for key in payload)
+        for payload in fake_client.payloads
+    )
+    assert fake_client.payloads[0]["slTriggerPx"] == "67500.0"
     assert fake_client.position_protection_payloads == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         lifecycle = session.query(StrategyLifecycle).one()
     assert binding.status == "open"
-    assert binding.order_id == "trigger-1,trigger-2"
+    assert binding.order_id == "order-1,order-2"
     assert binding.last_exchange_status == "submitted"
     assert lifecycle.execution_binding_id == binding.id
 
 
-def test_trigger_parent_event_is_durable_before_later_submission_bookkeeping_crashes(
+def test_entry_parent_event_is_durable_before_later_submission_bookkeeping_crashes(
     tmp_path, monkeypatch
 ):
     import telegram_kol_research.recovery_live_submit as submitter
@@ -3366,16 +3448,31 @@ def test_trigger_parent_event_is_durable_before_later_submission_bookkeeping_cra
         intents = session.query(TriggerProtectionIntent).all()
         parent_events = (
             session.query(ExecutionEvent)
-            .filter(ExecutionEvent.action == "create_trigger_entry")
+            .filter(ExecutionEvent.action == "create_limit_entry")
             .order_by(ExecutionEvent.order_id.asc())
             .all()
         )
-    assert [intent.parent_trigger_order_id for intent in intents] == ["trigger-1", "trigger-2"]
-    assert [event.order_id for event in parent_events] == ["trigger-1", "trigger-2"]
+    assert [intent.parent_trigger_order_id for intent in intents] == ["order-1", "order-2"]
+    assert [event.order_id for event in parent_events] == ["order-1", "order-2"]
     assert all(event.request_json for event in parent_events)
 
 
-def test_market_submit_uses_filled_position_id_even_when_different_from_order_id(tmp_path):
+def test_market_submit_refuses_to_claim_a_position_that_is_not_named_after_the_order(
+    tmp_path,
+):
+    """The identity equation is the claim; a symbol-and-side scan is not.
+
+    ``_DelayedFilledPositionDeepcoinClient`` produces the one shape phase 5
+    refuses: a new position of the right contract, direction and size appears
+    after the write, but it is *not* named after the order that was submitted.
+    Before the cutover that position was claimed and stamped ``verified``.
+    Production has never actually produced this shape -- 153 of 153 market entry
+    legs carrying both ids satisfy ``pos_id == order_id`` -- so if it ever does,
+    the honest answer is that this system does not know whose position it is.
+    The candidate id is still recorded, and left ``unverified``, which every
+    automatic modification, cancellation and claim already refuses to act on.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     _persist_ready_market_item(session_factory)
     save_trading_settings(session_factory, {"auto_trade_enabled": True})
@@ -3394,11 +3491,19 @@ def test_market_submit_uses_filled_position_id_even_when_different_from_order_id
     )
 
     assert result["submitted"] is True
-    assert fake_client.position_protection_payloads[0]["posId"] == "pos-filled-1"
-    assert fake_client.position_calls == 4
+    assert (
+        "entry_position_attribution_unverified:no_ws_position_frame_for_pos_id"
+        in result["warnings"]
+    )
+    # No protection is attached, because ownership was never proven: the write
+    # gate requires a verified leg, and refusing is the point.
+    assert fake_client.position_protection_payloads == []
+    assert "position_protection_failed_after_entry_submitted" in result["warnings"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
+        leg = session.query(ExecutionOrderLeg).filter_by(purpose="entry").one()
     assert binding.pos_id == "pos-filled-1"
+    assert (leg.pos_id, leg.attribution_status) == ("pos-filled-1", "unverified")
 
 
 def test_process_next_trade_signal_live_returns_none_without_pending_signal(tmp_path):

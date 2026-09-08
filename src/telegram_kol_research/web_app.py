@@ -72,6 +72,10 @@ from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
 )
 from telegram_kol_research.deepcoin_client import build_deepcoin_client_from_env
+from telegram_kol_research.deepcoin_entry_admission import (
+    set_entry_admission_inbox_provider,
+    set_entry_admission_runtime_role,
+)
 from telegram_kol_research.deepcoin_private_ws import (
     build_deepcoin_ws_health,
     run_deepcoin_private_ws_loop,
@@ -4930,6 +4934,18 @@ def create_web_app(
     async def lifespan(app: FastAPI):
         try:
             app.state.web_event_loop = asyncio.get_running_loop()
+            # Phase 5 gates new entries on this process's own WebSocket
+            # observation, and the gate has to know whether this process is the
+            # one that runs the stream. Declared from the resolved role rather
+            # than read from the environment: the role comes from a CLI option
+            # that merely *defaults* to the environment variable, so the
+            # environment is not the authority on it. Declared on startup and
+            # withdrawn on shutdown, so a process that never runs never claims
+            # to be the worker.
+            set_entry_admission_runtime_role(app.state.runtime_role)
+            set_entry_admission_inbox_provider(
+                lambda: getattr(app.state, "deepcoin_private_ws_inbox", None)
+            )
             if (
                 app.state.runtime_role in {"worker", "all"}
                 and app.state.recognition_execution_schema_valid
@@ -5510,6 +5526,8 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.deepcoin_reconcile_task = None
+            set_entry_admission_inbox_provider(None)
+            set_entry_admission_runtime_role(None)
             await _stop_live_listener_task(app)
             bot_command_task = app.state.telegram_bot_command_task
             if bot_command_task is not None:

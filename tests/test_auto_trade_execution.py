@@ -135,7 +135,7 @@ def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
         chat_id=100,
         message_id=3428,
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -150,7 +150,21 @@ def test_auto_trade_blocks_deleted_source_before_any_exchange_call(tmp_path):
 
 
 class _FakeDeepcoinClient:
-    def __init__(self):
+    """A Deepcoin stand-in that answers the way the real one was observed to.
+
+    Two details matter to phase 5 and used to be modelled wrongly here.
+    ``POST /trade/order`` returns ``ordId`` and no ``posId`` -- checked against
+    the creation contract and against every raw response captured on
+    2026-09-07 -- and the split position an ordinary order opens is named after
+    that order. So a filled market order makes a position whose ``posId`` *is*
+    the ``ordId``, and the stream separately pushes a ``Position`` frame naming
+    it. Given a session factory this fake pushes that frame too, because
+    attribution now requires it and a fake that skips it would be testing a
+    world the exchange does not produce.
+    """
+
+    def __init__(self, session_factory=None):
+        self.session_factory = session_factory
         self.orders = []
         self.trigger_orders = []
         self.protections = []
@@ -163,10 +177,61 @@ class _FakeDeepcoinClient:
 
     def place_order(self, order_payload):
         self.orders.append(order_payload)
-        data = {"ordId": f"order-{len(self.orders)}"}
+        order_id = f"order-{len(self.orders)}"
         if order_payload.get("ordType") == "market":
-            data["posId"] = f"pos-{len(self.orders)}"
-        return {"code": "0", "data": data}
+            self._open_position(order_id, order_payload)
+        return {"code": "0", "data": {"ordId": order_id}}
+
+    def _open_position(self, order_id, order_payload):
+        """Fill the market order: a new split position, plus its stream frame."""
+
+        self.positions = [
+            *self.positions,
+            {
+                "instId": order_payload.get("instId"),
+                "posId": order_id,
+                "posSide": order_payload.get("posSide"),
+                "pos": str(order_payload.get("sz") or "0"),
+                "avgPx": "68000",
+                "mrgPosition": "split",
+                "mgnMode": "cross",
+                "uTime": "1",
+            },
+        ]
+        if self.session_factory is None:
+            return
+        import hashlib as _hashlib
+
+        from telegram_kol_research.models import DeepcoinWsEvent
+
+        payload = json.dumps(
+            {
+                "result": [
+                    {
+                        "table": "Position",
+                        "data": {
+                            "PI": order_id,
+                            "Po": str(order_payload.get("sz") or "0"),
+                        },
+                    }
+                ]
+            },
+            sort_keys=True,
+        )
+        with self.session_factory() as session:
+            session.add(
+                DeepcoinWsEvent(
+                    venue="deepcoin",
+                    channel="Position",
+                    action="PushPosition",
+                    position_id=order_id,
+                    received_at=datetime(2026, 6, 12, 8, 1),
+                    received_ms=1_780_000_000_000,
+                    raw_payload=payload,
+                    payload_hash=_hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+                )
+            )
+            session.commit()
 
     def trigger_order(self, order_payload):
         self.trigger_orders.append(order_payload)
@@ -242,8 +307,8 @@ class _SequencedProtectionDeepcoinClient(_FakeDeepcoinClient):
 
 
 class _TickerForbiddenDeepcoinClient(_FakeDeepcoinClient):
-    def __init__(self):
-        super().__init__()
+    def __init__(self, session_factory=None):
+        super().__init__(session_factory)
         self.ticker_calls = 0
 
     def get_ticker_price(self, *, inst_id):
@@ -358,7 +423,7 @@ def test_management_failure_does_not_block_same_message_entry(tmp_path, monkeypa
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     )
 
     assert calls == [("management", management_id), ("entry", entry_id)]
@@ -396,7 +461,7 @@ def test_same_message_management_submission_precedes_entry_submission(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     )
 
     assert call_log == ["management", "entry"]
@@ -433,13 +498,13 @@ def test_unknown_management_submission_propagates_to_lease_and_is_not_retried(
             session_factory,
             raw_message_id=raw_message_id,
             group_config=_group_config(),
-            deepcoin_client=_FakeDeepcoinClient(),
+            deepcoin_client=_FakeDeepcoinClient(session_factory),
         )
     second = auto_process_message_trade_signal(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     )
 
     assert call_counts == {"management": 1, "entry": 1}
@@ -471,7 +536,7 @@ def test_retired_instruction_set_never_falls_back_to_candidate_execution(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     ) == {"status": "completed", "items": []}
 
 
@@ -504,7 +569,7 @@ def test_management_recovery_required_is_unknown_and_does_not_block_same_message
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     )
 
     assert call_log == ["management", "entry"]
@@ -533,7 +598,7 @@ def test_unrecognized_instruction_outcome_fails_instead_of_defaulting_success(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
     )
 
     assert result["status"] == "partial_failed"
@@ -885,7 +950,7 @@ def test_wrong_geometry_candidate_is_rejected_and_alerted_without_exchange_write
         session_factory,
         {"auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"]},
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
 
     first = auto_process_message_trade_signal(
         session_factory,
@@ -1042,7 +1107,7 @@ def test_live_entry_preamble_multiplies_usdt_risk_before_contract_sizing(tmp_pat
         session_factory,
         raw_message_id=strategy_raw_id,
         group_config=_group_config(chat_id=chat_id),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
     )
@@ -1106,7 +1171,7 @@ def test_live_adjacent_admission_defers_before_exchange_or_trade_signal(tmp_path
             "entry_message_assembly_v2_mode": "live",
         },
     )
-    client = _TickerForbiddenDeepcoinClient()
+    client = _TickerForbiddenDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -1179,7 +1244,7 @@ def test_adjacent_entry_deferral_keeps_instruction_pending_for_wakeup(
         "project_entry_deferred_contract",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("projection failed")),
     )
-    client = _TickerForbiddenDeepcoinClient()
+    client = _TickerForbiddenDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -1375,7 +1440,7 @@ def test_shadow_entry_preamble_reports_half_but_executes_configured_risk(tmp_pat
         session_factory,
         raw_message_id=strategy_raw_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
     )
@@ -1475,7 +1540,7 @@ def test_live_v2_fragment_applies_half_budget_and_supplemental_leg_once(tmp_path
         session_factory,
         raw_message_id=strategy_raw_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
     )
@@ -1531,7 +1596,7 @@ def test_invalid_persisted_entry_preamble_multiplier_blocks_before_trade_signal(
         session_factory,
         raw_message_id=strategy_raw_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 5, 12, 2, tzinfo=UTC),
     )
@@ -1601,7 +1666,7 @@ def test_group_position_limit_blocks_entry_before_exchange_access(tmp_path):
         },
     )
     _seed_verified_positions(session_factory, chat_id=100, count=4)
-    fake_client = _TickerForbiddenDeepcoinClient()
+    fake_client = _TickerForbiddenDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -1644,7 +1709,7 @@ def test_new_entry_is_blocked_by_critical_unprotected_position_in_same_chat(tmp_
         ),
     )
     _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-naked")
-    client = _TickerForbiddenDeepcoinClient()
+    client = _TickerForbiddenDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory, raw_message_id=raw_message_id, group_config=_group_config(),
@@ -1679,7 +1744,7 @@ def test_critical_unprotected_position_does_not_block_other_chat_entry(tmp_path)
         ),
     )
     _verify_bound_position(session_factory, binding_id=binding_id, pos_id="pos-other-chat-naked")
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory, raw_message_id=raw_message_id, group_config=_group_config(),
@@ -1688,7 +1753,8 @@ def test_critical_unprotected_position_does_not_block_other_chat_entry(tmp_path)
     )
 
     assert result["status"] == "submitted"
-    assert len(client.trigger_orders) == 2
+    assert client.trigger_orders == []
+    assert len(client.orders) == 2
 
 
 def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission(tmp_path):
@@ -1711,7 +1777,7 @@ def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission
     )
     _seed_verified_positions(session_factory, chat_id=100, count=3)
     _seed_verified_positions(session_factory, chat_id=200, count=4)
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -1723,8 +1789,8 @@ def test_group_position_limit_isolated_by_chat_below_boundary_reaches_submission
     )
 
     assert result["status"] == "submitted"
-    assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 2
+    assert fake_client.trigger_orders == []
+    assert len(fake_client.orders) == 2
 
 
 def test_management_disabled_records_safe_skip_before_planning_or_exchange_access(
@@ -1774,7 +1840,7 @@ def test_management_disabled_records_safe_skip_before_planning_or_exchange_acces
             AssertionError("disabled management must not plan")
         ),
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -1920,7 +1986,7 @@ def test_management_planning_shadows_or_executes_only_the_durable_batch(
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -2073,7 +2139,7 @@ def test_management_planning_preserves_runtime_risk_gates(
         session_factory,
         raw_message_id=raw_id,
         group_config=group_config,
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
     )
 
@@ -2100,7 +2166,7 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
             },
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -2113,9 +2179,9 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 2
-    assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    assert fake_client.trigger_orders == []
+    assert len(fake_client.orders) == 2
+    assert fake_client.orders[0]["ordType"] == "limit"
     with session_factory() as session:
         assembly_evidence = json.loads(
             session.query(EntryStrategyAssembly).one().evidence_json
@@ -2123,12 +2189,12 @@ def test_auto_process_message_trade_signal_submits_live_order_with_protection(tm
     assert assembly_evidence["order_draft_snapshot"]["contract_spec"][
         "quantity_step"
     ] == 1.0
-    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+    assert [order["px"] for order in fake_client.orders] == [
         "68290.0",
         "68080.0",
     ]
-    assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == "67500.0"
+    assert all(not any(key.startswith("tp") for key in order) for order in fake_client.orders)
+    assert fake_client.orders[0]["slTriggerPx"] == "67500.0"
     assert fake_client.protections == []
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
@@ -2161,7 +2227,7 @@ def test_auto_entry_capability_rejection_precedes_every_durable_or_exchange_writ
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -2195,7 +2261,7 @@ def test_auto_entry_global_allowlist_precedes_venue_capability(tmp_path):
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=provider,
         processed_at=datetime(2026, 8, 8, 9, 0, tzinfo=UTC),
     )
@@ -2232,7 +2298,7 @@ def test_auto_entry_embeds_exact_dynamic_sol_spec_and_snapshot_digest(tmp_path):
             )
         ]
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
     client.ticker_prices["SOL-USDT-SWAP"] = 151.0
 
     result = auto_process_message_trade_signal(
@@ -2269,7 +2335,7 @@ def test_auto_entry_rechecks_capability_before_trade_signal_enqueue(tmp_path):
         session_factory,
         {"auto_trade_enabled": True, "allowed_symbols": ["BTC", "ETH"]},
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
     provider = _ChangingCapabilityContractSpecProvider()
 
     result = auto_process_message_trade_signal(
@@ -2316,10 +2382,10 @@ def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_sub
 
     class _FingerprintInspectingClient(_FakeDeepcoinClient):
         def __init__(self):
-            super().__init__()
+            super().__init__(session_factory)
             self.inspected_first_submission = False
 
-        def trigger_order(self, order_payload):
+        def place_order(self, order_payload):
             if not self.inspected_first_submission:
                 with session_factory() as session:
                     assembly = session.query(EntryStrategyAssembly).one()
@@ -2333,7 +2399,7 @@ def test_recovery_trigger_synchronizes_finalized_fingerprint_before_exchange_sub
                     "deepcoin_order_draft"
                 ]["entry_preamble_assembly"]["assembly_fingerprint"]
                 self.inspected_first_submission = True
-            return super().trigger_order(order_payload)
+            return super().place_order(order_payload)
 
     client = _FingerprintInspectingClient()
     result = auto_process_message_trade_signal(
@@ -2386,13 +2452,13 @@ def test_partial_v2_entry_submission_is_quarantined_and_never_reenqueued(
     )
 
     class _SecondLegUnknownClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_orders.append(order_payload)
-            if len(self.trigger_orders) >= 2:
+        def place_order(self, order_payload):
+            self.orders.append(order_payload)
+            if len(self.orders) >= 2:
                 raise DeepcoinRequestOutcomeUnknown("second leg outcome unknown")
-            return {"code": "0", "data": {"ordId": "trigger-1"}}
+            return {"code": "0", "data": {"ordId": "order-1"}}
 
-    client = _SecondLegUnknownClient()
+    client = _SecondLegUnknownClient(session_factory)
     with pytest.raises(DeepcoinRequestOutcomeUnknown):
         auto_process_message_trade_signal(
             session_factory,
@@ -2443,7 +2509,10 @@ def test_partial_v2_entry_submission_is_quarantined_and_never_reenqueued(
             contract_spec_provider=_StaticContractSpecProvider(),
         )
 
-    assert len(client.trigger_orders) == 2
+    # Exactly two writes: the confirmed first leg and the one whose outcome is
+    # unknown. The quarantined signal is never retried into a third.
+    assert len(client.orders) == 2
+    assert client.trigger_orders == []
     with session_factory() as session:
         signal = session.query(TradeSignal).one()
         assert signal.status == "partial_submission_failed"
@@ -2487,7 +2556,7 @@ def test_auto_market_draft_uses_immutable_signal_enqueue(tmp_path, monkeypatch):
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 8, 8, 8, 1, tzinfo=UTC),
     )
@@ -2523,7 +2592,7 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
             },
         },
     )
-    client = _FakeDeepcoinClient()
+    client = _FakeDeepcoinClient(session_factory)
     import telegram_kol_research.auto_trade_execution as auto_module
 
     import telegram_kol_research.trade_signals as trade_signals_module
@@ -2574,8 +2643,8 @@ def test_recovery_trigger_fingerprint_sync_failure_blocks_exchange_submission(
 
     assert result["status"] == "submitted"
     assert len(sync_calls) == 2
-    assert client.orders == []
-    assert len(client.trigger_orders) == 2
+    assert client.trigger_orders == []
+    assert len(client.orders) == 2
 
 
 def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_path):
@@ -2599,15 +2668,15 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
 
     class _OrderedClient(_FakeDeepcoinClient):
         def __init__(self):
-            super().__init__()
+            super().__init__(session_factory)
             self.call_order = []
 
         def list_trigger_orders_pending(self, *, inst_id):
             self.call_order.append(("snapshot", inst_id))
             return []
 
-        def trigger_order(self, order_payload):
-            self.call_order.append(("trigger", order_payload["instId"]))
+        def place_order(self, order_payload):
+            self.call_order.append(("order", order_payload["instId"]))
             with session_factory() as session:
                 intent = (
                     session.query(TriggerProtectionIntent)
@@ -2619,7 +2688,7 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
                 )
                 assert intent.pre_submit_tpsl_baseline_json == "[]"
                 assert intent.parent_trigger_order_id is None
-            return super().trigger_order(order_payload)
+            return super().place_order(order_payload)
 
     client = _OrderedClient()
     auto_process_message_trade_signal(
@@ -2631,11 +2700,13 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
         processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
     )
 
+    # The baseline snapshot still precedes each parent write; only the endpoint
+    # the parent goes to changed.
     assert client.call_order[:4] == [
         ("snapshot", "BTC-USDT-SWAP"),
-        ("trigger", "BTC-USDT-SWAP"),
+        ("order", "BTC-USDT-SWAP"),
         ("snapshot", "BTC-USDT-SWAP"),
-        ("trigger", "BTC-USDT-SWAP"),
+        ("order", "BTC-USDT-SWAP"),
     ]
     with session_factory() as session:
         intents = session.query(TriggerProtectionIntent).order_by(TriggerProtectionIntent.id).all()
@@ -2648,11 +2719,11 @@ def test_trigger_limit_entry_persists_tpsl_intent_before_parent_submission(tmp_p
     assert [intent.execution_order_leg_id for intent in intents] == [leg.id for leg in legs]
     assert [json.loads(intent.pre_submit_tpsl_baseline_json) for intent in intents] == [[], []]
     assert all(len(intent.request_fingerprint) == 64 for intent in intents)
-    assert [intent.parent_trigger_order_id for intent in intents] == ["trigger-1", "trigger-2"]
+    assert [intent.parent_trigger_order_id for intent in intents] == ["order-1", "order-2"]
     assert {row.role for row in protection_legs} == {
         "primary_stop", "backup_stop", "take_profit"
     }
-    assert {row.parent_entry_order_id for row in protection_legs} == {"trigger-1", "trigger-2"}
+    assert {row.parent_entry_order_id for row in protection_legs} == {"order-1", "order-2"}
     assert all(row.pos_id is None and row.exchange_order_id is None for row in protection_legs)
 
 
@@ -2821,16 +2892,20 @@ def test_trigger_limit_entry_rejects_alias_parent_id_without_persisting_it(tmp_p
     )
 
     class _AliasParentClient(_FakeDeepcoinClient):
-        def trigger_order(self, order_payload):
-            self.trigger_orders.append(order_payload)
+        def place_order(self, order_payload):
+            if order_payload.get("ordType") != "limit":
+                return super().place_order(order_payload)
+            self.orders.append(order_payload)
             return {"code": "0", "data": {"orderId": "alias-parent"}}
 
-    with pytest.raises(DeepcoinClientError, match="missing order id"):
+    # ``orderId`` is not ``ordId``; an alias is not an identity, so the outcome
+    # is unknown and the order is never resubmitted on the strength of it.
+    with pytest.raises(DeepcoinRequestOutcomeUnknown, match="missing exact order id"):
         auto_process_message_trade_signal(
             session_factory,
             raw_message_id=raw_message_id,
             group_config=_group_config(),
-            deepcoin_client=_AliasParentClient(),
+            deepcoin_client=_AliasParentClient(session_factory),
             contract_spec_provider=_StaticContractSpecProvider(),
             processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
         )
@@ -2900,16 +2975,16 @@ def test_sl_only_trigger_entry_snapshots_and_persists_protection_intent(tmp_path
 
     class _OrderedClient(_FakeDeepcoinClient):
         def __init__(self):
-            super().__init__()
+            super().__init__(session_factory)
             self.call_order = []
 
         def list_trigger_orders_pending(self, *, inst_id):
             self.call_order.append("snapshot")
             return []
 
-        def trigger_order(self, order_payload):
-            self.call_order.append("trigger")
-            return super().trigger_order(order_payload)
+        def place_order(self, order_payload):
+            self.call_order.append(str(order_payload.get("ordType")))
+            return super().place_order(order_payload)
 
     client = _OrderedClient()
     auto_process_message_trade_signal(
@@ -2921,10 +2996,12 @@ def test_sl_only_trigger_entry_snapshots_and_persists_protection_intent(tmp_path
         processed_at=datetime(2026, 7, 20, 8, 1, tzinfo=UTC),
     )
 
-    assert client.call_order[:2] == ["snapshot", "trigger"]
+    # The market leg goes straight out; the protected limit parent is still
+    # preceded by its own pre-submit baseline snapshot.
+    assert client.call_order[:4] == ["market", "snapshot", "snapshot", "limit"]
     with session_factory() as session:
         intent = session.query(TriggerProtectionIntent).one()
-    assert intent.parent_trigger_order_id == "trigger-1"
+    assert intent.parent_trigger_order_id == "order-2"
     assert len(intent.request_fingerprint) == 64
     assert _trigger_protection_request_fingerprint({"slTriggerPx": 67500}) == (
         _trigger_protection_request_fingerprint({"slTriggerPx": 67500, "tpTriggerPx": None})
@@ -2956,7 +3033,7 @@ def test_auto_process_range_entry_uses_fixed_threshold_and_second_offset_when_ne
             },
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -2968,21 +3045,21 @@ def test_auto_process_range_entry_uses_fixed_threshold_and_second_offset_when_ne
     )
 
     assert result["status"] == "submitted"
-    assert len(fake_client.orders) == 1
-    assert len(fake_client.trigger_orders) == 1
-    assert fake_client.orders[0]["ordType"] == "market"
+    # Both legs are ordinary orders now: the market one as always, the limit
+    # one because its trigger price only ever equalled its limit price.
+    assert fake_client.trigger_orders == []
+    assert [order["ordType"] for order in fake_client.orders] == ["market", "limit"]
     assert fake_client.orders[0]["sz"] == "3.2"
-    assert fake_client.trigger_orders[0]["orderType"] == "limit"
-    assert fake_client.trigger_orders[0]["triggerPrice"] == "1567.0"
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.2"]
+    assert fake_client.orders[1]["px"] == "1567.0"
+    assert [order["sz"] for order in fake_client.orders] == ["3.2", "3.2"]
     with session_factory() as session:
         binding = session.query(ExecutionBinding).one()
         events = session.query(ExecutionEvent).order_by(ExecutionEvent.id.asc()).all()
         assert session.query(TriggerProtectionIntent).count() == 1
     assert binding.symbol == "ETH"
-    assert binding.order_id == "order-1,trigger-1"
+    assert binding.order_id == "order-1,order-2"
     assert [event.action for event in events] == [
-        "create_trigger_entry",
+        "create_limit_entry",
         "open_market_position",
         "set_position_tpsl",
     ]
@@ -3015,7 +3092,7 @@ def test_auto_process_short_range_uses_fixed_market_threshold_and_second_offset(
             },
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3027,12 +3104,10 @@ def test_auto_process_short_range_uses_fixed_market_threshold_and_second_offset(
     )
 
     assert result["status"] == "submitted"
-    assert [order["ordType"] for order in fake_client.orders] == ["market"]
-    assert [order["sz"] for order in fake_client.orders] == ["3.2"]
-    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
-        "1603.0"
-    ]
-    assert [order["sz"] for order in fake_client.trigger_orders] == ["3.2"]
+    assert fake_client.trigger_orders == []
+    assert [order["ordType"] for order in fake_client.orders] == ["market", "limit"]
+    assert [order["sz"] for order in fake_client.orders] == ["3.2", "3.2"]
+    assert fake_client.orders[1]["px"] == "1603.0"
 
 
 def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path):
@@ -3052,7 +3127,7 @@ def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path)
             },
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.ticker_prices["BTC-USDT-SWAP"] = 68200.0
 
     result = auto_process_message_trade_signal(
@@ -3065,8 +3140,8 @@ def test_auto_process_zero_fixed_market_threshold_keeps_two_limit_legs(tmp_path)
     )
 
     assert result["status"] == "submitted"
-    assert fake_client.orders == []
-    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+    assert fake_client.trigger_orders == []
+    assert [order["px"] for order in fake_client.orders] == [
         "68290.0",
         "68080.0",
     ]
@@ -3174,7 +3249,7 @@ def test_dabiaoke_4210_exact_revision_uses_dedicated_confidence_threshold(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         processed_at=datetime(2026, 7, 1, 8, 1, tzinfo=UTC),
     )
@@ -3264,7 +3339,7 @@ def test_strategy_revision_rejects_disallowed_authoritative_binding_symbol(
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
         revision_replacement_writer=lambda **_kwargs: {
             "status": "unexpected_replacement"
@@ -3299,7 +3374,7 @@ def test_auto_process_message_trade_signal_uses_symbol_specific_risk_budget(tmp_
             "max_market_entry_deviation_pct": 0.01,
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3324,7 +3399,7 @@ def test_auto_process_message_trade_signal_blocks_media_when_vision_auto_trade_d
         session_factory,
         {"auto_trade_enabled": True, "allow_vision_auto_trade": False},
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3362,7 +3437,7 @@ def test_deployment_entry_freeze_blocks_entry_without_enabling_management(
             "position_management_liveness_v2_mode": "live",
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3399,7 +3474,7 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -3425,7 +3500,7 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "market"
     assert fake_client.orders[0]["ordType"] == "market"
-    assert fake_client.protections[0]["posId"] == "pos-1"
+    assert fake_client.protections[0]["posId"] == "order-1"
     assert fake_client.protections[0]["slTriggerPx"] == "67500.0"
     assert [payload.get("tpTriggerPx") for payload in fake_client.protections] == [None]
     assert [payload.get("sz") for payload in fake_client.protections] == [None]
@@ -3436,7 +3511,7 @@ def test_auto_process_message_trade_signal_submits_market_order_then_position_sl
         "open_market_position",
         "set_position_tpsl",
     ]
-    assert events[1].pos_id == "pos-1"
+    assert events[1].pos_id == "order-1"
     assert '"stop_loss": "67500.0"' in (events[1].after_json or "")
     assert len(convergences) == 1
     assert convergences[0].status == "waiting_position"
@@ -3464,7 +3539,7 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client = _SequencedProtectionDeepcoinClient(session_factory)
     fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
     fake_client.positions = [
         {
@@ -3497,7 +3572,7 @@ def test_auto_process_message_trade_signal_records_entry_protection_ledger(tmp_p
         binding_ids = {binding.id for binding in session.query(ExecutionBinding).all()}
         leg_ids = {leg.id for leg in session.query(ExecutionOrderLeg).all()}
     assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
-        ("sltp-1", "pos-1", "stop_loss", "1788.0"),
+        ("sltp-1", "order-1", "stop_loss", "1788.0"),
     ]
     assert {row.execution_binding_id for row in rows} == binding_ids
     assert {row.execution_order_leg_id for row in rows} == leg_ids
@@ -3522,7 +3597,7 @@ def test_auto_process_message_trade_signal_records_response_anchored_primary_sto
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client = _SequencedProtectionDeepcoinClient(session_factory)
     fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
     fake_client.positions = [
         {
@@ -3565,7 +3640,7 @@ def test_auto_process_message_trade_signal_records_response_anchored_primary_sto
             .all()
         )
     assert [(row.order_id, row.pos_id, row.purpose, row.trigger_price) for row in rows] == [
-        ("sltp-1", "pos-1", "stop_loss", "1788.0"),
+        ("sltp-1", "order-1", "stop_loss", "1788.0"),
     ]
     assert {json.loads(row.evidence_json)["match"] for row in rows} == {
         "exchange_returned_order_id_exact_readback",
@@ -3590,7 +3665,7 @@ def test_auto_process_message_trade_signal_does_not_ledger_price_only_tpsl(tmp_p
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _SequencedProtectionDeepcoinClient()
+    fake_client = _SequencedProtectionDeepcoinClient(session_factory)
     fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
     fake_client.positions = [
         {
@@ -3650,7 +3725,7 @@ def test_auto_process_message_trade_signal_records_combined_entry_protection(tmp
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _CombinedProtectionDeepcoinClient()
+    fake_client = _CombinedProtectionDeepcoinClient(session_factory)
     fake_client.ticker_prices["ETH-USDT-SWAP"] = 1844.0
     fake_client.positions = [
         {
@@ -3698,7 +3773,7 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3711,9 +3786,9 @@ def test_auto_process_message_trade_signal_accepts_nearby_single_entry_price(tmp
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 1
-    assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    assert fake_client.trigger_orders == []
+    assert len(fake_client.orders) == 1
+    assert fake_client.orders[0]["ordType"] == "limit"
 
 
 def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_path):
@@ -3733,7 +3808,7 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.ticker_prices["BTC-USDT-SWAP"] = 59680.0
     fake_client.positions = [
         {
@@ -3762,7 +3837,7 @@ def test_auto_process_nearby_single_entry_uses_market_when_price_is_close(tmp_pa
     assert len(fake_client.orders) == 1
     assert fake_client.orders[0]["ordType"] == "market"
     assert fake_client.trigger_orders == []
-    assert fake_client.protections[0]["posId"] == "pos-1"
+    assert fake_client.protections[0]["posId"] == "order-1"
 
 
 def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path):
@@ -3782,7 +3857,7 @@ def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.ticker_prices["BTC-USDT-SWAP"] = 60300.0
 
     result = auto_process_message_trade_signal(
@@ -3796,9 +3871,9 @@ def test_auto_process_nearby_single_entry_keeps_limit_when_price_is_far(tmp_path
 
     assert result["status"] == "submitted"
     assert result["entry_execution_type"] == "limit"
-    assert fake_client.orders == []
-    assert len(fake_client.trigger_orders) == 1
-    assert fake_client.trigger_orders[0]["orderType"] == "limit"
+    assert fake_client.trigger_orders == []
+    assert len(fake_client.orders) == 1
+    assert fake_client.orders[0]["ordType"] == "limit"
 
 
 def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_path):
@@ -3829,7 +3904,7 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
             },
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.get_ticker_price = lambda *, inst_id: 59195.0
 
     result = auto_process_message_trade_signal(
@@ -3842,13 +3917,13 @@ def test_auto_process_message_trade_signal_expands_btc_wan_shorthand_prices(tmp_
     )
 
     assert result["status"] == "submitted"
-    assert fake_client.orders == []
-    assert [order["triggerPrice"] for order in fake_client.trigger_orders] == [
+    assert fake_client.trigger_orders == []
+    assert [order["px"] for order in fake_client.orders] == [
         "59300.0",
         "58900.0",
     ]
     assert fake_client.protections == []
-    assert fake_client.trigger_orders[0]["slTriggerPx"] == "57800.0"
+    assert fake_client.orders[0]["slTriggerPx"] == "57800.0"
     assert all(not any(key.startswith("tp") for key in order) for order in fake_client.trigger_orders)
 
 
@@ -3871,7 +3946,7 @@ def test_auto_process_message_trade_signal_skips_lifecycle_entry_confirmation(tm
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
 
     result = auto_process_message_trade_signal(
         session_factory,
@@ -3898,7 +3973,7 @@ def test_auto_process_message_trade_signal_blocks_low_confidence(tmp_path):
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
     )
 
@@ -3921,7 +3996,7 @@ def test_ordinary_new_entry_at_revision_confidence_remains_blocked(tmp_path):
         session_factory,
         raw_message_id=raw_message_id,
         group_config=_group_config(),
-        deepcoin_client=_FakeDeepcoinClient(),
+        deepcoin_client=_FakeDeepcoinClient(session_factory),
         contract_spec_provider=_StaticContractSpecProvider(),
     )
 
@@ -3977,7 +4052,7 @@ def test_auto_process_message_trade_signal_closes_position_from_close_signal(tmp
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -4085,7 +4160,7 @@ def test_auto_process_close_signal_does_not_steal_live_position_from_other_chat(
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -4171,7 +4246,7 @@ def test_auto_process_close_signal_does_not_recover_ambiguous_positions(tmp_path
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -4253,7 +4328,7 @@ def test_auto_process_message_trade_signal_does_not_guess_filled_binding_before_
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -4334,7 +4409,7 @@ def test_auto_process_message_trade_signal_partially_closes_profit_percent(tmp_p
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",
@@ -4409,7 +4484,7 @@ def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_updat
             "allowed_symbols": ["BTC", "ETH"],
         },
     )
-    fake_client = _FakeDeepcoinClient()
+    fake_client = _FakeDeepcoinClient(session_factory)
     fake_client.positions = [
         {
             "instId": "BTC-USDT-SWAP",

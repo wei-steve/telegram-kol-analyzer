@@ -7,7 +7,7 @@ import time
 import hashlib
 import json
 from copy import deepcopy
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -26,6 +26,20 @@ from telegram_kol_research.deployment_entry_freeze import (
     deployment_entry_admission_frozen,
 )
 from telegram_kol_research.deepcoin_order_builder import _coalesce_equivalent_entry_legs
+from telegram_kol_research.deepcoin_limit_entry import (
+    DeepcoinLimitEntryError,
+    build_deepcoin_limit_entry_payload,
+    limit_leg_requires_trigger_order,
+)
+from telegram_kol_research.deepcoin_ordinary_entry_binding import (
+    ATTRIBUTION_UNVERIFIED,
+    ATTRIBUTION_VERIFIED,
+    resolve_ordinary_entry_attribution,
+)
+from telegram_kol_research.deepcoin_entry_admission import (
+    DeepcoinEntryAdmissionBlocked,
+    require_ws_observation_permits_new_entry,
+)
 from telegram_kol_research.entry_strategy_assembly import (
     build_bounded_entry_order_draft_snapshot,
     canonical_entry_assembly_fingerprint,
@@ -287,6 +301,26 @@ def _require_synchronized_finalized_entry_assembly(
     return True
 
 
+def _require_ws_observation_or_raise() -> None:
+    """Refuse a new entry the WebSocket observation cannot vouch for.
+
+    Phase 4's retest 12 established that the Deepcoin private stream does not
+    replay on reconnect: it pushes changes only. The ``TU: default -> posId``
+    frame that binds an entry's protection therefore happens exactly once, and
+    REST cannot stand in for it. An entry submitted while the stream is
+    unsubscribed, resyncing, or holding an unconverged gap would be an entry
+    whose protection can never be attributed -- so it is not submitted at all.
+
+    The reason code travels in the error message, so a paused entry shows up as
+    a recorded failure rather than a silently dropped intention.
+    """
+
+    try:
+        require_ws_observation_permits_new_entry()
+    except DeepcoinEntryAdmissionBlocked as exc:
+        raise RecoveryLiveSubmitError(str(exc)) from exc
+
+
 @contextmanager
 def _entry_source_exchange_write_gate(
     session_factory: sessionmaker,
@@ -301,6 +335,10 @@ def _entry_source_exchange_write_gate(
     with source_message_execution_authority(session_factory):
         if deployment_entry_admission_frozen():
             raise RecoveryLiveSubmitError("deployment_entry_frozen")
+        # The stream cannot replay what it did not push, so an entry submitted
+        # into a gap can never be verified afterwards. Checked once up front and
+        # again here, at the last moment before the write.
+        _require_ws_observation_or_raise()
         barrier = source_identity_execution_barrier(
             session_factory,
             chat_id=chat_id,
@@ -1310,6 +1348,9 @@ def _submit_recovery_signal_direct(
     order_legs = draft.get("order_legs")
     if not isinstance(order_legs, list) or not order_legs:
         raise RecoveryLiveSubmitError("missing_order_legs")
+    # Phase 5, task 4. Pausing means *not submitting*, never submitting and then
+    # cancelling, and it always names the stream state that refused.
+    _require_ws_observation_or_raise()
 
     submitted_orders: list[dict[str, Any]] = []
     now = submitted_at or datetime.now(UTC)
@@ -1382,18 +1423,48 @@ def _submit_recovery_signal_direct(
                 )
             progress.record_confirmed_leg()
             client_order_id = str(leg.get("client_order_id") or order_payload.get("clOrdId") or "")
-            pos_id = _extract_position_id(response) or _find_open_position_id(
-                deepcoin_client,
+            attribution = _attribute_ordinary_entry(
+                session_factory,
+                deepcoin_client=deepcoin_client,
                 draft=draft,
-                side=side_key,
-                exclude_pos_ids=pre_submit_position_ids,
+                leg=leg,
+                order_id=order_id,
             )
+            pos_id = attribution.pos_id
+            attribution_status = attribution.status
+            attribution_reason = attribution.reason
+            attribution_evidence = dict(attribution.evidence)
+            if pos_id is None:
+                # The equation could not be confirmed. Protection still has to
+                # go on -- "以损定量、亏损有界" only holds while the stop is
+                # actually attached, and refusing here would leave a filled
+                # position whose loss boundary is the liquidation price. So the
+                # pre/post snapshot difference is used to *attach the stop* and
+                # never to claim ownership: the leg is recorded ``unverified``,
+                # which is the condition every automatic modify, cancel and
+                # claim in this repository already refuses to act on.
+                pos_id = _extract_position_id(response) or _find_open_position_id(
+                    deepcoin_client,
+                    draft=draft,
+                    side=side_key,
+                    exclude_pos_ids=pre_submit_position_ids,
+                )
+                if pos_id:
+                    attribution_evidence["protection_pos_id_source"] = (
+                        "new_position_snapshot_difference"
+                    )
+                    warnings.append(
+                        "entry_position_attribution_unverified:" + attribution_reason
+                    )
             provisional_order = {
                 "leg_index": index,
                 "execution_type": "market",
                 "client_order_id": client_order_id,
                 "order_id": order_id,
                 "pos_id": pos_id,
+                "attribution_status": attribution_status,
+                "attribution_reason": attribution_reason,
+                "attribution_evidence": attribution_evidence,
                 "request": _persisted_order_request(order_payload, leg),
                 "response": response,
             }
@@ -1456,7 +1527,34 @@ def _submit_recovery_signal_direct(
                 protection_response = {"error": str(exc)}
                 warnings.append("position_protection_failed_after_entry_submitted")
         elif order_type == "limit":
-            order_payload = build_deepcoin_trigger_order_payload(draft, leg)
+            # Phase 5's migration rule, evaluated per leg. ``None`` means this
+            # leg's trigger price is identical to its limit price and it
+            # carries no trigger semantics at all -- the only shape that moves
+            # onto the ordinary order. Anything else, including a leg shape
+            # nobody has seen before, keeps trigger-order and its separate
+            # parent/child attribution flow.
+            trigger_order_reason = limit_leg_requires_trigger_order(leg, draft)
+            migrates_to_ordinary_order = trigger_order_reason is None
+            if migrates_to_ordinary_order:
+                try:
+                    order_payload = build_deepcoin_limit_entry_payload(
+                        draft,
+                        leg,
+                        margin_mode=_deepcoin_margin_mode(
+                            str(draft.get("margin_mode") or "cross")
+                        ),
+                        position_mode=_deepcoin_position_mode(
+                            str(draft.get("position_mode") or "split")
+                        ),
+                        stop_loss=draft.get("stop_loss"),
+                    )
+                except DeepcoinLimitEntryError as exc:
+                    # A payload this builder refuses is not a reason to fall
+                    # back to trigger-order: that would be migrating by
+                    # exception. Refuse the leg without submitting anything.
+                    raise RecoveryLiveSubmitError(str(exc)) from exc
+            else:
+                order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
                 with _entry_source_exchange_write_gate(
                     session_factory,
@@ -1479,10 +1577,22 @@ def _submit_recovery_signal_direct(
                             },
                             order_payload=order_payload,
                             submission_progress=progress,
+                            order_kind=(
+                                "limit" if migrates_to_ordinary_order else "trigger_limit"
+                            ),
+                            submit=(
+                                deepcoin_client.place_order
+                                if migrates_to_ordinary_order
+                                else None
+                            ),
                         )
                     else:
                         progress.record_attempt()
-                        response = deepcoin_client.trigger_order(order_payload)
+                        response = (
+                            deepcoin_client.place_order(order_payload)
+                            if migrates_to_ordinary_order
+                            else deepcoin_client.trigger_order(order_payload)
+                        )
             except DeepcoinClientError:
                 raise
             except RecoveryLiveSubmitError:
@@ -1490,17 +1600,59 @@ def _submit_recovery_signal_direct(
             except Exception as exc:  # pragma: no cover - defensive boundary
                 raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
 
-            order_id = _normalized_trigger_order_id(response)
-            progress.record_confirmed_leg()
-            pos_id = _extract_position_id(response)
-            client_order_id = str(leg.get("client_order_id") or "")
-            protection_payload = {
-                key: order_payload[key]
-                for key in ("tpTriggerPx", "slTriggerPx", "tpOrdPx", "slOrdPx")
-                if key in order_payload
-            }
-            protection_response = {"code": "0", "data": {"attached_on_trigger_order": True}}
-            order_type = "trigger_limit"
+            if migrates_to_ordinary_order:
+                order_id = _normalized_entry_order_id(response, order_kind="limit")
+                progress.record_confirmed_leg()
+                # An ordinary limit order is live, not filled, so the identity
+                # equation has nothing to confirm yet: one attempt, no waiting
+                # loop, and the leg stays ``unverified`` until the fill makes
+                # the position real. From there the existing reconcile path
+                # attributes it at tier 0 through the same equation
+                # (``direct_order_position_id`` in ``position_attribution``).
+                attribution = _attribute_ordinary_entry(
+                    session_factory,
+                    deepcoin_client=deepcoin_client,
+                    draft=draft,
+                    leg=leg,
+                    order_id=order_id,
+                    attempts=1,
+                )
+                pos_id = attribution.pos_id
+                attribution_status = attribution.status
+                attribution_reason = attribution.reason
+                attribution_evidence = dict(attribution.evidence)
+                # The locally generated key is persisted and never sent. Phase 5
+                # task 1: keep a durable idempotency key of our own, and do not
+                # lean on ``clOrdId`` or ``tag`` as proof of ownership at the
+                # exchange -- the accepted response's ``ordId`` is the order's
+                # only exchange identity, and the experiment showed that merely
+                # *including* the field gets a limit order rejected.
+                client_order_id = str(leg.get("client_order_id") or "")
+                protection_payload = {
+                    key: order_payload[key]
+                    for key in ("tpTriggerPx", "slTriggerPx")
+                    if key in order_payload
+                }
+                protection_response = {
+                    "code": "0",
+                    "data": {"attached_on_order": True},
+                }
+                order_type = "limit"
+            else:
+                order_id = _normalized_trigger_order_id(response)
+                progress.record_confirmed_leg()
+                pos_id = _extract_position_id(response)
+                client_order_id = str(leg.get("client_order_id") or "")
+                protection_payload = {
+                    key: order_payload[key]
+                    for key in ("tpTriggerPx", "slTriggerPx", "tpOrdPx", "slOrdPx")
+                    if key in order_payload
+                }
+                protection_response = {
+                    "code": "0",
+                    "data": {"attached_on_trigger_order": True},
+                }
+                order_type = "trigger_limit"
         else:
             order_payload = build_deepcoin_trigger_order_payload(draft, leg)
             try:
@@ -1523,6 +1675,9 @@ def _submit_recovery_signal_direct(
                 )
             progress.record_confirmed_leg()
             pos_id = _extract_position_id(response)
+            attribution_status = None
+            attribution_reason = ""
+            attribution_evidence = {}
             client_order_id = str(leg.get("client_order_id") or "")
             protection_payload = {
                 key: order_payload[key]
@@ -1537,6 +1692,9 @@ def _submit_recovery_signal_direct(
                 "client_order_id": client_order_id,
                 "order_id": order_id,
                 "pos_id": pos_id,
+                "attribution_status": attribution_status,
+                "attribution_reason": attribution_reason,
+                "attribution_evidence": attribution_evidence,
                 "request": _persisted_order_request(order_payload, leg),
                 "response": response,
                 "protection_request": protection_payload,
@@ -1673,6 +1831,38 @@ def _submission_source_leg_indices(
     return mapped
 
 
+def _attribute_ordinary_entry(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client: DeepcoinTradingClientProtocol,
+    draft: dict[str, Any],
+    leg: dict[str, Any],
+    order_id: str,
+    attempts: int = 5,
+):
+    """Ask the identity equation which position this ordinary order opened.
+
+    Phase 5 promotes phase 4's criterion 2 into the live path: an ordinary
+    order's position is identified by that order's own ordId, and the answer is
+    only accepted when the stream, REST and the leg's own direction and size all
+    say so. Anything less is ``unverified``, which is what the repository
+    already requires before it will modify, cancel or claim a protection.
+
+    A failure to read is never allowed to become a verdict here either: the
+    resolver reports ``rest_positions_unreadable`` and the leg stays unverified.
+    """
+
+    return resolve_ordinary_entry_attribution(
+        session_factory,
+        deepcoin_client=deepcoin_client,
+        ord_id=str(order_id),
+        inst_id=str(draft["instrument_id"]),
+        expected_position_side=str(leg.get("position_side") or ""),
+        expected_size=leg.get("quantity"),
+        attempts=attempts,
+    )
+
+
 def _has_embedded_trigger_protection(order_payload: dict[str, Any]) -> bool:
     return any(
         order_payload.get(key) not in (None, "")
@@ -1689,6 +1879,7 @@ def _prepare_trigger_protection_intent(
     leg_index: int,
     binding_context: dict[str, Any],
     order_payload: dict[str, Any],
+    order_kind: str = "trigger_limit",
 ) -> int:
     """Create the local entry leg needed to durably identify the intent."""
 
@@ -1717,7 +1908,7 @@ def _prepare_trigger_protection_intent(
             strategy_instance_id=str(draft.get("strategy_instance_id") or trade_signal.strategy_instance_id or ""),
             leg_index=leg_index,
             purpose="entry",
-            order_kind="trigger_limit",
+            order_kind=order_kind,
             client_order_id=str(leg.get("client_order_id") or order_payload.get("clOrdId") or "") or None,
             status="submitting",
             request=_persisted_order_request(order_payload, leg),
@@ -1736,8 +1927,18 @@ def _submit_trigger_with_protection_intent(
     binding_context: dict[str, Any],
     order_payload: dict[str, Any],
     submission_progress: EntrySubmissionProgress,
+    order_kind: str = "trigger_limit",
+    submit: Callable[[dict[str, Any]], Any] | None = None,
 ) -> dict[str, Any]:
-    """Snapshot, persist intent, submit parent, and bind its returned identity."""
+    """Snapshot, persist intent, submit parent, and bind its returned identity.
+
+    Phase 5 moved the plain entry limit leg onto ``POST /deepcoin/trade/order``
+    while leaving every conditional leg on ``trigger-order``. The durable
+    intent, the pre-submit baseline and the one-at-a-time lock are about
+    *attributing the protection orders the parent spawns*, which both endpoints
+    do identically, so they are shared rather than duplicated: ``order_kind``
+    and ``submit`` are the only two things that differ.
+    """
 
     inst_id = str(order_payload.get("instId") or "").upper()
     side = str(order_payload.get("posSide") or order_payload.get("side") or "").lower()
@@ -1765,6 +1966,7 @@ def _submit_trigger_with_protection_intent(
             leg_index=leg_index,
             binding_context=binding_context,
             order_payload=order_payload,
+            order_kind=order_kind,
         )
         request_fingerprint = _trigger_protection_request_fingerprint(order_payload)
         correlation_id = f"trigger-protection:{execution_order_leg_id}"
@@ -1794,12 +1996,12 @@ def _submit_trigger_with_protection_intent(
             session.commit()
         try:
             submission_progress.record_attempt()
-            response = deepcoin_client.trigger_order(order_payload)
+            response = (submit or deepcoin_client.trigger_order)(order_payload)
         except DeepcoinClientError:
             raise
         except Exception as exc:  # pragma: no cover - defensive boundary
             raise DeepcoinClientError(f"Deepcoin client failed: {exc}") from exc
-        parent_order_id = _normalized_trigger_order_id(response)
+        parent_order_id = _normalized_entry_order_id(response, order_kind=order_kind)
         with session_factory() as session:
             intent = (
                 session.query(TriggerProtectionIntent)
@@ -1828,7 +2030,16 @@ def _submit_trigger_with_protection_intent(
             record_execution_event(
                 session_factory,
                 ExecutionEventRecord(
-                    action="create_trigger_entry",
+                    # The parent event names the endpoint that actually placed
+                    # the order, so a migrated limit leg is a
+                    # ``create_limit_entry`` -- the same action the later
+                    # bookkeeping pass records for it, which is what keeps the
+                    # two from writing the event twice.
+                    action=(
+                        "create_limit_entry"
+                        if order_kind == "limit"
+                        else "create_trigger_entry"
+                    ),
                     reason="live_signal_auto_trade",
                     after=_extract_tpsl_snapshot(_persisted_order_request(order_payload, leg)),
                     request=_persisted_order_request(order_payload, leg),
@@ -2154,6 +2365,28 @@ def _optional_snapshot_text(row: dict[str, Any], *keys: str) -> str | None:
     return None
 
 
+def _normalized_entry_order_id(response: Any, *, order_kind: str) -> str:
+    """The exchange's own id for the parent entry order this submission made.
+
+    A trigger order that comes back without one has always raised
+    ``DeepcoinClientError``. An ordinary order that comes back without one is
+    the case phase 5's hard rule 5 names explicitly: the write may well have
+    reached the exchange, so it is ``DeepcoinRequestOutcomeUnknown`` -- which is
+    never resent -- rather than a generic client error.
+    """
+
+    if order_kind == "trigger_limit":
+        return _normalized_trigger_order_id(response)
+    order_id = (
+        _extract_exact_market_order_id(response) if isinstance(response, dict) else None
+    )
+    if not order_id:
+        raise DeepcoinRequestOutcomeUnknown(
+            f"{order_kind} order response missing exact order id"
+        )
+    return order_id
+
+
 def _normalized_trigger_order_id(response: Any) -> str:
     if not isinstance(response, dict):
         raise DeepcoinClientError("Deepcoin trigger order response missing order id")
@@ -2238,13 +2471,30 @@ def _record_submitted_order_legs(
     for order in submitted_orders:
         execution_type = str(order.get("execution_type") or "unknown").lower()
         pos_id = str(order.get("pos_id") or "") or None
+        # The exchange's reply is persisted exactly as it arrived. It carries
+        # ``ordId`` and every other receipt field, and it carries no ``posId``:
+        # that was checked against the creation contract and against every raw
+        # response captured on 2026-09-07. Earlier code wrote this system's own
+        # ``pos_id`` into the stored body, which then read back as though the
+        # exchange had said it -- the circularity phase 5 ends. Nothing is lost
+        # by stopping: an ordinary order's position is identified by the
+        # equation ``order_id == pos_id``, which
+        # ``position_attribution.has_authoritative_persisted_position`` already
+        # checks first and directly.
         stored_response = (
             dict(order.get("response"))
             if isinstance(order.get("response"), dict)
             else {}
         )
-        if pos_id:
-            stored_response["posId"] = pos_id
+        attribution_status = order.get("attribution_status")
+        if attribution_status is None:
+            attribution_status = ATTRIBUTION_VERIFIED if pos_id else None
+        attribution_status = str(attribution_status) if attribution_status else None
+        attribution_evidence = order.get("attribution_evidence")
+        evidence = dict(attribution_evidence) if isinstance(attribution_evidence, dict) else {}
+        reason = str(order.get("attribution_reason") or "")
+        if reason:
+            evidence["refusal_reason"] = reason
         upsert_execution_order_leg(
             session_factory,
             ExecutionOrderLegRecord(
@@ -2257,7 +2507,12 @@ def _record_submitted_order_legs(
                 client_order_id=str(order.get("client_order_id") or "") or None,
                 pos_id=pos_id,
                 status="active" if pos_id else "open",
-                attribution_status="verified" if pos_id else None,
+                attribution_status=(
+                    ATTRIBUTION_VERIFIED
+                    if attribution_status == ATTRIBUTION_VERIFIED
+                    else (ATTRIBUTION_UNVERIFIED if pos_id else None)
+                ),
+                attribution_evidence=evidence or None,
                 request=order.get("request") if isinstance(order.get("request"), dict) else None,
                 response=stored_response or None,
             ),
@@ -2921,10 +3176,11 @@ def _record_submitted_order_events(
         else:
             request = order.get("request") if isinstance(order.get("request"), dict) else {}
             action = "create_limit_entry" if execution_type == "limit" else "create_trigger_entry"
-            if action == "create_trigger_entry" and _trigger_parent_event_exists(
+            if _trigger_parent_event_exists(
                 session_factory,
                 execution_binding_id=binding_id,
                 order_id=base["order_id"],
+                action=action,
             ):
                 continue
             record_execution_event(
@@ -2945,14 +3201,23 @@ def _trigger_parent_event_exists(
     *,
     execution_binding_id: int,
     order_id: str | None,
+    action: str = "create_trigger_entry",
 ) -> bool:
+    """Whether the durable-intent submission already recorded this leg's event.
+
+    The intent path writes the parent event inside its own transaction so a
+    crash between the exchange write and the bookkeeping cannot lose the
+    exchange identity. This is how the bookkeeping pass afterwards recognises
+    that event as already written, for whichever action the leg used.
+    """
+
     if not order_id:
         return False
     with session_factory() as session:
         return (
             session.query(ExecutionEvent.id)
             .filter(ExecutionEvent.execution_binding_id == execution_binding_id)
-            .filter(ExecutionEvent.action == "create_trigger_entry")
+            .filter(ExecutionEvent.action == action)
             .filter(ExecutionEvent.order_id == order_id)
             .first()
             is not None

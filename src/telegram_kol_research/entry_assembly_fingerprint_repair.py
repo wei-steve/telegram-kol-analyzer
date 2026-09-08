@@ -2369,9 +2369,15 @@ def legacy_finalized_execution_legs_match(
         if not isinstance(expected, Mapping) or request is None:
             return False
         order_type = str(expected.get("order_type") or "").lower()
-        expected_kind = {"limit": "trigger_limit", "market": "market"}.get(
-            order_type
-        )
+        # A draft's ``limit`` leg is submitted as an ordinary ``limit`` order
+        # since phase 5, and as a ``trigger_limit`` before it (and still today
+        # whenever the leg carries a real trigger condition). Both spellings
+        # describe the same draft leg, so both are accepted here; a repair must
+        # not decide a pre-cutover binding no longer matches its own draft.
+        expected_kinds = {
+            "limit": frozenset({"trigger_limit", "limit"}),
+            "market": frozenset({"market"}),
+        }.get(order_type)
         if (
             _leg_value(row, "leg_index") != index
             or str(_leg_value(row, "strategy_instance_id") or "")
@@ -2384,8 +2390,8 @@ def legacy_finalized_execution_legs_match(
                     or _leg_value(row, "order_id") != submitted["order_id"]
                 )
             )
-            or expected_kind is None
-            or str(_leg_value(row, "order_kind") or "").lower() != expected_kind
+            or expected_kinds is None
+            or str(_leg_value(row, "order_kind") or "").lower() not in expected_kinds
             or (
                 require_initial_order_identity
                 and (

@@ -605,11 +605,20 @@ def test_health_endpoint_is_localhost_only_and_returns_no_payload(tmp_path):
 # watermark, and projects the health view. ``models`` defines it.
 # ``deepcoin_shadow_binding`` was added by phase 4 and reads it to build the
 # shadow chain -- which drives no decision, takes no authority and issues no
-# exchange write, so the property this test protects ("no exchange decision
-# depends on unverified push data") still holds. Any other reader would break
-# it, which is why this list is explicit rather than a pattern.
+# exchange write.
+#
+# ``deepcoin_ordinary_entry_binding`` was added by phase 5 and is the one reader
+# whose answer does reach a decision, so it is worth being exact about what it
+# may do with the frames. The stream can only ever *withhold* an attribution
+# there, never grant one: a ``Position`` frame is necessary and not sufficient,
+# REST has to confirm the same posId independently, and direction and size have
+# to agree before anything is claimed. So the property this test protects still
+# holds in the direction that matters -- no exchange write is authorised by push
+# data -- while a missing frame is allowed to stop one. Any other reader would
+# break it, which is why this list is explicit rather than a pattern.
 _ALLOWED_INBOX_READERS = frozenset(
     {
+        "deepcoin_ordinary_entry_binding.py",
         "deepcoin_private_ws.py",
         "deepcoin_shadow_binding.py",
         "models.py",
