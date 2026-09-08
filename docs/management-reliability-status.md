@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 3c
-current_step_file: docs/plans/2026-09-07-management-reliability/step-3c-unreadable-env-file.md
-step_status: in_progress              # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 3b
-last_completed_commit: 992a0b5d71c27e79be0b5771801ded45475a4edd
+current_step: 4
+current_step_file: docs/plans/2026-09-07-management-reliability/step-4-ledger-repair.md
+step_status: planned              # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 3c
+last_completed_commit: a6869acf559776c43b608437eb68a88eeadb9874
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -62,6 +62,18 @@ user_decisions_2026_09_07:
 
 执行会话在此追加，格式：`- step-N (日期, 会话ID): 提交 SHA；做了什么；验证结果；遗留问题`。
 
+- step-3c (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（热修，L1）。分支 `mgmt/step-3c-unreadable-env`，代码提交 `a6869acf559776c43b608437eb68a88eeadb9874`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署，2026-09-08T13:42Z）。部署前生产 HEAD `992a0b5d71c27e79be0b5771801ded45475a4edd`（A-3b）为回滚参考；部署前 `active_write_count=0`、在途管理批次 0。全量 **7900 passed / 4 skipped / 0 failed**。
+  **步骤文件的诊断在三处被执行时的只读核实推翻，指挥会话已全部接受并改写了步骤文件**：
+  (1) **抛异常的不是 `telegram_client._load_env_file_values`**。仓库里有**两份**独立的同名实现；生产链是 `context_resolution_worker` → `web_app.reanalyze:4623` → `process_authoritative_message` → `apply_authoritative_assessment` → `message_recognition.apply_authoritative_mimo_payload:2816` → `config.load_multi_target_management_config:269` → **`llm_chat._load_env_file_values`**。只改步骤文件点名的那份，生产一行都不会变。两份都已改。
+  (2) **`llm_chat` 那份早就有 `except PermissionError`，但是按文件名 opt-in 的**，只有 `runtime_incident_agent.env` 进了 `ignore_unreadable_names`。这不是疏漏——它在执行下面 (4) 那条刻意的二分。该参数与两处 opt-in 已删除：一个"让某个调用方保留旧行为"的开关，正是这件事复发的路径。
+  (3) **任务 2 原文（"ingest 只传 config/telegram.env"）作废，未执行**。`web_app` 对 `split_runtime` 已统一给 `load_llm_proxy_config` / `load_strategy_alert_config` / `load_multi_target_management_config` 传 `env_file_paths=[]`，`cli.py` 对 `load_telegram_auth_config` 也是 `all` 用默认、其余传 `[]`——**ingest 现在根本不读该文件**，照原文改反而会让它开始读一个 root 0600 文件。真正的漏洞是 `web_app.reanalyze` 调 `process_authoritative_message` 时**漏传** `multi_target_management_config`（其孪生 `_run_authoritative_processor:4512` 一直传），于是回落到模块默认 `[".env", "config/telegram.env"]`，**每条走上下文重解析的消息都重读一次**。已补传并对齐。
+  (4) **本步推翻了一条被写进测试名字的刻意决定，指挥会话裁定为方案 A + 零成本可见度补偿**：`test_runtime_config_does_not_hide_unreadable_non_secret_config`（引入于 `4b294140`）与相邻两条一起编码了"密钥文件不可读→容忍，非密钥配置不可读→必须抛"的二分。**原则对（必须让人知道），载体错**——在按消息调用的热路径上，"大声"的实现方式变成了让消息处理失败。现在改为无条件 fail-open，可见度由两条零成本载体承担：**每个路径每进程只记一次 WARNING**（这些加载器按消息调用，每次都记会把要报告的事实本身淹没），以及 **deployment-identity health 新字段 `unreadable_config_files`**（该端点有"绝不碰数据库"的既有契约，读一个进程内集合是内存读，契约不破）。只记路径，永不记内容——内容本来就没被读到。那条测试改写为断言新契约，并在 docstring 里保留了它原本要保护的原则。共享记录在新模块 `env_file_readability.py`（两份加载器共用，避免互相 import）。
+  **生产证实修复生效且非空过**：部署后 worker 的 health 直接给出 `unreadable_config_files: ["config/runtime_incident_agent.env", "config/telegram.env"]`——这证明新进程**确实去读了**该文件、发现不可读、跳过并记录，而不是"碰巧没读所以没报错"。**顺带曝光了一件此前完全不可见的事**：`config/runtime_incident_agent.env`（root 0600）worker 也读不了，它一直被旧白名单静默跳过，行为未变，只是从此可见。
+  **观察（L1，15 分钟或 5 条消息取先到）**：`13:44:22Z` 起 120 秒内 **6 条真实消息、5 个作业成功、0 个失败、journal 中 `PermissionError.*telegram.env` 计数 0**，三角色全程 200、HEAD 恒为 a6869acf。日志 `/root/evidence/step3c-observation.log`。
+  **只读统计（journal 保留至 08-23，窗口完整覆盖）**：自首次发生 2026-09-04 12:45Z 起共 38 条报错，按"报错后紧邻的 raw_message_id"关联出 25 条、涉 **7 个 raw id**：12798、14825、14830、14836、14840、15449、15450。**其中 6 个重试后最终成功**；唯一永久失败的是 **raw 14825**（作业 `failed`、5 次尝试、1 次 attempt 落 `uncertain`），内容是 09-04 12:33:29 的「底仓全部止盈出局」，识别为 `close_signal / full_exit` 指向 lifecycle 1076。**无交易影响**：lifecycle 1076（SOL 空）的 `execution_binding_id` 为 NULL，是纯纸面跟踪、交易所侧本就无仓位，且已于 12:34:56 标记 `exited`——这是账面处理失败，不是漏平仓。调用点普查与统计明细见 `/root/evidence/step3c-env-callsite-survey.md`。
+  **未改服务器上任何文件权限与属主**（那是用户的决定）；两个文件当前仍是 `root` 0600，代码侧 fail-open 后不再影响消息处理。
+  **遗留（本步新发现，指挥裁定记录不修）**：`app_logging.configure_application_logging` 对 `telegram_kol_research` 这个 logger 设 `propagate = False` 且**进程内永久生效**。只要 `test_app_logging.py` 在同一进程里先跑过，任何后续测试的 `caplog`（挂在 root logger）就再也收不到本包日志——本步两条日志断言最初正是这样在全量里偶发失败、单跑却通过。已改为在模块自身 logger 上挂 handler 规避，**未动 `app_logging`**。别的会话写日志断言时会踩同一个坑。
+  **另一条过程教训**：`journalctl --since` 按主机**本地时区**解析，而数据库存 UTC。监视器一开始对两者传同一个字符串，把重启前旧进程（PID 3186969，最后一次 13:40:47Z）的 12 次报错算进了部署后窗口，一度误报"缺陷仍在"。核对 PID 与时间戳后确认新进程零次；监视器已改为同时维护 UTC 与本地两个时间串。后续步骤在服务器上做时间窗统计时需要注意这一点。
 - step-3b (2026-09-08, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**。分支 `mgmt/step-3b-contact-digits`，代码提交 `992a0b5d71c27e79be0b5771801ded45475a4edd`（已 fast-forward 进 `codex/deepcoin-auto-trading-v1` 并部署，2026-09-08T12:11Z）。部署前生产 HEAD `1c132f7c991cade3ef4169ca0860836ef801d4ac` 为回滚参考；部署前 `active_write_count=0`、在途管理批次 0。其后 `21cb1c29`/`279940c4` 两个提交只含测试与文档，**生产代码与 992a0b5d 完全一致，不需要重新部署**。
   **根因是两条彼此独立的注入路径，任务 1 同时堵住**：(1) `message_recognition._extract_explicit_stop_loss_from_management_text` 的第一条正则允许 `止损` 与数字之间隔 20 个非数字字符，而 `！\n@Tarderfengge QQ:` 正好 19 个；(2) `management_directives._text_contains_explicit_stop_value` 用"数字前 32 字符内出现止损词"确认模型给的值，同一签名同样成立——**文本 provenance 能证明数字来自哪里，永远不能证明它是什么**。只堵一条另一条仍会复发，两条各有独立回归用例（指挥会话要求）。
   **做法**：新模块 `contact_digit_scrubbing.py`，在**抽取输入**上脱除 QQ／扣扣／微信·VX·weixin·wechat·v信／电话·手机／`@handle`／≥9 位纯数字串；**不改保存的原文，不影响识别的其他字段**。脱除是**等长替换**（每个被脱字符变一个空格，**换行保留**）——下游有 20 字符邻近窗口、32 字符 provenance 窗口和按行抽取，等长且保行才能保证幸存数字与标签的距离一分不差。刻意的两条边界：`QQQ`/`QQQUSDT` 是真实标的，第三个 Q 即否决匹配（生产文本里实有 `qqqusdt现在的价格是：718.6`）；`@2530` 是带 at 号的价格而非 handle，因 Telegram 用户名不能以数字开头而被保留。接入点：上述两条路径 + `_extract_entry_confirmation_price` + `_extract_labeled_entry_text` + 数量抽取 `_percentage_values`；`_clean_bitcoin_junzhang_text` 原本自带一份同规则的私有副本，改为复用同一实现。
