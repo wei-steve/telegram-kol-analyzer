@@ -16,7 +16,7 @@
 ## 任务
 
 1. 白名单：把上述三类加入默认白名单（代码默认值），并让 `context_worker_exhausted` 只在
-   `operation` 以 `raw_message_` 开头时投递，避免 1466 条历史噪音。**历史积压不补发**：投递器只处理
+   `operation` 以 `raw_message_` 开头时投递（实测现存积压全部带该前缀，过滤只对未来的 backfill/scanner 来源有效；挡住历史积压的唯一承重是 AFTER_ID 水位线）。**历史积压不补发**：投递器只处理
    本步部署之后新产生的事件（用现有 `AFTER_ID` 机制，部署时把门槛设为当前最大 id，记进证据）。
 2. 权威执行落成 `uncertain` 时生成一条 `runtime_incidents`（类型 `authoritative_execution_uncertain`，
    severity high，summary 含 raw_message_id、error_summary、attempt id），并纳入白名单。
