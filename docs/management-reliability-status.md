@@ -14,8 +14,8 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 3
 current_step_file: docs/plans/2026-09-07-management-reliability/step-3-deferred-resume-and-backlog.md
-step_status: planned              # planned | claimed | in_progress | completed | blocked
-claimed_by: null
+step_status: claimed              # planned | claimed | in_progress | completed | blocked
+claimed_by: local_9b3a4352-d3b3-4431-a00c-e159c4db1860
 last_completed_step: 2
 last_completed_commit: ca66a2d5c095c22313d6009b9a61048840a88800
 user_decisions_2026_09_07:
