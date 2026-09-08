@@ -57,6 +57,11 @@ action 全是 `auto_trade_skipped`、status=skipped、order_id/client_order_id/p
 修法：`hazardous_event` 判据必须要求事件带交易所身份（order_id 或 client_order_id 或 pos_id 非空）或 action 属于
 写入类白名单；`auto_trade_skipped` 及其他 skipped/blocked 类 action 不算危险。加以 3501/3589/3796/3967 为固定用例的回归测试。
 
+### 9. 观察项（3d 遗留）
+
+下一次 `adjacent_entry_context_pending` 推迟出现时，恢复器要么到点释放它、要么在 deadline 产生 `entry_admission_expired`
+并送达，两者都会留痕；本步观察窗内若出现，记入证据作为 3d 的实盘样本。
+
 ## 禁止
 
 - 不改止盈单价格或数量；只改主止损单数量且只能改小到等于在仓量。
