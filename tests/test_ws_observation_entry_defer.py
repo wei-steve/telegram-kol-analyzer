@@ -547,3 +547,75 @@ def test_the_contract_carries_the_same_deadline_as_the_item(tmp_path, monkeypatc
         assert contract.deadline_at == (
             NOW + ENTRY_ADMISSION_EXECUTION_DEADLINE
         ).replace(tzinfo=None)
+
+
+def test_the_ws_reason_code_never_costs_us_the_detailed_summary():
+    """A refused detailed summary would drop the group, deadline and reason.
+
+    The alert is the whole operator-facing outcome of an expired entry, and the
+    new reason code has to survive the same opaque-token heuristic the deadline
+    label already tripped once.
+    """
+
+    from telegram_kol_research.runtime_incident_adapters import (
+        _deadline_label,
+        _summary,
+    )
+    from telegram_kol_research.runtime_incidents import (
+        _validate_redacted_json_contract,
+    )
+
+    moment = datetime(2026, 1, 1, 0, 0)
+    for step in range(400):
+        deadline = moment + timedelta(hours=step * 8 + step)
+        summary = _summary(
+            component="entry_admission",
+            source_status="expired",
+            reason_code=WS_OBSERVATION_DEFER_REASON,
+            operation="instruction_item_5",
+            raw_message_id=1,
+            chat_id=-1002409877375,
+            deadline_at=_deadline_label(deadline),
+            impact="entry_never_submitted",
+        )
+        _validate_redacted_json_contract("redacted_summary", summary)
+
+
+def test_a_real_incident_row_lands_for_an_expired_ws_deferral(tmp_path, monkeypatch):
+    """No injected reporter: the default path must write the row itself."""
+
+    from telegram_kol_research import runtime_incident_adapters
+    from telegram_kol_research.config import RuntimeIncidentConfig
+    from telegram_kol_research.models import RuntimeIncident
+
+    session_factory = create_session_factory(tmp_path / "ws-incident.db")
+    deadline = NOW + timedelta(hours=6)
+    item_id = _persist_ws_deferred_entry(session_factory, deadline_at=deadline)
+    monkeypatch.setattr(
+        runtime_incident_adapters,
+        "load_runtime_incident_config",
+        lambda **_kwargs: RuntimeIncidentConfig(
+            capture_types=frozenset({"entry_admission_expired"})
+        ),
+    )
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=deadline + timedelta(seconds=1),
+        execution_contract_mode="shadow",
+        ws_admission=_admits(False),
+    )
+
+    assert (result.expired, result.incidents) == (1, 1)
+    with session_factory() as session:
+        incident = (
+            session.query(RuntimeIncident)
+            .filter(RuntimeIncident.incident_type == "entry_admission_expired")
+            .one()
+        )
+        assert incident.severity == "high"
+        assert incident.source_record_id == str(item_id)
+        summary = json.loads(incident.redacted_summary)
+        assert summary["reason_code"] == WS_OBSERVATION_DEFER_REASON
+        assert summary["chat_id"] == 500
+        assert summary["impact"] == "entry_never_submitted"
