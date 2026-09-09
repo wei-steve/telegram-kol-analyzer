@@ -11,6 +11,13 @@ VISIBILITY_DEFER_REASONS = frozenset(
         "adjacent_entry_context_pending",
         "target_strategy_binding_not_visible_yet",
         "preceding_entry_context_unresolved",
+        # Phase 6-pre-1. The private stream does not replay on reconnect, so an
+        # entry that arrives during a gap cannot be submitted -- but it also
+        # must not be thrown away, which is what a terminal failure did to
+        # every entry that landed inside a tg-deploy restart. Holding it is a
+        # deferral like the others: nothing was written, and the recheck is the
+        # stream returning to converged health before the entry deadline.
+        "ws_observation_pending",
     }
 )
 

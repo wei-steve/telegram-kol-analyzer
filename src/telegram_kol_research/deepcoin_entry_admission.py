@@ -31,13 +31,22 @@ from __future__ import annotations
 import logging
 import threading
 from collections.abc import Callable
+from datetime import datetime
 from typing import Any
+
+from sqlalchemy import update
 
 from telegram_kol_research.deepcoin_ws_stream_state import (
     ws_observation_permits_new_entry,
 )
 
 logger = logging.getLogger(__name__)
+
+# The defer reason one held entry carries while the stream is not vouching.
+# Registered in ``instruction_execution_outcomes.VISIBILITY_DEFER_REASONS``, so
+# the existing instruction-item defer path and A-3d's
+# ``entry_admission_reconciler`` both recognise it without a second mechanism.
+WS_OBSERVATION_DEFER_REASON = "ws_observation_pending"
 
 # The runtime roles that run ``deepcoin_private_ws`` and therefore must hold a
 # healthy stream before entering. Kept as a constant rather than a setting: this
@@ -123,3 +132,105 @@ def require_ws_observation_permits_new_entry() -> None:
     permitted, reason = ws_observation_admits_new_entry()
     if not permitted:
         raise DeepcoinEntryAdmissionBlocked(reason or "unavailable")
+
+
+def ws_observation_entry_defer_result(
+    session_factory,
+    *,
+    message_instruction_item_id: int | None,
+    now: datetime,
+) -> dict[str, Any] | None:
+    """``None`` to proceed, or the defer result for one entry the stream cannot vouch for.
+
+    Phase 5 refused such an entry outright, and the refusal was terminal: the
+    item read ``failed`` and the intention was gone. Every ``tg-deploy``
+    restart opens a gap of a few seconds, so an entry that arrived inside one
+    died there. This returns the same refusal as a **deferral** instead --
+    nothing is submitted either way, but the entry stays claimable and the
+    reconciler retries it until the stream converges or the entry deadline
+    passes.
+
+    The gate itself is unchanged and still fail-closed: the two checkpoints in
+    the writer (once before submitting, once inside the exchange-write gate)
+    still refuse outright, and this only moves the *first* refusal earlier,
+    before the execution contract has declared an imminent exchange write.
+
+    Without an instruction item there is nothing durable to defer onto -- a CLI
+    recovery submit, a revision replacement -- so this proceeds and leaves the
+    refusal to those two checkpoints, exactly as before.
+    """
+
+    permitted, reason = ws_observation_admits_new_entry()
+    if permitted:
+        return None
+    if message_instruction_item_id is None:
+        return None
+    _ensure_entry_admission_deadline(
+        session_factory,
+        message_instruction_item_id=int(message_instruction_item_id),
+        now=now,
+    )
+    return {
+        "status": "deferred",
+        "reason": WS_OBSERVATION_DEFER_REASON,
+        "ws_observation_reason": str(reason or "unavailable"),
+    }
+
+
+def _ensure_entry_admission_deadline(
+    session_factory,
+    *,
+    message_instruction_item_id: int,
+    now: datetime,
+) -> None:
+    """Stamp the entry deadline once, never extend one the item already holds.
+
+    An adjacent-context defer stamps this in ``_persist_attempt``; a stream gap
+    reaches the item without ever building an attempt row, so the same deadline
+    has to be stamped here or the reconciler would hold the entry forever. The
+    ``IS NULL`` predicate is what keeps a repeated defer from sliding the
+    deadline forward on every recheck.
+
+    The execution contract gets the same deadline, because holding an entry
+    creates a staleness this repository did not have before: a refusal used to
+    be terminal within seconds. With the deadline on the contract,
+    ``prepare_entry_submission_contract`` refuses a stale entry immediately
+    before the writer no matter which recheck released it, so the deadline is
+    enforced on the submit path itself and not only by the reconciler's timer.
+    """
+
+    from telegram_kol_research.entry_assembly_admission import (
+        ENTRY_ADMISSION_EXECUTION_DEADLINE,
+    )
+    from telegram_kol_research.models import (
+        InstructionExecutionContract,
+        MessageInstructionItem,
+    )
+
+    deadline_at = now + ENTRY_ADMISSION_EXECUTION_DEADLINE
+    with session_factory() as session:
+        session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == int(message_instruction_item_id),
+                MessageInstructionItem.execution_deadline_at.is_(None),
+            )
+            .values(execution_deadline_at=deadline_at)
+        )
+        session.flush()
+        item_deadline = session.query(
+            MessageInstructionItem.execution_deadline_at
+        ).filter(
+            MessageInstructionItem.id == int(message_instruction_item_id)
+        ).scalar()
+        if item_deadline is not None:
+            session.execute(
+                update(InstructionExecutionContract)
+                .where(
+                    InstructionExecutionContract.message_instruction_item_id
+                    == int(message_instruction_item_id),
+                    InstructionExecutionContract.deadline_at.is_(None),
+                )
+                .values(deadline_at=item_deadline, updated_at=now)
+            )
+        session.commit()

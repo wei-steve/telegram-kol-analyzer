@@ -12,6 +12,10 @@ from sqlalchemy import and_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_entry_admission import (
+    WS_OBSERVATION_DEFER_REASON,
+    ws_observation_admits_new_entry,
+)
 from telegram_kol_research.entry_assembly_admission import (
     _is_adjacent_entry_context_defer,
     _release_adjacent_entry_visibility_delay,
@@ -47,6 +51,7 @@ def reconcile_due_entry_admissions(
     execution_contract_mode: str = "disabled",
     entry_after_item_id: int = 0,
     incident_reporter: Callable[..., object] | None = None,
+    ws_admission: Callable[[], tuple[bool, str]] | None = None,
 ) -> EntryAdmissionReconcileResult:
     """Release or expire due attempts without invoking any exchange writer.
 
@@ -60,6 +65,13 @@ def reconcile_due_entry_admissions(
     depends on the enforcement semantics that ``live`` switches on (the durable
     mirror convergence, fail-closed contract projection, the terminal-write
     compare-and-set); those stay gated on ``live`` exactly as they were.
+
+    Phase 6-pre-1 adds a second deferral kind to the same loop: an entry held
+    because the private WebSocket could not vouch for it. It carries no
+    ``EntryAssemblyAttempt`` row -- its adjacent context was complete, the
+    stream was not -- so it is selected from the instruction item and its
+    contract alone, and its recheck is the stream's own admission gate rather
+    than the adjacent-context assessment.
     """
 
     if execution_contract_mode == "disabled":
@@ -196,7 +208,174 @@ def reconcile_due_entry_admissions(
             session.commit()
             counts["released"] += 1
 
+    _reconcile_ws_observation_defers(
+        session_factory,
+        now=now,
+        limit=bounded_limit,
+        entry_after_item_id=int(entry_after_item_id),
+        incident_reporter=incident_reporter,
+        ws_admission=ws_admission or ws_observation_admits_new_entry,
+        counts=counts,
+    )
     return EntryAdmissionReconcileResult(**counts)
+
+
+def _is_ws_observation_defer(result_json: str | None) -> bool:
+    try:
+        result = json.loads(result_json or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return False
+    return (
+        isinstance(result, dict)
+        and str(result.get("status") or "") == "deferred"
+        and str(result.get("reason") or "") == WS_OBSERVATION_DEFER_REASON
+    )
+
+
+def _reconcile_ws_observation_defers(
+    session_factory: sessionmaker,
+    *,
+    now: datetime,
+    limit: int,
+    entry_after_item_id: int,
+    incident_reporter: Callable[..., object] | None,
+    ws_admission: Callable[[], tuple[bool, str]],
+    counts: dict[str, int],
+) -> None:
+    """Retry or expire the entries a WebSocket gap is holding.
+
+    Releasing only clears the visibility delay; it never submits and never
+    touches the exchange. The submit path re-runs its own two admission
+    checkpoints afterwards, so a release decided here against a stale stream
+    reading still cannot produce an entry the stream cannot vouch for.
+    """
+
+    with session_factory() as session:
+        item_ids = [
+            int(row_id)
+            for (row_id,) in (
+                session.query(MessageInstructionItem.id)
+                .join(
+                    InstructionExecutionContract,
+                    InstructionExecutionContract.message_instruction_item_id
+                    == MessageInstructionItem.id,
+                )
+                .filter(
+                    MessageInstructionItem.id > int(entry_after_item_id),
+                    MessageInstructionItem.instruction_kind == "entry",
+                    MessageInstructionItem.status == "pending",
+                    MessageInstructionItem.retired_at.is_(None),
+                    MessageInstructionItem.updated_at
+                    <= now - ENTRY_ADMISSION_RECHECK_DELAY,
+                    MessageInstructionItem.result_json.like(
+                        f"%{WS_OBSERVATION_DEFER_REASON}%"
+                    ),
+                    InstructionExecutionContract.state == "deferred",
+                )
+                .order_by(
+                    MessageInstructionItem.updated_at,
+                    MessageInstructionItem.id,
+                )
+                .limit(int(limit))
+                .all()
+            )
+        ]
+    if not item_ids:
+        return
+
+    permitted: bool | None = None
+    for item_id in item_ids:
+        snapshot = _load_ws_defer_snapshot(session_factory, item_id=item_id)
+        if snapshot is None:
+            counts["skipped"] += 1
+            continue
+        item, contract = snapshot
+        deadline = _as_utc(item.execution_deadline_at)
+        if deadline is not None and now >= deadline:
+            if _expire_deferred_entry_truth(
+                session_factory,
+                attempt_id=None,
+                item_id=int(item.id),
+                contract_id=int(contract.id),
+                contract_version=int(contract.state_version),
+                now=now,
+            ):
+                counts["expired"] += 1
+                if _report_entry_admission_expired(
+                    session_factory,
+                    item=item,
+                    deadline_at=deadline,
+                    now=now,
+                    incident_reporter=incident_reporter,
+                ):
+                    counts["incidents"] += 1
+            continue
+        if permitted is None:
+            # One reading per tick: the stream state is process-wide, and
+            # re-reading it per item could release one entry and hold the next
+            # on two different answers within the same pass.
+            permitted = bool(ws_admission()[0])
+        if not permitted:
+            continue
+        if _release_ws_observation_defer(
+            session_factory,
+            item_id=int(item.id),
+            now=now,
+        ):
+            counts["released"] += 1
+        else:
+            counts["skipped"] += 1
+
+
+def _load_ws_defer_snapshot(session_factory, *, item_id: int):
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, int(item_id))
+        if (
+            item is None
+            or item.status != "pending"
+            or item.retired_at is not None
+            or item.instruction_kind != "entry"
+            or not _is_ws_observation_defer(item.result_json)
+        ):
+            return None
+        contract = (
+            session.query(InstructionExecutionContract)
+            .filter(
+                InstructionExecutionContract.message_instruction_item_id
+                == int(item.id)
+            )
+            .one_or_none()
+        )
+        if contract is None or contract.state != "deferred":
+            return None
+        session.expunge(item)
+        session.expunge(contract)
+        return item, contract
+
+
+def _release_ws_observation_defer(
+    session_factory,
+    *,
+    item_id: int,
+    now: datetime,
+) -> bool:
+    """Make one held entry claimable again, or report that it moved on."""
+
+    with session_factory() as session:
+        result = session.execute(
+            update(MessageInstructionItem)
+            .where(
+                MessageInstructionItem.id == int(item_id),
+                MessageInstructionItem.status == "pending",
+                MessageInstructionItem.visibility_next_attempt_at.is_not(None),
+            )
+            .values(visibility_next_attempt_at=None, updated_at=now)
+        )
+        if result.rowcount != 1:
+            session.rollback()
+            return False
+        session.commit()
+        return True
 
 
 def _report_entry_admission_expired(
@@ -303,14 +482,18 @@ def _load_attempt_snapshot(session_factory, *, attempt_id: int):
 def _expire_deferred_entry_truth(
     session_factory,
     *,
-    attempt_id: int,
+    attempt_id: int | None,
     item_id: int,
     contract_id: int,
     contract_version: int,
     now: datetime,
     reason: str = "entry_admission_deadline_expired",
 ) -> bool:
-    evidence_json = '[{"kind":"entry_assembly_attempt"}]'
+    evidence_json = (
+        '[{"kind":"entry_assembly_attempt"}]'
+        if attempt_id is not None
+        else '[{"kind":"message_instruction_item"}]'
+    )
     error_json = json.dumps(
         {"status": "expired", "reason": reason},
         ensure_ascii=False,
@@ -352,18 +535,23 @@ def _expire_deferred_entry_truth(
                 updated_at=now,
             )
         )
-        attempt_result = session.execute(
-            update(EntryAssemblyAttempt)
-            .where(
-                EntryAssemblyAttempt.id == int(attempt_id),
-                EntryAssemblyAttempt.status == "pending",
-            )
-            .values(status="expired", updated_at=now)
-        )
+        # A WebSocket-gap deferral never built an attempt row: its adjacent
+        # context was complete. Expiring one is the contract plus the item, and
+        # demanding a third rowcount would make every such expiry roll back.
+        attempt_rowcount = 1
+        if attempt_id is not None:
+            attempt_rowcount = session.execute(
+                update(EntryAssemblyAttempt)
+                .where(
+                    EntryAssemblyAttempt.id == int(attempt_id),
+                    EntryAssemblyAttempt.status == "pending",
+                )
+                .values(status="expired", updated_at=now)
+            ).rowcount
         if (
             contract_result.rowcount != 1
             or item_result.rowcount != 1
-            or attempt_result.rowcount != 1
+            or attempt_rowcount != 1
         ):
             session.rollback()
             return False
