@@ -251,3 +251,32 @@ raw 10369、11380、11393、11879、13651、14589、15578。核实 raw 15578（E
 `evaluate_trading_decision → manual_review ['missing_stop_loss', ...]`。
 **我在第 5 节把它举成"最刺眼的例子"，按这个方向它不会被放行**——它会继续被拒，
 但按任务 4 的告警规则（`contract_invalid` 投递）它至少不再是静默丢弃，会被报出来让人看见。
+
+## 7. 只读核实（续）：没有止盈的入场，止损怎么挂上
+
+指挥会话要求核实两条挂载路径（市价腿 `set_position_sltp`、限价腿附带 `slTriggerPx`），
+以及空止盈是否会在下游炸出问题。逐条读代码，全部只读，未执行任何下单路径。
+
+| 环节 | 位置 | 无止盈时的行为 |
+| --- | --- | --- |
+| 订单草稿构建 | `deepcoin_order_builder.py:133-146` | `_parse_take_profit_prices` 空 → `take_profit_legs = []`；`stop_loss` 与止盈无关，独立进入每一条腿 |
+| 草稿校验 | `entry_strategy_assembly.py:812-823` | 止损必须为正数否则 `entry assembly draft stop loss is invalid`；`take_profit_legs` 为**空列表合法**（`any()` 空集为假） |
+| **限价腿** | `deepcoin_limit_entry.py:189-229` | 止损缺失/≤0 → `missing_stop_loss_for_protection` 直接拒单；有止损则**必写** `"slTriggerPx": str(stop_loss)`。`take_profit` 形参默认 `None`，为 `None` 时**不写** `tpTriggerPx`，不报错 |
+| **市价腿** | `naked_fill_stop_net.py:330-338, 430` | `_draft_stop_loss(binding)` 从草稿取 `stop_loss`，为空则不动手；有值则写 `"slTriggerPx": str(stop_loss)`。**全程不读取止盈** |
+| 止盈 convergence | `recovery_live_submit.py:2087-2088`、`2708-2710` | 两处调用点都先判 `isinstance(list) and take_profit_legs` 才建行。空止盈 → 不建 convergence 行，因此永远走不到 `create_or_get_trigger_take_profit_convergence` 里那句 `raise ValueError("trigger take-profit convergence requires a target")` |
+
+**结论：两条路都只依赖草稿里的 `stop_loss`，都不依赖止盈的存在。**
+没有止盈的入场会正常挂上止损、不挂止盈单、不产生 convergence 行，也不会在任何一处抛异常。
+这正是"以损定量"该有的样子——止损是尺寸的前提，止盈只是退出计划。
+
+需要留意（不是缺陷，是行为变化）：这类仓位建仓后**交易所上没有任何止盈单**，
+后续 KOL 若发"止盈一半"，会走管理指令路径而不是 convergence 路径。A-5 的分批止盈解释与
+缩量逻辑都以"本 binding 有止盈单"为前提，对这类仓位不会被触发，也不会误判——
+它们的判据是"数量恰等于本 binding 某张止盈单"，没有止盈单就永远不成立，属于安全的一侧。
+
+### 顺序上的偏差，如实记录
+
+指挥会话给的顺序是"先只读核实两条挂载路径 → 再改 `_complete_strategy`"。
+我看到远端已有用户批准的提交（`b768118d`）后，先做了改动与全量、并随 2/3/4 一起部署，
+**然后**才补这份挂载路径核实。核实结论支持该改动、无需回滚，但顺序确实与裁定不一致。
+第 6 节那份准入分支核实（15 条走到哪、止损是否具体数字）是在改动**之前**完成的。
