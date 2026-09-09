@@ -49,6 +49,12 @@ deadline 内 WS 回到 healthy 即提交，到期则走 `entry_admission_expired
 自动复位为 idle 并告警（ALWAYS_NOTIFIED）；(3) `acquire` 见 blocked 时先检查前持有者进程是否仍存活——为此 `_blocked_document()` 必须把 `held` 文档的 `owner_pid` 与 `owner_start_ticks` 一并带过去（目前只留 token_sha256 与 prior_owner_kind，翻成 blocked 后查不出持有者）；idle 文档键集固定为 {schema_version, state, generation, released_at}，任何额外字段会让文档被判非法，复位理由只能写进审计行；
 (4) 授权过期被拒记为确定性拒绝（A-6c 已在边界侧处理）。
 
+## 6-pre-7：新入场路径的租约同形洞（L2）
+
+`recovery_live_submit` 的新入场路径在 `attempted_writes > 0` 时不释放 `entry_revision_exchange_authority`，持有者形如
+`signal:<trade_signal_id>`，没有批次行可证终态，6-pre-6 的收尾扫描明确跳过它。用 `trade_signals` 的终态
+（succeeded / failed / expired / voided 等）做同样的按 generation 归还扫描；运行中的信号不扫；静态守护限制调用者；写审计。
+
 ## 完成条件
 
-六项完成后状态文件 `current_phase: 6`，等待用户对阶段 6 的单独批准（批准前须向用户出示阶段 5 的逐笔保护确认与第 10 项结论）。
+七项完成后状态文件 `current_phase: 6`（顺序：6-pre-5 → 6-pre-7 → 6-pre-4），等待用户对阶段 6 的单独批准（批准前须向用户出示阶段 5 的逐笔保护确认与第 10 项结论）。
