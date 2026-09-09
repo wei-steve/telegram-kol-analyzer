@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 9
+current_step: done
 current_step_file: docs/plans/2026-09-07-management-reliability/step-9-bot-choose-candidate.md
-step_status: in_progress           # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 6b
-last_completed_commit: c0520b944d931e49794301a688880e27e946e12c
+step_status: completed             # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 9
+last_completed_commit: 1ff967c6ee33ea0ca67a9b2a0007bef7537f993d
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -307,3 +307,11 @@ user_decisions_2026_09_07:
   **既有测试按新行为更新一条**：`test_uncertain_authoritative_execution_records_a_high_incident` 断言的 `error_summary` 现在会多带 `no_exchange_write_tracked`，已更新断言。
   **L1 观察（12:11:40Z → 12:26:52Z，按时长达标）**：`elapsed=15m msgs=2 chats=2 uncertain=0 uncertain_no_evidence=0 no_write_alerts=0 guard_stacks=0 guard_info=0 worker_err_lines=0 head=c0520b94`。**证明**：部署健康、15 分钟零错误行。**未证明**：窗内 `uncertain=0`（任务 1 无样本）、`guard_info=0`（护栏一次都没被触发，所以 `guard_stacks=0` 只说明"没发生"，不说明"修好了"）。两条目前只有单测覆盖，已起加长观察器（`/root/evidence/step6b_observe_ext.sh`，停止条件改为"出现新的 uncertain 或出现一次护栏命中"，最长 6 小时），凑到样本后补记。
   **遗留**：(1) 加长观察窗的真实样本核对未完成。(2) `idempotency_key` / `request_fingerprint` / `sCode` / `sMsg` 未入证据，需先裁定是否让执行边界捕获请求负载。(3) 按步骤文件不追溯改那 23 条历史 uncertain 行。
+
+- step-9 (2026-09-09, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L2）。**A 线到此收口**。分支 `mgmt/step-9-bot-choose-candidate`，SHA **`1ff967c6ee33ea0ca67a9b2a0007bef7537f993d`**（13:01:00Z 上线，**回滚参考 `c0520b94`**）。全量 **8114 passed / 4 skipped / 0 failed**，新增 9 个用例。证据 `/root/evidence/step9/observation.md`。
+  **四项任务**：(1) 通知给候选编号并写明回复格式，且**把当时展示的候选列表存进指令项的 `result_json`**——`/choose N` 解析的是操作员看到的那一份，而不是几分钟后重算的集合，否则编号会指向别的仓位。(2) `telegram_bot_commands` 增加 `/choose <raw_message_id> <编号>` 与 `/dismiss <raw_message_id>`，只接受 SYSTEM bot 配置的 chat_id（轮询循环本就丢弃非告警会话，但 `process_system_operator_command` 也可被直接调用，所以授权在函数内再查一次）；`/choose` 把指令项转回 `pending`、写 `result_json.operator_choice`，并把选中的 lifecycle 写回 `SignalCandidate.target_lifecycle_id`（worker 从那里解析目标，只改 `result_json` 会让指令项回到 pending 却指不到任何东西）；`/dismiss` 记 `failed / operator_dismissed`。(3) 超时 `management_confirmation_timeout_minutes` 默认 120，到期前 30 分钟提醒一次（提醒标记写在指令项上，每分钟一次的扫描因此不会发 60 条），到期 `failed / confirmation_timeout` 并通知。(4) `/choose` 接受前**重跑一遍 A-7 的验证**，被拒时指令项仍留在待确认态、不会被悄悄放行，并写一条 `accepted=false` 的审计行。四种结局都写审计行，且都登记进 `NON_EXCHANGE_WRITING_EXECUTION_ACTIONS`（否则审计行会被 A-5 任务 8 当成危险动作、冻住该消息的源删除泳道）。**命令只改指令项与审计，不写交易所。**
+  **L2 观察窗（13:01:00Z → 13:49:48Z）**：48 分钟 / 5 条真实消息 / 3 个群 / 零错误行 / HEAD 恒定，**达标**。窗内出现一条**真实的确认通知**（incident 2086，raw 15660，龚有财群，"英伟达空单有效，可以随意止盈了"，`no_verifiable_target`，13:35:40 送达）。但**该消息没有任何指令项**，所以 `/choose`、`/dismiss`、超时与提醒**都没有真实样本**，四条命令路径目前只有单测覆盖。未在生产上人为制造待确认指令来凑验收。
+  **新发现（本步未修，建议单开）**：`management_target_needs_confirmation` 自 A-7 上线以来**只出现过两条，两条都没有停下任何指令项**（2082/raw 15628 是 A-7 缺陷的产物；2086/raw 15660 是修复后的正常行为）。即 A-7 的闸门在"是否有东西可停"之前就发出了问句，操作员收到一个自己无法回答的问题——`/choose` 会答"没有等待确认的指令项"。**建议**：只有确实停下了至少一条指令项时才发这条通知，一条都没停下时改走 A-8 的 `no_actionable_intent` / `no_target_named` 那类安静记录。风险低（只减通知、不改执行），但方向上是**减少**告警，需裁定后再改。
+  **事件循环阻塞普查**：新路由在异步循环里直接调 `_command_name`，被普查拦下；它是纯字符串切分且同一函数在姊妹回调循环里早已在白名单内，按同样理由登记条目并写明原因，未为让测试变绿而改写结构。
+  **附带的定点账本修复（同日，L3）**：改单批次 7（raw 15633）。只读复核交易所：单 `1001125173252446` 已不在挂单、history `uTime=09:51:05Z / triggerTime=0 / errorCode=0`（触发前撤单、零成交）；单 `1001125173252560` 仍挂着（81910 / sz 6 / 止损 83000），用户决定保留。工具 `one_off/revision_batch_7_alignment_2026_09_09.py`（提交 `76ab2ac04ee4d185a74b19441be9d7c3dee7a66e`）：leg 591 `pending → cancelled` + `terminal_reason=revision_cancel_confirmed_by_history`（history 行原样存进证据字段），revision leg 12 → `cancelled`，批次 7 → `resolved / operator_kept_remaining_leg`；**leg 592 一个字段未动**。审计行 3969–3972，前后 `quick_check` 均 ok，**未对交易所写入**。备份 `/root/evidence/step9-fix/research-backup-20260909T130443Z.db`（980,090,880 字节），按保留规矩开始前先删掉最早那份（step6，删前记了路径/大小/sha256 前 12 位 `00551edd9b21`），演练副本用完即删；副本上连跑三次验证幂等（改 3 处 → 零改动 → 审计行数不变），生产与演练逐行一致。SYSTEM bot 已发一条通知（message_id 4086）。
+  **A 线遗留**：(1) 上面那条"确认通知停不下任何指令项"的建议待裁定。(2) A-8 与 A-6b 的加长观察器仍在等真实样本（A-8 146 分钟 / 14 条消息仍无新码与新入场候选；A-6b 98 分钟 / 10 条消息仍无 uncertain 与护栏命中），拿到样本后补记。(3) A-6b 的 `idempotency_key` / `request_fingerprint` / `sCode` 未入证据，需先裁定是否让执行边界捕获请求负载。(4) A-8 的"真的丢了指令"区间 10–23 条按裁定不再收紧。(5) A-5d 剩余梯子策略与开关收敛清单转入后续独立排期。
