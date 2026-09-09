@@ -30,6 +30,9 @@ from telegram_kol_research.entry_revision_exchange_authority import (
 from telegram_kol_research.naked_fill_stop_net import (
     reconcile_naked_market_fills,
 )
+from telegram_kol_research.revision_cancel_confirmation import (
+    reconcile_unknown_revision_cancels,
+)
 from telegram_kol_research.entry_admission_reconciler import (
     reconcile_due_entry_admissions,
 )
@@ -2881,6 +2884,16 @@ def run_operator_maintenance_tick(
         # is configured. Its exceptions are caught and logged here because the
         # loop that drives this tick swallows exceptions wholesale -- a safety
         # net that fails silently is worse than none.
+        try:
+            # Phase 6-pre-5. A batch frozen by a lost cancel receipt asks the
+            # exchange what actually happened; it writes nothing there itself.
+            reconcile_unknown_revision_cancels(
+                session_factory,
+                deepcoin_client=execution_reconciliation_client,
+                now=now,
+            )
+        except Exception:
+            logger.warning("revision_cancel_reconcile_tick_failed", exc_info=True)
         try:
             reconcile_naked_market_fills(
                 session_factory,

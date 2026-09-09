@@ -27,7 +27,13 @@ from telegram_kol_research.models import (
 PENDING_ENTRY_STATES = frozenset({"pending", "submitted", "open", "active"})
 FILLED_ENTRY_STATES = frozenset({"filled", "partial_closed"})
 TERMINAL_REVISION_STATES = frozenset(
-    {"succeeded", "recovery_required", "failed", "blocked"}
+    # ``resolved`` is here as of 6-pre-5. A batch an operator settled by hand
+    # -- batch 7 on 2026-09-09, where the user chose to keep one resting leg --
+    # was protected only by the caller checking ``planned.status != "planned"``.
+    # That is protection in the wrong place: any other caller reaching
+    # ``advance_strategy_revision`` directly would have resumed the batch and
+    # cancelled the leg the user asked to keep. The refusal belongs here.
+    {"succeeded", "recovery_required", "failed", "blocked", "resolved"}
 )
 REPLACEMENT_WRITE_BOUNDARY_STATES = frozenset(
     {"submitting_replacements", "reconciling"}

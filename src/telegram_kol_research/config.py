@@ -179,6 +179,11 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # and the idle document's key set is fixed, so the alert and the audit
         # row are the only places the reason can live.
         "entry_revision_authority_blocked_reset",
+        # Phase 6-pre-5: a cancel receipt was lost and neither the pending list
+        # nor the history could settle what the exchange did. The batch stays
+        # frozen and nothing is resent, so the only way this gets resolved is a
+        # person reading the exchange.
+        "revision_cancel_outcome_unresolved",
         # A-2: the management-instruction failures. Production's hand-edited
         # list named none of these, so a durably failed instruction left a
         # ledger row and no message for weeks. Delivery of
