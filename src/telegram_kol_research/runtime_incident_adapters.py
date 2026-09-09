@@ -469,6 +469,56 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_uncertain_without_write(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    attempt_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    error_class: str | None,
+    error_summary: str | None,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture an ``uncertain`` freeze with no exchange write behind it (A-6b).
+
+    Since A-6 an execution that crossed the boundary and then refused on its
+    own terms ends in ``failed_safe``, carrying its evidence. So this
+    combination should no longer occur, and if it does the boundary has either
+    stopped tracking writes or something reached the venue outside it. Both
+    leave a position whose real state nobody can read off the ledger, which is
+    why this cannot be silenced by an environment whitelist.
+    """
+
+    if not config.captures("uncertain_without_write"):
+        return None
+    fixed = {
+        "component": "authoritative_execution",
+        "source_status": "uncertain",
+        "reason_code": "no_exchange_write_tracked",
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+        "attempt_id": int(attempt_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="authoritative_execution_attempt",
+        source_record_id=str(int(attempt_id)),
+        incident_type="uncertain_without_write",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            error_type=_safe_label(error_class),
+            error_summary=_safe_sentence(error_summary),
+            impact="frozen_without_evidence_of_contact",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_deferred_instruction_expired(
     session_factory: sessionmaker,
     *,

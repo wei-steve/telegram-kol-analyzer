@@ -5604,23 +5604,35 @@ def resolve_context_once(
         *,
         retrying: bool = False,
     ) -> dict[str, Any]:
-        result = process_authoritative_message(
-            session_factory,
-            raw_message_id=raw_message_id,
-            ai_recognition_config=ai_config,
-            media_root=media_root,
-            auto_trade_executor=None,
-            context_resolver=resolve_contextual_strategy,
-            exchange_state_provider=lambda message_id, candidate_thread_ids=None: build_redacted_exchange_state(
-                session_factory,
-                message_id,
-                candidate_thread_ids=candidate_thread_ids,
-            ),
-            reuse_current_evidence=True,
-            resume_completed_execution=retrying,
-            execution_owner=execution_owner,
-            execution_registry=execution_registry,
+        from telegram_kol_research.recognition_decisions import (
+            AuthoritativeExecutionInProgress,
         )
+
+        try:
+            result = process_authoritative_message(
+                session_factory,
+                raw_message_id=raw_message_id,
+                ai_recognition_config=ai_config,
+                media_root=media_root,
+                auto_trade_executor=None,
+                context_resolver=resolve_contextual_strategy,
+                exchange_state_provider=lambda message_id, candidate_thread_ids=None: build_redacted_exchange_state(
+                    session_factory,
+                    message_id,
+                    candidate_thread_ids=candidate_thread_ids,
+                ),
+                reuse_current_evidence=True,
+                resume_completed_execution=retrying,
+                execution_owner=execution_owner,
+                execution_registry=execution_registry,
+            )
+        except AuthoritativeExecutionInProgress as guard:
+            # A-6b, same expected state the web path reports rather than raises.
+            return {
+                "status": "execution_in_progress",
+                "comparison_status": guard.comparison_status,
+                "raw_message_id": guard.raw_message_id,
+            }
         if result.assessment.agreement_status == "authoritative_failed":
             raise RuntimeError(
                 result.assessment.mimo.error_message

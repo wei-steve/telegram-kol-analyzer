@@ -394,6 +394,11 @@ def build_execution_boundary_outcome(
             "kind": "deepcoin_write",
             "method": str(item["method"]),
             "ordinal": int(item["ordinal"]),
+            # A-6b: without the per-write outcome, a frozen attempt cannot say
+            # whether a request reached the venue and went unanswered or was
+            # definitely rejected -- which is the whole question a person has
+            # to settle by hand afterwards.
+            "outcome": str(item.get("outcome") or "started"),
             **(
                 {"order_id": str(item["order_id"])}
                 if item.get("order_id") is not None

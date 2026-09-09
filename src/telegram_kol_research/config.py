@@ -224,6 +224,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # real management instructions on live positions. Silence was the
         # defect, so it cannot be re-enabled by editing an env line.
         "authoritative_recognition_failed",
+        # A-6b: an attempt frozen as ``uncertain`` with no exchange write
+        # tracked behind it. Since A-6 that combination should be impossible --
+        # a refusal with no writes ends in ``failed_safe`` -- so its appearance
+        # means the boundary lost sight of a write, and the position's real
+        # state cannot be read off the ledger.
+        "uncertain_without_write",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to

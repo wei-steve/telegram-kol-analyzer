@@ -295,7 +295,11 @@ def test_uncertain_authoritative_execution_records_a_high_incident(
         summary = json.loads(row.redacted_summary)
         assert summary["raw_message_id"] == raw_id
         assert summary["attempt_id"] == claim.attempt_id
-        assert summary["error_summary"] == "read timed out after submit"
+        # A-6b appends the label when the freeze tracked no exchange write, so
+        # the incident says which of the two situations this was.
+        assert summary["error_summary"] == (
+            "read timed out after submit no_exchange_write_tracked"
+        )
         assert summary["operation"] == f"raw_message_{raw_id}"
     # The type is in the baseline, so a configured whitelist delivers it.
     assert load_runtime_incident_config(

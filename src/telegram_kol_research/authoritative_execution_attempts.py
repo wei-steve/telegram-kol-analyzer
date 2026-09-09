@@ -422,6 +422,13 @@ def fail_safe_authoritative_execution_attempt(
         return True
 
 
+#: Appended to ``error_summary`` when a frozen attempt tracked no exchange
+#: write at all. "We sent something and never heard back" and "we sent nothing"
+#: are the two situations a person has to tell apart by hand afterwards, and
+#: for twenty-three production rows the attempt said neither.
+NO_WRITE_TRACKED = "no_exchange_write_tracked"
+
+
 def mark_authoritative_execution_uncertain(
     session_factory,
     *,
@@ -430,8 +437,22 @@ def mark_authoritative_execution_uncertain(
     uncertain_at: datetime,
     error_class: str | None,
     error_summary: str | None,
+    evidence_refs: list[dict[str, Any]] | None = None,
 ) -> bool:
-    """Freeze an exact post-boundary attempt; it is never made replayable."""
+    """Freeze an exact post-boundary attempt; it is never made replayable.
+
+    A-6b. ``evidence_refs`` is what the execution boundary tracked: one row per
+    exchange write, with the method and that write's own outcome. Every one of
+    the twenty-three uncertain rows since 2026-09-04 had ``evidence_refs_json``
+    empty, so nothing on the row could say whether the venue had been contacted
+    -- and the A-7 monitor's ``uncertain_no_evidence`` counter could never
+    reach zero.
+
+    An empty list is written as ``[]`` rather than left NULL, and says so in
+    ``error_summary``: since A-6, a refusal with no writes behind it ends in
+    ``failed_safe``, not here, so an uncertain with no write is now a
+    contradiction worth alarming on rather than a silence.
+    """
 
     require_recognition_execution_schema(session_factory)
     with session_factory() as session:
@@ -461,10 +482,19 @@ def mark_authoritative_execution_uncertain(
         if int(decision_result.rowcount or 0) != 1:
             session.rollback()
             return False
+        writes = [
+            ref
+            for ref in (evidence_refs or [])
+            if str(ref.get("kind") or "") == "deepcoin_write"
+        ]
+        summary = str(error_summary or "")
+        if not writes:
+            summary = f"{summary} {NO_WRITE_TRACKED}".strip()
         row.status = "uncertain"
         row.exchange_effect = "outcome_unknown"
         row.error_class = _bounded(error_class, 128)
-        row.error_summary = _bounded(error_summary, 512)
+        row.error_summary = _bounded(summary, 512)
+        row.evidence_refs_json = _evidence_json(list(evidence_refs or []))
         row.uncertain_at = uncertain_at
         row.completed_at = uncertain_at
         row.updated_at = uncertain_at
@@ -476,9 +506,62 @@ def mark_authoritative_execution_uncertain(
         raw_message_id=raw_message_id,
         occurred_at=uncertain_at,
         error_class=error_class,
-        error_summary=error_summary,
+        error_summary=summary,
     )
+    if not writes:
+        _capture_uncertain_without_write(
+            session_factory,
+            attempt_id=int(attempt_id),
+            raw_message_id=raw_message_id,
+            occurred_at=uncertain_at,
+            error_class=error_class,
+            error_summary=summary,
+        )
     return True
+
+
+def _capture_uncertain_without_write(
+    session_factory,
+    *,
+    attempt_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    error_class: str | None,
+    error_summary: str | None,
+) -> None:
+    """Alarm on a freeze that contradicts A-6's own rule.
+
+    Since A-6, an execution that crossed the side-effect boundary and then
+    refused on its own terms ends in ``failed_safe`` with its evidence, not
+    here. So an ``uncertain`` with no tracked write means either the boundary
+    stopped tracking or something reached the venue outside it -- both worth a
+    person's attention, and neither visible from the row itself before A-6b.
+
+    Like the freeze incident above, this never fails the freeze: it runs after
+    the commit and swallows its own errors.
+    """
+
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_uncertain_without_write,
+        )
+
+        capture_uncertain_without_write(
+            session_factory,
+            config=load_runtime_incident_config(),
+            attempt_id=attempt_id,
+            raw_message_id=raw_message_id,
+            occurred_at=occurred_at,
+            error_class=error_class,
+            error_summary=error_summary,
+        )
+    except Exception as exc:  # pragma: no cover - defensive
+        logger.warning(
+            "Uncertain-without-write incident capture failed open: attempt=%s error=%s",
+            attempt_id,
+            type(exc).__name__,
+        )
 
 
 def _capture_uncertain_incident(

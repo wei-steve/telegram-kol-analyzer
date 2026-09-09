@@ -63,7 +63,17 @@ def test_boundary_envelope_records_confirmed_write_without_persisting_payload():
     )
 
     assert outcome.exchange_effect == "confirmed_applied"
-    assert outcome.evidence_refs == ({"kind": "deepcoin_write", "method": "place_order", "ordinal": 1, "order_id": "order-7"},)
+    assert outcome.evidence_refs == (
+        {
+            "kind": "deepcoin_write",
+            "method": "place_order",
+            "ordinal": 1,
+            # A-6b: the per-write outcome rides along, so a frozen attempt can
+            # say whether the venue answered.
+            "outcome": "confirmed_applied",
+            "order_id": "order-7",
+        },
+    )
     assert "api_key" not in repr(outcome)
 
 

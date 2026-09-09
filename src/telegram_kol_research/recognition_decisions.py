@@ -15,6 +15,27 @@ from sqlalchemy.orm import Session, sessionmaker
 from telegram_kol_research.models import RawMessage, RecognitionDecision, utc_now
 
 
+class AuthoritativeExecutionInProgress(RuntimeError):
+    """The message is already being executed, or is frozen as uncertain.
+
+    A-6b. This is an expected state, not a fault: the guard exists so a
+    reanalysis cannot overwrite a decision whose execution has crossed the
+    side-effect boundary. It was a bare ``RuntimeError``, so the only way to
+    tell it from a real failure was to match its message text -- and nobody
+    did, which is why ``context_resolution_worker`` logged a full stack for
+    every one of them, twelve in one thirty-minute window. It stays a
+    ``RuntimeError`` so existing handlers behave exactly as they did.
+    """
+
+    def __init__(self, *, raw_message_id: int, comparison_status: str) -> None:
+        super().__init__(
+            "authoritative execution is already in progress or outcome is uncertain"
+        )
+        self.raw_message_id = int(raw_message_id)
+        self.comparison_status = str(comparison_status)
+
+
+
 @dataclass(frozen=True)
 class RecognitionDecisionRecord:
     raw_message_id: int
@@ -88,8 +109,9 @@ def _save_terminal_authoritative_decision_in_session(
         return row
 
     if row.comparison_status in {"execution_running", "execution_uncertain"}:
-        raise RuntimeError(
-            "authoritative execution is already in progress or outcome is uncertain"
+        raise AuthoritativeExecutionInProgress(
+            raw_message_id=int(row.raw_message_id),
+            comparison_status=str(row.comparison_status),
         )
 
     observed_status = row.comparison_status
@@ -202,8 +224,9 @@ def save_pending_authoritative_decision(
             return row
 
         if row.comparison_status in {"execution_running", "execution_uncertain"}:
-            raise RuntimeError(
-                "authoritative execution is already in progress or outcome is uncertain"
+            raise AuthoritativeExecutionInProgress(
+                raw_message_id=int(row.raw_message_id),
+                comparison_status=str(row.comparison_status),
             )
 
         observed_status = row.comparison_status

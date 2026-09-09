@@ -153,6 +153,9 @@ from telegram_kol_research.group_config import GroupConfig
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
+from telegram_kol_research.recognition_decisions import (
+    AuthoritativeExecutionInProgress,
+)
 from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
@@ -4624,7 +4627,36 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
         retrying: bool = False,
     ) -> dict[str, Any]:
         ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
-        result = process_authoritative_message(
+        try:
+            result = _reanalyze_once(raw_message_id, ai_config, retrying=retrying)
+        except AuthoritativeExecutionInProgress as guard:
+            # A-6b: expected, not a fault. The execution that owns this message
+            # crossed the side-effect boundary; a reanalysis must not overwrite
+            # its decision, and the caller finishing this claim is the correct
+            # end of the road. Logging a stack for it filled the worker's error
+            # log twelve times in one thirty-minute window.
+            logger.info(
+                "context reanalysis skipped, execution owns the message "
+                "raw_message_id=%s comparison_status=%s",
+                guard.raw_message_id,
+                guard.comparison_status,
+            )
+            return {
+                "status": "execution_in_progress",
+                "comparison_status": guard.comparison_status,
+                "raw_message_id": guard.raw_message_id,
+            }
+        if result.assessment.agreement_status == "authoritative_failed":
+            raise RuntimeError(
+                result.assessment.mimo.error_message
+                or "context reanalysis failed"
+            )
+        return {
+            "status": str(result.automation.get("status") or "completed"),
+        }
+
+    def _reanalyze_once(raw_message_id: int, ai_config, *, retrying: bool):
+        return process_authoritative_message(
             app.state.session_factory,
             raw_message_id=raw_message_id,
             ai_recognition_config=ai_config,
@@ -4649,14 +4681,6 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
             execution_owner=app.state.recognition_execution_owner,
             execution_registry=app.state.recognition_execution_registry,
         )
-        if result.assessment.agreement_status == "authoritative_failed":
-            raise RuntimeError(
-                result.assessment.mimo.error_message
-                or "context reanalysis failed"
-            )
-        return {
-            "status": str(result.automation.get("status") or "completed"),
-        }
 
     def is_eligible(raw_message_id: int) -> bool:
         with app.state.session_factory() as session:

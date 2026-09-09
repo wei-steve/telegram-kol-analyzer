@@ -2199,6 +2199,10 @@ def _run_leased_authoritative_execution(
                 uncertain_at=datetime.now(UTC),
                 error_class="ExecutionBoundaryOutcomeUnknown",
                 error_summary=boundary.reason_code or boundary.raw_status,
+                # A-6b: the boundary knows which writes it made and how each
+                # one ended; the frozen row is the only place a person can read
+                # that afterwards.
+                evidence_refs=list(boundary.evidence_refs),
             ):
                 raise RuntimeError("authoritative_uncertain_transition_failed")
             raise RuntimeError("authoritative_execution_outcome_unknown")
