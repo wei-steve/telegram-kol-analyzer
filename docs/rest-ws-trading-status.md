@@ -13,13 +13,13 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-2
+current_phase: 6-pre-3
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+claimed_by:
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -530,6 +530,68 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   `strategy_management_planner`；陈旧指令项 1022/1023 按指挥会话裁定交 A 线 step 6 会话处理，本会话未动。
 - writer-allowlist-3 (2026-09-09, 指挥会话知情记录): 仓库架构不变量 test_all_position_writes_cross_the_exact_gateway 的写入者白名单 ALLOWED_WRITER_PATHS 由 position_mutation_gateway.py、deepcoin_client.py 两个文件扩为三个，新增 naked_fill_stop_net.py（6-pre-2 裸仓安全网的最小止损写入器）。放行理由：只构造含 slTriggerPx 的 set-position-sltp、每笔单最多一次、四条前置缺一不可、写前耐久意图 + 写入前重验 + 回读确认、不认领所有权、经写限流器；反向约束测试断言白名单恰好三个文件。既有三道所有权门（require_verified_position_ownership / exact_position_write_gate / _load_verified_binding）一行未改。
 - phase-6-pre-2-ruling (2026-09-09, 指挥会话): 既有 set-position-sltp 路径三道门都要求 verified 所有权，安全网不得在其上开口子；裁定新增只服务安全网的旁路 authority 构造器（前置 (a) 市价腿 unverified、(b) 成交满 60 秒、(c) 该 instId+side 恰有一个无人认领且数量相等的活跃仓位、(d) 快照完整），只能构造 include_take_profit=False 的止损写入，静态守护测试保证只有安全网模块能用；不加运行时开关；每次触发留 critical 告警、审计行、attribution 标记三处痕迹；跑在 worker 5 秒运维 tick，异常单独捕获。事实更正：现有代码在 unverified 时已尝试挂止损但被所有权门拒绝（position_protection_failed_after_entry_submitted）。
+- phase-6-pre-2-completed (2026-09-09, 会话 local_4a6676b0): 市价成交裸仓安全网 B-5d 上线。
+  提交 **`90b663116342394fc62b292e2ef6efc917be6199`**，2026-09-09T05:39Z 经 tg-deploy 上线。
+  **回滚参考 `6e6241911b85892e6f14f12ce0a4cd558ae4c681`（6-pre-1），但已不能单独回滚**：
+  A 线随后部署了 step-8 与 6b，生产 HEAD 现为 `c0520b94`（`90b66311` 是它的祖先，本阶段代码在线）。
+  回到 `6e624191` 会同时撤掉 A 线那批工作，要单独撤本阶段须另做 revert 提交。
+  **实现形状与阶段文件不同，原因是只读核实推翻了它的前提**：文件说"走既有 position_mutation_gateway 与
+  set-position-sltp 路径"，做不到——那条路在**三处独立**拒绝 unverified 仓位
+  （`build_position_mutation_authority` → `require_verified_position_ownership`；调用方的
+  `exact_position_write_gate`；以及 `set_exact_position_sltp` 内部的 `_load_verified_binding`，
+  它要求 `attribution_status` 逐字等于 `verified` 并**再调一次**所有权检查）。
+  复用就必须削弱其中之一，即硬性禁止第 7 条与 ARCHITECTURE 4.7 依赖的那一条保证。
+  经指挥会话两次裁定，改为**只活在 `naked_fill_stop_net` 的最小写入器**：只发 `slTriggerPx`
+  （payload 出现任何 `tp*` 键即抛错）、写前落 `position_mutation_intents` 耐久意图
+  （key `naked-fill-sl:<ordId>:<posId>`，operation `naked_fill_set_position_sltp`）、
+  写入前最后一刻重验 (c)(d)、POST 失败按硬性禁止第 2 条记 unknown 不重发、
+  回读 `trigger-orders-pending` 按 `slTriggerPrice`（**不是**仓位行的 `slTriggerPx`）匹配才 confirmed、
+  经 `DeepcoinTpslWriteLimiter`。三道既有所有权门**一行未改**。
+  **对阶段文件的一处事实更正**（已获指挥会话接受）：文件说市价腿"止损靠成交后 set_position_tpsl 写，
+  而那道写入门要求 verified"，对；但现在的代码**并非没尝试**——`recovery_live_submit.py:1451-1540`
+  归属 unverified 时 `pos_id` 退回前后快照差并照样调 `submit_exact_position_sltp`，
+  是**被自己的所有权门挡住**，落一条 `position_protection_failed_after_entry_submitted` 警告。
+  **另一处只读发现**：`execution_order_legs` 有 `(venue, pos_id)` 唯一索引（pos_id 非空时生效），
+  所以一个仓位在库层面至多被一条 leg 持有。"无人认领"因此只能读作
+  **不被任何其他 leg 持有且不在保护账本里**——严格读作"不被任何 leg 持有"会让本网永远不可能触发，
+  因为被救的那条 leg 通常已经持有快照差得来的 `pos_id`。
+  **写入者白名单由 2 变 3**（指挥会话知情记录见 `066bd007`）：仓库级架构不变量
+  `test_all_position_writes_cross_the_exact_gateway` 只允许 `position_mutation_gateway.py` 与
+  `deepcoin_client.py` 直接调 `set_position_sltp`；本模块加入白名单并在同处写明放行理由，
+  同时补**反向约束** `test_the_position_writer_allowlist_is_exactly_three_files`——加第四个必须先让它变红。
+  **测试**：全量 **8054 passed / 4 skipped / 0 failed**。新增 `tests/test_naked_fill_stop_net.py` 14 条
+  （唯一候选→挂一次止损且 payload 无 `tp*`；两个候选→只告警；无候选→只告警；已 verified 不触发；
+  宽限期内不触发；快照读不到→只告警且**不等于**无候选；其他 leg 持有→不是候选；保护账本已有→不是候选；
+  draft 无止损价→只告警；回读失败→记 unknown 且第二次不重发；重验在决定与写入之间失败→intent blocked 零请求；
+  payload 构造只能带止损）与 `tests/test_naked_fill_stop_net_boundary.py` 7 条静态守护
+  （本模块外不得 import 旁路构造器或整体 import 本模块；`submit_exact_position_sltp` 调用者集合不变；
+  安全网不得触碰那条证明所有权的写入器；三道既有门的代码原样还在；白名单恰好三个文件）。
+  **两个自己测试抓到的真 bug（已修并锁住）**：最后一刻重验拒绝、或幂等键已被占用时写入器返回 None，
+  而调用方仍给 leg 打标记、写审计行、计为 attached——等于记录一次**根本没发生**的写入。
+  **一处自己引入的回归（已修）**：为免安全网被 `instruction_execution_contract_mode` 意外关掉而无条件构造
+  交易所客户端，导致没有凭据的角色里 `build_deepcoin_client_from_env()` 抛异常会**拖垮整个运维 cycle**
+  （连 6-pre-1 的入场恢复器一起不跑）。改为构造失败只记 warning 并降级 `execution_client=None`。
+  **观察（L2，达标）**：窗口 05:40:04Z–06:22:11Z 连续 30 分钟，5 条真实消息、2 个群，
+  44 条每分钟采样**零不健康、零重置**（证据 `/root/evidence/phase-6-pre-2/observer-samples.jsonl`）。
+  **预期无样本，确认无样本**：全窗口 `unverified_market_legs` 恒为 0，
+  安全网三处痕迹（`position_mutation_intents.operation='naked_fill_set_position_sltp'`、
+  `execution_events.action='naked_fill_stop_attached'`、
+  `runtime_incidents.incident_type='naked_market_fill_safety_net'`）**全程恒为 0**，
+  `rescued_legs` 恒为 0。历史 153/153 市价成交满足等式，此网本就预期永不触发；本次只证明它**静默且零写入**，
+  **未在生产中被真实触发过**，触发路径只有测试证据。
+  **交易所直读：零非预期写入。** 部署前与窗口结束指纹**逐字节一致**
+  `29ca3626118f31af7f7610f6ab04d35088e1e53fe09255ec2a78b383ecfaedfb`（均 4 仓 1 挂单）；
+  `execution_order_legs` 596、`position_protection_ledger` 683、`position_mutation_intents` 658 全程不变。
+  部署后 worker journal 零 error、零 `naked_fill` 相关告警。
+  **窗口结束后（09:51Z、09:59Z，已在 A 线 c0520b94 部署之后）出现的两条
+  `authoritative_execution_uncertain`（attempt 818/820，raw 15633/15635）与
+  `execution_events` 4065 `cancel_revision_entry_leg / submit_unknown`
+  （`revision_cancel_not_terminally_confirmed`，strategy `deepcoin:-1002370796392:3633:BTC:short`）
+  属于既有的改单撤销路径，与本安全网无关**（本网三处痕迹全零，从未运行）。
+  按硬性规则不可重放，需要人来了结——已一并报给指挥会话。
+  **一处过程失误**：本阶段的后台等待器用 `pgrep -f observe-6pre2.sh` 判断监视器是否退出，
+  而这条 ssh 远程命令自身的命令行**就含有该模式**，于是它一直匹配到自己、永不退出。
+  窗口其实 06:22:11Z 就达标了，直到指挥会话 12:31Z 提醒才发现。监视器本身与结论不受影响。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
