@@ -46,6 +46,8 @@ EXPIRY_CONTINUE_COMMAND = "expiry_continue"
 EXPIRY_EXPIRE_CANCEL_COMMAND = "expiry_expire_cancel"
 EXPIRY_EXPIRE_KEEP_COMMAND = "expiry_expire_keep"
 EXPIRY_REFRESH_COMMAND = "expiry_refresh"
+CHOOSE_COMMAND = "choose"
+DISMISS_COMMAND = "dismiss"
 EXPIRY_REVIEW_CONTINUE_HOURS = 3
 EXPIRY_REFRESH_ELIGIBLE_LIFECYCLE_STATUSES = frozenset({"pending_entry", "entered"})
 EXPIRY_PARTIAL_ENTRY_LEG_STATUSES = frozenset(
@@ -212,12 +214,16 @@ def _process_system_operator_command_update(
     text: str,
     *,
     deepcoin_client_factory=None,
+    operator_chat_id: int | str | None = None,
+    alert_chat_id: int | str | None = None,
 ) -> str | None:
     deepcoin_client = deepcoin_client_factory() if deepcoin_client_factory else None
     return process_system_operator_command(
         session_factory,
         text,
         deepcoin_client=deepcoin_client,
+        operator_chat_id=operator_chat_id,
+        alert_chat_id=alert_chat_id,
     )
 
 
@@ -227,12 +233,16 @@ async def _run_system_operator_command_update(
     *,
     update_id: int,
     deepcoin_client_factory=None,
+    operator_chat_id: int | str | None = None,
+    alert_chat_id: int | str | None = None,
 ) -> str | None:
     command_unit = _CancellableManagementUnit(
         _process_system_operator_command_update,
         session_factory,
         text,
         deepcoin_client_factory=deepcoin_client_factory,
+        operator_chat_id=operator_chat_id,
+        alert_chat_id=alert_chat_id,
     )
     return await _run_cancellable_management_unit(
         command_unit,
@@ -285,6 +295,19 @@ async def run_telegram_bot_command_loop(
                     )
                     for chunk in split_telegram_message(response_text):
                         await _send_message(client, base_url, chat_id=chat_id, text=chunk)
+                elif _command_name(text) in {CHOOSE_COMMAND, DISMISS_COMMAND}:
+                    response_text = await asyncio.to_thread(
+                        process_system_operator_command,
+                        session_factory,
+                        text,
+                        operator_chat_id=str((message.get("chat") or {}).get("id") or ""),
+                        alert_chat_id=chat_id,
+                    )
+                    if response_text:
+                        for chunk in split_telegram_message(response_text):
+                            await _send_message(
+                                client, base_url, chat_id=chat_id, text=chunk
+                            )
                 elif text in {"/start", "/help"}:
                     await _send_message(
                         client,
@@ -293,7 +316,9 @@ async def run_telegram_bot_command_loop(
                         text=(
                             "可用命令:\n"
                             "/positions - 查询当前 KOL 群组持仓策略\n"
-                            "/pending - 查询当前 KOL 群组待入场策略"
+                            "/pending - 查询当前 KOL 群组待入场策略\n"
+                            "/choose <raw_message_id> <编号> - 为待确认的管理指令选定候选\n"
+                            "/dismiss <raw_message_id> - 放弃待确认的管理指令"
                         ),
                     )
             await asyncio.sleep(poll_interval_seconds)
@@ -673,8 +698,26 @@ def process_system_operator_command(
     *,
     now: datetime | None = None,
     deepcoin_client=None,
+    operator_chat_id: int | str | None = None,
+    alert_chat_id: int | str | None = None,
 ) -> str | None:
     command = _command_name(text)
+    if command in {CHOOSE_COMMAND, DISMISS_COMMAND}:
+        # A-9. The polling loop already drops anything that is not from the
+        # alert chat, but this function is also reachable directly, so the
+        # authorised chat is checked here too rather than assumed. Without a
+        # chat id there is nobody to authorise, so the command is refused.
+        if operator_chat_id is None:
+            return "未识别操作者 chat，命令已拒绝"
+        if str(operator_chat_id) != str(alert_chat_id or ""):
+            return "该命令只接受来自 SYSTEM bot 会话的消息"
+        return _process_confirmation_command(
+            session_factory,
+            command,
+            text,
+            operator_chat_id=int(operator_chat_id),
+            now=now,
+        )
     if command not in {
         EXPIRY_CONTINUE_COMMAND,
         EXPIRY_EXPIRE_CANCEL_COMMAND,
@@ -691,6 +734,57 @@ def process_system_operator_command(
         now=now,
         deepcoin_client=deepcoin_client,
     )
+
+
+def _process_confirmation_command(
+    session_factory: sessionmaker,
+    command: str,
+    text: str,
+    *,
+    operator_chat_id: int,
+    now: datetime | None,
+) -> str:
+    """Answer a target-confirmation question (A-9). Writes no exchange order."""
+
+    from telegram_kol_research.management_target_confirmation import (
+        choose_management_target,
+        dismiss_management_target,
+    )
+
+    parts = text.split()
+    if command == DISMISS_COMMAND:
+        if len(parts) < 2:
+            return "用法：/dismiss <raw_message_id>"
+        raw_message_id = _positive_int(parts[1])
+        if raw_message_id is None:
+            return "raw_message_id 必须是正整数，例如 /dismiss 15155"
+        return dismiss_management_target(
+            session_factory,
+            raw_message_id=raw_message_id,
+            operator_chat_id=operator_chat_id,
+            now=now,
+        ).message
+    if len(parts) < 3:
+        return "用法：/choose <raw_message_id> <候选编号>"
+    raw_message_id = _positive_int(parts[1])
+    choice_number = _positive_int(parts[2])
+    if raw_message_id is None or choice_number is None:
+        return "用法：/choose <raw_message_id> <候选编号>，两者都必须是正整数"
+    return choose_management_target(
+        session_factory,
+        raw_message_id=raw_message_id,
+        choice_number=choice_number,
+        operator_chat_id=operator_chat_id,
+        now=now,
+    ).message
+
+
+def _positive_int(value: str) -> int | None:
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed > 0 else None
 
 
 def _process_expiry_action(

@@ -52,6 +52,7 @@ disqualify every candidate and turn a stale view into a confident refusal.
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
@@ -235,28 +236,67 @@ def confirmation_reason_code(candidate_count: int, snapshot_stale: bool) -> str:
     return AMBIGUOUS if candidate_count > 1 else NO_VERIFIABLE_TARGET
 
 
+def numbered_candidates(candidates: Iterable[Any]) -> tuple[dict[str, Any], ...]:
+    """The offered candidates, in the order the operator will see them.
+
+    A-9. The number is the whole point: ``/choose 15155 2`` is answerable from
+    a phone, a lifecycle id is not. It is positional and recorded with the
+    parked items, so the number the operator reads and the number the command
+    resolves are the same list even if the candidates would be computed
+    differently later.
+    """
+
+    numbered: list[dict[str, Any]] = []
+    for index, candidate in enumerate(candidates, start=1):
+        summary = getattr(candidate, "lifecycle_summary", None) or {}
+        numbered.append(
+            {
+                "number": index,
+                "lifecycle_id": summary.get("id"),
+                "symbol": getattr(candidate, "symbol", None),
+                "side": getattr(candidate, "side", None),
+                "entry_range_low": summary.get("entry_range_low"),
+                "entry_range_high": summary.get("entry_range_high"),
+                "entered_at": str(summary.get("entered_at") or "")[:19] or None,
+            }
+        )
+    return tuple(numbered)
+
+
 def describe_candidates(candidates: Iterable[Any]) -> str:
-    """One short line per candidate for the operator message.
+    """One short numbered line per candidate, plus how to answer.
 
     Group, symbol, side, entry and when it opened -- enough to tell two
     positions apart at a glance, and nothing that would let a reader mistake
-    the message for an instruction to act.
+    the message for an instruction to act. A-9 adds the number and the reply
+    format, because before it the notification asked a question the operator
+    had no way to answer.
     """
 
-    parts: list[str] = []
-    for candidate in candidates:
-        summary = getattr(candidate, "lifecycle_summary", None) or {}
-        parts.append(
-            "lifecycle {id} {symbol} {side} entry {low}-{high} opened {entered}".format(
-                id=summary.get("id", "?"),
-                symbol=getattr(candidate, "symbol", "?"),
-                side=getattr(candidate, "side", "?"),
-                low=summary.get("entry_range_low", "?"),
-                high=summary.get("entry_range_high", "?"),
-                entered=str(summary.get("entered_at") or "?")[:19],
-            )
+    parts = [
+        "[{number}] lifecycle {id} {symbol} {side} entry {low}-{high} opened {entered}".format(
+            number=item["number"],
+            id=item["lifecycle_id"] if item["lifecycle_id"] is not None else "?",
+            symbol=item["symbol"] or "?",
+            side=item["side"] or "?",
+            low=item["entry_range_low"] if item["entry_range_low"] is not None else "?",
+            high=item["entry_range_high"] if item["entry_range_high"] is not None else "?",
+            entered=item["entered_at"] or "?",
         )
+        for item in numbered_candidates(candidates)
+    ]
     return "; ".join(parts) if parts else "(no verifiable candidate)"
+
+
+def reply_instructions(raw_message_id: int, candidate_count: int) -> str:
+    """What the operator should type back."""
+
+    if candidate_count <= 0:
+        return f"/dismiss {int(raw_message_id)}"
+    return (
+        f"/choose {int(raw_message_id)} <1-{candidate_count}> "
+        f"or /dismiss {int(raw_message_id)}"
+    )
 
 
 def request_management_target_confirmation(
@@ -293,8 +333,16 @@ def request_management_target_confirmation(
             .order_by(MessageInstructionItem.sequence, MessageInstructionItem.id)
             .all()
         )
+        offered = numbered_candidates(described)
         for item in items:
             item.status = AWAITING_CONFIRMATION
+            # The list the operator was shown is stored with the item, so
+            # ``/choose N`` resolves against exactly what was offered rather
+            # than against a set recomputed minutes later.
+            payload = _result_payload(item.result_json)
+            payload["confirmation_candidates"] = [dict(row) for row in offered]
+            payload["confirmation_reason_code"] = reason_code
+            item.result_json = json.dumps(payload, ensure_ascii=False, sort_keys=True)
             item.last_progress_at = now
             item.updated_at = now
             moved.append(int(item.id))
@@ -317,8 +365,21 @@ def request_management_target_confirmation(
         chat_id=chat_id,
         candidate_count=len(described),
         reason_code=reason_code,
-        candidate_digest=describe_candidates(described),
+        candidate_digest=(
+            f"{describe_candidates(described)} | reply: "
+            f"{reply_instructions(int(raw_message_id), len(described))}"
+        ),
         occurred_at=now,
     )
     return tuple(moved)
+
+
+def _result_payload(value: Any) -> dict[str, Any]:
+    if not value:
+        return {}
+    try:
+        parsed = json.loads(str(value))
+    except (TypeError, ValueError):
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
 

@@ -100,6 +100,14 @@ NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
         # action and freeze that message's source-deletion exit (A-5 task 8).
         "management_freeze_bypassed",
         "management_freeze_rejected",
+        # A-9 audit rows for the operator's answer to a target-confirmation
+        # question. They record which candidate was chosen, dismissed, or left
+        # to time out, and touch no exchange -- listed here for the same reason
+        # as the A-6 rows above.
+        "management_target_chosen",
+        "management_target_dismissed",
+        "management_target_confirmation_timeout",
+        "management_target_confirmation_reminder",
     }
 )
 

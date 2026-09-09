@@ -20,6 +20,9 @@ from telegram_kol_research.runtime_worker_executor import (
 from telegram_kol_research.management_recovery_timeout import (
     expire_stuck_management_recoveries,
 )
+from telegram_kol_research.management_target_confirmation import (
+    expire_stale_management_confirmations,
+)
 from telegram_kol_research.strategy_management_batches import (
     ManagementLegCreate,
     ManagementBatchRecord,
@@ -210,6 +213,51 @@ def run_strategy_management_worker_tick(
         )
     except Exception:
         logger.exception("management recovery timeout pass failed")
+
+    # A-9 task 3. A question nobody answered must expire rather than wait
+    # forever; an instruction parked two hours ago is stale enough that acting
+    # on it would be its own hazard. Reads only local state, so it costs
+    # nothing on a tick with nothing parked.
+    def _notify_confirmation_lapse(*, raw_message_id: int, kind: str, item_ids) -> None:
+        """Tell somebody a parked instruction is lapsing, or has (A-9).
+
+        Reuses A-7's confirmation incident type: to a reader this is the same
+        conversation -- the question they were asked is running out, or has run
+        out -- and a second type would split one thread of alerts in two.
+        """
+
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_target_needs_confirmation,
+            capture_runtime_incident_best_effort,
+        )
+
+        ids = tuple(item_ids)
+        capture_runtime_incident_best_effort(
+            capture_management_target_needs_confirmation,
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            chat_id=0,
+            candidate_count=len(ids),
+            reason_code=str(kind),
+            candidate_digest=(
+                "items " + ",".join(str(item) for item in ids)
+            ),
+            occurred_at=now,
+        )
+
+    try:
+        expire_stale_management_confirmations(
+            session_factory,
+            now=now,
+            timeout_minutes=int(
+                load_trading_settings(
+                    session_factory
+                ).management_confirmation_timeout_minutes
+            ),
+            notify=_notify_confirmation_lapse,
+        )
+    except Exception:
+        logger.exception("management confirmation timeout pass failed")
 
     should_reconcile_composite = (
         composite_reconciler is not reconcile_composite_management_components

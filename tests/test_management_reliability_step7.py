@@ -414,7 +414,11 @@ def test_no_verifiable_candidate_is_reported_as_such(tmp_path):
     )
 
     assert captured[0]["reason_code"] == "no_verifiable_target"
-    assert captured[0]["candidate_digest"] == "(no verifiable candidate)"
+    # A-9 appends how to answer. With nothing to choose between, the only
+    # answer offered is to dismiss.
+    assert captured[0]["candidate_digest"] == (
+        "(no verifiable candidate) | reply: /dismiss 15155"
+    )
 
 
 def test_a_stale_snapshot_is_reported_as_staleness_not_as_absence(tmp_path):

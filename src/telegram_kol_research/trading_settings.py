@@ -104,6 +104,11 @@ class TradingSettings:
     # three days. After this many minutes the batch is blocked (never
     # re-run) so the freeze lifts and a person decides what happens next.
     management_recovery_timeout_minutes: float = 60.0
+    #: A-9: how long a management instruction may sit in
+    #: ``awaiting_user_confirmation`` before it fails on its own. Two hours is
+    #: long enough for somebody to answer and short enough that acting on the
+    #: instruction afterwards would be its own hazard.
+    management_confirmation_timeout_minutes: float = 120.0
     # A-5 task 7: the same shape for a source-deletion exit, which holds a
     # whole chat+symbol+side lane rather than one strategy, so it gets a
     # longer rope before the alert fires.
@@ -585,6 +590,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         raw.get("management_recovery_timeout_minutes"),
         defaults.management_recovery_timeout_minutes,
     )
+    management_confirmation_timeout_minutes = _positive_float(
+        raw.get("management_confirmation_timeout_minutes"),
+        defaults.management_confirmation_timeout_minutes,
+    )
     source_deletion_exit_timeout_minutes = _positive_float(
         raw.get("source_deletion_exit_timeout_minutes"),
         defaults.source_deletion_exit_timeout_minutes,
@@ -678,6 +687,7 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         deferred_resume_timeout_minutes=deferred_resume_timeout_minutes,
         management_recovery_timeout_minutes=management_recovery_timeout_minutes,
+        management_confirmation_timeout_minutes=management_confirmation_timeout_minutes,
         source_deletion_exit_timeout_minutes=source_deletion_exit_timeout_minutes,
         position_protection_incident_delivery_after_id=(
             position_protection_incident_delivery_after_id
