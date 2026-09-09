@@ -30,6 +30,7 @@ from telegram_kol_research.config import (
     load_multi_target_management_config,
 )
 from telegram_kol_research.contact_digit_scrubbing import scrub_contact_identifiers
+from telegram_kol_research import recognition_failure_attribution as recognition_attribution
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
@@ -2231,6 +2232,96 @@ def _apply_low_confidence_group_exit_if_matched(
     return applied
 
 
+def _attribute_unapplied_lifecycle_event(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle_event: dict[str, Any],
+    current_message_text: str | None,
+) -> recognition_attribution.LifecycleApplicationVerdict:
+    """Name why a lifecycle event the model produced changed nothing (A-8).
+
+    Both questions are asked with the same code the application path itself
+    used, so the verdict describes what actually happened rather than a second
+    opinion: ``resolve_management_directive`` for "was anything asked for", and
+    A-7's ``verify_lifecycle_targets`` for "could we stand behind the target".
+    Neither writes.
+    """
+
+    text = raw_message.text or "" if current_message_text is None else current_message_text
+    intent: str | None = None
+    directive_error = ""
+    try:
+        directive = resolve_management_directive(
+            text=text, lifecycle_event=lifecycle_event
+        )
+    except ValueError as exc:
+        # An ambiguous fraction is a real instruction we could not size, not an
+        # absence of one; keep the asked-for action as the intent so the target
+        # decides, and carry the parse error into the verdict's detail.
+        intent = str(lifecycle_event.get("management_action") or "") or None
+        directive_error = str(exc)
+    else:
+        intent = str(getattr(directive, "intent", "") or "") or None
+
+    # A multi-target instruction names its lifecycles inside ``targets``, and a
+    # malformed one expands to nothing at all -- which is a refusal to read the
+    # instruction, not an instruction that named no target. Both must be told
+    # apart from the genuinely target-less case or a fail-closed refusal would
+    # be filed as benign and never alerted.
+    expanded = _expand_lifecycle_event_targets(lifecycle_event)
+    if expanded is None:
+        return recognition_attribution.LifecycleApplicationVerdict(
+            recognition_attribution.TARGET_NOT_VERIFIABLE,
+            "explicit_targets_malformed",
+        )
+    target_ids = [
+        value
+        for value in (
+            _int_or_none(target.get("target_lifecycle_id")) for target in expanded
+        )
+        if value is not None
+    ]
+    target_lifecycle_id = target_ids[0] if target_ids else None
+    target_verified: bool | None = None
+    target_detail = ""
+    if target_ids:
+        from telegram_kol_research.management_target_verification import (
+            load_verified_position_ids,
+            verify_lifecycle_targets,
+        )
+
+        now = utc_now()
+        verdicts = verify_lifecycle_targets(
+            session,
+            target_ids,
+            verified_position_ids=load_verified_position_ids(session, now=now),
+        )
+        # Every named target has to stand up: one unverifiable target in a
+        # multi-target instruction means part of it would have gone nowhere.
+        unverified = [
+            verdicts[target_id]
+            for target_id in target_ids
+            if target_id in verdicts and not verdicts[target_id].verified
+        ]
+        target_verified = not unverified and bool(verdicts)
+        if unverified:
+            target_detail = unverified[0].reason
+
+    verdict = recognition_attribution.classify_unapplied_lifecycle_event(
+        intent=intent,
+        target_lifecycle_id=target_lifecycle_id,
+        target_verified=target_verified,
+        target_detail=target_detail,
+    )
+    if directive_error and verdict.reason_code == recognition_attribution.APPLY_FAILED:
+        # The target was fine; what we could not do is read the instruction.
+        return recognition_attribution.LifecycleApplicationVerdict(
+            verdict.reason_code, directive_error
+        )
+    return verdict
+
+
 def _apply_deterministic_management_scope_if_matched(
     session,
     raw_message: RawMessage,
@@ -3044,10 +3135,23 @@ def apply_authoritative_mimo_payload(
             )
             _upsert_recognition(session, result, engine=model)
         elif event_type != "none":
+            # A-8: the model answered; only its answer's *application* failed.
+            # Which of the four ways it failed decides whether anyone needs to
+            # be told, so name it rather than calling all four "识别失败".
+            verdict = _attribute_unapplied_lifecycle_event(
+                session,
+                raw_message=raw_message,
+                lifecycle_event=lifecycle_event,
+                current_message_text=current_message_text,
+            )
             result = MessageRecognitionResult(
                 raw_message_id=raw_message_id,
-                status="识别失败",
-                reason="MiMo lifecycle event could not be applied safely",
+                status=(
+                    "识别失败"
+                    if verdict.reason_code == recognition_attribution.APPLY_FAILED
+                    else str(payload.get("recognition_result") or "非策略")
+                ),
+                reason=verdict.recognition_reason,
                 ai_payload=payload,
                 parse_source="mimo_authoritative",
             )

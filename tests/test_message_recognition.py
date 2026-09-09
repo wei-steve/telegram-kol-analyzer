@@ -710,7 +710,14 @@ def test_authoritative_empty_targets_without_single_lifecycle_stays_fail_closed(
         model="mimo-v2.5",
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0
@@ -1016,7 +1023,14 @@ def test_authoritative_multi_target_full_exit_stays_dormant_without_live_allowli
         multi_target_management_config=config_module.MultiTargetManagementConfig(),
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0
@@ -1067,7 +1081,14 @@ def test_authoritative_multi_target_persistence_is_all_or_nothing(tmp_path):
         authoritative_generation="multi-target-3465",
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert session.query(SignalCandidate).filter_by(raw_message_id=raw_id).count() == 0
         assert session.query(MessageInstructionItem).filter_by(raw_message_id=raw_id).count() == 0
@@ -1254,7 +1275,14 @@ def test_live_multi_target_admission_freezes_overlapping_pos_id_sets(tmp_path):
         ),
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0
@@ -1288,7 +1316,14 @@ def test_multi_target_rejects_target_level_policy_overrides_before_persistence(t
         authoritative_generation="hostile-target-override",
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert session.query(SignalCandidate).filter_by(raw_message_id=raw_id).count() == 0
 
@@ -1518,7 +1553,14 @@ def test_authoritative_ambiguous_management_fraction_fails_closed(tmp_path):
         authoritative_generation="ambiguous-fraction-9721",
     )
 
-    assert result.status == "识别失败"
+    # A-8 relabelled this: the refusal is unchanged (nothing is persisted
+    # below), but "识别失败" was never true here -- the model recognised the
+    # message fine and we declined to act on it. The reason now says which
+    # refusal it was, and target_not_verifiable is an alerted one.
+    assert result.status != "识别失败"
+    assert result.reason == (
+        "authoritative_lifecycle_not_applied:target_not_verifiable"
+    )
     with session_factory() as session:
         assert (
             session.query(SignalCandidate)

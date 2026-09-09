@@ -725,6 +725,60 @@ def capture_management_target_needs_confirmation(
     )
 
 
+def capture_authoritative_recognition_failed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    chat_id: int,
+    reason_code: str,
+    failure_point: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a message whose recognised instruction changed nothing (A-8).
+
+    The A-8 inventory found 181 of these in auto_trade groups and not one had
+    ever produced an alert -- among them ten real management instructions on
+    live positions, including two stop-loss resets and a "take half off and
+    protect the rest", and twenty-two entry signals the instruction contract
+    dropped whole. Silence was the actual defect: each individual drop was
+    defensible, and nobody could see the pattern.
+
+    Only the reasons in ``ALERTED_REASONS`` reach here, so a "hold what you
+    have" or a message that named no target does not wake anybody. That
+    restraint is the point -- the same inventory shows noise is what buried
+    the real cases, and an alarm that fires on all four outcomes would bury
+    them again.
+    """
+
+    if not config.captures("authoritative_recognition_failed"):
+        return None
+    fixed = {
+        "component": "authoritative_recognition",
+        "reason_code": _safe_label(reason_code),
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_recognition",
+        source_record_id=str(int(raw_message_id)),
+        incident_type="authoritative_recognition_failed",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            chat_id=int(chat_id),
+            failure_point=_safe_sentence(failure_point),
+            impact="instruction_not_applied",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def _deadline_label(deadline_at: datetime | None) -> str:
     """A bare minute-resolution instant, carried in its own summary field.
 

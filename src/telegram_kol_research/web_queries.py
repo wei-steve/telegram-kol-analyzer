@@ -10,6 +10,7 @@ from typing import Iterable
 from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research import recognition_failure_attribution as recognition_attribution
 from telegram_kol_research.models import (
     ContextAnalysisBackfill,
     ContextResolutionAttempt,
@@ -1642,7 +1643,12 @@ def _serialize_system_acceptance(
     admission_failure_reasons = {
         "target_unresolved",
         "mimo_authoritative_failed",
+        # Rows written before A-8 split this one into the five below.
         "mimo_authoritative_not_safely_applied",
+        # A-8: only the outcomes that are actually a refusal. A message that
+        # asked for nothing, or named no target, is not "未安全接纳" -- calling
+        # it that is what made 181 of these unreadable in the first place.
+        *recognition_attribution.ALERTED_REASONS,
     }
     if authoritative_status == "识别失败" and not accepted_rows:
         status = "failed"
@@ -1656,7 +1662,16 @@ def _serialize_system_acceptance(
     elif reason_code in admission_failure_reasons:
         status = "failed"
         status_label = "系统未安全接纳"
-    elif candidates and not actionable_rows and reason_code != "mimo_no_action":
+    elif (
+        candidates
+        and not actionable_rows
+        and reason_code
+        not in {
+            "mimo_no_action",
+            recognition_attribution.NO_ACTIONABLE_INTENT,
+            recognition_attribution.NO_TARGET_NAMED,
+        }
+    ):
         status = "accepted"
         status_label = "系统已接纳"
         accepted_candidate_ids.update(int(candidate.id) for candidate in candidates)
@@ -1992,6 +2007,12 @@ def _execution_reason_label(reason: str | None) -> str | None:
         "close_final_preflight_failed": "最终仓位或合约规格校验失败",
         "management_close_result_requires_recovery": "平仓结果需要人工复核",
         "mimo_authoritative_not_safely_applied": "MiMo 生命周期事件未能安全落地",
+        # A-8 split that one label into what it was actually hiding.
+        "no_actionable_intent": "消息未要求任何动作",
+        "no_target_named": "模型未指明目标仓位",
+        "target_not_verifiable": "目标仓位无法验证，已转人工确认",
+        "contract_invalid": "指令契约校验未通过",
+        "lifecycle_apply_failed": "目标已验证但生命周期事件未落地",
     }.get(str(reason or ""))
 
 

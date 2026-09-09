@@ -65,6 +65,8 @@ from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 from telegram_kol_research.mimo_v2_execution_adapter import (
     adapt_mimo_v2_to_current_payload,
 )
+from telegram_kol_research import recognition_failure_attribution as recognition_attribution
+from telegram_kol_research import management_target_verification
 from telegram_kol_research.models import (
     AuthoritativeExecutionAttempt,
     MediaAsset,
@@ -1529,6 +1531,141 @@ def _ensure_entry_strategy_thread(
     )
 
 
+def _alert_recognition_not_applied(
+    session_factory,
+    *,
+    raw_message_id: int,
+    automation: Mapping[str, Any] | None,
+    group_trading_mode_provider,
+    capture=None,
+) -> str | None:
+    """Tell somebody, but only about the outcomes that are not benign (A-8).
+
+    Returns the reason it alerted on, or ``None``. Two narrowings, both from
+    the inventory rather than from taste:
+
+    * only ``ALERTED_REASONS`` -- a "hold what you have", or a message that
+      named no target, is not a loss and firing on it would rebuild the noise
+      that hid the real cases for two months;
+    * only auto_trade groups -- a notify_only group executes nothing, so an
+      unapplied instruction there costs nothing. The row is still written with
+      its reason; it just does not page anyone.
+    """
+
+    reason = str((automation or {}).get("reason") or "")
+    if reason not in recognition_attribution.ALERTED_REASONS:
+        return None
+    if group_trading_mode_provider is None:
+        return None
+    already_awaiting = False
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, int(raw_message_id))
+        chat_id = int(raw_message.chat_id) if raw_message is not None else 0
+        if reason == recognition_attribution.TARGET_NOT_VERIFIABLE:
+            already_awaiting = bool(
+                session.query(MessageInstructionItem)
+                .filter(
+                    MessageInstructionItem.raw_message_id == int(raw_message_id),
+                    MessageInstructionItem.retired_at.is_(None),
+                    MessageInstructionItem.status
+                    == management_target_verification.AWAITING_CONFIRMATION,
+                )
+                .first()
+            )
+    if not chat_id:
+        return None
+    if already_awaiting:
+        # A-7's own gate parks and notifies during assessment. When both gates
+        # see the same message, one message must still mean one question.
+        return None
+    try:
+        mode = str(group_trading_mode_provider(chat_id) or "")
+    except Exception:
+        # An unreadable mode must not silence an alert: err towards telling.
+        logger.warning(
+            "group trading mode unavailable for recognition alert raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+        mode = "auto_trade"
+    if mode != "auto_trade":
+        return None
+    if reason == recognition_attribution.TARGET_NOT_VERIFIABLE:
+        # A-8 task 3. A named target we cannot stand behind is exactly what
+        # A-7 already built a channel for, and that channel does more than
+        # alert: it parks the instruction items in
+        # ``awaiting_user_confirmation`` and lists the candidates. Raising the
+        # A-8 incident here as well would notify twice for one message.
+        from telegram_kol_research.management_target_verification import (
+            request_management_target_confirmation,
+        )
+
+        request_management_target_confirmation(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            candidates=(),
+            snapshot_stale=False,
+            now=datetime.now(UTC),
+        )
+        return reason
+    if capture is None:
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_authoritative_recognition_failed,
+            capture_runtime_incident_best_effort,
+        )
+
+        def capture(**kwargs: Any) -> None:
+            capture_runtime_incident_best_effort(
+                capture_authoritative_recognition_failed,
+                session_factory,
+                **kwargs,
+            )
+
+    capture(
+        raw_message_id=int(raw_message_id),
+        chat_id=chat_id,
+        reason_code=reason,
+        failure_point=_failure_point_for(reason),
+        occurred_at=datetime.now(UTC),
+    )
+    return reason
+
+
+def _failure_point_for(reason: str) -> str:
+    """Where in the pipeline this reason was decided, in a person's terms."""
+
+    return {
+        recognition_attribution.CONTRACT_INVALID: (
+            "instruction contract rejected the payload"
+        ),
+        recognition_attribution.TARGET_NOT_VERIFIABLE: (
+            "target lifecycle has no verifiable live position"
+        ),
+        recognition_attribution.APPLY_FAILED: (
+            "verified target but the lifecycle event did not apply"
+        ),
+    }.get(reason, reason)
+
+
+def _lifecycle_not_applied_reason(recognition: Any) -> str | None:
+    """The A-8 reason code for a recognition whose event changed nothing.
+
+    Returns ``None`` for every other recognition, so the caller's chain reads
+    the same as before for messages that did apply. A row written before A-8
+    still carries the old blanket text and maps to the old reason, which keeps
+    the historical rows' meaning intact rather than retro-labelling them.
+    """
+
+    code = recognition_attribution.reason_code_from_recognition_reason(
+        getattr(recognition, "reason", None)
+    )
+    if code is not None:
+        return code
+    if str(getattr(recognition, "status", "")) == "识别失败":
+        return "mimo_authoritative_not_safely_applied"
+    return None
+
+
 def process_authoritative_message(
     session_factory: sessionmaker,
     *,
@@ -1684,6 +1821,16 @@ def process_authoritative_message(
             execution_owner=execution_owner,
             execution_registry=execution_registry,
         )
+    # A-8 task 4. Raised here, where both execution paths have converged and
+    # every session is closed, for the same reason A-7 raises its confirmation
+    # here: an alert that shares a transaction with the work it describes can
+    # be rolled back with it.
+    _alert_recognition_not_applied(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+        automation=automation,
+        group_trading_mode_provider=group_trading_mode_provider,
+    )
     return AuthoritativeProcessingResult(
         assessment=assessment,
         recognition=recognition,
@@ -1891,10 +2038,10 @@ def _run_legacy_authoritative_execution(
             "status": "skipped",
             "reason": "mimo_authoritative_failed",
         }
-    elif recognition.status == "识别失败":
+    elif _lifecycle_not_applied_reason(recognition) is not None:
         automation = {
             "status": "skipped",
-            "reason": "mimo_authoritative_not_safely_applied",
+            "reason": _lifecycle_not_applied_reason(recognition),
         }
     elif not _has_current_mimo_candidate(session_factory, raw_message_id):
         automation = {"status": "skipped", "reason": "mimo_no_action"}
@@ -1988,14 +2135,12 @@ def _run_leased_authoritative_execution(
                 evidence_refs=(),
                 public_result=automation,
             )
-        elif recognition.status == "识别失败":
-            automation = {
-                "status": "skipped",
-                "reason": "mimo_authoritative_not_safely_applied",
-            }
+        elif _lifecycle_not_applied_reason(recognition) is not None:
+            reason_code = _lifecycle_not_applied_reason(recognition)
+            automation = {"status": "skipped", "reason": reason_code}
             boundary = ExecutionBoundaryOutcome(
                 "completed", "not_started", "skipped",
-                "mimo_authoritative_not_safely_applied", (), automation
+                reason_code, (), automation
             )
         elif not _has_current_mimo_candidate(session_factory, raw_message_id):
             automation = {"status": "skipped", "reason": "mimo_no_action"}

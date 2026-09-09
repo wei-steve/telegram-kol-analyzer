@@ -216,6 +216,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # (``ambiguous_target_notifies_user``), and asking is only asking if
         # it actually reaches somebody.
         "management_target_needs_confirmation",
+        # A-8: a recognised instruction that changed nothing, in an
+        # auto_trade group, for one of the three reasons that are not benign:
+        # the instruction contract rejected it, its target could not be
+        # verified, or it was aimed at a verified target and still failed. The
+        # inventory found 181 such messages and not one alert -- ten of them
+        # real management instructions on live positions. Silence was the
+        # defect, so it cannot be re-enabled by editing an env line.
+        "authoritative_recognition_failed",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to
