@@ -13,7 +13,7 @@ brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 6b
-current_step_file: docs/plans/2026-09-07-management-reliability/step-6b-uncertain-evidence-and-reanalyze-guard.md   # 该步骤文件尚未编写
+current_step_file: docs/plans/2026-09-07-management-reliability/step-6b-uncertain-evidence-and-reanalyze-guard.md
 step_status: planned               # planned | claimed | in_progress | completed | blocked
 claimed_by: null
 last_completed_step: 8
