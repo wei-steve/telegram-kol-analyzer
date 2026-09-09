@@ -166,6 +166,13 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # therefore refused. The summary carries the order id and the candidate
         # position id so a person can look at the exchange immediately.
         "market_fill_attribution_unverified",
+        # Phase 6-pre-2: the safety net under that same failure. Either it
+        # attached a stop to a position identified only by a uniqueness
+        # argument -- a write no ownership proof authorized -- or it could not
+        # act and a filled position may be sitting with no stop at all. Both
+        # need a person's eyes within seconds, so neither can be silenced by an
+        # environment whitelist.
+        "naked_market_fill_safety_net",
         # A-2: the management-instruction failures. Production's hand-edited
         # list named none of these, so a durably failed instruction left a
         # ledger row and no message for weeks. Delivery of

@@ -23,6 +23,9 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.naked_fill_stop_net import (
+    reconcile_naked_market_fills,
+)
 from telegram_kol_research.entry_admission_reconciler import (
     reconcile_due_entry_admissions,
 )
@@ -2748,15 +2751,20 @@ def _run_operator_maintenance_cycle(
         execution_mode = str(
             execution_settings.instruction_execution_contract_mode
         )
-        if execution_mode != "disabled":
-            if deepcoin_client_factory is None:
-                from telegram_kol_research.deepcoin_client import (
-                    build_deepcoin_client_from_env,
-                )
+        # The client is needed by two independent consumers now: contract
+        # reconciliation, which is gated on the mode, and the phase 6-pre-2
+        # naked-fill net, which is not -- a filled position with no stop is a
+        # live risk whatever the instruction bookkeeping is set to. Building it
+        # unconditionally keeps the net from being silently disabled by a
+        # setting that has nothing to do with it.
+        if deepcoin_client_factory is None:
+            from telegram_kol_research.deepcoin_client import (
+                build_deepcoin_client_from_env,
+            )
 
-                execution_client = build_deepcoin_client_from_env()
-            else:
-                execution_client = deepcoin_client_factory()
+            execution_client = build_deepcoin_client_from_env()
+        else:
+            execution_client = deepcoin_client_factory()
         run_operator_maintenance_tick(
             session_factory,
             now=datetime.now(UTC),
@@ -2840,6 +2848,21 @@ def run_operator_maintenance_tick(
         execution_contract_mode=execution_contract_mode,
         entry_after_item_id=int(execution_entry_after_item_id),
     )
+    if execution_reconciliation_client is not None:
+        # Phase 6-pre-2. The net under a market fill the identity equation could
+        # not attribute. It is not gated on the contract mode: a filled position
+        # with no stop is a live risk regardless of how instruction bookkeeping
+        # is configured. Its exceptions are caught and logged here because the
+        # loop that drives this tick swallows exceptions wholesale -- a safety
+        # net that fails silently is worse than none.
+        try:
+            reconcile_naked_market_fills(
+                session_factory,
+                deepcoin_client=execution_reconciliation_client,
+                now=now,
+            )
+        except Exception:
+            logger.warning("naked_fill_stop_net_tick_failed", exc_info=True)
     if (
         execution_contract_mode != "disabled"
         and execution_reconciliation_client is not None
