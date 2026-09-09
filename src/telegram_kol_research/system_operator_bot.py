@@ -2757,14 +2757,22 @@ def _run_operator_maintenance_cycle(
         # live risk whatever the instruction bookkeeping is set to. Building it
         # unconditionally keeps the net from being silently disabled by a
         # setting that has nothing to do with it.
-        if deepcoin_client_factory is None:
-            from telegram_kol_research.deepcoin_client import (
-                build_deepcoin_client_from_env,
-            )
+        # Building it must never be able to fail the tick: the entry admission
+        # reconciler shares this cycle and needs no exchange client at all, so
+        # a role without credentials has to degrade to "no client" rather than
+        # take the whole maintenance cycle down with it.
+        try:
+            if deepcoin_client_factory is None:
+                from telegram_kol_research.deepcoin_client import (
+                    build_deepcoin_client_from_env,
+                )
 
-            execution_client = build_deepcoin_client_from_env()
-        else:
-            execution_client = deepcoin_client_factory()
+                execution_client = build_deepcoin_client_from_env()
+            else:
+                execution_client = deepcoin_client_factory()
+        except Exception:
+            logger.warning("operator_tick_exchange_client_unavailable", exc_info=True)
+            execution_client = None
         run_operator_maintenance_tick(
             session_factory,
             now=datetime.now(UTC),

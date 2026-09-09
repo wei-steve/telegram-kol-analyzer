@@ -210,3 +210,23 @@ def test_the_safety_net_never_reaches_the_ownership_proving_writer():
     # It may borrow the gateway's read-only helpers -- parsing a response shape
     # or matching a readback row is not authority -- but nothing that writes.
     assert "PositionMutationGateway(" not in source
+
+
+def test_the_position_writer_allowlist_is_exactly_three_files():
+    """Widening the allowlist must cost a red test, not a quiet edit.
+
+    Before phase 6-pre-2 the set of modules permitted to issue a raw position
+    write was two, and it was two because every write went through the gateway
+    that proves ownership. This phase makes it three. Pinning the exact set is
+    the price of that: a fourth entry is a decision someone has to make on
+    purpose, in front of this assertion, rather than a line that slips into a
+    diff.
+    """
+
+    from tests.test_position_mutation_architecture import ALLOWED_WRITER_PATHS
+
+    assert ALLOWED_WRITER_PATHS == {
+        "src/telegram_kol_research/position_mutation_gateway.py",
+        "src/telegram_kol_research/deepcoin_client.py",
+        "src/telegram_kol_research/naked_fill_stop_net.py",
+    }

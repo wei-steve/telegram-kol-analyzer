@@ -14,6 +14,26 @@ FORBIDDEN_POSITION_WRITE_ATTRIBUTES = {
 ALLOWED_WRITER_PATHS = {
     "src/telegram_kol_research/position_mutation_gateway.py",
     "src/telegram_kol_research/deepcoin_client.py",
+    # Phase 6-pre-2. The only writer that does not prove ownership first, and
+    # the only one that could not: it exists for the position whose ownership
+    # cannot be proved at all. It is on this list rather than behind the
+    # gateway because the gateway refuses an unverified position three times
+    # over -- in build_position_mutation_authority, in exact_position_write_gate
+    # and in _load_verified_binding -- and weakening any of those to admit the
+    # net would have cost far more than the net is worth.
+    #
+    # What earns it the exemption, all of it enforced in
+    # tests/test_naked_fill_stop_net.py: it sends a stop and nothing else (no
+    # take profit, no close, no cancel); it acts once per order, latched by a
+    # compare-and-set; it requires all four preconditions (an unverified market
+    # entry leg, sixty seconds elapsed, exactly one unclaimed active position of
+    # exactly the filled size, a readable snapshot); it reserves a durable
+    # position_mutation_intents row before the request, revalidates immediately
+    # before it, never resends an unknown outcome, and confirms by exact
+    # readback; it crosses DeepcoinTpslWriteLimiter like every other write; and
+    # it never claims ownership -- the marker it leaves is deliberately not
+    # "verified", so every ownership check keeps refusing the position.
+    "src/telegram_kol_research/naked_fill_stop_net.py",
 }
 POSITION_SLTP_PATH_FRAGMENTS = {
     "/deepcoin/trade/set-position-sltp",
