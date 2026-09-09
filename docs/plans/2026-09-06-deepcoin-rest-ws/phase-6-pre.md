@@ -46,7 +46,7 @@ deadline 内 WS 回到 healthy 即提交，到期则走 `entry_admission_expired
 `trading_settings.entry_revision_exchange_authority` 租约；下一个申请者（raw 15668，峰哥 BTC 限价多）发现过期后把文档翻成
 `blocked`，而 `blocked` 没有任何自动或人工复位路径，此后所有改单被拒，直到指挥会话批准一次性复位。改为：
 (1) 批次进入 recovery_required / resolved / blocked 等任何终态时必须归还租约；(2) `blocked` 超过 10 分钟且无存活持有者时
-自动复位为 idle 并告警（ALWAYS_NOTIFIED）；(3) `acquire` 见 blocked 时先检查前持有者进程是否仍存活；
+自动复位为 idle 并告警（ALWAYS_NOTIFIED）；(3) `acquire` 见 blocked 时先检查前持有者进程是否仍存活——为此 `_blocked_document()` 必须把 `held` 文档的 `owner_pid` 与 `owner_start_ticks` 一并带过去（目前只留 token_sha256 与 prior_owner_kind，翻成 blocked 后查不出持有者）；idle 文档键集固定为 {schema_version, state, generation, released_at}，任何额外字段会让文档被判非法，复位理由只能写进审计行；
 (4) 授权过期被拒记为确定性拒绝（A-6c 已在边界侧处理）。
 
 ## 完成条件
