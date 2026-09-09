@@ -44,6 +44,7 @@ user_decisions_2026_09_07:
 | 5b | 追既往被 partial_position_unexplained 冻结的 29 条止盈收敛（已平→终态，活跃→新判据重判） | L2 | 否 |
 | 5c | 部分止盈成交证据扩展到 orders-history，并重判活跃仓位的冻结收敛（A-5 判据三在当前交易所行为下拿不到证据） | L2 | 否 |
 | 6 | 确定性拒绝不升级为结果未知；降风险指令绕过冻结 | L2（改交易语义） | 是 |
+| 5e | 止损缩量必须先挂新、确认后撤旧（set-position-sltp 是叠加语义） | L2 | 否 |
 | 6b | uncertain 的 evidence_refs_json 从不写入；reanalyze 护栏命中记为预期状态而非 err | L1 | 否 |
 | 9 | 操作员 bot 增加“选择候选”命令，闭环目标歧义确认 | L2 | 否 |
 | 8 | 权威识别器 477 条“识别失败”的归因（auto_trade 群 108 条），先只读再修 | 盘点 L0 / 修复视方案 | 视方案 |
@@ -156,6 +157,7 @@ user_decisions_2026_09_07:
 
 - step-6b-result (2026-09-09, 指挥会话记录): 部署 c0520b94：uncertain 冻结时写入 writes 证据（含 outcome）、空 writes 记 no_exchange_write_tracked 并告警 uncertain_without_write；reanalyze 撞护栏改为 info + 结构化返回。遗留：执行边界按设计不捕获 idempotency_key / request_fingerprint / sCode，证据里没有这些字段。两个加长观察器（A-8 新码与契约放宽、6b 的 uncertain 与护栏）继续等真实样本。
 - step-8-result (2026-09-09, 指挥会话记录): 部署 14ef9d57：五个失败码分流（含第五码 lifecycle_apply_failed）、authoritative_recognition_failed 告警只对 auto_trade 群非良性三类投递、幽灵目标改在“未落地”路径校验并走确认通道（降风险指令的刻意放行不动）、契约放宽已按用户批准落地。顺序偏差：契约改动先于挂载路径核实部署，核实结论支持改动（两条路只依赖 stop_loss，空止盈不会触发 convergence 的 ValueError）。L1 窗口只证明部署健康，新行为无真实样本，已挂 6 小时加长观察器。丢失指令区间 10–23 条不再收紧（不影响任何后续动作）。step-6b 与 step-9 文件已补写。
+- step-5e-planned (2026-09-09, 指挥会话): B 线 6-pre-3 实测 set-position-sltp 为叠加语义（每次新 ordId，旧单留存）。A-5 任务 2 的止损缩量只挂新不撤旧，账本会误记为已缩量而交易所两张并存；该路径至今零触发。新增 step 5e：先挂新、回读确认、再撤旧、再改账本，任何一步失败保留新单并告警冻结。break_even 路径已有撤旧步骤，形状正确。A-6c 之后执行。
 - step-8-contract-approval (2026-09-09, 用户在指挥会话明确批准): 入场契约放宽为 symbol / side / entry / stop_loss 必填、take_profit 可选（原要求五项齐全）。缺止损的信号继续拒绝并进 contract_invalid 告警。执行前须只读核实历史 15 条只缺止盈的信号放行后的准入分支与止损挂载路径。
 - step-8-attribution (2026-09-09, 指挥会话记录): auto_trade 群共 181 条（9 个群）“识别失败”，MiMo 调用错误 0、证据无效 0——全部发生在把模型答案落到生命周期那一步，标签被无差别写成识别失败。分类：契约校验失败 22（近 7 天 3，21 条只缺一项，15 缺止盈 / 6 缺止损）、无上下文解析记录 113、解析成功未落地 45、解析出错 2。真正被吞的可执行管理指令下界 10 条（最晚 09-02，近 7 天 0）。裁定：先做标签分流与幽灵目标通知确认，告警只对 auto_trade 群的 contract_invalid / target_not_verifiable 投递；契约放宽方向为 symbol/side/entry/stop_loss 必填、take_profit 可选，等用户批准；不追溯重放、不改提示词。
 - step-7-result (2026-09-09, 指挥会话记录): 首版 4f25d4b6 因把变更追加表当心跳表导致 auto_trade 群全部管理指令进确认态，09:29Z 回滚，修正版 d4348d11 改读 execution_bindings 的每轮重写行，验收窗 stale_confirm=0。新遗留：(1) 所有 uncertain attempt 的 evidence_refs_json 自 09-04 起全为空，落 uncertain 的写入路径从不写证据引用——列为 A-6b；(2) web_app.reanalyze 重试遇到“已在执行/结果未知”护栏时把栈打进 err 日志，应当作预期状态处理——并入 A-6b；(3) 操作员 bot 无“选择候选”命令，目标歧义通知只能人工处理——列为 A-9。attempt 818/820（改单撤单与入场的 outcome_unknown）属 B 线背景率，交 B-5c/阶段 6。
