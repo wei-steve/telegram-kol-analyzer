@@ -23,6 +23,10 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.entry_revision_exchange_authority import (
+    release_authority_for_finished_batches,
+    reset_blocked_entry_revision_authority,
+)
 from telegram_kol_research.naked_fill_stop_net import (
     reconcile_naked_market_fills,
 )
@@ -2856,6 +2860,20 @@ def run_operator_maintenance_tick(
         execution_contract_mode=execution_contract_mode,
         entry_after_item_id=int(execution_entry_after_item_id),
     )
+    # Phase 6-pre-6. The slow half of the deadlock fix. The fast half runs
+    # inside acquire, but only when somebody is still trying to acquire; a
+    # block whose owner died and whose applicants have all given up would sit
+    # there forever without this. Needs no exchange client -- it only reads a
+    # settings row and a pid.
+    try:
+        # Two halves of the same deadlock. The sweep returns a lease still held
+        # for a batch that has finished -- seconds after it finishes, instead
+        # of the twenty minutes that expiry-then-block would take. The reset
+        # catches what is already blocked and can no longer be held by anyone.
+        release_authority_for_finished_batches(session_factory, now=now)
+        reset_blocked_entry_revision_authority(session_factory, now=now)
+    except Exception:
+        logger.warning("entry_revision_authority_reset_tick_failed", exc_info=True)
     if execution_reconciliation_client is not None:
         # Phase 6-pre-2. The net under a market fill the identity equation could
         # not attribute. It is not gated on the contract mode: a filled position

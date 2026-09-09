@@ -173,6 +173,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # need a person's eyes within seconds, so neither can be silenced by an
         # environment whitelist.
         "naked_market_fill_safety_net",
+        # Phase 6-pre-6: the entry-revision authority was blocked by an owner
+        # that no longer exists, and something reset it without being asked.
+        # Nobody requested that write, so somebody has to be told it happened --
+        # and the idle document's key set is fixed, so the alert and the audit
+        # row are the only places the reason can live.
+        "entry_revision_authority_blocked_reset",
         # A-2: the management-instruction failures. Production's hand-edited
         # list named none of these, so a durably failed instruction left a
         # ledger row and no message for weeks. Delivery of

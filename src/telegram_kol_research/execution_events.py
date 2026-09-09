@@ -98,6 +98,11 @@ NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
         # way the freeze was resolved and nothing else; listing them here is
         # required, because otherwise a bypass audit would read as a hazardous
         # action and freeze that message's source-deletion exit (A-5 task 8).
+        # Phase 6-pre-6: the audit row for an authority reset. It records that a
+        # lease was returned to idle and nothing else; it issues no request of
+        # its own, and listing it here keeps it from reading as a hazardous
+        # action that would freeze that message's source-deletion exit.
+        "entry_revision_authority_reset",
         "management_freeze_bypassed",
         "management_freeze_rejected",
         # A-9 audit rows for the operator's answer to a target-confirmation
