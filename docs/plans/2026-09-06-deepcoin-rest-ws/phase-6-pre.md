@@ -33,6 +33,22 @@ deadline 内 WS 回到 healthy 即提交，到期则走 `entry_admission_expired
 每次约 7 秒缺口）。改为：静默到阈值先做应用层探活（listenkey 续期成功且一次只读 REST 快照与收件箱水位对照无差异即视为活），
 探活失败才重连；目标日缺口占比 < 0.1%。保留 ping/pong 与真正断线的重连。测试覆盖探活成功不重连、探活失败重连、断线立即重连。
 
+## 6-pre-5：撤单回执丢失后自动确认（L2）
+
+改单批次撤旧单时 POST 回执丢失（`submit_unknown` / `revision_cancel_outcome_unknown`）会让批次停在 `recovery_required`
+且永不自愈（2026-09-09 批次 7）。改为：回执未知时在下一轮 reconcile 用 `trigger-order-history` 的 `uTime` / `triggerTime`
+与 `trigger-orders-pending` 是否仍在来确认撤单结果；确认已撤 → leg cancelled、批次继续；仍挂着 → 按原意图重试撤单一次；
+两者都读不到 → 保持 recovery_required 并告警。
+
+## 6-pre-6：入场改单授权租约不得成为死锁（L2）
+
+2026-09-09：批次 7 的持有者（`legacy-raw:15633`）在批次进入 `recovery_required` 后从未归还
+`trading_settings.entry_revision_exchange_authority` 租约；下一个申请者（raw 15668，峰哥 BTC 限价多）发现过期后把文档翻成
+`blocked`，而 `blocked` 没有任何自动或人工复位路径，此后所有改单被拒，直到指挥会话批准一次性复位。改为：
+(1) 批次进入 recovery_required / resolved / blocked 等任何终态时必须归还租约；(2) `blocked` 超过 10 分钟且无存活持有者时
+自动复位为 idle 并告警（ALWAYS_NOTIFIED）；(3) `acquire` 见 blocked 时先检查前持有者进程是否仍存活；
+(4) 授权过期被拒记为确定性拒绝（A-6c 已在边界侧处理）。
+
 ## 完成条件
 
-四项完成后状态文件 `current_phase: 6`，等待用户对阶段 6 的单独批准（批准前须向用户出示阶段 5 的逐笔保护确认与第 10 项结论）。
+六项完成后状态文件 `current_phase: 6`，等待用户对阶段 6 的单独批准（批准前须向用户出示阶段 5 的逐笔保护确认与第 10 项结论）。
