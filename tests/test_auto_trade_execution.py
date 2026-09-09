@@ -4531,3 +4531,281 @@ def test_auto_process_message_trade_signal_adjusts_stop_loss_from_position_updat
     }
     assert fake_client.cancel_trigger_orders == []
     assert fake_client.protections == []
+
+
+# --------------------------------------------------------------------------
+# Phase 6-pre-1: a WebSocket gap holds a new entry instead of killing it
+# --------------------------------------------------------------------------
+
+
+class _WsInbox:
+    """The worker's stream inbox, as the admission gate reads it."""
+
+    def __init__(self, *, state, gaps, resync="converged"):
+        from telegram_kol_research.deepcoin_ws_stream_state import (
+            DeepcoinWsStreamStateMachine,
+        )
+
+        self.state_machine = DeepcoinWsStreamStateMachine(
+            now_provider=lambda: datetime(2026, 6, 12, 8, 0, tzinfo=UTC),
+            monotonic_ms_provider=lambda: 0,
+        )
+        self.state_machine.state = state
+        self.state_machine.last_resync_outcome = resync
+        self._gaps = gaps
+
+    def _open_gap_count(self):
+        return self._gaps
+
+
+@pytest.fixture()
+def ws_stream():
+    """Drive the real admission gate the way the worker process does."""
+
+    from telegram_kol_research.deepcoin_entry_admission import (
+        set_entry_admission_inbox_provider,
+        set_entry_admission_runtime_role,
+    )
+    from telegram_kol_research.deepcoin_ws_stream_state import WS_STATE_HEALTHY
+
+    set_entry_admission_runtime_role("worker")
+    holder = {}
+
+    def gapped():
+        holder["inbox"] = _WsInbox(state=WS_STATE_HEALTHY, gaps=1)
+
+    def healthy():
+        holder["inbox"] = _WsInbox(state=WS_STATE_HEALTHY, gaps=0)
+
+    def disconnected():
+        holder["inbox"] = _WsInbox(state="disconnected", gaps=0)
+
+    set_entry_admission_inbox_provider(lambda: holder.get("inbox"))
+    gapped()
+    try:
+        yield SimpleNamespace(
+            gapped=gapped, healthy=healthy, disconnected=disconnected
+        )
+    finally:
+        set_entry_admission_inbox_provider(None)
+        set_entry_admission_runtime_role(None)
+
+
+def _ws_defer_settings(session_factory):
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+            "entry_message_assembly_v2_mode": "live",
+            "instruction_execution_contract_mode": "shadow",
+            "symbol_entry_thresholds": {
+                "BTC": {
+                    "market_leg_threshold": "50",
+                    "first_limit_offset": "90",
+                    "second_limit_offset": "80",
+                }
+            },
+        },
+    )
+
+
+def _entry_item(session_factory, raw_message_id):
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_message_id
+        )
+        session.commit()
+        return items[0].id
+
+
+def test_a_stream_gap_holds_the_entry_instead_of_failing_it(tmp_path, ws_stream):
+    session_factory = create_session_factory(tmp_path / "ws-gap-defer.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    item_id = _entry_item(session_factory, raw_message_id)
+    _ws_defer_settings(session_factory)
+    fake_client = _FakeDeepcoinClient(session_factory)
+    processed_at = datetime(2026, 6, 12, 8, 1, tzinfo=UTC)
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=processed_at,
+    )
+
+    assert result["status"] == "in_progress"
+    # Nothing reached the exchange, and no trade signal was even created: the
+    # refusal happens before anything declares an imminent write.
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    with session_factory() as session:
+        assert session.query(TradeSignal).count() == 0
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "pending"
+        assert json.loads(item.result_json)["reason"] == "ws_observation_pending"
+        assert json.loads(item.result_json)["ws_observation_reason"] == "open_gap"
+        assert item.visibility_next_attempt_at.replace(tzinfo=UTC) == (
+            processed_at + timedelta(seconds=5)
+        )
+        assert item.execution_deadline_at.replace(tzinfo=UTC) == (
+            processed_at + timedelta(hours=6)
+        )
+        contract = session.query(InstructionExecutionContract).one()
+        assert contract.state == "deferred"
+        assert contract.reason_code == "ws_observation_pending"
+        assert contract.attempted_exchange_write is False
+
+
+def test_a_recovered_stream_lets_the_held_entry_submit_exactly_once(
+    tmp_path, ws_stream
+):
+    from telegram_kol_research.entry_admission_reconciler import (
+        reconcile_due_entry_admissions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "ws-gap-recover.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    item_id = _entry_item(session_factory, raw_message_id)
+    _ws_defer_settings(session_factory)
+    fake_client = _FakeDeepcoinClient(session_factory)
+    deferred_at = datetime(2026, 6, 12, 8, 1, tzinfo=UTC)
+
+    ws_stream.disconnected()
+    auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=deferred_at,
+    )
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, item_id).status == "pending"
+
+    ws_stream.healthy()
+    released = reconcile_due_entry_admissions(
+        session_factory,
+        now=deferred_at + timedelta(seconds=10),
+        execution_contract_mode="shadow",
+    )
+    assert released.released == 1
+    with session_factory() as session:
+        assert (
+            session.get(MessageInstructionItem, item_id).visibility_next_attempt_at
+            is None
+        )
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=deferred_at + timedelta(seconds=11),
+    )
+
+    assert result["status"] == "completed"
+    assert len(fake_client.orders) == 2
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "submitted"
+        assert session.query(ExecutionBinding).count() == 1
+        assert session.query(TradeSignal).count() == 1
+
+    # A second pass after the submission must not place the entry again.
+    repeat = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=deferred_at + timedelta(seconds=12),
+    )
+    assert repeat["status"] == "completed"
+    assert len(fake_client.orders) == 2
+    with session_factory() as session:
+        assert session.query(ExecutionBinding).count() == 1
+
+
+def test_a_gap_that_outlives_the_deadline_expires_the_held_entry(
+    tmp_path, ws_stream
+):
+    from telegram_kol_research.entry_admission_reconciler import (
+        reconcile_due_entry_admissions,
+    )
+
+    session_factory = create_session_factory(tmp_path / "ws-gap-expire.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    item_id = _entry_item(session_factory, raw_message_id)
+    _ws_defer_settings(session_factory)
+    fake_client = _FakeDeepcoinClient(session_factory)
+    deferred_at = datetime(2026, 6, 12, 8, 1, tzinfo=UTC)
+
+    auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=deferred_at,
+    )
+    reported = []
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=deferred_at + timedelta(hours=6, seconds=1),
+        execution_contract_mode="shadow",
+        incident_reporter=lambda **kwargs: reported.append(kwargs) or object(),
+    )
+
+    assert (result.expired, result.incidents) == (1, 1)
+    assert reported[0]["defer_reason_code"] == "ws_observation_pending"
+    assert fake_client.orders == []
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "failed"
+        assert json.loads(item.error_json)["reason"] == (
+            "entry_admission_deadline_expired"
+        )
+        assert session.query(InstructionExecutionContract).one().state == "expired"
+        assert session.query(TradeSignal).count() == 0
+
+
+def test_a_healthy_stream_submits_exactly_as_phase_five_did(tmp_path, ws_stream):
+    """The deferral must be invisible when the stream is converged."""
+
+    session_factory = create_session_factory(tmp_path / "ws-healthy.db")
+    raw_message_id = _persist_candidate(
+        session_factory, parse_source="mimo_authoritative"
+    )
+    item_id = _entry_item(session_factory, raw_message_id)
+    _ws_defer_settings(session_factory)
+    fake_client = _FakeDeepcoinClient(session_factory)
+    ws_stream.healthy()
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "completed"
+    assert len(fake_client.orders) == 2
+    with session_factory() as session:
+        item = session.get(MessageInstructionItem, item_id)
+        assert item.status == "submitted"
+        assert item.execution_deadline_at is None
+        assert session.query(ExecutionBinding).count() == 1

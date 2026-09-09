@@ -145,6 +145,8 @@ def test_defer_reason_registry_is_single_and_complete():
             "adjacent_entry_context_pending",
             "target_strategy_binding_not_visible_yet",
             "preceding_entry_context_unresolved",
+            # Phase 6-pre-1: an entry the private stream cannot vouch for yet.
+            "ws_observation_pending",
         }
     )
 

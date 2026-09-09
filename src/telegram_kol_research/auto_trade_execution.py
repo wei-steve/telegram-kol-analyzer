@@ -831,6 +831,24 @@ def _auto_process_single_message_trade_signal(
     if admission.status == "blocked":
         return {"status": "blocked", "reason": admission.reason_code}
 
+    # Phase 6-pre-1. The private stream does not replay on reconnect, so an
+    # entry submitted into a gap could never be verified -- the writer refuses
+    # it at two later checkpoints and always did. Asking here, before anything
+    # declares an imminent exchange write, is what lets the refusal be recorded
+    # as a retryable deferral instead of a terminal failure: every entry that
+    # arrived inside a tg-deploy restart used to die on those checkpoints.
+    from telegram_kol_research.deepcoin_entry_admission import (
+        ws_observation_entry_defer_result,
+    )
+
+    ws_observation_defer = ws_observation_entry_defer_result(
+        session_factory,
+        message_instruction_item_id=message_instruction_item_id,
+        now=now,
+    )
+    if ws_observation_defer is not None:
+        return ws_observation_defer
+
     from telegram_kol_research.runtime_incident_scanner import (
         list_critical_unprotected_positions,
     )
