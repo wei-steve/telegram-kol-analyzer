@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 6b
-current_step_file: docs/plans/2026-09-07-management-reliability/step-6b-uncertain-evidence-and-reanalyze-guard.md
-step_status: in_progress           # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 8
-last_completed_commit: 14ef9d57dce514d80b2a1cf3e206f671537a1d1d
+current_step: 9
+current_step_file: docs/plans/2026-09-07-management-reliability/step-9-bot-choose-candidate.md
+step_status: planned               # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 6b
+last_completed_commit: c0520b944d931e49794301a688880e27e946e12c
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -299,3 +299,10 @@ user_decisions_2026_09_07:
   **任务 1 契约放宽**（用户 2026-09-09 批准，见 `step-8-contract-approval`）：`symbol/side/entry/stop_loss` 必填、`take_profit` 可选，`authoritative_instructions._complete_strategy` 与 `mimo_v2_contract._parse_complete_strategy` 同步改；缺失的止盈存 `None` 而非 `""`（空串在下游读作"给了但为空"）。**只读核实两轮**：(a) 准入分支——15 条只缺止盈的信号里，**只有 3 条**会变成 `eligible_for_auto_trade`（10358/10574 BTC、14492 ETH，止损都是具体数字、几何校验通过），另 12 条撞 `symbol_not_whitelisted`（四个群白名单都只有 BTC/ETH）且入场写的是"现价"还会再撞 `entry_price_geometry_ambiguous`；那 12 条其实是 6 对重复。缺止损的 7 条即使通过契约也永远到不了自动交易——`evaluate_trading_decision` 本来就有 `missing_stop_loss → manual_review`，契约那道拒绝是纵深防御的第二层。(b) 止损挂载——限价腿 `deepcoin_limit_entry.py` 无止损直接拒单、有止损必写 `slTriggerPx`，`tpTriggerPx` 仅在有止盈时写；市价腿 `naked_fill_stop_net.py` 从草稿取止损写 `slTriggerPx`、全程不读止盈；止盈 convergence 两处调用点都先判 `take_profit_legs` 非空才建行，所以空止盈走不到 `requires a target` 那个 ValueError。**顺序偏差如实记录**：契约改动是在看到用户批准提交后先做并部署、**之后**才补的挂载路径核实（准入分支那份在改动之前完成），结论支持该改动、无需回滚。
   **L1 观察（11:23:30Z → 11:39:11Z，按时长达标）**：`elapsed=15m msgs=2 chats=2 old_label=0 blanket_reason=0 a8_incidents=0 worker_err_lines=0 head=14ef9d57`。**证明**：部署健康、旧标签与旧 reason 一条都没有再写入。**未证明**：窗内只有 2 条真实消息、1 条识别决策（`mimo_no_action`，既有码）、**0 条新入场候选**——五个新码、新告警、放宽后的契约**都没有真实样本**，指挥会话给的验收条件"窗内若出现只缺止盈的真实入场信号，逐笔确认它进入下单通道且止损挂上"是**条件未发生**，不是通过。这三条目前只有单测覆盖，已另起加长观察器（停止条件改为"出现任一新码的决策或任一新入场候选"，最长 6 小时）等真实样本，凑到后补记。
   **遗留**：(1) 加长观察窗的真实样本核对未完成。(2) 报告里"真的丢了指令"的区间是 10–23 条，收紧需再跑一轮意图计算。(3) 不改 MiMo 提示词（按裁定记为遗留）；不追溯重放这 181 条（最晚可执行指令 09-02，仓位状态早已改变）。
+
+- step-6b (2026-09-09, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（L1）。分支 `mgmt/step-6b-uncertain-evidence`，SHA **`c0520b944d931e49794301a688880e27e946e12c`**（12:11:40Z 上线，**回滚参考 `14ef9d57`**，即 A-8）。全量 **8105 passed / 4 skipped / 0 failed**，新增 7 个用例在 `tests/test_management_reliability_step6b.py`。
+  **任务 1（uncertain 必须带证据）**：`mark_authoritative_execution_uncertain()` 新增 `evidence_refs` 形参，冻结时把执行边界跟踪到的 writes 写进 `evidence_refs_json`。**同时给每条 write 加了 `outcome` 字段**（`execution_boundary.py` 的 `deepcoin_write` 证据项原本只有 kind/method/ordinal/order_id）——没有它，证据只能说明"发生过一次 place_order"，说不出这次是**没回执**还是**被明确拒绝**，而这恰恰是人工善后唯一要判断的事。writes 为空时写 `[]`（不是 NULL）、`error_summary` 追加 `no_exchange_write_tracked`、并触发 `uncertain_without_write`（severity high，已进 `ALWAYS_NOTIFIED_INCIDENT_TYPES` 代码基线）：A-6 之后"无 writes 的确定性拒绝"应当落 `failed_safe` 而非 `uncertain`，所以这个组合再出现就意味着边界丢失了一次写入、或有东西绕过边界碰了交易所，两者都必须有人看见。**未按步骤文件写入 `idempotency_key` / `request_fingerprint` / `sCode` / `sMsg`**：`ExecutionBoundaryTracker` 的设计注释是"只记方法与结果标识，绝不记请求体或请求头"，它压根没有捕获这些字段；要加就得让边界开始读取请求负载，那是另一个有隐私与设计取舍的改动，记为遗留待裁定。method + ordinal + outcome + order_id 已足以区分"发过没回执"与"没发"。
+  **任务 2（reanalyze 护栏）**：新增 `AuthoritativeExecutionInProgress`，**仍继承 `RuntimeError`**，所以既有 `except RuntimeError` 的行为一字未变。原来是裸 `RuntimeError`，要和真故障区分只能匹配文案，没人这么做，于是 `context_resolution_worker.py:617` 的 `logger.exception` 对每一次都打完整栈（A-7 窗内 12 条）。`web_app.reanalyze` 与 `cli` 的同名函数现在都捕获它、记 info（含 raw_message_id 与 comparison_status）、返回 `{"status": "execution_in_progress", ...}`；worker 因此正常结束这次认领，而不是重试撞回同一道护栏。
+  **既有测试按新行为更新一条**：`test_uncertain_authoritative_execution_records_a_high_incident` 断言的 `error_summary` 现在会多带 `no_exchange_write_tracked`，已更新断言。
+  **L1 观察（12:11:40Z → 12:26:52Z，按时长达标）**：`elapsed=15m msgs=2 chats=2 uncertain=0 uncertain_no_evidence=0 no_write_alerts=0 guard_stacks=0 guard_info=0 worker_err_lines=0 head=c0520b94`。**证明**：部署健康、15 分钟零错误行。**未证明**：窗内 `uncertain=0`（任务 1 无样本）、`guard_info=0`（护栏一次都没被触发，所以 `guard_stacks=0` 只说明"没发生"，不说明"修好了"）。两条目前只有单测覆盖，已起加长观察器（`/root/evidence/step6b_observe_ext.sh`，停止条件改为"出现新的 uncertain 或出现一次护栏命中"，最长 6 小时），凑到样本后补记。
+  **遗留**：(1) 加长观察窗的真实样本核对未完成。(2) `idempotency_key` / `request_fingerprint` / `sCode` / `sMsg` 未入证据，需先裁定是否让执行边界捕获请求负载。(3) 按步骤文件不追溯改那 23 条历史 uncertain 行。
