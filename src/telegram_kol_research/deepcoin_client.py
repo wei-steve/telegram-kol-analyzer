@@ -1002,6 +1002,19 @@ class DeepcoinRestClient:
         inst_id: str,
         order_id: str,
     ) -> list[dict[str, Any]]:
+        """**Unreliable: the exchange ignores the ``ordId`` filter.**
+
+        Measured on 2026-09-08 (A-5b): this returns ``[]`` for every order id,
+        including ids that are demonstrably present in the unfiltered history.
+        An empty list from here therefore means *nothing* -- it does not mean
+        "no such historical order" -- so a caller that reads it as absence is
+        fail-open. Use :meth:`find_trigger_order_history_rows`, which pages the
+        unfiltered endpoint and filters locally, and which says explicitly when
+        it could not finish looking.
+
+        Kept only so an existing caller does not break at import time.
+        """
+
         payload = self._request(
             "GET",
             _path_with_query(
@@ -1010,6 +1023,60 @@ class DeepcoinRestClient:
             ),
         )
         return _require_list_data(payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH)
+
+    def find_trigger_order_history_rows(
+        self,
+        *,
+        inst_id: str,
+        order_id: str,
+        max_pages: int = 5,
+    ) -> tuple[list[dict[str, Any]], bool]:
+        """Return ``(exact matches, searched_to_the_end)`` from trigger history.
+
+        The endpoint returns the newest hundred rows and pages backwards with
+        ``after=<oldest id on the page>``. The second element is ``False`` when
+        the page budget ran out before the history did, which is the caller's
+        signal that "not found" is *unknown* rather than *absent*.
+        """
+
+        cursor: str | None = None
+        for _ in range(max(1, int(max_pages))):
+            query: dict[str, Any] = {"instType": "SWAP", "instId": inst_id}
+            if cursor is not None:
+                query["after"] = cursor
+            payload = self._request(
+                "GET", _path_with_query(DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH, query)
+            )
+            rows = _require_list_data(
+                payload, endpoint=DEEPCOIN_TRIGGER_ORDERS_HISTORY_PATH
+            )
+            if not rows:
+                return [], True
+            matches = [
+                dict(row)
+                for row in rows
+                if isinstance(row, dict)
+                and str(order_id)
+                in {
+                    str(row.get(key)).strip()
+                    for key in ("ordId", "orderId", "order_id", "id")
+                    if row.get(key) not in (None, "")
+                }
+            ]
+            if matches:
+                return matches, True
+            identifiers = [
+                str(row.get("ordId") or "").strip()
+                for row in rows
+                if isinstance(row, dict) and str(row.get("ordId") or "").strip()
+            ]
+            if not identifiers:
+                return [], True
+            next_cursor = min(identifiers)
+            if next_cursor == cursor:
+                return [], True
+            cursor = next_cursor
+        return [], False
 
     def get_trigger_order_history_by_id(
         self,

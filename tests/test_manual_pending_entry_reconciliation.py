@@ -89,6 +89,21 @@ class ReadOnlyClient:
             raise result
         return result
 
+    def find_trigger_order_history_rows(self, *, inst_id, order_id, max_pages=5):
+        """A-5c replacement for the endpoint whose ordId filter is ignored.
+
+        The double keeps the same matching it always did and reports that it
+        searched the whole history, which is what the paging reader promises
+        when it reaches the end.
+        """
+
+        return (
+            self.list_trigger_order_history_by_order_id(
+                inst_id=inst_id, order_id=order_id
+            ),
+            True,
+        )
+
     def list_trigger_order_history_by_order_id(self, *, inst_id, order_id):
         self.exact_history_calls.append((inst_id, order_id))
         instrument_rows = [
@@ -153,11 +168,12 @@ class TimedReadOnlyClient(ReadOnlyClient):
             order_id=order_id,
         )
 
-    def list_trigger_order_history_by_order_id(self, *, inst_id, order_id):
+    def find_trigger_order_history_rows(self, *, inst_id, order_id, max_pages=5):
         self.exact_history_started_at.append(self.clock())
-        return super().list_trigger_order_history_by_order_id(
+        return super().find_trigger_order_history_rows(
             inst_id=inst_id,
             order_id=order_id,
+            max_pages=max_pages,
         )
 
 
@@ -984,7 +1000,11 @@ def test_manual_reconciliation_requires_exact_zero_fills_per_target(
                 }
             ]
             * 100,
-            "target_history_query_incomplete",
+            # A-5c: a hundred rows carrying the same ordId is a uniqueness
+            # problem, not a truncation one. Truncation now has its own signal
+            # -- the paging reader's ``searched_to_the_end`` flag -- which the
+            # test below covers.
+            "target_cancelled_history_not_unique",
         ),
         (
             [
@@ -1028,6 +1048,44 @@ def test_manual_reconciliation_exact_history_is_single_attempt_and_fail_closed(
     assert plan.status == "blocked"
     assert plan.reason_code == reason
     assert client.exact_history_calls == [(target.instrument_id, target.order_id)]
+
+
+def test_manual_reconciliation_treats_an_unfinished_history_search_as_unknown(
+    tmp_path,
+):
+    """A-5c: "not found" only means absent if the whole history was searched.
+
+    The exchange ignores the ``ordId`` filter and answers ``[]`` for every id,
+    so the old reader made every target look like it had no history at all.
+    The paging reader says when it ran out of pages, and that is fail-closed.
+    """
+
+    from telegram_kol_research.manual_pending_entry_reconciliation import (
+        build_manual_pending_entry_reconciliation_plan,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    target = _seed_pending_target(session_factory)
+
+    class TruncatedHistoryClient(ReadOnlyClient):
+        def find_trigger_order_history_rows(
+            self, *, inst_id, order_id, max_pages=5
+        ):
+            self.exact_history_calls.append((inst_id, order_id))
+            return [], False
+
+    client = TruncatedHistoryClient()
+
+    plan = build_manual_pending_entry_reconciliation_plan(
+        session_factory,
+        deepcoin_client=client,
+        targets=(target,),
+        runtime_guard=RuntimeGuard(),
+        now=NOW,
+    )
+
+    assert plan.status == "blocked"
+    assert plan.reason_code == "target_history_query_incomplete"
 
 
 def test_manual_reconciliation_fingerprint_binds_exact_history(tmp_path):

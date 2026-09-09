@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import Session
@@ -181,6 +181,7 @@ def reconcile_trigger_take_profit_order_history(
     observed_at: datetime | None = None,
     position_snapshot_complete: bool = False,
     pending_snapshot_complete_by_instrument: dict[str, bool] | None = None,
+    contract_spec_provider: object | None = None,
 ) -> None:
     """Reconcile TP audit records from read-only exchange observations.
 
@@ -305,7 +306,22 @@ def reconcile_trigger_take_profit_order_history(
             and str(_load_evidence(convergence.error_json).get("type") or "")
             == "DeepcoinDefiniteRejection"
         )
-        if convergence.status != "submitted" and not rejected_without_submission:
+        # A-5c task 3. A convergence frozen on an unexplained partial reduction
+        # used to be skipped forever, which is how 29 of them accumulated
+        # (A-5b). It is now re-judged every round: criterion 3 gained a second
+        # form, so a freeze taken before that evidence existed can be lifted by
+        # the same rules that would apply to a fresh one -- and a closed
+        # position can reach the terminalization branch below instead of
+        # waiting for a hand-written repair.
+        frozen_partial_reduction = bool(
+            convergence.status == "conflicted"
+            and convergence.reason_code == "convergence_partial_position_unexplained"
+        )
+        if (
+            convergence.status != "submitted"
+            and not rejected_without_submission
+            and not frozen_partial_reduction
+        ):
             continue
         orders = (
             session.query(PositionTakeProfitOrder)
@@ -408,6 +424,18 @@ def reconcile_trigger_take_profit_order_history(
                     if not _take_profit_order_is_explained_fill(row)
                 ],
                 trigger_history=trigger_history,
+                order_history=order_history or [],
+                position_side=str(binding.side) if binding is not None else None,
+                price_tick=_instrument_price_tick(
+                    contract_spec_provider, instrument_id
+                ),
+                reduction_observed_at_ms=_reduction_observed_at_ms(
+                    session,
+                    pos_id=str(convergence.pos_id),
+                    live_size=live_size,
+                    fallback=now,
+                ),
+                used_close_order_ids=_spent_close_order_ids(orders),
             )
             if explanation.explained:
                 _record_explained_partial_take_profit_fill(
@@ -417,6 +445,14 @@ def reconcile_trigger_take_profit_order_history(
                     explanation=explanation,
                     observed_at=now,
                 )
+                if frozen_partial_reduction:
+                    # The freeze is lifted, not resolved: the convergence goes
+                    # back to the state the online scan itself writes before it
+                    # promotes a row, and production re-derives readiness from
+                    # there. This module never decides a ladder is ready.
+                    convergence.status = "waiting_backup_stop"
+                    convergence.reason_code = None
+                    convergence.completed_at = None
                 continue
             # Fail closed, but never on the conclusion alone: the freeze carries
             # the live size, the outstanding protection size, and every owned
@@ -596,6 +632,77 @@ def _record_proven_tp1_fill(
         evidence=evidence["tp1_fill"],
         completed_at=observed_at,
     )
+
+
+def _instrument_price_tick(contract_spec_provider, instrument_id: str):
+    """The instrument's price tick, or ``None`` when it cannot be read.
+
+    ``None`` makes form (ii) of criterion 3 undecidable, which refuses rather
+    than falling back to a guessed tolerance -- a tolerance nobody chose is not
+    a tolerance.
+    """
+
+    if contract_spec_provider is None or not instrument_id:
+        return None
+    getter = getattr(contract_spec_provider, "get_contract_spec", None)
+    if not callable(getter):
+        return None
+    try:
+        spec = getter(instrument_id)
+    except Exception:
+        return None
+    return getattr(spec, "price_tick", None)
+
+
+def _reduction_observed_at_ms(
+    session: Session,
+    *,
+    pos_id: str,
+    live_size: Decimal,
+    fallback: datetime,
+) -> int:
+    """When the reduced size was first seen, as the upper bound for a fill.
+
+    A close that landed *after* the reduction this pass is explaining cannot be
+    its cause. The tightest honest bound is the first complete observation that
+    already showed the reduced size; without one, this round's own timestamp is
+    used, which is still an upper bound because the reduction is being observed
+    right now.
+    """
+
+    row = (
+        session.query(PositionReconciliationObservation)
+        .filter_by(venue="deepcoin", pos_id=str(pos_id))
+        .filter(PositionReconciliationObservation.snapshot_complete.is_(True))
+        .filter(PositionReconciliationObservation.size_text == _format_decimal(live_size))
+        .order_by(PositionReconciliationObservation.observed_at.asc())
+        .first()
+    )
+    moment = row.observed_at if row is not None else fallback
+    if moment is None:
+        moment = fallback
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=UTC)
+    return int(moment.timestamp() * 1000)
+
+
+def _spent_close_order_ids(orders) -> tuple[str, ...]:
+    """Closing orders already spent explaining an earlier stage of this ladder."""
+
+    spent: list[str] = []
+    for row in orders:
+        evidence = _load_evidence(row.evidence_json).get("partial_take_profit_fill")
+        if not isinstance(evidence, dict):
+            continue
+        close_order = evidence.get("close_order")
+        if isinstance(close_order, dict) and close_order.get("ordId"):
+            spent.append(str(close_order["ordId"]))
+    return tuple(spent)
+
+
+def _format_decimal(value: Decimal) -> str:
+    normalized = format(value.normalize(), "f")
+    return "0" if normalized == "-0" else normalized
 
 
 def _take_profit_order_is_explained_fill(row: PositionTakeProfitOrder) -> bool:

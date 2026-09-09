@@ -358,26 +358,28 @@ def _exact_target_history_evidence(
     *,
     pacer: _MaintenanceExactReadPacer,
 ) -> tuple[str | None, list[dict[str, object]]]:
-    reader = getattr(
-        deepcoin_client,
-        "list_trigger_order_history_by_order_id",
-        None,
-    )
+    # A-5c: ``list_trigger_order_history_by_order_id`` is unreliable -- the
+    # exchange ignores the ``ordId`` filter and answers ``[]`` for every id,
+    # which this function used to read as "no historical order". That is
+    # fail-open. ``find_trigger_order_history_row`` pages the unfiltered
+    # endpoint and reports whether it reached the end of the history, so an
+    # unfinished search is treated as unknown rather than as absence.
+    reader = getattr(deepcoin_client, "find_trigger_order_history_rows", None)
     if not callable(reader):
         return "target_history_query_incomplete", []
     evidence: list[dict[str, object]] = []
     for target in reviewed:
         try:
             pacer.wait("trigger_history")
-            rows = reader(
+            rows, searched_to_the_end = reader(
                 inst_id=target.instrument_id,
                 order_id=target.order_id,
             )
         except Exception:
             return "target_history_query_incomplete", evidence
         if (
-            not isinstance(rows, list)
-            or len(rows) >= 100
+            not searched_to_the_end
+            or not isinstance(rows, list)
             or any(not isinstance(row, dict) for row in rows)
         ):
             return "target_history_query_incomplete", evidence

@@ -156,10 +156,16 @@ def test_reduction_whose_take_profit_never_triggered_is_not_explained():
 
 
 def test_reduction_whose_take_profit_is_absent_from_history_is_not_explained():
+    """A-5c: with no order-history inputs supplied, form (ii) is undecidable.
+
+    The outcome is unchanged -- the reduction stays unexplained -- but the
+    reason now names the half of criterion 3 that could not be evaluated.
+    """
+
     result = _explain(trigger_history=[])
 
     assert result.explained is False
-    assert result.reason_code == "partial_reduction_trigger_history_missing"
+    assert result.reason_code == "partial_reduction_close_evidence_inputs_missing"
 
 
 def test_reduction_whose_trigger_failed_is_not_explained():
@@ -183,6 +189,8 @@ def test_two_equally_sized_owned_take_profits_stay_unexplained():
     assert result.explained is False
     assert result.reason_code == "partial_reduction_take_profit_ambiguous"
     assert result.evidence["candidate_order_ids"] == ["tp1", "tp2"]
+    # A-5c: trigger history naming exactly one of them does NOT break the tie.
+    assert result.evidence["corroborated_order_ids"] == ["tp1"]
 
 
 # --------------------------------------------------------------------------
@@ -1115,6 +1123,9 @@ def _convergence_fixture(tmp_path):
                     trigger_price=price,
                     size_text=size,
                     status="active",
+                    # The ladder is placed before it can fill; form (ii) of
+                    # criterion 3 refuses a close that predates its stage.
+                    created_at=(NOW - timedelta(hours=1)).replace(tzinfo=None),
                 )
             )
         session.commit()
@@ -1227,8 +1238,287 @@ def test_convergence_still_freezes_on_an_unexplained_reduction(tmp_path):
         )
         # A-5 task 4: the freeze records the fields it judged, not just a verdict.
         error = json.loads(convergence.error_json)["partial_position_unexplained"]
-        assert error["reason_code"] == "partial_reduction_trigger_history_missing"
+        assert error["reason_code"] == "partial_reduction_close_evidence_inputs_missing"
         assert (error["planned_size"], error["live_size"]) == ("10", "5")
         assert error["reduction_size"] == "5"
         assert error["order_id"] == "tp1"
         assert error["binding_take_profit_order_ids"] == ["tp1", "tp2", "tp3"]
+
+
+# --------------------------------------------------------------------------
+# A-5c: criterion 3 form (ii) -- a filled close from orders-history
+# --------------------------------------------------------------------------
+
+
+def _close_row(**overrides):
+    """The shape production actually returned for conv 237's TP1 close."""
+
+    row = {
+        "ordId": "close-1",
+        "posSide": "short",
+        "side": "buy",
+        "sz": "5",
+        "fillSz": "5",
+        "avgPx": "81100",
+        "state": "filled",
+        "ordType": "market",
+        # 2026-09-04T08:34:43Z -- the real trigger instant from convergence 222.
+        "cTime": "1788510883000",
+    }
+    row.update(overrides)
+    return row
+
+
+def _explain_with_close(**overrides):
+    stage = _TakeProfitRow(order_id="tp1", size_text="5")
+    stage.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    kwargs = {
+        "execution_binding_id": 337,
+        "pos_id": "pos-222",
+        "planned_size": Decimal("10"),
+        "live_size": Decimal("5"),
+        "take_profit_orders": [stage],
+        # Form (i) has nothing: this is the production reality after
+        # 2026-09-08T01:23Z.
+        "trigger_history": [],
+        "order_history": [_close_row()],
+        "position_side": "short",
+        "price_tick": Decimal("0.1"),
+        "reduction_observed_at_ms": 1788510890000,
+    }
+    kwargs.update(overrides)
+    return explain_partial_position_reduction(**kwargs)
+
+
+def test_a_matching_filled_close_explains_the_reduction():
+    result = _explain_with_close()
+
+    assert result.explained is True
+    assert result.order_id == "tp1"
+    assert result.evidence["evidence_form"] == "orders_history"
+    assert result.evidence["close_order"]["ordId"] == "close-1"
+    assert result.evidence["close_order"]["price_delta"] == "0"
+
+
+def test_a_close_on_the_same_side_as_the_position_is_not_evidence():
+    result = _explain_with_close(order_history=[_close_row(side="sell")])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+def test_a_close_of_a_different_size_is_not_evidence():
+    result = _explain_with_close(order_history=[_close_row(sz="4", fillSz="4")])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+def test_an_unfilled_close_is_not_evidence():
+    result = _explain_with_close(order_history=[_close_row(state="canceled")])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+@pytest.mark.parametrize(
+    "avg_price,explained",
+    [
+        ("81100", True),      # exact
+        ("81100.2", True),    # +2 ticks, the boundary
+        ("81099.8", True),    # -2 ticks, the boundary
+        ("81100.3", False),   # 3 ticks away
+    ],
+)
+def test_the_price_tolerance_is_exactly_two_ticks(avg_price, explained):
+    result = _explain_with_close(order_history=[_close_row(avgPx=avg_price)])
+
+    assert result.explained is explained
+
+
+def test_a_close_older_than_the_stage_is_not_evidence():
+    """A fill that predates the order cannot be that order's fill."""
+
+    result = _explain_with_close(order_history=[_close_row(cTime="1788500000000")])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+def test_a_close_after_the_reduction_was_observed_is_not_evidence():
+    result = _explain_with_close(reduction_observed_at_ms=1788510800000)
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+def test_a_close_already_spent_on_another_stage_is_not_reused():
+    result = _explain_with_close(used_close_order_ids=["close-1"])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_order_missing"
+
+
+def test_two_equal_stages_are_separated_by_the_close_price():
+    """The one case where equal-sized stages stop being ambiguous."""
+
+    near = _TakeProfitRow(order_id="tp-near", size_text="5")
+    near.trigger_price = "81100"
+    near.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    far = _TakeProfitRow(order_id="tp-far", size_text="5")
+    far.trigger_price = "82000"
+    far.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+
+    result = _explain_with_close(take_profit_orders=[near, far])
+
+    assert result.explained is True
+    assert result.order_id == "tp-near"
+
+
+def test_two_equal_stages_stay_ambiguous_when_the_close_fits_neither():
+    near = _TakeProfitRow(order_id="tp-near", size_text="5")
+    near.trigger_price = "83000"
+    near.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+    far = _TakeProfitRow(order_id="tp-far", size_text="5")
+    far.trigger_price = "84000"
+    far.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+
+    result = _explain_with_close(take_profit_orders=[near, far])
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_take_profit_ambiguous"
+
+
+def test_form_one_alone_cannot_separate_two_equal_stages():
+    """Trigger history is incomplete for recent orders, so absence proves nothing."""
+
+    near = _TakeProfitRow(order_id="tp-near", size_text="5")
+    far = _TakeProfitRow(order_id="tp-far", size_text="5")
+
+    result = _explain_with_close(
+        take_profit_orders=[near, far],
+        trigger_history=_triggered_history(order_id="tp-near"),
+        order_history=[],
+    )
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_take_profit_ambiguous"
+    assert result.evidence["corroborated_order_ids"] == ["tp-near"]
+
+
+def test_a_missing_price_tick_refuses_rather_than_guessing_a_tolerance():
+    result = _explain_with_close(price_tick=None)
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_close_evidence_inputs_missing"
+
+
+# --------------------------------------------------------------------------
+# A-5c task 3: a frozen convergence over a live position is re-judged
+# --------------------------------------------------------------------------
+
+
+class _SpecProvider:
+    def get_contract_spec(self, instrument_id):
+        class _Spec:
+            price_tick = Decimal("0.1")
+
+        return _Spec()
+
+
+def _reconcile_5c(session_factory, *, order_history, live_size="5"):
+    from telegram_kol_research.position_take_profit_orders import (
+        reconcile_trigger_take_profit_order_history,
+    )
+
+    positions = [
+        {
+            "posId": "pos-222",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "long",
+            "mrgPosition": "split",
+            "pos": live_size,
+        }
+    ]
+    with session_factory() as session:
+        reconcile_trigger_take_profit_order_history(
+            session,
+            positions=positions,
+            pending_orders=[{"ordId": "tp2"}, {"ordId": "tp3"}],
+            trigger_history=[],
+            order_history=order_history,
+            observed_at=NOW,
+            position_snapshot_complete=True,
+            pending_snapshot_complete_by_instrument={"BTC-USDT-SWAP": True},
+            contract_spec_provider=_SpecProvider(),
+        )
+        session.commit()
+
+
+def _freeze(session_factory):
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, 222)
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_partial_position_unexplained"
+        convergence.completed_at = NOW
+        session.commit()
+
+
+def test_a_frozen_convergence_over_a_live_position_is_re_judged(tmp_path):
+    """The A-5b backlog would never have formed if this ran every round."""
+
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+
+    session_factory = _convergence_fixture(tmp_path)
+    _freeze(session_factory)
+
+    _reconcile_5c(
+        session_factory,
+        order_history=[
+            {
+                "ordId": "close-1",
+                "posSide": "long",
+                "side": "sell",
+                "sz": "5",
+                "fillSz": "5",
+                "avgPx": "81100",
+                "state": "filled",
+                "cTime": "1788510883000",
+            }
+        ],
+    )
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, 222)
+        # The freeze is lifted back to the state the online scan writes before
+        # it promotes a row; production decides readiness, not this pass.
+        assert convergence.status == "waiting_backup_stop"
+        assert convergence.reason_code is None
+        assert convergence.completed_at is None
+        tp1 = session.query(PositionTakeProfitOrder).filter_by(order_id="tp1").one()
+        assert tp1.status == "completed"
+        evidence = json.loads(tp1.evidence_json)["partial_take_profit_fill"]
+        assert evidence["evidence_form"] == "orders_history"
+        assert evidence["close_order"]["ordId"] == "close-1"
+
+
+def test_a_frozen_convergence_without_evidence_stays_frozen(tmp_path):
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+
+    session_factory = _convergence_fixture(tmp_path)
+    _freeze(session_factory)
+
+    _reconcile_5c(session_factory, order_history=[])
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, 222)
+        assert (convergence.status, convergence.reason_code) == (
+            "conflicted",
+            "convergence_partial_position_unexplained",
+        )
+        assert (
+            session.query(PositionTakeProfitOrder).filter_by(order_id="tp1").one().status
+            == "active"
+        )

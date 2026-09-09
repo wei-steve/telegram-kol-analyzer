@@ -438,7 +438,10 @@ def reconcile_deepcoin_execution_bindings(
             processed_at=now,
         )
         result = _apply_reconcile_snapshot(
-            session_factory, snapshot=snapshot, recovered_at=now
+            session_factory,
+            snapshot=snapshot,
+            recovered_at=now,
+            contract_spec_provider=contract_spec_provider,
         )
         if contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
@@ -484,6 +487,7 @@ def reconcile_deepcoin_execution_bindings_read_only(
     *,
     client: DeepcoinReadOnlyClient,
     recovered_at: datetime | None = None,
+    contract_spec_provider: object | None = None,
 ) -> ExecutionReconciliationResult:
     """Refresh local binding state without invoking exchange mutation workers."""
 
@@ -497,6 +501,7 @@ def reconcile_deepcoin_execution_bindings_read_only(
             session_factory,
             snapshot=snapshot,
             recovered_at=now,
+            contract_spec_provider=contract_spec_provider,
         )
         if snapshot.errors:
             raise DeepcoinReconciliationSnapshotUnavailable(
@@ -816,6 +821,7 @@ def _apply_reconcile_snapshot(
     *,
     snapshot: _ReconcileSnapshot,
     recovered_at: datetime,
+    contract_spec_provider: object | None = None,
 ) -> ExecutionReconciliationResult:
     result = ExecutionReconciliationResult()
     trading_settings = load_trading_settings(session_factory)
@@ -1155,6 +1161,9 @@ def _apply_reconcile_snapshot(
                     snapshot.pending_tpsl_observations
                 )
             ),
+            # A-5c: form (ii) of criterion 3 compares a fill price against the
+            # stage's trigger price within two ticks, so it needs the tick.
+            contract_spec_provider=contract_spec_provider,
         )
         from telegram_kol_research.protection_health import (
             reconcile_position_protection_health,
