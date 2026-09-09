@@ -15,11 +15,11 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 6-pre-1
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: planned                 # planned | claimed | in_progress | completed | blocked
+phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by:
+claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
