@@ -366,3 +366,81 @@ def test_the_audit_actions_write_no_exchange_order():
         "management_target_confirmation_reminder",
     ):
         assert action in NON_EXCHANGE_WRITING_EXECUTION_ACTIONS
+
+
+# --------------------------------------------------------------------------
+# A-7b: only ask a question somebody can answer
+# --------------------------------------------------------------------------
+
+
+def _message_without_items(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                id=15660,
+                chat_id=-1002458558902,
+                message_id=503,
+                text="英伟达空单有效，可以随意止盈了！",
+                posted_at=NAIVE,
+                created_at=NAIVE,
+            )
+        )
+        session.commit()
+    return session_factory
+
+
+def test_a_confirmation_that_parks_nothing_is_not_sent(tmp_path):
+    """raw 15660's shape, and raw 15628's before it.
+
+    Both confirmations production ever raised parked nothing, because neither
+    message had an instruction item. An operator answering one of those is
+    told there is nothing awaiting confirmation -- the question was asked
+    before anything was known to be parkable.
+    """
+
+    from telegram_kol_research.management_target_verification import (
+        request_management_target_confirmation,
+    )
+
+    session_factory = _message_without_items(tmp_path)
+    captured: list[dict] = []
+
+    moved = request_management_target_confirmation(
+        session_factory,
+        raw_message_id=15660,
+        candidates=(),
+        snapshot_stale=False,
+        now=NOW,
+        capture=lambda **kwargs: captured.append(kwargs),
+    )
+
+    assert moved == ()
+    assert captured == []
+
+
+def test_a_confirmation_that_parks_something_is_still_sent(tmp_path):
+    """The alarm is narrowed, not removed: a real parked instruction still asks."""
+
+    from telegram_kol_research.management_target_verification import (
+        request_management_target_confirmation,
+    )
+
+    session_factory = _fixture(tmp_path, awaiting=False)
+    captured: list[dict] = []
+
+    moved = request_management_target_confirmation(
+        session_factory,
+        raw_message_id=RAW_ID,
+        candidates=(),
+        snapshot_stale=False,
+        now=NOW,
+        capture=lambda **kwargs: captured.append(kwargs),
+    )
+
+    assert moved == (1500,)
+    assert len(captured) == 1
+    assert captured[0]["reason_code"] == "no_verifiable_target"
+    assert f"/dismiss {RAW_ID}" in captured[0]["candidate_digest"]
+    with session_factory() as session:
+        assert session.get(MessageInstructionItem, 1500).status == AWAITING_CONFIRMATION

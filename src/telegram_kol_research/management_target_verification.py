@@ -53,6 +53,7 @@ disqualify every candidate and turn a stale view into a confident refusal.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Iterable
@@ -66,6 +67,8 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 
+
+logger = logging.getLogger(__name__)
 
 #: How long ago the reconcile loop may have run and still settle the question.
 #: Beyond this the answer is "unknown", which routes to a confirmation request.
@@ -313,6 +316,17 @@ def request_management_target_confirmation(
     Returns the item ids moved. Idempotent by state: an item already awaiting
     confirmation is left alone, so a re-run of the same message does not
     produce a second alert.
+
+    **The question is only asked when something is actually waiting on it**
+    (A-7b). Both confirmations production ever raised -- raw 15628 and raw
+    15660 -- parked nothing, because neither message had an instruction item
+    at all, and an operator who answers one of those gets told there is
+    nothing awaiting confirmation. Asking before knowing anything is parkable
+    produces a question nobody can answer, and A-8's inventory is a long
+    account of what unanswerable alerts cost. With nothing parked the message
+    is still recorded -- the decision row keeps its own reason, which for
+    these is ``mimo_no_action`` or one of A-8's quiet codes -- it just does
+    not page anybody.
     """
 
     described = list(candidates)
@@ -347,6 +361,15 @@ def request_management_target_confirmation(
             item.updated_at = now
             moved.append(int(item.id))
         session.commit()
+    if not moved:
+        logger.info(
+            "management target confirmation not raised, nothing was parked "
+            "raw_message_id=%s reason_code=%s candidates=%s",
+            int(raw_message_id),
+            reason_code,
+            len(described),
+        )
+        return ()
     if capture is None:
         from telegram_kol_research.runtime_incident_adapters import (
             capture_management_target_needs_confirmation,
