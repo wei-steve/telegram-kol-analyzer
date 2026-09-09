@@ -13,13 +13,13 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-1
+current_phase: 6-pre-2
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+claimed_by:
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -480,6 +480,54 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - phase-5b-ruling (2026-09-07, 指挥会话裁定): 读限流配额按角色分配而非按进程平均——worker 3/s、web 1/s、ingest 1/s，合计不超过账户 5/s。理由：worker 是唯一有持续读循环的角色（实测原速率约 4.5/s，2/s 使 reconcile 轮间隔 44s → 65s，保护反应最坏多等 20 秒）；web/ingest 只在人工调用与断线重同步时读。阶段 5 上线后 V2 分页会放大 worker 请求量，届时按实测重新评估配额。要求重新部署并重新计窗。
 - phase-5a-rulings (2026-09-07, 指挥会话裁定，用户要求由指挥会话判断): (1) 观察窗只覆盖 1 群——接受，5a 是只读端点切换、零交易所写入、指纹逐字节不变，不为群数再等一轮；(2) 护栏零实战命中——接受，首次实战验证推迟到阶段 5，不为造样本下单；(3) 护栏严格度——保持严格，只认 execution_order_legs 里 order_kind 为普通 order 且由本系统记录的 ordId，缺 leg 时记事故并停手，不放宽到 execution_bindings；(4) 5b 限流器必须按物理 HTTP 请求计数（V2 分页每页一次），不按逻辑调用计数，已写入 phase-5b 文件。5a 维持 completed，代码保持在线。
 - followup-ws-gap-entry-retry (2026-09-09, 指挥会话记录，A-5 会话发现): 阶段 5 的准入门在 WS 缺口（含每次 tg-deploy 重启的几秒）期间以 ws_observation_blocked_new_entry 直接拒绝提交而非延后，缺口内到达的入场会丢。阶段 6 前置项：被准入门挡下的入场应进入可重试的推迟态（复用 A-3d 修好的 entry_admission_reconciler 到点重试），deadline 内 WS 恢复即提交，到期则 entry_admission_expired 告警。
+- phase-6-pre-1-completed (2026-09-09, 会话 local_4a6676b0): WS 缺口期间的入场从终态拒绝改为可重试推迟。
+  提交 **`6e6241911b85892e6f14f12ce0a4cd558ae4c681`**，2026-09-09T04:14Z 经 tg-deploy 上线，
+  **回滚参考 `21aab901e4532c0de8603789b39fded718b5d0cd`**（回滚即 `tg-deploy 21aab901...`）。
+  **改了什么**：`deepcoin_entry_admission.ws_observation_entry_defer_result()` 在流不放行时返回
+  `{"status":"deferred","reason":"ws_observation_pending"}`，并把 6 小时入场 deadline
+  （`ENTRY_ADMISSION_EXECUTION_DEADLINE`）**一次性**盖到指令项与执行合约（`IS NULL` 才写，重复推迟不顺延）；
+  `auto_trade_execution._auto_process_single_message_trade_signal` 在 admission 判定之后、
+  任何交易所读写之前调它（**唯一一处 18 行**，指挥会话单独放行）；`ws_observation_pending` 进
+  `VISIBILITY_DEFER_REASONS`，因此复用既有指令项推迟写入器与 A-3d 的 `entry_admission_reconciler`，
+  退避照搬既有 `VISIBILITY_RETRY_DELAYS`（首次 5 秒）而非另起平坦 30 秒；恢复器新增 WS 分支：
+  每 tick 只读一次流状态、放行即清 `visibility_next_attempt_at`、到 deadline 走 expired +
+  `entry_admission_expired` 告警（该分支无 attempt 行，共用的过期写入器把 attempt 改为可选）。
+  **为什么推迟必须发生在这里**：`_prepare_instruction_entry_submission` 之后合约已是 `submitting`，
+  而 `LEGAL_INSTRUCTION_EXECUTION_EDGES` 里**没有 (submitting → deferred)**；在更晚的地方改成推迟
+  就得给状态机加一条"已声明要写交易所的合约可以退回可重试态"的边。
+  **`recovery_live_submit` 的两处检查点一字未动**，仍然抛 `ws_observation_blocked_new_entry` 并 fail-closed：
+  本次只把**第一次**拒绝提前到合约尚未声明写入意图的位置，任何时刻 `permits_new_entry` 为假仍然不提交。
+  **测试**：全量 **8033 passed / 4 skipped / 0 failed**；新增 `tests/test_ws_observation_entry_defer.py` 19 条
+  与 `tests/test_auto_trade_execution.py` 末尾 4 条端到端（缺口→推迟→恢复→提交且只提交一次、
+  缺口持续到期→告警且零下单、healthy 与阶段 5 逐字段一致）；`tests/test_instruction_execution_outcomes.py`
+  的封闭集断言同步加一项。**变异检验双向**：去掉调用点 4 条端到端转红 3 条（healthy 那条保持绿，正确）；
+  恢复器里把门写死 `True` 转红 2 条、忽略 deadline 转红 3 条。
+  `tests/test_runtime_event_loop_blocking_census.py` 3 条通过。
+  **观察（L2）**：窗口 04:24:30Z–04:54:34Z 连续 30 分钟，7 条真实消息、3 个群、每分钟采样 43 条全部健康
+  （证据 `/root/evidence/phase-6-pre-1/observer-samples.jsonl`）。04:14:28Z 起的第一个窗口在 04:24:30Z
+  因采样时**正处在一个未闭合的 silence_timeout 缺口**被判不健康而重置——判据偏严（开着的缺口正是本阶段
+  要处理的常态而非故障），如实记录。
+  **没有拿到实盘样本，如实记**：部署自身的重启缺口（gap 367，`process_start`，04:14:19.855→04:14:25.566Z，
+  5.71 秒）**期间零消息到达**；窗口内唯一的缺口（gap 369，`silence_timeout`，04:39:11→04:39:19Z，8.64 秒）
+  同样零消息；整个窗口**没有产生任何入场指令项**（7 条消息是止盈/出场/行情评论），
+  所以推迟路径与 healthy 提交路径都**只有测试证据、没有生产样本**。
+  为观测而下单是被禁止的，未做。
+  **交易所直读**：部署前指纹 `72336a44d52f67b5e307d8787a599ac091449d858398f6c0ba3f76facd4cae8b`
+  （4 仓 1 挂单），窗口结束 `29ca3626118f31af7f7610f6ab04d35088e1e53fe09255ec2a78b383ecfaedfb`（仍 4 仓 1 挂单）。
+  **指纹变化已逐笔归因，零非预期写入**：窗口内仅两次交易所写入，
+  `execution_events` 4057 `strategy_management_close_submit`（04:28:59Z，chat -1002409877375 message 9210
+  的"获利出局/头仓也出/清仓"，指令项 1036 → batch 162，`close_submissions_pending_reconciliation`）
+  与 4058 `create_backup_stop`（04:44:46Z，既有 `trigger_protection_stop_rescue_mode=live` 安全网，
+  pos 1001125195880289）。两者都是既有路径、与本阶段无关；本阶段只动入场准入，而窗口内零入场。
+  新增的 5 行 `position_protection_ledger`（679-683）`evidence_source` 全是
+  `reconciliation_trigger_protection_intent` / `position_mutation_intent_readback` /
+  `trigger_take_profit_pending_readback`，是**读回观测**不是写入。
+  `execution_order_legs` 与 `execution_bindings` 全窗口不变（596 / 346）。
+  部署后 `runtime_incidents` 零条、worker journal 零 error 零 traceback、`submit_unknown` 恒为 0。
+  另用 `python -B` 只读加载**已部署**代码，对生产库跑了一次恢复器的 WS 选择查询，确认它能执行
+  （返回空集），排除"异常被运维循环的 `except Exception: pass` 吞掉"这一可能。
+  **未做**：未碰 `recovery_live_submit`、`execution_boundary`、`authoritative_recognition`、
+  `strategy_management_planner`；陈旧指令项 1022/1023 按指挥会话裁定交 A 线 step 6 会话处理，本会话未动。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
