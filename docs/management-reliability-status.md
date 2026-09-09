@@ -151,6 +151,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- step-5c-rulings (2026-09-09, 指挥会话): 允许一次重判解释多档（各档独立满足判据三、每笔成交单只用一次、组合不唯一则 ambiguous）；成交价容差改为 max(2 tick, 2 个基点)，不区分滑点方向。依据：conv 237 两档在 A-5 上线前已连续成交（减少量 1.6 不等于任何单档），且 TP1 成交价滑 3 tick（0.03 / 2470 = 1.2 bp）。
 - step-5b-rulings (2026-09-09, 指挥会话): 29 条冻结收敛中 28 条仓位已平→completed/convergence_position_terminal，仍 active 的止盈行按既有写法 expired+position_terminal_order_absent；conv 237（ETH 空，在仓 0.5）保持冻结并写全现场。发现 2026-09-08 01:23Z 之后创建的 TPSL 单不再出现在 trigger-orders-history，其成交只在 orders-history 里以方向相反、数量恰等于该档、价等于触发价的市价平仓单出现，A-5 判据三因此在生产拿不到证据；新增 step 5c 扩展判据并重判活跃仓位的冻结收敛。list_trigger_order_history_by_order_id 的 ordId 过滤实测无效。
 - step-5-rulings (2026-09-08/09, 指挥会话): 磁盘清理六组约 10G 历史备份与演练副本全删，只留 step4/step3d 两份回滚源（tg-deploy 本身不做数据库备份，“部署前备份”不存在）；小仓位分档沿用既有分配器的舍入方向（3 张 → 1/2），不在共用函数里引入第二套舍入，用户决定的实质是缩减档位数、最少一档；危险动作判据用“非写入 action 集合的补集”实现 fail-closed；止损缩量不加表列，每轮从活状态推导，落在 break_even_convergence_worker 的 tick。
 - step-5-decisions (2026-09-08, 用户在指挥会话按推荐确认): 小仓位分档按可分配张数缩减档位数（3 张→2/1，2 张→1/1，1 张→一档），最少一档，价格取最靠前的档位；通知通道先加各自 AFTER 门槛，再由用户在服务器填 TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID 为系统机器人同一私聊，不改代码路由。
