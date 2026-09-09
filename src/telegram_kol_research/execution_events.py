@@ -94,6 +94,12 @@ NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
         "management_history_recovery",
         "historical_state_convergence_repair",
         "entry_assembly_fingerprint_reconciled",
+        # A-6 audit rows for the frozen-lifecycle decision. They record which
+        # way the freeze was resolved and nothing else; listing them here is
+        # required, because otherwise a bypass audit would read as a hazardous
+        # action and freeze that message's source-deletion exit (A-5 task 8).
+        "management_freeze_bypassed",
+        "management_freeze_rejected",
     }
 )
 

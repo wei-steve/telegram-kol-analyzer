@@ -3869,9 +3869,17 @@ def test_full_exit_keeps_restored_failure_locked_without_protection_evidence(
     assert result.reason_code == "prior_management_batch_unresolved"
 
 
-def test_full_exit_keeps_partial_then_break_even_failure_locked_even_if_restored(
+def test_full_exit_is_no_longer_blocked_by_an_unresolved_partial_batch(
     monkeypatch, tmp_path
 ):
+    """A-6, user decision ``risk_reducing_bypasses_frozen`` (2026-09-07).
+
+    An unresolved ``partial_then_break_even`` batch used to block every later
+    management instruction for that lifecycle, ``full_exit`` included -- so the
+    instruction most likely to be sent *because* the partial went wrong was the
+    one guaranteed to be refused. The freeze no longer applies to it, with or
+    without protection evidence on the predecessor.
+    """
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "research.db")
     raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
@@ -3898,8 +3906,115 @@ def test_full_exit_keeps_partial_then_break_even_failure_locked_even_if_restored
         planned_at=PLANNED_AT,
     )
 
+    assert result.status == "ready"
+    assert result.reason_code != "prior_partial_batch_unresolved"
+    with session_factory() as session:
+        predecessor = (
+            session.query(StrategyManagementBatch)
+            .filter(StrategyManagementBatch.intent == "partial_then_break_even")
+            .one()
+        )
+        assert predecessor.status == "resolved"
+        assert predecessor.reason_code == "superseded_by_risk_reduction"
+
+
+def test_full_exit_supersedes_the_unresolved_partial_it_overtakes(
+    monkeypatch, tmp_path
+):
+    """The bypass in full: the partial stands down, unexecuted, and is audited."""
+
+    from telegram_kol_research.models import ExecutionEvent
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="full_exit"
+    )
+    predecessor_id = _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="partial_then_break_even",
+        effective_action="partial_then_break_even",
+        reason_code="protection_replacement_failed_and_restored",
+        protection_evidence=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.effective_action == "full_exit"
+    with session_factory() as session:
+        predecessor = session.get(StrategyManagementBatch, predecessor_id)
+        # Stood down, never executed.
+        assert predecessor.status == "resolved"
+        assert predecessor.reason_code == "superseded_by_risk_reduction"
+        audit = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "management_freeze_bypassed")
+            .one()
+        )
+        assert audit.reason == "prior_partial_batch_unresolved"
+        assert str(predecessor_id) in str(audit.after_json)
+        assert "full_exit" in str(audit.after_json)
+
+
+def test_a_partial_instruction_is_still_blocked_by_the_freeze(monkeypatch, tmp_path):
+    """The half of the freeze that stays: a partial on top of a partial."""
+
+    from telegram_kol_research.models import ExecutionEvent
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "research.db")
+    raw_id, lifecycle_id, binding_id = _persist_exact_management_target(
+        session_factory, intent="partial_take_profit", management_fraction=0.5
+    )
+    predecessor_id = _persist_prior_partial_batch(
+        session_factory,
+        raw_id=raw_id,
+        lifecycle_id=lifecycle_id,
+        binding_id=binding_id,
+        status="partial_failed",
+        reconciled=False,
+        leg_statuses=("restored",),
+        intent="partial_then_break_even",
+        effective_action="partial_then_break_even",
+        protection_evidence=True,
+    )
+    _disable_reconciliation(monkeypatch, planner)
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=_ReadOnlyDeepcoin([_position()]),
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
     assert result.status == "blocked"
     assert result.reason_code == "prior_partial_batch_unresolved"
+    with session_factory() as session:
+        assert session.get(StrategyManagementBatch, predecessor_id).status == (
+            "partial_failed"
+        )
+        audit = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "management_freeze_rejected")
+            .one()
+        )
+        assert audit.reason == "prior_partial_batch_unresolved"
+        assert str(predecessor_id) in str(audit.before_json)
 
 
 def test_duplicate_partial_message_returns_same_batch_without_advancing_round(

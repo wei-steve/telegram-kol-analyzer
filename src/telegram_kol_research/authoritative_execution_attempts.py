@@ -298,6 +298,77 @@ def record_authoritative_automation_outcome(
         return int(result.rowcount or 0) == 1
 
 
+def record_authoritative_deterministic_refusal(
+    session_factory,
+    *,
+    attempt_id: int,
+    claim_token: str,
+    automation_status: str,
+    automation_reason: str | None,
+    evidence_refs: list[dict[str, Any]] | None,
+    error_summary: str | None,
+    refused_at: datetime,
+) -> bool:
+    """Close an attempt that was refused before any request reached the venue.
+
+    A-6. ``fail_safe_authoritative_execution_attempt`` only accepts ``claimed``
+    -- it is for a lease abandoned *before* the side-effect boundary. An
+    execution that crossed the boundary and then found its own reason not to
+    trade had nowhere to go but ``uncertain``, which is how twenty-one
+    production attempts came to sit frozen with ``evidence_refs_json`` NULL
+    and no exchange write behind any of them.
+
+    This is the missing terminal state: ``executing`` to ``failed_safe``, with
+    the refusal's own evidence attached, and the decision row marked failed so
+    the message is eligible to be tried again -- unlike ``uncertain``, which
+    the scanner re-logs forever and nothing ever retries.
+    """
+
+    require_recognition_execution_schema(session_factory)
+    if not evidence_refs:
+        raise ValueError("a deterministic refusal must carry its evidence")
+    with session_factory() as session:
+        row = session.get(AuthoritativeExecutionAttempt, int(attempt_id))
+        if (
+            row is None
+            or row.claim_token != str(claim_token)
+            or row.status != "executing"
+        ):
+            return False
+        decision_result = session.execute(
+            update(RecognitionDecision)
+            .where(
+                RecognitionDecision.raw_message_id == int(row.raw_message_id),
+                RecognitionDecision.comparison_status == "execution_running",
+                RecognitionDecision.comparison_claim_token
+                == str(row.authoritative_generation),
+            )
+            .values(
+                comparison_status="completed",
+                agreement_status="review_disabled",
+                comparison_claim_token=None,
+                comparison_started_at=None,
+                automation_status="failed",
+                automation_reason=_bounded(automation_reason, 256),
+                updated_at=refused_at,
+            )
+        )
+        if int(decision_result.rowcount or 0) != 1:
+            session.rollback()
+            return False
+        row.status = "failed_safe"
+        row.exchange_effect = "not_started"
+        row.automation_status = _bounded(automation_status, 32) or "failed"
+        row.automation_reason = _bounded(automation_reason, 256)
+        row.evidence_refs_json = _evidence_json(evidence_refs)
+        row.error_class = "ExecutionBoundaryDeterministicRefusal"
+        row.error_summary = _bounded(error_summary, 512)
+        row.completed_at = refused_at
+        row.updated_at = refused_at
+        session.commit()
+        return True
+
+
 def fail_safe_authoritative_execution_attempt(
     session_factory,
     *,

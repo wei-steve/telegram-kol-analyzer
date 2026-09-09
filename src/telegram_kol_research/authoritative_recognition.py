@@ -98,6 +98,7 @@ from telegram_kol_research.authoritative_execution_attempts import (
     mark_authoritative_execution_uncertain,
     mark_authoritative_side_effect_started,
     record_authoritative_automation_outcome,
+    record_authoritative_deterministic_refusal,
 )
 from telegram_kol_research.authoritative_execution_schema import (
     require_recognition_execution_schema,
@@ -1926,6 +1927,26 @@ def _run_leased_authoritative_execution(
                 raise RuntimeError("execution_boundary_outcome_missing")
             boundary = observed
             automation = dict(boundary.public_result)
+        if boundary.status == "failed_safe" and boundary.evidence_refs:
+            # A-6: refused before any request, and the refusal says why. This
+            # is a fact, not an unknown, so the attempt closes and the message
+            # stays eligible for another try instead of freezing forever.
+            if not record_authoritative_deterministic_refusal(
+                session_factory,
+                attempt_id=lease_claim.attempt_id,
+                claim_token=lease_claim.claim_token,
+                automation_status=str(automation.get("status") or "failed"),
+                automation_reason=(
+                    str(automation.get("reason"))
+                    if automation.get("reason") is not None
+                    else boundary.raw_status
+                ),
+                evidence_refs=list(boundary.evidence_refs),
+                error_summary=boundary.reason_code or boundary.raw_status,
+                refused_at=datetime.now(UTC),
+            ):
+                raise RuntimeError("authoritative_deterministic_refusal_cas_failed")
+            return recognition, automation, assessment
         if boundary.exchange_effect == "outcome_unknown":
             if not mark_authoritative_execution_uncertain(
                 session_factory,

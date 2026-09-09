@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import hashlib
 import json
 from collections import Counter
@@ -99,7 +101,22 @@ from telegram_kol_research.management_stop_price_gate import (
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
+logger = logging.getLogger(__name__)
+
 PARTIAL_INTENTS = frozenset({"partial_take_profit", "partial_then_break_even"})
+#: A-6, user decision ``risk_reducing_bypasses_frozen`` (2026-09-07). An
+#: unresolved partial-close batch used to block *every* management instruction
+#: for that lifecycle, including the ones that only ever reduce exposure. That
+#: is backwards: the batch is unresolved precisely because something went
+#: wrong, and "get me out" is the instruction most likely to be sent next.
+#: ``adjust_stop_loss`` is included only in its tightening direction, which the
+#: existing gate further down enforces before anything is superseded.
+#: ``partial_*`` intents stay blocked -- a second partial on top of an
+#: unresolved one is exactly the ambiguity the freeze exists for.
+RISK_REDUCING_INTENTS = frozenset(
+    {"full_exit", "move_stop_to_break_even", "adjust_stop_loss"}
+)
+SUPERSEDED_BY_RISK_REDUCTION = "superseded_by_risk_reduction"
 PROTECTION_INTENTS = frozenset(
     {"adjust_stop_loss", "move_stop_to_break_even", "partial_then_break_even"}
 )
@@ -583,12 +600,30 @@ def _plan_strategy_management_batch_locked(
         partial_policy_state = _load_partial_policy_state(
             session, target_lifecycle_id=lifecycle.id
         )
+    risk_reduction_bypass = False
     if partial_policy_state.frozen:
-        return ManagementPlanningResult(
-            status="blocked",
-            reason_code="prior_partial_batch_unresolved",
-            target_lifecycle_id=lifecycle.id,
-        )
+        if intent not in RISK_REDUCING_INTENTS:
+            _record_management_freeze_audit(
+                session_factory,
+                action="management_freeze_rejected",
+                raw_message_id=raw_message_id,
+                identity=identity,
+                intent=intent,
+                lifecycle_id=lifecycle.id,
+                freeze_reason="prior_partial_batch_unresolved",
+                batch_ids=_unresolved_partial_batch_ids(partial_policy_state),
+                now=now,
+            )
+            return ManagementPlanningResult(
+                status="blocked",
+                reason_code="prior_partial_batch_unresolved",
+                target_lifecycle_id=lifecycle.id,
+            )
+        # Armed, not applied. ``adjust_stop_loss`` still has to pass the
+        # tightening gate below, and a blocked instruction must not supersede
+        # anything -- so the unresolved batches are only stood down in the same
+        # transaction that creates the replacement.
+        risk_reduction_bypass = True
 
     entry_leg_plan = _entry_leg_management_plan(identity.entry_legs, binding=binding)
     if entry_leg_plan.block_reason is not None:
@@ -1355,6 +1390,30 @@ def _plan_strategy_management_batch_locked(
     ]
     try:
         with session_factory() as session:
+            if risk_reduction_bypass:
+                superseded_ids = _supersede_partial_batches_in_session(
+                    session,
+                    target_lifecycle_id=lifecycle.id,
+                    superseded_at=now,
+                )
+                # The concurrency guard below re-reads this state and refuses
+                # if it moved. It moved because *this* transaction moved it, so
+                # the expectation is rebased here -- the guard keeps its whole
+                # purpose, which is catching a change made by somebody else.
+                partial_policy_state = _load_partial_policy_state(
+                    session, target_lifecycle_id=lifecycle.id
+                )
+                _record_management_freeze_audit_in_session(
+                    session,
+                    action="management_freeze_bypassed",
+                    raw_message_id=raw_message_id,
+                    identity=identity,
+                    intent=intent,
+                    lifecycle_id=lifecycle.id,
+                    freeze_reason="prior_partial_batch_unresolved",
+                    batch_ids=superseded_ids,
+                    now=now,
+                )
             if intent == "full_exit":
                 predecessor_state = (
                     resolve_restored_protection_failure_for_full_exit_in_session(
@@ -2004,6 +2063,136 @@ def _require_frozen_identity_and_policy_current(
     ) != partial_policy_state:
         raise ManagementPlanningStateChanged(
             "target_identity_changed_during_planning"
+        )
+
+
+def _unresolved_partial_batch_ids(state) -> tuple[int, ...]:
+    """Batch ids whose unresolved state is what the freeze is made of."""
+
+    return tuple(
+        int(entry[0])
+        for entry in state.history
+        if str(entry[1]) not in {"blocked", "resolved"}
+    )
+
+
+def _supersede_partial_batches_in_session(
+    session,
+    *,
+    target_lifecycle_id: int,
+    superseded_at: datetime,
+) -> tuple[int, ...]:
+    """Stand the unresolved partial batches down without executing them.
+
+    ``resolved`` and not ``blocked``: the batch is not being refused, it is
+    being overtaken by an instruction that reduces exposure. It is also the
+    state that frees both the freeze and the one-active-batch-per-strategy
+    index, which the replacement batch is about to need.
+    """
+
+    batches = (
+        session.query(StrategyManagementBatch)
+        .filter(StrategyManagementBatch.target_lifecycle_id == int(target_lifecycle_id))
+        .filter(StrategyManagementBatch.intent.in_(sorted(PARTIAL_INTENTS)))
+        .filter(StrategyManagementBatch.status.not_in(("blocked", "resolved")))
+        .order_by(StrategyManagementBatch.id.asc())
+        .all()
+    )
+    superseded: list[int] = []
+    for batch in batches:
+        batch.status = "resolved"
+        batch.reason_code = SUPERSEDED_BY_RISK_REDUCTION
+        batch.completed_at = superseded_at
+        batch.updated_at = superseded_at
+        superseded.append(int(batch.id))
+    session.flush()
+    return tuple(superseded)
+
+
+def _record_management_freeze_audit_in_session(
+    session,
+    *,
+    action: str,
+    raw_message_id: int,
+    identity,
+    intent: str,
+    lifecycle_id: int,
+    freeze_reason: str,
+    batch_ids: tuple[int, ...],
+    now: datetime,
+) -> None:
+    """One durable row per refusal and per bypass, with the whole judgement."""
+
+    from telegram_kol_research.execution_events import (
+        ExecutionEventRecord,
+        record_execution_event,
+    )
+
+    raw_message = session.get(RawMessage, int(raw_message_id))
+    record_execution_event(
+        None,
+        ExecutionEventRecord(
+            venue="deepcoin",
+            action=action,
+            status="bypassed" if action == "management_freeze_bypassed" else "blocked",
+            chat_id=raw_message.chat_id if raw_message is not None else None,
+            message_id=raw_message.message_id if raw_message is not None else None,
+            reason=freeze_reason,
+            before={
+                "freeze_reason": freeze_reason,
+                "unresolved_partial_batch_ids": list(batch_ids),
+                "target_lifecycle_id": int(lifecycle_id),
+            },
+            after={
+                "instruction_intent": intent,
+                "raw_message_id": int(raw_message_id),
+                "superseded_batch_ids": (
+                    list(batch_ids)
+                    if action == "management_freeze_bypassed"
+                    else []
+                ),
+                "policy": "risk_reducing_bypasses_frozen",
+            },
+            created_at=now,
+        ),
+        session=session,
+    )
+
+
+def _record_management_freeze_audit(
+    session_factory,
+    *,
+    action: str,
+    raw_message_id: int,
+    identity,
+    intent: str,
+    lifecycle_id: int,
+    freeze_reason: str,
+    batch_ids: tuple[int, ...],
+    now: datetime,
+) -> None:
+    try:
+        with session_factory() as session:
+            _record_management_freeze_audit_in_session(
+                session,
+                action=action,
+                raw_message_id=raw_message_id,
+                identity=identity,
+                intent=intent,
+                lifecycle_id=lifecycle_id,
+                freeze_reason=freeze_reason,
+                batch_ids=batch_ids,
+                now=now,
+            )
+            session.commit()
+    except Exception:
+        # The refusal itself is already the durable outcome; losing its audit
+        # row must not turn a clean block into an exception.
+        logger.warning(
+            "management freeze audit failed raw_message_id=%s action=%s",
+            raw_message_id,
+            action,
+            exc_info=True,
         )
 
 

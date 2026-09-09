@@ -848,6 +848,12 @@ def _public_item_result(item: MessageInstructionItem) -> dict:
     payload = json.loads(payload_text) if payload_text else None
     if item.status in ERROR_STATUSES:
         summary["reason"] = _payload_reason(payload, fallback=item.status)
+        if isinstance(payload, dict):
+            # A-6: the execution boundary has to tell a deterministic refusal
+            # ("blocked before any request") from an unknown outcome, and the
+            # bare reason string cannot carry that -- the structured payload's
+            # own ``status`` can.
+            summary["error"] = payload
     elif payload is not None:
         summary["result"] = payload
     else:

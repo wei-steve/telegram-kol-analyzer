@@ -45,6 +45,17 @@ _KNOWN_EFFECT_STATUSES = frozenset(
         "executed",
     }
 )
+#: Message-level statuses that mean "refused before any request", so long as
+#: every item proves it individually. ``failed`` keeps its own rule above.
+_RETRIABLE_REFUSAL_STATUSES = frozenset({"blocked", "partial_failed"})
+#: Item-level payload statuses that prove the item finished without touching
+#: the venue. Deliberately narrower than ``_KNOWN_NO_EFFECT_STATUSES``: that
+#: set is about a *message* return value and includes ``pending`` and
+#: ``planned``, which on an item mean "not finished", not "did nothing". An
+#: unfinished item is a hand-off, judged separately below.
+_ITEM_TERMINAL_NO_CONTACT_STATUSES = frozenset(
+    {"blocked", "deferred", "skipped", "shadow_planned", "new_thread_required", "failed"}
+)
 _KNOWN_UNKNOWN_STATUSES = frozenset(
     {
         "unknown",
@@ -214,6 +225,81 @@ def _response_order_id(value: Any) -> str | None:
     return None
 
 
+def _item_payload(item: dict[str, Any]) -> dict[str, Any] | None:
+    for key in ("result", "error"):
+        payload = item.get(key)
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def _items_prove_no_exchange_contact(
+    result: dict[str, Any],
+) -> tuple[bool, tuple[dict[str, Any], ...]]:
+    """Whether every item states, in its own payload, that it never traded.
+
+    A-6. The message-level status rolls several items into one word and loses
+    the reason: twelve production attempts read ``completed`` while every item
+    said ``{"reason": "kol_or_group_auto_trade_disabled", "status": "skipped"}``,
+    and four read ``partial_failed`` while every item said ``status: blocked``
+    with a pre-submit refusal reason. Both were frozen as "outcome unknown"
+    with no evidence at all, which is the opposite of what the evidence said.
+
+    The proof is per item and it is the item's own structured payload, not the
+    rolled-up word: every item must carry a payload whose ``status`` is one the
+    project already treats as having no exchange effect. One item without a
+    payload, or with an effect-bearing one, and nothing is proven.
+    """
+
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return False, ()
+    refs: list[dict[str, Any]] = []
+    for item in items:
+        if not isinstance(item, dict):
+            return False, ()
+        payload = _item_payload(item)
+        if payload is None:
+            return False, ()
+        item_status = str(payload.get("status") or "")
+        if item_status not in _ITEM_TERMINAL_NO_CONTACT_STATUSES:
+            return False, ()
+        item_id = item.get("item_id")
+        refs.append(
+            {
+                "kind": "instruction_item_no_exchange_contact",
+                **(
+                    {"item_id": int(item_id)}
+                    if isinstance(item_id, int) and not isinstance(item_id, bool)
+                    else {}
+                ),
+                "instruction_kind": str(item.get("instruction_kind") or ""),
+                "item_status": str(item.get("status") or ""),
+                "payload_status": item_status,
+                "reason": str(payload.get("reason") or item.get("reason") or ""),
+            }
+        )
+    return True, tuple(refs)
+
+
+def _items_are_all_unfinished(result: dict[str, Any]) -> bool:
+    """Whether every item is still owned by an asynchronous path.
+
+    ``in_progress`` means the lease handed the work to a batch or an entry
+    queue and returned. Those paths carry their own ledger, their own retries
+    and their own alerting; the lease itself issued no request, so freezing the
+    *message* on their behalf only guarantees it is never looked at again.
+    """
+
+    items = result.get("items")
+    if not isinstance(items, list) or not items:
+        return False
+    return all(
+        isinstance(item, dict) and str(item.get("status") or "") in {"pending", "executing"}
+        for item in items
+    )
+
+
 def build_execution_boundary_outcome(
     public_result: dict[str, Any],
     tracker: ExecutionBoundaryTracker,
@@ -258,13 +344,40 @@ def build_execution_boundary_outcome(
     ):
         exchange_effect = "outcome_unknown"
 
+    # A-6. Only reached with no tracked write: everything above this point,
+    # and every path where ``writes`` is non-empty, is unchanged.
+    deterministic_refs: tuple[dict[str, Any], ...] = ()
+    handed_off = False
+    if not writes:
+        proven, deterministic_refs = _items_prove_no_exchange_contact(result)
+        if proven and exchange_effect == "outcome_unknown":
+            exchange_effect = "not_started"
+        elif (
+            not proven
+            and exchange_effect == "outcome_unknown"
+            and raw_status == "in_progress"
+            and _items_are_all_unfinished(result)
+        ):
+            exchange_effect = "not_started"
+            handed_off = True
+
     if exchange_effect == "outcome_unknown":
         status = "outcome_unknown"
-    elif exchange_effect == "not_started" and raw_status == "failed":
+    elif exchange_effect == "not_started" and (
+        raw_status == "failed"
+        or (deterministic_refs and raw_status in _RETRIABLE_REFUSAL_STATUSES)
+    ):
+        # A deterministic refusal is a fact, not an unknown: record it as
+        # failed_safe so the message can be tried again once whatever blocked
+        # it is resolved, and carry each item's own reason as the evidence.
         status = "failed_safe"
     else:
         status = "completed"
-    evidence_refs = tuple(
+    if handed_off:
+        result["handed_off_from_status"] = raw_status
+        result["status"] = "completed"
+        result["reason"] = "handed_off_to_batch"
+    evidence_refs = deterministic_refs + tuple(
         {
             "kind": "deepcoin_write",
             "method": str(item["method"]),
