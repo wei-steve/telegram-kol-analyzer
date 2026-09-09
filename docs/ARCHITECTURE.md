@@ -358,6 +358,13 @@ historical_state_repair.py               position_management_remediation.py
   排查这类问题时先原样打印整行 JSON，再挑字段。
   同一份返回里 `triggerOrderType == "Conditional"` 的行是**挂单入场**（开仓方向的
   `side`），不是保护单，别把它算进保护里。
+- **判断后台进程是否还活着，不要用 `pgrep -f <脚本名>`。** 发起这次检查的命令行**自身**
+  就含有那个模式，于是 `pgrep` 匹配到自己，永远返回"还活着"。经 ssh 执行时尤其隐蔽：
+  远程那条 `bash -c "pgrep -f observe.sh"` 的命令行里就有 `observe.sh`。
+  6-pre-3 之前踩过一次——监视器其实早已达标退出，等待器却又空转了 6 小时才被人发现。
+  正确做法：让脚本退出时写一个**标记文件**（`DONE` / `WINDOW_MET`）并检查该文件，
+  或者启动时记下**精确 PID** 再用 `kill -0 <pid>` / `ps -p <pid>` 判断。
+
 - **这台机器的本地时区是 UTC+8，而数据库里所有时间戳是 UTC。** 两者差 8 小时，
   两条最容易踩的线：
   `journalctl --since "2026-09-08 22:05"` 把裸时间戳按**本地**时间解析，所以传一个 UTC

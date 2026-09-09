@@ -13,13 +13,13 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-3
+current_phase: 6-pre-4
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+claimed_by:
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -595,6 +595,28 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **一处过程失误**：本阶段的后台等待器用 `pgrep -f observe-6pre2.sh` 判断监视器是否退出，
   而这条 ssh 远程命令自身的命令行**就含有该模式**，于是它一直匹配到自己、永不退出。
   窗口其实 06:22:11Z 就达标了，直到指挥会话 12:31Z 提醒才发现。监视器本身与结论不受影响。
+- phase-6-pre-3-completed (2026-09-09, 会话 local_4a6676b0，**全程只读、未下单、未撤单、未改账本**):
+  补测第 10 项完成，结论写进 `phase-6-protection-authority.md` 的"补测第 10 项"一节。
+  样本：生产自然发生的 `set-position-sltp` **5 个仓位 / 18 次已确认写入**
+  （2026-09-07 01:00Z ~ 2026-09-09 04:45Z，含 A-5 跨 13 小时的止损缩量与保本移动），
+  远超要求的 3 个；对照 `deepcoin_ws_events` 的 70 条 `TriggerOrder` 帧与
+  REST `trigger-orders-pending` 实时读数。
+  **(1) `OS` 每次修改都变**——18 次写入拿到 18 个互不相同的 ordId。
+  **(2) `TU` 恒等于 posId，30/30 零例外**；入场腿的 `TU: default → posId` 翻转又观测到 5 例，
+  翻转值恒为 `OS + 1`。
+  **(3) `trigger-orders-pending` 的行是"新增"，不是更新也不是替换，旧行原样留着**——
+  posId `1001125195880289` 上实时并存 5 张 TPSL，其中 `...880288`(SL 2530) 与 `...885731`(SL 2535.06)
+  **两张都是止损且价格不同**；posId `1001125179691393` 同样并存 SL 2530 与 SL 2535.06。
+  **(4) 新旧关联 = `TU == posId`**，可查且稳定。
+  **判定：阶段 6 设计前提成立，不需要停下重新设计**（`OS` 变了但第 4 条给出了可查关联）。
+  **但第 3 条改变了阶段 6 任务 1 的定义**：`set-position-sltp` 是**叠加**语义而非**修改**语义，
+  "改止损"不能实现成"再发一次"——那只会多挂一张，两张触发价不同的止损并存时
+  **更靠近现价的那张先执行**，等于修改没生效。正确形状是**先按 `TU == posId` 收全旧单、撤干净、再挂新，
+  撤销失败就不许挂新**。已写进阶段 6 文件。
+  这也解释了 ARCHITECTURE 第 6 节 A-5b "两张止损单"现象的成因。
+  方法：`sqlite3 -readonly` 读库，worker 真实凭据经 `/proc/<MainPID>/environ` 取得，
+  `python -B` 不写字节码，只调 GET 类接口。
+  顺带把 6-pre-2 的 pgrep 自匹配教训写进 ARCHITECTURE 第 6 节（判活用标记文件或精确 PID）。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
