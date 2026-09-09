@@ -60,6 +60,22 @@ _UNTRIGGERED_TIMES = frozenset({"0", "0.0", "0.00", ""})
 
 _CLEAN_ERROR_CODES = frozenset({"", "0", "00000"})
 
+#: A take-profit plan is at most five stages (``take_profit_plan``), so the
+#: subset search is bounded at 2**5. The guard is here so a corrupted ladder
+#: cannot turn this into an exponential walk.
+_MAX_STAGES = 8
+
+#: Price tolerance for form (ii). Two ticks alone is too tight on a four-digit
+#: instrument: ETH's tick is 0.01, so it allows 0.008% of slippage, and
+#: convergence 237's TP1 filled 0.03 away from its 2470 trigger -- three ticks,
+#: but only 1.2 basis points. A trigger price is the condition; the fill is a
+#: market order that follows it, and market orders slip. Two basis points is
+#: the floor, two ticks the floor for instruments whose tick is coarse.
+#: Slippage is accepted in both directions: the exact size match and the time
+#: window already pin the fill down, and a favourable fill is no less this
+#: stage's fill than an unfavourable one.
+_PRICE_TOLERANCE_BPS = Decimal("0.0002")
+
 
 @dataclass(frozen=True, slots=True)
 class PartialTakeProfitExplanation:
@@ -71,6 +87,11 @@ class PartialTakeProfitExplanation:
     filled_size: str | None = None
     remaining_size: str | None = None
     evidence: dict[str, Any] = field(default_factory=dict)
+    #: ``(order_id, evidence)`` for every stage this reduction explains. One
+    #: reduction can cover several stages when they filled between two
+    #: observations -- convergence 237's TP1 and TP2 both filled before A-5
+    #: existed, so the first look saw one 1.6-lot drop, not two.
+    explained_orders: tuple[tuple[str, dict[str, Any]], ...] = ()
 
 
 def explain_partial_position_reduction(
@@ -124,49 +145,51 @@ def explain_partial_position_reduction(
     )
     base_evidence["binding_take_profit_order_ids"] = ledger_order_ids
 
-    # Criterion 1 + 2 together: the matching order must be one of *ours*, and
-    # exactly one of ours may match. Two same-sized take-profit orders make the
-    # reduction ambiguous, and an ambiguous reduction is an unexplained one.
-    candidates = [
+    # Criterion 2: only stages this binding owns for this position are even
+    # looked at. Criterion 1 is no longer "one stage equals the reduction" but
+    # "some set of stages sums to it exactly" -- see the module docstring.
+    stages = [
         row
         for row in rows
         if int(getattr(row, "execution_binding_id", -1) or -1)
         == int(execution_binding_id)
         and str(getattr(row, "pos_id", "") or "").strip() == str(pos_id or "").strip()
         and str(getattr(row, "order_id", "") or "").strip()
-        and _decimal(getattr(row, "size_text", None)) == reduction
+        and (_decimal(getattr(row, "size_text", None)) or Decimal("0")) > 0
     ]
-    if not candidates:
+    if not stages:
         return _refuse(
             "partial_reduction_size_matches_no_owned_take_profit",
-            evidence={
-                **base_evidence,
-                "owned_take_profit_sizes": [
-                    _text(_decimal(getattr(row, "size_text", None)))
-                    for row in rows
-                ],
-            },
+            evidence={**base_evidence, "owned_take_profit_sizes": []},
+        )
+    if len(stages) > _MAX_STAGES:
+        return _refuse(
+            "partial_reduction_too_many_stages",
+            evidence={**base_evidence, "stage_count": len(stages)},
         )
 
-    # Criterion 3, per candidate. Two stages of the same size are only
-    # separable if exactly one of them is corroborated -- which form (ii) can
-    # do, because equal-sized stages still sit at different trigger prices.
     trigger_rows = [row for row in trigger_history if isinstance(row, Mapping)]
     close_rows = [row for row in order_history if isinstance(row, Mapping)]
     spent = {str(item).strip() for item in used_close_order_ids if str(item).strip()}
+    size_counts: dict[str, int] = {}
+    for stage in stages:
+        key = _text(_decimal(getattr(stage, "size_text", None))) or ""
+        size_counts[key] = size_counts.get(key, 0) + 1
+
     proven: list[tuple[Any, dict[str, Any]]] = []
-    refusals: list[tuple[str, dict[str, Any]]] = []
-    for candidate in candidates:
-        order_id = str(candidate.order_id).strip()
+    refusals: dict[str, tuple[str, dict[str, Any]]] = {}
+    for stage in stages:
+        order_id = str(stage.order_id).strip()
+        stage_size = _decimal(getattr(stage, "size_text", None))
         evidence = {
             **base_evidence,
             "order_id": order_id,
-            "order_size_text": str(candidate.size_text),
-            "order_status": str(getattr(candidate, "status", "") or ""),
-            "order_trigger_price": str(getattr(candidate, "trigger_price", "") or ""),
+            "order_size_text": str(stage.size_text),
+            "order_status": str(getattr(stage, "status", "") or ""),
+            "order_trigger_price": str(getattr(stage, "trigger_price", "") or ""),
         }
         verdict = _criterion_three(
-            candidate=candidate,
+            candidate=stage,
             order_id=order_id,
             pos_id=str(pos_id or "").strip(),
             evidence=evidence,
@@ -177,77 +200,143 @@ def explain_partial_position_reduction(
             reduction_observed_at_ms=reduction_observed_at_ms,
             spent_close_order_ids=spent,
         )
-        if isinstance(verdict, dict):
-            proven.append((candidate, verdict))
-        else:
-            refusals.append(verdict)
+        if not isinstance(verdict, dict):
+            refusals[order_id] = verdict
+            continue
+        if (
+            verdict.get("evidence_form") == "trigger_orders_history"
+            and size_counts.get(_text(stage_size) or "", 0) > 1
+        ):
+            # Another stage of this binding has the same size. Trigger history
+            # is incomplete for recent orders, so "the sibling is not in it"
+            # says nothing about whether the sibling fired -- only form (ii),
+            # which tests the fill price, can tell equal-sized stages apart.
+            refusals[order_id] = (
+                "partial_reduction_take_profit_ambiguous",
+                {**verdict, "ambiguous_with_equal_sized_stage": True},
+            )
+            continue
+        proven.append((stage, verdict))
 
-    if len(candidates) > 1 and not (
-        len(proven) == 1 and proven[0][1].get("evidence_form") == "orders_history"
-    ):
-        # Equal-sized stages stay ambiguous. Only form (ii) may break the tie,
-        # and only when exactly one stage matches: its test includes the fill
-        # price, which is the one field two same-sized stages do not share.
-        # Form (i) naming one of them is not enough -- the trigger history is
-        # incomplete for recent orders, so "the other one is absent" carries no
-        # information about whether it fired.
+    combinations = _combinations_summing_to(proven, reduction)
+    if len(combinations) > 1:
         return _refuse(
             "partial_reduction_take_profit_ambiguous",
             evidence={
                 **base_evidence,
                 "candidate_order_ids": sorted(
-                    str(row.order_id).strip() for row in candidates
+                    str(stage.order_id).strip() for stage, _ in proven
                 ),
-                "corroborated_order_ids": sorted(
-                    str(row.order_id).strip() for row, _ in proven
-                ),
-                "corroborating_forms": sorted(
-                    str(detail.get("evidence_form") or "") for _, detail in proven
-                ),
-                "per_candidate_reason_codes": [reason for reason, _ in refusals],
+                "matching_combinations": [
+                    sorted(str(stage.order_id).strip() for stage, _ in combo)
+                    for combo in combinations
+                ],
             },
         )
-    if len(proven) > 1:
-        return _refuse(
-            "partial_reduction_take_profit_ambiguous",
-            evidence={
-                **base_evidence,
-                "candidate_order_ids": sorted(
-                    str(row.order_id).strip() for row in candidates
-                ),
-                "corroborated_order_ids": sorted(
-                    str(row.order_id).strip() for row, _ in proven
-                ),
-            },
-        )
-    if not proven:
-        if len(candidates) > 1:
+    if not combinations:
+        exact = [
+            stage
+            for stage in stages
+            if _decimal(getattr(stage, "size_text", None)) == reduction
+        ]
+        if len(exact) == 1:
+            order_id = str(exact[0].order_id).strip()
+            refusal = refusals.get(order_id)
+            if refusal is not None:
+                return _refuse(refusal[0], order_id=order_id, evidence=refusal[1])
+        if exact:
             return _refuse(
                 "partial_reduction_take_profit_ambiguous",
                 evidence={
                     **base_evidence,
                     "candidate_order_ids": sorted(
-                        str(row.order_id).strip() for row in candidates
+                        str(stage.order_id).strip() for stage in exact
                     ),
-                    "per_candidate_reason_codes": [reason for reason, _ in refusals],
+                    "per_candidate_reason_codes": sorted(
+                        {
+                            refusals[str(stage.order_id).strip()][0]
+                            for stage in exact
+                            if str(stage.order_id).strip() in refusals
+                        }
+                    ),
                 },
             )
-        reason_code, evidence = refusals[0]
         return _refuse(
-            reason_code,
-            order_id=str(candidates[0].order_id).strip(),
-            evidence=evidence,
+            "partial_reduction_size_matches_no_owned_take_profit",
+            evidence={
+                **base_evidence,
+                "owned_take_profit_sizes": [
+                    _text(_decimal(getattr(stage, "size_text", None)))
+                    for stage in stages
+                ],
+                "per_stage_reason_codes": sorted(
+                    {reason for reason, _ in refusals.values()}
+                ),
+            },
         )
 
-    candidate, evidence = proven[0]
+    combo = combinations[0]
+    explained_orders = tuple(
+        (str(stage.order_id).strip(), evidence) for stage, evidence in combo
+    )
+    summary = dict(explained_orders[0][1]) if len(explained_orders) == 1 else {
+        **base_evidence,
+        "evidence_form": "multi_stage",
+        "stages": [
+            {
+                "order_id": order_id,
+                "evidence_form": evidence.get("evidence_form"),
+                "order_size_text": evidence.get("order_size_text"),
+                "order_trigger_price": evidence.get("order_trigger_price"),
+                "close_order": evidence.get("close_order"),
+                "trigger_history": evidence.get("trigger_history"),
+            }
+            for order_id, evidence in explained_orders
+        ],
+    }
     return PartialTakeProfitExplanation(
         explained=True,
         reason_code=PARTIAL_TAKE_PROFIT_FILLED,
-        order_id=str(candidate.order_id).strip(),
+        order_id=explained_orders[0][0] if len(explained_orders) == 1 else None,
         filled_size=_text(reduction),
         remaining_size=_text(live),
-        evidence=evidence,
+        evidence=summary,
+        explained_orders=explained_orders,
     )
+
+
+def _combinations_summing_to(
+    proven: list[tuple[Any, dict[str, Any]]],
+    reduction: Decimal,
+) -> list[tuple[tuple[Any, dict[str, Any]], ...]]:
+    """Every set of proven stages that sums to the reduction exactly.
+
+    More than one such set means the reduction cannot be attributed, which is a
+    freeze -- picking the "obvious" one would be exactly the guessing this
+    module exists to avoid. A closing order may appear in at most one stage of
+    a set: one fill closes one stage.
+    """
+
+    found: list[tuple[tuple[Any, dict[str, Any]], ...]] = []
+    total = len(proven)
+    for mask in range(1, 1 << total):
+        chosen = [proven[index] for index in range(total) if mask & (1 << index)]
+        if sum(
+            (_decimal(getattr(stage, "size_text", None)) or Decimal("0"))
+            for stage, _ in chosen
+        ) != reduction:
+            continue
+        close_ids = [
+            str((evidence.get("close_order") or {}).get("ordId") or "")
+            for _, evidence in chosen
+        ]
+        used = [item for item in close_ids if item]
+        if len(used) != len(set(used)):
+            continue
+        found.append(tuple(chosen))
+        if len(found) > 1:
+            return found
+    return found
 
 
 def _criterion_three(
@@ -361,7 +450,7 @@ def _close_order_evidence(
             {**evidence, "evidence_form": "orders_history"},
         )
     closing_side = "sell" if side == "long" else "buy"
-    tolerance = tick * 2
+    tolerance = max(tick * 2, abs(trigger_price) * _PRICE_TOLERANCE_BPS)
     matches: list[dict[str, Any]] = []
     for row in close_rows:
         row_id = _row_order_id(row)
@@ -403,6 +492,7 @@ def _close_order_evidence(
                 "trigger_price": _text(trigger_price),
                 "price_delta": _text(abs(avg_price - trigger_price)),
                 "price_tick": _text(tick),
+                "price_tolerance": _text(tolerance),
                 "cTime": str(created),
                 "state": state,
             }

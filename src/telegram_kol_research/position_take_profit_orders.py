@@ -730,8 +730,15 @@ def _record_explained_partial_take_profit_fill(
     the stop-loss resize (A-5 task 2) then converges the protection size to.
     """
 
+    # One reduction can settle several stages at once (A-5c): each keeps its
+    # own evidence, so a later pass can still see which fill closed which
+    # stage and refuse to spend that fill twice.
+    per_order_evidence = dict(explanation.explained_orders) or {
+        str(explanation.order_id): explanation.evidence
+    }
     for row in orders:
-        if str(row.order_id or "").strip() != str(explanation.order_id):
+        order_id = str(row.order_id or "").strip()
+        if order_id not in per_order_evidence:
             continue
         evidence = _load_evidence(row.evidence_json)
         evidence["partial_take_profit_fill"] = {
@@ -739,18 +746,17 @@ def _record_explained_partial_take_profit_fill(
             "observed_at": observed_at.isoformat(),
             "filled_size": explanation.filled_size,
             "remaining_position_size": explanation.remaining_size,
-            **explanation.evidence,
+            **per_order_evidence[order_id],
         }
         row.status = "completed"
         row.evidence_json = _json(evidence)
         row.completed_at = observed_at
         row.updated_at = observed_at
-        break
     convergence.error_json = _json(
         {
             **_load_evidence(convergence.error_json),
             "partial_take_profit_filled": {
-                "order_id": explanation.order_id,
+                "order_ids": sorted(per_order_evidence),
                 "observed_at": observed_at.isoformat(),
                 "filled_size": explanation.filled_size,
                 "remaining_position_size": explanation.remaining_size,

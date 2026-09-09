@@ -190,7 +190,12 @@ def test_two_equally_sized_owned_take_profits_stay_unexplained():
     assert result.reason_code == "partial_reduction_take_profit_ambiguous"
     assert result.evidence["candidate_order_ids"] == ["tp1", "tp2"]
     # A-5c: trigger history naming exactly one of them does NOT break the tie.
-    assert result.evidence["corroborated_order_ids"] == ["tp1"]
+    # tp1 is corroborated by trigger history but has an equal-sized sibling, so
+    # form (i) may not claim it; tp2 has no evidence of any kind.
+    assert result.evidence["per_candidate_reason_codes"] == [
+        "partial_reduction_close_evidence_inputs_missing",
+        "partial_reduction_take_profit_ambiguous",
+    ]
 
 
 # --------------------------------------------------------------------------
@@ -1324,14 +1329,53 @@ def test_an_unfilled_close_is_not_evidence():
 @pytest.mark.parametrize(
     "avg_price,explained",
     [
-        ("81100", True),      # exact
-        ("81100.2", True),    # +2 ticks, the boundary
-        ("81099.8", True),    # -2 ticks, the boundary
-        ("81100.3", False),   # 3 ticks away
+        ("81100", True),         # exact
+        ("81116.22", True),      # +2 basis points exactly, the boundary
+        ("81083.78", True),      # -2 basis points exactly: slippage both ways
+        ("81116.23", False),     # a hair past 2 basis points
+        ("81200", False),        # plainly a different fill
     ],
 )
-def test_the_price_tolerance_is_exactly_two_ticks(avg_price, explained):
+def test_the_price_tolerance_is_two_basis_points_when_ticks_are_fine(
+    avg_price, explained
+):
+    """A-5c ruling: tolerance is max(2 ticks, 2 basis points).
+
+    Two ticks alone allows 0.008% on an instrument whose tick is 0.01, which
+    is tighter than an ordinary market fill. Convergence 237's TP1 filled
+    2470.03 against a 2470 trigger -- three ticks, but 1.2 basis points.
+    """
+
     result = _explain_with_close(order_history=[_close_row(avgPx=avg_price)])
+
+    assert result.explained is explained
+
+
+@pytest.mark.parametrize(
+    "avg_price,explained",
+    [
+        ("100", True),      # exact
+        ("102", True),      # +2 ticks, which is far wider than 2 bp here
+        ("98", True),       # -2 ticks
+        ("102.5", False),   # past both floors
+    ],
+)
+def test_the_tick_floor_wins_when_the_instrument_is_coarse(avg_price, explained):
+    """The other half of ``max``: a coarse tick on a cheap instrument.
+
+    Two basis points of 100 is 0.02, far below one tick, so the two-tick floor
+    is what applies.
+    """
+
+    stage = _TakeProfitRow(order_id="tp1", size_text="5")
+    stage.trigger_price = "100"
+    stage.created_at = datetime(2026, 9, 4, 8, 0, tzinfo=UTC)
+
+    result = _explain_with_close(
+        take_profit_orders=[stage],
+        price_tick=Decimal("1"),
+        order_history=[_close_row(avgPx=avg_price)],
+    )
 
     assert result.explained is explained
 
@@ -1403,7 +1447,6 @@ def test_form_one_alone_cannot_separate_two_equal_stages():
 
     assert result.explained is False
     assert result.reason_code == "partial_reduction_take_profit_ambiguous"
-    assert result.evidence["corroborated_order_ids"] == ["tp-near"]
 
 
 def test_a_missing_price_tick_refuses_rather_than_guessing_a_tolerance():
@@ -1522,3 +1565,149 @@ def test_a_frozen_convergence_without_evidence_stays_frozen(tmp_path):
             session.query(PositionTakeProfitOrder).filter_by(order_id="tp1").one().status
             == "active"
         )
+
+
+# --------------------------------------------------------------------------
+# A-5c ruling: one reduction may cover several stages, if exactly one set fits
+# --------------------------------------------------------------------------
+
+
+def _stage(order_id, size, trigger_price):
+    row = _TakeProfitRow(
+        order_id=order_id, size_text=size, binding_id=345, pos_id="pos-237"
+    )
+    row.trigger_price = trigger_price
+    row.created_at = datetime(2026, 9, 8, 3, 11, tzinfo=UTC)
+    return row
+
+
+def _fill(order_id, size, price, when_ms):
+    return {
+        "ordId": order_id,
+        "posSide": "short",
+        "side": "buy",
+        "sz": size,
+        "fillSz": size,
+        "avgPx": price,
+        "state": "filled",
+        "ordType": "market",
+        "cTime": str(when_ms),
+    }
+
+
+def test_convergence_237_is_explained_by_both_stages_together():
+    """The production case, field for field.
+
+    ETH short: entered 2.1 at 03:11:20Z, TP1 (1 @2470) filled 06:02:29Z at
+    2470.03, TP2 (0.6 @2450) filled 13:39:12Z at 2450, and the first look at it
+    saw a single 1.6-lot drop. Neither stage equals 1.6; together they do.
+    """
+
+    result = explain_partial_position_reduction(
+        execution_binding_id=345,
+        pos_id="pos-237",
+        planned_size=Decimal("2.1"),
+        live_size=Decimal("0.5"),
+        take_profit_orders=[
+            _stage("tp1", "1", "2470"),
+            _stage("tp2", "0.6", "2450"),
+            _stage("tp3", "0.5", "2430"),
+        ],
+        trigger_history=[],
+        order_history=[
+            _fill("1001125181469680", "1", "2470.03", 1788847349000),
+            _fill("1001125186263340", "0.6", "2450", 1788874752000),
+        ],
+        position_side="short",
+        price_tick=Decimal("0.01"),
+        reduction_observed_at_ms=1788874754000,
+    )
+
+    assert result.explained is True
+    assert [order_id for order_id, _ in result.explained_orders] == ["tp1", "tp2"]
+    assert result.order_id is None
+    assert result.filled_size == "1.6"
+    assert result.remaining_size == "0.5"
+    assert result.evidence["evidence_form"] == "multi_stage"
+    assert [stage["close_order"]["ordId"] for stage in result.evidence["stages"]] == [
+        "1001125181469680",
+        "1001125186263340",
+    ]
+    # TP3 is still live and untouched by the judgement.
+    assert "tp3" not in {order_id for order_id, _ in result.explained_orders}
+
+
+def test_two_different_sets_summing_to_the_reduction_stay_ambiguous():
+    """1 + 0.6 and 1.6 both fit, so nothing is attributed."""
+
+    result = explain_partial_position_reduction(
+        execution_binding_id=345,
+        pos_id="pos-237",
+        planned_size=Decimal("3.2"),
+        live_size=Decimal("1.6"),
+        take_profit_orders=[
+            _stage("tp1", "1", "2470"),
+            _stage("tp2", "0.6", "2450"),
+            _stage("tp3", "1.6", "2430"),
+        ],
+        trigger_history=[],
+        order_history=[
+            _fill("close-a", "1", "2470", 1788847349000),
+            _fill("close-b", "0.6", "2450", 1788874752000),
+            _fill("close-c", "1.6", "2430", 1788874753000),
+        ],
+        position_side="short",
+        price_tick=Decimal("0.01"),
+        reduction_observed_at_ms=1788874754000,
+    )
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_take_profit_ambiguous"
+    assert len(result.evidence["matching_combinations"]) == 2
+
+
+def test_a_set_is_only_formed_from_stages_that_each_have_their_own_fill():
+    """1 + 0.6 sums correctly, but TP2 has no fill of its own."""
+
+    result = explain_partial_position_reduction(
+        execution_binding_id=345,
+        pos_id="pos-237",
+        planned_size=Decimal("2.1"),
+        live_size=Decimal("0.5"),
+        take_profit_orders=[
+            _stage("tp1", "1", "2470"),
+            _stage("tp2", "0.6", "2450"),
+            _stage("tp3", "0.5", "2430"),
+        ],
+        trigger_history=[],
+        order_history=[_fill("1001125181469680", "1", "2470.03", 1788847349000)],
+        position_side="short",
+        price_tick=Decimal("0.01"),
+        reduction_observed_at_ms=1788874754000,
+    )
+
+    assert result.explained is False
+    assert result.reason_code == "partial_reduction_size_matches_no_owned_take_profit"
+
+
+def test_one_fill_cannot_be_spent_on_two_stages_of_the_same_size():
+    """Two 0.8-lot stages, one 0.8-lot fill: 1.6 is not explained by it twice."""
+
+    result = explain_partial_position_reduction(
+        execution_binding_id=345,
+        pos_id="pos-237",
+        planned_size=Decimal("2.1"),
+        live_size=Decimal("0.5"),
+        take_profit_orders=[
+            _stage("tp-a", "0.8", "2470"),
+            _stage("tp-b", "0.8", "2470"),
+            _stage("tp3", "0.5", "2430"),
+        ],
+        trigger_history=[],
+        order_history=[_fill("close-a", "0.8", "2470", 1788847349000)],
+        position_side="short",
+        price_tick=Decimal("0.01"),
+        reduction_observed_at_ms=1788874754000,
+    )
+
+    assert result.explained is False
