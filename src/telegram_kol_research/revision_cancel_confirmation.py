@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
@@ -162,6 +163,26 @@ def confirm_unknown_cancel_outcome(
 
 RECOVERY_REASON = "revision_cancel_outcome_unknown"
 UNREADABLE_INCIDENT_TYPE = "revision_cancel_outcome_unresolved"
+STALE_INCIDENT_TYPE = "revision_batch_too_stale_to_resume"
+
+#: How old a frozen batch may be and still be resumed automatically.
+#:
+#: A revision carries a trading intention -- cancel these resting entries and
+#: put these ones up instead -- and that intention has a shelf life. Unfreezing
+#: a batch means the ordinary advance path will place its replacement orders,
+#: at the prices somebody chose when the batch was planned.
+#:
+#: This is not hypothetical. When this phase was about to deploy, production
+#: held three batches frozen since 2026-08-17..08-21 whose replacements were
+#: BTC longs at 60000-73000 while BTC was trading near 80000. Resuming them
+#: would have placed three sets of orders nobody had asked for in three weeks.
+#: A-3d hit the same shape and had to void an instruction item by hand before
+#: deploying its reconciler.
+#:
+#: Six hours matches ENTRY_ADMISSION_EXECUTION_DEADLINE: the same horizon the
+#: rest of the system already uses for "this entry intention is no longer
+#: current".
+STALE_BATCH_HORIZON = timedelta(hours=6)
 
 
 @dataclass(frozen=True, slots=True)
@@ -275,6 +296,11 @@ def _reconcile_one_batch(
         if batch is None or batch.status != "recovery_required":
             counts["skipped"] += 1
             return
+        planned_at = batch.planned_at
+        if planned_at is not None and planned_at.tzinfo is None and now.tzinfo:
+            planned_at = planned_at.replace(tzinfo=now.tzinfo)
+        stale = planned_at is None or (now - planned_at) > STALE_BATCH_HORIZON
+        batch_planned_at = str(batch.planned_at or "")
         binding = session.get(ExecutionBinding, int(batch.execution_binding_id))
         symbol = str(getattr(binding, "symbol", "") or "").upper()
         unknown_legs = [
@@ -295,6 +321,20 @@ def _reconcile_one_batch(
         ]
     if not symbol or not unknown_legs:
         counts["skipped"] += 1
+        return
+    if stale:
+        # Confirming the cancel would return the batch to ``planned``, and the
+        # advance path would then place its replacement orders at prices chosen
+        # this long ago. Say so and leave it frozen; only a person can decide
+        # whether an intention this old should still be acted on.
+        _report_stale(
+            session_factory,
+            batch_id=batch_id,
+            planned_at=batch_planned_at,
+            now=now,
+            incident_reporter=incident_reporter,
+        )
+        counts["alerted"] += 1
         return
     inst_id = f"{symbol}-USDT-SWAP"
 
@@ -493,4 +533,51 @@ def _report_unresolved(
         logger.warning(
             "revision_cancel_unresolved_alert_failed batch_id=%s", batch_id,
             exc_info=True,
+        )
+
+
+def _report_stale(session_factory, *, batch_id, planned_at, now, incident_reporter):
+    """A frozen batch too old to resume is a decision, not a defect."""
+
+    try:
+        if incident_reporter is not None:
+            incident_reporter(
+                batch_id=batch_id, order_id="", reason="batch_too_stale_to_resume",
+                now=now,
+            )
+            return
+        import hashlib
+        import json as _json
+
+        from telegram_kol_research.runtime_incidents import record_runtime_incident
+
+        record_runtime_incident(
+            session_factory,
+            source_kind="strategy_revision_batch",
+            source_record_id=str(batch_id),
+            incident_type=STALE_INCIDENT_TYPE,
+            severity="high",
+            fingerprint=hashlib.sha256(
+                f"{STALE_INCIDENT_TYPE}:{batch_id}".encode()
+            ).hexdigest(),
+            redacted_summary=_json.dumps(
+                {
+                    "component": "revision_cancel_confirmation",
+                    "reason_code": "batch_too_stale_to_resume",
+                    "operation": f"revision_batch_{int(batch_id)}",
+                    "impact": "frozen_revision_intent_older_than_horizon",
+                    "containment": "left_frozen_no_exchange_write",
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ),
+            occurred_at=now,
+            feature_policy_version="phase-6-pre-5-cancel-confirmation-v1",
+            prompt_version="none",
+            tool_policy_version="no-exchange-write",
+            evidence_refs_json=_json.dumps([f"strategy_revision_batch:{batch_id}"]),
+        )
+    except Exception:  # pragma: no cover
+        logger.warning(
+            "revision_batch_stale_alert_failed batch_id=%s", batch_id, exc_info=True
         )

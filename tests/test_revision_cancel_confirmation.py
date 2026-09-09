@@ -386,3 +386,64 @@ def test_the_reconciler_issues_no_exchange_write(tmp_path):
         ),
         now=NOW + timedelta(minutes=5),
     )
+
+
+def test_a_batch_older_than_the_horizon_is_never_resumed(tmp_path):
+    """The exact shape found in production the moment before deploying.
+
+    Three batches had been frozen since 2026-08-17..08-21 with replacements
+    that were BTC longs at 60000-73000, while BTC traded near 80000. Confirming
+    their cancels would have handed them back to the advance path, which would
+    have placed those orders. Nobody had asked for them in three weeks.
+    """
+
+    session_factory, batch_id, legs = _batch_seven(tmp_path, name="stale.db")
+    client = Client(pending=[RESTING_ROW], history=CANCELLED_HISTORY)
+
+    result = reconcile_unknown_revision_cancels(
+        session_factory,
+        deepcoin_client=client,
+        now=NOW + timedelta(days=21),
+    )
+
+    assert (result.confirmed, result.retried) == (0, 0)
+    assert result.alerted == 1
+    with session_factory() as session:
+        # Still frozen, and not one leg touched.
+        assert session.get(StrategyRevisionBatch, batch_id).status == (
+            "recovery_required"
+        )
+        for order_id, (execution_leg_id, revision_leg_id) in legs.items():
+            assert session.get(ExecutionOrderLeg, execution_leg_id).status == "pending"
+            assert session.get(StrategyRevisionLeg, revision_leg_id).status == (
+                "submit_unknown"
+            )
+        incident = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.incident_type == "revision_batch_too_stale_to_resume"
+            )
+            .one()
+        )
+        assert incident.severity == "high"
+
+
+def test_a_fresh_batch_is_still_resumed(tmp_path):
+    """The horizon must not disable the feature it guards."""
+
+    session_factory, batch_id, _ = _batch_seven(tmp_path, name="fresh.db")
+    client = Client(pending=[RESTING_ROW], history=CANCELLED_HISTORY)
+
+    result = reconcile_unknown_revision_cancels(
+        session_factory, deepcoin_client=client, now=NOW + timedelta(hours=5)
+    )
+
+    assert (result.confirmed, result.retried) == (1, 1)
+    with session_factory() as session:
+        assert session.get(StrategyRevisionBatch, batch_id).status == "planned"
+
+
+def test_the_stale_alert_is_always_notified():
+    from telegram_kol_research.config import ALWAYS_NOTIFIED_INCIDENT_TYPES
+
+    assert "revision_batch_too_stale_to_resume" in ALWAYS_NOTIFIED_INCIDENT_TYPES

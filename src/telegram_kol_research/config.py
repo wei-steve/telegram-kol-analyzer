@@ -184,6 +184,10 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # frozen and nothing is resent, so the only way this gets resolved is a
         # person reading the exchange.
         "revision_cancel_outcome_unresolved",
+        # Phase 6-pre-5: a frozen revision whose trading intention is older than
+        # the horizon. Resuming it would place orders at prices somebody chose
+        # long ago, so it stays frozen and a person decides.
+        "revision_batch_too_stale_to_resume",
         # A-2: the management-instruction failures. Production's hand-edited
         # list named none of these, so a durably failed instruction left a
         # ledger row and no message for weeks. Delivery of
