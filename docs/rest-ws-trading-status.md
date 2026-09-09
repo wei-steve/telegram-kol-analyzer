@@ -528,6 +528,7 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （返回空集），排除"异常被运维循环的 `except Exception: pass` 吞掉"这一可能。
   **未做**：未碰 `recovery_live_submit`、`execution_boundary`、`authoritative_recognition`、
   `strategy_management_planner`；陈旧指令项 1022/1023 按指挥会话裁定交 A 线 step 6 会话处理，本会话未动。
+- phase-6-pre-2-ruling (2026-09-09, 指挥会话): 既有 set-position-sltp 路径三道门都要求 verified 所有权，安全网不得在其上开口子；裁定新增只服务安全网的旁路 authority 构造器（前置 (a) 市价腿 unverified、(b) 成交满 60 秒、(c) 该 instId+side 恰有一个无人认领且数量相等的活跃仓位、(d) 快照完整），只能构造 include_take_profit=False 的止损写入，静态守护测试保证只有安全网模块能用；不加运行时开关；每次触发留 critical 告警、审计行、attribution 标记三处痕迹；跑在 worker 5 秒运维 tick，异常单独捕获。事实更正：现有代码在 unverified 时已尝试挂止损但被所有权门拒绝（position_protection_failed_after_entry_submitted）。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
