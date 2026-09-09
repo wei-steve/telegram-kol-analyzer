@@ -528,3 +528,94 @@ def test_a_refused_fraction_keeps_the_recognition_result(tmp_path):
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0
         assert session.get(StrategyLifecycle, target_id).lifecycle_status == "entered"
+
+
+# --------------------------------------------------------------------------
+# A-8c: the fraction record is written either way, delivered only where it matters
+# --------------------------------------------------------------------------
+
+
+def _fraction_incident(tmp_path, *, chat_id, provider, name, row_chat_id=None):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.management_fraction_gate import (
+        record_fraction_rejection,
+    )
+    from telegram_kol_research.models import RawMessage, RuntimeIncident
+
+    factory = create_session_factory(tmp_path / name)
+    with factory() as session:
+        raw = RawMessage(
+            chat_id=row_chat_id if row_chat_id is not None else chat_id,
+            message_id=7,
+            text="减仓",
+        )
+        session.add(raw)
+        session.commit()
+        raw_id = raw.id
+
+    record_fraction_rejection(
+        factory,
+        raw_message_id=raw_id,
+        chat_id=chat_id,
+        group_trading_mode_provider=provider,
+    )
+    with factory() as session:
+        return session.query(RuntimeIncident).one()
+
+
+def test_a_refused_fraction_in_an_auto_trade_group_stays_deliverable(tmp_path):
+    row = _fraction_incident(
+        tmp_path,
+        chat_id=-1002337721508,
+        provider=lambda chat_id: "auto_trade",
+        name="auto.db",
+    )
+
+    assert row.incident_type == "management_fraction_rejected"
+    assert row.notification_status == "pending"
+    assert "auto_trade_deliverable" in row.redacted_summary
+
+
+def test_a_refused_fraction_in_a_notify_only_group_is_recorded_but_silent(tmp_path):
+    """raw 15702 and 15703's group. Nothing there executes, so nothing was lost.
+
+    The row is written ``suppressed`` rather than left in ``pending`` for a
+    claimer that is never coming -- a queue of things nobody will send is how
+    the real ones get lost.
+    """
+
+    row = _fraction_incident(
+        tmp_path,
+        chat_id=-1002960443256,
+        provider=lambda chat_id: "notify_only",
+        name="notify.db",
+    )
+
+    assert row.notification_status == "suppressed"
+    assert "records_only_group_mode_notify_only" in row.redacted_summary
+
+
+def test_an_unknown_group_mode_is_silent_rather_than_wrong(tmp_path):
+    """No provider, no chat, or a provider that raises: all answer the same.
+
+    Silence about a message that could not have traded is cheap; paging
+    somebody about one is not.
+    """
+
+    def explode(chat_id):
+        raise RuntimeError("groups.yaml unreadable")
+
+    for provider, chat_id, name in (
+        (None, -1002960443256, "no-provider.db"),
+        (lambda chat_id: "auto_trade", None, "no-chat.db"),  # chat unavailable
+        (explode, -1002960443256, "provider-raises.db"),
+    ):
+        row = _fraction_incident(
+            tmp_path,
+            chat_id=chat_id,
+            provider=provider,
+            name=name,
+            row_chat_id=-1002960443256,
+        )
+        assert row.notification_status == "suppressed"
+        assert "records_only_group_mode_unknown" in row.redacted_summary

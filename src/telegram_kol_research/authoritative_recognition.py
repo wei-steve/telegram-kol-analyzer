@@ -1362,9 +1362,11 @@ def apply_authoritative_assessment(
     assessment: AuthoritativeAssessment,
     *,
     multi_target_management_config: MultiTargetManagementConfig | None = None,
+    group_trading_mode_provider=None,
 ) -> MessageRecognitionResult:
     result = apply_authoritative_mimo_payload(
         session_factory,
+        group_trading_mode_provider=group_trading_mode_provider,
         raw_message_id=assessment.raw_message_id,
         payload=assessment.mimo.payload,
         model=assessment.mimo.model,
@@ -1833,6 +1835,7 @@ def process_authoritative_message(
                     lease_claim=lease_claim,
                     auto_trade_executor=auto_trade_executor,
                     multi_target_management_config=multi_target_management_config,
+                    group_trading_mode_provider=group_trading_mode_provider,
                 )
         finally:
             scope.__exit__(None, None, None)
@@ -1843,6 +1846,7 @@ def process_authoritative_message(
             assessment=assessment,
             auto_trade_executor=auto_trade_executor,
             multi_target_management_config=multi_target_management_config,
+            group_trading_mode_provider=group_trading_mode_provider,
         )
     if auto_trade_executor is not None:
         _run_entry_assembly_wakeups(
@@ -2044,14 +2048,20 @@ def _run_legacy_authoritative_execution(
     assessment,
     auto_trade_executor,
     multi_target_management_config,
+    group_trading_mode_provider=None,
 ):
     if multi_target_management_config is None:
-        recognition = apply_authoritative_assessment(session_factory, assessment)
+        recognition = apply_authoritative_assessment(
+            session_factory,
+            assessment,
+            group_trading_mode_provider=group_trading_mode_provider,
+        )
     else:
         recognition = apply_authoritative_assessment(
             session_factory,
             assessment,
             multi_target_management_config=multi_target_management_config,
+            group_trading_mode_provider=group_trading_mode_provider,
         )
     from telegram_kol_research.source_message_deletion import (
         source_execution_barrier,
@@ -2128,17 +2138,23 @@ def _run_leased_authoritative_execution(
     lease_claim,
     auto_trade_executor,
     multi_target_management_config,
+    group_trading_mode_provider=None,
 ):
     """Classify every claimed generation without ever making it replayable."""
 
     try:
         if multi_target_management_config is None:
-            recognition = apply_authoritative_assessment(session_factory, assessment)
+            recognition = apply_authoritative_assessment(
+                session_factory,
+                assessment,
+                group_trading_mode_provider=group_trading_mode_provider,
+            )
         else:
             recognition = apply_authoritative_assessment(
                 session_factory,
                 assessment,
                 multi_target_management_config=multi_target_management_config,
+                group_trading_mode_provider=group_trading_mode_provider,
             )
         from telegram_kol_research.source_message_deletion import (
             source_execution_barrier,

@@ -2897,6 +2897,7 @@ def apply_authoritative_mimo_payload(
     authoritative_generation: str | None = None,
     _exact_context_risk_reduction_authorized: bool = False,
     multi_target_management_config: MultiTargetManagementConfig | None = None,
+    group_trading_mode_provider=None,
 ) -> MessageRecognitionResult:
     """Persist only the authoritative MiMo interpretation."""
 
@@ -2963,6 +2964,10 @@ def apply_authoritative_mimo_payload(
             record_fraction_rejection(
                 session_factory, raw_message_id=raw_message_id, error=exc,
                 authoritative_generation=authoritative_generation,
+                # A-8c: the chat is already in hand; the mode decides only
+                # whether the record is deliverable.
+                chat_id=int(raw_message.chat_id),
+                group_trading_mode_provider=group_trading_mode_provider,
             )
             return result
 

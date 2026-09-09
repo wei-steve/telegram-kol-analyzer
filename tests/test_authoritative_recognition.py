@@ -735,13 +735,15 @@ def test_authoritative_apply_rechecks_deleted_source_before_auto_trade(
     auto_trade_calls = []
     original_apply = apply_authoritative_assessment
 
-    def delete_source_during_authoritative_apply(factory, assessment):
+    def delete_source_during_authoritative_apply(factory, assessment, **kwargs):
         record_source_message_deleted(
             factory,
             chat_id=101,
             message_id=3428,
         )
-        return original_apply(factory, assessment)
+        # A-8c threads the group mode through this call; the stub passes
+        # whatever it is given straight on rather than pinning the signature.
+        return original_apply(factory, assessment, **kwargs)
 
     monkeypatch.setattr(
         "telegram_kol_research.authoritative_recognition.apply_authoritative_assessment",
