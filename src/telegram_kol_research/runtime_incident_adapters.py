@@ -670,6 +670,61 @@ def capture_source_deletion_exit_stuck(
     )
 
 
+def capture_management_target_needs_confirmation(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    chat_id: int,
+    candidate_count: int,
+    reason_code: str,
+    candidate_digest: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a management instruction whose target nobody can settle.
+
+    Two production messages are why this exists. 峰哥 raw 15155 resolved to
+    ``target_ambiguous`` between two candidates, one of them a lifecycle that
+    had been simulated into existence after its entry failed; 大镖客 raw 15201
+    was matched to a position that had closed four days earlier, by price
+    description rather than by a reply. Both went nowhere and neither produced
+    a single alert.
+
+    The user's 2026-09-07 decision is to notify rather than re-point an
+    instruction at a different position. This incident is that notification,
+    and it is the whole operator-facing outcome: nothing is executed.
+    """
+
+    if not config.captures("management_target_needs_confirmation"):
+        return None
+    fixed = {
+        "component": "management_target",
+        "source_status": "awaiting_user_confirmation",
+        "reason_code": _safe_label(reason_code),
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_instruction_target",
+        source_record_id=str(int(raw_message_id)),
+        incident_type="management_target_needs_confirmation",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            chat_id=int(chat_id),
+            candidate_count=int(candidate_count),
+            candidates=_safe_sentence(candidate_digest),
+            impact="not_executed_awaiting_user",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def _deadline_label(deadline_at: datetime | None) -> str:
     """A bare minute-resolution instant, carried in its own summary field.
 

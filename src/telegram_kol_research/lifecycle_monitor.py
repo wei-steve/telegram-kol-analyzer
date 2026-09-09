@@ -312,6 +312,7 @@ class LifecycleMonitor:
         expiry_review_notifier: ExpiryReviewNotifier | None = None,
         context_resolution_scheduler: Callable[..., int] | None = None,
         context_resolution_worker: Callable[[], Any] | None = None,
+        group_trading_mode_provider: Callable[[int], str] | None = None,
     ) -> None:
         self._session_factory = session_factory
         self._broker = broker
@@ -324,6 +325,13 @@ class LifecycleMonitor:
         self._expiry_review_notifier = expiry_review_notifier
         self._context_resolution_scheduler = context_resolution_scheduler
         self._context_resolution_worker = context_resolution_worker
+        # A-7 task 3. This monitor replays candles to decide when a *notified*
+        # strategy would have entered. In a group that actually trades, that
+        # replay is not evidence of anything: lifecycle 1121 was an entry that
+        # failed and was simulated into ``entered`` anyway, and then offered
+        # itself as a management target. Only a real binding may enter one of
+        # those. ``None`` keeps the pre-A-7 behaviour for every other caller.
+        self._group_trading_mode_provider = group_trading_mode_provider
 
     # ── public API ────────────────────────────────────────────────
 
@@ -1458,6 +1466,26 @@ class LifecycleMonitor:
 
     # ── persistence ────────────────────────────────────────────────
 
+    def _is_auto_trade_lifecycle(self, row: StrategyLifecycle) -> bool:
+        """Whether this lifecycle's group trades, so simulation must not enter it.
+
+        Unknown means "do not block": without a configured mode this monitor
+        behaves exactly as it did before A-7, and the notify_only groups it
+        exists for keep working.
+        """
+
+        provider = self._group_trading_mode_provider
+        if provider is None or row.chat_id is None:
+            return False
+        try:
+            return str(provider(int(row.chat_id)) or "").lower() == "auto_trade"
+        except Exception:
+            logger.warning(
+                "group trading mode unavailable for lifecycle_id=%s", row.id,
+                exc_info=True,
+            )
+            return False
+
     def _apply_transitions(self, transitions: list[StateTransition]) -> None:
         if not transitions:
             return
@@ -1481,6 +1509,15 @@ class LifecycleMonitor:
                         row.execution_binding_id,
                         t.to_status,
                         t.exit_reason,
+                    )
+                    continue
+                if t.to_status == "entered" and self._is_auto_trade_lifecycle(row):
+                    logger.info(
+                        "Skipping simulated lifecycle entry in an auto_trade group: "
+                        "lifecycle_id=%s chat_id=%s binding_id=%s",
+                        row.id,
+                        row.chat_id,
+                        row.execution_binding_id,
                     )
                     continue
                 if t.to_status == "entered" and _before(t.occurred_at, row.signal_at):

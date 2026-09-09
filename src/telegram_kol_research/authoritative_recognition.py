@@ -315,16 +315,61 @@ def _numeric_range(value: Any) -> tuple[float | None, float | None]:
     )
 
 
+def _management_target_gate(
+    session,
+    *,
+    raw_message_id: int,
+    first_pass_payload: dict[str, Any],
+    group_trading_mode_provider,
+) -> tuple[bool, frozenset[str] | None]:
+    """Whether to require a verified position, and the ids that would prove it.
+
+    The gate is deliberately narrow: only a management instruction (the first
+    pass reported a lifecycle event) in a group that actually trades. A
+    notify_only group never executes, so narrowing its candidates would only
+    make its notifications worse, and an entry is not choosing between existing
+    positions at all.
+    """
+
+    if group_trading_mode_provider is None:
+        return False, None
+    lifecycle_event = first_pass_payload.get("lifecycle_event")
+    lifecycle_event = lifecycle_event if isinstance(lifecycle_event, Mapping) else {}
+    if str(lifecycle_event.get("event_type") or "none") == "none":
+        return False, None
+    raw_message = session.get(RawMessage, int(raw_message_id))
+    if raw_message is None:
+        return False, None
+    try:
+        mode = str(group_trading_mode_provider(int(raw_message.chat_id)) or "")
+    except Exception:
+        # An unreadable group mode must not silently widen the candidate set.
+        logger.warning(
+            "group trading mode unavailable raw_message_id=%s", raw_message_id,
+            exc_info=True,
+        )
+        return False, None
+    if mode.lower() != "auto_trade":
+        return False, None
+    from telegram_kol_research.management_target_verification import (
+        load_verified_position_ids,
+    )
+
+    return True, load_verified_position_ids(session, now=datetime.now(UTC))
+
+
 def _load_resolution_inputs(
     session_factory: sessionmaker,
     *,
     raw_message_id: int,
     first_pass_payload: dict[str, Any],
     evidence_row,
+    group_trading_mode_provider=None,
 ) -> tuple[
     dict[str, Any],
     ContextualMessageWindow,
     tuple[StrategyThreadCandidate, ...],
+    dict[str, Any] | None,
 ]:
     normalized_evidence = json.loads(evidence_row.normalized_evidence_json or "{}")
     text_evidence = json.loads(evidence_row.text_evidence_json or "{}")
@@ -352,9 +397,20 @@ def _load_resolution_inputs(
             session,
             raw_message_id=int(raw_message_id),
         )
+        # A-7 task 1: a management instruction in an auto_trade group may only
+        # be offered lifecycles whose position the exchange showed open in the
+        # last five minutes. Everywhere else the candidate set is unchanged.
+        require_verified_position, verified_position_ids = _management_target_gate(
+            session,
+            raw_message_id=int(raw_message_id),
+            first_pass_payload=first_pass_payload,
+            group_trading_mode_provider=group_trading_mode_provider,
+        )
         candidates = generate_strategy_thread_candidates(
             session,
             raw_message_id=int(raw_message_id),
+            require_verified_position=require_verified_position,
+            verified_position_ids=verified_position_ids,
             symbol=strategy.get("symbol"),
             side=strategy.get("side"),
             entry_range_low=entry_low,
@@ -366,7 +422,20 @@ def _load_resolution_inputs(
                 else None
             ),
         )
-    return evidence, window, candidates
+    # A-7 task 2. Exactly one verifiable target is the only case this system
+    # may act on by itself. Zero, two, or "the snapshot is too old to say" all
+    # go to a person -- the caller raises it once the session is closed, so the
+    # confirmation write never nests inside this read.
+    needs_confirmation = require_verified_position and len(candidates) != 1
+    return evidence, window, candidates, (
+        {
+            "raw_message_id": int(raw_message_id),
+            "candidates": list(candidates),
+            "snapshot_stale": verified_position_ids is None,
+        }
+        if needs_confirmation
+        else None
+    )
 
 
 def _load_exchange_state(provider, raw_message_id: int, candidates) -> Any:
@@ -790,6 +859,7 @@ def assess_message_authoritatively(
     context_resolver=None,
     exchange_state_provider=None,
     reuse_current_evidence: bool = False,
+    group_trading_mode_provider=None,
 ) -> AuthoritativeAssessment:
     saved = (
         _load_current_mimo_evidence_result(session_factory, raw_message_id)
@@ -943,12 +1013,39 @@ def assess_message_authoritatively(
     context_decision = None
     context_triggers: tuple[str, ...] = ()
     if not mimo.error_message and mimo.status != "识别失败":
-        evidence, context_window, candidates = _load_resolution_inputs(
+        (
+            evidence,
+            context_window,
+            candidates,
+            target_confirmation,
+        ) = _load_resolution_inputs(
             session_factory,
             raw_message_id=raw_message_id,
             first_pass_payload=mimo.payload,
             evidence_row=evidence_row,
+            group_trading_mode_provider=group_trading_mode_provider,
         )
+        if target_confirmation is not None:
+            from telegram_kol_research.management_target_verification import (
+                request_management_target_confirmation,
+            )
+
+            try:
+                request_management_target_confirmation(
+                    session_factory,
+                    raw_message_id=int(target_confirmation["raw_message_id"]),
+                    candidates=target_confirmation["candidates"],
+                    snapshot_stale=bool(target_confirmation["snapshot_stale"]),
+                    now=datetime.now(UTC),
+                )
+            except Exception:
+                # The narrowed candidate set already stops execution; losing the
+                # alert must not also lose the message.
+                logger.warning(
+                    "management target confirmation request failed raw_message_id=%s",
+                    raw_message_id,
+                    exc_info=True,
+                )
         needs_resolution, context_triggers = requires_context_resolution(
             first_pass_payload=mimo.payload,
             evidence=evidence,
@@ -1440,6 +1537,7 @@ def process_authoritative_message(
     media_root: str | Path,
     auto_trade_executor=None,
     context_resolver=None,
+    group_trading_mode_provider=None,
     exchange_state_provider=None,
     reuse_current_evidence: bool = False,
     multi_target_management_config: MultiTargetManagementConfig | None = None,
@@ -1470,6 +1568,7 @@ def process_authoritative_message(
         ai_recognition_config=ai_recognition_config,
         media_root=media_root,
         context_resolver=context_resolver,
+        group_trading_mode_provider=group_trading_mode_provider,
         exchange_state_provider=exchange_state_provider,
         reuse_current_evidence=reuse_current_evidence,
     )

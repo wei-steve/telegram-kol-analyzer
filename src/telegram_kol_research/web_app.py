@@ -4526,6 +4526,10 @@ def _run_authoritative_processor(app: FastAPI, *, raw_message_id: int):
         multi_target_management_config=app.state.multi_target_management_config,
         execution_owner=app.state.recognition_execution_owner,
         execution_registry=app.state.recognition_execution_registry,
+        # A-7 task 1: the candidate gate only tightens in groups that trade.
+        group_trading_mode_provider=lambda chat: _group_trading_mode(
+            app.state.group_config, chat
+        ),
     )
 
 
@@ -5273,6 +5277,9 @@ def create_web_app(
                     expiry_review_notifier=expiry_review_notifier,
                     context_resolution_scheduler=app.state.context_resolution_scheduler,
                     context_resolution_worker=app.state.context_resolution_worker,
+                    group_trading_mode_provider=lambda chat: _group_trading_mode(
+                        app.state.group_config, chat
+                    ),
                 )
                 app.state.lifecycle_monitor_task = asyncio.create_task(
                     app.state.lifecycle_monitor.run_loop()
@@ -9827,6 +9834,21 @@ def _build_deepcoin_reconcile_client(deepcoin_client_factory, *, now_provider=No
     client = deepcoin_client_factory()
     synced_at = now_provider() if now_provider is not None else datetime.now(UTC)
     return client, synced_at
+
+
+def _group_trading_mode(group_config, chat_id: int) -> str:
+    """The configured trading mode for one chat, or "" when it is unknown.
+
+    An unknown chat returns "" rather than a default: the caller treats
+    anything that is not ``auto_trade`` as "do not tighten", and inventing
+    ``auto_trade`` for a chat nobody configured would narrow candidates on a
+    guess.
+    """
+
+    for group in getattr(group_config, "groups", ()) or ():
+        if group.chat_id is not None and int(group.chat_id) == int(chat_id):
+            return str(group.trading_mode or "")
+    return ""
 
 
 async def run_deepcoin_execution_reconcile_loop(

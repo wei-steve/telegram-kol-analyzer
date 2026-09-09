@@ -8,6 +8,9 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from telegram_kol_research.management_target_verification import (
+    verify_lifecycle_targets,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -71,6 +74,12 @@ class StrategyThreadCandidate:
     live_verified_pos_ids: tuple[str, ...]
     pending_entry_leg_ids: tuple[int, ...]
     uncertain_entry_leg_ids: tuple[int, ...]
+    #: A-7: why this thread is, or is not, a usable management target --
+    #: ``verified`` / ``no_execution_binding`` / ``position_absent_from_snapshot``
+    #: / ``snapshot_stale`` / ``not_required``. Recorded on every candidate,
+    #: including the ones that survive, so a later reader can see what the
+    #: filter was working from rather than only what it kept.
+    position_verification: str = "not_required"
 
 
 def _overlaps(
@@ -225,6 +234,26 @@ def _binding_context(
     )
 
 
+def _candidate_lifecycle_ids(session: Session, threads) -> list[int]:
+    """Lifecycle ids the candidate loop is about to consider, in one pass."""
+
+    found: list[int] = []
+    for thread in threads:
+        lifecycle_id = thread.current_lifecycle_id
+        if lifecycle_id is not None:
+            found.append(int(lifecycle_id))
+            continue
+        row = (
+            session.query(StrategyLifecycle.id)
+            .filter(StrategyLifecycle.strategy_thread_id == int(thread.id))
+            .order_by(StrategyLifecycle.signal_at.desc(), StrategyLifecycle.id.desc())
+            .first()
+        )
+        if row is not None:
+            found.append(int(row[0]))
+    return found
+
+
 def generate_strategy_thread_candidates(
     session: Session,
     *,
@@ -236,8 +265,20 @@ def generate_strategy_thread_candidates(
     stop_loss: float | None = None,
     take_profit: str | None = None,
     max_candidates: int = 20,
+    require_verified_position: bool = False,
+    verified_position_ids: frozenset[str] | None = None,
 ) -> tuple[StrategyThreadCandidate, ...]:
-    """Return deterministic, auditable candidates without calling an AI."""
+    """Return deterministic, auditable candidates without calling an AI.
+
+    A-7 task 1. ``require_verified_position`` is set for a management
+    instruction in an ``auto_trade`` group, and then a thread only survives if
+    its lifecycle carries an execution binding whose position is in
+    ``verified_position_ids``. That set comes from
+    ``management_target_verification.load_verified_position_ids``; ``None``
+    there means the snapshot is stale, and a stale snapshot disqualifies
+    *everything* rather than nothing -- the caller is expected to ask a person
+    instead of guessing, and an empty candidate set is how it finds out.
+    """
 
     current = session.get(RawMessage, int(raw_message_id))
     if current is None:
@@ -252,6 +293,16 @@ def generate_strategy_thread_candidates(
         session,
         chat_id=int(current.chat_id),
         limit=200,
+    )
+    candidate_lifecycle_ids = _candidate_lifecycle_ids(session, threads)
+    verdicts = (
+        verify_lifecycle_targets(
+            session,
+            candidate_lifecycle_ids,
+            verified_position_ids=verified_position_ids,
+        )
+        if require_verified_position
+        else {}
     )
     ranked: list[tuple[tuple[int, int, float, int], StrategyThreadCandidate]] = []
     for thread in threads:
@@ -316,6 +367,12 @@ def generate_strategy_thread_candidates(
             pending_entry_leg_ids,
             uncertain_entry_leg_ids,
         ) = _binding_context(session, lifecycle)
+        verdict = verdicts.get(int(lifecycle.id))
+        verification = verdict.reason if verdict is not None else "not_required"
+        if require_verified_position and (verdict is None or not verdict.verified):
+            # A ghost lifecycle, a closed position, or a snapshot too old to
+            # settle it. None of the three may be offered as a target.
+            continue
         candidate = StrategyThreadCandidate(
             thread_id=int(thread.id),
             lifecycle_id=int(lifecycle.id),
@@ -345,6 +402,7 @@ def generate_strategy_thread_candidates(
             live_verified_pos_ids=live_verified_pos_ids,
             pending_entry_leg_ids=pending_entry_leg_ids,
             uncertain_entry_leg_ids=uncertain_entry_leg_ids,
+            position_verification=verification,
         )
         rank = (
             0 if reply_depth == 1 else 1 if reply_depth is not None else 2,

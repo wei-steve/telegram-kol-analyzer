@@ -210,6 +210,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # complete silence -- the ``incidents`` counter on the reconciler's
         # result had never been incremented by anything.
         "entry_admission_expired",
+        # A-7: a management instruction whose target could not be settled --
+        # two verifiable positions, none, or a positions snapshot too old to
+        # judge. The user decision is to ask rather than guess
+        # (``ambiguous_target_notifies_user``), and asking is only asking if
+        # it actually reaches somebody.
+        "management_target_needs_confirmation",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to
