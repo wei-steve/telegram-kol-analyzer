@@ -35,6 +35,13 @@
 - 10 条 binding 为 NULL 的 entered lifecycle（1091、1102、1105、1108、1112、1114、1116、1119、1120、1121）：notify_only 群的按设计保留但标注
   `simulated_only`；auto_trade 群的按任务 3 的新规则改为 `entry_failed`（或项目等价终态），逐条交易所直读确认无仓位后再改。
 
+### 6. 三周未被认领的消息作业（A-6 发现）
+
+`message_processing_jobs` 有 5 条 2026-08-20 的 `pending` 作业（id 9/11/12/14/15，raw 11768/11770/11771/11773/11774，
+`history_reconcile_enqueued`，`attempt_count=0`），worker 的认领查询把它们排除在外。只读查清认领条件为何排除它们
+（shadow 列？chat 过滤？水位线？），写进证据；这 5 条消息本身已过时，按 A-3 作废工具的形状标为 `expired`（reason
+`stale_job_voided_2026_09_09`），并修正认领条件或加告警，避免再出现"永远排不到"的作业。
+
 ## 禁止
 
 - 不自动把指令改指向另一个仓位。
