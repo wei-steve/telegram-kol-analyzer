@@ -13,7 +13,7 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-5
+current_phase: 6-pre-7
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
 phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
@@ -655,6 +655,51 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **未修、需另立项的同形状风险**：`recovery_live_submit` 新入场路径（`attempted_writes > 0` 时不释放）
   持有者是 `signal:<id>` 而非 `batch:<id>`，**没有批次行可以证明终态**，本次扫描明确跳过它
   （已加测试 `test_a_signal_holder_is_never_swept` 固定该行为）。那条路径的死锁风险仍在，已报指挥会话待裁。
+- phase-6-pre-5-completed (2026-09-09, 会话 local_4a6676b0): 撤单回执丢失后自动确认。
+  提交 **`89d9657be2a2bf2b4dea5902cd212a3dedd9934c`**，2026-09-09T16:29Z 上线；回滚参考 `2779c2fb`
+  （生产 HEAD 随后被 A 线 `9299c228` 取代，`89d9657b` 是其祖先、代码在线；单撤本阶段须另做 revert）。
+  全量 **8171 passed / 0 failed**。
+  **实现**：两次独立只读确认才定论——仍在 `trigger-orders-pending` = 撤单没生效；不在 pending **且**
+  `trigger-order-history` 有终态行（`triggerTime=0`）= 已撤；其余一律 unknown（含任一读失败、两处都查不到、
+  history 显示它先触发了），保持 `recovery_required` 并告警。**不在 pending 本身不是任何证据**，
+  当成"已撤"会对一张实际已成交的单重发撤单。
+  **reconciler 零交易所写入**：确认仍挂着时只盖幂等键 `cancel-retry:<ordId>`（记在 leg 的 error_json）
+  并把批次放回 `planned`，重试由**既有的、已审计的** advance 撤单路径执行——不新造第二条写入路径。
+  幂等键在重试**之前**盖，崩溃也不会产生第二次。有测试用"任何写入方法都抛断言"的假客户端固定这一点。
+  **部署前的确认拦下了一次事故（本阶段最重要的一件事）**：例行核对"新 reconciler 上线后会选中什么，必须为 0"
+  时得到 **3**——批次 3/4/6 自 2026-08-17~08-21 冻结，替换意图是 **BTC 多单 60000-73000 而 BTC 现价约 8 万**。
+  确认已撤会把它们放回 `planned`，advance 随即按三周前的判断挂出三组单。与 A-3d 部署前必须作废 item 1029 同类。
+  **因此新增 `STALE_BATCH_HORIZON = 6 小时`**（与 `ENTRY_ADMISSION_EXECUTION_DEADLINE` 同量级）：
+  批次 `planned_at` 超期只告警不动作、保持冻结，新告警 `revision_batch_too_stale_to_resume` 进 ALWAYS_NOTIFIED。
+  这是代码层面的修复，不只是绕开这一次。
+  **三个陈旧批次已按指挥会话裁定作废**（备份 `research-backup-20260909T161250Z.db` sha256 `8d233b54...`、
+  副本演练两次可复现、生产执行与演练逐字一致、`PRAGMA quick_check` ok、演练副本用完即删）：
+  批次 3/4/6 → `resolved / stale_batch_voided_2026_09_09`，改单腿 5/6/7/8/10 → `cancelled`（腿 11 已终态未动），
+  共 **8 处变更、9 条 `historical_cleanup` 审计行**，全库其余表行数一字未变，
+  SYSTEM bot 聚合通知 message_id **4092**，**零交易所动作**。
+  **一处判定限度写进审计与通知**：涉及的两张单在 `trigger-order-history` 里查不到，但它们是三周前的单而
+  history 有保留窗口，所以"查不到"= 看不到，**不等于**确认已撤；零敞口的依据是三证
+  （不在 pending、无成交、账户无任何 BTC 多头持仓）加账本里 2026-08-31 操作员撤销记录。
+  **顺带加固**：`resolved` 加进 `TERMINAL_REVISION_STATES`。批次 7 是用户手工了结并明确保留一条挂单的，
+  原先只靠调用方检查 `!= "planned"` 保护——防护在调用方而非被调方，任何别的调用方直接走 advance 就会撤掉那张单。
+  **观察（L2，指挥会话裁定 (a) 接受）**：第二段窗口 17:14:15Z 起 **30 分钟连续健康**，31 条采样
+  **零不健康、零重置**，`head_ok` 全绿，`unsettled_batches=0`、`kept_leg_intact=1`
+  （已了结的批次没被复活、用户保留的挂单没被动），零非预期交易所写入。
+  **但 `messages=0`，未达 L2 的 ≥5 条门槛，如实记。**
+  裁定接受的理由：本阶段 reconciler 的触发条件（`recovery_required + revision_cancel_outcome_unknown +
+  completed_at IS NULL` 的批次）在生产中为 **0**，且 `any_nonterminal_revision_batch` 也为 **0**——
+  窗口内该路径必然零动作，**与消息量无关**；"再等 5 条消息"买不到关于这段新代码的任何证据。
+  该路径**在生产无真实样本，只有测试证据**；"有流量时仍健康"的一般性信号由 6-pre-7 的白天窗口承接。
+  流量事实：16:00Z 后一小时仅 4 条、最近 40 分钟 0 条（北京时间凌晨 1:30，KOL 群停更）。
+  **两起过程事故，已处理并写进 ARCHITECTURE 第 6 节（提交 `c1210b2d`）**：
+  (1) **监视器骗过了我**——A 线 17:06 部署换 HEAD，第一段 **40 条采样每条 `healthy=1`、`window_reset=0`**，
+  因为重启只几秒而采样一分钟一次、且 `deploy_sha` 是启动参数不是实时读；**一个跨版窗口冒充了干净窗口**。
+  该段归档为 `observer-samples-segment1-interrupted-by-a-line-deploy.jsonl` **不作达标窗口用**，
+  监视器加实时 HEAD 比对（`head_ok`）后重新起窗。
+  (2) **kill 错 PID**——停旧监视器时杀了父 `bash` 而非脚本本身，旧实例与新实例同写一个采样文件三分钟，
+  该段归档为 `segment2-mixed-instances.jsonl` 作废。判进程存活今天栽两次（先 pgrep 自匹配、后 kill 错 PID），
+  而"用精确 PID"正是本会话自己写进架构文档的那条。
+  证据目录 `/root/evidence/phase-6-pre-5/`。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
