@@ -14,7 +14,7 @@ integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成�
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: 8
 current_step_file: docs/plans/2026-09-07-management-reliability/step-8-recognition-failure-attribution.md
-step_status: claimed              # planned | claimed | in_progress | completed | blocked
+step_status: in_progress           # planned | claimed | in_progress | completed | blocked
 claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
 last_completed_step: 7
 last_completed_commit: d4348d113bc6b4dc7caabca1af2340b193592e1d
