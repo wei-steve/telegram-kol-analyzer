@@ -13,8 +13,8 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-protection-authority.md
+current_phase: 6-pre-1
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
 phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
@@ -480,6 +480,7 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
 - phase-5b-ruling (2026-09-07, 指挥会话裁定): 读限流配额按角色分配而非按进程平均——worker 3/s、web 1/s、ingest 1/s，合计不超过账户 5/s。理由：worker 是唯一有持续读循环的角色（实测原速率约 4.5/s，2/s 使 reconcile 轮间隔 44s → 65s，保护反应最坏多等 20 秒）；web/ingest 只在人工调用与断线重同步时读。阶段 5 上线后 V2 分页会放大 worker 请求量，届时按实测重新评估配额。要求重新部署并重新计窗。
 - phase-5a-rulings (2026-09-07, 指挥会话裁定，用户要求由指挥会话判断): (1) 观察窗只覆盖 1 群——接受，5a 是只读端点切换、零交易所写入、指纹逐字节不变，不为群数再等一轮；(2) 护栏零实战命中——接受，首次实战验证推迟到阶段 5，不为造样本下单；(3) 护栏严格度——保持严格，只认 execution_order_legs 里 order_kind 为普通 order 且由本系统记录的 ordId，缺 leg 时记事故并停手，不放宽到 execution_bindings；(4) 5b 限流器必须按物理 HTTP 请求计数（V2 分页每页一次），不按逻辑调用计数，已写入 phase-5b 文件。5a 维持 completed，代码保持在线。
 - followup-ws-gap-entry-retry (2026-09-09, 指挥会话记录，A-5 会话发现): 阶段 5 的准入门在 WS 缺口（含每次 tg-deploy 重启的几秒）期间以 ws_observation_blocked_new_entry 直接拒绝提交而非延后，缺口内到达的入场会丢。阶段 6 前置项：被准入门挡下的入场应进入可重试的推迟态（复用 A-3d 修好的 entry_admission_reconciler 到点重试），deadline 内 WS 恢复即提交，到期则 entry_admission_expired 告警。
+- phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
 - phase-5-deploy-authorization (2026-09-08, 指挥会话): 依据用户 2026-09-07 的 phase-5-approval 与用户明确授权由指挥会话裁定，放行部署候选 a3713ec418b5e6e6487631482bcc630079daa52b（回滚 230ba1cc）。裁定 (a) 收紧接受：市价成交归属 unverified 时记录 + critical 告警（market_fill_attribution_unverified，进代码级默认白名单）+ 不动作；后续 B-5d 安全网在阶段 6 前完成、需用户单独批准。观察要求：窗口内每笔新入场逐笔核对止损已挂上，任何“成交但无可验证止损”立即回滚。用户可随时以“回滚阶段 5”否决。
 - phase-5a-approval (2026-09-07, 用户在指挥会话 local_858790fe 明确批准): 阶段 5a（list_open_orders 切 V2 orders-pending，含分页、fail-closed、逐调用点分析与护栏，L3）获批领取；部署前须只读拉一次生产当前挂单，确认为空或逐条可归属，不能归属的对象只出示不动作。
 - phase-5-checkpoint (2026-09-07, 指挥会话，依据阶段 5 会话 local_ad007c43 汇报): 前置受控实验 10 格全部由用户本人执行完成，实验前后交易所 fingerprint 一致，零非计划写入。结论：限价 order 可用字段组合 = instId, tdMode, mrgPosition, side, posSide, ordType=limit, px, sz, slTriggerPx (+可选 tpTriggerPx)，**不含 clOrdId**（判重键就是 clOrdId 字段存在本身）；市价腿继续带 clOrdId 不动；撤未成交入场单时附带 TPSL 同帧消失，无需额外清理。迁移本体代码在分支 rest-ws/phase-5-order-entry（94dc4632，17 提交）**未部署、未合并**，任务 1/3/4 未完成，阶段留 in_progress。
