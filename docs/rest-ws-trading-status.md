@@ -13,13 +13,13 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-6
+current_phase: 6-pre-5
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+claimed_by:
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -618,6 +618,43 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   方法：`sqlite3 -readonly` 读库，worker 真实凭据经 `/proc/<MainPID>/environ` 取得，
   `python -B` 不写字节码，只调 GET 类接口。
   顺带把 6-pre-2 的 pgrep 自匹配教训写进 ARCHITECTURE 第 6 节（判活用标记文件或精确 PID）。
+- phase-6-pre-6-completed (2026-09-09, 会话 local_4a6676b0): 入场改单授权租约不再成为死锁。
+  提交 **`192588ddaac2517ec85215a65e923918f192bfbe`**，2026-09-09T15:15Z 经 tg-deploy 上线。
+  **回滚参考 `00719ea010f46eb91f8b3aebe1029dac5c29267e`，但已不能单独回滚**：A 线随后又部署两次
+  （`a1b4ff06` step-6c、`127d3a19` step-5e），生产 HEAD 现为 `127d3a19`（`192588dd` 是其祖先，本阶段代码在线）。
+  单撤本阶段须另做 revert 提交。
+  **根因**：`entry_revision_executor` 在"写入含糊且结果非成功"时直接 return **不归还租约**——
+  这条隔离分支本身是对的（含糊写入未澄清时不许别的批次写交易所），错的是**时长**：
+  token 随该次调用消亡，租约此后由**无人**持有，10 分钟过期后下一个申请者把文档翻成 `blocked`，
+  而 `blocked` 没有任何复位路径。批次 7 走的正是这条分支，此后所有入场被拒直到人工干预，丢了一笔真实入场（raw 15668）。
+  **三条改动，均不削弱那条隔离：**
+  (a) `_blocked_document` 带上 `owner_pid` / `owner_start_ticks`；**旧形状 `_LEGACY_BLOCKED_KEYS` 保持合法**——
+  部署瞬间生产若是旧 blocked 文档，判它非法会把"可恢复的阻塞"变成"解析不了的阻塞"，比原 bug 更糟。
+  (b) `reset_blocked_entry_revision_authority`：持有者**可证已死**立即复位；**判不出**（旧文档 / `/proc` 读不到 / 跨机 pid）
+  则等与租约同长的宽限后复位。存活判定返回**三态**，`None` 绝不当成"已死"——否则会在持有者正在写时复位掉它；
+  身份用 `pid + start_ticks` **成对**，因为 pid 复用会读成"活着"。复位留审计行 + `entry_revision_authority_blocked_reset`
+  告警（已进 ALWAYS_NOTIFIED）；idle 文档键集固定 4 键，理由确实只能进审计与告警。
+  (c) `release_authority_for_finished_batches`：**独立的收尾扫描**，把仍为已终态批次持有的租约按 generation 归还。
+  **刻意做成扫描而不是执行器里的一行**——指挥会话裁定 (c) 在原调用点上有内在矛盾：
+  在 `execute_entry_revision` 里"写入含糊"与"批次落终态"是同一刻，就地归还必然让 6 条隔离测试转红。
+  做成扫描后：执行器返回时租约仍 held（隔离保持，6 条测试全绿），下一个运维 tick（5 秒）再归还。
+  **秒级恢复，而不是"过期 10 分钟 + 阻塞宽限 10 分钟"的约 20 分钟**——对入场而言这就是救回与丢失的差别。
+  免 token 归还是一个刻意开的洞，所以它**自己重新读批次**、非终态就拒、generation 被别人拿走就拒，
+  并有静态守护测试把调用者集合钉在一个（与 6-pre-2 同形）。
+  **测试**：全量 **8134 passed / 4 skipped / 0 failed**。新增 `tests/test_entry_revision_authority_deadlock.py` **18 条**，
+  覆盖四条 + 复位后 acquire 可取 + 存活持有者绝不被复位 + 旧格式仍合法 + 两处痕迹齐全 +
+  运行中批次不被扫走 + 陈旧 generation 被拒 + 普通释放仍需 token + 调用者集合守护。
+  **变异检验双向**：去掉终态守卫转红 1 条、去掉存活守卫转红 2 条。
+  **观察（L2，达标）**：15:16:39Z–15:46:43Z 连续 30 分钟，**27 条真实消息、5 个群**，31 条采样
+  **零不健康、零重置**，租约取值**恒为 idle**，worker 零 error、零本阶段 warning。
+  三条新路径痕迹全为 0（复位审计 / 终态归还审计 / 复位告警）——生产此刻没有卡住的租约，
+  **本窗口证明的是新逻辑不误伤，不是它救过一次**；触发路径只有测试证据。
+  **一处监视器指标的局限，如实记**：`lease_nonidle_secs` 实际是"距 `updated_at` 的秒数"，
+  只有在状态非 idle 时才有意义；窗口内状态恒为 idle，所以该值（最大 4507）**不代表非 idle 持续时长**，
+  健康判据 `state != idle && secs > 1500` 也从未触发。指标无害但命名有误导，下次应改为仅在非 idle 时计算。
+  **未修、需另立项的同形状风险**：`recovery_live_submit` 新入场路径（`attempted_writes > 0` 时不释放）
+  持有者是 `signal:<id>` 而非 `batch:<id>`，**没有批次行可以证明终态**，本次扫描明确跳过它
+  （已加测试 `test_a_signal_holder_is_never_swept` 固定该行为）。那条路径的死锁风险仍在，已报指挥会话待裁。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
