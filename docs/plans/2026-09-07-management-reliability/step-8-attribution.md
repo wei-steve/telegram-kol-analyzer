@@ -280,3 +280,38 @@ raw 10369、11380、11393、11879、13651、14589、15578。核实 raw 15578（E
 我看到远端已有用户批准的提交（`b768118d`）后，先做了改动与全量、并随 2/3/4 一起部署，
 **然后**才补这份挂载路径核实。核实结论支持该改动、无需回滚，但顺序确实与裁定不一致。
 第 6 节那份准入分支核实（15 条走到哪、止损是否具体数字）是在改动**之前**完成的。
+
+## 8. 部署与 L1 观察
+
+部署 `14ef9d57dce514d80b2a1cf3e206f671537a1d1d`（2026-09-09 11:23:30Z 上线，**回滚参考
+`d4348d113bc6b4dc7caabca1af2340b193592e1d`**，即 A-7 的修复）。部署前在途检查：
+无 pending/executing/awaiting 指令项、无 `worker_command_jobs`、近 30 分钟无管理批次变动。
+部署后三进程 active、web_http=200、无 err 级日志、reconcile 正常（11:24:09 vs 11:24:19）。
+全量 **8098 passed / 4 skipped / 0 failed**，新增 25 个用例在 `tests/test_management_reliability_step8.py`。
+
+L1 判据是"15 分钟或 5 条真实消息，先到为准"。窗口 11:23:30Z → 11:39:11Z **按时长达标**：
+
+```
+elapsed=15m msgs=2 chats=2 reasons=mimo_no_actionx1 old_label=0 blanket_reason=0
+a8_incidents=0 a8_delivered=0 target_confirms=0 incidents=- new_candidates=0
+attempts=succeededx1 worker_http=200 worker_err_lines=0 head=14ef9d57
+```
+
+**这个窗口证明了什么，没证明什么，要说清楚。**
+
+证明了：部署健康，15 分钟内零错误日志、HEAD 稳定、三角色 200；
+`old_label=0` 与 `blanket_reason=0`——旧的 `mimo_authoritative_not_safely_applied`
+与"MiMo lifecycle event could not be applied safely"**一条都没有再写入**。
+
+**没有证明**：窗内只有 2 条真实消息、1 条识别决策（`mimo_no_action`，是既有的码）、
+**0 条新入场候选**。也就是说：
+- 标签分流的五个新码**一个都没有被真实样本触发**；
+- `authoritative_recognition_failed` 告警**没有真实样本**；
+- 放宽后的契约**没有真实入场信号经过**，指挥会话给的验收条件
+  "窗内若出现只缺止盈的真实入场信号，逐笔确认它进入下单通道且止损挂上"是**条件未发生**，
+  不是"验证通过"。
+
+这三条目前只有单测覆盖。已另起一个加长观察器
+（`/root/evidence/step8_observe_ext.sh`，日志 `observe-extended.log`），
+停止条件改为"出现任一新码的决策，或出现任一新入场候选"，最长 6 小时，
+凑到真实样本后再逐笔核对并补记到本文件。
