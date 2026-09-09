@@ -1352,3 +1352,201 @@ def release_authority_for_finished_batches(
         now=observed_at,
         audit_recorder=audit_recorder,
     )
+
+
+# --------------------------------------------------------------------------
+# 6-pre-7: the same hole on the new-entry path, where the holder is a signal.
+# --------------------------------------------------------------------------
+
+#: Trade signal states that mean the signal can do nothing further. A
+#: **whitelist**, not "anything but running": a state nobody anticipated must
+#: leave the lease alone rather than be guessed at.
+TERMINAL_TRADE_SIGNAL_STATES = frozenset(
+    {
+        "submitted",
+        "failed",
+        "partial_submission_failed",
+        "unknown_exchange_outcome",
+    }
+)
+
+TRADE_SIGNAL_RELEASE_AUDIT_ACTION = "entry_revision_authority_signal_release"
+
+
+def release_entry_revision_authority_for_terminal_signal(
+    session_factory,
+    *,
+    trade_signal_id: int,
+    generation: int,
+    owner_kind: Literal["entry_revision_worker", "new_entry_worker"],
+    now: datetime,
+    audit_recorder=None,
+) -> EntryRevisionAuthorityTerminalRelease:
+    """Return a lease whose trade signal has finished, without its token.
+
+    The new-entry path holds the lease as ``signal:<id>`` and, like the
+    revision path before 6-pre-6, keeps holding it on every failure where a
+    write had been attempted. The token dies with that call, so the lease sits
+    held by nobody until it expires and the next applicant blocks it.
+
+    Same shape as the batch version and the same reasoning: the terminality is
+    **re-read here** rather than taken from the caller, the generation and
+    owner kind must both match so a lease somebody else has since taken cannot
+    be stolen, and the state test is a whitelist so an unfamiliar status is
+    left alone.
+    """
+
+    from telegram_kol_research.models import TradeSignal
+
+    clean_owner_kind = _owner_kind(owner_kind)
+    expected_generation = _generation(generation)
+    observed_at = _timestamp(now)
+    with session_factory() as session:
+        session.execute(text("BEGIN IMMEDIATE"))
+        signal = session.get(TradeSignal, int(trade_signal_id))
+        if signal is None:
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False, reason_code="trade_signal_missing"
+            )
+        signal_status = str(signal.status or "")
+        if signal_status not in TERMINAL_TRADE_SIGNAL_STATES:
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False, reason_code="trade_signal_not_terminal"
+            )
+        row = _authority_row(session)
+        if row is None:
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False,
+                reason_code="entry_revision_exchange_authority_missing",
+            )
+        document = _authority_document(row.value_json)
+        if document is None:
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False,
+                reason_code="entry_revision_exchange_authority_invalid",
+            )
+        if document["state"] != "held":
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False,
+                generation=int(document["generation"]),
+                reason_code="entry_revision_exchange_authority_not_held",
+            )
+        if (
+            int(document["generation"]) != expected_generation
+            or document["owner_kind"] != clean_owner_kind
+        ):
+            session.rollback()
+            return EntryRevisionAuthorityTerminalRelease(
+                released=False,
+                generation=int(document["generation"]),
+                reason_code="entry_revision_exchange_authority_owner_mismatch",
+            )
+        next_generation = expected_generation + 1
+        row.value_json = _canonical_json(
+            _idle_document(generation=next_generation, released_at=observed_at)
+        )
+        row.updated_at = observed_at
+        session.commit()
+
+    _record_signal_release_audit(
+        session_factory,
+        detail={
+            "trade_signal_id": int(trade_signal_id),
+            "prior_generation": expected_generation,
+            "generation": next_generation,
+            "owner_kind": clean_owner_kind,
+            "signal_status": signal_status,
+            "write_boundary_reached": bool(document["write_boundary_reached"]),
+        },
+        now=observed_at,
+        audit_recorder=audit_recorder,
+    )
+    return EntryRevisionAuthorityTerminalRelease(
+        released=True,
+        generation=next_generation,
+        reason_code="trade_signal_terminal",
+    )
+
+
+def release_authority_for_finished_trade_signals(
+    session_factory,
+    *,
+    now: datetime,
+    audit_recorder=None,
+) -> EntryRevisionAuthorityTerminalRelease:
+    """Sweep the new-entry half of the deadlock, mirroring the batch sweep."""
+
+    observed_at = _timestamp(now)
+    with session_factory() as session:
+        row = _authority_row(session)
+        document = _authority_document(row.value_json) if row is not None else None
+    if document is None or document["state"] != "held":
+        return EntryRevisionAuthorityTerminalRelease(
+            released=False,
+            reason_code="entry_revision_exchange_authority_not_held",
+        )
+    action_id = str(document["action_id"])
+    if not action_id.startswith("signal:"):
+        return EntryRevisionAuthorityTerminalRelease(
+            released=False,
+            generation=int(document["generation"]),
+            reason_code="entry_revision_authority_holder_not_a_signal",
+        )
+    try:
+        trade_signal_id = int(action_id.split(":", 1)[1])
+    except (ValueError, IndexError):
+        return EntryRevisionAuthorityTerminalRelease(
+            released=False,
+            generation=int(document["generation"]),
+            reason_code="entry_revision_authority_holder_unparsable",
+        )
+    return release_entry_revision_authority_for_terminal_signal(
+        session_factory,
+        trade_signal_id=trade_signal_id,
+        generation=int(document["generation"]),
+        owner_kind=str(document["owner_kind"]),
+        now=observed_at,
+        audit_recorder=audit_recorder,
+    )
+
+
+def _record_signal_release_audit(
+    session_factory, *, detail, now, audit_recorder
+) -> None:
+    try:
+        if audit_recorder is not None:
+            audit_recorder(detail=detail, now=now)
+            return
+        from telegram_kol_research.execution_events import (
+            ExecutionEventRecord,
+            record_execution_event,
+        )
+
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action=TRADE_SIGNAL_RELEASE_AUDIT_ACTION,
+                status="skipped",
+                trade_signal_id=int(detail["trade_signal_id"]),
+                reason=str(detail["signal_status"]),
+                before={
+                    "state": "held",
+                    "generation": detail["prior_generation"],
+                    "owner_kind": detail["owner_kind"],
+                    "trade_signal_id": detail["trade_signal_id"],
+                    "signal_status": detail["signal_status"],
+                    "write_boundary_reached": detail["write_boundary_reached"],
+                },
+                after={"state": "idle", "generation": detail["generation"]},
+                created_at=now,
+            ),
+        )
+    except Exception:  # pragma: no cover - the release is already committed
+        logger.warning(
+            "entry_revision_authority_signal_release_audit_failed", exc_info=True
+        )

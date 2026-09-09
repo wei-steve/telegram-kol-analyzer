@@ -578,3 +578,242 @@ def test_the_ordinary_release_still_requires_its_token(tmp_path):
 
     assert released.released is False
     assert _document(session_factory)["state"] == "held"
+
+
+# --- 6-pre-7: the same hole where the holder is a trade signal ------------
+
+
+def _terminal_signal(session_factory, *, status="failed"):
+    from telegram_kol_research.models import TradeSignal
+
+    with session_factory() as session:
+        signal = TradeSignal(
+            signal_uid=f"uid-{status}",
+            strategy_instance_id="deepcoin:-1001:9:BTC:short",
+            source_type="recovery",
+            venue="deepcoin",
+            kol_id="k",
+            chat_id=-1001,
+            message_id=9,
+            symbol="BTC",
+            side="short",
+            action="open_position",
+            status=status,
+            payload_json="{}",
+            created_at=NOW,
+            updated_at=NOW,
+        )
+        session.add(signal)
+        session.commit()
+        return signal.id
+
+
+def _hold_for_signal(session_factory, signal_id):
+    acquired = acquire_entry_revision_exchange_authority(
+        session_factory,
+        owner_kind="new_entry_worker",
+        owner_id=f"signal:{signal_id}",
+        acquired_at=NOW,
+    )
+    assert acquired.acquired
+    return acquired.generation
+
+
+def test_a_lease_held_for_a_finished_signal_is_returned(tmp_path):
+    """The hole 6-pre-6 deliberately left open, now closed."""
+
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_authority_for_finished_trade_signals,
+    )
+
+    session_factory = _factory(tmp_path, name="signal-release.db")
+    signal_id = _terminal_signal(session_factory, status="failed")
+    generation = _hold_for_signal(session_factory, signal_id)
+
+    result = release_authority_for_finished_trade_signals(
+        session_factory, now=NOW + timedelta(seconds=5)
+    )
+
+    assert result.released is True
+    assert result.generation == generation + 1
+    assert _document(session_factory)["state"] == "idle"
+    with session_factory() as session:
+        audit = (
+            session.query(ExecutionEvent)
+            .filter(
+                ExecutionEvent.action == "entry_revision_authority_signal_release"
+            )
+            .one()
+        )
+        before = json.loads(audit.before_json)
+        assert before["trade_signal_id"] == signal_id
+        assert before["signal_status"] == "failed"
+        assert before["generation"] == generation
+
+
+@pytest.mark.parametrize("status", ["pending", "processing"])
+def test_a_lease_held_for_a_running_signal_is_left_alone(tmp_path, status):
+    """A signal still working must keep its exclusion."""
+
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_authority_for_finished_trade_signals,
+    )
+
+    session_factory = _factory(tmp_path, name=f"signal-running-{status}.db")
+    signal_id = _terminal_signal(session_factory, status=status)
+    _hold_for_signal(session_factory, signal_id)
+
+    result = release_authority_for_finished_trade_signals(
+        session_factory, now=NOW + timedelta(seconds=5)
+    )
+
+    assert result.released is False
+    assert result.reason_code == "trade_signal_not_terminal"
+    assert _document(session_factory)["state"] == "held"
+
+
+def test_an_unfamiliar_signal_state_leaves_the_lease_alone(tmp_path):
+    """The state test is a whitelist, so a state nobody anticipated is safe."""
+
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_authority_for_finished_trade_signals,
+    )
+
+    session_factory = _factory(tmp_path, name="signal-unknown-state.db")
+    signal_id = _terminal_signal(session_factory, status="some_future_state")
+    _hold_for_signal(session_factory, signal_id)
+
+    result = release_authority_for_finished_trade_signals(
+        session_factory, now=NOW + timedelta(seconds=5)
+    )
+
+    assert result.released is False
+    assert result.reason_code == "trade_signal_not_terminal"
+    assert _document(session_factory)["state"] == "held"
+
+
+def test_the_signal_release_refuses_a_generation_someone_else_now_holds(tmp_path):
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_entry_revision_authority_for_terminal_signal,
+    )
+
+    session_factory = _factory(tmp_path, name="signal-stale-gen.db")
+    signal_id = _terminal_signal(session_factory)
+    generation = _hold_for_signal(session_factory, signal_id)
+
+    result = release_entry_revision_authority_for_terminal_signal(
+        session_factory,
+        trade_signal_id=signal_id,
+        generation=generation - 1,
+        owner_kind="new_entry_worker",
+        now=NOW + timedelta(seconds=5),
+    )
+
+    assert result.released is False
+    assert result.reason_code == "entry_revision_exchange_authority_owner_mismatch"
+    assert _document(session_factory)["state"] == "held"
+
+
+def test_the_two_sweeps_do_not_touch_each_others_holders(tmp_path):
+    """A batch sweep must not release a signal's lease, and vice versa."""
+
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_authority_for_finished_batches,
+        release_authority_for_finished_trade_signals,
+    )
+
+    session_factory = _factory(tmp_path, name="cross-holder.db")
+    signal_id = _terminal_signal(session_factory)
+    _hold_for_signal(session_factory, signal_id)
+
+    batch_sweep = release_authority_for_finished_batches(
+        session_factory, now=NOW + timedelta(seconds=5)
+    )
+    assert batch_sweep.released is False
+    assert batch_sweep.reason_code == "entry_revision_authority_holder_not_a_batch"
+    assert _document(session_factory)["state"] == "held"
+
+    signal_sweep = release_authority_for_finished_trade_signals(
+        session_factory, now=NOW + timedelta(seconds=6)
+    )
+    assert signal_sweep.released is True
+
+
+def test_the_signal_sweep_refuses_a_batch_holder(tmp_path):
+    """The dangerous direction, and the one the ids make easy to get wrong.
+
+    A ``batch:7`` holder parses as the integer 7 just as happily as a
+    ``signal:7`` one. Without the prefix check the signal sweep would look up
+    trade signal 7 -- an unrelated row that may well be terminal -- and release
+    a lease held for a batch that is still running.
+    """
+
+    from telegram_kol_research.entry_revision_exchange_authority import (
+        release_authority_for_finished_trade_signals,
+    )
+    from telegram_kol_research.models import StrategyRevisionBatch
+
+    session_factory = _factory(tmp_path, name="signal-sweep-batch-holder.db")
+    # A running batch holds the lease...
+    batch_id = _terminal_batch(session_factory, status="planned", reason="")
+    _hold_for_batch(session_factory, batch_id)
+    # ...and a *terminal* trade signal happens to carry the same id.
+    with session_factory() as session:
+        assert session.get(StrategyRevisionBatch, batch_id) is not None
+    from telegram_kol_research.models import TradeSignal
+
+    with session_factory() as session:
+        session.add(
+            TradeSignal(
+                id=batch_id,
+                signal_uid="collision",
+                strategy_instance_id="s",
+                source_type="recovery",
+                venue="deepcoin",
+                kol_id="k",
+                chat_id=-1001,
+                message_id=9,
+                symbol="BTC",
+                side="short",
+                action="open_position",
+                status="failed",
+                payload_json="{}",
+                created_at=NOW,
+                updated_at=NOW,
+            )
+        )
+        session.commit()
+
+    result = release_authority_for_finished_trade_signals(
+        session_factory, now=NOW + timedelta(seconds=5)
+    )
+
+    assert result.released is False
+    assert result.reason_code == "entry_revision_authority_holder_not_a_signal"
+    # The running batch keeps its exclusion.
+    assert _document(session_factory)["state"] == "held"
+
+
+def test_only_the_authority_module_may_release_a_signal_without_a_token():
+    """Second token-free release, same guard as the first."""
+
+    import ast
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parents[1] / "src" / "telegram_kol_research"
+    guarded = "release_entry_revision_authority_for_terminal_signal"
+    callers = set()
+    for path in sorted(src.glob("*.py")):
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and any(
+                alias.name == guarded for alias in node.names
+            ):
+                callers.add(path.name)
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id == guarded
+            ):
+                callers.add(path.name)
+    assert callers == {"entry_revision_exchange_authority.py"}, sorted(callers)

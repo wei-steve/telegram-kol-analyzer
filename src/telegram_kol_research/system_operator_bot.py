@@ -25,6 +25,7 @@ from telegram_kol_research.config import (
 )
 from telegram_kol_research.entry_revision_exchange_authority import (
     release_authority_for_finished_batches,
+    release_authority_for_finished_trade_signals,
     reset_blocked_entry_revision_authority,
 )
 from telegram_kol_research.naked_fill_stop_net import (
@@ -2874,6 +2875,7 @@ def run_operator_maintenance_tick(
         # of the twenty minutes that expiry-then-block would take. The reset
         # catches what is already blocked and can no longer be held by anyone.
         release_authority_for_finished_batches(session_factory, now=now)
+        release_authority_for_finished_trade_signals(session_factory, now=now)
         reset_blocked_entry_revision_authority(session_factory, now=now)
     except Exception:
         logger.warning("entry_revision_authority_reset_tick_failed", exc_info=True)

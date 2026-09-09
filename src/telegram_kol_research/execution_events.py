@@ -103,6 +103,8 @@ NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
         # its own, and listing it here keeps it from reading as a hazardous
         # action that would freeze that message's source-deletion exit.
         "entry_revision_authority_reset",
+        # Phase 6-pre-7: the same audit row for the new-entry half.
+        "entry_revision_authority_signal_release",
         "management_freeze_bypassed",
         "management_freeze_rejected",
         # A-9 audit rows for the operator's answer to a target-confirmation
