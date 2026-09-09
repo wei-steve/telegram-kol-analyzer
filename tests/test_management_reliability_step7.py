@@ -40,7 +40,47 @@ from telegram_kol_research.models import (
 NOW = datetime(2026, 9, 9, 6, 0, tzinfo=UTC)
 
 
-def _observation(session, *, pos_id, size, observed_at, complete=True, fingerprint=None):
+def _reconciled_binding(
+    session,
+    *,
+    binding_id,
+    pos_id,
+    live=True,
+    recovered_at,
+    chat_id=-100,
+):
+    """A binding as one reconcile round leaves it.
+
+    ``recovered_at`` is stamped every round whatever the outcome; ``active`` +
+    ``position_ownership_verified`` is the round saying it found this pos_id in
+    the live positions list. When the position closes the same round rewrites
+    the row -- which is why this, and not the append-on-change observation
+    table, is what "still open" is read from.
+    """
+
+    session.add(
+        ExecutionBinding(
+            id=binding_id,
+            venue="deepcoin",
+            strategy_instance_id=f"strategy-{binding_id}",
+            kol_id=1,
+            chat_id=chat_id,
+            message_id=binding_id,
+            symbol="BTC",
+            side="long",
+            status="active" if live else "closed",
+            last_exchange_status=(
+                "position_ownership_verified" if live else "entry_legs_terminal"
+            ),
+            pos_id=pos_id if live else None,
+            recovered_at=recovered_at.replace(tzinfo=None),
+        )
+    )
+
+
+def _observation(session, *, pos_id, size, observed_at, complete=True):
+    """A row of the append-on-change table, for the regression that needs one."""
+
     session.add(
         PositionReconciliationObservation(
             venue="deepcoin",
@@ -48,10 +88,7 @@ def _observation(session, *, pos_id, size, observed_at, complete=True, fingerpri
             execution_order_leg_id=1,
             strategy_instance_id="strategy-1",
             avg_entry_price="80000",
-            snapshot_fingerprint=(
-                fingerprint
-                or f"{pos_id}-{observed_at.isoformat()}".ljust(64, "0")[:64]
-            ),
+            snapshot_fingerprint=f"{pos_id}-{observed_at.isoformat()}".ljust(64, "0")[:64],
             pos_id=pos_id,
             instrument_id="BTC-USDT-SWAP",
             side="long",
@@ -63,21 +100,24 @@ def _observation(session, *, pos_id, size, observed_at, complete=True, fingerpri
     )
 
 
-def _lifecycle(session, *, lifecycle_id, binding_id, pos_id, chat_id=-100):
+def _lifecycle(
+    session,
+    *,
+    lifecycle_id,
+    binding_id,
+    pos_id,
+    chat_id=-100,
+    live=True,
+    recovered_at=None,
+):
     if binding_id is not None:
-        session.add(
-            ExecutionBinding(
-                id=binding_id,
-                venue="deepcoin",
-                strategy_instance_id=f"strategy-{binding_id}",
-                kol_id=1,
-                chat_id=chat_id,
-                message_id=binding_id,
-                symbol="BTC",
-                side="long",
-                status="active",
-                pos_id=pos_id,
-            )
+        _reconciled_binding(
+            session,
+            binding_id=binding_id,
+            pos_id=pos_id,
+            live=live,
+            recovered_at=recovered_at or (NOW - timedelta(seconds=30)),
+            chat_id=chat_id,
         )
     session.add(
         StrategyLifecycle(
@@ -99,38 +139,48 @@ def _lifecycle(session, *, lifecycle_id, binding_id, pos_id, chat_id=-100):
 # --------------------------------------------------------------------------
 
 
-def test_a_fresh_complete_snapshot_lists_the_open_positions(tmp_path):
+def test_a_fresh_round_lists_what_it_found_open(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        _observation(session, pos_id="pos-open", size="3", observed_at=NOW - timedelta(minutes=1))
-        _observation(session, pos_id="pos-closed", size="0", observed_at=NOW - timedelta(minutes=1))
+        _reconciled_binding(
+            session, binding_id=345, pos_id="pos-open", live=True,
+            recovered_at=NOW - timedelta(seconds=20),
+        )
+        _reconciled_binding(
+            session, binding_id=337, pos_id="pos-closed", live=False,
+            recovered_at=NOW - timedelta(seconds=20),
+        )
         session.commit()
 
     with session_factory() as session:
         assert load_verified_position_ids(session, now=NOW) == frozenset({"pos-open"})
 
 
-def test_a_snapshot_older_than_five_minutes_is_unknown_not_empty(tmp_path):
+def test_one_binding_may_own_several_positions(tmp_path):
+    """Production binding 345 holds two pos_ids, comma-joined."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _reconciled_binding(
+            session, binding_id=345, pos_id="pos-a,pos-b", live=True,
+            recovered_at=NOW - timedelta(seconds=20),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        assert load_verified_position_ids(session, now=NOW) == frozenset(
+            {"pos-a", "pos-b"}
+        )
+
+
+def test_a_stopped_reconcile_loop_is_unknown_not_empty(tmp_path):
     """The distinction the whole design turns on."""
 
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        _observation(session, pos_id="pos-open", size="3", observed_at=NOW - timedelta(minutes=6))
-        session.commit()
-
-    with session_factory() as session:
-        assert load_verified_position_ids(session, now=NOW) is None
-
-
-def test_an_incomplete_snapshot_is_not_used(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        _observation(
-            session,
-            pos_id="pos-open",
-            size="3",
-            observed_at=NOW - timedelta(minutes=1),
-            complete=False,
+        _reconciled_binding(
+            session, binding_id=345, pos_id="pos-open", live=True,
+            recovered_at=NOW - timedelta(minutes=6),
         )
         session.commit()
 
@@ -138,13 +188,66 @@ def test_an_incomplete_snapshot_is_not_used(tmp_path):
         assert load_verified_position_ids(session, now=NOW) is None
 
 
-def test_the_newest_observation_per_position_wins(tmp_path):
-    """A position that closed a minute ago is not open because it once was."""
+def test_a_reconcile_loop_that_never_ran_is_unknown(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=345, venue="deepcoin", strategy_instance_id="strategy-345",
+                kol_id=1, chat_id=-100, message_id=345, symbol="BTC", side="long",
+                status="active", last_exchange_status="position_ownership_verified",
+                pos_id="pos-open",
+            )
+        )
+        session.commit()
+
+    with session_factory() as session:
+        assert load_verified_position_ids(session, now=NOW) is None
+
+
+def test_a_binding_the_round_skipped_does_not_count_as_open(tmp_path):
+    """Reconcile skips manual-terminal and conflicted bindings.
+
+    Their rows keep whatever the last round that did touch them wrote, so the
+    same freshness window that proves the loop is running has to be applied to
+    each row, not only to the newest one.
+    """
 
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
-        _observation(session, pos_id="pos-a", size="5", observed_at=NOW - timedelta(minutes=4))
-        _observation(session, pos_id="pos-a", size="0", observed_at=NOW - timedelta(minutes=1))
+        _reconciled_binding(
+            session, binding_id=345, pos_id="pos-open", live=True,
+            recovered_at=NOW - timedelta(seconds=20),
+        )
+        _reconciled_binding(
+            session, binding_id=200, pos_id="pos-abandoned", live=True,
+            recovered_at=NOW - timedelta(days=40),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        assert load_verified_position_ids(session, now=NOW) == frozenset({"pos-open"})
+
+
+def test_a_position_that_closed_is_not_open_because_it_once_was(tmp_path):
+    """The regression that took production down, from the other side.
+
+    ``position_reconciliation_observations`` only ever records *non-zero*
+    positions and never gains a closing row, so reading its newest row per
+    position would report this one open forever -- lifecycle 1074's bug. The
+    binding row is rewritten by the round that finds the position gone.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _observation(
+            session, pos_id="pos-gone", size="5",
+            observed_at=NOW - timedelta(days=5),
+        )
+        _reconciled_binding(
+            session, binding_id=337, pos_id="pos-gone", live=False,
+            recovered_at=NOW - timedelta(seconds=20),
+        )
         session.commit()
 
     with session_factory() as session:
@@ -407,12 +510,6 @@ def _candidate_fixture(tmp_path):
         )
         _thread_with_lifecycle(
             session, thread_id=97, lifecycle_id=1097, binding_id=345, pos_id="pos-open"
-        )
-        _observation(
-            session,
-            pos_id="pos-open",
-            size="3",
-            observed_at=NOW - timedelta(minutes=1),
         )
         session.commit()
     return session_factory

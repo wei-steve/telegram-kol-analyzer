@@ -14,40 +14,65 @@ A-7 tasks 1 and 2. Two production messages are the reason this exists:
 Both are the same failure: a candidate set that contains lifecycles with no
 verifiable position behind them. The fix is not smarter matching -- it is a
 smaller candidate set. A lifecycle may be a management target only when it
-carries an execution binding *and* that binding's position is in a recent,
-complete exchange snapshot.
+carries an execution binding *and* the reconcile loop's latest round still
+found that binding's position open on the exchange.
 
-**The snapshot is read, never taken.** ``position_reconciliation_observations``
-is what the reconcile loop already writes every round, so this adds no exchange
-call and no new failure mode. It also carries the one thing a freshness rule
-needs: when the observation was made.
+**The snapshot is read, never taken.** The reconcile loop already asks Deepcoin
+for the live positions every round, so this adds no exchange call and no new
+failure mode. The question is only which of its records still answers "is this
+position open *now*".
 
-**Staleness is not emptiness.** With no complete observation inside the window,
-this returns ``None`` -- "unknown" -- and the caller must notify rather than
-judge. Returning an empty set instead would read as "no position exists
-anywhere", which would disqualify every candidate and silently turn a stale
-snapshot into a confident refusal.
+**Not the observation table.** ``position_reconciliation_observations`` is
+append-on-change and records only *non-zero* positions: a position that closes
+simply stops producing rows, and its last row still shows the size it had while
+it was open. Reading the newest row per position would therefore call every
+closed position open -- lifecycle 1074's bug, rebuilt. Nor is a recent row a
+freshness test: in production the newest row was four hours old while reconcile
+ran every twenty seconds. The first deployment of this gate demanded one, found
+none, and turned every auto_trade management instruction into a confirmation
+request (incident 2082, raw 15628, ``snapshot_stale``).
+
+**The binding rows.** Every round rewrites each binding from the live positions
+list and stamps ``recovered_at``, so the binding carries both answers at once:
+
+* **Is our view current?** The newest ``recovered_at`` is when the loop last
+  ran. Older than ``max_age`` and the answer is "unknown".
+* **What is open?** ``status == "active"`` with
+  ``last_exchange_status == "position_ownership_verified"`` is the reconcile
+  saying, this round, that it found this binding's position in the snapshot.
+  When the position goes, the same round moves the binding to ``closed`` or
+  ``stale``. A binding the loop skipped keeps an old ``recovered_at`` and is
+  excluded by the same window.
+
+**Staleness is not emptiness.** With the loop out of date this returns ``None``
+-- "unknown" -- and the caller must notify rather than judge. Returning an empty
+set instead would read as "we looked and nothing is open", which would
+disqualify every candidate and turn a stale view into a confident refusal.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable
+
+from sqlalchemy import func
 
 from telegram_kol_research.models import (
     ExecutionBinding,
     MessageInstructionItem,
-    PositionReconciliationObservation,
     RawMessage,
     StrategyLifecycle,
 )
 
 
-#: How old a complete positions snapshot may be and still settle the question.
+#: How long ago the reconcile loop may have run and still settle the question.
 #: Beyond this the answer is "unknown", which routes to a confirmation request.
 DEFAULT_SNAPSHOT_MAX_AGE = timedelta(minutes=5)
+
+#: What the reconcile writes on a binding whose position it saw this round.
+LIVE_OWNERSHIP_STATUS = "active"
+LIVE_OWNERSHIP_EVIDENCE = "position_ownership_verified"
 
 VERIFIED = "verified"
 NO_BINDING = "no_execution_binding"
@@ -79,31 +104,35 @@ def load_verified_position_ids(
     """
 
     cutoff = _naive(now) - max_age
+    last_round = (
+        session.query(func.max(ExecutionBinding.recovered_at))
+        .filter(ExecutionBinding.venue == venue)
+        .scalar()
+    )
+    if last_round is None or _naive(last_round) < cutoff:
+        # The reconcile loop has not looked at the exchange recently enough for
+        # anything it recorded to settle the question.
+        return None
     rows = (
-        session.query(PositionReconciliationObservation)
+        session.query(ExecutionBinding)
         .filter(
-            PositionReconciliationObservation.venue == venue,
-            PositionReconciliationObservation.snapshot_complete.is_(True),
-            PositionReconciliationObservation.observed_at >= cutoff,
+            ExecutionBinding.venue == venue,
+            ExecutionBinding.status == LIVE_OWNERSHIP_STATUS,
+            ExecutionBinding.last_exchange_status == LIVE_OWNERSHIP_EVIDENCE,
+            ExecutionBinding.recovered_at >= cutoff,
         )
-        .order_by(PositionReconciliationObservation.observed_at.desc())
         .all()
     )
-    if not rows:
-        return None
     open_ids: set[str] = set()
-    seen: set[str] = set()
     for row in rows:
-        pos_id = str(row.pos_id or "").strip()
-        if not pos_id or pos_id in seen:
-            # Newest observation per position wins; older rows for the same
-            # position describe a state that has already been superseded.
-            continue
-        seen.add(pos_id)
-        size = _decimal(row.size_text)
-        if size is not None and size > 0:
-            open_ids.add(pos_id)
+        open_ids.update(_split_pos_ids(row.pos_id))
     return frozenset(open_ids)
+
+
+def _split_pos_ids(value: Any) -> tuple[str, ...]:
+    """A binding may own several positions; they are stored comma-joined."""
+
+    return tuple(item.strip() for item in str(value or "").split(",") if item.strip())
 
 
 def verify_lifecycle_targets(
@@ -135,11 +164,7 @@ def verify_lifecycle_targets(
             .filter(ExecutionBinding.id.in_(binding_ids))
             .all()
         ):
-            pos_ids_by_binding[int(binding.id)] = tuple(
-                item.strip()
-                for item in str(binding.pos_id or "").split(",")
-                if item.strip()
-            )
+            pos_ids_by_binding[int(binding.id)] = _split_pos_ids(binding.pos_id)
     for lifecycle in lifecycles:
         lifecycle_id = int(lifecycle.id)
         binding_id = (
@@ -187,16 +212,6 @@ def verify_lifecycle_targets(
             ),
         )
     return verdicts
-
-
-def _decimal(value: Any) -> Decimal | None:
-    if value in (None, ""):
-        return None
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return None
-    return parsed if parsed.is_finite() else None
 
 
 def _naive(value: datetime) -> datetime:

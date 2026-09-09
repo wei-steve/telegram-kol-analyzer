@@ -382,5 +382,21 @@ historical_state_repair.py               position_management_remediation.py
   证据目录里的 JSON / md / 脚本一律保留——占地的是 `.db`，不是它们。
   清理前把路径、大小、sha256 前 12 位写进当步的证据文件，清理后记 `df`
   （范例：`/root/evidence/step5/disk-cleanup.md`）。
+- **`position_reconciliation_observations` 是"变更追加"表，不是心跳表，也不能当"当前持仓"用。**
+  写入方 `execution_bindings.py::_record_owned_position_observations` 只收 `_has_nonzero_size()`
+  为真的仓位行，且按 `snapshot_fingerprint` 去重：**指纹没变就不写新行**。两个后果各坑过一次（A-7）：
+  一是**它的最新一行有多旧完全说明不了 reconcile 是否还在跑**——生产上最新一行停在 04:44、
+  当时 09:08，而 reconcile 每约 20 秒一轮跑得好好的。A-7 第一版拿"5 分钟内有完整快照行"当新鲜度判据，
+  于是 auto_trade 群**每一条**管理指令都拿不到候选、全变成 `management_target_needs_confirmation`
+  （incident 2082 / raw 15628 / `snapshot_stale`），减风险指令也一起被挡。
+  二是**仓位平掉后不会补一行 `size=0`**，只是不再出现，最新一行仍是它当初的持仓量，
+  所以"取每个 pos_id 最新一行、size>0 即在场"会把每个历史已平仓位永远判成在场。
+  **要问"现在有哪些仓位、我们的视图新不新鲜"，读 `execution_bindings`**：reconcile 每轮用实时持仓列表
+  重算每条 binding 并盖 `recovered_at`（在场 → `status='active'` + `last_exchange_status='position_ownership_verified'`；
+  仓位没了 → 同一轮改成 `closed/entry_legs_terminal` 或 `stale/verified_position_missing_from_exchange`）。
+  `max(recovered_at)` 是新鲜度，逐行的 `recovered_at` 也要在同一个窗口内——reconcile 会跳过
+  manual-terminal 和 pos_id 冲突的 binding，它们的行停在旧时间。
+  同类陷阱还有 `position_protection_ledger.last_seen_at`（变更式，停在 04:44）与
+  `.updated_at`（每轮刷新）：**同一张表上，一个字段是心跳、另一个是变更时间，用之前先确认是哪一种。**
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
   都是读错了需求，停下来问。
