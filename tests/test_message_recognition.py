@@ -5330,7 +5330,9 @@ def test_authoritative_mimo_routes_btc_eth_price_scale_conflict_to_manual_review
         authoritative_generation="generation-1",
     )
 
-    assert result.status == "识别失败"
+    # A-8b: recognised, then refused for the price-scale contradiction and
+    # sent to manual review below. It was never unrecognised.
+    assert result.status == "是策略"
     assert result.reason is not None
     assert "symbol_price_scale_conflict" in result.reason
     with session_factory() as session:
@@ -5345,7 +5347,7 @@ def test_authoritative_mimo_routes_btc_eth_price_scale_conflict_to_manual_review
     assert candidate.review_status == "needs_review"
     assert candidate.confidence == pytest.approx(0.69)
     assert "BTC/ETH" in (candidate.review_note or "")
-    assert recognition.status == "识别失败"
+    assert recognition.status == "是策略"
     assert lifecycle_count == 0
 
 
@@ -5713,7 +5715,10 @@ def test_invalid_management_fraction_records_incident_without_instruction(tmp_pa
             "symbol": "BTC", "side": "long", "confidence": 0.95},
     })
     assert result.reason == "management_fraction_invalid"
-    assert result.status == "识别失败"
+    # A-8b: the model recognised the message; we refused to size the
+    # instruction. The refusal is unchanged below -- no candidate, no item --
+    # only the label stops calling it a recognition failure.
+    assert result.status == "非策略"
     with factory() as session:
         assert session.query(SignalCandidate).count() == 0
         assert session.query(MessageInstructionItem).count() == 0

@@ -2013,6 +2013,10 @@ def _execution_reason_label(reason: str | None) -> str | None:
         "target_not_verifiable": "目标仓位无法验证，已转人工确认",
         "contract_invalid": "指令契约校验未通过",
         "lifecycle_apply_failed": "目标已验证但生命周期事件未落地",
+        # A-8b: the other refusals, each with its own name.
+        "management_fraction_invalid": "管理指令的减仓比例无法读取，已拒绝",
+        "symbol_price_scale_conflict": "标的与价格区间矛盾，已转人工复核",
+        "media_unreadable": "图片无法读取（未下载或 OCR 无内容）",
     }.get(str(reason or ""))
 
 

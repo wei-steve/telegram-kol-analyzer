@@ -50,8 +50,61 @@ CONTRACT_INVALID = "contract_invalid"
 #: if it starts happening, nobody would otherwise notice.
 APPLY_FAILED = "lifecycle_apply_failed"
 
+#: A-8b. A-8 split the one branch that reported "the lifecycle event did not
+#: apply", and left every *other* writer of ``识别失败`` falling back to the
+#: legacy blanket reason -- the fallback that exists so pre-A-8 rows keep
+#: their meaning. raw 15702 and 15703 landed that way on 2026-09-09, hours
+#: after A-8 shipped, which is how the gap was found. These are the rest of
+#: the refusals, each with its own name.
+#:
+#: A fraction we could read as a number but not as a share of the position:
+#: "close some" with no proportion, or a proportion that contradicts the
+#: text. A real management instruction, refused rather than guessed at.
+MANAGEMENT_FRACTION_INVALID = "management_fraction_invalid"
+
+#: The model named one symbol while every price in the message belongs to
+#: another -- BTC with entries in the ETH thousands. The strategy is real and
+#: is sent to manual review; before this nobody was told it existed.
+SYMBOL_PRICE_SCALE_CONFLICT = "symbol_price_scale_conflict"
+
+#: The message was an image we could not read at all: the file never
+#: downloaded, or OCR returned nothing. In a group that trades, an unread
+#: image can be an entry nobody ever saw.
+MEDIA_UNREADABLE = "media_unreadable"
+
 #: Reasons a person is told about, in auto_trade groups only.
-ALERTED_REASONS = frozenset({CONTRACT_INVALID, TARGET_NOT_VERIFIABLE, APPLY_FAILED})
+#:
+#: Every one of them means "something real was refused, or could not be read".
+#: The two benign outcomes stay out, because the A-8 inventory is an account
+#: of what happens when an alarm fires on those as well: the losses that
+#: mattered spent two months buried under them.
+ALERTED_REASONS = frozenset(
+    {
+        CONTRACT_INVALID,
+        TARGET_NOT_VERIFIABLE,
+        APPLY_FAILED,
+        MANAGEMENT_FRACTION_INVALID,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+        MEDIA_UNREADABLE,
+    }
+)
+
+#: Recognition reasons that name their own refusal, mapped to the code that
+#: reports it. Matched by prefix because several carry a human sentence after
+#: the code -- ``symbol_price_scale_conflict: MiMo 输出 BTC，但...``.
+_REASON_PREFIX_CODES: tuple[tuple[str, str], ...] = (
+    ("authoritative_instruction_contract_invalid", CONTRACT_INVALID),
+    ("management_fraction_invalid", MANAGEMENT_FRACTION_INVALID),
+    ("symbol_price_scale_conflict", SYMBOL_PRICE_SCALE_CONFLICT),
+)
+
+#: The image refusals write a Chinese sentence rather than a code, so they are
+#: recognised by the phrases those sentences are built from.
+_MEDIA_REASON_MARKERS: tuple[str, ...] = (
+    "图片识别失败",
+    "图片文件未下载",
+    "图片未能下载",
+)
 
 #: The prefix that carries a verdict through ``message_recognitions.reason``.
 REASON_PREFIX = "authoritative_lifecycle_not_applied"
@@ -104,9 +157,12 @@ def reason_code_from_recognition_reason(reason: Any) -> str | None:
     """
 
     text = str(reason or "")
-    if text.startswith("authoritative_instruction_contract_invalid"):
-        return CONTRACT_INVALID
     if text.startswith(f"{REASON_PREFIX}:"):
         code = text.split(":", 1)[1].strip()
         return code or None
+    for prefix, code in _REASON_PREFIX_CODES:
+        if text.startswith(prefix):
+            return code
+    if any(marker in text for marker in _MEDIA_REASON_MARKERS):
+        return MEDIA_UNREADABLE
     return None

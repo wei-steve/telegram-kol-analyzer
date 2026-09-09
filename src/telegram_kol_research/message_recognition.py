@@ -2947,8 +2947,12 @@ def apply_authoritative_mimo_payload(
                 payload, _authoritative_current_message_text(raw_message.text, payload),
             )
         except ManagementFractionInvalid as exc:
+            # A-8b: the model read the message fine; we refused to size the
+            # instruction. Calling that a recognition failure is the same
+            # mislabelling A-8 unpicked one branch over.
             result = MessageRecognitionResult(
-                raw_message_id=raw_message_id, status="识别失败",
+                raw_message_id=raw_message_id,
+                status=str(payload.get("recognition_result") or "非策略"),
                 reason=exc.reason_code, ai_payload=payload, parse_source="mimo_authoritative",
             )
             _upsert_recognition(session, result, engine=model)
@@ -3105,7 +3109,14 @@ def apply_authoritative_mimo_payload(
                 review_candidate.review_note = conflict.reason
                 result = MessageRecognitionResult(
                     raw_message_id=raw_message_id,
-                    status="非策略" if lifecycle_applied else "识别失败",
+                    # A-8b: the strategy was recognised and then refused for a
+                    # price-scale contradiction; it is on its way to manual
+                    # review, not unrecognised.
+                    status=(
+                        "非策略"
+                        if lifecycle_applied
+                        else str(payload.get("recognition_result") or "非策略")
+                    ),
                     reason=conflict.reason,
                     ai_payload=payload,
                     parse_source="mimo_authoritative",

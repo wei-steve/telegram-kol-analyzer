@@ -1644,6 +1644,17 @@ def _failure_point_for(reason: str) -> str:
         recognition_attribution.APPLY_FAILED: (
             "verified target but the lifecycle event did not apply"
         ),
+        recognition_attribution.MANAGEMENT_FRACTION_INVALID: (
+            "management instruction refused: the share of the position could "
+            "not be read"
+        ),
+        recognition_attribution.SYMBOL_PRICE_SCALE_CONFLICT: (
+            "strategy refused: the symbol contradicts the price scale, sent "
+            "to manual review"
+        ),
+        recognition_attribution.MEDIA_UNREADABLE: (
+            "image could not be read: not downloaded, or OCR returned nothing"
+        ),
     }.get(reason, reason)
 
 

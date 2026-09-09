@@ -382,3 +382,149 @@ def test_a_relaxed_entry_still_faces_every_risk_gate():
     assert decide("ETH", "2335", None).action == "eligible_for_auto_trade"
     assert "symbol_not_whitelisted" in decide("NEIRO", "0.0000675", None).reason_codes
     assert "missing_stop_loss" in decide("ETH", None, "3200").reason_codes
+
+
+# --------------------------------------------------------------------------
+# A-8b: the refusals A-8 left wearing the old label
+# --------------------------------------------------------------------------
+
+
+def test_every_other_refusal_now_has_its_own_code():
+    """raw 15702 and 15703 are why this exists.
+
+    They landed hours after A-8 shipped, still carrying
+    ``mimo_authoritative_not_safely_applied`` -- because A-8 split one branch
+    and everything else fell through the fallback that keeps pre-A-8 rows
+    honest.
+    """
+
+    from telegram_kol_research.recognition_failure_attribution import (
+        MANAGEMENT_FRACTION_INVALID,
+        MEDIA_UNREADABLE,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+    )
+
+    cases = {
+        "management_fraction_invalid": MANAGEMENT_FRACTION_INVALID,
+        "symbol_price_scale_conflict: MiMo 输出 BTC，但入场价处于 ETH 区间": (
+            SYMBOL_PRICE_SCALE_CONFLICT
+        ),
+        "图片识别失败：GLM-OCR 未能提取到文字内容": MEDIA_UNREADABLE,
+        "图片文件未下载到本地，请重新同步该消息后再识别": MEDIA_UNREADABLE,
+    }
+    for reason, expected in cases.items():
+        assert reason_code_from_recognition_reason(reason) == expected
+
+
+def test_a_genuine_recognition_failure_keeps_the_legacy_reason():
+    """A MiMo call that failed is a recognition failure, and says so.
+
+    The fallback still protects it, and every pre-A-8 row with it.
+    """
+
+    from telegram_kol_research.authoritative_recognition import (
+        _lifecycle_not_applied_reason,
+    )
+
+    class Row:
+        status = "识别失败"
+        reason = "MiMo authoritative recognition failed"
+
+    assert reason_code_from_recognition_reason(Row.reason) is None
+    assert _lifecycle_not_applied_reason(Row()) == (
+        "mimo_authoritative_not_safely_applied"
+    )
+
+
+def test_each_new_code_alerts_in_an_auto_trade_group():
+    from telegram_kol_research.recognition_failure_attribution import (
+        MANAGEMENT_FRACTION_INVALID,
+        MEDIA_UNREADABLE,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+    )
+
+    for reason in (
+        MANAGEMENT_FRACTION_INVALID,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+        MEDIA_UNREADABLE,
+    ):
+        captured: list[dict] = []
+        assert _alert(reason, "auto_trade", captured) == reason
+        assert captured[0]["reason_code"] == reason
+
+
+def test_each_new_code_is_recorded_but_silent_in_a_notify_only_group():
+    """raw 15702 and 15703 were both notify_only: nothing there executes."""
+
+    from telegram_kol_research.recognition_failure_attribution import (
+        MANAGEMENT_FRACTION_INVALID,
+        MEDIA_UNREADABLE,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+    )
+
+    for reason in (
+        MANAGEMENT_FRACTION_INVALID,
+        SYMBOL_PRICE_SCALE_CONFLICT,
+        MEDIA_UNREADABLE,
+    ):
+        captured: list[dict] = []
+        assert _alert(reason, "notify_only", captured) is None
+        assert captured == []
+
+
+def test_a_refused_fraction_keeps_the_recognition_result(tmp_path):
+    """The refusal is unchanged; only the label stops lying about it."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.message_recognition import (
+        apply_authoritative_mimo_payload,
+    )
+    from telegram_kol_research.models import (
+        MessageInstructionItem,
+        RawMessage,
+        SignalCandidate,
+        StrategyLifecycle,
+    )
+
+    factory = create_session_factory(tmp_path / "fraction.db")
+    with factory() as session:
+        raw = RawMessage(chat_id=9821, message_id=7, text="减仓")
+        target = StrategyLifecycle(
+            chat_id=9821,
+            message_id=6,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="entered",
+            signal_at=datetime(2026, 9, 5, tzinfo=UTC),
+        )
+        session.add_all([raw, target])
+        session.commit()
+        raw_id, target_id = raw.id, target.id
+
+    result = apply_authoritative_mimo_payload(
+        factory,
+        raw_message_id=raw_id,
+        model="mimo",
+        payload={
+            "recognition_result": "非策略",
+            "confidence": 0.95,
+            "lifecycle_event": {
+                "event_type": "position_update",
+                "management_action": "partial_take_profit",
+                "management_fraction": "150%",
+                "target_lifecycle_id": target_id,
+                "symbol": "BTC",
+                "side": "long",
+                "confidence": 0.95,
+            },
+        },
+    )
+
+    assert result.status == "非策略"
+    assert reason_code_from_recognition_reason(result.reason) == (
+        "management_fraction_invalid"
+    )
+    with factory() as session:
+        assert session.query(SignalCandidate).count() == 0
+        assert session.query(MessageInstructionItem).count() == 0
+        assert session.get(StrategyLifecycle, target_id).lifecycle_status == "entered"
