@@ -186,3 +186,64 @@ def test_a_message_with_no_items_is_unchanged():
     assert _outcome({"status": "partial_failed"}).status == "outcome_unknown"
     assert _outcome({"status": "blocked"}).status == "completed"
     assert _outcome({"status": "failed"}).status == "failed_safe"
+
+
+def test_a_visibility_deferred_item_is_a_hand_off_not_a_finished_no_op():
+    """The shape B-line phase 6-pre-1 produces when the WS stream has a gap.
+
+    The item is deferred for visibility, so its status stays ``pending`` while
+    its payload already reads ``deferred``. The payload alone would look like a
+    finished statement that nothing was sent; it is not one -- the
+    visibility-retry timer still owns the item and will try again. Judging on
+    the item's own status keeps that distinction, and the message comes out as
+    a hand-off rather than a completed no-op.
+    """
+
+    outcome = _outcome(
+        {
+            "status": "in_progress",
+            "items": [
+                {
+                    "item_id": 1,
+                    "sequence": 0,
+                    "instruction_kind": "entry",
+                    "status": "pending",
+                    "result": {
+                        "status": "deferred",
+                        "reason": "ws_observation_pending",
+                    },
+                }
+            ],
+        }
+    )
+
+    assert (outcome.status, outcome.exchange_effect) == ("completed", "not_started")
+    assert outcome.public_result["reason"] == "handed_off_to_batch"
+    assert outcome.public_result["handed_off_from_status"] == "in_progress"
+
+
+def test_a_finished_item_whose_payload_deferred_is_still_proof_of_no_contact():
+    """A defer that was *not* retried terminalises the item; that is a no-op."""
+
+    outcome = _outcome(
+        {
+            "status": "partial_failed",
+            "items": [
+                _item(1, "failed", {"status": "deferred", "reason": "entry_deferred"})
+            ],
+        }
+    )
+
+    assert outcome.status == "failed_safe"
+    assert outcome.evidence_refs[0]["payload_status"] == "deferred"
+
+
+def test_a_submitted_item_can_never_be_part_of_a_no_contact_proof():
+    outcome = _outcome(
+        {
+            "status": "completed",
+            "items": [_item(1, "submitted", {"status": "skipped"}, kind="entry")],
+        }
+    )
+
+    assert outcome.status == "outcome_unknown"

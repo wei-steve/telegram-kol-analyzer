@@ -56,6 +56,13 @@ _RETRIABLE_REFUSAL_STATUSES = frozenset({"blocked", "partial_failed"})
 _ITEM_TERMINAL_NO_CONTACT_STATUSES = frozenset(
     {"blocked", "deferred", "skipped", "shadow_planned", "new_thread_required", "failed"}
 )
+#: Item statuses that mean the item is finished. ``submitted`` is deliberately
+#: absent: it claims an exchange effect, so it can never be part of a proof
+#: that nothing was sent.
+_ITEM_FINISHED_STATUSES = frozenset({"failed", "unknown", "succeeded"})
+#: Item statuses that mean somebody else still owns the work -- an async batch,
+#: the entry queue, or the visibility-retry timer behind a deferred item.
+_ITEM_UNFINISHED_STATUSES = frozenset({"pending", "executing"})
 _KNOWN_UNKNOWN_STATUSES = frozenset(
     {
         "unknown",
@@ -258,6 +265,10 @@ def _items_prove_no_exchange_contact(
     for item in items:
         if not isinstance(item, dict):
             return False, ()
+        if str(item.get("status") or "") not in _ITEM_FINISHED_STATUSES:
+            # Still owned by someone else. Whatever its payload says right now,
+            # it is not a finished statement about what did or did not happen.
+            return False, ()
         payload = _item_payload(item)
         if payload is None:
             return False, ()
@@ -295,7 +306,8 @@ def _items_are_all_unfinished(result: dict[str, Any]) -> bool:
     if not isinstance(items, list) or not items:
         return False
     return all(
-        isinstance(item, dict) and str(item.get("status") or "") in {"pending", "executing"}
+        isinstance(item, dict)
+        and str(item.get("status") or "") in _ITEM_UNFINISHED_STATUSES
         for item in items
     )
 
