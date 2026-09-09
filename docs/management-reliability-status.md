@@ -12,12 +12,12 @@ server_notes: docs/2026-09-07-management-instruction-incident-server-notes.md
 brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，执行会话完成后必须 send_message 到这里
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
-current_step: 8
-current_step_file: docs/plans/2026-09-07-management-reliability/step-8-recognition-failure-attribution.md
-step_status: in_progress           # planned | claimed | in_progress | completed | blocked
-claimed_by: local_22ee72a5-d88c-4ba2-9b17-366585562d10
-last_completed_step: 7
-last_completed_commit: d4348d113bc6b4dc7caabca1af2340b193592e1d
+current_step: 6b
+current_step_file: docs/plans/2026-09-07-management-reliability/step-6b-uncertain-evidence-and-reanalyze-guard.md   # 该步骤文件尚未编写
+step_status: planned               # planned | claimed | in_progress | completed | blocked
+claimed_by: null
+last_completed_step: 8
+last_completed_commit: 14ef9d57dce514d80b2a1cf3e206f671537a1d1d
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -287,3 +287,14 @@ user_decisions_2026_09_07:
   **incident 2082 的处置（指挥会话裁定）**：raw 15628 原文是"靠近第二止盈位"的行情播报、`message_instruction_items` 零行，**不放回也不作废**；incident 走既有 `transition_runtime_incident` 的 `pending → closed`，`queue_notification=False`，**未发任何新通知**，`evidence_refs_json` 带三个 SHA。顺带记一个坑（本步不修）：`runtime_incidents` 的脱敏契约会把普通 snake_case 长标识当凭据——`_looks_like_opaque_secret()` 判"单 token 三类字符且不重复字符 ≥12"，裁定的 reason 字面量 `defect_false_positive_a7_snapshot_stale` 与测试路径 `tests/test_management_reliability_step7.py` 都被 `diagnosis_json` 拒收，最终 classification 存成两个词 `defect_false_positive a7_snapshot_stale`；A-2 改过 `_safe_sentence` 的同类误判，这是另一条路径。
   **验收窗口**（修复后 09:41:30Z → 10:11:32Z，监视器 `/root/evidence/step7b_observe.sh`）：**30 分钟 / 7 条真实消息 / 4 个群**，`WINDOW_MET`。**`stale_confirm=0`——缺陷的反面得到验证**：窗内没有任何管理指令因闸门看不见持仓而进确认态；`reconcile_lag_s` 全窗 9–28 秒，`verified_pos` 稳定为 2（3 个 pos_id）；`auto_trade_ghosts=0`（任务 3 通过）。**两条验收未被真实样本覆盖**：窗内没有出现目标歧义的真实指令（任务 2 只有单测覆盖），notify_only 群只有 2 条非管理消息（任务 4 同样只有单测覆盖，但修复上线后全库再无 `not be applied safely`）。
   **遗留问题（本步未处置，均与本次修复无关）**：(1) `authoritative_execution_attempts` 里 `status='uncertain'` 的行，**从 09-04 至今 23 条全部 `evidence_refs_json` 为空**——落 uncertain 的写入路径从来不写证据引用，`uncertain_no_evidence` 这个验收指标只要窗内出现 uncertain 就不可能为 0（此前几步显示 0 只是因为窗内恰好没有 uncertain）。建议单开一步。(2) 窗内 12 条 traceback 全是同一个 `RuntimeError: authoritative execution is already in progress or outcome is uncertain`，来自 `web_app.reanalyze → save_pending_authoritative_decision`，时间戳与两条 uncertain 精确对应——护栏本身正确，问题是调用方重试时把栈打进日志而不是当预期状态处理。(3) 窗内两条 uncertain（attempt 818 / raw 15633 改单撤单 `revision_cancel_outcome_unknown`，attempt 820 / raw 15635 入场）都是**入场线（B 线）**事件，`ExecutionBoundaryOutcomeUnknown` 是每天 2–7 条的长期背景率。(4) 操作员 bot 仍**没有"选择候选"的命令**，任务 2 的确认通知目前只能靠人工另行处理。证据 `/root/evidence/step7/{observation.md,observe-fix.log,incident-2082-closure.json,cleanup-production.json}`。
+
+- step-8 (2026-09-09, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **completed**（盘点 L0 + 修复 L1）。分支 `mgmt/step-8-recognition-failures`，最终 SHA **`14ef9d57dce514d80b2a1cf3e206f671537a1d1d`**（11:23:30Z 上线，**回滚参考 `d4348d11`**，即 A-7 的修复）。全量 **8098 passed / 4 skipped / 0 failed**，新增 25 个用例。归因报告 `docs/plans/2026-09-07-management-reliability/step-8-attribution.md`。
+  **基数更正**：不是 108 条，是 **181 条**——步骤文件那个数只统计了 4 个群，`groups.yaml` 现有 9 个 auto_trade 群（全库 479）。181 条**没有一条后来被成功识别过**。
+  **核心结论：这 181 条没有一条是"识别失败"。** MiMo 每次都正常返回（`MiMo 调用错误或超时` 0 条、`存储证据无效` 0 条），失败全在"把模型答案落到生命周期"那一步，而 `message_recognition.py` 一个分支把四种完全不同的情况写死成 `识别失败`。分类：A 契约校验失败 22（近 7 天 3）｜B 无上下文解析记录 113（近 7 天 1）｜C 解析成功但未落地 45（近 7 天 3）｜D 解析出错 2（均已停止）。
+  **真正被吞掉的可执行管理指令 10 条**（下界 10、上界 23，口径见报告），目标仓位当时真实存活，最晚 09-02、近 7 天为 0：含 raw 9115「止损位重设为 61500」、10254「过夜单，止损位下移 500 点，重设为 63300」、11598「接近第一止盈，可以止盈一半带保护」、5941「移动止损到成本附近」、7012「ETH 这单…平一半」。其余 171 条绝大多数**本就不该被执行**（29 条无动作播报、27 条幽灵目标、55 条模型没点名目标、24 条目标当时已退出或未入场）——**错的是标签，不是行为**。
+  **任务 2 标签分流**：新模块 `recognition_failure_attribution.py`，五个码 `no_actionable_intent` / `no_target_named` / `target_not_verifiable` / `contract_invalid` / `lifecycle_apply_failed`（第五个是残余类，本次盘点 0 条，正因如此才需要报警），写进 `automation_reason`，`status` 保留识别结果。**判定顺序**先问"有没有要求做什么"：一条"继续拿着不变"无论指向什么都不构成损失，对这类告警正是当初把 10 条真实指令埋掉的噪音来源。A-8 之前的历史行**不做追溯改标**（它们没记录自己属于哪一类）。
+  **任务 4 告警**：`authoritative_recognition_failed`（high，已进 `ALWAYS_NOTIFIED_INCIDENT_TYPES` 代码基线），只对 auto_trade 群、只对非良性三类投递；notify_only 群只记不投。
+  **任务 3 幽灵目标**：接 A-7 的确认通道（既告警又把指令项停成 `awaiting_user_confirmation`），并加了去重——A-7 的闸门在评估期就可能已问过，**一条消息只问一个问题**。**未按字面把校验插进 `_apply_deterministic_management_scope_if_matched` 内部**：那条路对降风险指令在目标不可验证时是刻意放行的（`_verified_live_target` 为空仍返回 `explicit_unverified` 目标），堵住反而更不安全；改在"未落地"这条路上校验。
+  **任务 1 契约放宽**（用户 2026-09-09 批准，见 `step-8-contract-approval`）：`symbol/side/entry/stop_loss` 必填、`take_profit` 可选，`authoritative_instructions._complete_strategy` 与 `mimo_v2_contract._parse_complete_strategy` 同步改；缺失的止盈存 `None` 而非 `""`（空串在下游读作"给了但为空"）。**只读核实两轮**：(a) 准入分支——15 条只缺止盈的信号里，**只有 3 条**会变成 `eligible_for_auto_trade`（10358/10574 BTC、14492 ETH，止损都是具体数字、几何校验通过），另 12 条撞 `symbol_not_whitelisted`（四个群白名单都只有 BTC/ETH）且入场写的是"现价"还会再撞 `entry_price_geometry_ambiguous`；那 12 条其实是 6 对重复。缺止损的 7 条即使通过契约也永远到不了自动交易——`evaluate_trading_decision` 本来就有 `missing_stop_loss → manual_review`，契约那道拒绝是纵深防御的第二层。(b) 止损挂载——限价腿 `deepcoin_limit_entry.py` 无止损直接拒单、有止损必写 `slTriggerPx`，`tpTriggerPx` 仅在有止盈时写；市价腿 `naked_fill_stop_net.py` 从草稿取止损写 `slTriggerPx`、全程不读止盈；止盈 convergence 两处调用点都先判 `take_profit_legs` 非空才建行，所以空止盈走不到 `requires a target` 那个 ValueError。**顺序偏差如实记录**：契约改动是在看到用户批准提交后先做并部署、**之后**才补的挂载路径核实（准入分支那份在改动之前完成），结论支持该改动、无需回滚。
+  **L1 观察（11:23:30Z → 11:39:11Z，按时长达标）**：`elapsed=15m msgs=2 chats=2 old_label=0 blanket_reason=0 a8_incidents=0 worker_err_lines=0 head=14ef9d57`。**证明**：部署健康、旧标签与旧 reason 一条都没有再写入。**未证明**：窗内只有 2 条真实消息、1 条识别决策（`mimo_no_action`，既有码）、**0 条新入场候选**——五个新码、新告警、放宽后的契约**都没有真实样本**，指挥会话给的验收条件"窗内若出现只缺止盈的真实入场信号，逐笔确认它进入下单通道且止损挂上"是**条件未发生**，不是通过。这三条目前只有单测覆盖，已另起加长观察器（停止条件改为"出现任一新码的决策或任一新入场候选"，最长 6 小时）等真实样本，凑到后补记。
+  **遗留**：(1) 加长观察窗的真实样本核对未完成。(2) 报告里"真的丢了指令"的区间是 10–23 条，收紧需再跑一轮意图计算。(3) 不改 MiMo 提示词（按裁定记为遗留）；不追溯重放这 181 条（最晚可执行指令 09-02，仓位状态早已改变）。
