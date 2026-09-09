@@ -202,7 +202,13 @@ def _complete_strategy(value: Any, *, ordinal: int) -> dict[str, Any]:
     if not isinstance(value, Mapping):
         raise AuthoritativeInstructionError(f"instruction_{ordinal}_strategy_missing")
     strategy = {str(key): item for key, item in value.items()}
-    required = ("symbol", "side", "entry", "stop_loss", "take_profit")
+    # A-8, approved by the user 2026-09-09. The prompt asks the model for "at
+    # least one of stop_loss / take_profit"; this contract used to demand both,
+    # and dropped 22 real entry signals whole -- 21 of them missing exactly one
+    # field. A stop loss stays required because position size is derived from
+    # it; a take profit does not, and the order draft already accepts an empty
+    # take_profit_legs list.
+    required = ("symbol", "side", "entry", "stop_loss")
     if any(strategy.get(field) in (None, "") for field in required):
         raise AuthoritativeInstructionError(
             f"instruction_{ordinal}_strategy_incomplete"
@@ -214,8 +220,14 @@ def _complete_strategy(value: Any, *, ordinal: int) -> dict[str, Any]:
         )
     strategy["symbol"] = str(strategy["symbol"]).strip().upper()
     strategy["side"] = side
-    for field in ("entry", "stop_loss", "take_profit"):
+    for field in ("entry", "stop_loss"):
         strategy[field] = str(strategy[field]).strip()
+    take_profit = strategy.get("take_profit")
+    # Absent stays absent: a normalized "" would read downstream as a take
+    # profit that was given and is empty, which is a different claim.
+    strategy["take_profit"] = (
+        str(take_profit).strip() if take_profit not in (None, "") else None
+    )
     return strategy
 
 

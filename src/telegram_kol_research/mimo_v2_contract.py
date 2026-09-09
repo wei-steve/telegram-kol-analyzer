@@ -394,7 +394,9 @@ def _parse_complete_strategy(raw: Any, *, ordinal: int) -> dict[str, Any]:
         raise MimoV2ContractError(f"intent_{ordinal}_strategy_missing")
     if set(raw) - _STRATEGY_ALLOWED_FIELDS:
         raise MimoV2ContractError(f"intent_{ordinal}_strategy_fields_invalid")
-    required = ("symbol", "side", "entry", "stop_loss", "take_profit")
+    # A-8: same relaxation as the authoritative contract, for the same reason.
+    # Stop loss required (size is derived from it), take profit optional.
+    required = ("symbol", "side", "entry", "stop_loss")
     if any(raw.get(field) in (None, "") for field in required):
         raise MimoV2ContractError(f"intent_{ordinal}_strategy_incomplete")
     side = str(raw.get("side") or "").strip().lower()
@@ -406,10 +408,17 @@ def _parse_complete_strategy(raw: Any, *, ordinal: int) -> dict[str, Any]:
     strategy = dict(raw)
     strategy["symbol"] = symbol.strip().upper()
     strategy["side"] = side
-    for field in ("entry", "stop_loss", "take_profit"):
+    for field in ("entry", "stop_loss"):
         strategy[field] = _bounded_parameter_text(
             raw[field],
             error=f"intent_{ordinal}_strategy_{field}_invalid",
+        )
+    if raw.get("take_profit") in (None, ""):
+        strategy["take_profit"] = None
+    else:
+        strategy["take_profit"] = _bounded_parameter_text(
+            raw["take_profit"],
+            error=f"intent_{ordinal}_strategy_take_profit_invalid",
         )
     leverage = raw.get("leverage")
     if leverage is not None:

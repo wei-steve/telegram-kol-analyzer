@@ -260,3 +260,125 @@ def test_one_message_asks_one_question_when_both_gates_fire():
     result = _alert(TARGET_NOT_VERIFIABLE, "auto_trade", captured, awaiting=True)
     assert result is None
     assert captured == []
+
+
+# --------------------------------------------------------------------------
+# Task 1: the contract, relaxed as the user approved on 2026-09-09
+# --------------------------------------------------------------------------
+
+
+def _entry_payload(*, stop_loss, take_profit):
+    return {
+        "recognition_result": "是策略",
+        "confidence": 0.8,
+        "strategy": {
+            "symbol": "ETH",
+            "side": "long",
+            "entry": "2370附近",
+            "stop_loss": stop_loss,
+            "take_profit": take_profit,
+        },
+    }
+
+
+def test_an_entry_without_a_take_profit_is_accepted():
+    """raw 14492's shape: ETH long 2370附近, stop 2335, no target named.
+
+    Fifteen of the twenty-two dropped signals were missing only this field.
+    """
+
+    from telegram_kol_research.authoritative_instructions import (
+        normalize_authoritative_instructions,
+    )
+
+    built = normalize_authoritative_instructions(
+        _entry_payload(stop_loss="2335", take_profit=None)
+    )
+    assert len(built) == 1
+    assert built[0].strategy["stop_loss"] == "2335"
+    # Absent, not empty: "" would read downstream as a take profit that was
+    # given and is blank, which is a different claim about the message.
+    assert built[0].strategy["take_profit"] is None
+
+
+def test_an_entry_without_a_stop_loss_is_still_refused():
+    """raw 15578: ETH long 2464, take profit 3200, no stop.
+
+    Position size is derived from the stop, so this one stays refused -- and
+    now it is refused loudly, as contract_invalid.
+    """
+
+    from telegram_kol_research.authoritative_instructions import (
+        AuthoritativeInstructionError,
+        normalize_authoritative_instructions,
+    )
+
+    with pytest.raises(AuthoritativeInstructionError) as excinfo:
+        normalize_authoritative_instructions(
+            _entry_payload(stop_loss=None, take_profit="3200")
+        )
+    assert "strategy_incomplete" in str(excinfo.value)
+    assert reason_code_from_recognition_reason(
+        f"authoritative_instruction_contract_invalid:{excinfo.value}"
+    ) == CONTRACT_INVALID
+
+
+def test_the_v2_contract_relaxes_the_same_field():
+    from telegram_kol_research.mimo_v2_contract import _parse_complete_strategy
+
+    parsed = _parse_complete_strategy(
+        {"symbol": "eth", "side": "long", "entry": "2370", "stop_loss": "2335"},
+        ordinal=0,
+    )
+    assert parsed["symbol"] == "ETH"
+    assert parsed["take_profit"] is None
+
+
+def test_the_v2_contract_still_requires_a_stop_loss():
+    from telegram_kol_research.mimo_v2_contract import (
+        MimoV2ContractError,
+        _parse_complete_strategy,
+    )
+
+    with pytest.raises(MimoV2ContractError):
+        _parse_complete_strategy(
+            {"symbol": "ETH", "side": "long", "entry": "2464", "take_profit": "3200"},
+            ordinal=0,
+        )
+
+
+def test_a_relaxed_entry_still_faces_every_risk_gate():
+    """Relaxing the contract admits messages to the pipeline, not to trading.
+
+    Twelve of the fifteen name a symbol outside the whitelist and stay in
+    manual review; the one without a stop would be refused twice over.
+    """
+
+    from telegram_kol_research.trading_decision import (
+        TradingDecisionInput,
+        evaluate_trading_decision,
+    )
+
+    def decide(symbol, stop_loss, take_profit):
+        return evaluate_trading_decision(
+            TradingDecisionInput(
+                kol_id=1,
+                chat_id=-1002337721508,
+                message_id=14492,
+                symbol=symbol,
+                side="long",
+                entry_text="2370附近",
+                stop_loss_text=stop_loss,
+                take_profit_text=take_profit,
+                parse_source="mimo_authoritative",
+                confidence=0.8,
+                trading_mode="auto_trade",
+                symbol_whitelist=["BTC", "ETH"],
+                max_loss_usdt=100.0,
+            ),
+            active_positions=[],
+        )
+
+    assert decide("ETH", "2335", None).action == "eligible_for_auto_trade"
+    assert "symbol_not_whitelisted" in decide("NEIRO", "0.0000675", None).reason_codes
+    assert "missing_stop_loss" in decide("ETH", None, "3200").reason_codes

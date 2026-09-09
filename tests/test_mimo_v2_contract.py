@@ -553,26 +553,48 @@ def test_rejects_invalid_contract_values(mutator, error):
         parse_mimo_v2_payload(payload)
 
 
-def test_rejects_incomplete_entry_strategy():
+def _entry_intent(strategy):
+    return {
+        "intent_type": "new_strategy",
+        "action": {
+            "kind": "entry",
+            "target": {"lifecycle_id": None, "thread_id": None},
+            "strategy": strategy,
+            "parameters": {},
+        },
+        "reason": "entry",
+        "confidence": 0.9,
+        "evidence_refs": ["text:observed_text"],
+    }
+
+
+def test_accepts_an_entry_strategy_without_a_take_profit():
+    """A-8, approved by the user 2026-09-09.
+
+    The prompt asks for at least one of stop_loss / take_profit; demanding
+    both dropped 22 real entry signals whole, 21 of them missing exactly one
+    field. Size is derived from the stop, so only the stop stays required.
+    """
+
     payload = _valid_payload()
     payload["intents"] = [
-        {
-            "intent_type": "new_strategy",
-            "action": {
-                "kind": "entry",
-                "target": {"lifecycle_id": None, "thread_id": None},
-                "strategy": {
-                    "symbol": "ETH",
-                    "side": "long",
-                    "entry": "1880",
-                    "stop_loss": "1850",
-                },
-                "parameters": {},
-            },
-            "reason": "missing take profit",
-            "confidence": 0.9,
-            "evidence_refs": [],
-        }
+        _entry_intent(
+            {"symbol": "ETH", "side": "long", "entry": "1880", "stop_loss": "1850"}
+        )
+    ]
+
+    parsed = parse_mimo_v2_payload(payload)
+    strategy = parsed.intents[0].action.strategy
+    assert strategy["stop_loss"] == "1850"
+    assert strategy["take_profit"] is None
+
+
+def test_rejects_an_entry_strategy_without_a_stop_loss():
+    payload = _valid_payload()
+    payload["intents"] = [
+        _entry_intent(
+            {"symbol": "ETH", "side": "long", "entry": "1880", "take_profit": "1950"}
+        )
     ]
 
     with pytest.raises(MimoV2ContractError, match="intent_0_strategy_incomplete"):
