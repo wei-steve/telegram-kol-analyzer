@@ -59,5 +59,5 @@
 
 ## 完成条件
 
-更新状态文件：`current_step: done`、`step_status: completed`；`send_message` 给 `brain_session_id`：
+更新状态文件到 `current_step: 8`、`current_step_file: docs/plans/2026-09-07-management-reliability/step-8-recognition-failure-attribution.md`；`send_message` 给 `brain_session_id`：
 分支、SHA、部署与回滚 SHA、测试结论、窗口内的状态分布与通知记录、遗留（如 bot 选择命令）。

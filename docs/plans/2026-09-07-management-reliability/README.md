@@ -41,5 +41,6 @@
 5c. `step-5c-partial-fill-evidence-from-order-history.md`
 6. `step-6-rejection-semantics-and-frozen-bypass.md`
 7. `step-7-target-resolution-and-ghost-lifecycles.md`
+8. `step-8-recognition-failure-attribution.md`
 
 每份自包含，执行会话只读自己那一份。
