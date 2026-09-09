@@ -206,3 +206,48 @@ raw 14500/15170/15316 指向的 lifecycle 1043/1096 都是 `execution_binding_id
 - **不建议改 MiMo 提示词**。大头一改契约就够了，改提示词要重跑评测、影响面大，按步骤文件记为遗留。
 - **不建议追溯重放这 181 条**。最晚的可执行指令是 09-02，对应仓位状态早已改变，
   重放等于按过期意图动仓位——与 A-6 对 B 族 uncertain 的裁定同理。
+
+## 6. 只读核实：契约放宽后这 15 条会走到哪（指挥会话指定方向）
+
+裁定的方向是 `symbol / side / entry / stop_loss` 必填、`take_profit` 可选——只缺止盈的 15 条放行，
+缺止损的 7 条继续拒绝。核实结果如下。
+
+### 下游本来就要止损，不要止盈
+
+`entry_strategy_assembly.py:812` 对订单草稿的判据是
+`if not _is_positive_draft_number(order_draft.get("stop_loss")): raise ValueError("entry assembly draft stop loss is invalid")`
+——**止损是硬性必填**。而同一函数对 `take_profit_legs` 只校验"若有腿则每条腿要有正的 price 与 allocation_pct"，
+**空列表合法**。所以"止损必填、止盈可选"与下游装配的既有契约完全一致，不需要动装配。
+
+更重要的是，`trading_decision.evaluate_trading_decision()` 里本来就有一条
+`if not signal.stop_loss_text: reason_codes.append("missing_stop_loss")` → `manual_review`。
+**也就是说，缺止损的信号即使通过了 v2 契约，也永远到不了 `eligible_for_auto_trade`**；
+契约那道拒绝是纵深防御的第二层，不是唯一一层。这一点让"继续拒绝缺止损"的代价变得很低：
+它们本来就只会进人工复核。
+
+### 15 条逐条跑过 `validate_candidate_entry_price_geometry` + `evaluate_trading_decision`
+
+（纯函数，本地按当前代码执行，未连生产库、未下单。）
+
+| 结果 | 条数 | 说明 |
+| --- | --- | --- |
+| **`eligible_for_auto_trade`** | **3** | raw 10358（BTC 多 64000/止损 62000）、10574（BTC 多 63500-60000 均价 61700/止损 59500）、14492（ETH 多 2370附近/止损 2335） |
+| `manual_review` / `symbol_not_whitelisted` | 12 | NEIRO×2、XAI×2、GRAM×2、AXS×2、ETC×2、NEIRO×2 —— 四个群的 `symbol_whitelist` 都只有 `['BTC','ETH']` |
+
+**所以放宽契约实际会新放进自动交易通道的是 3 条**，不是 15 条。
+那 12 条还会再撞一道 `entry_price_geometry_ambiguous`（入场写的是"现价"/"市价进场"，
+`_proves_absolute_candidate_field` 判为不可解析），即便有朝一日白名单放开也仍然进人工复核。
+
+**这 3 条都能挂上止损**：止损都是具体数字，几何校验 `passed=True`，
+装配时会走正常的"以损定量"路径，止盈腿为空。
+
+顺带一个发现：那 12 条是 **6 对重复**（10273/10274、10277/10278、10530/10531、10953/10954、
+11158/11159、14364/14365），同一条信号被识别了两次。15 条里真正互不相同的信号只有 9 条。
+
+### 缺止损的 7 条，按裁定继续拒绝
+
+raw 10369、11380、11393、11879、13651、14589、15578。核实 raw 15578（ETH 多 2464 / 止盈 3200 / 无止损）：
+`geometry=False / entry_price_geometry_required_value_missing`，
+`evaluate_trading_decision → manual_review ['missing_stop_loss', ...]`。
+**我在第 5 节把它举成"最刺眼的例子"，按这个方向它不会被放行**——它会继续被拒，
+但按任务 4 的告警规则（`contract_invalid` 投递）它至少不再是静默丢弃，会被报出来让人看见。
