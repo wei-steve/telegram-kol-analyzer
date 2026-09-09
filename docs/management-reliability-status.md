@@ -44,6 +44,8 @@ user_decisions_2026_09_07:
 | 5b | 追既往被 partial_position_unexplained 冻结的 29 条止盈收敛（已平→终态，活跃→新判据重判） | L2 | 否 |
 | 5c | 部分止盈成交证据扩展到 orders-history，并重判活跃仓位的冻结收敛（A-5 判据三在当前交易所行为下拿不到证据） | L2 | 否 |
 | 6 | 确定性拒绝不升级为结果未知；降风险指令绕过冻结 | L2（改交易语义） | 是 |
+| 6b | uncertain 的 evidence_refs_json 从不写入；reanalyze 护栏命中记为预期状态而非 err | L1 | 否 |
+| 9 | 操作员 bot 增加“选择候选”命令，闭环目标歧义确认 | L2 | 否 |
 | 8 | 权威识别器 477 条“识别失败”的归因（auto_trade 群 108 条），先只读再修 | 盘点 L0 / 修复视方案 | 视方案 |
 | 7 | 目标不唯一/无活跃仓位时通知确认；入场失败不得模拟为已入场；只通知群跳过用独立状态 | L2 | 否 |
 
@@ -152,6 +154,7 @@ user_decisions_2026_09_07:
   **回滚路径**：生产 HEAD 已前移到 `ca66a2d5`。撤销本步须在最新 HEAD 上 revert 本步的代码提交后重新部署，**并把 env 的 AFTER_ID 从 2069 改回 272**（备份文件在服务器上）；不可用单条 `tg-deploy 7a4d852a`，那会连带回退 B 线阶段 5。
   **遗留问题**：(a) 两条停投通道 + `position_attribution_audits` 共约 3300 条积压，根因为空的 `NOTIFICATION_BOT_CHAT_ID`，交 step 5——按裁定先给各通道加 AFTER 门槛，再由用户决定补 chat_id 还是改路由；(b) 上列 7 个批次（123/127/129/133/144/150/153）补进 step 4 复核清单；(c) `management_stop_rejected` 等零投递类型是否补进基线待裁定。
 
+- step-7-result (2026-09-09, 指挥会话记录): 首版 4f25d4b6 因把变更追加表当心跳表导致 auto_trade 群全部管理指令进确认态，09:29Z 回滚，修正版 d4348d11 改读 execution_bindings 的每轮重写行，验收窗 stale_confirm=0。新遗留：(1) 所有 uncertain attempt 的 evidence_refs_json 自 09-04 起全为空，落 uncertain 的写入路径从不写证据引用——列为 A-6b；(2) web_app.reanalyze 重试遇到“已在执行/结果未知”护栏时把栈打进 err 日志，应当作预期状态处理——并入 A-6b；(3) 操作员 bot 无“选择候选”命令，目标歧义通知只能人工处理——列为 A-9。attempt 818/820（改单撤单与入场的 outcome_unknown）属 B 线背景率，交 B-5c/阶段 6。
 - step-7-rulings (2026-09-09, 指挥会话): 任务 4 的原诊断被生产数据推翻——mimo_authoritative_not_safely_applied 与群模式无关（477 条中 auto_trade 群 108 条；notify_only 管理消息仅 1 条命中），不做 notify_only 特例；验收线改为“窗内 notify_only 群管理消息的 automation_reason 落在已知集合且非空”。任务 6 只把 5 条 shadow=1 的 pending 作业标 expired，认领条件无缺陷不改。新增 step 8 归因识别失败。
 - step-6-result (2026-09-09, 指挥会话记录): 部署 21aab901，窗内 attempt succeeded×7 / uncertain×0；一次真实 full_exit（batch 162，平掉 ETH 多 1001125164628529）走通改过的规划器；新入场 ETH 空 2.3@2508 的后备止损与三档止盈由系统建出；三通道门槛实盘验证通过（门槛后 4/36/2 投递，门槛前 3318 条未动）；item 1022/1023 已作废并聚合通知。遗留：lifecycle 1117（exited/NULL 纸面）与 5 条 08-20 未被认领的 message_processing_jobs 交 step 7。
 - notification-chat-id-filled (2026-09-09, 用户在服务器执行): /etc/telegram-kol-worker.env 的 TELEGRAM_KOL_NOTIFICATION_BOT_CHAT_ID 已填为 8129644952，token 非空，worker 已重启并从 /proc/<pid>/environ 核实生效。三条通道（position_protection_incidents / strategy_management_notifications / position_attribution_audits）自此只投各自门槛（422 / 97 / 3844）之后的新行。
