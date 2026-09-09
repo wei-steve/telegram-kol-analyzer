@@ -469,6 +469,54 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_stop_resize_replace_incomplete(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    pos_id: str,
+    old_order_id: str,
+    new_order_id: str | None,
+    reason_code: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a stop resize that placed the new stop but could not retire the old.
+
+    A-5e. ``set-position-sltp`` adds a TPSL rather than editing one, so the
+    resize is a replacement: new stop on, old stop off. When the second half
+    fails the position carries two armed stops for the same lots, and at the
+    same trigger price the oversized one can fire first -- a larger exit than
+    the position has. Nothing retries this path, and the new stop is never
+    cancelled to tidy up, so a person has to cancel the old order.
+    """
+
+    if not config.captures("stop_resize_replace_incomplete"):
+        return None
+    fixed = {
+        "component": "stop_loss_resize",
+        "reason_code": _safe_label(reason_code),
+        "operation": f"pos_{_safe_label(pos_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="position_protection_ledger",
+        source_record_id=str(old_order_id),
+        incident_type="stop_resize_replace_incomplete",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            old_order_id=_safe_label(old_order_id),
+            new_order_id=_safe_label(new_order_id or "unset"),
+            impact="two_stops_armed_on_one_position",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_uncertain_without_write(
     session_factory: sessionmaker,
     *,

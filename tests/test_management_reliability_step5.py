@@ -389,11 +389,26 @@ def test_resize_never_grows_the_stop(tmp_path):
 
 
 class _ResizeClient:
-    """Accepts one set-position-sltp and reports it back on the pending list."""
+    """Accepts one set-position-sltp and reports it back on the pending list.
 
-    def __init__(self, *, readback: bool = True):
+    A-5e: ``set-position-sltp`` adds a TPSL rather than editing one, so the
+    fake keeps the old order on the pending list until it is cancelled --
+    which is the whole behaviour the resize has to cope with.
+    """
+
+    def __init__(
+        self,
+        *,
+        readback: bool = True,
+        cancel_raises: bool = False,
+        old_stop_survives_cancel: bool = False,
+    ):
         self.calls: list[dict] = []
+        self.cancels: list[dict] = []
         self._readback = readback
+        self._cancel_raises = cancel_raises
+        self._old_stop_survives_cancel = old_stop_survives_cancel
+        self._old_cancelled = False
 
     def _set_position_sltp_unchecked(self, payload):
         self.calls.append(dict(payload))
@@ -402,10 +417,21 @@ class _ResizeClient:
     def set_position_tpsl(self, payload):  # pragma: no cover - alias guard
         return self._set_position_sltp_unchecked(payload)
 
+    def _cancel_position_sltp_unchecked(self, payload):
+        self.cancels.append(dict(payload))
+        if self._cancel_raises:
+            raise RuntimeError("cancel refused by venue")
+        if not self._old_stop_survives_cancel:
+            self._old_cancelled = True
+        return {"ordId": "stop-1", "sCode": "0"}
+
+    def cancel_position_sltp(self, payload):  # pragma: no cover - alias guard
+        return self._cancel_position_sltp_unchecked(payload)
+
     def list_trigger_orders_pending(self, *, inst_id):
         if not self._readback:
             return []
-        return [
+        rows = [
             {
                 "ordId": "stop-2",
                 "posId": "pos-222",
@@ -415,6 +441,19 @@ class _ResizeClient:
                 "sz": "5",
             }
         ]
+        if not self._old_cancelled:
+            # The oversized stop the resize is replacing, still armed.
+            rows.append(
+                {
+                    "ordId": "stop-1",
+                    "posId": "pos-222",
+                    "posSide": "long",
+                    "instId": inst_id,
+                    "slTriggerPx": "78500",
+                    "sz": "10",
+                }
+            )
+        return rows
 
     def list_positions(self, *, inst_id=None):
         return [
@@ -448,6 +487,8 @@ def test_resize_submits_the_live_size_and_moves_the_ledger(tmp_path):
 
     assert result.status == "succeeded"
     assert len(client.calls) == 1
+    # A-5e: the resize is a replacement, so the old order is cancelled too.
+    assert [entry.get("ordId") for entry in client.cancels] == ["stop-1"]
     call = client.calls[0]
     # Size shrinks; the trigger price is re-sent unchanged and no take-profit
     # field appears anywhere in the payload.

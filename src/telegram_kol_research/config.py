@@ -236,6 +236,11 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # means the boundary lost sight of a write, and the position's real
         # state cannot be read off the ledger.
         "uncertain_without_write",
+        # A-5e: a stop resize placed the new, smaller stop and could not
+        # retire the old one, so two stops are armed against the same lots and
+        # the oversized one can fire first. Nothing retries it and the new stop
+        # is never cancelled to tidy up, so the alert is the whole hand-off.
+        "stop_resize_replace_incomplete",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to
