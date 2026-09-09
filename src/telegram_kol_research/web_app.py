@@ -156,6 +156,9 @@ from telegram_kol_research.live_position_snapshot import LivePositionSnapshotSto
 from telegram_kol_research.recognition_decisions import (
     AuthoritativeExecutionInProgress,
 )
+from telegram_kol_research.authoritative_recognition import (
+    AutomaticRetryBlocked,
+)
 from telegram_kol_research.models import (
     AiPromptTestRun,
     ExecutionBinding,
@@ -4629,6 +4632,20 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
         ai_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
         try:
             result = _reanalyze_once(raw_message_id, ai_config, retrying=retrying)
+        except AutomaticRetryBlocked as guard:
+            # A-6c, the same expected state one layer down: a retry arrived
+            # while an execution still owns this message.
+            logger.info(
+                "context reanalysis skipped, execution owns the message "
+                "raw_message_id=%s attempt_status=%s",
+                guard.raw_message_id,
+                guard.attempt_status,
+            )
+            return {
+                "status": "execution_in_progress",
+                "comparison_status": guard.attempt_status,
+                "raw_message_id": guard.raw_message_id,
+            }
         except AuthoritativeExecutionInProgress as guard:
             # A-6b: expected, not a fault. The execution that owns this message
             # crossed the side-effect boundary; a reanalysis must not overwrite

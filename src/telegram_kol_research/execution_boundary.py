@@ -63,6 +63,36 @@ _ITEM_FINISHED_STATUSES = frozenset({"failed", "unknown", "succeeded"})
 #: Item statuses that mean somebody else still owns the work -- an async batch,
 #: the entry queue, or the visibility-retry timer behind a deferred item.
 _ITEM_UNFINISHED_STATUSES = frozenset({"pending", "executing"})
+#: A-6c. Refusal reasons that are raised *before* the exchange authority is
+#: even acquired, and therefore before anything could be planned or sent.
+#: ``auto_trade_execution`` asks for the authority first and returns one of
+#: these when it does not get it, so an item carrying one of them proves no
+#: request reached the venue -- even though its payload has no ``status`` key
+#: for the rule above to read.
+#:
+#: raw 15668 is why this exists: a real BTC limit long whose item failed with
+#: ``entry_revision_exchange_authority_expired_blocked`` -- authority orphaned
+#: by another message's revision, not a byte sent -- and which froze as
+#: "outcome unknown" because its payload carried a ``message`` and no
+#: ``status``. Nothing was ever in doubt about that one.
+#:
+#: The set is deliberately only the *acquisition* failures. Release failures
+#: are excluded on purpose: a release happens after the writes, so a failure
+#: there says nothing about whether the venue was contacted.
+_PRE_SUBMIT_REFUSAL_REASONS = frozenset(
+    {
+        "entry_revision_exchange_authority_expired_blocked",
+        "entry_revision_exchange_authority_blocked",
+        "entry_revision_exchange_authority_busy",
+        "entry_revision_exchange_authority_invalid",
+        "entry_revision_exchange_authority_missing",
+        "entry_revision_exchange_authority_unavailable",
+    }
+)
+#: Payload keys that may carry the refusal reason. A ``RecoveryLiveSubmitError``
+#: lands as ``message``; the structured refusals use ``reason``.
+_REFUSAL_REASON_KEYS = ("reason", "message")
+
 _KNOWN_UNKNOWN_STATUSES = frozenset(
     {
         "unknown",
@@ -232,6 +262,21 @@ def _response_order_id(value: Any) -> str | None:
     return None
 
 
+def _pre_submit_refusal_reason(payload: dict[str, Any]) -> str | None:
+    """The refusal code an item carries, when it proves nothing was sent.
+
+    Exact match against a closed set, on the payload's own reason fields. No
+    prefix or substring matching: a reason that merely *mentions* the
+    authority is not a proof that the authority was never obtained.
+    """
+
+    for key in _REFUSAL_REASON_KEYS:
+        value = payload.get(key)
+        if isinstance(value, str) and value in _PRE_SUBMIT_REFUSAL_REASONS:
+            return value
+    return None
+
+
 def _item_payload(item: dict[str, Any]) -> dict[str, Any] | None:
     for key in ("result", "error"):
         payload = item.get(key)
@@ -273,12 +318,20 @@ def _items_prove_no_exchange_contact(
         if payload is None:
             return False, ()
         item_status = str(payload.get("status") or "")
-        if item_status not in _ITEM_TERMINAL_NO_CONTACT_STATUSES:
+        refusal_reason = _pre_submit_refusal_reason(payload)
+        if item_status not in _ITEM_TERMINAL_NO_CONTACT_STATUSES and (
+            refusal_reason is None
+        ):
             return False, ()
         item_id = item.get("item_id")
         refs.append(
             {
                 "kind": "instruction_item_no_exchange_contact",
+                **(
+                    {"pre_submit_refusal": refusal_reason}
+                    if refusal_reason is not None
+                    else {}
+                ),
                 **(
                     {"item_id": int(item_id)}
                     if isinstance(item_id, int) and not isinstance(item_id, bool)
@@ -287,7 +340,15 @@ def _items_prove_no_exchange_contact(
                 "instruction_kind": str(item.get("instruction_kind") or ""),
                 "item_status": str(item.get("status") or ""),
                 "payload_status": item_status,
-                "reason": str(payload.get("reason") or item.get("reason") or ""),
+                # A ``RecoveryLiveSubmitError`` carries its reason as
+                # ``message``; without that fallback the evidence would name
+                # the refusal in one field and leave this one blank.
+                "reason": str(
+                    payload.get("reason")
+                    or refusal_reason
+                    or item.get("reason")
+                    or ""
+                ),
             }
         )
     return True, tuple(refs)

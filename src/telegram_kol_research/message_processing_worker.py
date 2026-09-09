@@ -12,6 +12,9 @@ from uuid import uuid4
 
 from sqlalchemy import DateTime, bindparam, or_, text
 
+from telegram_kol_research.authoritative_recognition import (
+    AutomaticRetryBlocked,
+)
 from telegram_kol_research.models import RawMessage, utc_now
 from telegram_kol_research.models import MessageProcessingJob
 from telegram_kol_research.raw_ingest import NormalizedMessageRecord
@@ -659,11 +662,24 @@ async def run_message_processing_worker_tick(
                             "raw_message_id=%s",
                             claim.raw_message_id,
                         )
-            logger.exception(
-                "message processing job failed raw_message_id=%s status=%s",
-                claim.raw_message_id,
-                status,
-            )
+            if isinstance(exc, AutomaticRetryBlocked):
+                # A-6c: an expected state, not a fault. The job is deferred
+                # exactly as before -- only the stack goes away. On the day an
+                # uncertain attempt occurred this logged three full tracebacks
+                # for a guard that was working correctly.
+                logger.info(
+                    "message processing job deferred, execution owns the message "
+                    "raw_message_id=%s status=%s attempt_status=%s",
+                    claim.raw_message_id,
+                    status,
+                    exc.attempt_status,
+                )
+            else:
+                logger.exception(
+                    "message processing job failed raw_message_id=%s status=%s",
+                    claim.raw_message_id,
+                    status,
+                )
             return
         settled = await asyncio.to_thread(
             _settle_message_processing_job,

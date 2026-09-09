@@ -1647,6 +1647,26 @@ def _failure_point_for(reason: str) -> str:
     }.get(reason, reason)
 
 
+class AutomaticRetryBlocked(RuntimeError):
+    """A retry arrived while an execution still owns the message (A-6c).
+
+    Expected, not a fault: the guard exists so an automatic retry cannot start
+    a second authoritative generation over an execution that has crossed the
+    side-effect boundary. It was a bare ``RuntimeError``, so
+    ``message_processing_worker`` logged a full stack for every one of them --
+    the same shape A-6b fixed one layer up, found again on the day an
+    ``uncertain`` attempt finally occurred. It stays a ``RuntimeError`` so
+    existing handlers behave exactly as they did.
+    """
+
+    def __init__(self, *, raw_message_id: int, attempt_status: str) -> None:
+        super().__init__(
+            "automatic retry blocked by active or uncertain authoritative execution"
+        )
+        self.raw_message_id = int(raw_message_id)
+        self.attempt_status = str(attempt_status)
+
+
 def _lifecycle_not_applied_reason(recognition: Any) -> str | None:
     """The A-8 reason code for a recognition whose event changed nothing.
 
@@ -1882,8 +1902,9 @@ def _load_completed_execution_for_automatic_retry(
             "executing",
             "uncertain",
         }:
-            raise RuntimeError(
-                "automatic retry blocked by active or uncertain authoritative execution"
+            raise AutomaticRetryBlocked(
+                raw_message_id=int(raw_message_id),
+                attempt_status=str(attempt.status),
             )
         if attempt is not None and attempt.status == "outcome_recorded":
             if _finalize_attempted:
