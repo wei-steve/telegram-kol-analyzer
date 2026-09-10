@@ -430,3 +430,31 @@ user_decisions_2026_09_07:
   · `absence_obs=0`、`guard_alerts=0`——**A-10b 的"两次缺席"路径与 A-10d 的退化告警，本窗口一个生产样本都没有**（要触发前者需恰好有个仓位在快照里读不到，后者需守卫连续三轮拒判全部）。**这两条仍然只有单测覆盖。**
   · **"无回归"是联合证据，不是 A-10e 单独的**：本窗口观察的 HEAD 同时含 B 线 6a 的切换（**真实交易所写入语义**）。这一点由 B 线先对自己的窗口指出，反向同样成立，故在此写明。
   · 本窗口是 **L1 且实际只按时长达标**（15 分钟，消息数不设门槛），消息侧证据价值本来就低。
+
+- step-11 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **一次交易所零写入的拒绝被标成"结果未知"**（L2，分支 `mgmt/step-11-authority-refusal-is-definite`）。来源是 B 线 6c 的发现：管理执行器的自动平仓腿在网关因归属未核实而拒绝写入时拿到 `PositionMutationAuthorityError`，落进通用 `except Exception` → 腿 `submit_unknown` / `submission_outcome_unknown`、**批次冻结**、发 `management_submit_unknown` 告警——**而交易所一次都没被调用**。冻结是要人来清的状态，所以标错的代价不止是用词。
+  **但原方案的前提不成立，先修前提再修分类。** B 线报的是"该异常只从 `submit()` 之前的 `_block` 与授权构建阶段抛出"。**核 `_require_submitted_response()` 本身发现它有两条提交之后的路径**：
+  · 需要并发方的那条：写入返回 → `submitting → submitted` 的 CAS 失败 → `return self._intent_result(intent_id)` 把库里当前 `row.status` 原样返回 → 不在预期集合里就落到兜底 `raise PositionMutationAuthorityError`。
+  · **不需要任何并发方、且更容易发生的那条（B 线复核时补的）**：放行条件要求 `response is not None`，而 `_intent_result` 里 `response = _load_json(row.response_json) or None`——**回执没存、存空、或解不出，状态明明是 `submitted`，response 却是 `None`**，于是一次已落地的写入被报成授权问题。
+  **所以按异常类型直接归确定性失败，会把"单子可能已在交易所"标成"确定没写"并解冻批次——这是 A-6b/A-6c 那条边界的危险方向。**
+  **改动（四处）**：
+  · **网关兜底改成白名单、默认失败关闭**：`NEVER_SUBMITTED_INTENT_STATUSES = {"reserved", "blocked", "prewrite_refused"}` 才抛 `PositionMutationAuthorityError`（可证明未提交 = 确定），**其余一律 `DeepcoinRequestOutcomeUnknown`**。将来 `POSITION_MUTATION_INTENT_STATUSES` 新增状态默认落"不知道"，而不是默认落"确定没写"。**这一改的副作用是让其他 20 余个调用点收到的该异常类型第一次真的等于"交易所零写入"——改之前它不可靠**，已提醒 B 线回头核它 6a/6b 里按类型分类的地方（它自查后确认恰好都在安全一侧，但"不是因为想到了这个洞"）。
+  · **普通平仓腿**（`except` 前插入分支）→ `failed` / `authority_refused`，批次不冻结。
+  · **补救平仓腿** → 同上，**并且照 `DeepcoinDefiniteRejection` 那条一样跑 `_restore_precancelled_protection_for_rejected_close`**。**这一条原方案没有，是读那条分支时发现的**：该腿在尝试平仓前撤过保护，拒绝而不还原会把"平仓被拒"变成"仓位现在裸着"——**两个失败里更坏的那个**。B 线把它归纳成"失败时要停在过度保护那一侧，不能停在没有保护那一侧"，与它 6a 的"撤旧失败保留新单"同向。
+  · **触发保护 rescue**（`submit_exact_position_sltp`）→ `rescue_authority_refused`，不再 `unknown=True`。
+  **新告警 `management_close_authority_refused`（进 ALWAYS_NOTIFIED 代码基线）**：分类正确之后这个失败变得很安静——腿失败、批次不冻结、什么都不重试——**所以告警是"KOL 要求平仓而什么都没平"唯一的出口**。原来它虽然标错，至少还冻批次逼人来看。**修正一个错误分类会顺手拿掉它附带的噪音，而那噪音可能正是唯一在报警的东西**，这一点单独记。
+  **同类扫描（AST 扫的，不是眼看的）**——管理执行器全部通用 `except Exception`，按"try 内是否含经网关的交易所写"分：
+  | try@ | except@ | 含写调用 | 处置 |
+  |---|---|---|---|
+  | 360 | 388 | `submit_exact_position_sltp` | **已加分支**（rescue） |
+  | 821 | 900 | `close_exact_position` | **已加分支** |
+  | 1549 | 1687 | `close_exact_position` | **已加分支** |
+  | 1025 | 1053 | `submit_exact_position_sltp` | 写 `recovery_required`，**同类未改** |
+  | 1126 | 1150 | `cancel_exact_position_sltp` | 同上 |
+  | 2053 | 2078 | `submit_exact_position_sltp` | 同上 |
+  | 2151 | 2176 | `cancel_exact_position_sltp` | 同上 |
+  | 2839 | 2951 | `submit_exact_position_sltp` | 同上 |
+  | 4525 | 4536 | 裸 `cancel_order` / `cancel_trigger_order` | **不在类内**（不经网关，收不到该异常） |
+  | 594 / 1416 / 1475 / 1893 / 4685 / 1057 / 113 / 2083 | — | 无写调用 | 与本步无关 |
+  **后五处刻意未改，理由写明**：它们写 `recovery_required` 而不是 `submit_unknown`，错得比原案例轻；而每一条都在本会话没有通读过的流程里（保护替换、撤单配对），其中有的可能像补救平仓腿那样需要配套还原动作。**在读透之前改它们，正是本程序今天一直在修的那种错。** 建议单立 **A-11b** 逐条处理（指挥会话与 B 线均已同意不改）。
+  **新增 6 条用例**：授权拒绝 → 腿 `failed` + 事件 `authority_refused` + 交易所零调用 + 无 `submission_outcome_unknown`；告警 incident 行**真的存在**且带 pos_id 与 reason（A-10e 的教训）；真实提交后异常仍 `submit_unknown`（边界另一侧不动）；**回执缺失 → `DeepcoinRequestOutcomeUnknown`**；**CAS 竞态 → 同样 unknown**；三个可证明未提交的状态 → `PositionMutationAuthorityError`。后两条**分成两个具名用例**，因为这两条路径一条需要并发方、一条不需要，合成一条会让下一个人以为只有一种。
+  **B 线对自己那句错误前提的归因值得引一句**：它是从"哪些地方会抛"推到"抛出时系统处于什么状态"，**中间少了一步"还有谁会抛"**；而且报出去时没有标明"这是推理不是核对"。本步的第一个动作就是去读那个兜底本身。

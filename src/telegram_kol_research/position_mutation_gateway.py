@@ -1021,17 +1021,50 @@ def _build_fresh_authority(
         )
 
 
+#: A-11. States from which the exchange provably has not been written yet, so
+#: an exception carrying one of them means "definitely nothing was submitted".
+#: The list is an allowlist and the fall-through below is
+#: ``DeepcoinRequestOutcomeUnknown``, so a status added to
+#: ``POSITION_MUTATION_INTENT_STATUSES`` later is treated as "we do not know"
+#: until somebody decides it is safe to call definite.
+NEVER_SUBMITTED_INTENT_STATUSES = frozenset(
+    {"reserved", "blocked", "prewrite_refused"}
+)
+
+
 def _require_submitted_response(
     result: PositionMutationResult,
 ) -> Mapping[str, Any]:
+    """Turn a gateway result into a response, or into the right kind of failure.
+
+    A-11: the caller decides whether to freeze a batch on the strength of the
+    exception type, so the type has to carry the distinction. The fall-through
+    used to raise ``PositionMutationAuthorityError`` for *any* unexpected
+    status, and two of those are reachable after a successful write.
+
+    One needs a concurrent writer: the submit lands, the
+    ``submitting -> submitted`` CAS loses, ``_intent_result`` returns whatever
+    the row now says, and anything unrecognised took the authority branch.
+
+    The other needs nobody at all, and is the likelier of the two. The success
+    condition below requires ``response is not None``, while
+    ``_intent_result`` builds it as ``_load_json(row.response_json) or None``
+    -- so a receipt that was never stored, stored empty, or no longer parses
+    leaves the status saying ``submitted`` and the response saying nothing, and
+    a write that did land is reported as an authority problem. Neither is
+    hypothetical enough to leave on the definite side: labelling either
+    "definitely not submitted" would mark the leg failed and unfreeze the batch
+    while an order may be live on the venue.
+    """
+
     if result.status in {"submitted", "confirmed"} and result.response is not None:
         return result.response
     reason = result.reason or f"position_mutation_{result.status}"
     if result.status == "rejected":
         raise DeepcoinDefiniteRejection(reason)
-    if result.status in {"submitting", "recovery_required"}:
-        raise DeepcoinRequestOutcomeUnknown(reason)
-    raise PositionMutationAuthorityError(reason)
+    if result.status in NEVER_SUBMITTED_INTENT_STATUSES:
+        raise PositionMutationAuthorityError(reason)
+    raise DeepcoinRequestOutcomeUnknown(reason)
 
 
 def exact_position_write_gate(

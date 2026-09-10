@@ -262,6 +262,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # the journal. A guard whose failure is indistinguishable from success
         # needs its own alarm.
         "manual_close_guard_degenerate",
+        # A-11: the gateway refused a close before writing anything, so the
+        # leg fails cleanly and the batch is not frozen -- which is precisely
+        # why somebody has to be told. A KOL asked for a position to be closed
+        # and nothing was closed; correctly classified, that is otherwise
+        # silent.
+        "management_close_authority_refused",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to

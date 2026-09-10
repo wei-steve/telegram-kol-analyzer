@@ -7222,3 +7222,202 @@ def test_stop_gate_rechecks_changed_market_at_cancel_boundary(tmp_path):
         execute_management_batch(factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW)
     assert client.cancel_calls == client.set_calls == client.close_calls == []
     assert load_management_batch(factory, batch.id).reason_code == "management_stop_deviation_exceeded"
+
+
+# ---------------------------------------------------------------------------
+# A-11: a refusal that never reached the exchange is a definite failure
+#
+# The gateway refuses before it writes when it cannot prove the position
+# belongs to this leg. That refusal used to land in the generic except: leg
+# submit_unknown, batch frozen, a management_submit_unknown alert -- every part
+# of it describing an exchange call that never happened. A frozen batch is a
+# state somebody has to come and clear by hand, so the mislabelling had a cost
+# beyond the wrong word.
+
+
+def _refuse_authority(monkeypatch, reason="target_live_position_not_unique"):
+    """Make the gateway refuse before writing, the way it does on a real refusal.
+
+    Patched at the executor's own call so the test is about the executor's
+    classification and nothing else; the gateway's side of the boundary -- which
+    statuses are allowed to raise this at all -- is asserted separately in
+    ``test_a_submit_that_lands_but_loses_the_cas_stays_unknown``.
+    """
+
+    from telegram_kol_research import strategy_management_executor as executor
+    from telegram_kol_research.position_mutation_authority import (
+        PositionMutationAuthorityError,
+    )
+
+    def _raise(**kwargs):
+        raise PositionMutationAuthorityError(reason)
+
+    monkeypatch.setattr(executor, "close_exact_position", _raise)
+
+
+def test_an_authority_refusal_fails_the_leg_and_writes_nothing(
+    tmp_path, monkeypatch
+):
+    from telegram_kol_research.models import ExecutionEvent
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    client = _FakeClient(session_factory)
+    _refuse_authority(monkeypatch)
+
+    execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert client.calls == [], "the refusal happens before any exchange write"
+    legs = load_management_batch(session_factory, batch.id).legs
+    assert [leg.status for leg in legs] == ["failed", "failed"]
+
+    with session_factory() as session:
+        reasons = [
+            row.reason
+            for row in session.query(ExecutionEvent)
+            .order_by(ExecutionEvent.id)
+            .all()
+        ]
+    assert "authority_refused" in reasons
+    assert "submission_outcome_unknown" not in reasons
+
+
+def test_an_authority_refusal_actually_produces_an_incident_row(tmp_path):
+    """A-10e's lesson applied here: assert the alarm, not just the event.
+
+    Classified correctly this failure is quiet -- the leg fails, the batch
+    finishes, nothing retries. So the alert is the only thing standing between
+    "a KOL asked to close a position and nothing was closed" and silence.
+    """
+
+    from telegram_kol_research.config import (
+        ALWAYS_NOTIFIED_INCIDENT_TYPES,
+        RuntimeIncidentConfig,
+    )
+    from telegram_kol_research.db import create_session_factory as _factory
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_management_close_authority_refused,
+    )
+
+    session_factory = _factory(tmp_path / "incidents.db")
+    capture_management_close_authority_refused(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset(ALWAYS_NOTIFIED_INCIDENT_TYPES)
+        ),
+        batch_id=7,
+        leg_id=11,
+        pos_id="1001125178552543",
+        reason="target_live_position_not_unique",
+        occurred_at=NOW,
+    )
+
+    with session_factory() as session:
+        rows = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.incident_type
+                == "management_close_authority_refused"
+            )
+            .all()
+        )
+    assert len(rows) == 1
+    assert "target_live_position_not_unique" in rows[0].redacted_summary
+    assert "1001125178552543" in rows[0].redacted_summary
+
+
+def test_an_exception_after_a_real_submit_is_still_submit_unknown(tmp_path):
+    """The other side of the boundary, unchanged and load-bearing."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch = _persist_close_batch(session_factory)
+    client = _FakeClient(
+        session_factory,
+        [RuntimeError("connection died mid-flight"),
+         {"code": "0", "data": {"ordId": "close-2"}}],
+    )
+
+    execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert len(client.calls) == 2, "the exchange was called before it failed"
+    legs = load_management_batch(session_factory, batch.id).legs
+    assert legs[0].status == "submit_unknown"
+
+
+def test_a_landed_submit_with_no_stored_receipt_stays_unknown():
+    """A-11's first change, and the likelier of its two paths.
+
+    The success condition requires ``response is not None``, and
+    ``_intent_result`` builds that from ``row.response_json``. A receipt never
+    stored, stored empty, or no longer parseable therefore leaves the status
+    saying ``submitted`` and the response saying nothing -- a write that did
+    land, reported as an authority problem. No concurrent writer needed, which
+    is what makes it easy for the next reader to dismiss as impossible.
+    """
+
+    import pytest
+
+    from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+    from telegram_kol_research.position_mutation_gateway import (
+        PositionMutationResult,
+        _require_submitted_response,
+    )
+
+    with pytest.raises(DeepcoinRequestOutcomeUnknown):
+        _require_submitted_response(
+            PositionMutationResult(
+                status="submitted", reason=None, intent_id=1, response=None
+            )
+        )
+
+
+def test_a_submit_that_lands_but_loses_the_cas_stays_unknown():
+    """The other path: a concurrent writer moved the intent under us.
+
+    The submit lands, the submitting -> submitted CAS loses, and
+    ``_intent_result`` returns whatever the row now says. Calling an
+    unrecognised status "definitely not submitted" would fail the leg and
+    release the batch while an order may be live.
+    """
+
+    import pytest
+
+    from telegram_kol_research.deepcoin_client import DeepcoinRequestOutcomeUnknown
+    from telegram_kol_research.position_mutation_authority import (
+        PositionMutationAuthorityError,
+    )
+    from telegram_kol_research.position_mutation_gateway import (
+        PositionMutationResult,
+        _require_submitted_response,
+    )
+
+    with pytest.raises(DeepcoinRequestOutcomeUnknown):
+        _require_submitted_response(
+            PositionMutationResult(
+                status="verified", reason=None, intent_id=1, response=None
+            )
+        )
+
+    # Provably never submitted: definite, and the caller may fail the leg.
+    for never_submitted in ("blocked", "reserved", "prewrite_refused"):
+        with pytest.raises(PositionMutationAuthorityError):
+            _require_submitted_response(
+                PositionMutationResult(
+                    status=never_submitted,
+                    reason="target_live_position_not_unique",
+                    intent_id=1,
+                    response=None,
+                )
+            )

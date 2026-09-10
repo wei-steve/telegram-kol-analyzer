@@ -50,6 +50,9 @@ from telegram_kol_research.position_attribution import TERMINAL_ENTRY_LEG_STATES
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.position_mutation_authority import (
+    PositionMutationAuthorityError,
+)
 from telegram_kol_research.position_mutation_gateway import (
     cancel_exact_position_sltp,
     close_exact_position,
@@ -371,6 +374,16 @@ def execute_trigger_protection_stop_rescue(
         return _complete_trigger_protection_rescue_failure(
             session_factory, rescue_id=int(rescue_id), now=now,
             reason="rescue_submission_rejected", error=exc,
+        )
+    except PositionMutationAuthorityError as exc:
+        # A-11, third site of the same class: the gateway raises this only from
+        # intent states that prove nothing was submitted, so the rescue failed
+        # definitely rather than unknowably. Left in the generic branch it
+        # would sit as an unknown outcome, which is the state nothing retries
+        # and somebody has to clear by hand.
+        return _complete_trigger_protection_rescue_failure(
+            session_factory, rescue_id=int(rescue_id), now=now,
+            reason="rescue_authority_refused", error=exc,
         )
     except Exception as exc:
         return _complete_trigger_protection_rescue_failure(
@@ -842,6 +855,46 @@ def _execute_break_even_by_market_batch(
                 status="failed",
                 reason="submission_rejected",
                 created_at=executed_at,
+            )
+            continue
+        except PositionMutationAuthorityError as exc:
+            # A-11. The gateway refuses before it writes when it cannot prove
+            # this position belongs to this leg, and that refusal used to fall
+            # into the generic branch below: leg submit_unknown, batch frozen,
+            # a management_submit_unknown alert -- all of it describing an
+            # exchange call that never happened. It belongs on the same side as
+            # a definite rejection. The gateway only raises this for intent
+            # states from which nothing was submitted (A-11 narrowed that too);
+            # anything ambiguous now arrives as DeepcoinRequestOutcomeUnknown
+            # and still lands in the generic branch.
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status="failed",
+                transitioned_at=executed_at,
+                last_error={"type": type(exc).__name__, "message": str(exc)},
+            )
+            _record_leg_event(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg_id=leg.id,
+                pos_id=leg.pos_id,
+                client_order_id=client_order_id,
+                request=request,
+                response=None,
+                order_id=None,
+                status="failed",
+                reason="authority_refused",
+                created_at=executed_at,
+            )
+            _capture_management_close_authority_refusal(
+                session_factory,
+                batch=batch,
+                leg=leg,
+                reason=str(exc),
+                occurred_at=executed_at,
             )
             continue
         except Exception as exc:
@@ -1567,6 +1620,68 @@ def execute_management_batch(
                 status="failed",
                 reason="submission_rejected",
                 created_at=now,
+            )
+            continue
+        except PositionMutationAuthorityError as exc:
+            # A-11, same reclassification as the plain close leg above, plus the
+            # restore: this leg cancelled the position's protection before
+            # attempting the close, so a refusal that writes nothing must put
+            # those stops back exactly as a definite rejection does. Leaving
+            # them off would turn "the close was refused" into "the position is
+            # now unprotected", which is the worse of the two failures.
+            failed_leg_status = "failed"
+            restore_error = _restore_precancelled_protection_for_rejected_close(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg=leg,
+                deepcoin_client=deepcoin_client,
+            )
+            if restore_error is not None:
+                failed_leg_status = "recovery_required"
+            transition_leg(
+                session_factory,
+                leg.id,
+                expected_statuses={"reserved"},
+                new_status=failed_leg_status,
+                transitioned_at=now,
+                request={
+                    **request,
+                    "recovery_phase": (
+                        "authority_refused_close_restore"
+                        if restore_error is not None
+                        else None
+                    ),
+                    "expected_replacement_count": len(
+                        (leg.old_tpsl or {}).get("row_snapshots") or []
+                    ),
+                },
+                last_error={
+                    "type": type(exc).__name__,
+                    "message": str(exc),
+                    "protection_restore_error": restore_error,
+                },
+            )
+            _record_leg_event(
+                session_factory,
+                batch=batch,
+                binding=binding,
+                leg_id=leg.id,
+                pos_id=leg.pos_id,
+                client_order_id=client_order_id,
+                request=request,
+                response=None,
+                order_id=None,
+                status=failed_leg_status,
+                reason="authority_refused",
+                created_at=now,
+            )
+            _capture_management_close_authority_refusal(
+                session_factory,
+                batch=batch,
+                leg=leg,
+                reason=str(exc),
+                occurred_at=now,
             )
             continue
         except Exception as exc:
@@ -4548,6 +4663,46 @@ def _extract_order_id(response: Any) -> str | None:
             if value not in (None, ""):
                 return str(value)
     return None
+
+
+def _capture_management_close_authority_refusal(
+    session_factory: sessionmaker,
+    *,
+    batch,
+    leg,
+    reason: str,
+    occurred_at: datetime,
+) -> None:
+    """Tell a person a close was refused, and never fail the batch for trying.
+
+    A-11. Correct classification makes this quiet: the leg fails, the batch is
+    not frozen, and nothing retries -- so without an alert, "the KOL asked to
+    close this position and nothing was closed" is invisible. The capture is
+    best-effort for the same reason it is elsewhere: an alert that cannot be
+    written must not turn a clean definite failure into an exception.
+    """
+
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_close_authority_refused,
+        )
+
+        capture_management_close_authority_refused(
+            session_factory,
+            config=load_runtime_incident_config(),
+            batch_id=int(batch.id),
+            leg_id=int(leg.id),
+            pos_id=str(leg.pos_id or ""),
+            reason=reason,
+            occurred_at=occurred_at,
+        )
+    except Exception:  # pragma: no cover - defensive, never fails the batch
+        logger.warning(
+            "management close authority refusal capture failed for leg %s",
+            getattr(leg, "id", None),
+            exc_info=True,
+        )
 
 
 def _record_leg_event(

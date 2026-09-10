@@ -542,6 +542,53 @@ def capture_position_marked_manually_closed(
     )
 
 
+def capture_management_close_authority_refused(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    batch_id: int,
+    leg_id: int,
+    pos_id: str,
+    reason: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a close the gateway refused before writing anything (A-11).
+
+    The refusal is definite: nothing reached the venue, so the leg fails and
+    the batch is not frozen. That is exactly why it needs an alert of its own.
+    Before A-11 this arrived as ``management_submit_unknown`` -- wrong, but
+    loud, and it froze the batch, which is a state somebody has to come and
+    clear. Classified correctly it is quiet, the batch finishes, and "the KOL
+    asked to close a position and nothing was closed" would otherwise show up
+    nowhere.
+    """
+
+    if not config.captures("management_close_authority_refused"):
+        return None
+    fixed = {
+        "component": "management_close",
+        "reason_code": _safe_label(reason),
+        "operation": f"batch_{int(batch_id)}_leg_{int(leg_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="strategy_management_leg",
+        source_record_id=str(int(leg_id)),
+        incident_type="management_close_authority_refused",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact="close_not_submitted_position_still_open",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_manual_close_guard_degenerate(
     session_factory: sessionmaker,
     *,
