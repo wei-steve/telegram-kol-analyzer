@@ -10,6 +10,9 @@ from decimal import Decimal, InvalidOperation
 
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.deepcoin_trigger_rows import (
+    take_profit_present_failing_closed,
+)
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
     DeepcoinRequestOutcomeUnknown,
@@ -1377,16 +1380,10 @@ def _row_has_take_profit_fields(row: dict[str, object]) -> bool:
     unrecognized payload keeps failing closed instead of being waved through.
     """
 
-    for key in ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice"):
-        value = row.get(key)
-        if value in (None, ""):
-            continue
-        parsed = _decimal(value)
-        if parsed is None:
-            return True
-        if parsed > 0:
-            return True
-    return False
+    # A-14: same keys, same order, same fail-closed rule, now named. Kept
+    # separate from the price reader on purpose -- see that function's
+    # docstring for why "unparseable counts as present" must not be shared.
+    return take_profit_present_failing_closed(row)
 
 
 def _text_alias_values(

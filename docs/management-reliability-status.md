@@ -533,3 +533,25 @@ user_decisions_2026_09_07:
   `tests/test_break_even_convergence_executor.py` 的假客户端在 `set_position_sltp` 里把请求原样回填成挂单行：`{"posId": payload["posId"], "slTriggerPx": payload["slTriggerPx"], …}`——**真实端点这两个键一个都没有**。生产代码读的正是它们，**于是测试全绿、生产恒拒**。
   **这条形状解释了为什么单测挡不住这一类**：不是漏了断言，而是**夹具与生产读的是同一份错误词表**。建议进 `ARCHITECTURE` 第 6 节（本步只读、未落笔，等裁定由谁写）：**用"我们发出的请求"回填出来的假响应，会让任何"把请求形状的键读在响应上"的代码通过测试；假客户端的响应必须按真实响应造，否则它验证的只是"我们自己的字段名和我们自己的字段名一致"。**
   **结构性发现｜没有共享的归一化层**：20 个模块"知道"真实键名，但**没有公开的归一化函数**。容错读法只存在于 `protection_attribution` 内部的私有 `_first_text(row, "slTriggerPx", "slTriggerPrice", "stopLossPrice")`，以及 `web_app`、`trigger_take_profit_convergence_executor` 里各自重复的键名元组。**每个消费者各自重新实现或忘记**——保本收敛是忘记的那个。**建议**把"从 trigger 行读触发价、读 posId（并知道它可能不存在）"提成**公开具名读取器**，让忘记它变成 import 缺失而不是静默错值；**落地归属由指挥会话定**（横跨 B 线保护链与 A 线收敛）。
+
+- step-14 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **给 trigger 行的键名建一个公开具名读取器**（L2，分支 `mgmt/step-14-trigger-row-reader`）。动机是 A-13 的结构性发现：20 个模块各自重复键名元组、容错读法只藏在 `protection_attribution` 的私有 `_first_text` 里，而保本收敛是忘记它的那个。**目标是让"忘记词表"变成 ImportError，而不是静默错值。** 全量 **8311 passed / 4 skipped / 0 failed**。
+  **新模块 `deepcoin_trigger_rows.py`**，按"这行是什么"分函数，而不是按"要哪个字段"：
+  · `stop_trigger_price` / `take_profit_trigger_price`——仓位行与 TPSL 行（`slTriggerPx` / `slTriggerPrice` / `stopLossPrice`）
+  · **`entry_attached_stop_trigger_price` / `entry_attached_take_profit_trigger_price` 单独两个函数**——条件入场单的 `closeSL/TPTriggerPrice`。**故意不混进上面那对**：未成交入场单的自带止损**此刻什么都没保护**，把它算成活仓位的保护是 A-13 标出的独立风险。要"任意一种"必须显式 `or`。
+  · `position_id_or_none`——**TPSL 行返回 `None` 而不是 `""`**。docstring 写明这正是保本收敛的死因：拿 `""` 与真实 pos_id 比永远为假，而调用方把它读成"漂移"。
+  · `trigger_price`——条件单的 `triggerPx` / `triggerPrice`。
+  · **返回文本，"空"与"缺失"都是 `None`**——真实仓位行的 `tpTriggerPx` 是 `""`，两者必须同一个答案。
+  **联合读取器（按裁定 (a)）**：`any_trigger_price_including_entry_attached(row, *, kind, include_position_field=True)`——**函数名写明它合并了入场自带语义**，docstring 注明该合并正是 A-13 标的风险、只适用于展示与影子比对、判"仓位有没有保护"必须改用 `stop_trigger_price` + 按 ordId 匹配。零视为缺失，**返回值保持原样不 str 化**。四处旧读点改为调用它：`protection_attribution._protection_price`、`web_app._deepcoin_tpsl_price`（订单行，`include_position_field=False` 精确保留它原本排除仓位行拼写的行为）、`web_app._deepcoin_position_tpsl_price`、`web_app` 显示路径那处 `next(...)`。
+  **第五处不是价格读取，另立一个函数**：`trigger_take_profit_convergence_executor._row_has_take_profit_fields` 是**带 fail-closed 语义的存在性判定**（"解析不出来也算存在"），与价格读取共享实现会破坏它。改为 `take_profit_present_failing_closed(row)`，键名照旧移出调用点、语义分开。
+  **我第一版把它写错了，被既有测试挡下——记下来**：我用 `float()` 实现，而 `"NaN"` 能解析成 nan、`nan > 0` 为假 → 返回"不存在"；原版用 `Decimal` 会拒掉 NaN → 返回"存在"。**方向正好错在不安全那一侧（把"读不懂"当成"没有"）**。`test_row_has_take_profit_fields_branches` 立刻变红。已用 `math.isfinite` 修正并在本步用例里把 NaN 锁住。**这是今天第二次别人写的既有测试挡下我的改动**（第一次是 B 线的确定性断言挡下 A-10d 的每轮写入）。
+  **测试夹具逐字来自真实响应**（A-13 的 E 类教训）：仓位行、TPSL 行、条件入场行三条原样粘贴、注明抓取日期 2026-09-10。8 条用例。**`ARCHITECTURE` 第 6 节已落 E 类条目**，含 B 线补的一句：**假响应越像真的越危险**——敷衍的 `{}` 会立刻变红，而精心用请求回填的假响应看起来最专业、最能骗过所有人。
+  **只读子项（裁定要求）：`build_position_evidence` 3177/3178 的 `stop_loss` / `take_profits` 被谁消费**
+  B 线也查了这一处，它的结论"只参与入场归属的经济学比对、没有任何一处当'有没有保护'的判据"**成立**（保护判据在 `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`）。**但那个经济学比对本身是一道闸门，而它现在过不去——这次先测量再报**：
+  ```
+  ev = build_position_evidence(<2026-09-10 逐字真实仓位行>)
+  ev.stop_loss    -> 75700.0
+  ev.take_profits -> ()                      # 真实行 tpTriggerPx: ""
+  _reviewed_position_matches_live(ev, ev) -> False       ← 同一行和自己比
+  ```
+  成因是 `_reviewed_position_matches_live` 里的合取 `and reviewed.take_profits and current.take_profits`——**要求两侧都非空**。于是 `require_equivalent_live_position_economics` 抛 `live_position_economics_changed`，而它由 `strategy_management_worker`（两处）与 `deepcoin_execution_actions` 调用，**是管理执行路上的闸门**。**未查的一半明确标出**：这道闸门是否真会被走到（与保护替换预检的先后）我没有追，所以正确说法是"**闸门本身实测过不去**"，不是"管理指令一定死在这一步"。
+  **A-15 的动机，记在这里**：这已是今天**第四个**"要求 TP 与 SL 都有、而生产的入场只带 SL"的判据——(1) A-12 `_request_has_combined_trigger_protection`、(2) A-13 保本收敛那四处读点、(3) step-12 更正后的保护替换预检、(4) 本条 `take_profits` 合取。**四个连起来看不像四次独立疏漏，更像阶段 5 把入场形状从"带一对"改成"只带止损"时，下游一批判据没有跟着改。** 建议按这个假设做专项扫描（找所有同时要求 TP 与 SL 的合取），而不是逐个偶遇——已立为 A-15。

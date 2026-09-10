@@ -6,6 +6,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any
 
+from telegram_kol_research.deepcoin_trigger_rows import (
+    any_trigger_price_including_entry_attached,
+    stop_trigger_price,
+    take_profit_trigger_price,
+)
+
 
 @dataclass(slots=True)
 class PositionProtection:
@@ -46,12 +52,11 @@ def snapshot_protection_rows(rows: list[dict[str, Any]]) -> list[dict[str, Any]]
             "id",
         )
         size = _first_text(row, "sz", "size") or "0"
-        tp_price = _first_text(
-            row, "tpTriggerPx", "tpTriggerPrice", "takeProfitPrice"
-        )
-        sl_price = _first_text(
-            row, "slTriggerPx", "slTriggerPrice", "stopLossPrice"
-        )
+        # A-14: the same three spellings, now read through a named function so
+        # that a module which forgets the vocabulary gets an ImportError rather
+        # than a silently wrong value. Key order and result are unchanged.
+        tp_price = take_profit_trigger_price(row)
+        sl_price = stop_trigger_price(row)
         if _nonzero_text(tp_price) is not None and _nonzero_text(sl_price) is not None:
             snapshots.append(
                 {
@@ -291,16 +296,10 @@ def _row_has_protection(row: dict[str, Any]) -> bool:
 
 
 def _protection_price(row: dict[str, Any], kind: str) -> float | None:
-    keys = (
-        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-        if kind == "sl"
-        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
+    # A-14: same keys, same order, same zero-as-absent rule, now named.
+    return _float_or_none(
+        any_trigger_price_including_entry_attached(row, kind=kind)
     )
-    for key in keys:
-        value = _float_or_none(row.get(key))
-        if value is not None and value != 0:
-            return value
-    return None
 
 
 def _order_ids(rows: list[dict[str, Any]]) -> list[str]:
