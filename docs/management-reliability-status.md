@@ -644,3 +644,14 @@ user_decisions_2026_09_07:
   **+22 逐条对上了，没有含糊过去**：新基点在测试里净增 **21** 条用例函数（新增 27、其中 6 条是同名移动而非删除），另有一条新参数化 `test_the_reader_accepts_the_other_spellings_too` 带 2 个用例、比一条函数多算 1 —— **21 + 1 = 22**。
   **B 线自核 `recovery_live_submit` 三处后带回的一层，把本步的故事收紧了**：`create_or_get_trigger_take_profit_convergence` 的主创建点是 **2089**，**无任何 `order_kind` 过滤**，而它的**下一行**就是 `_create_trigger_protection_leg_plan`——**收敛行与那四条永远绑不上的 `planned` 腿，是同一个调用点在同一口气里生出来的，两者都不带入场类型条件，而下游三道门全部只认 `trigger_limit`**。所以分叉不在两个词表之间，在**"建"与"用"之间**；`d3e423bf` 只是让这条早已存在的落差**开始有后果**（在那之前限价入场根本没有止盈计划可建）。
   **B 线由此给出的一条判据我要记下，因为我自己栽在它的镜像上**："和它自己的来源集一致"不足以放过一个过滤，**得先证明它不是唯一入口**。我当初放过 1491/1514，正是因为看到止损腿的 `pos_id` 盖上了——**我证明了它对止损腿不是唯一入口，却没证明它对止盈腿也不是**。
+  **部署前基线（在部署之前读的，不是之后）**，2026-09-10 23:27:33Z，生产 HEAD = 回滚参考 **`d11592e2cb8d8ce613428f7450c40512564f343a`**：
+  ```
+  conv 244/245 = conflicted/convergence_exact_leg_not_verified @ 2026-09-10 19:18:56（两行同一时刻，冻住未动）
+  conv 21/22   = conflicted @ 2026-07-26 22:35:46      conv 228 = conflicted @ 2026-09-06 16:34:23
+  take_profit_would_place 审计 = 0      preplanned_take_profit_legs_bound 审计 = 0
+  腿 945/946/949/950 = pos_id 空 / planned / exchange_order_id 空（四条一致）
+  这两个仓位的 take_profit 账本行 = 0      position_take_profit_orders 全表 = 210      position_mutation_intents 全表 = 665
+  status='ready' 的收敛行 = 0
+  ```
+  **`ready=0` 这一条值得单独说**：执行器每轮只取前 5 条 `ready`（按 `created_at`），**当前一条都没有**，所以部署后 244/245 会是仅有的两条，不会被别人挤掉——**这是"每轮都会被处理"这个前提的证据，不是假设**。`mutation_intents=665` 与 B 线 6h 备份止损之后的读数一致，**说明此刻到部署之间没有新的交易所写入**。
+  **观察器** `/root/evidence/step15_1_observe.sh`（新文件名，不覆盖任何在跑的脚本），**带 `set -u`**（B 线的做法：让失败变成显式的零采样，而不是一屏看起来正常的错值）。
