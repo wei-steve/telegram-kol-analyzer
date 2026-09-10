@@ -25,7 +25,14 @@ from telegram_kol_research.protection_authority import (
 #: then requires a code change, a full suite and a deploy, which is exactly the
 #: deliberate pause the approval asked for. A runtime flag would let the second
 #: one go out by editing a row.
-ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset({"1001125216121996"})
+#:
+#: 1001125216121996 released 2026-09-10 20:36Z, order 1001125219289222 at
+#: 75548.6; all six approved fields and all three guardrails checked against
+#: the venue afterwards (status file, phase-6f-1). 1001125216153672 released
+#: after that check, on the same approval.
+ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset(
+    {"1001125216121996", "1001125216153672"}
+)
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg

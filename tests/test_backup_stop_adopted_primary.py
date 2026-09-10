@@ -2,6 +2,8 @@
 
 from datetime import UTC, datetime
 
+import pytest
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import (
     DeepcoinContractSpec,
@@ -15,7 +17,10 @@ from telegram_kol_research.execution_bindings import (
 )
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
-from telegram_kol_research.trigger_backup_stop_executor import _plan_submission
+from telegram_kol_research.trigger_backup_stop_executor import (
+    ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
+    _plan_submission,
+)
 
 
 NOW = datetime(2026, 9, 10, 20, 0, tzinfo=UTC)
@@ -140,19 +145,21 @@ def test_a_normally_recorded_primary_is_not_held_back(tmp_path):
     assert plan.status != "shadow_ready_adopted_primary"
 
 
-def test_a_released_position_is_not_held(tmp_path):
+@pytest.mark.parametrize("released", sorted(ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS))
+def test_a_released_position_is_not_held(tmp_path, released):
     """The release is per position id, and it is the only thing that lifts the hold.
 
     Without this the hold could be made unconditional -- every adopted primary
     held forever -- and the test above would still pass while phase 6f did
     nothing at all.
+
+    Parametrized over the whole set rather than one member of it. The first
+    version took ``sorted(...)[0]``, which was the same id before and after the
+    second position was released -- so adding an id to the constant would have
+    changed production behaviour while the test carried on exercising only the
+    one that was already live.
     """
 
-    from telegram_kol_research.trigger_backup_stop_executor import (
-        ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
-    )
-
-    released = sorted(ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS)[0]
     session_factory, binding_id, leg_id = _seed(
         tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
     )

@@ -1036,6 +1036,49 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-second-release-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话给定):
+  放第二笔 `1001125216153672`（把它加进 `ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS`）。
+  **收窗判据，L2**：
+  (1) **两个仓位各持主 + 备两张**：`1001125216121996` = 主 `1001125216121995`(75700) + 备 `1001125219289222`(75548.6)；
+      `1001125216153672` = 主 `1001125216153671`(75700) + 备 <新单>(75548.6)；
+  (2) **交易所 `trigger-orders-pending` 全表恰 6 张**（起窗前 5 张 + 本次 1 张），
+      且**原 5 张 ordId 逐条仍在**——只增不减；
+  (3) **`position_protection_ledger` 该两仓位恰 4 行**（2 主采纳 + 2 备回读）；
+  (4) **零撤单**：窗内 `position_mutation_intents` 无任何 `cancel_*` 操作，
+      `set_position_sltp` 恰 1 行且 `status=confirmed`；
+  (5) 六项核对（触发价 / 无 `sz` / `posSide` / 端点 / 无显式 reduce-only /
+      `slOrdPx=-1` 且交易所侧 `sz=0`）逐项通过；
+  (6) 30 分钟连续窗口、≥5 条真实消息、`head_ok`/`units_ok` 全程 1、零重置。
+  **下单前基线**：起窗前读 `trigger-orders-pending` 全表并存证（预期 5 张）。
+  **上一次的教训已应用**：6f 首笔那次，部署后第一轮 reconcile 在 **worker 重启时立刻跑**，
+  不是按 ~49 分钟的间隔，我打算作为"下单前基线"的那次读因此落在了写入之后。
+  **这次基线在部署之前读，不在部署之后读。**
+- phase-6f-first-order-verified (2026-09-10, 会话 local_4a6676b0, **本项目第一次由采纳而来的主止损驱动出真实交易所写入**):
+  部署 `586da3c2d2edda494fdae8858c8684bdfeda6d9c`（含 6f-1），回滚参考 `681257331d23a6337088ae0c8e22e91d2dedcf72`。
+  四步部署四项全绿。全量 **8332 passed / 4 skipped / 0 failed**。
+  20:36:36Z 发出备份止损 **`1001125219289222`**，`position_mutation_intents` id=664 `status=confirmed`。
+  **实际 payload 原样**：
+  `{"instType":"SWAP","instId":"BTC-USDT-SWAP","posSide":"long","mrgPosition":"split","tdMode":"cross","posId":"1001125216121996","slTriggerPx":"75548.6","slTriggerPxType":"last","slOrdPx":"-1"}`
+  **六项逐条**：(1) 触发价 `75548.6` = 75700 × (1−20bps)，< 主止损、> `liqPx` 68116.6 ✓
+  (2) **无 `sz` 键**（键仅 instId/instType/mrgPosition/posId/posSide/slOrdPx/slTriggerPx/slTriggerPxType/tdMode）✓
+  (3) `posSide=long` ✓ (4) 端点 `set_position_sltp` ✓ (5) 无 `reduceOnly` 键，靠 posId 绑定的 TPSL 端点语义只减仓 ✓
+  (6) `slOrdPx="-1"`、交易所侧该单 **`sz=0`** 即全仓 ✓
+  **三条护栏逐条**：只对 `exchange_adopted_by_tu` 放开 ✓；
+  **自部署起全库 `position_mutation_intents` 仅 1 行**（限流生效，第二笔的保护腿 947/948 仍 `planned`、`pos_id` 空）✓；
+  **主止损未被撤**——交易所挂单 **4 → 5，只增不减**，原 4 张 ordId 逐条仍在 ✓
+  **6f-1 在生产上按设计生效**：腿 943 `primary_stop` 的 `planned_trigger_price` **仍是 `"75700.0"` 未被改写**，
+  同时正常绑定 `pos_id` / `exchange_order_id` / `verified`；腿 944 由 NULL 回填为 `75548.6` / `0`。
+  **流程偏差，如实记**：指挥会话要求"首笔下单前后各读一次"，我**没有抢在下单前读**——
+  部署后第一轮 reconcile 在 worker 重启时立刻跑了。结论不受影响（部署前基线读过两次且一致，
+  皆为同样 4 张、ordId 逐条相同），但我把误名的证据文件从 `phase-6f-1-before.json`
+  改名为 `phase-6f-1-after-order.json` 并写了 `phase-6f-1-README.txt` 说明为什么——
+  **留一个名字叫 before 的 after，正是"不要求任何人动手的错误描述可以无限期存活"**。
+  证据：`/root/evidence/phase-6f-before.json`（真基线）、`phase-6f-1-after-order.json`、`phase-6f-1-README.txt`。
+  **一条新观察（已写入 ARCHITECTURE 4.8，并作为 6h 判据）**：下单后
+  **仓位行的 `slTriggerPx` 变成了备份价 `75548.6`**，而主止损单仍在 `trigger-orders-pending` 里。
+  叠加语义下仓位行只显示最后写的那张，而先触及的是 `75700` 那张——**仓位行显示的恰恰不是会先生效的那张**。
+  break-even 读的正是仓位行这个字段：6h 只改字段名而仍读仓位行，会拿备份止损价去判断保本是否达成，
+  **读得到、格式对、含义错**，比拼错字段名更难发现。
 - phase-6f-1-planned-values-compared-as-strings (2026-09-10, 会话 local_4a6676b0, **6f 首笔被一条既有守卫挡住，指挥会话裁定作为 6f 前置缺陷在 6f 内修**):
   6f 部署（`681257331d23a6337088ae0c8e22e91d2dedcf72`）后第一轮 reconcile（20:08:02Z），
   释放的仓位 `1001125216121996` **没有下出去**，记 `backup_stop_blocked` /
