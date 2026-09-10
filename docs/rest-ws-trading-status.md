@@ -1036,6 +1036,21 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- rule-baseline-must-be-read-before-the-deploy (2026-09-10, 会话 local_4a6676b0, 指挥会话要求写成规矩):
+  **要在一次部署引发的第一笔交易所写入之前拿到基线，那次读必须发生在部署之前，不是之后。**
+  reconcile 轮 **约 60 秒一轮**（`trigger: by_timer`；journal 连续 12 轮实测
+  `20:40:41 → 20:41:38 → 20:42:37 → 20:43:57 → … → 20:51:59`），
+  所以**任何一次部署后 60 秒内必然有一轮**，"部署完再去读基线"这个做法本身就不成立。
+  6f 首笔即栽在这里：我打算作为下单前基线的那次读落在了写入之后
+  （见 `phase-6f-first-order-verified`）。
+  **顺带更正一个我先前报错的事实**：我曾两次称 reconcile "约 49 分钟一轮"，
+  那是从两条 `backup_stop_shadow_ready` 事故行的时间戳（19:18:56 → 20:08:02）推出来的，
+  **而 `position_protection_incidents` 按 fingerprint 去重**——连续多轮内容相同不新增行，
+  所以那个间隔是"内容变化的间隔"，不是"调度周期"。
+  **形状**：拿一个真实存在的数据事实，去回答一个它并不回答的问题。
+  这已经是同一形状的第三次（读代码推运行时行为、看签名推 payload、读事故表推调度周期）。
+  **判据**：任何"多久一次 / 多少轮"的结论，只能取自调度侧的直接观测
+  （journal 的 `started_at`、`trigger`），不能从任何**带去重或带条件写入**的表反推。
 - phase-6f-second-release-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话给定):
   放第二笔 `1001125216153672`（把它加进 `ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS`）。
   **收窗判据，L2**：
