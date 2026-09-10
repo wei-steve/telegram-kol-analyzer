@@ -885,6 +885,26 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **作废前那 27 分钟仍有参考价值但不作判据**：2 次探活全通过、0 个 silence_timeout，基线是 3 个/30 分钟。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
+- phase-6a-completed (2026-09-10, 会话 local_4a6676b0, **子步 6a 完成，但判据未取得生产样本**):
+  切换本体 **`e99d829f0060053024c10d0f24f7e02c275585b5`**，2026-09-10T13:14Z 经 `tg-deploy` 上线，
+  **回滚参考 `42034e08`**（部署前生产 HEAD，A 线 A-10d）。部署后已按新规矩立即推上共享分支。
+  含三个提交：切换本体、排除判据、AGENTS.md 部署规矩。
+  影子提交 `75652eec` 见 `phase-6a-shadow-window`。
+  **窗口（对 HEAD `5c07ab6d`，含 A 线 A-10e）**：13:30:29Z ~ 14:00:35Z（30 分 06 秒）、31 采样、
+  **零重置、head_ok 全程 1、units_ok 全程 1**、真实消息 12 条 / **4 个群**，`WINDOW_MET` 自行退出。
+  证据 `/root/evidence/phase-6a-cutover-r2/observer-samples.jsonl`。
+  35 轮 reconcile，`positions_seen` **31 个采样全为 0**；窗口内新增：保护 incident 0、
+  `position_mutation_intents` 0、`trigger_protection_intents` 0、影子行 0、`uncertain` 0。
+  **对照起窗前写下的三条判据（`phase-6a-cutover-window-criteria`）：一条都没取到。**
+  起窗时交易所 0 仓位（用户 12:50Z 手工平掉 BTC 空单），窗口全程 0 仓位，所以
+  管理 TPSL 修改替换、保本收敛替换、新仓位归属与排除判据的正面样本**全部为零**。
+  **6a 的新写入路径在生产上仅有测试覆盖（focused 26 + 全量 8267 passed / 0 failed），无仓位样本。**
+  **两条限制必须一起读**：(1) 本窗口观察的 HEAD 同时含 A 线 A-10e，所以"无回归"是**联合证据**，
+  不是 6a 单独的（A 线对其 L1 窗做了对称声明）；(2) 消息数达标（12 条 / 4 群）**不等于**本步判据被触发——
+  L2 的消息门槛衡量的是系统在有流量时是否健康，与"保护写入路径是否被走到"是两件事，
+  本窗口满足前者、完全没有后者。
+  **待补**：交易所再次出现仓位、且发生一次真实保护修改时，需按判据逐笔核对一次；在那之前
+  6a 的生产验证是不完整的，不得以"窗口达标"代替。
 - phase-6a-cutover-window-criteria (2026-09-10T13:30Z, 会话 local_4a6676b0, **起窗前写下，不是收窗后补的**):
   6a 切换窗口（生产 HEAD `5c07ab6d`，含 A 线 A-10e；回滚参考 `e99d829f`）**要取到下列任一才算证明了本步**：
   (1) 一次真实的管理 TPSL 修改走到止损组替换——逐笔记下挂了哪个 ordId、回读结果、撤了哪些旧单、撤净回读结果；
