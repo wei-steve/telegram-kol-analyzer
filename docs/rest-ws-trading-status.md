@@ -13,13 +13,13 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-7
+current_phase: 6-pre-4
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+claimed_by:
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -700,6 +700,36 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   该段归档为 `segment2-mixed-instances.jsonl` 作废。判进程存活今天栽两次（先 pgrep 自匹配、后 kill 错 PID），
   而"用精确 PID"正是本会话自己写进架构文档的那条。
   证据目录 `/root/evidence/phase-6-pre-5/`。
+- phase-6-pre-7-completed (2026-09-10, 会话 local_4a6676b0): 新入场路径的租约同形洞已补。
+  提交 `824b19ad`，部署 **`7fd87e5b83efaf0d320b347158d86dbd79215ded`**，2026-09-10T00:51Z 上线，
+  **回滚参考 `9299c228`**（A 线 A-8c）。全量 **8184 passed / 0 failed**。
+  **补的是 6-pre-6 明确跳过并加测试固定的那个洞**：新入场路径把租约持有成 `signal:<id>`，
+  没有批次行可证终态，所以那次的收尾扫描绕过它。现在用 `trade_signals` 的终态做同样的按 generation 归还。
+  **终态用白名单**（`submitted / failed / partial_submission_failed / unknown_exchange_outcome`）
+  而不是"非运行中"——没预料到的状态一律不动；`pending` / `processing` 不扫；
+  generation 或 owner_kind 不匹配不动；静态守护把免 token 归还的调用者集合钉在一个（与 6-pre-2 / 6-pre-6 同形）；
+  审计行 `entry_revision_authority_signal_release` 已登记为非交易所写入动作。
+  **变异检验抓到一个真实测试缺口**：去掉持有者前缀判别后测试**全绿**——
+  `test_the_two_sweeps_do_not_touch_each_others_holders` 名字读起来覆盖双向，实际只测了
+  "batch 扫描遇到 signal 持有者"。反向才危险：`batch:7` 与 `signal:7` 同样解析成整数 7，
+  没有前缀检查时 signal 扫描会去查**无关的** trade_signal 7、发现它终态、
+  然后归还一把**仍在运行的批次**持有的租约。补 `test_the_signal_sweep_refuses_a_batch_holder` 后变异才转红。
+  测试由 18 条增至 **26 条**。
+  **观察（L2，完整达标）**：窗口 00:52:54Z–01:35:01Z，**11 条真实消息、3 个群**，
+  **44 条采样、零不健康、零重置**；全程 `head_ok=1`（实时比对生产 HEAD，本次无跨版）、
+  **`released_while_running=0`**（本阶段最不该发生的事：放掉一把仍在运行的持有者的租约——没有发生）、
+  `signal_releases=0` / `batch_releases=0` / `resets=0`（生产无卡住的租约，三条路径全程零动作）、
+  `unsettled_batches=0`、`kept_leg_intact=1`、`submit_unknown=0`。
+  窗口结束时生产 HEAD 仍是 `7fd87e5b`、租约仍 `idle gen28`、worker 零 error。
+  **本窗口证明的是新逻辑不误伤，不是它救过一次**；触发路径只有测试证据。
+  证据 `/root/evidence/phase-6-pre-7/observer-samples.jsonl`。
+  **本轮同时把三条与 A 线共同撞出的教训写进 `docs/ARCHITECTURE.md` 第 6 节**：
+  (1) 带命名空间前缀的 id 配上会丢掉前缀的匹配器是一类专门的缺陷，触发条件是
+  `batch:7`/`signal:7` 这类 id 遇上 `int()` / `split(':')[-1]` / 子串包含，而**不是**"有两个并列处理器"；
+  (2) 「松匹配」本身不是缺陷等级，它落在哪个方向才是——over-alert 可以排期，
+  误归还仍在运行的租约必须当场补，这个判据能回答"先修哪个"；
+  (3) 名字声称覆盖双向的用例要确认真的两个方向都跑了，**判据是删掉那道检查它会不会红，不是它的名字**，
+  靠"记得写反向用例"防不住、靠变异检验才防得住。按第 6 节体例不署名。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
