@@ -990,6 +990,19 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **同源教训**：判据也会写错，而写错的判据在收窗时会伪装成"未达成"。
   这与"窗口合格 ≠ 判据被验证"是一对：那条防的是拿窗口充数，这条防的是**拿一个不可能成立的
   判据把真样本判成没取到**。
+- phase-6e-shadow-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**):
+  本窗覆盖 A 线 A-11b 与本会话的 `chain_resolved_legacy_absent` 分档 + `would_adopt` 计数（6e 影子）。
+  **仍然只观测、不写账本、不写交易所。**
+  **要取到下列才算证明了 6e 影子**：
+  (1) **`would_adopt` 对当前两个仓位各恰好 1**（即窗口内每轮 `would_adopt == 2`）——
+      它们各有一张随单止损、账本各无行；
+  (2) **被排除的挂单入场自带止损不进 `would_adopt`**：binding 347 那两张仍在挂的
+      （`1001125208806869` / `1001125208807099`）必须只出现在 `excluded_pending_entry_stops` 里，
+      **`would_adopt` 不得因它们增加**；
+  (3) `chain_resolved_legacy_absent` 取代此前的 `set_mismatch`——同样两个仓位、每轮各 1。
+  **本窗与前几窗不同：判据预期能取到**，因为样本（两个活仓 + 两张随单止损 + 两张在挂入场止损）
+  此刻就在交易所上。若窗内仓位被平掉而样本消失，照实记"样本中途消失"，不追补。
+  同时顺带核对 `phase-6a-open-verification` 的三条常开判据（真实止损替换仍预期取不到）。
 - phase-6e-blame-combined-protection-gate (2026-09-10, 会话 local_4a6676b0, **改之前先查为什么**):
   指挥会话要求把 `_request_has_combined_trigger_protection`（要求请求同时带 `tpTriggerPx` 与
   `slTriggerPx`）放宽成"带 SL 即可"之前，先查当初为何要求两者都有。查了：
