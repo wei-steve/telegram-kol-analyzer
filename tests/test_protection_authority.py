@@ -459,3 +459,78 @@ def test_once_the_trade_unit_flips_the_stop_is_owned_again(tmp_path):
     assert authority.excluded_pending_entry_order_ids == ()
     assert authority.order_ids == ("entry-stop-98",)
     assert [item.order_id for item in authority.adoptions] == ["entry-stop-98"]
+
+
+def test_the_cancel_precheck_passes_only_when_all_four_fields_still_agree(tmp_path):
+    """instrument, posSide, trigger price and size -- by exact order id."""
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _ledger(
+        session_factory,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        order_id="stop-1",
+        purpose="stop_loss",
+        price="2500",
+        size="4",
+    )
+    rows = [_stop_row("stop-1", price="2500", size="4")]
+    authority = _resolve(session_factory, rows)
+
+    from telegram_kol_research.protection_authority import (
+        CANCEL_TARGET_ABSENT,
+        CANCEL_TARGET_NOT_RESOLVED,
+        CANCEL_TARGET_SIDE_CHANGED,
+        CANCEL_TARGET_SIZE_CHANGED,
+        CANCEL_TARGET_TRIGGER_CHANGED,
+        evaluate_cancel_precheck,
+    )
+
+    assert evaluate_cancel_precheck(authority, rows, "stop-1") is None
+
+    moved = [_stop_row("stop-1", price="2535.06", size="4")]
+    assert (
+        evaluate_cancel_precheck(authority, moved, "stop-1")
+        == CANCEL_TARGET_TRIGGER_CHANGED
+    )
+    resized = [_stop_row("stop-1", price="2500", size="2")]
+    assert (
+        evaluate_cancel_precheck(authority, resized, "stop-1")
+        == CANCEL_TARGET_SIZE_CHANGED
+    )
+    flipped = [_stop_row("stop-1", price="2500", size="4", pos_side="short")]
+    assert (
+        evaluate_cancel_precheck(authority, flipped, "stop-1")
+        == CANCEL_TARGET_SIDE_CHANGED
+    )
+    assert evaluate_cancel_precheck(authority, [], "stop-1") == CANCEL_TARGET_ABSENT
+    assert (
+        evaluate_cancel_precheck(authority, rows, "never-resolved")
+        == CANCEL_TARGET_NOT_RESOLVED
+    )
+
+
+def test_an_unreadable_pending_list_is_never_permission_to_cancel(tmp_path):
+    """Unknown is not "go ahead" -- hard rule 4, on the way out this time."""
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _ledger(
+        session_factory,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        order_id="stop-1",
+        purpose="stop_loss",
+        price="2500",
+        size="4",
+    )
+    authority = _resolve(session_factory, [_stop_row("stop-1", size="4")])
+
+    from telegram_kol_research.protection_authority import (
+        FREEZE_PENDING_READ_INCOMPLETE,
+        evaluate_cancel_precheck,
+    )
+
+    assert (
+        evaluate_cancel_precheck(authority, None, "stop-1")
+        == FREEZE_PENDING_READ_INCOMPLETE
+    )

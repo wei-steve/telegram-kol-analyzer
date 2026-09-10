@@ -51,6 +51,8 @@ from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.protection_authority import (
     FREEZE_POSITION_NOT_VERIFIED,
+    evaluate_cancel_precheck,
+    ledger_drift,
     resolve_protection_authority,
     summarize_authority,
 )
@@ -95,6 +97,8 @@ class ShadowComparison:
     legacy_order_ids: tuple[str, ...]
     adopted_order_ids: tuple[str, ...]
     excluded_order_ids: tuple[str, ...]
+    cancel_precheck: Mapping[str, str]
+    ledger_drift: Mapping[str, str]
     detail: Mapping[str, Any]
 
     @property
@@ -110,6 +114,8 @@ class ShadowComparison:
                 "legacy_order_ids": sorted(self.legacy_order_ids),
                 "adopted_order_ids": sorted(self.adopted_order_ids),
                 "excluded_order_ids": sorted(self.excluded_order_ids),
+                "cancel_precheck": dict(sorted(self.cancel_precheck.items())),
+                "ledger_drift": dict(sorted(self.ledger_drift.items())),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -125,6 +131,7 @@ def compare_position_protection(
     instrument_id: str,
     pending_rows: Sequence[Mapping[str, Any]] | None,
     all_positions: Sequence[Mapping[str, Any]],
+    recheck_rows: Sequence[Mapping[str, Any]] | None = None,
 ) -> ShadowComparison | None:
     """Resolve one position both ways and name the difference. Read-only."""
 
@@ -178,6 +185,30 @@ def compare_position_protection(
         legacy_order_ids=legacy_order_ids,
         adopted_order_ids=tuple(item.order_id for item in authority.adoptions),
         excluded_order_ids=tuple(authority.excluded_pending_entry_order_ids),
+        # Phase 6b, shadow half: for every order the chain says this position
+        # owns, ask the exact question a cancel would ask -- is this still the
+        # same order, by id, instrument, side, trigger and size -- without
+        # cancelling anything. A cancel only happens when something asks for
+        # one, which may be never in a given window; this asks the question on
+        # every live protection order instead.
+        #
+        # ``recheck_rows`` is a *second* read, taken after the one the
+        # authority was resolved from. Evaluating the check against the same
+        # read it was built from would compare a read with itself and could
+        # only ever answer "match" -- a counter that cannot fail is not an
+        # observation. The two reads are what makes this the real question.
+        cancel_precheck={
+            order_id: (
+                evaluate_cancel_precheck(
+                    authority,
+                    recheck_rows if recheck_rows is not None else pending_rows,
+                    order_id,
+                )
+                or "match"
+            )
+            for order_id in authority.order_ids
+        },
+        ledger_drift=ledger_drift(authority),
         detail={
             "authority": summarize_authority(authority),
             "legacy_evidence": dict(getattr(legacy, "evidence", {}) or {}),
@@ -203,6 +234,8 @@ def run_protection_authority_shadow_pass(
     read_failures: list[str] = []
     recorded = 0
     excluded_pending_entry_stops = 0
+    cancel_precheck_counts: dict[str, int] = {}
+    ledger_drift_count = 0
     try:
         positions = deepcoin_client.list_positions()
     except Exception:
@@ -211,11 +244,14 @@ def run_protection_authority_shadow_pass(
             "positions_seen": 0,
             "counts_by_verdict": counts,
             "excluded_pending_entry_stops": 0,
+            "cancel_precheck": {},
+            "ledger_drift": 0,
             "rows_recorded": 0,
             "read_failures": ["positions"],
         }
     live = [row for row in positions if isinstance(row, Mapping) and _has_size(row)]
     pending_by_instrument: dict[str, list[dict[str, Any]] | None] = {}
+    recheck_by_instrument: dict[str, list[dict[str, Any]] | None] = {}
     for row in live:
         instrument_id = (_first_text(row, "instId", "inst_id", "instrument_id") or "").upper()
         if not instrument_id or instrument_id in pending_by_instrument:
@@ -231,7 +267,24 @@ def run_protection_authority_shadow_pass(
                 exc_info=True,
             )
             pending_by_instrument[instrument_id] = None
+            recheck_by_instrument[instrument_id] = None
             read_failures.append(instrument_id)
+            continue
+        try:
+            # The second read the cancel path would take. Its cost is one GET
+            # per instrument per round; without it the pre-cancel check has
+            # nothing to compare against but itself.
+            recheck_by_instrument[instrument_id] = (
+                deepcoin_client.list_trigger_orders_pending(inst_id=instrument_id)
+            )
+        except Exception:
+            logger.warning(
+                "protection shadow pass could not re-read pending trigger orders inst_id=%s",
+                instrument_id,
+                exc_info=True,
+            )
+            recheck_by_instrument[instrument_id] = None
+            read_failures.append(f"{instrument_id}:recheck")
 
     with session_factory() as session:
         for row in live:
@@ -247,11 +300,17 @@ def run_protection_authority_shadow_pass(
                 instrument_id=instrument_id,
                 pending_rows=pending_by_instrument.get(instrument_id),
                 all_positions=live,
+                recheck_rows=recheck_by_instrument.get(instrument_id),
             )
             if comparison is None:
                 continue
             counts[comparison.verdict] = counts.get(comparison.verdict, 0) + 1
             excluded_pending_entry_stops += len(comparison.excluded_order_ids)
+            for outcome in comparison.cancel_precheck.values():
+                cancel_precheck_counts[outcome] = (
+                    cancel_precheck_counts.get(outcome, 0) + 1
+                )
+            ledger_drift_count += len(comparison.ledger_drift)
             if comparison.verdict == VERDICT_UNBOUND_POSITION:
                 continue
             if _record_when_changed(
@@ -270,6 +329,14 @@ def run_protection_authority_shadow_pass(
         # zero could equally mean "the exclusion worked" or "no entry was
         # resting" (ARCHITECTURE section 6).
         "excluded_pending_entry_stops": excluded_pending_entry_stops,
+        # ``match`` is the positive observation for the cancel path: a window
+        # with no mismatches proves nothing on its own, because a window with
+        # no protection orders looks exactly the same.
+        "cancel_precheck": cancel_precheck_counts,
+        # Not a gate -- see ``protection_authority.ledger_drift``. Counted so a
+        # future decision about keying the cancel gate on the ledger rests on a
+        # measurement rather than on an assumption that drift is rare.
+        "ledger_drift": ledger_drift_count,
         "rows_recorded": recorded,
         "read_failures": read_failures,
     }
@@ -318,6 +385,8 @@ def _record_when_changed(
                 "excluded_pending_entry_order_ids": list(
                     comparison.excluded_order_ids
                 ),
+                "cancel_precheck": dict(comparison.cancel_precheck),
+                "ledger_drift": dict(comparison.ledger_drift),
                 "chain_status": comparison.chain_status,
                 "chain_reason_code": comparison.chain_reason_code,
                 "chain_order_ids": list(comparison.chain_order_ids),

@@ -435,3 +435,82 @@ def test_a_resting_entrys_stop_is_counted_as_stepped_over_not_as_a_freeze(tmp_pa
     assert result["counts_by_verdict"][VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS] == 1
     row = _shadow_rows(session_factory)[0]
     assert "entry-stop-98" in row.after_json
+
+
+def test_the_cancel_precheck_is_evaluated_on_every_live_protection_order(tmp_path):
+    """Its positive count exists because "no mismatches" alone proves nothing.
+
+    A window with no protection orders and a window where every precheck passed
+    both report zero mismatches. Only the ``match`` count separates them.
+    """
+
+    session_factory = _seed(tmp_path)
+    client = _Client([_stop_row("stop-1")])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert result["cancel_precheck"] == {"match": 1}
+    row = _shadow_rows(session_factory)[0]
+    assert '"stop-1": "match"' in row.after_json.replace("'", '"')
+
+
+def test_an_order_that_moved_between_the_two_reads_is_not_a_match(tmp_path):
+    """The drift a cancel must catch happens *between* the two reads.
+
+    Comparing the resolve-time read with itself can only ever answer "match",
+    so the check is only worth anything if the second read is a real one. Here
+    the exchange changes the trigger price between them, which is precisely the
+    moment a cancel would otherwise remove an order it no longer recognises.
+    """
+
+    session_factory = _seed(tmp_path)
+
+    class _ShiftingClient(_Client):
+        def __init__(self, rows):
+            super().__init__(rows)
+            self.reads = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.reads += 1
+            rows = super().list_trigger_orders_pending(inst_id=inst_id)
+            if self.reads > 1:
+                rows = [dict(row) for row in rows]
+                for row in rows:
+                    if row["ordId"] == "stop-1":
+                        row["slTriggerPrice"] = "2400"
+            return rows
+
+    client = _ShiftingClient([_stop_row("stop-1")])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert client.reads == 2
+    assert result["cancel_precheck"] == {
+        "protection_cancel_target_trigger_changed": 1
+    }
+
+
+def test_ledger_drift_is_observed_without_blocking_anything(tmp_path):
+    """A stale ledger row is a reason to look, not a reason to refuse a cancel.
+
+    A staged take profit that partially fills leaves our recorded size behind
+    the live one. Keying the cancel gate on that would break a management
+    instruction that works today, so it is counted and not enforced.
+    """
+
+    session_factory = _seed(tmp_path)
+    drifted = _stop_row("stop-1")
+    drifted["sz"] = "2"  # ledger says 4
+
+    client = _Client([drifted])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert result["ledger_drift"] == 1
+    assert result["cancel_precheck"] == {"match": 1}

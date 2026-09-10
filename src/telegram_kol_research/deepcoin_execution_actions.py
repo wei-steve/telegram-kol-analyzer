@@ -52,12 +52,12 @@ from telegram_kol_research.models import (
     RecoveryOrderConfirmation,
     StrategyLifecycle,
 )
-from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
 from telegram_kol_research.protection_authority import (
     adopt_protection_orders,
+    evaluate_cancel_precheck,
     resolve_protection_authority,
 )
 from telegram_kol_research.protection_replacement import (
@@ -3000,73 +3000,22 @@ def _capture_protection_authority_refusal(
 
 
 def _build_pre_cancel_check(*, authority: Any, instrument_id: str):
-    """Refuse to cancel an order that is no longer what the chain resolved.
+    """Bind the shared four-field pre-cancel check to one resolved authority.
 
-    The read that produced ``authority`` and the cancel that follows are two
-    moments, and between them the exchange can have replaced, filled or resized
-    the order. Cancelling on the strength of the older read is how a live stop
-    gets removed by accident, so the order is looked at again by its exact id
-    and every attribute the chain matched on has to still agree.
+    The check itself lives in :mod:`protection_authority` so the replacement
+    path here and the cancel path in the gateway ask the same question of the
+    same read. ``instrument_id`` is already carried by the authority; it stays
+    in the signature because callers name it and a disagreement between the two
+    is worth failing on rather than silently preferring one.
     """
 
-    expected = {
-        item.order_id: item
-        for item in (*authority.stop_orders, *authority.take_profit_orders)
-    }
+    if str(instrument_id).upper() != str(authority.instrument_id).upper():
+        raise DeepcoinExecutionActionError("protection_cancel_instrument_mismatch")
 
     def check(rows, order_id: str) -> str | None:
-        item = expected.get(str(order_id))
-        if item is None:
-            return "protection_cancel_target_not_resolved"
-        for row in rows:
-            observed = _order_id_from_payload(dict(row))
-            if observed != str(order_id):
-                continue
-            normalized = normalize_native_tpsl(dict(row))
-            if normalized is None:
-                return "protection_cancel_target_not_tpsl"
-            if (
-                normalized.inst_id
-                and normalized.inst_id != str(instrument_id).upper()
-            ):
-                return "protection_cancel_target_instrument_changed"
-            if (
-                normalized.pos_side
-                and authority.side
-                and normalized.pos_side != authority.side
-            ):
-                return "protection_cancel_target_side_changed"
-            observed_trigger = (
-                normalized.stop_loss_trigger_price
-                if item.group == PROTECTION_GROUP_STOP
-                else normalized.take_profit_trigger_price
-            )
-            if _text_or_none(observed_trigger) != item.trigger_price:
-                return "protection_cancel_target_trigger_changed"
-            if _text_or_none(normalized.size) != item.size_text:
-                return "protection_cancel_target_size_changed"
-            return None
-        # Gone from the pending list between the two reads. It is not cancelled
-        # here on the strength of a stale read.
-        return "protection_cancel_target_absent"
+        return evaluate_cancel_precheck(authority, rows, str(order_id))
 
     return check
-
-
-def _text_or_none(value: Any) -> str | None:
-    if value is None or value == "":
-        return None
-    if isinstance(value, Decimal):
-        normalized = format(value.normalize(), "f")
-        return "0" if normalized == "-0" else normalized
-    try:
-        parsed = Decimal(str(value))
-    except (InvalidOperation, TypeError, ValueError):
-        return str(value)
-    if not parsed.is_finite():
-        return str(value)
-    normalized = format(parsed.normalize(), "f")
-    return "0" if normalized == "-0" else normalized
 
 
 def _build_position_tpsl_row_payload(

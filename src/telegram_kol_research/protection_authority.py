@@ -114,8 +114,15 @@ class ProtectionOrderRef:
     order_id: str
     group: str
     purpose: str
+    #: What the exchange showed for this order at resolution time.
     trigger_price: str | None
     size_text: str | None
+    #: What our durable record says it should be. ``None`` for an order the
+    #: ledger does not know yet -- there the two are equal by construction at
+    #: adoption time, and saying so is more honest than pretending the check
+    #: compared two independent sources.
+    ledger_trigger_price: str | None
+    ledger_size_text: str | None
     #: ``ledger`` -- a durable row already names it; ``exchange_adopted_by_tu``
     #: -- only the exchange and a ``TU`` frame do, so the caller must adopt it
     #: into the ledger before acting on it.
@@ -342,6 +349,12 @@ def resolve_protection_authority(
             purpose=purpose,
             trigger_price=trigger_price,
             size_text=size_text,
+            ledger_trigger_price=(
+                _text(ledger_row.trigger_price) if ledger_row is not None else None
+            ),
+            ledger_size_text=(
+                _text(ledger_row.size_text) if ledger_row is not None else None
+            ),
             source=source or "ledger",
             row=dict(row),
         )
@@ -387,6 +400,117 @@ def resolve_protection_authority(
         excluded_pending_entry_order_ids=tuple(excluded),
         evidence={"pending_tpsl_rows_considered": considered},
     )
+
+
+CANCEL_TARGET_NOT_RESOLVED = "protection_cancel_target_not_resolved"
+CANCEL_TARGET_NOT_TPSL = "protection_cancel_target_not_tpsl"
+CANCEL_TARGET_INSTRUMENT_CHANGED = "protection_cancel_target_instrument_changed"
+CANCEL_TARGET_SIDE_CHANGED = "protection_cancel_target_side_changed"
+CANCEL_TARGET_TRIGGER_CHANGED = "protection_cancel_target_trigger_changed"
+CANCEL_TARGET_SIZE_CHANGED = "protection_cancel_target_size_changed"
+CANCEL_TARGET_ABSENT = "protection_cancel_target_absent"
+
+
+def evaluate_cancel_precheck(
+    authority: ProtectionAuthority,
+    pending_rows: Sequence[Mapping[str, Any]] | None,
+    order_id: str,
+) -> str | None:
+    """Whether this exact order is still what the chain resolved. ``None`` = yes.
+
+    The read that produced ``authority`` and the cancel that follows are two
+    moments, and between them the exchange can have replaced, filled or resized
+    the order. Cancelling on the strength of the older read is how a live stop
+    gets removed by accident, so the order is looked at again **by its exact
+    id** and all four attributes have to still agree: instrument, ``posSide``,
+    trigger price and size.
+
+    Two answers are deliberately not "go ahead":
+
+    * the order is no longer listed -- it is not cancelled on the strength of a
+      stale read, and "already gone" is the caller's decision to interpret;
+    * the pending list could not be read -- unknown is never permission
+      (hard rule 4).
+    """
+
+    expected = {
+        item.order_id: item
+        for item in (*authority.stop_orders, *authority.take_profit_orders)
+    }
+    item = expected.get(str(order_id))
+    if item is None:
+        return CANCEL_TARGET_NOT_RESOLVED
+    if pending_rows is None:
+        return FREEZE_PENDING_READ_INCOMPLETE
+    for row in pending_rows:
+        if not isinstance(row, Mapping):
+            continue
+        normalized = normalize_native_tpsl(dict(row))
+        observed = _order_identity(dict(row))
+        if observed != str(order_id):
+            continue
+        if normalized is None:
+            return CANCEL_TARGET_NOT_TPSL
+        if normalized.inst_id and normalized.inst_id != authority.instrument_id:
+            return CANCEL_TARGET_INSTRUMENT_CHANGED
+        if (
+            normalized.pos_side
+            and authority.side
+            and normalized.pos_side != authority.side
+        ):
+            return CANCEL_TARGET_SIDE_CHANGED
+        observed_trigger = (
+            normalized.stop_loss_trigger_price
+            if item.group == GROUP_STOP
+            else normalized.take_profit_trigger_price
+        )
+        # Compared against what this authority saw when it resolved, which is
+        # the point of the check: the question is whether the order drifted
+        # between the read that named it and the cancel about to remove it, and
+        # answering it requires two reads of the same order at two moments.
+        #
+        # Deliberately *not* compared against the ledger. A ledger row can be
+        # stale relative to the exchange for legitimate reasons -- a staged
+        # take profit that partially filled leaves our recorded size behind the
+        # live one -- and blocking a cancel on that would break a management
+        # instruction that works today. Identity is the order id; these four
+        # fields corroborate that the same order is still the same order.
+        # Ledger drift is worth *observing* (the shadow counts it) but it is
+        # not this gate's question.
+        if _text(observed_trigger) != item.trigger_price:
+            return CANCEL_TARGET_TRIGGER_CHANGED
+        if _text(normalized.size) != item.size_text:
+            return CANCEL_TARGET_SIZE_CHANGED
+        return None
+    return CANCEL_TARGET_ABSENT
+
+
+def ledger_drift(authority: ProtectionAuthority) -> dict[str, str]:
+    """Where the durable record and the exchange disagree about our own orders.
+
+    Not a gate: a stale ledger row is a reason to look, not a reason to refuse
+    a cancel (see :func:`evaluate_cancel_precheck`). It is counted because a
+    stricter rule keyed on the ledger would only be safe if this were rare, and
+    "rare" is a measurement nobody has made.
+    """
+
+    drift: dict[str, str] = {}
+    for item in (*authority.stop_orders, *authority.take_profit_orders):
+        if item.ledger_trigger_price is None:
+            continue
+        if item.ledger_trigger_price != item.trigger_price:
+            drift[item.order_id] = "trigger_price"
+        elif item.ledger_size_text != item.size_text:
+            drift[item.order_id] = "size"
+    return drift
+
+
+def _order_identity(row: Mapping[str, Any]) -> str:
+    for key in ("ordId", "orderId", "order_id", "algoId", "triggerOrderId", "id"):
+        value = row.get(key)
+        if value not in (None, ""):
+            return str(value).strip()
+    return ""
 
 
 def adopt_protection_orders(
