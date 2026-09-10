@@ -960,6 +960,23 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   并按 `ALWAYS_NOTIFIED` 发出 `management_submit_unknown` 告警。
   阶段文件任务 3 的范围是 `close_bound_position`（人工路径），而这条在管理批次执行器里、
   属 A 线模块，**故本步不动**，交指挥会话裁定归属。
+- phase-6cd-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下；待 A-11 上线后部署**):
+  这一窗覆盖**三样东西**：A 线 A-11（写入结果分类改白名单）、6c（三个拒绝用例，无生产代码）、
+  6d（裸仓安全网前置 (e)）。**所以"无回归"是联合证据，不是任何一步单独的**——
+  与 6a 那次同一条规矩，两条线都已按此声明。
+  **要取到下列才算证明了 6d（本步唯一有生产代码的部分）**：
+  (1) `naked_fill_stop_net` 的补挂路径**被触发一次**——即出现一条 `market` 入场腿、
+      `attribution_status=unverified`、过了宽限期，从而被那一轮扫描选中；
+  (2) 该次决定的审计行里 `preconditions` 含 **`e:pass`**（问过交易所、答"没有止损"）
+      或 **`e:fail` / `e:unknown`**（已有止损 → 不挂只告警 / 读不到 → 算不知道），三者任一都是样本；
+  (3) `position_already_protected_on_exchange` 与 `protection_snapshot_incomplete`
+      两个 incident 的条数与归因。
+  **预先声明极可能取不到**：该路径的设计前提就是"**永远不该发生**"——生产 153/153 市价入场腿
+  都满足身份等式，这个网自上线以来一次都没动过。**再加上起窗时交易所 0 仓位**，
+  (1) 取不到的概率接近 1。取不到就照实记"仅测试覆盖"，**不为验证而构造一次裸仓**（阶段文件明令）。
+  同时顺带核对 `phase-6a-open-verification` 的三条常开判据与 6b 的 `cancel_precheck`（同样预期为空）。
+  **这一条本身就是"窗口的证据价值由被改的判据决定"的极端例子**：一个正确的安全网，
+  它的正面样本要求系统先出一次它专门防的故障。
 - phase-6b-shadow-window-criteria (2026-09-10T14:35Z, 会话 local_4a6676b0, **起窗前写下**):
   6b 影子已上线：**`760b2ab8dc740bab6bf9b7b3e9ea7f10557c42b7`**，14:33Z 经 `tg-deploy`，
   **回滚参考 `5c07ab6d`**（A 线 A-10e），部署后已立即推共享分支（已核实）。
