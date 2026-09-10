@@ -1036,10 +1036,23 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-shown-detail-correction (2026-09-10, 会话 local_4a6676b0 自查, **出示给用户的明细有一项不准**):
+  我向用户出示 6f 时写了"**数量 15**"，实际发出的 payload **没有 `sz` 字段**。
+  `build_backup_stop_trigger_payload` 返回的键只有
+  `instType / instId / posSide / mrgPosition / tdMode / posId / slTriggerPx / slTriggerPxType / slOrdPx`；
+  `size` 参数**只用于入参校验**（必须为正），不进 payload。它是**仓位绑定**的 TPSL，
+  `slOrdPx=-1` 表示市价平掉**触发时该仓位的全部持仓**。
+  **差别是实质性的**："数量 15"读起来像固定 15 张，实际**跟随仓位**——仓位变 20 张就平 20 张。
+  今天两者数值相同（仓位正好 15），不影响首笔的风险判断，但与"最多只平 15 张"的理解不符。
+  **怎么发现的**：写用例断言 `payload["sz"] == "15"` 时 `KeyError`——**逐字段核对 payload 才撞出来**。
+  我原来那句是从函数签名的 `size=` 参数**推**出来的，**又一次把签名当成了行为**；
+  与"叙述跑在事实前面"同族，区别是**这次跑在前面的叙述已经送到用户面前**。
+  处置：已报指挥会话，建议向用户补一句更正再下单；首笔核对第六项改为
+  **"新单不带 `sz`、`slOrdPx=-1`、覆盖全仓"**而不是核对"数量=15"。**未答复前不部署 6f。**
 - phase-6f-approval (2026-09-10, 用户在指挥会话 local_858790fe 明确批准，原话"批准 6f"):
   **6f（在真实仓位上放开由采纳而来的备份止损下单）获批。** 出示给用户的明细逐项如下：
   拟备份止损**触发价 `75548.6`**（= 主止损 75700 × (1 − 20bps)，long 向下取整到 tick；
-  `liqPx=68116.6`，代码硬校验要求备份止损 < 主止损且 > 强平价）、**数量 `15`**（该仓位全量）、
+  `liqPx=68116.6`，代码硬校验要求备份止损 < 主止损且 > 强平价）、**数量：payload 实际不带 `sz`**（见 `phase-6f-shown-detail-correction`，出示时写的是"数量 15"）、
   方向 `posSide=long`、端点 **`set_position_sltp`**（非 trigger-order）、
   payload `{"instType":"SWAP","instId":"BTC-USDT-SWAP","posSide":"long","mrgPosition":"split",
   "tdMode":"cross","posId":<pos>,"slTriggerPx":"75548.6","slTriggerPxType":"last","slOrdPx":"-1"}`、
