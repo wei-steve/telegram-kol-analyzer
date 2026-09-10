@@ -246,7 +246,7 @@ class _FakeDeepcoinClient:
                 "instId": "ETH-USDT-SWAP",
                 "posSide": "long",
                 "posId": "pos-1",
-                "tpTriggerPx": "1605.6",
+                "tpTriggerPrice": "1605.6",
                 "sz": "0.1",
                 "cTime": "1000",
             },
@@ -256,7 +256,7 @@ class _FakeDeepcoinClient:
                 "instId": "ETH-USDT-SWAP",
                 "posSide": "long",
                 "posId": "pos-1",
-                "slTriggerPx": "1567.52",
+                "slTriggerPrice": "1567.52",
                 "sz": "0.1",
                 "cTime": "1000",
             },
@@ -325,6 +325,13 @@ class _FakeDeepcoinClient:
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     def set_position_sltp(self, protection_payload):
+        # The pending row this appends is built to the *response* shape the
+        # venue really returns, not by echoing the request back. A fake that
+        # backfills the request is how break-even's field-name defect passed
+        # its tests for weeks: `posId` and `slTriggerPx` are request keys, and
+        # `trigger-orders-pending` returns neither -- it returns
+        # `slTriggerPrice` and no position id at all. Echoing the request makes
+        # any code that reads request keys off a response look correct.
         self.protection_payloads.append(protection_payload)
         if self.protection_outcomes:
             outcome = self.protection_outcomes.pop(0)
@@ -347,12 +354,12 @@ class _FakeDeepcoinClient:
                 {
                     "ordId": order_id,
                     "instId": protection_payload["instId"],
-                    "posId": protection_payload["posId"],
                     "posSide": protection_payload["posSide"],
+                    "triggerOrderType": "TPSL",
                     **(
-                        {"slTriggerPx": protection_payload["slTriggerPx"]}
+                        {"slTriggerPrice": protection_payload["slTriggerPx"]}
                         if protection_payload.get("slTriggerPx") not in (None, "")
-                        else {"tpTriggerPx": protection_payload["tpTriggerPx"]}
+                        else {"tpTriggerPrice": protection_payload["tpTriggerPx"]}
                     ),
                     "sz": protection_payload.get("sz", "0"),
                 }
