@@ -1016,6 +1016,24 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   或者让采样器不做白名单抽取、而是把整个 `protection_shadow` 对象原样落进采样行。
   **后者更彻底**（新增字段自动进证据），作为后续改进记在这里。
   已补 `would_adopt` 并重起窗（18:21:10Z），损失一分钟。
+- phase-6e-shadow-window-closed (2026-09-10, 会话 local_4a6676b0, **本阶段第一次判据逐轮精确达成**):
+  影子本体 **`a8a3a0691221fd6b00ba487e8f2a8e88077e6e19`**（含 A 线 A-11b），18:21:10Z 起窗，
+  回滚参考 `117f8b09`。窗口 **1865 秒（31 分 05 秒）**、32 采样、**零重置、head_ok / units_ok 全程 1**、
+  35 轮 reconcile。证据 `/root/evidence/phase-6e-shadow/observer-samples.jsonl`。
+  **三条判据（起窗前写下）全部达成，且每项都是精确倍数，没有一轮例外**：
+  `would_adopt` 累计 **70 = 2 × 35**；`excluded_pending_entry_stops` **140 = 4 × 35**
+  且 `would_adopt` 始终只有 2/轮（被排除的两张从未混进来）；
+  `chain_resolved_legacy_absent` **70 = 2 × 35**、`set_mismatch` **全窗 0**。
+  附带：`cancel_precheck` 全 `match`、`ledger_drift` 全窗 0。
+  **未达标项：`msgs=0/5`**（19:00Z 前后安静时段），按指挥会话裁定按现状收窗——
+  **消息数对本步判据没有信息量**：本步要的是活仓与活保护单，两者全窗都在。
+  与前几窗照同一口径分开记：**L2 时长达标、消息门槛未达、本步三条判据全部取得生产样本**。
+- phase-6e-cutover-selfcheck (2026-09-10, 会话 local_4a6676b0 自查, **接线前必须先补**):
+  我给指挥会话的下游清单里写了"保本收敛撤旧会走 6a 的撤前四项回读"。核实后**当时并不成立**：
+  该路径确实已走 `protection_replacement`（6a 改的），但**四项回读 `pre_cancel_check` 是可选参数，
+  break-even 那条调用没有传**。
+  **这正是"一条只在人记得时才执行的判据等于没有判据"的又一个实例**，而且这次它差点变成
+  写进清单、报给指挥会话、却在代码里不成立的一句话。处置：把该参数改为**必传**而不是"记得传"。
 - phase-6e-shadow-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**):
   本窗覆盖 A 线 A-11b 与本会话的 `chain_resolved_legacy_absent` 分档 + `would_adopt` 计数（6e 影子）。
   **仍然只观测、不写账本、不写交易所。**
