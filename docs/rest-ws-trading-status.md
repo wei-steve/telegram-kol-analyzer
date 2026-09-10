@@ -798,6 +798,23 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **对 6-pre-4 的副作用**：它证实本地账本与交易所存在真实漂移，因此静默探活的重连判据
   **不能**用"与本地账本对照"（每次都会不一致 → 每 600 秒照样重连，毫无改善），
   改用**快照指纹自比**；账本差异降级为观测字段。
+- phase-6-pre-4-silence-contract (2026-09-10, 6-pre-4 会话 local_4a6676b0): 6-pre-4 改的是一条**既有测试写死的契约**，必须显式记：
+  `test_an_open_but_silent_socket_is_treated_as_a_gap`（"开着但静默的 socket 就是缺口"）
+  正是本阶段要推翻的断言，已拆成两条覆盖两个方向的测试并逐条变异验证：
+  `test_a_silent_socket_whose_picture_moved_is_still_a_gap`（快照变了 → 仍记 silence_timeout 缺口、仍重连）
+  与 `test_a_silent_socket_that_missed_nothing_is_not_a_gap`（快照未变 → 不记缺口、保持 HEALTHY）。
+  把守卫改成恒真只红前者、改成恒假只红后者，各 1 秒内断言失败。
+  **发现过程本身是个教训**：全量测试卡死 3 小时 54 分（CPU 仅 8 分 54 秒），
+  两次 faulthandler 因 `exit=True` 不 flush 而无输出；改为写文件后拿到栈，
+  显示主线程在事件循环空转、工作线程闲置——**根本不是线程卡住，是探活通过后 `continue`
+  回到 recv，0.05 秒又超时、再探活再通过的无限循环**。
+  我此前加的 `DEEPCOIN_WS_PROBE_TIMEOUT_SECONDS=15` 是对的防御但不是本次病因，
+  "加了超时还卡"曾把我引向错误方向（以为 `asyncio.to_thread` 不可取消）。
+  **生产为什么不会这样循环下去**：静默超时 600 秒、listen key TTL 2700 秒，
+  `key_limited` 分支在 key 到期前抢先触发，因此连续通过最多 4 次就被 key 轮换强制重连并重新 resync。
+  测试里循环不止是因为 `monotonic_ms_provider` 是冻结时钟，deadline 永不到达——
+  这是测试替身的性质，不是产品行为。新测试因此都给静默连接加了读取次数上限：
+  守卫一旦被改坏必须**快速断言失败**，不能变成又一次全量卡死（卡死的套件什么都报不出来）。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。

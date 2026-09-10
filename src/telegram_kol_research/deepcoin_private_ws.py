@@ -104,6 +104,11 @@ DEEPCOIN_WS_LISTEN_KEY_TTL_SECONDS = 2700.0
 # text so that a wording change does not silently disable the early reconnect.
 DEEPCOIN_WS_LISTEN_KEY_EXPIRED_CODE = "50118"
 
+# 6-pre-4. The silence probe's own deadline. Three GETs against a 5/s limiter
+# finish in well under this; anything slower is an exchange we cannot read in
+# time, which is the same answer as one we cannot read at all.
+DEEPCOIN_WS_PROBE_TIMEOUT_SECONDS = 15.0
+
 DEEPCOIN_WS_BACKOFF_BASE_SECONDS = 1.0
 DEEPCOIN_WS_BACKOFF_CAP_SECONDS = 60.0
 
@@ -774,6 +779,18 @@ def build_deepcoin_ws_health(
         "open_gap_count": open_gaps,
         "gap_count": total_gaps,
         "instrument_map_size": int(getattr(inbox, "instrument_map_size", 0) or 0),
+        # 6-pre-4. A probe that passes writes no gap row, so without these a
+        # window showing fewer ``silence_timeout`` gaps cannot distinguish "the
+        # probe held the connection" from "the stream simply was not silent".
+        # Process-local like the read-limit counters below; a restart zeroes them.
+        "silence_probe_total": int(getattr(inbox, "silence_probe_total", 0) or 0),
+        "silence_probe_passes": int(getattr(inbox, "silence_probe_passes", 0) or 0),
+        "silence_probe_reconnects": int(
+            getattr(inbox, "silence_probe_reconnects", 0) or 0
+        ),
+        "silence_probe_refreshes": int(
+            getattr(inbox, "silence_probe_refreshes", 0) or 0
+        ),
         **_wake_health(wake_signal or getattr(inbox, "wake_signal", None), now),
         # Phase 5b read-throttling counters for THIS process. Deepcoin's 5/s
         # quota is per API key across the whole account, but a limiter can only
@@ -994,7 +1011,21 @@ class DeepcoinPrivateWsInbox:
                     close()
 
         try:
-            return await asyncio.to_thread(_run)
+            # Bounded on purpose. Without this the probe becomes a new way for
+            # the reader to hang: a REST call that never returns would leave
+            # the loop neither reading frames nor reconnecting, which is worse
+            # than the unconditional reconnect this phase replaced. A probe
+            # that cannot answer in time has not answered, and rule 4 makes
+            # that a reconnect.
+            return await asyncio.wait_for(
+                asyncio.to_thread(_run), timeout=DEEPCOIN_WS_PROBE_TIMEOUT_SECONDS
+            )
+        except (TimeoutError, asyncio.TimeoutError):
+            logger.warning(
+                "Deepcoin silence probe timed out after %.0fs; reconnecting",
+                DEEPCOIN_WS_PROBE_TIMEOUT_SECONDS,
+            )
+            return SilenceProbeResult(PROBE_UNREADABLE, reason="probe_timeout")
         except Exception as exc:
             # The probe failing is itself an unreadable answer, which means
             # reconnect. It must never propagate as a new kind of crash.
@@ -1029,6 +1060,18 @@ class DeepcoinPrivateWsInbox:
                 self.silence_baseline_stale = False
         else:
             self.silence_probe_reconnects += 1
+        # Logged at INFO on every outcome, passes included. The counters above
+        # are lost on restart and only readable through the health endpoint;
+        # journald is the one place an observation window can go back and read
+        # what each individual probe decided.
+        logger.info(
+            "Deepcoin silence probe %s (%s): pass=%d reconnect=%d refresh=%d",
+            probe.status,
+            probe.reason or "-",
+            self.silence_probe_passes,
+            self.silence_probe_reconnects,
+            self.silence_probe_refreshes,
+        )
         logger.info(
             "Deepcoin silence probe: %s (%s) gets=%s",
             probe.status,

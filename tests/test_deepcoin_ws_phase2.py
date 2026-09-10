@@ -969,8 +969,11 @@ def test_a_converged_resync_closes_the_gap_and_reports_health(tmp_path):
 class _SilentConnection:
     """Open, subscribable, and permanently quiet. A live pong proves nothing."""
 
-    def __init__(self):
+    def __init__(self, *, stub=None, quiet_reads=None):
         self.sent: list[str] = []
+        self._stub = stub
+        self._quiet_reads = quiet_reads
+        self.reads = 0
 
     async def __aenter__(self):
         return self
@@ -982,14 +985,57 @@ class _SilentConnection:
         self.sent.append(payload)
 
     async def recv(self):
+        self.reads += 1
+        if self._stub is not None:
+            # The read loop has started, so the silence baseline is already
+            # taken: every exchange read from here on is a probe.
+            self._stub.reading = True
+        if self._quiet_reads is not None and self.reads > self._quiet_reads:
+            # A silent socket that passes its probe is kept, so without a
+            # deliberate end the read loop would go round for as long as the
+            # listen key lasts -- which under this test's frozen clock is
+            # forever. Ending it here is the test's stopwatch, not a failure.
+            raise asyncio.CancelledError
         await asyncio.Event().wait()
 
 
-def test_an_open_but_silent_socket_is_treated_as_a_gap(tmp_path):
+class _MovingPositionsStub(_RestStub):
+    """Empty while the baseline is taken, holding a position once probing starts.
+
+    The change is the whole point: it stands for the ``TU`` frame the silent
+    socket never delivered.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.reading = False
+
+    def list_positions(self, **kwargs):
+        self.calls.append("positions")
+        if not self.reading:
+            return []
+        return [{"posId": "1001125178552543", "posSide": "short", "pos": "3"}]
+
+
+def test_a_silent_socket_whose_picture_moved_is_still_a_gap(tmp_path):
+    """6-pre-4 keeps silent connections, but only the ones that cost nothing.
+
+    A position appeared while the socket said nothing. Whatever frame announced
+    it was not delivered, so this silence *is* a gap and the stream is rebuilt.
+    """
+
     session_factory = create_session_factory(tmp_path / "ws.db")
+    stub = _MovingPositionsStub()
     inbox = _offline_inbox(
         session_factory,
-        connections=[_SilentConnection(), _SilentConnection()],
+        client=stub,
+        connections=[
+            # Bounded, though one read is all a working probe needs: if the
+            # guard were ever broken open the loop would spin instead of
+            # failing, and a suite that hangs reports nothing at all.
+            _SilentConnection(stub=stub, quiet_reads=5),
+            _SilentConnection(stub=stub, quiet_reads=5),
+        ],
         silence_timeout_seconds=0.05,
     )
 
@@ -1014,6 +1060,64 @@ def test_an_open_but_silent_socket_is_treated_as_a_gap(tmp_path):
     assert gaps[1].reconnected_at is None, "the silence is still an open gap"
     assert inbox.state_machine.state == WS_STATE_DISCONNECTED
     assert inbox.permits_new_entry()[0] is False
+    assert inbox.silence_probe_reconnects == 1
+    assert inbox.silence_probe_passes == 0
+
+
+def test_a_silent_socket_that_missed_nothing_is_not_a_gap(tmp_path):
+    """The other direction, and the reason the phase exists.
+
+    Production logged 134 ``silence_timeout`` reconnects against 11 process
+    starts. A reconnect that rebuilds a picture nothing changed buys no
+    information and spends a real resync, so a probe that can show the
+    snapshot is unmoved keeps the connection and records no gap.
+    """
+
+    session_factory = create_session_factory(tmp_path / "ws.db")
+    stub = _RestStub()
+    connection = _SilentConnection(quiet_reads=3)
+    inbox = _offline_inbox(
+        session_factory,
+        client=stub,
+        connections=[connection],
+        silence_timeout_seconds=0.05,
+    )
+
+    async def _sleep(_seconds):
+        raise asyncio.CancelledError
+
+    inbox._sleep = _sleep
+
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(inbox.run_forever())
+
+    from telegram_kol_research.models import DeepcoinWsConnectionGap
+
+    with session_factory() as session:
+        gaps = list(
+            session.execute(
+                select(DeepcoinWsConnectionGap).order_by(DeepcoinWsConnectionGap.id)
+            ).scalars()
+        )
+    assert [gap.reason for gap in gaps] == ["process_start"], (
+        "silence alone must no longer open a gap"
+    )
+    assert gaps[0].reconnected_at is not None, "the resync did converge"
+    assert inbox.state_machine.state == WS_STATE_HEALTHY
+    assert inbox.permits_new_entry()[0] is True
+    assert inbox.silence_probe_passes == 3
+    assert inbox.silence_probe_reconnects == 0
+
+    # The window's verdict metric is the gap count, and a passing probe leaves
+    # no gap row. Without these counters "fewer silence_timeout gaps" and "the
+    # stream was busy" look identical from outside.
+    health = build_deepcoin_ws_health(
+        session_factory=session_factory, inbox=inbox, now=NOW
+    )
+    assert health["silence_probe_total"] == 3
+    assert health["silence_probe_passes"] == 3
+    assert health["silence_probe_reconnects"] == 0
+    assert health["silence_probe_refreshes"] == 0
 
 
 def test_listen_key_rotation_is_a_planned_reconnect_without_backoff_escalation(
