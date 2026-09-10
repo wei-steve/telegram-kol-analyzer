@@ -1773,8 +1773,13 @@ def test_alias_conflict_convergence_retries_while_other_conflicts_stay_frozen(
     assert len(readiness["owned_stop_evidence_fingerprint"]) == 64
 
     # Every other conflict stays fail-closed and is not even touched.
+    # ``convergence_exact_leg_not_verified`` used to be in this list and was
+    # moved out by A-15-1: "the leg is not verified yet" is a condition that
+    # becomes true with time, so it is re-judged now. Its two directions are
+    # covered by test_exact_leg_conflict_is_rejudged_while_the_entry_leg_can_
+    # still_verify and test_exact_leg_conflict_on_a_terminal_entry_leg_is_left_
+    # untouched. The two below are unchanged, and still carry this rule.
     for reason_code in (
-        "convergence_exact_leg_not_verified",
         "convergence_partial_position_unexplained",
         "convergence_pending_alias_conflict_before_write",
     ):
@@ -9575,3 +9580,144 @@ def test_manual_bind_rolls_back_binding_and_lifecycle_when_leg_owner_conflicts(t
     assert lifecycle.execution_binding_id is None
     assert lifecycle.lifecycle_status == "pending_entry"
     assert candidate_binding is None
+
+
+def _seeded_exact_leg_conflict(session_factory, *, order_kind, leg_status):
+    """Seed one convergence frozen on ``convergence_exact_leg_not_verified``."""
+
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+    from telegram_kol_research.trigger_take_profit_convergence import (
+        create_or_get_trigger_take_profit_convergence,
+    )
+
+    binding_id = _seed_exact_backup_candidate(
+        session_factory, order_kind=order_kind, with_primary=False
+    )
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        binding.pos_id = "pos-1"
+        leg = session.query(ExecutionOrderLeg).filter_by(
+            execution_binding_id=binding_id
+        ).one()
+        convergence = create_or_get_trigger_take_profit_convergence(
+            session,
+            venue="deepcoin",
+            execution_order_leg_id=int(leg.id),
+            desired_take_profits=[{"price": "1890", "allocation_pct": "100"}],
+        )
+        session.add(PositionBackupStopOrder(
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=int(leg.id),
+            pos_id="pos-1",
+            instrument_id="ETH-USDT-SWAP",
+            side="short",
+            trigger_price="1903.8",
+            order_id="backup-1",
+            client_order_id="backup-client-1",
+            status="active",
+            request_json=json.dumps({
+                "instId": "ETH-USDT-SWAP", "posId": "pos-1",
+                "posSide": "short", "slTriggerPx": "1903.8", "slOrdPx": "-1",
+            }),
+        ))
+        convergence.status = "conflicted"
+        convergence.reason_code = "convergence_exact_leg_not_verified"
+        convergence.updated_at = datetime(2026, 8, 1, 0, 0)
+        leg.status = leg_status
+        session.commit()
+        return binding_id, int(convergence.id)
+
+
+def _readiness_snapshot(*, live_position=True):
+    from telegram_kol_research.execution_bindings import _ReconcileSnapshot
+
+    return _ReconcileSnapshot(
+        positions=[{
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "pos": "3.4", "avgPx": "1883", "mgnMode": "cross",
+            "mrgPosition": "split", "cTime": "1784512860000",
+        }] if live_position else [],
+        pending_trigger_orders=[{
+            "instId": "ETH-USDT-SWAP", "posId": "pos-1", "posSide": "short",
+            "ordId": "backup-1", "triggerOrderType": "TPSL",
+            "slTriggerPx": "1903.8", "slOrdPx": "-1", "sz": "0",
+            "cTime": "1784512861000",
+        }],
+    )
+
+
+def test_exact_leg_conflict_is_rejudged_while_the_entry_leg_can_still_verify(tmp_path):
+    """A-15-1 gate 2: "not verified yet" is a question time can answer."""
+
+    from telegram_kol_research.execution_bindings import (
+        _ready_verified_trigger_take_profit_convergences,
+    )
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+
+    session_factory = create_session_factory(tmp_path / "exact-leg-rejudge.db")
+    _, convergence_id = _seeded_exact_leg_conflict(
+        session_factory, order_kind="limit", leg_status="active"
+    )
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        _ready_verified_trigger_take_profit_convergences(
+            session,
+            legs=[leg],
+            snapshot=_readiness_snapshot(),
+            recovered_at=datetime(2026, 9, 10, 10, 0),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert (convergence.status, convergence.reason_code) == ("ready", None)
+        assert convergence.pos_id == "pos-1"
+
+
+def test_exact_leg_conflict_on_a_terminal_entry_leg_is_left_untouched(tmp_path):
+    """A-15-1 gate 2: the rows whose entry is long gone are not woken.
+
+    Not "they end up conflicted again" -- they are not written at all, which is
+    what keeps three dead rows from being rewritten every round forever.
+    """
+
+    from telegram_kol_research.execution_bindings import (
+        _ready_verified_trigger_take_profit_convergences,
+    )
+    from telegram_kol_research.models import TriggerTakeProfitConvergence
+
+    session_factory = create_session_factory(tmp_path / "exact-leg-terminal.db")
+    _, convergence_id = _seeded_exact_leg_conflict(
+        session_factory, order_kind="trigger_limit", leg_status="manually_closed"
+    )
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        before = (
+            convergence.status,
+            convergence.reason_code,
+            convergence.updated_at,
+            convergence.request_json,
+        )
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        _ready_verified_trigger_take_profit_convergences(
+            session,
+            legs=[leg],
+            snapshot=_readiness_snapshot(live_position=False),
+            recovered_at=datetime(2026, 9, 10, 10, 0),
+        )
+        session.commit()
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        assert (
+            convergence.status,
+            convergence.reason_code,
+            convergence.updated_at,
+            convergence.request_json,
+        ) == before

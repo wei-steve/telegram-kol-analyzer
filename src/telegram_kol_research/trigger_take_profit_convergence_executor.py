@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -20,6 +21,7 @@ from telegram_kol_research.deepcoin_client import (
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionAttributionAudit,
     PositionBackupStopOrder,
     PositionProtectionLeg,
     PositionProtectionLedger,
@@ -39,6 +41,9 @@ from telegram_kol_research.position_mutation_gateway import (
 )
 from telegram_kol_research.position_take_profit_orders import (
     record_take_profit_order,
+)
+from telegram_kol_research.trigger_take_profit_convergence import (
+    AUTOMATIC_ENTRY_ORDER_KINDS,
 )
 from telegram_kol_research.position_protection_legs import bind_verified_exchange_order
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -83,6 +88,136 @@ def _refusal_detail_json(reason: object) -> str | None:
     return json.dumps(
         {"reason_code": str(reason), "refusal_detail": detail}, ensure_ascii=False
     )
+
+
+logger = logging.getLogger(__name__)
+
+#: A-15-1. Positions cleared to receive the first take-profit orders ever placed
+#: for a plain limit entry. Empty on purpose: the three gates that used to stop
+#: those orders are fixed, but "the code is now correct" and "start writing to
+#: the exchange" are two decisions, and the second one is the user's. A position
+#: that is not listed here still gets its whole plan computed and then held, so
+#: what would be sent is on the record before anybody approves it.
+TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset()
+
+WOULD_PLACE_EVENT = "take_profit_would_place"
+WOULD_PLACE_ENDPOINT = "POST /deepcoin/trade/set-position-sltp"
+
+
+def _limit_entry_release_withheld(
+    session_factory, *, convergence_id: int, plan, now: datetime
+) -> dict[str, object] | None:
+    """Hold a plain limit entry's take profits, recording what would be sent.
+
+    Returns ``None`` when this convergence is not withheld -- either its entry
+    is not a plain limit entry (those paths are unchanged by A-15-1) or its
+    position has been released.
+    """
+
+    with session_factory() as session:
+        convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
+        if convergence is None:
+            return None
+        leg = session.get(ExecutionOrderLeg, convergence.execution_order_leg_id)
+        if leg is None or str(leg.order_kind or "") != "limit":
+            return None
+        pos_id = str(convergence.pos_id or "")
+        if pos_id in TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS:
+            return None
+        binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        for tier_index, payload in enumerate(plan.payloads, start=1):
+            # Logged every round on purpose: an observation window needs to see
+            # the same four lines again and again, not one line and then
+            # silence. The audit row below is the deduplicated half.
+            logger.info(
+                "%s convergence=%s pos_id=%s tier=%s trigger_price=%s size=%s "
+                "endpoint=%s position_size=%s",
+                WOULD_PLACE_EVENT,
+                convergence_id,
+                pos_id,
+                tier_index,
+                payload.get("tpTriggerPx"),
+                payload.get("sz"),
+                WOULD_PLACE_ENDPOINT,
+                plan.position_size_text,
+            )
+            _record_would_place_audit(
+                session,
+                binding=binding,
+                leg=leg,
+                pos_id=pos_id,
+                tier_index=tier_index,
+                payload=payload,
+                position_size_text=plan.position_size_text,
+                created_at=now,
+            )
+        session.commit()
+    return {
+        "convergence_id": convergence_id,
+        "status": "withheld",
+        "reason": "take_profit_limit_entry_release_withheld",
+    }
+
+
+def _record_would_place_audit(
+    session,
+    *,
+    binding,
+    leg,
+    pos_id: str,
+    tier_index: int,
+    payload: dict[str, str],
+    position_size_text: str | None,
+    created_at: datetime,
+) -> None:
+    """One audit row per tier, deduplicated on what would actually be sent."""
+
+    identity = {
+        "event_type": WOULD_PLACE_EVENT,
+        "pos_id": pos_id,
+        "tier_index": int(tier_index),
+        "trigger_price": str(payload.get("tpTriggerPx") or ""),
+        "size": str(payload.get("sz") or ""),
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            identity, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+        ).encode("utf-8")
+    ).hexdigest()
+    exists = (
+        session.query(PositionAttributionAudit.id)
+        .filter(PositionAttributionAudit.fingerprint == fingerprint)
+        .first()
+    )
+    if exists is not None:
+        return
+    session.add(
+        PositionAttributionAudit(
+            execution_binding_id=int(leg.execution_binding_id),
+            execution_order_leg_id=int(leg.id),
+            venue=str(leg.venue or "deepcoin"),
+            pos_id=pos_id,
+            event_type=WOULD_PLACE_EVENT,
+            prior_state="ready",
+            new_state="withheld",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                {
+                    **identity,
+                    "endpoint": WOULD_PLACE_ENDPOINT,
+                    "position_size": str(position_size_text or ""),
+                    "instrument_id": str(payload.get("instId") or ""),
+                    "position_side": str(payload.get("posSide") or ""),
+                    "symbol": str(getattr(binding, "symbol", "") or ""),
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            created_at=created_at,
+        )
+    )
+    session.flush()
 
 
 @dataclass(frozen=True, slots=True)
@@ -182,6 +317,11 @@ def execute_trigger_take_profit_convergence(
                     session.commit()
                     return {"convergence_id": convergence_id, "status": "submitted", "reason": None}
         return {"convergence_id": convergence_id, "status": plan.status, "reason": plan.reason_code}
+    withheld = _limit_entry_release_withheld(
+        session_factory, convergence_id=convergence_id, plan=plan, now=now
+    )
+    if withheld is not None:
+        return withheld
     with session_factory() as session:
         convergence = session.get(TriggerTakeProfitConvergence, convergence_id)
         if convergence is None or convergence.status != "ready":
@@ -486,6 +626,68 @@ def _pending_contains_order_id(
     )
 
 
+def _record_preplanned_take_profit_leg_binding(
+    session,
+    *,
+    binding,
+    leg,
+    pos_id: str,
+    bound_legs,
+) -> None:
+    """Audit the A-15-1 binding of pre-planned take-profit legs.
+
+    One row per (leg, pos_id, leg ids) so a repeated round adds nothing, and the
+    evidence carries what was bound rather than a count -- a count cannot be
+    checked against the ledger afterwards.
+    """
+
+    evidence = {
+        "reason": "preplanned_take_profit_legs_bound_by_convergence",
+        "entry_order_kind": str(leg.order_kind or ""),
+        "protection_leg_ids": [int(row.id) for row in bound_legs],
+        "planned_trigger_prices": [
+            str(row.planned_trigger_price or "") for row in bound_legs
+        ],
+    }
+    fingerprint = hashlib.sha256(
+        json.dumps(
+            {
+                "pos_id": str(pos_id),
+                "execution_order_leg_id": int(leg.id),
+                "protection_leg_ids": evidence["protection_leg_ids"],
+                "event_type": "preplanned_take_profit_legs_bound",
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    ).hexdigest()
+    exists = (
+        session.query(PositionAttributionAudit.id)
+        .filter(PositionAttributionAudit.fingerprint == fingerprint)
+        .first()
+    )
+    if exists is not None:
+        return
+    session.add(
+        PositionAttributionAudit(
+            execution_binding_id=int(binding.id),
+            execution_order_leg_id=int(leg.id),
+            venue=str(leg.venue or "deepcoin"),
+            pos_id=str(pos_id),
+            event_type="preplanned_take_profit_legs_bound",
+            prior_state="planned",
+            new_state="protection_recovery_pending",
+            fingerprint=fingerprint,
+            evidence_json=json.dumps(
+                evidence, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+            ),
+            created_at=utc_now(),
+        )
+    )
+    session.flush()
+
+
 def _prepare_plan(
     session,
     *,
@@ -503,7 +705,13 @@ def _prepare_plan(
         or binding is None
         or int(leg.execution_binding_id) != int(binding.id)
         or str(leg.purpose) != "entry"
-        or str(leg.order_kind) not in {"trigger_limit", "market"}
+        # One vocabulary, shared with the planner that created this row. It used
+        # to be a local ``{"trigger_limit", "market"}``, and when ``limit`` joined
+        # the planner's set in phase 5 (d3e423bf) this copy was not updated: the
+        # planner staged take profits for every plain limit entry and this gate
+        # refused all of them as ``convergence_exact_leg_not_verified``. Sixteen
+        # take-profit legs were planned that way and none reached the exchange.
+        or str(leg.order_kind) not in AUTOMATIC_ENTRY_ORDER_KINDS
         or str(leg.status).lower() != "active"
         or str(leg.attribution_status) != "verified"
         or not str(convergence.pos_id or "").strip()
@@ -639,6 +847,59 @@ def _prepare_plan(
                     bind_filled_position(session, target, pos_id=pos_id)
         except ValueError:
             return "convergence_protection_leg_conflict"
+    else:
+        # A-15-1 gate 3. The branch above only builds protection legs when this
+        # entry has none. A plain limit entry always has some: recovery_live_
+        # submit._create_trigger_protection_leg_plan writes one ``planned`` row
+        # per staged tier at submit time. Nothing then bound them, because the
+        # one online binder is reached only for ``trigger_limit`` entries that
+        # also carried a stop and a take profit on the entry request -- a plain
+        # limit entry carries neither condition. So the legs stayed ``planned``
+        # with an empty ``pos_id``, the matcher below (which selects by
+        # ``pos_id``) found none, and every round ended in
+        # ``convergence_protection_leg_conflict``. Measured on a copy of
+        # production before this branch existed.
+        #
+        # Binding here rather than widening the online adoption path keeps the
+        # change inside this file: the adoption path's own conditions (entry
+        # kind, and a stop and take profit on the entry request) are not
+        # touched. bind_verified_filled_position_protection re-checks that the
+        # entry leg is active, verified, and carries exactly this pos_id, and
+        # raises otherwise -- so an entry that does not own this position
+        # cannot bind its legs.
+        unbound_targets = (
+            session.query(PositionProtectionLeg)
+            .filter(PositionProtectionLeg.execution_order_leg_id == leg.id)
+            .filter(PositionProtectionLeg.role == "take_profit")
+            .filter(PositionProtectionLeg.status == "planned")
+            .filter(PositionProtectionLeg.exchange_order_id.is_(None))
+            .filter(
+                (PositionProtectionLeg.pos_id.is_(None))
+                | (PositionProtectionLeg.pos_id == "")
+            )
+            .order_by(PositionProtectionLeg.id.asc())
+            .all()
+        )
+        if unbound_targets:
+            from telegram_kol_research.position_protection_legs import (
+                bind_verified_filled_position_protection,
+            )
+
+            try:
+                bind_verified_filled_position_protection(
+                    session,
+                    execution_order_leg_id=int(leg.id),
+                    pos_id=pos_id,
+                )
+            except ValueError:
+                return "convergence_protection_leg_conflict"
+            _record_preplanned_take_profit_leg_binding(
+                session,
+                binding=binding,
+                leg=leg,
+                pos_id=pos_id,
+                bound_legs=unbound_targets,
+            )
     active_orders = (
         session.query(PositionTakeProfitOrder)
         .filter(PositionTakeProfitOrder.venue == "deepcoin")

@@ -1313,6 +1313,28 @@ def _pending_tpsl_snapshot_completeness(
     }
 
 
+#: Conflicted take-profit convergences that are re-judged every round instead
+#: of staying frozen. Earlier releases could terminalize a convergence for a
+#: full-position (``sz=0``) primary stop or for legacy TPSLs whose exact ledger
+#: owner was not consulted. ``convergence_pending_alias_conflict`` joined them
+#: once the veto that produced it was found to misread non-protection rows (see
+#: ``native_tpsl.is_protection_order_row``): those rows were frozen by a defect,
+#: not by a real conflict. ``convergence_exact_leg_not_verified`` joined in
+#: A-15-1 for a different reason -- "the leg is not verified yet" is a condition
+#: that becomes true with time, so freezing on it permanently answers a
+#: temporary question with a permanent no. Every other conflict remains
+#: fail-closed.
+REJUDGED_CONVERGENCE_CONFLICTS = frozenset(
+    {
+        "convergence_verified_stop_missing",
+        "convergence_unowned_take_profit_present",
+        "convergence_exchange_preflight_unavailable",
+        "convergence_pending_alias_conflict",
+        "convergence_exact_leg_not_verified",
+    }
+)
+
+
 def _ready_verified_trigger_take_profit_convergences(
     session,
     *,
@@ -1350,25 +1372,29 @@ def _ready_verified_trigger_take_profit_convergences(
         .all()
     )
     for row in rows:
-        # Earlier releases could terminalize a convergence for a full-position
-        # (``sz=0``) primary stop or for legacy TPSLs whose exact ledger owner
-        # was not consulted. ``convergence_pending_alias_conflict`` joined them
-        # once the veto that produced it was found to misread non-protection
-        # rows (see ``native_tpsl.is_protection_order_row``): those rows were
-        # frozen by a defect, not by a real conflict, so the position they
-        # belong to still has no laddered take profit. All three are re-verified
-        # below against the live position and the exact owned stop evidence;
-        # every other conflict, including
-        # ``convergence_exact_leg_not_verified``, remains fail-closed.
-        if str(row.status) == "conflicted" and str(row.reason_code) not in {
-            "convergence_verified_stop_missing",
-            "convergence_unowned_take_profit_present",
-            "convergence_exchange_preflight_unavailable",
-            "convergence_pending_alias_conflict",
-        }:
+        rejudged_reason = (
+            str(row.reason_code) if str(row.status) == "conflicted" else None
+        )
+        if (
+            rejudged_reason is not None
+            and rejudged_reason not in REJUDGED_CONVERGENCE_CONFLICTS
+        ):
             continue
         leg = next((item for item in legs if int(item.id) == int(row.execution_order_leg_id)), None)
         if leg is None or _trigger_leg_child_fill_incomplete(leg, snapshot=snapshot):
+            continue
+        # A-15-1 gate 2, second half. ``convergence_exact_leg_not_verified`` is
+        # re-judged only while the entry leg can still become verified. Lifting
+        # the freeze unconditionally would also wake the rows whose entry leg is
+        # long terminal (three of them, from 2026-07-24 and 2026-09-06): their
+        # position is gone, so the live-position branch below would drop them
+        # into ``waiting_backup_stop`` and rewrite that row every round,
+        # forever. Nothing is gained by that and a row written every minute
+        # reads like activity. They stay exactly as they are, untouched.
+        if (
+            rejudged_reason == "convergence_exact_leg_not_verified"
+            and str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES
+        ):
             continue
         binding = session.get(ExecutionBinding, row.execution_binding_id)
         inst_id = f"{str(binding.symbol).upper()}-USDT-SWAP" if binding is not None else ""

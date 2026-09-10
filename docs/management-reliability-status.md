@@ -562,3 +562,81 @@ user_decisions_2026_09_07:
   **B 线替本步测的一条**：`position_mutation_intents` 全库自 6f 首笔以来仍只有 `id=664` 一行——**A-14 的部署零交易所写入**（由 B 线测得，本步引用）。
   **推迟 B 线第二笔 4 分钟的判断，连门槛一起记**：其第二笔部署会重启三服务、把本窗清零。它倾向"现在就上"（`81934cac` 对 A-14 代码路径零改动，窗口内容不受影响、只是计时归零），**理由成立**；但本步已跑到第 11 分钟，**那 4 分钟买到的不是计时而是归因**——本窗那三个观测量正是保护与归属路径，恰是 6f 会碰的地方，一旦异动就无法归给谁。**门槛写下来：剩余时间短于归因价值就等，长于就让路**（若还在第 2 分钟，应选"现在就上"）。
   **由 B 线一条更正引出的自查：本步之前的窗口判据里有一半是恒等式。** 它更正"reconcile 约 60 秒一轮"（此前说 49 分钟，那个数是从按 fingerprint 去重的事故表推的，读到的其实是"内容变化的间隔"）。对照本窗：**15 分钟 = 15 轮，严丝合缝**。由此发现自 A-10b 沿用至今的一个多余设计——**轮次由固定 60 秒定时触发，所以 `rounds == elapsed_minutes` 是恒等式，不携带信息**，它只能说明定时器没死，而 `worker_http=200` 已经说了。**而本程序从 A-10d 起一直把"`rounds` 在涨"当作成对观测量的一半来读**：`guard_skips=0` 配 `rounds=17` 被当成"轮次在跑而守卫没误拒"。**成对里有一半是恒等式，就等于没有成对。** 这与 B 线"两例其实被上一层挡住"同源：**以为在读两个独立的量，其实一个是另一个的时间坐标。** 下一步起把分母换成能失败的量（例如"本轮实际检查过的 binding 数"）而不是墙上的钟。
+
+- step-15-1 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **入场类型词表归一 + 按新形状扫描 + 首次写入的只读推演**（分支 `mgmt/step-15-1-entry-kind-vocabulary`，**先做代码不部署**）。按 A-15-0 的裁定执行三件事。
+  **(1) 506 与计划器共用一个词表。** `trigger_take_profit_convergence_executor.py:506` 原来是本地字面量 `{"trigger_limit", "market"}`，现在直接用计划器的 `AUTOMATIC_ENTRY_ORDER_KINDS`（单一来源）。**那个常量自己的注释就写着本意**——"``limit`` joined the set in phase 5 … A staged take profit belongs to the entry, not to the endpoint that placed it"——**执行器那份副本没收到这句话**。
+  **三条用例，三次变异，各咬住一条**（逐条实测，不是推断）：
+  | 变异 | 转红的用例 |
+  |---|---|
+  | 执行器改回本地字面量（**不含** `limit`） | `..._plans_every_entry_kind_the_planner_stages[limit]` |
+  | 执行器内联一个**含** `limit` 的字面量（词表相等但不再单一来源） | `..._reads_the_shared_vocabulary_rather_than_a_local_copy` |
+  | 从共享常量里删掉 `limit` | 上面两条 + `..._share_one_entry_kind_vocabulary` |
+  **参数化故意不读被测常量**：`EXPECTED_AUTOMATIC_ENTRY_KINDS` 是写死的三个字面量。**若参数化改为遍历那个常量，删掉 `limit` 会让用例悄悄少一个而不是转红**——这正是 B 线刚测出的"夹具替实现背书"的同一个坑，只不过换成了参数化。
+  **并且把那条用例的 docstring 改成它实际担保的话**：它只抓"内联字面量且仍收 `limit`"；内联字面量而丢掉 `limit` 是另一条用例抓的。**两条合起来才覆盖两个方向**——这句是实测三次之后写的，不是设计时的说法。
+  **(2) 按"入场类型词表"扫描全部 `order_kind` 集合判定（30 处），清单如下，除 506 外本步不改。**
+  | 位置 | 词表 | 与计划器一致？ |
+  |---|---|---|
+  | `trigger_take_profit_convergence` 55/91 | `AUTOMATIC_ENTRY_ORDER_KINDS` | 基准 |
+  | `trigger_take_profit_convergence_executor` **506** | 曾为 `{trigger_limit, market}` | **本步改为共用** |
+  | `naked_fill_stop_net` **192 / 911** | `== "market"` | **不一致，且是清单里最值得先看的一条**——它是"归属未解析的普通入场腿"的裸成交止损网，而限价入场在阶段 5 之后**同样是普通单**（`REGULAR_ORDER_LEG_KINDS = {market, limit}` 已经这么承认了），却拿不到这张网 |
+  | `strategy_management_planner` **2869** | `== "trigger_limit"` | 不一致：限价入场的止损救援不覆盖 |
+  | `execution_bindings` **1491 / 1514** | `== "trigger_limit"` **且**要求下单时 TP∧SL 同时带 | 不一致，**并且是 (3) 里第三道门**（见下） |
+  | `execution_bindings` 2921 | `== "trigger_limit"` | 不一致：保护暴露计数不含限价入场 |
+  | `execution_bindings` 2150、`entry_protection_ledger_repair` 407/1556/1786/2289/2839 | `trigger_limit` | **一致（自洽）**：trigger 保护意图本来就只为 `trigger_limit` 建（2839 是唯一来源） |
+  | `manual_pending_entry_reconciliation` 609/704、`entry_assembly_fingerprint_repair` 1786 | `trigger_limit` | **一致**：讲的是母触发单本身 |
+  | `trigger_backup_stop_executor` 326/661、`backup_stop_repair` 98 | 仅排除 `manual_bind` | **一致（收 `limit`）**——这就是止损挂得上而止盈挂不上的原因 |
+  | `open_order_action_guard` 51 | `{market, limit}`（有注释说明为阶段 5 预留） | **一致** |
+  | `strategy_thread_candidates` 208 | `{market, limit, regular, trigger, trigger_limit}` | **一致（最宽）** |
+  | `entry_revision_executor` 154/1001 | `"trigger" in kind or kind == "limit"` | **一致（显式收 `limit`）** |
+  | `position_attribution` 254、`deepcoin_ws_silence_probe` 222 | 单一 kind 的专门分支 | 一致 |
+  | `recovery_live_submit` 2145/2483/2726 | 按 kind 分派 | **B 线的文件，已抄送请其自核** |
+  **(3) 只读推演：把它跑出来，而不是算出来——第一次跑就推翻了我自己的结论。**
+  我原本按算术给出"7 + 8 = 15"。为了给用户出示，改用**生产库副本 + 打了本步这一行的源码副本 + 只读交易所**跑真实计划器。**第一次结果不是 `ready`，是 `conflicted / convergence_protection_leg_conflict`。**
+  由此查明**三道门，而不是一道**：
+  1. **506 词表**——本步已修；
+  2. **`convergence_exact_leg_not_verified` 被有意设为不可复议**（`execution_bindings` 1362-1369 的白名单，注释原文 "every other conflict … remains fail-closed"），所以 244/245 两行**修好 506 也不会被重新拿出来算**；
+  3. **四条止盈腿停在 `planned`、没盖仓位号**。执行器自建腿的分支有 `if existing_protection_targets == 0`，而这四条腿**已经存在**（`recovery_live_submit._create_trigger_protection_leg_plan` 在下单时就建好了），于是分支跳过；随后匹配器按 `pos_id` 找腿找到 0 条，判 `convergence_protection_leg_conflict`。能给它们盖仓位号的 `bind_verified_filled_position_protection` 的在线调用方要求 `trigger_limit` **且** TP∧SL 同时带——**限价入场两条都不满足**。
+  **所以"修好 506 就会挂出止盈"是错的，我在 A-15-0 的结论里没有说到这一层。** A-15-0 找对了那道门，但把它当成了唯一一道。**更正记在这里**：A-15-0 的成因判断（词表分叉、日期、历史 16/0）不变，"卡在哪一道"要改成"第一道，后面还有两道"。
+  **把第 2、3 道也在副本上打开之后，计划器给出 `ready`**，四张单逐字如下（`sz` 之和 = 15 = 全仓，待撤单列表为空）：
+  | 仓位 | 触发价 | 张数 |
+  |---|---|---|
+  | 1001125216121996 | 79800 / 81900 | 7 / 8 |
+  | 1001125216153672 | 80000 / 81900 | 7 / 8 |
+  余数给**最后一档**（更远那一档），所以是 7+8 而不是 8+7——**离场比等分更慢一点**。端点 `POST /deepcoin/trade/set-position-sltp`，一档一单，每单前重查仓位与挂单。生产 `position_management_liveness_v2_mode = "live"`，所以这条路真会写。
+  **明细已写成给用户看的一页**：`docs/limit-entry-take-profit-first-write.md`，并在其中写明**今天批准也发不出单（0 张）**，那四张是"三道门全开之后"的样子。**不把推演结果说成即将发生的事**。
+  **副本纪律**：`quick_check` ok，用完即删，事后核对生产库两行仍 `conflicted`、四条腿仍 `planned`。凭据取自 worker 的 `/proc/<MainPID>/environ`，`env_file_paths=[]` 显式传入（**不再靠"那个文件恰好不存在"来隔离**，这条legacy 项顺手清掉了），未落盘未打印。
+  **本步的一般教训**：**"我算得出来"不等于"它会这么跑"。** 算术给了我一个自洽但错误的答案，副本上跑一次真实函数**立刻**给出了 `convergence_protection_leg_conflict`——那是我读了一整天代码都没读出来的第三道门。**能跑就别算**，尤其是在准备把数字拿给人批准的时候。
+
+- step-15-1 续（同日，同分支）：**指挥会话把范围扩到三道门 + 释放常量 + 影子部署**，以下是三道门全部落地后的记录。**语义裁定**：普通限价入场**应当**带止盈（所以修 executor 一侧，而不是让 planner 不生成）。
+  **第 2 道门：不做一次性数据复位，把 `convergence_exact_leg_not_verified` 加进复议集合**（新常量 `REJUDGED_CONVERGENCE_CONFLICTS`）。裁定理由记下来：**"腿还没 verified" 是一个会随时间变真的条件，用永久 fail-closed 去回答一个临时问题，是拿永久的"不"回答暂时的"还没"。**
+  **但我没有照字面只加一行——加一行会让三行死掉的记录每轮被重写一次，永远。** 逐条追了那五行之后加了第二个条件：**入场腿已是终态就不解冻**。
+  | 收敛行 | 入场腿 | 腿状态 | 预期去向 |
+  |---|---|---|---|
+  | 21 (leg 360, `trigger_limit`) | 2026-07-24 | `manually_closed` | **完全不动**（终态腿跳过，零写入） |
+  | 22 (leg 361, `trigger_limit`) | 2026-07-24 | `manually_closed` | **完全不动** |
+  | 228 (leg 585, `market`) | 2026-09-06 | `manually_closed` | **完全不动** |
+  | 244 (leg 601, `limit`) | 2026-09-10 | `active` / `verified` | 复议 → `waiting_backup_stop` → `ready` → 算完计划 → **扣住** |
+  | 245 (leg 602, `limit`) | 2026-09-10 | `active` / `verified` | 同上 |
+  **为什么不是"再次 conflicted"**：那三行的仓位早已不在，复议后会掉进活仓位分支的 else，被写成 `waiting_backup_stop` 并**每轮重写 `updated_at`**。零交易所写入不假，但**一行每分钟被写一次会被读成"有事在发生"**——本程序刚在 step-14 吃过"把恒等式当观测量"的亏，不该再造一个。**所以裁定的意图（无写入）我实现了，字面（再次 conflicted/expired）我没有照抄，理由写在这里。**
+  **第 3 道门：执行器绑定预建但未绑定的止盈腿。** 原代码的自建分支是 `if existing_protection_targets == 0`，而限价入场**总是**已经有腿（`recovery_live_submit._create_trigger_protection_leg_plan` 在下单时按档建好 `planned` 行）。新增 `else` 分支：若存在 `status='planned'`、`pos_id` 空、无 `exchange_order_id` 的止盈腿，调 `bind_verified_filled_position_protection` 绑定，并写一行 `position_attribution_audits`（`event_type=preplanned_take_profit_legs_bound`，证据里带腿 id 与各档价，**带的是绑了什么而不是绑了几条**——数目事后无法与账本对账）。**按裁定不动在线采纳路的 TP∧SL 合取**：改动全部留在本文件内，`bind_verified_filled_position_protection` 自己会复核"入场腿 active + verified + 恰好持有这个 pos_id"，不满足就抛。
+  **释放常量**：`TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS = frozenset()`，闸门放在**整套计划算完之后、第一次写交易所之前**。未列入者每轮**算完 → 记 `take_profit_would_place` → 停手**，返回 `withheld`。审计行按"仓位+档位+价+量"去重（4 行封顶），**日志行每轮都打**——观察窗要看到同样的四行反复出现，而不是一行然后沉默。
+  **五次变异，五条用例，各咬住一条**（逐条实测）：
+  | 变异 | 转红 |
+  |---|---|
+  | 复议集合里删掉 `exact_leg_not_verified` | `..._rejudged_while_the_entry_leg_can_still_verify` |
+  | 去掉"终态腿不解冻"（无条件解冻） | `..._on_a_terminal_entry_leg_is_left_untouched` |
+  | 删掉 gate-3 的 `else` 分支 | `..._preplanned_unbound_..._bound_instead_of_conflicting`（并连带两条） |
+  | 拿掉扣住的调用（修完直接写交易所） | `..._withheld_until_the_position_is_released` |
+  | 扣住不再看 `order_kind`（把 `trigger_limit` 也扣住） | `..._a_trigger_limit_entry_is_never_withheld_...` |
+  **影子窗判据，起窗前写在这里**（照 step-14 那条教训，分母取**能失败的量**，不取墙上的钟）：
+  1. `position_attribution_audits` 里 `take_profit_would_place` **恰好 4 行**，`(pos_id, 价, 量)` 与明细逐字一致（79800/7、81900/8、80000/7、81900/8）；
+  2. 每轮 journal 里 `take_profit_would_place` **4 条**，且四条的价与量在整个窗口内**不变**；
+  3. **分母**：每轮"实际被复议的收敛行数"应为 **2**（244/245），不是 `rounds`——**这个数会失败**：若第 2 道门没生效它是 0，若终态跳过失灵它是 5；
+  4. 交易所上 BTC-USDT-SWAP 的止盈挂单数**全程为 0**，`position_take_profit_orders` 新增行为 **0**；
+  5. 腿 945/946/949/950 变为 `pos_id` 已盖、`status=protection_recovery_pending`、`exchange_order_id` 仍空；`preplanned_take_profit_legs_bound` 审计 **2 行**（每条入场腿一行）；
+  6. 收敛行 21/22/228 的 `status`/`reason_code`/`updated_at` **全程一字不变**。
+  **本步不请示用户**：明细 `docs/limit-entry-take-profit-first-write.md` 已按释放名单的设计改写（第 5 节现在说的是"算完再扣住"，不再是"今天批准也发不出单"），影子窗收窗后由指挥会话拿去请示。
+  **`naked_fill_stop_net:192` 的 `== "market"` 按裁定转入 B 线阶段 6 清单**，不在本步。
+  **两条口径分歧记在这里，因为它决定了扫描能不能扫到第三道门**：B 线按"具名集合常量"扫，全仓 6 处，结论"506 是唯一漏掉 `limit` 的"；我按"把单值 `==` 也算进去"扫，30 处。**第三道门（`execution_bindings` 1491/1514 的 `order_kind == "trigger_limit"`）只在后一个口径里出现。** 两个口径都要：前者抓"集合忘了加成员"，后者抓"根本没写成集合"。已写进 `ARCHITECTURE` 第 6 节。
+  **全量第一次不是绿的，那条红用例值得单独记**：`test_alias_conflict_convergence_retries_while_other_conflicts_stay_frozen` 的"其余冲突一律冻死"清单里**明确列着 `convergence_exact_leg_not_verified`**——它把旧契约写下来了，而本步正是要改这条契约。处置是**把它从清单里移出并注明去向**（指向本步那两条新用例），清单里另两个 reason_code 原样保留，**那条一般规则仍由它们担保**。
+  **这条红是这次最好的一个信号**：它说明"其余一律 fail-closed"不是一句注释里的说法，**是有用例在守的**。改契约时它准时红了——**如果它没红，我才该担心**。
