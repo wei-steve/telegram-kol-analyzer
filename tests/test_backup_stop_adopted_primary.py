@@ -32,17 +32,20 @@ INST = "BTC-USDT-SWAP"
 
 
 class _Client:
-    def __init__(self):
+    def __init__(self, pos_id="pos-1"):
         self.writes = []
+        self.pos_id = pos_id
 
     def list_positions(self, *, inst_id=None):
-        return [{"instId": INST, "posId": "pos-1", "posSide": "long", "pos": "15",
-                 "avgPx": "76000", "mgnMode": "cross", "mrgPosition": "split"}]
+        return [{"instId": INST, "posId": self.pos_id, "posSide": "long", "pos": "15",
+                 "avgPx": "77000", "liqPx": "68116.6", "lever": "125",
+                 "mgnMode": "cross", "mrgPosition": "split"}]
 
     def read_trigger_orders_pending(self, *, inst_id):
         return {"code": "0", "data": [{
             "ordId": "adopted-stop", "instId": INST, "posSide": "long",
-            "triggerOrderType": "TPSL", "slTriggerPrice": "75700", "sz": "15",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "75700",
+            "slTriggerPx": "75700", "posId": self.pos_id, "sz": "15",
         }]}
 
     def list_trigger_orders_pending(self, *, inst_id):
@@ -53,7 +56,7 @@ class _Client:
         raise AssertionError("an adopted primary must not trigger a backup stop order")
 
 
-def _seed(tmp_path, *, evidence_source):
+def _seed(tmp_path, *, evidence_source, pos_id="pos-1"):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
         session_factory,
@@ -74,7 +77,7 @@ def _seed(tmp_path, *, evidence_source):
         leg.attribution_evidence_json = '{"policy_version":2}'
         upsert_protection_ledger_row(
             session, venue="deepcoin", execution_binding_id=binding_id,
-            execution_order_leg_id=leg_id, strategy_instance_id=None, pos_id="pos-1",
+            execution_order_leg_id=leg_id, strategy_instance_id=None, pos_id=pos_id,
             instrument_id=INST, side="long", order_id="adopted-stop",
             purpose="stop_loss", trigger_price="75700", size_text="15",
             status="verified", evidence_source=evidence_source, evidence={}, seen_at=NOW,
@@ -102,7 +105,16 @@ def test_an_adopted_primary_stop_yields_a_recorded_plan_and_no_order(tmp_path):
     assert plan.reason_code == "primary_stop_adopted_from_exchange"
     assert plan.primary_order_id == "adopted-stop"
     assert plan.primary_stop == "75700"
-    assert plan.payload is None
+    # Phase 6f: the held plan carries what it would have sent. A record saying
+    # only "held" cannot be approved by anyone.
+    assert plan.backup_stop == "75548.6"
+    assert plan.payload["slTriggerPx"] == "75548.6"
+    assert plan.payload["posSide"] == "long"
+    # The payload carries no ``sz``: a position-bound TPSL with ``slOrdPx=-1``
+    # closes whatever the position holds. The size is validated on the way in
+    # and deliberately not sent, so this stop follows the position rather than
+    # pinning a quantity.
+    assert "sz" not in plan.payload
     assert client.writes == []
 
 
@@ -121,6 +133,34 @@ def test_a_normally_recorded_primary_is_not_held_back(tmp_path):
     with session_factory() as session:
         plan = _plan_submission(
             session, binding_id=binding_id, leg_id=leg_id, pos_id="pos-1",
+            client=client, contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert plan.status != "shadow_ready_adopted_primary"
+
+
+def test_a_released_position_is_not_held(tmp_path):
+    """The release is per position id, and it is the only thing that lifts the hold.
+
+    Without this the hold could be made unconditional -- every adopted primary
+    held forever -- and the test above would still pass while phase 6f did
+    nothing at all.
+    """
+
+    from telegram_kol_research.trigger_backup_stop_executor import (
+        ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
+    )
+
+    released = sorted(ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS)[0]
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
+    )
+    client = _Client(pos_id=released)
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id=released,
             client=client, contract_spec_provider=_spec_provider(),
             backup_stop_buffer_bps=20.0, submitted_at=NOW,
         )

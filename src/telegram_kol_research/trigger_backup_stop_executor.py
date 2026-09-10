@@ -15,6 +15,17 @@ from telegram_kol_research.execution_bindings import build_client_order_id
 from telegram_kol_research.protection_authority import (
     ADOPTION_EVIDENCE_SOURCE as ADOPTED_EVIDENCE_SOURCE,
 )
+
+#: Phase 6f. Positions whose adopted primary stop may actually receive a backup
+#: stop on the exchange. The user approved this on 2026-09-10 for one position
+#: first, with the second to follow only after the first order is checked
+#: field by field against the venue.
+#:
+#: A constant rather than a setting, on purpose: releasing the second position
+#: then requires a code change, a full suite and a deploy, which is exactly the
+#: deliberate pause the approval asked for. A runtime flag would let the second
+#: one go out by editing a row.
+ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset({"1001125216121996"})
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
@@ -59,6 +70,9 @@ class BackupStopPlan:
     pos_id: str | None = None
     primary_order_id: str | None = None
     primary_stop: str | None = None
+    #: Phase 6f: what a held plan *would* have sent, so the record is something
+    #: a person can agree to rather than a bare "held".
+    backup_stop: str | None = None
     payload: dict[str, str] | None = None
     position: dict[str, Any] | None = None
     open_positions: tuple[dict[str, Any], ...] = ()
@@ -376,18 +390,6 @@ def _plan_submission(
     primary_stop = _primary_stop_price(primary)
     if primary_stop is None:
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_not_verified")
-    if str(getattr(primary, "evidence_source", "") or "") == ADOPTED_EVIDENCE_SOURCE:
-        # Phase 6e/6f. This primary stop reached the ledger by adoption -- the
-        # exchange holds it, nothing here submitted it, and until 6e no local
-        # record named it at all. Adoption is a ledger write; placing a backup
-        # stop beside it would be an *exchange* write on a live position that
-        # nobody has agreed to yet, and it would happen in the same reconcile
-        # round as the adoption, with no person in between. So the plan is
-        # rendered and recorded and not sent. Phase 6f is where that changes,
-        # and it carries the user's approval.
-        return _shadow_ready_plan(
-            binding_id, leg_id, pos_id, primary=primary, primary_stop=primary_stop
-        )
     primary_order_id = str(primary.order_id or "").strip() if primary is not None else ""
     if not primary_order_id:
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_identifier_unavailable")
@@ -490,6 +492,28 @@ def _plan_submission(
         )
     except BackupStopError:
         return _blocked_plan(binding_id, leg_id, pos_id, "backup_stop_unsafe")
+    if str(getattr(primary, "evidence_source", "") or "") == ADOPTED_EVIDENCE_SOURCE:
+        # Phase 6e/6f. This primary stop reached the ledger by adoption: the
+        # exchange holds it and nothing here submitted it. Placing a backup stop
+        # beside it is an exchange write on a live position, and it would
+        # otherwise happen in the same reconcile round as the adoption with no
+        # person in between -- so it is held unless this exact position is in
+        # the released set below.
+        #
+        # The plan is computed first and held second, deliberately. Holding
+        # before the computation is what the first version did, and it produced
+        # a record saying only "held" -- no price, no size, nothing an operator
+        # or an approval request could be built on.
+        if str(pos_id) not in ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS:
+            return _shadow_ready_plan(
+                binding_id,
+                leg_id,
+                pos_id,
+                primary=primary,
+                primary_stop=primary_stop,
+                backup_stop=str(backup_price),
+                payload=payload,
+            )
     try:
         from telegram_kol_research.position_protection_legs import (
             materialize_verified_position_protection,
@@ -603,8 +627,15 @@ def _shadow_ready_plan(
     *,
     primary,
     primary_stop: str,
+    backup_stop: str | None = None,
+    payload: dict[str, str] | None = None,
 ) -> BackupStopPlan:
-    """A plan that is computed, recorded and deliberately not sent."""
+    """A plan that is computed in full, recorded in full, and not sent.
+
+    It carries the price and size it *would* have sent, because that is the
+    only form in which a person can agree to it -- an approval request built on
+    "something would have been placed" is not an approval of anything.
+    """
 
     return BackupStopPlan(
         status="shadow_ready_adopted_primary",
@@ -614,6 +645,8 @@ def _shadow_ready_plan(
         pos_id=pos_id,
         primary_order_id=str(getattr(primary, "order_id", "") or ""),
         primary_stop=str(primary_stop),
+        backup_stop=(None if backup_stop is None else str(backup_stop)),
+        payload=dict(payload) if payload else None,
     )
 
 
@@ -637,6 +670,24 @@ def _record_incident(
     if plan.binding_id is None or plan.leg_id is None or not plan.pos_id:
         return
     evidence = {"reason_code": str(plan.reason_code or incident_type)}
+    # Phase 6f. A held plan has to record what it would have sent. The first
+    # version recorded only the reason code, and the approval request for 6f had
+    # to be reconstructed by hand from the code and a live position read --
+    # which is the same work this row exists to save.
+    if plan.primary_stop:
+        evidence["primary_stop"] = str(plan.primary_stop)
+    if plan.primary_order_id:
+        evidence["primary_order_id"] = str(plan.primary_order_id)
+    if plan.backup_stop:
+        evidence["proposed_backup_stop"] = str(plan.backup_stop)
+    if plan.payload:
+        # No ``sz`` is sent: a position-bound TPSL with ``slOrdPx=-1`` covers
+        # whatever the position holds. Recording it as "whole_position" rather
+        # than echoing a quantity keeps the row honest about what would reach
+        # the venue.
+        evidence["proposed_size"] = "whole_position"
+        evidence["proposed_pos_side"] = str(plan.payload.get("posSide") or "")
+        evidence["proposed_endpoint"] = "set_position_sltp"
     fingerprint = hashlib.sha256(json.dumps({
         "venue": "deepcoin", "binding_id": plan.binding_id, "leg_id": plan.leg_id,
         "pos_id": plan.pos_id, "incident_type": incident_type, "evidence": evidence,
