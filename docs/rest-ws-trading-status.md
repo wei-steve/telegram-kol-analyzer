@@ -1036,6 +1036,40 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6h-shadow-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话确认):
+  影子上线（`break_even_shadow` 每轮计算 + 执行器 650/795 读法修正 + 释放常量默认空集）。
+  **收窗判据**：
+  (1) 每轮 `break_even_shadow.legacy_would_refuse == stops_examined`——
+      旧判据在同一批行上仍然全拒，证明缺陷真实存在且影子读的是同一批行；
+  (2) 每轮 `stops_resolved == stops_examined`，两处 `read_failures == 0`；
+  (3) `would_cancel_order_ids` **不含任何备份 ordId**（`1001125219289222` / `1001125219582177`）；
+  (4) 全窗 `position_mutation_intents` **零新增**；`break_even_would_replace` 事件若出现，
+      其 `released` 必须全为 False；
+  (5) 每轮 `break_even_shadow.rows` 对两个仓位**各恰好 1 行**，且该行
+      `action == "set_break_even"`、`target_stop_price == "77000"`（= `avgPx`）、
+      `would_cancel_order_ids` 恰为该仓位主止损（`…121995` / `…153671`）；
+  (6) 30 分钟连续窗、`head_ok`/`units_ok` 全程 1、零重置。
+  **消息数不作为判据**：本步的观测量每轮由 reconcile 产生，不依赖消息流
+  （6f 收窗时实测该时段到达率约 1.3 条/小时，见 `phase-6f-completed`）。
+  **(1) 是本窗唯一能失败的成对观测**：一侧是旧判据、一侧是新读法，两者读同一批行；
+  若两侧同时为 0，说明根本没读到止损，而不是"一致"。
+  **待观测项（不在本窗判据内，下一次真实 convergence 发生时核对）**：
+  执行器写出的 `break_even_would_replace` 事件三项——每个被扣仓位恰 1 条、
+  `target_stop_price` 为该仓位 `avgPx`、`would_cancel_order_ids` 恰为其主止损 ordId。
+  **为什么不放进本窗**：该事件由执行器在被扣住时写，而执行器只在存在 convergence 批次时运行；
+  convergence 由 `_plan_proven_tp1_fills` 生成，**前提是 TP1 已被证明成交**。
+  生产 `strategy_break_even_convergences` 全表仅 2 行、皆 2026-08-03、之后再无。
+  所以 30 分钟窗内该事件的期望值是 **0 条**，写成判据只会逼出"事后改判据"。
+- phase-6h-open-question-no-take-profits (2026-09-10, 会话 local_4a6676b0, **观测，未定性；已交 A 线只读查**):
+  查判据 (6) 可测量性时读到：`1001125216121996` 与 `1001125216153672`
+  **在交易所上一张止盈都没有，`position_protection_ledger` 里也一行 `take_profit` 都没有**，
+  而下单计划有四档（腿 945 `79800.0`、946 `81900.0`、949 `80000.0`、950 `81900.0`），
+  四条全是 `status=planned`、`pos_id` 空、`exchange_order_id` 空；
+  仓位行 `tpTriggerPx=""`，交易所 pending 6 张全是 TPSL 止损。
+  **我没有定性**：止盈是否本来就等某个条件才挂、是否由管理路径在别的时机挂、
+  是否与"限价入场自带止损"的迁移形态有关——**一条都没验证**，按规矩作为观测上报而非因果。
+  与 6h 相关处：**没有止盈就不会有 TP1 成交，也就不会有 convergence**，
+  所以 6h 修好的那条执行器路径在这两个仓位当前状态下不会被触发（不影响影子窗）。
 - tooling-git-checkout-granularity (2026-09-10, 会话 local_4a6676b0 自查):
   我用一条过于贪婪的正则改测试夹具改坏了，想回退那一次编辑，用了
   `git checkout -- tests/test_break_even_convergence_executor.py`——
