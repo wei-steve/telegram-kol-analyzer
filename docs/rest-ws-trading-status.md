@@ -885,6 +885,28 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **作废前那 27 分钟仍有参考价值但不作判据**：2 次探活全通过、0 个 silence_timeout，基线是 3 个/30 分钟。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
+- phase-6a-suite-environment (2026-09-10, 会话 local_4a6676b0, 指挥会话质询后查明): 我先前报的"全量 15 failed，与基线 da1add77 逐条相同"，
+  **事实无误但框定错了**——那从来不是基线的性质，是**我的工作树里没有 `.venv`**。
+  `tests/test_server_update_scripts.py` 与 `tests/test_minimal_server_updater.py` 把
+  `PLANNER_PYTHON=ROOT/.venv/bin/python` 传给被测 shell 脚本，`ROOT` 是测试文件所在的仓库根；
+  主检出有 `.venv`、工作树没有，脚本一律 `exit 2 "Planner Python is unavailable."`。
+  工作树内建 `.venv -> ../../.venv` 符号链接（`.gitignore` 已覆盖，不提交）后**全量 8257 passed / 4 skipped / 0 failed**。
+  教训与本文件多处同源：**"与基线相同"不是解释，只是把两个都没查的现象并排放着**；
+  差异出现时要问"我和对方的命令行与环境差在哪"，而不是先假定是代码。
+- phase-6a-pending-entry-stop-lookalike (2026-09-10, 会话 local_4a6676b0 只读查明，**推翻本会话先前的归因**):
+  6a 影子窗口里 26 次 `chain_frozen` 全部归因于仓位 `1001125178552543`，我先前报成"那个 unmanaged 仓位的两张无主挂单"。
+  **真实成因不是那个仓位，而是一类同形**：`1001125208806869`（sz 6）与 `1001125208807099`（sz 14）
+  是**我们自己两张仍在挂着的限价入场单自带的止损**（binding 347 的腿 597/598，request
+  `sz 6.0/14.0`、`slTriggerPx 81000.0`、同 instId/posSide，落库 02:41:16.95Z / 02:41:18.61Z；
+  cTime 02:41:17Z / 02:41:18Z）。止损随入场单附带写入（ARCHITECTURE 4.7），**不走 set-position-sltp**，
+  所以 `position_mutation_intents` / `execution_events` / 保护账本里一行都没有——这不是异常，是那条路径的正常形状。
+  止损 ordId 恰为入场 ordId 减一，**记录但不采信**（硬性禁止第 1 条：id 相邻是分配模式不是外键）。
+  WS 收件箱两帧俱在、`trade_unit_id="default"`（仓位尚未存在），02:41 前后最近的缺口是 02:33:01–09 与 02:51:18–28，**都不覆盖**。
+  该仓位只有 3 张，而这两张止损是 6 和 14，本来就不可能是它的。旧两张止损（83000 sz 3 / 83166 sz 0）仍在挂单里。
+  **结论**：一张挂在"尚未成交的限价入场单"上的止损，与"某仓位的无主止损"在 `trigger-orders-pending` 里完全同形
+  （`TPSL` + 无 posId + `TU=default`），于是保护链会冻结**任何与在挂限价入场单同 instId+posSide 的仓位**。
+  旧匹配器今天有同一个盲区（`global_unowned_order_present`），所以这是复现既有缺陷而非新引入，
+  但排除判据待指挥会话裁定后补。
 - phase-6a-shadow-window (2026-09-10, 会话 local_4a6676b0, **6a 影子部署已完成并收窗**):
   分支 `rest-ws/phase-6-protection-authority`，提交 **`75652eec1ce21c9646b434b4ab69df8a3d915651`**，
   2026-09-10T11:22Z 经 `tg-deploy` 上线；**回滚参考 `4953490b4d8414b449c790fc0784e4bac83f40b9`**（部署前生产 HEAD）。
