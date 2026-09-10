@@ -727,3 +727,229 @@ def test_the_two_clocks_are_recorded_beside_the_row_stamp(tmp_path):
     assert after["wall_clock_at"] == read_at.isoformat()
     # The row's own stamp is still the round's, deliberately unchanged.
     assert str(events[0].created_at) == str(round_opened_at)
+
+
+# ---------------------------------------------------------------------------
+# A-10d, second finding: the alarm could never fire
+#
+# A-10b's whole point was that writing off a bound position stops being
+# silent. The alert carried pos_id, which was not in the closed summary
+# vocabulary, so runtime_incidents refused both the detailed and the minimal
+# summary and produced no row -- and the refusal is logged, not raised, so the
+# sweep looked entirely healthy. Three real write-offs on 2026-09-10 went
+# unannounced. Every test written for A-10b asserted the event row, which is
+# the thing being built, and none asserted the incident row, which is the
+# thing being relied on.
+
+
+def _permissive_incident_config():
+    from telegram_kol_research.config import (
+        ALWAYS_NOTIFIED_INCIDENT_TYPES,
+        RuntimeIncidentConfig,
+    )
+
+    return RuntimeIncidentConfig(
+        capture_types=frozenset(ALWAYS_NOTIFIED_INCIDENT_TYPES)
+    )
+
+
+def test_writing_off_a_position_actually_produces_an_incident_row(tmp_path):
+    """Not "the adapter was called" -- the row exists and names the position."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_position_marked_manually_closed,
+    )
+
+    session_factory = create_session_factory(tmp_path / "incidents.db")
+    capture_position_marked_manually_closed(
+        session_factory,
+        config=_permissive_incident_config(),
+        execution_binding_id=345,
+        pos_id=POS,
+        basis="position_history_full_close",
+        occurred_at=NOW,
+    )
+
+    with session_factory() as session:
+        rows = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.incident_type == "position_marked_manually_closed"
+            )
+            .all()
+        )
+    assert len(rows) == 1, "the summary was refused and nobody was told"
+    assert POS in rows[0].redacted_summary
+    assert "position_history_full_close" in rows[0].redacted_summary
+
+
+def test_a_degenerate_guard_actually_produces_an_incident_row(tmp_path):
+    """The same assertion for the guard's own alarm, so it cannot rot quietly."""
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_manual_close_guard_degenerate,
+    )
+
+    session_factory = create_session_factory(tmp_path / "incidents.db")
+    capture_manual_close_guard_degenerate(
+        session_factory,
+        config=_permissive_incident_config(),
+        streak=3,
+        live_bindings=2,
+        occurred_at=NOW,
+    )
+
+    with session_factory() as session:
+        rows = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.incident_type == "manual_close_guard_degenerate"
+            )
+            .all()
+        )
+    assert len(rows) == 1
+    assert "guard_refused_every_binding" in rows[0].redacted_summary
+
+
+# ---------------------------------------------------------------------------
+# A-10e: an empty read is confirmed the same way absence is
+#
+# A-10b stood the whole sweep down on any empty positions read, because an
+# empty page and an empty account are indistinguishable and one of them would
+# close every bound position at once. On 2026-09-10 the last position closed
+# and the account went genuinely flat -- and the sweep then did nothing at all,
+# six rounds running, and would have kept doing nothing forever. So the empty
+# read gets the same treatment a missing position gets: seen twice, at least a
+# minute apart, before it is allowed to mean anything.
+
+
+def test_one_empty_read_still_decides_nothing(tmp_path):
+    session_factory = _fixture(tmp_path)
+    at = NAIVE
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=at,
+        snapshot_clock=lambda: at,
+    )
+
+    assert result.skipped_empty_snapshot is True
+    assert result.proceeded_on_confirmed_empty is False
+    assert _state(session_factory) == ("active", "active", "entered")
+    assert _events(session_factory, ABSENCE_OBSERVED_ACTION) == []
+
+
+def test_two_empty_reads_too_close_together_still_decide_nothing(tmp_path):
+    session_factory = _fixture(tmp_path)
+    at = NAIVE
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=at,
+        snapshot_clock=lambda: at,
+    )
+    second_at = at + timedelta(seconds=59)
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=second_at,
+        snapshot_clock=lambda: second_at,
+    )
+
+    assert result.skipped_empty_snapshot is True
+    assert _state(session_factory) == ("active", "active", "entered")
+
+
+def test_two_empty_reads_a_minute_apart_let_the_sweep_work_again(tmp_path):
+    """The frozen-forever case. The account really is flat; act like it."""
+
+    session_factory = _fixture(tmp_path)
+    at = NAIVE
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=at,
+        snapshot_clock=lambda: at,
+    )
+    second_at = at + timedelta(seconds=61)
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=second_at,
+        snapshot_clock=lambda: second_at,
+    )
+
+    assert result.skipped_empty_snapshot is False
+    assert result.proceeded_on_confirmed_empty is True
+    # It works again, and A-10b still applies: absence is recorded, not acted on.
+    assert result.pending_absence == 1
+    assert _state(session_factory) == ("active", "active", "entered")
+
+
+def test_a_non_empty_read_in_between_restarts_the_confirmation(tmp_path):
+    """One position reappearing means the account was never flat."""
+
+    session_factory = _fixture(tmp_path)
+    at = NAIVE
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=at,
+        snapshot_clock=lambda: at,
+    )
+    middle_at = at + timedelta(seconds=30)
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(),
+        synced_at=middle_at,
+        snapshot_clock=lambda: middle_at,
+    )
+    later_at = at + timedelta(seconds=120)
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(positions=[]),
+        synced_at=later_at,
+        snapshot_clock=lambda: later_at,
+    )
+
+    assert result.skipped_empty_snapshot is True, (
+        "the clock restarted at the later empty read, so it is the first again"
+    )
+
+
+def test_a_summary_key_outside_the_vocabulary_fails_the_suite(tmp_path):
+    """The guard for every guard here (A-10e).
+
+    Capture fails open in production on purpose. That is also how A-8c and
+    A-10b each shipped an alarm that could never fire: the only symptom was a
+    log line. Under the suite the same condition raises, so the next one is a
+    red test instead of a silence somebody notices weeks later.
+    """
+
+    import pytest
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.runtime_incident_adapters import _capture
+    from telegram_kol_research.runtime_incidents import RuntimeIncidentBoundsError
+
+    session_factory = create_session_factory(tmp_path / "strict.db")
+    with pytest.raises(RuntimeIncidentBoundsError):
+        _capture(
+            session_factory,
+            config=_permissive_incident_config(),
+            source_kind="execution_binding",
+            source_record_id="343",
+            incident_type="position_marked_manually_closed",
+            severity="high",
+            redacted_summary='{"component":"x","not_a_known_field":"y"}',
+            occurred_at=NOW,
+            recorder=None,
+        )

@@ -209,6 +209,7 @@ def _capture(
     affected_raw_message_id: int | None = None,
     message_operation_contract_id: int | None = None,
     recorder: Callable[..., Any] | None = None,
+    strict_final: bool = True,
 ):
     if not config.captures(incident_type):
         return None
@@ -246,6 +247,16 @@ def _capture(
             **capture_kwargs,
         )
     except Exception as exc:
+        # A-10e. Failing open is right in production -- an alert that cannot be
+        # written must not take the work down with it. But it is also how a
+        # summary key outside the closed vocabulary becomes a permanently silent
+        # alarm: A-8c lost one to ``group_trading_mode`` and A-10b lost one to
+        # ``pos_id``, and in both cases every test passed because the only
+        # symptom is a log line. Under the strict flag -- set by the test
+        # suite -- this raises instead, so the next one is caught in a unit
+        # test rather than by someone reading a journal weeks later.
+        if strict_final and _strict_capture_enabled():
+            raise
         logger.warning(
             "Runtime incident capture failed open: type=%s source=%s error=%s",
             incident_type,
@@ -368,6 +379,19 @@ def capture_context_worker_state(
     )
 
 
+#: A-10e. Environment flag, read per call rather than at import, so a test can
+#: turn it on and off around a case that deliberately exercises failing open.
+STRICT_CAPTURE_ENV_VAR = "TELEGRAM_KOL_RUNTIME_INCIDENT_STRICT_CAPTURE"
+
+
+def _strict_capture_enabled() -> bool:
+    return os.environ.get(STRICT_CAPTURE_ENV_VAR, "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
 def _capture_with_minimal_fallback(
     session_factory: sessionmaker,
     *,
@@ -401,6 +425,9 @@ def _capture_with_minimal_fallback(
         redacted_summary=detailed_summary,
         occurred_at=occurred_at,
         recorder=recorder,
+        # Refusing the detailed summary is the case this function exists for,
+        # so it is never the final word; only the minimal retry below is.
+        strict_final=False,
     )
     if recorded is not None or minimal_summary == detailed_summary:
         return recorded

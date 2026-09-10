@@ -1,7 +1,25 @@
+import os
+
 import pytest
 
 from telegram_kol_research.models import MediaAsset, RawMessage, StrategyLifecycle
 from telegram_kol_research.recognition_experiments import MimoAuthoritativeResult
+from telegram_kol_research.runtime_incident_adapters import STRICT_CAPTURE_ENV_VAR
+
+# A-10e. Incident capture fails open in production on purpose: an alert that
+# cannot be written must not take the work down with it. The cost is that a
+# summary key outside the closed vocabulary produces a permanently silent
+# alarm whose only symptom is a log line -- A-8c lost one that way, and A-10b
+# lost another, discovered only when three real write-offs went unannounced.
+# Under the suite, the same condition raises, so the next one is a red test.
+os.environ.setdefault(STRICT_CAPTURE_ENV_VAR, "1")
+
+
+@pytest.fixture
+def allow_incident_capture_to_fail_open(monkeypatch):
+    """For the cases that assert the production fail-open behaviour itself."""
+
+    monkeypatch.delenv(STRICT_CAPTURE_ENV_VAR, raising=False)
 
 
 @pytest.fixture

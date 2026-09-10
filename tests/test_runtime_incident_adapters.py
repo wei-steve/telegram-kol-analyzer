@@ -911,6 +911,7 @@ def test_provider_and_notification_failures_store_only_bounded_error_type(tmp_pa
 
 def test_disabled_or_failing_capture_never_changes_or_raises_to_source_flow(
     tmp_path,
+    allow_incident_capture_to_fail_open,
 ):
     session_factory = create_session_factory(tmp_path / "best-effort.db")
     source_state = {"status": "partial_failed", "reason": "already_persisted"}

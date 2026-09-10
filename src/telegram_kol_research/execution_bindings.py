@@ -176,6 +176,9 @@ class ManualCloseSyncResult:
     #: A-10c. Somebody claimed this binding after our snapshot was taken, so
     #: the snapshot cannot speak about it. Left untouched, counted, and logged.
     skipped_claimed_after_snapshot: int = 0
+    #: A-10e. Two empty reads a minute apart agreed the account is flat, so the
+    #: sweep ran rather than standing down for the rest of time.
+    proceeded_on_confirmed_empty: bool = False
 
 
 @dataclass(slots=True)
@@ -4083,17 +4086,39 @@ def sync_manual_closed_deepcoin_positions(
     from telegram_kol_research.models import StrategyLifecycle, TradeIdea
 
     now = synced_at or datetime.now(UTC)
+    read_clock = snapshot_clock or (lambda: datetime.now(UTC))
+    first_read_at = read_clock()
     positions = client.list_positions()
     if not positions:
-        # A-10b. An empty positions list is a read that told us nothing. The
-        # account having genuinely no positions and the venue having answered
-        # 200 with an empty page look identical from here, and one of those
-        # would close every bound position at once. A read error already
-        # raises out of ``list_positions``; this covers the silent case.
-        logger.warning(
-            "manual-close sync skipped: positions snapshot is empty",
+        # A-10b. An empty positions list is a read that told us nothing: an
+        # account with genuinely no positions and a venue answering 200 with an
+        # empty page look identical from here, and one of those would close
+        # every bound position at once. A read error already raises out of
+        # ``list_positions``; this covers the silent case.
+        #
+        # A-10e. But standing down on every empty read means a genuinely flat
+        # account freezes this sweep forever -- which is what happened on
+        # 2026-09-10 once the last position closed: six rounds in a row did
+        # nothing at all, and would have kept doing nothing. So an empty read
+        # is confirmed the same way absence is: twice, at least a minute apart.
+        # One empty read still decides nothing.
+        if not _empty_snapshot_confirmed(
+            session_factory, observed_at=first_read_at
+        ):
+            logger.warning(
+                "manual-close sync skipped: positions snapshot is empty at %s "
+                "and not yet confirmed",
+                first_read_at.isoformat(),
+            )
+            return ManualCloseSyncResult(skipped_empty_snapshot=True)
+        logger.info(
+            "manual-close sync proceeding on a confirmed-empty account at %s",
+            first_read_at.isoformat(),
         )
-        return ManualCloseSyncResult(skipped_empty_snapshot=True)
+        result_proceeded_on_confirmed_empty = True
+    else:
+        result_proceeded_on_confirmed_empty = False
+        _clear_empty_snapshot_confirmation(session_factory, observed_at=first_read_at)
     active_pos_ids = {
         pos_id
         for position in positions
@@ -4113,7 +4138,9 @@ def sync_manual_closed_deepcoin_positions(
             active_pos_ids={str(pos_id) for pos_id in active_pos_ids if pos_id},
             cleaned_at=now,
         ))
-    result = ManualCloseSyncResult()
+    result = ManualCloseSyncResult(
+        proceeded_on_confirmed_empty=result_proceeded_on_confirmed_empty
+    )
     marked_for_alert: list[tuple[int, str, str]] = []
     with session_factory() as session:
         management_reserved_pos_ids = _active_management_reserved_pos_ids(
@@ -4139,12 +4166,14 @@ def sync_manual_closed_deepcoin_positions(
         # instead of guessing at it. When the cleanup wrote nothing, the round
         # read cache serves this for free; when it did write, the cache is
         # already dropped and this is one real GET (see ARCHITECTURE 4.6).
-        snapshot_at = (snapshot_clock or (lambda: datetime.now(UTC)))()
+        snapshot_at = read_clock()
         positions = client.list_positions()
-        if not positions:
+        if not positions and not _empty_snapshot_confirmed(
+            session_factory, observed_at=snapshot_at, record=False
+        ):
             logger.warning(
                 "manual-close sync skipped: positions snapshot is empty on "
-                "re-read at %s",
+                "re-read at %s and not yet confirmed",
                 snapshot_at.isoformat(),
             )
             return ManualCloseSyncResult(skipped_empty_snapshot=True)
@@ -4787,6 +4816,11 @@ MIN_ABSENCE_CONFIRMATION_SECONDS = 60
 GUARD_DEGENERATE_STREAK_ALERT = 3
 GUARD_HEALTH_SETTINGS_KEY = "manual_close_guard_health"
 GUARD_DEGENERATE_INCIDENT_TYPE = "manual_close_guard_degenerate"
+#: A-10e. An empty positions read is confirmed the same way absence is: seen
+#: twice, at least this far apart. One empty read still decides nothing, and a
+#: genuinely flat account stops freezing the sweep forever.
+MIN_EMPTY_CONFIRMATION_SECONDS = 60
+EMPTY_SNAPSHOT_SETTINGS_KEY = "manual_close_empty_snapshot"
 
 
 def _claimed_after_snapshot(
@@ -4940,6 +4974,107 @@ def _absence_proof(
     ):
         return "two_absent_snapshots"
     return None
+
+
+def _read_settings_document(session, key: str) -> dict[str, Any]:
+    """The JSON document under one ``trading_settings`` key, or an empty one."""
+
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == key)
+        .one_or_none()
+    )
+    if row is None:
+        return {}
+    try:
+        loaded = json.loads(row.value_json or "{}")
+    except (TypeError, ValueError):
+        return {}
+    return loaded if isinstance(loaded, dict) else {}
+
+
+def _write_settings_document(
+    session, key: str, document: dict[str, Any], *, updated_at: datetime
+) -> None:
+    payload = json.dumps(document, ensure_ascii=False, sort_keys=True)
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == key)
+        .one_or_none()
+    )
+    if row is None:
+        session.add(
+            TradingSetting(key=key, value_json=payload, updated_at=updated_at)
+        )
+    elif row.value_json != payload:
+        row.value_json = payload
+        row.updated_at = updated_at
+
+
+def _empty_snapshot_confirmed(
+    session_factory: sessionmaker,
+    *,
+    observed_at: datetime,
+    record: bool = True,
+) -> bool:
+    """Has the account read empty twice, at least a minute apart? (A-10e)
+
+    The first empty read is written down and answers "no". Only a second one,
+    far enough after it, is allowed to mean the account really is flat -- the
+    same discipline A-10b applies to a single missing position, for the same
+    reason: one read that returns nothing is not the same as nothing existing.
+
+    ``record=False`` is for the call inside the sweep's own transaction, where
+    opening a second write session would contend with the lock the outer one
+    holds. That call only reads; standing down one extra round is the safe
+    direction, and the next round's first read records it.
+    """
+
+    with session_factory() as session:
+        document = _read_settings_document(session, EMPTY_SNAPSHOT_SETTINGS_KEY)
+        first_raw = document.get("first_empty_at")
+        first_empty_at = None
+        if isinstance(first_raw, str):
+            try:
+                first_empty_at = datetime.fromisoformat(first_raw)
+            except ValueError:
+                first_empty_at = None
+        if first_empty_at is not None:
+            elapsed = (
+                _naive_utc(observed_at) - _naive_utc(first_empty_at)
+            ).total_seconds()
+            if elapsed >= MIN_EMPTY_CONFIRMATION_SECONDS:
+                return True
+            return False
+        if record:
+            _write_settings_document(
+                session,
+                EMPTY_SNAPSHOT_SETTINGS_KEY,
+                {
+                    "schema_version": 1,
+                    "first_empty_at": observed_at.isoformat(),
+                },
+                updated_at=observed_at,
+            )
+            session.commit()
+        return False
+
+
+def _clear_empty_snapshot_confirmation(
+    session_factory: sessionmaker, *, observed_at: datetime
+) -> None:
+    """A non-empty read means the account is not flat; forget the streak."""
+
+    with session_factory() as session:
+        row = (
+            session.query(TradingSetting)
+            .filter(TradingSetting.key == EMPTY_SNAPSHOT_SETTINGS_KEY)
+            .one_or_none()
+        )
+        if row is None:
+            return
+        session.delete(row)
+        session.commit()
 
 
 def _record_guard_health(

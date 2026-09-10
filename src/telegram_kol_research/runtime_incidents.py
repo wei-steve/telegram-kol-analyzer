@@ -89,6 +89,15 @@ _SUMMARY_FIELDS = frozenset(
         "error_summary",
         "raw_message_id",
         "task_name",
+        # A-10d, same rationale, learned the hard way: "a bound position was
+        # written off" is unactionable without saying which position. The
+        # A-10b alert carried ``pos_id`` and was refused by this vocabulary on
+        # both the detailed and the minimal summary, so it produced no row at
+        # all -- three real write-offs went unannounced before anyone noticed,
+        # and the refusal is logged rather than raised, so nothing failed
+        # loudly. The value is a venue order id passed through
+        # ``_safe_label``, and the redaction scan below still runs over it.
+        "pos_id",
         # A-3d, same rationale as the A-2 identifiers above: an entry that
         # expired without submitting is only actionable if the operator can see
         # which group it belonged to and when the deadline was. Both are their
