@@ -330,3 +330,132 @@ def test_adoption_writes_a_ledger_row_naming_how_it_was_proven(tmp_path):
         assert row.evidence_source == ADOPTION_EVIDENCE_SOURCE
         assert row.execution_binding_id == binding_id
         assert row.execution_order_leg_id == leg_id
+
+
+def _pending_entry_leg(session_factory, *, binding_id, order_id, size, stop, index=9):
+    """One resting limit entry whose ``slTriggerPx`` the exchange already holds."""
+
+    leg_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id,
+            leg_index=index,
+            purpose="entry",
+            order_kind="limit",
+            strategy_instance_id="deepcoin:1:1:ETH:long",
+            venue="deepcoin",
+            status="pending",
+            attribution_status="unassigned",
+            order_id=order_id,
+            request={
+                "instId": INST,
+                "posSide": "long",
+                "ordType": "limit",
+                "px": "2600.0",
+                "sz": size,
+                "slTriggerPx": stop,
+                "tdMode": "cross",
+                "mrgPosition": "split",
+                "side": "buy",
+            },
+        ),
+    )
+    return leg_id
+
+
+def test_a_resting_entrys_own_stop_is_excluded_not_frozen(tmp_path):
+    """The production shape from 2026-09-10: two resting entries froze a position.
+
+    A migrated limit entry carries ``slTriggerPx`` on the order, so the
+    exchange arms that stop while the entry rests. In
+    ``trigger-orders-pending`` it is a ``TPSL`` row with no position id and
+    ``TU == "default"`` -- the same shape as an ownerless stop on an open
+    position. Excluding it is not claiming it: it is left exactly alone.
+    """
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _ledger(
+        session_factory,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        order_id="stop-1",
+        purpose="stop_loss",
+        price="2500",
+    )
+    _pending_entry_leg(
+        session_factory, binding_id=binding_id, order_id="entry-99", size="6.0", stop="2400.0"
+    )
+    with session_factory() as session:
+        session.add(_ws_trigger_frame("entry-stop-98", "default"))
+        session.commit()
+
+    authority = _resolve(
+        session_factory,
+        [_stop_row("stop-1"), _stop_row("entry-stop-98", price="2400", size="6")],
+    )
+
+    assert authority.resolved
+    assert authority.order_ids == ("stop-1",)
+    assert authority.excluded_pending_entry_order_ids == ("entry-stop-98",)
+    assert authority.unattributable_order_ids == ()
+
+
+def test_a_default_trade_unit_alone_does_not_exclude(tmp_path):
+    """Condition (b): without a matching resting entry it is still unattributable."""
+
+    session_factory, _, _ = _seed(tmp_path)
+    with session_factory() as session:
+        session.add(_ws_trigger_frame("orphan-1", "default"))
+        session.commit()
+
+    authority = _resolve(session_factory, [_stop_row("orphan-1", price="2400", size="6")])
+
+    assert authority.status == "frozen"
+    assert authority.reason_code == FREEZE_ORDER_UNATTRIBUTABLE
+    assert authority.excluded_pending_entry_order_ids == ()
+
+
+def test_a_matching_entry_without_a_default_frame_does_not_exclude(tmp_path):
+    """Condition (a): an order no frame ever placed is unknown, not excluded.
+
+    "The position does not exist yet" and "no frame ever arrived" are different
+    facts. Only the first one may exclude.
+    """
+
+    session_factory, binding_id, _ = _seed(tmp_path)
+    _pending_entry_leg(
+        session_factory, binding_id=binding_id, order_id="entry-99", size="6.0", stop="2400.0"
+    )
+
+    authority = _resolve(session_factory, [_stop_row("silent-1", price="2400", size="6")])
+
+    assert authority.status == "frozen"
+    assert authority.reason_code == FREEZE_ORDER_UNATTRIBUTABLE
+    assert authority.excluded_pending_entry_order_ids == ()
+
+
+def test_once_the_trade_unit_flips_the_stop_is_owned_again(tmp_path):
+    """After the entry fills, ``TU`` names the position and exclusion stops.
+
+    The flip leaves both values behind (``default`` then the posId), so the
+    exclusion must key on "``default`` and nothing else" rather than on
+    "``default`` appears somewhere".
+    """
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _pending_entry_leg(
+        session_factory, binding_id=binding_id, order_id="entry-99", size="6.0", stop="2400.0"
+    )
+    with session_factory() as session:
+        session.add(_ws_trigger_frame("entry-stop-98", "default"))
+        session.add(_ws_trigger_frame("entry-stop-98", "pos-1"))
+        session.commit()
+
+    authority = _resolve(
+        session_factory, [_stop_row("entry-stop-98", price="2400", size="6")]
+    )
+
+    assert authority.resolved
+    assert authority.excluded_pending_entry_order_ids == ()
+    assert authority.order_ids == ("entry-stop-98",)
+    assert [item.order_id for item in authority.adoptions] == ["entry-stop-98"]

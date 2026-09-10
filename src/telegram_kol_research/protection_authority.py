@@ -44,6 +44,7 @@ it may act on an adopted order; writing them is
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
@@ -51,6 +52,7 @@ from typing import Any, Iterable, Mapping, Sequence
 
 from telegram_kol_research.models import (
     DeepcoinWsEvent,
+    ExecutionOrderLeg,
     PositionProtectionLedger,
 )
 from telegram_kol_research.native_tpsl import (
@@ -78,6 +80,21 @@ TAKE_PROFIT_PURPOSES = frozenset({"take_profit"})
 ACTIVE_LEDGER_STATUSES = frozenset({"verified", "protected", "active"})
 
 ADOPTION_EVIDENCE_SOURCE = "exchange_adopted_by_tu"
+
+#: The ``TU`` a protection order carries before its position exists. A migrated
+#: limit entry leg puts ``slTriggerPx`` on the order itself, so the exchange
+#: arms that stop while the entry is still resting -- and it shows up in
+#: ``trigger-orders-pending`` as a ``TPSL`` row with no position id and this
+#: value, which is *indistinguishable in shape* from an ownerless stop on an
+#: open position. Observed in production 2026-09-10: binding 347's two resting
+#: entries froze every BTC short position for as long as they rested.
+TRADE_UNIT_BEFORE_POSITION = "default"
+
+#: Entry-leg states in which the exchange may be holding that leg's attached
+#: stop while no position exists yet.
+PENDING_ENTRY_LEG_STATUSES = frozenset(
+    {"pending", "submitted", "live", "partially_filled"}
+)
 
 GROUP_STOP = "stop"
 GROUP_TAKE_PROFIT = "take_profit"
@@ -133,6 +150,7 @@ class ProtectionAuthority:
     take_profit_orders: tuple[ProtectionOrderRef, ...] = ()
     adoptions: tuple[ProtectionAdoption, ...] = ()
     unattributable_order_ids: tuple[str, ...] = ()
+    excluded_pending_entry_order_ids: tuple[str, ...] = ()
     evidence: Mapping[str, Any] = field(default_factory=dict)
 
     @property
@@ -173,6 +191,8 @@ def resolve_protection_authority(
     instrument_id = str(instrument_id or "").strip().upper()
     normalized_side = str(side or "").strip().lower()
 
+    excluded: list[str] = []
+
     def frozen(
         reason: str,
         *,
@@ -186,6 +206,7 @@ def resolve_protection_authority(
             side=normalized_side,
             reason_code=reason,
             unattributable_order_ids=unattributable_order_ids,
+            excluded_pending_entry_order_ids=tuple(excluded),
             evidence=dict(evidence),
         )
 
@@ -203,6 +224,7 @@ def resolve_protection_authority(
     strategy_instance_id = str(leg.strategy_instance_id or "") or None
 
     ledger_by_order = _active_ledger_rows_by_order_id(session, venue=venue)
+    pending_entry_signatures: set[tuple[str, str, str, str]] | None = None
     stop_orders: list[ProtectionOrderRef] = []
     take_profit_orders: list[ProtectionOrderRef] = []
     adoptions: list[ProtectionAdoption] = []
@@ -240,7 +262,21 @@ def resolve_protection_authority(
             owner_pos_id = str(ledger_row.pos_id or "")
             source = "ledger"
         else:
-            tu_pos_id = _trade_unit_pos_id(session, venue=venue, order_id=order_id)
+            trade_units = _trade_unit_values(session, venue=venue, order_id=order_id)
+            if trade_units == {TRADE_UNIT_BEFORE_POSITION}:
+                # No position exists for this order yet. If it also matches one
+                # of our own resting entry legs exactly, it is that leg's
+                # attached stop -- not an ownerless stop on an open position.
+                # Excluding it is not claiming it: nothing here reads, cancels
+                # or adopts it, and being wrong costs one untouched order.
+                if pending_entry_signatures is None:
+                    pending_entry_signatures = _pending_entry_stop_signatures(
+                        session, venue=venue
+                    )
+                if _row_signature(normalized) in pending_entry_signatures:
+                    excluded.append(order_id)
+                    continue
+            tu_pos_id = _sole_position_trade_unit(trade_units)
             if tu_pos_id is None:
                 tu_pos_id = str(normalized.pos_id or "").strip() or None
                 if tu_pos_id is not None:
@@ -348,6 +384,7 @@ def resolve_protection_authority(
         stop_orders=tuple(stop_orders),
         take_profit_orders=tuple(take_profit_orders),
         adoptions=tuple(adoptions),
+        excluded_pending_entry_order_ids=tuple(excluded),
         evidence={"pending_tpsl_rows_considered": considered},
     )
 
@@ -410,13 +447,12 @@ def _active_ledger_rows_by_order_id(session, *, venue: str) -> dict[str, Any]:
     return by_order
 
 
-def _trade_unit_pos_id(session, *, venue: str, order_id: str) -> str | None:
-    """The ``TU`` every ``TriggerOrder`` frame for this order agrees on.
+def _trade_unit_values(session, *, venue: str, order_id: str) -> set[str]:
+    """Every distinct ``TU`` this order's ``TriggerOrder`` frames carry.
 
-    Frames repeat and may arrive out of order (hard rule 6), so this asks for
-    agreement rather than for the newest row: two different ``TU`` values for
-    one ``OS`` would mean the relation this phase rests on does not hold, and
-    the honest answer there is "unknown", not "the last one wins".
+    ``default`` is kept rather than filtered here: "the position does not exist
+    yet" and "no frame ever arrived" are different facts, and only the first
+    one may exclude a row as a resting entry's stop.
     """
 
     rows = (
@@ -427,15 +463,73 @@ def _trade_unit_pos_id(session, *, venue: str, order_id: str) -> str | None:
         .distinct()
         .all()
     )
-    values = {
+    return {
         str(row[0]).strip()
         for row in rows
-        if row[0] not in (None, "")
-        and str(row[0]).strip().lower() not in {"default", "0"}
+        if row[0] not in (None, "") and str(row[0]).strip() != "0"
     }
-    if len(values) != 1:
+
+
+def _sole_position_trade_unit(trade_units: set[str]) -> str | None:
+    """The one real posId these frames agree on, or ``None``.
+
+    Frames repeat and may arrive out of order (hard rule 6), so this asks for
+    agreement rather than for the newest row: two different ``TU`` values for
+    one ``OS`` would mean the relation this phase rests on does not hold, and
+    the honest answer there is "unknown", not "the last one wins". A ``TU`` that
+    flipped from ``default`` to a posId leaves both values behind, and only the
+    posId is a position.
+    """
+
+    positions = {
+        value for value in trade_units if value != TRADE_UNIT_BEFORE_POSITION
+    }
+    if len(positions) != 1:
         return None
-    return next(iter(values))
+    return next(iter(positions))
+
+
+def _pending_entry_stop_signatures(
+    session, *, venue: str
+) -> set[tuple[str, str, str, str]]:
+    """``(instId, posSide, sz, slTriggerPx)`` of every resting entry leg's stop.
+
+    Read from our own durable leg rows, never from the exchange: the question
+    is "did we ask for this stop as part of an entry", and only our record can
+    answer it.
+    """
+
+    rows = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == str(venue or "deepcoin").lower())
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .filter(ExecutionOrderLeg.status.in_(sorted(PENDING_ENTRY_LEG_STATUSES)))
+        .all()
+    )
+    signatures: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        try:
+            request = json.loads(row.request_json or "{}")
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(request, dict):
+            continue
+        instrument = str(request.get("instId") or "").strip().upper()
+        pos_side = str(request.get("posSide") or "").strip().lower()
+        size = _text(request.get("sz"))
+        stop = _text(request.get("slTriggerPx"))
+        if instrument and pos_side and size and stop:
+            signatures.add((instrument, pos_side, size, stop))
+    return signatures
+
+
+def _row_signature(normalized: Any) -> tuple[str, str, str, str]:
+    return (
+        str(normalized.inst_id or "").upper(),
+        str(normalized.pos_side or "").lower(),
+        _text(normalized.size) or "",
+        _text(normalized.stop_loss_trigger_price) or "",
+    )
 
 
 def _purpose_for(ledger_row: Any, *, group: str) -> str:
@@ -479,6 +573,9 @@ def summarize_authority(authority: ProtectionAuthority) -> dict[str, Any]:
         ],
         "adopted_order_ids": [item.order_id for item in authority.adoptions],
         "unattributable_order_ids": list(authority.unattributable_order_ids),
+        "excluded_pending_entry_order_ids": list(
+            authority.excluded_pending_entry_order_ids
+        ),
         "evidence": dict(authority.evidence),
     }
 

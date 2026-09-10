@@ -94,6 +94,7 @@ class ShadowComparison:
     legacy_status: str
     legacy_order_ids: tuple[str, ...]
     adopted_order_ids: tuple[str, ...]
+    excluded_order_ids: tuple[str, ...]
     detail: Mapping[str, Any]
 
     @property
@@ -108,6 +109,7 @@ class ShadowComparison:
                 "legacy_status": self.legacy_status,
                 "legacy_order_ids": sorted(self.legacy_order_ids),
                 "adopted_order_ids": sorted(self.adopted_order_ids),
+                "excluded_order_ids": sorted(self.excluded_order_ids),
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -175,6 +177,7 @@ def compare_position_protection(
         legacy_status=legacy_status,
         legacy_order_ids=legacy_order_ids,
         adopted_order_ids=tuple(item.order_id for item in authority.adoptions),
+        excluded_order_ids=tuple(authority.excluded_pending_entry_order_ids),
         detail={
             "authority": summarize_authority(authority),
             "legacy_evidence": dict(getattr(legacy, "evidence", {}) or {}),
@@ -199,6 +202,7 @@ def run_protection_authority_shadow_pass(
     counts = {verdict: 0 for verdict in SHADOW_VERDICTS}
     read_failures: list[str] = []
     recorded = 0
+    excluded_pending_entry_stops = 0
     try:
         positions = deepcoin_client.list_positions()
     except Exception:
@@ -206,6 +210,7 @@ def run_protection_authority_shadow_pass(
         return {
             "positions_seen": 0,
             "counts_by_verdict": counts,
+            "excluded_pending_entry_stops": 0,
             "rows_recorded": 0,
             "read_failures": ["positions"],
         }
@@ -246,6 +251,7 @@ def run_protection_authority_shadow_pass(
             if comparison is None:
                 continue
             counts[comparison.verdict] = counts.get(comparison.verdict, 0) + 1
+            excluded_pending_entry_stops += len(comparison.excluded_order_ids)
             if comparison.verdict == VERDICT_UNBOUND_POSITION:
                 continue
             if _record_when_changed(
@@ -258,6 +264,12 @@ def run_protection_authority_shadow_pass(
     return {
         "positions_seen": len(live),
         "counts_by_verdict": counts,
+        # The positive observation paired with ``chain_frozen``: every time a
+        # resting entry's own stop is stepped over instead of freezing the
+        # position, it is counted here. Without it, a freeze count that fell to
+        # zero could equally mean "the exclusion worked" or "no entry was
+        # resting" (ARCHITECTURE section 6).
+        "excluded_pending_entry_stops": excluded_pending_entry_stops,
         "rows_recorded": recorded,
         "read_failures": read_failures,
     }
@@ -303,6 +315,9 @@ def _record_when_changed(
             },
             after={
                 "fingerprint": comparison.fingerprint,
+                "excluded_pending_entry_order_ids": list(
+                    comparison.excluded_order_ids
+                ),
                 "chain_status": comparison.chain_status,
                 "chain_reason_code": comparison.chain_reason_code,
                 "chain_order_ids": list(comparison.chain_order_ids),

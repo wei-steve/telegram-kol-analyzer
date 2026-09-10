@@ -275,6 +275,19 @@ REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两�
   落 `position_protection_incidents`）。那一刻"不是我们的"和"是我们的但没记下来"不可分辨：
   撤它是盲写，留它则意味着旧止损仍然武装、这次修改等于没生效。两种猜法都会错，所以停下来叫人。
 - `triggerOrderType == "Conditional"` 是**挂单入场**，这条路径永远不撤它。
+- **挂在"尚未成交的限价入场单"上的止损要排除掉，它不是任何仓位的保护单。**
+  迁移后的限价腿把 `slTriggerPx` 带在 order 上（第 4.7 节），交易所在入场单还挂着的时候就把这张止损
+  摆进 `trigger-orders-pending`，形状与"某仓位的无主止损"**完全一样**：`TPSL`、无 posId、`TU="default"`。
+  2026-09-10 实测：binding 347 的两张在挂入场单（sz 6 / 14、`slTriggerPx` 81000）
+  让**每一个 BTC 空头仓位**在整个影子窗口里被冻结 26 次。判据是两条**同时**成立才排除：
+  (a) 该 ordId 的 `TriggerOrder` 帧 `TU == "default"`（仓位还不存在），且
+  (b) `(instId, posSide, sz, slTriggerPrice)` 等于我们自己某条**仍 pending 的入场腿**的请求四元组。
+  两条都查本地持久记录。**这是排除不是认领**——排除后既不进保护集合、也不冻结、更不会被撤，
+  判错的代价是"我们不碰它"。入场成交后 `TU` 翻成子单 posId，那张单自然经 `TU` 归属，
+  不需要特殊处理；所以判据必须是"`TU` 恰好只有 `default`"，而不是"`default` 出现过"
+  （翻转会把两个值都留下）。每排除一张记一次 `excluded_pending_entry_stops`，与冻结计数成对看：
+  冻结数降到零有两个成因，只有这个计数分得开。
+
 - 一张同时带 `slTriggerPrice` 与 `tpTriggerPrice` 的单也冻结：按组替换会把另一半一起撤掉。
 
 **两个组，两种相反的顺序**（`protection_replacement.py`，`deepcoin_execution_actions.adjust_position_tpsl`
@@ -429,6 +442,14 @@ historical_state_repair.py               position_management_remediation.py
   6-pre-7 有一条 `test_the_two_sweeps_do_not_touch_each_others_holders`，读起来覆盖双向，
   实际只测了"batch 扫描遇到 signal 持有者"；把前缀检查删掉后它**照样全绿**，变异检验才把缺口指出来。
   会写这条用例的人通常也会漏掉其中一个方向，所以靠"记得写反向用例"防不住，**靠变异检验才防得住**。
+
+- **在工作树里跑全量之前，先确认 `.venv` 存在（没有就建符号链接指向主检出的那个）。**
+  `tests/test_server_update_scripts.py` 与 `tests/test_minimal_server_updater.py` 把
+  `PLANNER_PYTHON=<仓库根>/.venv/bin/python` 传给被测脚本，`<仓库根>` 是**测试文件所在的那个**——
+  主检出有 `.venv`、工作树没有，于是这两个文件的 15 条一起 `exit 2 "Planner Python is unavailable."`。
+  2026-09-10 B 线因此报了三次"全量 15 failed，与基线相同"；**"与基线相同"不是解释**，
+  它只是把两个都没查的现象并排放着。两条线跑同一套件结果不同时，先对命令行与环境
+  （cwd、`.venv`、env 文件、`-p no:randomly`），不要先假定是代码。
 
 - **观察监视器必须实时比对生产 HEAD，只看 unit 是否 active 抓不到换版。**
   `tg-deploy` 的重启只花几秒，而监视器通常一分钟采一次样，正好采不到 unit 非 active 的那一刻。

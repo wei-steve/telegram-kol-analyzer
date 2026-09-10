@@ -366,3 +366,72 @@ def test_a_position_no_leg_owns_is_counted_but_never_written_down(tmp_path):
     assert result["counts_by_verdict"][VERDICT_UNBOUND_POSITION] == 1
     assert result["rows_recorded"] == 0
     assert _shadow_rows(session_factory) == []
+
+
+def test_a_resting_entrys_stop_is_counted_as_stepped_over_not_as_a_freeze(tmp_path):
+    """The positive observation paired with ``chain_frozen``.
+
+    A freeze count of zero has two causes -- the exclusion worked, or no entry
+    was resting -- and only this counter tells them apart.
+    """
+
+    from telegram_kol_research.execution_bindings import ExecutionOrderLegRecord
+
+    session_factory = _seed(tmp_path)
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=1,
+            leg_index=9,
+            purpose="entry",
+            order_kind="limit",
+            strategy_instance_id="deepcoin:1:1:ETH:long",
+            venue="deepcoin",
+            status="pending",
+            attribution_status="unassigned",
+            order_id="entry-99",
+            request={
+                "instId": INST,
+                "posSide": "long",
+                "ordType": "limit",
+                "px": "2600.0",
+                "sz": "6.0",
+                "slTriggerPx": "2400.0",
+                "tdMode": "cross",
+                "mrgPosition": "split",
+                "side": "buy",
+            },
+        ),
+    )
+    with session_factory() as session:
+        session.add(
+            DeepcoinWsEvent(
+                venue="deepcoin",
+                channel="TriggerOrder",
+                action="push",
+                order_sys_id="entry-stop-98",
+                trade_unit_id="default",
+                received_at=NOW,
+                received_ms=1,
+                raw_payload="{}",
+                payload_hash="hash-entry-stop-98",
+            )
+        )
+        session.commit()
+    resting = _stop_row("entry-stop-98", price="2400")
+    resting["sz"] = "6"
+    client = _Client([_stop_row("stop-1"), resting])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert result["excluded_pending_entry_stops"] == 1
+    assert result["counts_by_verdict"][VERDICT_CHAIN_FROZEN] == 0
+    # And this is where the new chain beats the old matcher: the same resting
+    # entry's stop makes the legacy matcher call the whole instrument
+    # ambiguous, while the chain steps over it and still names the position's
+    # own stop.
+    assert result["counts_by_verdict"][VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS] == 1
+    row = _shadow_rows(session_factory)[0]
+    assert "entry-stop-98" in row.after_json
