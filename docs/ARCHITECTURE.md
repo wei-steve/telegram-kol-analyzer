@@ -442,6 +442,18 @@ historical_state_repair.py               position_management_remediation.py
   6-pre-7 有一条 `test_the_two_sweeps_do_not_touch_each_others_holders`，读起来覆盖双向，
   实际只测了"batch 扫描遇到 signal 持有者"；把前缀检查删掉后它**照样全绿**，变异检验才把缺口指出来。
   会写这条用例的人通常也会漏掉其中一个方向，所以靠"记得写反向用例"防不住，**靠变异检验才防得住**。
+  **但变异检验本身在纵深防御下会说谎，这是上面那条的修正。** 同一条性质若被多处守卫挡着，
+  只关掉其中一处，用例照样全绿——读起来就是"这些用例根本没在测"，而事实恰恰相反。
+  2026-09-10 6c 的实例：`unverified` 绑定不得修改/撤销/平仓，单独关掉
+  `require_verified_position_ownership` 时**十条用例全绿**，因为网关里还有一处独立的
+  `attribution_status` 比较；两处一起关才有 6 条转红。**所以判据要改成：把同一条性质的
+  全部守卫一起关掉，才算证明用例咬住了。** 只关一处得到的绿，既不能证明用例没用，
+  也不能证明它有用——它什么都不能证明。
+  **同一次检验还要盯住"拒绝的理由对不对"：因为夹具的原因被拒，不算拒绝。**
+  6c 的平仓用例最初拿到的是 `position_not_bound_to_exactly_one_active_binding`——
+  夹具没给 binding 写 `pos_id`，于是它在触及归属检查**之前**就失败了，
+  而"因为夹具坏了被拒"与"因为归属未核实被拒"在断言里长得一模一样。
+  修好夹具让用例真正走到那道门之后，单点变异才让它转红。
 
 - **在工作树里跑全量之前，先确认 `.venv` 存在（没有就建符号链接指向主检出的那个）。**
   `tests/test_server_update_scripts.py` 与 `tests/test_minimal_server_updater.py` 把
