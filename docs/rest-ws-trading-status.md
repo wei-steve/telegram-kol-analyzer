@@ -990,6 +990,31 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **同源教训**：判据也会写错，而写错的判据在收窗时会伪装成"未达成"。
   这与"窗口合格 ≠ 判据被验证"是一对：那条防的是拿窗口充数，这条防的是**拿一个不可能成立的
   判据把真样本判成没取到**。
+- phase-6e-blame-combined-protection-gate (2026-09-10, 会话 local_4a6676b0, **改之前先查为什么**):
+  指挥会话要求把 `_request_has_combined_trigger_protection`（要求请求同时带 `tpTriggerPx` 与
+  `slTriggerPx`）放宽成"带 SL 即可"之前，先查当初为何要求两者都有。查了：
+  引入提交 **`a1fab461`（2026-07-20，"feat: adopt verified trigger entry protection"）**——
+  **提交信息无理由，函数无 docstring 无注释，同批测试全部用"两者都带"的夹具，
+  没有一条断言"只带 SL 必须被排除"。**
+  **但"当时只有 combined 这一种形状"这个最省事的解释被生产数据否掉**：
+  `order_kind='trigger_limit'` 的入场腿里 **SL-only 最早出现在 2026-07-09**，比这道门早 11 天，
+  到 2026-08-01 已 74 条。**作者是面对着已经存在的 SL-only 形状把它排除在外的，不是没见过。**
+  旁证两条：`has_tp` 形状最后一条是 2026-07-21（门写完第二天就不再产生），
+  该采纳路径最后一次产出 2026-07-24、此后事实停产；SL-only 一直产到 2026-09-08（全期 189 条）。
+  **结论：理由无记录，且无法证明它不存在。** 因此**不放宽该谓词**——放宽会让历史上 74+ 条
+  被刻意排除的腿一并变成可采纳，而我们不知道当初排除它们的理由。
+  改为**新增一条并列判据**，准入不看请求形状而看阶段 6 的证据标准
+  （`TU==posId` + 该 ordId 在 `trigger-orders-pending` 在场 + instId/posSide 相符 + `TPSL` 类型），
+  **比原路径的证据更强而非更弱**，对 limit / trigger_limit、SL-only / combined 一视同仁；原路径原样保留。
+  **方法论**：查不到理由时，可选的不是"那就当没有理由"，而是**换一条不依赖那个理由的路**。
+- phase-6a-coverage-fact (2026-09-10, 会话 local_4a6676b0, **我此前没说清的覆盖面**):
+  6a 改的是 `deepcoin_execution_actions.adjust_position_tpsl`，而**自动（KOL）管理指令进不了那个函数**——
+  它开头就是 `automated_position_tpsl_requires_management_batch`，非人工来源一律拒绝、要求走管理批次。
+  **所以新绑定链目前只覆盖人工管理路径，不覆盖自动路径**；自动路径在 `strategy_management_executor`，
+  仍用 `match_position_protection`（行 658）。
+  **但它不会"挂新不撤旧"**：匹配器答不出来时预检抛
+  `protection_preflight_rows_ambiguous_or_drifted`，整批拒绝。
+  所以这两个账本无行的仓位上，**自动管理指令的现网后果是"做不了任何事"，不是"多挂一张"**。
 - phase-6cd-shadow-verdict-gap (2026-09-10, 会话 local_4a6676b0, **待随 A-11b 之后上线**):
   影子把"旧匹配器 `absent` + 新链 resolved"归进了 `set_mismatch`，读起来像"新旧两条路打架"，
   实际与 `chain_resolved_legacy_ambiguous` 同族，是**改进**。分类少了一档
