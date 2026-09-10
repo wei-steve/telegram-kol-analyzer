@@ -885,6 +885,39 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **作废前那 27 分钟仍有参考价值但不作判据**：2 次探活全通过、0 个 silence_timeout，基线是 3 个/30 分钟。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
+- phase-6a-shadow-window (2026-09-10, 会话 local_4a6676b0, **6a 影子部署已完成并收窗**):
+  分支 `rest-ws/phase-6-protection-authority`，提交 **`75652eec1ce21c9646b434b4ab69df8a3d915651`**，
+  2026-09-10T11:22Z 经 `tg-deploy` 上线；**回滚参考 `4953490b4d8414b449c790fc0784e4bac83f40b9`**（部署前生产 HEAD）。
+  纯影子：新绑定链只计算不写交易所。窗口 11:24:00Z ~ 11:54:08Z（30 分 09 秒）、31 个采样、
+  **零重置、head_ok 全程 1、units_ok 全程 1**、真实消息 7 条 / 2 群，达标退出写 `WINDOW_MET`。
+  证据 `/root/evidence/phase-6a/observer-samples.jsonl`。
+  **逐笔比对结果**：26 轮 reconcile、104 次仓位比对，`agreed` 78、`chain_frozen` 26、
+  **`set_mismatch` 0、`chain_resolved_legacy_ambiguous` 0、`unbound_position` 0、读失败 0**。
+  26 次冻结全部是同一个仓位 `1001125178552543`（即 6-pre-4 已发现、转 A 线归因的 unmanaged 仓位），
+  冻结原因 `protection_order_unattributable`，两张挂单 `1001125208806869` / `1001125208807099`
+  既不在账本、也没有 TU 帧；**旧匹配器对同一个仓位同样拒绝**（`global_unowned_order_present`），
+  所以新链没有丢失任何现有能力，两条路在同一个地方停下。
+  execution_events 只落了 4 行（首轮各仓位一行），此后 26 轮无变化即不追加——变更追加的去重按预期生效。
+  **本窗口没有出现的两种情形，如实记为未取样**：`chain_resolved_legacy_ambiguous`（新链的增量能力）
+  与"一张同时带 SL 和 TP 的合并单"（会冻结）在生产 30 分钟内**一次都没发生**，只有测试覆盖。
+- phase-6a-contract-changes (2026-09-10, 会话 local_4a6676b0): 6a 改了两条既有测试写死的契约，显式记录以免日后被当成偷改。
+  (1) `tests/test_deepcoin_private_ws.py::_ALLOWED_INBOX_READERS` 加入 `protection_authority.py`：
+  `TU` 是唯一能把保护单连回仓位的字段（`OS` 每次写入都变、REST 从不同时给出两者），所以保护链必须读
+  `deepcoin_ws_events`。**推送不被单独采信**——被认领的单必须同时出现在 REST `trigger-orders-pending`
+  且 instId / posSide / `triggerOrderType=TPSL` 相符，这是硬性禁止第 5 条要求的"先唤醒、再 REST 核验"形状，
+  不是它的例外。
+  (2) `tests/test_naked_fill_stop_net_boundary.py` 通往 `submit_exact_position_sltp` 的调用者名单：
+  加 `protection_replacement.py`、去掉 `deepcoin_execution_actions.py` 与 `break_even_convergence_executor.py`
+  （两者改为经共用件调用，直接 import 成了死代码并删除）。**路径数因此少一条而不是多一条。**
+- phase-6a-deploy-gate-defect (2026-09-10, 会话 local_4a6676b0 自查): 部署前的"2 分钟无 auto_trade 消息"
+  用 `journalctl | grep -ci auto_trade` 判定，**它永远不会归零**：生产上每约 65 秒有一条
+  `lifecycle_monitor Skipping simulated lifecycle entry in an auto_trade group: lifecycle_id=1145`，
+  那是一条说明"什么都没做"的周期日志，却含有 `auto_trade` 字样。照此判据等下去，部署窗口永不出现。
+  形状与同日 A 线的 `rounds` 恒为 0、以及 6-pre-4 的探活翻倍**同源**：
+  **观测量的定义依赖了一个没人保证的不变量**（"含 auto_trade 字样的日志行 = 有交易活动"）。
+  改用可判定的库内判据：`message_processing_jobs` 无 claimed/processing、`position_mutation_intents`
+  无未决行、近 2 分钟无 `execution_events`、无运行中批次；并单独确认那条日志之外**再无**其他
+  auto_trade 行。本次部署即按新判据放行（四项全 0）。
 - phase-6-approval (2026-09-10, 用户在指挥会话 local_858790fe 明确批准，原话"批准阶段6"): 阶段 6（新绑定链驱动 TPSL 修改、撤销与平仓，L3）获批。批准前已向用户出示：阶段 5 逐笔保护确认（binding 346 市价腿回执无 posId、三重确认在提交时通过、止损 2445 与三档止盈在交易所；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；无"成交但无可验证止损"）与补测第 10 项结论（set-position-sltp 为叠加语义、每次写入新 ordId；TU 恒等于 posId 30/30，即新旧保护单的可查关联）。附加裁定：任务 1 的替换顺序改为 A-5e 形状"先挂新→回读确认→按 TU==posId 撤旧全集→确认撤净→改账本"，撤旧失败保留新单并告警冻结，phase-6-protection-authority.md 已同步改写。领取条件：6-pre-4 completed 后 current_phase 置 6，由 B 线会话领取；unverified 绑定一律拒绝修改/撤销/自动平仓，撤销前精确回读，web 角色无执行权限，重启后先查询核对认领不重复挂保护。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
 - phase-5-deploy-authorization (2026-09-08, 指挥会话): 依据用户 2026-09-07 的 phase-5-approval 与用户明确授权由指挥会话裁定，放行部署候选 a3713ec418b5e6e6487631482bcc630079daa52b（回滚 230ba1cc）。裁定 (a) 收紧接受：市价成交归属 unverified 时记录 + critical 告警（market_fill_attribution_unverified，进代码级默认白名单）+ 不动作；后续 B-5d 安全网在阶段 6 前完成、需用户单独批准。观察要求：窗口内每笔新入场逐笔核对止损已挂上，任何“成交但无可验证止损”立即回滚。用户可随时以“回滚阶段 5”否决。
