@@ -1016,6 +1016,26 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   或者让采样器不做白名单抽取、而是把整个 `protection_shadow` 对象原样落进采样行。
   **后者更彻底**（新增字段自动进证据），作为后续改进记在这里。
   已补 `would_adopt` 并重起窗（18:21:10Z），损失一分钟。
+- fake-responses-built-from-requests (2026-09-10, A 线 local_22ee72a5 在 A-13 归纳、本会话自查确认):
+  **用"我们发出的请求"回填出来的假响应，会让任何"把请求形状的键读在响应上"的代码通过测试。**
+  break-even 的假客户端把 `payload["posId"]` 与 `payload["slTriggerPx"]` 原样写进假挂单行，
+  而 `trigger-orders-pending` **两个都不返回**（它给 `slTriggerPrice`，且没有仓位 id）——
+  于是生产恒拒、测试全绿。
+  **本会话按这条标准自查了 `tests/test_deepcoin_execution_actions.py`**：它的假客户端**有同一个写法**。
+  改成真实响应形状（去掉回填的 `posId`、改真实键名、补 `triggerOrderType`）后 **138 条一条没红**——
+  本会话这条链的归属走账本与 `TU`，不依赖挂单行自带的 `posId`。
+  **但改动保留了**（`cafdf208`）：即使当前用例不依赖，**夹具会一直向下一个人示范错误的词表**。
+  **"当前没坏"不是保留一个错误示范的理由。**
+  **值得补的一句**：这条的可怕之处在于**假响应越像真的越危险**——一个敷衍的假响应（`{}`）会让
+  测试立刻红，而一个用请求精心回填的假响应看起来最专业、也最能骗过所有人。
+- position-evidence-stop-loss-is-not-a-protection-criterion (2026-09-10, A 线提请、本会话查证):
+  `execution_bindings.build_position_evidence` 3177/3178 从**仓位行**取 `slTriggerPx` / `tpTriggerPx`
+  填 `PositionEvidence.stop_loss` / `take_profits`。键名在仓位行上是**对的**，
+  但 ARCHITECTURE 已明文"仓位行那两个字段不能当'有没有止损'的判据"，所以要查它被谁消费。
+  **查了：`PositionEvidence.stop_loss` 只参与 `position_attribution` 的入场归属经济学比对
+  （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
+  `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
+  记在这里是为了让下一个人不必重新查一遍。
 - phase-6h-break-even-field-names (2026-09-10, 会话 local_4a6676b0 发现, **指挥会话立为 6h，需用户批准**):
   **自动保本收敛在生产上从未成功过，而且按现在的代码必然失败。**
   `break_even_convergence_executor` 的市场预检拿 `trigger-orders-pending` 的**原始行**比对：
