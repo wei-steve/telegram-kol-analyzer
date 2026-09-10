@@ -1036,6 +1036,44 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6e-cutover-completed (2026-09-10, 会话 local_4a6676b0, **五条判据全部达成，含交易所侧证据**):
+  接线本体 **`14fdf1b1ba29e441644b7c57cfabaee689915ed2`**，19:17Z 上线，**回滚参考 `a8a3a069`**，
+  四步部署（第 3 步第三次撞并发推送，按不变量合并不变基）。全量 **8312 passed / 4 skipped / 0 failed**。
+  窗口 19:20:31Z ~ 19:50Z（**1810 秒**）、31 采样、**零重置、head_ok / units_ok 全程 1**、32 轮。
+  证据 `/root/evidence/phase-6e-cutover/observer-samples.jsonl`。
+  **判据逐条**：
+  (1) **两行账本，各一行** ——
+      `1001125216121996|1001125216121995` 与 `1001125216153672|1001125216153671`，
+      皆 `stop_loss / 75700 / 15 / verified / exchange_adopted_by_tu`，与交易所那两张随单止损逐字段一致 ✓
+  (2) 两条 `protection_adopted_from_exchange` 事件 + 两条 runtime incident，**均 `delivered`**（19:19:07Z），
+      `refused_positions` 全窗 0 ✓
+  (3) 两条 `backup_stop_shadow_ready`，**且收窗时交易所 TPSL 仍为 4 张、四个 ordId 与部署前完全相同** ✓
+  (4) `backup_stop_blocked` 不再产生（已越过 `primary_stop_not_verified` 那道门）✓
+  (5) **全窗零交易所写入**：`position_mutation_intents` 窗内 **0 行** ✓
+  **(3)(5) 是本步最重要的两条**，都用交易所侧读数证明，而不是只看我们自己的计数。
+  **两个自己走出来的确认**：`adopted_rows` 全窗恒 **0**（幂等按设计生效，无重复采纳）；
+  影子判定从 `chain_resolved_legacy_absent` 自动转为 **`chain_resolved_legacy_ambiguous`**（64 = 2 × 32）——
+  账本现在能给出那两张止损的归属，旧匹配器不再说 absent，但仍被那两张**在挂入场单自带止损**卡成 ambiguous。
+  **未达标项**：`msgs=0/5`（深夜安静时段），与前两窗同一口径：**消息数对本步判据没有信息量**。
+- phase-6e-shadow-ready-missing-payload (2026-09-10, 会话 local_4a6676b0 自查, **随 6f 提交修**):
+  指挥会话要求 `backup_stop_shadow_ready` **含拟价/量**，而落库的两条只有
+  `{"reason_code": "primary_stop_adopted_from_exchange"}`——**没有价也没有量**。
+  原因：我把闸门放在了"计算之前"而不是"提交之前"，于是根本没算就返回了。
+  **拟下单内容（按生产真实持仓与代码逐行算出，供 6f 申请用）**：
+  两仓位相同——`posSide=long`、数量 `15`（全量）、主止损 `75700`、
+  **拟备份止损 `75548.6`**（= 75700 × (1−20bps)，long 向下取整到 tick）、`liqPx=68116.6`（校验要求
+  备份止损 < 主止损且 > 强平价）、端点 **`set_position_sltp`**、
+  payload `{...,"posId":<pos>,"slTriggerPx":"75548.6","slTriggerPxType":"last","slOrdPx":"-1"}`、
+  **无显式 reduce-only**（仓位绑定 TPSL，按端点语义只减仓）、
+  失败处置：该模块**零撤单调用**（grep 计数 0），主止损绝不会被动。
+  修法：把闸门下移到 payload 算完之后、提交之前。
+- observer-count-trap-hit-in-a-check (2026-09-10, 会话 local_4a6676b0 自查):
+  收窗时我用 `ps -eo pid,cmd | awk "/step6_observe/"` 数残留监视器，得到 **3**——
+  **那三个是这条检查命令自己的进程**（ssh 的 `bash -c`、`ps`、`awk` 的命令行里都含该模式）。
+  换成锚定完整命令行的 `awk "/^ *[0-9]+ \/bin\/bash \/root\/step6_observe_v2\.sh/"` 后是 **0**。
+  **ARCHITECTURE 第 6 节点名的正是这一条**（"不要用 `pgrep -f <脚本名>`，发起检查的命令行自身就含那个模式"），
+  而我在写监视器时守住了它、却在**临时敲的一条检查命令里**踩了进去。
+  **教训与"一条只在人记得时才执行的判据"同源**：规矩写在脚本里，而临时命令不经过脚本。
 - phase-6e-cutover-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话给定):
   6e 接线（真正的采纳）上线后，**要取到下列全部才算证明本步**：
   (1) 两个仓位（`1001125216121996` / `1001125216153672`）**各新增恰好 1 行**保护账本行：
