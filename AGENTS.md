@@ -47,29 +47,42 @@
   and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
   Record the pre-deploy production HEAD as the rollback SHA; rollback is
   `tg-deploy <that-sha>`.
-  **Immediately after `tg-deploy`, confirm that the deployed sha is on
-  `origin/codex/deepcoin-auto-trading-v1`, and push it there at once if it is
-  not.** Deploying from a side branch leaves production ahead of the shared
-  branch, and the next person to deploy from that branch silently reverts your
-  work. "Is production HEAD my own ancestor" and "is what I deployed on the
-  shared branch" are two different checks: the first stops you from reverting
-  yourself, the second stops somebody else from reverting you. Both are
-  required. **A cutover commit that has not been released must never reach the
-  shared branch** -- push the exact deployed sha, not your branch tip. The bar
-  is production *code*, not the sha: the shared branch may run ahead by
+  **Before `tg-deploy`, confirm the candidate is a descendant of the current
+  production HEAD; after `tg-deploy`, confirm the deployed sha is on
+  `origin/codex/deepcoin-auto-trading-v1` and push it there at once if it is
+  not.** Both directions were needed on 2026-09-10, one each way: the A line
+  nearly deployed a commit that did not contain the B line's just-observed
+  phase, and the B line's released candidate turned out not to contain the A
+  line's. Neither was caught by tooling; both were caught by someone running
+  the check by hand. Deploying from a side branch leaves production ahead of
+  the shared branch, and the next person to deploy from that branch silently
+  reverts your work. The two checks answer different questions: the pre-deploy
+  one stops you from reverting somebody else, the post-deploy one stops
+  somebody else from reverting you. Neither substitutes for the other.
+  **A cutover commit that has not been released must never reach the shared
+  branch** -- push the exact deployed sha, not your branch tip. The bar is
+  production *behaviour*, not the sha: the shared branch may run ahead by
   documentation-only commits, and the test is
   `git diff <production sha> <branch tip> --name-only | grep -vE '^docs/|\.md$'`
   coming back empty. Prose is exempt wherever it lives -- `docs/`, this file,
-  any `README` -- because nothing executes it. Everything else counts, and
-  `.py` is not the boundary: a `scripts/*.sh` change, a systemd unit, or a
-  `pyproject.toml` dependency bump all alter how production behaves, and the
-  dependency case is the one this same section warns about two paragraphs
-  down, since tg-deploy does not install them. Read literally as "never ahead
-  of production" the rule would
-  make an observation window's own result impossible to record without
+  any `README` -- because nothing executes it, and position does not decide
+  that. Everything else counts, and `.py` is not the boundary: a `scripts/*`
+  change, a systemd unit under `deploy/`, a `config/*` file read at runtime, or
+  a `pyproject.toml` dependency bump all alter how production behaves, and the
+  dependency case is the one this same section warns about two paragraphs down,
+  since tg-deploy does not install them. **The test is an allowlist on
+  purpose**: anything added to this repository later counts as code until
+  somebody decides otherwise, which is the safe default for a directory nobody
+  has thought about yet. Read literally as "never ahead of production" the rule
+  would make an observation window's own result impossible to record without
   redeploying for a docs change and resetting somebody else's window, which is
   a cost with nothing on the other side of it -- what the rule exists to stop
   is undeployed code riding along on the next person's deploy.
+  **A rule of this shape earns its first test on its own commit**: run the
+  check against the commit that introduces it before pushing. The 2026-09-10
+  wording went through two wrong judgements -- `.py$`, too narrow, and "outside
+  `docs/`", which forbade the very commit carrying it -- and the second was
+  caught only because somebody ran the grep before pushing rather than after.
   tg-deploy does not install Python dependencies: when
   `pyproject.toml` dependencies change, `pip install` them into
   `/opt/telegram-kol-analyzer/.venv` on the server before running tg-deploy.
