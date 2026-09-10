@@ -88,8 +88,11 @@
   copy only when schema/bootstrap/migration files change or a production data
   mutation is planned. Preserve a backup, `PRAGMA quick_check`, and before/after
   counts for affected and critical business tables; do not hash every table
-  unless an anomaly requires a wider audit. Any change to real exchange-write
-  semantics must be explicitly included in the approved phase scope.
+  unless an anomaly requires a wider audit. When a repair backup is retired,
+  leave its size and `sha256` behind in place of the file, so a deleted
+  recovery point is still identifiable rather than merely reported as gone.
+  Any change to real exchange-write semantics must be explicitly included in
+  the approved phase scope.
 - During development, use focused tests for each edit. Run the full suite once
   after all production-code changes are assembled into the final candidate. If
   production code changes after that run, it becomes a new final candidate: run
