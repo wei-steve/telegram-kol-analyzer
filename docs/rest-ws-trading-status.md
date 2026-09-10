@@ -834,6 +834,17 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   (2) 观测脚本的正则改成只匹配新格式 `Deepcoin silence probe <status> (`。
   **顺带印证了 4 个 GET**：`gets=4`，与部署前只读实测一致。
   第一个窗口 `messages=0`（什么都没攒到）时重开，代价近似为零。
+- phase-6-pre-4-observer-timezone (2026-09-10, 6-pre-4 会话 local_4a6676b0): 观测脚本第二次起窗，
+  **首样本就写着 `probes=3` 而窗口才开 0 秒**——`journalctl --since` 按**本地时区**解释，
+  脚本传的是 UTC 字符串，服务器 UTC+8，等于把查询窗口往前多开了 8 小时，
+  把上一个窗口的探活算进了新窗口。同一时间戳实测：本地解释取到 17169 行，加 ` UTC` 后 117 行。
+  **与本阶段早先那次读错 epoch（把 1788830587000 读成 09-07）是同一类错**：
+  时间戳在说明时区之前不是一个数。数据库那半边没错（sqlite 存 UTC、比较也用 UTC），
+  只有 journalctl 这一路混了口径——**同一个脚本里两种时间口径并存**才是真正的坑。
+  修法：journalctl 单独传 `"$WS_ISO UTC"`。前两次窗口的样本作废存档为
+  `observer-samples-void-1.jsonl`（旧日志双计数）与 `observer-samples-void-2.jsonl`（时区错配），
+  正式窗口从 2026-09-10T09:08:45Z 起，deploy_sha `3d40a59a`。
+  **作废前那 27 分钟仍有参考价值但不作判据**：2 次探活全通过、0 个 silence_timeout，基线是 3 个/30 分钟。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
