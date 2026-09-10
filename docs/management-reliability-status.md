@@ -477,6 +477,12 @@ user_decisions_2026_09_07:
   **写测试时撞到一个值得记的事实**：把 `PositionMutationAuthorityError` 当作**客户端写入的返回结果**注进去，**并不能复现一次 refusal**——网关会把写入调用抛出的任何异常转成 `recovery_required`（`_finish_with_error(intent_id, "recovery_required", …)`），而**它这么做是对的：到那一步交易所已经被联系过了**。真实的 refusal 严格发生在写入之前。所以这五处的用例都注在执行器自己的调用点上，而"网关如何映射状态"由 A-11 那两条具名用例锁住。**这同时是对 A-11 前提的一次侧面验证：网关本来就没有把"写入调用自己抛异常"当成确定失败。**
   **新增 5 条用例**（每处一条）：refused 的保护替换走回滚而非停等（并断言 `recovery_required` 不出现）；该拒绝的 incident 行**真的存在**且带 reason（A-10e 的教训）；回滚中的 refusal **仍是** `recovery_required`；回执缺失**仍在**未知侧；restore 的 refusal **仍是** `recovery_required`（并直接对源码断言调用方那条降级契约，而不是对一个替身断言）。**三条"仍是"的用例是刻意写的**——它们的作用是让下一个人在没读流程的情况下改不动这三处。
 
+  **部署**：`117f8b0964ba6d1bee1d187fe2bd9f674205a76f`，**回滚参考 `20445fc6`**（B 线 6c+6d），三服务 MainPID 全新、全 active。全量 **8301 passed / 4 skipped / 0 failed**。变基前核过：共享分支自本步基点起只多三个**纯文档**提交（非文档路径数 0），故该次全量对本候选的生产代码仍然有效。
+  **这次四步顺序走对了**（A-11 那次是照旧措辞先部署后推、撞上 `Could not parse object`）：push 到自己的分支 `mgmt/step-11b-same-class-sites` → 部署前核"生产 HEAD 是候选祖先" ✓ → `tg-deploy 117f8b09` → 把该确切 sha 推共享分支 → 双向核："部署的 sha 在共享分支上" ✓、"共享分支比生产多出的代码文件数 = 0" ✓。
+  **L1 观察窗（17:53:09Z → 18:08:20Z，`WINDOW_MET`）**：15 分钟 / **rounds=17** / msgs=1 / 1 群 / 零重置 / `head_ok` 全程 1 / `err_lines=0` / `worker_http=200` / `capture_failopen=0`。判据起窗前写下，收窗照实分开记：
+  · **未取得 A-11b 的样本**：`prot_alerts=0 / restored_legs=0 / recovery_legs=0`，A-11 的四个（`auth_refused` / `auth_alerts` / `submit_unknown` / `frozen_batches`）同样全 0——窗口内没有管理批次执行，**既没有拒绝可分类、也没有替换可回滚。本步与 A-11 的重分类在生产上均为零样本，仅测试覆盖。**
+  · **取得的是"无回归"，且是三方联合证据**：HEAD 里同时含 B 线 6c 与 6d。
+  · **一条意外的持续证据**：`empty_state` 从上一窗那个 `2026-09-10T13:29:57` 的时间戳变成 `-`——**因为账户此刻有仓位，A-10e 的"非空读即重置"在生产上真的执行了一次**，且"仅在变化时写"仍然成立。这证明的是**上一步仍在工作**，不是本步被验证。
 - step-12 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **入场单自带的止损从来不进保护账本**（**read-only 归因，零改动、零写入**）。起因是 B 线在 6c/6d 窗口里发现两条 `backup_stop_blocked` 落在 A 线路径上并告知；**本条的每项事实我自己核过，未采信转述**。凭据只从 `/proc/<MainPID>/environ` 取、`python -B`、经 stdin 不落盘。
   **现场**：16:07 开出两个 BTC 多头 `1001125216121996` / `1001125216153672`（各 15 张 @77000，binding 349/350，leg 601/602）。交易所侧我直读确认**各自有一张真实止损**（挂单 `posSide=long / sz=15 / slTriggerPrice=75700`，ordId `…121995` / `…153671`，即 **入场 ordId − 1**）。账本侧 `position_protection_ledger` 对这两个 pos_id 与这两个 order_id **零行**。于是 `protection_health` 判 `primary_stop_not_verified`，备份止损被挡：`position_protection_incidents` **444 / 445 = `backup_stop_blocked`**，均 `delivered`。**仓位是有保护的，方向是安全的（挡住而非乱挂），告警也到了人。**
   **(1) 本该由哪条路径进账本：设计了两条，两条都不覆盖**
