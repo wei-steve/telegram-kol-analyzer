@@ -46,7 +46,16 @@
   hard-resets the server checkout (branch `live`) to that SHA, clears bytecode,
   and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
   Record the pre-deploy production HEAD as the rollback SHA; rollback is
-  `tg-deploy <that-sha>`. tg-deploy does not install Python dependencies: when
+  `tg-deploy <that-sha>`.
+  **Immediately after `tg-deploy`, confirm that the deployed sha is on
+  `origin/codex/deepcoin-auto-trading-v1`, and push it there at once if it is
+  not.** Deploying from a side branch leaves production ahead of the shared
+  branch, and the next person to deploy from that branch silently reverts your
+  work. "Is production HEAD my own ancestor" and "is what I deployed on the
+  shared branch" are two different checks: the first stops you from reverting
+  yourself, the second stops somebody else from reverting you. Both are
+  required. **A cutover commit that has not been released must never reach the
+  shared branch** -- push the exact deployed sha, not your branch tip. tg-deploy does not install Python dependencies: when
   `pyproject.toml` dependencies change, `pip install` them into
   `/opt/telegram-kol-analyzer/.venv` on the server before running tg-deploy.
   The former stage/activate helper
