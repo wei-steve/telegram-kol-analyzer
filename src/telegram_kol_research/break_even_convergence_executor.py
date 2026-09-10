@@ -25,11 +25,15 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergence,
     StrategyBreakEvenConvergenceLeg,
 )
+from telegram_kol_research.protection_replacement import (
+    GROUP_STOP as PROTECTION_GROUP_STOP,
+    NewProtectionOrder,
+    ProtectionReplacementPlan,
+    replace_stop_group,
+)
 from telegram_kol_research.position_mutation_gateway import (
-    cancel_exact_position_sltp,
     close_exact_position,
     exact_position_write_gate,
-    submit_exact_position_sltp,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.position_mutation_intents import (
@@ -244,6 +248,7 @@ def _execute_market_decisions(
         work = [
             {
                 "id": int(leg.id),
+                "execution_binding_id": int(binding.id),
                 "execution_order_leg_id": int(leg.execution_order_leg_id),
                 "pos_id": str(leg.pos_id),
                 "size": str(leg.preflight_size),
@@ -277,65 +282,76 @@ def _execute_market_decisions(
                 )
                 continue
             if action == "set_break_even":
-                response = submit_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
+                # Phase 6a. The same replacement sequence the management path
+                # uses, so there is one implementation of "place the new stop,
+                # then prove the old ones are gone" rather than two that drift.
+                # What this adds here is the proof: before, the cancel was
+                # issued and its outcome assumed.
+                plan = ProtectionReplacementPlan(
+                    venue="deepcoin",
                     pos_id=item["pos_id"],
-                    payload={
-                        "instType": "SWAP",
-                        "instId": instrument_id,
-                        "posId": item["pos_id"],
-                        "slTriggerPx": item["entry"],
-                        "slTriggerPxType": "last",
-                        "slOrdPx": "-1",
-                        "sz": item["size"],
-                    },
-                    idempotency_key=(
-                        f"break-even:{convergence_id}:{item['id']}:set-stop"
+                    instrument_id=instrument_id,
+                    execution_binding_id=int(item["execution_binding_id"]),
+                    execution_order_leg_id=int(item["execution_order_leg_id"]),
+                    group=PROTECTION_GROUP_STOP,
+                    new_orders=(
+                        NewProtectionOrder(
+                            purpose="stop_loss",
+                            payload={
+                                "instType": "SWAP",
+                                "instId": instrument_id,
+                                "posId": item["pos_id"],
+                                "slTriggerPx": item["entry"],
+                                "slTriggerPxType": "last",
+                                "slOrdPx": "-1",
+                                "sz": item["size"],
+                            },
+                        ),
                     ),
+                    old_order_ids=tuple(
+                        str(old_order_id)
+                        for old_order_id in item["decision"].get(
+                            "replace_stop_order_ids", []
+                        )
+                    ),
+                    idempotency_prefix=f"break-even:{convergence_id}:{item['id']}",
+                )
+                replacement = replace_stop_group(
+                    session_factory,
+                    plan=plan,
+                    deepcoin_client=deepcoin_client,
+                    executed_at=executed_at,
                     live_execution_gate=lambda pos_id=item["pos_id"]: (
                         _runtime_mode_enabled(session_factory, execution_mode="live")
                         and exact_position_write_gate(session_factory, pos_id=pos_id)
                     ),
-                    now_provider=lambda: executed_at,
-                    require_readback=True,
                 )
-                order_id = _response_order_id(response)
-                if not order_id:
-                    raise RuntimeError("break_even_stop_response_missing_order_id")
-                _record_break_even_stop(
-                    session_factory,
-                    convergence_id=convergence_id,
-                    leg_id=item["id"],
-                    order_id=order_id,
-                    instrument_id=instrument_id,
-                    trigger_price=item["entry"],
-                    size=item["size"],
-                    seen_at=executed_at,
+                order_id = (
+                    replacement.new_order_ids[0]
+                    if replacement.new_order_ids
+                    else ""
                 )
-                for old_order_id in item["decision"].get(
-                    "replace_stop_order_ids", []
-                ):
-                    cancel_exact_position_sltp(
-                        session_factory=session_factory,
-                        deepcoin_client=deepcoin_client,
-                        pos_id=item["pos_id"],
-                        order_id=str(old_order_id),
-                        instrument_id=instrument_id,
-                        idempotency_key=(
-                            f"break-even:{convergence_id}:{item['id']}:"
-                            f"cancel-stop:{old_order_id}"
-                        ),
-                        live_execution_gate=lambda pos_id=item["pos_id"]: (
-                            _runtime_mode_enabled(session_factory, execution_mode="live")
-                            and exact_position_write_gate(session_factory, pos_id=pos_id)
-                        ),
-                        now_provider=lambda: executed_at,
-                    )
-                    _mark_old_stop_cancelled(
+                if order_id:
+                    _record_break_even_stop(
                         session_factory,
-                        order_id=str(old_order_id),
-                        cancelled_at=executed_at,
+                        convergence_id=convergence_id,
+                        leg_id=item["id"],
+                        order_id=order_id,
+                        instrument_id=instrument_id,
+                        trigger_price=item["entry"],
+                        size=item["size"],
+                        seen_at=executed_at,
+                    )
+                if not replacement.succeeded:
+                    # The new stop may well be live; the old one could not be
+                    # proven gone. That is over-protection plus an incident the
+                    # shared sequence already filed. Raising keeps this on the
+                    # existing recovery path -- the convergence goes
+                    # ``recovery_required`` and is never retried on its own --
+                    # rather than reporting a convergence it did not achieve.
+                    raise RuntimeError(
+                        "break_even_stop_replacement_"
+                        f"{replacement.reason_code or 'incomplete'}"
                     )
                 _finish_leg(
                     session_factory,

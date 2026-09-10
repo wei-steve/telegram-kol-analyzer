@@ -185,9 +185,13 @@ def test_the_set_of_ownership_proving_writer_callers_did_not_grow():
     }
     assert callers == {
         "backup_stop_repair.py",
-        "break_even_convergence_executor.py",
-        "deepcoin_execution_actions.py",
         "native_tpsl_migration.py",
+        # Phase 6a. The shared replacement sequence. The two modules that used
+        # to call the writer directly -- ``deepcoin_execution_actions`` (the
+        # management TPSL path) and ``break_even_convergence_executor`` -- now
+        # reach it only through here, so the number of ways to that writer went
+        # down by one rather than up.
+        "protection_replacement.py",
         "recovery_live_submit.py",
         "stop_loss_size_convergence.py",
         "strategy_management_composite_executor.py",

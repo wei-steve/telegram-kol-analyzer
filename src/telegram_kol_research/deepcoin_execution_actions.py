@@ -46,19 +46,32 @@ from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
     ExecutionOrderLeg,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     RawMessage,
     RecoveryOrderConfirmation,
     StrategyLifecycle,
 )
+from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
+from telegram_kol_research.protection_authority import (
+    adopt_protection_orders,
+    resolve_protection_authority,
+)
+from telegram_kol_research.protection_replacement import (
+    GROUP_STOP as PROTECTION_GROUP_STOP,
+    GROUP_TAKE_PROFIT as PROTECTION_GROUP_TAKE_PROFIT,
+    STATUS_SKIPPED as PROTECTION_REPLACEMENT_SKIPPED,
+    NewProtectionOrder,
+    ProtectionReplacementPlan,
+    replace_stop_group,
+    replace_take_profit_group,
+)
 from telegram_kol_research.position_mutation_gateway import (
-    cancel_exact_position_sltp,
     close_exact_position,
     exact_position_write_gate,
-    submit_exact_position_sltp,
 )
 from telegram_kol_research.position_attribution import (
     PositionAttributionError,
@@ -86,6 +99,12 @@ from telegram_kol_research.source_message_deletion import (
 
 
 logger = logging.getLogger(__name__)
+
+
+#: A protection write the binding chain refused to make. Phase 6: a refusal
+#: must reach a person, because "the stop was not moved" is indistinguishable
+#: from "the stop did not need moving" from the outside.
+PROTECTION_AUTHORITY_REFUSED_INCIDENT_TYPE = "protection_authority_refused"
 
 
 class DeepcoinExecutionActionError(RuntimeError):
@@ -439,24 +458,60 @@ def adjust_position_tpsl(
     )
     pending = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
     pos_id = _first_string(position, "posId", "pos_id", "id")
+    # Phase 6a. Which orders protect this position is now answered by the
+    # binding chain -- verified entry leg, ledger rows, and ``TU == posId`` --
+    # instead of by candidate matching over the instrument. The chain either
+    # names the exact set or refuses; it never guesses, and a refusal here is
+    # an alert rather than a silent skip.
     with session_factory() as session:
-        ledger_rows = list_verified_account_ledger_rows(session)
-    exact_order_position_ids = {
-        str(row.order_id): str(row.pos_id)
-        for row in ledger_rows
-        if str(row.order_id or "").strip()
-    }
-    protection = match_position_protection(
-        live_positions,
-        pending,
-        exact_order_position_ids=exact_order_position_ids,
-    ).by_pos_id.get(pos_id or "")
-    if protection is not None and protection.status == "present_but_ambiguous":
-        raise DeepcoinExecutionActionError("ambiguous_pending_position_tpsl")
-    old_order_ids = protection.order_ids if protection is not None else []
-    old_order_id_set = set(old_order_ids)
+        authority = resolve_protection_authority(
+            session,
+            venue=binding.venue,
+            pos_id=str(pos_id or ""),
+            instrument_id=inst_id,
+            side=binding.side,
+            pending_rows=pending,
+        )
+    if not authority.resolved:
+        _capture_protection_authority_refusal(
+            session_factory, binding=binding, authority=authority, now=now
+        )
+        raise DeepcoinExecutionActionError(
+            f"protection_authority_frozen:{authority.reason_code}"
+        )
+    if authority.adoptions:
+        # An order the exchange and a ``TU`` frame prove is ours, that the
+        # ledger never recorded. It is written down *before* it is acted on, so
+        # the durable record and the write always agree about who owns it.
+        try:
+            with session_factory() as session:
+                adopt_protection_orders(
+                    session,
+                    authority=authority,
+                    venue=binding.venue,
+                    adopted_at=now,
+                )
+                session.commit()
+        except Exception as exc:
+            _capture_protection_authority_refusal(
+                session_factory,
+                binding=binding,
+                authority=authority,
+                now=now,
+                reason_code="protection_order_adoption_failed",
+            )
+            raise DeepcoinExecutionActionError(
+                "protection_order_adoption_failed"
+            ) from exc
+
+    old_stop_order_ids = tuple(item.order_id for item in authority.stop_orders)
+    old_take_profit_order_ids = tuple(
+        item.order_id for item in authority.take_profit_orders
+    )
+    old_order_ids = list(old_stop_order_ids + old_take_profit_order_ids)
     old_tpsl_rows = [
-        row for row in pending if _order_id_from_payload(row) in old_order_id_set
+        dict(item.row)
+        for item in (*authority.stop_orders, *authority.take_profit_orders)
     ]
     if require_existing and not old_order_ids:
         raise DeepcoinExecutionActionError("no_existing_position_tpsl_to_adjust")
@@ -482,158 +537,108 @@ def adjust_position_tpsl(
     common_payload = _build_position_tpsl_payload(
         binding=binding, position=position, inst_id=inst_id, after={}
     )
+
+    stop_rows = [
+        row for row in adjusted_row_snapshots if row.get("purpose") == "stop_loss"
+    ]
+    take_profit_rows = [
+        row for row in adjusted_row_snapshots if row.get("purpose") == "take_profit"
+    ]
+    unsupported = [
+        row
+        for row in adjusted_row_snapshots
+        if row.get("purpose") not in {"stop_loss", "take_profit"}
+    ]
+    if unsupported:
+        # A ``combined`` row carries both triggers, so replacing one group
+        # would silently retire the other. The chain already refuses to resolve
+        # such an order; this is the belt for a snapshot built another way.
+        raise DeepcoinExecutionActionError("position_tpsl_row_purpose_unsupported")
+
     set_payloads = [
         _build_position_tpsl_row_payload(common_payload, row)
         for row in adjusted_row_snapshots
     ]
-    if old_row_snapshots:
-        pending_recheck = deepcoin_client.list_trigger_orders_pending(inst_id=inst_id)
-        rechecked = match_position_protection(
-            live_positions,
-            pending_recheck,
-            exact_order_position_ids=exact_order_position_ids,
-        ).by_pos_id.get(pos_id or "")
-        rechecked_pending_rows = [
-            row
-            for row in pending_recheck
-            if _order_id_from_payload(row) in old_order_id_set
-        ]
-        if (
-            rechecked is None
-            or rechecked.status != "verified"
-            or rechecked.order_ids != old_order_ids
-            or snapshot_protection_rows(rechecked_pending_rows)
-            != old_row_snapshots
-        ):
-            raise DeepcoinExecutionActionError(
-                "pending_position_tpsl_changed_before_cancel"
-            )
+    pre_cancel_check = _build_pre_cancel_check(
+        authority=authority, instrument_id=inst_id
+    )
+    gate = lambda: exact_position_write_gate(  # noqa: E731
+        session_factory, pos_id=str(pos_id)
+    )
 
-    cancel_responses: list[dict[str, Any]] = []
-    for order_id in old_order_ids:
-        response = cancel_exact_position_sltp(
-            session_factory=session_factory,
-            deepcoin_client=deepcoin_client,
+    new_order_ids: list[str] = []
+    cancelled_order_ids: list[str] = []
+    set_responses: list[dict[str, Any]] = []
+    # The stop group first, and new-first inside it: the downside is settled
+    # before anything touches the upside, and it is never without a stop.
+    for group, rows, old_ids, runner, purpose in (
+        (
+            PROTECTION_GROUP_STOP,
+            stop_rows,
+            old_stop_order_ids,
+            replace_stop_group,
+            "stop_loss",
+        ),
+        (
+            PROTECTION_GROUP_TAKE_PROFIT,
+            take_profit_rows,
+            old_take_profit_order_ids,
+            replace_take_profit_group,
+            "take_profit",
+        ),
+    ):
+        if not rows and not old_ids:
+            continue
+        plan = ProtectionReplacementPlan(
+            venue=binding.venue,
             pos_id=str(pos_id),
-            order_id=str(order_id),
             instrument_id=inst_id,
-            idempotency_key=(
-                f"signal:{trade_signal.id}:cancel:{order_id}"
+            execution_binding_id=int(binding.id),
+            execution_order_leg_id=int(authority.execution_order_leg_id),
+            group=group,
+            new_orders=tuple(
+                NewProtectionOrder(
+                    purpose=purpose,
+                    payload=_build_position_tpsl_row_payload(common_payload, row),
+                )
+                for row in rows
             ),
-            live_execution_gate=lambda: exact_position_write_gate(
-                session_factory, pos_id=str(pos_id)
-            ),
-            now_provider=lambda: now,
+            old_order_ids=tuple(old_ids),
+            idempotency_prefix=f"signal:{trade_signal.id}:{group}",
         )
-        _mark_position_tpsl_ledger_cancelled(
+        result = runner(
             session_factory,
-            order_id=str(order_id),
+            plan=plan,
+            deepcoin_client=deepcoin_client,
+            executed_at=now,
+            live_execution_gate=gate,
+            pre_cancel_check=pre_cancel_check,
+        )
+        new_order_ids.extend(result.new_order_ids)
+        cancelled_order_ids.extend(result.cancelled_order_ids)
+        set_responses.extend({"ordId": order_id} for order_id in result.new_order_ids)
+        if not result.succeeded and result.status != PROTECTION_REPLACEMENT_SKIPPED:
+            raise DeepcoinExecutionActionError(
+                f"position_tpsl_{result.reason_code}"
+            )
+        _record_position_tpsl_ledger_rows(
+            session_factory,
+            binding=binding,
+            position=position,
+            inst_id=inst_id,
+            rows=rows,
+            order_ids=list(result.new_order_ids),
+            evidence_source="tpsl_write_response",
             seen_at=now,
         )
-        cancel_responses.append({"order_id": str(order_id), "response": response})
-    set_responses: list[dict[str, Any]] = []
-    new_order_ids: list[str] = []
-    try:
-        for set_payload in set_payloads:
-            set_response = submit_exact_position_sltp(
-                session_factory=session_factory,
-                deepcoin_client=deepcoin_client,
-                pos_id=str(pos_id),
-                payload=set_payload,
-                idempotency_key=(
-                    f"signal:{trade_signal.id}:set:{len(set_responses)}"
-                ),
-                live_execution_gate=lambda: exact_position_write_gate(
-                    session_factory, pos_id=str(pos_id)
-                ),
-                now_provider=lambda: now,
-                require_readback=True,
-            )
-            new_order_id = _extract_order_id(set_response)
-            if not new_order_id:
-                raise DeepcoinExecutionActionError(
-                    "position_tpsl_replacement_missing_order_id"
-                )
-            set_responses.append(set_response)
-            new_order_ids.append(new_order_id)
-            _record_position_tpsl_ledger_rows(
-                session_factory,
-                binding=binding,
-                position=position,
-                inst_id=inst_id,
-                rows=[adjusted_row_snapshots[len(new_order_ids) - 1]],
-                order_ids=[new_order_id],
-                evidence_source="tpsl_write_response",
-                seen_at=now,
-            )
-    except Exception as replacement_error:
-        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
-            raise DeepcoinExecutionActionError(
-                f"position_tpsl_replacement_outcome_unknown:{replacement_error}"
-            ) from replacement_error
-        try:
-            for new_order_id in new_order_ids:
-                cancel_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
-                    pos_id=str(pos_id),
-                    order_id=new_order_id,
-                    instrument_id=inst_id,
-                    idempotency_key=(
-                        f"signal:{trade_signal.id}:rollback_cancel:{new_order_id}"
-                    ),
-                    live_execution_gate=lambda: exact_position_write_gate(
-                        session_factory, pos_id=str(pos_id)
-                    ),
-                    now_provider=lambda: now,
-                )
-                _mark_position_tpsl_ledger_cancelled(
-                    session_factory,
-                    order_id=new_order_id,
-                    seen_at=now,
-                )
-            for restore_index, old_row in enumerate(old_row_snapshots):
-                restore_payload = _build_position_tpsl_row_payload(
-                    common_payload, old_row
-                )
-                restore_response = submit_exact_position_sltp(
-                    session_factory=session_factory,
-                    deepcoin_client=deepcoin_client,
-                    pos_id=str(pos_id),
-                    payload=restore_payload,
-                    idempotency_key=(
-                        f"signal:{trade_signal.id}:restore:{restore_index}"
-                    ),
-                    live_execution_gate=lambda: exact_position_write_gate(
-                        session_factory, pos_id=str(pos_id)
-                    ),
-                    now_provider=lambda: now,
-                    require_readback=True,
-                )
-                if not _extract_order_id(restore_response):
-                    raise DeepcoinExecutionActionError(
-                        "position_tpsl_restore_missing_order_id"
-                    )
-        except Exception as restore_error:
-            raise DeepcoinExecutionActionError(
-                f"position_tpsl_recovery_required:{restore_error}"
-            ) from replacement_error
-        raise DeepcoinExecutionActionError(
-            f"position_tpsl_replacement_failed_restored:{replacement_error}"
-        ) from replacement_error
-    set_payload = set_payloads[-1]
-    set_response = set_responses[-1]
-    new_order_id = new_order_ids[-1]
-    _record_position_tpsl_ledger_rows(
-        session_factory,
-        binding=binding,
-        position=position,
-        inst_id=inst_id,
-        rows=adjusted_row_snapshots,
-        order_ids=new_order_ids,
-        evidence_source="tpsl_write_response",
-        seen_at=now,
-    )
+
+    cancel_responses = [
+        {"order_id": order_id, "response": {"cancelled": True}}
+        for order_id in cancelled_order_ids
+    ]
+    old_order_ids = list(cancelled_order_ids)
+    set_payload = set_payloads[-1] if set_payloads else {}
+    set_response = set_responses[-1] if set_responses else {}
     for cancelled in cancel_responses:
         cancelled_order_id = str(cancelled["order_id"])
         record_execution_event(
@@ -2897,6 +2902,171 @@ def _ledger_trigger_price(row: dict[str, Any]) -> str | None:
         if isinstance(stop, dict) and stop.get("trigger_price") is not None:
             return str(stop["trigger_price"])
     return None
+
+
+def _capture_protection_authority_refusal(
+    session_factory: sessionmaker,
+    *,
+    binding: _LoadedBinding,
+    authority: Any,
+    now: datetime,
+    reason_code: str | None = None,
+) -> None:
+    """Tell a person that a protection write was refused, and why.
+
+    A refusal that only raises is a refusal nobody sees: the caller turns it
+    into a failed instruction, and the reason -- which order could not be
+    placed, on which position -- stays in a stack trace. Phase 6 requires the
+    refusal itself to be an alert, because "the stop was not moved" looks
+    exactly like "the stop did not need moving".
+    """
+
+    code = reason_code or authority.reason_code or "protection_authority_frozen"
+    fingerprint = f"protection_authority_refused:{authority.pos_id}:{code}"[:64]
+    evidence = {
+        "reason_code": code,
+        "pos_id": authority.pos_id,
+        "instrument_id": authority.instrument_id,
+        "unattributable_order_ids": list(authority.unattributable_order_ids),
+        "manual_action": (
+            "Read this position's pending TPSL orders on the exchange. The "
+            "protection chain could not name its own orders, so nothing was "
+            "written and nothing retries."
+        ),
+    }
+    try:
+        with session_factory() as session:
+            leg_id = authority.execution_order_leg_id
+            if leg_id is None:
+                # A frozen resolution carries no leg -- that is often the very
+                # reason it froze -- but the incident row needs one. The
+                # binding's own leg for this position is the honest answer, and
+                # without it there is nothing to hang the row on.
+                leg_id = (
+                    session.query(ExecutionOrderLeg.id)
+                    .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+                    .filter(ExecutionOrderLeg.pos_id == authority.pos_id)
+                    .order_by(ExecutionOrderLeg.id.asc())
+                    .limit(1)
+                    .scalar()
+                )
+            if leg_id is None:
+                leg_id = (
+                    session.query(ExecutionOrderLeg.id)
+                    .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))
+                    .filter(ExecutionOrderLeg.purpose == "entry")
+                    .order_by(ExecutionOrderLeg.id.asc())
+                    .limit(1)
+                    .scalar()
+                )
+            if leg_id is None:
+                logger.warning(
+                    "protection authority refusal has no leg to record against pos_id=%s",
+                    authority.pos_id,
+                )
+                return
+            exists = (
+                session.query(PositionProtectionIncident.id)
+                .filter(PositionProtectionIncident.fingerprint == fingerprint)
+                .first()
+            )
+            if exists is None:
+                session.add(
+                    PositionProtectionIncident(
+                        venue=binding.venue,
+                        execution_binding_id=int(binding.id),
+                        execution_order_leg_id=int(leg_id),
+                        pos_id=authority.pos_id,
+                        incident_type=PROTECTION_AUTHORITY_REFUSED_INCIDENT_TYPE,
+                        fingerprint=fingerprint,
+                        evidence_json=json.dumps(
+                            evidence,
+                            ensure_ascii=False,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        ),
+                        delivery_status="pending",
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+                session.commit()
+    except Exception:  # pragma: no cover - an alert must never break the caller
+        logger.warning(
+            "protection authority refusal incident failed pos_id=%s",
+            authority.pos_id,
+            exc_info=True,
+        )
+
+
+def _build_pre_cancel_check(*, authority: Any, instrument_id: str):
+    """Refuse to cancel an order that is no longer what the chain resolved.
+
+    The read that produced ``authority`` and the cancel that follows are two
+    moments, and between them the exchange can have replaced, filled or resized
+    the order. Cancelling on the strength of the older read is how a live stop
+    gets removed by accident, so the order is looked at again by its exact id
+    and every attribute the chain matched on has to still agree.
+    """
+
+    expected = {
+        item.order_id: item
+        for item in (*authority.stop_orders, *authority.take_profit_orders)
+    }
+
+    def check(rows, order_id: str) -> str | None:
+        item = expected.get(str(order_id))
+        if item is None:
+            return "protection_cancel_target_not_resolved"
+        for row in rows:
+            observed = _order_id_from_payload(dict(row))
+            if observed != str(order_id):
+                continue
+            normalized = normalize_native_tpsl(dict(row))
+            if normalized is None:
+                return "protection_cancel_target_not_tpsl"
+            if (
+                normalized.inst_id
+                and normalized.inst_id != str(instrument_id).upper()
+            ):
+                return "protection_cancel_target_instrument_changed"
+            if (
+                normalized.pos_side
+                and authority.side
+                and normalized.pos_side != authority.side
+            ):
+                return "protection_cancel_target_side_changed"
+            observed_trigger = (
+                normalized.stop_loss_trigger_price
+                if item.group == PROTECTION_GROUP_STOP
+                else normalized.take_profit_trigger_price
+            )
+            if _text_or_none(observed_trigger) != item.trigger_price:
+                return "protection_cancel_target_trigger_changed"
+            if _text_or_none(normalized.size) != item.size_text:
+                return "protection_cancel_target_size_changed"
+            return None
+        # Gone from the pending list between the two reads. It is not cancelled
+        # here on the strength of a stale read.
+        return "protection_cancel_target_absent"
+
+    return check
+
+
+def _text_or_none(value: Any) -> str | None:
+    if value is None or value == "":
+        return None
+    if isinstance(value, Decimal):
+        normalized = format(value.normalize(), "f")
+        return "0" if normalized == "-0" else normalized
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+    if not parsed.is_finite():
+        return str(value)
+    normalized = format(parsed.normalize(), "f")
+    return "0" if normalized == "-0" else normalized
 
 
 def _build_position_tpsl_row_payload(

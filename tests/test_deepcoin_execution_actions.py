@@ -27,7 +27,9 @@ from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.models import (
     BoundPositionCloseReservation,
     ExecutionBinding,
+    DeepcoinWsEvent,
     ExecutionOrderLeg,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     RawMessage,
     StrategyLifecycle,
@@ -266,6 +268,10 @@ class _FakeDeepcoinClient:
         self.cancel_order_payloads = []
         self.protection_payloads = []
         self.protection_outcomes = []
+        self.protection_order_seq = 0
+        # One ordered log across both write kinds: phase 6's correctness is the
+        # *sequence* (new stop before old stop, old take profit before new).
+        self.calls = []
         self.order_payloads = []
         self.trigger_payloads = []
         self.order_history = []
@@ -301,6 +307,17 @@ class _FakeDeepcoinClient:
     def cancel_position_sltp(self, cancel_payload):
         self.cancel_position_payloads.append(cancel_payload)
         self.cancel_trigger_payloads.append(cancel_payload)
+        # A cancelled trigger order leaves ``trigger-orders-pending``. Phase 6
+        # proves each cancel by reading that list again, so a fake that keeps
+        # showing the order would model an exchange that never cancels
+        # anything.
+        cancelled_id = str(cancel_payload.get("ordId") or "")
+        self.calls.append(("cancel", cancelled_id))
+        self.trigger_pending = [
+            row
+            for row in self.trigger_pending
+            if str(row.get("ordId") or "") != cancelled_id
+        ]
         return {"code": "0", "data": {"ordId": cancel_payload.get("ordId")}}
 
     def cancel_order(self, cancel_payload):
@@ -315,7 +332,9 @@ class _FakeDeepcoinClient:
                 raise outcome
             response = outcome
         else:
-            response = {"code": "0", "data": {"ordId": "tpsl-new"}}
+            self.protection_order_seq += 1
+            suffix = "" if self.protection_order_seq == 1 else f"-{self.protection_order_seq}"
+            response = {"code": "0", "data": {"ordId": f"tpsl-new{suffix}"}}
         data = response.get("data") if isinstance(response, dict) else None
         order_id = (
             data.get("ordId") if isinstance(data, dict)
@@ -323,6 +342,7 @@ class _FakeDeepcoinClient:
             else None
         )
         if order_id:
+            self.calls.append(("set", order_id))
             self.trigger_pending.append(
                 {
                     "ordId": order_id,
@@ -1940,7 +1960,7 @@ def test_reviewed_equivalent_assignment_rejects_coordinated_cross_owner_componen
     assert client.order_payloads == []
 
 
-def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_path):
+def test_adjust_stop_loss_places_the_new_stop_before_cancelling_the_old(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _binding(session_factory)
     trade_signal = _signal(
@@ -1957,14 +1977,22 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
         executed_at=datetime(2026, 6, 30, 9, 0, tzinfo=UTC),
     )
 
-    assert [item["ordId"] for item in client.cancel_trigger_payloads] == ["tp-old", "sl-old"]
+    # Phase 6: the stop group goes first and places before it cancels, so the
+    # position is never without a stop; the take-profit group is the opposite
+    # order, so two take profits are never armed against the same lots.
+    assert client.calls == [
+        ("set", "tpsl-new"),
+        ("cancel", "sl-old"),
+        ("cancel", "tp-old"),
+        ("set", "tpsl-new-2"),
+    ]
     assert client.actual_trigger_order_payloads == []
     assert all(item["instType"] == "SWAP" for item in client.cancel_position_payloads)
     assert [
         (item.get("tpTriggerPx"), item.get("slTriggerPx"), item["sz"])
         for item in client.protection_payloads
-    ] == [("1605.6", None, "0.1"), (None, "1577.04", "0.1")]
-    assert result["cancelled_tpsl_order_ids"] == ["tp-old", "sl-old"]
+    ] == [(None, "1577.04", "0.1"), ("1605.6", None, "0.1")]
+    assert result["cancelled_tpsl_order_ids"] == ["sl-old", "tp-old"]
     assert result["before"] == {"take_profit": 1605.6, "stop_loss": 1567.52}
     assert result["after"] == {"take_profit": 1605.6, "stop_loss": 1577.04}
 
@@ -1974,7 +2002,7 @@ def test_adjust_stop_loss_cancels_existing_position_tpsl_before_resetting(tmp_pa
         "cancel_position_tpsl",
         "cancel_position_tpsl",
     ]
-    assert events[0].related_order_id == "tp-old,sl-old"
+    assert events[0].related_order_id == "sl-old,tp-old"
 
 
 def test_adjust_stop_loss_records_new_tpsl_orders_in_protection_ledger(tmp_path):
@@ -1986,9 +2014,10 @@ def test_adjust_stop_loss_records_new_tpsl_orders_in_protection_ledger(tmp_path)
         payload={"binding_id": binding_id, "stop_loss": 1577.04},
     )
     client = _FakeDeepcoinClient()
+    # The stop group is placed first now, so the first response is the stop's.
     client.protection_outcomes = [
-        {"code": "0", "data": {"ordId": "tp-new-ledger"}},
         {"code": "0", "data": {"ordId": "sl-new-ledger"}},
+        {"code": "0", "data": {"ordId": "tp-new-ledger"}},
     ]
 
     adjust_position_tpsl(
@@ -2069,20 +2098,28 @@ def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
     )
 
     assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
+        "sl-old",
         "tp-old",
         "tp-old-2",
-        "sl-old",
     ]
     assert [
         (item.get("tpTriggerPx"), item.get("slTriggerPx"), item["sz"])
         for item in client.protection_payloads
     ] == [
+        (None, "1577.04", "0.1"),
         ("1605.6", None, "0.04"),
         ("1615.6", None, "0.06"),
-        (None, "1577.04", "0.1"),
     ]
-    assert client.protection_payloads[1]["tpTriggerPxType"] == "mark"
-    assert client.protection_payloads[1]["tpOrdPx"] == "1615"
+    # Both partial take profits are re-placed with their own size and price:
+    # they are never collapsed into one row by the replacement.
+    assert client.protection_payloads[2]["tpTriggerPxType"] == "mark"
+    assert client.protection_payloads[2]["tpOrdPx"] == "1615"
+    # Neither take profit is live while the other is being replaced.
+    take_profit_calls = [
+        item for item in client.calls if item[1] in {"tp-old", "tp-old-2"}
+        or item[0] == "set" and item[1].startswith("tpsl-new") and item[1] != "tpsl-new"
+    ]
+    assert [name for name, _ in take_profit_calls] == ["cancel", "cancel", "set", "set"]
 
 
 @pytest.mark.parametrize(
@@ -2090,7 +2127,7 @@ def test_adjust_position_tpsl_preserves_multiple_take_profit_rows(tmp_path):
     [DeepcoinRequestOutcomeUnknown("response lost"), {"code": "0", "data": {}}],
     ids=["request_unknown", "success_missing_order_id"],
 )
-def test_manual_tpsl_unknown_replacement_never_guesses_cancel_or_restore(
+def test_manual_tpsl_unknown_replacement_cancels_nothing(
     outcome, tmp_path
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
@@ -2105,17 +2142,19 @@ def test_manual_tpsl_unknown_replacement_never_guesses_cancel_or_restore(
 
     with pytest.raises(
         DeepcoinExecutionActionError,
-        match="position_tpsl_replacement_outcome_unknown",
+        match="position_tpsl_stop_replacement_outcome_unknown",
     ):
         adjust_position_tpsl(
             session_factory, trade_signal=signal, deepcoin_client=client
         )
 
-    assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
-        "tp-old",
-        "sl-old",
-    ]
+    # Phase 6: the failed write is now the *first* step, so nothing was
+    # cancelled and the position keeps exactly the protection it had. The old
+    # order cancelled first and then failed to place, which is the state this
+    # test was written to catch, is no longer reachable.
+    assert client.cancel_trigger_payloads == []
     assert len(client.protection_payloads) == 1
+    assert {row["ordId"] for row in client.trigger_pending} == {"tp-old", "sl-old"}
 
 
 def test_kol_tpsl_cannot_call_exact_manual_helper_without_batch(tmp_path):
@@ -2161,7 +2200,7 @@ def test_adjust_position_tpsl_refuses_to_append_when_existing_tpsl_is_missing(tm
     assert client.protection_payloads == []
 
 
-def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path):
+def test_adjust_position_tpsl_freezes_and_alerts_on_unattributed_tpsl_orders(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = _binding(session_factory)
     with session_factory() as session:
@@ -2187,7 +2226,7 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
 
     with pytest.raises(
         DeepcoinExecutionActionError,
-        match="no_existing_position_tpsl_to_adjust",
+        match="protection_authority_frozen:protection_order_unattributable",
     ):
         adjust_position_tpsl(
             session_factory,
@@ -2197,6 +2236,16 @@ def test_adjust_position_tpsl_refuses_unattributed_pending_tpsl_orders(tmp_path)
 
     assert client.cancel_trigger_payloads == []
     assert client.protection_payloads == []
+    # Phase 6 says this out loud instead of reporting "nothing to adjust".
+    # There *were* two protection orders; what was missing was any proof of
+    # whose they are, and the difference decides whether a new stop may be
+    # placed beside them.
+    with session_factory() as session:
+        incidents = [
+            (row.incident_type, row.pos_id)
+            for row in session.query(PositionProtectionIncident).all()
+        ]
+    assert incidents == [("protection_authority_refused", "pos-1")]
 
 
 def test_adjust_position_tpsl_accepts_ledger_owned_unscoped_orders(tmp_path):
@@ -2217,10 +2266,10 @@ def test_adjust_position_tpsl_accepts_ledger_owned_unscoped_orders(tmp_path):
         deepcoin_client=client,
     )
 
-    assert result["cancelled_tpsl_order_ids"] == ["tp-old", "sl-old"]
+    assert result["cancelled_tpsl_order_ids"] == ["sl-old", "tp-old"]
     assert [item["ordId"] for item in client.cancel_trigger_payloads] == [
-        "tp-old",
         "sl-old",
+        "tp-old",
     ]
 
 
@@ -3240,3 +3289,111 @@ def test_recreated_pending_entry_requires_exact_exchange_response_order_id(
     assert [(leg.order_id, leg.client_order_id, leg.status) for leg in legs] == [
         ("trigger-old", "client-old", "open")
     ]
+
+
+def test_adjust_position_tpsl_adopts_a_stop_the_ledger_never_recorded(tmp_path):
+    """``TU == posId`` places an order no ledger row names, and it is written down.
+
+    The old matcher turned the whole instrument ambiguous over one such order,
+    which is why a stop could not be replaced while it existed. Adopting it is
+    only allowed because the exchange lists it *and* a ``TriggerOrder`` frame
+    ties it to this exact position -- never because it is the only candidate.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+    client = _FakeDeepcoinClient()
+    client.trigger_pending.append(
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-orphan",
+            "instId": "ETH-USDT-SWAP",
+            "posSide": "long",
+            "slTriggerPx": "1560",
+            "sz": "0.1",
+            "cTime": "1000",
+        }
+    )
+    with session_factory() as session:
+        session.add(
+            DeepcoinWsEvent(
+                venue="deepcoin",
+                channel="TriggerOrder",
+                action="push",
+                order_sys_id="sl-orphan",
+                trade_unit_id="pos-1",
+                received_at=datetime(2026, 6, 30, 8, 0, tzinfo=UTC),
+                received_ms=1,
+                raw_payload="{}",
+                payload_hash="hash-sl-orphan",
+            )
+        )
+        session.commit()
+
+    result = adjust_position_tpsl(
+        session_factory,
+        trade_signal=trade_signal,
+        deepcoin_client=client,
+        executed_at=datetime(2026, 6, 30, 9, 0, tzinfo=UTC),
+    )
+
+    assert set(result["cancelled_tpsl_order_ids"]) == {"sl-old", "sl-orphan", "tp-old"}
+    with session_factory() as session:
+        adopted = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id="sl-orphan")
+            .one()
+        )
+    assert adopted.pos_id == "pos-1"
+    assert adopted.evidence_source == "exchange_adopted_by_tu"
+    # Adopted and then retired by the same replacement: the row exists so the
+    # cancel had a durable owner behind it, not so it could be kept.
+    assert adopted.status == "cancelled"
+
+
+def test_adjust_position_tpsl_will_not_cancel_a_stop_that_changed_underneath_it(tmp_path):
+    """Between resolving and cancelling, the exchange can have replaced the order."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = _binding(session_factory)
+    trade_signal = _signal(
+        session_factory,
+        action="adjust_stop_loss",
+        payload={"binding_id": binding_id, "stop_loss": 1577.04},
+    )
+
+    class _ShiftingClient(_FakeDeepcoinClient):
+        def __init__(self):
+            super().__init__()
+            self.pending_reads = 0
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.pending_reads += 1
+            if self.pending_reads > 1:
+                for row in self.trigger_pending:
+                    if row.get("ordId") == "sl-old":
+                        row["slTriggerPx"] = "1500"
+            return self.trigger_pending
+
+    client = _ShiftingClient()
+
+    with pytest.raises(
+        DeepcoinExecutionActionError,
+        match="protection_cancel_target_trigger_changed",
+    ):
+        adjust_position_tpsl(
+            session_factory,
+            trade_signal=trade_signal,
+            deepcoin_client=client,
+            executed_at=datetime(2026, 6, 30, 9, 0, tzinfo=UTC),
+        )
+
+    # The new stop was placed first, so the position is over-protected rather
+    # than naked, and the order nobody can vouch for is still armed.
+    assert client.cancel_trigger_payloads == []
+    assert any(row["ordId"] == "sl-old" for row in client.trigger_pending)

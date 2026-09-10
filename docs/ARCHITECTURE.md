@@ -253,6 +253,50 @@ worker（与本地 `all`）角色必须有活的 inbox 且 `ws_observation_permi
 
 回退就是 `tg-deploy <上一个 SHA>`，**没有运行时模式开关**，也不需要回滚任何状态。
 
+## 4.8 保护单归谁，以及"改止损"到底是哪两步
+
+**`set-position-sltp` 是叠加语义，不是修改语义。** 6-pre-3 只读观测了 18 次生产写入，
+拿到 18 个互不相同的 `ordId`，**旧单一张都没消失**。所以"改止损"在这个交易所上永远是
+"挂一张 + 撤一张"，没有第三种写法。再发一次 set-position-sltp 只会让同一个仓位上并存两张
+触发价不同的止损，实际生效的是先被触及的那张——对止损而言就是**更靠近现价的那张**，
+等于修改没生效。
+
+**保护单归属只有一条判据：`TU == posId`。** `OS`（保护单自己的 ordId）每次写入都变，
+REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两张止损之间唯一的可查关联，
+就是它们的 `TU` 都指回同一个 posId（6-pre-3：30 条能连上的帧 30 条相等）。
+`protection_authority.resolve_protection_authority()` 就是按这条判据回答"这个仓位有哪些
+保护单"：verified 入场腿 → `position_protection_ledger` 的行 → 加上 `TU` 指向本仓位的挂单。
+
+- 账本不认识、但 `TriggerOrder` 帧的 `TU` 指向本仓位的挂单，**先认领进账本**
+  （`evidence_source='exchange_adopted_by_tu'`）再动它。推送本身不被单独采信：
+  该单必须同时出现在 REST `trigger-orders-pending` 里，且 instId / posSide /
+  `triggerOrderType=TPSL` 相符。
+- **谁都放不进去的一张 TPSL 挂单会冻结整个仓位**（`protection_order_unattributable`，
+  落 `position_protection_incidents`）。那一刻"不是我们的"和"是我们的但没记下来"不可分辨：
+  撤它是盲写，留它则意味着旧止损仍然武装、这次修改等于没生效。两种猜法都会错，所以停下来叫人。
+- `triggerOrderType == "Conditional"` 是**挂单入场**，这条路径永远不撤它。
+- 一张同时带 `slTriggerPrice` 与 `tpTriggerPrice` 的单也冻结：按组替换会把另一半一起撤掉。
+
+**两个组，两种相反的顺序**（`protection_replacement.py`，`deepcoin_execution_actions.adjust_position_tpsl`
+与 `break_even_convergence_executor` 共用同一份实现）：
+
+| 组 | 顺序 | 为什么是这个方向 |
+|---|---|---|
+| 止损（`stop_loss` / `backup_stop`） | **先挂新 → 回读确认 → 撤旧全集 → 确认撤净 → 才改账本** | 两张止损并存只是短暂**过度保护**（先触及者执行，方向仍是保护）；而撤与挂之间的空隙是**裸仓**。失败保留新单、记 `stop_resize_replace_incomplete` 并冻结，绝不回撤新单——回撤才是唯一可能把仓位变裸的写入。 |
+| 止盈（`take_profit`） | **先撤旧 → 确认撤净 → 再挂新** | 两张止盈并存**不是无害的**：各自按自己的 sz 平仓，合计可能超过在仓量。而止盈的空窗期仓位仍有止损、不裸奔。挂新失败只告警并交止盈收敛重试，**不冻结止损**。 |
+
+两组都要改时**先止损组、后止盈组**：先把下行定下来，再动上行。
+
+**撤销前必须按 ordId 精确回读。** 解析出保护集合的那次读，和真正发出撤单的那一刻，是两个时刻；
+中间交易所可能已经把这张单替换、成交或改量。所以撤之前再按 ordId 看一眼，instId、posSide、
+触发价、数量四项全对得上才撤，任一不符就放弃并告警（`protection_cancel_target_*`）。
+**撤完还要再读一次确认它真的离开了 `trigger-orders-pending`**——读失败算"不知道"，
+绝不算"已经没了"，否则账本会把一张可能仍在武装的单标成已撤。
+
+**拒绝本身就是告警。** 绑定 unverified、保护集合无法解析、认领写库失败，一律拒绝写入并落
+`protection_authority_refused`。理由是从外面看，"止损没被移动"和"止损不需要移动"长得一模一样，
+一次沉默的拒绝没人会发现。
+
 ## 5. 模块分类（已核实）
 
 `src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见

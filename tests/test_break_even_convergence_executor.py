@@ -12,6 +12,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionMutationIntent,
+    PositionProtectionIncident,
     PositionProtectionLedger,
     PositionReconciliationObservation,
     StrategyBreakEvenConvergence,
@@ -692,3 +693,73 @@ def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
     assert len([
         call for call in client.calls if call[0] == "set_position_sltp"
     ]) == first_write_count
+
+
+def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_path):
+    """Phase 6a: the cancel is now proven, not assumed.
+
+    Before, an accepted cancel response ended the leg. An exchange that answers
+    "ok" and keeps the order armed left a weaker stop live while the ledger
+    said it was retired -- and the leg reported success.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = TriggerCancelClient(market_price="62000")
+    client.orders.append({
+        "ordId": "weak-stop",
+        "instId": "BTC-USDT-SWAP",
+        "posId": "pos-1",
+        "posSide": "short",
+        "slTriggerPx": "63500",
+        "sz": "5",
+    })
+
+    def accepted_but_not_honoured(payload):
+        client.calls.append(("cancel_position_sltp", dict(payload)))
+        return {"code": "0", "data": {"ordId": payload["ordId"]}}
+
+    client.cancel_position_sltp = accepted_but_not_honoured
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-1").one()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin",
+            execution_binding_id=leg.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-1",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="weak-stop",
+            purpose="stop_loss",
+            trigger_price="63500",
+            size_text="5",
+            status="verified",
+            evidence_source="test",
+            evidence_json="{}",
+        ))
+        session.commit()
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result.status == "recovery_required"
+    # The new stop stays: cancelling it is the one write that could leave the
+    # position naked.
+    assert any(row.get("ordId") == "be-stop-1" for row in client.orders)
+    with session_factory() as session:
+        retired = (
+            session.query(PositionProtectionLedger)
+            .filter_by(order_id="weak-stop")
+            .one()
+        )
+        incidents = [
+            row.incident_type
+            for row in session.query(PositionProtectionIncident).all()
+        ]
+    assert retired.status == "verified"
+    assert incidents == ["stop_resize_replace_incomplete"]
