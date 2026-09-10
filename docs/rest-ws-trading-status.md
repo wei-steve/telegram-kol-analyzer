@@ -1036,6 +1036,21 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6e-cutover-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话给定):
+  6e 接线（真正的采纳）上线后，**要取到下列全部才算证明本步**：
+  (1) 两个仓位（`1001125216121996` / `1001125216153672`）**各新增恰好 1 行**保护账本行：
+      `evidence_source=exchange_adopted_by_tu`、`status=verified`、`purpose=stop_loss`、
+      ordId 与价量与交易所那张随单止损对应；
+  (2) 两条 `protection_adopted_from_exchange` 事件、且 runtime incident **`delivered`**；
+  (3) 两条 `backup_stop_shadow_ready`（各 1），**且交易所 `BTC-USDT-SWAP` 的 TPSL 张数仍为 4**
+      ——即备份止损**没有真的下单**；
+  (4) `protection_health` 对这两个仓位不再给 `primary_stop_not_verified`；
+  (5) **全窗零交易所写入**：`position_mutation_intents` 无新行。
+  **(3) 与 (5) 是本窗最重要的两条**：6e 被定级为"只写账本"，而它的下游 `trigger_backup_stop_executor`
+  在 `position_management_liveness_v2_mode=live` 下本来会下单——**一次账本写入若在同一轮变成一次
+  交易所写入，就是本步最可能造成的伤害**，所以要用交易所上的张数（4）来证明它没有发生，
+  而不是只看我们自己的计数。
+  **预期能取到**：样本此刻就在交易所上。若窗内仓位被平掉，照实记"样本中途消失"。
 - phase-6h-break-even-field-names (2026-09-10, 会话 local_4a6676b0 发现, **指挥会话立为 6h，需用户批准**):
   **自动保本收敛在生产上从未成功过，而且按现在的代码必然失败。**
   `break_even_convergence_executor` 的市场预检拿 `trigger-orders-pending` 的**原始行**比对：
