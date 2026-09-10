@@ -729,6 +729,61 @@ def capture_stop_resize_replace_incomplete(
     )
 
 
+def capture_protection_adopted_from_exchange(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    pos_id: str,
+    instrument_id: str,
+    adopted: list,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a ledger row written for an order this system never submitted.
+
+    Phase 6e. A migrated limit entry's own stop never reaches the ledger -- its
+    order id is absent from the submission receipt -- so the exchange holds
+    protection that nothing local can name, and every consumer that asks the
+    ledger concludes the position is unprotected. Adoption fixes that by
+    writing the row from ``TU == posId`` evidence.
+
+    It is alerted rather than done quietly because the ledger is the record
+    this system acts on: a row appearing for an order nobody here sent is
+    exactly the shape of a mistake worth catching early, and the same shape as
+    the fix. A person seeing this should be able to check the order id against
+    the exchange and agree.
+    """
+
+    if not config.captures("protection_adopted_from_exchange"):
+        return None
+    order_ids = ",".join(
+        _safe_label(str(item.get("order_id") or "")) for item in adopted
+    )
+    fixed = {
+        "component": "protection_adoption",
+        "reason_code": "exchange_adopted_by_tu",
+        "operation": f"pos_{_safe_label(pos_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="position_protection_ledger",
+        source_record_id=str(pos_id),
+        incident_type="protection_adopted_from_exchange",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            instrument_id=_safe_label(instrument_id),
+            adopted_order_ids=order_ids or "none",
+            adopted_count=len(adopted),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_uncertain_without_write(
     session_factory: sessionmaker,
     *,

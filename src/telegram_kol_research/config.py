@@ -166,6 +166,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # therefore refused. The summary carries the order id and the candidate
         # position id so a person can look at the exchange immediately.
         "market_fill_attribution_unverified",
+        # Phase 6e: the ledger grew a row for a protection order this system
+        # never submitted. That is the fix for a limit entry's own stop never
+        # reaching the ledger, but it is also exactly the shape of a mistake --
+        # a row claiming an order nobody here sent -- so it is never silenced
+        # by an environment whitelist and a person can check it against the
+        # exchange.
+        "protection_adopted_from_exchange",
+
         # Phase 6-pre-2: the safety net under that same failure. Either it
         # attached a stop to a position identified only by a uniqueness
         # argument -- a write no ownership proof authorized -- or it could not
