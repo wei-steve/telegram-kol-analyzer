@@ -1036,6 +1036,24 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-2-window-criteria-amended-midwindow (2026-09-10, 会话 local_4a6676b0, **窗中途追加，如实标明**):
+  A 线（`local_22ee72a5`）在他们 A-14 收窗时发现：他们的观察脚本一直把 `rounds` 当成
+  "系统在干活"的证据，**但 reconcile 是固定 60 秒定时触发，`rounds == elapsed_minutes` 是恒等式**，
+  它只能说明定时器没死，而那件事 `worker_http=200` 已经说了。
+  **成对观测里有一半是恒等式，等于没有成对。**
+  拿这条去查我自己正在跑的 6f-2 窗，结论更难看：**起窗前写下的五项里，三项是零
+  （`window_writes` / `window_cancels` / `backup_incidents`）、两项是静态存储值
+  （`ledger_rows=4` / `bound_backups=2`）**。worker 死掉，这五项一个都不会变——
+  **"没有坏事发生"与"什么都没发生"在这五个数上不可分辨**，而本窗 `window_messages=0`，
+  正好落在那个不可分辨的区间里。
+  **追加判据**：`protection_shadow.positions_seen / rounds == 2`
+  且 `protection_shadow.read_failures == 0` 且 `protection_adoption.read_failures == 0`。
+  理由：`positions_seen` 是每轮**真的去交易所读回来的活仓位数**，交易所读失败、凭据失效、
+  仓位消失都会让它掉，**它不是定时器的函数**。阈值 2 取自已知账户状态（该 instId 恰有两个活仓位），
+  不是从观测数据里挑出来的。
+  **但必须标明：这一项是在窗开始之后追加的，而且我是在看到它当时读数为 2.0 之后才写下它的。**
+  按本仓库自己的规矩（"先量后立判据"是失格的），**它的证据效力低于起窗前写下的那五项**，
+  只当作liveness 的补充，不单独作为收窗依据。下一次起窗前必须把它写在前面。
 - rule-baseline-must-be-read-before-the-deploy (2026-09-10, 会话 local_4a6676b0, 指挥会话要求写成规矩):
   **要在一次部署引发的第一笔交易所写入之前拿到基线，那次读必须发生在部署之前，不是之后。**
   reconcile 轮 **约 60 秒一轮**（`trigger: by_timer`；journal 连续 12 轮实测
