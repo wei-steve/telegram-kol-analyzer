@@ -29,11 +29,15 @@ different times either match or they do not.
   "nothing happened". Reconnect.
 
 **Why the comparison is snapshot-to-snapshot and not snapshot-to-ledger.** The
-ledger drifts. On 2026-09-10 pos ``1001125178552543`` was a live three-contract
-BTC short while the leg owning it had read ``manually_closed`` for two days.
-Comparing against the ledger would find a difference on every probe forever,
-reconnect every ten minutes exactly as before, and cost three GETs for the
-privilege. The ledger difference is still computed -- as an *observation*
+ledger drifts. The example that prompted this: on 2026-09-10 pos
+``1001125178552543`` was a live three-contract BTC short while the leg owning
+it had read ``manually_closed`` for two days. (That particular row has since
+been repaired -- but the mechanism that produced it, a snapshot taken before a
+fact existed being committed after it, is not fixed yet, and its signature is
+``recovered_at`` later than ``updated_at``. The example is history; the drift
+is not.) Comparing against the ledger would find a difference on every probe
+for as long as any such row exists, reconnect every ten minutes exactly as
+before, and cost three GETs for the privilege. The ledger difference is still computed -- as an *observation*
 written into the gap statistics, so drift like that stops being invisible --
 but it never decides whether to reconnect.
 
