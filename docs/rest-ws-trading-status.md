@@ -1036,6 +1036,36 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-completed (2026-09-10, 会话 local_4a6676b0, **两笔真实交易所写入，逐笔核对通过；6f 完成**):
+  上线 **`c51894a45c0a06af4784ed1e1e090be69ff6a381`**（含 6f-1），回滚参考 **`d9a32f18`**（A-14）。
+  合并后全量 **8341 passed / 4 skipped / 0 failed**（合并前 8333；不拿合并前的绿当合并后的证据）。
+  四步部署四项全绿。第二次部署前按 A 线给的时间 **21:09:00Z** 等到 21:09:09Z 才动，未打断其 A-14 窗。
+  **两笔**：`1001125219289222`（pos `…121996`，20:36:36Z）与 `1001125219582177`（pos `…153672`，21:09:40Z），
+  皆 `set_position_sltp` / `status=confirmed` / `slTriggerPx=75548.6` / `slOrdPx=-1` / 无 `sz` 键 /
+  交易所侧 `sz=0`（全仓）/ 无 `reduceOnly`。
+  **交易所 4 → 5 → 6，两次 `removed=[]`**，每一步原有 ordId 逐条仍在。
+  **账本 4 行**（2 主 `exchange_adopted_by_tu` + 2 备 `position_mutation_intent_readback`）。
+  **零撤单**：`position_mutation_intents` 当日只有 `set_position_sltp`，无任何 `cancel_*`。
+  **6f-1 两次在生产验证**：腿 943 / 947 的 `planned_trigger_price` 仍是 `"75700.0"` **未被改写**，
+  同时正常绑定 `pos_id` / `exchange_order_id` / `verified`；944 / 948 由 NULL 回填 `75548.6` / `0`。
+  **观察窗** 21:15:53Z ~ 21:52:03Z，**37 采样、零重置、零不健康、`head_ok`/`units_ok` 全程 1**、35 轮。
+  起窗前写下的五项**全程单一取值**：`ledger_rows` 恒 4、`bound_backups` 恒 2、
+  `window_writes` / `window_cancels` / `backup_incidents` 恒 0；
+  窗中途追加的 liveness 量 `positions_seen/round` **恒 2.0**、两处 `read_failures` 恒 0。
+  证据 `/root/evidence/phase-6f-2/observer-samples.jsonl`、
+  `phase-6f-2-before-A/B/C.json`（三次独立基线，皆 5 张、ordId 逐条相同，**全部在部署之前**）、
+  `phase-6f-2-after-order.json`、`phase-6f-1-after-order.json`、`phase-6f-before.json`。
+  **收窗依据（指挥会话裁定甲），如实记**：判据里**只有"窗内 ≥5 条真实消息"未达成，窗内 0 条**。
+  不是"再等等就有"：本窗最后一条消息发生在 **20:36:51Z，比起窗还早 39 分钟**；
+  实测按 UTC 小时计的到达分布为 `09:1 10:8 11:17 12:21 13:23 14:4 15:9 16:3 17:2 18:0 19:0 20:3 21:0`——
+  **流量是昼夜性的**，活跃带（约 10:00–15:00Z）峰值 23 条/小时、轻松满足判据，
+  而本窗落在 17:00–21:00Z 的静默带（12 小时共 91 条，静默带内约 1.3 条/小时）。
+  **所以这条判据不是不可达，是在这个时段不可达。**
+  **更要紧的是：6f 这一步的证据本来就不来自消息流**——两笔的证明是 payload 原样、回执 ordId、
+  前后全表读、`removed=[]`、账本行——**消息量在这一步既不能证实也不能证伪任何东西**。
+  硬等一个与判据无关的量，反而会让这条记录看起来像是靠它成立的（A 线原话：
+  "记法是为了不夸大，不是为了自谦"）。流量信号由 6h 影子窗承接，那个窗要看的
+  `legacy_would_refuse` 与 `stops_resolved` 分叉每轮都产生，不依赖消息。
 - phase-6h-defect-restated (2026-09-10, 会话 local_4a6676b0 自查, **我说错了一句，而它已经被写进 6h 判据**):
   我曾向指挥会话与 A 线两次表述："break-even 的坏读取器读的正是仓位行的 `slTriggerPx`，
   6h 只改字段名而仍读仓位行会拿到备份止损价"。**查过之后，这句是错的。**
