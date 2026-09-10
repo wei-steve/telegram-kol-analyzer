@@ -734,7 +734,21 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **账本以为已平、交易所上仍在的仓位。** pos **`1001125178552543`**（BTC short，`pos=3`，`avgPx=79412.8`，
   `cTime=uTime=2026-09-07T01:23:07Z`）此刻仍在交易所；而 `execution_order_legs` **589**
   （binding **343**，ordId `1001125172997005`）自 **2026-09-08 01:23:03** 起是
-  **`manually_closed` / `manual_position_missing`**——系统当时读不到它、判定被手工平了，整整一天后。
+  **`manually_closed` / `manual_position_missing`**。
+  **【2026-09-10 更正】本条最初写的"整整一天后"是错的**：我把仓位 `cTime` 的 epoch
+  `1788830587000` 算成了 09-07，实际是 **2026-09-08T01:23:07Z**。正确时间线（只读核对）：
+  leg 589 创建于 09-07 16:09:48（条件单 `1001125172997005` 提交）；
+  **01:23:03.102990** 系统 `cancel_trigger_entry` 撤掉该条件单并做 `terminal_entry_cleanup_outcome`，
+  同刻把 leg 589 判成 `manually_closed / manual_position_missing`；
+  **01:23:07.27–33** WS 连续推来 `Trade` / `Position` / `Order` / `TriggerOrder`，
+  产生订单 **`1001125178552542`** 与仓位 **`1001125178552543`**（`TU: default → 1001125178552543`，
+  符合 4.7 节 `TU = OS + 1` 的规律，即 552543 是 552542 开出的仓位）；
+  **01:23:10.548** `create_backup_stop`，同刻写了 leg 589 的 `last_verified_at`。
+  **因此疑点不是"读不到仓位"，而是归属**：leg 589 的 ordId 是被撤掉的旧条件单 `...2997005`，
+  它的 `pos_id` 却是 4 秒后由**另一个订单 `...8552542`** 开出的仓位 `...8552543`；
+  且它在被判 `manually_closed` **之后** 7 秒还更新了 `last_verified_at`。
+  两个 id **相邻**（552542 / 552543）——正是硬性禁止第 1 条反复警告的"ID 相邻不得单独认领归属"的形状。
+  真正拥有 552543 的那条 leg 是否存在、系统是否把仓位挂错了对象，**由 A 线 A-10a 只读归因**。
   **不是裸奔**：按 ARCHITECTURE 第 6 节唯一判据（`trigger-orders-pending` 筛 `triggerOrderType=TPSL`、
   `posSide` 一致、看 `slTriggerPrice`，**不看仓位行的 `slTriggerPx`**）挂着两张止损——
   `1001125178552542`（sz **3**，`slTriggerPrice=83000`）与 `1001125178555463`（sz **0** 即全仓，
