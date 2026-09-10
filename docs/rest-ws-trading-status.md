@@ -1036,6 +1036,34 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6h-shadow-window-closed (2026-09-10, 会话 local_4a6676b0, **七条判据逐条达成，第三次窗**):
+  上线 **`d11592e2cb8d8ce613428f7450c40512564f343a`**，回滚参考 **`29c11354`**。
+  全量 **8363 passed / 4 skipped / 0 failed**。四步部署四项全绿。
+  窗 **23:01:51Z ~ 23:32:00Z（1810 秒）**、**31 采样、零重置、零不健康、
+  `head_ok`/`units_ok` 全程 1**、**28 轮**、`WINDOW_MET`。
+  **判据逐条**：
+  (1) **每轮 `legacy_would_refuse == stops_examined`** —— 全窗 **112 / 112**：
+      旧判据（`posId` 相等 + `slTriggerPx`）在同一批行上**逐条全拒**，
+      新读法**逐条全解析**。**这是本窗唯一能失败的成对观测，它分叉了** ✓
+  (2) `stops_resolved == stops_examined` **112 / 112**，两处 `read_failures` 全程 0 ✓
+  (3) `would_cancel_order_ids` **全窗不含任何备份 ordId** ✓
+  (4) `position_mutation_intents` 全窗 **零新增**；`released_events` / `released_closes` 全程 0 ✓
+  (5) 每轮两仓各恰 1 行；(5a) 不变量全程成立；(5b) 本窗无 `set_break_even` 轮次（见下）✓
+  (6) 30 分钟连续、零重置 ✓
+  (7) 每轮 `full_exit` 行均给出 `would_close_size=15` / `endpoint=close_position` /
+      `ord_type=market` / **`cancels_stops_first=False`**；`would_close_positions` 全窗 **56**
+      （= 2 仓 × 28 轮）✓
+  **本窗全程走 `full_exit` 分支**（`actions_seen {"full_exit": 56}`）——市价整窗在入场价 77000 下方。
+  **这不是缺陷，但要如实标明它对判据 (5b) 的影响**：`set_break_even` 分支在本窗**没有被真实数据走过**，
+  它只有单元测试与部署前那一轮（23:0xZ 之前，市价 77156.6 时）的手工读作为证据。
+  **(5b) 记为"本窗未取到样本"，不记为"通过"。**
+  证据 `/root/evidence/phase-6h/observer-samples.jsonl`。
+  **两次作废窗留档**（目录名即原因）：
+  `phase-6h-aborted-criterion-not-invariant`（判据把依赖市价的结果写成了不变量）、
+  `phase-6h-aborted-full-exit-ungated`（部署的 sha 让 `full_exit` 分支没有闸门）。
+  **三次起窗、两次作废，两次都是我自己的问题而不是系统的**——第一次是判据写错，
+  第二次是改动漏挡一个分支。**两次都在起窗后几分钟内被观察器或自查抓到**，
+  代价是重新计时；如果任何一次是在收窗时才发现，代价就是一份错误的切换依据。
 - phase-6-followup-naked-fill-stop-net-market-only (2026-09-10, **阶段 6 追加清单，本步不做**；A 线扫到、指挥会话转入本线):
   `naked_fill_stop_net.py:192` 用 `str(leg.order_kind or "") != "market"` 排除非市价入场腿
   （911 行另有 `order_kind == "market"` 的查询过滤）。这张网的作用是
