@@ -926,6 +926,29 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   "refusal for the wrong reason looks exactly like a refusal for the right one"。
   修好夹具后单点变异即可让三条平仓用例转红。
   全量 **8289 passed / 4 skipped / 0 failed**。
+- phase-6c-premise-correction (2026-09-10, A 线 local_22ee72a5 核出、本会话复核确认, **更正上一条的前提**):
+  上一条我写的"`PositionMutationAuthorityError` 只从 `submit()` 之前抛出，**因此**等于一次交易所写入都没有"
+  **不成立**，有两条写入之后仍会抛出它的路径：
+  (1) 写入返回后 CAS `submitting → submitted` 失败（并发方动过该 intent）→ 返回库里当前状态 →
+      落到 `_require_submitted_response` 的兜底 `raise PositionMutationAuthorityError`；
+  (2) **不需要并发方的那条**：放行条件是 `status in {submitted, confirmed} and response is not None`，
+      而 `_intent_result` 的 `response=_load_json(row.response_json) or None`——
+      **回执没存好（空/存不下/解不出），一次落地的写入就会被报成授权错误**。这条比 (1) 更容易发生。
+  **错法本身值得记**：我是从"哪些地方会抛"推出"抛出时系统处于什么状态"的，
+  中间缺了一步"**还有谁会抛**"；而且报出去时把推理当成了核对结论。
+  A 线是**去读那个兜底本身**才发现的——判断一个异常类型意味着什么，要读它的**全部**抛出点，
+  不是读你想到的那几个。
+  处置：A-11 改成白名单（只有可证明未提交的状态才算确定失败，其余一律 `DeepcoinRequestOutcomeUnknown`）。
+  **本会话 6a/6b 的替换件没有踩这个洞**（已核）：只把 `DeepcoinDefiniteRejection` 当确定失败，
+  其余一切（含该异常）→ `outcome_unknown` → 冻结告警，恰在安全侧。
+- failure-must-stop-on-the-over-protected-side (2026-09-10, A 线 local_22ee72a5 在 A-11 读出、本会话引用):
+  A 线改补救平仓腿的失败分类时发现：那条腿在尝试平仓**之前撤过保护**，所以拒绝而不还原
+  会把"平仓被拒"变成"仓位现在裸着"——**两个失败里更坏的那个**。
+  这与 6a"撤旧失败保留新单、只告警冻结"是同一个判断方向：
+  **失败时要停在"过度保护"那一侧，不能停在"没有保护"那一侧。**
+  另附一条同源观察：**修正一个错误分类会顺手拿掉它附带的噪音，而那噪音可能正是唯一在报警的东西**——
+  管理平仓腿原本标错成 `submit_unknown`，至少还冻结批次逼人来看；分类改对之后失败变得很安静，
+  所以必须补 `management_close_authority_refused` 告警，它成了"KOL 要求平仓而什么都没平"唯一的出口。
 - phase-6c-finding-close-refusal-mislabelled (2026-09-10, 会话 local_4a6676b0 只读发现,
   **不在本步改，报指挥会话定归属**): `strategy_management_executor` 的自动平仓腿
   （批次执行，非 worker_command 的人工平仓）在网关因归属未核实而**拒绝写入**时，
