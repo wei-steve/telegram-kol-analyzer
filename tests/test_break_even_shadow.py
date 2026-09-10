@@ -20,6 +20,12 @@ from telegram_kol_research.execution_bindings import (
     upsert_execution_binding,
     upsert_execution_order_leg,
 )
+from telegram_kol_research.models import PositionBackupStopOrder
+from telegram_kol_research.position_protection_legs import (
+    bind_filled_position,
+    bind_verified_exchange_order,
+    create_or_get_protection_leg,
+)
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
 
@@ -84,7 +90,13 @@ class _Client:
         raise AssertionError("the shadow must not write to the exchange")
 
 
-def _seed(tmp_path, stops=(("1001125216121995", "75700"),)):
+def _seed(
+    tmp_path,
+    stops=(("1001125216121995", "75700"),),
+    *,
+    backup_order_id=None,
+    backup_leg_order_id=None,
+):
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
         session_factory,
@@ -113,6 +125,28 @@ def _seed(tmp_path, stops=(("1001125216121995", "75700"),)):
                 purpose="stop_loss", trigger_price=price, size_text="15",
                 status="verified", evidence_source="test", evidence={},
                 seen_at=NOW,
+            )
+        if backup_order_id is not None:
+            session.add(
+                PositionBackupStopOrder(
+                    venue="deepcoin", execution_binding_id=binding_id,
+                    execution_order_leg_id=leg_id, pos_id=POS,
+                    instrument_id=INST, side="long", trigger_price="75548.6",
+                    client_order_id="TK-test-backup", order_id=backup_order_id,
+                    status="active", request_json="{}",
+                    created_at=NOW, updated_at=NOW,
+                )
+            )
+        if backup_leg_order_id is not None:
+            leg = create_or_get_protection_leg(
+                session, venue="deepcoin", execution_order_leg_id=leg_id,
+                role="backup_stop", leg_index=1,
+                planned_trigger_price="75548.6", planned_size="0",
+            )
+            bind_filled_position(session, leg, pos_id=POS)
+            bind_verified_exchange_order(
+                session, leg, exchange_order_id=backup_leg_order_id,
+                readback_evidence={"ordId": backup_leg_order_id, "posId": POS},
             )
         session.commit()
     return session_factory
@@ -176,15 +210,71 @@ def test_a_price_the_venue_spells_differently_still_compares_equal(tmp_path):
     assert row.reason_code is None
 
 
-def test_break_even_would_cancel_the_backup_stop_as_well(tmp_path):
-    """Both stops go, and the shadow says so before it can happen.
+def test_break_even_replaces_the_primary_and_leaves_the_backup_alone(tmp_path):
+    """The replacement set is the primary stop only. Ruled 2026-09-10.
 
-    Since phase 6f a protected position carries a primary and a backup. Both
-    sit below the entry price on a long, so neither qualifies as break-even
-    and the decision is ``set_break_even`` -- which replaces *every* collected
-    stop. That is a real consequence of the executor's own query and it is
-    invisible in its code; a shadow round is a better place to find it than a
-    position that has just lost its backup.
+    Since phase 6f a protected position carries a primary and a backup, and
+    both sit below the entry price on a long, so neither qualifies as
+    break-even and the decision is ``set_break_even``. The executor collects
+    *every* ledger stop row, so left alone it would cancel both and leave one
+    stop at the entry price -- the position losing its backup as a side effect
+    of tightening its primary.
+
+    The backup is not re-priced here. ``trigger_backup_stop_executor``
+    recomputes it from the new primary on a later round and replaces the old
+    one in the A-5e order, which is the only path that has ever placed one.
+    """
+
+    session_factory = _seed(
+        tmp_path,
+        stops=(("1001125216121995", "75700"), ("1001125219289222", "75548.6")),
+        backup_order_id="1001125219289222",
+    )
+    client = _Client(
+        [_position()],
+        [
+            _tpsl_row("1001125216121995", "75700"),
+            _tpsl_row("1001125219289222", "75548.6", sz="0"),
+        ],
+    )
+
+    row = _run(session_factory, client).rows[0]
+
+    assert row.action == "set_break_even"
+    assert row.target_stop_price == "77000"
+    assert row.would_cancel_order_ids == ("1001125216121995",)
+    assert "1001125219289222" not in row.would_cancel_order_ids
+    assert row.current_stop_prices == ("75700", "75548.6")
+    assert row.legacy_would_refuse == 2
+
+
+def test_a_backup_recorded_only_as_a_protection_leg_is_still_spared(tmp_path):
+    """Either record is enough to mark an order a backup; the union is the point."""
+
+    session_factory = _seed(
+        tmp_path,
+        stops=(("1001125216121995", "75700"), ("1001125219289222", "75548.6")),
+        backup_leg_order_id="1001125219289222",
+    )
+    client = _Client(
+        [_position()],
+        [
+            _tpsl_row("1001125216121995", "75700"),
+            _tpsl_row("1001125219289222", "75548.6", sz="0"),
+        ],
+    )
+
+    row = _run(session_factory, client).rows[0]
+
+    assert row.would_cancel_order_ids == ("1001125216121995",)
+
+
+def test_a_primary_that_cannot_be_named_exactly_refuses(tmp_path):
+    """Unknown is not a subset.
+
+    Two stops and neither recorded as a backup: the shadow cannot say which
+    one a break-even should replace, so it names none. Cancelling "the ones we
+    could identify" would be a guess with a live position behind it.
     """
 
     session_factory = _seed(
@@ -202,11 +292,8 @@ def test_break_even_would_cancel_the_backup_stop_as_well(tmp_path):
     row = _run(session_factory, client).rows[0]
 
     assert row.action == "set_break_even"
-    assert row.target_stop_price == "77000"
-    assert set(row.would_cancel_order_ids) == {
-        "1001125216121995", "1001125219289222"
-    }
-    assert row.legacy_would_refuse == 2
+    assert row.would_cancel_order_ids == ()
+    assert row.reason_code == "primary_stop_not_exactly_one:2"
 
 
 def test_a_stop_already_at_break_even_is_kept_and_cancels_nothing(tmp_path):
@@ -269,6 +356,7 @@ def test_the_shadow_writes_nothing(tmp_path):
     session_factory = _seed(
         tmp_path,
         stops=(("1001125216121995", "75700"), ("1001125219289222", "75548.6")),
+        backup_order_id="1001125219289222",
     )
     client = _Client(
         [_position()],
@@ -280,7 +368,9 @@ def test_the_shadow_writes_nothing(tmp_path):
 
     result = _run(session_factory, client)
 
-    assert result.would_cancel_total == 2  # it decided to, and still did not
+    # It decided to cancel the primary, and still cancelled nothing. A run
+    # that decided nothing would satisfy "wrote nothing" for the wrong reason.
+    assert result.would_cancel_total == 1
     with session_factory() as session:
         from telegram_kol_research.models import PositionMutationIntent
 

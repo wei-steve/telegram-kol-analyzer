@@ -48,7 +48,11 @@ from telegram_kol_research.deepcoin_trigger_rows import (
     position_id_or_none,
     stop_trigger_price,
 )
-from telegram_kol_research.models import PositionProtectionLedger
+from telegram_kol_research.models import (
+    PositionBackupStopOrder,
+    PositionProtectionLeg,
+    PositionProtectionLedger,
+)
 from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     assess_break_even_with_existing_stop,
@@ -233,6 +237,9 @@ def _shadow_one_position(
             (str(row.order_id or "").strip(), str(row.trigger_price or "").strip())
             for row in ledger_stops
         ]
+        backup_order_ids = _backup_stop_order_ids(
+            session, venue=venue, pos_id=pos_id
+        )
     if not ledger:
         return _with(base, reason_code="no_ledger_stop")
 
@@ -306,8 +313,30 @@ def _shadow_one_position(
             reason_code=f"market_policy_refused:{exc}",
         )
 
+    # A break-even replacement touches the **primary stop only**. The backup
+    # beside it is not re-priced here: `trigger_backup_stop_executor` recomputes
+    # it from the new primary on a later round and replaces the old one in the
+    # A-5e order. Cancelling both here would replace two stops with one and
+    # leave the position without a backup in between, which is the opposite of
+    # what the backup exists for.
+    primary_order_ids = [
+        order_id for order_id in stop_order_ids if order_id not in backup_order_ids
+    ]
+    if decision.action == "set_break_even" and len(primary_order_ids) != 1:
+        # Not "cancel what we can identify". If the primary cannot be named
+        # exactly, the replacement set is unknown, and unknown is not a subset.
+        return _with(
+            base,
+            action=decision.action,
+            target_stop_price=entry_price,
+            current_stop_prices=tuple(stop_prices),
+            stops_examined=len(ledger),
+            stops_resolved=len(stop_prices),
+            legacy_would_refuse=legacy_refusals,
+            reason_code=f"primary_stop_not_exactly_one:{len(primary_order_ids)}",
+        )
     would_cancel = (
-        tuple(stop_order_ids) if decision.action == "set_break_even" else ()
+        tuple(primary_order_ids) if decision.action == "set_break_even" else ()
     )
     return _with(
         base,
@@ -322,6 +351,39 @@ def _shadow_one_position(
         stops_resolved=len(stop_prices),
         legacy_would_refuse=legacy_refusals,
     )
+
+
+def _backup_stop_order_ids(session, *, venue: str, pos_id: str) -> frozenset[str]:
+    """Order ids on this position that are backup stops, from both records.
+
+    The union of two sources on purpose, and the union is the safe direction:
+    marking one order too many as a backup can only shrink the replacement set
+    (and, if it swallows the primary, produce a refusal), whereas missing one
+    would let a break-even cancel the backup. Over-refusing costs a round;
+    under-refusing costs the position its second stop.
+    """
+
+    order_ids: set[str] = set()
+    for row in (
+        session.query(PositionBackupStopOrder)
+        .filter(PositionBackupStopOrder.venue == venue)
+        .filter(PositionBackupStopOrder.pos_id == pos_id)
+        .all()
+    ):
+        text = str(getattr(row, "order_id", "") or "").strip()
+        if text:
+            order_ids.add(text)
+    for row in (
+        session.query(PositionProtectionLeg)
+        .filter(PositionProtectionLeg.venue == venue)
+        .filter(PositionProtectionLeg.pos_id == pos_id)
+        .filter(PositionProtectionLeg.role == "backup_stop")
+        .all()
+    ):
+        text = str(getattr(row, "exchange_order_id", "") or "").strip()
+        if text:
+            order_ids.add(text)
+    return frozenset(order_ids)
 
 
 def _with(row: BreakEvenShadowRow, **changes: Any) -> BreakEvenShadowRow:

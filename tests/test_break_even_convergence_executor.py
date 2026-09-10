@@ -1,25 +1,38 @@
 """Break-even convergence.
 
-**Three tests below assert a blocked outcome caused by a live production
-defect, not by what they were written to check.** The market preflight compares
-``trigger-orders-pending`` rows against the ledger using ``row["slTriggerPx"]``
-and ``row["posId"]``, while that endpoint returns ``slTriggerPrice`` and no
-position id at all -- the exact trap ARCHITECTURE section 6 names. Once the
-fixtures here carry the field names the venue actually returns, the preflight
-raises ``break_even_existing_stop_drift`` and the convergence blocks, which is
-what production does: ``strategy_break_even_convergences`` holds two rows, both
-``blocked / break_even_market_preflight_unavailable``, and no successful
-convergence has ever been recorded.
+**Phase 6h repaired the defect these tests used to assert.** The preflight
+compared ``trigger-orders-pending`` rows against the ledger using
+``row["slTriggerPx"]`` and ``row["posId"]``, while that endpoint returns
+``slTriggerPrice`` and no position id at all, so every candidate was refused
+with ``break_even_existing_stop_drift`` -- matching production, where
+``strategy_break_even_convergences`` held two rows and no convergence had ever
+succeeded. Both sides (stop and take-profit) now read through the named
+readers in :mod:`deepcoin_trigger_rows` and compare as ``Decimal``.
 
-They assert that state on purpose rather than being restored to green by
-putting the wrong field names back into the fixtures -- a fixture that
-disagrees with the venue is how this survived unnoticed. The repair is phase 6h
-and carries its own approval, because fixing it starts an exchange-write path
-that has never run.
+**The TPSL fixtures below carry no ``posId``**, because the venue's do not.
+They used to, and that is the whole reason the defect survived: a fixture that
+agrees with the code instead of the venue makes a broken read look correct. A
+mutation check proved it -- with the invented ``posId`` still in place,
+restoring the old ``row["posId"] == pos_id`` requirement left every test
+green.
+
+**Fixing the read did not release the write.** Reconnecting a path that has
+never once run against the venue is a separate decision from correcting a
+field name, so the executor holds at
+``BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS``, which is empty in production. The
+tests that exercise the replacement mechanics run with the position released,
+via the ``released_positions`` fixture; the gate itself is covered by its own
+pair of tests at the end, in both directions. Do not make that fixture
+autouse -- the empty-constant case has to be exercised explicitly, or a
+removed gate would look green.
 """
 
 import json
 from datetime import UTC, datetime, timedelta
+
+import pytest
+
+import telegram_kol_research.break_even_convergence_executor as break_even_module
 
 from telegram_kol_research.break_even_convergence_executor import (
     execute_break_even_convergence,
@@ -30,6 +43,7 @@ from telegram_kol_research.break_even_convergence_planner import (
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
     ExecutionOrderLeg,
     PositionMutationIntent,
     PositionProtectionIncident,
@@ -40,6 +54,17 @@ from telegram_kol_research.models import (
     StrategyLifecycle,
 )
 from telegram_kol_research.trading_settings import save_trading_settings
+
+
+@pytest.fixture
+def released_positions(monkeypatch):
+    """Release the positions these fixtures use, for the write-path tests."""
+
+    monkeypatch.setattr(
+        break_even_module,
+        "BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS",
+        frozenset({"pos-1", "pos-2"}),
+    )
 
 
 NOW = datetime(2026, 8, 2, 8, 0, tzinfo=UTC)
@@ -440,7 +465,7 @@ def test_shadow_convergence_reads_and_decides_but_never_writes_exchange(tmp_path
         assert json.loads(leg.decision_json)["action"] == "set_break_even"
 
 
-def test_short_leg_below_cost_adds_exact_break_even_stop_and_completes(tmp_path):
+def test_short_leg_below_cost_adds_exact_break_even_stop_and_completes(released_positions, tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory)
     client = TriggerCancelClient(market_price="62000")
@@ -492,11 +517,14 @@ def test_existing_tighter_short_stop_is_kept_without_position_write(tmp_path):
     convergence = _seed_convergence(session_factory)
     client = TriggerCancelClient(market_price="62000")
     client.orders.append({
+        # Venue-shaped: a TPSL row carries no posId and spells the price
+        # slTriggerPrice. It used to carry both of the position row's spellings
+        # here, which is how the executor's broken read kept passing.
         "ordId": "tight-stop",
         "instId": "BTC-USDT-SWAP",
-        "posId": "pos-1",
         "posSide": "short",
-        "slTriggerPx": "62900",
+        "triggerOrderType": "TPSL",
+        "slTriggerPrice": "62900",
         "sz": "5",
     })
     with session_factory() as session:
@@ -536,7 +564,7 @@ def test_existing_tighter_short_stop_is_kept_without_position_write(tmp_path):
         assert json.loads(leg.decision_json)["action"] == "keep_tighter_stop"
 
 
-def test_each_live_leg_uses_its_own_exchange_average_price(tmp_path):
+def test_each_live_leg_uses_its_own_exchange_average_price(released_positions, tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory, second_live=True)
     client = TriggerCancelClient(market_price="62000")
@@ -565,7 +593,7 @@ def test_each_live_leg_uses_its_own_exchange_average_price(tmp_path):
     }
 
 
-def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp_path):
+def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(released_positions, tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory)
     client = TriggerCancelClient(market_price="62000")
@@ -573,7 +601,6 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
         {
             "ordId": "weak-stop",
             "instId": "BTC-USDT-SWAP",
-            "posId": "pos-1",
             "posSide": "short",
             "triggerOrderType": "TPSL",
             "slTriggerPrice": "63500",
@@ -582,7 +609,6 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
         {
             "ordId": "tp-remaining",
             "instId": "BTC-USDT-SWAP",
-            "posId": "pos-1",
             "posSide": "short",
             "triggerOrderType": "TPSL",
             "tpTriggerPrice": "61000",
@@ -620,16 +646,20 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
         executed_at=NOW,
     )
 
-    assert result.status == "blocked"
-    assert result.reason_code == "break_even_market_preflight_unavailable"
-    # Nothing was written: the preflight stopped before the leg loop.
+    assert result.status == "completed"
+    # The A-5e ordering, which is the property this test exists for: the new
+    # stop is placed and confirmed *before* the weaker one is cancelled, so
+    # there is no instant in which the position carries neither.
     position_writes = [
         call[0] for call in client.calls
         if call[0] in {"set_position_sltp", "cancel_position_sltp"}
     ]
-    assert position_writes == []
+    assert position_writes[0] == "set_position_sltp"
+    assert position_writes.index("set_position_sltp") < position_writes.index(
+        "cancel_position_sltp"
+    )
+    assert not any(row.get("ordId") == "weak-stop" for row in client.orders)
     assert any(row.get("ordId") == "tp-remaining" for row in client.orders)
-    assert any(row.get("ordId") == "weak-stop" for row in client.orders)
 
 
 def test_untrusted_quote_blocks_all_position_mutations(tmp_path):
@@ -664,14 +694,13 @@ def test_untrusted_quote_blocks_all_position_mutations(tmp_path):
     ]
 
 
-def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
+def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(released_positions, tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory)
     client = TriggerCancelClient(market_price="62000")
     client.orders.append({
         "ordId": "weak-stop",
         "instId": "BTC-USDT-SWAP",
-        "posId": "pos-1",
         "posSide": "short",
         "triggerOrderType": "TPSL",
         "slTriggerPrice": "63500",
@@ -710,24 +739,27 @@ def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
         executed_at=NOW,
     )
 
-    assert result.status == "blocked"
-    assert result.reason_code == "break_even_market_preflight_unavailable"
+    # The cancel's outcome is unknown, so the new stop stays and a person is
+    # required. Not "blocked": a blocked convergence claims nothing happened,
+    # and something did -- the replacement stop is on the exchange.
+    assert result.status == "recovery_required"
     first_write_count = len([
         call for call in client.calls if call[0] == "set_position_sltp"
     ])
+    assert first_write_count == 1
     repeated = execute_break_even_convergence(
         session_factory,
         convergence_id=convergence.id,
         deepcoin_client=client,
         executed_at=NOW,
     )
-    assert repeated.status == "blocked"
+    assert repeated.status == "recovery_required"
     assert len([
         call for call in client.calls if call[0] == "set_position_sltp"
     ]) == first_write_count
 
 
-def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_path):
+def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(released_positions, tmp_path):
     """Phase 6a: the cancel is now proven, not assumed.
 
     Before, an accepted cancel response ended the leg. An exchange that answers
@@ -741,7 +773,6 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
     client.orders.append({
         "ordId": "weak-stop",
         "instId": "BTC-USDT-SWAP",
-        "posId": "pos-1",
         "posSide": "short",
         "triggerOrderType": "TPSL",
         "slTriggerPrice": "63500",
@@ -780,8 +811,11 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
         executed_at=NOW,
     )
 
-    assert result.status == "blocked"
-    assert result.reason_code == "break_even_market_preflight_unavailable"
+    # The venue accepted the cancel and the order is still there on read-back.
+    # Not a finished break-even, and not a failure either: the new stop exists,
+    # so the position is over-protected rather than bare, and a person decides.
+    # The ledger must NOT retire an order still resting on the venue.
+    assert result.status == "recovery_required"
     with session_factory() as session:
         retired = (
             session.query(PositionProtectionLedger)
@@ -793,5 +827,125 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
             for row in session.query(PositionProtectionIncident).all()
         ]
     assert retired.status == "verified"
-    # No incident: the preflight blocked before any replacement was attempted.
-    assert incidents == []
+    assert incidents != []
+
+
+# ---------------------------------------------------------------------------
+# Phase 6h: the release gate. Correcting the preflight reconnected a path that
+# has never once run against the venue; releasing it is a separate decision,
+# and in production the set is empty.
+# ---------------------------------------------------------------------------
+
+
+def _position_writes(client):
+    return [
+        call[0] for call in client.calls
+        if call[0] in {"set_position_sltp", "cancel_position_sltp"}
+    ]
+
+
+def _seed_break_even_ready_client(session_factory):
+    """A convergence whose every check passes, so only the gate can stop it.
+
+    The TPSL rows are venue-shaped: no ``posId``, price as ``slTriggerPrice``.
+    """
+
+    client = TriggerCancelClient(market_price="62000")
+    client.orders.extend([
+        {
+            "ordId": "weak-stop", "instId": "BTC-USDT-SWAP", "posSide": "short",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "63500", "sz": "5",
+        },
+        {
+            "ordId": "tp-remaining", "instId": "BTC-USDT-SWAP", "posSide": "short",
+            "triggerOrderType": "TPSL", "tpTriggerPrice": "61000", "sz": "5",
+        },
+    ])
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-1").one()
+        for order_id, purpose, price in [
+            ("weak-stop", "stop_loss", "63500"),
+            ("tp-remaining", "take_profit", "61000"),
+        ]:
+            session.add(PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=leg.execution_binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id="pos-1", instrument_id="BTC-USDT-SWAP", side="short",
+                order_id=order_id, purpose=purpose, trigger_price=price,
+                size_text="5", status="verified", evidence_source="test",
+                evidence_json="{}",
+            ))
+        session.commit()
+    return client
+
+
+def test_an_unreleased_position_computes_the_replacement_and_sends_none(tmp_path):
+    """The production default. Everything decided, nothing written.
+
+    Deliberately not using ``released_positions``: this is the one case that
+    must run against the real constant, or a gate removed by accident would
+    never be noticed.
+    """
+
+    assert break_even_module.BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS == frozenset()
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = _seed_break_even_ready_client(session_factory)
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert _position_writes(client) == []
+    # Not "completed": nothing was replaced, so claiming convergence would be a
+    # false statement about the exchange -- the weaker stop is still in force.
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_replacement_not_released"
+    with session_factory() as session:
+        held = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "break_even_would_replace")
+            .all()
+        )
+    # The record has to be reviewable on its own: which position, the price it
+    # would move to, and the exact orders it would cancel.
+    assert len(held) == 1
+    payload = json.loads(held[0].after_json)
+    assert payload["pos_id"] == "pos-1"
+    assert payload["target_stop_price"]
+    assert payload["would_cancel_order_ids"] == ["weak-stop"]
+    assert payload["released"] is False
+
+
+def test_a_released_position_reaches_the_replacement(released_positions, tmp_path):
+    """The other direction, so the gate is not merely "never writes".
+
+    Without this the constant could be hard-wired shut and every test above
+    would still pass while phase 6h did nothing.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = _seed_break_even_ready_client(session_factory)
+
+    execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert "set_position_sltp" in _position_writes(client)
+    with session_factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "break_even_would_replace")
+            .count()
+            == 0
+        )

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -16,6 +17,15 @@ from telegram_kol_research.deepcoin_client import (
 )
 from telegram_kol_research.deepcoin_normalization import (
     normalize_deepcoin_swap_instrument,
+)
+from telegram_kol_research.execution_events import (
+    ExecutionEventRecord,
+    record_execution_event,
+)
+from telegram_kol_research.deepcoin_trigger_rows import (
+    position_id_or_none,
+    stop_trigger_price,
+    take_profit_trigger_price,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -52,7 +62,28 @@ from telegram_kol_research.terminal_entry_cleanup import (
 from telegram_kol_research.trading_settings import load_trading_settings
 
 
+logger = logging.getLogger(__name__)
+
 _MAX_QUOTE_AGE = timedelta(seconds=30)
+
+#: Phase 6h. Positions whose break-even convergence may actually replace a stop
+#: on the exchange. **Empty on purpose.**
+#:
+#: Correcting the preflight below (it read TPSL rows with a position row's
+#: vocabulary and so refused every candidate it ever saw) reconnects a path
+#: that has never once run to completion against the venue. Reconnecting it and
+#: releasing it are two different decisions, and only the first one belongs in
+#: the same change as a fixed read. While this set is empty the executor
+#: computes the whole replacement, records it, and returns without writing.
+#:
+#: A constant rather than a setting, for the same reason as
+#: ``ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS``: releasing a position then costs
+#: a code change, a full suite and a deploy, which is the deliberate pause. A
+#: runtime flag would let the first one go out by editing a row.
+BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
+
+#: Recorded on the convergence leg when a replacement was computed but held.
+BREAK_EVEN_WOULD_REPLACE_KEY = "break_even_would_replace"
 
 
 @dataclass(frozen=True, slots=True)
@@ -263,6 +294,7 @@ def _execute_market_decisions(
             for leg in legs
         ]
 
+    held_unreleased = False
     for item in work:
         if item["status"] == "succeeded":
             continue
@@ -320,6 +352,24 @@ def _execute_market_decisions(
                     ),
                     idempotency_prefix=f"break-even:{convergence_id}:{item['id']}",
                 )
+                # Phase 6h. The plan is complete and every check above has
+                # passed; this is the last step before the exchange is written
+                # to. Until a position is named in the released set, that write
+                # does not happen: the computed replacement is recorded and the
+                # item is skipped. Computed first and held second, deliberately
+                # -- holding earlier would leave a record saying only "held",
+                # with no target price and no order id for a person to approve
+                # (the same mistake phase 6f made and fixed).
+                if str(item["pos_id"]) not in BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS:
+                    held_unreleased = True
+                    _record_break_even_would_replace(
+                        session_factory,
+                        convergence_id=convergence_id,
+                        item=item,
+                        plan=plan,
+                        recorded_at=executed_at,
+                    )
+                    continue
                 # Phase 6e. The four-field read-back is not optional: the
                 # order about to be cancelled is looked at again, by its exact
                 # id, and instrument / posSide / trigger / size all have to
@@ -462,6 +512,18 @@ def _execute_market_decisions(
                 finished_at=executed_at,
             )
 
+    if held_unreleased:
+        # Nothing was replaced, so this convergence did not converge. Reporting
+        # "completed" here would be a false statement of exchange state -- the
+        # weaker stop is still the position's stop -- and it is the reading a
+        # person or a later round would act on.
+        return _finish_convergence(
+            session_factory,
+            convergence_id=convergence_id,
+            status="blocked",
+            reason_code="break_even_replacement_not_released",
+            finished_at=executed_at,
+        )
     return _finish_convergence(
         session_factory,
         convergence_id=convergence_id,
@@ -645,12 +707,21 @@ def _reserve_market_decisions(
             stop_order_ids = []
             for stop in stop_rows:
                 exchange_row = pending_by_id.get(str(stop.order_id))
-                if (
-                    exchange_row is None
-                    or str(exchange_row.get("posId") or "") != str(leg.pos_id)
-                    or not _decimal_equal(
-                        exchange_row.get("slTriggerPx"), stop.trigger_price
-                    )
+                if exchange_row is None:
+                    raise RuntimeError("break_even_existing_stop_drift")
+                # Phase 6h. Attribution is the order id -- the key this row was
+                # looked up by. A TPSL row from ``trigger-orders-pending``
+                # carries no ``posId`` at all, so requiring one to equal the
+                # position id could only ever fail, and did: every candidate
+                # this executor ever saw was refused here. A position id is
+                # allowed to contradict, never to be required.
+                row_pos_id = position_id_or_none(exchange_row)
+                if row_pos_id is not None and row_pos_id != str(leg.pos_id):
+                    raise RuntimeError("break_even_existing_stop_drift")
+                # And the price is spelled ``slTriggerPrice`` on a TPSL row,
+                # not ``slTriggerPx``. Read it by name, compare it as a number.
+                if not _decimal_equal(
+                    stop_trigger_price(exchange_row), stop.trigger_price
                 ):
                     raise RuntimeError("break_even_existing_stop_drift")
                 stop_prices.append(str(stop.trigger_price))
@@ -746,6 +817,67 @@ def _record_break_even_stop(
         session.commit()
 
 
+def _record_break_even_would_replace(
+    session_factory: sessionmaker,
+    *,
+    convergence_id: int,
+    item: dict[str, Any],
+    plan: ProtectionReplacementPlan,
+    recorded_at: datetime,
+) -> None:
+    """Write down the replacement that was computed and not sent.
+
+    Everything a person needs to approve it, in one row: the position, the
+    stop it would move to, and the exact order ids it would cancel. Phase 6f
+    learned this the hard way -- its first hold recorded only "held", which is
+    unreviewable, so the plan is computed first and held second here too.
+
+    The leg is finished ``blocked``. Leaving it pending would make the
+    convergence spin, re-deciding and re-recording the same held replacement
+    every round; ``blocked`` is also simply true -- the replacement did not
+    happen. A release re-runs the convergence rather than resuming this one.
+    """
+
+    payload = {
+        "pos_id": str(item["pos_id"]),
+        "target_stop_price": str(item.get("entry")),
+        "size": str(item.get("size")),
+        "would_cancel_order_ids": list(plan.old_order_ids),
+        "instrument_id": plan.instrument_id,
+        "convergence_id": int(convergence_id),
+        "released": False,
+    }
+    try:
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action=BREAK_EVEN_WOULD_REPLACE_KEY,
+                venue="deepcoin",
+                status="held",
+                execution_binding_id=int(item["execution_binding_id"]),
+                pos_id=str(item["pos_id"]),
+                symbol=plan.instrument_id,
+                order_id=",".join(plan.old_order_ids),
+                reason="break_even_replacement_not_released",
+                after=payload,
+                created_at=recorded_at,
+            ),
+        )
+    except Exception:  # pragma: no cover - a record must not break the hold
+        logger.warning(
+            "break-even would-replace record failed pos_id=%s",
+            item.get("pos_id"),
+            exc_info=True,
+        )
+    _finish_leg(
+        session_factory,
+        leg_id=item["id"],
+        status="blocked",
+        reason_code="break_even_replacement_not_released",
+        finished_at=recorded_at,
+    )
+
+
 def _finish_leg(
     session_factory: sessionmaker,
     *,
@@ -790,10 +922,18 @@ def _validate_remaining_take_profits(
     total = Decimal("0")
     for row in rows:
         pending = pending_by_id.get(str(row.order_id))
+        if pending is None:
+            raise RuntimeError("break_even_remaining_take_profit_drift")
+        # Phase 6h, the same correction as the stop side above and in the same
+        # change, because the two halves fail identically and fixing one alone
+        # would leave a convergence refusing for the other's reason.
+        pending_pos_id = position_id_or_none(pending)
+        if pending_pos_id is not None and pending_pos_id != str(leg.pos_id):
+            raise RuntimeError("break_even_remaining_take_profit_drift")
         if (
-            pending is None
-            or str(pending.get("posId") or "") != str(leg.pos_id)
-            or not _decimal_equal(pending.get("tpTriggerPx"), row.trigger_price)
+            not _decimal_equal(
+                take_profit_trigger_price(pending), row.trigger_price
+            )
             or row.size_text in (None, "")
             or not _decimal_equal(pending.get("sz"), row.size_text)
         ):
