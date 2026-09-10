@@ -1036,6 +1036,19 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-approval (2026-09-10, 用户在指挥会话 local_858790fe 明确批准，原话"批准 6f"):
+  **6f（在真实仓位上放开由采纳而来的备份止损下单）获批。** 出示给用户的明细逐项如下：
+  拟备份止损**触发价 `75548.6`**（= 主止损 75700 × (1 − 20bps)，long 向下取整到 tick；
+  `liqPx=68116.6`，代码硬校验要求备份止损 < 主止损且 > 强平价）、**数量 `15`**（该仓位全量）、
+  方向 `posSide=long`、端点 **`set_position_sltp`**（非 trigger-order）、
+  payload `{"instType":"SWAP","instId":"BTC-USDT-SWAP","posSide":"long","mrgPosition":"split",
+  "tdMode":"cross","posId":<pos>,"slTriggerPx":"75548.6","slTriggerPxType":"last","slOrdPx":"-1"}`、
+  **无显式 reduce-only**（仓位绑定 TPSL，按端点语义只减仓）、
+  **只对 `evidence_source=exchange_adopted_by_tu` 的主止损放开**（其余来源今天本来就在下单，不在本次批准范围）、
+  **首笔单仓位限流**、失败即停且**不撤主止损**（该模块零撤单调用，grep 计数 0）。
+  执行顺序（指挥会话裁定）：6e 收窗 → 6f 提交 → 全量 → 四步部署 →
+  **首笔下单前后各读一次 `trigger-orders-pending` 全表**、六项核对结果原样报指挥会话 →
+  确认后才放第二笔 → 收窗。
 - phase-6e-cutover-completed (2026-09-10, 会话 local_4a6676b0, **五条判据全部达成，含交易所侧证据**):
   接线本体 **`14fdf1b1ba29e441644b7c57cfabaee689915ed2`**，19:17Z 上线，**回滚参考 `a8a3a069`**，
   四步部署（第 3 步第三次撞并发推送，按不变量合并不变基）。全量 **8312 passed / 4 skipped / 0 failed**。
