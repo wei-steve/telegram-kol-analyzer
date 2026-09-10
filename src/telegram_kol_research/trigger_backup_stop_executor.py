@@ -12,6 +12,9 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.execution_bindings import build_client_order_id
+from telegram_kol_research.protection_authority import (
+    ADOPTION_EVIDENCE_SOURCE as ADOPTED_EVIDENCE_SOURCE,
+)
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
@@ -100,6 +103,15 @@ def submit_verified_trigger_backup_stops(
                 submitted_at=submitted_at,
             )
             if plan.status == "already_protected":
+                continue
+            if plan.status == "shadow_ready_adopted_primary":
+                _record_incident(
+                    session,
+                    plan=plan,
+                    incident_type="backup_stop_shadow_ready",
+                    observed_at=submitted_at,
+                )
+                session.commit()
                 continue
             if plan.status != "ready" or plan.payload is None:
                 _record_incident(
@@ -364,6 +376,18 @@ def _plan_submission(
     primary_stop = _primary_stop_price(primary)
     if primary_stop is None:
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_not_verified")
+    if str(getattr(primary, "evidence_source", "") or "") == ADOPTED_EVIDENCE_SOURCE:
+        # Phase 6e/6f. This primary stop reached the ledger by adoption -- the
+        # exchange holds it, nothing here submitted it, and until 6e no local
+        # record named it at all. Adoption is a ledger write; placing a backup
+        # stop beside it would be an *exchange* write on a live position that
+        # nobody has agreed to yet, and it would happen in the same reconcile
+        # round as the adoption, with no person in between. So the plan is
+        # rendered and recorded and not sent. Phase 6f is where that changes,
+        # and it carries the user's approval.
+        return _shadow_ready_plan(
+            binding_id, leg_id, pos_id, primary=primary, primary_stop=primary_stop
+        )
     primary_order_id = str(primary.order_id or "").strip() if primary is not None else ""
     if not primary_order_id:
         return _blocked_plan(binding_id, leg_id, pos_id, "primary_stop_identifier_unavailable")
@@ -569,6 +593,27 @@ def _submission_still_reserved(
 def _blocked_plan(binding_id: int, leg_id: int, pos_id: str, reason_code: str) -> BackupStopPlan:
     return BackupStopPlan(
         status="blocked", reason_code=reason_code, binding_id=binding_id, leg_id=leg_id, pos_id=pos_id
+    )
+
+
+def _shadow_ready_plan(
+    binding_id: int,
+    leg_id: int,
+    pos_id: str,
+    *,
+    primary,
+    primary_stop: str,
+) -> BackupStopPlan:
+    """A plan that is computed, recorded and deliberately not sent."""
+
+    return BackupStopPlan(
+        status="shadow_ready_adopted_primary",
+        reason_code="primary_stop_adopted_from_exchange",
+        binding_id=binding_id,
+        leg_id=leg_id,
+        pos_id=pos_id,
+        primary_order_id=str(getattr(primary, "order_id", "") or ""),
+        primary_stop=str(primary_stop),
     )
 
 

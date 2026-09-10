@@ -25,6 +25,10 @@ from telegram_kol_research.models import (
     StrategyBreakEvenConvergence,
     StrategyBreakEvenConvergenceLeg,
 )
+from telegram_kol_research.protection_authority import (
+    evaluate_cancel_precheck,
+    resolve_protection_authority,
+)
 from telegram_kol_research.protection_replacement import (
     GROUP_STOP as PROTECTION_GROUP_STOP,
     NewProtectionOrder,
@@ -316,6 +320,23 @@ def _execute_market_decisions(
                     ),
                     idempotency_prefix=f"break-even:{convergence_id}:{item['id']}",
                 )
+                # Phase 6e. The four-field read-back is not optional: the
+                # order about to be cancelled is looked at again, by its exact
+                # id, and instrument / posSide / trigger / size all have to
+                # still agree with what was resolved. Until this was passed,
+                # break-even cancelled on the strength of a read taken before
+                # the new stop was even placed.
+                with session_factory() as session:
+                    authority = resolve_protection_authority(
+                        session,
+                        venue="deepcoin",
+                        pos_id=item["pos_id"],
+                        instrument_id=instrument_id,
+                        side=_position_side_for_leg(session, item),
+                        pending_rows=_read_pending_rows(
+                            deepcoin_client, instrument_id
+                        ),
+                    )
                 replacement = replace_stop_group(
                     session_factory,
                     plan=plan,
@@ -324,6 +345,11 @@ def _execute_market_decisions(
                     live_execution_gate=lambda pos_id=item["pos_id"]: (
                         _runtime_mode_enabled(session_factory, execution_mode="live")
                         and exact_position_write_gate(session_factory, pos_id=pos_id)
+                    ),
+                    pre_cancel_check=(
+                        lambda rows, order_id, _authority=authority: (
+                            evaluate_cancel_precheck(_authority, rows, str(order_id))
+                        )
                     ),
                 )
                 order_id = (
@@ -775,6 +801,27 @@ def _validate_remaining_take_profits(
         total += Decimal(str(row.size_text))
     if total > Decimal(str(leg.preflight_size)):
         raise RuntimeError("break_even_remaining_take_profit_oversized")
+
+
+def _read_pending_rows(deepcoin_client, instrument_id: str):
+    """One pending read for the pre-cancel check. ``None`` means "could not look"."""
+
+    lister = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if not callable(lister):
+        return None
+    try:
+        rows = lister(inst_id=instrument_id)
+    except Exception:
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def _position_side_for_leg(session, item) -> str:
+    leg = session.get(ExecutionOrderLeg, int(item["execution_order_leg_id"]))
+    if leg is None:
+        return ""
+    binding = session.get(ExecutionBinding, int(item["execution_binding_id"]))
+    return str(getattr(binding, "side", "") or "").lower()
 
 
 def _mark_old_stop_cancelled(

@@ -18,6 +18,18 @@ from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 
 
 NOW = datetime(2026, 9, 10, 12, 0, tzinfo=UTC)
+
+
+def _agrees(rows, order_id):
+    """A pre-cancel check that always agrees.
+
+    Passed explicitly by every test that is not about the check itself: the
+    argument is required precisely so that no caller can forget it, and a test
+    helper that hides it would put the forgetting back.
+    """
+
+    return None
+
 INST = "ETH-USDT-SWAP"
 
 
@@ -165,6 +177,7 @@ def test_a_stop_is_placed_before_the_old_one_is_cancelled(tmp_path, recorded):
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_SUCCEEDED
@@ -196,6 +209,7 @@ def test_a_take_profit_is_cancelled_before_the_new_one_is_placed(tmp_path, recor
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_SUCCEEDED
@@ -221,6 +235,7 @@ def test_a_failed_cancel_keeps_the_new_stop_and_freezes(tmp_path, recorded):
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_INCOMPLETE
@@ -251,6 +266,7 @@ def test_an_old_stop_still_listed_after_its_cancel_is_not_retired(tmp_path, reco
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_INCOMPLETE
@@ -258,7 +274,7 @@ def test_an_old_stop_still_listed_after_its_cancel_is_not_retired(tmp_path, reco
     assert _ledger_status(session_factory, "old-stop") == "verified"
 
 
-def test_an_unreadable_pending_list_is_never_proof_the_old_stop_is_gone(tmp_path, recorded):
+def test_an_unreadable_pending_list_stops_the_replacement_before_any_cancel(tmp_path, recorded):
     _, _ = recorded
     session_factory, binding_id, leg_id = _seed(tmp_path)
     exchange = _Exchange(pending_raises=True)
@@ -276,10 +292,16 @@ def test_an_unreadable_pending_list_is_never_proof_the_old_stop_is_gone(tmp_path
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_INCOMPLETE
-    assert result.reason_code == "protection_old_order_absence_unproven"
+    # Since the pre-cancel read-back became mandatory this is caught one step
+    # earlier -- before any cancel is issued rather than after -- so the reason
+    # names the read that failed. The property under test is unchanged: an
+    # unreadable list never retires the ledger row.
+    assert result.reason_code == "protection_cancel_precheck_unreadable"
+    assert result.cancelled_order_ids == ()
     assert _ledger_status(session_factory, "old-stop") == "verified"
 
 
@@ -302,6 +324,7 @@ def test_a_rejected_stop_placement_leaves_the_old_stop_armed(tmp_path, recorded)
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_UNKNOWN
@@ -328,6 +351,7 @@ def test_a_failed_take_profit_cancel_places_nothing(tmp_path, recorded):
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_INCOMPLETE
@@ -384,6 +408,7 @@ def test_a_group_with_nothing_new_to_place_is_not_a_cancel_all(tmp_path, recorde
         deepcoin_client=exchange,
         executed_at=NOW,
         live_execution_gate=lambda: True,
+        pre_cancel_check=_agrees,
     )
 
     assert result.status == pr.STATUS_SKIPPED

@@ -534,3 +534,59 @@ def test_an_unreadable_pending_list_is_never_permission_to_cancel(tmp_path):
         evaluate_cancel_precheck(authority, None, "stop-1")
         == FREEZE_PENDING_READ_INCOMPLETE
     )
+
+
+def test_a_row_with_no_order_type_freezes_rather_than_vanishing(tmp_path):
+    """Skipping it would answer "no protection" about a row that may be the stop.
+
+    ``is_protection_order_row`` treats an absent or self-contradictory
+    ``triggerOrderType`` as protection so malformed protective state fails
+    closed. Resolution has to agree: the dangerous direction here is not
+    cancelling something odd, it is concluding a live position is unprotected
+    because a row could not be classified.
+    """
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _ledger(
+        session_factory,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        order_id="stop-1",
+        purpose="stop_loss",
+        price="2500",
+    )
+    typeless = _stop_row("mystery-1")
+    typeless.pop("triggerOrderType")
+
+    authority = _resolve(session_factory, [_stop_row("stop-1"), typeless])
+
+    assert authority.status == "frozen"
+    assert authority.reason_code == FREEZE_ORDER_UNATTRIBUTABLE
+    assert authority.unattributable_order_ids == ("mystery-1",)
+
+
+def test_a_conditional_entry_row_is_still_skipped_not_frozen(tmp_path):
+    """The other half: an explicitly typed pending entry is not protection."""
+
+    session_factory, binding_id, leg_id = _seed(tmp_path)
+    _ledger(
+        session_factory,
+        binding_id=binding_id,
+        leg_id=leg_id,
+        order_id="stop-1",
+        purpose="stop_loss",
+        price="2500",
+    )
+    entry = {
+        "ordId": "entry-1",
+        "instId": INST,
+        "posSide": "long",
+        "side": "buy",
+        "triggerOrderType": "Conditional",
+        "closeSLTriggerPrice": "2400",
+    }
+
+    authority = _resolve(session_factory, [_stop_row("stop-1"), entry])
+
+    assert authority.resolved
+    assert authority.order_ids == ("stop-1",)

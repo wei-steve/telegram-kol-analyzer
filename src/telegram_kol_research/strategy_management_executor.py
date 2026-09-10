@@ -655,12 +655,13 @@ def reserve_break_even_market_actions(
                 session_factory,
                 [leg.pos_id for leg in allowed_legs],
             )
+            exact_order_position_ids = _exact_order_position_ids(
+                ledger_rows_by_pos_id
+            )
             matches = match_position_protection(
                 live_positions,
                 pending,
-                exact_order_position_ids=_exact_order_position_ids(
-                    ledger_rows_by_pos_id
-                ),
+                exact_order_position_ids=exact_order_position_ids,
             )
             protection_rows = {}
             seen_order_ids: set[str] = set()
@@ -684,6 +685,23 @@ def reserve_break_even_market_actions(
                     or len(order_ids) != len(set(order_ids))
                     or bool(seen_order_ids.intersection(order_ids))
                 ):
+                    # Phase 6e. Two very different situations reach this
+                    # refusal and the operator has to be able to tell them
+                    # apart. "Ambiguous or drifted" means the ledger and the
+                    # exchange disagree about orders both of them name. But when
+                    # the exchange is holding TPSL orders that no ledger row can
+                    # attribute at all -- the shape a limit entry's own stop
+                    # produces -- the accurate statement is that the venue has
+                    # protection this system cannot name, which is a different
+                    # problem with a different fix.
+                    unattributed = _unattributed_exchange_tpsl_order_ids(
+                        pending, exact_order_position_ids
+                    )
+                    if unattributed:
+                        raise ManagementBatchExecutionError(
+                            "protection_rows_unattributed_on_exchange:"
+                            f"{leg.pos_id}:{','.join(unattributed)}"
+                        )
                     raise ManagementBatchExecutionError(
                         "protection_preflight_rows_ambiguous_or_drifted"
                     )
@@ -3425,6 +3443,32 @@ def _remaining_size_after_partial_close(leg: Any) -> Decimal | None:
         return None
     remaining = preflight - close_size
     return remaining if remaining > 0 else None
+
+
+def _unattributed_exchange_tpsl_order_ids(
+    pending, exact_order_position_ids
+) -> list[str]:
+    """TPSL orders the venue is holding that no ledger row can place.
+
+    Read-only and deliberately narrow: it names order ids for a person, and
+    nothing acts on the answer. ``Conditional`` rows are pending entries and are
+    not protection, so they are excluded.
+    """
+
+    from telegram_kol_research.native_tpsl import native_tpsl_row_order_types
+
+    unattributed: list[str] = []
+    for row in pending or []:
+        if not isinstance(row, dict):
+            continue
+        if native_tpsl_row_order_types(row) != {"TPSL"}:
+            continue
+        order_id = str(
+            row.get("ordId") or row.get("orderId") or row.get("order_id") or ""
+        ).strip()
+        if order_id and order_id not in (exact_order_position_ids or {}):
+            unattributed.append(order_id)
+    return sorted(unattributed)
 
 
 def _ledger_rows_by_pos_id(

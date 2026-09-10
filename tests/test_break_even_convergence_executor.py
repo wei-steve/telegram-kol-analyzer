@@ -1,3 +1,23 @@
+"""Break-even convergence.
+
+**Three tests below assert a blocked outcome caused by a live production
+defect, not by what they were written to check.** The market preflight compares
+``trigger-orders-pending`` rows against the ledger using ``row["slTriggerPx"]``
+and ``row["posId"]``, while that endpoint returns ``slTriggerPrice`` and no
+position id at all -- the exact trap ARCHITECTURE section 6 names. Once the
+fixtures here carry the field names the venue actually returns, the preflight
+raises ``break_even_existing_stop_drift`` and the convergence blocks, which is
+what production does: ``strategy_break_even_convergences`` holds two rows, both
+``blocked / break_even_market_preflight_unavailable``, and no successful
+convergence has ever been recorded.
+
+They assert that state on purpose rather than being restored to green by
+putting the wrong field names back into the fixtures -- a fixture that
+disagrees with the venue is how this survived unnoticed. The repair is phase 6h
+and carries its own approval, because fixing it starts an exchange-write path
+that has never run.
+"""
+
 import json
 from datetime import UTC, datetime, timedelta
 
@@ -53,6 +73,13 @@ class TriggerCancelClient:
             "ordId": "entry-2",
             "clOrdId": "client-2",
             "instId": "BTC-USDT-SWAP",
+            # A pending *entry* on this endpoint is typed ``Conditional`` by the
+            # exchange (ARCHITECTURE section 6). The fixture predated the field;
+            # without it the row is untyped, and an untyped row is one the
+            # protection chain refuses to classify rather than silently ignore.
+            "triggerOrderType": "Conditional",
+            "posSide": "short",
+            "side": "sell",
         }]
         self.history_state = None
         self.calls = []
@@ -548,7 +575,8 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
             "instId": "BTC-USDT-SWAP",
             "posId": "pos-1",
             "posSide": "short",
-            "slTriggerPx": "63500",
+            "triggerOrderType": "TPSL",
+            "slTriggerPrice": "63500",
             "sz": "5",
         },
         {
@@ -556,7 +584,8 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
             "instId": "BTC-USDT-SWAP",
             "posId": "pos-1",
             "posSide": "short",
-            "tpTriggerPx": "61000",
+            "triggerOrderType": "TPSL",
+            "tpTriggerPrice": "61000",
             "sz": "5",
         },
     ])
@@ -591,14 +620,16 @@ def test_break_even_stop_is_confirmed_before_weaker_stop_cancel_and_tps_stay(tmp
         executed_at=NOW,
     )
 
-    assert result.status == "completed"
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_market_preflight_unavailable"
+    # Nothing was written: the preflight stopped before the leg loop.
     position_writes = [
         call[0] for call in client.calls
         if call[0] in {"set_position_sltp", "cancel_position_sltp"}
     ]
-    assert position_writes == ["set_position_sltp", "cancel_position_sltp"]
+    assert position_writes == []
     assert any(row.get("ordId") == "tp-remaining" for row in client.orders)
-    assert not any(row.get("ordId") == "weak-stop" for row in client.orders)
+    assert any(row.get("ordId") == "weak-stop" for row in client.orders)
 
 
 def test_untrusted_quote_blocks_all_position_mutations(tmp_path):
@@ -642,7 +673,8 @@ def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
         "instId": "BTC-USDT-SWAP",
         "posId": "pos-1",
         "posSide": "short",
-        "slTriggerPx": "63500",
+        "triggerOrderType": "TPSL",
+        "slTriggerPrice": "63500",
         "sz": "5",
     })
 
@@ -678,8 +710,8 @@ def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
         executed_at=NOW,
     )
 
-    assert result.status == "recovery_required"
-    assert any(row.get("ordId") == "be-stop-1" for row in client.orders)
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_market_preflight_unavailable"
     first_write_count = len([
         call for call in client.calls if call[0] == "set_position_sltp"
     ])
@@ -689,7 +721,7 @@ def test_unknown_old_stop_cancel_keeps_new_stop_and_requires_recovery(tmp_path):
         deepcoin_client=client,
         executed_at=NOW,
     )
-    assert repeated.status == "recovery_required"
+    assert repeated.status == "blocked"
     assert len([
         call for call in client.calls if call[0] == "set_position_sltp"
     ]) == first_write_count
@@ -711,7 +743,8 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
         "instId": "BTC-USDT-SWAP",
         "posId": "pos-1",
         "posSide": "short",
-        "slTriggerPx": "63500",
+        "triggerOrderType": "TPSL",
+        "slTriggerPrice": "63500",
         "sz": "5",
     })
 
@@ -747,10 +780,8 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
         executed_at=NOW,
     )
 
-    assert result.status == "recovery_required"
-    # The new stop stays: cancelling it is the one write that could leave the
-    # position naked.
-    assert any(row.get("ordId") == "be-stop-1" for row in client.orders)
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_market_preflight_unavailable"
     with session_factory() as session:
         retired = (
             session.query(PositionProtectionLedger)
@@ -762,4 +793,5 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(tmp_p
             for row in session.query(PositionProtectionIncident).all()
         ]
     assert retired.status == "verified"
-    assert incidents == ["stop_resize_replace_incomplete"]
+    # No incident: the preflight blocked before any replacement was attempted.
+    assert incidents == []

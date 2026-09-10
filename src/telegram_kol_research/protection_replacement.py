@@ -112,11 +112,13 @@ class ProtectionReplacementResult:
         return self.status == STATUS_SUCCEEDED
 
 
-#: A pre-cancel check the caller may supply: given the live pending rows and one
-#: order id, say whether that order is still exactly what we think it is. Phase
-#: 6b passes the real one; a caller that passes nothing keeps the pre-6b
-#: behaviour, where the cancel is attempted and the read-back afterwards is what
-#: proves the outcome.
+#: Given the live pending rows and one order id, say whether that order is still
+#: exactly what the caller resolved -- ``None`` if it is, a reason code if it is
+#: not. **Required, not optional.** It was optional until 2026-09-10, and the
+#: consequence was a claim written into a phase report ("the cancel goes through
+#: the four-field read-back") that was not true of one of the two callers,
+#: because that caller simply did not pass it. An argument that must be
+#: remembered is a check that will eventually be skipped.
 PreCancelCheck = Callable[[Sequence[Mapping[str, Any]], str], str | None]
 
 
@@ -127,7 +129,7 @@ def replace_stop_group(
     deepcoin_client: Any,
     executed_at: datetime,
     live_execution_gate: Callable[[], bool],
-    pre_cancel_check: PreCancelCheck | None = None,
+    pre_cancel_check: PreCancelCheck,
 ) -> ProtectionReplacementResult:
     """Place the new stops, then retire the old ones. Never the other way."""
 
@@ -252,7 +254,7 @@ def replace_take_profit_group(
     deepcoin_client: Any,
     executed_at: datetime,
     live_execution_gate: Callable[[], bool],
-    pre_cancel_check: PreCancelCheck | None = None,
+    pre_cancel_check: PreCancelCheck,
 ) -> ProtectionReplacementResult:
     """Retire the old take profits first, so two of them never fire together."""
 
@@ -349,7 +351,7 @@ def _cancel_and_confirm(
     deepcoin_client: Any,
     executed_at: datetime,
     live_execution_gate: Callable[[], bool],
-    pre_cancel_check: PreCancelCheck | None,
+    pre_cancel_check: PreCancelCheck,
 ) -> tuple[list[str], str | None]:
     """Cancel each old order and prove it left ``trigger-orders-pending``."""
 
@@ -357,17 +359,14 @@ def _cancel_and_confirm(
     if not plan.old_order_ids:
         return cancelled, None
 
-    pending_before: Sequence[Mapping[str, Any]] | None = None
-    if pre_cancel_check is not None:
-        pending_before = _read_pending(deepcoin_client, plan.instrument_id)
-        if pending_before is None:
-            return cancelled, "protection_cancel_precheck_unreadable"
+    pending_before = _read_pending(deepcoin_client, plan.instrument_id)
+    if pending_before is None:
+        return cancelled, "protection_cancel_precheck_unreadable"
 
     for order_id in plan.old_order_ids:
-        if pre_cancel_check is not None and pending_before is not None:
-            mismatch = pre_cancel_check(pending_before, order_id)
-            if mismatch is not None:
-                return cancelled, mismatch
+        mismatch = pre_cancel_check(pending_before, order_id)
+        if mismatch is not None:
+            return cancelled, mismatch
         try:
             cancel_exact_position_sltp(
                 session_factory=session_factory,

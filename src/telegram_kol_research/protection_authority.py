@@ -242,10 +242,21 @@ def resolve_protection_authority(
         if not isinstance(row, Mapping):
             continue
         order_types = native_tpsl_row_order_types(dict(row))
+        if order_types == {"CONDITIONAL"}:
+            # A ``Conditional`` row is a pending *entry*, not protection
+            # (ARCHITECTURE section 6). It is never this position's stop and is
+            # never cancelled here.
+            continue
         if order_types != {"TPSL"}:
-            # A ``Conditional`` row is a pending entry, and a row whose type is
-            # absent or self-contradictory is not something this module may
-            # cancel. Neither is protection this position owns.
+            # Absent or self-contradictory type. ``is_protection_order_row``
+            # treats such a row as protection so malformed protective state
+            # fails closed, and the same reasoning applies harder here: silently
+            # skipping it would let this module answer "this position has no
+            # protection" about a row that may well be its stop. It cannot be
+            # classified, so it freezes the position instead -- the same
+            # treatment as a row nothing can attribute.
+            identity = _order_identity(dict(row))
+            unattributable.append(identity or "<unidentified>")
             continue
         normalized = normalize_native_tpsl(dict(row))
         if normalized is None:

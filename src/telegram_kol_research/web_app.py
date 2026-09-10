@@ -86,6 +86,9 @@ from telegram_kol_research.deepcoin_reconcile_wake import (
 from telegram_kol_research.deepcoin_reconcile_wake import (
     DeepcoinReconcileWakeSignal,
 )
+from telegram_kol_research.protection_adoption import (
+    run_protection_adoption_pass,
+)
 from telegram_kol_research.protection_authority_shadow import (
     run_protection_authority_shadow_pass,
 )
@@ -10022,6 +10025,15 @@ async def run_deepcoin_execution_reconcile_loop(
             deepcoin_client_factory=deepcoin_client_factory,
             now_provider=now_provider,
         )
+        # Phase 6e. The one step here that writes: a ledger row for protection
+        # the exchange holds and no local record names. It makes no exchange
+        # call, and the row it writes is marked so the one consumer that would
+        # turn it into an order holds back until phase 6f.
+        protection_adoption_summary = await _run_protection_adoption_step(
+            session_factory=session_factory,
+            deepcoin_client_factory=deepcoin_client_factory,
+            now_provider=now_provider,
+        )
         await _log_deepcoin_reconcile_round_step(
             session_factory=session_factory,
             trigger=trigger,
@@ -10032,6 +10044,7 @@ async def run_deepcoin_execution_reconcile_loop(
             wake_signal=wake_signal,
             shadow_summary=shadow_summary,
             protection_shadow_summary=protection_shadow_summary,
+            protection_adoption_summary=protection_adoption_summary,
         )
         if wake_signal is None:
             await asyncio.sleep(interval_seconds)
@@ -10084,6 +10097,7 @@ def _build_deepcoin_reconcile_round_log(
     wake_requested_at: datetime | None,
     shadow_summary: dict | None,
     protection_shadow_summary: dict | None = None,
+    protection_adoption_summary: dict | None = None,
 ) -> dict:
     """Assemble the one structured line phase 4 adds per reconcile round.
 
@@ -10128,6 +10142,8 @@ def _build_deepcoin_reconcile_round_log(
         # mismatches and freezes the negative one. Both live on the same line
         # so a window can be summed from the journal alone.
         payload["protection_shadow"] = protection_shadow_summary
+    if protection_adoption_summary is not None:
+        payload["protection_adoption"] = protection_adoption_summary
     return payload
 
 
@@ -10140,6 +10156,7 @@ async def _log_deepcoin_reconcile_round_step(
     wake_signal,
     shadow_summary: dict | None,
     protection_shadow_summary: dict | None = None,
+    protection_adoption_summary: dict | None = None,
 ) -> None:
     """Emit the per-round line. Never allowed to affect the reconcile loop."""
 
@@ -10153,6 +10170,7 @@ async def _log_deepcoin_reconcile_round_step(
             wake_requested_at=getattr(wake_signal, "last_request_at", None),
             shadow_summary=shadow_summary,
             protection_shadow_summary=protection_shadow_summary,
+            protection_adoption_summary=protection_adoption_summary,
         )
     except Exception:
         logger.debug("Failed to build Deepcoin reconcile round log")
@@ -10287,6 +10305,53 @@ async def _run_protection_authority_shadow_step(
         raise
     except Exception:
         logger.warning("Protection authority shadow pass failed", exc_info=True)
+        return None
+
+
+async def _run_protection_adoption_step(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    now_provider,
+) -> dict | None:
+    """Run one adoption pass off the loop, swallowing every failure.
+
+    Isolated the same way the two shadow passes are: a failure here is logged
+    and dropped, never allowed to skip or repeat a reconciliation. Adoption is
+    idempotent, so the next round simply tries again.
+    """
+
+    def _run(now):
+        client = deepcoin_client_factory()
+        try:
+            result = run_protection_adoption_pass(
+                session_factory,
+                deepcoin_client=client,
+                now=now,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Protection adoption client cleanup failed")
+        return {
+            "positions_seen": result.positions_seen,
+            "adopted_rows": result.adopted_rows,
+            "refused_positions": result.refused_positions,
+            "read_failures": list(result.read_failures),
+        }
+
+    try:
+        return await run_on_management_worker(
+            _run,
+            (now_provider() if now_provider is not None else datetime.now(UTC)),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Protection adoption pass failed", exc_info=True)
         return None
 
 
