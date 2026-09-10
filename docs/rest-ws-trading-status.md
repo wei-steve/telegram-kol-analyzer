@@ -740,15 +740,32 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   leg 589 创建于 09-07 16:09:48（条件单 `1001125172997005` 提交）；
   **01:23:03.102990** 系统 `cancel_trigger_entry` 撤掉该条件单并做 `terminal_entry_cleanup_outcome`，
   同刻把 leg 589 判成 `manually_closed / manual_position_missing`；
-  **01:23:07.27–33** WS 连续推来 `Trade` / `Position` / `Order` / `TriggerOrder`，
-  产生订单 **`1001125178552542`** 与仓位 **`1001125178552543`**（`TU: default → 1001125178552543`，
-  符合 4.7 节 `TU = OS + 1` 的规律，即 552543 是 552542 开出的仓位）；
+  **01:23:07.27–33** WS 连续推来 `Trade` / `Position` / `Order` / `TriggerOrder`；
   **01:23:10.548** `create_backup_stop`，同刻写了 leg 589 的 `last_verified_at`。
-  **因此疑点不是"读不到仓位"，而是归属**：leg 589 的 ordId 是被撤掉的旧条件单 `...2997005`，
-  它的 `pos_id` 却是 4 秒后由**另一个订单 `...8552542`** 开出的仓位 `...8552543`；
-  且它在被判 `manually_closed` **之后** 7 秒还更新了 `last_verified_at`。
-  两个 id **相邻**（552542 / 552543）——正是硬性禁止第 1 条反复警告的"ID 相邻不得单独认领归属"的形状。
-  真正拥有 552543 的那条 leg 是否存在、系统是否把仓位挂错了对象，**由 A 线 A-10a 只读归因**。
+  **【2026-09-10 第二次更正：我基于上面时间线做的"归属挂错"推断也是错的，已由 A 线 A-10a 查实推翻】**
+  我当时写"`TU = OS + 1`，所以 552543 是 552542 开出的仓位、leg 589 挂错了对象"。**方向反了**：
+  `1001125178552543` **本身就是那张成交开仓单的 id**（订单历史：`limit / sell / short / sz 3 /
+  accFillSz 3 / avgPx 79412.8 / filled / 01:23:07`），这正是 4.7 节"**普通 order 的 posId == ordId**"；
+  而 `1001125178552542` 是**止损单**（挂单里 `triggerOrderType=TPSL / buy / short / sz 3 /
+  slTriggerPrice 83000`，保护账本第 667 行记为 `stop_loss`），id 比仓位**小 1**。
+  全库没有 552542 的 leg 是**正常**的——止损单不进 `execution_order_legs`。
+  **我的错误是把条件单的 `TU = OS + 1`（6-pre-3 观测到的、条件单派生子单的规律）
+  错套到了一张普通 limit 单上**，两者的 id 关系本就不同。
+  归属审计 `position_attribution_audits` 3802 写的是 `unassigned → verified` /
+  `evidence_source=trigger_fill` / `time_distance_ms=0` / 01:23:10.548695——**leg 589 的归属是对的**。
+  **A 线查实的真实机制**（一轮 reconcile 内部，`started 01:22:56.17 / finished 01:23:46.99 / 50.8s`）：
+  轮次开头取一次 `synced_at=01:23:03.102990` 并盖给该轮所有写入；真实时间 01:23:10.548
+  从订单侧认领了 leg 589 ← pos 552543 并挂上备份止损；**之后同一轮的
+  `sync_manual_closed_deepcoin_positions` 调 `list_positions()` 里没有 552543**，
+  于是把 binding 343 判 `closed / manual_closed_or_not_found_on_exchange`。
+  `updated_at` 早于 `recovered_at` 的怪状即由那个轮次级时间戳造成。
+  **根因是"单轮持仓快照缺席被当成已平"**，由 A 线 A-10b 修（缺席必须由交易所历史证明、
+  或相隔 ≥60 秒两次都看不到；快照为空则整轮跳过；标记时必发告警——此前完全静默，
+  正是这个仓位躺了 34 小时无人知晓的原因）。
+  **一条对 6-pre-4 的实测支撑**：第 2 步那次 POST 会 `_invalidate_round_read_cache()`，
+  所以第 3 步的 `list_positions()` 是**真去交易所的新读**——即在系统已从订单侧确知仓位存在、
+  并已为它挂上止损之后，**持仓端点仍未返回它**。同一轮里两个端点会互相矛盾，
+  这正是静默探针必须"快照比快照"而非"快照比账本"的又一个理由。
   **不是裸奔**：按 ARCHITECTURE 第 6 节唯一判据（`trigger-orders-pending` 筛 `triggerOrderType=TPSL`、
   `posSide` 一致、看 `slTriggerPrice`，**不看仓位行的 `slTriggerPx`**）挂着两张止损——
   `1001125178552542`（sz **3**，`slTriggerPrice=83000`）与 `1001125178555463`（sz **0** 即全仓，
