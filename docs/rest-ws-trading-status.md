@@ -13,13 +13,15 @@ brain_session_title: 自动项目多线程迁移后的代码清理
 integration_branch: codex/deepcoin-auto-trading-v1               # 本地集成分支；阶段完成后由指挥会话合并
 design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
-current_phase: 6-pre-4
-current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-pre.md
-phase_status: claimed                 # planned | claimed | in_progress | completed | blocked
+current_phase: 6
+current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-protection-authority.md
+phase_status: planned                 # planned | claimed | in_progress | completed | blocked
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
-                                      # 阶段 6 改交易所写入语义，需用户单独批准后才能领取。
-claimed_by: local_4a6676b0-cf9c-4971-916e-37048cac1b40
+                                      # 七个前置 6-pre-1..7 全部完成并上线（最后一个 6-pre-4，2026-09-10T09:07Z）。
+                                      # 阶段 6 改交易所写入语义，**需用户单独批准后才能领取**——
+                                      # 在用户明确批准前，任何会话不得把 phase_status 改成 claimed。
+claimed_by: 
 last_completed_phase: 5
 last_completed_commit: 7a4d852a31708515aa92e58313a941c206f5637c
 user_approval_required_for: [1, 2, 4, 5, 6]   # 见"用户批准门"
@@ -834,6 +836,34 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   (2) 观测脚本的正则改成只匹配新格式 `Deepcoin silence probe <status> (`。
   **顺带印证了 4 个 GET**：`gets=4`，与部署前只读实测一致。
   第一个窗口 `messages=0`（什么都没攒到）时重开，代价近似为零。
+- phase-6-pre-4-completed (2026-09-10, 6-pre-4 会话 local_4a6676b0，**阶段完成**): 静默到点先探活、证明没漏东西才保住连接。
+  **上线**：`3d40a59a0d431b9667f4dcd417728769fe54f3af` 于 2026-09-10T09:07Z（回滚 SHA `7fd87e5b`）。
+  全量 8208 passed / 4 skipped / **0 failed**（用例总数 8212，相对 merge-base `dac91806` 的 8191 恰好 +21：
+  新文件 `test_ws_silence_probe.py` 20 条 + `test_deepcoin_ws_phase2.py` 45→46）。
+  **L2 观察窗**：2026-09-10T09:08:45Z → 09:51:57Z，**43 分 12 秒**，44 个指标样本，
+  **零窗口重置、零不健康样本、`head_ok` 全程 1**（生产 HEAD 每个样本现读现比，不是启动参数）。
+
+  | 指标 | 基线 | 窗口内 |
+  |---|---|---|
+  | `silence_timeout` 缺口 | 3 个 / 30 分钟（43 分钟应有 ~4.3 个） | **0** |
+  | 探活次数 / 通过 | — | **4 / 4** |
+  | `other_gaps`、`open_gaps`、`criticals`、`submit_unknown`、`ws_deferred_entries` | — | 全程 0 |
+  | 消息 / 群 | ≥5 条（L2 门槛） | 5 条 / 4 群 |
+
+  **判据是 `probe_passes=4`，不是"缺口降为 0"**：缺口变少有两个成因（探活挡住了、本来就不静默），
+  只看缺口分不开，必须有一个正向计数记下"它差点发生但被挡住了"。这一点是 A 线（A-8c / A-10b 的
+  `absence_obs`、`skipped_claimed_after_snapshot`）指出的更一般形式，本阶段两次踩到（见上两条）。
+
+  **三条如实的限制，不得写成"全路径已验证"**：
+  1. 窗口内 **`frames=0` 全程**，流从头到尾静默。生产上只验到"探活通过 → 连接保住"这一个方向；
+     **"快照变了 → 重连"生产上一次都没走过**，仅有测试覆盖（双向变异验证过）。
+  2. 43 分钟未达 2700 秒 listen key 硬过期，**计划内轮换路径本窗口未走**（该路径代码未改）。
+  3. 残留风险不变且不可消除：**"订阅已死但恰好无事发生"探活无法分辨**。
+     该情形下不重连不产生信息损失；暴露上界是下一次探活（600 秒）或 key 硬过期的计划内重连，二者取先。
+     生产上界实测：600 秒静默 / 2700 秒 TTL ⇒ 连续通过最多 4 次即被 key 轮换强制重连并重新 resync。
+
+  **未挂追记**：24 小时缺口统计（数量、秒数、占比）对照基线 145 次 / 1060 秒 / 1.23%，**不阻塞阶段完成**，
+  由后续会话在 2026-09-11T09:07Z 之后取一次即可。
 - phase-6-pre-4-observer-timezone (2026-09-10, 6-pre-4 会话 local_4a6676b0): 观测脚本第二次起窗，
   **首样本就写着 `probes=3` 而窗口才开 0 秒**——`journalctl --since` 按**本地时区**解释，
   脚本传的是 UTC 字符串，服务器 UTC+8，等于把查询窗口往前多开了 8 小时，

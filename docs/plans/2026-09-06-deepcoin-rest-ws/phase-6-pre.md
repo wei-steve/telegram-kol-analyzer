@@ -29,6 +29,12 @@ deadline 内 WS 回到 healthy 即提交，到期则走 `entry_admission_expired
 
 ## 6-pre-4：静默到点先确认"没漏掉东西"，再决定是否重连（L2，6-pre-1 量化后新增）
 
+> **已完成并上线** 2026-09-10T09:07Z，`3d40a59a`。L2 窗口 43 分 12 秒：
+> `silence_timeout` 缺口 0（基线 3 个/30 分钟）、探活 4 次全通过。
+> 详见 `docs/rest-ws-trading-status.md` 的 `phase-6-pre-4-completed`，
+> **含三条限制**（窗口内 frames=0，"快照变了→重连"生产未走过；
+> key 硬过期路径未走；"订阅已死但恰好无事发生"不可分辨）。
+
 分支 `rest-ws/phase-6-pre-4-silence-probe`。现状：应用层静默计时器 600 秒到点就重连 + 完整重同步。
 6-pre-1 的只读量化：过去 24 小时 **145 个 WS 缺口、累计 1060.4 秒、占全天 1.23%**，
 其中 **134 个是 `silence_timeout`**、只有 11 个是 `process_start`。也就是说系统每天有 1.2% 的时间
