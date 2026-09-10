@@ -385,7 +385,8 @@ def test_the_summary_carries_every_field_the_round_log_needs(tmp_path):
 
     assert set(summary) == {
         "positions_seen", "counts_by_action", "stops_examined", "stops_resolved",
-        "legacy_would_refuse", "would_cancel_total", "read_failures", "rows",
+        "legacy_would_refuse", "would_cancel_total", "would_close_positions",
+        "read_failures", "rows",
     }
     assert summary["rows"][0]["pos_id"] == POS
     assert summary["legacy_would_refuse"] == 1
@@ -407,3 +408,47 @@ def test_the_reader_accepts_the_other_spellings_too(
     client = _Client([_position()], [row])
 
     assert _run(session_factory, client).rows[0].stops_resolved == 1
+
+
+def test_a_full_exit_row_says_what_the_branch_would_actually_do(tmp_path):
+    """``full_exit`` is a market close, and the row has to say so.
+
+    Recording only the action name tells a reviewer which branch runs and
+    nothing about what it does -- the unreviewable record phase 6f already had
+    to fix once. ``cancels_stops_first`` is asserted explicitly because it is
+    the one fact not visible from the payload: this branch issues no cancel,
+    so the stops resting on the position are untouched by it.
+    """
+
+    session_factory = _seed(tmp_path)
+    # Below the entry price on a long: moving the stop to entry would trigger
+    # at once, so the policy answers full_exit instead.
+    client = _Client(
+        [_position(last="76500")], [_tpsl_row("1001125216121995", "75700")]
+    )
+
+    result = _run(session_factory, client)
+    row = result.rows[0]
+
+    assert row.action == "full_exit"
+    assert row.would_close_size == "15"
+    assert row.would_close_endpoint == "close_position"
+    assert row.would_close_ord_type == "market"
+    assert row.would_close_cancels_stops_first is False
+    assert row.would_cancel_order_ids == ()
+    assert result.would_close_positions == 1
+    assert result.summary()["rows"][0]["would_close_size"] == "15"
+
+
+def test_a_replacement_row_carries_no_close_fields(tmp_path):
+    """The negative half: the close fields appear only on the close branch."""
+
+    session_factory = _seed(tmp_path)
+    client = _Client([_position()], [_tpsl_row("1001125216121995", "75700")])
+
+    row = _run(session_factory, client).rows[0]
+
+    assert row.action == "set_break_even"
+    assert row.would_close_size is None
+    assert row.would_close_endpoint is None
+    assert row.would_close_cancels_stops_first is None

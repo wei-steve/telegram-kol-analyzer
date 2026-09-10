@@ -1036,6 +1036,45 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6h-full-exit-was-ungated (2026-09-10, 会话 local_4a6676b0 自查, **我自己改动里的缺口，部署之后才发现**):
+  6h 第一版把 `set_break_even` 挡在了释放常量后面，**却漏掉了平级的 `full_exit` 分支**：
+  ```
+  320|  if action == "set_break_even":
+  363|      if pos_id not in BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS:   ← 闸门在这里
+  441|  if action == "full_exit":
+  442|      close_exact_position(...)                                    ← 无闸门，市价平掉整仓
+  ```
+  修 650/795 之前前置校验每次必抛，**两个分支都到不了**；把读修对之后
+  `set_break_even` 被挡住、**`full_exit` 直通**。
+  **形状**：我验证的是"`set_break_even` 会不会写"，而不是**"这次改动让哪些写变成可能"**。
+  修一个读的副作用是把**所有**下游分支一起接通，而不只是我正在看的那一支。
+  **判据**：任何"修好一个前置校验"的改动，必须先列出**该校验通过后可达的全部分支**，
+  逐个回答"这一支会不会写交易所"，再决定挡哪些——**不能只挡自己正在做的那一支**。
+  修法（指挥会话采纳）：`BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS` **独立常量、默认空集**，
+  闸门置于 `close_exact_position` 之前，未列入者记 `break_even_would_close`
+  （pos_id / 数量 / 端点 / `ordType=market` / **`cancels_stops_first=False`**）并返回
+  `blocked / break_even_full_exit_not_released`。
+  **两个常量刻意分开**：`set_break_even` 与 `full_exit` 来自同一个决策
+  （市场政策按市价在入场价哪一侧选分支，2026-09-10 实测 1 分钟内翻过一次：
+  `lastPx` 77156.6 → 76957.8，入场 77000），但**"移止损"与"市价平仓"是两种风险量级，
+  用户应当能分别批准**；合用一个常量等于批准前者时静默批准了后者。
+  **变异检验补了两处此前沉默的**：把两个常量写成别名（`FULL_EXIT = REPLACEMENT`）
+  **运行时测不出来**——monkeypatch 只重绑一个名字，另一个仍指向原对象，
+  所以加了一条**读源码**的静态判据（两个常量必须各自声明为独立的空 frozenset）；
+  影子省略 `would_close` 字段也曾全绿，补了对应用例后转红。
+- phase-6h-tpsl-after-market-close (2026-09-10, 会话 local_4a6676b0, **只读历史证据，n=1**):
+  指挥会话问：仓位被市价平掉后，交易所侧遗留的 TPSL 会怎样？**用历史证据答。**
+  取到一条完整链：备份止损 `1001125164631326`（仓位 `1001125164628529`，ETH）
+  - `cTime` **2026-09-07 02:38:52Z** 由本系统 `set_position_sltp` 挂出（intent 642，confirmed）；
+  - 平仓 intent 654 `close_position` **confirmed 2026-09-09 04:28:59Z**；
+  - 该单 `uTime` **2026-09-09 04:29:10Z**——**平仓后 11 秒**；
+  - `triggerTime = "0"`（**从未触发**）；现处于 `trigger-order-history` 而非 pending，
+    当前 ETH pending 全表为 0 条。
+  - **排除是我们撤的**：全库 `position_mutation_intents` 中提到该 ordId 的**只有** 642 那一条
+    `set_position_sltp`，**cancel 类 0 条**；`execution_events` 只有 `create_backup_stop`。
+  **结论**：交易所会在仓位平掉后自行把仓位绑定的 TPSL 置为终态，不需要我们撤单，
+  且它不是被触发而是被作废。**但这是 n=1**——一条样本、一个币种、一次平仓，
+  未在多次平仓上复现，也未验证止盈类挂单是否同样处理。**按 n=1 记，不当作规律。**
 - phase-6h-shadow-window-criteria (2026-09-10, 会话 local_4a6676b0, **起窗前写下**, 判据由指挥会话确认):
   影子上线（`break_even_shadow` 每轮计算 + 执行器 650/795 读法修正 + 释放常量默认空集）。
   **收窗判据**：

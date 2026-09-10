@@ -57,6 +57,17 @@ from telegram_kol_research.trading_settings import save_trading_settings
 
 
 @pytest.fixture
+def released_full_exit(monkeypatch):
+    """Release the market-close branch, which has its own constant."""
+
+    monkeypatch.setattr(
+        break_even_module,
+        "BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS",
+        frozenset({"pos-1", "pos-2"}),
+    )
+
+
+@pytest.fixture
 def released_positions(monkeypatch):
     """Release the positions these fixtures use, for the write-path tests."""
 
@@ -492,7 +503,7 @@ def test_short_leg_below_cost_adds_exact_break_even_stop_and_completes(released_
         assert intent.status == "confirmed"
 
 
-def test_short_leg_crossed_cost_is_closed_by_exact_position_id(tmp_path):
+def test_short_leg_crossed_cost_is_closed_by_exact_position_id(released_full_exit, tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory)
     client = TriggerCancelClient(market_price="64000")
@@ -837,6 +848,15 @@ def test_a_cancel_the_exchange_did_not_honour_is_not_a_finished_break_even(relea
 # ---------------------------------------------------------------------------
 
 
+def _closes(client):
+    """A market close arrives as place_order carrying closePosId."""
+
+    return [
+        call for call in client.calls
+        if call[0] == "place_order" and "closePosId" in (call[1] or {})
+    ]
+
+
 def _position_writes(client):
     return [
         call[0] for call in client.calls
@@ -948,4 +968,161 @@ def test_a_released_position_reaches_the_replacement(released_positions, tmp_pat
             .filter(ExecutionEvent.action == "break_even_would_replace")
             .count()
             == 0
+        )
+
+
+def _seed_full_exit_ready_client(session_factory):
+    """A convergence whose market has crossed back through the entry price.
+
+    Same seed as the replacement case, but the quote sits on the losing side,
+    so the policy answers ``full_exit`` instead of ``set_break_even``. Which
+    branch a live convergence takes is decided by where the market happens to
+    be at that instant -- observed flipping on production data within one
+    minute on 2026-09-10 -- so both branches need their own gate and both
+    gates need their own pair of tests.
+    """
+
+    client = TriggerCancelClient(market_price="64000")
+    client.orders.append({
+        "ordId": "weak-stop", "instId": "BTC-USDT-SWAP", "posSide": "short",
+        "triggerOrderType": "TPSL", "slTriggerPrice": "63500", "sz": "5",
+    })
+    with session_factory() as session:
+        leg = session.query(ExecutionOrderLeg).filter_by(pos_id="pos-1").one()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin",
+            execution_binding_id=leg.execution_binding_id,
+            execution_order_leg_id=leg.id,
+            strategy_instance_id=leg.strategy_instance_id,
+            pos_id="pos-1", instrument_id="BTC-USDT-SWAP", side="short",
+            order_id="weak-stop", purpose="stop_loss", trigger_price="63500",
+            size_text="5", status="verified", evidence_source="test",
+            evidence_json="{}",
+        ))
+        session.commit()
+    return client
+
+
+def test_an_unreleased_full_exit_records_the_close_and_sends_none(tmp_path):
+    """A market close is a different decision from moving a stop, gated apart.
+
+    Runs against the real constant on purpose: this is the branch that ends
+    the position, and a gate removed by accident here costs more than one
+    removed on the replacement side.
+    """
+
+    assert break_even_module.BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS == frozenset()
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = _seed_full_exit_ready_client(session_factory)
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert _position_writes(client) == []
+    assert _closes(client) == []
+    assert result.status == "blocked"
+    assert result.reason_code == "break_even_full_exit_not_released"
+    with session_factory() as session:
+        held = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "break_even_would_close")
+            .all()
+        )
+    assert len(held) == 1
+    payload = json.loads(held[0].after_json)
+    assert payload["pos_id"] == "pos-1"
+    assert payload["ord_type"] == "market"
+    assert payload["endpoint"] == "close_position"
+    # The fact that is not visible from the payload: this branch cancels
+    # nothing first, so the stops on the position are untouched by it.
+    assert payload["cancels_stops_first"] is False
+    assert payload["released"] is False
+
+
+def test_a_released_full_exit_reaches_the_close(released_full_exit, tmp_path):
+    """The other direction, so the full-exit gate is not merely "never closes"."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = _seed_full_exit_ready_client(session_factory)
+
+    execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    closes = _closes(client)
+    assert len(closes) == 1
+    assert closes[0][1]["closePosId"] == "pos-1"
+    assert closes[0][1]["ordType"] == "market"
+    with session_factory() as session:
+        assert (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "break_even_would_close")
+            .count()
+            == 0
+        )
+
+
+def test_the_two_gates_are_independent(tmp_path, monkeypatch):
+    """Releasing the replacement must not release the close.
+
+    They came from one decision -- the market policy picks the branch -- so a
+    single constant would have let approving "move the stop" quietly approve
+    "close the position" as well.
+    """
+
+    monkeypatch.setattr(
+        break_even_module,
+        "BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS",
+        frozenset({"pos-1", "pos-2"}),
+    )
+    assert break_even_module.BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS == frozenset()
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    convergence = _seed_convergence(session_factory)
+    client = _seed_full_exit_ready_client(session_factory)
+
+    result = execute_break_even_convergence(
+        session_factory,
+        convergence_id=convergence.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert _closes(client) == []
+    assert result.reason_code == "break_even_full_exit_not_released"
+
+
+def test_the_two_release_constants_are_declared_independently():
+    """Source-level, because aliasing them cannot be caught at runtime.
+
+    ``BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS = BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS``
+    behaves identically in every test that rebinds the names -- monkeypatch
+    replaces one name and the other keeps pointing at the original object --
+    so the runtime independence test above stays green. The risk it misses is
+    an editing risk: with the names aliased, adding a position id to the
+    replacement set silently releases the market close for it too. That is a
+    property of the text, so the text is what this reads.
+    """
+
+    import inspect
+
+    source = inspect.getsource(break_even_module)
+    for name in (
+        "BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS",
+        "BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS",
+    ):
+        declaration = f"{name}: frozenset[str] = frozenset()"
+        assert declaration in source, (
+            f"{name} must be declared as its own empty frozenset; releasing "
+            "one branch must never release the other"
         )

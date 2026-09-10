@@ -77,6 +77,10 @@ class BreakEvenShadowRow:
     target_stop_price: str | None = None
     current_stop_prices: tuple[str, ...] = ()
     would_cancel_order_ids: tuple[str, ...] = ()
+    would_close_size: str | None = None
+    would_close_endpoint: str | None = None
+    would_close_ord_type: str | None = None
+    would_close_cancels_stops_first: bool | None = None
     stops_examined: int = 0
     stops_resolved: int = 0
     legacy_would_refuse: int = 0
@@ -93,6 +97,7 @@ class BreakEvenShadowResult:
     stops_resolved: int = 0
     legacy_would_refuse: int = 0
     would_cancel_total: int = 0
+    would_close_positions: int = 0
 
     def summary(self) -> dict[str, Any]:
         """The shape the reconcile round log carries."""
@@ -104,6 +109,7 @@ class BreakEvenShadowResult:
             "stops_resolved": self.stops_resolved,
             "legacy_would_refuse": self.legacy_would_refuse,
             "would_cancel_total": self.would_cancel_total,
+            "would_close_positions": self.would_close_positions,
             "read_failures": list(self.read_failures),
             "rows": [
                 {
@@ -114,6 +120,12 @@ class BreakEvenShadowResult:
                     "target_stop_price": row.target_stop_price,
                     "current_stop_prices": list(row.current_stop_prices),
                     "would_cancel_order_ids": list(row.would_cancel_order_ids),
+                    "would_close_size": row.would_close_size,
+                    "would_close_endpoint": row.would_close_endpoint,
+                    "would_close_ord_type": row.would_close_ord_type,
+                    "would_close_cancels_stops_first": (
+                        row.would_close_cancels_stops_first
+                    ),
                     "stops_examined": row.stops_examined,
                     "stops_resolved": row.stops_resolved,
                     "legacy_would_refuse": row.legacy_would_refuse,
@@ -195,6 +207,9 @@ def run_break_even_shadow_pass(
         stops_resolved=sum(row.stops_resolved for row in rows),
         legacy_would_refuse=sum(row.legacy_would_refuse for row in rows),
         would_cancel_total=sum(len(row.would_cancel_order_ids) for row in rows),
+        would_close_positions=sum(
+            1 for row in rows if row.action == "full_exit" and row.would_close_size
+        ),
     )
 
 
@@ -338,8 +353,24 @@ def _shadow_one_position(
     would_cancel = (
         tuple(primary_order_ids) if decision.action == "set_break_even" else ()
     )
+    # ``full_exit`` is not "no action" -- it is a market close of the whole
+    # position, and the shadow has to say so. Recording only the action name
+    # would tell a reviewer which branch runs and nothing about what it does,
+    # which is exactly the unreviewable record phase 6f had to fix once
+    # already. ``cancels_stops_first`` is False and stated rather than omitted:
+    # the branch issues no cancel, so the stops resting on the position are
+    # untouched by it.
+    close_fields: dict[str, Any] = {}
+    if decision.action == "full_exit":
+        close_fields = {
+            "would_close_size": _text(position, "pos", "sz", "size", "availPos"),
+            "would_close_endpoint": "close_position",
+            "would_close_ord_type": "market",
+            "would_close_cancels_stops_first": False,
+        }
     return _with(
         base,
+        **close_fields,
         action=decision.action,
         target_stop_price=(
             entry_price if decision.action == "set_break_even"
@@ -397,6 +428,10 @@ def _with(row: BreakEvenShadowRow, **changes: Any) -> BreakEvenShadowRow:
         "target_stop_price": row.target_stop_price,
         "current_stop_prices": row.current_stop_prices,
         "would_cancel_order_ids": row.would_cancel_order_ids,
+        "would_close_size": row.would_close_size,
+        "would_close_endpoint": row.would_close_endpoint,
+        "would_close_ord_type": row.would_close_ord_type,
+        "would_close_cancels_stops_first": row.would_close_cancels_stops_first,
         "stops_examined": row.stops_examined,
         "stops_resolved": row.stops_resolved,
         "legacy_would_refuse": row.legacy_would_refuse,

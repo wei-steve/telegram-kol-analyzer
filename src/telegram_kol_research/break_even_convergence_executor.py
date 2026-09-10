@@ -82,8 +82,29 @@ _MAX_QUOTE_AGE = timedelta(seconds=30)
 #: runtime flag would let the first one go out by editing a row.
 BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
 
+#: Phase 6h. Positions whose break-even convergence may actually **close the
+#: position at market**. **Empty on purpose, and separate from the constant
+#: above on purpose.**
+#:
+#: The two are different orders of risk and a person should be able to approve
+#: them separately: moving a stop to the entry price leaves the position open,
+#: while ``full_exit`` sends ``ordType="market"`` with ``closePosId`` and the
+#: position is gone. They also arrive from the same decision -- the market
+#: policy returns ``set_break_even`` while price sits on the profitable side of
+#: the entry and ``full_exit`` the moment it does not -- so which branch a
+#: convergence takes is decided by where the market happens to be at that
+#: instant. Observed flipping on live data on 2026-09-10: lastPx 77156.6 then
+#: 76957.8 against an entry of 77000, one minute apart.
+#:
+#: This constant exists because correcting the preflight reconnected *both*
+#: branches, and the first version of that change gated only the replacement.
+BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS: frozenset[str] = frozenset()
+
 #: Recorded on the convergence leg when a replacement was computed but held.
 BREAK_EVEN_WOULD_REPLACE_KEY = "break_even_would_replace"
+
+#: Recorded when a market close was computed but held.
+BREAK_EVEN_WOULD_CLOSE_KEY = "break_even_would_close"
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +316,7 @@ def _execute_market_decisions(
         ]
 
     held_unreleased = False
+    held_reason: str | None = None
     for item in work:
         if item["status"] == "succeeded":
             continue
@@ -362,6 +384,7 @@ def _execute_market_decisions(
                 # (the same mistake phase 6f made and fixed).
                 if str(item["pos_id"]) not in BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS:
                     held_unreleased = True
+                    held_reason = held_reason or "break_even_replacement_not_released"
                     _record_break_even_would_replace(
                         session_factory,
                         convergence_id=convergence_id,
@@ -439,6 +462,25 @@ def _execute_market_decisions(
                 )
                 continue
             if action == "full_exit":
+                # Phase 6h. The market has crossed back through the entry
+                # price, so the policy's answer is to close rather than to
+                # move the stop onto a price that would trigger at once. That
+                # is a market close of the whole position, and it is held
+                # behind its own constant until a person releases this exact
+                # position -- separately from the replacement gate, because
+                # "move a stop" and "close the position" are not the same
+                # decision to approve.
+                if str(item["pos_id"]) not in BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS:
+                    held_unreleased = True
+                    held_reason = held_reason or "break_even_full_exit_not_released"
+                    _record_break_even_would_close(
+                        session_factory,
+                        convergence_id=convergence_id,
+                        item=item,
+                        instrument_id=instrument_id,
+                        recorded_at=executed_at,
+                    )
+                    continue
                 response = close_exact_position(
                     session_factory=session_factory,
                     deepcoin_client=deepcoin_client,
@@ -513,15 +555,17 @@ def _execute_market_decisions(
             )
 
     if held_unreleased:
-        # Nothing was replaced, so this convergence did not converge. Reporting
-        # "completed" here would be a false statement of exchange state -- the
-        # weaker stop is still the position's stop -- and it is the reading a
-        # person or a later round would act on.
+        # Nothing was replaced or closed, so this convergence did not converge.
+        # Reporting "completed" would be a false statement of exchange state --
+        # the weaker stop is still the position's stop, or the position is
+        # still open -- and it is the reading a person or a later round would
+        # act on. The reason names which hold fired; per-leg reason codes carry
+        # the detail when both did.
         return _finish_convergence(
             session_factory,
             convergence_id=convergence_id,
             status="blocked",
-            reason_code="break_even_replacement_not_released",
+            reason_code=held_reason or "break_even_replacement_not_released",
             finished_at=executed_at,
         )
     return _finish_convergence(
@@ -815,6 +859,65 @@ def _record_break_even_stop(
         leg.reason_code = "break_even_stop_confirmed_pending_old_stop_cleanup"
         leg.updated_at = seen_at
         session.commit()
+
+
+def _record_break_even_would_close(
+    session_factory: sessionmaker,
+    *,
+    convergence_id: int,
+    item: dict[str, Any],
+    instrument_id: str,
+    recorded_at: datetime,
+) -> None:
+    """Write down the market close that was computed and not sent.
+
+    Reviewable on its own, like the replacement record: which position, how
+    much, through which endpoint, and the one fact that is not visible from
+    the payload -- **this branch cancels nothing first**. The stops resting on
+    the position are not touched by it, and what the venue does with them once
+    the position is gone is recorded in the status file rather than assumed
+    here.
+    """
+
+    payload = {
+        "pos_id": str(item["pos_id"]),
+        "size": str(item.get("size")),
+        "instrument_id": instrument_id,
+        "endpoint": "close_position",
+        "ord_type": "market",
+        "cancels_stops_first": False,
+        "entry_price": str(item.get("entry")),
+        "convergence_id": int(convergence_id),
+        "released": False,
+    }
+    try:
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action=BREAK_EVEN_WOULD_CLOSE_KEY,
+                venue="deepcoin",
+                status="held",
+                execution_binding_id=int(item["execution_binding_id"]),
+                pos_id=str(item["pos_id"]),
+                symbol=instrument_id,
+                reason="break_even_full_exit_not_released",
+                after=payload,
+                created_at=recorded_at,
+            ),
+        )
+    except Exception:  # pragma: no cover - a record must not break the hold
+        logger.warning(
+            "break-even would-close record failed pos_id=%s",
+            item.get("pos_id"),
+            exc_info=True,
+        )
+    _finish_leg(
+        session_factory,
+        leg_id=item["id"],
+        status="blocked",
+        reason_code="break_even_full_exit_not_released",
+        finished_at=recorded_at,
+    )
 
 
 def _record_break_even_would_replace(
