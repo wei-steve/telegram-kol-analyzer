@@ -590,6 +590,18 @@ user_decisions_2026_09_07:
   **教训不是"锚得更死"，恰恰相反**：`pgrep -f` 的坑是**匹配到自己**（假阳性），我今天两次提醒过别人；而**锚定得越精确，越容易因为一个我没想到的前缀而漏掉真正在跑的东西（假阴性）**。**在"有没有东西在跑"这个问题上，假阴性比假阳性危险**——前者让我去部署，后者只是让我多等。
   **做法改成先枚举后看，不要从自己写的模式推"什么都没有"**：`ps -eo pid,cmd | grep -iE "observe|monitor"`（宽匹配、人眼确认），或者干脆列出所有 `bash` 进程。**"我的模式没匹配到"与"没有东西在跑"是两件事**——这与本步 (7) 那条"矛盾的数字是待办"同源：我把一个 0 当成了事实，而它只是一次查询的结果。
   **这条的一般教训**：`in`、`any`、批次级聚合、以及对**源码文本**的断言，都会让一条用例"看起来在防守某处"而实际不碰它。**"这条用例覆盖那个分支"只能由"单独删掉那个分支看它红不红"来证明**——而我今天两次（A-11b 的注释、这次收紧后的再试）都栽在同一个地方。
+- step-15-0 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **限价入场成交后止盈从没挂出过——卡在 planner 与 executor 的词表分叉上**（只读排查，未改代码）。总指挥给了三个假设（"要主止损在账本 verified"、TP∧SL 同族闸门、A-7/lifecycle），**三个都不是**。
+  **该走的路径**：`trigger_take_profit_convergence`（planner，生成收敛行）→ `trigger_take_profit_convergence_executor`（executor，**既给止盈腿盖 `pos_id`、又挂单**）。止盈腿的绑定者就是 executor 本身（`materialize_verified_position_protection` / `bind_filled_position`，见 executor 617/639），不是 `_adopt_verified_trigger_entry_protection`。
+  **那道门**：`trigger_take_profit_convergence_executor.py:506` 要求 `order_kind in {"trigger_limit", "market"}`；而它的 planner 在 `trigger_take_profit_convergence.py:24` 用 `AUTOMATIC_ENTRY_ORDER_KINDS = {"trigger_limit", "limit", "market"}`——**收 `limit`**。于是 planner 为限价入场生成收敛行，executor 永远执行不了。
+  **生产证据（单合取项隔离）**：收敛行 **244 / 245**（腿 601 / 602）`status=conflicted`、`reason_code=convergence_exact_leg_not_verified`。那道门是一个大 OR，我把其余每个合取项都在库里查了：`purpose=entry`、`status=active`、`attribution_status=verified`、`leg.pos_id = binding.pos_id = 1001125216121996 / 1001125216153672`、`binding.status=active`——**全部通过，只有 `order_kind=limit` 落空**。`updated_at` 每轮刷新（19:18:56），说明每轮重判、每轮再冲突。
+  **三个假设为什么都不是**：readiness 那道**已经放行**——收敛行的 `request_json` 里 `owned_stop_evidence_fingerprint` 已写入，且 943/944/947/948 四条止损腿都是 `verified` 且带 `exchange_order_id`；不是 TP∧SL 同族闸门（那道在 `_request_has_combined_trigger_protection`，与本路无关）；不是 A-7/lifecycle（腿与 binding 都 active、`pos_id` 双向一致）。
+  **历史（阶段 5 后所有限价腿）**：止盈腿 **16 条、挂出 0 条**（首条 2026-09-09 03:21:08，末条 2026-09-10 15:11:25）；收敛层面 `limit` 共 **6 行 = 4 `waiting_backup_stop` + 2 `conflicted`、`completed` 0**。对照同期 `market` **57 completed**、`trigger_limit` **45 completed**。
+  **成因是词表分叉，有日期**：`d3e423bf`（2026-09-07，*the plain limit entry becomes an ordinary order*）把 planner 的词表加宽到含 `limit`；executor 那道门自 `dbd484f5`（2026-07-25）起**一次没动过**。`limit` 入场腿本身不是新东西（26 条，最早 2026-07-05），**新的是"限价入场也开始计划止盈"**——所以 16 条止盈腿全部集中在 9-09 之后。
+  **风险边写清楚：不是裸仓。** 主止损（75700）与备份止损（75548.6）都已在交易所且账本 `verified`；缺的只是上行退出。**为什么止损能挂上而止盈挂不上**：`trigger_backup_stop_executor` 只排除 `manual_bind`（326/661 两处），收 `limit`——同一个仓位上，两个执行器对 `order_kind` 用了两套词表。
+  **更正我自己压缩前的说法**：我此前把根因写成"`_adopt_verified_trigger_entry_protection` 的 `trigger_limit` 过滤饿死了这些腿的 `pos_id`"（即 A-12 那道门的第二个后果）。**那句不对**——止损腿的 `pos_id` 明明盖上了，说明另有绑定者。真正咬住的是 executor:506。**这两道门都是 `trigger_limit`-only，但只有后者在这条路上。**
+  **这一条是 step-14 那个假设的第一个被确认（而非被缩小）的实例**：阶段 5 改了入场形状，下游一批判据没跟着改。**但形状与我原先猜的不同**——不是"要求 TP 与 SL 成对"，是**入场类型词表**。建议按新形状再扫一遍：**所有对 `order_kind` 做集合判定的地方，逐处核它与 planner 侧词表是否一致**。
+  **本步只读，未改代码。** 修法（加宽 executor:506，或让 planner 不为它执行不了的形状生成收敛行）涉及 B 线阶段 5/6 的普通限价入场，已抄送 B 线定夺。
+
 - step-15-1 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **入场类型词表归一 + 按新形状扫描 + 首次写入的只读推演**（分支 `mgmt/step-15-1-entry-kind-vocabulary`，**先做代码不部署**）。按 A-15-0 的裁定执行三件事。
   **(1) 506 与计划器共用一个词表。** `trigger_take_profit_convergence_executor.py:506` 原来是本地字面量 `{"trigger_limit", "market"}`，现在直接用计划器的 `AUTOMATIC_ENTRY_ORDER_KINDS`（单一来源）。**那个常量自己的注释就写着本意**——"``limit`` joined the set in phase 5 … A staged take profit belongs to the entry, not to the endpoint that placed it"——**执行器那份副本没收到这句话**。
   **三条用例，三次变异，各咬住一条**（逐条实测，不是推断）：
