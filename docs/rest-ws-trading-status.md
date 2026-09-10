@@ -1045,9 +1045,21 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   (3) `would_cancel_order_ids` **不含任何备份 ordId**（`1001125219289222` / `1001125219582177`）；
   (4) 全窗 `position_mutation_intents` **零新增**；`break_even_would_replace` 事件若出现，
       其 `released` 必须全为 False；
-  (5) 每轮 `break_even_shadow.rows` 对两个仓位**各恰好 1 行**，且该行
-      `action == "set_break_even"`、`target_stop_price == "77000"`（= `avgPx`）、
-      `would_cancel_order_ids` 恰为该仓位主止损（`…121995` / `…153671`）；
+  (5) 每轮 `break_even_shadow.rows` 对两个仓位**各恰好 1 行**，且：
+      **(5a) 不变量，恒须成立**——`action` ∈ {`set_break_even`, `keep_tighter_stop`, `full_exit`}
+      （三者都是市场政策的合法结论）；`would_cancel_order_ids` 是该仓位主止损的子集，
+      **绝不含任何备份 ordId**；`entry_price == "77000"`；
+      **(5b) 条件项**——仅当 `action == "set_break_even"` 时，
+      `target_stop_price == entry_price` 且 `would_cancel_order_ids` **恰为**该仓位主止损
+      （`…121995` / `…153671`）。
+      **本条在起窗后第 1 分钟改过一次，原因如实记**：原判据把
+      `action == "set_break_even"` 与 `target == "77000"` 写成了恒成立项，
+      而它们**依赖实时市价**——起窗时 `lastPx=77156.6`（高于入场 77000，故 `set_break_even`），
+      1 分钟后 `lastPx=76957.8`（跌破入场），决策合法地翻成 `full_exit`，
+      观察器立刻报 `bad_rounds=1`。**是判据错了，不是系统错了。**
+      我把那一次的证据目录留名 `phase-6h-aborted-criterion-not-invariant` 保存，
+      **改判据后重新起窗计时**，不在原窗上打补丁——
+      在一个已经开始的窗里放宽判据，与"先量后立判据"没有区别。
   (6) 30 分钟连续窗、`head_ok`/`units_ok` 全程 1、零重置。
   **消息数不作为判据**：本步的观测量每轮由 reconcile 产生，不依赖消息流
   （6f 收窗时实测该时段到达率约 1.3 条/小时，见 `phase-6f-completed`）。
