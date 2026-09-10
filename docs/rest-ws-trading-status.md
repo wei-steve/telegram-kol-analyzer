@@ -1036,6 +1036,42 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6f-1-planned-values-compared-as-strings (2026-09-10, 会话 local_4a6676b0, **6f 首笔被一条既有守卫挡住，指挥会话裁定作为 6f 前置缺陷在 6f 内修**):
+  6f 部署（`681257331d23a6337088ae0c8e22e91d2dedcf72`）后第一轮 reconcile（20:08:02Z），
+  释放的仓位 `1001125216121996` **没有下出去**，记 `backup_stop_blocked` /
+  `protection_leg_conflict`；未释放的 `1001125216153672` 按预期持有，
+  且这次带了完整明细（`primary_stop` / `proposed_backup_stop` / `proposed_endpoint` /
+  `proposed_pos_side` / `proposed_size`）——`phase-6e-shadow-ready-missing-payload` 的修复生效。
+  **零写入已双向核实**：`position_mutation_intents` 近 90 分钟 0 条；
+  `trigger-orders-pending` 下单后复读仍是下单前那 4 条、ordId 逐条相同
+  （`/root/evidence/phase-6f-before.json`）。
+  **根因**：`create_or_get_protection_leg` 对 `planned_trigger_price` / `planned_size`
+  做的是**字符串** `!=` 比较。计划腿由下单计划写入、经 Python float 格式化成
+  `"75700.0"`；6e 采纳把交易所原文 `"75700"` 写进 `position_protection_ledger`；
+  `trigger_backup_stop_executor` 从账本取 `primary_stop` 原样传给
+  `materialize_verified_position_protection` → `"75700.0" != "75700"` → `ValueError`
+  → `protection_leg_conflict`。本地用真实函数成对复现：
+  `stored=75700.0 incoming=75700` 抛、`75700/75700` 放行、`75700.0/75700.0` 放行。
+  **这不是 6e/6f 引入的缺陷**，但 6e 是第一条把交易所原文写进账本的路径，
+  所以是第一次必然撞上它的路径。
+  **修**：改为 `Decimal` 相等比较（`_planned_value_changed`）。`None` 语义不变
+  （一侧无计划＝不是比较，仍走回填）；不可解析文本、非有限值一律按"无法证明相同"
+  保留拒绝；**不改写已存的计划值**——接受第二种写法不等于把第一种覆盖掉，
+  否则这条守卫会去动它自己要按住的东西。
+  **历史范围**：`protection_leg_conflict` 自 2026-07-26 起共 **27 个不同仓位、每仓 1 次**，
+  最近一次即本次。其中 `1001125104601308`（2026-09-03）在库里同样呈现
+  `76500.0` vs `76500` 的纯格式差异。据此判断这 27 笔属**格式差异导致的误拒**，
+  但**只对本次这一笔做了证明，其余 26 笔未逐笔证明**。
+  **这条守卫此前没有任何测试**——46 天里挡下 27 个仓位，零覆盖。本次补 19 个用例
+  （等值不同格式放行含生产原值对、真实差异仍抛含 `75700` vs `75700.01`、
+  不可解析文本抛、非有限值抛、端到端走 `materialize_verified_position_protection` 复现生产那次）。
+  变异测试三处，全部咬住：还原成字符串比较 → 7 failed；恒不拒绝 → 10 failed；
+  去掉有限性检查 → **第一次 0 failed**，因为 `nan`/`inf` 与数字比本来就不等、
+  是 Decimal 比较自己挡的，只有 `inf` vs `Infinity`、`-inf` vs `-Infinity`
+  这两种**同值不同拼写**才会走到有限性检查；补这两例后 → 2 failed。
+  教训：**测试写了"这一例是为某个分支而设"的注释，不等于那一例真的走到那个分支**；
+  是变异测试而不是阅读发现了这条注释在说谎。
+  验证：focused 27 passed；相关面 581 passed；全量 **8332 passed / 4 skipped / 0 failed**。
 - phase-6f-shown-detail-correction (2026-09-10, 会话 local_4a6676b0 自查, **出示给用户的明细有一项不准**):
   我向用户出示 6f 时写了"**数量 15**"，实际发出的 payload **没有 `sz` 字段**。
   `build_backup_stop_trigger_payload` 返回的键只有

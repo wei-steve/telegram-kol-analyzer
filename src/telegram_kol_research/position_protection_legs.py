@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from decimal import Decimal, DecimalException
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -98,15 +99,9 @@ def create_or_get_protection_leg(
         .one_or_none()
     )
     if existing is not None:
-        if (
-            planned_trigger_price is not None
-            and existing.planned_trigger_price is not None
-            and existing.planned_trigger_price != planned_trigger_price
-        ) or (
-            planned_size is not None
-            and existing.planned_size is not None
-            and existing.planned_size != planned_size
-        ):
+        if _planned_value_changed(
+            existing.planned_trigger_price, planned_trigger_price
+        ) or _planned_value_changed(existing.planned_size, planned_size):
             raise ValueError("protection_leg_planned_values_immutable")
         if existing.planned_trigger_price is None and planned_trigger_price is not None:
             existing.planned_trigger_price = planned_trigger_price
@@ -291,6 +286,44 @@ def record_verified_take_profit_fill(
     protection_leg.updated_at = completed_at
     session.flush()
     return protection_leg
+
+
+def _planned_value_changed(existing: str | None, incoming: str | None) -> bool:
+    """Did the plan change, as opposed to being written down differently?
+
+    These rows are compared across two writers that format the same number
+    differently. A strategy plan reaches ``planned_trigger_price`` through
+    Python float formatting and stores ``"75700.0"``; the same stop adopted
+    back from the exchange (phase 6e) carries the venue's own ``"75700"``.
+    A string comparison calls those a changed plan and refuses -- which is
+    what happened in production on 2026-09-10, blocking the backup stop for
+    position 1001125216121996 with ``protection_leg_conflict``, and what has
+    refused 27 distinct positions since 2026-07-26.
+
+    So compare the *numbers*. What this guard exists to catch -- a second
+    caller quietly planning a different price or size for a leg already
+    planned -- is unchanged, because a different number is still a different
+    number.
+
+    Anything that cannot be shown to be the same number keeps the refusal:
+    a value that is not parseable as a decimal, or is not finite, cannot be
+    proven equal, and this guard's job is to refuse when it cannot prove
+    sameness. ``None`` on either side is not a comparison at all -- it means
+    one side has no plan yet, and the caller backfills it below.
+    """
+
+    if existing is None or incoming is None:
+        return False
+    if existing == incoming:
+        return False
+    try:
+        left = Decimal(str(existing))
+        right = Decimal(str(incoming))
+    except (DecimalException, ValueError):
+        return True
+    if not (left.is_finite() and right.is_finite()):
+        return True
+    return left != right
 
 
 def _bind_immutable_text(
