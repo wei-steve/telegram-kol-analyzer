@@ -977,6 +977,23 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   同时顺带核对 `phase-6a-open-verification` 的三条常开判据与 6b 的 `cancel_precheck`（同样预期为空）。
   **这一条本身就是"窗口的证据价值由被改的判据决定"的极端例子**：一个正确的安全网，
   它的正面样本要求系统先出一次它专门防的故障。
+- phase-6b-shadow-completed (2026-09-10, 会话 local_4a6676b0, **6b 停在影子，切换未做**):
+  影子本体 **`760b2ab8dc740bab6bf9b7b3e9ea7f10557c42b7`**，14:33Z 上线，回滚参考 `5c07ab6d`，
+  部署后已推共享分支。窗口 14:34:01Z ~ 15:24:11Z（**50 分 10 秒**）、51 采样、
+  **零重置、head_ok 全程 1、units_ok 全程 1**、真实消息 5 条 / **3 个群**，`WINDOW_MET` 自行退出，
+  监视器已自行结束（精确 PID + marker 判定，锚定命令行数过 = 0）。
+  证据 `/root/evidence/phase-6b-shadow/observer-samples.jsonl`。
+  59 轮 reconcile，**全窗 `positions_seen` = 0**；窗口内新增影子行 0、保护 incident 0、
+  `position_mutation_intents` 0。
+  **对照起窗前写下的三条判据（`phase-6b-shadow-window-criteria`）：一条都没取到。**
+  `cancel_precheck` 全窗为空字典、`ledger_drift` 恒 0——因为 0 仓位就没有活的保护单可问。
+  **6b 的四项精确回读在生产上零样本，仅有测试覆盖**（focused 30，含两处变异检验：
+  把第二次读换回第一次读、把账本比较写回去，对应用例各自转红）。
+  **限制照旧一起读**：本窗口 HEAD 只含 6b 影子（A-10e 之上），所以"无回归"这一条是干净的；
+  但**消息数达标（5 条 / 3 群）不等于本步判据被触发**——前者衡量有流量时系统是否健康，
+  后者要求有活的保护单可问，本窗满足前者、完全没有后者。
+  **6b 切换（撤销走新链）按指挥会话裁定停在此处**，放行条件见 `phase-6a-open-verification`：
+  需 6a 三条判据至少取到一条真实样本，**而那要等市场先给出一个仓位**，不是时长问题。
 - phase-6b-shadow-window-criteria (2026-09-10T14:35Z, 会话 local_4a6676b0, **起窗前写下**):
   6b 影子已上线：**`760b2ab8dc740bab6bf9b7b3e9ea7f10557c42b7`**，14:33Z 经 `tg-deploy`，
   **回滚参考 `5c07ab6d`**（A 线 A-10e），部署后已立即推共享分支（已核实）。
