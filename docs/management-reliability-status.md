@@ -420,3 +420,13 @@ user_decisions_2026_09_07:
   **(2) 空快照守卫会让真空账户永久冻结这个扫描。** 账户在窗口内清零后，`sync_manual_closed_deepcoin_positions` **每轮都在开头返回**（`empty_skips` 六次且会一直增长），history 强路径与部分腿收敛都进不去。这是上线前写明的取舍，现在成了实际状态。**改法（裁定采纳）**：空读与缺席同一纪律——**相隔 ≥60 秒读到两次空，才认账户真空**；一次空读仍然不作数；期间出现非空即重置。状态落 `trading_settings` 的 `manual_close_empty_snapshot` 键（与 guard health 同形、仅变化时写）。**扫描内层那次重读只查不写**，因为在外层事务持锁时再开一个写会话正是"告警把工作拖垮"的那条老坑；少判一轮是安全方向，下一轮的首读会记下它。
   **(3) fail-open 的系统性陷阱，加了测试期严格模式。** 事故捕获在生产上失败即静默是**对的**（一条写不进去的告警不该把工作带崩），但它也是 A-8c 与 A-10b **两次**把告警造成永久静默的原因，**唯一症状是一行日志**。现在最终那次尝试失败时，在 `TELEGRAM_KOL_RUNTIME_INCIDENT_STRICT_CAPTURE` 打开的情况下**直接抛出**，而 `tests/conftest.py` 默认打开它——**任何摘要键越界从此在单测里就红**。详细→最小的回退**不受影响**（那正是回退存在的理由，只有最小那次才算最终），并提供 `allow_incident_capture_to_fail_open` fixture 给两条刻意验证 fail-open 的既有用例。
   **新增 7 条用例**（我第一稿把这个数写成 9，`git diff | grep -c '^+def test_'` 实测是 7 —— 又一个我该自己核而没核的数字，改了并留着这句）：incident 行真的存在（写掉、退化各一）、单次空不动、两次相隔不足 60 秒不动、两次相隔 ≥60 秒放行扫描、期间非空即重置、越界摘要在测试期必须抛。观测脚本另加 `empty_unconfirmed` / `empty_confirmed` / `empty_state` / `capture_failopen` 四个观测量——**"`empty_skips` 在涨"本身分不清是"挡住了一次谎报"还是"账户真空被永久冻结"，必须两半都能看见。**
+  **L1 观察窗（13:29:31Z → 13:44:40Z，`WINDOW_MET`）**：15 分钟 / 16 采样 / **rounds=17** / msgs=9 / 2 群 / 零重置 / `head_ok` 全程 1 / `worker_http=200`。**起窗前先写下了判据**（按 `ARCHITECTURE` 第 6 节那条），收窗按"证明了什么 / 没取到什么"分开记。
+  **取到的两个正面样本——这是本程序里第一次拿到"守卫生效"的生产证据，而不是"计数全 0、记成未取得样本"**：
+  · **空读两次确认成立**：`empty_unconfirmed=2` → `empty_confirmed=16`，`empty_state` 写入 `2026-09-10T13:29:57.473490+00:00`。**对照上一版同样的零持仓条件下 `empty_skips=6` 且会永久增长——"永久冻结"变成了"站下一轮、确认后恢复"。**
+  · **词表修复成立，告警真的到人**：`marked_closed=1` **且** `marked_incidents=1`、`capture_failopen=0`。incident **2094**、`notification_status=delivered`、摘要为 `{"component":"manual_close_sync","impact":"binding_no_longer_managed","operation":"binding_343","pos_id":"1001125178552543","reason_code":"position_history_full_close"}`。**而这条告警正是关于 binding 343**——被误判、被认领回来的那个仓位：用户 12:50Z 手工平仓 → 交易所历史证明全平 → 系统写掉它**并且告诉了人**。这正是 A-10b 本该有、却从上线到 A-10e 之前一次也没有过的行为。
+  · 附带：`guard_skips=0`（17 轮）说明 A-10d 仍成立；`b343=closed/entry_legs_terminal` 是**强路径**关的，不是那条弱分支。
+  **`err_lines=3` 已归因，不是本步引入**：13:30:48–49 同一秒的三条 traceback，根因 `httpcore.ConnectError: [Errno 104] Connection reset by peer`（一次瞬时网络故障）；B 线的影子记 WARNING 后继续，本步的扫描那一轮记的正是"空读、未确认"。13:31:30 之后 traceback 计数为 **0**。**值得单独记一句：这次故障恰好落在一次空读判定上，而规则守住了——没有拿第一次空读做任何事。** 这是"读不到不得解释为零"这条硬性禁止在真实故障下的一次实测。
+  **没取到的样本，照实写**：
+  · `absence_obs=0`、`guard_alerts=0`——**A-10b 的"两次缺席"路径与 A-10d 的退化告警，本窗口一个生产样本都没有**（要触发前者需恰好有个仓位在快照里读不到，后者需守卫连续三轮拒判全部）。**这两条仍然只有单测覆盖。**
+  · **"无回归"是联合证据，不是 A-10e 单独的**：本窗口观察的 HEAD 同时含 B 线 6a 的切换（**真实交易所写入语义**）。这一点由 B 线先对自己的窗口指出，反向同样成立，故在此写明。
+  · 本窗口是 **L1 且实际只按时长达标**（15 分钟，消息数不设门槛），消息侧证据价值本来就低。
