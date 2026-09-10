@@ -622,6 +622,15 @@ _ALLOWED_INBOX_READERS = frozenset(
         "deepcoin_private_ws.py",
         "deepcoin_shadow_binding.py",
         "models.py",
+        # Phase 6. ``TU`` is the only thing that links a protection order to a
+        # position -- ``OS`` changes on every write and REST never returns the
+        # pair -- so the protection chain reads ``TriggerOrder`` frames to place
+        # an order the ledger does not know. The push is not trusted on its own:
+        # the order must also be present in a REST ``trigger-orders-pending``
+        # read with a matching instrument, ``posSide`` and ``triggerOrderType``
+        # before it is adopted, which is the "wake, then verify by REST" shape
+        # hard rule 5 requires rather than an exception to it.
+        "protection_authority.py",
     }
 )
 

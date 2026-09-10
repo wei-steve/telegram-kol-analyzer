@@ -86,6 +86,9 @@ from telegram_kol_research.deepcoin_reconcile_wake import (
 from telegram_kol_research.deepcoin_reconcile_wake import (
     DeepcoinReconcileWakeSignal,
 )
+from telegram_kol_research.protection_authority_shadow import (
+    run_protection_authority_shadow_pass,
+)
 from telegram_kol_research.deepcoin_shadow_binding import (
     ShadowLedgerMutationError,
     run_shadow_binding_pass,
@@ -10012,6 +10015,13 @@ async def run_deepcoin_execution_reconcile_loop(
                 instrument_map=shadow_instrument_map_provider(),
                 now_provider=now_provider,
             )
+        # Phase 6a. Same isolation, same rule: it resolves both answers for
+        # every live position and writes only its own observation rows.
+        protection_shadow_summary = await _run_protection_authority_shadow_step(
+            session_factory=session_factory,
+            deepcoin_client_factory=deepcoin_client_factory,
+            now_provider=now_provider,
+        )
         await _log_deepcoin_reconcile_round_step(
             session_factory=session_factory,
             trigger=trigger,
@@ -10021,6 +10031,7 @@ async def run_deepcoin_execution_reconcile_loop(
             ),
             wake_signal=wake_signal,
             shadow_summary=shadow_summary,
+            protection_shadow_summary=protection_shadow_summary,
         )
         if wake_signal is None:
             await asyncio.sleep(interval_seconds)
@@ -10072,6 +10083,7 @@ def _build_deepcoin_reconcile_round_log(
     round_finished_at: datetime,
     wake_requested_at: datetime | None,
     shadow_summary: dict | None,
+    protection_shadow_summary: dict | None = None,
 ) -> dict:
     """Assemble the one structured line phase 4 adds per reconcile round.
 
@@ -10111,6 +10123,11 @@ def _build_deepcoin_reconcile_round_log(
         payload["touched_binding_ids_truncated"] = True
     if shadow_summary is not None:
         payload["shadow"] = shadow_summary
+    if protection_shadow_summary is not None:
+        # Phase 6a's paired counters: agreements are the positive observation,
+        # mismatches and freezes the negative one. Both live on the same line
+        # so a window can be summed from the journal alone.
+        payload["protection_shadow"] = protection_shadow_summary
     return payload
 
 
@@ -10122,6 +10139,7 @@ async def _log_deepcoin_reconcile_round_step(
     round_finished_at: datetime,
     wake_signal,
     shadow_summary: dict | None,
+    protection_shadow_summary: dict | None = None,
 ) -> None:
     """Emit the per-round line. Never allowed to affect the reconcile loop."""
 
@@ -10134,6 +10152,7 @@ async def _log_deepcoin_reconcile_round_step(
             round_finished_at=round_finished_at,
             wake_requested_at=getattr(wake_signal, "last_request_at", None),
             shadow_summary=shadow_summary,
+            protection_shadow_summary=protection_shadow_summary,
         )
     except Exception:
         logger.debug("Failed to build Deepcoin reconcile round log")
@@ -10227,6 +10246,47 @@ async def _run_deepcoin_shadow_observation_step(
         return None
     except Exception:
         logger.warning("Deepcoin shadow observation failed", exc_info=True)
+        return None
+
+
+async def _run_protection_authority_shadow_step(
+    *,
+    session_factory,
+    deepcoin_client_factory,
+    now_provider,
+) -> dict | None:
+    """Run one phase-6 protection comparison off the loop, swallowing failures.
+
+    It uses its own client the same way the phase-4 pass does, so a read it
+    makes can never disturb the reconcile round's own read cache, and every
+    failure is logged and dropped rather than allowed to skip a reconciliation.
+    """
+
+    def _run(now):
+        client = deepcoin_client_factory()
+        try:
+            return run_protection_authority_shadow_pass(
+                session_factory,
+                deepcoin_client=client,
+                now=now,
+            )
+        finally:
+            close = getattr(client, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    logger.debug("Protection shadow client cleanup failed")
+
+    try:
+        return await run_on_management_worker(
+            _run,
+            (now_provider() if now_provider is not None else datetime.now(UTC)),
+        )
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.warning("Protection authority shadow pass failed", exc_info=True)
         return None
 
 
