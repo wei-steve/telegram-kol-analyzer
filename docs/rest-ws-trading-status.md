@@ -1036,6 +1036,14 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- tooling-git-checkout-granularity (2026-09-10, 会话 local_4a6676b0 自查):
+  我用一条过于贪婪的正则改测试夹具改坏了，想回退那一次编辑，用了
+  `git checkout -- tests/test_break_even_convergence_executor.py`——
+  **它把该文件自 HEAD 以来的全部编辑一起回退了**，不只是坏的那次：
+  文件头重写、新增 fixture、五处签名改动、三处断言恢复，全没了，只能重做一遍。
+  **`git checkout --` 的粒度是"文件回到某个提交"，不是"撤销上一次编辑"。**
+  做法：在一连串未提交的编辑中途要回退其中一次，先 `cp` 一份再改，
+  或者把每一步都先提交（可以后面 squash），不要用 `checkout --` 当 undo。
 - phase-6f-completed (2026-09-10, 会话 local_4a6676b0, **两笔真实交易所写入，逐笔核对通过；6f 完成**):
   上线 **`c51894a45c0a06af4784ed1e1e090be69ff6a381`**（含 6f-1），回滚参考 **`d9a32f18`**（A-14）。
   合并后全量 **8341 passed / 4 skipped / 0 failed**（合并前 8333；不拿合并前的绿当合并后的证据）。
