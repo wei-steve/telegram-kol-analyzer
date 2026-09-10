@@ -469,6 +469,52 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_position_marked_manually_closed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    execution_binding_id: int,
+    pos_id: str,
+    basis: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a bound position being written off as closed (A-10b).
+
+    The sweep used to do this in silence, and on 2026-09-08 it wrote off a BTC
+    short that was still on the exchange with both stops armed. Nobody learned
+    of it for more than a day, and only because another session went looking at
+    something else. Whatever the basis -- venue history, two absent
+    snapshots, or a proven take-profit close -- somebody is told now, because
+    the one case where this is wrong is the case where a live position stops
+    being managed.
+    """
+
+    if not config.captures("position_marked_manually_closed"):
+        return None
+    fixed = {
+        "component": "manual_close_sync",
+        "reason_code": _safe_label(basis),
+        "operation": f"binding_{int(execution_binding_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="execution_binding",
+        source_record_id=str(int(execution_binding_id)),
+        incident_type="position_marked_manually_closed",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact="binding_no_longer_managed",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_stop_resize_replace_incomplete(
     session_factory: sessionmaker,
     *,

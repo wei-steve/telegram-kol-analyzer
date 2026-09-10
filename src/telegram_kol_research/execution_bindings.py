@@ -6,6 +6,7 @@ import json
 import math
 import hashlib
 from dataclasses import dataclass, field
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
@@ -72,6 +73,9 @@ _MANAGEMENT_POSITION_RESERVATION_STATUSES = frozenset(
 class DeepcoinReconciliationSnapshotUnavailable(RuntimeError):
     """A read-only refresh could not obtain a complete exchange snapshot."""
 
+
+
+logger = logging.getLogger(__name__)
 
 @dataclass(slots=True)
 class ExecutionBindingRecord:
@@ -161,6 +165,16 @@ class ManualCloseSyncResult:
     manually_closed: int = 0
     partial_legs_closed: int = 0
     skipped_without_pos_id: int = 0
+    #: A-10b. Absent from this snapshot and not yet proven gone. The binding is
+    #: untouched and an observation is recorded; a second absence at least a
+    #: minute later, or position history, is what settles it.
+    pending_absence: int = 0
+    #: The whole sweep declined to judge anything, because an empty positions
+    #: list is a read that told us nothing, not an account with no positions.
+    skipped_empty_snapshot: bool = False
+    #: A-10c. Somebody claimed this binding after our snapshot was taken, so
+    #: the snapshot cannot speak about it. Left untouched, counted, and logged.
+    skipped_claimed_after_snapshot: int = 0
 
 
 @dataclass(slots=True)
@@ -4062,6 +4076,16 @@ def sync_manual_closed_deepcoin_positions(
 
     now = synced_at or datetime.now(UTC)
     positions = client.list_positions()
+    if not positions:
+        # A-10b. An empty positions list is a read that told us nothing. The
+        # account having genuinely no positions and the venue having answered
+        # 200 with an empty page look identical from here, and one of those
+        # would close every bound position at once. A read error already
+        # raises out of ``list_positions``; this covers the silent case.
+        logger.warning(
+            "manual-close sync skipped: positions snapshot is empty",
+        )
+        return ManualCloseSyncResult(skipped_empty_snapshot=True)
     active_pos_ids = {
         pos_id
         for position in positions
@@ -4082,6 +4106,7 @@ def sync_manual_closed_deepcoin_positions(
             cleaned_at=now,
         ))
     result = ManualCloseSyncResult()
+    marked_for_alert: list[tuple[int, str, str]] = []
     with session_factory() as session:
         management_reserved_pos_ids = _active_management_reserved_pos_ids(
             session
@@ -4104,6 +4129,18 @@ def sync_manual_closed_deepcoin_positions(
             if any(pos_id in management_reserved_pos_ids for pos_id in pos_ids):
                 continue
             result.checked += 1
+            # A-10c. Our snapshot predates what the ledger already knows about
+            # this binding, so it cannot answer for it. See
+            # ``_claimed_after_snapshot``.
+            if _claimed_after_snapshot(row, entry_legs, snapshot_at=now):
+                result.skipped_claimed_after_snapshot += 1
+                logger.info(
+                    "manual-close sync skipped binding %s: claimed after the "
+                    "snapshot at %s",
+                    int(row.id),
+                    now.isoformat(),
+                )
+                continue
             if str(row.status or "") == "unknown" and not entry_legs:
                 continue
             if any(pos_id in active_pos_ids for pos_id in pos_ids):
@@ -4159,6 +4196,27 @@ def sync_manual_closed_deepcoin_positions(
                 pos_ids=pos_ids,
                 client=client,
             )
+            # A-10b. Absence is not proof. Either the venue's own history says
+            # this position closed, or we failed to see it twice at least a
+            # minute apart; otherwise the binding is left exactly as it is and
+            # only the observation is written down.
+            basis = (
+                "take_profit_close_proven"
+                if take_profit_closed
+                else _absence_proof(
+                    session,
+                    binding=row,
+                    pos_ids=pos_ids,
+                    client=client,
+                    now=now,
+                )
+            )
+            if basis is None:
+                _record_absence_observation(
+                    session, binding=row, pos_ids=pos_ids, observed_at=now
+                )
+                result.pending_absence += 1
+                continue
             row.status = "closed"
             row.last_exchange_status = (
                 "take_profit_closed_on_exchange"
@@ -4167,6 +4225,12 @@ def sync_manual_closed_deepcoin_positions(
             )
             row.updated_at = now
             result.manually_closed += 1
+            _record_marked_closed(
+                session, binding=row, pos_ids=pos_ids, basis=basis, marked_at=now
+            )
+            marked_for_alert.extend(
+                (int(row.id), str(pos_id), str(basis)) for pos_id in pos_ids
+            )
 
             for leg in (
                 session.query(ExecutionOrderLeg)
@@ -4211,6 +4275,7 @@ def sync_manual_closed_deepcoin_positions(
                         trade_idea.status = "closed"
                         trade_idea.closed_at = now
         session.commit()
+    _capture_marked_closed_incidents(session_factory, marked_for_alert, marked_at=now)
     return result
 
 
@@ -4625,6 +4690,225 @@ def _confirm_close_reservation_for_terminal_leg(
     reservation.status = "confirmed"
     reservation.last_error = None
     reservation.updated_at = confirmed_at
+
+
+def _naive_utc(value: datetime) -> datetime:
+    """Stored timestamps are naive UTC; compare like with like."""
+
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+#: A-10b. One absence is an observation; the pair is the proof.
+ABSENCE_OBSERVED_ACTION = "position_absence_observed"
+#: Raised whenever a leg is actually marked closed, whatever the basis. Before
+#: A-10b this happened in complete silence: pos 1001125178552543 was written
+#: off on 2026-09-08 and nobody was told for thirty-four hours while the
+#: position sat on the exchange with both its stops armed.
+MARKED_CLOSED_ACTION = "position_marked_manually_closed"
+#: How long the two absences must be apart. Shorter than this and they can
+#: come from one bad minute at the venue rather than two independent looks.
+MIN_ABSENCE_CONFIRMATION_SECONDS = 60
+
+
+def _claimed_after_snapshot(
+    binding: ExecutionBinding,
+    legs: list[ExecutionOrderLeg],
+    *,
+    snapshot_at: datetime,
+) -> bool:
+    """Did somebody claim this binding after our positions snapshot was taken?
+
+    A-10c. On 2026-09-08 two things wrote to binding 343 inside the same
+    minute. One had claimed leg 589 for pos 1001125178552543 from trigger-fill
+    evidence, set the binding ``active``, and placed a stop on the position;
+    it stamped 01:23:10.548695. The other was this sweep, holding a positions
+    snapshot taken at 01:23:03.102990 -- four seconds before that position
+    existed -- and it committed last, overwriting ``active`` with ``closed``
+    while leaving ``recovered_at`` at 01:23:10.548695 behind as the fingerprint
+    of what it had just erased.
+
+    The snapshot is not wrong; it is simply older than the fact. So the rule is
+    about age, not about truth: if the ledger learned something after this
+    snapshot was taken, this snapshot does not get to speak about it. The next
+    round reads a fresh one and decides then.
+    """
+
+    if binding.recovered_at is not None and _naive_utc(
+        binding.recovered_at
+    ) > _naive_utc(snapshot_at):
+        return True
+    return any(
+        leg.last_verified_at is not None
+        and _naive_utc(leg.last_verified_at) > _naive_utc(snapshot_at)
+        for leg in legs
+    )
+
+
+def _record_absence_observation(
+    session,
+    *,
+    binding: ExecutionBinding,
+    pos_ids: list[str],
+    observed_at: datetime,
+) -> None:
+    """Write down that we did not see it, and change nothing else."""
+
+    from telegram_kol_research.execution_events import (
+        ExecutionEventRecord,
+        record_execution_event,
+    )
+
+    for pos_id in pos_ids:
+        record_execution_event(
+            None,
+            ExecutionEventRecord(
+                execution_binding_id=int(binding.id),
+                venue=str(binding.venue or "deepcoin"),
+                action=ABSENCE_OBSERVED_ACTION,
+                status="observed",
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                pos_id=str(pos_id),
+                reason="absent_from_positions_snapshot",
+                created_at=observed_at,
+            ),
+            session=session,
+        )
+
+
+def _prior_absence_confirms(
+    session,
+    *,
+    binding: ExecutionBinding,
+    pos_id: str,
+    now: datetime,
+) -> bool:
+    """Whether we already failed to see this position, long enough ago."""
+
+    from telegram_kol_research.models import ExecutionEvent
+
+    cutoff = _naive_utc(now) - timedelta(seconds=MIN_ABSENCE_CONFIRMATION_SECONDS)
+    return (
+        session.query(ExecutionEvent.id)
+        .filter(
+            ExecutionEvent.action == ABSENCE_OBSERVED_ACTION,
+            ExecutionEvent.execution_binding_id == int(binding.id),
+            ExecutionEvent.pos_id == str(pos_id),
+            ExecutionEvent.created_at <= cutoff,
+        )
+        .first()
+        is not None
+    )
+
+
+def _absence_proof(
+    session,
+    *,
+    binding: ExecutionBinding,
+    pos_ids: list[str],
+    client: DeepcoinReadOnlyClient,
+    now: datetime,
+) -> str | None:
+    """What proves this position is gone, or ``None`` if nothing does yet.
+
+    A-10b. The old rule asked for proof only when the leg was *poorly*
+    attributed, so a leg we were sure about could be written off by a single
+    snapshot that happened not to list it. That inversion is what wrote off a
+    live BTC short. Now every absence needs one of two things, and the leg's
+    attribution quality does not enter into it.
+    """
+
+    history_reader = getattr(client, "list_position_history", None)
+    for pos_id in pos_ids:
+        if history_reader is not None and _position_history_proves_full_close(
+            history_reader, binding=binding, pos_id=str(pos_id)
+        ):
+            return "position_history_full_close"
+    if all(
+        _prior_absence_confirms(session, binding=binding, pos_id=str(pos_id), now=now)
+        for pos_id in pos_ids
+    ):
+        return "two_absent_snapshots"
+    return None
+
+
+def _capture_marked_closed_incidents(
+    session_factory: sessionmaker,
+    marked: list[tuple[int, str, str]],
+    *,
+    marked_at: datetime,
+) -> None:
+    """Tell a person, after the sweep has committed.
+
+    Deliberately not inside the sweep's transaction: opening a second session
+    for the alert while the first still holds the write lock is how an alert
+    turns into a failed sweep. The rows are already durable by the time this
+    runs, so a capture that fails loses the message, not the work.
+    """
+
+    if not marked:
+        return
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_position_marked_manually_closed,
+        )
+
+        config = load_runtime_incident_config()
+        for binding_id, pos_id, basis in marked:
+            capture_position_marked_manually_closed(
+                session_factory,
+                config=config,
+                execution_binding_id=int(binding_id),
+                pos_id=str(pos_id),
+                basis=str(basis),
+                occurred_at=marked_at,
+            )
+    except Exception:  # pragma: no cover - defensive, never fails the sweep
+        logger.warning(
+            "manual-close incident capture failed for %s binding(s)",
+            len(marked),
+            exc_info=True,
+        )
+
+
+def _record_marked_closed(
+    session,
+    *,
+    binding: ExecutionBinding,
+    pos_ids: list[str],
+    basis: str,
+    marked_at: datetime,
+) -> None:
+    """Say so, every time, whatever the basis."""
+
+    from telegram_kol_research.execution_events import (
+        ExecutionEventRecord,
+        record_execution_event,
+    )
+
+    for pos_id in pos_ids:
+        record_execution_event(
+            None,
+            ExecutionEventRecord(
+                execution_binding_id=int(binding.id),
+                venue=str(binding.venue or "deepcoin"),
+                action=MARKED_CLOSED_ACTION,
+                status="recorded",
+                chat_id=binding.chat_id,
+                message_id=binding.message_id,
+                symbol=binding.symbol,
+                side=binding.side,
+                pos_id=str(pos_id),
+                reason=basis,
+                created_at=marked_at,
+            ),
+            session=session,
+        )
 
 
 def _position_history_proves_full_close(

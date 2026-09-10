@@ -250,6 +250,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # the oversized one can fire first. Nothing retries it and the new stop
         # is never cancelled to tidy up, so the alert is the whole hand-off.
         "stop_resize_replace_incomplete",
+        # A-10b: a bound position was written off as closed. Before this the
+        # sweep did it in silence -- pos 1001125178552543 was marked closed on
+        # 2026-09-08, four seconds before it existed, and nobody was told for
+        # more than a day while it sat on the exchange with both stops armed.
+        # Whatever the basis, somebody is told now.
+        "position_marked_manually_closed",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to

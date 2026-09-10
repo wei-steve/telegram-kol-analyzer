@@ -4169,7 +4169,9 @@ def test_read_only_reconcile_scopes_real_multi_instrument_history_failure(
             self.history_calls = []
 
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -5145,7 +5147,9 @@ def test_reconcile_marks_leg_exchange_cancelled_from_recorded_cancel_event(tmp_p
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -5427,7 +5431,9 @@ def test_reconcile_restores_prior_authority_after_outage_and_position_close(tmp_
 
     class CompleteEmptyClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -5510,7 +5516,9 @@ def test_reconcile_does_not_restore_prior_authority_over_current_identity_confli
 
     class ConflictingClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -5587,7 +5595,9 @@ def test_reconcile_does_not_restore_prior_authority_over_local_position_owner_co
 
     class CompleteEmptyClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -5866,7 +5876,9 @@ def test_reconcile_deepcoin_execution_bindings_marks_restart_state(tmp_path):
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return [
@@ -5920,7 +5932,9 @@ def test_reconcile_deepcoin_execution_bindings_keeps_trigger_pending_order_open(
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -7399,7 +7413,9 @@ def test_reconcile_manual_lifecycle_terminalizes_legacy_backfilled_closed_leg(tm
 
     class EmptySnapshotClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
@@ -8066,7 +8082,19 @@ def test_sync_manual_closed_positions_closes_missing_bound_position(tmp_path, bi
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
+
+    # A-10b: a single absent snapshot only records an observation now.
+    # The first pass is that observation; the second, a minute later,
+    # is what settles it.
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=datetime(2026, 6, 30, 10, 0) - timedelta(seconds=61),
+    )
 
     result = sync_manual_closed_deepcoin_positions(
         session_factory,
@@ -8210,7 +8238,9 @@ def test_sync_missing_position_attributes_verified_take_profit_close(
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_position_history(self, *, inst_id, pos_id=None):
             assert inst_id == "BTC-USDT-SWAP"
@@ -8324,15 +8354,27 @@ def test_reconcile_then_sync_closes_a_previously_verified_missing_position(tmp_p
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_open_orders(self):
             return []
 
     client = FakeClient()
     reconcile_deepcoin_execution_bindings(
-        session_factory, client=client, recovered_at=datetime(2026, 6, 30, 9, 59)
+        # A-10c: the claim has to predate both snapshots, or the guard
+        # correctly refuses to let a snapshot speak about a newer fact.
+        session_factory, client=client, recovered_at=datetime(2026, 6, 30, 9, 55)
     )
+    # A-10b: a single absent snapshot only records an observation now.
+    # The first pass is that observation; the second, a minute later,
+    # is what settles it.
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory, client=client, synced_at=datetime(2026, 6, 30, 10, 0) - timedelta(seconds=61)
+    )
+
     result = sync_manual_closed_deepcoin_positions(
         session_factory, client=client, synced_at=datetime(2026, 6, 30, 10, 0)
     )
@@ -8555,7 +8597,9 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
             self.trigger_history = []
 
         def list_positions(self, *, inst_id=None):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_trigger_orders_pending(self, *, inst_id):
             return list(self.trigger_orders)
@@ -8581,6 +8625,16 @@ def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_pa
             return []
 
     client = FakeClient()
+    # A-10b: a single absent snapshot only records an observation now.
+    # The first pass is that observation; the second, a minute later,
+    # is what settles it.
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=client,
+        synced_at=datetime(2026, 7, 30, 2, 0) - timedelta(seconds=61),
+    )
+
     result = sync_manual_closed_deepcoin_positions(
         session_factory,
         client=client,
@@ -8659,7 +8713,9 @@ def test_sync_manual_closed_positions_disables_exchange_mutations_explicitly(
             self.cancel_calls = 0
 
         def list_positions(self, *, inst_id=None):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def cancel_trigger_order(self, _payload):
             self.cancel_calls += 1
@@ -8758,7 +8814,9 @@ def test_missing_position_history_uncertainty_does_not_skip_pending_order_cancel
             self.cancel_calls = 0
 
         def list_positions(self, *, inst_id=None):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_trigger_orders_pending(self, *, inst_id):
             return list(self.pending)
@@ -9020,7 +9078,9 @@ def test_sync_manual_closed_positions_terminalizes_exited_conflict_legs_with_exa
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_position_history(self, *, inst_id, pos_id):
             assert inst_id == "BTC-USDT-SWAP"
@@ -9078,7 +9138,9 @@ def test_sync_manual_closed_positions_keeps_unknown_legacy_binding_without_entry
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
     result = sync_manual_closed_deepcoin_positions(
         session_factory,
@@ -9156,7 +9218,9 @@ def test_sync_repairs_terminal_lifecycle_with_pending_entry_leg_exactly_once(tmp
             self.trigger_history = []
 
         def list_positions(self, *, inst_id=None):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_trigger_orders_pending(self, *, inst_id):
             return list(self.trigger_orders)
@@ -9302,7 +9366,9 @@ def test_terminal_cleanup_query_does_not_starve_anomaly_after_clean_history(
             self.cancel_calls = 0
 
         def list_positions(self, *, inst_id=None):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
         def list_trigger_orders_pending(self, *, inst_id):
             return list(self.pending)
@@ -9368,9 +9434,19 @@ def test_sync_closed_position_finalizes_pending_kol_exit_exactly_once(tmp_path):
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
     closed_at = datetime(2026, 6, 30, 10, 0)
+    # A-10b: absence has to be seen twice, so the first look only observes.
+    # ``first`` below is the pass that settles it, and ``second`` proves the
+    # finalisation still happens exactly once.
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=FakeClient(),
+        synced_at=closed_at - timedelta(seconds=61),
+    )
     first = sync_manual_closed_deepcoin_positions(
         session_factory,
         client=FakeClient(),
@@ -9435,7 +9511,9 @@ def test_sync_manual_closed_positions_keeps_binding_open_for_unfilled_entry_leg(
 
     class FakeClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "read told us nothing";
+            # an unrelated position keeps the snapshot meaningful.
+            return [{"instId": "SOL-USDT-SWAP", "posId": "unrelated-pos", "posSide": "long", "pos": "1", "avgPx": "100", "mgnMode": "cross", "mrgPosition": "split"}]
 
     result = sync_manual_closed_deepcoin_positions(
         session_factory,

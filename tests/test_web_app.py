@@ -5208,7 +5208,19 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(
 ):
     class FakeDeepcoinClient:
         def list_positions(self):
-            return []
+            # A-10b: an empty list now means "the read told us nothing"; an
+            # unrelated position keeps the snapshot meaningful.
+            return [
+                {
+                    "instId": "SOL-USDT-SWAP",
+                    "posId": "unrelated-pos",
+                    "posSide": "long",
+                    "pos": "1",
+                    "avgPx": "100",
+                    "mgnMode": "cross",
+                    "mrgPosition": "split",
+                }
+            ]
 
     app = create_web_app(
         database_path=tmp_path / "research.db",
@@ -5240,6 +5252,28 @@ def test_execution_sync_api_marks_missing_deepcoin_position_closed(
         session.add_all([lifecycle, binding])
         session.commit()
         lifecycle_id = lifecycle.id
+        # A-10b: absence must be seen twice, at least a minute apart. Two
+        # calls in the same second would not qualify, so the earlier
+        # observation is seeded here rather than waited for.
+        from telegram_kol_research.execution_bindings import (
+            ABSENCE_OBSERVED_ACTION,
+        )
+        from telegram_kol_research.models import ExecutionEvent
+
+        session.add(
+            ExecutionEvent(
+                execution_binding_id=binding.id,
+                venue="deepcoin",
+                action=ABSENCE_OBSERVED_ACTION,
+                status="observed",
+                pos_id="pos-missing",
+                reason="absent_from_positions_snapshot",
+                # The endpoint syncs on a fixed clock (2026-06-30 10:00), so
+                # the earlier observation is dated against that, not wall time.
+                created_at=datetime(2026, 6, 30, 10, 0) - timedelta(minutes=2),
+            )
+        )
+        session.commit()
 
     response = TestClient(app).post("/api/execution/sync-deepcoin")
 

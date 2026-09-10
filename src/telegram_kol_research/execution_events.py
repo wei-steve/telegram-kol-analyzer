@@ -115,6 +115,12 @@ NON_EXCHANGE_WRITING_EXECUTION_ACTIONS = frozenset(
         "management_target_dismissed",
         "management_target_confirmation_timeout",
         "management_target_confirmation_reminder",
+        # A-10b: the manual-close sweep's own record of what it saw and what it
+        # decided. Neither issues a request; listing them here keeps an
+        # observation from reading as a hazardous action and freezing that
+        # message's source-deletion exit (A-5 task 8).
+        "position_absence_observed",
+        "position_marked_manually_closed",
     }
 )
 
