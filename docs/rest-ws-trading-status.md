@@ -1068,8 +1068,26 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   仓位行 `tpTriggerPx=""`，交易所 pending 6 张全是 TPSL 止损。
   **我没有定性**：止盈是否本来就等某个条件才挂、是否由管理路径在别的时机挂、
   是否与"限价入场自带止损"的迁移形态有关——**一条都没验证**，按规矩作为观测上报而非因果。
-  与 6h 相关处：**没有止盈就不会有 TP1 成交，也就不会有 convergence**，
-  所以 6h 修好的那条执行器路径在这两个仓位当前状态下不会被触发（不影响影子窗）。
+  **成因已由 A 线 A-15-0 查明（2026-09-10），并更正了我上面一句含混的因果**：
+  卡在 `trigger_take_profit_convergence_executor.py:506`——executor 只收
+  `order_kind in {trigger_limit, market}`，而它自己的 planner
+  （`trigger_take_profit_convergence.py:24` `AUTOMATIC_ENTRY_ORDER_KINDS`）收
+  `{trigger_limit, limit, market}`。**planner 为限价入场生成收敛行，executor 永远执行不了。**
+  词表分叉自 `d3e423bf`（2026-09-07 普通限价入场）加宽 planner 起；
+  逐行核过 `git log -L 506,506`，那道门自 `dbd484f5`（2026-07-25）没动过，
+  且 `git show --stat d3e423bf -- <executor>` 为空——**09-07 加宽了 planner，从未打开 executor**。
+  阶段 5 之后限价止盈腿 16 条、挂出 0 条。
+  **我原话"没有止盈就不会有 TP1 成交，也就不会有 convergence"要分两张表说**：
+  `trigger_take_profit_convergences` 里这两个仓位**是有行的**（244/245，`conflicted`，
+  `reason_code=convergence_exact_leg_not_verified`，A 线逐个合取项查库，只有
+  `order_kind=limit` 落空）；缺的是 TP1 成交，因而缺的是
+  `strategy_break_even_convergences`（全表 2 行、皆 2026-08-03）。两张表不能混。
+  **对 6h 的依赖关系，写清楚免得下一个人误读**：这个前提**不会自己长出来**——
+  它不是"等时机"，是一道代码门。在 506 加宽之前，**限价入场永远不会有止盈、
+  因而永远不会有 TP1 成交**，6h 修好的那条执行器写路径在这类仓位上**永远不触发**。
+  所以"切换之后 break-even 会真的动手"这个判断，**对限价入场的仓位挂在 A-15-1 上**；
+  对 `trigger_limit` / `market` 入场的仓位不受此限。
+  **影子窗若观测不到执行器事件，是这道门的必然结果，不是流量或时机问题。**
 - tooling-git-checkout-granularity (2026-09-10, 会话 local_4a6676b0 自查):
   我用一条过于贪婪的正则改测试夹具改坏了，想回退那一次编辑，用了
   `git checkout -- tests/test_break_even_convergence_executor.py`——
