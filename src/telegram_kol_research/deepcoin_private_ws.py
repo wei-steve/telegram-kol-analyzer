@@ -849,6 +849,13 @@ class DeepcoinPrivateWsInbox:
         self.connected = False
         self.events_persisted = 0
         self.duplicates_persisted = 0
+        # 6-pre-4 state. The baseline is the snapshot taken once a connection
+        # has been established and its resync converged -- the last moment the
+        # local picture is known to be right.
+        self.silence_baseline_fingerprint: str | None = None
+        self.silence_probe_total = 0
+        self.silence_probe_passes = 0
+        self.silence_probe_reconnects = 0
         self.last_event_id: int | None = None
         self.last_event_received_ms: int | None = None
         self.open_gap_id: int | None = None
@@ -915,6 +922,108 @@ class DeepcoinPrivateWsInbox:
         from websockets.asyncio.client import connect
 
         return connect
+
+    async def _capture_silence_baseline(self) -> None:
+        """Record the picture at the moment coverage is known to be complete.
+
+        Failure is not fatal and not silent: with no baseline the next probe
+        answers ``no_baseline`` and reconnects, which is exactly the old
+        behaviour. Losing the optimisation is acceptable; guessing is not.
+        """
+
+        from telegram_kol_research.deepcoin_ws_silence_probe import (
+            instruments_to_probe,
+            take_silence_snapshot,
+        )
+
+        def _run():
+            instruments, needs_open_orders = instruments_to_probe(
+                self._session_factory
+            )
+            client = self._deepcoin_client_factory()
+            try:
+                return take_silence_snapshot(
+                    client,
+                    instruments=instruments,
+                    include_open_orders=needs_open_orders,
+                )
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+
+        try:
+            fingerprint, detail = await asyncio.to_thread(_run)
+        except Exception:
+            logger.warning(
+                "Deepcoin silence baseline snapshot failed", exc_info=True
+            )
+            self.silence_baseline_fingerprint = None
+            return
+        self.silence_baseline_fingerprint = fingerprint
+        if fingerprint is None:
+            logger.warning(
+                "Deepcoin silence baseline unavailable: %s",
+                (detail or {}).get("failure"),
+            )
+
+    async def _probe_silence(self):
+        """Run the probe off the event loop; never let it become a new failure mode."""
+
+        from telegram_kol_research.deepcoin_ws_silence_probe import (
+            PROBE_UNREADABLE,
+            SilenceProbeResult,
+            probe_silence,
+        )
+
+        def _run():
+            client = self._deepcoin_client_factory()
+            try:
+                return probe_silence(
+                    client,
+                    self._session_factory,
+                    baseline_fingerprint=self.silence_baseline_fingerprint,
+                )
+            finally:
+                close = getattr(client, "close", None)
+                if callable(close):
+                    close()
+
+        try:
+            return await asyncio.to_thread(_run)
+        except Exception as exc:
+            # The probe failing is itself an unreadable answer, which means
+            # reconnect. It must never propagate as a new kind of crash.
+            logger.warning("Deepcoin silence probe failed", exc_info=True)
+            return SilenceProbeResult(
+                PROBE_UNREADABLE, reason=f"probe_error:{type(exc).__name__}"
+            )
+
+    def _record_probe_outcome(self, probe) -> None:
+        """Record every probe, including the ones that keep the connection.
+
+        A probe that passes leaves no gap row, so without this the only visible
+        trace of the change would be gaps that stopped happening -- which is
+        indistinguishable from the stream having gone quiet for other reasons.
+        """
+
+        from telegram_kol_research.deepcoin_ws_silence_probe import PROBE_PASS
+
+        self.silence_probe_total += 1
+        if probe.status == PROBE_PASS:
+            self.silence_probe_passes += 1
+            # A passing probe is the new baseline: it is the most recent moment
+            # we know the picture was right.
+            if probe.fingerprint:
+                self.silence_baseline_fingerprint = probe.fingerprint
+        else:
+            self.silence_probe_reconnects += 1
+        logger.info(
+            "Deepcoin silence probe: %s (%s) gets=%s",
+            probe.status,
+            probe.reason,
+            (probe.detail or {}).get("gets"),
+        )
 
     def _acquire_listen_key(self) -> str:
         client = self._deepcoin_client_factory()
@@ -1070,6 +1179,13 @@ class DeepcoinPrivateWsInbox:
             self.connected = True
             self._record_gap_end()
             self.state_machine.transition(WS_STATE_HEALTHY, reason="resync_converged")
+            # 6-pre-4. The resync just converged, so this is the last moment the
+            # local picture is known to be right -- exactly what a later silence
+            # probe needs to compare against. Taken here rather than lazily at
+            # the first probe, because by then ten minutes of silence have
+            # already passed and a snapshot taken then proves nothing about the
+            # ten minutes before it.
+            await self._capture_silence_baseline()
             logger.info(
                 "Deepcoin private WS healthy on %s (resync %s)",
                 list(DEEPCOIN_WS_TABLES),
@@ -1170,7 +1286,19 @@ class DeepcoinPrivateWsInbox:
             except (TimeoutError, asyncio.TimeoutError):
                 if key_limited:
                     raise DeepcoinWsListenKeyExpiring() from None
-                raise DeepcoinWsSilenceTimeout() from None
+                # 6-pre-4. Silence is not a disconnect. Before tearing the
+                # stream down, ask the only question a REST snapshot can
+                # actually answer: did anything change during this silence
+                # that we would have missed? If nothing did, this connection
+                # has cost us no information and there is nothing to rebuild.
+                # Anything other than an affirmative answer -- changed,
+                # unreadable, no baseline -- still reconnects.
+                probe = await self._probe_silence()
+                if probe.missed_nothing:
+                    self._record_probe_outcome(probe)
+                    continue
+                self._record_probe_outcome(probe)
+                raise DeepcoinWsSilenceTimeout(probe.reason) from None
             except closed_types:
                 # Clean or unclean, a closed socket is a gap. The caller records
                 # it and reconnects; it never becomes "there were no events".
@@ -1269,3 +1397,4 @@ async def run_deepcoin_private_ws_loop(
     if inbox_sink is not None:
         inbox_sink(inbox)
     await inbox.run_forever()
+
