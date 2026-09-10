@@ -476,3 +476,29 @@ user_decisions_2026_09_07:
   **另外记一条"可能已写"边界的实测**：`protection_replacement_missing_order_id` 留在未知侧不动，**且应当如此**——那里写入已经发出、只是回执没拿到。
   **写测试时撞到一个值得记的事实**：把 `PositionMutationAuthorityError` 当作**客户端写入的返回结果**注进去，**并不能复现一次 refusal**——网关会把写入调用抛出的任何异常转成 `recovery_required`（`_finish_with_error(intent_id, "recovery_required", …)`），而**它这么做是对的：到那一步交易所已经被联系过了**。真实的 refusal 严格发生在写入之前。所以这五处的用例都注在执行器自己的调用点上，而"网关如何映射状态"由 A-11 那两条具名用例锁住。**这同时是对 A-11 前提的一次侧面验证：网关本来就没有把"写入调用自己抛异常"当成确定失败。**
   **新增 5 条用例**（每处一条）：refused 的保护替换走回滚而非停等（并断言 `recovery_required` 不出现）；该拒绝的 incident 行**真的存在**且带 reason（A-10e 的教训）；回滚中的 refusal **仍是** `recovery_required`；回执缺失**仍在**未知侧；restore 的 refusal **仍是** `recovery_required`（并直接对源码断言调用方那条降级契约，而不是对一个替身断言）。**三条"仍是"的用例是刻意写的**——它们的作用是让下一个人在没读流程的情况下改不动这三处。
+
+- step-12 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **入场单自带的止损从来不进保护账本**（**read-only 归因，零改动、零写入**）。起因是 B 线在 6c/6d 窗口里发现两条 `backup_stop_blocked` 落在 A 线路径上并告知；**本条的每项事实我自己核过，未采信转述**。凭据只从 `/proc/<MainPID>/environ` 取、`python -B`、经 stdin 不落盘。
+  **现场**：16:07 开出两个 BTC 多头 `1001125216121996` / `1001125216153672`（各 15 张 @77000，binding 349/350，leg 601/602）。交易所侧我直读确认**各自有一张真实止损**（挂单 `posSide=long / sz=15 / slTriggerPrice=75700`，ordId `…121995` / `…153671`，即 **入场 ordId − 1**）。账本侧 `position_protection_ledger` 对这两个 pos_id 与这两个 order_id **零行**。于是 `protection_health` 判 `primary_stop_not_verified`，备份止损被挡：`position_protection_incidents` **444 / 445 = `backup_stop_blocked`**，均 `delivered`。**仓位是有保护的，方向是安全的（挡住而非乱挂），告警也到了人。**
+  **(1) 本该由哪条路径进账本：设计了两条，两条都不覆盖**
+  | 路径 | 覆盖条件（源码） | 产出 |
+  |---|---|---|
+  | `recovery_live_submit` → `entry_protection_response` | `if str(order.get("execution_type") or "").lower() != "market": continue` | 只覆盖**市价腿**；98 行，最近 2026-09-10 03:39——**活着** |
+  | `execution_bindings._adopt_verified_trigger_entry_protection` → `reconciliation_trigger_entry_adoption` | ① `order_kind == "trigger_limit"` ② `_request_has_combined_trigger_protection()` 要求 `tpTriggerPx` **且** `slTriggerPx` | 17 行，**最后一行 2026-07-24**——事实上已停产 |
+  **所以答案不是"从未设计"，而是"设计了、只覆盖市价腿"——并且比这更糟**：实测四条腿的请求
+  `leg 601 / 602`（限价）`tpTriggerPx = NULL, slTriggerPx = 75700.0`；`leg 589 / 590`（`trigger_limit`）`tpTriggerPx = NULL, slTriggerPx = 83000.0`。**全部只带 SL、不带 TP**，所以第二道闸门**连它本来要服务的 `trigger_limit` 腿也一起排除了**。这解释了它 7 月 24 日后零产出——**不是偶发，是它对现在的下单形状不适用**。**把 `order_kind` 放宽到 `limit` 只拆掉两道闸门里的一道。**
+  **B 线独立查到的同一根因的另一半**（我引用并认为与上表一致）：`entry_protection_response` 是从**下单回执**里取保护 ordId，而阶段 5 迁移后的限价腿回执里**只有入场单自己的 ordId**，随单止损的 ordId 只出现在 `trigger-orders-pending` 与 WS `TriggerOrder` 帧里。它按 `ordId = 入场 ordId − 1` 全量扫过，**历史上 0 条**这样的账本行。**这是阶段 5 限价迁移之后的结构性后果**，此前多数仓位很快被 `set_position_sltp` 写过（于是有了新 ordId 的行）或很快平掉，才没暴露。
+  **(2) 逐条读六条管理路径，对这两个仓位**
+  | 路径 | 能否作用 | 依据 |
+  |---|---|---|
+  | `protection_health` / 备份止损 | **不能** | incidents 444/445，`primary_stop_not_verified` |
+  | 止损缩量 | **不能** | 候选来自账本 `purpose=main_stop AND status='verified' AND pos_id IN (live)`；零行 |
+  | 保本收敛 | **不能** | 同样从账本取，`status IN ('verified','protected')` |
+  | 止盈收敛 | **不能** | 同样从账本按 binding 取 |
+  | A-7 目标验证 | **能** | binding 349/350 = `active` + `position_ownership_verified` |
+  | **管理指令的保护替换** | **会动手，但是瞎的** | 它读交易所挂单经 `match_position_protection`；**我用真实快照实测：两个仓位都是 `status=absent, rows=0`**（账本无行 → `exact_order_position_ids` 为空）→ `old_rows=[]` → 撤单集合为空 → **挂新止损、不撤原单** |
+  **最后一行是本次最尖的一条**：一条"把止损移到 X"的 KOL 指令会**加一张止损而不动原来那张**，结果是一个仓位挂两张不同价位的止损、账本只知道新的那张，**而旧止损仍在 75700——该指令实际上没有生效**。方向上属"过度保护"（合 A-11b 那条通则的安全侧），但**它同时意味着管理指令静默失效**。（B 线影子读到的 `legacy absent` 与我这次独立跑 `match_position_protection` 的结果一致；我没有采信它的读数。）
+  **(3) 全库扫**：交易所当前只有这两个活仓位，**2/2 全中**。另外两张挂单 TPSL（`…806869` / `…807099`，`posSide=short`、sz 6/14、sl 81000）属于 binding 347 **尚未成交的入场单**，不对应仓位，不计入。
+  **(4) 建议（只给证据与建议，落地多半归 B 线）**：同意在**归属发生的那一刻**（TU 翻成 posId 被 reconcile 认领时）把 `TU == posId` 的 TPSL 采纳进账本（`exchange_adopted_by_tu`，与 6a 同源），而不是等到修改时才认领——**等到修改时，在此之前保护健康、三条收敛、备份止损全部对它失明**，本次两条 `backup_stop_blocked` 就是这个失明的产物。**但建议改既有那条采纳路径而非新造**：它已带完整的拒绝与证据簿记（`_record_protection_adoption_refusal`）、本来就是为"入场自带止损"设计、且已停产六周半——**留着不动等于把一条死路径留在树上，下一个人会以为它在工作**。要动的两道闸门：`order_kind` 需容纳 `limit`；`_request_has_combined_trigger_protection()` 应改为"带 SL 即可"。
+  **本次唯一未查清的点，明确标出**：那道"必须 TP 与 SL 都有"的闸门**当初是否有理由**（例如只有组合单才能确定那张 TPSL 一定由本次入场产生）——**我没有查到理由，也不能证明没有**。不该由我推断，改它之前应先查清。
+  **另一条独立建议**：即使采纳路径修好，**历史遗留的无行仓位仍会走管理替换那条**。建议加一道独立安全阀——**挂新止损前若交易所侧存在未归属的同向 TPSL，则拒绝并告警**。这与"失败停在过度保护一侧"不冲突：**拒绝比挂第二张更接近过度保护的正确形态**，因为原止损仍在。
+  **归属**：这条横跨两线（账本落地在入场侧、后果在 A 线备份止损侧、目前唯一能归属它的是 B 线 6a 的 TU 认领链）。**两线都没有自行动手，等指挥会话定归属。**
