@@ -1100,6 +1100,14 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
       **改判据后重新起窗计时**，不在原窗上打补丁——
       在一个已经开始的窗里放宽判据，与"先量后立判据"没有区别。
   (6) 30 分钟连续窗、`head_ok`/`units_ok` 全程 1、零重置。
+  **(7) 起第三次窗前追加（`full_exit` 闸门补上之后，见 `phase-6h-full-exit-was-ungated`）**：
+      每轮凡 `action == "full_exit"` 的行，必须同时给出
+      `would_close_size` 非空、`would_close_endpoint == "close_position"`、
+      `would_close_ord_type == "market"`、`would_close_cancels_stops_first is False`；
+      且全窗 `break_even_would_close` 事件若出现，其 `released` 必须全为 False。
+      **这一条是在新窗起窗之前写的**，不是在跑着的窗里加的——
+      前两次窗（`phase-6h-aborted-criterion-not-invariant`、
+      `phase-6h-aborted-full-exit-ungated`）都已作废留档，本窗从零计时。
   **消息数不作为判据**：本步的观测量每轮由 reconcile 产生，不依赖消息流
   （6f 收窗时实测该时段到达率约 1.3 条/小时，见 `phase-6f-completed`）。
   **(1) 是本窗唯一能失败的成对观测**：一侧是旧判据、一侧是新读法，两者读同一批行；
