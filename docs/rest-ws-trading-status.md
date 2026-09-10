@@ -1036,6 +1036,33 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6-followup-naked-fill-stop-net-market-only (2026-09-10, **阶段 6 追加清单，本步不做**；A 线扫到、指挥会话转入本线):
+  `naked_fill_stop_net.py:192` 用 `str(leg.order_kind or "") != "market"` 排除非市价入场腿
+  （911 行另有 `order_kind == "market"` 的查询过滤）。这张网的作用是
+  **"归属尚未解析的普通入场腿成交了就先给它挂上止损"**，
+  而阶段 5 之后**限价入场同样是普通单**——`open_order_action_guard.REGULAR_ORDER_LEG_KINDS`
+  已经写成 `{market, limit}` 并在 2026-09-07 更新过。**限价入场拿不到这张网。**
+  应改为与 `REGULAR_ORDER_LEG_KINDS` **同集**并加同集断言
+  （判据形式见 A 线 A-15-1：断言两个集合相等而非断言含哪些值）。
+  **风险形态**：归属未解析 + 已成交 + 无网 = 真裸仓。
+  **但这是观测不是因果**——A 线只扫到该行，**未验证这条组合在生产上是否真会发生**；
+  我也未验证。待办包含"先查它是否发生过"，不是直接改。
+- phase-6-order-kind-two-scanning-lenses (2026-09-10, 会话 local_4a6676b0 + A 线, **两个口径都要**):
+  我扫"`order_kind` 集合判定"得 6 处，结论"`executor:506` 是唯一还漏 `limit` 的"——
+  **在"具名集合常量"这个口径下成立**，但**漏掉了单值 `==`**。
+  A 线按"把单值 `==` 也算进去"扫得 30 处，而这次限价入场止盈的**第三道门恰好落在那一格**：
+  `execution_bindings:1491/1514` 的 `str(leg.order_kind or "") == "trigger_limit"`
+  是唯一能给预建止盈腿盖 `pos_id` 的路，它不是集合字面量，所以不在我的表里。
+  **两个口径抓的是不同的病**：我的抓"集合忘了加成员"，
+  A 线的抓"**根本没写成集合**"——**后者更隐蔽，因为它连"这里有个词表"这件事都不显式。**
+  **我的三处自核（应 A 线之请，自己查而非采信）**：
+  `recovery_live_submit:2145` 选事件 action 名（`create_limit_entry` / `create_trigger_entry`）、
+  `2483` 选 order id 提取策略（`trigger_limit` 走触发单提取，其余走普通单 + `DeepcoinRequestOutcomeUnknown`）
+  ——两处都是**按 kind 分派**，`limit` 各有自己的分支，不是"是否执行"的闸门；
+  `2726` 是过滤（`order_kind == "market"`），但它是**补充路径**：
+  主创建点 `recovery_live_submit:2089` 在下单时对任何带 `take_profit_legs` 的入场腿创建收敛、
+  **无 `order_kind` 过滤**，生产库里 `limit` 收敛 6 条即由此而来（另 market 64、trigger_limit 175）。
+  **三处在两个口径下都干净。**
 - phase-6h-full-exit-was-ungated (2026-09-10, 会话 local_4a6676b0 自查, **我自己改动里的缺口，部署之后才发现**):
   6h 第一版把 `set_break_even` 挡在了释放常量后面，**却漏掉了平级的 `full_exit` 分支**：
   ```
