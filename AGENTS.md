@@ -47,10 +47,17 @@
   and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
   Record the pre-deploy production HEAD as the rollback SHA; rollback is
   `tg-deploy <that-sha>`.
-  **Before `tg-deploy`, confirm the candidate is a descendant of the current
-  production HEAD; after `tg-deploy`, confirm the deployed sha is on
-  `origin/codex/deepcoin-auto-trading-v1` and push it there at once if it is
-  not.** Both directions were needed on 2026-09-10, one each way: the A line
+  **The order is: push the candidate to your own branch on origin, `tg-deploy`
+  it, then push that exact sha to the shared branch, then verify both
+  directions.** `tg-deploy` fetches and hard-resets to the sha, so a sha that
+  exists only locally fails with `Could not parse object` -- but pushing the
+  candidate to the *shared* branch first would put undeployed code there, which
+  the rule below forbids. Your own branch is the way through: it makes the sha
+  fetchable without the shared branch ever leading production by code. Both
+  verifications are still required and they answer different questions --
+  before deploying, that the candidate is a descendant of the current
+  production HEAD; after, that the deployed sha is on
+  `origin/codex/deepcoin-auto-trading-v1`.** Both directions were needed on 2026-09-10, one each way: the A line
   nearly deployed a commit that did not contain the B line's just-observed
   phase, and the B line's released candidate turned out not to contain the A
   line's. Neither was caught by tooling; both were caught by someone running
