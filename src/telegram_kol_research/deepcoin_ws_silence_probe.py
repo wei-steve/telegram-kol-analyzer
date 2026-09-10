@@ -182,7 +182,15 @@ def instruments_to_probe(session_factory) -> tuple[list[str], bool]:
     live ordinary limit leg. Phase 5a established that endpoint is blind to
     ordinary limit orders on V1 and that the migrated legs are the only ones
     that need it, so reading it unconditionally would spend a GET to learn
-    nothing. Three GETs is the ceiling.
+    nothing.
+
+    The cost is ``1 + len(instruments) + (1 if limit legs else 0)``, so it
+    scales with how many instruments the account holds at once -- measured at
+    **4** against production on 2026-09-10 (BTC and ETH). The phase note's
+    "three GETs" was written assuming a single instrument and is wrong; the
+    real ceiling is the instrument count, which nothing here caps. At one probe
+    per 600s against a 5/s quota that is not worth capping, but a bound nobody
+    enforces must not be written down as if it were one.
     """
 
     from telegram_kol_research.models import ExecutionOrderLeg

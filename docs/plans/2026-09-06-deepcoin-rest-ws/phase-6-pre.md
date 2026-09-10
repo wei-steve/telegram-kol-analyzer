@@ -55,8 +55,11 @@ deadline 内 WS 回到 healthy 即提交，到期则走 `entry_admission_expired
 
 **对照口径**（避免踩已知的坑）：用 `posId` / `ordId` 集合与 `sz`、`posSide`；
 **不用 `slTriggerPx`**（ARCHITECTURE 第 6 节：仓位行的该字段只反映最近一对 TPSL，判不了有没有止损）。
-`trigger-orders-pending` 按既有分页取全。**若本地有未了结的普通挂单腿**再加一次 V2 `orders-pending`，
-否则不加，**最多三个 GET**。
+`trigger-orders-pending` 按既有分页取全。**若本地有未了结的普通挂单腿**再加一次 V2 `orders-pending`，否则不加。
+~~最多三个 GET~~ —— **这句写错了**（2026-09-10 实现时按生产实测更正）：开销是
+`1 + 持仓 instrument 数 + (有限价腿则 1)`，生产当时是 BTC + ETH 两个 instrument、
+有 2 条限价腿，**实际 4 个 GET**。instrument 数没有任何代码上界；每 600 秒一次、
+对着 5/s 配额不值得加限，但不能把没人执行的上界当成上界写下来。
 
 **残留风险，如实写明**：本方案不能排除"订阅已死但恰好无事发生"。那种情况下不重连**不产生任何信息损失**，
 而暴露窗口的上界是**下一次探活（600 秒后）或 60 分钟硬过期的计划内重连，二者取先**。
