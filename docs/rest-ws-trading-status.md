@@ -960,6 +960,40 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   并按 `ALWAYS_NOTIFIED` 发出 `management_submit_unknown` 告警。
   阶段文件任务 3 的范围是 `close_bound_position`（人工路径），而这条在管理批次执行器里、
   属 A 线模块，**故本步不动**，交指挥会话裁定归属。
+- phase-6cd-window-closed (2026-09-10, 会话 local_4a6676b0, **判据首次取得生产样本**):
+  窗口 15:54:19Z ~ 17:46:49Z（**1 小时 52 分**）、113 采样、**零重置、head_ok / units_ok 全程 1**、
+  125 轮 reconcile。**真实消息 4 条 / 1 群，未达 L2 的 ≥5 条门槛**——按指挥会话裁定按现状收窗，
+  因为**消息数对本步判据没有信息量**：本步判据要的是活仓与活保护单，不是消息流量。
+  证据 `/root/evidence/phase-6cd/observer-samples.jsonl`。
+  **16:07Z 交易所开出两个仓位**（`1001125216121996` / `1001125216153672`，BTC 多头、限价入场、
+  binding 349/350、`attribution_status=verified`），窗口性质因此从"零样本"变为有样本：
+  ```
+  positions=220  cancel_precheck={"match":220}  excluded_pending_entry_stops=440
+  set_mismatch=220  agreed=0  chain_frozen=0  ledger_drift=0
+  ```
+  **判据逐条**：
+  - **6b (1) `cancel_precheck.match ≥ 1`：取到，220/220**——跨两次真实读、四项一致，零不一致。
+  - **6b (3) `ledger_drift` 读数：取到，为 0**——这是"有活保护单在场时测得 0"，不是空窗的零。
+  - **6a (3)：字面未达成、实质达成**（见下条判据错误）。
+  - **6a (1)(2) 与 6d 全部判据：未取到**——窗口内无真实止损替换、无保本收敛、裸仓网一次未触发。
+  - **6b 切换放行条件仍未满足**：条件是"一次**真实止损替换**走通新路径并回读一致"（判据 (1)），
+    本次到来的是新仓位归属，不是替换。**不以此充数。**
+  **三方联合证据**：本窗口 HEAD 同时含 A-11、6c、6d，所以"无回归"是三方联合的，非任一单独。
+- phase-6a-criterion-3-was-written-on-a-false-assumption (2026-09-10, 会话 local_4a6676b0):
+  我把 6a 判据 (3) 写成"新入场成交开出仓位，**新链把它解析成 `agreed`**"。
+  实际到来的样本是 `set_mismatch`，**而 `agreed` 在这种情形下根本不可能成立**：
+  `agreed` 的定义是新链与旧匹配器给出同一个 ordId 集合，而旧匹配器对这两个仓位给出的是
+  **`absent`**（账本里没有任何行能给出那两张随单止损的归属）。
+  **我写判据时假设了"两边都会认出来"，而这一步存在的理由恰恰是旧匹配器认不出来。**
+  判据改写为：**新入场开仓后新链 `status=resolved` 且认出该仓位的保护单**（无论旧匹配器说什么），
+  若同时有在挂入场单的自带止损则 `excluded_pending_entry_stops ≥ 1`。
+  **同源教训**：判据也会写错，而写错的判据在收窗时会伪装成"未达成"。
+  这与"窗口合格 ≠ 判据被验证"是一对：那条防的是拿窗口充数，这条防的是**拿一个不可能成立的
+  判据把真样本判成没取到**。
+- phase-6cd-shadow-verdict-gap (2026-09-10, 会话 local_4a6676b0, **待随 A-11b 之后上线**):
+  影子把"旧匹配器 `absent` + 新链 resolved"归进了 `set_mismatch`，读起来像"新旧两条路打架"，
+  实际与 `chain_resolved_legacy_ambiguous` 同族，是**改进**。分类少了一档
+  （拟名 `chain_resolved_legacy_absent`）。补丁会重置窗口，故按裁定排在 A 线 A-11b 之后。
 - phase-6cd-deployed (2026-09-10, 会话 local_4a6676b0): 6c + 6d 上线，
   **`20445fc6fc08a7ffb56f8752de174fb133197711`**（变基到 A 线 A-11 `113cd70c` 之上），
   15:53Z 经 `tg-deploy`，**回滚参考 `113cd70c`**。全量 **8296 passed / 4 skipped / 0 failed**
