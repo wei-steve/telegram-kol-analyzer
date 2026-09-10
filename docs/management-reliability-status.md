@@ -514,3 +514,22 @@ user_decisions_2026_09_07:
   **本次唯一未查清的点，明确标出**：那道"必须 TP 与 SL 都有"的闸门**当初是否有理由**（例如只有组合单才能确定那张 TPSL 一定由本次入场产生）——**我没有查到理由，也不能证明没有**。不该由我推断，改它之前应先查清。
   **另一条独立建议**：即使采纳路径修好，**历史遗留的无行仓位仍会走管理替换那条**。建议加一道独立安全阀——**挂新止损前若交易所侧存在未归属的同向 TPSL，则拒绝并告警**。这与"失败停在过度保护一侧"不冲突：**拒绝比挂第二张更接近过度保护的正确形态**，因为原止损仍在。
   **归属**：这条横跨两线（账本落地在入场侧、后果在 A 线备份止损侧、目前唯一能归属它的是 B 线 6a 的 TU 认领链）。**两线都没有自行动手，等指挥会话定归属。**
+
+- step-13 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **对 trigger 行用错键名的全库扫描**（**read-only，未改任何代码**）。起因是 B 线发现 `break_even_convergence_executor` 的市场预检直接对 `trigger-orders-pending` 原始行取 `posId` 与 `slTriggerPx`，而生产该端点**行不带 `posId`、触发价键叫 `slTriggerPrice`**。方法：AST 扫描全部 `.get("<key>")` / `["<key>"]` 读点（不是眼看），逐处读源码定对象来源，再核生产库。
+  **结论：误读只有一处模块、四个读点。** 其余 20 余个 `slTriggerPx` 读点全部落在**我们自己的请求载荷**或**仓位行**上——键名在那两种对象上是对的。
+  **A 类｜读原始 trigger 行、键名错（生产可达，功能全废）**
+  | 位置 | 键 | 对象来源 | 错在哪 | 后果方向 |
+  |---|---|---|---|---|
+  | `break_even_convergence_executor._reserve_market_decisions` **624** | `posId` | `pending_by_id[stop.order_id]`（`list_trigger_orders_pending`） | TPSL 行**不带 `posId`** → 恒 `""` ≠ pos_id | **误判为"漂移"** → `raise break_even_existing_stop_drift` |
+  | 同上 **626** | `slTriggerPx` | 同上 | 真实键 `slTriggerPrice` → `None` | 同上；**与 624 各自单独足以触发** |
+  | `._validate_remaining_take_profits` **769** | `posId` | 同上 | 同 624 | **误判为"漂移"** → `raise break_even_remaining_take_profit_drift` |
+  | 同上 **770** | `tpTriggerPx` | 同上 | 真实键 `tpTriggerPrice` | 同上 |
+  **生产证据（自查）**：`strategy_break_even_convergences` **共 2 行、全部 `blocked`、最后 2026-08-03 14:28:22**——**自动保本收敛在生产上从未成功过一次。** 后果方向是"漂移"而非"无单"，所以**不会误挂或误撤**，只会永远拒绝：安全侧，但功能等于不存在。修的时候**四个读点都要动**，只改一个仍恒拒。
+  **B 类｜`slTriggerPx` 读在我们自己的请求/载荷上（正确）**：`deepcoin_execution_actions` 1777/2749、`protection_authority` 644、`trigger_protection_rescue_worker` 167、`execution_bindings` 2942/2943（即 step-12 那道闸门）/3668/3673/3679、`entry_assembly_fingerprint_repair` 1730–1737/1925/1985。
+  **C 类｜读仓位行（`posId` 正确）**：`native_tpsl_migration` 482、`execution_bindings` 1386、`backup_stop_repair` 140/360、`strategy_management_composite_executor` 1441。
+  **C 类里一处单独提**：`execution_bindings.build_position_evidence` **3177/3178** 从仓位行取 `slTriggerPx`/`tpTriggerPx` 填 `PositionEvidence.stop_loss` / `take_profits`。**键名对**，但 `ARCHITECTURE` 第 6 节已明文：仓位行这两个字段只反映**最近一对** TPSL、**不能当"有没有止损"的判据**（A-4 发现、A-5b 又撞一次）。**本次未查它被谁消费、是否被当成保护判据——列为待查项，不推断。**
+  **D 类｜`triggerPx` 读在 trigger 行上（正确）**：`execution_bindings._order_row_price` 3526；真实端点确实返回 `triggerPx`。
+  **E 类｜它为什么能上线：夹具按"我们发出的请求"造，不是按响应造**
+  `tests/test_break_even_convergence_executor.py` 的假客户端在 `set_position_sltp` 里把请求原样回填成挂单行：`{"posId": payload["posId"], "slTriggerPx": payload["slTriggerPx"], …}`——**真实端点这两个键一个都没有**。生产代码读的正是它们，**于是测试全绿、生产恒拒**。
+  **这条形状解释了为什么单测挡不住这一类**：不是漏了断言，而是**夹具与生产读的是同一份错误词表**。建议进 `ARCHITECTURE` 第 6 节（本步只读、未落笔，等裁定由谁写）：**用"我们发出的请求"回填出来的假响应，会让任何"把请求形状的键读在响应上"的代码通过测试；假客户端的响应必须按真实响应造，否则它验证的只是"我们自己的字段名和我们自己的字段名一致"。**
+  **结构性发现｜没有共享的归一化层**：20 个模块"知道"真实键名，但**没有公开的归一化函数**。容错读法只存在于 `protection_attribution` 内部的私有 `_first_text(row, "slTriggerPx", "slTriggerPrice", "stopLossPrice")`，以及 `web_app`、`trigger_take_profit_convergence_executor` 里各自重复的键名元组。**每个消费者各自重新实现或忘记**——保本收敛是忘记的那个。**建议**把"从 trigger 行读触发价、读 posId（并知道它可能不存在）"提成**公开具名读取器**，让忘记它变成 import 缺失而不是静默错值；**落地归属由指挥会话定**（横跨 B 线保护链与 A 线收敛）。
