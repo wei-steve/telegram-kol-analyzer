@@ -1016,6 +1016,26 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   或者让采样器不做白名单抽取、而是把整个 `protection_shadow` 对象原样落进采样行。
   **后者更彻底**（新增字段自动进证据），作为后续改进记在这里。
   已补 `would_adopt` 并重起窗（18:21:10Z），损失一分钟。
+- phase-6h-break-even-field-names (2026-09-10, 会话 local_4a6676b0 发现, **指挥会话立为 6h，需用户批准**):
+  **自动保本收敛在生产上从未成功过，而且按现在的代码必然失败。**
+  `break_even_convergence_executor` 的市场预检拿 `trigger-orders-pending` 的**原始行**比对：
+  `exchange_row.get("posId") != leg.pos_id` 且 `_decimal_equal(exchange_row.get("slTriggerPx"), ...)`。
+  而生产返回的行**每一行 `posId` 都是 `null`**、触发价字段叫 **`slTriggerPrice`**（2026-09-10 只读探测原样）。
+  两个条件因此恒真，只要账本里有该仓位的 stop_loss 行，预检必抛 `break_even_existing_stop_drift`。
+  **生产数据吻合**：`strategy_break_even_convergences` 全表**只有 2 行、全部
+  `blocked / break_even_market_preflight_unavailable`**（最后一次 2026-08-03），**无一次成功**。
+  **这正是 ARCHITECTURE 第 6 节 A-5b 点名的那个陷阱**，而这处代码没有照它改。
+  **怎么撞出来的**：为让 6e 判据成立，我把 break-even 测试夹具改成生产真实形状
+  （补 `triggerOrderType`、`slTriggerPx` → `slTriggerPrice`），**改完三条测试立刻红**——
+  它们此前一直绿，因为夹具用的是**生产不存在的字段名**。
+  **测试通过证明的是"代码与夹具一致"，而夹具与生产不一致。**
+  处置：**不顺手修**（修好等于让一条从未运行过的交易所写入路径开始运行，性质同 6f）。
+  三条用例改为断言现网会在预检阻塞并在文件头写明原委——**不把夹具改回不真实的形状让它们变绿**，
+  那正是这个缺陷长期存活的原因。6h 形状：先影子（预检改用归一化行、只记 `break_even_would_replace`），
+  用户批准后再切换。A 线另行只读全库扫同类读点。
+  **对 6e 下游清单的更正**：原写"保本收敛会按 A-5e 替换那张随单止损，属修复，允许"，
+  该格改为 **"当前不可达（字段名缺陷），修复后需单独批准"**；
+  我 6a 给 break-even 加的 A-5e 序列与刚加的四项回读，**在生产上一次都没执行过**。
 - phase-6e-shadow-window-closed (2026-09-10, 会话 local_4a6676b0, **本阶段第一次判据逐轮精确达成**):
   影子本体 **`a8a3a0691221fd6b00ba487e8f2a8e88077e6e19`**（含 A 线 A-11b），18:21:10Z 起窗，
   回滚参考 `117f8b09`。窗口 **1865 秒（31 分 05 秒）**、32 采样、**零重置、head_ok / units_ok 全程 1**、
