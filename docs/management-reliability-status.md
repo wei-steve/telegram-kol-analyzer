@@ -495,8 +495,14 @@ user_decisions_2026_09_07:
   | 保本收敛 | **不能** | 同样从账本取，`status IN ('verified','protected')` |
   | 止盈收敛 | **不能** | 同样从账本按 binding 取 |
   | A-7 目标验证 | **能** | binding 349/350 = `active` + `position_ownership_verified` |
-  | **管理指令的保护替换** | **会动手，但是瞎的** | 它读交易所挂单经 `match_position_protection`；**我用真实快照实测：两个仓位都是 `status=absent, rows=0`**（账本无行 → `exact_order_position_ids` 为空）→ `old_rows=[]` → 撤单集合为空 → **挂新止损、不撤原单** |
-  **最后一行是本次最尖的一条**：一条"把止损移到 X"的 KOL 指令会**加一张止损而不动原来那张**，结果是一个仓位挂两张不同价位的止损、账本只知道新的那张，**而旧止损仍在 75700——该指令实际上没有生效**。方向上属"过度保护"（合 A-11b 那条通则的安全侧），但**它同时意味着管理指令静默失效**。（B 线影子读到的 `legacy absent` 与我这次独立跑 `match_position_protection` 的结果一致；我没有采信它的读数。）
+  | **管理指令的保护替换** | **整批被拒**（见下方更正） | 预检在账本无行时抛 `protection_preflight_rows_ambiguous_or_drifted`，整批拒绝 |
+  **【更正，2026-09-10：上面那一行我原先写错了，B 线核出来的】** 我原文写的是"会挂新止损、不撤原单，结果一个仓位两张止损、管理指令静默失效"。**这是错的。** 实际行为是**整批被拒绝**：`strategy_management_executor` 在进入替换循环之前有预检，两条分支都会拒——
+  · 并非所有腿都带 `old_tpsl.order_ids` 时走内联匹配器分支，条件 `protection is None or protection.status != "verified" or not current_rows or …` 命中即 `raise ManagementBatchExecutionError("protection_preflight_rows_ambiguous_or_drifted")`；`status=absent, rows=0` **同时命中其中两项**。
+  · 都带 `old_tpsl.order_ids` 时走 `_preflight_exact_protection_rows`，其尾部在 `current_ids != expected.get("order_ids")` 等条件下**抛同一个错误**。
+  **所以后果是"KOL 的止损指令整批失败"，而不是"悄悄挂了第二张止损"——失败是响的，不是静默的。** 这把严重性推向更安全的一侧：不会出现一个仓位挂两张不同价位止损的状态。
+  **我错在哪，值得写下来**：我**实测的是匹配器本身**（`match_position_protection` 对真实快照返回 `absent / rows=0`，这一条成立），然后**读了替换循环那段代码（`old_rows` → 撤单集合为空）就推出了执行器的行为**——而那段代码位于预检**之后**，`absent` 根本到不了那里。**我把一次推理当成了实测写进结论**，而这正是我今天在别人身上纠过、也在自己身上纠过多次的同一个动作：**measured one thing, asserted another**。B 线读的是执行器主路径（约 658 行），它读对了。
+  **顺带确认 B 线的另一条**（我自己核的源码，不是采信）：6a 的绑定链只覆盖人工来源——`deepcoin_execution_actions.adjust_position_tpsl` 在 `trade_signal.source_type not in MANUAL_MANAGEMENT_SOURCE_TYPES` 时抛 `automated_position_tpsl_requires_management_batch`，所以自动来源被挡在门外、走不到那条链。
+  （B 线影子读到的 `legacy absent` 与我独立跑 `match_position_protection` 的结果一致——那一层的实测没有问题，错的是从它到执行器行为的那一步推理。）
   **(3) 全库扫**：交易所当前只有这两个活仓位，**2/2 全中**。另外两张挂单 TPSL（`…806869` / `…807099`，`posSide=short`、sz 6/14、sl 81000）属于 binding 347 **尚未成交的入场单**，不对应仓位，不计入。
   **(4) 建议（只给证据与建议，落地多半归 B 线）**：同意在**归属发生的那一刻**（TU 翻成 posId 被 reconcile 认领时）把 `TU == posId` 的 TPSL 采纳进账本（`exchange_adopted_by_tu`，与 6a 同源），而不是等到修改时才认领——**等到修改时，在此之前保护健康、三条收敛、备份止损全部对它失明**，本次两条 `backup_stop_blocked` 就是这个失明的产物。**但建议改既有那条采纳路径而非新造**：它已带完整的拒绝与证据簿记（`_record_protection_adoption_refusal`）、本来就是为"入场自带止损"设计、且已停产六周半——**留着不动等于把一条死路径留在树上，下一个人会以为它在工作**。要动的两道闸门：`order_kind` 需容纳 `limit`；`_request_has_combined_trigger_protection()` 应改为"带 SL 即可"。
   **本次唯一未查清的点，明确标出**：那道"必须 TP 与 SL 都有"的闸门**当初是否有理由**（例如只有组合单才能确定那张 TPSL 一定由本次入场产生）——**我没有查到理由，也不能证明没有**。不该由我推断，改它之前应先查清。
