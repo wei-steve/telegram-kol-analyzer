@@ -1102,7 +1102,22 @@ def _execute_break_even_by_market_batch(
             )
             continue
 
-        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
+        # A-11b. An authority refusal is on the same side as a definite
+        # rejection now that the gateway only raises it from states where
+        # nothing was submitted (A-11): the failing row did not reach the
+        # venue, the rows before it did and are in ``created_order_ids``, and
+        # rolling those back is exactly what the definite path below does.
+        # Left on the unknown side the leg goes to recovery_required and the
+        # half-replaced protection set stays on the exchange waiting for a
+        # person -- safe, because it is over-protection rather than none, but
+        # it is a state somebody has to come and clear when the outcome was
+        # never actually in doubt. ``protection_replacement_missing_order_id``
+        # stays on the unknown side, and should: there the write happened and
+        # only the receipt is missing.
+        if not isinstance(
+            replacement_error,
+            (DeepcoinDefiniteRejection, PositionMutationAuthorityError),
+        ):
             transition_leg(
                 session_factory,
                 leg.id,
@@ -1121,8 +1136,23 @@ def _execute_break_even_by_market_batch(
             )
             continue
 
+        if isinstance(replacement_error, PositionMutationAuthorityError):
+            _capture_management_protection_refusal(
+                session_factory,
+                batch=batch,
+                leg=leg,
+                reason=str(replacement_error),
+                rolled_back=len(created_order_ids),
+                occurred_at=executed_at,
+            )
         restoration_error: Exception | None = None
         restore_responses: list[dict[str, Any]] = []
+        # A-11b, deliberately NOT reclassified: a refusal here is definite --
+        # this new protection order was not cancelled -- but the state it
+        # leaves still needs a person. The order the rollback meant to remove
+        # is still live on the venue and the ledger no longer expects it, so
+        # "definitely failed" and "safe to finish" are not the same thing.
+        # recovery_required is the honest label.
         try:
             for order_id in created_order_ids:
                 _require_remediation_live_gate(session_factory, batch=batch)
@@ -2129,7 +2159,22 @@ def _execute_protection_batch(
             )
             continue
 
-        if not isinstance(replacement_error, DeepcoinDefiniteRejection):
+        # A-11b. An authority refusal is on the same side as a definite
+        # rejection now that the gateway only raises it from states where
+        # nothing was submitted (A-11): the failing row did not reach the
+        # venue, the rows before it did and are in ``created_order_ids``, and
+        # rolling those back is exactly what the definite path below does.
+        # Left on the unknown side the leg goes to recovery_required and the
+        # half-replaced protection set stays on the exchange waiting for a
+        # person -- safe, because it is over-protection rather than none, but
+        # it is a state somebody has to come and clear when the outcome was
+        # never actually in doubt. ``protection_replacement_missing_order_id``
+        # stays on the unknown side, and should: there the write happened and
+        # only the receipt is missing.
+        if not isinstance(
+            replacement_error,
+            (DeepcoinDefiniteRejection, PositionMutationAuthorityError),
+        ):
             transition_leg(
                 session_factory,
                 leg.id,
@@ -2147,7 +2192,22 @@ def _execute_protection_batch(
             failed_status = "recovery_required"
             continue
 
+        if isinstance(replacement_error, PositionMutationAuthorityError):
+            _capture_management_protection_refusal(
+                session_factory,
+                batch=batch,
+                leg=leg,
+                reason=str(replacement_error),
+                rolled_back=len(created_order_ids),
+                occurred_at=executed_at,
+            )
         restoration_error: Exception | None = None
+        # A-11b, deliberately NOT reclassified: a refusal here is definite --
+        # this new protection order was not cancelled -- but the state it
+        # leaves still needs a person. The order the rollback meant to remove
+        # is still live on the venue and the ledger no longer expects it, so
+        # "definitely failed" and "safe to finish" are not the same thing.
+        # recovery_required is the honest label.
         try:
             for order_id in created_order_ids:
                 _require_remediation_live_gate(session_factory, batch=batch)
@@ -2949,6 +3009,12 @@ def _restore_precancelled_protection_for_rejected_close(
             seen_at=datetime.now(UTC),
         )
     except Exception as exc:
+        # A-11b, deliberately NOT reclassified. A refusal here is definite, and
+        # what it definitely means is that the old stops are *not* back: the
+        # caller turns any error into recovery_required, and that is right,
+        # because this failure leaves the position under-protected rather than
+        # over-protected. This is the one place in the family where "nothing
+        # was written" is the bad news rather than the reassurance.
         return {"type": type(exc).__name__, "message": str(exc)}
     return None
 
@@ -4663,6 +4729,41 @@ def _extract_order_id(response: Any) -> str | None:
             if value not in (None, ""):
                 return str(value)
     return None
+
+
+def _capture_management_protection_refusal(
+    session_factory: sessionmaker,
+    *,
+    batch,
+    leg,
+    reason: str,
+    rolled_back: int,
+    occurred_at: datetime,
+) -> None:
+    """A-11b's alert, best-effort for the same reason A-11's is."""
+
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_protection_authority_refused,
+        )
+
+        capture_management_protection_authority_refused(
+            session_factory,
+            config=load_runtime_incident_config(),
+            batch_id=int(batch.id),
+            leg_id=int(leg.id),
+            pos_id=str(leg.pos_id or ""),
+            reason=reason,
+            rolled_back_order_ids=int(rolled_back),
+            occurred_at=occurred_at,
+        )
+    except Exception:  # pragma: no cover - defensive, never fails the batch
+        logger.warning(
+            "management protection refusal capture failed for leg %s",
+            getattr(leg, "id", None),
+            exc_info=True,
+        )
 
 
 def _capture_management_close_authority_refusal(

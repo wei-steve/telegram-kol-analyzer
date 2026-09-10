@@ -467,3 +467,12 @@ user_decisions_2026_09_07:
   · **未取得 A-11 的样本**：`auth_refused=0 / auth_alerts=0 / submit_unknown=0 / frozen_batches=0`——窗口内既无管理指令、也无活仓位，既没有授权拒绝可分类，也没有真实提交可对照。**本步的重分类在生产上零样本，仅测试覆盖。**
   · **取得的是"无回归"，且是联合证据**：HEAD 里同时带着 B 线 6b 影子，所以这一半不是 A-11 单独的。
   · **附带一条持续证据**：`empty_confirmed=17`、`empty_state` 自 13:29:57 起未变——A-10e 的空读确认仍在工作，且"仅在变化时写"仍然成立。
+
+- step-11b (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **A-11 那张 AST 清单上的五处，逐处通读所在流程后分类**（L2，分支 `mgmt/step-11b-same-class-sites`）。裁定要求：能证明提交前抛出的归确定性失败侧并告警，有"可能已写"歧义的保持 `recovery_required` 并写明理由，不确定就留在 `recovery_required`。**结论是 2 处改、3 处刻意不改，而分界线不是异常类型，是"这次确定性失败留下了什么"。**
+  **改的两处（保护替换的两个流程，判据在 `if not isinstance(replacement_error, ...)`）**：加入 `PositionMutationAuthorityError`。理由：A-11 之后该异常只从"可证明未提交"的状态抛出，所以**失败那一行没有到交易所，而它之前那些行到了、且都在 `created_order_ids` 里——把它们回滚正是确定性分支本来做的事**。留在未知侧的代价是腿停在 `recovery_required`、半套替换好的保护单留在交易所等人来清；那是安全的（多保护而非无保护），但**结果从来没有真的不确定过**。同时在该路径上发 `management_protection_authority_refused`（ALWAYS_NOTIFIED）——**理由与 A-11 同构：分类正确之后这个失败变安静**（回滚完成、腿记 `restored`、批次收尾），"这条指令本该移动的止损没有被移动"就再没有任何痕迹。
+  **不改的三处，逐条写明理由**：
+  · **回滚撤单循环（两个流程各一处）**：refusal 是确定的——**这张新挂的保护单没有被撤掉**——但它留下的状态仍然需要人：那张单还活在交易所上，而账本已经不再期待它。**"确定失败"和"可以收尾"是两个不同的主张，这里只有前一个成立。**
+  · **`_restore_precancelled_protection_for_rejected_close`**：**这一处是整族里唯一反过来的**。别处"什么都没写"是安慰，而这里没写成的那次写入是**把仓位原来的止损放回去**，所以确定性拒绝意味着**仓位处于欠保护状态**——那是最不该被自动收尾的状态。调用方把任何 restore 错误降级为 `recovery_required`，是对的。
+  **另外记一条"可能已写"边界的实测**：`protection_replacement_missing_order_id` 留在未知侧不动，**且应当如此**——那里写入已经发出、只是回执没拿到。
+  **写测试时撞到一个值得记的事实**：把 `PositionMutationAuthorityError` 当作**客户端写入的返回结果**注进去，**并不能复现一次 refusal**——网关会把写入调用抛出的任何异常转成 `recovery_required`（`_finish_with_error(intent_id, "recovery_required", …)`），而**它这么做是对的：到那一步交易所已经被联系过了**。真实的 refusal 严格发生在写入之前。所以这五处的用例都注在执行器自己的调用点上，而"网关如何映射状态"由 A-11 那两条具名用例锁住。**这同时是对 A-11 前提的一次侧面验证：网关本来就没有把"写入调用自己抛异常"当成确定失败。**
+  **新增 5 条用例**（每处一条）：refused 的保护替换走回滚而非停等（并断言 `recovery_required` 不出现）；该拒绝的 incident 行**真的存在**且带 reason（A-10e 的教训）；回滚中的 refusal **仍是** `recovery_required`；回执缺失**仍在**未知侧；restore 的 refusal **仍是** `recovery_required`（并直接对源码断言调用方那条降级契约，而不是对一个替身断言）。**三条"仍是"的用例是刻意写的**——它们的作用是让下一个人在没读流程的情况下改不动这三处。

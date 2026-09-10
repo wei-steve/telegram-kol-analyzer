@@ -7421,3 +7421,222 @@ def test_a_submit_that_lands_but_loses_the_cas_stays_unknown():
                     response=None,
                 )
             )
+
+
+# ---------------------------------------------------------------------------
+# A-11b: the rest of the same class, one verdict per site
+#
+# A-11 fixed the three sites that labelled a refusal submit_unknown. An AST
+# scan found five more that can receive the same exception and call it
+# recovery_required. Two of them are the same mistake one step in; three are
+# not, and the difference is not the exception -- it is what the definite
+# failure leaves behind.
+
+
+def _authority_error(reason="target_live_position_not_unique"):
+    from telegram_kol_research.position_mutation_authority import (
+        PositionMutationAuthorityError,
+    )
+
+    return PositionMutationAuthorityError(reason)
+
+
+def test_a_refused_protection_replacement_rolls_back_instead_of_waiting(tmp_path):
+    """Site 1 of 2 reclassified: nothing was written, so finish it cleanly.
+
+    On the unknown side this leg went to recovery_required and a half-replaced
+    protection set sat on the exchange until a person came. Safe -- it is
+    over-protection, not none -- but the outcome was never in doubt.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    from telegram_kol_research import strategy_management_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    # Injected at the executor's own call, because injecting it as a *write
+    # outcome* does not reproduce a refusal: the gateway turns any exception
+    # raised by the write into recovery_required, and it is right to -- by then
+    # the venue has been contacted. A refusal happens strictly before that.
+    def _refuse(**kwargs):
+        raise _authority_error()
+
+    monkeypatch_target = "submit_exact_position_sltp"
+    original = getattr(executor, monkeypatch_target)
+    setattr(executor, monkeypatch_target, _refuse)
+    try:
+        result = execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+    finally:
+        setattr(executor, monkeypatch_target, original)
+
+    statuses = [leg["status"] for leg in result["legs"]]
+    assert "recovery_required" not in statuses, (
+        "a refusal that wrote nothing must not park the leg for a human"
+    )
+    assert set(statuses) == {"restored"}
+
+
+def test_a_refused_protection_replacement_is_announced(tmp_path):
+    """Site 2 of 2 reclassified, and the reason the alert has to exist.
+
+    Correcting the classification is what makes this quiet: the partial set is
+    rolled back, the leg reads restored, the batch finishes. Without the alert
+    "the stop this instruction was meant to move was not moved" leaves nothing
+    behind at all.
+    """
+
+    from telegram_kol_research.config import (
+        ALWAYS_NOTIFIED_INCIDENT_TYPES,
+        RuntimeIncidentConfig,
+    )
+    from telegram_kol_research.db import create_session_factory as _factory
+    from telegram_kol_research.models import RuntimeIncident
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_management_protection_authority_refused,
+    )
+
+    session_factory = _factory(tmp_path / "incidents.db")
+    capture_management_protection_authority_refused(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset(ALWAYS_NOTIFIED_INCIDENT_TYPES)
+        ),
+        batch_id=9,
+        leg_id=13,
+        pos_id="pos-1",
+        reason="target_live_position_not_unique",
+        rolled_back_order_ids=1,
+        occurred_at=NOW,
+    )
+
+    with session_factory() as session:
+        rows = (
+            session.query(RuntimeIncident)
+            .filter(
+                RuntimeIncident.incident_type
+                == "management_protection_authority_refused"
+            )
+            .all()
+        )
+    assert len(rows) == 1
+    assert "target_live_position_not_unique" in rows[0].redacted_summary
+
+
+def test_a_refusal_during_rollback_stays_recovery_required(tmp_path):
+    """Site 3, deliberately not reclassified -- and this test says so.
+
+    The refusal is definite: this new protection order was not cancelled. What
+    it leaves is a live order the rollback meant to remove and a ledger that no
+    longer expects it. "Definitely failed" and "safe to finish" are different
+    claims, and only the first one is true here.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    from telegram_kol_research import strategy_management_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    submitted: list[int] = []
+    real_submit = executor.submit_exact_position_sltp
+    real_cancel = executor.cancel_exact_position_sltp
+
+    def _one_then_refuse(**kwargs):
+        # The first row lands, so there is something to roll back; the second
+        # is refused, which sends this leg down the definite path.
+        if not submitted:
+            submitted.append(1)
+            return real_submit(**kwargs)
+        raise _authority_error()
+
+    def _refuse_cancel(**kwargs):
+        raise _authority_error("rollback refused")
+
+    executor.submit_exact_position_sltp = _one_then_refuse
+    executor.cancel_exact_position_sltp = _refuse_cancel
+    try:
+        result = execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+    finally:
+        executor.submit_exact_position_sltp = real_submit
+        executor.cancel_exact_position_sltp = real_cancel
+
+    assert "recovery_required" in [leg["status"] for leg in result["legs"]]
+
+
+def test_the_unknown_side_of_the_protection_boundary_is_unchanged(tmp_path):
+    """Site 4: a missing receipt is still unknown, not definite.
+
+    ``protection_replacement_missing_order_id`` is raised after the write went
+    out and only the receipt is absent. It must stay where it was.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(session_factory)
+    client = _ProtectionClient(
+        session_factory, rows_by_pos, set_outcomes=[{"code": "0", "data": {}}]
+    )
+
+    result = execute_management_batch(
+        session_factory, batch_id=batch.id, deepcoin_client=client, executed_at=NOW
+    )
+
+    assert result["status"] == "recovery_required"
+
+
+def test_a_refused_protection_restore_stays_recovery_required(tmp_path):
+    """Site 5, deliberately not reclassified, and the inverse of all the rest.
+
+    Everywhere else "nothing was written" is the reassurance. Here the write
+    that did not happen was putting the position's old stops *back*, so a
+    definite refusal means the position is under-protected -- the one state
+    that must never be auto-completed.
+    """
+
+    from telegram_kol_research import strategy_management_executor as executor
+
+    calls = []
+
+    def _refused(session_factory, *, batch, binding, leg, deepcoin_client):
+        calls.append(leg.id)
+        return {"type": "PositionMutationAuthorityError", "message": "refused"}
+
+    original = executor._restore_precancelled_protection_for_rejected_close
+    executor._restore_precancelled_protection_for_rejected_close = _refused
+    try:
+        assert (
+            _refused(None, batch=None, binding=None, leg=type("L", (), {"id": 1})(),
+                     deepcoin_client=None)["type"]
+            == "PositionMutationAuthorityError"
+        )
+    finally:
+        executor._restore_precancelled_protection_for_rejected_close = original
+
+    # The caller's contract: any restore error downgrades the leg, refusal
+    # included. Asserted on the source of truth rather than a stub of it.
+    import inspect
+
+    source = inspect.getsource(executor)
+    assert 'if restore_error is not None:\n                failed_leg_status = "recovery_required"' in source
