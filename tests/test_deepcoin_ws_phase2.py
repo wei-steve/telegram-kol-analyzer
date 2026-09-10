@@ -12,6 +12,7 @@ hand-written frame would not prove anything about it.
 from __future__ import annotations
 
 import asyncio
+import logging
 import json
 import pathlib
 from datetime import UTC, datetime
@@ -1088,8 +1089,36 @@ def test_a_silent_socket_that_missed_nothing_is_not_a_gap(tmp_path):
 
     inbox._sleep = _sleep
 
-    with pytest.raises(asyncio.CancelledError):
-        asyncio.run(inbox.run_forever())
+    # Not caplog: it needs propagation to the root logger and the global disable
+    # level left alone, and something else in the suite leaves neither intact --
+    # under the full run caplog captured nothing at all and this assertion would
+    # have been vacuous. A handler on the logger itself depends on neither.
+    probe_lines: list[str] = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            probe_lines.append(record.getMessage())
+
+    ws_logger = logging.getLogger("telegram_kol_research.deepcoin_private_ws")
+    handler = _Collect(level=logging.INFO)
+    prior_level = ws_logger.level
+    prior_disable = logging.root.manager.disable
+    ws_logger.addHandler(handler)
+    ws_logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(inbox.run_forever())
+    finally:
+        ws_logger.removeHandler(handler)
+        ws_logger.setLevel(prior_level)
+        logging.disable(prior_disable)
+
+    # The observation window counts occurrences of this string to learn how many
+    # probes ran, so one probe must leave exactly one line. It once left two,
+    # and the sampled probe count silently doubled.
+    probes = [line for line in probe_lines if "Deepcoin silence probe" in line]
+    assert len(probes) == 3, probes
 
     from telegram_kol_research.models import DeepcoinWsConnectionGap
 

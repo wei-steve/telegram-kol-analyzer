@@ -1060,23 +1060,20 @@ class DeepcoinPrivateWsInbox:
                 self.silence_baseline_stale = False
         else:
             self.silence_probe_reconnects += 1
-        # Logged at INFO on every outcome, passes included. The counters above
-        # are lost on restart and only readable through the health endpoint;
-        # journald is the one place an observation window can go back and read
-        # what each individual probe decided.
+        # One line per outcome, passes included. The counters above are lost on
+        # restart and only readable through the health endpoint; journald is the
+        # one place an observation window can go back and read what each
+        # individual probe decided. Exactly one line, because an observer that
+        # counts occurrences of this string is counting probes -- two lines per
+        # probe made that count silently double.
         logger.info(
-            "Deepcoin silence probe %s (%s): pass=%d reconnect=%d refresh=%d",
+            "Deepcoin silence probe %s (%s) gets=%s: pass=%d reconnect=%d refresh=%d",
             probe.status,
             probe.reason or "-",
+            (probe.detail or {}).get("gets"),
             self.silence_probe_passes,
             self.silence_probe_reconnects,
             self.silence_probe_refreshes,
-        )
-        logger.info(
-            "Deepcoin silence probe: %s (%s) gets=%s",
-            probe.status,
-            probe.reason,
-            (probe.detail or {}).get("gets"),
         )
 
     def _acquire_listen_key(self) -> str:

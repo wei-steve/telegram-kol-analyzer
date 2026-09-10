@@ -821,6 +821,19 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   真实开销是 `1 + 持仓 instrument 数 + (有限价腿则 1)`，**instrument 数没有代码上界**。
   每 600 秒一次、对着 5/s 配额不构成风险，不加限；但阶段文件、模块 docstring 都已改成实情——
   一个没人执行的上界不能当上界写下来。发现方式：部署前拿生产库只读跑一遍取样口径。
+- phase-6-pre-4-double-counted-probes (2026-09-10, 6-pre-4 会话 local_4a6676b0，**第一次部署后 13 分钟自查发现**): 探活在生产上第一次跑通就暴露了我自己造的一个计数缺陷。
+  日志证据（08:40:32Z，部署后第一次静默到点）：
+  `Deepcoin silence probe missed_nothing (no_change_during_silence): pass=1 reconnect=0 refresh=0`
+  **同一次探活还打了第二条** `Deepcoin silence probe: missed_nothing (...) gets=4`——
+  后者是我更早写的，加前者时没发现已有一条。观测脚本靠 `grep -c "Deepcoin silence probe"`
+  数探活次数，于是样本里 `probes=2 / probe_passes=1`：**探活数悄悄翻倍**。
+  形状是"**观测量的定义依赖一个没人保证的不变量**"（一次事件一行日志），
+  和 A 线 A-8c、A-10b 的正向计数是同一族。修法两处：
+  (1) 合成一条日志（含 `gets=` 与三个计数），并加测试断言"三次探活恰好三行"，
+      变异（把日志加回两条）确认变红；
+  (2) 观测脚本的正则改成只匹配新格式 `Deepcoin silence probe <status> (`。
+  **顺带印证了 4 个 GET**：`gets=4`，与部署前只读实测一致。
+  第一个窗口 `messages=0`（什么都没攒到）时重开，代价近似为零。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
 - phase-6-pre (2026-09-09, 指挥会话): 阶段 5 完成（首笔真实入场 binding 346：市价腿回执无 posId、三重确认在提交时通过；限价腿 9 字段无 clOrdId 被接受、止损随单附带在成交前已存在；5a 护栏首次面对真实活挂单 allowed）。阶段 6 之前插入三项前置：6-pre-1 WS 缺口入场改为可重试推迟（L2）；6-pre-2 B-5d 市价成交裸仓安全网（L3，需用户批准）；6-pre-3 补测第 10 项修改 TPSL 后 OS/TU 稳定性只读观测。见 phase-6-pre.md。
