@@ -222,6 +222,9 @@ from telegram_kol_research.execution_bindings import sync_manual_closed_deepcoin
 from telegram_kol_research.position_attribution import PositionAttributionError
 from telegram_kol_research.position_attribution import has_authoritative_persisted_position
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
+from telegram_kol_research.deepcoin_trigger_rows import (
+    any_trigger_price_including_entry_attached,
+)
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.protection_ledger import (
     build_account_protection_ownership,
@@ -3492,17 +3495,10 @@ def _exchange_protection_display_rows(
             # instead of either dropping it or claiming a verified association.
             ownership_state = "无法归属"
 
-        for kind, keys in (
-            ("take_profit", ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")),
-            ("stop_loss", ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")),
-        ):
-            trigger_price = next(
-                (
-                    order.get(key)
-                    for key in keys
-                    if _is_nonzero_price(order.get(key))
-                ),
-                None,
+        # A-14: same keys, same order, same zero-as-absent rule, now named.
+        for kind, row_kind in (("take_profit", "tp"), ("stop_loss", "sl")):
+            trigger_price = any_trigger_price_including_entry_attached(
+                order, kind=row_kind
             )
             trigger_price_text = _position_text_value(trigger_price)
             if trigger_price_text is None:
@@ -3672,29 +3668,16 @@ def _normalize_position_amount(value: Any) -> str:
 def _deepcoin_tpsl_price(order: dict[str, Any] | None, kind: str) -> Any:
     if not order:
         return None
-    keys = (
-        ("slTriggerPrice", "closeSLTriggerPrice")
-        if kind == "sl"
-        else ("tpTriggerPrice", "closeTPTriggerPrice")
+    # A-14: order rows only, so the position-row spelling is excluded exactly
+    # as before; same keys, same order, same zero-as-absent rule.
+    return any_trigger_price_including_entry_attached(
+        order, kind=kind, include_position_field=False
     )
-    for key in keys:
-        value = order.get(key)
-        if _is_nonzero_price(value):
-            return value
-    return None
 
 
 def _deepcoin_position_tpsl_price(position: dict[str, Any], kind: str) -> Any:
-    keys = (
-        ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-        if kind == "sl"
-        else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
-    )
-    for key in keys:
-        value = position.get(key)
-        if _is_nonzero_price(value):
-            return value
-    return None
+    # A-14: same keys, same order, same zero-as-absent rule, now named.
+    return any_trigger_price_including_entry_attached(position, kind=kind)
 
 
 def _load_live_position_attribution_candidates(
