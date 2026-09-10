@@ -269,8 +269,17 @@ worker（与本地 `all`）角色必须有活的 inbox 且 `ws_observation_permi
 **所以任何"这个仓位的主止损是多少"的判断，只能读 `trigger-orders-pending` 全集、
 按 `TU`/`ordId` 取，绝不能读仓位行。** 这条比读错字段名危险：读错字段名会拿到 `None` 而暴露，
 读仓位行会拿到一个**存在的、格式正确的、含义错误的**价格。
-（6h 的判据即此：break-even 现在读的正是仓位行的这个字段，把字段名改对但仍读仓位行，
-会用备份止损价去判断保本是否达成。）
+**更正一处我自己说错的话。** 我曾据此告诉两条线"break-even 读的正是仓位行的这个字段"。
+**查过了，不对**：`break_even_convergence_executor` 从不读仓位行的 `slTriggerPx`，
+它读的是 `trigger-orders-pending`——**读对了表，用错了词汇**。两处（约 650 行的止损、
+约 795 行的止盈）都对 TPSL 挂单行取 `posId` 与 `slTriggerPx` / `tpTriggerPx`，
+而 TPSL 行**根本不带 `posId`**、价格字段叫 `slTriggerPrice` / `tpTriggerPrice`，
+所以两个条件各自都必然不成立，`break_even_existing_stop_drift` 每次必抛。
+**这条更正对 6h 的判据是实质性的**：把判据写成"必须读挂单表而不是仓位行"**不会改变任何事**，
+因为它已经在读挂单表了。真判据是**词汇与归属**——TPSL 行没有 `posId`，
+归属只能靠 ordId 或 `TU`，价格只能按 TPSL 行自己的键名读。
+**而我那句错话的来历，正是本节反复讲的那个形状**：仓位行翻成备份价是我实测的（真）、
+break-even 有坏读取器也是真的（A-13），我把两个真事实接成了一个从未验证的因果。
 
 **保护单归属只有一条判据：`TU == posId`。** `OS`（保护单自己的 ordId）每次写入都变，
 REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两张止损之间唯一的可查关联，

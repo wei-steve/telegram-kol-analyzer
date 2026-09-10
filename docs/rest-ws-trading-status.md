@@ -1036,6 +1036,26 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6h-defect-restated (2026-09-10, 会话 local_4a6676b0 自查, **我说错了一句，而它已经被写进 6h 判据**):
+  我曾向指挥会话与 A 线两次表述："break-even 的坏读取器读的正是仓位行的 `slTriggerPx`，
+  6h 只改字段名而仍读仓位行会拿到备份止损价"。**查过之后，这句是错的。**
+  `break_even_convergence_executor` **从不读仓位行的 `slTriggerPx`**。它对 `list_positions`
+  的两处使用（约 410 行的平仓回读取 `posId`/`pos`、约 542 行的漂移校验取
+  `instId`/`posSide`/`pos`/`avgPx`）**都是仓位行本来就带的字段，用法正确**。
+  **真实缺陷是"读对了表，用错了词汇"**：约 650 行（止损）与约 795 行（止盈）拿的是
+  `trigger-orders-pending` 的 TPSL 行，却对它取 `posId` 与 `slTriggerPx` / `tpTriggerPx`——
+  而 TPSL 行**根本不带 `posId`**（A-14 已把这条写成命名读取器），价格键叫
+  `slTriggerPrice` / `tpTriggerPrice`。**两个条件各自单独都必然不成立**，
+  所以 `break_even_existing_stop_drift` 每次必抛，与 A-13 观测到的"从未成功过"吻合。
+  **对 6h 判据的实质影响**：指挥会话据我那句话把判据定为
+  "必须读 `trigger-orders-pending` 全集、不读仓位行"。**这条判据不会改变任何事**，
+  因为它已经在读挂单表了。**真判据是词汇与归属**：TPSL 行无 `posId`，
+  归属只能按 ordId 或 `TU`；价格只能按 TPSL 行自己的键名读；比较前转 `Decimal`（6f-1）。
+  **这句错话的来历**：仓位行下单后翻成备份价，是我亲自实测的（真）；break-even 有坏读取器，
+  是 A-13 查出来的（真）。**我把两个真事实接成了一条从未验证过的因果。**
+  **这是同一形状在一天内的第五次**，而且是最贵的一次——前四次错的是我自己的判断，
+  这次错的东西**被上游采纳成了判据**。**说明"它能回答我这个问题吗"这一问，
+  在把结论交给别人之前必须再问一遍**，因为交出去之后，纠正的成本不再只由我承担。
 - phase-6f-2-window-criteria-amended-midwindow (2026-09-10, 会话 local_4a6676b0, **窗中途追加，如实标明**):
   A 线（`local_22ee72a5`）在他们 A-14 收窗时发现：他们的观察脚本一直把 `rounds` 当成
   "系统在干活"的证据，**但 reconcile 是固定 60 秒定时触发，`rounds == elapsed_minutes` 是恒等式**，
@@ -1110,8 +1130,9 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **一条新观察（已写入 ARCHITECTURE 4.8，并作为 6h 判据）**：下单后
   **仓位行的 `slTriggerPx` 变成了备份价 `75548.6`**，而主止损单仍在 `trigger-orders-pending` 里。
   叠加语义下仓位行只显示最后写的那张，而先触及的是 `75700` 那张——**仓位行显示的恰恰不是会先生效的那张**。
-  break-even 读的正是仓位行这个字段：6h 只改字段名而仍读仓位行，会拿备份止损价去判断保本是否达成，
-  **读得到、格式对、含义错**，比拼错字段名更难发现。
+  **（后续更正，见 `phase-6h-defect-restated`：我当时说"break-even 读的正是仓位行这个字段"，
+  查过之后是错的——它读的是挂单表，只是用了仓位行的字段名。仓位行"只显示最后一次写入"
+  这个观测本身成立且重要，但它不是 break-even 那个缺陷的成因。）**
 - phase-6f-1-planned-values-compared-as-strings (2026-09-10, 会话 local_4a6676b0, **6f 首笔被一条既有守卫挡住，指挥会话裁定作为 6f 前置缺陷在 6f 内修**):
   6f 部署（`681257331d23a6337088ae0c8e22e91d2dedcf72`）后第一轮 reconcile（20:08:02Z），
   释放的仓位 `1001125216121996` **没有下出去**，记 `backup_stop_blocked` /
