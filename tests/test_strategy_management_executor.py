@@ -7533,7 +7533,10 @@ def test_a_refused_protection_replacement_is_announced(tmp_path):
 
 
 def test_a_refusal_during_rollback_stays_recovery_required(tmp_path):
-    """Site 3, deliberately not reclassified -- and this test says so.
+    """Site 3, deliberately not reclassified -- and this test *records* that.
+
+    A-15 mutation-checked it: reclassifying the rollback leaves this green, so
+    it is documentation of the current behaviour rather than a guard on it.
 
     The refusal is definite: this new protection order was not cancelled. What
     it leaves is a live order the rollback meant to remove and a ledger that no
@@ -7579,7 +7582,15 @@ def test_a_refusal_during_rollback_stays_recovery_required(tmp_path):
         executor.submit_exact_position_sltp = real_submit
         executor.cancel_exact_position_sltp = real_cancel
 
-    assert "recovery_required" in [leg["status"] for leg in result["legs"]]
+    # A-15, and the claim is now only what was verified. The original `in`
+    # form was loosened further than intended, so it is tightened to the leg
+    # itself -- but a mutation check (treating the refusal as a successful
+    # rollback) leaves even the tightened form green, so **this test does not
+    # stop somebody reclassifying the rollback**. It records the current
+    # behaviour; it does not defend it. The A-11b comment that claimed
+    # otherwise was a claim, not a guarantee.
+    statuses = [leg["status"] for leg in result["legs"]]
+    assert statuses[0] == "recovery_required", statuses
 
 
 def test_the_unknown_side_of_the_protection_boundary_is_unchanged(tmp_path):
@@ -7634,8 +7645,12 @@ def test_a_refused_protection_restore_stays_recovery_required(tmp_path):
     finally:
         executor._restore_precancelled_protection_for_rejected_close = original
 
-    # The caller's contract: any restore error downgrades the leg, refusal
-    # included. Asserted on the source of truth rather than a stub of it.
+    # A-15, corrected claim: this asserts the *caller's* contract text -- that
+    # any restore error downgrades the leg -- and nothing about the helper. A
+    # mutation making the helper report success on a refusal leaves this green,
+    # so it does not stop somebody changing the helper; it only stops somebody
+    # removing the caller's downgrade. That is what it guarantees, and the
+    # earlier comment claimed more.
     import inspect
 
     source = inspect.getsource(executor)

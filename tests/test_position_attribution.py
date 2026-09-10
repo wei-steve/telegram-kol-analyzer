@@ -818,3 +818,73 @@ def test_recorded_cancel_event_classifies_as_exchange_cancelled():
         )
         == "exchange_cancelled"
     )
+
+
+# ---------------------------------------------------------------------------
+# A-15: a gate that could not pass, because it asked for a pair
+#
+# require_equivalent_live_position_economics compares a reviewed position
+# against the live row and refuses management execution when they differ. Two
+# of its conjuncts required a take-profit on *both* sides -- and production
+# entries carry a stop and no take-profit, so a real position row reads
+# tpTriggerPx: "" and the gate refused a row compared against itself. Measured
+# on 2026-09-10 before the fix; these tests are the fix's shape.
+
+_STOP_ONLY_POSITION_ROW = {
+    "avgPx": "77000", "cTime": "1789056476000", "instId": "BTC-USDT-SWAP",
+    "mgnMode": "cross", "mrgPosition": "split", "pos": "15",
+    "posId": "1001125216121996", "posSide": "long",
+    "slTriggerPx": "75700", "tpTriggerPx": "",
+}
+
+
+def _evidence(**overrides):
+    from telegram_kol_research.execution_bindings import build_position_evidence
+
+    row = dict(_STOP_ONLY_POSITION_ROW)
+    row.update(overrides)
+    return build_position_evidence(row)
+
+
+def test_a_stop_only_position_is_equivalent_to_itself():
+    """The failure this fixes: the gate refused a row compared with its copy."""
+
+    from telegram_kol_research.position_attribution import (
+        _reviewed_position_matches_live,
+    )
+
+    evidence = _evidence()
+    assert evidence.take_profits == (), "the real row carries no take-profit"
+    assert _reviewed_position_matches_live(evidence, _evidence()) is True
+
+
+def test_a_take_profit_appearing_or_disappearing_is_still_a_change():
+    """The other half: absent on one side and present on the other differs."""
+
+    from telegram_kol_research.position_attribution import (
+        _reviewed_position_matches_live,
+    )
+
+    stop_only = _evidence()
+    with_take_profit = _evidence(tpTriggerPx="80000")
+    assert _reviewed_position_matches_live(stop_only, with_take_profit) is False
+    assert _reviewed_position_matches_live(with_take_profit, stop_only) is False
+
+
+def test_the_stop_comparison_is_untouched():
+    """A-15 changed only the take-profit conjuncts."""
+
+    from telegram_kol_research.position_attribution import (
+        _reviewed_position_matches_live,
+    )
+
+    assert (
+        _reviewed_position_matches_live(_evidence(), _evidence(slTriggerPx="75000"))
+        is False
+    )
+    assert (
+        _reviewed_position_matches_live(
+            _evidence(tpTriggerPx="80000"), _evidence(tpTriggerPx="81000")
+        )
+        is False
+    )

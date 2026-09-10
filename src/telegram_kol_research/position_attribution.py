@@ -636,8 +636,15 @@ def _reviewed_position_matches_live(
     )
     return bool(
         not any(value is None for value in required_values)
-        and reviewed.take_profits
-        and current.take_profits
+        # A-15. These two conjuncts used to require a take-profit on *both*
+        # sides, which made the whole gate unpassable for the way entries are
+        # actually placed: production entries carry a stop and no take-profit,
+        # so a real position row reads ``tpTriggerPx: ""`` and the comparison
+        # failed against itself -- measured on 2026-09-10, this function
+        # returned False for one row compared with a copy of the same row.
+        # The comparison below already says what is meant: two empty tuples are
+        # equivalent, and one empty against one non-empty is a change. Requiring
+        # both to be non-empty said something else and was never intended.
         and _normalize_instrument(reviewed.symbol)
         == _normalize_instrument(current.symbol)
         and _normalize_side(reviewed.side) == _normalize_side(current.side)
