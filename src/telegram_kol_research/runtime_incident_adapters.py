@@ -542,6 +542,54 @@ def capture_position_marked_manually_closed(
     )
 
 
+def capture_management_protection_authority_refused(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    batch_id: int,
+    leg_id: int,
+    pos_id: str,
+    reason: str,
+    rolled_back_order_ids: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a protection replacement the gateway refused (A-11b).
+
+    Same reasoning as the close leg in A-11, one step further in: correcting
+    the classification is what makes this quiet. On the unknown side the leg
+    sat in recovery_required and a person came to look; on the definite side
+    the partial replacement is rolled back, the leg reads ``restored``, and the
+    batch finishes -- so "the stop this instruction was meant to move was not
+    moved" would leave no trace at all without this.
+    """
+
+    if not config.captures("management_protection_authority_refused"):
+        return None
+    fixed = {
+        "component": "management_protection",
+        "reason_code": _safe_label(reason),
+        "operation": f"batch_{int(batch_id)}_leg_{int(leg_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="strategy_management_leg",
+        source_record_id=str(int(leg_id)),
+        incident_type="management_protection_authority_refused",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact="protection_not_replaced_rolled_back",
+            retry_count=int(rolled_back_order_ids),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_management_close_authority_refused(
     session_factory: sessionmaker,
     *,
