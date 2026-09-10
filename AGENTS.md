@@ -55,7 +55,16 @@
   shared branch" are two different checks: the first stops you from reverting
   yourself, the second stops somebody else from reverting you. Both are
   required. **A cutover commit that has not been released must never reach the
-  shared branch** -- push the exact deployed sha, not your branch tip. tg-deploy does not install Python dependencies: when
+  shared branch** -- push the exact deployed sha, not your branch tip. The bar
+  is production *code*, not the sha: the shared branch may run ahead by
+  documentation-only commits, and the test is
+  `git diff <production sha> <branch tip> --name-only | grep '\.py$'` coming
+  back empty. Read literally as "never ahead of production" the rule would
+  make an observation window's own result impossible to record without
+  redeploying for a docs change and resetting somebody else's window, which is
+  a cost with nothing on the other side of it -- what the rule exists to stop
+  is undeployed code riding along on the next person's deploy.
+  tg-deploy does not install Python dependencies: when
   `pyproject.toml` dependencies change, `pip install` them into
   `/opt/telegram-kol-analyzer/.venv` on the server before running tg-deploy.
   The former stage/activate helper
