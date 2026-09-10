@@ -885,6 +885,38 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **作废前那 27 分钟仍有参考价值但不作判据**：2 次探活全通过、0 个 silence_timeout，基线是 3 个/30 分钟。
 - ws-gap-quantified (2026-09-09, 6-pre-1 会话发现，指挥会话记录): 过去 24 小时 145 个 WS 缺口、1060 秒、全天 1.23%，134 个来自 600 秒静默重连；阶段 5 的终态拒绝意味着约 1.2% 的新入场会被静默判死。6-pre-1 改为推迟重试后影响消除；新增 6-pre-4 改静默重连为先探活。item 1022/1023（17 小时的陈旧 pending 指令项）交 A 线 step 6 收尾时作废。
 - phase-6-pre-2-approval (2026-09-09, 用户在指挥会话明确批准): 6-pre-2 市价成交裸仓安全网（B-5d，L3）获批领取：市价腿归属 unverified 超 60 秒且该 instId+side 恰有一个无人认领、数量恰等于成交量的活跃仓位时，只挂止损不挂止盈、不认领所有权、attribution 标 unverified_sl_by_unique_candidate 并记 critical 告警；不唯一只告警。
+- phase-6c-close-authority (2026-09-10, 会话 local_4a6676b0, **子步 6c：核实为主，无交易所写入语义变化**):
+  阶段文件任务 3 要求"`close_bound_position` 按绑定链的确切 posId 平仓、unverified 拒绝走人工、
+  web 角色无执行权限"。**逐条核实的结论是这三条在代码里已经成立**，本步因此没有改交易语义，
+  只补上阶段文件明确要求、而此前缺失的"三个独立用例"，并把核实结果记在这里：
+  路径 `web → worker_command_jobs → worker`（`close_bound_position` 是四条命令之一），
+  `close_bound_position_market` 按精确 `pos_id` 选仓、`_require_verified_binding_positions` +
+  网关 `_load_verified_binding` 双重要求 `attribution_status='verified'`。
+  新增 `tests/test_phase6_unverified_refusals.py`：修改 / 撤销 / 平仓**三个独立用例**，
+  每个都断言两件事——拒绝了，**且交易所客户端一次都没被调用**（只断言 raises 的用例，
+  会被"发出去了但随后报错"骗过）。
+  **变异检验暴露了这套守卫的真实形状，值得记**：单独关掉
+  `require_verified_position_ownership` 时**十条用例全绿**——因为修改与撤销还被网关里
+  另一处独立的 `attribution_status` 比较挡着；把两处一起关掉才有 6 条转红。
+  也就是说**单点变异检验在纵深防御下会给出"测试没在测"的假象**，要证明用例真的咬住，
+  必须把**同一条性质的所有守卫**一起关掉。
+  **同时暴露了我自己一个更糟的写法**：平仓用例最初拿到的拒绝是
+  `position_not_bound_to_exactly_one_active_binding`——因为夹具没给 binding 写 `pos_id`，
+  于是它**因为夹具的原因被拒**，而不是因为归属未核实；这正是那条用例自己的注释警告的
+  "refusal for the wrong reason looks exactly like a refusal for the right one"。
+  修好夹具后单点变异即可让三条平仓用例转红。
+  全量 **8289 passed / 4 skipped / 0 failed**。
+- phase-6c-finding-close-refusal-mislabelled (2026-09-10, 会话 local_4a6676b0 只读发现,
+  **不在本步改，报指挥会话定归属**): `strategy_management_executor` 的自动平仓腿
+  （批次执行，非 worker_command 的人工平仓）在网关因归属未核实而**拒绝写入**时，
+  拿到的是 `PositionMutationAuthorityError`，而它落在**通用 `except Exception`** 分支里 →
+  腿被置为 **`submit_unknown`**、reason `submission_outcome_unknown`。
+  但 `PositionMutationAuthorityError` 只在 `_block`（全部发生在 `submit()` 之前）与
+  授权构建阶段抛出，**意味着一次交易所写入都没有发生**。
+  把"我们拒绝写"记成"可能已经写了"，代价是：批次被冻结等人处理一个从未被触碰的交易所状态，
+  并按 `ALWAYS_NOTIFIED` 发出 `management_submit_unknown` 告警。
+  阶段文件任务 3 的范围是 `close_bound_position`（人工路径），而这条在管理批次执行器里、
+  属 A 线模块，**故本步不动**，交指挥会话裁定归属。
 - phase-6b-shadow-window-criteria (2026-09-10T14:35Z, 会话 local_4a6676b0, **起窗前写下**):
   6b 影子已上线：**`760b2ab8dc740bab6bf9b7b3e9ea7f10557c42b7`**，14:33Z 经 `tg-deploy`，
   **回滚参考 `5c07ab6d`**（A 线 A-10e），部署后已立即推共享分支（已核实）。
