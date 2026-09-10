@@ -181,14 +181,14 @@ def apply_plan(session, plan: dict[str, Any], *, now: datetime,
         else:
             continue
         _audit(session, table=table, row_id=row_id, changes=fields,
-               exchange_evidence=exchange_evidence)
+               exchange_evidence=exchange_evidence, now=now)
         applied.append({"table": table, "row_id": row_id})
     session.flush()
     return {"applied": applied}
 
 
 def _audit(session, *, table: str, row_id: int, changes: list[tuple[str, Any, Any]],
-           exchange_evidence: dict[str, Any]) -> None:
+           exchange_evidence: dict[str, Any], now: datetime) -> None:
     fingerprint = hashlib.sha256(
         json.dumps({"repair": REPAIR_TAG, "table": table, "row_id": row_id},
                    sort_keys=True).encode("utf-8")
@@ -202,12 +202,21 @@ def _audit(session, *, table: str, row_id: int, changes: list[tuple[str, Any, An
         return
     session.add(
         PositionAttributionAudit(
+            # Addressed the way every other audit row is, so that looking this
+            # position up later finds the repair alongside its history. Which
+            # row was touched lives in ``evidence_json``; uniqueness is the
+            # fingerprint's job, not this column's.
+            execution_binding_id=BINDING_ID,
+            execution_order_leg_id=(
+                LEG_ID if table == "execution_order_legs" else None
+            ),
             venue="deepcoin",
-            pos_id=f"{table}:{row_id}",
+            pos_id=POS_ID,
             event_type=AUDIT_EVENT_TYPE,
             prior_state=str(changes[0][1])[:32] if changes and changes[0][1] else None,
             new_state=str(changes[0][2])[:32] if changes and changes[0][2] else "cleared",
             fingerprint=fingerprint,
+            created_at=now,
             evidence_json=json.dumps(
                 {
                     "repair": REPAIR_TAG,
@@ -215,9 +224,12 @@ def _audit(session, *, table: str, row_id: int, changes: list[tuple[str, Any, An
                     "table": table,
                     "row_id": row_id,
                     "why": (
-                        "written off by a single positions snapshot on "
-                        "2026-09-08T01:23:03Z; the position never left the "
-                        "exchange (A-10a)"
+                        "closed at 2026-09-08T01:23:03.102990Z by a sweep "
+                        "holding a positions snapshot taken before this "
+                        "position existed (cTime 01:23:07Z); it committed "
+                        "after the round that had just claimed the position "
+                        "and armed a stop on it, overwriting status=active. "
+                        "The position never left the exchange (A-10a/A-10c)"
                     ),
                     "exchange_evidence": exchange_evidence,
                     "changes": [
