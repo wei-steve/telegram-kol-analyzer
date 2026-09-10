@@ -59,6 +59,12 @@ PROBE_PASS = "missed_nothing"
 PROBE_CHANGED = "changed_during_silence"
 PROBE_UNREADABLE = "unreadable"
 PROBE_NO_BASELINE = "no_baseline"
+#: A frame arrived since the baseline was taken, so the baseline describes a
+#: world we have already been told changed. Comparing against it would report a
+#: difference we did not miss. The probe refreshes it and passes instead --
+#: what it is really asking is "has anything changed **since the last frame**",
+#: and a frame having just arrived is itself evidence the stream was alive.
+PROBE_REFRESHED = "baseline_refreshed_after_frame"
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,9 +76,15 @@ class SilenceProbeResult:
 
     @property
     def missed_nothing(self) -> bool:
-        """Only an affirmative answer keeps the connection. Everything else reconnects."""
+        """Only an affirmative answer keeps the connection. Everything else reconnects.
 
-        return self.status == PROBE_PASS
+        Two answers are affirmative and they mean different things: nothing
+        changed since the last probe, or the baseline predated a frame we did
+        receive. Both establish that no event went unseen; only the second one
+        costs a baseline refresh.
+        """
+
+        return self.status in (PROBE_PASS, PROBE_REFRESHED)
 
 
 def _canonical(value: Any) -> str:
@@ -258,6 +270,7 @@ def probe_silence(
     session_factory,
     *,
     baseline_fingerprint: str | None,
+    baseline_stale: bool = False,
 ) -> SilenceProbeResult:
     """The whole decision: keep reading, or reconnect.
 
@@ -277,6 +290,18 @@ def probe_silence(
         return SilenceProbeResult(
             PROBE_UNREADABLE,
             reason=str(detail.get("failure") or "unreadable"),
+            detail=detail,
+        )
+    if baseline_stale:
+        # Frames arrived after the baseline was taken. We were told about those
+        # changes, so a difference here is not something we missed -- it is the
+        # baseline being out of date. Adopt this snapshot as the new baseline
+        # and keep the connection: the arriving frames already showed the
+        # stream was being routed to us.
+        return SilenceProbeResult(
+            PROBE_REFRESHED,
+            fingerprint=fingerprint,
+            reason="baseline_predates_last_frame",
             detail=detail,
         )
     if baseline_fingerprint is None:

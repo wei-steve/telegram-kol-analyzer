@@ -853,9 +853,11 @@ class DeepcoinPrivateWsInbox:
         # has been established and its resync converged -- the last moment the
         # local picture is known to be right.
         self.silence_baseline_fingerprint: str | None = None
+        self.silence_baseline_stale = False
         self.silence_probe_total = 0
         self.silence_probe_passes = 0
         self.silence_probe_reconnects = 0
+        self.silence_probe_refreshes = 0
         self.last_event_id: int | None = None
         self.last_event_received_ms: int | None = None
         self.open_gap_id: int | None = None
@@ -961,6 +963,7 @@ class DeepcoinPrivateWsInbox:
             self.silence_baseline_fingerprint = None
             return
         self.silence_baseline_fingerprint = fingerprint
+        self.silence_baseline_stale = False
         if fingerprint is None:
             logger.warning(
                 "Deepcoin silence baseline unavailable: %s",
@@ -983,6 +986,7 @@ class DeepcoinPrivateWsInbox:
                     client,
                     self._session_factory,
                     baseline_fingerprint=self.silence_baseline_fingerprint,
+                    baseline_stale=self.silence_baseline_stale,
                 )
             finally:
                 close = getattr(client, "close", None)
@@ -1007,15 +1011,22 @@ class DeepcoinPrivateWsInbox:
         indistinguishable from the stream having gone quiet for other reasons.
         """
 
-        from telegram_kol_research.deepcoin_ws_silence_probe import PROBE_PASS
+        from telegram_kol_research.deepcoin_ws_silence_probe import (
+            PROBE_PASS,
+            PROBE_REFRESHED,
+        )
 
         self.silence_probe_total += 1
-        if probe.status == PROBE_PASS:
+        if probe.status == PROBE_REFRESHED:
+            self.silence_probe_refreshes += 1
+        if probe.status in (PROBE_PASS, PROBE_REFRESHED):
             self.silence_probe_passes += 1
             # A passing probe is the new baseline: it is the most recent moment
-            # we know the picture was right.
+            # we know the picture was right, and from here the next silence is
+            # measured against it rather than against anything older.
             if probe.fingerprint:
                 self.silence_baseline_fingerprint = probe.fingerprint
+                self.silence_baseline_stale = False
         else:
             self.silence_probe_reconnects += 1
         logger.info(
@@ -1311,6 +1322,11 @@ class DeepcoinPrivateWsInbox:
                 else str(raw)
             )
             self.state_machine.mark_frame_received()
+            # 6-pre-4. This frame told us about whatever it changed, so the
+            # baseline now describes a world we already know moved on. The next
+            # silence probe must refresh rather than report a difference we did
+            # not miss.
+            self.silence_baseline_stale = True
             # The expiry check rides along with the write so that a frame is
             # parsed once, in the worker thread, rather than a second time on
             # the event loop -- frames may be up to two megabytes.

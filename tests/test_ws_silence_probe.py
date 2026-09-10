@@ -370,3 +370,80 @@ def test_a_probe_that_raises_is_an_unreadable_answer_not_a_crash(tmp_path):
 
     assert result.status == PROBE_UNREADABLE
     assert result.missed_nothing is False
+
+
+# --- the stale baseline: a difference we were told about is not a miss ----
+
+
+def test_a_frame_since_the_baseline_refreshes_instead_of_reconnecting(tmp_path):
+    """The common case, and the one that would have cancelled the phase's gain.
+
+    Activity, then silence. The frames told us what changed, so comparing the
+    post-silence snapshot against a pre-activity baseline reports a difference
+    we did not miss -- and would reconnect every single time there had been
+    trading, which is precisely when silence follows.
+    """
+
+    from telegram_kol_research.deepcoin_ws_silence_probe import PROBE_REFRESHED
+
+    session_factory = _factory(tmp_path, name="stale.db",
+                               legs=[("trigger_limit", "pending")])
+    client = Client(positions=[_position("p1", size="2")], pending={INST: []})
+    baseline, _ = take_silence_snapshot(
+        client, instruments=[INST], include_open_orders=False
+    )
+    # A frame arrived and told us the position grew.
+    client._positions = [_position("p1", size="5")]
+
+    result = probe_silence(
+        client, session_factory,
+        baseline_fingerprint=baseline, baseline_stale=True,
+    )
+
+    assert result.status == PROBE_REFRESHED
+    assert result.missed_nothing is True
+    # The refreshed fingerprint describes the world as it is now.
+    assert result.fingerprint != baseline
+
+
+def test_a_stale_baseline_does_not_excuse_an_unreadable_exchange(tmp_path):
+    """Refreshing is still a read. If the read fails, rule 4 wins."""
+
+    session_factory = _factory(tmp_path, name="stale-unreadable.db",
+                               legs=[("trigger_limit", "pending")])
+    client = Client(fail="positions")
+
+    result = probe_silence(
+        client, session_factory,
+        baseline_fingerprint="old", baseline_stale=True,
+    )
+
+    assert result.status == PROBE_UNREADABLE
+    assert result.missed_nothing is False
+
+
+def test_the_frame_marks_the_baseline_stale_and_a_pass_clears_it(tmp_path):
+    """The flag has to be set by frames and cleared by an affirmative probe."""
+
+    import asyncio
+
+    from telegram_kol_research.deepcoin_ws_silence_probe import (
+        PROBE_REFRESHED,
+        SilenceProbeResult,
+    )
+
+    inbox = _inbox(
+        tmp_path,
+        probe_result=SilenceProbeResult(PROBE_REFRESHED, fingerprint="f2"),
+        name="stale-flag.db",
+    )
+    inbox.silence_baseline_stale = True
+
+    inbox._record_probe_outcome(
+        SilenceProbeResult(PROBE_REFRESHED, fingerprint="f2")
+    )
+
+    assert inbox.silence_baseline_stale is False
+    assert inbox.silence_baseline_fingerprint == "f2"
+    assert inbox.silence_probe_refreshes == 1
+    assert inbox.silence_probe_reconnects == 0
