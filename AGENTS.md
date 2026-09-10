@@ -58,8 +58,14 @@
   shared branch** -- push the exact deployed sha, not your branch tip. The bar
   is production *code*, not the sha: the shared branch may run ahead by
   documentation-only commits, and the test is
-  `git diff <production sha> <branch tip> --name-only | grep '\.py$'` coming
-  back empty. Read literally as "never ahead of production" the rule would
+  `git diff <production sha> <branch tip> --name-only | grep -vE '^docs/|\.md$'`
+  coming back empty. Prose is exempt wherever it lives -- `docs/`, this file,
+  any `README` -- because nothing executes it. Everything else counts, and
+  `.py` is not the boundary: a `scripts/*.sh` change, a systemd unit, or a
+  `pyproject.toml` dependency bump all alter how production behaves, and the
+  dependency case is the one this same section warns about two paragraphs
+  down, since tg-deploy does not install them. Read literally as "never ahead
+  of production" the rule would
   make an observation window's own result impossible to record without
   redeploying for a docs change and resetting somebody else's window, which is
   a cost with nothing on the other side of it -- what the rule exists to stop
