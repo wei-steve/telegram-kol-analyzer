@@ -20,6 +20,11 @@ which is which.
 * ``chain_resolved_legacy_ambiguous`` -- the improvement being bought. One
   unowned pending row makes the legacy matcher call the whole instrument
   ambiguous; the chain places that row by ``TU`` and keeps going.
+* ``chain_resolved_legacy_absent`` -- the same improvement by the other route:
+  the legacy matcher reports ``absent`` because nothing local can attribute the
+  order, so its verdict is "this position has no protection" while the exchange
+  holds one. Kept apart from ``set_mismatch`` because reading it as a
+  disagreement would frame the fix as a defect.
 * ``set_mismatch`` -- the two disagree about a concrete order id. This is the
   finding that would stop the switch, so it is recorded with both sets.
 * ``chain_frozen`` -- the chain refuses where the legacy matcher did not. Safe
@@ -67,6 +72,13 @@ SHADOW_EVENT_ACTION = "protection_authority_shadow"
 VERDICT_AGREED = "agreed"
 VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS = "chain_resolved_legacy_ambiguous"
 VERDICT_SET_MISMATCH = "set_mismatch"
+#: The chain named this position's protection and the legacy matcher answered
+#: ``absent`` -- it has no ownership source for an order nothing local records.
+#: Same family as ``chain_resolved_legacy_ambiguous``: an improvement, not a
+#: disagreement about a concrete order. Observed in production 2026-09-10 on
+#: both positions of that afternoon, where the legacy view was that two live
+#: positions had no protection at all while the exchange held a stop for each.
+VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT = "chain_resolved_legacy_absent"
 VERDICT_CHAIN_FROZEN = "chain_frozen"
 VERDICT_BOTH_EMPTY = "both_empty"
 #: A live position no verified entry leg owns -- somebody's manual position, or
@@ -79,6 +91,7 @@ SHADOW_VERDICTS = (
     VERDICT_AGREED,
     VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS,
     VERDICT_SET_MISMATCH,
+    VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT,
     VERDICT_CHAIN_FROZEN,
     VERDICT_BOTH_EMPTY,
     VERDICT_UNBOUND_POSITION,
@@ -171,6 +184,8 @@ def compare_position_protection(
         verdict = VERDICT_BOTH_EMPTY if not chain_order_ids else VERDICT_AGREED
     elif legacy_status == "present_but_ambiguous" and chain_order_ids:
         verdict = VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS
+    elif legacy_status == "absent" and chain_order_ids:
+        verdict = VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT
     else:
         verdict = VERDICT_SET_MISMATCH
 
@@ -236,6 +251,7 @@ def run_protection_authority_shadow_pass(
     excluded_pending_entry_stops = 0
     cancel_precheck_counts: dict[str, int] = {}
     ledger_drift_count = 0
+    would_adopt_count = 0
     try:
         positions = deepcoin_client.list_positions()
     except Exception:
@@ -246,6 +262,7 @@ def run_protection_authority_shadow_pass(
             "excluded_pending_entry_stops": 0,
             "cancel_precheck": {},
             "ledger_drift": 0,
+            "would_adopt": 0,
             "rows_recorded": 0,
             "read_failures": ["positions"],
         }
@@ -311,6 +328,13 @@ def run_protection_authority_shadow_pass(
                     cancel_precheck_counts.get(outcome, 0) + 1
                 )
             ledger_drift_count += len(comparison.ledger_drift)
+            # Phase 6e, shadow half. The chain already works out which orders it
+            # would have to write into the ledger before it may act on them;
+            # until now that plan was only recorded incidentally, inside the row
+            # of a position whose comparison happened to change. Counting it is
+            # what makes "how many protection orders is the ledger missing"
+            # answerable without writing anything.
+            would_adopt_count += len(comparison.adopted_order_ids)
             if comparison.verdict == VERDICT_UNBOUND_POSITION:
                 continue
             if _record_when_changed(
@@ -337,6 +361,7 @@ def run_protection_authority_shadow_pass(
         # future decision about keying the cancel gate on the ledger rests on a
         # measurement rather than on an assumption that drift is rare.
         "ledger_drift": ledger_drift_count,
+        "would_adopt": would_adopt_count,
         "rows_recorded": recorded,
         "read_failures": read_failures,
     }

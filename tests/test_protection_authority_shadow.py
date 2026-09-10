@@ -17,6 +17,7 @@ from telegram_kol_research.protection_authority_shadow import (
     VERDICT_AGREED,
     VERDICT_CHAIN_FROZEN,
     VERDICT_CHAIN_RESOLVED_LEGACY_AMBIGUOUS,
+    VERDICT_SET_MISMATCH,
     run_protection_authority_shadow_pass,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
@@ -514,3 +515,64 @@ def test_ledger_drift_is_observed_without_blocking_anything(tmp_path):
 
     assert result["ledger_drift"] == 1
     assert result["cancel_precheck"] == {"match": 1}
+
+
+def test_legacy_absent_and_chain_resolved_is_an_improvement_not_a_mismatch(tmp_path):
+    """The production shape of 2026-09-10 16:07, which `set_mismatch` misnamed.
+
+    A limit entry's own stop is never written into the ledger -- its order id
+    is not in the submission receipt -- so the legacy matcher has no ownership
+    source and answers ``absent``: its verdict is that a live position has no
+    protection at all, while the exchange holds a stop for it. The chain places
+    that order by ``TU`` and names it. Filing that under "the two disagree"
+    would frame the fix as a defect.
+    """
+
+    from telegram_kol_research.protection_authority_shadow import (
+        VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT,
+    )
+
+    session_factory = _seed(tmp_path, with_ledger_stop=False)
+    with session_factory() as session:
+        session.add(
+            DeepcoinWsEvent(
+                venue="deepcoin",
+                channel="TriggerOrder",
+                action="push",
+                order_sys_id="entry-attached-stop",
+                trade_unit_id="pos-1",
+                received_at=NOW,
+                received_ms=1,
+                raw_payload="{}",
+                payload_hash="hash-entry-attached",
+            )
+        )
+        session.commit()
+    client = _Client([_stop_row("entry-attached-stop")])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert result["counts_by_verdict"][VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT] == 1
+    assert result["counts_by_verdict"][VERDICT_SET_MISMATCH] == 0
+    # Phase 6e: the same pass says how many ledger rows are missing, without
+    # writing any of them.
+    assert result["would_adopt"] == 1
+    row = _shadow_rows(session_factory)[0]
+    assert row.reason == VERDICT_CHAIN_RESOLVED_LEGACY_ABSENT
+    assert "entry-attached-stop" in row.after_json
+
+
+def test_nothing_is_adopted_while_the_ledger_already_knows_the_order(tmp_path):
+    """``would_adopt`` counts what is missing, not what is present."""
+
+    session_factory = _seed(tmp_path)
+    client = _Client([_stop_row("stop-1")])
+
+    result = run_protection_authority_shadow_pass(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert result["would_adopt"] == 0
+    assert result["counts_by_verdict"][VERDICT_AGREED] == 1
