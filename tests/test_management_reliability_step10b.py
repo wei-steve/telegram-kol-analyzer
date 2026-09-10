@@ -459,7 +459,10 @@ def test_a_snapshot_older_than_the_claim_does_not_get_to_judge(tmp_path):
     _claim(session_factory, recovered_at=snapshot_at + timedelta(seconds=7.4))
 
     result = sync_manual_closed_deepcoin_positions(
-        session_factory, client=_Client(), synced_at=snapshot_at
+        session_factory,
+        client=_Client(),
+        synced_at=snapshot_at,
+        snapshot_clock=lambda: snapshot_at,
     )
 
     assert result.skipped_claimed_after_snapshot == 1
@@ -484,15 +487,20 @@ def test_a_stale_look_does_not_count_towards_the_two(tmp_path):
     _claim(session_factory, recovered_at=snapshot_at + timedelta(seconds=7.4))
 
     stale = sync_manual_closed_deepcoin_positions(
-        session_factory, client=_Client(), synced_at=snapshot_at
+        session_factory,
+        client=_Client(),
+        synced_at=snapshot_at,
+        snapshot_clock=lambda: snapshot_at,
     )
     assert stale.skipped_claimed_after_snapshot == 1
     assert _events(session_factory, ABSENCE_OBSERVED_ACTION) == []
 
+    later = snapshot_at + timedelta(seconds=61)
     fresh = sync_manual_closed_deepcoin_positions(
         session_factory,
         client=_Client(),
-        synced_at=snapshot_at + timedelta(seconds=61),
+        synced_at=later,
+        snapshot_clock=lambda: later,
     )
 
     assert fresh.skipped_claimed_after_snapshot == 0
@@ -520,7 +528,10 @@ def test_a_pos_id_claimed_inside_this_round_is_not_absent_from_it(tmp_path):
     )
 
     result = sync_manual_closed_deepcoin_positions(
-        session_factory, client=_Client(), synced_at=snapshot_at
+        session_factory,
+        client=_Client(),
+        synced_at=snapshot_at,
+        snapshot_clock=lambda: snapshot_at,
     )
 
     assert result.skipped_claimed_after_snapshot == 1
@@ -544,16 +555,175 @@ def test_a_claim_older_than_the_snapshot_is_not_an_excuse(tmp_path):
     )
 
     first = sync_manual_closed_deepcoin_positions(
-        session_factory, client=_Client(), synced_at=snapshot_at
+        session_factory,
+        client=_Client(),
+        synced_at=snapshot_at,
+        snapshot_clock=lambda: snapshot_at,
     )
     assert first.skipped_claimed_after_snapshot == 0
     assert first.pending_absence == 1
 
+    second_at = snapshot_at + timedelta(seconds=61)
     second = sync_manual_closed_deepcoin_positions(
         session_factory,
         client=_Client(),
-        synced_at=snapshot_at + timedelta(seconds=61),
+        synced_at=second_at,
+        snapshot_clock=lambda: second_at,
     )
     assert second.skipped_claimed_after_snapshot == 0
     assert second.manually_closed == 1
     assert _state(session_factory) == ("closed", "manually_closed", "exited")
+
+
+# ---------------------------------------------------------------------------
+# A-10d: the guard was keyed to the wrong moment, and nothing said so
+#
+# A-10c compared the claim against ``synced_at`` -- the stamp taken when the
+# reconcile round opened. The sweep does not run until reconcile finishes, and
+# on 2026-09-10 that was twenty-four seconds later; the management planner
+# reconciles on its own schedule and refreshes every live binding's
+# recovered_at in between. So the guard fired on every binding of every round
+# for twenty-five rounds, the sweep judged nothing at all, and the only reason
+# anyone found out is that a person read the journal.
+
+
+def test_the_round_stamp_is_not_the_read_and_a_fresh_read_may_judge(tmp_path):
+    """The production regression, as a test.
+
+    Round opens, reconcile runs, a concurrent claim lands, and only then does
+    the sweep read positions. The claim is newer than the round stamp and older
+    than the read, and the sweep is entitled to judge.
+    """
+
+    session_factory = _fixture(tmp_path)
+    round_opened_at = NAIVE
+    claimed_at = round_opened_at + timedelta(seconds=7)
+    read_at = round_opened_at + timedelta(seconds=24)
+    _claim(session_factory, recovered_at=claimed_at, last_verified_at=claimed_at)
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(),
+        synced_at=round_opened_at,
+        snapshot_clock=lambda: read_at,
+    )
+
+    assert result.skipped_claimed_after_snapshot == 0
+    assert result.pending_absence == 1
+    assert _state(session_factory) == ("active", "active", "entered")
+
+
+def test_a_claim_after_the_read_still_stops_the_judgement(tmp_path):
+    """The guard itself still works, now against the moment that means it."""
+
+    session_factory = _fixture(tmp_path)
+    read_at = NAIVE
+    _claim(session_factory, recovered_at=read_at + timedelta(seconds=1))
+
+    result = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(),
+        synced_at=read_at - timedelta(seconds=24),
+        snapshot_clock=lambda: read_at,
+    )
+
+    assert result.skipped_claimed_after_snapshot == 1
+    assert result.pending_absence == 0
+
+
+def _degenerate_round(session_factory, *, at, captured):
+    """One round in which the guard refuses the only live binding."""
+
+    import telegram_kol_research.runtime_incident_adapters as adapters
+
+    original = adapters.capture_manual_close_guard_degenerate
+
+    def _record(session_factory_arg, **kwargs):
+        captured.append(kwargs)
+        return None
+
+    adapters.capture_manual_close_guard_degenerate = _record
+    try:
+        _claim(session_factory, recovered_at=at + timedelta(seconds=1))
+        return sync_manual_closed_deepcoin_positions(
+            session_factory,
+            client=_Client(),
+            synced_at=at,
+            snapshot_clock=lambda: at,
+        )
+    finally:
+        adapters.capture_manual_close_guard_degenerate = original
+
+
+def test_two_degenerate_rounds_say_nothing_three_raise_the_alarm(tmp_path):
+    """One refused round is ordinary; three in a row is a broken guard.
+
+    A claim really can land inside the read, so refusing once proves nothing.
+    Refusing everything three rounds running means the reference moment is
+    wrong again -- and from outside, a guard that refuses everything is
+    indistinguishable from a quiet system.
+    """
+
+    session_factory = _fixture(tmp_path)
+    captured: list[dict] = []
+
+    first = _degenerate_round(session_factory, at=NAIVE, captured=captured)
+    assert first.skipped_claimed_after_snapshot == 1
+    assert captured == []
+
+    _degenerate_round(session_factory, at=NAIVE + timedelta(minutes=1), captured=captured)
+    assert captured == [], "two rounds must not alert"
+
+    _degenerate_round(session_factory, at=NAIVE + timedelta(minutes=2), captured=captured)
+    assert len(captured) == 1
+    assert captured[0]["streak"] == 3
+    assert captured[0]["live_bindings"] == 1
+
+
+def test_one_judging_round_clears_the_streak(tmp_path):
+    """The streak counts consecutive rounds, so a good round resets it."""
+
+    session_factory = _fixture(tmp_path)
+    captured: list[dict] = []
+
+    _degenerate_round(session_factory, at=NAIVE, captured=captured)
+    _degenerate_round(session_factory, at=NAIVE + timedelta(minutes=1), captured=captured)
+
+    # A round the guard lets through: the claim is older than the read.
+    healthy_at = NAIVE + timedelta(minutes=2)
+    _claim(session_factory, recovered_at=healthy_at - timedelta(seconds=30))
+    healthy = sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(),
+        synced_at=healthy_at,
+        snapshot_clock=lambda: healthy_at,
+    )
+    assert healthy.skipped_claimed_after_snapshot == 0
+
+    _degenerate_round(session_factory, at=NAIVE + timedelta(minutes=3), captured=captured)
+    assert captured == [], "the streak restarted, so three-in-a-row has not happened"
+
+
+def test_the_two_clocks_are_recorded_beside_the_row_stamp(tmp_path):
+    """A row's own stamp answers neither "when was this read" nor "when written"."""
+
+    session_factory = _fixture(tmp_path)
+    round_opened_at = NAIVE
+    read_at = round_opened_at + timedelta(seconds=24)
+
+    sync_manual_closed_deepcoin_positions(
+        session_factory,
+        client=_Client(),
+        synced_at=round_opened_at,
+        snapshot_clock=lambda: read_at,
+    )
+
+    events = _events(session_factory, ABSENCE_OBSERVED_ACTION)
+    assert len(events) == 1
+    import json
+
+    after = json.loads(events[0].after_json)
+    assert after["snapshot_read_at"] == read_at.isoformat()
+    assert after["wall_clock_at"] == read_at.isoformat()
+    # The row's own stamp is still the round's, deliberately unchanged.
+    assert str(events[0].created_at) == str(round_opened_at)

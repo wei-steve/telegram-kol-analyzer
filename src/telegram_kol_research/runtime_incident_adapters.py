@@ -515,6 +515,50 @@ def capture_position_marked_manually_closed(
     )
 
 
+def capture_manual_close_guard_degenerate(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    streak: int,
+    live_bindings: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a guard that has stopped letting anything through (A-10d).
+
+    A-10c refused to judge a binding whose claim was newer than the snapshot.
+    Keyed to the wrong moment, that refused every binding of every round: no
+    position was wrongly written off, and none was ever written off at all.
+    Twenty-five rounds ran that way on 2026-09-10 and a person found it by
+    reading the journal. This is the observable that makes the guard's own
+    failure visible, because "nothing bad happened" is what both a working
+    guard and a broken one look like.
+    """
+
+    if not config.captures("manual_close_guard_degenerate"):
+        return None
+    fixed = {
+        "component": "manual_close_sync",
+        "reason_code": "guard_refused_every_binding",
+        "operation": f"streak_{int(streak)}",
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="execution_binding",
+        source_record_id=f"guard_streak_{int(streak)}",
+        incident_type="manual_close_guard_degenerate",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            impact="manual_close_sync_no_longer_judges_anything",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_stop_resize_replace_incomplete(
     session_factory: sessionmaker,
     *,

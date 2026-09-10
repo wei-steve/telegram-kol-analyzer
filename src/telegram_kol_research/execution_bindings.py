@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from typing import Any
+from typing import Any, Callable
 
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
@@ -31,6 +31,7 @@ from telegram_kol_research.models import PositionMutationIntent
 from telegram_kol_research.models import StrategyManagementBatch
 from telegram_kol_research.models import StrategyManagementLeg
 from telegram_kol_research.models import TriggerProtectionIntent
+from telegram_kol_research.models import TradingSetting
 from telegram_kol_research.protection_snapshot import (
     observe_pending_tpsl,
     record_pending_tpsl_observation,
@@ -4069,8 +4070,15 @@ def sync_manual_closed_deepcoin_positions(
     client: DeepcoinReadOnlyClient,
     synced_at: datetime | None = None,
     allow_exchange_mutations: bool = True,
+    snapshot_clock: Callable[[], datetime] | None = None,
 ) -> ManualCloseSyncResult:
-    """Mark bound active positions as manual-closed when they vanish on Deepcoin."""
+    """Mark bound active positions as manual-closed when they vanish on Deepcoin.
+
+    ``synced_at`` stamps the rows this sweep writes and is taken once at the
+    opening of the reconcile round. It is deliberately *not* used to date the
+    positions read any more: ``snapshot_clock`` is, defaulting to the real
+    clock, and A-10d exists because those two are not the same moment.
+    """
 
     from telegram_kol_research.models import StrategyLifecycle, TradeIdea
 
@@ -4120,6 +4128,33 @@ def sync_manual_closed_deepcoin_positions(
             .order_by(ExecutionBinding.id.asc())
             .all()
         )
+        # A-10d. The snapshot above was read at the top of this function, and
+        # the cleanup in between makes its own exchange calls. On 2026-09-10
+        # that gap measured twenty-four seconds, which was long enough for the
+        # management planner -- a reconcile caller in its own right -- to
+        # refresh every live binding's ``recovered_at`` inside it, so the A-10c
+        # guard fired on every binding of every round and the sweep stopped
+        # judging anything at all. Reading again here puts the snapshot and the
+        # rows it is compared against milliseconds apart, and dates the read
+        # instead of guessing at it. When the cleanup wrote nothing, the round
+        # read cache serves this for free; when it did write, the cache is
+        # already dropped and this is one real GET (see ARCHITECTURE 4.6).
+        snapshot_at = (snapshot_clock or (lambda: datetime.now(UTC)))()
+        positions = client.list_positions()
+        if not positions:
+            logger.warning(
+                "manual-close sync skipped: positions snapshot is empty on "
+                "re-read at %s",
+                snapshot_at.isoformat(),
+            )
+            return ManualCloseSyncResult(skipped_empty_snapshot=True)
+        active_pos_ids = {
+            pos_id
+            for position in positions
+            if _has_nonzero_size(position)
+            for pos_id in _position_identity_ids(position)
+        }
+        live_binding_count = 0
         for row in rows:
             entry_legs = _entry_legs_for_binding(session, row)
             pos_ids = _split_ids(row.pos_id) or _entry_leg_position_ids(entry_legs)
@@ -4129,15 +4164,18 @@ def sync_manual_closed_deepcoin_positions(
             if any(pos_id in management_reserved_pos_ids for pos_id in pos_ids):
                 continue
             result.checked += 1
+            live_binding_count += 1
             # A-10c. Our snapshot predates what the ledger already knows about
             # this binding, so it cannot answer for it. See
-            # ``_claimed_after_snapshot``.
-            if _claimed_after_snapshot(row, entry_legs, snapshot_at=now):
+            # ``_claimed_after_snapshot``. A-10d: the reference is the moment
+            # the snapshot was actually read, not the round's opening stamp.
+            if _claimed_after_snapshot(row, entry_legs, snapshot_at=snapshot_at):
                 result.skipped_claimed_after_snapshot += 1
                 logger.info(
                     "manual-close sync skipped binding %s: claimed after the "
-                    "snapshot at %s",
+                    "snapshot read at %s (round stamp %s)",
                     int(row.id),
+                    snapshot_at.isoformat(),
                     now.isoformat(),
                 )
                 continue
@@ -4213,7 +4251,12 @@ def sync_manual_closed_deepcoin_positions(
             )
             if basis is None:
                 _record_absence_observation(
-                    session, binding=row, pos_ids=pos_ids, observed_at=now
+                    session,
+                    binding=row,
+                    pos_ids=pos_ids,
+                    observed_at=now,
+                    snapshot_at=snapshot_at,
+                    wall_clock_at=(snapshot_clock or (lambda: datetime.now(UTC)))(),
                 )
                 result.pending_absence += 1
                 continue
@@ -4226,7 +4269,13 @@ def sync_manual_closed_deepcoin_positions(
             row.updated_at = now
             result.manually_closed += 1
             _record_marked_closed(
-                session, binding=row, pos_ids=pos_ids, basis=basis, marked_at=now
+                session,
+                binding=row,
+                pos_ids=pos_ids,
+                basis=basis,
+                marked_at=now,
+                snapshot_at=snapshot_at,
+                wall_clock_at=(snapshot_clock or (lambda: datetime.now(UTC)))(),
             )
             marked_for_alert.extend(
                 (int(row.id), str(pos_id), str(basis)) for pos_id in pos_ids
@@ -4274,8 +4323,29 @@ def sync_manual_closed_deepcoin_positions(
                     if trade_idea is not None and trade_idea.status == "open":
                         trade_idea.status = "closed"
                         trade_idea.closed_at = now
+        # A-10d. The guard's own paired observable. A guard that refuses every
+        # binding of every round looks exactly like a quiet system from the
+        # outside: nothing is wrongly closed, and nothing is closed at all.
+        # That is what happened for twenty-five consecutive rounds on
+        # 2026-09-10, and it was found by a person reading the journal, which
+        # is not a detection mechanism.
+        degenerate_streak = _record_guard_health(
+            session,
+            degenerate=(
+                live_binding_count > 0
+                and result.skipped_claimed_after_snapshot == live_binding_count
+            ),
+            observed_at=snapshot_at,
+        )
         session.commit()
     _capture_marked_closed_incidents(session_factory, marked_for_alert, marked_at=now)
+    if degenerate_streak >= GUARD_DEGENERATE_STREAK_ALERT:
+        _capture_guard_degenerate_incident(
+            session_factory,
+            streak=degenerate_streak,
+            live_bindings=live_binding_count,
+            occurred_at=now,
+        )
     return result
 
 
@@ -4710,6 +4780,13 @@ MARKED_CLOSED_ACTION = "position_marked_manually_closed"
 #: How long the two absences must be apart. Shorter than this and they can
 #: come from one bad minute at the venue rather than two independent looks.
 MIN_ABSENCE_CONFIRMATION_SECONDS = 60
+#: A-10d. Rounds in a row where the guard refused every live binding before it
+#: is treated as broken rather than cautious. One such round is ordinary (a
+#: claim really can land inside the read); three in a row means the reference
+#: moment is wrong again and the sweep has stopped working.
+GUARD_DEGENERATE_STREAK_ALERT = 3
+GUARD_HEALTH_SETTINGS_KEY = "manual_close_guard_health"
+GUARD_DEGENERATE_INCIDENT_TYPE = "manual_close_guard_degenerate"
 
 
 def _claimed_after_snapshot(
@@ -4746,14 +4823,40 @@ def _claimed_after_snapshot(
     )
 
 
+def _clock_evidence(
+    *, snapshot_at: datetime | None, wall_clock_at: datetime | None
+) -> dict[str, str] | None:
+    """The two clocks a row's own stamp cannot stand in for (A-10d)."""
+
+    evidence = {
+        name: value.isoformat()
+        for name, value in (
+            ("snapshot_read_at", snapshot_at),
+            ("wall_clock_at", wall_clock_at),
+        )
+        if value is not None
+    }
+    return evidence or None
+
+
 def _record_absence_observation(
     session,
     *,
     binding: ExecutionBinding,
     pos_ids: list[str],
     observed_at: datetime,
+    snapshot_at: datetime | None = None,
+    wall_clock_at: datetime | None = None,
 ) -> None:
-    """Write down that we did not see it, and change nothing else."""
+    """Write down that we did not see it, and change nothing else.
+
+    A-10d records two clocks beside the row's own stamp, because the stamp is
+    the round's opening time and answers neither question that matters after an
+    incident: when the snapshot this decision rests on was actually read, and
+    when this row was actually written. On 2026-09-08 those three moments were
+    up to twenty-four seconds apart and only one of them was recorded, which
+    is why what that read saw is now unrecoverable.
+    """
 
     from telegram_kol_research.execution_events import (
         ExecutionEventRecord,
@@ -4775,6 +4878,9 @@ def _record_absence_observation(
                 pos_id=str(pos_id),
                 reason="absent_from_positions_snapshot",
                 created_at=observed_at,
+                after=_clock_evidence(
+                    snapshot_at=snapshot_at, wall_clock_at=wall_clock_at
+                ),
             ),
             session=session,
         )
@@ -4836,6 +4942,98 @@ def _absence_proof(
     return None
 
 
+def _record_guard_health(
+    session, *, degenerate: bool, observed_at: datetime
+) -> int:
+    """Count consecutive rounds in which the guard refused everything (A-10d).
+
+    Kept in ``trading_settings`` under its own key, the way the entry-revision
+    authority lease is, because the streak has to survive a restart: a guard
+    that has been degenerate for an hour must not look healthy again just
+    because the worker was redeployed. An in-process counter would.
+
+    Written only when the streak changes, so a healthy round writes nothing.
+    """
+
+    row = (
+        session.query(TradingSetting)
+        .filter(TradingSetting.key == GUARD_HEALTH_SETTINGS_KEY)
+        .one_or_none()
+    )
+    document: dict[str, Any] = {}
+    if row is not None:
+        try:
+            loaded = json.loads(row.value_json or "{}")
+        except (TypeError, ValueError):
+            loaded = {}
+        if isinstance(loaded, dict):
+            document = loaded
+    try:
+        streak = int(document.get("degenerate_streak") or 0)
+    except (TypeError, ValueError):
+        streak = 0
+    previous = streak
+    streak = streak + 1 if degenerate else 0
+    if streak == previous:
+        # Write on change only. A healthy round leaves no trace at all, which
+        # keeps this out of every round's write set and keeps a reconcile pass
+        # byte-identical to the one before it -- something the phase-3 WS tests
+        # assert by diffing the whole database between two passes, and they are
+        # right to: a row that moves every round because of the wall clock
+        # makes "did waking change anything?" unanswerable.
+        return streak
+    document.update(
+        {
+            "schema_version": 1,
+            "degenerate_streak": streak,
+            "streak_changed_at": observed_at.isoformat(),
+        }
+    )
+    payload = json.dumps(document, ensure_ascii=False, sort_keys=True)
+    if row is None:
+        session.add(
+            TradingSetting(
+                key=GUARD_HEALTH_SETTINGS_KEY,
+                value_json=payload,
+                updated_at=observed_at,
+            )
+        )
+    else:
+        row.value_json = payload
+        row.updated_at = observed_at
+    return streak
+
+
+def _capture_guard_degenerate_incident(
+    session_factory: sessionmaker,
+    *,
+    streak: int,
+    live_bindings: int,
+    occurred_at: datetime,
+) -> None:
+    """After the commit, for the same reason the marked-closed capture is."""
+
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_manual_close_guard_degenerate,
+        )
+
+        capture_manual_close_guard_degenerate(
+            session_factory,
+            config=load_runtime_incident_config(),
+            streak=int(streak),
+            live_bindings=int(live_bindings),
+            occurred_at=occurred_at,
+        )
+    except Exception:  # pragma: no cover - defensive, never fails the sweep
+        logger.warning(
+            "manual-close guard degeneracy capture failed (streak=%s)",
+            streak,
+            exc_info=True,
+        )
+
+
 def _capture_marked_closed_incidents(
     session_factory: sessionmaker,
     marked: list[tuple[int, str, str]],
@@ -4883,8 +5081,10 @@ def _record_marked_closed(
     pos_ids: list[str],
     basis: str,
     marked_at: datetime,
+    snapshot_at: datetime | None = None,
+    wall_clock_at: datetime | None = None,
 ) -> None:
-    """Say so, every time, whatever the basis."""
+    """Say so, every time, whatever the basis. Two clocks, as in A-10d."""
 
     from telegram_kol_research.execution_events import (
         ExecutionEventRecord,
@@ -4906,6 +5106,9 @@ def _record_marked_closed(
                 pos_id=str(pos_id),
                 reason=basis,
                 created_at=marked_at,
+                after=_clock_evidence(
+                    snapshot_at=snapshot_at, wall_clock_at=wall_clock_at
+                ),
             ),
             session=session,
         )

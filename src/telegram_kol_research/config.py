@@ -256,6 +256,12 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # more than a day while it sat on the exchange with both stops armed.
         # Whatever the basis, somebody is told now.
         "position_marked_manually_closed",
+        # A-10d: the guard from A-10c, keyed to the wrong moment, refused every
+        # binding of every round -- nothing wrongly closed, and nothing closed
+        # at all. Twenty-five rounds ran that way before a person noticed in
+        # the journal. A guard whose failure is indistinguishable from success
+        # needs its own alarm.
+        "manual_close_guard_degenerate",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to

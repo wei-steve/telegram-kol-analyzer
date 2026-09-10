@@ -183,6 +183,15 @@ Deepcoin 的频率限制是 **每个 API key 5 次/秒**，按整个账户计，
 缓存**（写后再读一定是新读），轮结束无条件丢弃，**绝不跨轮**。命中缓存不产生物理请求，因此也不取令牌。
 历史与成交（`orders-history` / `fills` / `trigger-orders-history`）不进缓存——一轮内没人重复读它们。
 
+**已知的一次有意重读（A-10d，2026-09-10）。** `sync_manual_closed_deepcoin_positions`
+在开头读一次 `positions` 给清理阶段用，**又在 binding 行查询之前紧挨着重读一次**，并以这次读取的
+真实时刻作为"账本是否在快照之后才被认领"的参照。清理阶段没有交易所写时，这次重读由轮内缓存服务、
+**零物理请求**；有写时缓存已作废，**这是每轮最多一个额外 GET**。
+为什么要重读：开头那次读与行查询之间隔着清理阶段的交易所往返，实测达 **24 秒**，
+而 `strategy_management_planner` 会在这段时间里用它自己的时间戳刷新所有活 binding 的 `recovered_at`
+（它是 `reconcile_deepcoin_execution_bindings` 的另一个调用点）。**拿轮次开头的 `synced_at` 当快照时刻，
+会让守卫每轮拒判所有 binding**——A-10c 上线后 25 轮全部如此。
+
 健康端点 `/api/runtime/deepcoin-ws-health` 输出本进程的 `read_limit_per_second`、
 `rate_limited_last_hour` 与 `retry_after_waits_last_hour`；worker（8002）那一份才是有意义的
 那一份。
@@ -464,5 +473,14 @@ historical_state_repair.py               position_management_remediation.py
   两个都是**观测量的定义依赖了一个没人保证的不变量**（"一次事件一行"、"时间戳自带时区"）。
   **所以正向计数要跟着一条断言它计数正确的测试**（"三次探活恰好三行"，并做变异检验），
   而不是只断言被观测的行为正确。
+  **A 线在写下这一条之后当天就自己违反了两次**，一并记着，因为它说明这条不是靠自觉能守住的：
+  一是观测脚本按 **logger 名字**猜日志所在的 unit（`deepcoin_reconcile_round` 的 logger 叫
+  `telegram_kol_research.web_app`，日志却由 **worker** unit 打），于是 `rounds` 计数整窗恒为 0，
+  实测 web unit 0 行 / worker unit 25 行；二是 A-10c 的守卫拿轮次开头的 `synced_at` 当
+  "快照时刻"，而它与实际 `list_positions()` 相差 24 秒，导致守卫每轮拒判所有 binding、
+  扫描连续 25 轮什么都不判——**而这个失败从外面看和"系统很安静"一模一样**，
+  是人翻 journal 才发现的，那不是检测机制。修法是给守卫本身也配一个成对观测量
+  （连续 3 轮拒判全部即告警），并且**这个计数必须落库**：进程内计数器一重启，
+  一个已退化一小时的守卫就重新显得健康。
 - 迁移只改变"在哪里跑、怎么组织"，从不改变"决定什么"。任何看起来需要改交易语义的改动
   都是读错了需求，停下来问。
