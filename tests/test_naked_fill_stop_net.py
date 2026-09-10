@@ -46,11 +46,19 @@ def _position(pos_id, *, size="2", side="long", inst=INST):
 
 
 class FakeClient:
-    def __init__(self, positions, *, readback_pos_id=None, raise_positions=False):
+    def __init__(
+        self,
+        positions,
+        *,
+        readback_pos_id=None,
+        raise_positions=False,
+        pending_before=(),
+    ):
         self.positions = positions
         self.set_position_sltp_calls = []
         self.raise_positions = raise_positions
         self._readback_pos_id = readback_pos_id
+        self.pending_before = list(pending_before)
 
     def list_positions(self, *, inst_id=None):
         if self.raise_positions:
@@ -62,6 +70,13 @@ class FakeClient:
         return {"code": "0", "data": {"ordId": "ord-rescue-stop"}}
 
     def list_trigger_orders_pending(self, *, inst_id):
+        # Phase 6 task 4 reads this endpoint *before* attaching as well as
+        # after, so the fake has to model the sequence rather than return the
+        # read-back row unconditionally: before the write there is no stop.
+        # A fake that always showed one would make the net refuse to attach
+        # anything and the read-back assertions vacuous.
+        if not self.set_position_sltp_calls:
+            return list(self.pending_before)
         return [
             {
                 "ordId": "ord-rescue-stop",
@@ -158,7 +173,11 @@ def test_a_single_unclaimed_candidate_gets_exactly_one_stop(tmp_path):
         before = json.loads(audit.before_json)
         assert before["candidate_pos_id"] == "pos-candidate"
         assert before["fill_size"] == "2"
-        assert before["preconditions"] == ["a:pass", "b:pass", "c:pass", "d:pass"]
+        # (e) is phase 6 task 4: the exchange was asked whether this position
+        # already holds a stop, and answered no.
+        assert before["preconditions"] == [
+            "a:pass", "b:pass", "c:pass", "d:pass", "e:pass",
+        ]
         after = json.loads(audit.after_json)
         assert after["ownership_claimed"] is False
         assert after["take_profit_attached"] is False
@@ -459,3 +478,75 @@ def test_the_payload_can_only_ever_carry_a_stop(tmp_path):
     assert not [key for key in payload if key.lower().startswith("tp")]
     assert payload["tdMode"] == "cross"
     assert payload["mrgPosition"] == "split"
+
+
+def test_a_stop_the_ledger_never_recorded_still_stops_a_second_one(tmp_path):
+    """Phase 6 task 4: "no local record" is not "no protection".
+
+    After a restart -- or after any ledger write that did not land -- the
+    position can already be protected by a stop nothing local names. Every
+    precondition up to (d) is about our own records and all of them pass in
+    that state, so without asking the exchange the net attaches a *second*
+    stop to a position that already has one.
+    """
+
+    session_factory, _ = _seed(tmp_path)
+    client = FakeClient(
+        [_position("pos-candidate")],
+        readback_pos_id="pos-candidate",
+        pending_before=[
+            {
+                "ordId": "stop-nobody-recorded",
+                "instId": INST,
+                "posId": "pos-candidate",
+                "posSide": "long",
+                "triggerOrderType": "TPSL",
+                "slTriggerPrice": "2490",
+                "sz": "2",
+            }
+        ],
+    )
+
+    result = reconcile_naked_market_fills(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert (result.attached, result.alerted) == (0, 1)
+    assert client.set_position_sltp_calls == []
+    with session_factory() as session:
+        incident = (
+            session.query(RuntimeIncident)
+            .order_by(RuntimeIncident.id.desc())
+            .first()
+        )
+    assert incident is not None
+    assert json.loads(incident.redacted_summary)["reason_code"] == (
+        "position_already_protected_on_exchange"
+    )
+
+
+def test_an_unreadable_protection_list_is_unknown_not_unprotected(tmp_path):
+    """The same rule as the position snapshot, on the other endpoint.
+
+    "Could not look" and "there is nothing there" must not produce the same
+    action, and here the action is a write onto a live position.
+    """
+
+    session_factory, _ = _seed(tmp_path)
+
+    class _PendingUnreadable(FakeClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            if not self.set_position_sltp_calls:
+                raise RuntimeError("exchange unreachable")
+            return super().list_trigger_orders_pending(inst_id=inst_id)
+
+    client = _PendingUnreadable(
+        [_position("pos-candidate")], readback_pos_id="pos-candidate"
+    )
+
+    result = reconcile_naked_market_fills(
+        session_factory, deepcoin_client=client, now=NOW
+    )
+
+    assert (result.attached, result.alerted) == (0, 1)
+    assert client.set_position_sltp_calls == []

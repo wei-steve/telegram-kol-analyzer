@@ -53,6 +53,7 @@ from telegram_kol_research.models import (
     ExecutionOrderLeg,
     PositionProtectionLedger,
 )
+from telegram_kol_research.native_tpsl import normalize_native_tpsl
 from telegram_kol_research.position_mutation_authority import (
     PositionMutationAuthority,
     PositionMutationAuthorityError,
@@ -163,8 +164,9 @@ def evaluate_naked_fill(
     live_positions: Any,
     now: datetime,
     venue: str = "deepcoin",
+    pending_orders: Any = None,
 ) -> NakedFillDecision:
-    """Decide, from the four preconditions, whether one stop may be attached.
+    """Decide, from the five preconditions, whether one stop may be attached.
 
     Every precondition is named in the returned decision whether it passed or
     failed, because the audit row has to carry them verbatim: an operator
@@ -278,13 +280,68 @@ def evaluate_naked_fill(
         return _with(base, reason="no_unclaimed_candidate", preconditions=("a:pass", "b:pass", "c:fail_none", "d:pass"))
     if len(candidates) > 1:
         return _with(base, reason="candidate_not_unique", preconditions=("a:pass", "b:pass", "c:fail_many", "d:pass"))
+
+    # (e) Phase 6 task 4. "Unclaimed" up to here is a purely *local* notion:
+    # no other leg and no ledger row names this position. After a restart --
+    # or after any ledger write that did not land -- that says nothing about
+    # what the exchange is holding. Asking it is the difference between
+    # attaching the stop a position lacks and attaching a second one beside
+    # the stop it already has.
+    #
+    # Unreadable is unknown, never "no protection" (hard rule 4): the net
+    # alerts instead of acting, exactly as it does for an unreadable position
+    # snapshot.
+    if not isinstance(pending_orders, list):
+        return _with(
+            base,
+            reason="protection_snapshot_incomplete",
+            pos_id=candidates[0],
+            preconditions=("a:pass", "b:pass", "c:pass", "d:pass", "e:unknown"),
+        )
+    existing = _exchange_stop_order_ids(pending_orders, pos_id=candidates[0])
+    if existing:
+        return _with(
+            base,
+            reason="position_already_protected_on_exchange",
+            pos_id=candidates[0],
+            preconditions=("a:pass", "b:pass", "c:pass", "d:pass", "e:fail"),
+        )
     return _with(
         base,
         status="attach",
         reason="unique_unclaimed_candidate",
         pos_id=candidates[0],
-        preconditions=("a:pass", "b:pass", "c:pass", "d:pass"),
+        preconditions=("a:pass", "b:pass", "c:pass", "d:pass", "e:pass"),
     )
+
+
+def _exchange_stop_order_ids(
+    pending_orders: list, *, pos_id: str
+) -> tuple[str, ...]:
+    """Stops the exchange already holds for this exact position.
+
+    Matched by the position id the row itself carries -- the only thing on a
+    pending row that names a position. A row that names no position is not
+    counted: it may be a resting entry's own attached stop, which belongs to an
+    order that has not filled and protects nothing here.
+
+    The looseness is deliberately in the safe direction. This function can only
+    ever *prevent* a write, so a false match costs one alert and a person's
+    glance, while a false miss costs a duplicate stop on a live position.
+    """
+
+    found: list[str] = []
+    for row in pending_orders:
+        if not isinstance(row, Mapping):
+            continue
+        normalized = normalize_native_tpsl(dict(row))
+        if normalized is None or normalized.stop_loss_trigger_price is None:
+            continue
+        if str(normalized.pos_id or "") != str(pos_id):
+            continue
+        if normalized.ord_id:
+            found.append(str(normalized.ord_id))
+    return tuple(found)
 
 
 def _with(decision: NakedFillDecision, **changes: Any) -> NakedFillDecision:
@@ -896,12 +953,16 @@ def _handle_one_naked_fill(
     counts: dict[str, int],
 ) -> None:
     live_positions = _read_positions(deepcoin_client, session_factory, leg_id=leg_id)
+    pending_orders = _read_pending_orders(
+        deepcoin_client, session_factory, leg_id=leg_id
+    )
     decision = evaluate_naked_fill(
         session_factory,
         leg_id=leg_id,
         live_positions=live_positions,
         now=now,
         venue=venue,
+        pending_orders=pending_orders,
     )
     if decision.status == "skip":
         counts["skipped"] += 1
@@ -931,13 +992,23 @@ def _handle_one_naked_fill(
     )
 
     def revalidate() -> bool:
+        # Both snapshots are re-read here, not just the positions one. The
+        # last-moment check exists because the exchange can change between the
+        # decision and the write, and "somebody else attached a stop to this
+        # position in the meantime" is exactly one of those changes -- leaving
+        # it out would re-ask four of the five preconditions and take the fifth
+        # on trust from a read that is now old.
         fresh = _read_positions(deepcoin_client, session_factory, leg_id=leg_id)
+        fresh_pending = _read_pending_orders(
+            deepcoin_client, session_factory, leg_id=leg_id
+        )
         recheck = evaluate_naked_fill(
             session_factory,
             leg_id=leg_id,
             live_positions=fresh,
             now=now,
             venue=venue,
+            pending_orders=fresh_pending,
         )
         return recheck.status == "attach" and recheck.pos_id == decision.pos_id
 
@@ -978,6 +1049,40 @@ def _handle_one_naked_fill(
         attached_order_id=attached_order_id or None,
     )
     counts["attached"] += 1
+
+
+def _read_pending_orders(
+    deepcoin_client: Any, session_factory: sessionmaker, *, leg_id: int
+):
+    """Return the live pending trigger rows, or ``None`` -- never an empty list.
+
+    Same rule as :func:`_read_positions`: an unreadable exchange produces
+    "unknown", never "there is no protection". Here the difference decides
+    whether the net attaches a second stop beside one that already exists.
+    """
+
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, int(leg_id))
+        binding = (
+            session.get(ExecutionBinding, int(leg.execution_binding_id))
+            if leg is not None
+            else None
+        )
+        inst_id = _leg_instrument_id(leg, binding) if leg is not None else ""
+    if not inst_id:
+        return None
+    lister = getattr(deepcoin_client, "list_trigger_orders_pending", None)
+    if not callable(lister):
+        return None
+    try:
+        rows = lister(inst_id=inst_id)
+    except Exception:
+        logger.warning(
+            "naked_fill_protection_snapshot_unavailable inst_id=%s", inst_id,
+            exc_info=True,
+        )
+        return None
+    return rows if isinstance(rows, list) else None
 
 
 def _read_positions(deepcoin_client: Any, session_factory: sessionmaker, *, leg_id: int):
