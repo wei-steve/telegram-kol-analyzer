@@ -2804,3 +2804,90 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   改成 aware/naive 混合并强制非 UTC 时区后才咬住。
   **腿 582 的处置**：不写一次性脚本，**由这条路径在部署后首轮自然收掉**，
   binding 338 随 `all_terminal` 归档。起窗时逐条核对并回报。
+
+- phase-6j-release-two-eth-positions (2026-09-11, B 线, **待部署**):
+  **放开三个闸门对 ETH 两仓（`1001125231241107` / `1001125231241310`，binding 352）**：
+  `ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS`、
+  `TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS`、
+  `BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS`；
+  **`BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS` 保持空集**（市价平仓类仍须用户单独批准）。
+  同一提交里 BTC 两个死 posId 的退役已在 `d445d214` 完成，本次是"清空 BTC + 加入 ETH"，
+  **不是把退役撤销了**。
+  **授权链**：用户 2026-09-11 原话"授权放开"，对应规则原文
+  "凡是影子期已证明'算出的动作与明细一致、零非预期写入'的路径，对系统自己在 auto_trade 群
+  开出的仓位，由指挥会话直接放开，事后告知；市价平仓类与改变交易语义的新规则仍单独请示"
+  （记录 `d91a4179`）。两个条件在此均成立：影子行已出示完整明细（见下），
+  两条腿 `attribution_status=verified`，证据 `direct_order_position_id`。
+  **被扣住时就已在案的明细**（不是事后补的）：
+  - `position_protection_incidents` 455/456 `backup_stop_shadow_ready`：
+    `primary_stop=2484`（TU 采纳）、`proposed_backup_stop=2479.03`、
+    `proposed_size=whole_position`、`proposed_endpoint=set_position_sltp`。
+  - `position_attribution_audits` 4023/4025 `take_profit_would_place`：
+    一档、`trigger_price=2790`、`size=0.9`、`position_size=0.9`——
+    **2790 正是 KOL 原文写的止盈**。
+  **本次是"按 posId 放开"，不是"按来源全放开"——这一步是被收窄回来的，记下经过**：
+  原裁定要把备份止损改成"对 `source=exchange_adopted_by_tu` 全放开"、
+  止盈改成"对 `order_kind=limit` 全放开"。收窄的理由有两条，**由两条独立路径各自提出**：
+  (甲) B 线（工程）：闸门"贵"是 `release_gates.py` 里明写的设计
+  （放开一个仓位要付一次代码改动、一次全量、一次部署），按来源放开等于对整整一类仓位
+  **永久移除**这个成本，**包括还不存在、也没被任何影子看过的未来仓位**；
+  (乙) A 线（授权范围）：用户三次给的都是逐仓位授权，**覆盖不到"默认开、逐个关"这种形状翻转**；
+  (丙) 以及 B 线第三条：`source=exchange_adopted_by_tu` 与 `order_kind=limit`
+  **本身并不蕴含"系统自己在 auto_trade 群开出"**，按它放开会比授权面宽。
+  **"按来源全放开"另立 6k**，前置是这两笔的**真实执行样本**（不是影子样本），
+  且判据必须显式带上"binding 所属群为 auto_trade 且归属 verified"。
+  **两条本可以分叉的判断没有分叉，这才是收窄成立的理由**，而不是任何一方说得响。
+  **补一条属于 B 线的诚实记录**：B 线那三条理由里**有一条是错的**——
+  我说过"限价入场止盈路径真实写入 0 笔"，**事实是 1 笔仓位 / 2 张单**：
+  conv 244 → 腿 601（`order_kind=limit`）→ pos `1001125216121996`，
+  intents 671/672 `confirmed`，ordId `1001125226308043`(79800×7) 与
+  `1001125226308486`(81900×8)，2026-09-11 09:23:16.279742Z。
+  我当时把这两行看成"A 线的止盈，不属于本节闸门"，**正好看反**。
+  **收窄不依赖这条错的理由**（另两条各自独立地够）——
+  **这说明收窄不是靠理由的条数立住的**；若当时是靠"三条都对"说服的，
+  今晚发现一条错就该回头重审。
+  **变异检验 4 项全红**：塞进第三个未批准的 posId(1红)、
+  `full_exit` 偷偷镜像 replacement 闸门(3红)、止盈闸门判断取反(2红)、
+  备份止损闸门硬接常开(2红)。
+  **部署后的闸门可观测行（已在工作树渲染核对）**：
+  `release_gates adopted_primary_backup_stop=1001125231241107,1001125231241310;`
+  `break_even_full_exit=-;break_even_replacement=1001125231241107,1001125231241310;`
+  `take_profit_limit_entry=1001125231241107,1001125231241310`，`total_released=6`。
+  **起窗判据（起窗前写死，任一不对即停）**：
+  (1) 两仓各挂 **1 张备份止损 2479.03**（`whole_position`）与 **1 张止盈 2790×0.9**；
+  (2) 交易所挂单 **2 → 6，只增不减**；
+  (3) **两张主止损 2484 仍在**（`1001125231241106` / `1001125231241309`）；
+  (4) `position_mutation_intents` **恰 4 行新增且全部 `confirmed`**；
+  (5) `BREAK_EVEN_FULL_EXIT` 侧 **零 `close_position`**。
+  **6i 不会碰这两条腿，已实读确认而非推断**：腿 605/606 是
+  `order_kind=limit` 且 `status=active`，**两个互相独立的理由**都落在 6i 作用面之外
+  （6i 只作用于 `purpose=entry` 且 `order_kind LIKE 'trigger%'` 且 `status='pending'`）。
+  **部署前基线（2026-09-11T17:45:14Z 实读，起窗前写下，不是事后补的）**：
+  - 交易所 ETH-USDT-SWAP：**仓位 2 个**（各 0.9，均价 2560.75 / 2560.48，`slTriggerPx=2484`、
+    `tpTriggerPx=""`）、**条件挂单 2 张**（`1001125231241106` 与 `1001125231241309`，
+    均 `triggerOrderType=TPSL`、`slTriggerPrice=2484`、`tpTriggerPrice=0`、`sz=0.9`），
+    `code=0`。BTC-USDT-SWAP：仓位 0、挂单 0。**这就是判据 (2) 里的那个"2"。**
+  - 账本侧：`backup_any_rows=0`、`tp_any_rows=0`、`primaries=2`。
+  **取凭据时踩到一次、值得记**：worker 的 MainPID 在 A-16c 部署时从 `336321` 变成了
+  `351773`，用旧 PID 读 `/proc/<pid>/environ` 直接 `FileNotFoundError`。
+  **这正是"凭据每次现取、不留副本"那条约束自带的好处**——如果当初把凭据抄下来复用，
+  这次读到的会是**一份仍然能用、但属于已经不存在的进程的**旧值，而它不会报错。
+  **报错是这条约束在替我们工作，不是它碍事。**
+  **2026-09-11 17:44Z：跨会话消息被限流暂停**（"sessions messaging each other
+  automatically"），在我给 A 线发"我等你收窗"那一条时触发。**入站不受影响，出站要等用户下一次输入。**
+  - **对部署协议的影响**：A 线的放行**已经拿到了**，是它上一条里给的明确条件——
+    "18:10Z 前后；若到 18:25Z 还没收窗，你直接上，我让路"。所以"部署前问 A 线并等明确答复"
+    这一条**已满足**，不是因为限流而绕过的。
+  - **但 6j 的部署本身停在这里等用户**，理由不是授权不足，而是这一步**会向交易所真实下单**
+    （两张备份止损 + 两张止盈，真实资金上的真实敞口），而限流恰恰在提示
+    **这一轮已经在没有人输入的情况下跑了很久**。
+    **可逆的部分（全量、提交、推我自己的分支）全部做完；不可逆的那一步交给人。**
+  **判据 (4)"恰 4 行"为什么不会被 break_even 打破，起窗前查证而不是假定**：
+  `break_even_convergence_planner` 要求 `trigger_type ∈ {"tp1_fill","confirmed_partial_close"}`
+  ——**没有 TP1 成交或已确认的部分平仓，就不会产生 convergence**，执行器也就没有对象。
+  实读核实：全库 `strategy_break_even_convergences` **只有 2 行**（均 2026-08-03、均 `blocked`），
+  **binding 352 为 0 行**。所以本窗内放开 `BREAK_EVEN_REPLACEMENT` **不产生任何写入**。
+  **但要如实说出窗口之后的事**：一旦 2790 的止盈挂上并成交，TP1 会产生 convergence，
+  那时这道已开的闸门**会**把主止损从 2484 上移到入场价（2560.75 / 2560.48）。
+  **这正是被批准的那件事**（多头在 TP1 后把止损提到保本），但它发生在本窗之外，
+  **不会被本窗的任何判据看到**——所以它属于登记簿 P1，不属于本窗的"通过"。

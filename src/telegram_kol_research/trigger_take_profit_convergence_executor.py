@@ -107,13 +107,32 @@ logger = logging.getLogger(__name__)
 #: deliberately still held -- one position first, verified order by order,
 #: then the other.
 #:
-#: Both are back out again, and the list is empty on purpose. The user closed
-#: the pair by hand on 2026-09-11 at 78611.6; the two orders released above had
-#: been live for five hours, were voided with the position, and the second
-#: position never got its own release. Leaving a pos_id here that no longer
-#: exists would be a dead value in live code -- it reads like a standing
-#: permission and grants nothing. The next position starts from empty.
-TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset()
+#: Both went back out again. The user closed the pair by hand on 2026-09-11 at
+#: 78611.6; the two orders released above had been live for five hours, were
+#: voided with the position, and the second position never got its own release.
+#: Leaving a pos_id here that no longer exists would be a dead value in live
+#: code -- it reads like a standing permission and grants nothing.
+#:
+#: **The two ETH ids are phase 6j**, released on 2026-09-11 under the authority
+#: the user granted that day ("授权放开", recorded at commit d91a4179). Binding
+#: 352, both legs ``order_kind=limit`` and ``attribution_status=verified`` by
+#: ``direct_order_position_id``. The withheld record was already on file before
+#: the release: audits 4023/4025, one tier, ``trigger_price=2790``,
+#: ``size=0.9`` against a ``position_size`` of 0.9 -- and 2790 is the take
+#: profit the KOL's own message names.
+#:
+#: **Releasing by ``order_kind == "limit"`` instead of by position id was
+#: proposed on 2026-09-11 and narrowed back**, by two objections that arrived
+#: independently: that the enumeration's cost is the design rather than a
+#: defect, and that ``order_kind=limit`` does not by itself carry "opened by
+#: this system in an auto_trade group", so a source-shaped release would be
+#: wider than the authority it is drawn from. That change is phase 6k; its
+#: precondition is the real execution these two ids are about to produce, and
+#: its predicate has to carry the auto_trade and verified conditions
+#: explicitly.
+TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset(
+    {"1001125231241107", "1001125231241310"}
+)
 
 WOULD_PLACE_EVENT = "take_profit_would_place"
 WOULD_PLACE_ENDPOINT = "POST /deepcoin/trade/set-position-sltp"
