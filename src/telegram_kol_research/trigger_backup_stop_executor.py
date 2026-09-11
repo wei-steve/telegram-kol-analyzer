@@ -30,14 +30,35 @@ from telegram_kol_research.protection_authority import (
 #: 75548.6; all six approved fields and all three guardrails checked against
 #: the venue afterwards (status file, phase-6f-1). 1001125216153672 released
 #: after that check, on the same approval.
-#: **Empty again since 2026-09-11.** Both received their backup stop
-#: (1001125219289222 and 1001125219582177, each at 75548.6 and each checked
-#: field by field against the venue -- phase-6f-1 and phase-6f-completed), and
-#: both positions were closed by hand on 2026-09-11 at 14:42Z. The ids now
-#: name positions that do not exist, which reads as a standing permission
-#: while granting nothing, and a reader cannot tell that from a live release
-#: without going to the exchange.
-ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset()
+#: **The two BTC ids were retired on 2026-09-11.** Both received their backup
+#: stop (1001125219289222 and 1001125219582177, each at 75548.6 and each
+#: checked field by field against the venue -- phase-6f-1 and
+#: phase-6f-completed), and both positions were closed by hand that day at
+#: 14:42Z. A released id naming a position that no longer exists reads as a
+#: standing permission while granting nothing, and a reader cannot tell that
+#: from a live release without going to the exchange.
+#:
+#: **The two ETH ids are phase 6j**, released the same day under the authority
+#: the user granted on 2026-09-11 ("授权放开", recorded at commit d91a4179):
+#: the command session may release a write path whose shadow has shown the
+#: computed action matching the disclosed detail with zero unexpected writes,
+#: acting only on verified positions this system opened in an auto_trade group.
+#: Both conditions hold here -- ``backup_stop_shadow_ready`` incidents 455/456
+#: carry the exact payload (primary 2484 adopted by TU, proposed backup
+#: 2479.03, whole_position, ``set_position_sltp``), and both legs are
+#: ``attribution_status=verified`` by ``direct_order_position_id``.
+#:
+#: **Still per position id, deliberately.** Releasing by *source* -- every
+#: primary stop adopted from the exchange, forever -- was proposed and
+#: narrowed back on 2026-09-11: the cost of a release (a code change, a full
+#: suite, a deploy) is the design rather than a defect, and the source
+#: predicate does not by itself carry "opened by this system in an auto_trade
+#: group", so releasing by it would be wider than the authority it is drawn
+#: from. That change is phase 6k, and its precondition is the *real execution*
+#: samples these two ids are about to produce -- not more shadow rows.
+ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset(
+    {"1001125231241107", "1001125231241310"}
+)
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg

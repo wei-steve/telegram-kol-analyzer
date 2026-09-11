@@ -87,16 +87,28 @@ _MAX_QUOTE_AGE = timedelta(seconds=30)
 #: ``trigger_backup_stop_executor`` to recompute on a later round, and happens
 #: only once a TP1 fill has produced a convergence. ``full_exit`` was shown in
 #: the same page and **was not approved** -- see the constant below.
-#: **Empty again since 2026-09-11.** Both were released that day on the user's
-#: approval and both were closed by hand hours later, at 14:42Z, so the ids
-#: now name positions that do not exist -- a standing permission that grants
-#: nothing, and one a reader cannot tell from a live release without going to
-#: the exchange. Retiring them costs nothing: releasing a future position is a
-#: code change either way.
+#: **The two BTC ids were retired on 2026-09-11.** Both were released that day
+#: on the user's approval and both were closed by hand hours later, at 14:42Z,
+#: so the ids came to name positions that do not exist -- a standing permission
+#: that grants nothing, and one a reader cannot tell from a live release
+#: without going to the exchange. Neither was ever acted on: no convergence
+#: existed while they were released, so ``break-even:``-prefixed exchange
+#: writes remain zero for all time (registry P1).
 #:
-#: Neither was ever acted on. No convergence existed while they were released,
-#: so `break-even:`-prefixed exchange writes remain zero for all time (P1).
-BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
+#: **The two ETH ids are phase 6j**, released the same day under the authority
+#: recorded at commit d91a4179. The break-even shadow has been producing a
+#: ``set_break_even`` row for each of them every round -- target stop equal to
+#: the entry price (2560.75 / 2560.48), ``would_cancel_order_ids`` containing
+#: the primary stop **only**, ``would_close_*`` all null -- so what a release
+#: permits here is exactly what the shadow has been printing.
+#:
+#: Still per position id: the execution side has no real sample yet. The
+#: shadow rows are plentiful and the executor has never run, because it needs a
+#: convergence and a convergence needs a TP1 fill. Those are two different
+#: things and this constant is gated on the second.
+BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset(
+    {"1001125231241107", "1001125231241310"}
+)
 
 #: Phase 6h. Positions whose break-even convergence may actually **close the
 #: position at market**. **Empty on purpose, and separate from the constant

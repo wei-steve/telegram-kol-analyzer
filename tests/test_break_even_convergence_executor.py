@@ -19,7 +19,9 @@ green.
 **Fixing the read did not release the write.** Reconnecting a path that has
 never once run against the venue is a separate decision from correcting a
 field name, so the executor holds at
-``BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS``, which is empty in production. The
+``BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS``, which names only the positions
+explicitly approved -- two ETH longs since phase 6j on 2026-09-11, and nothing
+before them had ever been acted on. The
 tests that exercise the replacement mechanics run with the position released,
 via the ``released_positions`` fixture; the gate itself is covered by its own
 pair of tests at the end, in both directions. Do not make that fixture

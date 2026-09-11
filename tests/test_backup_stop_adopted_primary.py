@@ -224,13 +224,29 @@ def test_a_released_position_is_not_held(tmp_path, monkeypatch):
     assert held.reason_code == "primary_stop_adopted_from_exchange"
 
 
-def test_the_release_set_is_empty_in_production():
-    """And it is empty right now, asserted separately from the behaviour above.
+def test_the_release_set_holds_exactly_what_was_approved():
+    """What is released right now, asserted separately from the behaviour above.
 
-    Split deliberately. The behavioural test must keep running whatever the
-    constant holds; this one records what it holds, and will need a deliberate
-    edit the next time a position is approved -- which is the point, since
-    releasing one is meant to cost a code change.
+    Split deliberately, and the split paid for itself on its first use: this
+    case needed an edit on 2026-09-11 when phase 6j released the two ETH
+    positions, while ``test_a_released_position_is_not_held`` above needed none,
+    because it supplies its own synthetic id. A behavioural test that had to be
+    touched every time a position is approved would eventually be loosened to
+    stop the churn -- which is how a gate's own test stops guarding it.
+
+    Needing a deliberate edit here is the feature. Releasing a position is
+    meant to cost a code change, a full suite and a deploy; if this line could
+    be satisfied without anyone writing the id down, that cost would be gone.
     """
 
-    assert ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS == frozenset()
+    assert ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS == frozenset(
+        {
+            # Phase 6j, 2026-09-11. ETH-USDT-SWAP longs from binding 352,
+            # both verified by direct_order_position_id, both holding an
+            # adopted primary stop at 2484. Releasing them lets the backup
+            # stop at 2479.03 -- exactly the payload incidents 455/456 had
+            # already recorded while held.
+            "1001125231241107",
+            "1001125231241310",
+        }
+    )
