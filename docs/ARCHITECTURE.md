@@ -498,6 +498,16 @@ historical_state_repair.py               position_management_remediation.py
   夹具没给 binding 写 `pos_id`，于是它在触及归属检查**之前**就失败了，
   而"因为夹具坏了被拒"与"因为归属未核实被拒"在断言里长得一模一样。
   修好夹具让用例真正走到那道门之后，单点变异才让它转红。
+  **同一个坑在写下这条的第二天又踩了一次，所以补上它真正的成因：否定式断言。**
+  2026-09-11 `test_a_released_position_is_not_held` 只断言
+  `plan.status != "shadow_ready_adopted_primary"`；夹具把入场腿的 `pos_id` 写死成
+  `"pos-1"`，而用例问的是另一个 id，于是 `_plan_submission` 在第一步就返回
+  `blocked / binding_or_leg_unavailable`——**永远满足那条不等式**。
+  把释放闸门硬接成常闭（`if True:`）**全绿**，而这条用例存在的唯一理由就是挡住这个变异。
+  **关键不在"夹具写错了"，在于 `!=` 这种断言天生分辨不了"没走到"与"走到了并放行"。**
+  **做法**：凡是用来证明某道门放行的用例，断言必须是**肯定式**的（`status == "ready"`
+  且带上它本该产出的字段），并在**同一条用例里**用同一份夹具把门关上再跑一次，
+  断言另一个结果。**一个仓位、一处差异、两种结局**——否则读者无从知道那处差异是不是原因。
 
 - **在工作树里跑全量之前，先确认 `.venv` 存在（没有就建符号链接指向主检出的那个）。**
   `tests/test_server_update_scripts.py` 与 `tests/test_minimal_server_updater.py` 把

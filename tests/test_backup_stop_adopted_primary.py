@@ -2,8 +2,6 @@
 
 from datetime import UTC, datetime
 
-import pytest
-
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_contract_specs import (
     DeepcoinContractSpec,
@@ -17,6 +15,7 @@ from telegram_kol_research.execution_bindings import (
 )
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+import telegram_kol_research.trigger_backup_stop_executor as backup_stop_module
 from telegram_kol_research.trigger_backup_stop_executor import (
     ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
     _plan_submission,
@@ -62,6 +61,16 @@ class _Client:
 
 
 def _seed(tmp_path, *, evidence_source, pos_id="pos-1"):
+    """Binding, entry leg and adopted primary stop, all on the same position.
+
+    ``pos_id`` has to reach the *leg* as well as the ledger row: the first
+    thing ``_plan_submission`` does is refuse with ``binding_or_leg_unavailable``
+    when ``leg.pos_id`` is not the position it was asked about. A seed that
+    left the leg on "pos-1" produced that refusal for every caller passing a
+    different id -- and a refusal for a fixture's reason reads exactly like a
+    refusal for the right one.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     binding_id = upsert_execution_binding(
         session_factory,
@@ -74,7 +83,7 @@ def _seed(tmp_path, *, evidence_source, pos_id="pos-1"):
         ExecutionOrderLegRecord(execution_binding_id=binding_id, leg_index=1,
                                 purpose="entry", order_kind="limit",
                                 strategy_instance_id="deepcoin:1:1:BTC:long",
-                                venue="deepcoin", pos_id="pos-1", status="active",
+                                venue="deepcoin", pos_id=pos_id, status="active",
                                 attribution_status="verified"),
     )
     with session_factory() as session:
@@ -145,21 +154,38 @@ def test_a_normally_recorded_primary_is_not_held_back(tmp_path):
     assert plan.status != "shadow_ready_adopted_primary"
 
 
-@pytest.mark.parametrize("released", sorted(ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS))
-def test_a_released_position_is_not_held(tmp_path, released):
+def test_a_released_position_is_not_held(tmp_path, monkeypatch):
     """The release is per position id, and it is the only thing that lifts the hold.
 
     Without this the hold could be made unconditional -- every adopted primary
     held forever -- and the test above would still pass while phase 6f did
     nothing at all.
 
-    Parametrized over the whole set rather than one member of it. The first
-    version took ``sorted(...)[0]``, which was the same id before and after the
-    second position was released -- so adding an id to the constant would have
-    changed production behaviour while the test carried on exercising only the
-    one that was already live.
+    **Released id supplied by the test, not read from the constant.** Two
+    earlier versions read it: the first took ``sorted(...)[0]``, so adding an
+    id changed production while the test kept exercising the one already live;
+    the second parametrized over the whole set, which was right until the set
+    went back to empty on 2026-09-11 -- and then pytest reported
+    ``got empty parameter set``, **a skip that reads as green**. A property
+    this test exists to hold does not stop being true when nothing is
+    currently released, so it must not stop being checked either.
+
+    **Asserted positively, and against the same fixture held.** The third
+    version of this test asserted only ``status != "shadow_ready_adopted_primary"``
+    and hard-wiring the gate shut did not turn it red: the fixture's leg
+    carried a different ``pos_id`` than the one under test, so every run
+    refused at ``binding_or_leg_unavailable`` long before reaching the gate.
+    A refusal for the fixture's reason is indistinguishable from a refusal for
+    the right one, so the pair below is the assertion: one position, one
+    difference -- the gate -- and two different outcomes.
     """
 
+    released = "pos-released-for-this-test"
+    monkeypatch.setattr(
+        backup_stop_module,
+        "ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS",
+        frozenset({released}),
+    )
     session_factory, binding_id, leg_id = _seed(
         tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
     )
@@ -172,4 +198,39 @@ def test_a_released_position_is_not_held(tmp_path, released):
             backup_stop_buffer_bps=20.0, submitted_at=NOW,
         )
 
-    assert plan.status != "shadow_ready_adopted_primary"
+    # Positive: the release lets the plan through to a real submission plan.
+    # "not held" is not enough -- a block reads the same way.
+    assert plan.status == "ready", (plan.status, plan.reason_code)
+    assert plan.payload["slTriggerPx"] == "75548.6"
+    assert client.writes == []
+
+    # Negative, same position, same fixture, gate closed. Only the gate moved.
+    monkeypatch.setattr(
+        backup_stop_module,
+        "ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS",
+        frozenset(),
+    )
+    held_factory, held_binding_id, held_leg_id = _seed(
+        tmp_path / "held", evidence_source="exchange_adopted_by_tu", pos_id=released
+    )
+    with held_factory() as session:
+        held = _plan_submission(
+            session, binding_id=held_binding_id, leg_id=held_leg_id, pos_id=released,
+            client=_Client(pos_id=released), contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert held.status == "shadow_ready_adopted_primary", (held.status, held.reason_code)
+    assert held.reason_code == "primary_stop_adopted_from_exchange"
+
+
+def test_the_release_set_is_empty_in_production():
+    """And it is empty right now, asserted separately from the behaviour above.
+
+    Split deliberately. The behavioural test must keep running whatever the
+    constant holds; this one records what it holds, and will need a deliberate
+    edit the next time a position is approved -- which is the point, since
+    releasing one is meant to cost a code change.
+    """
+
+    assert ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS == frozenset()

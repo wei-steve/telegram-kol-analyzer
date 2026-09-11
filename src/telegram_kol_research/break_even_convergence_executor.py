@@ -87,9 +87,16 @@ _MAX_QUOTE_AGE = timedelta(seconds=30)
 #: ``trigger_backup_stop_executor`` to recompute on a later round, and happens
 #: only once a TP1 fill has produced a convergence. ``full_exit`` was shown in
 #: the same page and **was not approved** -- see the constant below.
-BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset(
-    {"1001125216121996", "1001125216153672"}
-)
+#: **Empty again since 2026-09-11.** Both were released that day on the user's
+#: approval and both were closed by hand hours later, at 14:42Z, so the ids
+#: now name positions that do not exist -- a standing permission that grants
+#: nothing, and one a reader cannot tell from a live release without going to
+#: the exchange. Retiring them costs nothing: releasing a future position is a
+#: code change either way.
+#:
+#: Neither was ever acted on. No convergence existed while they were released,
+#: so `break-even:`-prefixed exchange writes remain zero for all time (P1).
+BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
 
 #: Phase 6h. Positions whose break-even convergence may actually **close the
 #: position at market**. **Empty on purpose, and separate from the constant

@@ -30,9 +30,14 @@ from telegram_kol_research.protection_authority import (
 #: 75548.6; all six approved fields and all three guardrails checked against
 #: the venue afterwards (status file, phase-6f-1). 1001125216153672 released
 #: after that check, on the same approval.
-ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset(
-    {"1001125216121996", "1001125216153672"}
-)
+#: **Empty again since 2026-09-11.** Both received their backup stop
+#: (1001125219289222 and 1001125219582177, each at 75548.6 and each checked
+#: field by field against the venue -- phase-6f-1 and phase-6f-completed), and
+#: both positions were closed by hand on 2026-09-11 at 14:42Z. The ids now
+#: name positions that do not exist, which reads as a standing permission
+#: while granting nothing, and a reader cannot tell that from a live release
+#: without going to the exchange.
+ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset()
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
