@@ -738,12 +738,18 @@ historical_state_repair.py               position_management_remediation.py
   **做法**：凡是本仓库里形如"必须满足 X 才能做 Y"的检查，其命令的输出必须是
   `PASS` / `FAIL` 本身，而不是一份需要人再判一次的清单：
   ```bash
-  if git diff "$PROD" "$SHARED" --name-only | grep -qvE '^docs/|\.md$'; then
-      echo "FAIL: code files beyond production:"; ...
-  else
-      echo "PASS: 0 code files beyond production"
-  fi
+  OFFENDERS=$(git diff "$PROD" "$SHARED" --name-only | sed -E '/^docs\//d; /\.md$/d')
+  [ -n "$OFFENDERS" ] && echo "FAIL: $OFFENDERS" || echo "PASS"
   ```
+  **而这条判据的第一版本身是错的，值得连同错误一起记**：我最初写的是
+  `grep -qvE '^docs/|\.md$'`。本环境的 `grep` 是包装 `ugrep` 的 shell 函数，
+  **它的 `-q` 与 `-v` 合用时报告的是"有没有行匹配 pattern"，而不是"有没有行被选中"**——
+  而 diff 里几乎总有一个 `docs/` 文件，**于是那个写法几乎永远返回"没有违规"**。
+  **一个稳定说 PASS 的检查，比那个它要取代的、被忘记执行的检查更糟。**
+  发现它的唯一原因是**它的结论与我已知的事实矛盾**（被测分支明明带着未部署的代码），
+  而我没有放过那个矛盾。
+  **推论**：把一条检查写成判定式还不够，**判定式检查本身要用一正一反两个输入验过**——
+  一个必须说 FAIL，一个必须说 PASS。否则"它给了我一个答案"会被当成"它算对了"。
   **同一条判据的两种写法，一种要人看着清单自己判，一种直接说 PASS 还是 FAIL。**
   前者依赖的是当时的注意力，而注意力在一天的末尾最不可靠——
   这与上一条"能红的用例不依赖记忆"是同一件事在**人工检查**上的形态。

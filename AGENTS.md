@@ -96,13 +96,24 @@
   saying the check was done. So run it in this form:
 
   ```bash
-  if git diff "$PROD" "$SHARED" --name-only | grep -qvE '^docs/|\.md$'; then
-      echo "FAIL: code files beyond production:"
-      git diff "$PROD" "$SHARED" --name-only | grep -vE '^docs/|\.md$'
+  OFFENDERS=$(git diff "$PROD" "$SHARED" --name-only | sed -E '/^docs\//d; /\.md$/d')
+  if [ -n "$OFFENDERS" ]; then
+      printf 'FAIL: code files beyond production:\n%s\n' "$OFFENDERS"
   else
       echo "PASS: 0 code files beyond production"
   fi
   ```
+
+  **Do not write this with `grep -qv`.** The first version of this rule did,
+  and it was wrong: in this environment `grep` is a shell function wrapping
+  `ugrep`, whose `-q` combined with `-v` reports whether any line *matched the
+  pattern* rather than whether any line was *selected*. Since a diff almost
+  always contains at least one `docs/` file, that form returns "no offenders"
+  essentially always -- **a check that reliably says PASS**, which is worse
+  than the missing check it replaced. It was caught only because its verdict
+  contradicted something already known: the branch under test plainly carried
+  undeployed code. **So test the check itself against both answers before
+  trusting it** -- one input that must say FAIL and one that must say PASS.
 
   **If undeployed code does reach the shared branch, withdraw it with a revert
   commit rather than by rewriting history** -- a force push is only acceptable
