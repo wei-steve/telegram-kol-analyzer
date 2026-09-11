@@ -47,6 +47,7 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_ordinary_entry_binding import (
     ATTRIBUTION_UNVERIFIED,
+    ATTRIBUTION_VERIFIED as ATTRIBUTION_VERIFIED_STATUS,
 )
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -157,6 +158,19 @@ def claimed_position_ids(session, *, venue: str, exclude_leg_id: int) -> set[str
     return claimed
 
 
+#: Which entry kinds precondition (a) admits. **The live net's default is
+#: unchanged from the day it was approved**; phase 6's shadow passes a wider
+#: set so it can record what a widened net would decide, without the live path
+#: behaving differently by so much as a branch.
+#:
+#: The narrow default is not arbitrary but it is also not load-bearing: as of
+#: 2026-09-11 the condition "submitted, sixty seconds on, still no pos_id, not
+#: verified" had occurred nineteen times in production and **every one was a
+#: limit entry** -- never once a market one. So this set alone would have kept
+#: the net silent even if nothing else had.
+LIVE_ENTRY_ORDER_KINDS = frozenset({"market"})
+
+
 def evaluate_naked_fill(
     session_factory: sessionmaker,
     *,
@@ -165,6 +179,8 @@ def evaluate_naked_fill(
     now: datetime,
     venue: str = "deepcoin",
     pending_orders: Any = None,
+    entry_order_kinds: frozenset[str] = LIVE_ENTRY_ORDER_KINDS,
+    require_unverified_attribution: bool = True,
 ) -> NakedFillDecision:
     """Decide, from the five preconditions, whether one stop may be attached.
 
@@ -186,11 +202,28 @@ def evaluate_naked_fill(
         fill_size = _leg_fill_size(leg)
         stop_loss = _draft_stop_loss(binding)
 
-        # (a) an ordinary market entry leg whose attribution never resolved.
+        # (a) an ordinary entry leg whose attribution never resolved.
+        #
+        # Both halves are parameters so the phase 6 shadow can ask what a
+        # widened net would decide while the live net keeps deciding exactly
+        # what it decided before. The attribution half matters more than it
+        # looks: ``ATTRIBUTION_UNVERIFIED`` has never once been written in
+        # production -- zero occurrences across every attribution transition on
+        # record -- because the only writer sets it when ``pos_id`` is truthy
+        # while the two producers of that status return ``pos_id=None``. So
+        # this predicate has never been satisfiable, and the net approved on
+        # 2026-09-09 has never been able to fire. See phase 6's correction to
+        # the 6-pre-2 record.
+        attribution = str(leg.attribution_status or "")
+        attribution_blocks = (
+            attribution != ATTRIBUTION_UNVERIFIED
+            if require_unverified_attribution
+            else attribution == ATTRIBUTION_VERIFIED_STATUS
+        )
         if (
             str(leg.purpose or "") != "entry"
-            or str(leg.order_kind or "") != "market"
-            or str(leg.attribution_status or "") != ATTRIBUTION_UNVERIFIED
+            or str(leg.order_kind or "") not in entry_order_kinds
+            or attribution_blocks
             or not order_id
         ):
             return NakedFillDecision(

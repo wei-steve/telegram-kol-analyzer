@@ -1056,6 +1056,50 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **这次结果证明转达是准确的**，但"转达准确"是事后才知道的，
   **它不改变两种做法在动手那一刻的证据强度差异**。
   指挥会话已另行向用户索取一句明确的"确认连带"并将原样转达双方。
+- phase-6-pre-2-correction-net-never-fireable (2026-09-11, 会话 local_4a6676b0, **对 6-pre-2 记录的更正**):
+  **B-5d 市价成交裸仓安全网自 2026-09-09 上线起，一次都不可能触发过。**
+  它的前置条件 (a) 要求 `attribution_status == "unverified"`，而**该值从未被写入过**：
+  `position_attribution_audits` 全表每一条状态转换里，
+  `prior_state` / `new_state` 出现 `'unverified'` 的记录数 **= 0**。
+  `execution_events` 中 `action LIKE '%naked%'` **0 条**；
+  配对事故 `market_fill_attribution_unverified` **从未产生**。
+  **成因（代码侧，与数据一致）**：`ATTRIBUTION_UNVERIFIED` 的两处产生点
+  （`deepcoin_ordinary_entry_binding.py:222-226` 与 `324-328`）**都带 `pos_id=None`**；
+  写入点 `recovery_live_submit.py:2615-2619` 却是 `UNVERIFIED if pos_id else None`——
+  **两个条件按构造互斥**，归属失败时写进去的是 `None`（落库成 `unassigned`）。
+  **第二道独立的门**：条件 (a) 还要求 `order_kind == "market"`，
+  而"已提交 + ≥60 秒无 `pos_id` + 非 verified"在生产里发生过 **19 次、全部是 `limit`**，
+  **`market` 一次都没有**。**两道门各自独立地足以让它永不触发。**
+  **一个修法上的更正，我自己撞出来的**：指挥会话最初裁定"归属失败即写 `unverified`"来解互斥。
+  我改了，既有测试 `test_submit_recovery_order_live_places_orders_and_persists_binding` 立刻红——
+  它断言"未成交的入场应为 `unassigned`"，注释写着*"An unfilled entry has opened no position,
+  so there is nothing to attribute"*。**那个改法会把每一张未成交挂单标成 `unverified`**，
+  而那正是网的触发键——**等于把正常态标成异常态，把假候选注入源头**。已回退。
+  **真正的成因比"互斥"更准**：`unverified` 的含义是"**成交了但归属不上**"，
+  而 `recovery_live_submit` 那个位置**在下单回执刚回来时写腿，根本不知道有没有成交**。
+  **互斥不是缺陷，是那个位置的信息不足。** 现在写 `unassigned` 是对的。
+  重裁后的修法（(乙)）：**网的谓词改用可观测事实**（非终态 + ≥60 秒 + 无 `pos_id` +
+  非 verified + **成交证据**），**不改状态机**；`unverified` 保留定义但不再是触发键。
+- phase-6-naked-fill-arrival-rate (2026-09-11, 只读实测, **写判据之前先量**):
+  "入场腿已提交 + ≥60 秒仍无 `pos_id` + attribution 非 verified"，限 `{market, limit}`：
+  **有史以来 19 条（全为 `limit`）、近 21 天 4 条（约每 5 天一次）**。
+  **但那 19 条一条都不是裸仓**：`cancelled` 11 / `manually_cancelled` 1 / `manually_closed` 7，
+  **全部终态**——前两类是**根本没成交就被撤掉的挂单**，它们没有仓位，不裸。
+  **所以原触发条件会把"未成交挂单"当候选**，而 (乙) 的放开条件写的是
+  "至少取到 1 个样本且判定与设计一致"——**它会被一个假样本满足**。
+  因此触发条件加了"**成交证据**"，且记录里写明**证据来自哪一源**。
+  **成交证据只有一源，而不是指挥会话裁定的两源**：我第一版按裁定同时用了
+  WS `Trade`/`Order` 帧，**静态守卫 `test_no_production_module_reads_the_phase_one_inbox_table`
+  当场拒绝**——阶段 1 把 `deepcoin_ws_events` 挡在每一条决策路径之外，
+  理由正是"**让交易所决策依赖未经验证的推送数据**"。
+  **而这条我们自己在 6e 已经决定过一次**：采纳一张保护单时，
+  *"推送本身不被单独采信：该单必须同时出现在 REST `trigger-orders-pending` 里"*。
+  **拿一条 WS 帧当成交证明，是同一个错误去掉了那个确认步骤。**
+  所以只保留 orders-history（`state=filled` / `accFillSz>0`）这一源，
+  **没有把模块加进守卫白名单**——白名单是给有理由的例外的，这里没有理由，只有一个更弱的证据。
+  **一个现有字段回答不了的问题，如实记**：`manually_closed + no_pos_id` 共 **57 条**
+  是唯一可能装着历史裸仓的桶，但**从腿这一行分不出"成交了但没归属"与"根本没成交、被人工标记关闭"**。
+  **所以"裸仓条件历史上发生过几次"，库里现有字段答不出。** 逐条查证那 57 条另列待办，本步不做。
 - phase-6g-shadow-window-closed (2026-09-11, 会话 local_4a6676b0, **甲类全部达成、乙类无样本**):
   上线 **`6457b77e55924c883632f6afe4c57160b160aaad`**，回滚参考 **`6863d66c`**。
   四步部署四项全绿，第 4 步用判定式检查（`sed` + 空判定，事前用一正一反验过）。
