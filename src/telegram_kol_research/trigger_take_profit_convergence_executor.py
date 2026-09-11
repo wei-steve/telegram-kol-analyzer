@@ -106,9 +106,14 @@ logger = logging.getLogger(__name__)
 #: untouched. The second position of that pair (1001125216153672) is
 #: deliberately still held -- one position first, verified order by order,
 #: then the other.
-TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset(
-    {"1001125216121996"}
-)
+#:
+#: Both are back out again, and the list is empty on purpose. The user closed
+#: the pair by hand on 2026-09-11 at 78611.6; the two orders released above had
+#: been live for five hours, were voided with the position, and the second
+#: position never got its own release. Leaving a pos_id here that no longer
+#: exists would be a dead value in live code -- it reads like a standing
+#: permission and grants nothing. The next position starts from empty.
+TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset()
 
 WOULD_PLACE_EVENT = "take_profit_would_place"
 WOULD_PLACE_ENDPOINT = "POST /deepcoin/trade/set-position-sltp"

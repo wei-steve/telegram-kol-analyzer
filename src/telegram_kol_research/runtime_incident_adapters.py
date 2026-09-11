@@ -8,6 +8,7 @@ import logging
 import os
 import re
 from datetime import datetime
+from collections.abc import Sequence
 from typing import Any, Callable
 
 from sqlalchemy.orm import sessionmaker
@@ -489,6 +490,112 @@ def capture_authoritative_execution_uncertain(
             **fixed,
             error_type=_safe_label(error_class),
             error_summary=_safe_sentence(error_summary),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_unresolved_management_item_claimed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    message_instruction_item_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """An untargeted management item reached the claim path (A-16c self-check).
+
+    It should be impossible: A-16c creates these items and parks them in the
+    same transaction. If one is ever claimed, the park did not hold, and the
+    thing about to happen is the original shape of the 2026-09-11 incident --
+    a management instruction executed without knowing which position it means.
+    The claim is refused and this says so; a refusal nobody hears is how that
+    incident stayed invisible for a day in the first place.
+    """
+
+    if not config.captures("unresolved_management_item_claimed"):
+        return None
+    fixed = {
+        "component": "message_instruction_items",
+        "reason_code": "unresolved_management_item_claimed",
+        "impact": "claim_refused_item_reparked",
+        "operation": f"item_{int(message_instruction_item_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_instruction_item",
+        source_record_id=str(int(message_instruction_item_id)),
+        incident_type="unresolved_management_item_claimed",
+        severity="high",
+        detailed_summary=_summary(**fixed),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_management_recognition_unresolved(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    chat_id: int | None,
+    decision: str,
+    conflict_types: Sequence[str],
+    candidate_thread_ids: Sequence[int],
+    instruction_text: str,
+    resolution_reason: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture a management instruction that resolved to nothing (A-16a).
+
+    On 2026-09-11 a KOL sent three messages managing two live BTC positions.
+    The resolver read every one of them correctly -- it recorded "part
+    take-profit 50%, move the stop to cost" as the action -- and then refused
+    each because the instruction named an entry price that matched two entered
+    threads rather than one. The refusal is legitimate. **Being silent about it
+    is not**: no instruction item, no batch, no notification, and the user
+    eventually closed both positions by hand.
+
+    Scope is measured, not guessed. Alerting on every unresolved context
+    resolution would be 100-200 alerts a day (3065 rows since 2026-07-27), which
+    is the same as no alert. Alerting only when the message carried a
+    management instruction is 75 rows over 46 days, one to eight a day. The
+    narrowing field is the resolver's own ``management_instruction`` evidence,
+    not a keyword list.
+    """
+
+    if not config.captures("management_recognition_unresolved"):
+        return None
+    threads = "_".join(str(int(item)) for item in candidate_thread_ids) or "none"
+    conflicts = "_".join(_safe_label(item) for item in conflict_types) or "none"
+    fixed = {
+        "component": "context_resolution",
+        "reason_code": _safe_label(decision),
+        "impact": "management_instruction_not_executed",
+        "raw_message_id": int(raw_message_id),
+        "candidate_thread_ids": _safe_label(threads),
+        "conflict_types": _safe_label(conflicts),
+    }
+    if chat_id is not None:
+        fixed["chat_id"] = int(chat_id)
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="raw_message",
+        source_record_id=str(int(raw_message_id)),
+        incident_type="management_recognition_unresolved",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            instruction_excerpt=_safe_sentence(instruction_text),
+            error_summary=_safe_sentence(resolution_reason),
         ),
         minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,

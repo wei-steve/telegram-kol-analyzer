@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import uuid
 from collections.abc import Collection
 from datetime import datetime, timedelta
@@ -27,6 +28,8 @@ from telegram_kol_research.models import (
     utc_now,
 )
 
+
+logger = logging.getLogger(__name__)
 
 MANAGEMENT_EVENT_TYPES = frozenset(
     {"close_signal", "position_update", "strategy_revision"}
@@ -232,8 +235,72 @@ def claim_next_message_instruction_item(
         item = session.get(MessageInstructionItem, item_id)
         if item is None:
             raise RuntimeError("claimed instruction item disappeared")
+        if _is_unresolved_management_item(item):
+            # A-16c self-check, and it refuses rather than only complaining.
+            # A-16c creates management items whose action is known and whose
+            # target is not, and parks them in the same transaction. An item of
+            # that shape seen ``pending`` means the park did not hold, and
+            # executing an untargeted management instruction is the original
+            # shape of the 2026-09-11 incident. Put it back where it belongs
+            # and tell somebody; the caller gets nothing to execute.
+            _refuse_unresolved_management_claim(
+                session, session_factory, item=item, now=now
+            )
+            return None
         session.expunge(item)
         return item
+
+
+def _is_unresolved_management_item(item: MessageInstructionItem) -> bool:
+    if str(item.instruction_kind or "") != "management":
+        return False
+    if not item.result_json:
+        return False
+    try:
+        payload = json.loads(str(item.result_json))
+    except (TypeError, ValueError):
+        return False
+    return bool(isinstance(payload, dict) and payload.get("management_unresolved"))
+
+
+def _refuse_unresolved_management_claim(
+    session, session_factory, *, item: MessageInstructionItem, now: datetime
+) -> None:
+    from telegram_kol_research.management_target_verification import (
+        AWAITING_CONFIRMATION,
+    )
+
+    item.status = AWAITING_CONFIRMATION
+    item.last_progress_at = now
+    item.updated_at = now
+    session.execute(
+        update(ManagementMessageTarget)
+        .where(
+            ManagementMessageTarget.message_instruction_item_id == int(item.id),
+            ManagementMessageTarget.execution_state == "executing",
+        )
+        .values(execution_state="pending", execution_started_at=None, updated_at=now)
+    )
+    session.commit()
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_unresolved_management_item_claimed,
+        )
+
+        capture_unresolved_management_item_claimed(
+            session_factory,
+            config=load_runtime_incident_config(),
+            message_instruction_item_id=int(item.id),
+            raw_message_id=int(item.raw_message_id),
+            occurred_at=now,
+        )
+    except Exception:
+        logger.warning(
+            "unresolved management claim refusal alert failed item=%s",
+            int(item.id),
+            exc_info=True,
+        )
 
 
 def defer_message_instruction_item_for_visibility(

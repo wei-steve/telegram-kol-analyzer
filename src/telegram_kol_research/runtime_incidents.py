@@ -109,6 +109,20 @@ _SUMMARY_FIELDS = frozenset(
         # both pass the scan that still runs over the assembled JSON.
         "chat_id",
         "deadline_at",
+        # A-16a. A management instruction the resolver could not tie to a single
+        # thread used to end in silence: three of them arrived on 2026-09-11,
+        # the model named the action correctly each time ("part take-profit,
+        # move the stop to cost"), and nobody was told, so the user closed the
+        # positions by hand. The alert is only actionable if it says which
+        # threads were in the running and what the instruction said, so both
+        # travel in the summary. ``candidate_thread_ids`` is digits and
+        # underscores, ``conflict_types`` is a closed set of fixed labels, and
+        # ``instruction_excerpt`` goes through ``_safe_sentence``; the redaction
+        # scan below still runs over the assembled JSON, and the adapter falls
+        # back to a summary without the excerpt if this one is refused.
+        "candidate_thread_ids",
+        "conflict_types",
+        "instruction_excerpt",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(
