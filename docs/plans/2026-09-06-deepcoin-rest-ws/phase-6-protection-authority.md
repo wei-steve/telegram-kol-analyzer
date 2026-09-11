@@ -244,3 +244,73 @@ ARCHITECTURE.md 已同步：是
 异常与遗留：
 证据路径（服务器）：
 ```
+
+## 6g — 自动管理路径改走绑定链共用件（只读调查先行）
+
+**范围（2026-09-11 指挥会话按查证后的版本定稿）**：把 `strategy_management_executor`
+的 replace/cancel 改走 `protection_replacement` 共用件，撤单前对**将撤的那张单**做四项回读，
+删掉执行器自己那套替换序列。**不是"接上绑定链"——它已经接着了。**
+
+### 先查证后立项：一句被推翻的印象
+
+我最初报告说该路径"不走绑定链、不走撤前四项回读"。**前半句错。** 逐层追实际调用链：
+
+```
+strategy_management_executor:841 / 1599   close_exact_position(...)
+strategy_management_executor:3894         cancel_exact_position_sltp(...)
+    → position_mutation_gateway:968 / :936   模块级适配器
+    → :982 / :949  _build_fresh_authority     重建 PositionMutationAuthority
+    → 网关方法 :283 _load_verified_binding     绑定链、要求 verified 归属
+```
+
+后半句要拆：**平仓无撤单动作，"撤前回读"对它不适用**（我把它算进去是范畴错误）；
+撤单侧 `_cancel_old_protection_after_replacement`（3880-3905）**确实缺**——
+其 docstring "每笔替换完成回读之后才撤旧" 回读的是**新单**，不是**即将被撤的那张旧单**。
+
+`grep pre_cancel_check` 命中 `break_even_convergence_executor` / `deepcoin_execution_actions` /
+`protection_replacement`，**不含 `strategy_management_executor`**；后者也未导入
+`replace_stop_group` / `replace_take_profit_group` / `resolve_protection_authority` /
+`evaluate_cancel_precheck`。
+
+### 生产样本（只读，2026-09-11 查）
+
+| 项 | 值 |
+|---|---|
+| `management:*:cancel:*` intent | **60**，全部 `confirmed` |
+| 跨批次 | **16** 个批次，2026-07-28 ~ 2026-09-01 |
+| 被撤单的用途 | **止损 34 / 止盈 26** |
+| 撤了账本不认识的 ordId | **0** |
+| 非成功回执 | **0** |
+
+**所以这条路径有充足生产样本，不是"无生产样本"。** 它跑过 60 次、每次都成功。
+
+### 一个比"缺回读"更要紧的发现：这条路径不留时序证据
+
+我本想用 intent 时间戳量出"挂新单到撤旧单之间的暴露窗口"，得到的是**全部批次 gap = 0.0 秒**。
+**那是假象。** 逐行看批次 97：
+
+```
+237 cancel …034448  reserved=submitted=2026-08-03 14:32:22.189520  confirmed=14:32:32.726971
+238 cancel …038461  reserved=submitted=同上                        confirmed=同上
+239 cancel …039342  reserved=submitted=同上                        confirmed=同上
+240 set stop_loss:0 reserved=submitted=confirmed=14:32:22.189520
+241 set stop_loss:1 同上
+242 set take_profit:2 同上
+```
+
+**`reserved_at` / `submitted_at` / `created_at` 全部等于批次的 `executed_at`**
+（调用点 `now_provider=lambda: executed_at`，如 852 / 1060 / 1189 / 3904 行），
+只有撤单的 `confirmed_at` 来自后续确认，比其余晚 10.5 秒。
+
+**后果**：库里**无法重建这条路径的动作顺序，也无法量出暴露窗口**。
+连 id 顺序都不可用作证据——批次 97 里撤单的 id（237-239）反而**小于**挂单的 id（240-242），
+那只反映预留顺序，不反映执行顺序。**"gap = 0" 是未知，不是零。**
+
+**这条给 6g 增加了一个目标**：共用件不只带来撤前四项回读，还带来**逐步骤的回读与确认记录**，
+从而使"当时有没有一瞬间没有止损"这个问题**事后可查**。现在它不可查。
+
+### 待办（起窗前补齐）
+
+- 找一次**管理指令驱动的保护替换**作为起点样本（intent 670 是**平仓**，
+  而平仓是这条路径上已经正确的那一半，**不能证明 6g 要修的缺陷**）；
+- 影子 → 切换两步，判据起窗前写，切换按治理规则由指挥会话放行。
