@@ -1056,6 +1056,36 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **这次结果证明转达是准确的**，但"转达准确"是事后才知道的，
   **它不改变两种做法在动手那一刻的证据强度差异**。
   指挥会话已另行向用户索取一句明确的"确认连带"并将原样转达双方。
+- phase-6-pre-4-followup-24h (2026-09-11 15:55Z, 会话 local_4a6676b0, **24 小时追记，只读**):
+  探活于 2026-09-10 09:07Z 上线，本次取数覆盖 **30.8 小时**。
+  ```
+  gaps_total 53   gaps_silence 0   gaps_other 53   gap_seconds 351.8   open_gaps 0
+  criticals 0     probes 150       probe_passes 150   probe_reconnects 0
+  ```
+  **归一到 24 小时后与基线对照**（基线 2026-09-09 实测，探活存在之前）：
+  | 项 | 基线 / 24h | 本次 / 24h |
+  |---|---|---|
+  | 缺口数 | 145 | **41.3** |
+  | 缺口秒数 | 1060.4 s | **274.1 s** |
+  | 占墙钟 | 1.23 % | **0.317 %** |
+  | 其中 `silence_timeout` | **134** | **0** |
+  **53 条缺口全部是计划内的**，按成因与日期分列（指挥会话要求重启造成的另计）：
+  ```
+  09-10  listen_key_renewal 11 (84.3s)   process_start 19 (101.8s)
+  09-11  listen_key_renewal 19 (144.1s)  process_start  4 ( 21.6s)
+  ```
+  **`process_start` 23 条是部署造成的**——09-10 那 19 条对应 6a/6b/6d/6e/6f 一连串上线，
+  09-11 那 4 条对应 6f 切换、6g、A-15-1、裸成交影子。**这部分缺口是我们自己制造的，不计入探活效果。**
+  扣掉它之后仅剩 `listen_key_renewal` 30 条 / 228.4 秒，**单条最长 9.1 秒**。
+  **最要紧的一行是 `silence_timeout` 从 134 变成 0。**
+  **但按脚本自己写在注释里的那句，不把它当成因果**：*"Numbers alone cannot say the
+  probe caused a drop -- probe_passes is the positive signal"*。
+  正面信号是 **`probes 150 / probe_passes 150 / probe_reconnects 0`**：
+  探活发了 150 次、全部通过、**一次都不需要强制重连**。
+  **这说明的是"连接在 150 次检查的时刻都是活的"，不是"探活把沉默消灭了"**——
+  沉默为零也可能来自这两天交易所侧的连接质量。**两者本次数据分不开，如实记。**
+  **一处口径提醒**：`gap_seconds` 把未闭合缺口算到当下；本次 `open_gaps = 0`，所以不受影响。
+  `probes` 来自 journal，**journald 会轮转，跨整日取数可能少计**；缺口数来自库，不轮转。
 - phase-6-naked-fill-shadow-window-closed (2026-09-11, 会话 local_4a6676b0, **甲类全部达成；乙类无样本，且窗内不存在可产生样本的对象**):
   上线 **`d48bba5fa0ff8ad3f20cb00060a11b2fc59ee8d0`**，回滚参考 **`6457b77e`**。
   四步部署四项全绿（第 4 步判定式）。全量 **8396 passed / 4 skipped / 0 failed**。
