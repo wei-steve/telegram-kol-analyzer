@@ -98,7 +98,17 @@ logger = logging.getLogger(__name__)
 #: the exchange" are two decisions, and the second one is the user's. A position
 #: that is not listed here still gets its whole plan computed and then held, so
 #: what would be sent is on the record before anybody approves it.
-TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset()
+#:
+#: 1001125216121996 was released on 2026-09-11 after the user confirmed the
+#: exact orders it would place, which the shadow window had by then recomputed
+#: identically on every pass for fifteen hours: 79800 x 7 and 81900 x 8 against
+#: a 15-contract position, no cancellations, the primary and backup stops
+#: untouched. The second position of that pair (1001125216153672) is
+#: deliberately still held -- one position first, verified order by order,
+#: then the other.
+TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset(
+    {"1001125216121996"}
+)
 
 WOULD_PLACE_EVENT = "take_profit_would_place"
 WOULD_PLACE_ENDPOINT = "POST /deepcoin/trade/set-position-sltp"
