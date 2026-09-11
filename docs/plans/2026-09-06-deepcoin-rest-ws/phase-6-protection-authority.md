@@ -314,3 +314,43 @@ strategy_management_executor:3894         cancel_exact_position_sltp(...)
 - 找一次**管理指令驱动的保护替换**作为起点样本（intent 670 是**平仓**，
   而平仓是这条路径上已经正确的那一半，**不能证明 6g 要修的缺陷**）；
 - 影子 → 切换两步，判据起窗前写，切换按治理规则由指挥会话放行。
+
+### 6g 起点样本：批次 155 / 腿 137（pos `1001125104601308`，2026-09-03 07:15:25Z）
+
+从 60 笔里挑的、前后状态最完整的一个。原样：
+
+```
+605 cancel  137:precancel:1001125104601392  stop_loss   76500  cancelled  management_protection_precancel
+606 cancel  137:precancel:1001125104602638  backup_stop 76347  cancelled  management_protection_precancel
+607 cancel  137:precancel:1001125104603160  take_profit 78300  cancelled  management_protection_precancel
+608 cancel  137:precancel:1001125104603274  take_profit 79000  cancelled  management_protection_precancel
+609 cancel  137:precancel:1001125104603426  take_profit 79700  cancelled  management_protection_precancel
+610 close_position  137:close:TM4B26…       （部分平仓）
+611 set     137:set:stop_loss:0             76500  verified  management_tpsl_replacement
+612 set     137:set:stop_loss:1             76347  verified  management_tpsl_replacement
+613 set     137:set:take_profit:2           79000  verified  management_tpsl_replacement
+614 set     137:set:take_profit:3           79700  verified  management_tpsl_replacement
+```
+
+**顺序是"先撤光全部保护 → 部分平仓 → 按剩余仓位重挂"**，由
+`_cancel_exact_risk_reduction_protection_before_close` 发出
+（docstring：*Durably reserve and cancel the exact old TPSL set before reducing risk*）。
+
+**这不是一个显而易见的缺陷，不要当成缺陷写**：先撤是**有意的**——旧 TPSL 按全仓尺寸，
+部分平仓后若不先撤会超额平仓（与共用件"止盈先撤后挂"同一条理由）；
+而且已有补偿路径 `_restore_precancelled_protection_for_rejected_close`（1626 / 1681），
+平仓被拒时把保护放回去（A 线 A-11b 做的就是这一段）。
+
+**6g 对这条路径实际增加的只有两件，两件都不改变它的顺序**：
+
+1. **撤前对将撤的那张单做四项回读**（instId / posSide / 触发价 / 数量）。
+   现在 605-609 直接按 ordId 撤，**不验证那张单还是不是解析时的那张**。
+   `grep pre_cancel_check` 在本文件命中 0 次。
+2. **逐步骤真实 wall clock 与回读记录**。现在 605-614 的
+   `created_at` / `reserved_at` / `submitted_at` **全部是批次的 `executed_at`**，
+   所以**"撤光到重挂之间，剩余仓位裸露了多久"在库里不可查**。
+   注意这里的措辞：**是不可查，不是为零**——这段裸露是这条流程结构上必然存在的，
+   问题不在于它存在，而在于**它的长度没有任何证据**。
+
+**所以 6g 的产出应当是**：同一条顺序、同一个业务语义，
+但撤每一张单之前先证明它还是那张，且事后能回答"裸露了多久"。
