@@ -285,6 +285,13 @@ posId 1001125216153672   slTriggerPx = 75548.6     tpTriggerPx = ""(空)
 **三次都不是"这个仓位的止损是多少"的答案**。
 **空尤其危险**：前两种至少给出一个数字，会让人去核对；
 空会被读成"没有保护"，而**"没有保护"通常触发的是补挂动作**。
+**但此刻不会有路径因这个空去补挂**（A-13 扫描结论，指挥会话 2026-09-11 转达）：
+仓位行 `slTriggerPx` / `tpTriggerPx` 的读点只有 `build_position_evidence`，
+**只进入入场归属的经济学比对，不作保护判据**；"这个仓位有没有保护"一律走
+`protection_snapshot` / `protection_health` 读 `trigger-orders-pending`。
+（`build_position_evidence` 那一半我在 2026-09-10 自己查过一次，结论相同。）
+**记这条交叉引用而不是再扫一遍**——但要注意它保证的是**此刻**：
+它是一份扫描结果，不是一条会在有人新写一处读点时转红的判据。
 
 **更正一处我自己说错的话。** 我曾据此告诉两条线"break-even 读的正是仓位行的这个字段"。
 **查过了，不对**：`break_even_convergence_executor` 从不读仓位行的 `slTriggerPx`，
