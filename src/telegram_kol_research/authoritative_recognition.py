@@ -870,6 +870,236 @@ def _management_instruction_text(payload: Mapping[str, Any]) -> str:
     return str(field.get("value") or "")
 
 
+UNRESOLVED_MANAGEMENT_MARKER = "management_unresolved"
+
+#: A-16c. Management event type carried by an instruction item whose action is
+#: known but whose target is not. It is never executed from this state -- the
+#: item is parked before the transaction commits and the claim path refuses it
+#: if it is ever seen ``pending`` -- so the type only has to be a management
+#: kind, which is what routes the item to ``instruction_kind="management"``.
+UNRESOLVED_MANAGEMENT_EVENT_TYPE = "position_update"
+
+
+def _route_unresolved_management_instruction(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    payload: Mapping[str, Any],
+    decision: ContextResolutionDecision,
+    candidates: Sequence[StrategyThreadCandidate],
+) -> None:
+    """Park and ask if we can, alert if we cannot. Never both, never neither.
+
+    A-16c over A-16a. Parking produces the A-7 confirmation notification, which
+    already carries the candidate list and the ``/choose`` instructions, so
+    raising the A-16a incident as well would notify twice for one message --
+    the same reason A-8 defers to this channel. When the message is outside the
+    parkable subset (no ``target_ambiguous``, or a single candidate) there is
+    nothing to choose between and the A-16a alert is the right and only output.
+
+    Never raises into the recognition path: losing the notice must not also
+    lose the message. A park that throws leaves nothing created, and the
+    fallback below still tells somebody.
+    """
+
+    parked: tuple[int, ...] = ()
+    try:
+        parked = _park_unresolved_management_instruction(
+            session_factory,
+            raw_message_id=raw_message_id,
+            payload=payload,
+            decision=decision,
+            candidates=candidates,
+        )
+    except Exception:
+        logger.warning(
+            "unresolved management park failed raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+    if parked:
+        _notify_unresolved_management_parked(
+            session_factory,
+            raw_message_id=raw_message_id,
+            candidates=candidates,
+        )
+        return
+    _alert_unresolved_management_instruction(
+        session_factory,
+        raw_message_id=raw_message_id,
+        payload=payload,
+        decision=decision,
+        candidates=candidates,
+    )
+
+
+def _notify_unresolved_management_parked(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    candidates: Sequence[StrategyThreadCandidate],
+) -> None:
+    """Reuse A-7's own notification, so the operator sees one familiar shape."""
+
+    try:
+        from telegram_kol_research.management_target_verification import (
+            confirmation_reason_code,
+            describe_candidates,
+            reply_instructions,
+        )
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_target_needs_confirmation,
+            capture_runtime_incident_best_effort,
+        )
+
+        chat_id = 0
+        with session_factory() as session:
+            raw_message = session.get(RawMessage, int(raw_message_id))
+            if raw_message is not None:
+                chat_id = int(raw_message.chat_id)
+        capture_runtime_incident_best_effort(
+            capture_management_target_needs_confirmation,
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            chat_id=chat_id,
+            candidate_count=len(candidates),
+            reason_code=confirmation_reason_code(len(candidates), False),
+            candidate_digest=(
+                f"{describe_candidates(candidates)} | reply: "
+                f"{reply_instructions(int(raw_message_id), len(candidates))}"
+            ),
+            occurred_at=datetime.now(UTC),
+        )
+    except Exception:
+        logger.warning(
+            "unresolved management confirmation notice failed raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+
+
+def _park_unresolved_management_instruction(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    payload: Mapping[str, Any],
+    decision: ContextResolutionDecision,
+    candidates: Sequence[StrategyThreadCandidate],
+) -> tuple[int, ...]:
+    """Stop and ask, instead of dropping a management instruction on the floor.
+
+    A-16c. The resolver may read an instruction correctly and still have no
+    single target for it: "keep 50% of the 77000 long" named an entry price that
+    two entered threads shared. Until now that ended the message -- the payload
+    was rewritten to 非策略, no signal candidate was produced, no instruction
+    item existed, and A-7's confirmation channel had nothing to park (its own
+    docstring records that both confirmations production ever raised parked
+    nothing for exactly this reason). Two live positions went unmanaged and the
+    user closed them by hand.
+
+    This builds the item explicitly, the way the ``strategy_revision`` path
+    already does, rather than un-erasing the payload: the payload keeps saying
+    exactly what it says today to every other consumer, and only this one route
+    produces this one kind of item.
+
+    **Creating and parking are one transaction.** An item that exists in
+    ``pending`` with no target is executable, and executing an untargeted
+    management instruction is the original shape of this whole incident. If the
+    park fails, nothing is created and the message falls back to the A-16a
+    alert, which is where it was before this step.
+
+    Narrow on purpose, and measured: ``target_ambiguous`` with two or more
+    candidates is the subset that covers every message in the 2026-09-11
+    incident, and it is the first time this route produces instruction items at
+    all.
+    """
+
+    from telegram_kol_research.management_target_verification import (
+        AWAITING_CONFIRMATION,
+        confirmation_reason_code,
+        numbered_candidates,
+    )
+    from telegram_kol_research.message_instruction_items import (
+        create_message_instruction_items_in_session,
+    )
+    from telegram_kol_research.models import MessageInstructionItem, SignalCandidate
+
+    instruction = _management_instruction_text(payload)
+    if not instruction:
+        return ()
+    if "target_ambiguous" not in set(decision.conflict_types):
+        return ()
+    if len(candidates) < 2:
+        return ()
+
+    offered = numbered_candidates(candidates)
+    reason_code = confirmation_reason_code(len(candidates), False)
+    symbol = str(getattr(candidates[0], "symbol", "") or "") or None
+    side = str(getattr(candidates[0], "side", "") or "") or None
+    moved: list[int] = []
+    with session_factory() as session:
+        candidate_row = (
+            session.query(SignalCandidate)
+            .filter(
+                SignalCandidate.raw_message_id == int(raw_message_id),
+                SignalCandidate.event_type == UNRESOLVED_MANAGEMENT_EVENT_TYPE,
+                SignalCandidate.parse_source == "mimo_authoritative",
+                SignalCandidate.target_lifecycle_id.is_(None),
+            )
+            .one_or_none()
+        )
+        if candidate_row is None:
+            candidate_row = SignalCandidate(
+                raw_message_id=int(raw_message_id),
+                event_type=UNRESOLVED_MANAGEMENT_EVENT_TYPE,
+                target_lifecycle_id=None,
+                parse_source="mimo_authoritative",
+            )
+            session.add(candidate_row)
+        candidate_row.symbol = symbol
+        candidate_row.side = side
+        candidate_row.management_action = None
+        candidate_row.confidence = float(decision.confidence)
+        session.flush()
+        create_message_instruction_items_in_session(
+            session,
+            raw_message_id=int(raw_message_id),
+            candidate_ids=[int(candidate_row.id)],
+        )
+        items = (
+            session.query(MessageInstructionItem)
+            .filter(
+                MessageInstructionItem.raw_message_id == int(raw_message_id),
+                MessageInstructionItem.signal_candidate_id == int(candidate_row.id),
+                MessageInstructionItem.retired_at.is_(None),
+            )
+            .all()
+        )
+        if not items:
+            raise RuntimeError("unresolved management item was not created")
+        now = datetime.now(UTC)
+        for item in items:
+            item.status = AWAITING_CONFIRMATION
+            result = {}
+            if item.result_json:
+                try:
+                    parsed = json.loads(str(item.result_json))
+                    result = parsed if isinstance(parsed, dict) else {}
+                except (TypeError, ValueError):
+                    result = {}
+            result[UNRESOLVED_MANAGEMENT_MARKER] = True
+            result["confirmation_candidates"] = [dict(row) for row in offered]
+            result["confirmation_reason_code"] = reason_code
+            result["management_instruction"] = instruction[:512]
+            result["resolution_reason"] = str(decision.reason or "")[:512]
+            item.result_json = json.dumps(result, ensure_ascii=False, sort_keys=True)
+            item.last_progress_at = now
+            item.updated_at = now
+            moved.append(int(item.id))
+        session.commit()
+    return tuple(moved)
+
+
 def _alert_unresolved_management_instruction(
     session_factory: sessionmaker,
     *,
@@ -1179,7 +1409,7 @@ def assess_message_authoritatively(
                     evidence_version_id=int(evidence_row.id),
                     decision=context_decision,
                 )
-                _alert_unresolved_management_instruction(
+                _route_unresolved_management_instruction(
                     session_factory,
                     raw_message_id=raw_message_id,
                     payload=mimo.payload,

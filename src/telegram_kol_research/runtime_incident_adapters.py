@@ -497,6 +497,48 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_unresolved_management_item_claimed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    message_instruction_item_id: int,
+    raw_message_id: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """An untargeted management item reached the claim path (A-16c self-check).
+
+    It should be impossible: A-16c creates these items and parks them in the
+    same transaction. If one is ever claimed, the park did not hold, and the
+    thing about to happen is the original shape of the 2026-09-11 incident --
+    a management instruction executed without knowing which position it means.
+    The claim is refused and this says so; a refusal nobody hears is how that
+    incident stayed invisible for a day in the first place.
+    """
+
+    if not config.captures("unresolved_management_item_claimed"):
+        return None
+    fixed = {
+        "component": "message_instruction_items",
+        "reason_code": "unresolved_management_item_claimed",
+        "impact": "claim_refused_item_reparked",
+        "operation": f"item_{int(message_instruction_item_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_instruction_item",
+        source_record_id=str(int(message_instruction_item_id)),
+        incident_type="unresolved_management_item_claimed",
+        severity="high",
+        detailed_summary=_summary(**fixed),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_management_recognition_unresolved(
     session_factory: sessionmaker,
     *,
