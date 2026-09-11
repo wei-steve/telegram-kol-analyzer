@@ -1036,6 +1036,40 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6h-cutover-window-closed (2026-09-11, 会话 local_4a6676b0, **切换窗达成；它补上了影子窗的空白，也留下一个相反的空白**):
+  上线 **`c99b33b21cc23404093f31ccf2d5e5d920455859`**，回滚参考 **`29f7e09a`**。
+  全量 **8375 passed / 4 skipped / 0 failed**。四步部署四项全绿。
+  **生产源码已逐行核实**（读服务器上的文件而非看提交）：
+  `BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS = {"1001125216121996","1001125216153672"}`、
+  `BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS = frozenset()`。
+  窗 **08:04:10Z ~ 08:34:20Z（1812 秒）**、**31 采样、零重置、零不健康、
+  `head_ok`/`units_ok` 全程 1**、**25 轮**、`WINDOW_MET`。
+  **判据逐条**：
+  (1) `be_writes == 0`（按 idempotency key 前缀 `break-even:` 归因）✓，
+      `other_writes == 0` ✓，`released_events == 0` ✓；
+  (2) 影子行：25 轮 **100 / 100 / 100**（examined / resolved / legacy_refused）、
+      `read_failures == 0`、每轮两仓各 1 行、撤单集合 ⊆ 主止损且不含备份 ✓；
+  (3) 零非预期写入：全窗 `position_mutation_intents` **零新增**，无需归因 ✓；
+  (4) `released_closes == 0` ✓（但见下）；
+  (5) 30 分钟连续、零重置 ✓。
+  **(1) 的 0 的意义，与起窗前写的一致，不改口**：闸门开着而没有写入，
+  **是因为没有 convergence（无 TP1 成交），不是因为闸门挡住了**。本窗不证明闸门有效。
+  **本窗补上了影子窗的空白**：市价整窗在入场价 77000 上方，
+  **`actions_seen` 全窗 `{"set_break_even": 50}`（25 轮 × 2 仓）**——
+  这正是 `phase-6h-shadow-window-closed` 里记为"本窗未取到样本"的那一支。
+  两窗合起来，`set_break_even` 与 `full_exit` 两条分支**各有 25 轮以上的真实样本**。
+  **但本窗留下一个方向相反的空白，必须同样如实记**：全窗无 `full_exit` 轮次，
+  所以判据 (4) 的前半"`would_close` 照常记录"**本窗无样本**；
+  只有后半 `released_closes == 0` 成立，而它是**平凡成立**的
+  （没有 `would_close` 可言，自然没有被标记为 released 的）。
+  **上一窗只取到 `full_exit`，本窗只取到 `set_break_even`——没有任何一窗同时取到两支。**
+  这不是缺陷，是市价决定的；但"两窗合起来覆盖了两支"这句话，
+  与"某一窗同时验证了两支"**不是一回事**，不能混写。
+  证据 `/root/evidence/phase-6h-cutover/observer-samples.jsonl`。
+  **待观测项（跨阶段，不属任何已收窗口）**：A 线放开限价入场止盈、TP1 真实成交之后的
+  **第一次 break-even convergence**——那一刻才第一次检验：
+  释放常量里的仓位真的执行替换（A-5e 顺序、只撤主止损、备份下一轮重挂），
+  且 `full_exit` 分支即使决策为它也仍被空集挡住。
 - phase-6g-scope-corrected-before-writing-it (2026-09-11, 会话 local_4a6676b0, **指挥会话拦下我一句印象**):
   我报告 intent 670（`management:163:141:close:`，2026-09-11 07:18:56，市价平掉 pos
   `1001125222877510` 7 张，`succeeded / management_close_exchange_confirmed`）时写道：
