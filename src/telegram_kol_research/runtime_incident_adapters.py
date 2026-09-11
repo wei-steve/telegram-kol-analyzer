@@ -784,6 +784,63 @@ def capture_protection_adopted_from_exchange(
     )
 
 
+def capture_management_cancel_precheck_observed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    pos_id: str,
+    order_id: str,
+    path: str,
+    verdict: str,
+    first_ever: bool,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Tell a person what the management path was about to cancel (phase 6g).
+
+    Raised on the first observation ever and on every one whose verdict is not
+    ``unchanged``. The first is not an anomaly -- it is the shadow proving it
+    runs at all -- and it is alerted because of when it happens: a management
+    protection replacement occurs roughly once every four days, so no window
+    will contain one and no moment prompts anyone to go looking. An observable
+    with no natural moment of inspection is one that is never inspected, which
+    this repository has already written down once as a criterion that only
+    runs when someone remembers.
+
+    A verdict other than ``unchanged`` says the order about to be cancelled is
+    no longer the one that was resolved -- replaced, resized, filled, or gone.
+    The management path does not yet act on that; it is recorded so the
+    decision to act can rest on how often it actually happens.
+    """
+
+    if not config.captures("management_cancel_precheck_observed"):
+        return None
+    fixed = {
+        "component": "management_cancel_precheck_shadow",
+        "reason_code": _safe_label(verdict),
+        "operation": f"pos_{_safe_label(pos_id)}",
+        "pos_id": _safe_label(pos_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="position_mutation_intents",
+        source_record_id=str(order_id),
+        incident_type="management_cancel_precheck_observed",
+        severity="high" if verdict != "unchanged" else "medium",
+        detailed_summary=_summary(
+            **fixed,
+            order_id=_safe_label(order_id),
+            path=_safe_label(path),
+            first_ever="yes" if first_ever else "no",
+            shadow_only="yes",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_uncertain_without_write(
     session_factory: sessionmaker,
     *,

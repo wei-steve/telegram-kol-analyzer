@@ -173,6 +173,13 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # by an environment whitelist and a person can check it against the
         # exchange.
         "protection_adopted_from_exchange",
+        # Phase 6g: the management path's cancel precheck, in shadow. Alerted
+        # not because it is an anomaly but because of its cadence -- a
+        # management protection replacement happens about once every four
+        # days, so no observation window will contain one and no moment
+        # prompts anyone to look. An environment whitelist could silence the
+        # only thing that will ever say this shadow ran.
+        "management_cancel_precheck_observed",
 
         # Phase 6-pre-2: the safety net under that same failure. Either it
         # attached a stop to a position identified only by a uniqueness

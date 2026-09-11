@@ -66,6 +66,11 @@ from telegram_kol_research.protection_attribution import (
     snapshot_protection_rows,
 )
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
+from telegram_kol_research.management_cancel_precheck_shadow import (
+    PATH_AFTER_REPLACEMENT,
+    PATH_RISK_REDUCTION_PRECANCEL,
+    observe_cancel_precheck,
+)
 from telegram_kol_research.protection_replacement_persistence import (
     VerifiedProtectionReplacement,
     persist_verified_protection_replacement,
@@ -2661,6 +2666,22 @@ def _cancel_exact_risk_reduction_protection_before_close(
                 )
                 session.commit()
             _require_remediation_live_gate(session_factory, batch=batch)
+            # Phase 6g, shadow. This is the flow that strips the whole TPSL set
+            # before a partial close, so it is also the one whose exposure
+            # interval nobody can measure: every intent it writes carries the
+            # batch's single ``cancelled_at``. The observation stamps a real
+            # clock, and says whether the order is still the one resolved.
+            observe_cancel_precheck(
+                session_factory,
+                deepcoin_client=deepcoin_client,
+                pos_id=str(leg.pos_id),
+                instrument_id=inst_id,
+                side=str(getattr(binding, "side", "") or ""),
+                order_id=str(order_id),
+                path=PATH_RISK_REDUCTION_PRECANCEL,
+                batch_id=getattr(batch, "id", None),
+                leg_id=getattr(leg, "id", None),
+            )
             response = cancel_exact_position_sltp(
                 session_factory=session_factory,
                 deepcoin_client=deepcoin_client,
@@ -3891,6 +3912,21 @@ def _cancel_old_protection_after_replacement(
 
     for order_id in old_order_ids:
         _require_remediation_live_gate(session_factory, batch=batch)
+        # Phase 6g, shadow. Ask whether this order is still the one that was
+        # resolved, write the answer down, and cancel either way. The verdict
+        # does not gate anything yet; what it is for is deciding, from how
+        # often it is not "unchanged", whether it should.
+        observe_cancel_precheck(
+            session_factory,
+            deepcoin_client=deepcoin_client,
+            pos_id=str(leg.pos_id),
+            instrument_id=inst_id,
+            side=str(getattr(leg, "side", "") or ""),
+            order_id=str(order_id),
+            path=PATH_AFTER_REPLACEMENT,
+            batch_id=getattr(batch, "id", None),
+            leg_id=getattr(leg, "id", None),
+        )
         cancel_exact_position_sltp(
             session_factory=session_factory,
             deepcoin_client=deepcoin_client,
