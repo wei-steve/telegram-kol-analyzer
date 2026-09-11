@@ -1056,6 +1056,31 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **这次结果证明转达是准确的**，但"转达准确"是事后才知道的，
   **它不改变两种做法在动手那一刻的证据强度差异**。
   指挥会话已另行向用户索取一句明确的"确认连带"并将原样转达双方。
+- phase-6-naked-fill-shadow-window-closed (2026-09-11, 会话 local_4a6676b0, **甲类全部达成；乙类无样本，且窗内不存在可产生样本的对象**):
+  上线 **`d48bba5fa0ff8ad3f20cb00060a11b2fc59ee8d0`**，回滚参考 **`6457b77e`**。
+  四步部署四项全绿（第 4 步判定式）。全量 **8396 passed / 4 skipped / 0 failed**。
+  **生产源码核实两项**：`run_naked_fill_shadow_pass` 在 `web_app` 出现 2 次；
+  `naked_fill_shadow.py` 里 `DeepcoinWsEvent` **计数 0**——静态守卫要求的那条在生产上是真的。
+  窗 **15:23:15Z ~ 15:53:25Z（1810 秒）**、**31 采样、零重置、零不健康、
+  `head_ok`/`units_ok`/`reads_ok` 全程 1**、**33 轮**、`WINDOW_MET`。
+  **甲类**：`be_writes` / `mgmt_writes` / `other_writes` 全程恒 **0**（按 key 前缀三分归因，非总数）✓；
+  仪表在线 ✓；`naked_fill_shadow` 每轮出现在 reconcile 轮日志里 ✓。
+  **乙类**：`nf_events` 全程 **0**。
+  **这次的"零"比前几个窗更弱一格，必须写清楚**：不是"检查了没发现"，
+  是**窗内根本没有可检查的对象**——全窗 `live_entry_legs` 恒 **1**，
+  而那唯一一条（腿 582，`trigger_limit`、`pending`、ordId `1001125122023573`、2026-09-04 挂至今）
+  **类型不在 `REGULAR_ORDER_LEG_KINDS` 内**，影子正确跳过；
+  `legs_examined` 全窗恒 0、`skipped_no_fill_evidence` 恒 0。
+  用户当日手工清空账户，604 条入场腿全部终态。
+  **所以本窗对"裸仓场景多久发生一次"零贡献**——
+  **"看了没看到"与"没有东西可看"不是一回事，后者连到达率都没有贡献。**
+  证据 `/root/evidence/naked-fill-shadow/observer-samples.jsonl`。
+  **待观测项登记新增 P6**：裸成交影子的第一个**真实成交**候选。
+  触发条件：一条 `market`/`limit` 入场腿成交、≥60 秒后仍无 `pos_id` 且非 verified，
+  且 orders-history 能证明它成交。**到达率未知**——
+  历史上符合原始谓词的 19 条全部是未成交后被撤的挂单（见 `phase-6-naked-fill-arrival-rate`），
+  而"成交却无归属"这个条件**库里现有字段答不出发生过几次**。
+  **状态：未到达，且当前无活跃对象。**
 - phase-6-pre-2-correction-net-never-fireable (2026-09-11, 会话 local_4a6676b0, **对 6-pre-2 记录的更正**):
   **B-5d 市价成交裸仓安全网自 2026-09-09 上线起，一次都不可能触发过。**
   它的前置条件 (a) 要求 `attribution_status == "unverified"`，而**该值从未被写入过**：
@@ -1196,6 +1221,14 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   - 要核对什么：同批次内 `observed_at_wall` 的最早与最晚之差
     （这正是现在不可查、而 6g 仪表补上的那个量）。
   - **状态：未到达。**
+  **(P6) 裸成交影子的第一个真实成交候选**（阶段 6 追加项）
+  - 触发条件：`market`/`limit` 入场腿**成交**、≥60 秒后仍无 `pos_id` 且非 verified、
+    且 orders-history 可证其成交。
+  - 到达率：**未知**。符合原始谓词的 19 条历史记录**全部是未成交后被撤的挂单**；
+    "成交却无归属"发生过几次，**现有字段答不出**。
+  - 要核对什么：唯一候选判定、拟止损价、**成交证据来源**；`unchanged` 之外的比例决定
+    (乙) 是否放开那张网。
+  - **状态：未到达，且当前无活跃对象**（全库仅 1 条非终态入场腿，类型不符）。
   **(P5) `_restore_precancelled_protection_for_rejected_close` 是否真兜住过**（6g，原 6g-2 之二）
   - 触发条件：一次 `precancel` 之后**平仓被拒**。
   - **状态：未查**（需逐笔看那 17 笔的平仓回执，排在 6g 影子起窗之后）。
