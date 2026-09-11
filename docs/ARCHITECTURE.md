@@ -727,6 +727,27 @@ historical_state_repair.py               position_management_remediation.py
   A-14 的 `tests/test_deepcoin_trigger_rows.py` 就是这么写的。
   与本节"成对的两个观测量必须来自独立的读"同源：**夹具与被测代码若共享同一个错误来源，它们的一致
   不构成证据。**
+- **检查命令必须自己给出判定，不能只给出供人判断的材料。**
+  2026-09-11：我把未部署的代码推上了共享分支——**今天第二次**。第一次的诊断是"忘了跑检查"，
+  并据此写下了"一条只在人记得时才执行的判据，等于没有判据"。
+  **第二次我跑了检查**：`git diff <prod> <shared> --name-only`，
+  **然后把输出打印出来、自己加了一句"这是故意还没部署的"，就过去了。**
+  漏掉的是 `| grep -vE '^docs/|\.md$'` ——**把清单变成判定的那一步**。
+  **两次的区别要紧**：第一次是没跑；第二次是**跑了、读了、然后用一句叙述替代了判定**。
+  后者更难防，因为从命令历史上看"检查做过了"。
+  **做法**：凡是本仓库里形如"必须满足 X 才能做 Y"的检查，其命令的输出必须是
+  `PASS` / `FAIL` 本身，而不是一份需要人再判一次的清单：
+  ```bash
+  if git diff "$PROD" "$SHARED" --name-only | grep -qvE '^docs/|\.md$'; then
+      echo "FAIL: code files beyond production:"; ...
+  else
+      echo "PASS: 0 code files beyond production"
+  fi
+  ```
+  **同一条判据的两种写法，一种要人看着清单自己判，一种直接说 PASS 还是 FAIL。**
+  前者依赖的是当时的注意力，而注意力在一天的末尾最不可靠——
+  这与上一条"能红的用例不依赖记忆"是同一件事在**人工检查**上的形态。
+
 - **一条能红的用例不依赖记忆；一条判据依赖。** 2026-09-11 6g：我写影子时直接复用了
   `evaluate_cancel_precheck`，而在那个位置构造它需要的 `ProtectionAuthority`，只能用**刚读回来
   的同一份 pending 列表**——于是比较的两边来自同一次读，**只可能答"一致"**。
