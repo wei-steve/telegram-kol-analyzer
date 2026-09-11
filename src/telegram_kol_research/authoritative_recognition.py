@@ -852,6 +852,85 @@ def _link_context_resolution(
         )
 
 
+def _management_instruction_text(payload: Mapping[str, Any]) -> str:
+    """Return the resolver's own management-instruction evidence, or ""."""
+
+    evidence = payload.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return ""
+    text_block = evidence.get("text")
+    if not isinstance(text_block, Mapping):
+        return ""
+    fields = text_block.get("fields")
+    if not isinstance(fields, Mapping):
+        return ""
+    field = fields.get("management_instruction")
+    if not isinstance(field, Mapping):
+        return ""
+    return str(field.get("value") or "")
+
+
+def _alert_unresolved_management_instruction(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+    payload: Mapping[str, Any],
+    decision: ContextResolutionDecision,
+    candidates: Sequence[StrategyThreadCandidate],
+) -> None:
+    """Break the silence when a management instruction resolves to nothing.
+
+    A-16a. The resolver may legitimately refuse to act -- an instruction that
+    names an entry price matching two entered threads has no single target --
+    but refusing and saying nothing are different things. On 2026-09-11 three
+    such refusals in a row left two live positions unmanaged, and the first
+    anyone heard of it was the user closing them by hand.
+
+    Deliberately narrow, and the width was measured rather than guessed: every
+    unresolved resolution would be 100-200 alerts a day, while "unresolved *and*
+    the resolver recorded a management instruction" is 75 in 46 days. The
+    condition mirrors the downgrade in ``_resolved_mimo_result`` so that an
+    alert fires exactly when that function turned the result into 非策略.
+
+    Never raises: an alert that loses the message is worse than the silence it
+    was meant to end.
+    """
+
+    try:
+        if decision.decision not in {"hold", "unresolved"} and (
+            decision.confidence >= 0.7
+        ):
+            return
+        instruction = _management_instruction_text(payload)
+        if not instruction:
+            return
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_management_recognition_unresolved,
+        )
+
+        capture_management_recognition_unresolved(
+            session_factory,
+            config=load_runtime_incident_config(),
+            raw_message_id=int(raw_message_id),
+            chat_id=None,
+            decision=str(decision.decision),
+            conflict_types=tuple(decision.conflict_types),
+            candidate_thread_ids=tuple(
+                int(candidate.thread_id) for candidate in candidates
+            ),
+            instruction_text=instruction,
+            resolution_reason=str(decision.reason or ""),
+            occurred_at=datetime.now(UTC),
+        )
+    except Exception:
+        logger.warning(
+            "unresolved management alert failed raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+
+
 def assess_message_authoritatively(
     session_factory: sessionmaker,
     *,
@@ -1099,6 +1178,13 @@ def assess_message_authoritatively(
                     raw_message_id=raw_message_id,
                     evidence_version_id=int(evidence_row.id),
                     decision=context_decision,
+                )
+                _alert_unresolved_management_instruction(
+                    session_factory,
+                    raw_message_id=raw_message_id,
+                    payload=mimo.payload,
+                    decision=context_decision,
+                    candidates=candidates,
                 )
             except Exception:
                 mimo = replace(
