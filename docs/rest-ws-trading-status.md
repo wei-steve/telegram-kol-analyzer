@@ -1036,6 +1036,35 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   （把仓位与入场腿的止损意图对上），没有任何一处拿它当保护判据**——那条判据在
   `protection_snapshot` / `protection_health`，走 `trigger-orders-pending`。**用途正确，不改。**
   记在这里是为了让下一个人不必重新查一遍。
+- phase-6g-scope-corrected-before-writing-it (2026-09-11, 会话 local_4a6676b0, **指挥会话拦下我一句印象**):
+  我报告 intent 670（`management:163:141:close:`，2026-09-11 07:18:56，市价平掉 pos
+  `1001125222877510` 7 张，`succeeded / management_close_exchange_confirmed`）时写道：
+  自动管理路径"**不走绑定链、不走撤前四项回读**"。**指挥会话要求与 A-11 记录对齐后再定 6g，不要按印象写。**
+  **查完了，前半句是错的。** 实际调用链（从 idempotency key 入手逐层追）：
+  `strategy_management_executor:841 / 1599` → `close_exact_position`（模块级适配器，
+  `position_mutation_gateway:968`）→ `:982 _build_fresh_authority` 重建
+  `PositionMutationAuthority` → 网关方法 `:283 _load_verified_binding`。
+  撤单侧同理：`strategy_management_executor:3894` → `cancel_exact_position_sltp`
+  （`position_mutation_gateway:936`）→ `:949 _build_fresh_authority`。
+  **所以管理路径的平仓与撤单本来就走绑定链、本来就要求 verified 归属。**
+  **后半句要拆开，其中一半是范畴错误**：平仓**无撤单动作**，"撤前回读"对它不适用；
+  撤单侧 `_cancel_old_protection_after_replacement`（3880-3905）**确实缺撤前四项回读**——
+  它的 docstring "每笔替换完成回读之后才撤旧"回读的是**新单**，不是**即将被撤的那张旧单**。
+  **6g 的真实范围**：不是"接上绑定链"（已接），而是**接上 6a 共用件 + 6e 撤前四项回读**。
+  证据：`grep pre_cancel_check src/telegram_kol_research/*.py` 命中
+  `break_even_convergence_executor` / `deepcoin_execution_actions` / `protection_replacement`，
+  **不含 `strategy_management_executor`**；后者也未导入
+  `replace_stop_group` / `replace_take_profit_group` / `resolve_protection_authority` /
+  `evaluate_cancel_precheck`，它有自己一套替换序列。
+  **intent 670 作为 6g 起点样本要降一级**：它是**平仓**，而平仓正是这条路径上**已经正确**的那一半，
+  **它不能证明 6g 要修的缺陷**。6g 需要的起点样本是一次**管理指令驱动的保护替换**，
+  阶段文件里先只读查：历史上走过几次 `_cancel_old_protection_after_replacement`、
+  有没有"撤掉了一张已经不是当初那张的单"的痕迹。**查完再定改什么。**
+  **形状**：我把"A 线查的止盈三道门"与"管理路径"两件真事接成了一条没验证的因果——
+  与 2026-09-10 我在 break-even 上犯的是同一个错（把仓位行观测接到 break-even 缺陷上）。
+  当时我自己写下过判据："把结论交给别人之前再问一遍它回答的是哪个问题。"
+  **这次我没做到，是上游拦下的。** 上次我自己发现，这次没有——
+  **所以那条判据目前只在我想起它时生效，等于还没有落成机制。**
 - phase-6h-approval (2026-09-11, 用户在指挥会话 local_858790fe 明确批准，原话"批准 6h"):
   **批准的是"移止损"那一支，`full_exit`（市价平掉整仓）同页出示、明确未批准。**
   两个常量因此分开：`BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS` 加入
