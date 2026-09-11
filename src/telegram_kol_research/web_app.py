@@ -88,6 +88,10 @@ from telegram_kol_research.deepcoin_reconcile_wake import (
 )
 from telegram_kol_research.break_even_shadow import run_break_even_shadow_pass
 from telegram_kol_research.naked_fill_shadow import run_naked_fill_shadow_pass
+from telegram_kol_research.release_gates import (
+    current_release_gates,
+    format_release_gates_for_log,
+)
 from telegram_kol_research.protection_adoption import (
     run_protection_adoption_pass,
 )
@@ -5300,6 +5304,13 @@ def create_web_app(
                             config=app.state.system_operator_bot_config,
                             payload=payload,
                         )
+                # Every gate that decides whether a path may write to the
+                # exchange, logged once per start. Their state otherwise lives
+                # only in the source file and in the memory of whoever
+                # deployed it -- a released gate announces itself to nobody,
+                # which on 2026-09-11 cost a round of two sessions disagreeing
+                # about whether one was open.
+                logger.info("%s", format_release_gates_for_log())
                 app.state.lifecycle_monitor = LifecycleMonitor(
                     session_factory=app.state.session_factory,
                     broker=app.state.live_update_broker,
@@ -6553,6 +6564,18 @@ def create_web_app(
         if app.state.runtime_role in {"all", "ingest"}:
             payload.update(app.state.message_lock_registry.snapshot())
         return payload
+
+    @app.get("/api/runtime/release-gates")
+    def api_runtime_release_gates():
+        """Which positions each exchange-write gate currently permits.
+
+        Read-only and process-local: it reports the constants this process
+        imported, which is exactly the question an operator or an observation
+        script needs answered -- not what the repository says, but what the
+        running worker holds.
+        """
+
+        return current_release_gates()
 
     @app.get("/api/runtime/deployment-identity")
     async def api_runtime_deployment_identity():
