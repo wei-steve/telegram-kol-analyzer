@@ -80,7 +80,16 @@ _MAX_QUOTE_AGE = timedelta(seconds=30)
 #: ``ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS``: releasing a position then costs
 #: a code change, a full suite and a deploy, which is the deliberate pause. A
 #: runtime flag would let the first one go out by editing a row.
-BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
+#:
+#: Both released 2026-09-11 on the user's approval ("批准 6h"), against the
+#: detail shown to them: the replacement moves the stop from 75700 to the entry
+#: price 77000, cancels only the primary, leaves the backup for
+#: ``trigger_backup_stop_executor`` to recompute on a later round, and happens
+#: only once a TP1 fill has produced a convergence. ``full_exit`` was shown in
+#: the same page and **was not approved** -- see the constant below.
+BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset(
+    {"1001125216121996", "1001125216153672"}
+)
 
 #: Phase 6h. Positions whose break-even convergence may actually **close the
 #: position at market**. **Empty on purpose, and separate from the constant
@@ -98,6 +107,11 @@ BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS: frozenset[str] = frozenset()
 #:
 #: This constant exists because correcting the preflight reconnected *both*
 #: branches, and the first version of that change gated only the replacement.
+#:
+#: **Shown to the user alongside the replacement on 2026-09-11 and deliberately
+#: not approved.** The replacement was released that day; this was not, and the
+#: separation is the whole reason the two constants exist. Do not add an id
+#: here because the same position appears in the constant above.
 BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS: frozenset[str] = frozenset()
 
 #: Recorded on the convergence leg when a replacement was computed but held.

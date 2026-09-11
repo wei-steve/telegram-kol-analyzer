@@ -907,9 +907,16 @@ def test_an_unreleased_position_computes_the_replacement_and_sends_none(tmp_path
     Deliberately not using ``released_positions``: this is the one case that
     must run against the real constant, or a gate removed by accident would
     never be noticed.
+
+    Asserts that *this fixture's* position is absent rather than that the
+    constant is empty. The constant stopped being empty on 2026-09-11 when the
+    user released the two live positions, and a test pinned to emptiness would
+    have had to be loosened on that day -- turning a released position into a
+    reason to weaken the gate's own test. What this case needs is an
+    unreleased position, which is a property it can keep forever.
     """
 
-    assert break_even_module.BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS == frozenset()
+    assert "pos-1" not in break_even_module.BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS
 
     session_factory = create_session_factory(tmp_path / "research.db")
     convergence = _seed_convergence(session_factory)
@@ -1112,17 +1119,36 @@ def test_the_two_release_constants_are_declared_independently():
     an editing risk: with the names aliased, adding a position id to the
     replacement set silently releases the market close for it too. That is a
     property of the text, so the text is what this reads.
+
+    Note what this can and cannot do. It guards the text, not the behaviour: an
+    equivalent rewrite that keeps the two independent would fail it wrongly,
+    and it cannot see an alias built at runtime. It is a weaker instrument
+    than the behavioural cases above and is here only for the one failure they
+    structurally cannot reach.
     """
 
     import inspect
 
     source = inspect.getsource(break_even_module)
-    for name in (
-        "BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS",
-        "BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS",
+    # Neither declaration may be written in terms of the other. Asserted this
+    # way rather than as "both are empty", because the replacement set stopped
+    # being empty when the user released two positions, while the property
+    # that matters -- releasing one branch never releases the other -- did not
+    # change that day and must not be weakened by it.
+    for name, other in (
+        ("BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS",
+         "BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS"),
+        ("BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS",
+         "BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS"),
     ):
-        declaration = f"{name}: frozenset[str] = frozenset()"
-        assert declaration in source, (
-            f"{name} must be declared as its own empty frozenset; releasing "
-            "one branch must never release the other"
+        declaration = next(
+            line for line in source.splitlines()
+            if line.startswith(f"{name}:") or line.startswith(f"{name} =")
         )
+        assert other not in declaration, (
+            f"{name} must not be declared in terms of {other}; releasing one "
+            "branch must never release the other"
+        )
+    # And the close branch specifically is still unreleased: the user approved
+    # the replacement on 2026-09-11 and did not approve this one.
+    assert break_even_module.BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS == frozenset()
