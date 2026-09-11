@@ -85,6 +85,31 @@
   redeploying for a docs change and resetting somebody else's window, which is
   a cost with nothing on the other side of it -- what the rule exists to stop
   is undeployed code riding along on the next person's deploy.
+  **Step 4's check must print its own verdict, not a file list.** Twice on
+  2026-09-10/11 undeployed code reached the shared branch. The first time the
+  check was skipped; the second time it was run as
+  `git diff <prod> <shared> --name-only`, its output read, captioned
+  "intentionally not deployed yet", and moved past -- the `grep` that turns
+  the list into an answer was the part left off. A check that hands back
+  material for a person to judge again is one that gets narrated past when
+  they are tired, and unlike a skipped check it leaves a command history
+  saying the check was done. So run it in this form:
+
+  ```bash
+  if git diff "$PROD" "$SHARED" --name-only | grep -qvE '^docs/|\.md$'; then
+      echo "FAIL: code files beyond production:"
+      git diff "$PROD" "$SHARED" --name-only | grep -vE '^docs/|\.md$'
+  else
+      echo "PASS: 0 code files beyond production"
+  fi
+  ```
+
+  **If undeployed code does reach the shared branch, withdraw it with a revert
+  commit rather than by rewriting history** -- a force push is only acceptable
+  after confirming nobody has built on the pushed sha, and the confirmation is
+  a read of the remote ref, not an assumption. (2026-09-11: confirmed and
+  forced; the rule stands for next time.)
+
   **A rule of this shape earns its first test on its own commit**: run the
   check against the commit that introduces it before pushing. The 2026-09-10
   wording went through two wrong judgements -- `.py$`, too narrow, and "outside
