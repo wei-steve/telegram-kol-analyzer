@@ -1301,6 +1301,23 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   - 要核对什么：唯一候选判定、拟止损价、**成交证据来源**；`unchanged` 之外的比例决定
     (乙) 是否放开那张网。
   - **状态：未到达，且当前无活跃对象**（全库仅 1 条非终态入场腿，类型不符）。
+  **(P0) `protection_authority_shadow` 的到达率要从日志算，不能从表算**（2026-09-11 查清，指挥会话指派）
+  - **它每一轮都跑**，不是"只跑一次"。证据：每轮 `deepcoin_reconcile_round` 日志行里
+    带 `protection_shadow` 段（`positions_seen` / `counts_by_verdict` / `read_failures` /
+    `rows_recorded`）。实测 **2026-09-11 17:00Z 起 30 分钟内 469 轮**（约 15.6 轮/分），
+    每轮 `counts_by_verdict={"agreed":2}`、`rows_recorded=0`。
+  - **表是去重的**：`_record_when_changed` 拿本仓位最近一行的 `fingerprint`
+    （verdict + chain 状态与单号 + legacy 状态与单号 + adopted/excluded + cancel_precheck
+    + ledger_drift）比对，**一样就不写行**。
+  - **所以 `execution_events` 里那 25 行是 25 次"判定发生了变化"，不是 25 次观测。**
+    把它当观测数会把到达率低估好几个数量级。
+    这正是本仓库 ARCHITECTURE §6 "一张去重过的表答不出'多久一次'"那一条；
+    **好消息是配对的另一半本来就有**——日志行每轮都打，只是名字叫 `protection_shadow`
+    而不是 action 名 `protection_authority_shadow`，**按 action 名去 grep 日志会得到 0**，
+    我第一次就是这么得到 0 的，差点记成"它停了"。
+  - **落点**：6b（退役旧匹配器）的样本量以**日志行**为准；
+    表只用来看"出现过哪几种判定、各自第一次与最后一次在什么时候"。
+  - **状态：已回答。** 不再需要样本。
   **(P5) `_restore_precancelled_protection_for_rejected_close` 是否真兜住过**（6g，原 6g-2 之二）
   - 触发条件：一次 `precancel` 之后**平仓被拒**。
   - **状态：已查清（2026-09-11 16:41Z），答案是"这条路从未跑过"。**
@@ -2743,3 +2760,47 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
     ——不管交易所回不回收，我们自己的归属链已经出现过同号跨实例。
     这是"清掉死 posId"的又一个理由，不是"别清"的理由；
     也是退役 `match_position_protection` 的又一个理由。
+
+- phase-6i-absent-conditional-entry (2026-09-11, B 线, **L2, 已写完待起窗；未部署**):
+  **起因**：用户在交易所看不到腿 582 那张条件入场单。只读核实（凭据取自
+  `/proc/336321/environ`，`python -B`，无副本）：
+  `trigger-orders-pending` 0 行；`trigger-order-history` **翻到尽头**——12 页 1176 行、
+  cTime **2026-06-29 → 2026-09-11 连续无缺口**——**没有 `1001125122023573`**；
+  `orders-history` 100 行回溯到 08-20 无匹配（`clOrdId` 用不上：下单回执里
+  `"clOrdId":""`）。而下单当时是 `code 0 / sCode 0 / Success`。
+  **两个假零必须点破，否则这个结论是假的**：
+  (a) `list_trigger_order_history_by_order_id` 返回 0——**仓库自己的 docstring 已写明
+  交易所忽略 `ordId` 过滤、对任何 id 都返回 `[]`（A-5b，2026-09-08 实测）**，那个 0 什么都不是；
+  (b) `find_trigger_order_history_rows` 默认 5 页返回 `([], False)`，
+  **第二个元素 False 就是"页预算用尽、'没找到'属未知"**。只有翻到第 13 页返回 0 行才算真不存在。
+  **根因（两层，不是一处遗漏）**：
+  1. `_refresh_exact_entry_leg_states` 的"消失"支只认 `{"open","submitted"}`，
+     而 **`pending` 正是这个函数自己在"单子还在"时写的状态**——写得进、收不回；
+  2. `_apply_recorded_terminal_entry_events` 只认**我们自己**记录的
+     `cancel_trigger_entry`/`cancel_regular_entry` 事件，我们没撤过这一单。
+  连带 `_derive_binding_from_entry_legs` 只在 `all_terminal` 时归档 → binding 338 永远 `open`。
+  **全库这样的入场腿恰好 1 条**（另两条非终态是 2026-09-11 的真活仓位，已读交易所核实）。
+  **改动**：新模块 `absent_conditional_entry.py` 只做判定不写库——
+  `pending` 的条件入场腿，在 (1) 不在挂单、(2) 不在快照历史页、(3) 距提交 ≥24 小时、
+  (4) 快照对该合约的 `pending_trigger_orders`/`trigger_history` **无读错误**、
+  (5) `find_trigger_order_history_rows` 返回 **`([], True)`** 时，
+  才判 `collect`，由调用方写 `exchange_cancelled` +
+  `terminal_reason=absent_from_pending_and_exhausted_history`，
+  并在**提交之后**发 `conditional_entry_absent_from_exchange`（已进
+  `ALWAYS_NOTIFIED_INCIDENT_TYPES`）。**其余一律 hold，且每种 hold 都有自己的名字**
+  （`history_not_exhausted` / `snapshot_read_error` / `too_recent` /
+  `no_instrument_id` / `no_exhaustive_history_reader` / `present_in_exhausted_history` …）
+  ——照 6f 的教训：只写"held"的记录没人能据以行动。
+  **合约 id 只从请求的 `instId` 读，不由 symbol 拼**：拼出来的 `f"{symbol}-USDT-SWAP"`
+  若有一天不对，就会去翻另一个合约的历史、翻不到，而本模块会把它读成"缺席"。
+  **同一提交删掉零调用者的 `_load_pending_trigger_orders`**（39 行）——它按 symbol 拼合约，
+  且内部 `except Exception: rows_for_instrument = []`，**把读失败当成"没有挂单"**，
+  正是硬规则 4 的反面；照原样接线，失败方向是把活单收成终态。
+  **变异检验 7 项，全部转红**：放行未翻完的搜索(2红)、忽略快照读错误(3红)、
+  去掉 24 小时窗(3红)、朴素时间戳按本地时区解释(1红)、命中也照收(2红)、
+  拆掉接线还原静默 continue(2红)、合约 id 改回按 symbol 拼(1红)。
+  **第 4 条第一次是哑的，成因记在 ARCHITECTURE §6**：用例给的 `now` 与 `created_at`
+  都是朴素的，两边同向偏移，差值不变——**用例把自己的主题消掉了**。
+  改成 aware/naive 混合并强制非 UTC 时区后才咬住。
+  **腿 582 的处置**：不写一次性脚本，**由这条路径在部署后首轮自然收掉**，
+  binding 338 随 `all_terminal` 归档。起窗时逐条核对并回报。

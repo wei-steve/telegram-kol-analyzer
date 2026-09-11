@@ -40,6 +40,11 @@ from telegram_kol_research.protection_revisions import (
     confirm_visible_protection_revision,
     expire_unconfirmed_protection_revisions,
 )
+from telegram_kol_research.absent_conditional_entry import (
+    TERMINAL_REASON as ABSENT_CONDITIONAL_ENTRY_TERMINAL_REASON,
+    AbsentEntryVerdict,
+    evaluate_absent_conditional_entry,
+)
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
     FillEvidence,
@@ -460,6 +465,7 @@ def reconcile_deepcoin_execution_bindings(
             snapshot=snapshot,
             recovered_at=now,
             contract_spec_provider=contract_spec_provider,
+            client=client,
         )
         if contract_spec_provider is not None:
             from telegram_kol_research.trigger_backup_stop_executor import (
@@ -520,6 +526,7 @@ def reconcile_deepcoin_execution_bindings_read_only(
             snapshot=snapshot,
             recovered_at=now,
             contract_spec_provider=contract_spec_provider,
+            client=client,
         )
         if snapshot.errors:
             raise DeepcoinReconciliationSnapshotUnavailable(
@@ -840,6 +847,7 @@ def _apply_reconcile_snapshot(
     snapshot: _ReconcileSnapshot,
     recovered_at: datetime,
     contract_spec_provider: object | None = None,
+    client: DeepcoinReadOnlyClient | None = None,
 ) -> ExecutionReconciliationResult:
     result = ExecutionReconciliationResult()
     trading_settings = load_trading_settings(session_factory)
@@ -951,7 +959,7 @@ def _apply_reconcile_snapshot(
             session.commit()
             return result
 
-        _refresh_exact_entry_leg_states(
+        absent_conditional_entries = _refresh_exact_entry_leg_states(
             [
                 leg
                 for leg in legs
@@ -959,6 +967,7 @@ def _apply_reconcile_snapshot(
             ],
             snapshot=snapshot,
             recovered_at=recovered_at,
+            client=client,
         )
         position_rows = [
             build_position_evidence(row)
@@ -1224,7 +1233,68 @@ def _apply_reconcile_snapshot(
             _count_reconcile_binding(result, binding)
         result.updated = len(bindings)
         session.commit()
+    # Phase 6i. Alerted after the commit, not inside it: the row is already
+    # written, so a failure to alert must not roll the sweep back -- and an
+    # alert sent before the commit could describe a change that never landed.
+    _alert_absent_conditional_entries(
+        session_factory, verdicts=absent_conditional_entries, occurred_at=recovered_at
+    )
     return result
+
+
+def _alert_absent_conditional_entries(
+    session_factory: sessionmaker,
+    *,
+    verdicts: list[AbsentEntryVerdict],
+    occurred_at: datetime,
+) -> None:
+    """Say out loud that our books and the exchange disagreed about an order.
+
+    The sweep tidies this system's side. It does not explain the discrepancy --
+    nothing here can tell "cancelled at the venue", "expired", and "never
+    actually rested" apart -- so the incident exists to put a person in front of
+    it. Never silenced by an environment whitelist, and never allowed to raise:
+    the leg is already terminal by the time this runs.
+    """
+
+    if not verdicts:
+        return
+    import json as _json
+
+    from telegram_kol_research.absent_conditional_entry import (
+        INCIDENT_TYPE,
+        incident_fingerprint,
+        incident_summary,
+    )
+    from telegram_kol_research.runtime_incidents import record_runtime_incident
+
+    for verdict in verdicts:
+        try:
+            record_runtime_incident(
+                session_factory,
+                source_kind="deepcoin_entry_order",
+                source_record_id=str(verdict.order_id),
+                incident_type=INCIDENT_TYPE,
+                severity="warning",
+                fingerprint=incident_fingerprint(verdict),
+                redacted_summary=_json.dumps(
+                    incident_summary(verdict), ensure_ascii=False, sort_keys=True
+                ),
+                occurred_at=occurred_at,
+                feature_policy_version=str(ATTRIBUTION_POLICY_VERSION),
+                prompt_version="none",
+                tool_policy_version="no-exchange-write",
+                evidence_refs_json=_json.dumps(
+                    [
+                        f"deepcoin_entry_order:{verdict.order_id}",
+                        f"execution_order_leg:{verdict.leg_id}",
+                    ]
+                ),
+            )
+        except Exception:  # pragma: no cover - evidence must not undo the sweep
+            logger.exception(
+                "absent_conditional_entry_incident_failed ord_id=%s", verdict.order_id
+            )
 
 
 def _record_owned_position_observations(
@@ -3118,9 +3188,20 @@ def _refresh_exact_entry_leg_states(
     *,
     snapshot: _ReconcileSnapshot,
     recovered_at: datetime,
-) -> None:
+    client: DeepcoinReadOnlyClient | None = None,
+) -> list[AbsentEntryVerdict]:
+    """Bring each entry leg's status in line with the venue.
+
+    Returns the phase-6i verdicts that actually collected a leg, so the caller
+    can alert on them after the transaction commits. ``client`` is optional and
+    its absence is a hold, not a skip of the rest: without the paging history
+    reader there is no honest way to tell "gone" from "off page one", and the
+    old behaviour -- leave it pending forever -- is the safe half of the two.
+    """
+
     pending_rows = [*snapshot.open_orders, *snapshot.pending_trigger_orders]
     history_rows = [*snapshot.order_history, *snapshot.trigger_history]
+    collected: list[AbsentEntryVerdict] = []
     for leg in legs:
         if str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES:
             continue
@@ -3156,6 +3237,28 @@ def _refresh_exact_entry_leg_states(
                     status="unknown",
                     updated_at=recovered_at,
                 )
+                continue
+            # Phase 6i. A conditional entry sitting at ``pending`` used to fall
+            # out here silently: ``pending`` is not in the set above, and it is
+            # the very status this function writes when the order *is* on the
+            # venue -- so it could be written and never un-written. Collect it
+            # only on an exhausted history search; every other answer holds.
+            verdict = evaluate_absent_conditional_entry(
+                leg,
+                absent_from_pending=True,
+                absent_from_history_page=True,
+                client=client,
+                snapshot_errors=snapshot.errors,
+                now=recovered_at,
+            )
+            if verdict.collects:
+                _set_entry_leg_exchange_state(
+                    leg,
+                    status="exchange_cancelled",
+                    terminal_reason=ABSENT_CONDITIONAL_ENTRY_TERMINAL_REASON,
+                    updated_at=recovered_at,
+                )
+                collected.append(verdict)
             continue
         state = classify_leg_exchange_state(history)
         if state != "unknown":
@@ -3169,6 +3272,7 @@ def _refresh_exact_entry_leg_states(
                 ),
                 updated_at=recovered_at,
             )
+    return collected
 
 
 def _exchange_row_matches_leg(row: dict[str, Any], leg: ExecutionOrderLeg) -> bool:
@@ -4022,45 +4126,6 @@ def _count_reconcile_binding(
         result.open += 1
     else:
         result.stale += 1
-
-
-def _load_pending_trigger_orders(
-    client: DeepcoinReadOnlyClient,
-    *,
-    rows: list[ExecutionBinding],
-) -> list[dict[str, Any]]:
-    method = getattr(client, "list_trigger_orders_pending", None)
-    if method is None:
-        return []
-    instruments = {
-        f"{str(row.symbol or '').upper()}-USDT-SWAP"
-        for row in rows
-        if str(row.symbol or "").strip()
-    }
-    pending: list[dict[str, Any]] = []
-    seen: set[tuple[str, str]] = set()
-    for instrument_id in sorted(instruments):
-        try:
-            rows_for_instrument = method(inst_id=instrument_id)
-        except TypeError:
-            rows_for_instrument = method()
-        except Exception:
-            rows_for_instrument = []
-        if not isinstance(rows_for_instrument, list):
-            continue
-        for order in rows_for_instrument:
-            if not isinstance(order, dict):
-                continue
-            order_id = _first_string(order, "ordId", "orderId", "order_id", "id") or ""
-            client_order_id = (
-                _first_string(order, "clOrdId", "clientOrderId", "client_order_id") or ""
-            )
-            identity = (order_id, client_order_id)
-            if identity in seen:
-                continue
-            seen.add(identity)
-            pending.append(order)
-    return pending
 
 
 def _cancel_missing_entry_lifecycle(session, row: ExecutionBinding, cancelled_at: datetime) -> None:

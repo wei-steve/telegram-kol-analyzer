@@ -69,6 +69,50 @@ def test_management_failure_types_are_folded_into_a_configured_whitelist():
     assert config.notifies("severe_protection_incident") is True
 
 
+def test_every_always_notified_type_survives_the_production_selector():
+    """No hand-written list: the set itself is the subject.
+
+    The test above names a handful of types under the real production selector,
+    which protects exactly the types someone remembered to name. This one
+    traverses ``ALWAYS_NOTIFIED_INCIDENT_TYPES``, so the next type added to that
+    set is covered whether or not anybody remembers to extend a list.
+
+    Why this particular set needs it: the set is the only switch deciding
+    whether an alert reaches a person, and dropping a member from it produces
+    no error anywhere. ``_with_always_notified_types`` returns an empty selector
+    untouched by design, and the fold is the only thing that puts the baseline
+    back into a non-empty one -- so a type that falls out of the set (a merge
+    resolved the wrong way, most plausibly, since three lines are being added to
+    it by two sessions on 2026-09-11) simply stops being delivered, silently,
+    while the code, the suite and the four-step deploy all stay green.
+    """
+
+    config = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": (
+                "management_partial_failed,severe_protection_incident"
+            ),
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES": (
+                "management_partial_failed,severe_protection_incident"
+            ),
+        },
+        env_file_paths=[],
+    )
+
+    # A traversal over an empty set passes without testing anything, and this
+    # set going empty is one of the failures the traversal exists to catch.
+    assert len(ALWAYS_NOTIFIED_INCIDENT_TYPES) >= 10
+
+    for incident_type in sorted(ALWAYS_NOTIFIED_INCIDENT_TYPES):
+        assert config.captures(incident_type) is True, incident_type
+        assert config.notifies(incident_type) is True, incident_type
+        assert incident_type in (config.telegram_notification_types or frozenset()), (
+            incident_type
+        )
+        assert incident_type in (config.capture_types or frozenset()), incident_type
+
+
 def test_an_explicitly_empty_selector_stays_a_complete_kill_switch():
     config = load_runtime_incident_config(
         environ={

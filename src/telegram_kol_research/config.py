@@ -180,6 +180,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # prompts anyone to look. An environment whitelist could silence the
         # only thing that will ever say this shadow ran.
         "management_cancel_precheck_observed",
+        # Phase 6i: a conditional entry the exchange acknowledged, and then had
+        # no record of in either the pending list or an exhausted history. The
+        # sweep ends the leg so the binding can archive, but that only tidies
+        # this system's side -- nothing here can tell "cancelled at the venue",
+        # "expired" and "never actually rested" apart, and the user noticing
+        # the order was missing is what surfaced the first one. Never silenced,
+        # because the discrepancy is the part a person has to judge.
+        "conditional_entry_absent_from_exchange",
 
         # Phase 6-pre-2: the safety net under that same failure. Either it
         # attached a stop to a position identified only by a uniqueness
