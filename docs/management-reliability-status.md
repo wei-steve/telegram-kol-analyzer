@@ -851,3 +851,21 @@ user_decisions_2026_09_07:
   · **(b) auto_trade 群消息进待重放队列、恢复后按序重放、管理类重放前先核目标仓位仍在**——支持。**但真正的缺陷是那个 15 分钟窗口**：不改它，队列里的东西照样会在供应商恢复之前过期。**建议把"供应商不可用"与"我们自己处理慢"分开计时**——前者不该消耗补救窗口。
   · **(c) 余额/配额预警**——支持。**在供应商没有余额接口的情况下，本次数据给出了一个现成的、不依赖供应商的信号：连续失败计数。** 本次它从 1 涨到 494，中间任何一个阈值（比如连续 5 次同一错误码）都会在几分钟内触发，**而实际上没有任何东西在看这个数**。
   **(6) 一条本步自己的观察**：`402` 这个状态码在全仓**没有任何特殊处理**（grep 无命中），它只是被并入"MiMo failed after 2 attempts"的通用失败路径。**供应商的"你欠费了"与"你的请求有问题"在我们这里长得一模一样**——而前者是运维事件、后者是代码缺陷，处置完全不同。
+  **A-16b 部署与 L2 窗（v2）**：候选 `fdb57d5ac04937f2fa5016ecc234ec0975ae1c5d`（后被 B 线 6k 合并为生产 `1fd45bc2`），**回滚参考 `2c4f82a6411a30e98c79ee0d0fe4ccd96ca1b48f`**，四步四项全绿，四个事故类型在生产上逐个点名核对。全量 **8467 passed**，对账 8422 + 基点净增 35（27 函数、其中 2 个参数化共 12 例，−1 个被删函数带 2 例）+ 本步 10 = 8467。
+  **v1 窗（18:40:48Z 起）在 `msgs=0` 上坐了 34 分钟而其余全绿，被停掉并留档 `step16b-v1-partial/`。** 原因不是故障：`msgs >= 5` 是**分母在系统之外**的量——入场比消息稀得多，要求 30 分钟内出现，就把"尚未被证明"变成了"永远无法收窗"。
+  **v2（19:23:55Z 起，新文件名、v1 按精确 pid 停）改了两处后于 19:54:15Z `WINDOW_MET`**：30 分钟 / 23 轮 / 零重置 / `pending_duplicates=0` / `check_failed=0` / `park_failed=0` / `err_lines=0` / `head_ok=1`；`msgs=0`、`entry_items=0` 为**记录项**，`a3=no_sample`。
+  1. `msgs` / `entry_items` 从门槛降为记录项；"至少一条非重复入场顺利开了"移入**乙类，本窗无样本**。
+  2. `rounds > 0` 进完成条件，作为 journal 可读性哨兵——所有 journal 派生字段都用 `grep -c`，**读不到日志时计数为 0，而 0 正是通过值**；本窗 `rounds=23`，所以那几个 0 是真的，**而且这次是判据替我核的，不是事后手工核的**。
+  **本窗能证明与证不了的，分开写**：能证明——A-16b 在生产上不产生噪音、不把带标记的项留在可执行态、两条永不抛的路一次没走到；**证不了**——"它放行了合法入场"，那要等真有入场，不由窗口决定。
+  **同一个夜里、同一个安静的群，出现了一次天然对照**：B 线的 6k 窗保留了 `msgs >= 5` 作为门槛，**50 分钟、51 次采样，其余判据每轮都满足，唯独 `msgs` 从头到尾是 0，照实记"判据未达成"、没有放宽**；我的 v2 窗去掉了这道门，30 分钟收窗。**B 线核对过零消息是群在睡而不是采集断了**（末条 17:38Z、当日 13 时峰值 33 条/时、ingest active）。**两个窗口并排，正好把"分母在系统之外"这条判据错误演示了一遍**——同样的系统状态，一个收得了、一个收不了，差别只在完成条件里有没有放一个不由系统决定的量。
+
+- step-17（2026-09-12，只读测量，**未改代码，等裁定**）：**binding 进终态时账本行与保护腿不跟着终态化——实测规模远大于"两仓六条"。**
+  **写入点**：`execution_bindings.sync_manual_closed_deepcoin_positions`（~4391）把 binding 置 `closed`、入场腿置 `closed`/`manually_closed`，**但对 `position_protection_ledger` 与 `position_protection_legs` 一行不动**。另两处 binding 置 `closed` 的点（`execution_bindings` ~4069、`position_attribution_repair` ~1123）同样不动。
+  **词表与约束**：账本活跃态 `_ACTIVE_OWNERSHIP_STATUSES = {"verified","protected"}`；腿的状态为 planned / waiting_fill / protection_recovery_pending / verified / filled（另见 cancelled）。**两张表都没有 retired 类终态值，也没有 `retired_at` 列；status 列无 CHECK 约束**（只有索引），所以新增一个终态值在 schema 上是安全的。
+  **生产实测（2026-09-12，只读）**：
+  ```
+  closed binding 下仍为 verified 的账本行：553 行 / 147 个 binding / 最早 2026-07-19 关闭
+  closed binding 下仍为非终态的保护腿：verified 448 · planned 340 · protection_recovery_pending 94 · waiting_fill 37（另 cancelled 40）
+  ```
+  **消费面**：按 `PositionProtectionLedger.status == "verified"` 读账本的模块约 12 个（止盈执行器 3 处、`web_app` 2、`protection_ledger` 2、`protection_health` 2、`legacy_conditional_cancel` 2、备份止损执行器、止损数量收敛、保护替换持久化、保护事故收敛、原生 TPSL 迁移、`execution_bindings`、账本修复各 1）；读腿状态的 4 个。**抽查的三个会动手的消费者**（`trigger_backup_stop_executor:418`、`stop_loss_size_convergence:122`、`protection_incident_convergence:310`）**在该查询前后 8 行内都没有 binding 状态过滤**。**它们是否只在活跃 binding 的调用链上被调用，我没有追到底——这里写的是"查询本身不过滤"，不是"它们会对已关闭仓位动手"。**
+  **所以这一步不是整理两仓六条**：它是"今后关闭时一并终态化"加上"是否回填 553 + 919 行、跨 147 个 binding、两个月的历史"，而后者是 L3 数据修复，且会改变约 12 个消费模块看到的东西。**已按常设规则报【需裁定】。**
