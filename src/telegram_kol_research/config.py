@@ -298,6 +298,7 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         "management_protection_authority_refused",
         "management_recognition_unresolved",
         "unresolved_management_item_claimed",
+        "duplicate_entry_needs_confirmation",
         # A-5 task 3: a management batch sat in ``recovery_required`` past
         # ``management_recovery_timeout_minutes``. Nothing re-runs it and the
         # freeze it held is now lifted, so the alert is the whole handover to
