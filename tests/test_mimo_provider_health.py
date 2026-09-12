@@ -453,7 +453,8 @@ def test_a_healthy_provider_sends_nothing(tmp_path):
     _attempt(session_factory, at=OUTAGE_START, status="completed")
 
     assert _tick(session_factory, OUTAGE_START + timedelta(minutes=1)) == {
-        "state": "healthy"
+        "state": "healthy",
+        "rows_read": 1,
     }
     with session_factory() as session:
         assert session.query(RuntimeIncident).count() == 0
@@ -572,3 +573,63 @@ def test_a_failing_health_tick_is_itself_raised_and_does_not_stop_the_loop(
     assert len(failed) == 1
     assert json.loads(failed[0].redacted_summary)["consecutive_failures"] == 3
     assert "健康检查本身失败" in format_runtime_incident_notification(failed[0])
+
+
+def test_the_pure_derivation_matches_the_database_one(tmp_path):
+    """Step 5 replays production rows through the pure function; it must be
+    the same derivation the tick runs, not a second one that could drift."""
+
+    session_factory = _session_factory(tmp_path)
+    seeded = [
+        (OUTAGE_START, "http_error", BALANCE),
+        (OUTAGE_START + timedelta(minutes=5), "http_error", "v1_authoritative_failed"),
+        (OUTAGE_START + timedelta(minutes=9), "http_error", BALANCE),
+        (OUTAGE_START + timedelta(minutes=70), "completed", None),
+    ]
+    for at, status, code in seeded:
+        _attempt(session_factory, at=at, status=status, error_code=code)
+
+    pure = health.derive_provider_outage(
+        [(status, code, at) for at, status, code in reversed(seeded)]
+    )
+
+    assert pure == health.load_latest_provider_outage(session_factory)
+    assert pure.failures == 2
+    assert pure.started_at == OUTAGE_START.replace(tzinfo=UTC)
+    assert pure.recovered_at == (OUTAGE_START + timedelta(minutes=70)).replace(tzinfo=UTC)
+
+
+def test_a_healthy_tick_says_so_in_the_log_with_a_row_count(
+    monkeypatch, tmp_path, caplog
+):
+    """A healthy provider sends nothing; the log line is the only evidence the
+    check runs at all, and ``rows_read`` is what makes it able to fail."""
+
+    _worker_env(monkeypatch)
+    session_factory = _session_factory(tmp_path)
+    _attempt(session_factory, at=OUTAGE_START, status="completed")
+    caplog.set_level("INFO", logger="telegram_kol_research.telegram_live_listener")
+
+    async def run_briefly():
+        task = asyncio.create_task(
+            run_authoritative_gap_recovery_loop(
+                session_factory=session_factory,
+                authoritative_processor=None,
+                chat_titles_by_id_provider=lambda: {},
+                interval_seconds=0.01,
+            )
+        )
+        await asyncio.sleep(0.2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(run_briefly())
+
+    heartbeats = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("mimo provider health tick state=")
+    ]
+    assert heartbeats, "no heartbeat line"
+    assert heartbeats[0] == "mimo provider health tick state=healthy rows_read=1 ticks=1"

@@ -1367,11 +1367,30 @@ async def run_authoritative_gap_recovery_loop(
     """
 
     consecutive_health_failures = 0
+    health_ticks = 0
+    last_health_state = None
     while True:
         if provider_health_tick is not None:
             try:
-                await asyncio.to_thread(provider_health_tick, session_factory)
+                health = await asyncio.to_thread(provider_health_tick, session_factory)
                 consecutive_health_failures = 0
+                health_ticks += 1
+                state = (health or {}).get("state") if isinstance(health, dict) else None
+                # A healthy provider sends nothing, so without this line a
+                # running health check and a missing one look identical.
+                # First tick, every state change, and about every 30 minutes.
+                if (
+                    health_ticks == 1
+                    or state != last_health_state
+                    or health_ticks % 90 == 0
+                ):
+                    logger.info(
+                        "mimo provider health tick state=%s rows_read=%s ticks=%s",
+                        state,
+                        (health or {}).get("rows_read") if isinstance(health, dict) else None,
+                        health_ticks,
+                    )
+                last_health_state = state
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

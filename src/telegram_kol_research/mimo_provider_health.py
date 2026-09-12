@@ -30,7 +30,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Iterable, Sequence
 
 import httpx
 from sqlalchemy.orm import sessionmaker
@@ -257,30 +257,21 @@ def _aware(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
-def load_latest_provider_outage(
-    session_factory: sessionmaker,
+def derive_provider_outage(
+    rows_newest_first: Iterable[tuple[Any, Any, datetime]],
     *,
-    scan_limit: int = DEFAULT_SCAN_LIMIT,
+    scan_limit: int | None = None,
 ) -> ProviderOutage | None:
-    """The most recent outage, open or just closed, or ``None``.
+    """The most recent outage, open or just closed, from ``(status,
+    error_code, completed_at)`` rows ordered newest first; ``None`` if none.
 
-    Reads newest first. Answered rows at the top mean the provider is up; the
-    earliest of them that sits directly above a run of unavailable rows is the
-    recovery moment. The run of unavailable rows beneath is the outage.
+    Pure, so the same derivation runs against production rows offline. Answered
+    rows at the top mean the provider is up; the earliest of them sitting
+    directly above a run of unavailable rows is the recovery moment, and that
+    run of unavailable rows is the outage.
     """
 
-    bounded_limit = max(1, int(scan_limit))
-    with session_factory() as session:
-        rows = (
-            session.query(
-                MimoRecognitionAttempt.status,
-                MimoRecognitionAttempt.error_code,
-                MimoRecognitionAttempt.completed_at,
-            )
-            .order_by(MimoRecognitionAttempt.id.desc())
-            .limit(bounded_limit)
-            .all()
-        )
+    rows_read = 0
     recovered_at: datetime | None = None
     answered_above = 0
     failures = 0
@@ -289,7 +280,8 @@ def load_latest_provider_outage(
     latest_kind: str | None = None
     latest_status: int | None = None
     ended_inside_scan = False
-    for status, error_code, completed_at in rows:
+    for status, error_code, completed_at in rows_newest_first:
+        rows_read += 1
         signal = _row_signal(status, error_code)
         if signal == _NEUTRAL:
             continue
@@ -318,8 +310,42 @@ def load_latest_provider_outage(
         http_status=latest_status,
         failures=failures,
         recovered_at=recovered_at,
-        scan_exhausted=(not ended_inside_scan and len(rows) >= bounded_limit),
+        scan_exhausted=(
+            not ended_inside_scan
+            and scan_limit is not None
+            and rows_read >= int(scan_limit)
+        ),
     )
+
+
+def _load_recent_attempt_rows(
+    session_factory: sessionmaker,
+    *,
+    scan_limit: int,
+) -> list[tuple[Any, Any, datetime]]:
+    with session_factory() as session:
+        return [
+            (row.status, row.error_code, row.completed_at)
+            for row in (
+                session.query(
+                    MimoRecognitionAttempt.status,
+                    MimoRecognitionAttempt.error_code,
+                    MimoRecognitionAttempt.completed_at,
+                )
+                .order_by(MimoRecognitionAttempt.id.desc())
+                .limit(max(1, int(scan_limit)))
+                .all()
+            )
+        ]
+
+
+def load_latest_provider_outage(
+    session_factory: sessionmaker,
+    *,
+    scan_limit: int = DEFAULT_SCAN_LIMIT,
+) -> ProviderOutage | None:
+    rows = _load_recent_attempt_rows(session_factory, scan_limit=scan_limit)
+    return derive_provider_outage(rows, scan_limit=scan_limit)
 
 
 # --------------------------------------------------------------------------
@@ -371,14 +397,18 @@ def run_mimo_provider_health_tick(
 ) -> dict[str, Any]:
     """One evaluation: alert an open outage per 30-minute bucket, or its end.
 
-    Returns what it decided so the loop can log it; every decision that sends
-    nothing says why in ``state``.
+    Returns what it decided, including ``rows_read`` -- the number of audit
+    rows this tick actually examined. A healthy provider sends nothing, so that
+    count is the only thing that distinguishes "checked and healthy" from "not
+    checking at all"; the loop logs it.
     """
 
     current = _aware(now or datetime.now(UTC))
-    outage = load_latest_provider_outage(session_factory, scan_limit=scan_limit)
+    rows = _load_recent_attempt_rows(session_factory, scan_limit=scan_limit)
+    outage = derive_provider_outage(rows, scan_limit=scan_limit)
+    rows_read = len(rows)
     if outage is None:
-        return {"state": "healthy"}
+        return {"state": "healthy", "rows_read": rows_read}
     if outage.recovered_at is None:
         elapsed = max(timedelta(0), current - outage.started_at)
         bucket = int(elapsed // REMINDER_INTERVAL)
@@ -388,7 +418,11 @@ def run_mimo_provider_health_tick(
             incident_type=UNAVAILABLE_INCIDENT_TYPE,
             source_record_id=source_record_id,
         ):
-            return {"state": "unavailable_already_alerted", "bucket": bucket}
+            return {
+                "state": "unavailable_already_alerted",
+                "bucket": bucket,
+                "rows_read": rows_read,
+            }
         capture = capture_unavailable or _default_capture(
             "capture_mimo_provider_unavailable"
         )
@@ -408,7 +442,7 @@ def run_mimo_provider_health_tick(
             bucket,
             outage.scan_exhausted,
         )
-        return {"state": "unavailable_alerted", "bucket": bucket}
+        return {"state": "unavailable_alerted", "bucket": bucket, "rows_read": rows_read}
     if not _incident_recorded(
         session_factory,
         incident_type=UNAVAILABLE_INCIDENT_TYPE,
@@ -417,13 +451,13 @@ def run_mimo_provider_health_tick(
         # An outage nobody was told about (it predates this code, or its
         # alert could not be recorded) gets no "recovered" message: a recovery
         # notice for an outage the reader never heard of is only confusing.
-        return {"state": "recovered_outage_never_alerted"}
+        return {"state": "recovered_outage_never_alerted", "rows_read": rows_read}
     if _incident_recorded(
         session_factory,
         incident_type=RECOVERED_INCIDENT_TYPE,
         source_record_id=outage.key,
     ):
-        return {"state": "recovery_already_announced"}
+        return {"state": "recovery_already_announced", "rows_read": rows_read}
     capture = capture_recovered or _default_capture("capture_mimo_provider_recovered")
     capture(session_factory, outage=outage, occurred_at=current)
     logger.warning(
@@ -434,4 +468,4 @@ def run_mimo_provider_health_tick(
         outage.started_at.isoformat(),
         outage.recovered_at.isoformat(),
     )
-    return {"state": "recovery_announced"}
+    return {"state": "recovery_announced", "rows_read": rows_read}
