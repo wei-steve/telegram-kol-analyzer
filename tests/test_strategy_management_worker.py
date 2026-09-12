@@ -8,6 +8,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_management_reliability_step17 import (  # noqa: F401
+    _add_protection,
+    _protection_summary,
+)
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
     ExecutionBindingRecord,
@@ -905,6 +909,12 @@ def test_capability_deferred_subset_finishes_after_mutation_resolves(
         session.add(lifecycle)
         session.commit()
         lifecycle_id = int(lifecycle.id)
+    # A-17: the close below must retire this binding's protection; the branch
+    # that keeps the binding active must leave it alone.
+    _add_protection(
+        session_factory, binding_id, pos_id="pos-deferred",
+        entry_leg_id=deferred_entry_id,
+    )
     parent = create_management_batch(
         session_factory, idempotency_fingerprint="capability-parent",
         raw_message_id=10, recognition_decision_id=1,
@@ -987,6 +997,7 @@ def test_capability_deferred_subset_finishes_after_mutation_resolves(
         assert final_parent.reason_code == (
             "management_subset_continued_by_successor"
         )
+        assert _protection_summary(session_factory, binding_id)["retired_by"] == set()
     else:
         assert final_parent.status == "succeeded"
         assert final_parent.reason_code == (
@@ -1000,6 +1011,9 @@ def test_capability_deferred_subset_finishes_after_mutation_resolves(
         assert deferred.status == "closed"
         assert deferred.terminal_reason == "position_mutation_close_confirmed"
         assert lifecycle.lifecycle_status == "exited"
+        assert _protection_summary(session_factory, binding_id)["retired_by"] == {
+            "capability_deferred_successor_close"
+        }
 
 
 def test_disabled_or_shadow_mode_never_claims_or_executes_ready_batches():

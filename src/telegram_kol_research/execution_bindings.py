@@ -4068,6 +4068,17 @@ def _derive_binding_from_entry_legs(
         binding.pos_id = None
         binding.status = "closed"
         binding.last_exchange_status = "entry_legs_terminal"
+        from telegram_kol_research.protection_retirement import (
+            retire_protection_for_closed_binding,
+        )
+
+        retire_protection_for_closed_binding(
+            session,
+            execution_binding_id=int(binding.id),
+            reason="binding_closed",
+            retired_at=recovered_at,
+            closed_by="entry_legs_terminal",
+        )
         _cancel_missing_entry_lifecycle(session, binding, recovered_at)
     elif verified_missing_pos_ids:
         binding.pos_id = _join_unique_ids(verified_missing_pos_ids)
@@ -4395,6 +4406,17 @@ def sync_manual_closed_deepcoin_positions(
                 else "manual_closed_or_not_found_on_exchange"
             )
             row.updated_at = now
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
+
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(row.id),
+                reason="binding_closed",
+                retired_at=now,
+                closed_by="manual_close_sweep",
+            )
             result.manually_closed += 1
             _record_marked_closed(
                 session,

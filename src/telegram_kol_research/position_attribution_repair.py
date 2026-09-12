@@ -558,6 +558,7 @@ def apply_position_attribution_repair_plan(
                 if action.action == "terminal_cancelled_leg":
                     leg.terminal_reason = "historical_exchange_cancelled"
             _derive_repaired_bindings(
+                session,
                 bindings,
                 list(legs_by_id.values()),
                 plan.created_at,
@@ -951,6 +952,18 @@ def _apply_historical_cleanup_action(
         binding.status = str(action.new_state)
         binding.last_exchange_status = "historical_cleanup_terminal"
         binding.updated_at = updated_at
+        if binding.status == "closed":
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
+
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(binding.id),
+                reason="binding_closed",
+                retired_at=updated_at,
+                closed_by="historical_cleanup_terminal",
+            )
         return
     if action.action == "exit_historical_lifecycle":
         lifecycle = lifecycles_by_id.get(int(action.lifecycle_id or 0))
@@ -1087,6 +1100,7 @@ def _repair_audit_fingerprint(plan, action) -> str:
 
 
 def _derive_repaired_bindings(
+    session,
     bindings,
     legs,
     updated_at,
@@ -1121,6 +1135,17 @@ def _derive_repaired_bindings(
         if binding_is_terminal:
             binding.pos_id = None
             binding.status = "closed"
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
+
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(binding.id),
+                reason="binding_closed",
+                retired_at=updated_at,
+                closed_by="attribution_repair_terminal",
+            )
         elif verified:
             binding.pos_id = ",".join(dict.fromkeys(verified))
             binding.status = "active"
@@ -1131,6 +1156,17 @@ def _derive_repaired_bindings(
             binding.pos_id = None
             binding.status = "closed"
             binding.last_exchange_status = "entry_legs_terminal_by_repair"
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
+
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(binding.id),
+                reason="binding_closed",
+                retired_at=updated_at,
+                closed_by="entry_legs_terminal_by_repair",
+            )
         else:
             binding.pos_id = None
             binding.status = "open" if any(

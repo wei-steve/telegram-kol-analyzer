@@ -1476,6 +1476,17 @@ def _resolve_capability_deferred_successor(
                     "management_full_close_confirmed"
                 )
                 binding.recovered_at = resolved_at
+                from telegram_kol_research.protection_retirement import (
+                    retire_protection_for_closed_binding,
+                )
+
+                retire_protection_for_closed_binding(
+                    session,
+                    execution_binding_id=int(binding.id),
+                    reason="binding_closed",
+                    retired_at=resolved_at,
+                    closed_by="capability_deferred_successor_close",
+                )
                 lifecycle.lifecycle_status = "exited"
                 lifecycle.exit_reason = "kol_signal"
                 lifecycle.exited_at = resolved_at

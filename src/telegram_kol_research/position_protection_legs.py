@@ -267,7 +267,10 @@ def record_verified_take_profit_fill(
         protection_leg.role != "take_profit"
         or not protection_leg.pos_id
         or not protection_leg.exchange_order_id
-        or protection_leg.status not in {"verified", "filled"}
+        # A-17: closing a binding retires its legs. A TP1 fill proven a round
+        # later is the more specific truth, and refusing it here would raise
+        # out of the reconcile snapshot, which has no handler around it.
+        or protection_leg.status not in {"verified", "filled", "retired"}
     ):
         raise ValueError("protection_leg_take_profit_fill_invalid")
     try:

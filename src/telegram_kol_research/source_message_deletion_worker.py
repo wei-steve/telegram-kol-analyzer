@@ -1150,6 +1150,17 @@ def finalize_source_message_deletion_exit(
                 if binding is not None:
                     binding.status = "closed"
                     binding.updated_at = now
+                    from telegram_kol_research.protection_retirement import (
+                        retire_protection_for_closed_binding,
+                    )
+
+                    retire_protection_for_closed_binding(
+                        session,
+                        execution_binding_id=int(binding.id),
+                        reason="binding_closed",
+                        retired_at=now,
+                        closed_by="source_message_deletion_exit",
+                    )
                 for leg in legs:
                     if _clean_id(leg.pos_id) in exact_pos_ids:
                         leg.status = "closed"

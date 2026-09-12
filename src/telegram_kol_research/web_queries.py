@@ -4024,6 +4024,17 @@ def mark_strategy_lifecycle_manual_close(
                 else f"manual_closed_by_user: {note}"[:64]
             )
             binding.updated_at = now
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
+
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(binding.id),
+                reason="binding_closed",
+                retired_at=now,
+                closed_by="web_manual_close",
+            )
             entry_legs = (
                 session.query(ExecutionOrderLeg)
                 .filter(ExecutionOrderLeg.execution_binding_id == int(binding.id))

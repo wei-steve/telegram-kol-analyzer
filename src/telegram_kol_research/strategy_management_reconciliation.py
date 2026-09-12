@@ -801,6 +801,17 @@ def _terminalize_selected_market_close_legs(
         binding.status = "closed"
         binding.pos_id = None
         binding.last_exchange_status = "management_full_close_confirmed"
+        from telegram_kol_research.protection_retirement import (
+            retire_protection_for_closed_binding,
+        )
+
+        retire_protection_for_closed_binding(
+            session,
+            execution_binding_id=int(binding.id),
+            reason="binding_closed",
+            retired_at=now,
+            closed_by="management_selected_close",
+        )
         lifecycle.lifecycle_status = "exited"
         lifecycle.exit_reason = "kol_signal"
         lifecycle.exited_at = now
@@ -1155,6 +1166,17 @@ def _terminalize_full_close(session, *, batch, legs, now: datetime) -> bool:
     binding.last_exchange_status = "management_full_close_confirmed"
     binding.recovered_at = now
     binding.updated_at = now
+    from telegram_kol_research.protection_retirement import (
+        retire_protection_for_closed_binding,
+    )
+
+    retire_protection_for_closed_binding(
+        session,
+        execution_binding_id=int(binding.id),
+        reason="binding_closed",
+        retired_at=now,
+        closed_by="management_full_close",
+    )
     lifecycle.lifecycle_status = "exited"
     lifecycle.exit_reason = "kol_signal"
     lifecycle.exited_at = now
