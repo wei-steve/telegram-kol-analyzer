@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -107,6 +108,9 @@ from telegram_kol_research.strategy_revision_planner import (
     advance_strategy_revision,
     plan_strategy_revision,
 )
+
+
+logger = logging.getLogger(__name__)
 
 
 def execute_strategy_revision(
@@ -316,6 +320,99 @@ def auto_process_message_trade_signal(
     )
 
 
+def _park_if_duplicate_entry(
+    session_factory,
+    *,
+    item,
+    raw_message_id: int,
+    now: datetime,
+) -> bool:
+    """Return whether this entry item was parked as a duplicate (A-16b).
+
+    Never raises: if the check itself fails, the caller proceeds exactly as it
+    does today. A broken duplicate-check must not stop entries from working.
+    """
+
+    try:
+        from telegram_kol_research.duplicate_entry_confirmation import (
+            find_duplicate_entry_binding,
+            park_duplicate_entry,
+        )
+
+        with session_factory() as session:
+            candidate = session.get(SignalCandidate, int(item.signal_candidate_id))
+            if candidate is None:
+                return False
+            binding = find_duplicate_entry_binding(
+                session,
+                raw_message_id=int(raw_message_id),
+                candidate=candidate,
+                now=now,
+            )
+            binding_id = int(binding.id) if binding is not None else None
+            binding_message_id = int(binding.message_id or 0) if binding else None
+            binding_symbol = str(binding.symbol or "") if binding else ""
+            binding_side = str(binding.side or "") if binding else ""
+        if binding_id is None:
+            return False
+    except Exception:
+        logger.warning(
+            "duplicate entry check failed raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+        return False
+
+    if not park_duplicate_entry(
+        session_factory,
+        message_instruction_item_id=int(item.id),
+        duplicate_of_execution_binding_id=binding_id,
+        duplicate_of_message_id=binding_message_id or 0,
+        duplicate_symbol=binding_symbol,
+        duplicate_side=binding_side,
+        now=now,
+    ):
+        return False
+    _notify_duplicate_entry_parked(
+        session_factory,
+        raw_message_id=int(raw_message_id),
+        message_instruction_item_id=int(item.id),
+        existing_binding_id=binding_id,
+        now=now,
+    )
+    return True
+
+
+def _notify_duplicate_entry_parked(
+    session_factory,
+    *,
+    raw_message_id: int,
+    message_instruction_item_id: int,
+    existing_binding_id: int,
+    now: datetime,
+) -> None:
+    try:
+        from telegram_kol_research.config import load_runtime_incident_config
+        from telegram_kol_research.runtime_incident_adapters import (
+            capture_duplicate_entry_needs_confirmation,
+        )
+
+        capture_duplicate_entry_needs_confirmation(
+            session_factory,
+            config=load_runtime_incident_config(),
+            raw_message_id=int(raw_message_id),
+            message_instruction_item_id=int(message_instruction_item_id),
+            existing_binding_id=int(existing_binding_id),
+            occurred_at=now,
+        )
+    except Exception:
+        logger.warning(
+            "duplicate entry confirmation notice failed raw_message_id=%s",
+            raw_message_id,
+            exc_info=True,
+        )
+
+
 def execute_message_instruction_items(
     session_factory: sessionmaker,
     *,
@@ -351,6 +448,15 @@ def execute_message_instruction_items(
                 ).scalar()
             if candidate_parse_source != "mimo_authoritative":
                 enforcement_mode = "disabled"
+        if item.instruction_kind == "entry" and _park_if_duplicate_entry(
+            session_factory, item=item, raw_message_id=raw_message_id, now=now
+        ):
+            # A-16b. A second entry at a price this chat is already in does not
+            # open a position; it waits for a person. 2026-09-10 turned one
+            # 77000 long into two, 15 contracts into 30, because the second
+            # message read like a new order and nothing compared it with the
+            # first. The item is parked, not failed: /choose still opens it.
+            continue
         try:
             result = _auto_process_single_message_trade_signal(
                 session_factory,

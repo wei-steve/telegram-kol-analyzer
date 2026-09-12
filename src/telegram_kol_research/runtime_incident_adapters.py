@@ -497,6 +497,54 @@ def capture_authoritative_execution_uncertain(
     )
 
 
+def capture_duplicate_entry_needs_confirmation(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    message_instruction_item_id: int,
+    existing_binding_id: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """A second entry at a price we already hold is waiting on a person (A-16b).
+
+    2026-09-10 turned one 77000 BTC long into two, 15 contracts into 30,
+    because the second message read like a new order and nothing compared it
+    with the first. The position is not opened now; it waits. And it has to be
+    said out loud, because an entry that silently does not happen looks exactly
+    like an entry nobody asked for -- which is the shape this programme has
+    spent two days removing.
+    """
+
+    if not config.captures("duplicate_entry_needs_confirmation"):
+        return None
+    fixed = {
+        "component": "auto_trade_execution",
+        "reason_code": "duplicate_entry_needs_confirmation",
+        "impact": "entry_withheld_awaiting_user_confirmation",
+        "operation": f"item_{int(message_instruction_item_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_instruction_item",
+        source_record_id=str(int(message_instruction_item_id)),
+        incident_type="duplicate_entry_needs_confirmation",
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            error_summary=_safe_sentence(
+                f"duplicates execution_binding {int(existing_binding_id)}"
+            ),
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def capture_unresolved_management_item_claimed(
     session_factory: sessionmaker,
     *,
