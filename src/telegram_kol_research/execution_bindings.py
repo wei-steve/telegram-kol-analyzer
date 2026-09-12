@@ -4056,6 +4056,7 @@ def _derive_binding_from_entry_legs(
     all_terminal = bool(legs) and all(
         str(leg.status or "").lower() in TERMINAL_ENTRY_LEG_STATES for leg in legs
     )
+    was_closed = str(binding.status or "").lower() == "closed"
     if verified_live_pos_ids:
         binding.pos_id = _join_unique_ids(verified_live_pos_ids)
         binding.status = "active"
@@ -4070,17 +4071,23 @@ def _derive_binding_from_entry_legs(
         binding.pos_id = None
         binding.status = "closed"
         binding.last_exchange_status = "entry_legs_terminal"
-        from telegram_kol_research.protection_retirement import (
-            retire_protection_for_closed_binding,
-        )
+        # A-17 is forward-only: retire on the transition to closed, never on a
+        # re-derivation of a binding that was already closed. Reconcile loads
+        # closed bindings every round; the unconditional call retired 664
+        # historical rows under 83 bindings in the first round after deploy
+        # (2026-09-12 21:00:50Z).
+        if not was_closed:
+            from telegram_kol_research.protection_retirement import (
+                retire_protection_for_closed_binding,
+            )
 
-        retire_protection_for_closed_binding(
-            session,
-            execution_binding_id=int(binding.id),
-            reason="binding_closed",
-            retired_at=recovered_at,
-            closed_by="entry_legs_terminal",
-        )
+            retire_protection_for_closed_binding(
+                session,
+                execution_binding_id=int(binding.id),
+                reason="binding_closed",
+                retired_at=recovered_at,
+                closed_by="entry_legs_terminal",
+            )
         _cancel_missing_entry_lifecycle(session, binding, recovered_at)
     elif verified_missing_pos_ids:
         binding.pos_id = _join_unique_ids(verified_missing_pos_ids)

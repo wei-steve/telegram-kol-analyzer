@@ -618,6 +618,115 @@ def test_a_tp1_fill_proven_after_retirement_is_still_recorded(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Forward-only. The first deploy retired 664 historical rows under 83 bindings
+# in its first reconcile round: reconcile loads closed bindings every round and
+# re-derived them through the all-entry-legs-terminal branch, which called the
+# retirement unconditionally. Every per-site test above started from a binding
+# that was not yet closed, so none of them could see it.
+# ---------------------------------------------------------------------------
+
+
+def _seed_closed_or_active_trigger_binding(session_factory, *, binding_status):
+    from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
+
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=77, symbol="ETH",
+            side="short", venue="deepcoin", status=binding_status,
+            order_id="old-trigger", client_order_id="old-client",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            venue="deepcoin", order_kind="trigger_limit", order_id="old-trigger",
+            client_order_id="old-client", status="cancelled",
+            terminal_reason="cancelled",
+        )
+        session.add(leg)
+        session.commit()
+        binding_id, leg_id = int(binding.id), int(leg.id)
+    _add_protection(session_factory, binding_id, pos_id="old-pos", entry_leg_id=leg_id)
+    return binding_id
+
+
+@pytest.mark.parametrize(
+    ("binding_status", "expect_retired"),
+    [("closed", False), ("active", True)],
+    ids=["already-closed-is-history", "active-transitions-now"],
+)
+def test_a_reconcile_round_retires_only_on_the_transition_to_closed(
+    tmp_path, binding_status, expect_retired
+):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
+    from telegram_kol_research.models import ExecutionBinding
+
+    session_factory = create_session_factory(tmp_path / "a17.db")
+    binding_id = _seed_closed_or_active_trigger_binding(
+        session_factory, binding_status=binding_status
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [{"instId": "ETH-USDT-SWAP", "posId": "unrelated-live-position",
+                     "posSide": "short", "pos": "1.5", "avgPx": "1770"}]
+
+        def list_open_orders(self):
+            return []
+
+    for _ in range(2):  # a second round must not change the answer either
+        reconcile_deepcoin_execution_bindings(session_factory, client=FakeClient())
+
+    with session_factory() as session:
+        assert session.get(ExecutionBinding, binding_id).status == "closed"
+    if expect_retired:
+        _assert_retired_by(session_factory, binding_id, "entry_legs_terminal")
+    else:
+        _assert_untouched(session_factory, binding_id)
+
+
+def test_re_deriving_an_already_closed_binding_leaves_its_protection(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.execution_bindings import _derive_binding_from_entry_legs
+    from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
+
+    session_factory = create_session_factory(tmp_path / "a17.db")
+    binding_id = _seed_binding_with_protection(session_factory, binding_status="closed")
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        legs = session.query(ExecutionOrderLeg).filter_by(execution_binding_id=binding_id).all()
+        for leg in legs:
+            leg.status = "cancelled"
+        _derive_binding_from_entry_legs(
+            session, binding=binding, legs=legs, live_position_ids=set(), recovered_at=NOW
+        )
+        session.commit()
+
+    _assert_untouched(session_factory, binding_id)
+
+
+def test_repair_of_an_already_closed_terminal_binding_leaves_its_protection(tmp_path):
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research.models import ExecutionBinding, ExecutionOrderLeg
+    from telegram_kol_research.position_attribution_repair import _derive_repaired_bindings
+
+    session_factory = create_session_factory(tmp_path / "a17.db")
+    binding_id = _seed_binding_with_protection(session_factory, binding_status="closed")
+    with session_factory() as session:
+        binding = session.get(ExecutionBinding, binding_id)
+        legs = session.query(ExecutionOrderLeg).filter_by(execution_binding_id=binding_id).all()
+        _derive_repaired_bindings(
+            session, [binding], legs, NOW,
+            affected_binding_ids={binding_id}, live_position_ids=set(),
+        )
+        session.commit()
+        assert session.get(ExecutionBinding, binding_id).status == "closed"
+
+    _assert_untouched(session_factory, binding_id)
+
+
+# ---------------------------------------------------------------------------
 # Traversal guard.
 # ---------------------------------------------------------------------------
 

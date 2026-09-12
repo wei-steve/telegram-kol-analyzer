@@ -1132,20 +1132,27 @@ def _derive_repaired_bindings(
                 and str(leg.status or "").lower() not in TERMINAL_ENTRY_LEG_STATES
             )
         ]
+        was_closed = str(binding.status or "").lower() == "closed"
         if binding_is_terminal:
             binding.pos_id = None
             binding.status = "closed"
-            from telegram_kol_research.protection_retirement import (
-                retire_protection_for_closed_binding,
-            )
+            # A-17 is forward-only: retire on the transition to closed, never on a
+            # re-derivation of a binding that was already closed. Reconcile loads
+            # closed bindings every round; the unconditional call retired 664
+            # historical rows under 83 bindings in the first round after deploy
+            # (2026-09-12 21:00:50Z).
+            if not was_closed:
+                from telegram_kol_research.protection_retirement import (
+                    retire_protection_for_closed_binding,
+                )
 
-            retire_protection_for_closed_binding(
-                session,
-                execution_binding_id=int(binding.id),
-                reason="binding_closed",
-                retired_at=updated_at,
-                closed_by="attribution_repair_terminal",
-            )
+                retire_protection_for_closed_binding(
+                    session,
+                    execution_binding_id=int(binding.id),
+                    reason="binding_closed",
+                    retired_at=updated_at,
+                    closed_by="attribution_repair_terminal",
+                )
         elif verified:
             binding.pos_id = ",".join(dict.fromkeys(verified))
             binding.status = "active"
