@@ -970,7 +970,8 @@ user_decisions_2026_09_07:
   **为什么十条逐点用例、遍历守卫、变异检查、L1 判据全都没抓到**：逐点用例全部从"尚未关闭"出发，测的是"转为 closed 时做了什么"，**没有一条测"对已关闭的东西再跑一遍"**；守卫与变异检查验证的是"调用在不在"，不是"调用何时生效"；L1 的 A1 只看"窗内新关闭的 binding"，**而这 664 行在快照那一刻已经发生，被计进了基数**——判据正确地没把它算作窗内问题，**唯一的信号是快照行里那个本该是 0 的数**，而它能被看见，是因为快照行把基数打印了出来。
   **修正**（`1ad96d2a`）：两处都改为只在状态真正转为 `closed` 时终态化；回归用例放在出事的那一层——对已关闭 binding 跑两轮完整对账保护行不动，同一轮里 active→closed 的仍被终态化；两处守卫各自变异，各有用例转红。
   **修正过程中的又一次自伤**：做变异时用 `git checkout -- <file>` 还原，**把尚未提交的修正本身一并抹掉**，且第二个变异是在第一个文件已无修正的状态下跑的，那组失败数作废。改为"备份 → 变异 → 从备份拷回"，并在变异前后核对修正仍在，随即提交。
-  **数据如何处理已报【需裁定】**：(a) 保留视作 A-19 已发生部分；(b) 修正部署后按 L3 用 `retired_from_status` 精确还原 664 行（我的建议）；(c) 回滚（不推荐）。每行证据带 `retired_from_status` 与同一个 `retired_at=2026-09-12T21:00:50.207630+00:00`；**`tg-deploy` 不备份数据库，部署前无库备份**，最近完整副本为 09-10。
+  **数据处理：指挥会话裁定 (a) 保留，不还原**（我建议的是 (b) L3 还原，裁定未采纳，照裁定执行）。理由：用户已同意 A-19 归档历史，这 664 行的去向与最终目标一致；`retired` 只让消费者少看到已关闭 binding 的 verified 行；还原本身是一次 L3 操作，成本与风险高于保留。附加条件：代码修正照常部署；交接写明这 664 行；只读核三个会动手的消费者的行为方向；剩余 808 行不再动；收窗时再核一次活仓 352。每行证据带 `retired_from_status` 与同一个 `retired_at=2026-09-12T21:00:50.207630+00:00`；**`tg-deploy` 不备份数据库，部署前无库备份**，最近完整副本为 09-10。
+  **三个会动手的消费者对 `retired` 行的方向（只读，一行结论）：都是"走不到或少做"，没有一个会因此多写交易所**——`trigger_backup_stop_executor._plan_submission` 在查账本之前就要求 binding 为 open/active，查不到 verified 主止损则以 `primary_stop_not_verified` 阻断；`stop_loss_size_convergence.plan_stop_loss_resizes` 只取 pos_id 在交易所活仓位中的行，查不到就不写；`protection_incident_convergence._replacement_visible_on_exchange` 只在事故 pos_id 仍为活仓位时被 `_classify_incident` 调用，且只返回分类、不写交易所。
 
 ## A 线收口交接清单（2026-09-12）
 
@@ -978,6 +979,7 @@ user_decisions_2026_09_07:
 
 1. **step-18 的建议，全部未实施**：`ALERTED_REASONS` 加遍历式守卫（凡"权威判定未产生"的 reason 必须在告警集合里，并断言非空）；独立事故类型 `mimo_provider_unavailable`（含恢复通知）；把"供应商不可用"与"处理慢"分开计时，前者不消耗 15 分钟补救窗口；连续失败计数预警；`402` 的专门处理；主动探活。（指挥会话另开 MiMo 新会话承接。）
 2. **A-19：历史数据归档**（指挥会话 2026-09-12 转达用户同意立项；**不在本会话做**，排在 MiMo 新会话之后）。关闭超过 30 天的 binding 及其账本行、保护腿、执行事件、批次等，一次性迁入归档表，生产表只留活的与近期的。按 L3 修复流程：备份、演练副本、`PRAGMA quick_check`、逐行前后、审计行、通知；**只动终态数据**。
+   **A-17 已意外提前终态化其中 664 行**（2026-09-12 21:00:50Z，83 个已关闭 binding，账本 208 / 腿 456，`retired_by=entry_legs_terminal`），**按指挥会话裁定 (a) 保留、不还原**；以 `retired_from_status` 与 `retired_at=2026-09-12T21:00:50.207630+00:00` 可精确定位，**A-19 时与其余历史统一归档**。已关闭 binding 下仍未退役的 **808 行按裁定不再动**，留给 A-19。
    **A-17b（历史行回填）并入本项**，原内容保留如下，作为 A-19 的前提与边界：553 条账本行 + 919 条保护腿，截至测量时分布在 147 个已关闭 binding 下（生产现有已关闭 binding 298 个）。**前提**：先追到底三个会动手的消费者（`trigger_backup_stop_executor`、`stop_loss_size_convergence`、`protection_incident_convergence`）在已关闭 binding 上是否可达——step-17 测量条目写的是"查询本身不过滤"，不是"它们会动手"。一并处理：两份一次性 sqlite 脚本（`batch150_management_terminalization`、`frozen_exchange_empty_state_alignment`）不走 ORM、不会终态化；保护替换在途时 binding 被关，replay 可能重建 `verified` 行（`_projection_complete`、`legacy_conditional_cancel._completed_target_matches` 的完成判定要求 `verified`）。
 3. **A-11b 剩余五处同类站点**（见 A-11b 条目）。
 4. **step-5c 条目的"遗留问题"三项**：(1) A-5d——剩余止盈梯子的处置策略；(2) B 线阶段 6 的 WS `TriggerOrder.TS` 可作第四条更早的成交证据，接口已留、未接；(3) `trigger-orders-history` 自 2026-09-08T01:23Z 起不再收录 TPSL 单，已作为交易所行为的已知事实记录，不再推测。
