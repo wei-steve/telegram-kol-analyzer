@@ -647,7 +647,17 @@ def _own_nodes(function):
 
 
 def _binding_status_writers():
-    closing, dynamic, retiring = set(), set(), set()
+    """Count, per function, constant ``closed`` writes, computed writes and retire calls.
+
+    Counted rather than flagged: one function (``_derive_repaired_bindings``)
+    closes a binding in two branches, and a per-function yes/no would still pass
+    with one of its two calls removed. That is how the first version of this
+    guard was shown to be too weak.
+    """
+
+    from collections import Counter
+
+    closing, dynamic, retiring = Counter(), Counter(), Counter()
     for path in sorted(_SRC.glob("*.py")):
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for function in ast.walk(tree):
@@ -658,7 +668,7 @@ def _binding_status_writers():
                 if isinstance(node, ast.Call) and getattr(node.func, "id", None) == (
                     "retire_protection_for_closed_binding"
                 ):
-                    retiring.add(key)
+                    retiring[key] += 1
                 if not isinstance(node, ast.Assign):
                     continue
                 for target in node.targets:
@@ -670,9 +680,9 @@ def _binding_status_writers():
                         continue
                     if isinstance(node.value, ast.Constant):
                         if node.value.value == "closed" and target.value.id in _CONSTANT_CLOSE_NAMES:
-                            closing.add(key)
+                            closing[key] += 1
                     elif target.value.id in _DYNAMIC_BINDING_NAMES:
-                        dynamic.add(key)
+                        dynamic[key] += 1
     return closing, dynamic, retiring
 
 
@@ -680,6 +690,8 @@ def test_every_function_that_closes_a_binding_retires_its_protection():
     closing, dynamic, retiring = _binding_status_writers()
 
     # Sentinel: a walk that parsed nothing would pass everything below.
-    assert len(closing) >= 8, sorted(closing)
-    assert closing - retiring == set(), sorted(closing - retiring)
-    assert dynamic - retiring == set(_DYNAMIC_STATUS_NOT_CLOSED), sorted(dynamic - retiring)
+    assert sum(closing.values()) >= 9, sorted(closing)
+    short = {key: (count, retiring[key]) for key, count in closing.items() if retiring[key] < count}
+    assert short == {}, short
+    unretired_dynamic = {key for key in dynamic if retiring[key] == 0}
+    assert unretired_dynamic == set(_DYNAMIC_STATUS_NOT_CLOSED), sorted(unretired_dynamic)
