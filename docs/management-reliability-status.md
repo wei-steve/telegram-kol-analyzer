@@ -967,13 +967,14 @@ user_decisions_2026_09_07:
 
 本线在 A-15 + A-16e + A-17 合并部署后收口。以下是**已知未做**的事，按条目名引用本文件与 `docs/ARCHITECTURE.md` §6，不引行号。
 
-1. **A-17b：历史回填**（L3）。553 条账本行 + 919 条保护腿，截至测量时分布在 147 个已关闭 binding 下（生产现有已关闭 binding 298 个）。**前提**：先追到底三个会动手的消费者（`trigger_backup_stop_executor`、`stop_loss_size_convergence`、`protection_incident_convergence`）在已关闭 binding 上是否可达——step-17 测量条目写的是"查询本身不过滤"，不是"它们会动手"。一并处理：两份一次性 sqlite 脚本（`batch150_management_terminalization`、`frozen_exchange_empty_state_alignment`）不走 ORM、不会终态化；保护替换在途时 binding 被关，replay 可能重建 `verified` 行（`_projection_complete`、`legacy_conditional_cancel._completed_target_matches` 的完成判定要求 `verified`）。
-2. **A-11b 剩余五处同类站点**（见 A-11b 条目）。
-3. **step-5c 条目的"遗留问题"三项**：(1) A-5d——剩余止盈梯子的处置策略；(2) B 线阶段 6 的 WS `TriggerOrder.TS` 可作第四条更早的成交证据，接口已留、未接；(3) `trigger-orders-history` 自 2026-09-08T01:23Z 起不再收录 TPSL 单，已作为交易所行为的已知事实记录，不再推测。
-4. **step-9 条目的"A 线遗留"五项**：(1)"确认通知停不下任何指令项"的建议待裁定；(2) A-8 与 A-6b 加长观察器等真实样本后补记——**本次收口的场地检查没有核到它们**（`/root/evidence/*/observer.pid` 列表里没有这两个），是否还在跑、样本是否出现，未核；(3) A-6b 的 `idempotency_key` / `request_fingerprint` / `sCode` 未入证据，需先裁定是否让执行边界捕获请求负载；(4) A-8"真的丢了指令"区间 10–23 条按裁定不再收紧（记录项，非待办）；(5) A-5d 剩余梯子策略与**开关收敛清单**转入后续独立排期。
-5. **126 个已平仓位的历史堆叠止损行**（step-5e 条目"查明后排除的假警报"末句）：活跃仓位上那两对是全仓止损、已排除，**未处理的是已平仓位上的堆叠**。它们多半是 A-17b 那 553 行的子集——回填前先对齐两边口径，别做两遍，也别各漏一半。
-6. **"让路"的粒度**（见同名待办）。
-7. **step-18 的建议，全部未实施**：`ALERTED_REASONS` 加遍历式守卫（凡"权威判定未产生"的 reason 必须在告警集合里，并断言非空）；独立事故类型 `mimo_provider_unavailable`（含恢复通知）；把"供应商不可用"与"处理慢"分开计时，前者不消耗 15 分钟补救窗口；连续失败计数预警；`402` 的专门处理；主动探活。
+1. **step-18 的建议，全部未实施**：`ALERTED_REASONS` 加遍历式守卫（凡"权威判定未产生"的 reason 必须在告警集合里，并断言非空）；独立事故类型 `mimo_provider_unavailable`（含恢复通知）；把"供应商不可用"与"处理慢"分开计时，前者不消耗 15 分钟补救窗口；连续失败计数预警；`402` 的专门处理；主动探活。（指挥会话另开 MiMo 新会话承接。）
+2. **A-19：历史数据归档**（指挥会话 2026-09-12 转达用户同意立项；**不在本会话做**，排在 MiMo 新会话之后）。关闭超过 30 天的 binding 及其账本行、保护腿、执行事件、批次等，一次性迁入归档表，生产表只留活的与近期的。按 L3 修复流程：备份、演练副本、`PRAGMA quick_check`、逐行前后、审计行、通知；**只动终态数据**。
+   **A-17b（历史行回填）并入本项**，原内容保留如下，作为 A-19 的前提与边界：553 条账本行 + 919 条保护腿，截至测量时分布在 147 个已关闭 binding 下（生产现有已关闭 binding 298 个）。**前提**：先追到底三个会动手的消费者（`trigger_backup_stop_executor`、`stop_loss_size_convergence`、`protection_incident_convergence`）在已关闭 binding 上是否可达——step-17 测量条目写的是"查询本身不过滤"，不是"它们会动手"。一并处理：两份一次性 sqlite 脚本（`batch150_management_terminalization`、`frozen_exchange_empty_state_alignment`）不走 ORM、不会终态化；保护替换在途时 binding 被关，replay 可能重建 `verified` 行（`_projection_complete`、`legacy_conditional_cancel._completed_target_matches` 的完成判定要求 `verified`）。
+3. **A-11b 剩余五处同类站点**（见 A-11b 条目）。
+4. **step-5c 条目的"遗留问题"三项**：(1) A-5d——剩余止盈梯子的处置策略；(2) B 线阶段 6 的 WS `TriggerOrder.TS` 可作第四条更早的成交证据，接口已留、未接；(3) `trigger-orders-history` 自 2026-09-08T01:23Z 起不再收录 TPSL 单，已作为交易所行为的已知事实记录，不再推测。
+5. **step-9 条目的"A 线遗留"五项**：(1)"确认通知停不下任何指令项"的建议待裁定；(2) A-8 与 A-6b 加长观察器等真实样本后补记——**本次收口的场地检查没有核到它们**（`/root/evidence/*/observer.pid` 列表里没有这两个），是否还在跑、样本是否出现，未核；(3) A-6b 的 `idempotency_key` / `request_fingerprint` / `sCode` 未入证据，需先裁定是否让执行边界捕获请求负载；(4) A-8"真的丢了指令"区间 10–23 条按裁定不再收紧（记录项，非待办）；(5) A-5d 剩余梯子策略与**开关收敛清单**转入后续独立排期。
+6. **126 个已平仓位的历史堆叠止损行**（step-5e 条目"查明后排除的假警报"末句）：活跃仓位上那两对是全仓止损、已排除，**未处理的是已平仓位上的堆叠**。它们多半是 A-17b 那 553 行的子集——回填前先对齐两边口径，别做两遍，也别各漏一半。
+7. **"让路"的粒度**（见同名待办）。
 8. **A-16b-1**：重复入场检查的两条"永不抛"路径（check failed / park failed）目前只进 journal，没有事故类型——"失败时走默认路径"必须留下能到人的记录。
 9. **B 线观察窗模板缺 journal 可读性哨兵**（见"B 线移交的一个已知缺口"）。
 10. **`take_profit_would_place` 审计行的可发现性**：写在 `position_attribution_audits`，按表名找不到，需在文档或查询面上显式指路。
@@ -981,4 +982,3 @@ user_decisions_2026_09_07:
 12. **`env_file_paths=[]` 的遗留调用方式**（见对应条目）。
 13. **`16b578de` 已作废，永不合并**：其代码部分是作废的第二仓位放开；文档部分已救回（见"从作废提交中救回的文档部分"）。
 14. **A-17 已知无害项**：几个"标记已撤"函数不带状态守卫，会把 `retired` 覆盖为 `cancelled`（两者皆终态）。
-
