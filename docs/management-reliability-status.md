@@ -952,3 +952,33 @@ user_decisions_2026_09_07:
 
 - **B 线移交的一个已知缺口（2026-09-12，B 线阶段 6 收口时提出，写进 A 线交接清单）**：B 线的观察窗模板（`/root/observe_template.sh`，6k 等窗口所用）**没有 journal 可读性哨兵**。它所有从 journal 数出来的计数字段，在 `journalctl` 本身读失败时都会是 `0`，而 `0` 恰是通过值——"读不到日志"与"日志里没有坏消息"在采样行上同形。A-16b v2 的做法是把 `rounds > 0` 放进完成条件当哨兵（本窗 `rounds=23`，那几个 0 由判据替我证明为真）。**B 线确认它的模板不改、交接摘要里未提，由 A 线一并带走。** 修法：在模板完成条件里加一个由 journal 派生、且系统正常时必然非零的哨兵（如 reconcile 轮数），并照 step-18 前后那条"读不到须决定收窗含义"的规则，让它为 0 时窗口判未达成而不是静默通过。
   **同时记下 B 线阶段 6 收口后的场地事实（由 B 线给出，部署时须自己复核）**：共享分支 `44429dc2`（相对生产只多文档），生产 HEAD 仍为 `1fd45bc2`，窗口 `head_ok` 期望值应为 `1fd45bc2`；B 线无观察器在跑（6k 窗按精确 pid 停，DONE 写 `STOPPED_BY_OPERATOR_CRITERION_UNMET_msgs_0`）；**B 线工作树由指挥会话删除，之后部署协调改找指挥会话**。查场地的方法：`/root/evidence/*/observer.pid` 逐个 `kill -0`。
+
+- step-17 实施（2026-09-12，分支 `mgmt/step-16e-first-pass-payload`，提交 `7b559074` + `2f99f735`；与 A-15、A-16e 合并部署）：**binding 置 `closed` 时，同一事务内把该 binding 的活跃账本行与保护腿置 `retired`**，只向前，历史的 553 + 919 行留给 A-17b。
+  **共用函数** `protection_retirement.retire_protection_for_closed_binding`：账本行只处理 `{verified, protected}`，腿只处理 `{planned, waiting_fill, protection_recovery_pending, verified}`（包含式词表，`filled`/`cancelled` 保持原样——覆盖 `filled` 会抹掉"止盈真的成交过"）；证据 JSON **合并不替换**，加 `retired_reason=binding_closed`、`retired_at`、`retired_from_status`、`retired_by=<关闭点>`，不可解析的旧证据原样存到 `unparsed_evidence`；不提交。
+  **范围与裁定原文不同，照实记**：裁定写"三处"，我第一次数是四处，**遍历源码后是九个函数里十处赋值**——漏掉的是管理全平（`_terminalize_full_close`）、管理选择性平仓后无剩余（`_terminalize_selected_market_close_legs`）、删源退出（`finalize_source_message_deletion_exit`）、网页手动关闭（`mark_strategy_lifecycle_manual_close`）、capability-deferred successor（`_resolve_capability_deferred_successor`），再加值来自计划的历史清理（`_apply_historical_cleanup_action`，`new_state == "closed"` 时）。**点名式的"三处"如果照做，会在十处里接三处。**
+  **不关闭的动态赋值**两处，写进守卫白名单并附理由：`upsert_execution_binding`（调用方只传 open/active）、`_persist_binding_from_readback`（`_terminal_binding_status` 永不返回 closed）。一次性 sqlite 脚本（`batch150_management_terminalization`、`frozen_exchange_empty_state_alignment`）不走 ORM，不在本步。
+  **接线时发现并修掉的一条会弄坏的路径**：`record_verified_take_profit_fill` 原本只接受 `verified`/`filled`。若 TP1 成交即整仓平掉，清扫先把腿置 `retired`，下一轮证成交时这里抛 `ValueError`——而 `_apply_reconcile_snapshot` 调止盈历史对账处**没有 try**，于是**每一轮对账都会中断**。现在放行 `retired`（记为 `filled`，退役证据保留），`planned` 仍拒绝。
+  **已知未处理的边缘（交接）**：几个"标记已撤"函数（`_mark_position_tpsl_ledger_cancelled` 等）不带状态守卫，会把 `retired` 覆盖成 `cancelled`——两者都是终态，无害；`_projection_complete` 与 `legacy_conditional_cancel._completed_target_matches` 的完成判定要求 `verified`，**binding 关闭时恰有保护替换在途**，replay 可能为已关闭 binding 重建 `verified` 行。
+  **测试**：十处各一条走真实路径的行为用例（清扫用两轮缺席；管理全平走两次 reconcile；删源走 worker tick + finalize；网页走 TestClient），外加反例（有剩余仓位时不动、修复函数不关闭的分支不动、单次缺席不动），外加 AST 遍历守卫。**变异检查**：每处单独换成 `pass`，守卫与该处用例都转红，未变异基线全绿。
+  **变异检查本身错过一次**：第一版定位用正则从 import 非贪婪匹配到目标 `closed_by`，在修复模块里（三处同缩进）**从最前面那个 import 一路跨函数匹配过去**，删掉一大段代码，于是该模块全部用例都挂——**看起来"被抓住了"，其实是模块被删坏**。复现后改为"从目标往回找最近的 import，并断言删掉的片段恰好 11 行、恰好一个调用"，重做后成立。**同一次重做还暴露守卫太弱**：`_derive_repaired_bindings` 有两处关闭，去掉其中一处调用，"函数里有没有调用"的守卫照样通过——**改为按函数计数：调用次数 ≥ `closed` 常量赋值次数。**
+  **L1 观察器判据在开窗前先喂过已知输入**（`/root/evidence/step17-combined/`，脚本 `step17_combined_observe.sh`）：A1"窗内新关闭 binding 下的未退役行"用**开窗时的已关闭 id 快照**界定"新"，不用 `updated_at`（否则任何碰到旧 binding `updated_at` 的写入都会把历史 1472 行拖进来）。部署前在生产库只读试跑：**正向对照（不加快照过滤）= 1472 = 553 + 919**，证明这条查询取得到非零；加快照后 = 0；`new_closed` = 0；`retired_by` 现有 0；哨兵 `deepcoin_reconcile_round` 近 10 分钟 8 次。SQL 输出非数字记 -1 并判未达成，`sql_errors.log` 非空也判未达成——**查询出错不许读成 0**。
+
+## A 线收口交接清单（2026-09-12）
+
+本线在 A-15 + A-16e + A-17 合并部署后收口。以下是**已知未做**的事，按条目名引用本文件与 `docs/ARCHITECTURE.md` §6，不引行号。
+
+1. **A-17b：历史回填**（L3）。553 条账本行 + 919 条保护腿，截至测量时分布在 147 个已关闭 binding 下（生产现有已关闭 binding 298 个）。**前提**：先追到底三个会动手的消费者（`trigger_backup_stop_executor`、`stop_loss_size_convergence`、`protection_incident_convergence`）在已关闭 binding 上是否可达——step-17 测量条目写的是"查询本身不过滤"，不是"它们会动手"。一并处理：两份一次性 sqlite 脚本（`batch150_management_terminalization`、`frozen_exchange_empty_state_alignment`）不走 ORM、不会终态化；保护替换在途时 binding 被关，replay 可能重建 `verified` 行（`_projection_complete`、`legacy_conditional_cancel._completed_target_matches` 的完成判定要求 `verified`）。
+2. **A-11b 剩余五处同类站点**（见 A-11b 条目）。
+3. **step-5c 条目的"遗留问题"三项**：(1) A-5d——剩余止盈梯子的处置策略；(2) B 线阶段 6 的 WS `TriggerOrder.TS` 可作第四条更早的成交证据，接口已留、未接；(3) `trigger-orders-history` 自 2026-09-08T01:23Z 起不再收录 TPSL 单，已作为交易所行为的已知事实记录，不再推测。
+4. **step-9 条目的"A 线遗留"五项**：(1)"确认通知停不下任何指令项"的建议待裁定；(2) A-8 与 A-6b 加长观察器等真实样本后补记——**本次收口的场地检查没有核到它们**（`/root/evidence/*/observer.pid` 列表里没有这两个），是否还在跑、样本是否出现，未核；(3) A-6b 的 `idempotency_key` / `request_fingerprint` / `sCode` 未入证据，需先裁定是否让执行边界捕获请求负载；(4) A-8"真的丢了指令"区间 10–23 条按裁定不再收紧（记录项，非待办）；(5) A-5d 剩余梯子策略与**开关收敛清单**转入后续独立排期。
+5. **126 个已平仓位的历史堆叠止损行**（step-5e 条目"查明后排除的假警报"末句）：活跃仓位上那两对是全仓止损、已排除，**未处理的是已平仓位上的堆叠**。它们多半是 A-17b 那 553 行的子集——回填前先对齐两边口径，别做两遍，也别各漏一半。
+6. **"让路"的粒度**（见同名待办）。
+7. **step-18 的建议，全部未实施**：`ALERTED_REASONS` 加遍历式守卫（凡"权威判定未产生"的 reason 必须在告警集合里，并断言非空）；独立事故类型 `mimo_provider_unavailable`（含恢复通知）；把"供应商不可用"与"处理慢"分开计时，前者不消耗 15 分钟补救窗口；连续失败计数预警；`402` 的专门处理；主动探活。
+8. **A-16b-1**：重复入场检查的两条"永不抛"路径（check failed / park failed）目前只进 journal，没有事故类型——"失败时走默认路径"必须留下能到人的记录。
+9. **B 线观察窗模板缺 journal 可读性哨兵**（见"B 线移交的一个已知缺口"）。
+10. **`take_profit_would_place` 审计行的可发现性**：写在 `position_attribution_audits`，按表名找不到，需在文档或查询面上显式指路。
+11. **墙钟敏感用例** `test_positions_panel_stale_snapshot_does_not_wait_for_background_refresh`：重跑抓到过一次假红。
+12. **`env_file_paths=[]` 的遗留调用方式**（见对应条目）。
+13. **`16b578de` 已作废，永不合并**：其代码部分是作废的第二仓位放开；文档部分已救回（见"从作废提交中救回的文档部分"）。
+14. **A-17 已知无害项**：几个"标记已撤"函数不带状态守卫，会把 `retired` 覆盖为 `cancelled`（两者皆终态）。
+
