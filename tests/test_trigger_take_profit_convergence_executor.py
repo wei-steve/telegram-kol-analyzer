@@ -3324,9 +3324,78 @@ def test_releasing_the_position_lets_the_same_plan_reach_the_exchange(tmp_path, 
         order_kind="limit",
     )
     _preplan_take_profit_legs(session_factory, prices=["64500"])
-    monkeypatch.setattr(
-        executor, "TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS", frozenset({"pos-10"})
+    client = _Client()
+
+    # Phase 6k: the release is a predicate now, not an id in a list. Supplied
+    # the way production supplies it -- a group trading mode provider -- so
+    # what this test exercises is the same condition production evaluates.
+    result = executor.execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+        group_trading_mode_provider=lambda chat: "auto_trade",
     )
+
+    assert result["status"] == "submitted"
+    assert [call["tpTriggerPx"] for call in client.submit_calls] == ["64500"]
+
+
+def test_the_same_plan_is_withheld_when_the_group_does_not_trade(tmp_path):
+    """One difference from the test above -- the group's mode -- and it holds.
+
+    The condition the source predicate alone does not carry: ``order_kind`` is
+    a property of the *order*, and says nothing about which group the position
+    was opened in. Without this, phase 6k would write into a group the user
+    configured to be watched and never traded.
+    """
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research import trigger_take_profit_convergence_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "notify_only.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+        order_kind="limit",
+    )
+    _preplan_take_profit_legs(session_factory, prices=["64500"])
+    client = _Client()
+
+    result = executor.execute_trigger_take_profit_convergence(
+        session_factory,
+        convergence_id=convergence_id,
+        deepcoin_client=client,
+        executed_at=NOW,
+        group_trading_mode_provider=lambda chat: "notify_only",
+    )
+
+    assert result["status"] == "withheld"
+    assert result["release_reason"] == "group_not_auto_trade"
+    assert client.submit_calls == []
+
+
+def test_a_missing_group_mode_provider_withholds_rather_than_releases(tmp_path):
+    """The direction the wiring can fail in, and it must fail closed.
+
+    Six signatures sit between the web app and this function. A caller that
+    forgets the provider must hold everything, and must say so with its own
+    reason code -- "nobody told us" is not the same as "configured not to
+    trade", and only one of them is a bug.
+    """
+
+    from telegram_kol_research.db import create_session_factory
+    from telegram_kol_research import trigger_take_profit_convergence_executor as executor
+
+    session_factory = create_session_factory(tmp_path / "no_provider.db")
+    convergence_id = _ready_convergence(
+        session_factory,
+        existing_take_profit=False,
+        desired_take_profits=[{"price": "64500", "allocation_pct": "100"}],
+        order_kind="limit",
+    )
+    _preplan_take_profit_legs(session_factory, prices=["64500"])
     client = _Client()
 
     result = executor.execute_trigger_take_profit_convergence(
@@ -3336,8 +3405,9 @@ def test_releasing_the_position_lets_the_same_plan_reach_the_exchange(tmp_path, 
         executed_at=NOW,
     )
 
-    assert result["status"] == "submitted"
-    assert [call["tpTriggerPx"] for call in client.submit_calls] == ["64500"]
+    assert result["status"] == "withheld"
+    assert result["release_reason"] == "group_trading_mode_unknown"
+    assert client.submit_calls == []
 
 
 def test_a_trigger_limit_entry_is_never_withheld_by_the_limit_release_list(tmp_path):

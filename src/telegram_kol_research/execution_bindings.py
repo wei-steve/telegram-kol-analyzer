@@ -442,6 +442,7 @@ def reconcile_deepcoin_execution_bindings(
     recovered_at: datetime | None = None,
     snapshot: _ReconcileSnapshot | None = None,
     contract_spec_provider: Any | None = None,
+    group_trading_mode_provider=None,
 ) -> ExecutionReconciliationResult:
     """Reconcile one coherent exchange snapshot through global leg attribution."""
 
@@ -479,6 +480,7 @@ def reconcile_deepcoin_execution_bindings(
                 client=client,
                 contract_spec_provider=contract_spec_provider,
                 submitted_at=now,
+                group_trading_mode_provider=group_trading_mode_provider,
             )
             if submitted_backup_stops:
                 snapshot = load_deepcoin_execution_reconciliation_snapshot(
