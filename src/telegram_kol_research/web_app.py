@@ -5394,6 +5394,9 @@ def create_web_app(
                         shadow_instrument_map_provider=(
                             _deepcoin_shadow_instrument_map_provider(app)
                         ),
+                        group_trading_mode_provider=lambda chat: _group_trading_mode(
+                            app.state.group_config, chat
+                        ),
                     )
                 )
             if runtime_role_starts_singleton_task(
@@ -5414,6 +5417,9 @@ def create_web_app(
                         ),
                         authority_failure_observer=(
                             app.state.runtime_authority_status.record_management_failure
+                        ),
+                        group_trading_mode_provider=lambda chat: _group_trading_mode(
+                            app.state.group_config, chat
                         ),
                     )
                 )
@@ -9919,6 +9925,7 @@ async def run_deepcoin_execution_reconcile_loop(
     authority_failure_observer=None,
     wake_signal=None,
     shadow_instrument_map_provider=None,
+    group_trading_mode_provider=None,
 ) -> None:
     """Reconcile on a fixed timer, and additionally as soon as a frame lands.
 
@@ -9967,6 +9974,7 @@ async def run_deepcoin_execution_reconcile_loop(
                         client=client,
                         recovered_at=synced_at,
                         contract_spec_provider=contract_spec_provider,
+                        group_trading_mode_provider=group_trading_mode_provider,
                     )
                     if system_operator_bot_enabled(system_operator_bot_config):
                         await deliver_pending_position_attribution_incidents(

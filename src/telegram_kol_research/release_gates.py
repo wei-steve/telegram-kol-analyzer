@@ -30,11 +30,9 @@ from telegram_kol_research.break_even_convergence_executor import (
     BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS,
     BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS,
 )
-from telegram_kol_research.trigger_backup_stop_executor import (
-    ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
-)
-from telegram_kol_research.trigger_take_profit_convergence_executor import (
-    TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS,
+from telegram_kol_research.source_release import (
+    SOURCE_RELEASE_BLOCKED_POS_IDS,
+    describe_source_release,
 )
 
 #: Name -> what releasing it permits. The description is part of the report on
@@ -65,8 +63,6 @@ def current_release_gates() -> dict[str, Any]:
     values = {
         "break_even_replacement": BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS,
         "break_even_full_exit": BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS,
-        "take_profit_limit_entry": TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS,
-        "adopted_primary_backup_stop": ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
     }
     gates = {
         name: {
@@ -76,9 +72,25 @@ def current_release_gates() -> dict[str, Any]:
         }
         for name, released in values.items()
     }
+    # Phase 6k. Two gates stopped being lists. A list renders as its contents;
+    # a predicate has no contents to render, so it renders its conditions --
+    # "all" would be the least informative possible line about the widest
+    # possible permission, which is the opposite of what this module is for.
+    source_shaped = describe_source_release()
+    for name, conditions in source_shaped.items():
+        if name == "blocked_pos_ids":
+            continue
+        gates[name] = {
+            "shape": "predicate",
+            "conditions": conditions,
+            "blocked_pos_ids": source_shaped["blocked_pos_ids"],
+            "permits": GATE_DESCRIPTIONS[name],
+        }
     return {
         "gates": gates,
-        "total_released": sum(gate["count"] for gate in gates.values()),
+        "total_released": sum(
+            gate.get("count", 0) for gate in gates.values()
+        ),
         # A single line an observation script can compare against, so a window
         # notices a gate changing under it the way it notices the sha changing.
         "fingerprint": release_gate_fingerprint(),
@@ -96,13 +108,22 @@ def release_gate_fingerprint() -> str:
     values = {
         "break_even_replacement": BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS,
         "break_even_full_exit": BREAK_EVEN_FULL_EXIT_RELEASED_POS_IDS,
-        "take_profit_limit_entry": TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS,
-        "adopted_primary_backup_stop": ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
     }
-    return ";".join(
+    parts = [
         f"{name}={','.join(sorted(str(item) for item in released)) or '-'}"
         for name, released in sorted(values.items())
+    ]
+    # A predicate-shaped gate renders as "by-source", plus the ids it is
+    # holding back. Rendering it as "-" would say "nothing is released", which
+    # is the exact opposite of what it means, and an observation script
+    # comparing fingerprints would go on matching while the shape changed
+    # underneath it.
+    blocked = ",".join(
+        sorted(str(item) for item in SOURCE_RELEASE_BLOCKED_POS_IDS)
     )
+    for name in sorted(("adopted_primary_backup_stop", "take_profit_limit_entry")):
+        parts.append(f"{name}=by-source(blocked:{blocked or 'none'})")
+    return ";".join(sorted(parts))
 
 
 def format_release_gates_for_log() -> str:

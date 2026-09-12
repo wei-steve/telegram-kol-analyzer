@@ -16,10 +16,7 @@ from telegram_kol_research.execution_bindings import (
 from telegram_kol_research.models import ExecutionOrderLeg
 from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 import telegram_kol_research.trigger_backup_stop_executor as backup_stop_module
-from telegram_kol_research.trigger_backup_stop_executor import (
-    ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS,
-    _plan_submission,
-)
+from telegram_kol_research.trigger_backup_stop_executor import _plan_submission
 
 
 NOW = datetime(2026, 9, 10, 20, 0, tzinfo=UTC)
@@ -154,38 +151,26 @@ def test_a_normally_recorded_primary_is_not_held_back(tmp_path):
     assert plan.status != "shadow_ready_adopted_primary"
 
 
-def test_a_released_position_is_not_held(tmp_path, monkeypatch):
-    """The release is per position id, and it is the only thing that lifts the hold.
+def test_a_released_position_is_not_held(tmp_path):
+    """The release is what lifts the hold, and it is the only thing that does.
 
-    Without this the hold could be made unconditional -- every adopted primary
-    held forever -- and the test above would still pass while phase 6f did
-    nothing at all.
+    **Phase 6k changed what "released" means, not what this test guards.** It
+    used to monkeypatch a synthetic id into an enumeration; the enumeration is
+    gone, and a release is now a predicate -- an adopted primary, in an
+    ``auto_trade`` group, on a ``verified`` entry leg. So the release is
+    supplied the way production supplies it: a group trading mode provider.
 
-    **Released id supplied by the test, not read from the constant.** Two
-    earlier versions read it: the first took ``sorted(...)[0]``, so adding an
-    id changed production while the test kept exercising the one already live;
-    the second parametrized over the whole set, which was right until the set
-    went back to empty on 2026-09-11 -- and then pytest reported
-    ``got empty parameter set``, **a skip that reads as green**. A property
-    this test exists to hold does not stop being true when nothing is
-    currently released, so it must not stop being checked either.
-
-    **Asserted positively, and against the same fixture held.** The third
-    version of this test asserted only ``status != "shadow_ready_adopted_primary"``
-    and hard-wiring the gate shut did not turn it red: the fixture's leg
-    carried a different ``pos_id`` than the one under test, so every run
-    refused at ``binding_or_leg_unavailable`` long before reaching the gate.
-    A refusal for the fixture's reason is indistinguishable from a refusal for
-    the right one, so the pair below is the assertion: one position, one
-    difference -- the gate -- and two different outcomes.
+    Asserted positively, and against the same fixture held. An earlier version
+    asserted only ``status != "shadow_ready_adopted_primary"`` and hard-wiring
+    the gate shut did not turn it red: the fixture's leg carried a different
+    ``pos_id`` than the one under test, so every run refused at
+    ``binding_or_leg_unavailable`` long before reaching the gate. A refusal for
+    the fixture's reason is indistinguishable from a refusal for the right one,
+    so the pair below is the assertion: one position, one difference -- the
+    group's trading mode -- and two different outcomes.
     """
 
     released = "pos-released-for-this-test"
-    monkeypatch.setattr(
-        backup_stop_module,
-        "ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS",
-        frozenset({released}),
-    )
     session_factory, binding_id, leg_id = _seed(
         tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
     )
@@ -196,20 +181,17 @@ def test_a_released_position_is_not_held(tmp_path, monkeypatch):
             session, binding_id=binding_id, leg_id=leg_id, pos_id=released,
             client=client, contract_spec_provider=_spec_provider(),
             backup_stop_buffer_bps=20.0, submitted_at=NOW,
+            group_trading_mode_provider=lambda chat: "auto_trade",
         )
 
     # Positive: the release lets the plan through to a real submission plan.
     # "not held" is not enough -- a block reads the same way.
-    assert plan.status == "ready", (plan.status, plan.reason_code)
+    assert plan.status == "ready", (plan.status, plan.reason_code, plan.release_reason)
     assert plan.payload["slTriggerPx"] == "75548.6"
     assert client.writes == []
 
-    # Negative, same position, same fixture, gate closed. Only the gate moved.
-    monkeypatch.setattr(
-        backup_stop_module,
-        "ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS",
-        frozenset(),
-    )
+    # Negative, same position, same fixture, one difference: the group is not
+    # configured to trade. Only that moved.
     held_factory, held_binding_id, held_leg_id = _seed(
         tmp_path / "held", evidence_source="exchange_adopted_by_tu", pos_id=released
     )
@@ -218,35 +200,76 @@ def test_a_released_position_is_not_held(tmp_path, monkeypatch):
             session, binding_id=held_binding_id, leg_id=held_leg_id, pos_id=released,
             client=_Client(pos_id=released), contract_spec_provider=_spec_provider(),
             backup_stop_buffer_bps=20.0, submitted_at=NOW,
+            group_trading_mode_provider=lambda chat: "notify_only",
         )
 
     assert held.status == "shadow_ready_adopted_primary", (held.status, held.reason_code)
     assert held.reason_code == "primary_stop_adopted_from_exchange"
+    # And the record says *which* condition refused, which the per-id gate
+    # never had to: it had only one possible answer.
+    assert held.release_reason == "group_not_auto_trade"
 
 
-def test_the_release_set_holds_exactly_what_was_approved():
-    """What is released right now, asserted separately from the behaviour above.
+def test_no_group_mode_provider_holds_rather_than_releases(tmp_path):
+    """A caller that forgot to wire the provider must not widen anything.
 
-    Split deliberately, and the split paid for itself on its first use: this
-    case needed an edit on 2026-09-11 when phase 6j released the two ETH
-    positions, while ``test_a_released_position_is_not_held`` above needed none,
-    because it supplies its own synthetic id. A behavioural test that had to be
-    touched every time a position is approved would eventually be loosened to
-    stop the churn -- which is how a gate's own test stops guarding it.
-
-    Needing a deliberate edit here is the feature. Releasing a position is
-    meant to cost a code change, a full suite and a deploy; if this line could
-    be satisfied without anyone writing the id down, that cost would be gone.
+    This is the direction the wiring can fail in -- six signatures between the
+    web app and this function -- and it has to fail closed. It also has to be
+    *visible*: the held plan carries ``group_trading_mode_unknown`` rather than
+    the same reason a notify_only group produces, because one means "configured
+    not to trade" and the other means "nobody told us".
     """
 
-    assert ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS == frozenset(
-        {
-            # Phase 6j, 2026-09-11. ETH-USDT-SWAP longs from binding 352,
-            # both verified by direct_order_position_id, both holding an
-            # adopted primary stop at 2484. Releasing them lets the backup
-            # stop at 2479.03 -- exactly the payload incidents 455/456 had
-            # already recorded while held.
-            "1001125231241107",
-            "1001125231241310",
-        }
+    released = "pos-released-for-this-test"
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
     )
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id=released,
+            client=_Client(pos_id=released), contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert plan.status == "shadow_ready_adopted_primary"
+    assert plan.release_reason == "group_trading_mode_unknown"
+
+
+def test_an_unverified_entry_leg_is_not_released(tmp_path):
+    """Every downstream write keys off pos_id, and an unverified one is a guess."""
+
+    released = "pos-released-for-this-test"
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="exchange_adopted_by_tu", pos_id=released
+    )
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, leg_id)
+        leg.attribution_status = "unassigned"
+        session.commit()
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id=released,
+            client=_Client(pos_id=released), contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+            group_trading_mode_provider=lambda chat: "auto_trade",
+        )
+
+    assert plan.status == "shadow_ready_adopted_primary"
+    assert plan.release_reason == "attribution_not_verified"
+
+
+def test_nothing_is_held_back_by_the_blacklist_in_production():
+    """What replaced the enumeration, asserted separately from the behaviour above.
+
+    The per-id release list is gone: phase 6k made the release a predicate, so
+    there is no list of approved ids to pin any more. What remains per position
+    is the *hold* list, and it is empty. An id appearing there should always
+    come with a line in the status file saying when it goes away -- which is
+    why this needs a deliberate edit to change, exactly as the release list did.
+    """
+
+    from telegram_kol_research.source_release import SOURCE_RELEASE_BLOCKED_POS_IDS
+
+    assert SOURCE_RELEASE_BLOCKED_POS_IDS == frozenset()

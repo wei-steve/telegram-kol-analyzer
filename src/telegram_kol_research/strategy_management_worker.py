@@ -148,6 +148,7 @@ def run_strategy_management_worker_tick(
     instruction_planner: Callable[..., Any] = plan_strategy_management_batch,
     composite_reconciler: Callable[..., Any] = reconcile_composite_management_components,
     composite_executor: Callable[..., Any] = execute_composite_management_batch,
+    group_trading_mode_provider=None,
 ) -> StrategyManagementWorkerResult:
     """Process a bounded amount of work, isolating every durable batch failure."""
 
@@ -531,6 +532,7 @@ def run_strategy_management_worker_tick(
                 recovered_at=now,
                 snapshot=get_snapshot(),
                 contract_spec_provider=contract_spec_provider,
+                group_trading_mode_provider=group_trading_mode_provider,
             )
         except Exception:
             logger.exception("backup-stop reconciliation before take-profit lane failed")
@@ -544,6 +546,7 @@ def run_strategy_management_worker_tick(
                     contract_spec_provider=contract_spec_provider,
                     processed_at=now,
                     limit=limit,
+                    group_trading_mode_provider=group_trading_mode_provider,
                 )
                 or 0
             )
@@ -980,6 +983,7 @@ def _load_settings_and_run_strategy_management_tick(
     now_provider=None,
     contract_spec_provider=None,
     authority_observer=None,
+    group_trading_mode_provider=None,
 ) -> None:
     """Run one settings read plus one tick as a single blocking unit.
 
@@ -998,6 +1002,7 @@ def _load_settings_and_run_strategy_management_tick(
         cursor=cursor,
         processed_at=observed_at,
         contract_spec_provider=contract_spec_provider,
+        group_trading_mode_provider=group_trading_mode_provider,
     )
     if authority_observer is not None:
         authority_observer(
@@ -1019,6 +1024,7 @@ async def run_strategy_management_worker_loop(
     contract_spec_provider=None,
     authority_observer=None,
     authority_failure_observer=None,
+    group_trading_mode_provider=None,
 ) -> None:
     """Run bounded ticks forever; cancellation is owned by the Web lifespan."""
 
@@ -1034,6 +1040,7 @@ async def run_strategy_management_worker_loop(
                 now_provider=now_provider,
                 contract_spec_provider=contract_spec_provider,
                 authority_observer=authority_observer,
+                group_trading_mode_provider=group_trading_mode_provider,
             )
         except asyncio.CancelledError:
             raise

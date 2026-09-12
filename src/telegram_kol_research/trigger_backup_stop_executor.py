@@ -12,6 +12,10 @@ from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.execution_bindings import build_client_order_id
+from telegram_kol_research.source_release import (
+    evaluate_source_release,
+    resolve_group_trading_mode,
+)
 from telegram_kol_research.protection_authority import (
     ADOPTION_EVIDENCE_SOURCE as ADOPTED_EVIDENCE_SOURCE,
 )
@@ -48,17 +52,22 @@ from telegram_kol_research.protection_authority import (
 #: 2479.03, whole_position, ``set_position_sltp``), and both legs are
 #: ``attribution_status=verified`` by ``direct_order_position_id``.
 #:
-#: **Still per position id, deliberately.** Releasing by *source* -- every
-#: primary stop adopted from the exchange, forever -- was proposed and
-#: narrowed back on 2026-09-11: the cost of a release (a code change, a full
-#: suite, a deploy) is the design rather than a defect, and the source
-#: predicate does not by itself carry "opened by this system in an auto_trade
-#: group", so releasing by it would be wider than the authority it is drawn
-#: from. That change is phase 6k, and its precondition is the *real execution*
-#: samples these two ids are about to produce -- not more shadow rows.
-ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS = frozenset(
-    {"1001125231241107", "1001125231241310"}
-)
+#: **Retired on 2026-09-12 (phase 6k).** Releasing by *source* was proposed on
+#: 2026-09-11 and narrowed back that day, by two objections that arrived
+#: independently: that the enumeration's cost is the design rather than a
+#: defect, and that the authority granted was per position and did not cover
+#: inverting the default. A third held on its own -- ``exchange_adopted_by_tu``
+#: says nothing about *who opened the position* -- and it is the reason the
+#: predicate that replaces the list is not the one originally proposed.
+#:
+#: ``source_release.evaluate_source_release`` now decides: a primary stop
+#: adopted from the exchange, **in a group configured ``auto_trade``**, **whose
+#: entry leg's attribution is ``verified``**. The two ids that were here --
+#: 1001125231241107 and 1001125231241310 -- satisfy it, so nothing they were
+#: permitted stops being permitted; what changes is that the next such position
+#: does not need a deploy. The per-position lever that remains is
+#: ``source_release.SOURCE_RELEASE_BLOCKED_POS_IDS``, and it holds rather than
+#: releases.
 from telegram_kol_research.models import ExecutionBinding
 from telegram_kol_research.models import ExecutionEvent
 from telegram_kol_research.models import ExecutionOrderLeg
@@ -106,6 +115,14 @@ class BackupStopPlan:
     #: Phase 6f: what a held plan *would* have sent, so the record is something
     #: a person can agree to rather than a bare "held".
     backup_stop: str | None = None
+    #: Phase 6k: *which* condition of the source-shaped release refused. Under
+    #: the per-id gate there was only ever one answer ("this id is not in the
+    #: list"), so ``reason_code`` alone was enough. A predicate can refuse for
+    #: four different reasons and they call for different actions -- a
+    #: notify_only group is a configuration decision, an unknown group mode is
+    #: a missing config entry, an unverified attribution is a data problem, and
+    #: a blocked id is somebody's deliberate hold.
+    release_reason: str | None = None
     payload: dict[str, str] | None = None
     position: dict[str, Any] | None = None
     open_positions: tuple[dict[str, Any], ...] = ()
@@ -117,6 +134,7 @@ def submit_verified_trigger_backup_stops(
     client: Any,
     contract_spec_provider: DeepcoinContractSpecProvider,
     submitted_at: datetime,
+    group_trading_mode_provider=None,
 ) -> int:
     """Submit opt-in stops only after a fresh exact live-position read.
 
@@ -148,6 +166,7 @@ def submit_verified_trigger_backup_stops(
                 contract_spec_provider=contract_spec_provider,
                 backup_stop_buffer_bps=backup_stop_buffer_bps,
                 submitted_at=submitted_at,
+                group_trading_mode_provider=group_trading_mode_provider,
             )
             if plan.status == "already_protected":
                 continue
@@ -378,6 +397,7 @@ def _plan_submission(
     contract_spec_provider,
     backup_stop_buffer_bps,
     submitted_at,
+    group_trading_mode_provider=None,
 ):
     binding = session.get(ExecutionBinding, binding_id)
     leg = session.get(ExecutionOrderLeg, leg_id)
@@ -537,7 +557,16 @@ def _plan_submission(
         # before the computation is what the first version did, and it produced
         # a record saying only "held" -- no price, no size, nothing an operator
         # or an approval request could be built on.
-        if str(pos_id) not in ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS:
+        release = evaluate_source_release(
+            pos_id=pos_id,
+            kind="adopted_primary_backup_stop",
+            evidence_source=getattr(primary, "evidence_source", None),
+            attribution_status=getattr(leg, "attribution_status", None),
+            group_trading_mode=resolve_group_trading_mode(
+                group_trading_mode_provider, getattr(binding, "chat_id", None)
+            ),
+        )
+        if not release.released:
             return _shadow_ready_plan(
                 binding_id,
                 leg_id,
@@ -546,6 +575,7 @@ def _plan_submission(
                 primary_stop=primary_stop,
                 backup_stop=str(backup_price),
                 payload=payload,
+                release_reason=release.reason,
             )
     try:
         from telegram_kol_research.position_protection_legs import (
@@ -662,6 +692,7 @@ def _shadow_ready_plan(
     primary_stop: str,
     backup_stop: str | None = None,
     payload: dict[str, str] | None = None,
+    release_reason: str | None = None,
 ) -> BackupStopPlan:
     """A plan that is computed in full, recorded in full, and not sent.
 
@@ -680,6 +711,7 @@ def _shadow_ready_plan(
         primary_stop=str(primary_stop),
         backup_stop=(None if backup_stop is None else str(backup_stop)),
         payload=dict(payload) if payload else None,
+        release_reason=release_reason,
     )
 
 
@@ -703,6 +735,11 @@ def _record_incident(
     if plan.binding_id is None or plan.leg_id is None or not plan.pos_id:
         return
     evidence = {"reason_code": str(plan.reason_code or incident_type)}
+    # Phase 6k. Which condition refused, when the source-shaped release was the
+    # thing that held it. Without this the incident says "adopted from the
+    # exchange" -- true, and no longer the reason it is being held.
+    if plan.release_reason:
+        evidence["release_reason"] = str(plan.release_reason)
     # Phase 6f. A held plan has to record what it would have sent. The first
     # version recorded only the reason code, and the approval request for 6f had
     # to be reconstructed by hand from the code and a live position read --

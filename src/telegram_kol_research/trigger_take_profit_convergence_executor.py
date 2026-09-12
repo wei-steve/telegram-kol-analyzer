@@ -130,8 +130,19 @@ logger = logging.getLogger(__name__)
 #: precondition is the real execution these two ids are about to produce, and
 #: its predicate has to carry the auto_trade and verified conditions
 #: explicitly.
-TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS: frozenset[str] = frozenset(
-    {"1001125231241107", "1001125231241310"}
+#: **Retired on 2026-09-12 (phase 6k).** The enumeration is replaced by
+#: ``source_release.evaluate_source_release``: a plain limit entry, in a group
+#: configured ``auto_trade``, whose entry leg's attribution is ``verified``.
+#: The two ids that were here -- 1001125231241107 and 1001125231241310 -- both
+#: satisfy that predicate, so nothing they were permitted stops being
+#: permitted; what changes is that the next such position does not need a
+#: deploy. The per-position lever that remains is
+#: ``source_release.SOURCE_RELEASE_BLOCKED_POS_IDS``, and it holds rather than
+#: releases.
+
+from telegram_kol_research.source_release import (
+    evaluate_source_release,
+    resolve_group_trading_mode,
 )
 
 WOULD_PLACE_EVENT = "take_profit_would_place"
@@ -139,7 +150,12 @@ WOULD_PLACE_ENDPOINT = "POST /deepcoin/trade/set-position-sltp"
 
 
 def _limit_entry_release_withheld(
-    session_factory, *, convergence_id: int, plan, now: datetime
+    session_factory,
+    *,
+    convergence_id: int,
+    plan,
+    now: datetime,
+    group_trading_mode_provider=None,
 ) -> dict[str, object] | None:
     """Hold a plain limit entry's take profits, recording what would be sent.
 
@@ -156,9 +172,18 @@ def _limit_entry_release_withheld(
         if leg is None or str(leg.order_kind or "") != "limit":
             return None
         pos_id = str(convergence.pos_id or "")
-        if pos_id in TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS:
-            return None
         binding = session.get(ExecutionBinding, convergence.execution_binding_id)
+        release = evaluate_source_release(
+            pos_id=pos_id,
+            kind="take_profit_limit_entry",
+            entry_order_kind=getattr(leg, "order_kind", None),
+            attribution_status=getattr(leg, "attribution_status", None),
+            group_trading_mode=resolve_group_trading_mode(
+                group_trading_mode_provider, getattr(binding, "chat_id", None)
+            ),
+        )
+        if release.released:
+            return None
         for tier_index, payload in enumerate(plan.payloads, start=1):
             # Logged every round on purpose: an observation window needs to see
             # the same four lines again and again, not one line and then
@@ -190,6 +215,12 @@ def _limit_entry_release_withheld(
         "convergence_id": convergence_id,
         "status": "withheld",
         "reason": "take_profit_limit_entry_release_withheld",
+        # Phase 6k: which condition refused. Under the per-id gate there was
+        # one answer; a predicate has four, and they call for different
+        # actions -- a notify_only group is a decision, an unknown group mode
+        # is a missing config entry, an unverified attribution is a data
+        # problem, a blocked id is somebody's deliberate hold.
+        "release_reason": release.reason,
     }
 
 
@@ -327,6 +358,7 @@ def execute_trigger_take_profit_convergence(
     deepcoin_client,
     contract_spec_provider=None,
     executed_at: datetime | None = None,
+    group_trading_mode_provider=None,
 ) -> dict[str, object]:
     """Cancel exact-leg TP orders, then create the replacement TP set once."""
 
@@ -352,7 +384,11 @@ def execute_trigger_take_profit_convergence(
                     return {"convergence_id": convergence_id, "status": "submitted", "reason": None}
         return {"convergence_id": convergence_id, "status": plan.status, "reason": plan.reason_code}
     withheld = _limit_entry_release_withheld(
-        session_factory, convergence_id=convergence_id, plan=plan, now=now
+        session_factory,
+        convergence_id=convergence_id,
+        plan=plan,
+        now=now,
+        group_trading_mode_provider=group_trading_mode_provider,
     )
     if withheld is not None:
         return withheld
@@ -575,6 +611,7 @@ def execute_ready_trigger_take_profit_convergences(
     contract_spec_provider=None,
     processed_at: datetime | None = None,
     limit: int = 5,
+    group_trading_mode_provider=None,
 ) -> int:
     """Run a bounded set of durable ready tasks; terminal tasks are skipped."""
 
@@ -611,6 +648,7 @@ def execute_ready_trigger_take_profit_convergences(
             deepcoin_client=deepcoin_client,
             contract_spec_provider=contract_spec_provider,
             executed_at=processed_at,
+            group_trading_mode_provider=group_trading_mode_provider,
         )
         if result.get("status") in {"submitted", "conflicted", "submit_unknown"}:
             completed += 1

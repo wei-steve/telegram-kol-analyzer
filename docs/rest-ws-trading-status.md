@@ -3023,8 +3023,28 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **变异检验 6 项全红**：去掉 auto_trade 条件(8红)、未知群模式当成 auto_trade(6红)、
   去掉 verified 条件(10红)、无视黑名单(2红)、未知 kind 继承许可(1红)、
   mode 解析器把抛异常的 provider 当成 auto_trade(1红)。
-  **尚未做的**：把它接进两个执行器以取代现有的 per-posId 常量。
-  接线即是行为改变，按治理规则等指挥会话决定，**一并与部署一起**。
+  **接线已完成（同日稍后），两个 per-posId 释放常量已退役**：
+  `ADOPTED_PRIMARY_BACKUP_RELEASED_POS_IDS` 与 `TAKE_PROFIT_LIMIT_ENTRY_RELEASED_POS_IDS`
+  都删掉，改由谓词决定；两处闸门各自记下**是哪一条否决的**
+  （`release_reason`，per-id 闸门从来不需要这个字段，因为它只有一个可能的答案）。
+  **闸门可观测行相应改成两种形状**：
+  `adopted_primary_backup_stop=by-source(blocked:none);break_even_full_exit=-;`
+  `break_even_replacement=1001125231241107,1001125231241310;take_profit_limit_entry=by-source(blocked:none)`
+  ——**谓词形状渲染成 `by-source(blocked:…)` 而不是 `-`**：渲染成 `-` 会说"什么都没放开"，
+  **恰是它含义的反面**，而比对指纹的观察脚本会在形状改变的情况下继续匹配。
+  **provider 一路从 web_app 穿六层**（reconcile loop / 管理 worker loop / tick / shim /
+  runner / executor）。**缺 provider 一律扣住**（`group_trading_mode_unknown`），
+  方向是安全的——**但也正因为安全，它可以整段静默失效**，
+  就是 6i 那个"永远不触发"的形状。
+  **所以补了一条链路用例**：逐个 `inspect.signature` 断言六层都**接受**这个参数，
+  再对 web_app 源码断言它至少在四处**真的传了**。
+  **这条用例不是多余的**：变异检验里"web_app 不再传 provider" 与 "某一层不再接受该参数"
+  **两项原本都是哑的**，加上它之后才转红。
+  **变异检验合计 10 项全红**：谓词侧 6 项（去掉 auto_trade / 未知当成 auto_trade /
+  去掉 verified / 无视黑名单 / 未知 kind 继承许可 / 解析器把异常当 auto_trade），
+  接线侧 4 项（备份止损闸门恒放行 / 止盈闸门恒放行 / web_app 不传 provider /
+  某一层不接受该参数）。
+  **仍未部署**，按治理规则等指挥会话决定。
   **6i-1 部署前算过它的调用成本，并且第一次算错了**：把页预算从 5 提到 40，
   意味着"扣住的那条腿"每轮要多打 REST。实测 reconcile 轮次约 **7 轮/分**
   （2026-09-12 17:00Z 起一小时 428 轮），所以代价是
@@ -3037,3 +3057,44 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   而它出现在我正要据此决定要不要部署的那一刻。
   **做法与本节已有的那条同源**：拿一个模式去找"有没有问题"，
   **先确认这个模式不会命中无关的东西**——尤其当这个数据集里全是长数字 id 时。
+
+- phase-6i-1-deployed (2026-09-12 18:14:48Z, **首轮生效，腿 582 被收掉**):
+  上线 **`2c4f82a6411a30e98c79ee0d0fe4ccd96ca1b48f`**，回滚参考 **`eb05923b`**。
+  全量 **8457 passed / 4 skipped / 0 failed**。四步部署三处 sha 完全一致，三个 unit `active`。
+  A 线明确让场（其 A-16b 全量未完、无候选、无窗）。
+  **部署前基线（写下来才好比）**：腿 582 `pending`、`terminal_reason` 空；
+  binding 338 `open`；事故 0 条。
+  **结果（部署完成后 9 秒，即首轮）**：
+  - 腿 582 → **`exchange_cancelled` / `absent_from_pending_and_exhausted_history`**，
+    `updated_at = 18:14:57.014798`；
+  - binding 338 → **`closed` / `entry_legs_terminal`**（`all_terminal` 连带归档，如设计）；
+  - 事故 **2113** `conditional_entry_absent_from_exchange`、severity `warning`、
+    **`notification_status = delivered`**——**告警真的送到了人**，不只是写了一行；
+    impact 带齐 `order=1001125122023573 inst=BTC-USDT-SWAP age_hours=203`。
+  - **没有过度收割**：全库只有这一条腿带该 `terminal_reason`；
+    ETH 的 605/606 仍 `active`、无 terminal_reason。
+  - **零交易所写入**：部署后 `position_mutation_intents` 0 行新增。
+  - **日志**：`verdict=collect ... searched_to_the_end=True history_matches=0 age_hours=203`
+    **只打了一行**，之后归于安静——腿进终态后不再进该分支，与设计一致。
+
+- journalctl-since-is-local-time (2026-09-12, **我这一整轮的日志窗口全都错了八小时，方向是"更宽"**):
+  `journalctl --since '2026-09-12 18:14:00' --utc` 里，**`--utc` 只改显示，不改 `--since` 的解释**；
+  `--since` 按**服务器本地时区**理解，而这台机器是 **CST (UTC+8)**，
+  于是我以为的 18:14Z 实际是 **10:14Z**——**窗口宽了八小时**。
+  实测对照：同一条命令的最早一行是 `Sep 12 10:14:05`（UTC 显示），
+  换成 `--since "@$(date -u -d '... UTC' +%s)"` 之后最早一行才是 `18:14:11`。
+  **本仓库早就写下过"`journalctl --since` 用 UTC/epoch"，我这一轮每一条日志查询都违反了它。**
+  **它没被发现，恰恰因为错的方向是"更宽"**：要找的东西仍然在结果里，
+  只是混进了八小时不该有的数据。**一个更宽的窗口不会让你查不到，只会让你数错。**
+  **受影响的数字，逐条更正**：
+  - "reconcile 约 **7 轮/分**（一小时 428 轮）"——**错**。
+    按真实 UTC 小时（17:00Z~18:00Z）重数是 **45 轮/小时 ≈ 0.75 轮/分**，
+    我原来的数字**高估约 9 倍**。
+  - 因此 6i-1 的调用成本也要更正：13 页 × 0.75 轮/分 ≈ **10 次/分**（而非我说的 91 次/分），
+    且只持续到该腿被收掉为止。**结论不变（可接受），但我给的数量级是错的。**
+  - "自 16:00 起 3190 行 `take_profit_would_place`"——同样是八小时更宽的窗，数字偏大；
+    该结论本身（扣住期间每轮都在打）不依赖具体条数。
+  - "过去一天 61 次 `429`"——窗更宽，但结论（全是 id 里的数字、真限流 0 次）不变。
+  **做法**：远程 journal 一律 `--since "@<epoch>"` / `--until "@<epoch>"`，
+  epoch 由 `date -u -d '<UTC 时刻> UTC' +%s` 生成；**观察器脚本里本来就是这么写的**，
+  是我手工查的时候图省事没照做。
