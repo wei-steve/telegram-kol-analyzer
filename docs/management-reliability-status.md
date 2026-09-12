@@ -590,6 +590,20 @@ user_decisions_2026_09_07:
   **教训不是"锚得更死"，恰恰相反**：`pgrep -f` 的坑是**匹配到自己**（假阳性），我今天两次提醒过别人；而**锚定得越精确，越容易因为一个我没想到的前缀而漏掉真正在跑的东西（假阴性）**。**在"有没有东西在跑"这个问题上，假阴性比假阳性危险**——前者让我去部署，后者只是让我多等。
   **做法改成先枚举后看，不要从自己写的模式推"什么都没有"**：`ps -eo pid,cmd | grep -iE "observe|monitor"`（宽匹配、人眼确认），或者干脆列出所有 `bash` 进程。**"我的模式没匹配到"与"没有东西在跑"是两件事**——这与本步 (7) 那条"矛盾的数字是待办"同源：我把一个 0 当成了事实，而它只是一次查询的结果。
   **这条的一般教训**：`in`、`any`、批次级聚合、以及对**源码文本**的断言，都会让一条用例"看起来在防守某处"而实际不碰它。**"这条用例覆盖那个分支"只能由"单独删掉那个分支看它红不红"来证明**——而我今天两次（A-11b 的注释、这次收紧后的再试）都栽在同一个地方。
+  **部署前复核，更正 step-15 (3) 与 (4) 两处——(3) 漏了一个调用点，(4) 把后果说重了。**
+  **(3) 的漏**：我写"它由 `strategy_management_worker`（两处）与 `deepcoin_execution_actions` 调用"，并据此断言"**普通管理批次根本不经过这道闸门**"。**漏了 `strategy_management_planner:697`**——它在 `_plan_strategy_management_batch_locked` 里，对每条目标入场腿**无条件**调用，失败即 `PositionAttributionError` → `_persist_blocked`。**那正是普通管理批次的规划路径**，所以"根本不经过"这句话是错的。
+  **(4) 的重**：我写"修后 `close_bound_position_market` 可以通过，那是一条真的会平掉真实仓位的路径"，读起来像"本步立刻放开了一条平仓路"。**实测不是。**
+  `require_equivalent_live_position_economics` 的第一件事是**早退**：`evidence_type != "equivalent_permutation_assignment"` 就直接 `return`。生产实测：
+  ```
+  入场腿按 attribution 证据类型分布（全库 602 条）
+    (none) 356   direct_pos_id 161   direct_order_position_id 75
+    prior_authoritative_position_audit 9   historical_authority_restored 1
+    equivalent_permutation_assignment ... 0 条
+  strategy_management_batches 中因 economics 被挡的批次 ... 0 条（全史）
+  ```
+  **所以这道闸门在生产上一次也没被走到过**，四个调用点（含我漏掉的那个）都在早退处返回。**A-15 修的是对的，但它今天的生产效果是零**——与指挥会话放行时那句"那道经济学闸门生产零次到达"一致，**是它先说对的，我的文档落后于它**。
+  **这不等于本步可以不做**：写那种证据的代码每轮都在跑（`execution_bindings:997` → `match_entry_legs_to_positions`），只是它要求"**一个分量里至少两条腿对至少两个仓位**"的歧义局面，而这种局面至今没出现过。**它第一次出现的时候，正是最不该有 bug 的时候。**
+  **由此，本步的观察窗性质要改口径**：它**不可能**取到"闸门放行"的样本，所以它是一个**回归窗**（A-15 不得弄坏任何东西），不是确认窗。**判据里那条"管理指令逐笔核对"照指挥会话要求写，但预期就是"本窗无样本"，收窗时记成空，不记成通过。**
 - step-15-0 (2026-09-10, local_22ee72a5-d88c-4ba2-9b17-366585562d10): **限价入场成交后止盈从没挂出过——卡在 planner 与 executor 的词表分叉上**（只读排查，未改代码）。总指挥给了三个假设（"要主止损在账本 verified"、TP∧SL 同族闸门、A-7/lifecycle），**三个都不是**。
   **本条后来被 step-15-1 更正过一次，先说在前面**：它找对了那道门，但把它当成了唯一一道。**实际是三道**——第 2 道是 `convergence_exact_leg_not_verified` 被有意设为不可复议，第 3 道是预建的止盈腿没有任何在线绑定者。成因判断（词表分叉、`d3e423bf` vs `dbd484f5`、历史 16/0）不变，"卡在哪一道"要读成"第一道，后面还有两道"。
   **该走的路径**：`trigger_take_profit_convergence`（planner，生成收敛行）→ `trigger_take_profit_convergence_executor`（executor，**既给止盈腿盖 `pos_id`、又挂单**）。止盈腿的绑定者就是 executor 本身（`materialize_verified_position_protection` / `bind_filled_position`，见 executor 617/639），不是 `_adopt_verified_trigger_entry_protection`。
