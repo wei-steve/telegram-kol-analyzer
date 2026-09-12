@@ -1403,17 +1403,17 @@ async def run_authoritative_gap_recovery_loop(
                     consecutive_health_failures > 3
                     and (consecutive_health_failures - 3) % 90 == 0
                 ):
-                    from telegram_kol_research.runtime_incident_adapters import (
-                        capture_mimo_provider_health_check_failed,
+                    from telegram_kol_research.mimo_provider_health import (
+                        record_health_check_failure,
                     )
 
+                    # The helper reads the clock inside the thread; reading it
+                    # here would put a blocking call in the loop body.
                     await asyncio.to_thread(
-                        capture_runtime_incident_best_effort,
-                        capture_mimo_provider_health_check_failed,
+                        record_health_check_failure,
                         session_factory,
                         consecutive_failures=consecutive_health_failures,
                         error_type=type(exc).__name__,
-                        occurred_at=utc_now(),
                     )
         try:
             if authoritative_processor is not None:

@@ -605,10 +605,18 @@ def test_a_healthy_tick_says_so_in_the_log_with_a_row_count(
     """A healthy provider sends nothing; the log line is the only evidence the
     check runs at all, and ``rows_read`` is what makes it able to fail."""
 
+    import logging
+
     _worker_env(monkeypatch)
     session_factory = _session_factory(tmp_path)
     _attempt(session_factory, at=OUTAGE_START, status="completed")
-    caplog.set_level("INFO", logger="telegram_kol_research.telegram_live_listener")
+    # ``configure_application_logging`` sets ``propagate = False`` on the
+    # package logger, so once any earlier test has configured logging the
+    # root-level caplog handler never sees this line. Attach it directly.
+    listener_logger = logging.getLogger("telegram_kol_research.telegram_live_listener")
+    previous_level = listener_logger.level
+    listener_logger.addHandler(caplog.handler)
+    listener_logger.setLevel(logging.INFO)
 
     async def run_briefly():
         task = asyncio.create_task(
@@ -624,7 +632,11 @@ def test_a_healthy_tick_says_so_in_the_log_with_a_row_count(
         with pytest.raises(asyncio.CancelledError):
             await task
 
-    asyncio.run(run_briefly())
+    try:
+        asyncio.run(run_briefly())
+    finally:
+        listener_logger.removeHandler(caplog.handler)
+        listener_logger.setLevel(previous_level)
 
     heartbeats = [
         record.getMessage()

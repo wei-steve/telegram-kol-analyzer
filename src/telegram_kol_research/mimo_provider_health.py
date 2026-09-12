@@ -469,3 +469,24 @@ def run_mimo_provider_health_tick(
         outage.recovered_at.isoformat(),
     )
     return {"state": "recovery_announced", "rows_read": rows_read}
+
+
+def record_health_check_failure(
+    session_factory: sessionmaker,
+    *,
+    consecutive_failures: int,
+    error_type: str,
+) -> None:
+    """Raise ``mimo_provider_health_check_failed``; meant to run in a thread.
+
+    The occurrence time is read here rather than by the caller, because the
+    caller is the event loop and a clock read there is exactly what the
+    event-loop blocking census exists to refuse.
+    """
+
+    _default_capture("capture_mimo_provider_health_check_failed")(
+        session_factory,
+        consecutive_failures=int(consecutive_failures),
+        error_type=str(error_type),
+        occurred_at=datetime.now(UTC),
+    )
