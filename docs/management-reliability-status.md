@@ -13,11 +13,11 @@ brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，
 integration_branch: codex/deepcoin-auto-trading-v1               # 每步完成后由指挥会话本地合并并 push
 deploy: tg-deploy <sha>（AGENTS.md 部署一节）
 current_step: done
-current_step_file: docs/plans/2026-09-07-management-reliability/step-9-bot-choose-candidate.md
+current_step_file: null   # A 线已收口（2026-09-12）；未做事项见本文件末尾"A 线收口交接清单（2026-09-12）"
 step_status: completed             # planned | claimed | in_progress | completed | blocked
 claimed_by: null
-last_completed_step: 9
-last_completed_commit: 1ff967c6ee33ea0ca67a9b2a0007bef7537f993d
+last_completed_step: 17   # A-15 + A-16e + A-17（含 forward-only 修正）合并部署，2026-09-12
+last_completed_commit: 0ed2d488aa5843187fa2e1e11ef9d986af7c648b   # 生产 HEAD；共享分支此后只多文档
 user_decisions_2026_09_07:
   risk_reducing_bypasses_frozen: true      # 全平 / 保本类指令绕过“未了结减仓批次”冻结
   ambiguous_target_notifies_user: true     # 目标不唯一或无活跃仓位 → 通知确认，不自动改指向
@@ -974,6 +974,14 @@ user_decisions_2026_09_07:
   **修正部署**：候选 `0ed2d488aa5843187fa2e1e11ef9d986af7c648b`（被测树 `1ad96d2a`，全量 **8532 passed / 4 skipped** = 8528 + 本修正 4 例），**回滚参考 `90403489`**，21:16:57Z 部署，共享分支已推同一 sha，双向计数 N1=N2=0。生产上正向核对两处 `if not was_closed:` 各 1、部署后错误行 0。L1 窗在 21:17:20Z 因 HEAD 变化自动重置（`resets=1`）。
   **修正后三轮对账复核（21:21:16Z）**：`retired_by` 行仍 **664**、`retired_at` 仍只有一个值、已关闭 binding 下未退役仍 **808**、活仓 352 六条腿仍全 `verified`。**这组数能证明的是"修正上线后没有新的历史被动"；证不了"修正生效了"**——能被那条分支重推导的历史，在第一轮已经全部退役，剩下 808 行本来就不走那条分支，**未修的版本在这里也会给出同样的数字**。修正生效的证据只有两份：对账整轮回归用例 + 两处守卫各自变异，以及生产代码上正向找到的守卫。**一个在修与未修两种世界里取值相同的量，不能作为修正的证据。**
   **三个会动手的消费者对 `retired` 行的方向（只读，一行结论）：都是"走不到或少做"，没有一个会因此多写交易所**——`trigger_backup_stop_executor._plan_submission` 在查账本之前就要求 binding 为 open/active，查不到 verified 主止损则以 `primary_stop_not_verified` 阻断；`stop_loss_size_convergence.plan_stop_loss_resizes` 只取 pos_id 在交易所活仓位中的行，查不到就不写；`protection_incident_convergence._replacement_visible_on_exchange` 只在事故 pos_id 仍为活仓位时被 `_classify_incident` 调用，且只返回分类、不写交易所。
+
+- **A-15 + A-16e + A-17 合并部署的 L1 窗：达标**（`/root/evidence/step17-combined/`，脚本 `step17_combined_observe.sh`）。21:01:12Z 开窗，21:17:20Z 因修正部署自动重置一次，**21:47:29Z `WINDOW_MET`**：30 分钟 / `rounds=25` / `new_closed=0` / `unretired_new=0` / `retired_new=0` / `tp_fill_invalid=0` / `err_lines=0` / `sql_errors=0` / `worker_http=200` / `head=0ed2d488` / `head_ok=1` / `resets=1`；观察器自行退出、pidfile 已删。
+  **三项各自：证明不弄坏，无真实样本。**
+  · **A-15**（止损单独的仓位判为与自身等价）：窗内无可观测字段，`b3=no_sample`；证明的是上线后对账 25 轮零错误行。
+  · **A-16e**（上下文消解降级时保留第一遍判定）：`first_pass_new=0`，窗内没有发生降级，`b2=no_sample`；证明的是识别链零错误行。
+  · **A-17**（关闭时终态化保护行）：`new_closed=0`，窗内没有 binding 关闭，`b1=no_sample`；证明的是 `unretired_new=0` 且 `tp_fill_invalid=0`。**窗外的那次真实触发（664 行历史）不是本判据能看见的，见上一条**；它正是"判据只限定本步"在另一侧的代价——判据对它保持沉默是对的，把它暴露出来的是快照行打印的基数。
+  **收窗复核（21:48:51Z，指挥会话要求）**：生产 HEAD 与共享分支均为 `0ed2d488`；活仓 binding 352 `active`，六条保护腿（主止损、备份止损、止盈各两条）全 `verified` 且带交易所单号，六行账本全 `verified`；`retired_by` 行 664、`retired_at` 单值、已关闭 binding 下未退役 808——与修正部署前一致。
+  **worktree 清理**：`mgmt-step-15/15-1/16a/16b/16c` 已删。`16b`、`16e` 按祖先关系在共享分支；`16a`、`16c` 按 `git cherry` 全部有等价补丁；`15` 的四个提交当初是重放的、补丁 id 不同，**逐对比较增删行**（两对只差一个空行、一对完全一致、一对原 25 行对重放 1 行——原提交新增的 12 行非空内容在共享 tip 上逐字找到，step-15-0 条目恰好一次）后才删；`15-1` 仅含作废提交 `16b578de`，删 worktree 不删分支，**该提交留在本地分支 `mgmt/step-15-1-entry-kind-vocabulary` 上，永不合并**。清点过程中两次被 zsh 不拆词骗到（一次计数循环只跑一轮给出"净增 0"，一次 `$G` 拼命令整条未执行、`|| echo` 打印成"全部已合并"），均作废后用 bash 显式重做。
 
 ## A 线收口交接清单（2026-09-12）
 
