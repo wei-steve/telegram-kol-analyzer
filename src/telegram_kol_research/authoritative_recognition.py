@@ -615,6 +615,30 @@ def _resolved_mimo_result(
         payload["lifecycle_event"] = original_lifecycle_event
     original_strategy = mimo.payload.get("strategy")
     context_payload = decision.to_dict()
+    # A-16e. Keep what the downgrade below is about to overwrite. The four
+    # fields it replaces are the only record of what the first pass actually
+    # read, and none of them survive anywhere else: ``recognition_decisions``
+    # stores the payload after this rewrite, and the run and attempt tables
+    # keep fingerprints only. A-16c's offline replay of the three messages that
+    # went silent on 2026-09-11 could therefore assert the routing decision and
+    # not the management action -- "which action did the model read" was
+    # already gone by the time anybody asked.
+    #
+    # Four fields, not the whole payload: these are exactly the ones the
+    # downgrade writes over, and the payload also carries the evidence text,
+    # which is already persisted in message_evidence_versions.
+    context_payload["first_pass"] = {
+        "recognition_result": str(mimo.payload.get("recognition_result") or ""),
+        "lifecycle_event": (
+            dict(original_lifecycle_event)
+            if isinstance(original_lifecycle_event, Mapping)
+            else None
+        ),
+        "strategy": (
+            dict(original_strategy) if isinstance(original_strategy, Mapping) else None
+        ),
+        "confidence": mimo.payload.get("confidence"),
+    }
     payload["_context_resolution"] = context_payload
     if decision.decision == "new_thread":
         return replace(mimo, payload=payload)
