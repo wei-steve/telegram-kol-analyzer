@@ -144,6 +144,14 @@ class MimoProviderAttemptTelemetry:
     provider_request_made: bool = True
     provider_usage: Mapping[str, Any] | None = None
     request_component_bytes: Mapping[str, Any] | None = None
+    #: Why this request failed, classified from the exception rather than its
+    #: text (``mimo_provider_health``): the provider would not serve us, it
+    #: rejected the request, or it answered with an invalid payload. ``None``
+    #: on success and on failures that cannot be named. Alerting only -- it
+    #: does not change what recognition decides.
+    failure_class: str | None = None
+    failure_kind: str | None = None
+    http_status: int | None = None
 
 
 class _MimoProviderPayload(dict[str, Any]):
@@ -1084,7 +1092,25 @@ def _call_mimo_authoritative_with_retry(
             return payload, None, tuple(provider_attempts)
         except Exception as exc:
             if not telemetry_recorded:
-                provider_attempts.append(_provider_attempt_telemetry(exc))
+                provider_attempts.append(
+                    _classified_attempt_telemetry(
+                        _provider_attempt_telemetry(exc),
+                        exc,
+                    )
+                )
+            else:
+                # The provider answered 2xx and the payload failed validation:
+                # the provider is up, the answer is what is wrong.
+                from dataclasses import replace as _replace
+
+                from telegram_kol_research.mimo_provider_health import (
+                    RESPONSE_INVALID,
+                )
+
+                provider_attempts[-1] = _replace(
+                    provider_attempts[-1],
+                    failure_class=RESPONSE_INVALID,
+                )
             errors.append(str(exc))
             if attempt >= attempts:
                 break
@@ -1246,6 +1272,35 @@ def _provider_attempt_telemetry(value: Any) -> MimoProviderAttemptTelemetry:
     if isinstance(telemetry, MimoProviderAttemptTelemetry):
         return telemetry
     return MimoProviderAttemptTelemetry(provider_request_made=True)
+
+
+def _classified_attempt_telemetry(
+    telemetry: MimoProviderAttemptTelemetry,
+    error: BaseException,
+) -> MimoProviderAttemptTelemetry:
+    """Name why a request that reached the provider failed (step-18).
+
+    A failure before any request was sent (payload assembly, unreadable
+    media) says nothing about the provider and stays unclassified.
+    """
+
+    if not telemetry.provider_request_made:
+        return telemetry
+    from dataclasses import replace as _replace
+
+    from telegram_kol_research.mimo_provider_health import (
+        classify_provider_failure,
+    )
+
+    failure = classify_provider_failure(error)
+    if failure is None:
+        return telemetry
+    return _replace(
+        telemetry,
+        failure_class=failure.failure_class,
+        failure_kind=failure.kind,
+        http_status=failure.http_status,
+    )
 
 
 def _provider_usage_audit(

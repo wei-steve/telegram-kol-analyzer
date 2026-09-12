@@ -123,6 +123,14 @@ _SUMMARY_FIELDS = frozenset(
         "candidate_thread_ids",
         "conflict_types",
         "instruction_excerpt",
+        # MiMo provider outage (step-18: 494 failed calls over fourteen hours,
+        # nobody told). "The provider is down" is only actionable with when it
+        # started, when it last failed, and -- on the recovery notice -- when it
+        # came back. Each is a bare minute-resolution instant in its own field,
+        # for the same opaque-secret reason as ``deadline_at`` above.
+        "episode_started_at",
+        "last_failure_at",
+        "recovered_at",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

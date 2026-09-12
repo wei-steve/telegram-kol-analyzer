@@ -1613,12 +1613,26 @@ def _run_v1_authority_with_audit(
     )
     failed = bool(mimo.error_message) or mimo.status == "识别失败"
     completed_at = utc_now()
+    # step-18: "the provider will not serve us" and "our request was bad" were
+    # both recorded as ``v1_authoritative_failed``. The code now says which,
+    # from the per-request classification; it is also what
+    # ``mimo_provider_health`` reads to find an outage.
+    failure_code = "v1_authoritative_failed"
+    if failed:
+        from telegram_kol_research.mimo_provider_health import (
+            v1_failure_error_code,
+        )
+
+        failure_code = (
+            v1_failure_error_code(mimo.provider_attempt_telemetry)
+            or "v1_authoritative_failed"
+        )
     attempt = record_mimo_attempt(
         session_factory,
         run_id=run.id,
         ordinal=1,
         status="http_error" if failed else "completed",
-        error_code="v1_authoritative_failed" if failed else None,
+        error_code=failure_code if failed else None,
         error_message=mimo.error_message if failed else None,
         response_payload=mimo.payload if not failed else None,
         duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
@@ -1642,7 +1656,7 @@ def _run_v1_authority_with_audit(
             run_id=run.id,
             status="failed",
             selected_ordinal=None,
-            final_error_code="v1_authoritative_failed",
+            final_error_code=failure_code,
             final_error_message=(
                 mimo.error_message or "MiMo v1 recognition failed"
             ),

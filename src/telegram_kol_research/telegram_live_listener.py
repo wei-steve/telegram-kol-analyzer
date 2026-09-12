@@ -27,6 +27,7 @@ from telegram_kol_research.contextual_message_window import (
 )
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.media_retention import resolve_media_path
+from telegram_kol_research.mimo_provider_health import run_mimo_provider_health_tick
 from telegram_kol_research.models import (
     MediaAsset,
     MessageProcessingJob,
@@ -1331,8 +1332,16 @@ async def run_authoritative_gap_recovery_loop(
     chat_titles_by_id_provider: Callable[[], dict[int, str]],
     interval_seconds: float = DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS,
     message_limit: int = 50,
+    provider_health_tick: Callable[..., Any] | None = run_mimo_provider_health_tick,
 ) -> None:
     """Recover missing authoritative decisions on a fast, network-free cadence.
+
+    ``provider_health_tick`` (step-18) evaluates MiMo provider availability
+    from the attempt audit on every iteration, so an outage is alerted and
+    re-alerted even when no message arrives to fail. It defaults **on**: the
+    production call site passes nothing, and a missing health check fails
+    silently, which is the failure it exists to end. Its own failures are
+    logged every time and, from the third in a row, raised as an incident.
 
     This loop runs in the ``worker`` role as the ``authoritative_gap_recovery_loop``
     singleton task and compares against the **database**: it finds messages
@@ -1357,7 +1366,36 @@ async def run_authoritative_gap_recovery_loop(
     :mod:`telegram_kol_research.position_authority_lock`.
     """
 
+    consecutive_health_failures = 0
     while True:
+        if provider_health_tick is not None:
+            try:
+                await asyncio.to_thread(provider_health_tick, session_factory)
+                consecutive_health_failures = 0
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_health_failures += 1
+                logger.exception(
+                    "mimo provider health tick failed consecutive=%s",
+                    consecutive_health_failures,
+                )
+                if consecutive_health_failures == 3 or (
+                    consecutive_health_failures > 3
+                    and (consecutive_health_failures - 3) % 90 == 0
+                ):
+                    from telegram_kol_research.runtime_incident_adapters import (
+                        capture_mimo_provider_health_check_failed,
+                    )
+
+                    await asyncio.to_thread(
+                        capture_runtime_incident_best_effort,
+                        capture_mimo_provider_health_check_failed,
+                        session_factory,
+                        consecutive_failures=consecutive_health_failures,
+                        error_type=type(exc).__name__,
+                        occurred_at=utc_now(),
+                    )
         try:
             if authoritative_processor is not None:
                 # Off the loop: the provider may be database-backed, and

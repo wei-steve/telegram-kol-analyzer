@@ -1356,6 +1356,145 @@ def capture_authoritative_recognition_failed(
     )
 
 
+def capture_mimo_provider_unavailable(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    outage: Any,
+    bucket: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture one 30-minute bucket of a MiMo provider outage (step-18).
+
+    ``outage`` is a ``mimo_provider_health.ProviderOutage``. The outage key
+    travels only in ``source_record_id``, which the reminder dedup reads. The
+    summary carries fixed labels, integers and bare instants so that the
+    fingerprint-free dedup never depends on what the summary happens to say,
+    and so no identifier composed with a timestamp grows toward the
+    32-character run the opaque-secret scan refuses.
+    """
+
+    incident_type = "mimo_provider_unavailable"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "mimo_provider",
+        "reason_code": _safe_label(outage.kind),
+        "operation": "mimo_provider_outage",
+        "incident_state": (
+            "unavailable_start_beyond_scan"
+            if bool(getattr(outage, "scan_exhausted", False))
+            else "unavailable"
+        ),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=f"{outage.key}_b{int(bucket)}",
+        incident_type=incident_type,
+        severity="critical",
+        detailed_summary=_summary(
+            **fixed,
+            error_code=(
+                f"http_{int(outage.http_status)}"
+                if outage.http_status is not None
+                else None
+            ),
+            episode_started_at=_deadline_label(outage.started_at),
+            last_failure_at=_deadline_label(outage.last_failure_at),
+            consecutive_failures=int(outage.failures),
+            retry_count=int(bucket),
+            impact="authoritative_recognition_unavailable",
+        ),
+        minimal_summary=_summary(**fixed, retry_count=int(bucket)),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_mimo_provider_recovered(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    outage: Any,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture the end of an announced MiMo provider outage, once."""
+
+    incident_type = "mimo_provider_recovered"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "mimo_provider",
+        "reason_code": _safe_label(outage.kind),
+        "operation": "mimo_provider_outage",
+        "incident_state": "recovered",
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=str(outage.key),
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            error_code=(
+                f"http_{int(outage.http_status)}"
+                if outage.http_status is not None
+                else None
+            ),
+            episode_started_at=_deadline_label(outage.started_at),
+            recovered_at=_deadline_label(outage.recovered_at),
+            consecutive_failures=int(outage.failures),
+            impact="authoritative_recognition_restored",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_mimo_provider_health_check_failed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    consecutive_failures: int,
+    error_type: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """The outage detector itself keeps failing, so outages go unannounced.
+
+    A health check that fails into a log line only is the step-18 silence one
+    level up: nobody reads the log until they already suspect something.
+    """
+
+    incident_type = "mimo_provider_health_check_failed"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "mimo_provider",
+        "task_name": "mimo_provider_health_tick",
+        "consecutive_failures": int(consecutive_failures),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=f"health_tick_failures_{int(consecutive_failures)}",
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(**fixed, error_type=_safe_label(error_type)),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def _deadline_label(deadline_at: datetime | None) -> str:
     """A bare minute-resolution instant, carried in its own summary field.
 

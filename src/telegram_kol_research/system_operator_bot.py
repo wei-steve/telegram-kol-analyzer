@@ -213,6 +213,76 @@ def wrap_ai_agent_notification(content: str, *, limit: int = 3500) -> str:
     return f"{AI_AGENT_NOTIFICATION_PREFIX}{bounded}）"
 
 
+#: step-18: the reader of a provider outage alert has to know what to do, so the
+#: reason is said in words -- "top up the balance" and "the key was revoked"
+#: need different people. Keyed by ``mimo_provider_health`` kind; the text is
+#: fixed here, never taken from the provider's response.
+_MIMO_PROVIDER_KIND_TEXT = {
+    "insufficient_balance": "余额不足，需要充值",
+    "auth_rejected": "鉴权被拒：API Key 失效或无权限",
+    "rate_limited": "被限流或配额用尽",
+    "server_error": "供应商服务端错误",
+    "timeout": "请求超时",
+    "network_error": "网络连接失败",
+}
+_MIMO_PROVIDER_INCIDENT_TYPES = frozenset(
+    {
+        "mimo_provider_unavailable",
+        "mimo_provider_recovered",
+        "mimo_provider_health_check_failed",
+    }
+)
+
+
+def _format_mimo_provider_incident_notification(incident, summary) -> str:
+    def value(key: str) -> str:
+        return _safe_runtime_incident_value(summary.get(key), limit=64)
+
+    kind = str(summary.get("reason_code") or "")
+    reason = _MIMO_PROVIDER_KIND_TEXT.get(kind, f"未分类（{value('reason_code')}）")
+    http_code = str(summary.get("error_code") or "")
+    if http_code.startswith("http_"):
+        reason = f"{reason}（HTTP {_safe_runtime_incident_value(http_code[5:], limit=8)}）"
+    incident_type = str(incident.incident_type or "")
+    if incident_type == "mimo_provider_unavailable":
+        lines = [
+            "MiMo 识别供应商不可用",
+            f"原因: {reason}",
+            f"开始于: {value('episode_started_at')} (UTC)",
+            f"最近一次失败: {value('last_failure_at')} (UTC)",
+            f"已连续失败调用: {value('consecutive_failures')} 次",
+            "影响: 新消息无法完成权威识别，auto_trade 群的入场与管理指令在此期间不会执行",
+            "提醒: 未恢复前每 30 分钟提醒一次；恢复时另发一条恢复通知",
+        ]
+        if str(summary.get("incident_state") or "").endswith("start_beyond_scan"):
+            lines.append("注意: 故障开始时间早于本次读取范围，实际开始得更早")
+    elif incident_type == "mimo_provider_recovered":
+        lines = [
+            "MiMo 识别供应商已恢复",
+            f"故障原因: {reason}",
+            f"故障期: {value('episode_started_at')} 至 {value('recovered_at')} (UTC)",
+            f"故障期间失败调用: {value('consecutive_failures')} 次",
+            "注意: 故障期间未完成识别的消息不会自动补做，请核对 auto_trade 群在此期间的消息",
+        ]
+    else:
+        lines = [
+            "MiMo 供应商健康检查本身失败",
+            f"已连续失败: {value('consecutive_failures')} 次",
+            f"错误类型: {value('error_type')}",
+            "影响: 供应商故障此时既不会被发现也不会告警；请查 worker 日志 "
+            "mimo provider health tick failed",
+        ]
+    lines.append(f"事件ID: {int(incident.id)}")
+    return wrap_ai_agent_notification(
+        "\n".join(lines),
+        limit=(
+            RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+            - len(AI_AGENT_NOTIFICATION_PREFIX)
+            - 1
+        ),
+    )
+
+
 def format_runtime_incident_notification(incident) -> str:
     """Render one bounded deterministic report without AI interpretation."""
 
@@ -222,6 +292,8 @@ def format_runtime_incident_notification(incident) -> str:
         summary = {}
     if not isinstance(summary, dict):
         summary = {}
+    if str(getattr(incident, "incident_type", "") or "") in _MIMO_PROVIDER_INCIDENT_TYPES:
+        return _format_mimo_provider_incident_notification(incident, summary)
     labels = {
         "component": "组件",
         "source_status": "源状态",

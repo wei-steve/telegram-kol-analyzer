@@ -308,6 +308,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # It is never re-claimed but keeps holding its chat+symbol+side lane,
         # so five of them silently blocked 28 instructions (A-3 evidence).
         "source_deletion_exit_stuck",
+        # step-18: the MiMo provider answered 402 for fourteen hours, 116
+        # messages were never recognised, and nothing reached a person. An
+        # outage, its end, and the detector itself failing are all silent by
+        # nature -- nothing downstream breaks loudly when recognition simply
+        # stops -- so none of the three can be switched off by an env line.
+        "mimo_provider_unavailable",
+        "mimo_provider_recovered",
+        "mimo_provider_health_check_failed",
     }
 )
 
