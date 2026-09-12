@@ -1597,6 +1597,15 @@ def _run_v1_authority_with_audit(
             final_error_message=str(exc),
             completed_at=completed_at,
         )
+        # Same journal line as the returned-failure path; the exception text is
+        # left out for the same reason the response body is.
+        logger.warning(
+            "mimo authoritative call failed raw_message_id=%s run_id=%s "
+            "contract=v1 error_code=v1_provider_error error_type=%s",
+            raw_message_id,
+            run.id,
+            type(exc).__name__,
+        )
         raise
 
     run = start_mimo_run(
@@ -1661,6 +1670,20 @@ def _run_v1_authority_with_audit(
                 mimo.error_message or "MiMo v1 recognition failed"
             ),
             completed_at=completed_at,
+        )
+        # step-18: 494 failures left zero journal lines, so nobody reading the
+        # log could see recognition had stopped. One line per failed call, with
+        # the classified code and never the provider's response body.
+        logger.warning(
+            "mimo authoritative call failed raw_message_id=%s run_id=%s "
+            "contract=v1 error_code=%s provider_requests=%s",
+            raw_message_id,
+            run.id,
+            failure_code,
+            sum(
+                int(item.provider_request_made)
+                for item in mimo.provider_attempt_telemetry
+            ),
         )
     else:
         completed = complete_mimo_run(

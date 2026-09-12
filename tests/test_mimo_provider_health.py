@@ -250,10 +250,46 @@ def _session_factory(tmp_path, name="health.db"):
     ],
 )
 def test_the_v1_audit_row_carries_the_classified_code(
-    monkeypatch, tmp_path, telemetry, expected
+    monkeypatch, tmp_path, caplog, telemetry, expected
 ):
+    import logging
+
     from telegram_kol_research import authoritative_recognition
 
+    # The package logger does not propagate once logging is configured, so the
+    # handler is attached to the module logger directly -- and propagation is
+    # switched off for the duration, so that in a run where it still reaches
+    # caplog's root handler each record is not collected twice. Exactly one
+    # collection path in every test ordering is what makes "exactly one line"
+    # a real assertion.
+    module_logger = logging.getLogger("telegram_kol_research.authoritative_recognition")
+    previous_level = module_logger.level
+    previous_propagate = module_logger.propagate
+    module_logger.addHandler(caplog.handler)
+    module_logger.setLevel(logging.WARNING)
+    module_logger.propagate = False
+    try:
+        _run_audit_and_assert(
+            authoritative_recognition, monkeypatch, tmp_path, telemetry, expected
+        )
+    finally:
+        module_logger.removeHandler(caplog.handler)
+        module_logger.setLevel(previous_level)
+        module_logger.propagate = previous_propagate
+
+    failure_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("mimo authoritative call failed")
+    ]
+    # Every failed call leaves exactly one journal line with its code, and the
+    # provider's response text never reaches the log.
+    assert len(failure_lines) == 1, failure_lines
+    assert f"error_code={expected}" in failure_lines[0]
+    assert "Payment Required" not in failure_lines[0]
+
+
+def _run_audit_and_assert(authoritative_recognition, monkeypatch, tmp_path, telemetry, expected):
     session_factory = _session_factory(tmp_path)
     monkeypatch.setattr(
         authoritative_recognition,
@@ -286,6 +322,57 @@ def test_the_v1_audit_row_carries_the_classified_code(
         run = session.query(MimoRecognitionRun).one()
         assert attempt.error_code == expected
         assert run.final_error_code == expected
+
+
+def test_a_raising_v1_call_also_leaves_one_journal_line(monkeypatch, tmp_path, caplog):
+    """The exception path is the other way a v1 call fails; it must not be the
+    silent one."""
+
+    import logging
+
+    from telegram_kol_research import authoritative_recognition
+
+    session_factory = _session_factory(tmp_path)
+
+    def raising_call(*args, **kwargs):
+        raise RuntimeError("provider body text that must not reach the log")
+
+    monkeypatch.setattr(
+        authoritative_recognition, "run_mimo_authoritative_for_message", raising_call
+    )
+    module_logger = logging.getLogger("telegram_kol_research.authoritative_recognition")
+    previous_level = module_logger.level
+    previous_propagate = module_logger.propagate
+    module_logger.addHandler(caplog.handler)
+    module_logger.setLevel(logging.WARNING)
+    module_logger.propagate = False
+    try:
+        with pytest.raises(RuntimeError):
+            authoritative_recognition._run_v1_authority_with_audit(
+                session_factory,
+                raw_message_id=1,
+                ai_recognition_config=SimpleNamespace(
+                    image_provider=SimpleNamespace(model="mimo-v2.5")
+                ),
+                media_root=tmp_path,
+                context_text="",
+                input_fingerprint="fp",
+                run_kind="v1_authoritative",
+            )
+    finally:
+        module_logger.removeHandler(caplog.handler)
+        module_logger.setLevel(previous_level)
+        module_logger.propagate = previous_propagate
+
+    failure_lines = [
+        record.getMessage()
+        for record in caplog.records
+        if record.getMessage().startswith("mimo authoritative call failed")
+    ]
+    assert len(failure_lines) == 1, failure_lines
+    assert "error_code=v1_provider_error" in failure_lines[0]
+    assert "error_type=RuntimeError" in failure_lines[0]
+    assert "provider body text" not in failure_lines[0]
 
 
 # --------------------------------------------------------------------------
