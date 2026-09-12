@@ -869,3 +869,14 @@ user_decisions_2026_09_07:
   ```
   **消费面**：按 `PositionProtectionLedger.status == "verified"` 读账本的模块约 12 个（止盈执行器 3 处、`web_app` 2、`protection_ledger` 2、`protection_health` 2、`legacy_conditional_cancel` 2、备份止损执行器、止损数量收敛、保护替换持久化、保护事故收敛、原生 TPSL 迁移、`execution_bindings`、账本修复各 1）；读腿状态的 4 个。**抽查的三个会动手的消费者**（`trigger_backup_stop_executor:418`、`stop_loss_size_convergence:122`、`protection_incident_convergence:310`）**在该查询前后 8 行内都没有 binding 状态过滤**。**它们是否只在活跃 binding 的调用链上被调用，我没有追到底——这里写的是"查询本身不过滤"，不是"它们会对已关闭仓位动手"。**
   **所以这一步不是整理两仓六条**：它是"今后关闭时一并终态化"加上"是否回填 553 + 919 行、跨 147 个 binding、两个月的历史"，而后者是 L3 数据修复，且会改变约 12 个消费模块看到的东西。**已按常设规则报【需裁定】。**
+
+- **收口核对时差点写进交接清单的一个假"已完成"——A-15 主体从未上线**（2026-09-12，只读核对）。
+  **经过**：整理 A 线待办时，我用一次**反向 grep** 判断 A-15 是否已在共享分支：搜 `'and reviewed.take_profits and current.take_profits'`，**没搜到，于是写下"A-15 已在共享分支"**。
+  **随后正向核对推翻了它**：(a) A-15 的三条用例名（`test_a_stop_only_position_is_equivalent_to_itself` 等）在共享分支上**命中 0 个文件**；(b) 直接读共享分支与**生产服务器**上的 `_reviewed_position_matches_live`，两处都**仍然是**
+  ```python
+          and reviewed.take_profits
+          and current.take_profits
+  ```
+  ——**两个合取词分在两行**。我的 grep 是单行模式，**它搜不到不是因为代码改了，是因为代码换了行。**
+  **所以真实状态是**：A-15 主体（分支 `mgmt/step-15-both-triggers-required`，修复提交 `dfd50c23`，当时全量 8378）**经指挥会话批准、测试通过、从未部署**；此后队列被 A-15-1、A-16a/c/b、step-18 反复插队，它一直停在分支上。其生产效果按 step-15 的更正**目前为零**（生产 602 条入场腿无一带 `equivalent_permutation_assignment`，该闸门在早退处返回），**但它仍是一个已批准却未交付的修复**，不能以"已上线"交接。
+  **这是今天那张"命令历史上做过检查 ≠ 有约束"表的又一例，而且是最危险的一种**：前几例是检查恒 PASS，这一例是**检查的否定结果被当成了肯定事实**——"没搜到旧代码"被读成"新代码已上线"。**判断"某个修复在不在"，只能正向找修复本身（新用例、新代码形状），不能反向找旧代码不在**；旧代码可能换了行、换了名、换了文件，任何一种都会让反向 grep 静默地给出"已修复"。
