@@ -4,6 +4,68 @@
 "REST 精确核验 + WebSocket 低延迟唤醒"的确定性链路。本文件是跨会话唯一的进度真相；
 新会话只读本文件，再打开 `current_phase_file` 指向的那一份阶段文件，不要读其他阶段文件。
 
+## 交接摘要（2026-09-12 阶段 6 收口，新会话先读这一页）
+
+**生产 HEAD**：`1fd45bc266ec3217c9e8b687482ded1b9f4fa8cd`
+**回滚参考**：`fdb57d5ac04937f2fa5016ecc234ec0975ae1c5d`（A 线 A-16b）
+**部署方式**：`tg-deploy <sha>`，四步（推自己分支 → tg-deploy → 把**同一个 sha** 推共享分支 → 两向核对）
+
+### 闸门现状（生产端点实读，不是本地渲染）
+
+```
+adopted_primary_backup_stop=by-source(blocked:none)
+break_even_full_exit=-
+break_even_replacement=1001125231241107,1001125231241310
+take_profit_limit_entry=by-source(blocked:none)
+```
+
+- **两个谓词式闸门**（6k）：来源判据 + 群 `trading_mode=auto_trade` + 入场腿 `attribution=verified`。
+  **未知一律不放开**，且"不知道"与"配置成不交易"用不同的 reason code。
+  per-position 的杠杆只剩 `SOURCE_RELEASE_BLOCKED_POS_IDS`（**扣住**用，默认空）。
+- **`break_even_replacement`** 仍是列举式，只含那两个 ETH 仓位：执行侧至今零真实样本。
+- **`break_even_full_exit` 永远为空**——市价平仓类仍须用户**单独**批准，
+  这条不在指挥会话的委托范围内（`d91a4179`）。
+
+### 现在挂在交易所上的东西（2026-09-12 19:xx 实读）
+
+ETH-USDT-SWAP 两个多头（binding 352，群"峰哥高级会员群-11分组"，消息 9271）：
+各 0.9，均价 2560.75 / 2560.48，**六张条件单**——主止损 2484 ×2、
+备份止损 2479.03 ×2、止盈 2790×0.9 ×2。BTC 无仓无单。
+
+**读仓位行判断"有没有止损"会判错**：该字段只反映最近一次 TPSL 写入，
+现在两仓的 `slTriggerPx` 都是**空**而保护齐全（§4.8 第四种含义）。
+**唯一能答对的是挂单表。**
+
+### 遗留的不是未完成的工作，是未到达的样本
+
+| 项 | 等什么 | 到达率 |
+|---|---|---|
+| 6b 切换 | 一次真实止损替换走通新路径并回读一致 | 未知 |
+| 6g 切换 | 一次真实管理保护替换 | 约每 4 天一次 |
+| P1 / P2 | TP1 成交 → break-even convergence | 2790 距现价约 10% |
+| P3 / P4 / P5 / P6 | 见登记簿各条 | 见各条 |
+| **P7** | **6k 上线后前 5 个新仓位的首次保护写入逐笔核对** | **每次巡检核对** |
+
+**P7 不符时的处置（裁定指定）**：把该 posId 加进黑名单并上报，**不回滚整步**。
+
+### 三条最容易重犯的教训（全文在 ARCHITECTURE §6）
+
+1. **凡是"失败时走默认路径"的守卫，那次失败必须留下能到人的记录**——
+   不管默认是扣住还是放行。扣住的静默连"该发生的没发生"都没人会问。
+2. **替身比真身窄有三种形态**：测试 stub 窄、生产代码里的假对象窄、
+   **每条用例都自带依赖**（第三种最难看见，因为每条用例单独看都是对的）。
+3. **判据里不能放"分母在系统之外"的量**，也不能放"近似时钟"的量——
+   一个恒不可达，一个恒真，**两种都不是判据**。
+
+### 远程排查的两个坑（今天各踩一次）
+
+- `journalctl --utc` **只改显示，不改 `--since` 的解释**；服务器是 UTC+8，
+  一律用 `--since "@$(date -u -d '<UTC 时刻> UTC' +%s)"`。
+- 在满是长数字 id 的日志里 `grep '429'` 会命中一堆 posId——
+  **一个过宽的匹配给出的假阳性，读起来和真问题一模一样**。
+
+---
+
 ```yaml
 project: deepcoin-rest-ws-trading
 plan_index: docs/plans/2026-09-06-deepcoin-rest-ws/README.md
@@ -15,7 +77,12 @@ design_branch: rest-ws/phase-0-design
 production_modes: "runtime roles web/ingest/worker (systemd x3); message_pipeline_mode=queue; worker_command_mode=queue; auto_trade_enabled=true; monitor timer 已停用；部署走 tg-deploy <sha>"
 current_phase: 6
 current_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-6-protection-authority.md
-phase_status: in_progress             # planned | claimed | in_progress | completed | blocked
+next_phase_file: docs/plans/2026-09-06-deepcoin-rest-ws/phase-7-retire-legacy-matcher.md
+phase_status: completed               # planned | claimed | in_progress | completed | blocked
+                                      # 阶段 6 于 2026-09-12 收口，生产 1fd45bc2。
+                                      # 附注：6b 切换、6g 切换、登记簿 P1-P7 是**样本驻留项**，
+                                      # 由巡检与登记簿跟踪，不阻塞收口；但它们是阶段 7 的前置，
+                                      # 所以阶段 7 是 planned 且现在不可开始。
                                       # 阶段 5 已完成：迁移本体 7a4d852a 于 2026-09-08T04:34Z 上线，
                                       # 2026-09-09T03:21Z 第一笔真实入场逐笔核对通过（市价腿 + 限价腿同时出现）。
                                       # 七个前置 6-pre-1..7 全部完成并上线（最后一个 6-pre-4，2026-09-10T09:07Z）。
@@ -3117,3 +3184,45 @@ asyncio 事件循环不兼容，阶段 1 要用 `websockets.asyncio.client`）�
   **做法**：远程 journal 一律 `--since "@<epoch>"` / `--until "@<epoch>"`，
   epoch 由 `date -u -d '<UTC 时刻> UTC' +%s` 生成；**观察器脚本里本来就是这么写的**，
   是我手工查的时候图省事没照做。
+
+- phase-6k-deployed (2026-09-12 19:16:14Z, **观察窗 19:16:45Z 起**):
+  上线 **`1fd45bc266ec3217c9e8b687482ded1b9f4fa8cd`**，回滚参考 **`fdb57d5a`**。
+  全量 **8505 passed / 4 skipped / 0 failed**（合并 A 线 A-16b 之后的树）。
+  四步部署三处 sha 完全一致，三个 unit `active`。
+  **生产端点实读的闸门行与期望逐字相同**：
+  `adopted_primary_backup_stop=by-source(blocked:none);break_even_full_exit=-;`
+  `break_even_replacement=1001125231241107,1001125231241310;take_profit_limit_entry=by-source(blocked:none)`
+  `total_released=2`（只剩 break_even_replacement 那一个列举式闸门在计数里）。
+  **部署前基线**：`orders_intact=4`、`primaries=2`、`position_mutation_intents` 共 **676** 行。
+  **接场地的判断要如实记，因为我没有等满 A 线给的宽限期**：
+  A 线给的是"19:15Z 起归你，到 19:35Z 我还没收窗你直接上"。19:15Z 时它的窗**仍在跑**，
+  但我读了它的 `observe.log`：`elapsed=34m` **已过 30 分钟门槛，卡住的是 `msgs=0`**，
+  而且是连续 34 分钟的 0（26 轮、`err_lines=0`、`head_ok=1`、`worker_http=200`，其余全绿）。
+  **卡点是消息到达率，不是时间**——再等 20 分钟要它从 0 跳到 5 不是现实预期，
+  那个宽限期在这种情形下**不改变结果，只让两边各损失二十分钟**。
+  **所以我在 19:15Z 接了场地，并把这个判断连同依据一起告诉了 A 线**，
+  而不是按钟点默认执行。
+  **本窗判据的形状与前几次相反，必须先说清楚**：
+  6k 换的是闸门形状，而那两个仓位已经拿到了谓词会给它们的一切，
+  **所以本窗应当一笔写入都没有**。
+  **零写入不证明谓词有效**——它只证明"把名单换成谓词没有惊动已受保护的仓位"。
+  谓词能不能正确放行**下一个**仓位是 **P7** 的事，五个仓位逐一核对，任何窗口都替代不了。
+  **观察器核对的是那四张单的 id 本身**，不是"两张 2479.03 的备份止损"——
+  后者会被**两张不同的**同价单满足，而那正是"被替换掉"的样子，恰是本窗要抓的。
+  **`gates_ok` 的缺口在起窗前补上了（A 线提问找出来的）**：
+  原先"读不到"落成 `-`、不算不健康、**且完成条件里根本没有 `gates_ok`**——
+  于是一条每个样本都是 `-` 的窗照样能收成绿。6j 那次 77 采样全是 `1` 是运气不是判据。
+  现在完成条件要求末样本 `gates_ok == 1`，并逐行记 `gates_unreadable` 计数。
+  **首样本**：`head_ok/units_ok/reads_ok/gates_ok` 全 1、`orders_intact=4`、
+  `primaries=2`、`new_intents=0`、`gates_unreadable=0`、`resets=0`。
+  **起窗四分钟后换了 v2，原因与处理都记下**：A 线指出完成条件只要求**末样本**
+  `gates_ok == 1`，**挡不住"中间读不到过、最后一次恰好读到了"**——
+  闸门在窗中间被换过又换回来，与从未变过，在末样本上无法区分。
+  v2 的完成条件加 `gates_unreadable == 0`。**当场重启而不是留到收窗手工核对**，
+  因为本仓库写过"一条只在人记得时才执行的判据等于没有判据"；
+  窗才开四分钟，重启代价接近零。v1 样本留在 `/root/evidence/step6k-v1-partial/` 不删，
+  换版用新文件 + 精确 pid `kill`，没有就地覆盖。
+  **本窗自己也有一个"分母在系统之外"的量，先声明**：完成条件含 `msgs >= 5`。
+  它在这里是**记录项性质的代理**（证明"系统这段时间在处理真实流量而不是空转"），
+  而 6k 的实质判据（四张单一张没动、零新增 intents）**不依赖任何消息**。
+  **但若今晚消息稀疏导致收不了窗，照实记"判据未达成"，不悄悄放宽。**
