@@ -72,6 +72,39 @@ SYMBOL_PRICE_SCALE_CONFLICT = "symbol_price_scale_conflict"
 #: image can be an entry nobody ever saw.
 MEDIA_UNREADABLE = "media_unreadable"
 
+#: step-18. The authoritative model produced no decision at all: the call
+#: failed, or the message aged out of the recovery window before one was
+#: produced. Neither reason was in ``ALERTED_REASONS``, so on 2026-09-12 fourteen
+#: hours of ``402 Payment Required`` -- 16 unrecognised messages in auto_trade
+#: groups -- paged nobody. They are not benign outcomes in the A-8 sense:
+#: nothing was refused because the message asked for nothing; nothing was read.
+MIMO_AUTHORITATIVE_FAILED = "mimo_authoritative_failed"
+GAP_RECOVERY_EXPIRED = "authoritative_gap_recovery_expired"
+
+#: Every reason meaning "no authoritative decision was produced".
+#:
+#: A narrowing that reads as reasonable can silently exclude the one case that
+#: matters most, and nothing reports the exclusion -- the third time this shape
+#: has cost us (A-10b ``pos_id``, A-15-0 ``limit``, step-18). So membership is
+#: not left to whoever edits ``ALERTED_REASONS``: a traversal test finds every
+#: writer of a terminal ``authoritative_failed`` decision, requires each to be
+#: registered in ``AUTHORITY_NOT_PRODUCED_WRITERS`` with the reason it records,
+#: and requires every such reason to be alerted.
+AUTHORITY_NOT_PRODUCED_REASONS = frozenset(
+    {MIMO_AUTHORITATIVE_FAILED, GAP_RECOVERY_EXPIRED}
+)
+
+#: ``module.function`` of each writer of a terminal ``authoritative_failed``
+#: decision, and the automation reason that outcome is recorded under.
+AUTHORITY_NOT_PRODUCED_WRITERS: dict[str, str] = {
+    "authoritative_recognition.assess_message_authoritatively": (
+        MIMO_AUTHORITATIVE_FAILED
+    ),
+    "telegram_live_listener._record_expired_authoritative_recovery_gap_in_session": (
+        GAP_RECOVERY_EXPIRED
+    ),
+}
+
 #: Reasons a person is told about, in auto_trade groups only.
 #:
 #: Every one of them means "something real was refused, or could not be read".
@@ -86,6 +119,7 @@ ALERTED_REASONS = frozenset(
         MANAGEMENT_FRACTION_INVALID,
         SYMBOL_PRICE_SCALE_CONFLICT,
         MEDIA_UNREADABLE,
+        *AUTHORITY_NOT_PRODUCED_REASONS,
     }
 )
 

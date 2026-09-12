@@ -530,6 +530,41 @@ def _defer_or_fail_message_processing_job(
     return (status if updated == 1 else "stale_claim"), reason
 
 
+def _alert_expired_without_decision(
+    session_factory,
+    *,
+    raw_message_id: int,
+    group_trading_mode_provider: Callable[[int], str] | None,
+) -> None:
+    """step-18: an expired message is permanently unrecognised -- say so.
+
+    Routed through the same gate as every other "not applied" outcome, so the
+    auto_trade-only and one-question-per-message rules are not re-derived
+    here. A failure to alert is logged and never blocks settling the job.
+    """
+
+    from telegram_kol_research import recognition_failure_attribution
+    from telegram_kol_research.authoritative_recognition import (
+        _alert_recognition_not_applied,
+    )
+
+    try:
+        _alert_recognition_not_applied(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            automation={
+                "status": "skipped",
+                "reason": recognition_failure_attribution.GAP_RECOVERY_EXPIRED,
+            },
+            group_trading_mode_provider=group_trading_mode_provider,
+        )
+    except Exception:
+        logger.exception(
+            "expired recovery gap alert failed raw_message_id=%s",
+            raw_message_id,
+        )
+
+
 async def run_message_processing_worker_tick(
     session_factory,
     *,
@@ -545,9 +580,16 @@ async def run_message_processing_worker_tick(
     loop_lag_snapshot_provider: Callable[[], dict[str, Any]] | None = None,
     terminal_failure_notifier: Callable[..., Any] | None = None,
     activity: MessageProcessingActivity | None = None,
+    group_trading_mode_provider: Callable[[int], str] | None = None,
     _preclaimed_jobs: list[MessageProcessingClaim] | None = None,
 ) -> MessageProcessingWorkerResult:
-    """Claim one ordered job per chat and process chat lanes concurrently."""
+    """Claim one ordered job per chat and process chat lanes concurrently.
+
+    ``group_trading_mode_provider`` lets an expired message in an auto_trade
+    group raise an alert (step-18). Missing it is silent -- no alert, no error
+    -- so the production wiring is pinned by a chain test, not only by the
+    behaviour tests that each pass it themselves.
+    """
 
     tick_time = now or utc_now()
     if _preclaimed_jobs is None:
@@ -582,6 +624,12 @@ async def run_message_processing_worker_tick(
                     session_factory,
                     raw_message=raw_message,
                     classification=classification,
+                )
+                await asyncio.to_thread(
+                    _alert_expired_without_decision,
+                    session_factory,
+                    raw_message_id=int(raw_message.id),
+                    group_trading_mode_provider=group_trading_mode_provider,
                 )
                 settled = await asyncio.to_thread(
                     _settle_message_processing_job,

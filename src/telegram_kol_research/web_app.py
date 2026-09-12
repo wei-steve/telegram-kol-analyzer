@@ -6388,6 +6388,13 @@ def create_web_app(
                 loop_lag_snapshot_provider=app.state.loop_lag_monitor.snapshot,
                 terminal_failure_notifier=notify_terminal_failure,
                 activity=app.state.message_processing_activity,
+                # step-18: an expired message in an auto_trade group is
+                # permanently unrecognised and must reach a person. Without
+                # this the expiry path cannot tell which groups trade, and the
+                # alert is silently skipped.
+                group_trading_mode_provider=lambda chat: _group_trading_mode(
+                    app.state.group_config, chat
+                ),
             )
         )
         app.state.message_processing_worker_task.add_done_callback(

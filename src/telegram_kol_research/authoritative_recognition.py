@@ -2034,6 +2034,14 @@ def _failure_point_for(reason: str) -> str:
         recognition_attribution.MEDIA_UNREADABLE: (
             "image could not be read: not downloaded, or OCR returned nothing"
         ),
+        recognition_attribution.MIMO_AUTHORITATIVE_FAILED: (
+            "the authoritative model produced no decision, so nothing in this "
+            "message was read or executed"
+        ),
+        recognition_attribution.GAP_RECOVERY_EXPIRED: (
+            "no authoritative decision before the recovery window closed; the "
+            "message is permanently unrecognised and was not executed"
+        ),
     }.get(reason, reason)
 
 
