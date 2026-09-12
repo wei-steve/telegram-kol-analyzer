@@ -71,6 +71,23 @@ TERMINAL_REASON = "absent_from_pending_and_exhausted_history"
 #: be told that the two disagreed.
 INCIDENT_TYPE = "conditional_entry_absent_from_exchange"
 
+#: How many pages of trigger-order history the exhaustive search may read.
+#:
+#: **The default was the whole reason phase 6i never fired.**
+#: ``find_trigger_order_history_rows`` defaults to ``max_pages=5``, which is 500
+#: rows. Measured on 2026-09-11: this account's entire trigger-order history was
+#: **1176 rows over 13 pages**, so the search ran out of budget every round and
+#: returned ``([], False)`` -- "did not finish looking". The module did exactly
+#: what it promised and held; leg 582 stayed ``pending`` and the binding stayed
+#: ``open``, with the sweep deployed and running. A correct refusal, forever.
+#:
+#: 40 rather than 13. 13 is today's history length, and a budget pinned to the
+#: measurement is a budget that expires silently the next time the account
+#: trades. 40 leaves roughly three times the present history, and the hold it
+#: eventually produces is now logged every round rather than silent, so the
+#: next person finds out by reading rather than by going to look.
+HISTORY_SEARCH_MAX_PAGES = 40
+
 _PENDING_STATUS = "pending"
 
 
@@ -166,6 +183,7 @@ def evaluate_absent_conditional_entry(
     snapshot_errors: dict[str, str] | None,
     now: datetime,
     min_absence_age: timedelta = MIN_ABSENCE_AGE,
+    history_search_max_pages: int = HISTORY_SEARCH_MAX_PAGES,
 ) -> AbsentEntryVerdict:
     """Decide whether this pending conditional entry may be collected.
 
@@ -246,7 +264,9 @@ def evaluate_absent_conditional_entry(
         )
     try:
         matches, searched_to_the_end = finder(
-            inst_id=instrument_id, order_id=order_id
+            inst_id=instrument_id,
+            order_id=order_id,
+            max_pages=int(history_search_max_pages),
         )
     except Exception:
         return _hold(
@@ -293,6 +313,40 @@ def evaluate_absent_conditional_entry(
     )
 
 
+#: Reasons that mean "this leg is not the kind of thing 6i is about". A caller
+#: logging every round must stay silent for these or it prints a line per leg
+#: per round forever; everything else is a genuine hold and has to be visible.
+QUIET_HOLD_REASONS = frozenset(
+    {
+        "not_an_entry_leg",
+        "not_a_conditional_entry",
+        "not_pending",
+        "still_on_the_pending_list",
+        "present_in_history_page",
+    }
+)
+
+
+def format_verdict_for_log(verdict: AbsentEntryVerdict) -> str:
+    """One line, every round, for any leg that actually reached the decision.
+
+    Phase 6i shipped without this and the cost was immediate: the sweep ran for
+    ninety minutes in production, refused every round for a reason nobody could
+    see, and the only way to learn that was to go and ask it by hand. A hold
+    that says nothing is indistinguishable from a sweep that is not running --
+    and from a sweep that has nothing to do.
+    """
+
+    return (
+        f"absent_conditional_entry leg={verdict.leg_id} "
+        f"order={verdict.order_id or '-'} inst={verdict.instrument_id or '-'} "
+        f"verdict={verdict.status} reason={verdict.reason} "
+        f"age_hours={(verdict.age_seconds or 0) // 3600} "
+        f"searched_to_the_end={verdict.searched_to_the_end} "
+        f"history_matches={verdict.history_matches}"
+    )
+
+
 def incident_summary(verdict: AbsentEntryVerdict) -> dict[str, Any]:
     """What the alert says. Enough to act on without opening the database."""
 
@@ -315,11 +369,14 @@ def incident_fingerprint(verdict: AbsentEntryVerdict) -> str:
 
 
 __all__ = [
+    "HISTORY_SEARCH_MAX_PAGES",
     "INCIDENT_TYPE",
     "MIN_ABSENCE_AGE",
+    "QUIET_HOLD_REASONS",
     "TERMINAL_REASON",
     "AbsentEntryVerdict",
     "evaluate_absent_conditional_entry",
+    "format_verdict_for_log",
     "incident_fingerprint",
     "incident_summary",
     "instrument_id_for_leg",

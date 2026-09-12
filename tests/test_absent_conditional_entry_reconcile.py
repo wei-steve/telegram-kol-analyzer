@@ -13,6 +13,7 @@ identical fixture with one thing changed.
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.absent_conditional_entry import (
+    HISTORY_SEARCH_MAX_PAGES,
     INCIDENT_TYPE,
     TERMINAL_REASON,
 )
@@ -81,8 +82,11 @@ class _Client:
     def read_trigger_order_history(self, *, inst_id=None):
         return {"code": "0", "data": []}
 
-    def find_trigger_order_history_rows(self, *, inst_id, order_id):
-        self.finder_calls.append((inst_id, order_id))
+    def find_trigger_order_history_rows(self, *, inst_id, order_id, max_pages=5):
+        # ``max_pages`` mirrors the real client, default included: a stub
+        # without it cannot see the budget, and the budget is what stopped the
+        # deployed sweep from ever finishing its search.
+        self.finder_calls.append((inst_id, order_id, max_pages))
         return list(self.matches), self.searched_to_the_end
 
 
@@ -140,7 +144,7 @@ def test_an_absent_week_old_conditional_entry_is_collected(tmp_path):
 
     assert _leg(session_factory, leg_id) == ("exchange_cancelled", TERMINAL_REASON)
     # It looked up the right order on the instrument the request names.
-    assert client.finder_calls == [(INST, ORDER)]
+    assert client.finder_calls == [(INST, ORDER, HISTORY_SEARCH_MAX_PAGES)]
     # And the binding follows, because every entry leg is now terminal. This is
     # the second half of the defect: without it the binding stays "open" even
     # once the leg is collected.
@@ -192,6 +196,74 @@ def test_a_page_budget_that_ran_out_leaves_the_leg_pending(tmp_path):
             .count()
             == 0
         )
+
+
+def test_the_reconciler_actually_prints_the_hold(tmp_path, caplog):
+    """The wiring, not the formatter.
+
+    ``format_verdict_for_log`` is tested on its own, and that test stayed green
+    when the call site was deleted -- the same shape as the defect this whole
+    step is about: the rule was right and nothing reached it. So this asserts
+    the line lands in the log during a real reconcile round, which is the only
+    place it does anybody any good.
+    """
+
+    import logging
+
+    session_factory, _, leg_id = _seed(
+        tmp_path, submitted_at=NOW - timedelta(days=7)
+    )
+
+    with caplog.at_level(logging.INFO, logger="telegram_kol_research.execution_bindings"):
+        _run(session_factory, _Client(matches=(), searched_to_the_end=False))
+
+    lines = [r.getMessage() for r in caplog.records]
+    held = [ln for ln in lines if ln.startswith("absent_conditional_entry ")]
+    assert held, lines
+    assert f"leg={leg_id}" in held[0]
+    assert "reason=history_not_exhausted" in held[0]
+    assert "searched_to_the_end=False" in held[0]
+
+
+def test_an_ordinary_leg_does_not_print_every_round(tmp_path, caplog):
+    """The other direction: a line per leg per round forever is not observability.
+
+    A limit entry is not what 6i is about, so it must produce no line at all --
+    otherwise the log fills with legs nobody is holding and the one leg that is
+    held stops standing out.
+    """
+
+    import logging
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        ExecutionBindingRecord(
+            kol_id="kol", chat_id=-1, message_id=1, symbol="BTC", side="long",
+            venue="deepcoin", margin_mode="cross", position_mode="split",
+            status="open",
+        ),
+    )
+    upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, leg_index=1, purpose="entry",
+            order_kind="limit", venue="deepcoin", status="pending",
+            order_id="ordinary-1",
+            strategy_instance_id="deepcoin:-1:1:BTC:long",
+            attribution_status="unassigned",
+            request={"instId": INST, "posSide": "long", "sz": "1"},
+        ),
+    )
+
+    with caplog.at_level(logging.INFO, logger="telegram_kol_research.execution_bindings"):
+        _run(session_factory, _Client(matches=(), searched_to_the_end=False))
+
+    held = [
+        r.getMessage() for r in caplog.records
+        if r.getMessage().startswith("absent_conditional_entry ")
+    ]
+    assert held == []
 
 
 def test_a_pending_read_error_leaves_the_leg_pending(tmp_path):

@@ -42,8 +42,10 @@ from telegram_kol_research.protection_revisions import (
 )
 from telegram_kol_research.absent_conditional_entry import (
     TERMINAL_REASON as ABSENT_CONDITIONAL_ENTRY_TERMINAL_REASON,
+    QUIET_HOLD_REASONS as ABSENT_CONDITIONAL_ENTRY_QUIET_REASONS,
     AbsentEntryVerdict,
     evaluate_absent_conditional_entry,
+    format_verdict_for_log,
 )
 from telegram_kol_research.position_attribution import (
     ATTRIBUTION_POLICY_VERSION,
@@ -3251,6 +3253,12 @@ def _refresh_exact_entry_leg_states(
                 snapshot_errors=snapshot.errors,
                 now=recovered_at,
             )
+            if verdict.reason not in ABSENT_CONDITIONAL_ENTRY_QUIET_REASONS:
+                # Logged every round on purpose, the way the take-profit hold
+                # is. Phase 6i shipped without this line and spent its first
+                # ninety minutes in production refusing for a reason that
+                # existed nowhere outside the function that computed it.
+                logger.info("%s", format_verdict_for_log(verdict))
             if verdict.collects:
                 _set_entry_leg_exchange_state(
                     leg,

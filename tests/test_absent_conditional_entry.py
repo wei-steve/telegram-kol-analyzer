@@ -22,6 +22,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from telegram_kol_research.absent_conditional_entry import (
+    HISTORY_SEARCH_MAX_PAGES,
     MIN_ABSENCE_AGE,
     TERMINAL_REASON,
     evaluate_absent_conditional_entry,
@@ -59,7 +60,15 @@ class _Leg:
 
 
 class _Client:
-    """A paging history reader, with the two answers spelled out separately."""
+    """A paging history reader, with the two answers spelled out separately.
+
+    The signature mirrors the real client **including ``max_pages`` and its
+    default of 5**, which is not decoration. The first version of this stub
+    omitted the parameter, so the tests could not see the page budget at all --
+    and the deployed sweep then refused every round because five pages do not
+    reach the end of a thirteen-page history. A fake narrower than the thing it
+    stands in for hides exactly the dimension it dropped.
+    """
 
     def __init__(self, *, matches=(), searched_to_the_end=True, raises=False):
         self.matches = list(matches)
@@ -67,8 +76,8 @@ class _Client:
         self.raises = raises
         self.calls = []
 
-    def find_trigger_order_history_rows(self, *, inst_id, order_id):
-        self.calls.append((inst_id, order_id))
+    def find_trigger_order_history_rows(self, *, inst_id, order_id, max_pages=5):
+        self.calls.append((inst_id, order_id, max_pages))
         if self.raises:
             raise RuntimeError("read failed")
         return list(self.matches), self.searched_to_the_end
@@ -98,7 +107,7 @@ def test_an_exhausted_search_that_found_nothing_collects_the_leg():
     assert verdict.history_matches == 0
     # And it asked about the right order on the right instrument. Paging some
     # other instrument's history would also return no match.
-    assert client.calls == [(INST, ORDER)]
+    assert client.calls == [(INST, ORDER, HISTORY_SEARCH_MAX_PAGES)]
 
 
 def test_a_page_budget_that_ran_out_collects_nothing():
@@ -298,6 +307,65 @@ def test_a_naive_stored_timestamp_is_read_as_utc_not_as_host_local_time(monkeypa
     finally:
         monkeypatch.undo()
         time.tzset()
+
+
+def test_the_search_gets_a_budget_far_past_the_client_default():
+    """The defect that shipped: a correct refusal, forever.
+
+    ``find_trigger_order_history_rows`` defaults to five pages. Measured against
+    production on 2026-09-11, this account's whole trigger-order history was
+    thirteen pages, so the search never reached the end, the module held every
+    round exactly as designed, and the leg it was written for stayed pending
+    with the sweep deployed and running.
+
+    Two assertions, because they fail for different reasons: the constant must
+    be larger than the client's own default (otherwise nothing changed), and it
+    must clear the measured history by a real margin (otherwise it is pinned to
+    one day's measurement and expires the next time the account trades).
+    """
+
+    import inspect
+
+    from telegram_kol_research.deepcoin_client import DeepcoinRestClient
+
+    client_default = inspect.signature(
+        DeepcoinRestClient.find_trigger_order_history_rows
+    ).parameters["max_pages"].default
+
+    assert HISTORY_SEARCH_MAX_PAGES > client_default
+    assert HISTORY_SEARCH_MAX_PAGES >= 13 * 2
+
+
+def test_a_hold_is_printable_so_it_cannot_refuse_silently():
+    """The other half of the same defect.
+
+    The sweep spent its first ninety minutes in production refusing for a reason
+    that existed nowhere outside the function that computed it -- no incident,
+    no log line, nothing. "Holding because it could not finish looking" and "not
+    running at all" produced identical evidence, which is none.
+    """
+
+    from telegram_kol_research.absent_conditional_entry import (
+        QUIET_HOLD_REASONS,
+        format_verdict_for_log,
+    )
+
+    verdict = _evaluate(client=_Client(matches=(), searched_to_the_end=False))
+    line = format_verdict_for_log(verdict)
+
+    assert "reason=history_not_exhausted" in line
+    assert "searched_to_the_end=False" in line
+    assert f"order={ORDER}" in line
+    assert f"inst={INST}" in line
+    # The reason a caller must NOT stay quiet about: it is the one that means
+    # "this leg is a candidate and something stopped me".
+    assert "history_not_exhausted" not in QUIET_HOLD_REASONS
+    assert "snapshot_read_error" not in QUIET_HOLD_REASONS
+    assert "too_recent" not in QUIET_HOLD_REASONS
+    # And the ones it must stay quiet about, or it prints a line per leg per
+    # round for every ordinary leg in the book.
+    assert "not_a_conditional_entry" in QUIET_HOLD_REASONS
+    assert "not_pending" in QUIET_HOLD_REASONS
 
 
 def test_snapshot_read_failed_for_names_the_key_it_tripped_on():
