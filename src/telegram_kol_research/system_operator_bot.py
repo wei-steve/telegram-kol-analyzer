@@ -225,11 +225,31 @@ _MIMO_PROVIDER_KIND_TEXT = {
     "timeout": "请求超时",
     "network_error": "网络连接失败",
 }
+#: step 4: the failure classes that are not "the provider will not serve us",
+#: plus the two probe failures that are ours. Same rule: fixed words.
+_MIMO_FAILURE_CLASS_TEXT = {
+    "request_rejected": "请求被供应商拒绝：请求本身有问题（参数、长度或格式），不是余额或鉴权",
+    "response_invalid": "供应商有回答，但内容没通过校验",
+    "unclassified": "未能分类的失败（查 worker 日志 mimo authoritative call failed）",
+    "mimo_model_not_configured": "识别配置里找不到 mimo-v2.5 模型",
+    "ai_config_unreadable": "读不到识别配置文件",
+}
+#: Which journal line to read when a provider check itself keeps failing.
+_MIMO_CHECK_TASK_LOG_LINE = {
+    "mimo_provider_health_tick": ("供应商健康检查", "mimo provider health tick failed"),
+    "mimo_provider_failure_streak_tick": (
+        "连续失败检查",
+        "mimo provider failure streak tick failed",
+    ),
+    "mimo_provider_probe_tick": ("每日探测", "mimo provider probe tick failed"),
+}
 _MIMO_PROVIDER_INCIDENT_TYPES = frozenset(
     {
         "mimo_provider_unavailable",
         "mimo_provider_recovered",
         "mimo_provider_health_check_failed",
+        "mimo_provider_failure_streak",
+        "mimo_provider_probe_failed",
         "provider_outage_entry_not_replayed",
         "provider_outage_management_not_replayed",
         "provider_outage_replay_started",
@@ -296,7 +316,9 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=64)
 
     kind = str(summary.get("reason_code") or "")
-    reason = _MIMO_PROVIDER_KIND_TEXT.get(kind, f"未分类（{value('reason_code')}）")
+    reason = _MIMO_PROVIDER_KIND_TEXT.get(kind) or _MIMO_FAILURE_CLASS_TEXT.get(
+        kind, f"未分类（{value('reason_code')}）"
+    )
     http_code = str(summary.get("error_code") or "")
     if http_code.startswith("http_"):
         reason = f"{reason}（HTTP {_safe_runtime_incident_value(http_code[5:], limit=8)}）"
@@ -322,13 +344,38 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
             "补做: auto_trade 群在故障期间未完成识别的消息会按原顺序重新识别；"
             "入场一律不执行、逐条通知，管理指令满足条件才执行，否则转人工确认",
         ]
-    else:
+    elif incident_type == "mimo_provider_failure_streak":
         lines = [
-            "MiMo 供应商健康检查本身失败",
+            "MiMo 识别连续失败",
+            f"原因: {reason}",
+            f"同一错误连续: {value('consecutive_failures')} 次（连续 5 次即告警）",
+            f"首次: {value('episode_started_at')}，最近: {value('last_failure_at')} (UTC)",
+            "影响: 这些消息没有完成权威识别，auto_trade 群的指令不会执行",
+            "提醒: 同一段连续失败只告警一次；中间出现一次成功就重新计数",
+        ]
+    elif incident_type == "mimo_provider_probe_failed":
+        lines = ["MiMo 每日探测失败", f"原因: {reason}"]
+        if summary.get("error_type"):
+            lines.append(f"错误类型: {value('error_type')}")
+        lines += [
+            "探测: 1 个 token 的最小请求，不走识别流程、不写业务表",
+            "影响: 供应商此刻可能无法完成识别；若同时收到“识别供应商不可用”告警，以那条为准",
+            "提醒: 同一天只告警一次；下次探测在 24 小时后或 worker 重启时",
+        ]
+    else:
+        task = str(summary.get("task_name") or "mimo_provider_health_tick")
+        check, log_line = _MIMO_CHECK_TASK_LOG_LINE.get(
+            task, _MIMO_CHECK_TASK_LOG_LINE["mimo_provider_health_tick"]
+        )
+        if task == "mimo_provider_health_tick":
+            impact = "影响: 供应商故障此时既不会被发现也不会告警"
+        else:
+            impact = "影响: 这项检查停摆期间，它负责发现的问题不会告警"
+        lines = [
+            f"MiMo {check}本身失败",
             f"已连续失败: {value('consecutive_failures')} 次",
             f"错误类型: {value('error_type')}",
-            "影响: 供应商故障此时既不会被发现也不会告警；请查 worker 日志 "
-            "mimo provider health tick failed",
+            f"{impact}；请查 worker 日志 {log_line}",
         ]
     lines.append(f"事件ID: {int(incident.id)}")
     return wrap_ai_agent_notification(

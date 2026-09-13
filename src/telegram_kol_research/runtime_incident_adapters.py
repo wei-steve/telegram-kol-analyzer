@@ -1465,30 +1465,139 @@ def capture_mimo_provider_health_check_failed(
     consecutive_failures: int,
     error_type: str,
     occurred_at: datetime,
+    task_name: str = "mimo_provider_health_tick",
     recorder: Callable[..., Any] | None = None,
 ):
     """The outage detector itself keeps failing, so outages go unannounced.
 
     A health check that fails into a log line only is the step-18 silence one
     level up: nobody reads the log until they already suspect something.
+    Step 4 added two more checks (failure streaks, the daily probe); each
+    keeps its own dedup key so that one failing check cannot hide another,
+    and the health tick keeps the key it has always had.
     """
 
     incident_type = "mimo_provider_health_check_failed"
     if not config.captures(incident_type):
         return None
+    task = _safe_label(task_name, fallback="mimo_provider_health_tick")
     fixed = {
         "component": "mimo_provider",
-        "task_name": "mimo_provider_health_tick",
+        "task_name": task,
         "consecutive_failures": int(consecutive_failures),
+    }
+    source_record_id = (
+        f"health_tick_failures_{int(consecutive_failures)}"
+        if task == "mimo_provider_health_tick"
+        else f"{task}_failures_{int(consecutive_failures)}"
+    )
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=source_record_id,
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(**fixed, error_type=_safe_label(error_type)),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_mimo_provider_failure_streak(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    streak: Any,
+    failure: Any,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """One run of the same MiMo error code, five or more long (step 4).
+
+    ``streak`` is a ``mimo_provider_health.FailureStreak`` and ``failure`` its
+    ``describe_failure_code``. The streak key travels only in
+    ``source_record_id``, which the once-per-streak dedup reads.
+    """
+
+    incident_type = "mimo_provider_failure_streak"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "mimo_provider",
+        "reason_code": _safe_label(failure.kind or failure.failure_class),
+        "operation": "mimo_provider_failure_streak",
+        "incident_state": "failure_streak",
     }
     return _capture_with_minimal_fallback(
         session_factory,
         config=config,
         source_kind="mimo_provider",
-        source_record_id=f"health_tick_failures_{int(consecutive_failures)}",
+        source_record_id=str(streak.key),
         incident_type=incident_type,
         severity="high",
-        detailed_summary=_summary(**fixed, error_type=_safe_label(error_type)),
+        detailed_summary=_summary(
+            **fixed,
+            error_code=(
+                f"http_{int(failure.http_status)}"
+                if failure.http_status is not None
+                else None
+            ),
+            episode_started_at=_deadline_label(streak.started_at),
+            last_failure_at=_deadline_label(streak.last_failure_at),
+            consecutive_failures=int(streak.failures),
+            attempt_id=int(streak.first_attempt_id),
+            impact="authoritative_recognition_failing",
+        ),
+        minimal_summary=_summary(**fixed, consecutive_failures=int(streak.failures)),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_mimo_provider_probe_failed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    outcome: Any,
+    source_record_id: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """The daily one-token probe did not get an answer (step 4).
+
+    ``outcome`` is a ``mimo_provider_probe.ProbeOutcome``: class, kind, HTTP
+    status and exception type only. It never carries the request, the
+    response body or the key.
+    """
+
+    incident_type = "mimo_provider_probe_failed"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "mimo_provider",
+        "reason_code": _safe_label(outcome.kind or outcome.failure_class),
+        "operation": "mimo_provider_probe",
+        "incident_state": "probe_failed",
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=str(source_record_id),
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            error_code=(
+                f"http_{int(outcome.http_status)}"
+                if outcome.http_status is not None
+                else None
+            ),
+            error_type=_safe_label(outcome.error_type) if outcome.error_type else None,
+            impact="provider_probe_unanswered",
+        ),
         minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,
         recorder=recorder,

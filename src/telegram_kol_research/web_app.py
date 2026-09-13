@@ -5350,6 +5350,12 @@ def create_web_app(
                         group_trading_mode_provider=lambda chat: _group_trading_mode(
                             app.state.group_config, chat
                         ),
+                        # step-18 step 4: the daily probe asks the provider with
+                        # the same settings recognition uses. Without this it
+                        # probes nothing and logs ``no_config_loader``.
+                        ai_recognition_config_loader=lambda: load_ai_recognition_config(
+                            app.state.ai_recognition_config_path
+                        ),
                     )
                 )
                 app.state.authoritative_gap_recovery_loop_task.add_done_callback(

@@ -27,7 +27,16 @@ from telegram_kol_research.contextual_message_window import (
 )
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.media_retention import resolve_media_path
-from telegram_kol_research.mimo_provider_health import run_mimo_provider_health_tick
+from telegram_kol_research.mimo_provider_health import (
+    FAILURE_STREAK_TICK_TASK,
+    PROBE_TICK_TASK,
+    run_mimo_failure_streak_tick,
+    run_mimo_provider_health_tick,
+)
+from telegram_kol_research.mimo_provider_probe import (
+    PROBE_INTERVAL,
+    run_mimo_provider_probe,
+)
 from telegram_kol_research.provider_outage_replay import run_provider_outage_replay_tick
 from telegram_kol_research.models import (
     MediaAsset,
@@ -1336,8 +1345,23 @@ async def run_authoritative_gap_recovery_loop(
     provider_health_tick: Callable[..., Any] | None = run_mimo_provider_health_tick,
     provider_outage_replay_tick: Callable[..., Any] | None = run_provider_outage_replay_tick,
     group_trading_mode_provider: Callable[[int], str] | None = None,
+    provider_failure_streak_tick: Callable[..., Any] | None = run_mimo_failure_streak_tick,
+    provider_probe: Callable[..., Any] | None = run_mimo_provider_probe,
+    ai_recognition_config_loader: Callable[[], Any] | None = None,
+    provider_probe_interval_seconds: float = PROBE_INTERVAL.total_seconds(),
 ) -> None:
     """Recover missing authoritative decisions on a fast, network-free cadence.
+
+    ``provider_failure_streak_tick`` and ``provider_probe`` (step-18, step 4)
+    both default **on**, for the health tick's reason. The streak tick is
+    database-only and runs every iteration. The probe is the one network call
+    in this loop: it runs in a thread on the first iteration and then once per
+    ``provider_probe_interval_seconds``, so a worker start always leaves a
+    "can the provider answer" line in the journal. It needs
+    ``ai_recognition_config_loader`` for the provider settings; without it the
+    probe is skipped and that is logged once, not silently. A failing streak
+    tick (from the third in a row) or probe tick (at once, since it runs
+    daily) is raised as ``mimo_provider_health_check_failed`` naming the task.
 
     ``provider_outage_replay_tick`` (step-18, step 3) gives the auto_trade
     messages an announced outage delayed back to the queue once. It needs
@@ -1379,6 +1403,10 @@ async def run_authoritative_gap_recovery_loop(
     health_ticks = 0
     last_health_state = None
     last_replay_state = None
+    consecutive_streak_failures = 0
+    last_streak_state = None
+    probe_due_at = None
+    probe_skip_logged = False
     while True:
         if provider_health_tick is not None:
             try:
@@ -1425,6 +1453,94 @@ async def run_authoritative_gap_recovery_loop(
                         consecutive_failures=consecutive_health_failures,
                         error_type=type(exc).__name__,
                     )
+        if provider_failure_streak_tick is not None:
+            try:
+                streak = await asyncio.to_thread(
+                    provider_failure_streak_tick, session_factory
+                )
+                consecutive_streak_failures = 0
+                streak_state = streak.get("state") if isinstance(streak, dict) else None
+                if streak_state != last_streak_state:
+                    logger.info(
+                        "mimo provider failure streak tick state=%s rows_read=%s",
+                        streak_state,
+                        streak.get("rows_read") if isinstance(streak, dict) else None,
+                    )
+                last_streak_state = streak_state
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_streak_failures += 1
+                logger.exception(
+                    "mimo provider failure streak tick failed consecutive=%s",
+                    consecutive_streak_failures,
+                )
+                if consecutive_streak_failures == 3 or (
+                    consecutive_streak_failures > 3
+                    and (consecutive_streak_failures - 3) % 90 == 0
+                ):
+                    from telegram_kol_research.mimo_provider_health import (
+                        record_health_check_failure,
+                    )
+
+                    try:
+                        await asyncio.to_thread(
+                            record_health_check_failure,
+                            session_factory,
+                            consecutive_failures=consecutive_streak_failures,
+                            error_type=type(exc).__name__,
+                            task_name=FAILURE_STREAK_TICK_TASK,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        logger.exception(
+                            "mimo provider check failure could not be raised task=%s",
+                            FAILURE_STREAK_TICK_TASK,
+                        )
+        if provider_probe is not None:
+            # The loop's own monotonic clock: no blocking call, and a probe
+            # that took thirty seconds does not shift the next one by a day.
+            loop_now = asyncio.get_running_loop().time()
+            if probe_due_at is None or loop_now >= probe_due_at:
+                probe_due_at = loop_now + max(0.0, float(provider_probe_interval_seconds))
+                if ai_recognition_config_loader is None:
+                    if not probe_skip_logged:
+                        logger.warning(
+                            "mimo provider probe skipped state=no_config_loader"
+                        )
+                        probe_skip_logged = True
+                else:
+                    try:
+                        await asyncio.to_thread(
+                            provider_probe,
+                            session_factory,
+                            config_loader=ai_recognition_config_loader,
+                        )
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        logger.exception("mimo provider probe tick failed")
+                        # Raised at once: the next attempt is a day away.
+                        from telegram_kol_research.mimo_provider_health import (
+                            record_health_check_failure,
+                        )
+
+                        try:
+                            await asyncio.to_thread(
+                                record_health_check_failure,
+                                session_factory,
+                                consecutive_failures=1,
+                                error_type=type(exc).__name__,
+                                task_name=PROBE_TICK_TASK,
+                            )
+                        except asyncio.CancelledError:
+                            raise
+                        except Exception:
+                            logger.exception(
+                                "mimo provider check failure could not be raised task=%s",
+                                PROBE_TICK_TASK,
+                            )
         if provider_outage_replay_tick is not None:
             try:
                 replay = await asyncio.to_thread(

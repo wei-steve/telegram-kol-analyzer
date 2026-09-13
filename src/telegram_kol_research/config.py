@@ -324,6 +324,13 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         "provider_outage_entry_not_replayed",
         "provider_outage_management_not_replayed",
         "provider_outage_replay_started",
+        # step-18 step 4: what step 1 cannot see -- the same error again and
+        # again when it is not an outage (a 400 the provider answers, rule-A
+        # isolated timeouts in a row) -- and the daily probe that asks the
+        # provider directly. Both exist to end a silence, so neither can be
+        # switched off by an env line.
+        "mimo_provider_failure_streak",
+        "mimo_provider_probe_failed",
     }
 )
 

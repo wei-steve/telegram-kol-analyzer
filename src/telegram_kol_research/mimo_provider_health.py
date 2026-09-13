@@ -540,22 +540,255 @@ def run_mimo_provider_health_tick(
     return {"state": "recovery_announced", "rows_read": rows_read}
 
 
+HEALTH_TICK_TASK = "mimo_provider_health_tick"
+FAILURE_STREAK_TICK_TASK = "mimo_provider_failure_streak_tick"
+PROBE_TICK_TASK = "mimo_provider_probe_tick"
+
+
 def record_health_check_failure(
     session_factory: sessionmaker,
     *,
     consecutive_failures: int,
     error_type: str,
+    task_name: str = HEALTH_TICK_TASK,
 ) -> None:
     """Raise ``mimo_provider_health_check_failed``; meant to run in a thread.
 
     The occurrence time is read here rather than by the caller, because the
     caller is the event loop and a clock read there is exactly what the
-    event-loop blocking census exists to refuse.
+    event-loop blocking census exists to refuse. ``task_name`` says which of
+    the provider checks keeps failing (step 4 added two).
     """
 
     _default_capture("capture_mimo_provider_health_check_failed")(
         session_factory,
         consecutive_failures=int(consecutive_failures),
         error_type=str(error_type),
+        task_name=str(task_name),
         occurred_at=datetime.now(UTC),
     )
+
+
+# --------------------------------------------------------------------------
+# Step 4: the same error, again and again
+# --------------------------------------------------------------------------
+
+STREAK_INCIDENT_TYPE = "mimo_provider_failure_streak"
+#: Consecutive failures with one error code that make a streak.
+STREAK_THRESHOLD = 5
+#: A streak whose last failure is older than this is history, not news: the
+#: first tick after a deploy must not page about last week.
+STREAK_FRESHNESS = timedelta(minutes=30)
+#: Recent attempt rows one streak tick reads. A streak longer than this within
+#: the freshness window keeps being re-keyed by its oldest row still read, so
+#: it is re-alerted roughly once per this many failures.
+STREAK_SCAN_LIMIT = 200
+#: A failure code none of the classes above names (the legacy
+#: ``v1_authoritative_failed`` fallback).
+UNCLASSIFIED = "unclassified"
+
+
+def describe_failure_code(code: Any) -> ProviderFailure:
+    """Read an attempt-row error code back into its class, kind and status."""
+
+    parsed = parse_unavailable_error_code(code)
+    if parsed is not None:
+        return ProviderFailure(PROVIDER_UNAVAILABLE, parsed[0], parsed[1])
+    text = str(code or "")
+    if text.startswith(REQUEST_REJECTED_ERROR_CODE_PREFIX):
+        suffix = text[len(REQUEST_REJECTED_ERROR_CODE_PREFIX):]
+        status = None
+        if suffix.startswith("http_"):
+            try:
+                status = int(suffix[len("http_"):])
+            except ValueError:
+                status = None
+        return ProviderFailure(REQUEST_REJECTED, None, status)
+    if text == RESPONSE_INVALID_ERROR_CODE:
+        return ProviderFailure(RESPONSE_INVALID)
+    return ProviderFailure(UNCLASSIFIED)
+
+
+@dataclass(frozen=True, slots=True)
+class FailureStreak:
+    error_code: str
+    first_attempt_id: int
+    failures: int
+    started_at: datetime
+    last_failure_at: datetime
+
+    @property
+    def key(self) -> str:
+        return f"streak_{int(self.first_attempt_id)}"
+
+
+def derive_failure_streaks(
+    rows: Iterable[tuple[Any, Any, Any, Any, datetime]],
+    *,
+    threshold: int = STREAK_THRESHOLD,
+) -> list[FailureStreak]:
+    """Runs of one error code, in completion order, at least ``threshold``
+    long, from ``(attempt_id, status, error_code, provider_request_count,
+    completed_at)`` rows in any order.
+
+    Pure, like :func:`derive_provider_outage`. What breaks a run: a completed
+    attempt, or an attempt that reached the provider with a different code.
+    What neither counts nor breaks: an attempt that never reached the provider
+    (``provider_request_count == 0`` -- an empty message, an unreadable image).
+    ``NULL`` counts as reached: rows written before the column existed carry
+    no count, and a streak reported once too often beats one never reported.
+
+    Completion order, not id order: chat lanes finish in parallel, and the
+    outage derivation already learned that ids lie about time.
+    """
+
+    ordered = sorted(rows, key=lambda row: (_aware(row[4]), int(row[0])))
+    streaks: list[FailureStreak] = []
+    code: str | None = None
+    first_id = 0
+    count = 0
+    first_at: datetime | None = None
+    last_at: datetime | None = None
+    for attempt_id, status, error_code, request_count, completed_at in ordered:
+        answered = str(status or "") == "completed"
+        if not answered and request_count is not None and int(request_count) <= 0:
+            continue
+        completed = _aware(completed_at)
+        row_code = None if answered else (str(error_code or "") or None)
+        if row_code is not None and row_code == code:
+            count += 1
+            last_at = completed
+            continue
+        if code is not None and count >= threshold and first_at and last_at:
+            streaks.append(FailureStreak(code, first_id, count, first_at, last_at))
+        code = row_code
+        first_id = int(attempt_id)
+        count = 1 if row_code is not None else 0
+        first_at = last_at = completed
+    if code is not None and count >= threshold and first_at and last_at:
+        streaks.append(FailureStreak(code, first_id, count, first_at, last_at))
+    return streaks
+
+
+def _load_streak_rows(
+    session_factory: sessionmaker,
+    *,
+    scan_limit: int,
+) -> list[tuple[Any, Any, Any, Any, datetime]]:
+    with session_factory() as session:
+        return [
+            (
+                row.id,
+                row.status,
+                row.error_code,
+                row.provider_request_count,
+                row.completed_at,
+            )
+            for row in (
+                session.query(
+                    MimoRecognitionAttempt.id,
+                    MimoRecognitionAttempt.status,
+                    MimoRecognitionAttempt.error_code,
+                    MimoRecognitionAttempt.provider_request_count,
+                    MimoRecognitionAttempt.completed_at,
+                )
+                .filter(MimoRecognitionAttempt.completed_at.isnot(None))
+                .order_by(MimoRecognitionAttempt.id.desc())
+                .limit(max(1, int(scan_limit)))
+                .all()
+            )
+        ]
+
+
+def _outage_alert_covers(
+    session_factory: sessionmaker,
+    outage: ProviderOutage | None,
+    streak: FailureStreak,
+) -> bool:
+    """Has a person already been told about the outage this streak is part of."""
+
+    if outage is None:
+        return False
+    if outage.started_at > streak.last_failure_at:
+        return False
+    if outage.recovered_at is not None and outage.recovered_at < streak.started_at:
+        return False
+    return _incident_recorded(
+        session_factory,
+        incident_type=UNAVAILABLE_INCIDENT_TYPE,
+        source_record_prefix=f"{outage.key}_b",
+    )
+
+
+def run_mimo_failure_streak_tick(
+    session_factory: sessionmaker,
+    *,
+    now: datetime | None = None,
+    scan_limit: int = STREAK_SCAN_LIMIT,
+    capture: Callable[..., Any] | None = None,
+) -> dict[str, Any]:
+    """Alert each fresh streak once.
+
+    What step 1 cannot see: a request the provider rejects (a 400 is the
+    provider answering, so it is no outage), an unclassified failure, and
+    unavailable failures that rule A calls isolated -- five hung requests in a
+    row while quick ones succeed around them. An unavailable streak inside an
+    outage step 1 already announced is not alerted again.
+    """
+
+    current = _aware(now or datetime.now(UTC))
+    rows = _load_streak_rows(session_factory, scan_limit=scan_limit)
+    fresh = [
+        streak
+        for streak in derive_failure_streaks(rows)
+        if streak.last_failure_at >= current - STREAK_FRESHNESS
+    ]
+    if not fresh:
+        return {"state": "no_streak", "rows_read": len(rows)}
+    alerted = covered = already = 0
+    outage_loaded = False
+    outage: ProviderOutage | None = None
+    for streak in fresh:
+        if _incident_recorded(
+            session_factory,
+            incident_type=STREAK_INCIDENT_TYPE,
+            source_record_id=streak.key,
+        ):
+            already += 1
+            continue
+        failure = describe_failure_code(streak.error_code)
+        if failure.failure_class == PROVIDER_UNAVAILABLE:
+            if not outage_loaded:
+                outage = load_latest_provider_outage(session_factory)
+                outage_loaded = True
+            if _outage_alert_covers(session_factory, outage, streak):
+                covered += 1
+                continue
+        (capture or _default_capture("capture_mimo_provider_failure_streak"))(
+            session_factory,
+            streak=streak,
+            failure=failure,
+            occurred_at=current,
+        )
+        logger.warning(
+            "mimo provider failure streak alert raised error_code=%s failures=%s "
+            "started_at=%s last_failure_at=%s",
+            streak.error_code,
+            streak.failures,
+            streak.started_at.isoformat(),
+            streak.last_failure_at.isoformat(),
+        )
+        alerted += 1
+    if alerted:
+        state = "streak_alerted"
+    elif covered:
+        state = "covered_by_outage_alert"
+    else:
+        state = "streak_already_alerted"
+    return {
+        "state": state,
+        "rows_read": len(rows),
+        "alerted": alerted,
+        "covered": covered,
+        "already_alerted": already,
+    }
