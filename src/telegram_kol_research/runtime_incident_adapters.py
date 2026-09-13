@@ -1563,13 +1563,16 @@ def capture_mimo_provider_probe_failed(
     outcome: Any,
     source_record_id: str,
     occurred_at: datetime,
+    recognition_ok: bool = False,
     recorder: Callable[..., Any] | None = None,
 ):
     """The daily one-token probe did not get an answer (step 4).
 
     ``outcome`` is a ``mimo_provider_probe.ProbeOutcome``: class, kind, HTTP
     status and exception type only. It never carries the request, the
-    response body or the key.
+    response body or the key. ``recognition_ok`` -- recognition was answered
+    throughout the last 30 minutes -- travels in the state, which the minimal
+    summary keeps too, so the alert cannot lose it and read as an outage.
     """
 
     incident_type = "mimo_provider_probe_failed"
@@ -1579,7 +1582,9 @@ def capture_mimo_provider_probe_failed(
         "component": "mimo_provider",
         "reason_code": _safe_label(outcome.kind or outcome.failure_class),
         "operation": "mimo_provider_probe",
-        "incident_state": "probe_failed",
+        "incident_state": (
+            "probe_failed_recognition_ok" if recognition_ok else "probe_failed"
+        ),
     }
     return _capture_with_minimal_fallback(
         session_factory,

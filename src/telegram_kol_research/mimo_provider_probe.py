@@ -188,10 +188,58 @@ def run_mimo_provider_probe(
         source_record_id=source_record_id,
     ):
         return {"state": "probe_failed_already_alerted", "failure_class": outcome.failure_class}
+    recognition_ok = recognition_answered_recently(session_factory, now=current)
     (capture or _default_capture("capture_mimo_provider_probe_failed"))(
         session_factory,
         outcome=outcome,
         source_record_id=source_record_id,
         occurred_at=current,
+        recognition_ok=recognition_ok,
     )
-    return {"state": "probe_failed_alerted", "failure_class": outcome.failure_class}
+    return {
+        "state": "probe_failed_alerted",
+        "failure_class": outcome.failure_class,
+        "recognition_ok": recognition_ok,
+    }
+
+
+#: When the probe fails, how far back recognition is looked at to say whether
+#: recognition itself is still being answered (step 4 ruling).
+RECOGNITION_OK_WINDOW = timedelta(minutes=30)
+
+
+def recognition_answered_recently(
+    session_factory: sessionmaker,
+    *,
+    now: datetime,
+) -> bool:
+    """Did every recognition attempt that reached the provider in the last 30
+    minutes complete -- and was there at least one?
+
+    A failed probe next to working recognition is a probe problem, not an
+    outage, and the alert has to say so or it reads as one (ruling of
+    2026-09-13). Attempts that never reached the provider say nothing either
+    way, as in the streak derivation; no attempt at all is "don't know", not
+    "fine".
+    """
+
+    from telegram_kol_research.models import MimoRecognitionAttempt
+
+    since = (_aware(now) - RECOGNITION_OK_WINDOW).replace(tzinfo=None)
+    with session_factory() as session:
+        rows = (
+            session.query(
+                MimoRecognitionAttempt.status,
+                MimoRecognitionAttempt.provider_request_count,
+            )
+            .filter(MimoRecognitionAttempt.completed_at >= since)
+            .all()
+        )
+    reached = [
+        str(status or "")
+        for status, request_count in rows
+        if str(status or "") == "completed"
+        or request_count is None
+        or int(request_count) > 0
+    ]
+    return bool(reached) and all(status == "completed" for status in reached)

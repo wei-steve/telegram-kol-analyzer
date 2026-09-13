@@ -536,7 +536,11 @@ def test_an_answer_without_choices_is_an_invalid_answer_not_ok(tmp_path):
         session_factory, lambda request: httpx.Response(200, json=empty, request=request)
     )
 
-    assert result == {"state": "probe_failed_alerted", "failure_class": "response_invalid"}
+    assert result == {
+        "state": "probe_failed_alerted",
+        "failure_class": "response_invalid",
+        "recognition_ok": False,
+    }
     (alert,) = _incidents(session_factory, "mimo_provider_probe_failed")
     assert "内容没通过校验" in format_runtime_incident_notification(alert)
 
@@ -580,6 +584,45 @@ def test_the_probe_default_capture_records_under_a_production_like_whitelist(
 
     (alert,) = _incidents(session_factory, "mimo_provider_probe_failed")
     assert "鉴权被拒" in format_runtime_incident_notification(alert)
+
+
+def test_a_failed_probe_says_so_when_recognition_is_answering(tmp_path):
+    """Ruling of 2026-09-13: a probe failure next to working recognition must
+    not read as an outage. Same probe, three recognition histories."""
+
+    refuse = lambda request: httpx.Response(402, text="no", request=request)  # noqa: E731
+
+    working = _factory(tmp_path, name="working.db")
+    _attempt(working, completed_at=T0 - timedelta(minutes=10), status="completed")
+    # Never reached the provider: says nothing either way.
+    _attempt(
+        working,
+        completed_at=T0 - timedelta(minutes=5),
+        error_code="v1_authoritative_failed",
+        provider_request_count=0,
+    )
+    assert _run_probe(working, refuse)["recognition_ok"] is True
+    (alert,) = _incidents(working, "mimo_provider_probe_failed")
+    assert json.loads(alert.redacted_summary)["incident_state"] == "probe_failed_recognition_ok"
+    text_ok = format_runtime_incident_notification(alert)
+    assert "探测失败但识别正常" in text_ok
+    assert "供应商此刻可能无法完成识别" not in text_ok
+
+    failing = _factory(tmp_path, name="failing.db")
+    _attempt(failing, completed_at=T0 - timedelta(minutes=10), status="completed")
+    _attempt(failing, completed_at=T0 - timedelta(minutes=5), error_code=REJECTED)
+    assert _run_probe(failing, refuse)["recognition_ok"] is False
+
+    quiet = _factory(tmp_path, name="quiet.db")
+    _attempt(quiet, completed_at=T0 - timedelta(minutes=40), status="completed")
+    assert _run_probe(quiet, refuse)["recognition_ok"] is False
+
+    for factory in (failing, quiet):
+        (alert,) = _incidents(factory, "mimo_provider_probe_failed")
+        assert json.loads(alert.redacted_summary)["incident_state"] == "probe_failed"
+        text_out = format_runtime_incident_notification(alert)
+        assert "识别正常" not in text_out
+        assert "供应商此刻可能无法完成识别" in text_out
 
 
 def test_both_types_can_never_be_silenced_by_an_env_line():

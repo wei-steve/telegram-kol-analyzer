@@ -354,14 +354,26 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
             "提醒: 同一段连续失败只告警一次；中间出现一次成功就重新计数",
         ]
     elif incident_type == "mimo_provider_probe_failed":
-        lines = ["MiMo 每日探测失败", f"原因: {reason}"]
+        recognition_ok = (
+            str(summary.get("incident_state") or "") == "probe_failed_recognition_ok"
+        )
+        lines = [
+            "MiMo 每日探测失败，但识别正常" if recognition_ok else "MiMo 每日探测失败",
+            f"原因: {reason}",
+        ]
         if summary.get("error_type"):
             lines.append(f"错误类型: {value('error_type')}")
-        lines += [
-            "探测: 1 个 token 的最小请求，不走识别流程、不写业务表",
-            "影响: 供应商此刻可能无法完成识别；若同时收到“识别供应商不可用”告警，以那条为准",
-            "提醒: 同一天只告警一次；下次探测在 24 小时后或 worker 重启时",
-        ]
+        lines.append("探测: 1 个 token 的最小请求，不走识别流程、不写业务表")
+        if recognition_ok:
+            lines.append(
+                "识别: 探测失败但识别正常——近 30 分钟打到供应商的识别尝试全部成功；"
+                "多半是探测请求本身的问题，不是供应商故障"
+            )
+        else:
+            lines.append(
+                "影响: 供应商此刻可能无法完成识别；若同时收到“识别供应商不可用”告警，以那条为准"
+            )
+        lines.append("提醒: 同一天只告警一次；下次探测在 24 小时后或 worker 重启时")
     else:
         task = str(summary.get("task_name") or "mimo_provider_health_tick")
         check, log_line = _MIMO_CHECK_TASK_LOG_LINE.get(
