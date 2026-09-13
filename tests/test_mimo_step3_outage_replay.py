@@ -670,9 +670,12 @@ def _announced_outage(session_factory, *, recovered_at):
 
 
 def _outage_with_three_messages(session_factory):
-    # Two auto_trade messages (posted out of id order) and one quiet group.
-    _raw(session_factory, raw_id=3, posted_at=T0 + timedelta(minutes=30))
-    _raw(session_factory, raw_id=2, posted_at=T0 + timedelta(minutes=10))
+    # Two auto_trade messages whose id order is the reverse of their posted
+    # order (raw 3 was posted first), and one message in a quiet group. The
+    # replay must follow the posted order, so it queues [3, 2]; ordering by id
+    # would queue [2, 3].
+    _raw(session_factory, raw_id=3, posted_at=T0 + timedelta(minutes=10))
+    _raw(session_factory, raw_id=2, posted_at=T0 + timedelta(minutes=30))
     _raw(session_factory, raw_id=4, chat_id=QUIET_CHAT, posted_at=T0 + timedelta(minutes=5))
     for raw_id in (3, 2, 4):
         _attempt(session_factory, raw_id=raw_id, at=T0 + timedelta(hours=1, minutes=raw_id))
@@ -716,7 +719,7 @@ def test_the_delayed_auto_trade_messages_are_queued_once_oldest_first(
     assert first == {"state": "replay_enqueued", "messages": 2}
     assert queued == [
         {
-            "raw_message_ids": [2, 3],
+            "raw_message_ids": [3, 2],
             "last_reason": replay.REPLAY_QUEUE_REASON,
             "resume_terminal_jobs": True,
         }
@@ -740,6 +743,47 @@ def test_the_delayed_auto_trade_messages_are_queued_once_oldest_first(
     assert second == {"state": "nothing_to_replay"}
     assert len(queued) == 1
     assert len(_incidents(session_factory, "provider_outage_replay_started")) == 1
+
+
+def test_the_executor_parks_delayed_management_before_claiming_items(monkeypatch):
+    """The order is the property: an item parked after its claim cannot be
+    finished (the finish requires ``executing`` and raises otherwise), so the
+    park has to run before the executor looks at instruction items at all."""
+
+    from telegram_kol_research import source_message_deletion
+
+    calls = []
+    monkeypatch.setattr(
+        source_message_deletion,
+        "source_execution_barrier",
+        lambda *args, **kwargs: SimpleNamespace(status="allow", reason=None),
+    )
+    monkeypatch.setattr(
+        replay,
+        "hold_delayed_management_for_confirmation",
+        lambda factory, **kwargs: calls.append("park") or (),
+    )
+
+    def has_items(factory, **kwargs):
+        calls.append("items")
+        return False
+
+    monkeypatch.setattr(auto_trade_execution, "has_message_instruction_items", has_items)
+    monkeypatch.setattr(
+        auto_trade_execution,
+        "_auto_process_single_message_trade_signal",
+        lambda *args, **kwargs: calls.append("execute") or {"status": "skipped", "reason": "x"},
+    )
+
+    auto_trade_execution.auto_process_message_trade_signal(
+        object(),
+        raw_message_id=1,
+        group_config=SimpleNamespace(groups=()),
+        deepcoin_client=None,
+        processed_at=_utc(T0),
+    )
+
+    assert calls == ["park", "items", "execute"]
 
 
 def test_without_a_group_mode_provider_nothing_is_replayed_and_it_says_so(tmp_path):
