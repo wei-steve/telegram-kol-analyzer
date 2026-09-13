@@ -131,6 +131,12 @@ _SUMMARY_FIELDS = frozenset(
         "episode_started_at",
         "last_failure_at",
         "recovered_at",
+        # step-18 step 3: an instruction the outage delayed and that was not
+        # executed is handed to a person, who needs when it was posted and --
+        # for an entry -- the price range it named. The instant is bare, like
+        # the fields above; the range goes through ``_safe_sentence``.
+        "message_posted_at",
+        "entry_summary",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

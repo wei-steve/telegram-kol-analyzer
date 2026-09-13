@@ -316,6 +316,14 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         "mimo_provider_unavailable",
         "mimo_provider_recovered",
         "mimo_provider_health_check_failed",
+        # step-18 step 3: what happens to the messages an outage delayed. An
+        # entry is never executed late and a management instruction that is
+        # too old or whose position cannot be confirmed is not executed; both
+        # leave the decision to a person, so both must reach one. The replay
+        # start says how many messages are being given back.
+        "provider_outage_entry_not_replayed",
+        "provider_outage_management_not_replayed",
+        "provider_outage_replay_started",
     }
 )
 

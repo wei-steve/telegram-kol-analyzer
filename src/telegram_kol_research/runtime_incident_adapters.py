@@ -1495,6 +1495,166 @@ def capture_mimo_provider_health_check_failed(
     )
 
 
+def _safe_text(value: Any, *, limit: int = 120) -> str:
+    """Bounded human text that keeps its language.
+
+    ``_safe_sentence`` keeps only ASCII letters and digits, which turns a KOL
+    message such as "BTC 77000 多" into "BTC 77000" -- the one word that says
+    long or short is gone. A person deciding whether to act on a missed entry
+    needs the words, so this keeps every printable character, collapses
+    whitespace and bounds the length. The sensitive-marker check still
+    redacts the whole value, and ``record_runtime_incident`` still runs its
+    opaque-secret scan over the assembled summary; if that refuses, the
+    adapter's minimal fallback records the incident without the text.
+    """
+
+    text = str(value or "").strip()
+    if any(marker in text.lower() for marker in _SENSITIVE_MARKERS):
+        return "redacted"
+    printable = "".join(
+        character if character.isprintable() else " " for character in text
+    )
+    normalized = " ".join(printable.split())
+    return (normalized or "unknown")[: max(1, int(limit))]
+
+
+def capture_provider_outage_entry_not_replayed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    chat_id: int,
+    message_text: str,
+    posted_at: datetime | None,
+    entry_summary: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """An entry a provider outage delayed was not executed (step-18 ruling).
+
+    One message, one incident: the source record is the raw message, so a
+    re-run of the same message coalesces instead of asking twice.
+    """
+
+    incident_type = "provider_outage_entry_not_replayed"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "provider_outage_replay",
+        "reason_code": "provider_outage_entry_not_replayed",
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_recognition",
+        source_record_id=str(int(raw_message_id)),
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            chat_id=int(chat_id),
+            message_posted_at=(
+                _deadline_label(posted_at) if posted_at is not None else None
+            ),
+            entry_summary=_safe_sentence(entry_summary, limit=128),
+            instruction_excerpt=_safe_text(message_text, limit=120),
+            impact="entry_not_executed_needs_person",
+        ),
+        minimal_summary=_summary(**fixed, chat_id=int(chat_id)),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_provider_outage_management_not_replayed(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    raw_message_id: int,
+    chat_id: int,
+    message_text: str,
+    posted_at: datetime | None,
+    reason_code: str,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """A delayed management instruction was not executed and nothing could be
+    parked for ``/choose`` -- the one case the confirmation channel is silent on.
+    """
+
+    incident_type = "provider_outage_management_not_replayed"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "provider_outage_replay",
+        "reason_code": _safe_label(reason_code),
+        "operation": f"raw_message_{int(raw_message_id)}",
+        "raw_message_id": int(raw_message_id),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="message_recognition",
+        source_record_id=str(int(raw_message_id)),
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            chat_id=int(chat_id),
+            message_posted_at=(
+                _deadline_label(posted_at) if posted_at is not None else None
+            ),
+            instruction_excerpt=_safe_text(message_text, limit=120),
+            impact="management_not_executed_needs_person",
+        ),
+        minimal_summary=_summary(**fixed, chat_id=int(chat_id)),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
+def capture_provider_outage_replay_started(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    outage_key: str,
+    started_at: datetime,
+    recovered_at: datetime,
+    message_count: int,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """After recovery, the delayed auto_trade messages were queued again, once."""
+
+    incident_type = "provider_outage_replay_started"
+    if not config.captures(incident_type):
+        return None
+    fixed = {
+        "component": "provider_outage_replay",
+        "operation": "provider_outage_replay",
+        "retry_count": int(message_count),
+    }
+    return _capture_with_minimal_fallback(
+        session_factory,
+        config=config,
+        source_kind="mimo_provider",
+        source_record_id=str(outage_key),
+        incident_type=incident_type,
+        severity="high",
+        detailed_summary=_summary(
+            **fixed,
+            episode_started_at=_deadline_label(started_at),
+            recovered_at=_deadline_label(recovered_at),
+            impact="delayed_messages_requeued",
+        ),
+        minimal_summary=_summary(**fixed),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 def _deadline_label(deadline_at: datetime | None) -> str:
     """A bare minute-resolution instant, carried in its own summary field.
 

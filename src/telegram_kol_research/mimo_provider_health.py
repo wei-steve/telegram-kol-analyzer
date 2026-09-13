@@ -285,8 +285,14 @@ def derive_provider_outage(
         signal = _row_signal(status, error_code)
         if signal == _NEUTRAL:
             continue
+        completed = _aware(completed_at)
         if failures == 0 and signal == _ANSWERED:
-            recovered_at = _aware(completed_at)
+            # Rows are ordered by id, and chat lanes finish in parallel, so
+            # id order is not time order: take the earliest, never the last
+            # row read.
+            recovered_at = (
+                completed if recovered_at is None else min(recovered_at, completed)
+            )
             answered_above += 1
             if answered_above >= _MAX_ANSWERED_ROWS_ABOVE_OUTAGE:
                 return None
@@ -297,10 +303,14 @@ def derive_provider_outage(
         parsed = parse_unavailable_error_code(error_code)
         assert parsed is not None
         if failures == 0:
-            last_failure_at = _aware(completed_at)
             latest_kind, latest_status = parsed
         failures += 1
-        started_at = _aware(completed_at)
+        # Same reason: the outage starts at its earliest failure and was last
+        # seen at its latest, whatever order the ids put them in.
+        last_failure_at = (
+            completed if last_failure_at is None else max(last_failure_at, completed)
+        )
+        started_at = completed if started_at is None else min(started_at, completed)
     if failures == 0 or started_at is None or last_failure_at is None:
         return None
     return ProviderOutage(

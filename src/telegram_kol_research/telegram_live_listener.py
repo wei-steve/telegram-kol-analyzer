@@ -28,6 +28,7 @@ from telegram_kol_research.contextual_message_window import (
 from telegram_kol_research.keyed_async_locks import KeyedAsyncLockRegistry
 from telegram_kol_research.media_retention import resolve_media_path
 from telegram_kol_research.mimo_provider_health import run_mimo_provider_health_tick
+from telegram_kol_research.provider_outage_replay import run_provider_outage_replay_tick
 from telegram_kol_research.models import (
     MediaAsset,
     MessageProcessingJob,
@@ -1333,8 +1334,16 @@ async def run_authoritative_gap_recovery_loop(
     interval_seconds: float = DEFAULT_AUTHORITATIVE_GAP_RECOVERY_INTERVAL_SECONDS,
     message_limit: int = 50,
     provider_health_tick: Callable[..., Any] | None = run_mimo_provider_health_tick,
+    provider_outage_replay_tick: Callable[..., Any] | None = run_provider_outage_replay_tick,
+    group_trading_mode_provider: Callable[[int], str] | None = None,
 ) -> None:
     """Recover missing authoritative decisions on a fast, network-free cadence.
+
+    ``provider_outage_replay_tick`` (step-18, step 3) gives the auto_trade
+    messages an announced outage delayed back to the queue once. It needs
+    ``group_trading_mode_provider`` to know which groups trade; without it the
+    tick reports ``no_group_mode_provider`` and replays nothing, which is logged
+    rather than silent, and the production wiring is pinned by a chain test.
 
     ``provider_health_tick`` (step-18) evaluates MiMo provider availability
     from the attempt audit on every iteration, so an outage is alerted and
@@ -1369,6 +1378,7 @@ async def run_authoritative_gap_recovery_loop(
     consecutive_health_failures = 0
     health_ticks = 0
     last_health_state = None
+    last_replay_state = None
     while True:
         if provider_health_tick is not None:
             try:
@@ -1415,6 +1425,29 @@ async def run_authoritative_gap_recovery_loop(
                         consecutive_failures=consecutive_health_failures,
                         error_type=type(exc).__name__,
                     )
+        if provider_outage_replay_tick is not None:
+            try:
+                replay = await asyncio.to_thread(
+                    provider_outage_replay_tick,
+                    session_factory,
+                    group_trading_mode_provider=group_trading_mode_provider,
+                )
+                replay_state = replay.get("state") if isinstance(replay, dict) else None
+                # Every state that queues nothing is a reason; a change of
+                # reason is logged so "not replaying" is never silent, and
+                # an actual requeue is logged every time it happens.
+                if replay_state == "replay_enqueued":
+                    logger.warning(
+                        "provider outage replay enqueued messages=%s",
+                        replay.get("messages"),
+                    )
+                elif replay_state != last_replay_state:
+                    logger.info("provider outage replay tick state=%s", replay_state)
+                last_replay_state = replay_state
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception("provider outage replay tick failed")
         try:
             if authoritative_processor is not None:
                 # Off the loop: the provider may be database-backed, and

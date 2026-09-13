@@ -230,11 +230,68 @@ _MIMO_PROVIDER_INCIDENT_TYPES = frozenset(
         "mimo_provider_unavailable",
         "mimo_provider_recovered",
         "mimo_provider_health_check_failed",
+        "provider_outage_entry_not_replayed",
+        "provider_outage_management_not_replayed",
+        "provider_outage_replay_started",
     }
 )
+_PROVIDER_OUTAGE_MANAGEMENT_REASON_TEXT = {
+    "provider_outage_management_too_old": "扣除故障时长后仍超过 15 分钟",
+    "provider_outage_management_target_unknown": "指令没有可核对的目标仓位",
+    "provider_outage_management_snapshot_stale": "持仓快照过旧，无法确认目标仓位仍在",
+    "provider_outage_management_target_not_open": "目标仓位已不在交易所",
+}
+
+
+def _format_provider_outage_replay_notification(incident, summary) -> str:
+    def value(key: str, limit: int = 64) -> str:
+        return _safe_runtime_incident_value(summary.get(key), limit=limit)
+
+    incident_type = str(incident.incident_type or "")
+    if incident_type == "provider_outage_entry_not_replayed":
+        lines = [
+            "MiMo 故障期间的入场未执行，需人工判断",
+            f"群: {value('chat_id')}",
+            f"消息时间: {value('message_posted_at')} (UTC)",
+            f"价格区间: {value('entry_summary', 128)}",
+            f"原文: {value('instruction_excerpt', 200)}",
+            "原因: 供应商故障耽误了识别；按规则，故障期间的入场一律不补执行",
+            "处理: 如仍要入场，请手动下单",
+        ]
+    elif incident_type == "provider_outage_management_not_replayed":
+        reason = _PROVIDER_OUTAGE_MANAGEMENT_REASON_TEXT.get(
+            str(summary.get("reason_code") or ""), value("reason_code")
+        )
+        lines = [
+            "MiMo 故障期间的管理指令未自动执行，需人工判断",
+            f"群: {value('chat_id')}",
+            f"消息时间: {value('message_posted_at')} (UTC)",
+            f"原文: {value('instruction_excerpt', 200)}",
+            f"原因: {reason}",
+            "处理: 这条指令没有可用 /choose 选择的项，请人工核对仓位后决定",
+        ]
+    else:
+        lines = [
+            "MiMo 恢复后开始补做识别",
+            f"故障期: {value('episode_started_at')} 至 {value('recovered_at')} (UTC)",
+            f"补做消息: {value('retry_count')} 条（auto_trade 群，按原顺序）",
+            "规则: 入场一律不执行、逐条通知；管理指令扣除故障时长后 15 分钟内且目标仓位仍在才执行，否则转人工确认",
+        ]
+    lines.append(f"事件ID: {int(incident.id)}")
+    return wrap_ai_agent_notification(
+        "\n".join(lines),
+        limit=(
+            RUNTIME_INCIDENT_MESSAGE_MAX_CHARS
+            - len(AI_AGENT_NOTIFICATION_PREFIX)
+            - 1
+        ),
+    )
 
 
 def _format_mimo_provider_incident_notification(incident, summary) -> str:
+    if str(incident.incident_type or "").startswith("provider_outage_"):
+        return _format_provider_outage_replay_notification(incident, summary)
+
     def value(key: str) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=64)
 
@@ -262,7 +319,8 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
             f"故障原因: {reason}",
             f"故障期: {value('episode_started_at')} 至 {value('recovered_at')} (UTC)",
             f"故障期间失败调用: {value('consecutive_failures')} 次",
-            "注意: 故障期间未完成识别的消息不会自动补做，请核对 auto_trade 群在此期间的消息",
+            "补做: auto_trade 群在故障期间未完成识别的消息会按原顺序重新识别；"
+            "入场一律不执行、逐条通知，管理指令满足条件才执行，否则转人工确认",
         ]
     else:
         lines = [

@@ -5343,6 +5343,13 @@ def create_web_app(
                         interval_seconds=(
                             app.state.authoritative_gap_recovery_interval_seconds
                         ),
+                        # step-18 step 3: the replay after an outage gives back
+                        # only auto_trade groups' messages, so the loop has to
+                        # know which groups trade. Without this it replays
+                        # nothing and says ``no_group_mode_provider``.
+                        group_trading_mode_provider=lambda chat: _group_trading_mode(
+                            app.state.group_config, chat
+                        ),
                     )
                 )
                 app.state.authoritative_gap_recovery_loop_task.add_done_callback(

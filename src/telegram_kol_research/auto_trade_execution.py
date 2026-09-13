@@ -296,6 +296,20 @@ def auto_process_message_trade_signal(
     if barrier.status == "hold":
         return {"status": "deferred", "reason": barrier.reason}
 
+    # step-18 ruling: a management instruction a provider outage delayed runs
+    # only while young and while its target position is still open. The items
+    # that fail that are parked for a person here, before any item is claimed,
+    # because an item parked after its claim cannot be finished.
+    from telegram_kol_research.provider_outage_replay import (
+        hold_delayed_management_for_confirmation,
+    )
+
+    hold_delayed_management_for_confirmation(
+        session_factory,
+        raw_message_id=raw_message_id,
+        now=processed_at or datetime.now(UTC),
+    )
+
     if has_message_instruction_items(
         session_factory,
         raw_message_id=raw_message_id,
@@ -736,6 +750,53 @@ def _auto_process_single_message_trade_signal(
                 ),
             )
             return {"status": "skipped", "reason": composite_gate_reason}
+        # step-18 ruling, second line: a delayed management instruction that
+        # reaches here without having been parked -- no instruction item to
+        # park, or it aged out between the park check and its claim -- is
+        # refused as a normal refusal and a person is told.
+        from telegram_kol_research.provider_outage_replay import (
+            management_replay_allowed,
+            notify_management_not_replayed,
+        )
+
+        replay_allowed, replay_reason = management_replay_allowed(
+            session_factory,
+            raw_message_id=raw_message_id,
+            target_lifecycle_ids=[management_loaded[1].target_lifecycle_id],
+            now=now,
+        )
+        if not replay_allowed:
+            raw_message, candidate, _source, _has_media = management_loaded
+            record_execution_event(
+                session_factory,
+                ExecutionEventRecord(
+                    action="provider_outage_replay",
+                    status="skipped",
+                    kol_id=f"group:{raw_message.chat_id}",
+                    chat_id=raw_message.chat_id,
+                    message_id=raw_message.message_id,
+                    symbol=candidate.symbol,
+                    side=candidate.side,
+                    reason=replay_reason,
+                    request={
+                        "raw_message_id": raw_message.id,
+                        "candidate_id": candidate.id,
+                        "management_action": candidate.management_action,
+                        "target_lifecycle_id": candidate.target_lifecycle_id,
+                    },
+                    created_at=now,
+                ),
+            )
+            notify_management_not_replayed(
+                session_factory,
+                raw_message_id=int(raw_message.id),
+                chat_id=int(raw_message.chat_id),
+                message_text=raw_message.text,
+                posted_at=raw_message.posted_at,
+                reason_code=str(replay_reason),
+                now=now,
+            )
+            return {"status": "skipped", "reason": replay_reason}
         if deepcoin_client is None:
             return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
         return _auto_process_management_signal(
@@ -760,6 +821,49 @@ def _auto_process_single_message_trade_signal(
     if loaded is None:
         return {"status": "skipped", "reason": "no_entry_signal_candidate"}
     raw_message, candidate, source, has_media = loaded
+    # step-18 ruling (2026-09-12): an entry that a provider outage kept from
+    # being recognised is never executed late -- the price it named may be long
+    # gone. It is recorded, a person is told, and the item finishes as a
+    # refusal. Replaying late entries under an age limit needs the user's own
+    # approval and is deliberately not implemented here.
+    from telegram_kol_research.provider_outage_replay import (
+        ENTRY_NOT_REPLAYED,
+        notify_entry_not_replayed,
+        replay_verdict,
+    )
+
+    if replay_verdict(session_factory, raw_message_id=raw_message_id, now=now).delayed:
+        record_execution_event(
+            session_factory,
+            ExecutionEventRecord(
+                action="provider_outage_replay",
+                status="skipped",
+                kol_id=f"group:{raw_message.chat_id}",
+                chat_id=raw_message.chat_id,
+                message_id=raw_message.message_id,
+                symbol=candidate.symbol,
+                side=candidate.side,
+                reason=ENTRY_NOT_REPLAYED,
+                request={
+                    "raw_message_id": raw_message.id,
+                    "candidate_id": candidate.id,
+                    "entry_text": candidate.entry_text,
+                },
+                created_at=now,
+            ),
+        )
+        notify_entry_not_replayed(
+            session_factory,
+            raw_message_id=int(raw_message.id),
+            chat_id=int(raw_message.chat_id),
+            message_text=raw_message.text,
+            posted_at=raw_message.posted_at,
+            symbol=candidate.symbol,
+            side=candidate.side,
+            entry_text=candidate.entry_text,
+            now=now,
+        )
+        return {"status": "skipped", "reason": ENTRY_NOT_REPLAYED}
     candidate_geometry = validate_candidate_entry_price_geometry(
         side=candidate.side,
         entry_text=candidate.entry_text,

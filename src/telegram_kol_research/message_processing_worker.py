@@ -848,6 +848,24 @@ def _classify_claim_expiry(
     )
     if _aware_utc(posted_at) > _aware_utc(now) - maximum_age:
         return None
+    # step-18: the recovery window measures our processing, not the provider's
+    # outage. A message the provider refused is aged without the time it was
+    # refused, so the replay after recovery reaches recognition instead of
+    # expiring on its first claim. Messages the provider never refused keep
+    # their plain wall-clock age.
+    from telegram_kol_research.provider_outage_replay import replay_verdict
+
+    verdict = replay_verdict(
+        session_factory,
+        raw_message_id=int(claim.raw_message_id),
+        now=_aware_utc(now),
+    )
+    if (
+        verdict.delayed
+        and verdict.effective_age is not None
+        and verdict.effective_age <= maximum_age
+    ):
+        return None
     from telegram_kol_research.telegram_live_listener import (
         _classify_expired_authoritative_recovery_gap,
     )
