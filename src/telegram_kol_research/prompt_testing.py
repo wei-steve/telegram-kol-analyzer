@@ -11,7 +11,11 @@ from typing import Any, Callable
 import httpx
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
+from telegram_kol_research.ai_recognition_config import (
+    AiRecognitionConfig,
+    stage_head_provider,
+)
+from telegram_kol_research.ai_stage_catalog import BATCH_TEXT_STAGE
 from telegram_kol_research.authoritative_recognition import compare_assessments
 from telegram_kol_research.message_recognition import (
     _build_ai_recognition_payload,
@@ -238,9 +242,22 @@ def _json_difference_paths(
     return [] if active == draft else [prefix or "payload"]
 
 
+def _deepseek_provider(config: AiRecognitionConfig):
+    """The model the prompt centre's DeepSeek test run should call.
+
+    Design §2.1 derives it from ``batch_text_recognition``: the historical
+    message test is meant to show what that prompt does on the model the text
+    path uses, so it follows the same chain head.
+    """
+
+    return stage_head_provider(
+        config, BATCH_TEXT_STAGE, legacy=config.text_provider
+    )
+
+
 def _model_name(config: AiRecognitionConfig, model_kind: str) -> str:
     if model_kind == "deepseek":
-        return config.text_provider.model or "deepseek"
+        return _deepseek_provider(config).model or "deepseek"
     model_config = _find_mimo_model(config)
     return model_config.model if model_config is not None else "mimo-v2.5"
 
@@ -268,7 +285,7 @@ def _call_configured_model(
             context_text=context_text,
         )
 
-    provider = config.text_provider
+    provider = _deepseek_provider(config)
     if not provider.is_configured:
         raise RuntimeError("DeepSeek model is not configured")
     request_payload = _build_ai_recognition_payload(

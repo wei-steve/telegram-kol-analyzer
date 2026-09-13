@@ -26,6 +26,12 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
     load_ai_recognition_config,
 )
+from telegram_kol_research.ai_model_router import (
+    resolve_stage_chain,
+    run_with_fallback,
+)
+from telegram_kol_research.ai_stage_catalog import SEMANTIC_REVIEW_STAGE
+from telegram_kol_research.context_resolution import model_config_from_provider
 from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
@@ -289,9 +295,10 @@ def run_deepseek_semantic_review(
     prompt = resolve_active_prompt(
         session_factory, SEMANTIC_DISAGREEMENT_REVIEW_PROMPT
     )
-    provider = config.text_provider
-    if not provider.is_configured:
+    chain = resolve_semantic_review_chain(config)
+    if not chain:
         raise RuntimeError("DeepSeek semantic-review provider is not configured")
+    provider = chain[0].provider
 
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
@@ -399,33 +406,70 @@ def run_deepseek_semantic_review(
         current_message_text = raw_message.text or ""
         input_kind = decision_row.input_kind
 
-    request_payload = {
-        "model": provider.model,
-        "messages": [
-            {"role": "system", "content": prompt.content},
-            {
-                "role": "user",
-                "content": json.dumps(context, ensure_ascii=False, sort_keys=True),
-            },
-        ],
-        "temperature": 0,
-        "response_format": {"type": "json_object"},
-    }
-    headers = {"Content-Type": "application/json"}
-    if provider.api_key:
-        headers["Authorization"] = f"Bearer {provider.api_key}"
     invoke = requester or _request_openai_compatible
     prompt_versions = {prompt.prompt_key: prompt.version_id}
     error_message: str | None = None
+    used_model = provider.model
+    ask_errors: list[BaseException] = []
+
+    def _ask(candidate, *, deadline_seconds: float | None = None):
+        """One model's whole answer: the request, the JSON, the contract.
+
+        All three are inside the chain attempt because all three mean this
+        model did not answer, and the next one might (design §4). This stage
+        is a read-only advisor, so nothing it decides changes; only which
+        model decided it.
+        """
+
+        candidate_provider = candidate.provider
+        request_payload = {
+            "model": candidate_provider.model,
+            "messages": [
+                {"role": "system", "content": prompt.content},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        context, ensure_ascii=False, sort_keys=True
+                    ),
+                },
+            ],
+            "temperature": 0,
+            "response_format": {"type": "json_object"},
+        }
+        headers = {"Content-Type": "application/json"}
+        if candidate_provider.api_key:
+            headers["Authorization"] = f"Bearer {candidate_provider.api_key}"
+        try:
+            response = invoke(
+                url=_chat_completions_url(candidate_provider.base_url),
+                json=request_payload,
+                headers=headers,
+                timeout=candidate_provider.timeout_seconds,
+            )
+            payload = _parse_strict_json_object(_extract_chat_content(response))
+            validate_review_payload(payload)
+        except Exception as exc:
+            ask_errors.append(exc)
+            raise
+        return payload
+
     try:
-        response = invoke(
-            url=_chat_completions_url(provider.base_url),
-            json=request_payload,
-            headers=headers,
-            timeout=provider.timeout_seconds,
+        # No chain-level ceiling: this stage runs on its own loop, so the
+        # budget is each model's own timeout in turn (design §4).
+        routed = run_with_fallback(chain, _ask)
+        if not routed.succeeded:
+            # A single-model chain raises exactly what it always raised: the
+            # contract errors this stage's callers match on are the model's,
+            # not the router's. Only a real chain needs a message of its own.
+            if len(ask_errors) == 1:
+                raise ask_errors[0]
+            raise RuntimeError(
+                routed.error_message or "semantic review provider request failed"
+            ) from (ask_errors[-1] if ask_errors else None)
+        review_payload = routed.value
+        used_model = (
+            routed.model.model if routed.model is not None else provider.model
         )
-        review_payload = _parse_strict_json_object(_extract_chat_content(response))
-        validate_review_payload(review_payload)
         automation = {
             "status": context["automation"]["automation_status"],
             "reason": context["automation"]["automation_reason"],
@@ -439,7 +483,7 @@ def run_deepseek_semantic_review(
         )
         return SemanticReviewRun(
             raw_message_id=raw_message_id,
-            model=provider.model,
+            model=used_model,
             review_payload=review_payload,
             auxiliary_payload=review_payload,
             decision=semantic_decision,
@@ -456,12 +500,32 @@ def run_deepseek_semantic_review(
                 correlation_key=f"semantic-review:{raw_message_id}",
                 raw_message_id=raw_message_id,
                 chat_id=chat_id,
-                model=provider.model,
+                model=used_model,
                 prompt_versions=prompt_versions,
                 status="failed" if error_message else "completed",
                 error_message=error_message,
             ),
         )
+
+
+def resolve_semantic_review_chain(config: AiRecognitionConfig):
+    """The models bound to ``semantic_review``, in order.
+
+    A configuration with no v2 model table falls back to the rule this
+    replaced -- ``config.text_provider`` -- and an unconfigured provider
+    yields an empty chain, which is what "not configured" has always meant
+    here.
+    """
+
+    chain = resolve_stage_chain(config, SEMANTIC_REVIEW_STAGE)
+    if chain:
+        return chain
+    if getattr(config, "models", None):
+        return []
+    provider = config.text_provider
+    if not provider.is_configured:
+        return []
+    return [model_config_from_provider(provider)]
 
 
 def _load_review_attempts(session_factory: sessionmaker, raw_message_id: int) -> int:

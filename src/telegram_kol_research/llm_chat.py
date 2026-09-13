@@ -32,6 +32,60 @@ class LLMProxyConfig:
     egress_socket_path: str | None = None
 
 
+@dataclass(frozen=True, slots=True)
+class ResearchChatChainEntry:
+    """One chain member for the Web group-message chat.
+
+    The router identifies members by ``id`` / ``model``; the requester takes an
+    :class:`LLMProxyConfig`, which also carries the egress socket the proxy
+    needs and which has nothing to do with which model answers.
+    """
+
+    id: str
+    model: str
+    proxy_config: "LLMProxyConfig"
+
+
+def resolve_research_chat_chain(
+    proxy_config: "LLMProxyConfig",
+    ai_config: Any,
+) -> list[ResearchChatChainEntry]:
+    """The models bound to ``research_chat``, ready to call.
+
+    Resolved per question rather than at process start. An empty chain means
+    nothing is bound and the environment-configured proxy stays in charge;
+    the egress socket is carried over, because it describes how this process
+    reaches the network, not which model it asks.
+    """
+
+    from telegram_kol_research.ai_model_router import resolve_stage_chain
+    from telegram_kol_research.ai_stage_catalog import RESEARCH_CHAT_STAGE
+
+    chain = resolve_stage_chain(ai_config, RESEARCH_CHAT_STAGE) if ai_config else []
+    if not chain:
+        return [
+            ResearchChatChainEntry(
+                id=proxy_config.model or "env",
+                model=proxy_config.model,
+                proxy_config=proxy_config,
+            )
+        ]
+    return [
+        ResearchChatChainEntry(
+            id=model.id,
+            model=model.model,
+            proxy_config=LLMProxyConfig(
+                base_url=model.base_url,
+                api_key=model.api_key,
+                model=model.model,
+                timeout_seconds=model.timeout_seconds,
+                egress_socket_path=proxy_config.egress_socket_path,
+            ),
+        )
+        for model in chain
+    ]
+
+
 class RuntimeAgentLLMConfigError(ValueError):
     """Dedicated Runtime Agent provider configuration is incomplete."""
 

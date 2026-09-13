@@ -28,6 +28,7 @@ start and the 30-minute bucket, so a restart neither repeats nor loses them.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Sequence
@@ -390,6 +391,21 @@ def derive_provider_outage(
 #: Where the chain head is read from when no loader is supplied.
 DEFAULT_AI_CONFIG_PATH = "config/ai_recognition.yaml"
 
+#: ``(path, mtime_ns, size) -> head model``. Both health ticks run on every
+#: iteration of the worker's 20-second gap-recovery loop, and each one needs
+#: the same answer from the same file; parsing a 40 KB YAML twice per tick to
+#: learn something that changes when a person saves a page is waste. The file
+#: identity is the key, so a save is picked up on the next tick.
+_CHAIN_HEAD_CACHE: dict[tuple[str, int, int], str | None] = {}
+
+
+def _config_file_identity(path: Any) -> tuple[str, int, int] | None:
+    try:
+        stat = os.stat(os.fspath(path))
+    except (OSError, TypeError, ValueError):
+        return None
+    return (str(path), int(stat.st_mtime_ns), int(stat.st_size))
+
 
 def resolve_chain_head_model(
     config_loader: Callable[[], Any] | None = None,
@@ -405,6 +421,13 @@ def resolve_chain_head_model(
     quietly stops counting is the failure this module exists to end.
     """
 
+    identity = (
+        _config_file_identity(ai_recognition_config_path)
+        if config_loader is None
+        else None
+    )
+    if identity is not None and identity in _CHAIN_HEAD_CACHE:
+        return _CHAIN_HEAD_CACHE[identity]
     try:
         from telegram_kol_research.ai_recognition_config import (
             load_ai_recognition_config,
@@ -426,7 +449,13 @@ def resolve_chain_head_model(
             exc_info=True,
         )
         return None
-    return chain[0].model if chain else None
+    head = chain[0].model if chain else None
+    if identity is not None:
+        # Bounded: one entry per file version, and a worker reads one file.
+        if len(_CHAIN_HEAD_CACHE) > 8:
+            _CHAIN_HEAD_CACHE.clear()
+        _CHAIN_HEAD_CACHE[identity] = head
+    return head
 
 
 def _chain_head_filter(query, chain_head_model: str | None):

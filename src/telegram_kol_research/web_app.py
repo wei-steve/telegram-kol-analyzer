@@ -60,6 +60,7 @@ from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
 )
+from telegram_kol_research.ai_model_router import run_with_fallback
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiProviderConfig,
@@ -227,6 +228,7 @@ from telegram_kol_research.llm_chat import (
     build_source_reference_map,
     extract_recent_message_limit,
     load_llm_proxy_config,
+    resolve_research_chat_chain,
     request_grounded_chat_answer,
 )
 from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_lifecycle
@@ -9893,7 +9895,13 @@ def create_web_app(
             limit=message_limit,
         )
         scope_context = build_scope_context(list(reversed(messages)))
-        config = app.state.llm_proxy_config
+        chat_chain = resolve_research_chat_chain(
+            app.state.llm_proxy_config,
+            _load_ai_recognition_config_best_effort(
+                app.state.ai_recognition_config_path
+            ),
+        )
+        config = chat_chain[0].proxy_config
         system = render_registered_prompt(
             app.state.session_factory,
             RESEARCH_CHAT_SYSTEM_PROMPT,
@@ -9913,14 +9921,34 @@ def create_web_app(
             version_map.update(group.version_map)
         invocation_status = "success"
         invocation_error = None
+        chat_errors: list[BaseException] = []
+
+        def _ask_model(candidate, *, deadline_seconds: float | None = None):
+            try:
+                return app.state.chat_requester(
+                    config=candidate.proxy_config,
+                    question=question,
+                    scope_context=scope_context,
+                    system_prompt=system.content,
+                    group_prompt=group_prompt,
+                )
+            except Exception as exc:
+                chat_errors.append(exc)
+                raise
+
         try:
-            answer = app.state.chat_requester(
-                config=config,
-                question=question,
-                scope_context=scope_context,
-                system_prompt=system.content,
-                group_prompt=group_prompt,
-            )
+            routed = run_with_fallback(chat_chain, _ask_model)
+            if not routed.succeeded:
+                # A single-model chain raises exactly what it always raised,
+                # so the 502 detail keeps naming the proxy's own error.
+                if len(chat_errors) == 1:
+                    raise chat_errors[0]
+                raise httpx.HTTPError(
+                    routed.error_message or "chat proxy request failed"
+                )
+            answer = routed.value
+            if routed.model is not None:
+                config = routed.model.proxy_config
         except httpx.HTTPError as exc:
             invocation_status = "error"
             invocation_error = str(exc)
@@ -11031,6 +11059,25 @@ def _provider_config_response(config: AiProviderConfig) -> dict[str, Any]:
         "model": config.model,
         "timeout_seconds": config.timeout_seconds,
     }
+
+
+def _load_ai_recognition_config_best_effort(path: Any) -> AiRecognitionConfig | None:
+    """The AI configuration, or ``None`` rather than a failed request.
+
+    A stage that cannot read its bindings falls back to the environment
+    settings it used before the bindings existed. Losing the answer to a
+    question because a YAML file is momentarily unreadable would be a worse
+    outcome than answering it with the previous model.
+    """
+
+    try:
+        return load_ai_recognition_config(path)
+    except Exception:
+        logger.warning(
+            "ai recognition config unreadable; stage chains fall back to env",
+            exc_info=True,
+        )
+        return None
 
 
 def _model_configs_from_payload(

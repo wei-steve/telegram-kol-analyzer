@@ -13,10 +13,16 @@ from typing import Any, Callable, Mapping
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_model_router import (
+    resolve_stage_chain,
+    run_with_fallback,
+)
 from telegram_kol_research.ai_recognition_config import (
+    AiModelConfig,
     AiProviderConfig,
     AiRecognitionConfig,
 )
+from telegram_kol_research.ai_stage_catalog import CONTEXT_RESOLUTION_STAGE
 from telegram_kol_research.context_resolution_prompt import (
     CONTEXT_RESOLUTION_PROMPT_VERSION,
     CONTEXT_RESOLUTION_SYSTEM_PROMPT,
@@ -488,12 +494,83 @@ def _collect_ids(value: Any, key_names: set[str]) -> set[int]:
     return found
 
 
+def model_config_from_provider(
+    provider: AiProviderConfig,
+    *,
+    fallback_id: str = "text_provider",
+) -> AiModelConfig:
+    """Wrap a bare provider as a one-model chain entry.
+
+    The router speaks :class:`AiModelConfig`. A stage that falls back to a v1
+    field holds only an :class:`AiProviderConfig`, which carries no id, so one
+    is made from the model name -- and ``AiModelConfig.provider`` rebuilds an
+    equal provider, so the call itself is unchanged.
+    """
+
+    return AiModelConfig(
+        id=(provider.model.strip() or fallback_id),
+        label=(provider.model.strip() or fallback_id),
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        model=provider.model,
+        timeout_seconds=provider.timeout_seconds,
+        supports_text=True,
+    )
+
+
+def resolve_context_model_chain(
+    config: AiRecognitionConfig,
+) -> list[AiModelConfig]:
+    """The models the ``context_resolution`` stage may call, in order.
+
+    A configuration that carries no v2 model table -- one built by hand, or by
+    code that predates the stage bindings -- falls back to the rule this
+    replaced: the text-capable model named by ``context_resolution_model_id``,
+    else ``text_provider``. The chain is never empty, because "not configured"
+    has always been a provider whose ``is_configured`` is false rather than an
+    absent one.
+    """
+
+    chain = resolve_stage_chain(config, CONTEXT_RESOLUTION_STAGE)
+    if chain:
+        return chain
+    if not getattr(config, "models", None):
+        requested = str(getattr(config, "context_resolution_model_id", "") or "")
+        for model in getattr(config, "ai_models", ()) or ():
+            if model.id == requested and model.supports_text:
+                return [model]
+    return [model_config_from_provider(config.text_provider)]
+
+
 def _select_provider(config: AiRecognitionConfig) -> AiProviderConfig:
-    requested = str(config.context_resolution_model_id or "")
-    for model in config.ai_models:
-        if model.id == requested and model.supports_text:
-            return model.provider
-    return config.text_provider
+    """The model this stage starts with. Kept for callers that want one."""
+
+    return resolve_context_model_chain(config)[0].provider
+
+
+class _ContextAttemptFailed(RuntimeError):
+    """One model of the chain did not produce a usable decision.
+
+    Carries what the outer loop needs to record: which contract failure it
+    was, the decoded body when there was one (for the rejected-response
+    diagnostic), and the raw result (for the usage entry).
+    """
+
+    def __init__(
+        self,
+        code: str,
+        *,
+        cause: BaseException | None = None,
+        decoded: Mapping[str, Any] | None = None,
+        raw_result: Any | None = None,
+        request_failed: bool = False,
+    ):
+        super().__init__(code)
+        self.code = code
+        self.cause = cause
+        self.decoded = decoded
+        self.raw_result = raw_result
+        self.request_failed = request_failed
 
 
 def _completion_url(base_url: str) -> str:
@@ -842,7 +919,8 @@ def resolve_contextual_strategy(
         session_factory,
         int(raw_message_id),
     )
-    provider = _select_provider(ai_recognition_config)
+    provider_chain = resolve_context_model_chain(ai_recognition_config)
+    provider = provider_chain[0].provider
     retry_policy = network_retry_policy or ContextNetworkRetryPolicy.from_environ()
     circuits = circuit_registry or _CONTEXT_PROVIDER_CIRCUITS
     provider_key = _provider_circuit_key(provider)
@@ -973,46 +1051,101 @@ def resolve_contextual_strategy(
                     system_prompt=active_system_prompt,
                 )
                 raise ContextResolutionError("network_error")
-        try:
-            raw_result = model_caller(
-                provider=provider,
-                system_prompt=active_system_prompt,
-                request_payload=request_payload,
+        attempt_failures: list[_ContextAttemptFailed] = []
+
+        def _call_one(
+            candidate: AiModelConfig,
+            *,
+            deadline_seconds: float | None = None,
+        ):
+            """One model's whole answer: the request, the JSON, the contract.
+
+            All three live inside the chain attempt because all three are
+            reasons to try the next model (design §4): a body that will not
+            decode, or a decision the contract refuses, is this model failing
+            to answer, not the request being wrong.
+            """
+
+            try:
+                raw = model_caller(
+                    provider=candidate.provider,
+                    system_prompt=active_system_prompt,
+                    request_payload=request_payload,
+                )
+            except Exception as exc:
+                error = _ContextAttemptFailed(
+                    "network_error", cause=exc, request_failed=True
+                )
+                attempt_failures.append(error)
+                raise error from exc
+            decoded_input = (
+                raw.content if isinstance(raw, ContextProviderResult) else raw
             )
-        except Exception as exc:
-            provider_usage_entries.append(
-                {
-                    "available": False,
-                    "reason": "provider_request_failed",
-                    "request_number": attempt_number,
-                }
+            try:
+                body = _decode_model_payload(decoded_input)
+            except (json.JSONDecodeError, TypeError, ValueError) as exc:
+                error = _ContextAttemptFailed(
+                    "malformed_json", cause=exc, raw_result=raw
+                )
+                attempt_failures.append(error)
+                raise error from exc
+            try:
+                parsed = parse_context_resolution_decision(
+                    body,
+                    allowed_thread_ids=allowed_thread_ids,
+                    allowed_message_ids=allowed_message_ids,
+                )
+            except ContextResolutionError as exc:
+                error = _ContextAttemptFailed(
+                    exc.code, cause=exc, decoded=body, raw_result=raw
+                )
+                attempt_failures.append(error)
+                raise error from exc
+            return raw, body, parsed
+
+        # No chain-level ceiling: this stage is not inside the 300 s job claim
+        # lease, so the budget is simply each model's own timeout, one after
+        # the other (design §4).
+        routed = run_with_fallback(provider_chain, _call_one)
+        if routed.succeeded:
+            raw_result, decoded, decision = routed.value
+            used_provider = (
+                routed.model.provider if routed.model is not None else provider
             )
-            failure = ContextResolutionError("network_error")
-            failure.__cause__ = exc
-        else:
-            circuits.record_success(provider_key)
+            if _provider_circuit_key(used_provider) == provider_key:
+                # A backup answering says nothing about the primary's
+                # connectivity, so it does not close the primary's breaker.
+                circuits.record_success(provider_key)
             provider_usage_entries.append(
                 _provider_usage_entry(raw_result, attempt_number)
             )
-            decoded_input = (
-                raw_result.content
-                if isinstance(raw_result, ContextProviderResult)
-                else raw_result
+        else:
+            last = attempt_failures[-1] if attempt_failures else None
+            used_provider = (
+                provider_chain[len(attempt_failures) - 1].provider
+                if attempt_failures
+                else provider
             )
-            try:
-                decoded = _decode_model_payload(decoded_input)
-            except (json.JSONDecodeError, TypeError, ValueError) as exc:
-                failure = ContextResolutionError("malformed_json")
-                failure.__cause__ = exc
+            if last is not None and last.request_failed:
+                provider_usage_entries.append(
+                    {
+                        "available": False,
+                        "reason": "provider_request_failed",
+                        "request_number": attempt_number,
+                    }
+                )
             else:
-                try:
-                    decision = parse_context_resolution_decision(
-                        decoded,
-                        allowed_thread_ids=allowed_thread_ids,
-                        allowed_message_ids=allowed_message_ids,
+                provider_usage_entries.append(
+                    _provider_usage_entry(
+                        last.raw_result if last is not None else None,
+                        attempt_number,
                     )
-                except ContextResolutionError as exc:
-                    failure = exc
+                )
+            decoded = last.decoded if last is not None else None
+            failure = ContextResolutionError(
+                last.code if last is not None else "network_error"
+            )
+            failure.__cause__ = last.cause if last is not None else None
         if failure is not None:
             terminal = attempt_number == 2
             next_attempt_at = None
@@ -1027,7 +1160,7 @@ def resolve_contextual_strategy(
                 raw_message_id=raw_message_id,
                 evidence_version_id=evidence_version_id,
                 context_fingerprint=context_fingerprint,
-                model=provider.model,
+                model=used_provider.model,
                 request_payload=request_payload,
                 decision=None,
                 status="exhausted" if terminal else "retry_pending",
@@ -1067,7 +1200,7 @@ def resolve_contextual_strategy(
             raw_message_id=raw_message_id,
             evidence_version_id=evidence_version_id,
             context_fingerprint=context_fingerprint,
-            model=provider.model,
+            model=used_provider.model,
             request_payload=request_payload,
             decision=decision,
             status="completed",

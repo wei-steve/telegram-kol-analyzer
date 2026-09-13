@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 3
+current_phase: 4
 phase_status: planned        # planned | in_progress | completed | blocked
 deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 ```
@@ -21,7 +21,7 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 |---|---|---|---|---|
 | 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | `18d62606` | 全量 8713 passed / 0 failed / 4 skipped |
 | 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | `4e5e37ad` | 全量 8746 passed / 0 failed / 4 skipped |
-| 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | planned | | |
+| 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | 见下方证据 | 全量 8768 passed / 0 failed / 4 skipped |
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证截图 | planned | | |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | planned | | |
 
@@ -75,6 +75,29 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   （`已切换到备用模型 <id> 继续识别`，走 `_safe_text`），`impact` 改为
   `authoritative_recognition_on_fallback_model`；Telegram 文案的「影响」行随之改写，
   不再说「新消息无法完成权威识别」。`runtime_incidents._SUMMARY_FIELDS` 相应放行 `fallback_note`。
+
+## 阶段 3 做了什么
+
+`ai_model_router` 新增 `async_run_with_fallback`：语义与同步版逐条相同，只是 `await` 那次尝试，
+共用 `RouterResult`；测试把两者对照跑。
+
+| 环节 | 取链方式 | 记录实际模型 | 空链 / 无 v2 表时 |
+|---|---|---|---|
+| `context_resolution` | `resolve_context_model_chain` | `ContextResolutionAttempt.model` | 回退到 `context_resolution_model_id` 指的那条，否则 `text_provider` |
+| `semantic_review` | `resolve_semantic_review_chain` | `SemanticReviewRun.model` + `prompt_invocations` | 回退到 `text_provider`；未配置则空链 |
+| `strategy_alert` | `resolve_strategy_alert_chain`（调用时解析） | `prompt_invocations.model` | 沿用现有 `StrategyAlertConfig`（env） |
+| `research_chat` | `llm_chat.resolve_research_chat_chain`（每次提问解析） | `prompt_invocations.model` + `proxy_payload.model` | 沿用 `app.state.llm_proxy_config` |
+| `batch_text_recognition` | `_batch_text_provider`（链首，单次尝试不变） | 原有 `engine` 字段 | 回退到 `text_provider` |
+| `batch_image_recognition` | `_batch_image_provider`（链首，单次尝试不变） | 原有 `engine` 字段 | 回退到 `image_provider` |
+| 探测 / 提示词中心 mimo | `_find_mimo_model`（阶段 2 已是链首包装） | 不变 | 不变 |
+| 提示词中心 deepseek | `prompt_testing._deepseek_provider` → `batch_text_recognition` 链首 | `_model_name` | 回退到 `text_provider` |
+
+`context_resolution` 与 `semantic_review` 把「发请求 + 解 JSON + 过合同」整个放进链内的一次尝试里，
+因为这三件事失败都意味着「这个模型没给出答案」，下一个模型可能会（设计 §4）。
+两者都没有链级时限：它们不在 300 s 作业认领租约里，预算就是各模型自己的 timeout 依次相加。
+
+健康线：`resolve_chain_head_model` 加了按文件身份 `(路径, mtime_ns, size)` 的缓存，
+两个 tick 每轮各问一次链首只会解析一次 YAML；页面保存后文件变了，下一轮就看到新链首。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -161,13 +184,43 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     因为那要改调用点的实参，会打到所有传 stub tick 的测试；两次 YAML 解析（~40 KB）
     比这两个 tick 本来就要做的数据库扫描便宜得多。要优化留给阶段 3。
 
+17. **`context_resolution` 的「链」是 `AiModelConfig` 列表，但调用点仍收 `AiProviderConfig`。**
+    `model_caller(provider=...)` 是既有注入点，几十个测试按这个签名写的。链内用
+    `candidate.provider` 取回同一个值（`AiModelConfig.provider` 每次构造的是相等的 frozen 对象），
+    调用方一个字都不用改。没有 v2 表时用 `model_config_from_provider` 把旧字段包成一条单元素链。
+
+18. **`context_resolution` 的熔断器仍然按链首计。**
+    `record_success` 只在答题的就是链首时才调用——备用模型通了，不代表主模型的网络通了，
+    和健康线是同一条规则。`context_fingerprint` 也仍然按链首算，否则换模型会让同一条消息的
+    重试 / 去重找不到自己原来的那一行。
+
+19. **`context_resolution` 的 provider usage 每次 attempt 仍然只记一条。**
+    `existing_request_count` 同时兼着「已经做过几次 attempt」的账，链内多发的请求如果每个都记一条，
+    重试计数会被顶掉、第二次 attempt 直接被跳过。usage 是尽力而为的审计，attempt 行的 `model`
+    才是「谁答的」的真相。
+
+20. **`semantic_review` 与 `research_chat` 在单模型链上重新抛出模型自己的异常。**
+    这两处的调用方 match 的是合同错误的类型和文本（`pytest.raises(ValueError, match="closed contract")`、
+    502 的 detail 由 `_build_chat_proxy_error_detail` 按 httpx 异常算）。只有真的有多个模型时
+    才换成路由自己的合并消息。
+
+21. **`strategy_alert` / `research_chat` 读不到 AI 配置时，回到 env 配置继续跑。**
+    这两个环节的替代品是「一条提醒没发出去」「一个问题没答上」，比用上一版模型回答更糟。
+    `_load_ai_config_for_alerts` / `_load_ai_recognition_config_best_effort` 吞掉异常并 warning。
+
+22. **第 16 条改用「按文件身份缓存」而不是把 loader 传进 tick。**
+    改 `asyncio.to_thread(provider_health_tick, session_factory)` 的实参会打到所有传 stub tick 的
+    测试；缓存放在 `resolve_chain_head_model` 里，调用点与签名一个字都不用动，
+    重复的那次只花一个 `stat()`。
+
 ## 已知限制 / 后续课题
 
 - 主模型故障期间每条消息都先付一次主模型失败的代价；跨消息熔断/冷却未做（设计 §4）。
 - 上下文结合分析触发频率偏高，本次不改（`docs/known-issues-and-deferred-work.md`）。
 - 阶段 1 只改配置层，所有调用点仍走旧字段；行为与改动前一致。
-- 阶段 2 只接了 `authoritative_recognition`。其余环节（context_resolution / semantic_review /
-  strategy_alert / research_chat / batch_*）仍读旧字段，行为与改动前一致，阶段 3 再接。
+- 阶段 3 之后，设计 §2.1 的 7 个环节全部按链取模型。只有 `runtime_incident_agent` 有意不纳入。
+- `batch_text_recognition` / `batch_image_recognition` 只取链首、保持单次尝试（设计 §6 说 fallback
+  属于加分项）。它们是 CLI / 批量工具，不在生产消息管线上。
 - `mimo_recognition_runs.model` 与 attempts 的 `model` 存的是**模型名**（`AiModelConfig.model`），
   不是 stage 绑定里的 model id。同名模型挂在两个 provider 下时无法区分——这和 run 表原本就有的
   歧义一样，本次没有扩大也没有解决。
@@ -229,3 +282,30 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   它用 `assert "303" not in str(payload)` 证明 chat id 没有泄漏，但同一个 payload 里有
   `now`（带微秒的 ISO 时间戳）和 `uptime_seconds`，任一处凑出 "303" 就会失败。
   第一次全量跑到了这一下，重跑即过；单独跑、整文件跑都过。与本阶段改动无关。
+
+### 阶段 3
+
+- 提交：`feat(ai-routing): phase 3 every remaining stage picks its own model`
+  （SHA 在后续文档提交里补写）
+- 全量：`uv run python -m pytest -q` → **8768 passed, 4 skipped, 0 failed**（640 s）
+- 新增测试文件：`tests/test_ai_stage_routing.py`（22 例）。关键用例：
+  - `test_the_async_router_decides_exactly_what_the_sync_one_decides`、
+    `test_the_async_router_honours_the_same_budget_rule`、
+    `test_the_async_router_does_not_change_model_when_classify_refuses`
+  - `test_context_resolution_falls_back_and_records_the_answering_model` /
+    `test_context_resolution_single_model_chain_is_unchanged` /
+    `test_context_resolution_changes_model_for_a_body_that_will_not_decode` /
+    `test_context_resolution_without_a_v2_table_keeps_the_old_rule`
+  - `test_semantic_review_falls_back_and_records_the_answering_model` /
+    `test_semantic_review_single_model_chain_is_unchanged` /
+    `test_semantic_review_without_a_v2_table_keeps_the_text_provider`
+  - `test_a_bound_strategy_alert_uses_the_chain_and_keeps_the_bot_settings` /
+    `test_an_unbound_strategy_alert_keeps_the_environment_model` /
+    `test_an_unreadable_ai_config_does_not_lose_the_alert`
+  - `test_a_bound_research_chat_uses_the_chain_and_keeps_the_egress_socket` /
+    `test_an_unbound_research_chat_keeps_the_environment_proxy`
+  - `test_the_batch_stages_read_their_own_chain_heads` /
+    `test_a_config_without_a_v2_table_keeps_the_v1_providers` /
+    `test_glm_ocr_is_still_decided_by_the_chain_heads_model_name`
+  - `test_the_prompt_centre_deepseek_test_follows_the_batch_text_chain`
+  - `test_the_chain_head_is_not_reparsed_on_every_tick`

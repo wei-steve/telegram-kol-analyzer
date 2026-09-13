@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Any, Awaitable, Callable
 
@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_model_router import async_run_with_fallback
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.models import (
     EntryRevisionReplacement,
@@ -78,6 +79,83 @@ class StrategyAlertEvent:
 
 
 LLMRequester = Callable[..., Awaitable[str]]
+
+
+@dataclass(frozen=True, slots=True)
+class _AlertChainEntry:
+    """One chain member, in the two shapes this stage needs at once.
+
+    The router identifies members by ``id`` / ``model``; the requester takes a
+    :class:`StrategyAlertConfig`, which also carries the bot destination and
+    the thresholds that have nothing to do with which model answers.
+    """
+
+    id: str
+    model: str
+    alert_config: StrategyAlertConfig
+
+
+def resolve_strategy_alert_chain(
+    config: StrategyAlertConfig,
+    ai_config: Any,
+) -> list[_AlertChainEntry]:
+    """The models bound to ``strategy_alert``, ready to call.
+
+    Resolved when the alert is classified, not when the process started, so a
+    change on the model-selection page takes effect on the next message like
+    every other stage. An empty chain means nothing is bound, and the
+    environment-configured model this bot has always used stays in charge --
+    which is also what happens when the AI configuration cannot be read.
+    """
+
+    from telegram_kol_research.ai_model_router import resolve_stage_chain
+    from telegram_kol_research.ai_stage_catalog import STRATEGY_ALERT_STAGE
+
+    chain = resolve_stage_chain(ai_config, STRATEGY_ALERT_STAGE) if ai_config else []
+    if not chain:
+        return [
+            _AlertChainEntry(
+                id=config.llm_model or "env", model=config.llm_model, alert_config=config
+            )
+        ]
+    return [
+        _AlertChainEntry(
+            id=model.id,
+            model=model.model,
+            alert_config=replace(
+                config,
+                llm_base_url=model.base_url,
+                llm_api_key=model.api_key,
+                llm_model=model.model,
+                timeout_seconds=model.timeout_seconds,
+            ),
+        )
+        for model in chain
+    ]
+
+
+def _load_ai_config_for_alerts(
+    loader: Callable[[], Any] | None,
+) -> Any | None:
+    """Read the AI configuration, or say nothing rather than lose the alert.
+
+    An unreadable configuration falls back to the environment settings this
+    bot has always used: a strategy alert that never arrives is worse than one
+    classified by the previous model.
+    """
+
+    try:
+        if loader is not None:
+            return loader()
+        from telegram_kol_research.ai_recognition_config import (
+            load_ai_recognition_config,
+        )
+
+        return load_ai_recognition_config("config/ai_recognition.yaml")
+    except Exception:
+        return None
+
+
 BotSender = Callable[..., Awaitable[None]]
 
 
@@ -524,6 +602,7 @@ async def process_strategy_alert_for_record(
     recognition_result: Any | None = None,
     llm_requester: LLMRequester = request_strategy_alert_decision,
     bot_sender: BotSender = send_strategy_alert_bot_message,
+    ai_recognition_config_loader: Callable[[], Any] | None = None,
 ) -> dict[str, Any]:
     """Classify and optionally forward one normalized message with idempotency."""
 
@@ -625,11 +704,27 @@ async def process_strategy_alert_for_record(
     prompt = rendered.content
     invocation_status = "success"
     invocation_error = None
-    try:
-        content = await _retry_async(
-            lambda: llm_requester(config=config, prompt=prompt),
+    alert_chain = resolve_strategy_alert_chain(
+        config, _load_ai_config_for_alerts(ai_recognition_config_loader)
+    )
+    used_model = alert_chain[0].alert_config.llm_model
+
+    async def _classify(candidate, *, deadline_seconds: float | None = None) -> str:
+        # This model's own three retries finish before the next model starts.
+        return await _retry_async(
+            lambda: llm_requester(config=candidate.alert_config, prompt=prompt),
             attempts=3,
         )
+
+    try:
+        routed = await async_run_with_fallback(alert_chain, _classify)
+        if not routed.succeeded:
+            raise RuntimeError(
+                routed.error_message or "strategy alert provider request failed"
+            )
+        content = routed.value
+        if routed.model is not None:
+            used_model = routed.model.alert_config.llm_model or routed.model.model
     except Exception as exc:
         invocation_status = "error"
         invocation_error = str(exc)
@@ -649,7 +744,7 @@ async def process_strategy_alert_for_record(
                 correlation_key=f"strategy_alert:{record.chat_id}:{record.message_id}",
                 raw_message_id=raw_message.id if raw_message is not None else None,
                 chat_id=record.chat_id,
-                model=config.llm_model,
+                model=used_model,
                 prompt_versions=rendered.version_map,
                 status=invocation_status,
                 error_message=invocation_error,

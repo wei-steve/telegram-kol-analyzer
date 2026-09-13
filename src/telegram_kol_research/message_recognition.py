@@ -19,6 +19,11 @@ from telegram_kol_research.ai_recognition_config import (
     AiProviderConfig,
     AiRecognitionConfig,
     load_ai_recognition_config,
+    stage_head_provider,
+)
+from telegram_kol_research.ai_stage_catalog import (
+    BATCH_IMAGE_STAGE,
+    BATCH_TEXT_STAGE,
 )
 from telegram_kol_research.authoritative_instructions import (
     AuthoritativeInstruction,
@@ -95,6 +100,27 @@ from telegram_kol_research.prompt_registry import (
     record_prompt_invocation,
 )
 from telegram_kol_research.trading_settings import load_trading_settings
+
+
+def _batch_text_provider(config: AiRecognitionConfig) -> AiProviderConfig:
+    """The model bound to ``batch_text_recognition``, else the v1 field.
+
+    These are the offline and batch tools, not the production pipeline, so
+    they keep their single attempt: the chain decides which model, and the
+    chain head is all a single attempt can use.
+    """
+
+    return stage_head_provider(
+        config, BATCH_TEXT_STAGE, legacy=config.text_provider
+    )
+
+
+def _batch_image_provider(config: AiRecognitionConfig) -> AiProviderConfig:
+    """The model bound to ``batch_image_recognition``, else the v1 field."""
+
+    return stage_head_provider(
+        config, BATCH_IMAGE_STAGE, legacy=config.image_provider
+    )
 
 
 BLOCKED_SYMBOLS = {
@@ -248,7 +274,7 @@ def recognize_message_now(
             session.commit()
             return result
 
-        if text.strip() and config.text_provider.is_configured:
+        if text.strip() and _batch_text_provider(config).is_configured:
             ai_event_result = _apply_ai_lifecycle_event_if_matched(
                 session,
                 raw_message=raw_message,
@@ -258,7 +284,7 @@ def recognize_message_now(
                 prompt_versions=deepseek_composition.version_map,
             )
             if ai_event_result is not None:
-                _upsert_recognition(session, ai_event_result, engine=config.text_provider.model)
+                _upsert_recognition(session, ai_event_result, engine=_batch_text_provider(config).model)
                 session.commit()
                 if ai_event_result.reason == "management_fraction_invalid":
                     record_fraction_rejection(session_factory, raw_message_id=raw_message.id)
@@ -286,7 +312,7 @@ def recognize_message_now(
 
         if (
             text.strip()
-            and not config.text_provider.is_configured
+            and not _batch_text_provider(config).is_configured
             and _apply_lifecycle_transition_signal_if_matched(session, raw_message, text)
         ):
             result = MessageRecognitionResult(
@@ -299,8 +325,8 @@ def recognize_message_now(
             session.commit()
             return result
 
-        if _has_image_like_media(media_assets) and config.image_provider.is_configured:
-            if _is_glm_ocr_model(config.image_provider.model):
+        if _has_image_like_media(media_assets) and _batch_image_provider(config).is_configured:
+            if _is_glm_ocr_model(_batch_image_provider(config).model):
                 result = _recognize_with_glm_ocr(
                     raw_message=raw_message,
                     media_assets=media_assets,
@@ -314,37 +340,37 @@ def recognize_message_now(
                 result = _invoke_with_prompt_audit(
                     session_factory=session_factory,
                     raw_message=raw_message,
-                    model=config.image_provider.model,
+                    model=_batch_image_provider(config).model,
                     prompt_versions=mimo_composition.version_map,
                     call=lambda: _recognize_with_ai_provider(
                         raw_message=raw_message,
                         media_assets=media_assets,
                         config=config,
-                        provider=config.image_provider,
+                        provider=_batch_image_provider(config),
                         parse_source="image_ai",
                         system_prompt=mimo_composition.system_prompt,
                     ),
                 )
-                _persist_ai_result(session, raw_message, result, engine=config.image_provider.model)
+                _persist_ai_result(session, raw_message, result, engine=_batch_image_provider(config).model)
             session.commit()
             return result
 
-        if (raw_message.text or "").strip() and config.text_provider.is_configured:
+        if (raw_message.text or "").strip() and _batch_text_provider(config).is_configured:
             result = _invoke_with_prompt_audit(
                 session_factory=session_factory,
                 raw_message=raw_message,
-                model=config.text_provider.model,
+                model=_batch_text_provider(config).model,
                 prompt_versions=deepseek_composition.version_map,
                 call=lambda: _recognize_with_ai_provider(
                     raw_message=raw_message,
                     media_assets=[],
                     config=config,
-                    provider=config.text_provider,
+                    provider=_batch_text_provider(config),
                     parse_source="text_ai",
                     system_prompt=deepseek_composition.system_prompt,
                 ),
             )
-            _persist_ai_result(session, raw_message, result, engine=config.text_provider.model)
+            _persist_ai_result(session, raw_message, result, engine=_batch_text_provider(config).model)
             session.commit()
             return result
 
@@ -403,7 +429,7 @@ def recognize_records_with_ai_config(
     """Recognize newly persisted records using the shared AI recognition config."""
 
     config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
-    if not (config.text_provider.is_configured or config.image_provider.is_configured):
+    if not (_batch_text_provider(config).is_configured or _batch_image_provider(config).is_configured):
         if fallback_recognizer is None:
             return {
                 "inserted_candidates": 0,
@@ -574,7 +600,7 @@ def _recognize_with_glm_ocr(
             parse_source="image_ai",
         )
         _upsert_recognition(
-            session, result, engine=config.image_provider.model,
+            session, result, engine=_batch_image_provider(config).model,
         )
         return result
 
@@ -585,7 +611,7 @@ def _recognize_with_glm_ocr(
         if not data_url:
             continue
         try:
-            ocr_text = _call_glm_ocr_api(config.image_provider, data_url)
+            ocr_text = _call_glm_ocr_api(_batch_image_provider(config), data_url)
             if ocr_text:
                 asset.ocr_text = ocr_text  # persist OCR result for web display
                 ocr_parts.append(ocr_text)
@@ -609,17 +635,17 @@ def _recognize_with_glm_ocr(
             parse_source="image_ai",
         )
         _upsert_recognition(
-            session, result, engine=config.image_provider.model,
+            session, result, engine=_batch_image_provider(config).model,
         )
         return result
 
     # ── Step 2: strategy recognition on the extracted text ──────────────
-    if config.text_provider.is_configured:
+    if _batch_text_provider(config).is_configured:
         # Use text AI provider for strategy recognition
         result = _invoke_with_prompt_audit(
             session_factory=session_factory,
             raw_message=raw_message,
-            model=config.text_provider.model,
+            model=_batch_text_provider(config).model,
             prompt_versions=prompt_versions,
             call=lambda: _recognize_text_with_ai_provider(
                 raw_message=raw_message,
@@ -644,14 +670,14 @@ def _recognize_with_glm_ocr(
                 ai_payload=result.ai_payload,
                 parse_source="image_ai",
             )
-            _upsert_recognition(session, result, engine=config.text_provider.model)
+            _upsert_recognition(session, result, engine=_batch_text_provider(config).model)
             return result
         if caption and ocr_parts and result.status != "是策略":
             try:
                 text_only_result = _invoke_with_prompt_audit(
                     session_factory=session_factory,
                     raw_message=raw_message,
-                    model=config.text_provider.model,
+                    model=_batch_text_provider(config).model,
                     prompt_versions=prompt_versions,
                     call=lambda: _recognize_text_with_ai_provider(
                         raw_message=raw_message,
@@ -667,11 +693,11 @@ def _recognize_with_glm_ocr(
                     session,
                     raw_message,
                     text_only_result,
-                    engine=config.text_provider.model,
+                    engine=_batch_text_provider(config).model,
                 )
                 return text_only_result
         _persist_ai_result(
-            session, raw_message, result, engine=config.text_provider.model,
+            session, raw_message, result, engine=_batch_text_provider(config).model,
         )
         # Tag the parse_source to reflect the image→ocr→text_ai pipeline
         object.__setattr__(result, "parse_source", "image_ai")
@@ -687,7 +713,7 @@ def _recognize_with_glm_ocr(
             parse_source="image_ai",
         )
         _upsert_recognition(
-            session, result, engine=config.image_provider.model,
+            session, result, engine=_batch_image_provider(config).model,
         )
         return result
 
@@ -698,7 +724,7 @@ def _recognize_with_glm_ocr(
         summary=_format_candidate_summary(candidate),
         parse_source="image_ai",
     )
-    _upsert_recognition(session, result, engine=config.image_provider.model)
+    _upsert_recognition(session, result, engine=_batch_image_provider(config).model)
     return result
 
 
@@ -715,12 +741,12 @@ def _recognize_text_with_ai_provider(
         raw_message=raw_message,
         media_assets=[],
         prompt=system_prompt,
-        model=config.text_provider.model,
+        model=_batch_text_provider(config).model,
     )
     # Override the user message content with the merged text
     payload["messages"][1]["content"] = merged_text
 
-    provider = config.text_provider
+    provider = _batch_text_provider(config)
     headers: dict[str, str] = {"Content-Type": "application/json"}
     if provider.api_key:
         headers["Authorization"] = f"Bearer {provider.api_key}"
@@ -845,7 +871,7 @@ def _apply_ai_lifecycle_event_if_matched(
         decision = _invoke_with_prompt_audit(
             session_factory=session_factory,
             raw_message=raw_message,
-            model=config.text_provider.model,
+            model=_batch_text_provider(config).model,
             prompt_versions=prompt_versions,
             call=lambda: _call_lifecycle_event_ai(
                 raw_message=raw_message,
@@ -1041,7 +1067,7 @@ def _call_lifecycle_event_ai(
     config: AiRecognitionConfig,
     system_prompt: str,
 ) -> dict[str, Any]:
-    provider = config.text_provider
+    provider = _batch_text_provider(config)
     payload = {
         "model": provider.model,
         "messages": [
@@ -2736,7 +2762,7 @@ def infer_deepseek_auxiliary(
 ) -> dict[str, Any] | None:
     """Run text-only DeepSeek assessment without persisting or mutating state."""
 
-    if not config.text_provider.is_configured:
+    if not _batch_text_provider(config).is_configured:
         return None
     seed_default_prompt_registry(session_factory, config)
     composition = compose_trading_prompt(
@@ -2779,15 +2805,15 @@ def infer_deepseek_auxiliary(
                 raw_message=raw_message,
                 media_assets=[],
                 prompt=composition.system_prompt,
-                model=config.text_provider.model,
+                model=_batch_text_provider(config).model,
             )
             request_payload["messages"][1]["content"] = user_content
             headers = {"Content-Type": "application/json"}
-            if config.text_provider.api_key:
-                headers["Authorization"] = f"Bearer {config.text_provider.api_key}"
-            with httpx.Client(timeout=config.text_provider.timeout_seconds) as client:
+            if _batch_text_provider(config).api_key:
+                headers["Authorization"] = f"Bearer {_batch_text_provider(config).api_key}"
+            with httpx.Client(timeout=_batch_text_provider(config).timeout_seconds) as client:
                 response = client.post(
-                    _chat_completions_url(config.text_provider.base_url),
+                    _chat_completions_url(_batch_text_provider(config).base_url),
                     json=request_payload,
                     headers=headers,
                 )
@@ -2817,7 +2843,7 @@ def infer_deepseek_auxiliary(
                 correlation_key=f"recognition:{raw_message_id}:deepseek",
                 raw_message_id=raw_message_id,
                 chat_id=raw_message.chat_id,
-                model=config.text_provider.model,
+                model=_batch_text_provider(config).model,
                 prompt_versions=composition.version_map,
                 status="failed" if error_message else "completed",
                 error_message=error_message,

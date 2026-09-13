@@ -221,6 +221,12 @@ AI_STAGE_KEYS: tuple[str, ...] = tuple(
 #: The stage whose chain head every other MiMo-facing check follows: the daily
 #: probe, the provider-health derivation and the prompt centre's "mimo" test.
 AUTHORITATIVE_STAGE = "authoritative_recognition"
+CONTEXT_RESOLUTION_STAGE = "context_resolution"
+SEMANTIC_REVIEW_STAGE = "semantic_review"
+STRATEGY_ALERT_STAGE = "strategy_alert"
+RESEARCH_CHAT_STAGE = "research_chat"
+BATCH_TEXT_STAGE = "batch_text_recognition"
+BATCH_IMAGE_STAGE = "batch_image_recognition"
 
 
 def stage_definition(stage_key: str) -> AiStageDefinition | None:

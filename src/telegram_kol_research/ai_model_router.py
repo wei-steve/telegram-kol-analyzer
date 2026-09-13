@@ -144,6 +144,69 @@ def request_reached_provider(error: BaseException) -> bool:
     return bool(made)
 
 
+async def async_run_with_fallback(
+    chain: Sequence[AiModelConfig],
+    attempt: Callable[..., Any],
+    *,
+    budget_seconds: float | None = None,
+    min_remaining_seconds: float = MIN_REMAINING_SECONDS,
+    classify: Callable[[BaseException], bool] = always_fallback,
+    monotonic: Callable[[], float] = time.monotonic,
+) -> RouterResult:
+    """:func:`run_with_fallback` for an ``await``-able attempt.
+
+    Same decisions, same :class:`RouterResult`; the only difference is that
+    ``attempt`` is awaited. It exists because ``strategy_alert`` and
+    ``research_chat`` run on the event loop, and pushing their HTTP call
+    through ``to_thread`` only to get a fallback would put a blocking client
+    where an async one already works. A test pins the two against each other.
+    """
+
+    started = monotonic()
+    failures: list[ModelFailure] = []
+    fallback_from: list[str] = []
+    models = list(chain)
+    for index, model in enumerate(models):
+        deadline: float | None = None
+        if budget_seconds is not None:
+            remaining = float(budget_seconds) - (monotonic() - started)
+            if index > 0 and remaining < float(min_remaining_seconds):
+                return RouterResult(
+                    succeeded=False,
+                    fallback_from=tuple(fallback_from),
+                    failures=tuple(failures),
+                    skipped_for_budget=tuple(item.id for item in models[index:]),
+                )
+            deadline = max(0.0, min(float(budget_seconds), remaining))
+        try:
+            value = await attempt(model, deadline_seconds=deadline)
+        except Exception as exc:  # noqa: BLE001 - the chain decides, not the type
+            failures.append(
+                ModelFailure(
+                    model_id=model.id,
+                    model=model.model,
+                    message=str(exc) or type(exc).__name__,
+                )
+            )
+            if not classify(exc):
+                break
+            if index + 1 < len(models):
+                fallback_from.append(model.id)
+            continue
+        return RouterResult(
+            succeeded=True,
+            model=model,
+            value=value,
+            fallback_from=tuple(fallback_from),
+            failures=tuple(failures),
+        )
+    return RouterResult(
+        succeeded=False,
+        fallback_from=tuple(fallback_from),
+        failures=tuple(failures),
+    )
+
+
 def run_with_fallback(
     chain: Sequence[AiModelConfig],
     attempt: Callable[..., Any],

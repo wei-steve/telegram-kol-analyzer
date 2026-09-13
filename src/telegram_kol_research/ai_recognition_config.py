@@ -788,6 +788,26 @@ def migrate_v1_ai_config(
     return providers, models, stages
 
 
+def stage_head_provider(
+    config: AiRecognitionConfig,
+    stage_key: str,
+    *,
+    legacy: AiProviderConfig | None = None,
+) -> AiProviderConfig:
+    """The provider one stage starts with, with the v1 field as the fallback.
+
+    Used by the stages that only ever make a single attempt (the batch tools,
+    the prompt centre's test runs): they need the head, not the chain. A
+    configuration with no v2 model table keeps whatever the v1 field said, so
+    a hand-built config behaves exactly as it did.
+    """
+
+    chain = resolve_stage_models(config, stage_key)
+    if chain:
+        return chain[0].provider
+    return legacy if legacy is not None else AiProviderConfig()
+
+
 def _migrated_model_id(source_id: str, *, taken: Iterable[str]) -> str:
     """Keep an id that is already a usable key; repair one that is not.
 
