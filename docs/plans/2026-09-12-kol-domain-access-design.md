@@ -1,5 +1,11 @@
 # kol.dwpc.com.cn access design
 
+> **Superseded in part (2026-09-13):** the Basic Auth layer described below has been
+> replaced by an in-application login page and signed session cookie. See
+> `docs/plans/2026-09-13-web-login-design.md` for the replacement and
+> `docs/web-login-status.md` for the cutover evidence. Everything else in this
+> document (DNS, the vhost, TLS, the loopback-bound proxy target) still stands.
+
 ## Goal
 
 Publish the existing Web role at `https://kol.dwpc.com.cn` without exposing its

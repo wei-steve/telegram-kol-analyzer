@@ -8,9 +8,35 @@ Open the web app from a computer or phone browser:
 
 ```text
 http://43.167.220.225/
+https://kol.dwpc.com.cn/
 ```
 
-The site is protected by Nginx Basic Auth.
+The site is protected by the application's own login page, not by Nginx Basic
+Auth. `GET /login` serves an HTML form whose fields carry
+`autocomplete="username"` / `autocomplete="current-password"`, so a browser
+password manager saves and refills the credential; a successful POST sets a
+signed, 30-day, sliding-renewal cookie (`telegram_kol_web_session`). Requests
+without a valid cookie are redirected to `/login` (browser navigations) or
+answered `401` (fetch/SSE). Loopback requests that carry no `X-Forwarded-For`
+header are exempt, which is what keeps the server-side monitor and diagnostic
+scripts working; every request arriving through Nginx carries that header and
+therefore always needs the cookie.
+
+The login is configured entirely through `/etc/telegram-kol-web.env`:
+`TELEGRAM_KOL_WEB_LOGIN_USERNAME`, `TELEGRAM_KOL_WEB_LOGIN_PASSWORD_HASH`,
+`TELEGRAM_KOL_WEB_SESSION_SECRET` and the optional
+`TELEGRAM_KOL_WEB_SESSION_DAYS` (default 30). All three required variables
+absent means login is disabled; a *partial* configuration makes the web process
+refuse to start. Generate the hash with
+
+```bash
+/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research web-login-password-hash
+```
+
+which reads the password without echo (or from one stdin line when piped) and
+prints a `scrypt$...` value. Never pass the password as a command-line argument.
+Design: `docs/plans/2026-09-13-web-login-design.md`; deployment evidence:
+`docs/web-login-status.md`.
 
 ## Current action-scoped release workflow
 
