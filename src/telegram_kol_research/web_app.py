@@ -9,6 +9,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
 import asyncio
+import base64
 import concurrent.futures
 import grp
 import hashlib
@@ -21,7 +22,7 @@ import re
 import secrets
 import threading
 import time
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode
 
 import httpx
 from sqlalchemy import func, select
@@ -29,7 +30,14 @@ from sqlalchemy import func, select
 try:
     from fastapi import FastAPI, Request
     from fastapi import HTTPException
-    from fastapi.responses import FileResponse, HTMLResponse, Response, StreamingResponse
+    from fastapi.responses import (
+        FileResponse,
+        HTMLResponse,
+        JSONResponse,
+        RedirectResponse,
+        Response,
+        StreamingResponse,
+    )
     from fastapi.staticfiles import StaticFiles
     from fastapi.templating import Jinja2Templates
 except (
@@ -427,6 +435,262 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
     "web": frozenset(),
 }
 logger = logging.getLogger(__name__)
+
+
+WEB_LOGIN_SESSION_COOKIE_NAME = "telegram_kol_web_session"
+WEB_LOGIN_USERNAME_ENV = "TELEGRAM_KOL_WEB_LOGIN_USERNAME"
+WEB_LOGIN_PASSWORD_HASH_ENV = "TELEGRAM_KOL_WEB_LOGIN_PASSWORD_HASH"
+WEB_LOGIN_SESSION_SECRET_ENV = "TELEGRAM_KOL_WEB_SESSION_SECRET"
+WEB_LOGIN_SESSION_DAYS_ENV = "TELEGRAM_KOL_WEB_SESSION_DAYS"
+DEFAULT_WEB_LOGIN_SESSION_DAYS = 30
+WEB_LOGIN_EXEMPT_PATHS = frozenset({"/login", "/logout"})
+WEB_LOGIN_FAILURE_DELAY_SECONDS = 1.0
+# 128 * N * r bytes of scratch memory: 16 MiB here, under the 32 MiB OpenSSL
+# default that ``hashlib.scrypt`` enforces when ``maxmem`` is left at 0.
+WEB_LOGIN_SCRYPT_N = 2 ** 14
+WEB_LOGIN_SCRYPT_R = 8
+WEB_LOGIN_SCRYPT_P = 1
+
+
+@dataclass(frozen=True)
+class WebLoginConfig:
+    """Resolved web-login settings, or absent entirely when login is off."""
+
+    username: str
+    password_hash: str
+    session_secret: str
+    session_days: int = DEFAULT_WEB_LOGIN_SESSION_DAYS
+
+    @property
+    def session_max_age_seconds(self) -> int:
+        return int(self.session_days) * 86400
+
+
+def build_web_login_password_hash(
+    password: str,
+    *,
+    n: int = WEB_LOGIN_SCRYPT_N,
+    r: int = WEB_LOGIN_SCRYPT_R,
+    p: int = WEB_LOGIN_SCRYPT_P,
+    salt: bytes | None = None,
+) -> str:
+    """Return ``scrypt$<n>$<r>$<p>$<salt_b64>$<hash_b64>`` for ``password``."""
+
+    if not password:
+        raise ValueError("password must not be empty")
+    salt_bytes = secrets.token_bytes(16) if salt is None else salt
+    derived = hashlib.scrypt(
+        password.encode("utf-8"), salt=salt_bytes, n=n, r=r, p=p, dklen=32
+    )
+    return "scrypt${n}${r}${p}${salt}${hash}".format(
+        n=n,
+        r=r,
+        p=p,
+        salt=base64.b64encode(salt_bytes).decode("ascii"),
+        hash=base64.b64encode(derived).decode("ascii"),
+    )
+
+
+def verify_web_login_password(password: str, stored_hash: str) -> bool:
+    """Constant-time check of ``password`` against a stored scrypt hash."""
+
+    parts = str(stored_hash or "").split("$")
+    if len(parts) != 6 or parts[0] != "scrypt":
+        return False
+    try:
+        n = int(parts[1])
+        r = int(parts[2])
+        p = int(parts[3])
+        salt_bytes = base64.b64decode(parts[4], validate=True)
+        expected = base64.b64decode(parts[5], validate=True)
+    except (ValueError, TypeError):
+        return False
+    if n < 2 or r < 1 or p < 1 or not salt_bytes or not expected:
+        return False
+    try:
+        derived = hashlib.scrypt(
+            str(password or "").encode("utf-8"),
+            salt=salt_bytes,
+            n=n,
+            r=r,
+            p=p,
+            dklen=len(expected),
+        )
+    except ValueError:
+        return False
+    return hmac.compare_digest(derived, expected)
+
+
+def load_web_login_config(env: dict[str, str] | None = None) -> WebLoginConfig | None:
+    """Read the login configuration from the environment.
+
+    All three required variables absent means login is disabled, which is the
+    behaviour every existing deployment and test has today. Any *partial*
+    configuration is a misconfiguration and raises, so the process refuses to
+    start half-protected rather than silently serving an open site.
+    """
+
+    source = os.environ if env is None else env
+    username = str(source.get(WEB_LOGIN_USERNAME_ENV, "") or "").strip()
+    password_hash = str(source.get(WEB_LOGIN_PASSWORD_HASH_ENV, "") or "").strip()
+    session_secret = str(source.get(WEB_LOGIN_SESSION_SECRET_ENV, "") or "").strip()
+
+    present = [bool(username), bool(password_hash), bool(session_secret)]
+    if not any(present):
+        return None
+    if not all(present):
+        missing = [
+            name
+            for name, value in (
+                (WEB_LOGIN_USERNAME_ENV, username),
+                (WEB_LOGIN_PASSWORD_HASH_ENV, password_hash),
+                (WEB_LOGIN_SESSION_SECRET_ENV, session_secret),
+            )
+            if not value
+        ]
+        raise ValueError(
+            "web login is partially configured; missing: " + ", ".join(missing)
+        )
+    if not password_hash.startswith("scrypt$"):
+        raise ValueError(
+            f"{WEB_LOGIN_PASSWORD_HASH_ENV} must be a scrypt$... hash produced by "
+            "`telegram-kol-research web-login-password-hash`"
+        )
+
+    raw_days = str(source.get(WEB_LOGIN_SESSION_DAYS_ENV, "") or "").strip()
+    if raw_days:
+        try:
+            session_days = int(raw_days)
+        except ValueError as exc:
+            raise ValueError(
+                f"{WEB_LOGIN_SESSION_DAYS_ENV} must be a positive integer"
+            ) from exc
+        if session_days < 1:
+            raise ValueError(
+                f"{WEB_LOGIN_SESSION_DAYS_ENV} must be a positive integer"
+            )
+    else:
+        session_days = DEFAULT_WEB_LOGIN_SESSION_DAYS
+
+    return WebLoginConfig(
+        username=username,
+        password_hash=password_hash,
+        session_secret=session_secret,
+        session_days=session_days,
+    )
+
+
+def _web_login_signature(secret: str, payload: str) -> str:
+    return hmac.new(
+        secret.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256
+    ).hexdigest()
+
+
+def issue_web_login_cookie_value(config: WebLoginConfig, now_unix: int) -> str:
+    """Mint ``v1.<exp_unix>.<nonce>.<hmac_sha256_hex>``."""
+
+    expires_at = int(now_unix) + config.session_max_age_seconds
+    nonce = secrets.token_urlsafe(12)
+    payload = f"v1.{expires_at}.{nonce}"
+    return f"{payload}.{_web_login_signature(config.session_secret, payload)}"
+
+
+def verify_web_login_cookie_value(
+    config: WebLoginConfig, raw_value: str, now_unix: int
+) -> int | None:
+    """Return the cookie's expiry when it is authentic and unexpired."""
+
+    parts = str(raw_value or "").split(".")
+    if len(parts) != 4 or parts[0] != "v1":
+        return None
+    try:
+        expires_at = int(parts[1])
+    except ValueError:
+        return None
+    payload = f"v1.{parts[1]}.{parts[2]}"
+    expected = _web_login_signature(config.session_secret, payload)
+    if not hmac.compare_digest(expected, parts[3]):
+        return None
+    if expires_at <= int(now_unix):
+        return None
+    return expires_at
+
+
+def web_request_is_secure(request: Request) -> bool:
+    forwarded = str(request.headers.get("x-forwarded-proto", "") or "")
+    first = forwarded.split(",")[0].strip().lower()
+    if first:
+        return first == "https"
+    return request.url.scheme == "https"
+
+
+def web_request_is_direct_loopback(request: Request) -> bool:
+    """Match ``require_monitor_capture_auth``'s "local direct connection" test.
+
+    A request that arrived through Nginx always carries ``X-Forwarded-For``, so
+    this exemption cannot be reached from the internet; it exists so the
+    server-side monitor and diagnostic scripts on 127.0.0.1 keep working.
+    """
+
+    client_host = request.client.host if request.client is not None else ""
+    return (
+        client_host in {"127.0.0.1", "::1"}
+        and "x-forwarded-for" not in request.headers
+    )
+
+
+def web_login_client_ip(request: Request) -> str:
+    forwarded = str(request.headers.get("x-forwarded-for", "") or "")
+    first = forwarded.split(",")[0].strip()
+    if first:
+        return first
+    return request.client.host if request.client is not None else "unknown"
+
+
+def sanitize_web_login_next(raw_next: str | None) -> str:
+    """Only same-site absolute paths survive; everything else becomes ``/``."""
+
+    candidate = str(raw_next or "")
+    if (
+        not candidate.startswith("/")
+        or candidate.startswith("//")
+        or candidate.startswith("/\\")
+    ):
+        return "/"
+    return candidate
+
+
+def set_web_login_cookie(
+    response: Response,
+    config: WebLoginConfig,
+    request: Request,
+    now_unix: int,
+) -> None:
+    response.set_cookie(
+        WEB_LOGIN_SESSION_COOKIE_NAME,
+        issue_web_login_cookie_value(config, now_unix),
+        max_age=config.session_max_age_seconds,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=web_request_is_secure(request),
+    )
+
+
+def clear_web_login_cookie(response: Response, request: Request) -> None:
+    response.delete_cookie(
+        WEB_LOGIN_SESSION_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="lax",
+        secure=web_request_is_secure(request),
+    )
+
+
+def web_request_wants_html(request: Request) -> bool:
+    return request.method == "GET" and "text/html" in str(
+        request.headers.get("accept", "") or ""
+    )
 
 
 def resolve_runtime_role(value: str) -> str:
@@ -5187,6 +5451,7 @@ def create_web_app(
     """Create the minimal FastAPI app used by the web command."""
 
     resolved_runtime_role = resolve_runtime_role(runtime_role)
+    web_login_config = load_web_login_config()
     deployment_entry_frozen = deployment_entry_admission_frozen()
     split_runtime = resolved_runtime_role != "all"
     resolved_ingest_refresh_url = resolve_ingest_refresh_url(ingest_refresh_url)
@@ -6333,6 +6598,44 @@ def create_web_app(
             )
         return response
 
+    app.state.web_login_config = web_login_config
+
+    # Registered after ``cache_versioned_workbench_assets``: Starlette runs the
+    # most recently added http middleware outermost, so authentication is
+    # decided first and the asset-cache middleware keeps seeing exactly the
+    # requests and responses it saw before.
+    @app.middleware("http")
+    async def require_web_login(request: Request, call_next):
+        config = app.state.web_login_config
+        if config is None:
+            return await call_next(request)
+
+        path = request.url.path
+        if (
+            path in WEB_LOGIN_EXEMPT_PATHS
+            or path == "/static"
+            or path.startswith("/static/")
+            or web_request_is_direct_loopback(request)
+        ):
+            return await call_next(request)
+
+        now_unix = int(time.time())
+        raw_cookie = request.cookies.get(WEB_LOGIN_SESSION_COOKIE_NAME, "")
+        expires_at = verify_web_login_cookie_value(config, raw_cookie, now_unix)
+        if expires_at is None:
+            if web_request_wants_html(request):
+                target = "/login?" + urlencode({"next": sanitize_web_login_next(path)})
+                return RedirectResponse(target, status_code=302)
+            return JSONResponse(
+                {"detail": "authentication required"}, status_code=401
+            )
+
+        response = await call_next(request)
+        remaining = expires_at - now_unix
+        if remaining * 2 < config.session_max_age_seconds:
+            set_web_login_cookie(response, config, request, now_unix)
+        return response
+
     async def ensure_message_processing_worker_mode() -> None:
         if not runtime_role_starts_singleton_task(
             app.state.runtime_role, "message_processing_worker"
@@ -6546,6 +6849,71 @@ def create_web_app(
         StaticFiles(directory=str(Path(__file__).parent / "static")),
         name="static",
     )
+
+    def _render_login_page(
+        request: Request, *, next_path: str, error: str | None = None
+    ):
+        return templates.TemplateResponse(
+            request,
+            "login.html",
+            {
+                "asset_version": app.state.asset_version,
+                "next_path": next_path,
+                "error": error,
+            },
+        )
+
+    @app.get("/login")
+    def login_page(request: Request):
+        config = app.state.web_login_config
+        next_path = sanitize_web_login_next(request.query_params.get("next"))
+        if config is None:
+            return RedirectResponse(next_path, status_code=302)
+        raw_cookie = request.cookies.get(WEB_LOGIN_SESSION_COOKIE_NAME, "")
+        if verify_web_login_cookie_value(config, raw_cookie, int(time.time())):
+            return RedirectResponse(next_path, status_code=302)
+        return _render_login_page(request, next_path=next_path)
+
+    @app.post("/login")
+    async def login_submit(request: Request):
+        config = app.state.web_login_config
+        # ``parse_qs`` on the raw body on purpose: ``fastapi.Form`` needs
+        # ``python-multipart``, which is not a dependency of this project and
+        # which ``tg-deploy`` would not install.
+        body = await request.body()
+        fields = parse_qs(body.decode("utf-8", "replace"), keep_blank_values=True)
+        next_path = sanitize_web_login_next(
+            (fields.get("next") or [""])[0] or request.query_params.get("next")
+        )
+        if config is None:
+            return RedirectResponse(next_path, status_code=302)
+
+        username = (fields.get("username") or [""])[0]
+        password = (fields.get("password") or [""])[0]
+        username_ok = hmac.compare_digest(
+            config.username.encode("utf-8"), username.encode("utf-8")
+        )
+        password_ok = verify_web_login_password(password, config.password_hash)
+        if not (username_ok and password_ok):
+            await asyncio.sleep(WEB_LOGIN_FAILURE_DELAY_SECONDS)
+            logger.warning(
+                "web login failed from %s", web_login_client_ip(request)
+            )
+            return _render_login_page(
+                request,
+                next_path=next_path,
+                error="用户名或密码错误",
+            )
+
+        response = RedirectResponse(next_path, status_code=302)
+        set_web_login_cookie(response, config, request, int(time.time()))
+        return response
+
+    @app.post("/logout")
+    def logout_submit(request: Request):
+        response = RedirectResponse("/login", status_code=302)
+        clear_web_login_cookie(response, request)
+        return response
 
     @app.get("/logs")
     def logs_page(request: Request):

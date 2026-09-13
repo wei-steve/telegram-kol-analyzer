@@ -2,6 +2,7 @@
 
 import asyncio
 import ctypes
+import getpass
 import hashlib
 import json
 import os
@@ -332,6 +333,7 @@ from telegram_kol_research.tpsl_ledger_backfill import (
 )
 from telegram_kol_research.web_app import (
     DEFAULT_INGEST_REFRESH_URL,
+    build_web_login_password_hash,
     create_web_app,
     resolve_runtime_role,
     runtime_role_owns_telegram_session,
@@ -6814,6 +6816,32 @@ def deepcoin_shadow_binding_export(
             sort_keys=True,
         )
     )
+
+
+@app.command("web-login-password-hash")
+def web_login_password_hash() -> None:
+    """Print a TELEGRAM_KOL_WEB_LOGIN_PASSWORD_HASH value for a password.
+
+    The password is read from the terminal without echo, or from a single
+    stdin line when stdin is not a tty (so it can be piped from a protected
+    file). It is never accepted as a command-line argument, which would leave
+    it in the shell history and in ``ps`` output.
+    """
+
+    if sys.stdin.isatty():
+        password = getpass.getpass("Web login password: ")
+        confirmation = getpass.getpass("Repeat password: ")
+        if password != confirmation:
+            typer.echo("Passwords do not match.", err=True)
+            raise typer.Exit(code=1)
+    else:
+        password = sys.stdin.readline().rstrip("\n")
+
+    if not password:
+        typer.echo("Password must not be empty.", err=True)
+        raise typer.Exit(code=1)
+
+    typer.echo(build_web_login_password_hash(password))
 
 
 def main() -> None:
