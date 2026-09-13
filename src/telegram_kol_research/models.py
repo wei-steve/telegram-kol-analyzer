@@ -1601,6 +1601,10 @@ class MimoRecognitionAttempt(Base):
     ordinal: Mapped[int] = mapped_column(Integer, nullable=False)
     retry_of_ordinal: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: Which model this attempt actually called. NULL on rows written before
+    #: a stage could hold more than one model, which the provider-health
+    #: derivation reads as "the chain head", because that is what they were.
+    model: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     error_code: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     error_message: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     response_fingerprint: Mapped[Optional[str]] = mapped_column(

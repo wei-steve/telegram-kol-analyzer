@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 2
+current_phase: 3
 phase_status: planned        # planned | in_progress | completed | blocked
 deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 ```
@@ -19,8 +19,8 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 
 | 阶段 | 内容 | 状态 | 提交 | 测试 |
 |---|---|---|---|---|
-| 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | 见下方证据 | 全量 8713 passed / 0 failed / 4 skipped |
-| 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | planned | | |
+| 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | `18d62606` | 全量 8713 passed / 0 failed / 4 skipped |
+| 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | 见下方证据 | 全量 8746 passed / 0 failed / 4 skipped |
 | 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | planned | | |
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证截图 | planned | | |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | planned | | |
@@ -43,6 +43,38 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 `cli.py`：新增 `telegram-kol-research ai-config-show [--ai-config-path PATH] [--json]`，
 只读打印 providers / models / 每个 stage 的绑定与有效链，API Key 只显示末 4 位。
+
+## 阶段 2 做了什么
+
+新增 `src/telegram_kol_research/ai_model_router.py`：
+- `resolve_stage_chain(config, stage_key)`；
+- `run_with_fallback(chain, attempt, *, budget_seconds, min_remaining_seconds, classify, monotonic)`
+  → `RouterResult(succeeded, model, value, fallback_from, failures, skipped_for_budget)`；
+- `MIN_REMAINING_SECONDS = 20.0`；`request_reached_provider` 是本项目用的分类器
+  （读异常上挂的 `MimoProviderAttemptTelemetry.provider_request_made`）。
+
+审计：`mimo_recognition_attempts` 新增可空列 `model VARCHAR(128)`
+（ORM + `db.SQLITE_COMPAT_COLUMNS` 补列 + `record_mimo_attempt(model=...)` + 视图字段）。
+`complete_mimo_run(model=...)` 可在完成时把 run 的模型改写成真正答题的那个。
+
+权威识别：
+- `recognition_experiments.resolve_authoritative_chain(config)` 是唯一取链处；
+  `_find_mimo_model` 保留为兼容包装（返回链首），探测与提示词中心照旧用它。
+- `infer_mimo_authoritative_v2`（v2）与 `run_mimo_authoritative_for_message`（v1）都遍历链，
+  每个模型内部保留原有的同模型重试与单请求 240 s 时限，**整条链共用 240 s 预算**。
+- run 的 `model` 是答题模型（全失败写链首）；每条 attempt 写实际模型；
+  `prompt_invocations` 与 `recognition_experiments` 结果里的 model 同样是实际模型。
+- `authoritative_recognition._run_v1_authority_with_audit` 的
+  `image_provider.model or "mimo-v2.5"` 改为链首；并按链里每个模型各写一条 attempt 行。
+
+健康线（`mimo_provider_health`）：
+- `resolve_chain_head_model()` 读 `authoritative_recognition` 链首；
+  `_load_recent_attempt_rows` / `_load_streak_rows` 只取 `model IS NULL OR model = <链首>`；
+  `load_latest_provider_outage` / 两个 tick 都接受 `chain_head_model` 或 `config_loader`。
+- 故障告警在检测到备用模型正在答题时，摘要多一个 `fallback_note`
+  （`已切换到备用模型 <id> 继续识别`，走 `_safe_text`），`impact` 改为
+  `authoritative_recognition_on_fallback_model`；Telegram 文案的「影响」行随之改写，
+  不再说「新消息无法完成权威识别」。`runtime_incidents._SUMMARY_FIELDS` 相应放行 `fallback_note`。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -93,18 +125,58 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
    会在 id 不可用时回退（先按 provider 匹配，再取第一个满足能力且已配置的模型）。
    用解析后的结果，才满足验收里那条更强的要求：「行为与迁移前逐环节一致」。
 
+10. **链的时间预算按「每次请求」而不是「每个模型」重算（`_remaining_deadline`）。**
+    设计说「每个请求的总时限 = min(240, 剩余)」。照字面只在模型开始时算一次是不够的：
+    同一个模型的第二次重试会拿到一份全新的时限——这正是改动前就存在的一个洞
+    （第一次尝试跑 239 s 不触顶、重试再给 240 s，两次请求加一次阻塞读会超过 300 s 租约）。
+    现在每次请求前都用「这一片预算 − 已用」重算，重试延时也算在内，所以整条链的墙钟时间
+    ≤ 240 s，加上最后一次阻塞读的 60 s 正好 ≤ 300 s 的作业认领租约。
+
+11. **v1 审计改成「链里每个模型一行 attempt」。**
+    改动前 v1 一次 run 只写 1 行（ordinal 1），同模型的重试藏在聚合里。
+    要满足「attempt 1 是主模型失败、attempt 2 是备用成功」，就必须按模型拆行。
+    单模型链的那一行与改动前逐字段一致：`started_at` 用整次调用的开始、`completed_at` 用结束、
+    `duration_ms` 用整次调用的耗时（多模型链时最后一行吸收余量），所以没有配备用时什么都没变。
+
+12. **`retry_of_ordinal` 只在同一个模型内部指向前一次。**
+    备用模型的第一次请求不是主模型那次的重试，原来的 `ordinal - 1` 会把它写成重试。
+
+13. **多模型失败时，错误信息里每个模型的摘要要先去掉 `response_body=` 尾巴
+    （`ModelFailure.describe`）。**
+    `mimo_recognition_runs._sanitize_error_message` 里 `response_body=.*$` 一直吃到字符串结尾，
+    直接拼接会让第一个模型的响应体把后面所有模型的摘要吞掉，错误里就只剩一个模型。
+    响应体本来就要被打码，所以在拼接前先截掉。单模型链的错误文本一个字节都没变。
+
+14. **健康线读不到配置时「失败即全量统计」，而不是不统计。**
+    `resolve_chain_head_model` 返回 `None` 时不加任何模型过滤，也就是改动前的行为。
+    一个悄悄停止计数的健康检查，正是这个模块存在的理由。
+
+15. **被禁用或未配置的成员不参与路由，所以链可能为空；空链 = 「未配置」。**
+    v2 配置里 `authoritative_recognition` 解析为空时，走的是原本「MiMo model is not configured」
+    那条路径，语义没变。只带 v1 字段的手工 config（大量既有测试）仍然回退到
+    `id/model == mimo-v2.5` 的老规则，`resolve_authoritative_chain` 里写明了。
+
+16. **健康线的两个 tick 各自读一次 `config/ai_recognition.yaml`（每轮 ~20 s 两次）。**
+    没有把 `ai_recognition_config_loader` 从 `run_authoritative_gap_recovery_loop` 传下去，
+    因为那要改调用点的实参，会打到所有传 stub tick 的测试；两次 YAML 解析（~40 KB）
+    比这两个 tick 本来就要做的数据库扫描便宜得多。要优化留给阶段 3。
+
 ## 已知限制 / 后续课题
 
 - 主模型故障期间每条消息都先付一次主模型失败的代价；跨消息熔断/冷却未做（设计 §4）。
 - 上下文结合分析触发频率偏高，本次不改（`docs/known-issues-and-deferred-work.md`）。
 - 阶段 1 只改配置层，所有调用点仍走旧字段；行为与改动前一致。
+- 阶段 2 只接了 `authoritative_recognition`。其余环节（context_resolution / semantic_review /
+  strategy_alert / research_chat / batch_*）仍读旧字段，行为与改动前一致，阶段 3 再接。
+- `mimo_recognition_runs.model` 与 attempts 的 `model` 存的是**模型名**（`AiModelConfig.model`），
+  不是 stage 绑定里的 model id。同名模型挂在两个 provider 下时无法区分——这和 run 表原本就有的
+  歧义一样，本次没有扩大也没有解决。
 
 ## 证据
 
 ### 阶段 1
 
-- 提交：`feat(ai-routing): phase 1 provider/model/stage configuration (schema v2)`
-  （SHA 在阶段 2 提交里补写，提交自身无法写下自己的 SHA）
+- 提交：`18d62606`（`feat(ai-routing): phase 1 ...`）
 - 全量：`uv run python -m pytest -q` → **8713 passed, 4 skipped, 0 failed**（684 s）
 - 新增测试文件：`tests/test_ai_stage_config.py`（24 例）。关键用例：
   - `test_example_v1_config_migrates_every_stage_to_production_behaviour`
@@ -121,3 +193,40 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   - `test_config_view_masks_api_keys` / `test_ai_config_show_prints_the_effective_chain`
 - 上线前只读核对命令（服务器上执行，不写文件）：
   `telegram-kol-research ai-config-show --ai-config-path config/ai_recognition.yaml`
+
+### 阶段 2
+
+- 提交：`feat(ai-routing): phase 2 model chain for authoritative recognition`
+  （SHA 在紧随其后的文档提交里补写）
+- 全量：`uv run python -m pytest -q` → **8746 passed, 4 skipped, 0 failed**（645 s）
+- 新增测试文件：`tests/test_ai_model_router.py`（30 例）；`tests/test_ai_stage_config.py` 追加 3 例。关键用例：
+  - `test_v2_falls_back_to_the_backup_model_and_records_both[http_402|timeout|bad_json]`
+    —— 402 / 超时 / 坏 JSON 三种都由第二个模型给出权威判定，run.model = 备用，
+    attempt 1 = 主模型失败、attempt 2 = 备用成功
+  - `test_v2_retries_the_primary_within_itself_before_changing_model`
+  - `test_v2_reports_both_models_when_the_whole_chain_fails` —— 错误信息含两个模型各自的摘要，
+    run.model = 链首
+  - `test_v2_does_not_change_model_for_an_unreadable_image`
+  - `test_v2_does_not_change_model_when_the_request_never_left`
+  - `test_the_next_model_is_not_started_below_the_minimum_remaining_budget`
+  - `test_every_request_gets_what_is_left_of_the_one_shared_budget`
+  - `test_the_whole_chain_plus_one_blocked_read_fits_inside_the_claim_lease`（240 + 60 ≤ 300）
+  - `test_a_slow_first_attempt_does_not_hand_its_retry_a_fresh_deadline`
+  - `test_a_single_model_chain_records_exactly_one_attempt` /
+    `test_the_v1_audit_of_a_single_model_chain_is_unchanged`
+  - `test_v1_falls_back_and_reports_the_answering_model` /
+    `test_the_v1_audit_writes_one_row_per_model`
+  - `test_the_v1_run_model_is_the_chain_head_not_the_image_provider`
+  - 健康线：`test_a_backup_answering_is_not_the_primary_recovering`、
+    `test_the_primary_answering_on_the_next_message_is_a_recovery`、
+    `test_rows_written_before_the_column_existed_count_as_the_head`、
+    `test_a_backup_answer_does_not_break_the_primary_failure_streak`、
+    `test_the_outage_alert_says_a_backup_is_carrying_recognition`、
+    `test_the_telegram_alert_says_recognition_continued_on_the_backup`、
+    `test_a_message_answered_by_the_backup_is_never_replayed`
+- 架构守卫 `tests/test_recognition_authority_architecture.py` 继续通过。
+- 顺带发现（未修，不在本次范围）：`tests/test_web_app.py::
+  test_ingest_loop_health_exposes_admission_state_without_database` 是一个**既有的不稳定断言**。
+  它用 `assert "303" not in str(payload)` 证明 chat id 没有泄漏，但同一个 payload 里有
+  `now`（带微秒的 ISO 时间戳）和 `uptime_seconds`，任一处凑出 "303" 就会失败。
+  第一次全量跑到了这一下，重跑即过；单独跑、整文件跑都过。与本阶段改动无关。

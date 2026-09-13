@@ -15,9 +15,12 @@ It deliberately stays outside recognition:
   does not prove a recognition request would, and a 400-class defect is
   invisible to it.
 * **The same provider settings as recognition.** The model comes from the same
-  ``ai_recognition.yaml`` through ``_find_mimo_model``; the key travels only in
-  the request header and never reaches a log line or an incident summary --
-  failures are reported by class, kind, HTTP status and exception *type*.
+  ``ai_recognition.yaml`` through ``_find_mimo_model``, which is now the head of
+  the ``authoritative_recognition`` chain -- probing a backup would say nothing
+  about the model recognition actually starts with, and the head is what the
+  outage derivation counts. The key travels only in the request header and
+  never reaches a log line or an incident summary -- failures are reported by
+  class, kind, HTTP status and exception *type*.
 
 What counts as an answer was checked against the production provider on
 2026-09-13: ``200`` with one choice whose ``message.content`` is the empty

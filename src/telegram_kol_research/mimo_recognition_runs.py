@@ -89,6 +89,7 @@ class MimoRecognitionAttemptView:
     ordinal: int
     retry_of_ordinal: int | None
     status: str
+    model: str | None
     error_code: str | None
     error_message: str | None
     response_fingerprint: str | None
@@ -170,6 +171,7 @@ def record_mimo_attempt(
     ordinal: int,
     status: str,
     retry_of_ordinal: int | None = None,
+    model: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     response_payload: Any | None = None,
@@ -193,6 +195,7 @@ def record_mimo_attempt(
     normalized_attempt_phase = _optional_identifier(
         attempt_phase, field="attempt phase"
     )
+    normalized_model = _optional_bounded_text(model, field="model", max_length=128)
     if (
         provider_request_count is not None
         and (
@@ -252,6 +255,7 @@ def record_mimo_attempt(
             ordinal=ordinal,
             retry_of_ordinal=retry_of_ordinal,
             status=status,
+            model=normalized_model,
             error_code=normalized_error_code,
             error_message=safe_error,
             response_fingerprint=(
@@ -293,8 +297,15 @@ def complete_mimo_run(
     final_error_message: str | None = None,
     became_authoritative: bool = False,
     completed_at: datetime | None = None,
+    model: str | None = None,
 ) -> MimoRecognitionRunView:
-    """Make the only guarded state transition from running to terminal."""
+    """Make the only guarded state transition from running to terminal.
+
+    ``model`` names the model that actually produced the answer. A run starts
+    under the chain head; when a fallback model answered instead, this is
+    where the run's model becomes that one. Omitting it leaves the run's model
+    as it was started, which is what a single-model chain always wants.
+    """
 
     if status not in TERMINAL_RUN_STATUSES:
         raise MimoRecognitionRunValidationError("invalid terminal status")
@@ -332,6 +343,7 @@ def complete_mimo_run(
     normalized_error_code = _optional_identifier(
         final_error_code, field="final error code"
     )
+    normalized_model = _optional_bounded_text(model, field="model", max_length=128)
     safe_error = _sanitize_error_message(final_error_message)
     finished = completed_at or utc_now()
     with session_factory() as session:
@@ -355,12 +367,16 @@ def complete_mimo_run(
                 raise MimoRecognitionRunValidationError(
                     "selected attempt must be a completed attempt"
                 )
+        changes: dict[Any, Any] = {}
+        if normalized_model is not None:
+            changes[MimoRecognitionRun.model] = normalized_model
         updated = (
             session.query(MimoRecognitionRun)
             .filter(MimoRecognitionRun.id == run_id)
             .filter(MimoRecognitionRun.status == "running")
             .update(
                 {
+                    **changes,
                     MimoRecognitionRun.status: status,
                     MimoRecognitionRun.attempt_count: len(attempts),
                     MimoRecognitionRun.selected_attempt_ordinal: selected_ordinal,
@@ -504,6 +520,22 @@ def _optional_identifier(value: str | None, *, field: str) -> str | None:
     return normalized
 
 
+def _optional_bounded_text(
+    value: str | None,
+    *,
+    field: str,
+    max_length: int,
+) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized:
+        return None
+    if len(normalized) > max_length:
+        raise MimoRecognitionRunValidationError(f"invalid {field}")
+    return normalized
+
+
 def _bounded_required_text(value: str, *, field: str, max_length: int) -> str:
     normalized = str(value or "").strip()
     if not normalized or len(normalized) > max_length:
@@ -551,6 +583,7 @@ def _attempt_view(
         ordinal=row.ordinal,
         retry_of_ordinal=row.retry_of_ordinal,
         status=row.status,
+        model=row.model,
         error_code=row.error_code,
         error_message=row.error_message,
         response_fingerprint=row.response_fingerprint,

@@ -33,6 +33,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Any, Callable, Iterable, Sequence
 
 import httpx
+from sqlalchemy import or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.models import MimoRecognitionAttempt, RuntimeIncident
@@ -386,22 +387,87 @@ def derive_provider_outage(
     )
 
 
+#: Where the chain head is read from when no loader is supplied.
+DEFAULT_AI_CONFIG_PATH = "config/ai_recognition.yaml"
+
+
+def resolve_chain_head_model(
+    config_loader: Callable[[], Any] | None = None,
+    *,
+    ai_recognition_config_path: Any = DEFAULT_AI_CONFIG_PATH,
+) -> str | None:
+    """The model name at the head of ``authoritative_recognition``.
+
+    ``None`` means "could not tell" -- an unreadable configuration, or a stage
+    with nothing usable bound. Every caller then reads **all** attempt rows,
+    which is exactly what this module did before chains existed: a health
+    check that fails open is one that keeps working, and a health check that
+    quietly stops counting is the failure this module exists to end.
+    """
+
+    try:
+        from telegram_kol_research.ai_recognition_config import (
+            load_ai_recognition_config,
+        )
+        from telegram_kol_research.recognition_experiments import (
+            resolve_authoritative_chain,
+        )
+
+        config = (
+            config_loader()
+            if config_loader is not None
+            else load_ai_recognition_config(ai_recognition_config_path)
+        )
+        chain = resolve_authoritative_chain(config)
+    except Exception:
+        logger.warning(
+            "mimo provider health could not read the model chain; "
+            "counting every attempt row",
+            exc_info=True,
+        )
+        return None
+    return chain[0].model if chain else None
+
+
+def _chain_head_filter(query, chain_head_model: str | None):
+    """Only the primary model's attempts say whether *it* is available.
+
+    A fallback model answering proves nothing about the model that failed, so
+    counting its rows would announce a recovery in the middle of an outage --
+    the same mistake rule A already fixed for stale answers. Rows written
+    before the column existed carry ``NULL`` and were the head by definition.
+    """
+
+    if not chain_head_model:
+        return query
+    return query.filter(
+        or_(
+            MimoRecognitionAttempt.model.is_(None),
+            MimoRecognitionAttempt.model == chain_head_model,
+        )
+    )
+
+
 def _load_recent_attempt_rows(
     session_factory: sessionmaker,
     *,
     scan_limit: int,
+    chain_head_model: str | None = None,
 ) -> list[tuple[Any, Any, datetime, datetime]]:
     with session_factory() as session:
+        query = _chain_head_filter(
+            session.query(
+                MimoRecognitionAttempt.status,
+                MimoRecognitionAttempt.error_code,
+                MimoRecognitionAttempt.started_at,
+                MimoRecognitionAttempt.completed_at,
+            ),
+            chain_head_model,
+        )
         return [
             (row.status, row.error_code, row.started_at, row.completed_at)
             for row in (
-                session.query(
-                    MimoRecognitionAttempt.status,
-                    MimoRecognitionAttempt.error_code,
-                    MimoRecognitionAttempt.started_at,
-                    MimoRecognitionAttempt.completed_at,
-                )
-                .order_by(MimoRecognitionAttempt.id.desc())
+                query.order_by(MimoRecognitionAttempt.id.desc())
                 .limit(max(1, int(scan_limit)))
                 .all()
             )
@@ -412,9 +478,43 @@ def load_latest_provider_outage(
     session_factory: sessionmaker,
     *,
     scan_limit: int = DEFAULT_SCAN_LIMIT,
+    chain_head_model: str | None = None,
 ) -> ProviderOutage | None:
-    rows = _load_recent_attempt_rows(session_factory, scan_limit=scan_limit)
+    rows = _load_recent_attempt_rows(
+        session_factory,
+        scan_limit=scan_limit,
+        chain_head_model=chain_head_model,
+    )
     return derive_provider_outage(rows, scan_limit=scan_limit)
+
+
+def _fallback_model_answering_since(
+    session_factory: sessionmaker,
+    *,
+    since: datetime,
+    chain_head_model: str | None,
+) -> str | None:
+    """Which non-head model has answered since the outage started, if any.
+
+    The alert says so, because "recognition has stopped" and "the primary
+    model has stopped and a backup is carrying it" need different urgency
+    from the person reading it.
+    """
+
+    if not chain_head_model:
+        return None
+    cutoff = _aware(since).replace(tzinfo=None)
+    with session_factory() as session:
+        row = (
+            session.query(MimoRecognitionAttempt.model)
+            .filter(MimoRecognitionAttempt.completed_at >= cutoff)
+            .filter(MimoRecognitionAttempt.status == "completed")
+            .filter(MimoRecognitionAttempt.model.isnot(None))
+            .filter(MimoRecognitionAttempt.model != chain_head_model)
+            .order_by(MimoRecognitionAttempt.id.desc())
+            .first()
+        )
+    return str(row[0]) if row is not None and row[0] else None
 
 
 # --------------------------------------------------------------------------
@@ -463,8 +563,15 @@ def run_mimo_provider_health_tick(
     scan_limit: int = DEFAULT_SCAN_LIMIT,
     capture_unavailable: Callable[..., Any] | None = None,
     capture_recovered: Callable[..., Any] | None = None,
+    config_loader: Callable[[], Any] | None = None,
+    chain_head_model: str | None = None,
 ) -> dict[str, Any]:
     """One evaluation: alert an open outage per 30-minute bucket, or its end.
+
+    Only the chain head's attempts are counted: a fallback model answering
+    says nothing about whether the primary one is back, and the primary is
+    retried from the head of the chain on every new message anyway, so a real
+    recovery is still noticed within one tick.
 
     Returns what it decided, including ``rows_read`` -- the number of audit
     rows this tick actually examined. A healthy provider sends nothing, so that
@@ -473,7 +580,10 @@ def run_mimo_provider_health_tick(
     """
 
     current = _aware(now or datetime.now(UTC))
-    rows = _load_recent_attempt_rows(session_factory, scan_limit=scan_limit)
+    head = chain_head_model or resolve_chain_head_model(config_loader)
+    rows = _load_recent_attempt_rows(
+        session_factory, scan_limit=scan_limit, chain_head_model=head
+    )
     outage = derive_provider_outage(rows, scan_limit=scan_limit)
     rows_read = len(rows)
     if outage is None:
@@ -495,23 +605,36 @@ def run_mimo_provider_health_tick(
         capture = capture_unavailable or _default_capture(
             "capture_mimo_provider_unavailable"
         )
+        fallback_model = _fallback_model_answering_since(
+            session_factory,
+            since=outage.started_at,
+            chain_head_model=head,
+        )
         capture(
             session_factory,
             outage=outage,
             bucket=bucket,
             occurred_at=current,
+            fallback_model=fallback_model,
         )
         logger.warning(
             "mimo provider unavailable alert raised kind=%s http_status=%s "
-            "failures=%s started_at=%s bucket=%s scan_exhausted=%s",
+            "failures=%s started_at=%s bucket=%s scan_exhausted=%s "
+            "fallback_model=%s",
             outage.kind,
             outage.http_status,
             outage.failures,
             outage.started_at.isoformat(),
             bucket,
             outage.scan_exhausted,
+            fallback_model,
         )
-        return {"state": "unavailable_alerted", "bucket": bucket, "rows_read": rows_read}
+        return {
+            "state": "unavailable_alerted",
+            "bucket": bucket,
+            "rows_read": rows_read,
+            "fallback_model": fallback_model,
+        }
     if not _incident_recorded(
         session_factory,
         incident_type=UNAVAILABLE_INCIDENT_TYPE,
@@ -674,8 +797,19 @@ def _load_streak_rows(
     session_factory: sessionmaker,
     *,
     scan_limit: int,
+    chain_head_model: str | None = None,
 ) -> list[tuple[Any, Any, Any, Any, datetime]]:
     with session_factory() as session:
+        query = _chain_head_filter(
+            session.query(
+                MimoRecognitionAttempt.id,
+                MimoRecognitionAttempt.status,
+                MimoRecognitionAttempt.error_code,
+                MimoRecognitionAttempt.provider_request_count,
+                MimoRecognitionAttempt.completed_at,
+            ).filter(MimoRecognitionAttempt.completed_at.isnot(None)),
+            chain_head_model,
+        )
         return [
             (
                 row.id,
@@ -685,15 +819,7 @@ def _load_streak_rows(
                 row.completed_at,
             )
             for row in (
-                session.query(
-                    MimoRecognitionAttempt.id,
-                    MimoRecognitionAttempt.status,
-                    MimoRecognitionAttempt.error_code,
-                    MimoRecognitionAttempt.provider_request_count,
-                    MimoRecognitionAttempt.completed_at,
-                )
-                .filter(MimoRecognitionAttempt.completed_at.isnot(None))
-                .order_by(MimoRecognitionAttempt.id.desc())
+                query.order_by(MimoRecognitionAttempt.id.desc())
                 .limit(max(1, int(scan_limit)))
                 .all()
             )
@@ -726,6 +852,8 @@ def run_mimo_failure_streak_tick(
     now: datetime | None = None,
     scan_limit: int = STREAK_SCAN_LIMIT,
     capture: Callable[..., Any] | None = None,
+    config_loader: Callable[[], Any] | None = None,
+    chain_head_model: str | None = None,
 ) -> dict[str, Any]:
     """Alert each fresh streak once.
 
@@ -737,7 +865,10 @@ def run_mimo_failure_streak_tick(
     """
 
     current = _aware(now or datetime.now(UTC))
-    rows = _load_streak_rows(session_factory, scan_limit=scan_limit)
+    head = chain_head_model or resolve_chain_head_model(config_loader)
+    rows = _load_streak_rows(
+        session_factory, scan_limit=scan_limit, chain_head_model=head
+    )
     fresh = [
         streak
         for streak in derive_failure_streaks(rows)
@@ -759,7 +890,9 @@ def run_mimo_failure_streak_tick(
         failure = describe_failure_code(streak.error_code)
         if failure.failure_class == PROVIDER_UNAVAILABLE:
             if not outage_loaded:
-                outage = load_latest_provider_outage(session_factory)
+                outage = load_latest_provider_outage(
+                    session_factory, chain_head_model=head
+                )
                 outage_loaded = True
             if _outage_alert_covers(session_factory, outage, streak):
                 covered += 1

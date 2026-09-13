@@ -28,8 +28,10 @@ from typing import Iterable
 
 #: Provider and model ids are stable keys that appear in stage bindings and in
 #: stored audit rows, so they stay conservative -- but ``mimo-v2.5`` is an
-#: existing id, so a dot has to be legal.
-_SLUG = re.compile(r"^[a-z0-9][a-z0-9._-]{0,63}$")
+#: existing id, so a dot has to be legal, and the v1 model list has always let
+#: a person type the id, so upper case has to be too: rejecting ``Qwen-Max``
+#: would turn somebody's existing configuration into a save that fails.
+_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
 #: Well-known hosts get a readable provider id; anything else is slugified.
 PROVIDER_ID_BY_HOST: dict[str, str] = {

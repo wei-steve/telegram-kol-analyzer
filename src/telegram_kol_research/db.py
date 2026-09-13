@@ -167,6 +167,9 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         ),
     },
     "mimo_recognition_attempts": {
+        "model": (
+            "ALTER TABLE mimo_recognition_attempts ADD COLUMN model VARCHAR(128)"
+        ),
         "attempt_phase": (
             "ALTER TABLE mimo_recognition_attempts "
             "ADD COLUMN attempt_phase VARCHAR(32)"

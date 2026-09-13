@@ -324,15 +324,29 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
         reason = f"{reason}（HTTP {_safe_runtime_incident_value(http_code[5:], limit=8)}）"
     incident_type = str(incident.incident_type or "")
     if incident_type == "mimo_provider_unavailable":
+        # A stage can bind a backup model, and whether one is answering decides
+        # what this alert's "impact" line is allowed to say: "nothing is being
+        # recognised" would be false, and a person who reads it that way loses
+        # the urgency they should keep for the day the backup fails too.
+        fallback_note = str(summary.get("fallback_note") or "")
         lines = [
             "MiMo 识别供应商不可用",
             f"原因: {reason}",
             f"开始于: {value('episode_started_at')} (UTC)",
             f"最近一次失败: {value('last_failure_at')} (UTC)",
             f"已连续失败调用: {value('consecutive_failures')} 次",
-            "影响: 新消息无法完成权威识别，auto_trade 群的入场与管理指令在此期间不会执行",
-            "提醒: 未恢复前每 30 分钟提醒一次；恢复时另发一条恢复通知",
         ]
+        if fallback_note:
+            lines.append(
+                "影响: 主用模型不可用，"
+                f"{_safe_runtime_incident_value(fallback_note, limit=180)}；"
+                "识别未中断，但主用模型仍需处理"
+            )
+        else:
+            lines.append(
+                "影响: 新消息无法完成权威识别，auto_trade 群的入场与管理指令在此期间不会执行"
+            )
+        lines.append("提醒: 未恢复前每 30 分钟提醒一次；恢复时另发一条恢复通知")
         if str(summary.get("incident_state") or "").endswith("start_beyond_scan"):
             lines.append("注意: 故障开始时间早于本次读取范围，实际开始得更早")
     elif incident_type == "mimo_provider_recovered":

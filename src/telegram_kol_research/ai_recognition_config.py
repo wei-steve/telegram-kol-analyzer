@@ -21,6 +21,7 @@ from telegram_kol_research.ai_stage_catalog import (
     default_provider_label,
     is_valid_slug,
     provider_id_for_base_url,
+    slugify,
     stage_definition,
 )
 
@@ -501,11 +502,17 @@ def resolve_stage_models(
     """
 
     definition = stage_definition(stage_key)
-    providers = config.providers_by_id
-    models = config.models_by_id
+    # ``getattr`` rather than the properties: several call sites hand this a
+    # stand-in config object that only carries the v1 fields, and a stage
+    # lookup against one of those has to answer "nothing bound", not raise.
+    providers = {
+        provider.id: provider for provider in getattr(config, "providers", ()) or ()
+    }
+    models = {model.id: model for model in getattr(config, "models", ()) or ()}
+    stages = getattr(config, "stages", None) or {}
     resolved: list[AiModelConfig] = []
     seen: set[str] = set()
-    for model_id in config.stages.get(str(stage_key or ""), ()):
+    for model_id in stages.get(str(stage_key or ""), ()):
         model = models.get(str(model_id))
         if model is None or not model.enabled or model.id in seen:
             continue
@@ -711,10 +718,15 @@ def migrate_v1_ai_config(
     providers: list[AiProvider] = []
     provider_id_by_key: dict[tuple[str, str, float], str] = {}
     models: list[AiModel] = []
+    model_id_by_source: dict[str, str] = {}
     for entry in ai_models:
         normalized = _normalize_model_config(entry)
         if not normalized.id:
             continue
+        model_id = _migrated_model_id(
+            normalized.id, taken=model_id_by_source.values()
+        )
+        model_id_by_source[normalized.id] = model_id
         key = (normalized.base_url, normalized.api_key, normalized.timeout_seconds)
         provider_id = provider_id_by_key.get(key)
         if provider_id is None:
@@ -735,7 +747,7 @@ def migrate_v1_ai_config(
             )
         models.append(
             AiModel(
-                id=normalized.id,
+                id=model_id,
                 provider_id=provider_id,
                 model=normalized.model,
                 label=normalized.label or normalized.id,
@@ -747,7 +759,8 @@ def migrate_v1_ai_config(
 
     known = {model.id for model in models}
 
-    def _chain(model_id: str) -> list[str]:
+    def _chain(source_id: str) -> list[str]:
+        model_id = model_id_by_source.get(str(source_id or "").strip(), "")
         return [model_id] if model_id and model_id in known else []
 
     mimo_model_id = ""
@@ -773,6 +786,27 @@ def migrate_v1_ai_config(
         ),
     }
     return providers, models, stages
+
+
+def _migrated_model_id(source_id: str, *, taken: Iterable[str]) -> str:
+    """Keep an id that is already a usable key; repair one that is not.
+
+    The v1 model list never validated its ids -- the Web form writes whatever
+    was typed -- and a stage binding is only a stable key if the id is one.
+    Every id in use today passes unchanged; an exotic one is slugified rather
+    than dropped, because dropping it would delete the model.
+    """
+
+    if is_valid_slug(source_id):
+        return source_id
+    base = slugify(source_id, fallback="model")
+    used = set(taken)
+    if base not in used:
+        return base
+    suffix = 2
+    while f"{base}-{suffix}" in used:
+        suffix += 1
+    return f"{base}-{suffix}"
 
 
 def _derive_v1_view(
@@ -1225,11 +1259,16 @@ def _save_from_v1(
         ),
     )
     raw_stages = _preserved_stage_chains(path, raw_stages, models=raw_models)
-    providers, models, stages, warning_list, errors = normalize_ai_config_v2(
+    providers, models, stages, warning_list, _errors = normalize_ai_config_v2(
         raw_providers, raw_models, raw_stages
     )
-    if errors:
-        raise AiRecognitionConfigValidationError(errors)
+    # Deliberately lenient, unlike the v2 path: this caller has only the v1
+    # fields, so it cannot describe -- or fix -- a stage binding. Refusing its
+    # save would turn "the model list has an entry that cannot serve the
+    # authoritative stage" into a 500 on a form that has worked for months.
+    # The offending binding is dropped and logged; the save goes through.
+    for message in warning_list:
+        logger.warning("ai_recognition save: %s", message)
     return AiRecognitionConfig(
         **_normalized_prompts(config),
         mode=_resolve_mode(config),

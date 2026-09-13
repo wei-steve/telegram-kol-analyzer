@@ -1363,9 +1363,16 @@ def capture_mimo_provider_unavailable(
     outage: Any,
     bucket: int,
     occurred_at: datetime,
+    fallback_model: str | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
     """Capture one 30-minute bucket of a MiMo provider outage (step-18).
+
+    ``fallback_model`` names the backup model that has been answering while
+    the primary is down. The reader still needs to hear that the primary
+    failed -- an empty balance does not top itself up -- but "recognition has
+    stopped" and "a backup is carrying it" call for different urgency, so the
+    summary says which.
 
     ``outage`` is a ``mimo_provider_health.ProviderOutage``. The outage key
     travels only in ``source_record_id``, which the reminder dedup reads. The
@@ -1406,7 +1413,16 @@ def capture_mimo_provider_unavailable(
             last_failure_at=_deadline_label(outage.last_failure_at),
             consecutive_failures=int(outage.failures),
             retry_count=int(bucket),
-            impact="authoritative_recognition_unavailable",
+            impact=(
+                "authoritative_recognition_on_fallback_model"
+                if fallback_model
+                else "authoritative_recognition_unavailable"
+            ),
+            fallback_note=(
+                _safe_text(f"已切换到备用模型 {fallback_model} 继续识别")
+                if fallback_model
+                else None
+            ),
         ),
         minimal_summary=_summary(**fixed, retry_count=int(bucket)),
         occurred_at=occurred_at,

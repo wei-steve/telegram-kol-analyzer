@@ -137,6 +137,14 @@ _SUMMARY_FIELDS = frozenset(
         # the fields above; the range goes through ``_safe_sentence``.
         "message_posted_at",
         "entry_summary",
+        # A stage can now bind more than one model, so "the provider will not
+        # serve us" and "recognition has stopped" are no longer the same
+        # sentence. The primary failing is still an operations event the person
+        # has to act on -- a backup carrying recognition does not top up a
+        # balance -- but whether anything is being recognised meanwhile decides
+        # how fast they have to. The note is one fixed sentence plus a model
+        # id, through ``_safe_text``; the scan below still runs over it.
+        "fallback_note",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

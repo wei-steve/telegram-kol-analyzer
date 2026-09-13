@@ -518,6 +518,94 @@ def test_replacing_the_context_model_id_promotes_it_to_the_chain_head(tmp_path):
     assert "deepseek-v4-flash" in saved.stages["context_resolution"]
 
 
+def test_a_v1_shaped_save_is_never_refused_for_a_binding_it_cannot_express(tmp_path):
+    """The old form has no way to fix a stage; refusing it would be a 500."""
+
+    path = tmp_path / "ai_recognition.yaml"
+
+    saved = save_ai_recognition_config(
+        path,
+        AiRecognitionConfig(
+            mode="ai_provider",
+            ai_models=[
+                AiModelConfig(
+                    id="mimo-v2.5",
+                    label="MiMo V2.5",
+                    base_url="https://api.xiaomimimo.com/v1",
+                    api_key="mimo-key",
+                    model="mimo-v2.5",
+                    supports_text=True,
+                    # The person unticked "image" on the model list; the
+                    # authoritative stage needs it.
+                    supports_image=False,
+                )
+            ],
+            active_text_model_id="mimo-v2.5",
+        ),
+    )
+
+    assert saved.stages["authoritative_recognition"] == []
+    assert path.exists()
+
+
+def test_an_id_the_old_form_allowed_still_saves(tmp_path):
+    """Model ids were never validated; upper case is somebody's real config."""
+
+    path = tmp_path / "ai_recognition.yaml"
+
+    saved = save_ai_recognition_config(
+        path,
+        AiRecognitionConfig(
+            mode="ai_provider",
+            ai_models=[
+                AiModelConfig(
+                    id="Qwen-Max",
+                    label="Qwen Max",
+                    base_url="https://api.example.com/v1",
+                    api_key="k",
+                    model="qwen-max",
+                    supports_text=True,
+                )
+            ],
+            active_text_model_id="Qwen-Max",
+        ),
+    )
+
+    assert {model.id for model in saved.models} >= {"Qwen-Max"}
+    assert saved.stages["batch_text_recognition"] == ["Qwen-Max"]
+    assert _load(path).stages["batch_text_recognition"] == ["Qwen-Max"]
+
+
+def test_an_id_that_cannot_be_a_key_is_repaired_rather_than_dropped(tmp_path):
+    path = tmp_path / "ai_recognition.yaml"
+
+    saved = save_ai_recognition_config(
+        path,
+        AiRecognitionConfig(
+            mode="ai_provider",
+            ai_models=[
+                AiModelConfig(
+                    id="我的 模型!",
+                    label="Mine",
+                    base_url="https://api.example.com/v1",
+                    api_key="k",
+                    model="mine-v1",
+                    supports_text=True,
+                )
+            ],
+            active_text_model_id="我的 模型!",
+        ),
+    )
+
+    repaired = [
+        model.id
+        for model in saved.models
+        if model.model == "mine-v1"
+    ]
+    assert len(repaired) == 1
+    assert saved.stages["batch_text_recognition"] == repaired
+
+
 # ---------------------------------------------------------------------------
 # Masked view and CLI
 # ---------------------------------------------------------------------------

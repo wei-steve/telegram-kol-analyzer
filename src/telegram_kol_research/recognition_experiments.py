@@ -17,11 +17,17 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_model_router import (
+    MIN_REMAINING_SECONDS,
+    resolve_stage_chain,
+    run_with_fallback,
+)
 from telegram_kol_research.ai_recognition_config import (
     AiModelConfig,
     AiRecognitionConfig,
     load_ai_recognition_config,
 )
+from telegram_kol_research.ai_stage_catalog import AUTHORITATIVE_STAGE
 from telegram_kol_research.contextual_message_window import (
     build_contextual_message_window,
     render_authoritative_context,
@@ -100,6 +106,11 @@ class MimoAuthoritativeResult:
     fallback_from: str | None = None
     projection_fingerprint: str | None = None
     provider_attempt_telemetry: tuple[MimoProviderAttemptTelemetry, ...] = ()
+    #: One entry per model of the stage chain that was actually tried, in
+    #: order. The v1 audit writes one ``mimo_recognition_attempts`` row per
+    #: entry, so a fallback is visible as its own attempt rather than hidden
+    #: inside the aggregate of the model that failed.
+    model_attempts: tuple["MimoModelAttempt", ...] = ()
 
     @property
     def is_actionable(self) -> bool:
@@ -111,6 +122,20 @@ class MimoAuthoritativeResult:
             if event_type != "none" and float(lifecycle.get("confidence") or 0.0) >= 0.7:
                 return True
         return self.status == "是策略" and float(self.payload.get("confidence") or 0.0) >= 0.7
+
+
+@dataclass(frozen=True, slots=True)
+class MimoModelAttempt:
+    """What one model of the chain did, including its own retries."""
+
+    model_id: str
+    model: str
+    succeeded: bool
+    error_message: str | None
+    telemetry: tuple[MimoProviderAttemptTelemetry, ...]
+    started_at: Any
+    completed_at: Any
+    duration_ms: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -135,6 +160,143 @@ class _MimoV2InvalidJson(ValueError):
     def __init__(self, message: str, *, response_payload: Any | None = None):
         super().__init__(message)
         self.response_payload = response_payload
+
+
+class _MimoModelFailed(RuntimeError):
+    """One model in the chain is finished, including its own retries.
+
+    ``request_made`` is what decides whether the next model is tried: a
+    failure that never left this process says nothing about the provider, and
+    changing model cannot fix it (design §4).
+    """
+
+    def __init__(self, message: str, *, request_made: bool):
+        super().__init__(message)
+        self.request_made = bool(request_made)
+
+
+def _should_try_next_model(error: BaseException) -> bool:
+    if isinstance(error, _MimoModelFailed):
+        return error.request_made
+    return True
+
+
+class _OrdinalCounter:
+    """Attempt ordinals run across the whole chain, not per model.
+
+    ``record_mimo_attempt`` enforces "the next ordinal", and the audit is one
+    append-only sequence per run, so model B's first request is ordinal 3 when
+    model A used two.
+    """
+
+    def __init__(self) -> None:
+        self._value = 0
+
+    def next(self) -> int:
+        self._value += 1
+        return self._value
+
+
+@dataclass(frozen=True, slots=True)
+class _V2Success:
+    attempt_ordinal: int
+    payload: dict[str, Any]
+    parsed: Any
+    adapted: Any
+    response_payload: Any
+
+
+@dataclass(frozen=True, slots=True)
+class _V2Terminal:
+    """A verdict that ends the chain rather than moving to the next model."""
+
+    result: "MimoV2InferenceResult"
+
+
+def resolve_authoritative_chain(
+    config: AiRecognitionConfig,
+) -> list[AiModelConfig]:
+    """The models bound to ``authoritative_recognition``, in order.
+
+    A configuration that carries no v2 model table at all (one built by hand
+    in a test, or by code that predates the stage bindings) falls back to the
+    rule this function replaced: the entry whose id or model name is
+    ``mimo-v2.5``.
+    """
+
+    chain = resolve_stage_chain(config, AUTHORITATIVE_STAGE)
+    if chain or (getattr(config, "models", None) or ()):
+        return chain
+    legacy = _legacy_mimo_model(config)
+    return [legacy] if legacy is not None else []
+
+
+def _legacy_mimo_model(config: AiRecognitionConfig) -> AiModelConfig | None:
+    for model in getattr(config, "ai_models", ()) or ():
+        if model.id == "mimo-v2.5" or model.model == "mimo-v2.5":
+            return model
+    return None
+
+
+def _remaining_deadline(
+    deadline_seconds: float | None,
+    started: float,
+) -> float | None:
+    """What is left of a slice of the chain budget, never below zero.
+
+    Recomputed before **every** request, not once per model: a model gets one
+    slice of the 240 s and its own retries and retry delays come out of that
+    same slice. Without this, a first attempt that ran 239 s without tripping
+    the ceiling would hand its retry a fresh 240 s, and two requests plus a
+    blocked read would run past the 300 s job claim lease -- the exact failure
+    the single-request ceiling was added to stop.
+    """
+
+    if deadline_seconds is None:
+        return None
+    return max(0.0, float(deadline_seconds) - (time.monotonic() - started))
+
+
+def _request_mimo_v2(
+    requester: Callable[..., Any] | None,
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    model_config: AiModelConfig,
+    prompt: str,
+    media_root: str | Path,
+    context_text: str,
+    deadline_seconds: float | None,
+) -> Any:
+    """One provider request, with the chain's remaining time as its ceiling.
+
+    A caller-supplied ``requester`` keeps the signature it always had: the
+    deadline is an implementation detail of the real HTTP call, and test stubs
+    do not have a clock to honour.
+    """
+
+    if requester is not None:
+        return requester(
+            raw_message=raw_message,
+            media_assets=media_assets,
+            model_config=model_config,
+            prompt=prompt,
+            media_root=media_root,
+            context_text=context_text,
+            json_mode=True,
+            disable_thinking=True,
+        )
+    return _call_mimo_direct_model(
+        raw_message=raw_message,
+        media_assets=media_assets,
+        model_config=model_config,
+        prompt=prompt,
+        media_root=media_root,
+        context_text=context_text,
+        json_mode=True,
+        disable_thinking=True,
+        total_deadline_seconds=deadline_seconds,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -337,7 +499,13 @@ def infer_mimo_authoritative_v2(
     max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
     retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
 ) -> MimoV2InferenceResult:
-    """Call and audit one strict MiMo v2 analysis without execution writes."""
+    """Call and audit one strict MiMo v2 analysis without execution writes.
+
+    The stage's whole chain is walked: a model keeps its own retries, and only
+    when it is finished does the next model start. The run records the model
+    that answered (the chain head when none did); every attempt row records
+    the model it actually called.
+    """
 
     attempts = _validated_mimo_v2_max_attempts(max_attempts)
     retry_delay = _validated_mimo_v2_retry_delay(retry_delay_seconds)
@@ -345,7 +513,8 @@ def infer_mimo_authoritative_v2(
         ai_recognition_config_path
     )
     seed_default_prompt_registry(session_factory, active_config)
-    model_config = _find_mimo_model(active_config)
+    chain = resolve_authoritative_chain(active_config)
+    model_config = chain[0] if chain else None
     model = model_config.model if model_config is not None else "mimo-v2.5"
 
     with session_factory() as session:
@@ -432,6 +601,8 @@ def infer_mimo_authoritative_v2(
             asset for asset in media_assets if _is_image_asset(asset)
         ]
     if unreadable_images:
+        # A failure before any request was sent. Another model cannot help it,
+        # so the chain is never started (design §4).
         return _complete_v2_failure(
             session_factory,
             raw_message_id=int(raw_message_id),
@@ -444,247 +615,250 @@ def infer_mimo_authoritative_v2(
             error_message="image media is declared but unavailable or unreadable",
         )
 
-    request = requester or _call_mimo_direct_model
-    last_error_code = "provider_http_error"
-    last_error_message = "MiMo provider request failed"
-    for ordinal in range(1, attempts + 1):
-        attempt_started_at = utc_now()
-        started = time.perf_counter()
-        response_payload: Any | None = None
-        try:
-            response_payload = request(
-                raw_message=raw_message,
-                media_assets=media_assets,
-                model_config=model_config,
-                prompt=composition.system_prompt,
-                media_root=media_root,
-                context_text=composition.context,
-                json_mode=True,
-                disable_thinking=True,
-            )
-            payload = _coerce_mimo_v2_payload(response_payload)
-            parsed = parse_mimo_v2_payload(payload)
-            adapted = adapt_mimo_v2_to_current_payload(parsed)
-        except (TimeoutError, httpx.TimeoutException) as exc:
-            last_error_code = "provider_timeout"
-            last_error_message = str(exc) or "MiMo provider timed out"
-            attempt = _record_v2_attempt(
-                session_factory,
-                run_id=run.id,
-                ordinal=ordinal,
-                status="timeout",
-                error_code=last_error_code,
-                error_message=last_error_message,
-                started_at=attempt_started_at,
-                started_monotonic=started,
-                telemetry_source=exc,
-            )
-            last_error_message = attempt.error_message or last_error_message
-            if not _mimo_v2_input_is_current(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                media_root=media_root,
-                expected_fingerprint=analysis_input_fingerprint,
-                expected_context=composition.context,
-                rebuild_context=context_text is None,
-            ):
-                return _complete_v2_failure(
-                    session_factory,
-                    raw_message_id=int(raw_message_id),
-                    chat_id=chat_id,
-                    run_id=run.id,
-                    input_kind=input_kind,
-                    model=model,
-                    prompt_versions=composition.version_map,
-                    error_code="input_changed_during_analysis",
-                    error_message="message input changed during MiMo analysis",
-                )
-            if ordinal < attempts:
-                _sleep_before_mimo_retry(retry_delay)
-                continue
-            break
-        except (MimoV2ContractError, MimoV2ExecutionAdapterError) as exc:
-            last_error_code = "contract_validation_failed"
-            last_error_message = str(exc) or "MiMo v2 contract validation failed"
-            attempt = _record_v2_attempt(
-                session_factory,
-                run_id=run.id,
-                ordinal=ordinal,
-                status="contract_failure",
-                error_code=last_error_code,
-                error_message=last_error_message,
-                response_payload=response_payload,
-                started_at=attempt_started_at,
-                started_monotonic=started,
-                telemetry_source=response_payload,
-            )
-            last_error_message = attempt.error_message or last_error_message
-            if not _mimo_v2_input_is_current(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                media_root=media_root,
-                expected_fingerprint=analysis_input_fingerprint,
-                expected_context=composition.context,
-                rebuild_context=context_text is None,
-            ):
-                return _complete_v2_failure(
-                    session_factory,
-                    raw_message_id=int(raw_message_id),
-                    chat_id=chat_id,
-                    run_id=run.id,
-                    input_kind=input_kind,
-                    model=model,
-                    prompt_versions=composition.version_map,
-                    error_code="input_changed_during_analysis",
-                    error_message="message input changed during MiMo analysis",
-                )
-            # The same malformed response is deterministic; only transport
-            # failures are retried so fallback can start without added delay.
-            break
-        except (_MimoV2InvalidJson, json.JSONDecodeError, ValueError) as exc:
-            last_error_code = "invalid_json"
-            last_error_message = str(exc) or "MiMo response is not valid JSON"
-            invalid_response = (
-                exc.response_payload
-                if isinstance(exc, _MimoV2InvalidJson)
-                else response_payload
-            )
-            attempt = _record_v2_attempt(
-                session_factory,
-                run_id=run.id,
-                ordinal=ordinal,
-                status="invalid_json",
-                error_code=last_error_code,
-                error_message=last_error_message,
-                response_payload=invalid_response,
-                started_at=attempt_started_at,
-                started_monotonic=started,
-                telemetry_source=(
-                    response_payload if response_payload is not None else exc
-                ),
-            )
-            last_error_message = attempt.error_message or last_error_message
-            if not _mimo_v2_input_is_current(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                media_root=media_root,
-                expected_fingerprint=analysis_input_fingerprint,
-                expected_context=composition.context,
-                rebuild_context=context_text is None,
-            ):
-                return _complete_v2_failure(
-                    session_factory,
-                    raw_message_id=int(raw_message_id),
-                    chat_id=chat_id,
-                    run_id=run.id,
-                    input_kind=input_kind,
-                    model=model,
-                    prompt_versions=composition.version_map,
-                    error_code="input_changed_during_analysis",
-                    error_message="message input changed during MiMo analysis",
-                )
-            # JSON shape errors are deterministic for this response and should
-            # fail fast into the guarded fallback path.
-            break
-        except Exception as exc:
-            last_error_code = "provider_http_error"
-            last_error_message = str(exc) or "MiMo provider request failed"
-            attempt = _record_v2_attempt(
-                session_factory,
-                run_id=run.id,
-                ordinal=ordinal,
-                status="http_error",
-                error_code=last_error_code,
-                error_message=last_error_message,
-                started_at=attempt_started_at,
-                started_monotonic=started,
-                telemetry_source=exc,
-            )
-            last_error_message = attempt.error_message or last_error_message
-            if not _mimo_v2_input_is_current(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                media_root=media_root,
-                expected_fingerprint=analysis_input_fingerprint,
-                expected_context=composition.context,
-                rebuild_context=context_text is None,
-            ):
-                return _complete_v2_failure(
-                    session_factory,
-                    raw_message_id=int(raw_message_id),
-                    chat_id=chat_id,
-                    run_id=run.id,
-                    input_kind=input_kind,
-                    model=model,
-                    prompt_versions=composition.version_map,
-                    error_code="input_changed_during_analysis",
-                    error_message="message input changed during MiMo analysis",
-                )
-            if ordinal < attempts:
-                _sleep_before_mimo_retry(retry_delay)
-                continue
-            break
-        else:
-            attempt = _record_v2_attempt(
-                session_factory,
-                run_id=run.id,
-                ordinal=ordinal,
-                status="completed",
-                response_payload=payload,
-                started_at=attempt_started_at,
-                started_monotonic=started,
-                telemetry_source=response_payload,
-            )
-            if not _mimo_v2_input_is_current(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                media_root=media_root,
-                expected_fingerprint=analysis_input_fingerprint,
-                expected_context=composition.context,
-                rebuild_context=context_text is None,
-            ):
-                return _complete_v2_failure(
-                    session_factory,
-                    raw_message_id=int(raw_message_id),
-                    chat_id=chat_id,
-                    run_id=run.id,
-                    input_kind=input_kind,
-                    model=model,
-                    prompt_versions=composition.version_map,
-                    error_code="input_changed_during_analysis",
-                    error_message="message input changed during MiMo analysis",
-                )
-            canonical_payload = json.loads(adapted.canonical_v2_json)
-            completed = complete_mimo_run(
-                session_factory,
-                run_id=run.id,
-                status="completed",
-                selected_ordinal=attempt.ordinal,
-                canonical_payload=canonical_payload,
-                projection_payload=_execution_projection(adapted.payload),
-                became_authoritative=True,
-            )
-            _record_mimo_v2_prompt_invocation(
-                session_factory,
-                raw_message_id=int(raw_message_id),
-                chat_id=chat_id,
-                run_id=run.id,
-                model=model,
-                prompt_versions=composition.version_map,
-                status="completed",
-                error_message=None,
-            )
-            return MimoV2InferenceResult(
-                raw_message_id=int(raw_message_id),
-                run_id=completed.id,
-                parsed_result=parsed,
-                adapted_result=adapted,
-                input_kind=input_kind,
-                model=model,
-                prompt_versions=dict(composition.version_map),
-                response_size_bytes=_provider_response_size(response_payload),
-            )
+    ordinals = _OrdinalCounter()
+    last_failure = {
+        "error_code": "provider_http_error",
+        "error_message": "MiMo provider request failed",
+    }
 
+    def _input_changed_result(attempt_model: str) -> MimoV2InferenceResult:
+        return _complete_v2_failure(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            chat_id=chat_id,
+            run_id=run.id,
+            input_kind=input_kind,
+            model=attempt_model,
+            prompt_versions=composition.version_map,
+            error_code="input_changed_during_analysis",
+            error_message="message input changed during MiMo analysis",
+        )
+
+    def _input_is_current() -> bool:
+        return _mimo_v2_input_is_current(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            media_root=media_root,
+            expected_fingerprint=analysis_input_fingerprint,
+            expected_context=composition.context,
+            rebuild_context=context_text is None,
+        )
+
+    def _attempt_model(
+        candidate: AiModelConfig,
+        *,
+        deadline_seconds: float | None = None,
+    ) -> Any:
+        error_code = "provider_http_error"
+        error_message = "MiMo provider request failed"
+        request_made = True
+        previous_ordinal: int | None = None
+        model_started = time.monotonic()
+        for model_attempt in range(1, attempts + 1):
+            ordinal = ordinals.next()
+            attempt_started_at = utc_now()
+            started = time.perf_counter()
+            response_payload: Any | None = None
+            try:
+                response_payload = _request_mimo_v2(
+                    requester,
+                    raw_message=raw_message,
+                    media_assets=media_assets,
+                    model_config=candidate,
+                    prompt=composition.system_prompt,
+                    media_root=media_root,
+                    context_text=composition.context,
+                    deadline_seconds=_remaining_deadline(
+                        deadline_seconds, model_started
+                    ),
+                )
+                payload = _coerce_mimo_v2_payload(response_payload)
+                parsed = parse_mimo_v2_payload(payload)
+                adapted = adapt_mimo_v2_to_current_payload(parsed)
+            except (TimeoutError, httpx.TimeoutException) as exc:
+                error_code = "provider_timeout"
+                error_message = str(exc) or "MiMo provider timed out"
+                request_made = _provider_attempt_telemetry(exc).provider_request_made
+                attempt = _record_v2_attempt(
+                    session_factory,
+                    run_id=run.id,
+                    ordinal=ordinal,
+                    retry_of_ordinal=previous_ordinal,
+                    model=candidate.model,
+                    status="timeout",
+                    error_code=error_code,
+                    error_message=error_message,
+                    started_at=attempt_started_at,
+                    started_monotonic=started,
+                    telemetry_source=exc,
+                )
+                error_message = attempt.error_message or error_message
+                if not _input_is_current():
+                    return _V2Terminal(_input_changed_result(candidate.model))
+                previous_ordinal = ordinal
+                if model_attempt < attempts:
+                    _sleep_before_mimo_retry(retry_delay)
+                    continue
+                break
+            except (MimoV2ContractError, MimoV2ExecutionAdapterError) as exc:
+                error_code = "contract_validation_failed"
+                error_message = str(exc) or "MiMo v2 contract validation failed"
+                attempt = _record_v2_attempt(
+                    session_factory,
+                    run_id=run.id,
+                    ordinal=ordinal,
+                    retry_of_ordinal=previous_ordinal,
+                    model=candidate.model,
+                    status="contract_failure",
+                    error_code=error_code,
+                    error_message=error_message,
+                    response_payload=response_payload,
+                    started_at=attempt_started_at,
+                    started_monotonic=started,
+                    telemetry_source=response_payload,
+                )
+                error_message = attempt.error_message or error_message
+                if not _input_is_current():
+                    return _V2Terminal(_input_changed_result(candidate.model))
+                # The same malformed response is deterministic; only transport
+                # failures are retried so fallback can start without added delay.
+                break
+            except (_MimoV2InvalidJson, json.JSONDecodeError, ValueError) as exc:
+                error_code = "invalid_json"
+                error_message = str(exc) or "MiMo response is not valid JSON"
+                invalid_response = (
+                    exc.response_payload
+                    if isinstance(exc, _MimoV2InvalidJson)
+                    else response_payload
+                )
+                attempt = _record_v2_attempt(
+                    session_factory,
+                    run_id=run.id,
+                    ordinal=ordinal,
+                    retry_of_ordinal=previous_ordinal,
+                    model=candidate.model,
+                    status="invalid_json",
+                    error_code=error_code,
+                    error_message=error_message,
+                    response_payload=invalid_response,
+                    started_at=attempt_started_at,
+                    started_monotonic=started,
+                    telemetry_source=(
+                        response_payload if response_payload is not None else exc
+                    ),
+                )
+                error_message = attempt.error_message or error_message
+                if not _input_is_current():
+                    return _V2Terminal(_input_changed_result(candidate.model))
+                # JSON shape errors are deterministic for this response and should
+                # fail fast into the guarded fallback path.
+                break
+            except Exception as exc:
+                error_code = "provider_http_error"
+                error_message = str(exc) or "MiMo provider request failed"
+                request_made = _provider_attempt_telemetry(exc).provider_request_made
+                attempt = _record_v2_attempt(
+                    session_factory,
+                    run_id=run.id,
+                    ordinal=ordinal,
+                    retry_of_ordinal=previous_ordinal,
+                    model=candidate.model,
+                    status="http_error",
+                    error_code=error_code,
+                    error_message=error_message,
+                    started_at=attempt_started_at,
+                    started_monotonic=started,
+                    telemetry_source=exc,
+                )
+                error_message = attempt.error_message or error_message
+                if not _input_is_current():
+                    return _V2Terminal(_input_changed_result(candidate.model))
+                previous_ordinal = ordinal
+                if model_attempt < attempts:
+                    _sleep_before_mimo_retry(retry_delay)
+                    continue
+                break
+            else:
+                attempt = _record_v2_attempt(
+                    session_factory,
+                    run_id=run.id,
+                    ordinal=ordinal,
+                    retry_of_ordinal=previous_ordinal,
+                    model=candidate.model,
+                    status="completed",
+                    response_payload=payload,
+                    started_at=attempt_started_at,
+                    started_monotonic=started,
+                    telemetry_source=response_payload,
+                )
+                if not _input_is_current():
+                    return _V2Terminal(_input_changed_result(candidate.model))
+                return _V2Success(
+                    attempt_ordinal=attempt.ordinal,
+                    payload=payload,
+                    parsed=parsed,
+                    adapted=adapted,
+                    response_payload=response_payload,
+                )
+        last_failure["error_code"] = error_code
+        last_failure["error_message"] = error_message
+        raise _MimoModelFailed(error_message, request_made=request_made)
+
+    routed = run_with_fallback(
+        chain,
+        _attempt_model,
+        budget_seconds=MIMO_REQUEST_TOTAL_DEADLINE_SECONDS,
+        min_remaining_seconds=MIN_REMAINING_SECONDS,
+        classify=_should_try_next_model,
+    )
+    if routed.succeeded:
+        outcome = routed.value
+        if isinstance(outcome, _V2Terminal):
+            return outcome.result
+        answered_model = routed.model.model if routed.model is not None else model
+        if routed.used_fallback:
+            logger.warning(
+                "mimo authoritative fell back to another model raw_message_id=%s "
+                "run_id=%s contract=v2 from=%s to=%s",
+                raw_message_id,
+                run.id,
+                ",".join(routed.fallback_from),
+                answered_model,
+            )
+        canonical_payload = json.loads(outcome.adapted.canonical_v2_json)
+        completed = complete_mimo_run(
+            session_factory,
+            run_id=run.id,
+            status="completed",
+            selected_ordinal=outcome.attempt_ordinal,
+            canonical_payload=canonical_payload,
+            projection_payload=_execution_projection(outcome.adapted.payload),
+            became_authoritative=True,
+            model=answered_model,
+        )
+        _record_mimo_v2_prompt_invocation(
+            session_factory,
+            raw_message_id=int(raw_message_id),
+            chat_id=chat_id,
+            run_id=run.id,
+            model=answered_model,
+            prompt_versions=composition.version_map,
+            status="completed",
+            error_message=None,
+        )
+        return MimoV2InferenceResult(
+            raw_message_id=int(raw_message_id),
+            run_id=completed.id,
+            parsed_result=outcome.parsed,
+            adapted_result=outcome.adapted,
+            input_kind=input_kind,
+            model=answered_model,
+            prompt_versions=dict(composition.version_map),
+            response_size_bytes=_provider_response_size(outcome.response_payload),
+        )
+
+    # Every model failed. The run keeps the chain head as its model, and the
+    # error names each model that was tried.
     return _complete_v2_failure(
         session_factory,
         raw_message_id=int(raw_message_id),
@@ -693,8 +867,10 @@ def infer_mimo_authoritative_v2(
         input_kind=input_kind,
         model=model,
         prompt_versions=composition.version_map,
-        error_code=last_error_code,
-        error_message=last_error_message,
+        error_code=str(last_failure["error_code"]),
+        error_message=(
+            routed.error_message or str(last_failure["error_message"])
+        ),
     )
 
 
@@ -745,6 +921,8 @@ def _record_v2_attempt(
     status: str,
     started_at,
     started_monotonic: float,
+    retry_of_ordinal: int | None = None,
+    model: str | None = None,
     error_code: str | None = None,
     error_message: str | None = None,
     response_payload: Any | None = None,
@@ -756,7 +934,10 @@ def _record_v2_attempt(
         session_factory,
         run_id=run_id,
         ordinal=ordinal,
-        retry_of_ordinal=ordinal - 1 if ordinal > 1 else None,
+        # Only a retry of the *same* model is a retry. The first request of a
+        # fallback model is a new attempt, not a repeat of the one before it.
+        retry_of_ordinal=retry_of_ordinal,
+        model=model,
         status=status,
         error_code=error_code,
         error_message=error_message,
@@ -947,7 +1128,8 @@ def run_mimo_authoritative_for_message(
 ) -> MimoAuthoritativeResult:
     config = ai_recognition_config or load_ai_recognition_config(ai_recognition_config_path)
     seed_default_prompt_registry(session_factory, config)
-    model_config = _find_mimo_model(config)
+    chain = resolve_authoritative_chain(config)
+    model_config = chain[0] if chain else None
     if model_config is None or not model_config.provider.is_configured:
         return MimoAuthoritativeResult(
             raw_message_id=raw_message_id,
@@ -1012,20 +1194,33 @@ def run_mimo_authoritative_for_message(
             model_kind="mimo",
             context=effective_context,
         )
-        payload, error_message, provider_attempt_telemetry = (
-            _call_mimo_authoritative_with_retry(
-                raw_message=raw_message,
-                media_assets=media_assets,
-                model_config=model_config,
-                prompt=composition.system_prompt,
-                media_root=media_root,
-                context_text=composition.context,
-            )
+        (
+            payload,
+            error_message,
+            provider_attempt_telemetry,
+            answered_model,
+            model_attempts,
+        ) = _call_mimo_authoritative_over_chain(
+            chain,
+            raw_message=raw_message,
+            media_assets=media_assets,
+            prompt=composition.system_prompt,
+            media_root=media_root,
+            context_text=composition.context,
         )
+        if len(model_attempts) > 1:
+            logger.warning(
+                "mimo authoritative fell back to another model raw_message_id=%s "
+                "contract=v1 tried=%s answered=%s",
+                raw_message_id,
+                ",".join(item.model_id for item in model_attempts),
+                answered_model.model if answered_model is not None else "none",
+            )
+        used_model = answered_model or model_config
         experiment = _upsert_experiment_result(
             session,
             raw_message=raw_message,
-            model_config=model_config,
+            model_config=used_model,
             input_kind=input_kind,
             payload=payload,
             error_message=error_message,
@@ -1039,7 +1234,7 @@ def run_mimo_authoritative_for_message(
                 correlation_key=f"recognition:{raw_message_id}:mimo",
                 raw_message_id=raw_message_id,
                 chat_id=raw_message.chat_id,
-                model=model_config.model,
+                model=used_model.model,
                 prompt_versions=composition.version_map,
                 status="failed" if error_message else "completed",
                 error_message=error_message,
@@ -1049,12 +1244,99 @@ def run_mimo_authoritative_for_message(
             raw_message_id=raw_message_id,
             payload=payload,
             input_kind=input_kind,
-            model=model_config.model,
+            model=used_model.model,
             status=experiment.status,
             error_message=error_message,
             prompt_versions=composition.version_map,
             provider_attempt_telemetry=provider_attempt_telemetry,
+            model_attempts=model_attempts,
         )
+
+
+def _call_mimo_authoritative_over_chain(
+    chain: list[AiModelConfig],
+    *,
+    raw_message: RawMessage,
+    media_assets: list[MediaAsset],
+    prompt: str,
+    media_root: str | Path,
+    context_text: str,
+    max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
+    retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
+) -> tuple[
+    dict[str, Any],
+    str | None,
+    tuple[MimoProviderAttemptTelemetry, ...],
+    AiModelConfig | None,
+    tuple[MimoModelAttempt, ...],
+]:
+    """Walk the stage chain; each model finishes its own retries first.
+
+    The whole chain shares ``MIMO_REQUEST_TOTAL_DEADLINE_SECONDS``, because
+    that ceiling plus one blocked read is what has to fit inside the 300 s job
+    claim lease -- giving each model its own 240 s would put a second full
+    deadline inside the same lease, which is exactly what the single-model
+    retry rule already refuses to do.
+    """
+
+    records: list[MimoModelAttempt] = []
+
+    def _attempt(
+        candidate: AiModelConfig,
+        *,
+        deadline_seconds: float | None = None,
+    ) -> tuple[dict[str, Any], tuple[MimoProviderAttemptTelemetry, ...]]:
+        started_at = utc_now()
+        started = time.perf_counter()
+        payload, error_message, telemetry = _call_mimo_authoritative_with_retry(
+            raw_message=raw_message,
+            media_assets=media_assets,
+            model_config=candidate,
+            prompt=prompt,
+            media_root=media_root,
+            context_text=context_text,
+            max_attempts=max_attempts,
+            retry_delay_seconds=retry_delay_seconds,
+            total_deadline_seconds=deadline_seconds,
+        )
+        records.append(
+            MimoModelAttempt(
+                model_id=candidate.id,
+                model=candidate.model,
+                succeeded=error_message is None,
+                error_message=error_message,
+                telemetry=telemetry,
+                started_at=started_at,
+                completed_at=utc_now(),
+                duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+            )
+        )
+        if error_message is not None:
+            raise _MimoModelFailed(
+                error_message,
+                request_made=any(
+                    item.provider_request_made for item in telemetry
+                ),
+            )
+        return payload, telemetry
+
+    routed = run_with_fallback(
+        chain,
+        _attempt,
+        budget_seconds=MIMO_REQUEST_TOTAL_DEADLINE_SECONDS,
+        min_remaining_seconds=MIN_REMAINING_SECONDS,
+        classify=_should_try_next_model,
+    )
+    if routed.succeeded:
+        payload, telemetry = routed.value
+        return payload, None, telemetry, routed.model, tuple(records)
+    return (
+        {},
+        routed.error_message or "MiMo provider request failed",
+        tuple(item for record in records for item in record.telemetry),
+        None,
+        tuple(records),
+    )
 
 
 def _call_mimo_authoritative_with_retry(
@@ -1067,6 +1349,7 @@ def _call_mimo_authoritative_with_retry(
     context_text: str,
     max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
     retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
+    total_deadline_seconds: float | None = None,
 ) -> tuple[
     dict[str, Any],
     str | None,
@@ -1075,6 +1358,7 @@ def _call_mimo_authoritative_with_retry(
     errors: list[str] = []
     provider_attempts: list[MimoProviderAttemptTelemetry] = []
     attempts = max(1, max_attempts)
+    model_started = time.monotonic()
     for attempt in range(1, attempts + 1):
         telemetry_recorded = False
         try:
@@ -1085,6 +1369,9 @@ def _call_mimo_authoritative_with_retry(
                 prompt=prompt,
                 media_root=media_root,
                 context_text=context_text,
+                total_deadline_seconds=_remaining_deadline(
+                    total_deadline_seconds, model_started
+                ),
             )
             provider_attempts.append(_provider_attempt_telemetry(payload))
             telemetry_recorded = True
@@ -1186,7 +1473,12 @@ class MimoRequestDeadlineExceeded(TimeoutError):
     """
 
 
-def _read_response_within_deadline(response: Any, *, started: float) -> bytes:
+def _read_response_within_deadline(
+    response: Any,
+    *,
+    started: float,
+    total_deadline_seconds: float | None = None,
+) -> bytes:
     """Read the streamed body, checking the wall clock after every chunk.
 
     Verified against a local trickle server before use: a client closed from
@@ -1195,13 +1487,18 @@ def _read_response_within_deadline(response: Any, *, started: float) -> bytes:
     ceiling.
     """
 
+    ceiling = (
+        float(total_deadline_seconds)
+        if total_deadline_seconds is not None
+        else MIMO_REQUEST_TOTAL_DEADLINE_SECONDS
+    )
     chunks: list[bytes] = []
     for chunk in response.iter_bytes():
         chunks.append(chunk)
         elapsed = time.monotonic() - started
-        if elapsed > MIMO_REQUEST_TOTAL_DEADLINE_SECONDS:
+        if elapsed > ceiling:
             raise MimoRequestDeadlineExceeded(
-                f"MiMo request exceeded its {MIMO_REQUEST_TOTAL_DEADLINE_SECONDS:.0f}s "
+                f"MiMo request exceeded its {ceiling:.0f}s "
                 f"total deadline after {elapsed:.0f}s"
             )
     return b"".join(chunks)
@@ -1217,6 +1514,7 @@ def _call_mimo_direct_model(
     context_text: str = "",
     json_mode: bool = False,
     disable_thinking: bool = False,
+    total_deadline_seconds: float | None = None,
 ) -> dict[str, Any]:
     headers = {"Content-Type": "application/json"}
     if model_config.api_key:
@@ -1269,7 +1567,9 @@ def _call_mimo_direct_model(
                 headers=headers,
             ) as response:
                 body = _read_response_within_deadline(
-                    response, started=request_started
+                    response,
+                    started=request_started,
+                    total_deadline_seconds=total_deadline_seconds,
                 )
                 try:
                     response.raise_for_status()
@@ -1664,10 +1964,17 @@ def _has_meaningful_strategy_fields(strategy: dict[str, Any]) -> bool:
 
 
 def _find_mimo_model(config: AiRecognitionConfig) -> AiModelConfig | None:
-    for model in config.ai_models:
-        if model.id == "mimo-v2.5" or model.model == "mimo-v2.5":
-            return model
-    return None
+    """The model the authoritative stage would call first.
+
+    The name is kept because the daily probe, the prompt centre's MiMo test
+    and the side-channel experiments all ask this same question, and because
+    it is what those call sites already import. What changed is the answer:
+    the head of the ``authoritative_recognition`` chain rather than a
+    hard-coded search for ``mimo-v2.5``.
+    """
+
+    chain = resolve_authoritative_chain(config)
+    return chain[0] if chain else _legacy_mimo_model(config)
 
 
 def _extract_chat_content(data: dict[str, Any]) -> str:

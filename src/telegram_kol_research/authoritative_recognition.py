@@ -1538,6 +1538,96 @@ def _record_v2_circuit_failure(
         record_mimo_v2_outcome(session_factory, outcome=str(error_code))
 
 
+def _record_v1_chain_attempts(
+    session_factory: sessionmaker,
+    *,
+    run_id: int,
+    run_kind: str,
+    mimo,
+    chain_head_model: str,
+    failed: bool,
+    started_at,
+    completed_at,
+    elapsed_ms: int,
+):
+    """One attempt row per model of the chain; returns the last one written.
+
+    A single-model chain writes exactly the row this function replaced, with
+    the same timestamps and the same duration: the first row starts when the
+    call did and the last row ends when it ended, so nothing about a
+    configuration without fallbacks changes shape.
+    """
+
+    from telegram_kol_research.mimo_provider_health import v1_failure_error_code
+    from telegram_kol_research.recognition_experiments import MimoModelAttempt
+
+    records = list(getattr(mimo, "model_attempts", ()) or ())
+    if not records:
+        # An early return, or a caller that never walked a chain: keep the
+        # aggregate shape this audit has always written.
+        records = [
+            MimoModelAttempt(
+                model_id=chain_head_model,
+                model=mimo.model or chain_head_model,
+                succeeded=not failed,
+                error_message=mimo.error_message,
+                telemetry=mimo.provider_attempt_telemetry,
+                started_at=started_at,
+                completed_at=completed_at,
+                duration_ms=elapsed_ms,
+            )
+        ]
+    last_index = len(records) - 1
+    consumed_ms = 0
+    attempt = None
+    for index, record in enumerate(records):
+        is_last = index == last_index
+        row_failed = (not record.succeeded) or (is_last and failed)
+        if is_last:
+            duration_ms = max(0, elapsed_ms - consumed_ms)
+            row_completed_at = completed_at
+        else:
+            duration_ms = int(record.duration_ms)
+            consumed_ms += duration_ms
+            row_completed_at = record.completed_at
+        attempt = record_mimo_attempt(
+            session_factory,
+            run_id=run_id,
+            ordinal=index + 1,
+            status="http_error" if row_failed else "completed",
+            model=record.model or chain_head_model,
+            error_code=(
+                (
+                    v1_failure_error_code(record.telemetry)
+                    or "v1_authoritative_failed"
+                )
+                if row_failed
+                else None
+            ),
+            error_message=(
+                (mimo.error_message if is_last else record.error_message)
+                if row_failed
+                else None
+            ),
+            response_payload=(
+                mimo.payload if (is_last and not row_failed) else None
+            ),
+            duration_ms=duration_ms,
+            started_at=started_at if index == 0 else record.started_at,
+            completed_at=row_completed_at,
+            attempt_phase=run_kind,
+            provider_request_count=sum(
+                int(item.provider_request_made) for item in record.telemetry
+            ),
+            provider_usage=_provider_usage_audit(record.telemetry),
+            request_component_bytes=_request_component_bytes_audit(
+                _latest_provider_request_telemetry(record.telemetry)
+            ),
+        )
+    assert attempt is not None
+    return attempt
+
+
 def _run_v1_authority_with_audit(
     session_factory: sessionmaker,
     *,
@@ -1550,7 +1640,14 @@ def _run_v1_authority_with_audit(
     retry_of_run_id: int | None = None,
     fallback_from: str | None = None,
 ) -> MimoAuthoritativeResult:
-    model = ai_recognition_config.image_provider.model or "mimo-v2.5"
+    from telegram_kol_research.recognition_experiments import (
+        resolve_authoritative_chain,
+    )
+
+    # The stage's chain head, not ``image_provider`` -- the v1 file's image
+    # model is GLM-OCR, which this path has never called.
+    chain = resolve_authoritative_chain(ai_recognition_config)
+    model = (chain[0].model if chain else "") or "mimo-v2.5"
     input_kind = _message_input_kind(session_factory, raw_message_id)
     started_at = utc_now()
     started = time.perf_counter()
@@ -1581,6 +1678,7 @@ def _run_v1_authority_with_audit(
             run_id=run.id,
             ordinal=1,
             status="http_error",
+            model=model,
             error_code="v1_provider_error",
             error_message=str(exc),
             duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
@@ -1622,43 +1720,23 @@ def _run_v1_authority_with_audit(
     )
     failed = bool(mimo.error_message) or mimo.status == "识别失败"
     completed_at = utc_now()
+    elapsed_ms = max(0, round((time.perf_counter() - started) * 1000))
     # step-18: "the provider will not serve us" and "our request was bad" were
     # both recorded as ``v1_authoritative_failed``. The code now says which,
     # from the per-request classification; it is also what
     # ``mimo_provider_health`` reads to find an outage.
-    failure_code = "v1_authoritative_failed"
-    if failed:
-        from telegram_kol_research.mimo_provider_health import (
-            v1_failure_error_code,
-        )
-
-        failure_code = (
-            v1_failure_error_code(mimo.provider_attempt_telemetry)
-            or "v1_authoritative_failed"
-        )
-    attempt = record_mimo_attempt(
+    attempt = _record_v1_chain_attempts(
         session_factory,
         run_id=run.id,
-        ordinal=1,
-        status="http_error" if failed else "completed",
-        error_code=failure_code if failed else None,
-        error_message=mimo.error_message if failed else None,
-        response_payload=mimo.payload if not failed else None,
-        duration_ms=max(0, round((time.perf_counter() - started) * 1000)),
+        run_kind=run_kind,
+        mimo=mimo,
+        chain_head_model=model,
+        failed=failed,
         started_at=started_at,
         completed_at=completed_at,
-        attempt_phase=run_kind,
-        provider_request_count=sum(
-            int(item.provider_request_made)
-            for item in mimo.provider_attempt_telemetry
-        ),
-        provider_usage=_provider_usage_audit(mimo.provider_attempt_telemetry),
-        request_component_bytes=_request_component_bytes_audit(
-            _latest_provider_request_telemetry(
-                mimo.provider_attempt_telemetry
-            )
-        ),
+        elapsed_ms=elapsed_ms,
     )
+    failure_code = attempt.error_code or "v1_authoritative_failed"
     if failed:
         completed = complete_mimo_run(
             session_factory,
