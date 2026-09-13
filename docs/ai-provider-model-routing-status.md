@@ -20,7 +20,7 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 | 阶段 | 内容 | 状态 | 提交 | 测试 |
 |---|---|---|---|---|
 | 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | `18d62606` | 全量 8713 passed / 0 failed / 4 skipped |
-| 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | 见下方证据 | 全量 8746 passed / 0 failed / 4 skipped |
+| 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | `4e5e37ad` | 全量 8746 passed / 0 failed / 4 skipped |
 | 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | planned | | |
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证截图 | planned | | |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | planned | | |
@@ -196,8 +196,7 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 ### 阶段 2
 
-- 提交：`feat(ai-routing): phase 2 model chain for authoritative recognition`
-  （SHA 在紧随其后的文档提交里补写）
+- 提交：`4e5e37ad`（`feat(ai-routing): phase 2 ...`）
 - 全量：`uv run python -m pytest -q` → **8746 passed, 4 skipped, 0 failed**（645 s）
 - 新增测试文件：`tests/test_ai_model_router.py`（30 例）；`tests/test_ai_stage_config.py` 追加 3 例。关键用例：
   - `test_v2_falls_back_to_the_backup_model_and_records_both[http_402|timeout|bad_json]`
