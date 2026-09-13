@@ -86,11 +86,27 @@ def load_message_outage_span(
 ) -> MessageOutageSpan | None:
     """``None`` when no attempt for this message was refused by the provider."""
 
+    from sqlalchemy import and_, exists
+    from sqlalchemy.orm import aliased
+
     answered_filter = or_(
         MimoRecognitionAttempt.status == "completed",
         MimoRecognitionAttempt.error_code.startswith(REQUEST_REJECTED_ERROR_CODE_PREFIX),
         MimoRecognitionAttempt.error_code == RESPONSE_INVALID_ERROR_CODE,
     )
+    # The mirror of rule A (found by the step-5 replay of 2026-09-12): an answer
+    # to a request that was already in flight when failures started completing
+    # is not evidence the provider is up. Attempt 6749 started 03:00:21 and
+    # answered at 03:00:53 after two 402s had completed inside its span; read as
+    # a recovery it would split the outage and understate every delayed
+    # message's outage span.
+    unavailable_attempt = aliased(MimoRecognitionAttempt)
+    stale_answer = exists().where(
+        unavailable_attempt.error_code.startswith(UNAVAILABLE_ERROR_CODE_PREFIX),
+        unavailable_attempt.completed_at >= MimoRecognitionAttempt.started_at,
+        unavailable_attempt.completed_at <= MimoRecognitionAttempt.completed_at,
+    )
+    fresh_answer = and_(answered_filter, ~stale_answer)
     with session_factory() as session:
         failures = (
             session.query(
@@ -117,7 +133,7 @@ def load_message_outage_span(
             overlapped = (
                 session.query(MimoRecognitionAttempt.id)
                 .filter(
-                    answered_filter,
+                    fresh_answer,
                     MimoRecognitionAttempt.completed_at >= request_started_at,
                     MimoRecognitionAttempt.completed_at <= request_completed_at,
                 )
@@ -133,13 +149,7 @@ def load_message_outage_span(
             session.query(MimoRecognitionAttempt.completed_at)
             .filter(
                 MimoRecognitionAttempt.completed_at > _naive(last),
-                or_(
-                    MimoRecognitionAttempt.status == "completed",
-                    MimoRecognitionAttempt.error_code.startswith(
-                        REQUEST_REJECTED_ERROR_CODE_PREFIX
-                    ),
-                    MimoRecognitionAttempt.error_code == RESPONSE_INVALID_ERROR_CODE,
-                ),
+                fresh_answer,
             )
             .order_by(MimoRecognitionAttempt.completed_at.asc())
             .first()

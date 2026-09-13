@@ -258,20 +258,20 @@ def _aware(value: datetime) -> datetime:
 
 
 def _answered_during(
-    answered_completions: Sequence[datetime],
+    completions: Sequence[datetime],
     started_at: datetime | None,
     completed_at: datetime,
 ) -> bool:
-    """Did any answered attempt complete while this failed request was running."""
+    """Did any of ``completions`` (sorted) fall while this request was running."""
 
     if started_at is None:
         return False
     from bisect import bisect_left
 
-    index = bisect_left(answered_completions, _aware(started_at))
+    index = bisect_left(completions, _aware(started_at))
     return (
-        index < len(answered_completions)
-        and answered_completions[index] <= _aware(completed_at)
+        index < len(completions)
+        and completions[index] <= _aware(completed_at)
     )
 
 
@@ -301,11 +301,28 @@ def derive_provider_outage(
     """
 
     rows = list(rows_newest_first)
-    answered_completions = sorted(
+    unavailable_completions = sorted(
         _aware(completed)
         for status, error_code, _started, completed in rows
-        if _row_signal(status, error_code) == _ANSWERED
+        if _row_signal(status, error_code) == _UNAVAILABLE
     )
+    # The mirror of rule A (found by the step-5 replay of 2026-09-12): an
+    # answer to a request that was already in flight when unavailable failures
+    # completed is not evidence the provider is up. Attempt 6749 started
+    # 03:00:21 and answered 03:00:53 after two 402s completed inside its span;
+    # read as a recovery it paged "unavailable", "recovered", "unavailable"
+    # within forty seconds. Such stale answers are neutral, and they do not
+    # make a failure isolated either.
+    stale_answers: set[int] = set()
+    fresh_answer_completions: list[datetime] = []
+    for index, (status, error_code, request_started_at, completed_at) in enumerate(rows):
+        if _row_signal(status, error_code) != _ANSWERED:
+            continue
+        if _answered_during(unavailable_completions, request_started_at, completed_at):
+            stale_answers.add(index)
+        else:
+            fresh_answer_completions.append(_aware(completed_at))
+    answered_completions = sorted(fresh_answer_completions)
     rows_read = 0
     recovered_at: datetime | None = None
     answered_above = 0
@@ -315,10 +332,12 @@ def derive_provider_outage(
     latest_kind: str | None = None
     latest_status: int | None = None
     ended_inside_scan = False
-    for status, error_code, request_started_at, completed_at in rows:
+    for index, (status, error_code, request_started_at, completed_at) in enumerate(rows):
         rows_read += 1
         signal = _row_signal(status, error_code)
-        if signal == _UNAVAILABLE and _answered_during(
+        if signal == _ANSWERED and index in stale_answers:
+            signal = _NEUTRAL
+        elif signal == _UNAVAILABLE and _answered_during(
             answered_completions, request_started_at, completed_at
         ):
             signal = _NEUTRAL

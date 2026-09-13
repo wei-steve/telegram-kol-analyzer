@@ -1036,6 +1036,88 @@ def test_a_message_touched_only_by_an_isolated_failure_was_not_delayed(tmp_path)
     assert verdict.delayed is False
 
 
+#: Production rows 6745-6753, 2026-09-12, the start of the 402 outage, as
+#: (status, error_code, started, completed) in id order. Attempt 6749 was
+#: already in flight at 03:00:21 and answered at 03:00:53, after 6747 and 6748
+#: had completed with 402 inside its span. Found by the step-5 offline replay:
+#: read as a recovery, it paged "unavailable" at 03:00:40, "recovered" at
+#: 03:01:00 and "unavailable" again at 03:01:20.
+OUTAGE_START_ROWS_ID_ORDER = [
+    ("completed", None, _at(2, 58, 30), _at(2, 59, 38)),
+    ("completed", None, _at(2, 59, 16), _at(2, 59, 54)),
+    ("http_error", BALANCE, _at(3, 0, 22), _at(3, 0, 25)),
+    ("http_error", BALANCE, _at(3, 0, 39), _at(3, 0, 42)),
+    ("completed", None, _at(3, 0, 21), _at(3, 0, 53)),
+    ("http_error", BALANCE, _at(3, 0, 59), _at(3, 1, 1)),
+    ("http_error", BALANCE, _at(3, 1, 8), _at(3, 1, 10)),
+    ("http_error", BALANCE, _at(3, 1, 11), _at(3, 1, 13)),
+    ("http_error", BALANCE, _at(3, 1, 47), _at(3, 1, 49)),
+]
+
+
+@pytest.mark.parametrize(
+    "tick",
+    [_at(3, 0, 40), _at(3, 1, 0), _at(3, 1, 20), _at(3, 2, 0)],
+)
+def test_an_answer_already_in_flight_when_failures_began_is_not_a_recovery(tick):
+    from telegram_kol_research.mimo_provider_health import derive_provider_outage
+
+    known_newest_first = [
+        row for row in reversed(OUTAGE_START_ROWS_ID_ORDER) if row[3] <= tick
+    ]
+
+    outage = derive_provider_outage(known_newest_first)
+
+    assert outage is not None, tick
+    assert outage.recovered_at is None, tick
+    assert outage.started_at == _utc(_at(3, 0, 25)), tick
+
+
+def test_a_stale_answer_does_not_shorten_a_delayed_messages_outage(tmp_path):
+    """Without the mirror rule the 03:00:53 answer would end the message's
+    outage span there, and at 03:30 a message delayed the whole time would be
+    aged 29 minutes -- too old to replay a management instruction."""
+
+    session_factory = _factory(tmp_path)
+    _raw(session_factory, raw_id=1, posted_at=_at(3, 0, 0))
+    _raw(session_factory, raw_id=2, posted_at=_at(3, 0, 0))
+    for raw_id, status, code, started, completed in (
+        (1, "http_error", BALANCE, _at(3, 0, 22), _at(3, 0, 25)),
+        (2, "completed", None, _at(3, 0, 21), _at(3, 0, 53)),
+    ):
+        run = start_mimo_run(
+            session_factory,
+            raw_message_id=raw_id,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="fp",
+            prompt_versions={},
+            started_at=started,
+        )
+        record_mimo_attempt(
+            session_factory,
+            run_id=run.id,
+            ordinal=1,
+            status=status,
+            error_code=code,
+            error_message=None if status == "completed" else "failed",
+            duration_ms=0,
+            started_at=started,
+            completed_at=completed,
+            attempt_phase="v1_authoritative",
+        )
+
+    verdict = replay.replay_verdict(
+        session_factory, raw_message_id=1, now=_utc(_at(3, 30, 0))
+    )
+
+    assert verdict.delayed is True
+    assert verdict.span.recovered_at is None
+    assert verdict.effective_age < timedelta(minutes=1)
+
+
 # --------------------------------------------------------------------------
 # The total request deadline (ruling of 2026-09-13)
 # --------------------------------------------------------------------------
