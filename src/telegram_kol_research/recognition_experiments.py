@@ -1112,6 +1112,10 @@ def _call_mimo_authoritative_with_retry(
                     failure_class=RESPONSE_INVALID,
                 )
             errors.append(str(exc))
+            if isinstance(exc, MimoRequestDeadlineExceeded):
+                # A second full deadline would not fit inside the job claim
+                # lease; the queue's own retry is the next attempt.
+                break
             if attempt >= attempts:
                 break
             if retry_delay_seconds > 0:
@@ -1157,6 +1161,50 @@ def _load_experiment_messages(
     if input_kind == "image":
         query = query.distinct()
     return query.limit(max(limit, 1)).all()
+
+
+#: Wall-clock ceiling for one MiMo request, from sending it to its last byte.
+#:
+#: ``timeout_seconds`` is handed to httpx, whose timeouts are per operation:
+#: a response that trickles a byte every few seconds never trips a read
+#: timeout. On 2026-09-12 run 7253 took 606 s that way; the queue reclaimed its
+#: job after 5 minutes, a second run succeeded, and the first thread wrote its
+#: failure ten minutes later -- which paged a person about an outage that was
+#: not happening. Measured against production (30 days, 6159 successful
+#: calls): 11 took over 240 s end to end, and only 1 of those was a single
+#: request, so 240 s costs about one legitimate success a month. A request
+#: that hits the ceiling is not retried (``_call_mimo_authoritative_with_retry``)
+#: because the last blocked read can still add one per-read timeout, and
+#: 240 s + 60 s must stay within the 300 s job claim lease; a test pins that.
+MIMO_REQUEST_TOTAL_DEADLINE_SECONDS = 240.0
+
+
+class MimoRequestDeadlineExceeded(TimeoutError):
+    """One request ran past ``MIMO_REQUEST_TOTAL_DEADLINE_SECONDS``.
+
+    A ``TimeoutError``, so provider classification names it a timeout.
+    """
+
+
+def _read_response_within_deadline(response: Any, *, started: float) -> bytes:
+    """Read the streamed body, checking the wall clock after every chunk.
+
+    Verified against a local trickle server before use: a client closed from
+    another thread does not interrupt a blocked read (the request ran on to
+    the 60 s per-read timeout), while a check between chunks aborts at the
+    ceiling.
+    """
+
+    chunks: list[bytes] = []
+    for chunk in response.iter_bytes():
+        chunks.append(chunk)
+        elapsed = time.monotonic() - started
+        if elapsed > MIMO_REQUEST_TOTAL_DEADLINE_SECONDS:
+            raise MimoRequestDeadlineExceeded(
+                f"MiMo request exceeded its {MIMO_REQUEST_TOTAL_DEADLINE_SECONDS:.0f}s "
+                f"total deadline after {elapsed:.0f}s"
+            )
+    return b"".join(chunks)
 
 
 def _call_mimo_direct_model(
@@ -1213,17 +1261,26 @@ def _call_mimo_direct_model(
                 provider_usage=None,
                 request_component_bytes=request_component_bytes,
             )
-            response = client.post(
+            request_started = time.monotonic()
+            with client.stream(
+                "POST",
                 f"{model_config.base_url.rstrip('/')}/chat/completions",
                 json=payload,
                 headers=headers,
-            )
-            try:
-                response.raise_for_status()
-            except httpx.HTTPStatusError as exc:
-                response_body = exc.response.text[:1200]
-                raise RuntimeError(f"{exc}; response_body={response_body}") from exc
-            data = response.json()
+            ) as response:
+                body = _read_response_within_deadline(
+                    response, started=request_started
+                )
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPStatusError as exc:
+                    # A streamed response has no ``.text`` once read; the body
+                    # we already hold is the same bytes.
+                    response_body = body.decode("utf-8", errors="replace")[:1200]
+                    raise RuntimeError(
+                        f"{exc}; response_body={response_body}"
+                    ) from exc
+            data = json.loads(body)
         usage = data.get("usage") if isinstance(data, Mapping) else None
         telemetry = MimoProviderAttemptTelemetry(
             provider_request_made=True,
@@ -1235,18 +1292,7 @@ def _call_mimo_direct_model(
         raise
     try:
         content = _extract_chat_content(data)
-        raw_response_content = getattr(response, "content", None)
-        if isinstance(raw_response_content, bytes):
-            response_size_bytes = len(raw_response_content)
-        else:
-            response_size_bytes = len(
-                json.dumps(
-                    data,
-                    ensure_ascii=False,
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            )
+        response_size_bytes = len(body)
         return _MimoProviderPayload(
             _parse_json_object(content),
             response_size_bytes=response_size_bytes,

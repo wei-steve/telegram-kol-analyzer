@@ -36,6 +36,43 @@ from telegram_kol_research.recognition_experiments import (
 )
 
 
+class _StreamedFakeResponse:
+    """A post-style fake response, read the way production now reads it.
+
+    Since the MiMo request got a total deadline (step-18), production reads the
+    body through ``client.stream`` and checks the clock between chunks. The
+    fakes in this module predate that and implement only ``post``. The streamed
+    body is what a real response carries: its JSON, or its error text.
+    """
+
+    def __init__(self, response):
+        self._response = response
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def iter_bytes(self):
+        if hasattr(self._response, "json"):
+            yield json.dumps(self._response.json(), ensure_ascii=False).encode("utf-8")
+        else:
+            yield str(getattr(self._response, "text", "")).encode("utf-8")
+
+    def raise_for_status(self):
+        return self._response.raise_for_status()
+
+
+def _with_stream(fake_client_class):
+    def stream(self, method, url, json, headers):
+        assert method == "POST"
+        return _StreamedFakeResponse(self.post(url, json=json, headers=headers))
+
+    fake_client_class.stream = stream
+    return fake_client_class
+
+
 def _v2_config() -> AiRecognitionConfig:
     return AiRecognitionConfig(
         ai_models=[
@@ -556,7 +593,7 @@ def test_run_mimo_direct_experiment_persists_side_channel_only(tmp_path, monkeyp
             assert "图片与图文补充规则" in system_prompt
             return FakeResponse()
 
-    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", _with_stream(FakeClient))
 
     stats = run_mimo_direct_experiment(
         session_factory,
@@ -659,7 +696,7 @@ def test_run_mimo_direct_for_message_persists_text_side_channel(tmp_path, monkey
             assert "SOL short 73 SL 75 TP 70" in user_content
             return FakeResponse()
 
-    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", _with_stream(FakeClient))
 
     result = run_mimo_direct_for_message(
         session_factory,
@@ -752,7 +789,7 @@ def test_run_mimo_direct_for_message_omits_empty_strategy_json(tmp_path, monkeyp
         def post(self, url, json, headers):
             return FakeResponse()
 
-    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", _with_stream(FakeClient))
 
     run_mimo_direct_for_message(
         session_factory,
@@ -854,7 +891,7 @@ def test_run_mimo_direct_for_message_accepts_position_management_status(
             assert "\u4ed3\u4f4d\u7ba1\u7406" in system_prompt
             return FakeResponse()
 
-    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", _with_stream(FakeClient))
 
     run_mimo_direct_for_message(
         session_factory,
@@ -918,7 +955,7 @@ def test_run_mimo_direct_experiment_persists_http_error_response_body(tmp_path, 
         def post(self, url, json, headers):
             return FakeResponse()
 
-    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", FakeClient)
+    monkeypatch.setattr("telegram_kol_research.recognition_experiments.httpx.Client", _with_stream(FakeClient))
 
     stats = run_mimo_direct_experiment(
         session_factory,
@@ -1055,7 +1092,7 @@ def test_mimo_v2_default_provider_persists_raw_usage_and_exact_request_bytes(
 
     monkeypatch.setattr(
         "telegram_kol_research.recognition_experiments.httpx.Client",
-        FakeClient,
+        _with_stream(FakeClient),
     )
     original_build_payload = _build_mimo_payload
 
@@ -1213,7 +1250,7 @@ def test_mimo_observability_failure_does_not_change_provider_result(
 
     monkeypatch.setattr(
         "telegram_kol_research.recognition_experiments.httpx.Client",
-        FakeClient,
+        _with_stream(FakeClient),
     )
     monkeypatch.setattr(
         "telegram_kol_research.recognition_experiments._measure_mimo_request_component_bytes",

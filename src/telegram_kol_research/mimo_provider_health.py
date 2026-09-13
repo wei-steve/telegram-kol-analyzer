@@ -257,20 +257,55 @@ def _aware(value: datetime) -> datetime:
     return value.astimezone(UTC)
 
 
+def _answered_during(
+    answered_completions: Sequence[datetime],
+    started_at: datetime | None,
+    completed_at: datetime,
+) -> bool:
+    """Did any answered attempt complete while this failed request was running."""
+
+    if started_at is None:
+        return False
+    from bisect import bisect_left
+
+    index = bisect_left(answered_completions, _aware(started_at))
+    return (
+        index < len(answered_completions)
+        and answered_completions[index] <= _aware(completed_at)
+    )
+
+
 def derive_provider_outage(
-    rows_newest_first: Iterable[tuple[Any, Any, datetime]],
+    rows_newest_first: Iterable[tuple[Any, Any, datetime | None, datetime]],
     *,
     scan_limit: int | None = None,
 ) -> ProviderOutage | None:
     """The most recent outage, open or just closed, from ``(status,
-    error_code, completed_at)`` rows ordered newest first; ``None`` if none.
+    error_code, started_at, completed_at)`` rows ordered newest first;
+    ``None`` if none.
 
     Pure, so the same derivation runs against production rows offline. Answered
     rows at the top mean the provider is up; the earliest of them sitting
     directly above a run of unavailable rows is the recovery moment, and that
     run of unavailable rows is the outage.
+
+    **An isolated failure is not an outage** (ruling of 2026-09-13, rule A). On
+    2026-09-13 00:02:34Z one request that had hung since 23:52:28Z failed with
+    a network error while three other calls succeeded inside that same span;
+    reading only the newest rows called that an outage and paged a person, then
+    paged again four minutes later that it had recovered. So an unavailable row
+    counts only if no answered attempt -- by any message, anywhere in the rows
+    read, including rows *below* it in id order -- completed between its start
+    and its end. An isolated one still carries its code and its log line; it
+    just opens no outage.
     """
 
+    rows = list(rows_newest_first)
+    answered_completions = sorted(
+        _aware(completed)
+        for status, error_code, _started, completed in rows
+        if _row_signal(status, error_code) == _ANSWERED
+    )
     rows_read = 0
     recovered_at: datetime | None = None
     answered_above = 0
@@ -280,9 +315,13 @@ def derive_provider_outage(
     latest_kind: str | None = None
     latest_status: int | None = None
     ended_inside_scan = False
-    for status, error_code, completed_at in rows_newest_first:
+    for status, error_code, request_started_at, completed_at in rows:
         rows_read += 1
         signal = _row_signal(status, error_code)
+        if signal == _UNAVAILABLE and _answered_during(
+            answered_completions, request_started_at, completed_at
+        ):
+            signal = _NEUTRAL
         if signal == _NEUTRAL:
             continue
         completed = _aware(completed_at)
@@ -332,14 +371,15 @@ def _load_recent_attempt_rows(
     session_factory: sessionmaker,
     *,
     scan_limit: int,
-) -> list[tuple[Any, Any, datetime]]:
+) -> list[tuple[Any, Any, datetime, datetime]]:
     with session_factory() as session:
         return [
-            (row.status, row.error_code, row.completed_at)
+            (row.status, row.error_code, row.started_at, row.completed_at)
             for row in (
                 session.query(
                     MimoRecognitionAttempt.status,
                     MimoRecognitionAttempt.error_code,
+                    MimoRecognitionAttempt.started_at,
                     MimoRecognitionAttempt.completed_at,
                 )
                 .order_by(MimoRecognitionAttempt.id.desc())

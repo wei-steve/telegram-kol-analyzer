@@ -218,10 +218,25 @@ def test_the_outage_starts_at_its_earliest_failure_whatever_the_id_order():
     from telegram_kol_research.mimo_provider_health import derive_provider_outage
 
     rows_newest_first = [
-        ("completed", None, T0 + timedelta(hours=14)),
-        ("http_error", BALANCE, T0 + timedelta(hours=1, minutes=4)),
-        ("http_error", BALANCE, T0 + timedelta(hours=1, minutes=2)),
-        ("http_error", BALANCE, T0 + timedelta(hours=1, minutes=3)),
+        ("completed", None, T0 + timedelta(hours=14), T0 + timedelta(hours=14)),
+        (
+            "http_error",
+            BALANCE,
+            T0 + timedelta(hours=1, minutes=4),
+            T0 + timedelta(hours=1, minutes=4),
+        ),
+        (
+            "http_error",
+            BALANCE,
+            T0 + timedelta(hours=1, minutes=2),
+            T0 + timedelta(hours=1, minutes=2),
+        ),
+        (
+            "http_error",
+            BALANCE,
+            T0 + timedelta(hours=1, minutes=3),
+            T0 + timedelta(hours=1, minutes=3),
+        ),
     ]
 
     outage = derive_provider_outage(rows_newest_first)
@@ -868,3 +883,268 @@ def test_the_three_replay_types_can_never_be_silenced_by_an_env_line():
         "provider_outage_replay_started",
     ):
         assert incident_type in ALWAYS_NOTIFIED_INCIDENT_TYPES, incident_type
+
+
+# --------------------------------------------------------------------------
+# Rule A (ruling of 2026-09-13): an isolated failure is not an outage
+# --------------------------------------------------------------------------
+
+UTC_DAY = datetime(2026, 9, 12)
+
+
+def _at(hour, minute, second):
+    return UTC_DAY + timedelta(hours=hour, minutes=minute, seconds=second)
+
+
+#: Production rows 7249-7255, 2026-09-12/13, as (status, error_code, started,
+#: completed), newest id first. 7253 hung from 23:52:28 to 00:02:34 while
+#: 7249, 7250 and 7251 completed inside that span; 7252 never reached the
+#: provider. The deployed step 1 paged "unavailable" at 00:02:47 and
+#: "recovered" at 00:06:48 on exactly these rows.
+PRODUCTION_ROWS_NEWEST_FIRST = [
+    ("completed", None, _at(24, 7, 44), _at(24, 8, 55)),
+    ("completed", None, _at(24, 4, 58), _at(24, 6, 30)),
+    (
+        "http_error",
+        "mimo_provider_unavailable.network_error",
+        _at(23, 52, 28),
+        _at(24, 2, 34),
+    ),
+    ("http_error", "v1_authoritative_failed", _at(24, 1, 26), _at(24, 1, 26)),
+    ("completed", None, _at(23, 59, 58), _at(24, 0, 41)),
+    ("completed", None, _at(23, 58, 7), _at(23, 58, 52)),
+    ("completed", None, _at(23, 57, 29), _at(23, 57, 50)),
+]
+
+
+@pytest.mark.parametrize(
+    "tick_label,rows",
+    [
+        # At 00:02:47 rows 7254 and 7255 did not exist yet.
+        ("00:02:47", PRODUCTION_ROWS_NEWEST_FIRST[2:]),
+        ("00:06:48", PRODUCTION_ROWS_NEWEST_FIRST[1:]),
+    ],
+)
+def test_the_hung_request_of_2026_09_13_opens_no_outage(tick_label, rows):
+    from telegram_kol_research.mimo_provider_health import derive_provider_outage
+
+    assert derive_provider_outage(rows) is None, tick_label
+
+
+def test_the_same_production_rows_page_nobody_through_the_real_tick(tmp_path):
+    from telegram_kol_research import mimo_provider_health as health
+
+    session_factory = _factory(tmp_path)
+    for index, (status, code, started, completed) in enumerate(
+        reversed(PRODUCTION_ROWS_NEWEST_FIRST[1:]), start=1
+    ):
+        _raw(session_factory, raw_id=index)
+        run = start_mimo_run(
+            session_factory,
+            raw_message_id=index,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model="mimo-v2.5",
+            input_kind="text",
+            input_fingerprint="fp",
+            prompt_versions={},
+            started_at=started,
+        )
+        record_mimo_attempt(
+            session_factory,
+            run_id=run.id,
+            ordinal=1,
+            status=status,
+            error_code=code,
+            error_message=None if status == "completed" else "failed",
+            duration_ms=0,
+            started_at=started,
+            completed_at=completed,
+            attempt_phase="v1_authoritative",
+        )
+    captured = []
+
+    state = health.run_mimo_provider_health_tick(
+        session_factory,
+        now=_utc(_at(24, 6, 48)),
+        capture_unavailable=lambda factory, **kwargs: captured.append(kwargs),
+        capture_recovered=lambda factory, **kwargs: captured.append(kwargs),
+    )
+
+    assert state["state"] == "healthy"
+    assert captured == []
+
+
+def test_failures_with_no_answer_in_between_are_still_an_outage():
+    """The control: same shape, nothing answered while the requests ran."""
+
+    from telegram_kol_research.mimo_provider_health import derive_provider_outage
+
+    rows = [
+        ("http_error", BALANCE, T0 + timedelta(minutes=2), T0 + timedelta(minutes=3)),
+        ("http_error", BALANCE, T0 + timedelta(minutes=1), T0 + timedelta(minutes=2)),
+        ("http_error", BALANCE, T0, T0 + timedelta(minutes=1)),
+        ("completed", None, T0 - timedelta(minutes=5), T0 - timedelta(minutes=4)),
+    ]
+
+    outage = derive_provider_outage(rows)
+    assert outage is not None
+    assert outage.failures == 3
+    assert outage.recovered_at is None
+
+    recovered = derive_provider_outage(
+        [("completed", None, T0 + timedelta(minutes=4), T0 + timedelta(minutes=5)), *rows]
+    )
+    assert recovered.recovered_at == _utc(T0 + timedelta(minutes=5))
+
+
+def test_a_message_touched_only_by_an_isolated_failure_was_not_delayed(tmp_path):
+    """A hung request must not make a live entry look like a late one."""
+
+    session_factory = _factory(tmp_path)
+    _raw(session_factory, raw_id=1)
+    run = start_mimo_run(
+        session_factory,
+        raw_message_id=1,
+        run_kind="v1_authoritative",
+        contract_version="v1",
+        model="mimo-v2.5",
+        input_kind="text",
+        input_fingerprint="fp",
+        prompt_versions={},
+        started_at=T0,
+    )
+    record_mimo_attempt(
+        session_factory,
+        run_id=run.id,
+        ordinal=1,
+        status="http_error",
+        error_code="mimo_provider_unavailable.network_error",
+        error_message="failed",
+        duration_ms=0,
+        started_at=T0,
+        completed_at=T0 + timedelta(minutes=10),
+        attempt_phase="v1_authoritative",
+    )
+    _raw(session_factory, raw_id=2)
+    _attempt(session_factory, raw_id=2, at=T0 + timedelta(minutes=5), status="completed")
+
+    verdict = replay.replay_verdict(
+        session_factory, raw_message_id=1, now=_utc(T0 + timedelta(minutes=11))
+    )
+
+    assert verdict.delayed is False
+
+
+# --------------------------------------------------------------------------
+# The total request deadline (ruling of 2026-09-13)
+# --------------------------------------------------------------------------
+
+
+def test_a_trickling_response_is_cut_at_the_total_deadline(tmp_path, monkeypatch):
+    """httpx timeouts are per read; a byte a second never trips one."""
+
+    import http.server
+    import socketserver
+    import threading
+    import time as time_module
+
+    from telegram_kol_research import recognition_experiments as experiments
+    from telegram_kol_research.ai_recognition_config import AiModelConfig
+    from telegram_kol_research.mimo_provider_health import classify_provider_failure
+
+    class Trickle(http.server.BaseHTTPRequestHandler):
+        def do_POST(self):
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(200)
+            self.send_header("Content-Length", "5")
+            self.end_headers()
+            for _ in range(5):
+                try:
+                    self.wfile.write(b" ")
+                    self.wfile.flush()
+                except Exception:
+                    return
+                time_module.sleep(1)
+
+        def log_message(self, *args):
+            pass
+
+    class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
+        daemon_threads = True
+
+    server = Server(("127.0.0.1", 0), Trickle)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setattr(experiments, "MIMO_REQUEST_TOTAL_DEADLINE_SECONDS", 1.0)
+    model_config = AiModelConfig(
+        id="mimo-v2.5",
+        label="MiMo",
+        base_url=f"http://127.0.0.1:{server.server_address[1]}/v1",
+        model="mimo-v2.5",
+        timeout_seconds=30.0,
+    )
+    started = time_module.monotonic()
+    try:
+        with pytest.raises(TimeoutError) as raised:
+            experiments._call_mimo_direct_model(
+                raw_message=RawMessage(id=1, chat_id=AUTO_CHAT, message_id=1, text="BTC 多"),
+                media_assets=[],
+                model_config=model_config,
+                prompt="",
+                media_root=tmp_path,
+                context_text="",
+            )
+    finally:
+        server.shutdown()
+    elapsed = time_module.monotonic() - started
+
+    assert isinstance(raised.value, experiments.MimoRequestDeadlineExceeded)
+    assert elapsed < 4.0
+    assert classify_provider_failure(raised.value).kind == "timeout"
+    assert experiments._provider_attempt_telemetry(raised.value).provider_request_made is True
+
+
+def test_the_deadline_plus_one_blocked_read_fits_inside_the_job_claim_lease():
+    """Past the lease the queue reclaims the job and a second run starts --
+    exactly how 2026-09-13's hung request became a late, false page."""
+
+    from telegram_kol_research.ai_recognition_config import AiModelConfig
+    from telegram_kol_research.message_processing_worker import DEFAULT_CLAIM_STALE_AFTER
+    from telegram_kol_research.recognition_experiments import (
+        MIMO_REQUEST_TOTAL_DEADLINE_SECONDS,
+    )
+
+    per_read_timeout = AiModelConfig(id="mimo-v2.5", label="MiMo").timeout_seconds
+    assert (
+        MIMO_REQUEST_TOTAL_DEADLINE_SECONDS + per_read_timeout
+        <= DEFAULT_CLAIM_STALE_AFTER.total_seconds()
+    )
+
+
+def test_a_request_that_hit_the_deadline_is_not_retried(tmp_path, monkeypatch):
+    """A retry would put a second full deadline inside the same claim lease."""
+
+    from telegram_kol_research import recognition_experiments as experiments
+
+    calls = []
+
+    def hung(**kwargs):
+        calls.append(kwargs)
+        raise experiments.MimoRequestDeadlineExceeded("total deadline exceeded")
+
+    monkeypatch.setattr(experiments, "_call_mimo_direct_model", hung)
+
+    payload, error, attempts = experiments._call_mimo_authoritative_with_retry(
+        raw_message=RawMessage(id=1, chat_id=AUTO_CHAT, message_id=1, text="BTC 多"),
+        media_assets=[],
+        model_config=object(),
+        prompt="",
+        media_root=tmp_path,
+        context_text="",
+        retry_delay_seconds=0,
+    )
+
+    assert payload == {}
+    assert len(calls) == 1
+    assert len(attempts) == 1
+    assert attempts[0].failure_kind == "timeout"

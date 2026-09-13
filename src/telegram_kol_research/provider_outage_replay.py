@@ -86,9 +86,17 @@ def load_message_outage_span(
 ) -> MessageOutageSpan | None:
     """``None`` when no attempt for this message was refused by the provider."""
 
+    answered_filter = or_(
+        MimoRecognitionAttempt.status == "completed",
+        MimoRecognitionAttempt.error_code.startswith(REQUEST_REJECTED_ERROR_CODE_PREFIX),
+        MimoRecognitionAttempt.error_code == RESPONSE_INVALID_ERROR_CODE,
+    )
     with session_factory() as session:
-        bounds = (
-            session.query(MimoRecognitionAttempt.completed_at)
+        failures = (
+            session.query(
+                MimoRecognitionAttempt.started_at,
+                MimoRecognitionAttempt.completed_at,
+            )
             .join(MimoRecognitionRun, MimoRecognitionRun.id == MimoRecognitionAttempt.run_id)
             .filter(
                 MimoRecognitionRun.raw_message_id == int(raw_message_id),
@@ -99,10 +107,28 @@ def load_message_outage_span(
             .order_by(MimoRecognitionAttempt.completed_at.asc())
             .all()
         )
-        if not bounds:
+        # Rule A (2026-09-13): a failure while other calls were being answered
+        # is an isolated request -- a hung connection -- not the provider being
+        # down. Counting it would mark a message "delayed by an outage", age it
+        # without that time and refuse it as a late entry: carrying a false
+        # alarm into the trading path, which matters more than the alarm.
+        kept: list[datetime] = []
+        for request_started_at, request_completed_at in failures:
+            overlapped = (
+                session.query(MimoRecognitionAttempt.id)
+                .filter(
+                    answered_filter,
+                    MimoRecognitionAttempt.completed_at >= request_started_at,
+                    MimoRecognitionAttempt.completed_at <= request_completed_at,
+                )
+                .first()
+            )
+            if overlapped is None:
+                kept.append(request_completed_at)
+        if not kept:
             return None
-        first = _aware(bounds[0][0])
-        last = _aware(bounds[-1][0])
+        first = _aware(kept[0])
+        last = _aware(kept[-1])
         answered = (
             session.query(MimoRecognitionAttempt.completed_at)
             .filter(

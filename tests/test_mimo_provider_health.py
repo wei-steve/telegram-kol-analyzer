@@ -677,7 +677,7 @@ def test_the_pure_derivation_matches_the_database_one(tmp_path):
         _attempt(session_factory, at=at, status=status, error_code=code)
 
     pure = health.derive_provider_outage(
-        [(status, code, at) for at, status, code in reversed(seeded)]
+        [(status, code, at, at) for at, status, code in reversed(seeded)]
     )
 
     assert pure == health.load_latest_provider_outage(session_factory)
