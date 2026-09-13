@@ -4,10 +4,47 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable, Sequence
+import logging
 import warnings
 
 import yaml
+
+from telegram_kol_research.ai_stage_catalog import (
+    AI_STAGE_DEFINITIONS,
+    AI_STAGE_DEFINITIONS_BY_KEY,
+    AI_STAGE_KEYS,
+    AUTHORITATIVE_STAGE,
+    AiModel,
+    AiProvider,
+    AiStageDefinition,
+    default_provider_label,
+    is_valid_slug,
+    provider_id_for_base_url,
+    stage_definition,
+)
+
+
+logger = logging.getLogger(__name__)
+
+#: ``config/ai_recognition.yaml`` layout this module writes. A file without the
+#: key is v1 and is migrated in memory on every load; nothing is written back
+#: until someone saves, so a production file is not rewritten by a deploy.
+AI_CONFIG_SCHEMA_VERSION = 2
+
+
+class AiRecognitionConfigValidationError(ValueError):
+    """A save was refused because the v2 structure is not self-consistent.
+
+    Carries every problem found, so the Web layer can return one 422 listing
+    all of them rather than making the user fix one per round trip.
+    """
+
+    def __init__(self, errors: Sequence[str]):
+        self.errors = tuple(str(error) for error in errors)
+        super().__init__("; ".join(self.errors) or "invalid AI configuration")
+
+
 
 
 DEFAULT_RECOGNITION_PROMPT = """你是 Telegram 加密货币 KOL 消息的交易策略识别器。你的任务不是做行情分析，而是判断“这一条单独消息”是否包含可以进入自动化交易流程的明确策略。
@@ -278,6 +315,25 @@ class AiModelConfig:
 
 @dataclass(frozen=True)
 class AiRecognitionConfig:
+    """AI settings in both shapes at once.
+
+    ``providers`` / ``models`` / ``stages`` are the schema-v2 structure. The
+    six fields below them are the v1 view every un-migrated call site still
+    reads; :func:`load_ai_recognition_config` and
+    :func:`save_ai_recognition_config` keep the two consistent, deriving the v1
+    view from ``stages`` exactly as the design specifies (``text_provider`` and
+    ``active_text_model_id`` from ``batch_text_recognition[0]``,
+    ``image_provider`` / ``active_image_model_id`` from
+    ``batch_image_recognition[0]``, ``context_resolution_model_id`` from
+    ``context_resolution[0]``).
+
+    They are left as plain fields rather than read-only properties on purpose:
+    every existing construction site and every ``dataclasses.replace`` keeps
+    working unchanged, which is what phase 1 promised. A hand-built config is
+    therefore exactly what its caller passed, and derivation happens only where
+    the file is read or written.
+    """
+
     recognition_prompt: str = DEFAULT_RECOGNITION_PROMPT
     lifecycle_event_prompt: str = DEFAULT_LIFECYCLE_EVENT_PROMPT
     mimo_direct_prompt: str = DEFAULT_MIMO_DIRECT_PROMPT
@@ -288,6 +344,25 @@ class AiRecognitionConfig:
     active_text_model_id: str = ""
     active_image_model_id: str = ""
     context_resolution_model_id: str = ""
+    providers: list[AiProvider] = field(default_factory=list)
+    models: list[AiModel] = field(default_factory=list)
+    stages: dict[str, list[str]] = field(default_factory=dict)
+    #: What loading skipped and why. Never part of equality: two configs that
+    #: describe the same models are the same config.
+    config_warnings: tuple[str, ...] = field(default=(), compare=False)
+
+    @property
+    def providers_by_id(self) -> dict[str, AiProvider]:
+        return {provider.id: provider for provider in self.providers}
+
+    @property
+    def models_by_id(self) -> dict[str, AiModel]:
+        return {model.id: model for model in self.models}
+
+    def stage_chain(self, stage_key: str) -> list[AiModelConfig]:
+        """The usable, ordered models bound to one stage (may be empty)."""
+
+        return resolve_stage_models(self, stage_key)
 
 
 def build_authoritative_mimo_prompt(config: AiRecognitionConfig) -> str:
@@ -387,6 +462,356 @@ DEFAULT_AI_MODELS = [
 ]
 
 
+#: The v1 ``_find_mimo_model`` rule, kept here so migration reproduces exactly
+#: what production does today rather than what the old selection page said.
+MIMO_AUTHORITATIVE_MODEL_NAME = "mimo-v2.5"
+
+
+def _bind_model(model: AiModel, provider: AiProvider) -> AiModelConfig:
+    """Join one provider and one model into the flat runtime shape.
+
+    :class:`AiModelConfig` stays the type every caller and the provider client
+    already speak, so nothing downstream has to learn the two-layer storage.
+    """
+
+    return AiModelConfig(
+        id=model.id,
+        label=model.label or model.id,
+        base_url=provider.base_url,
+        api_key=provider.api_key,
+        model=model.model,
+        timeout_seconds=provider.timeout_seconds,
+        supports_text=model.supports_text,
+        supports_image=model.supports_image,
+    )
+
+
+def resolve_stage_models(
+    config: AiRecognitionConfig,
+    stage_key: str,
+) -> list[AiModelConfig]:
+    """The ordered models one stage can actually call right now.
+
+    Membership is stored; routability is decided here. A member whose model or
+    provider is disabled, or whose provider has no endpoint, stays bound (so a
+    temporary disable does not lose the binding) but is skipped -- the same
+    meaning as OpenMinis' ``availableEntryIds``. An empty result means "this
+    stage has no usable model", which every call site must already handle
+    because that is what an unconfigured provider has always meant.
+    """
+
+    definition = stage_definition(stage_key)
+    providers = config.providers_by_id
+    models = config.models_by_id
+    resolved: list[AiModelConfig] = []
+    seen: set[str] = set()
+    for model_id in config.stages.get(str(stage_key or ""), ()):
+        model = models.get(str(model_id))
+        if model is None or not model.enabled or model.id in seen:
+            continue
+        provider = providers.get(model.provider_id)
+        if provider is None or not provider.enabled:
+            continue
+        if definition is not None and not definition.supports(
+            supports_text=model.supports_text,
+            supports_image=model.supports_image,
+        ):
+            continue
+        bound = _bind_model(model, provider)
+        if not bound.provider.is_configured:
+            continue
+        seen.add(model.id)
+        resolved.append(bound)
+    return resolved
+
+
+def _normalize_provider(provider: AiProvider) -> AiProvider:
+    return AiProvider(
+        id=str(provider.id or "").strip(),
+        label=str(provider.label or "").strip(),
+        base_url=str(provider.base_url or "").strip().rstrip("/"),
+        api_key=str(provider.api_key or "").strip(),
+        timeout_seconds=float(provider.timeout_seconds or 60),
+        enabled=bool(provider.enabled),
+    )
+
+
+def _normalize_model(model: AiModel) -> AiModel:
+    model_id = str(model.id or "").strip()
+    return AiModel(
+        id=model_id,
+        provider_id=str(model.provider_id or "").strip(),
+        model=str(model.model or "").strip(),
+        label=str(model.label or "").strip() or model_id,
+        supports_text=bool(model.supports_text),
+        supports_image=bool(model.supports_image),
+        enabled=bool(model.enabled),
+    )
+
+
+def normalize_ai_config_v2(
+    providers: Iterable[AiProvider],
+    models: Iterable[AiModel],
+    stages: dict[str, Iterable[str]] | None,
+) -> tuple[
+    list[AiProvider],
+    list[AiModel],
+    dict[str, list[str]],
+    list[str],
+    list[str],
+]:
+    """Normalize one v2 structure; report what was dropped and what was wrong.
+
+    Returns ``(providers, models, stages, warnings, errors)``. Loading applies
+    the warnings and keeps going (a half-broken file must not stop recognition
+    from starting); saving turns ``errors`` into a 422 so the page says what to
+    fix. Every dropped member appears in ``warnings`` either way.
+    """
+
+    warning_list: list[str] = []
+    error_list: list[str] = []
+
+    normalized_providers: list[AiProvider] = []
+    provider_ids: set[str] = set()
+    for provider in providers:
+        item = _normalize_provider(provider)
+        if not is_valid_slug(item.id):
+            error_list.append(f"provider id is not a valid slug: {item.id!r}")
+            warning_list.append(f"skipped provider with invalid id {item.id!r}")
+            continue
+        if item.id in provider_ids:
+            error_list.append(f"duplicate provider id: {item.id!r}")
+            warning_list.append(f"skipped duplicate provider {item.id!r}")
+            continue
+        provider_ids.add(item.id)
+        normalized_providers.append(item)
+    providers_by_id = {item.id: item for item in normalized_providers}
+
+    normalized_models: list[AiModel] = []
+    model_ids: set[str] = set()
+    for model in models:
+        item = _normalize_model(model)
+        if not is_valid_slug(item.id):
+            error_list.append(f"model id is not a valid slug: {item.id!r}")
+            warning_list.append(f"skipped model with invalid id {item.id!r}")
+            continue
+        if item.id in model_ids:
+            error_list.append(f"duplicate model id: {item.id!r}")
+            warning_list.append(f"skipped duplicate model {item.id!r}")
+            continue
+        provider = providers_by_id.get(item.provider_id)
+        if provider is None:
+            error_list.append(
+                f"model {item.id!r} references unknown provider "
+                f"{item.provider_id!r}"
+            )
+            warning_list.append(
+                f"skipped model {item.id!r}: provider {item.provider_id!r} is unknown"
+            )
+            continue
+        model_ids.add(item.id)
+        normalized_models.append(
+            AiModel(
+                id=item.id,
+                provider_id=item.provider_id,
+                model=item.model,
+                label=item.label,
+                supports_text=item.supports_text,
+                supports_image=item.supports_image,
+                enabled=item.enabled,
+                provider=provider,
+            )
+        )
+    models_by_id = {item.id: item for item in normalized_models}
+
+    raw_stages = dict(stages or {})
+    for stage_key in raw_stages:
+        if stage_key not in AI_STAGE_DEFINITIONS_BY_KEY:
+            warning_list.append(f"dropped unknown stage {stage_key!r}")
+    normalized_stages: dict[str, list[str]] = {}
+    for definition in AI_STAGE_DEFINITIONS:
+        chain: list[str] = []
+        for raw_id in raw_stages.get(definition.stage_key, ()) or ():
+            model_id = str(raw_id or "").strip()
+            if not model_id or model_id in chain:
+                continue
+            model = models_by_id.get(model_id)
+            if model is None:
+                warning_list.append(
+                    f"stage {definition.stage_key}: dropped unknown model "
+                    f"{model_id!r}"
+                )
+                continue
+            if not definition.supports(
+                supports_text=model.supports_text,
+                supports_image=model.supports_image,
+            ):
+                error_list.append(
+                    f"stage {definition.stage_key} requires "
+                    f"{definition.capability_label}; model {model_id!r} cannot serve it"
+                )
+                warning_list.append(
+                    f"stage {definition.stage_key}: dropped {model_id!r}, it does not "
+                    f"support {definition.capability_label}"
+                )
+                continue
+            if not model.enabled:
+                warning_list.append(
+                    f"stage {definition.stage_key}: {model_id!r} is bound but disabled"
+                )
+            elif model.provider is not None and not model.provider.enabled:
+                warning_list.append(
+                    f"stage {definition.stage_key}: {model_id!r} is bound but its "
+                    f"provider {model.provider_id!r} is disabled"
+                )
+            elif model.provider is not None and not model.provider.is_configured:
+                warning_list.append(
+                    f"stage {definition.stage_key}: {model_id!r} is bound but its "
+                    f"provider {model.provider_id!r} has no base_url"
+                )
+            chain.append(model_id)
+        normalized_stages[definition.stage_key] = chain
+    return (
+        normalized_providers,
+        normalized_models,
+        normalized_stages,
+        warning_list,
+        error_list,
+    )
+
+
+def migrate_v1_ai_config(
+    ai_models: Sequence[AiModelConfig],
+    *,
+    active_text_model_id: str = "",
+    active_image_model_id: str = "",
+    context_resolution_model_id: str = "",
+) -> tuple[list[AiProvider], list[AiModel], dict[str, list[str]]]:
+    """Turn the flat v1 model list into providers, models and stage chains.
+
+    Pure and idempotent: nothing is read or written, and re-running it on the
+    v1 view derived from its own output gives the same answer.
+
+    The ids passed in must already be the **resolved** ones (what
+    ``_select_active_model`` picked), not the raw YAML strings, so the stages
+    describe what production actually does today rather than what the old page
+    displayed. ``authoritative_recognition`` follows
+    ``recognition_experiments._find_mimo_model`` -- the entry whose id or model
+    name is ``mimo-v2.5`` -- because that, not ``active_image_model_id``, is
+    the model the production path has been calling.
+
+    Providers are deduplicated by ``(base_url, api_key, timeout_seconds)``. The
+    design says ``(base_url, api_key)``; the timeout is included because two
+    v1 entries on one endpoint with different timeouts would otherwise come
+    back from a round trip with a timeout they never had, and a silent change
+    to a request deadline is exactly the kind of thing this project does not
+    do quietly.
+    """
+
+    providers: list[AiProvider] = []
+    provider_id_by_key: dict[tuple[str, str, float], str] = {}
+    models: list[AiModel] = []
+    for entry in ai_models:
+        normalized = _normalize_model_config(entry)
+        if not normalized.id:
+            continue
+        key = (normalized.base_url, normalized.api_key, normalized.timeout_seconds)
+        provider_id = provider_id_by_key.get(key)
+        if provider_id is None:
+            provider_id = provider_id_for_base_url(
+                normalized.base_url,
+                taken=provider_id_by_key.values(),
+            )
+            provider_id_by_key[key] = provider_id
+            providers.append(
+                AiProvider(
+                    id=provider_id,
+                    label=default_provider_label(provider_id),
+                    base_url=normalized.base_url,
+                    api_key=normalized.api_key,
+                    timeout_seconds=normalized.timeout_seconds,
+                    enabled=True,
+                )
+            )
+        models.append(
+            AiModel(
+                id=normalized.id,
+                provider_id=provider_id,
+                model=normalized.model,
+                label=normalized.label or normalized.id,
+                supports_text=normalized.supports_text,
+                supports_image=normalized.supports_image,
+                enabled=True,
+            )
+        )
+
+    known = {model.id for model in models}
+
+    def _chain(model_id: str) -> list[str]:
+        return [model_id] if model_id and model_id in known else []
+
+    mimo_model_id = ""
+    for entry in ai_models:
+        if (
+            entry.id == MIMO_AUTHORITATIVE_MODEL_NAME
+            or entry.model == MIMO_AUTHORITATIVE_MODEL_NAME
+        ):
+            mimo_model_id = entry.id.strip()
+            break
+    text_id = str(active_text_model_id or "").strip()
+    stages = {
+        AUTHORITATIVE_STAGE: _chain(mimo_model_id),
+        "context_resolution": _chain(
+            str(context_resolution_model_id or "").strip() or text_id
+        ),
+        "semantic_review": _chain(text_id),
+        "strategy_alert": [],
+        "research_chat": [],
+        "batch_text_recognition": _chain(text_id),
+        "batch_image_recognition": _chain(
+            str(active_image_model_id or "").strip()
+        ),
+    }
+    return providers, models, stages
+
+
+def _derive_v1_view(
+    providers: list[AiProvider],
+    models: list[AiModel],
+    stages: dict[str, list[str]],
+    *,
+    fallback_text_provider: AiProviderConfig,
+    fallback_image_provider: AiProviderConfig,
+) -> dict[str, Any]:
+    """The v1 fields, read off the v2 structure (design §3).
+
+    A stage with no usable model leaves its v1 field alone: that is exactly
+    what "no provider configured" has always looked like to the call sites.
+    """
+
+    probe = AiRecognitionConfig(providers=providers, models=models, stages=stages)
+    text_chain = resolve_stage_models(probe, "batch_text_recognition")
+    image_chain = resolve_stage_models(probe, "batch_image_recognition")
+    context_chain = resolve_stage_models(probe, "context_resolution")
+    ai_models = [
+        _bind_model(model, model.provider)
+        for model in models
+        if model.provider is not None
+    ]
+    return {
+        "ai_models": ai_models,
+        "text_provider": (
+            text_chain[0].provider if text_chain else fallback_text_provider
+        ),
+        "image_provider": (
+            image_chain[0].provider if image_chain else fallback_image_provider
+        ),
+        "active_text_model_id": text_chain[0].id if text_chain else "",
+        "active_image_model_id": image_chain[0].id if image_chain else "",
+        "context_resolution_model_id": context_chain[0].id if context_chain else "",
+    }
+
+
 def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     """Load AI recognition settings, falling back to conservative defaults."""
 
@@ -401,6 +826,12 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
             model for model in ai_models if model.id == "deepseek-v4-flash"
         )
         image_model = next(model for model in ai_models if model.id == "mimo-v2.5")
+        providers, models, stages = migrate_v1_ai_config(
+            ai_models,
+            active_text_model_id=text_model.id,
+            active_image_model_id=image_model.id,
+            context_resolution_model_id=text_model.id,
+        )
         return AiRecognitionConfig(
             recognition_prompt=_with_price_shorthand_instruction(DEFAULT_RECOGNITION_PROMPT),
             lifecycle_event_prompt=_with_lifecycle_event_instructions(
@@ -411,6 +842,9 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
             active_text_model_id=text_model.id,
             active_image_model_id=image_model.id,
             context_resolution_model_id=text_model.id,
+            providers=providers,
+            models=models,
+            stages=stages,
         )
 
     raw_data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
@@ -446,6 +880,16 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
     mode = str(raw_data.get("mode") or "local_rule_parser")
     raw_text_provider = _load_provider_config(raw_data.get("text_provider"))
     raw_image_provider = _load_provider_config(raw_data.get("image_provider"))
+    if _schema_version(raw_data) >= 2:
+        return _load_v2_config(
+            raw_data,
+            recognition_prompt=recognition_prompt,
+            lifecycle_event_prompt=lifecycle_event_prompt,
+            mimo_direct_prompt=mimo_direct_prompt,
+            mode=mode,
+            fallback_text_provider=raw_text_provider,
+            fallback_image_provider=raw_image_provider,
+        )
     ai_models = _load_ai_models(
         raw_data.get("ai_models"),
         text_provider=raw_text_provider,
@@ -471,6 +915,14 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         supports="text",
         fallback_provider=(text_model.provider if text_model else raw_text_provider),
     )
+    providers, models, stages = migrate_v1_ai_config(
+        ai_models,
+        active_text_model_id=text_model.id if text_model else "",
+        active_image_model_id=image_model.id if image_model else "",
+        context_resolution_model_id=(
+            context_resolution_model.id if context_resolution_model else ""
+        ),
+    )
     return AiRecognitionConfig(
         recognition_prompt=recognition_prompt,
         lifecycle_event_prompt=lifecycle_event_prompt,
@@ -484,17 +936,263 @@ def load_ai_recognition_config(config_path: str | Path) -> AiRecognitionConfig:
         context_resolution_model_id=(
             context_resolution_model.id if context_resolution_model else ""
         ),
+        providers=providers,
+        models=models,
+        stages=stages,
     )
+
+
+def _schema_version(raw_data: dict[str, Any]) -> int:
+    try:
+        return int(raw_data.get("schema_version") or 1)
+    except (TypeError, ValueError):
+        return 1
+
+
+def _provider_from_payload(value: Any) -> AiProvider:
+    data = value if isinstance(value, dict) else {}
+    return AiProvider(
+        id=str(data.get("id") or ""),
+        label=str(data.get("label") or ""),
+        base_url=str(data.get("base_url") or ""),
+        api_key=str(data.get("api_key") or ""),
+        timeout_seconds=float(data.get("timeout_seconds") or 60),
+        enabled=bool(data.get("enabled", True)),
+    )
+
+
+def _model_from_payload(value: Any) -> AiModel:
+    data = value if isinstance(value, dict) else {}
+    return AiModel(
+        id=str(data.get("id") or data.get("model") or ""),
+        provider_id=str(data.get("provider_id") or ""),
+        model=str(data.get("model") or ""),
+        label=str(data.get("label") or ""),
+        supports_text=bool(data.get("supports_text", True)),
+        supports_image=bool(data.get("supports_image", False)),
+        enabled=bool(data.get("enabled", True)),
+    )
+
+
+def _stages_from_payload(value: Any) -> dict[str, list[str]]:
+    if not isinstance(value, dict):
+        return {}
+    stages: dict[str, list[str]] = {}
+    for key, members in value.items():
+        if isinstance(members, str):
+            members = [members]
+        if not isinstance(members, (list, tuple)):
+            continue
+        stages[str(key)] = [str(item) for item in members]
+    return stages
+
+
+def _load_v2_config(
+    raw_data: dict[str, Any],
+    *,
+    recognition_prompt: str,
+    lifecycle_event_prompt: str,
+    mimo_direct_prompt: str,
+    mode: str,
+    fallback_text_provider: AiProviderConfig,
+    fallback_image_provider: AiProviderConfig,
+) -> AiRecognitionConfig:
+    """Read a schema-v2 file. Broken members are skipped, never fatal."""
+
+    raw_providers = raw_data.get("providers")
+    raw_models = raw_data.get("models")
+    providers, models, stages, warning_list, _errors = normalize_ai_config_v2(
+        [
+            _provider_from_payload(item)
+            for item in (raw_providers if isinstance(raw_providers, list) else [])
+        ],
+        [
+            _model_from_payload(item)
+            for item in (raw_models if isinstance(raw_models, list) else [])
+        ],
+        _stages_from_payload(raw_data.get("stages")),
+    )
+    for message in warning_list:
+        logger.warning("ai_recognition config: %s", message)
+    derived = _derive_v1_view(
+        providers,
+        models,
+        stages,
+        fallback_text_provider=fallback_text_provider,
+        fallback_image_provider=fallback_image_provider,
+    )
+    return AiRecognitionConfig(
+        recognition_prompt=recognition_prompt,
+        lifecycle_event_prompt=lifecycle_event_prompt,
+        mimo_direct_prompt=mimo_direct_prompt,
+        mode=mode,
+        providers=providers,
+        models=models,
+        stages=stages,
+        config_warnings=tuple(warning_list),
+        **derived,
+    )
+
+
+#: The three stages a v1-shaped caller can still name, and the v1 field that
+#: names each one.
+_LEGACY_STAGE_FIELDS = (
+    ("batch_text_recognition", "active_text_model_id"),
+    ("batch_image_recognition", "active_image_model_id"),
+    ("context_resolution", "context_resolution_model_id"),
+)
+
+
+def _promote_legacy_heads(
+    stages: dict[str, list[str]],
+    *,
+    models: list[AiModel],
+    heads: dict[str, str],
+) -> dict[str, list[str]]:
+    """Let an explicit v1 field decide its stage's head, keeping the tail.
+
+    ``dataclasses.replace(config, context_resolution_model_id=...)`` is how
+    ``context_authority_cutover`` changes a model, and the old
+    ``POST /api/ai-recognition-config`` form works the same way. Neither can
+    express a chain, so the head they name is moved to the front and the
+    fallbacks already configured stay behind it instead of being erased.
+    """
+
+    models_by_id = {model.id: model for model in models}
+    merged = {key: list(value) for key, value in stages.items()}
+    for stage_key, head in heads.items():
+        head = str(head or "").strip()
+        if not head:
+            continue
+        model = models_by_id.get(head)
+        definition = stage_definition(stage_key)
+        if model is None or definition is None:
+            continue
+        if not definition.supports(
+            supports_text=model.supports_text,
+            supports_image=model.supports_image,
+        ):
+            continue
+        chain = merged.get(stage_key, [])
+        if chain[:1] == [head]:
+            continue
+        merged[stage_key] = [head] + [item for item in chain if item != head]
+    return merged
+
+
+def _preserved_stage_chains(
+    path: Path,
+    stages: dict[str, list[str]],
+    *,
+    models: list[AiModel],
+) -> dict[str, list[str]]:
+    """Keep chains the caller had no way to express.
+
+    A v1-shaped save carries no ``stages``, so every chain is rebuilt from the
+    v1 fields -- which name at most one model each. Without this, saving the
+    old "AI配置" form once would silently delete every fallback a user had
+    configured on the new page. So for each stage, the chain already on disk
+    is kept when it starts with the same model the rebuild chose, and it is
+    kept whole when the rebuild produced nothing at all.
+    """
+
+    if not path.exists():
+        return stages
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return stages
+    if not isinstance(raw, dict) or _schema_version(raw) < 2:
+        return stages
+    known = {model.id for model in models}
+    existing = _stages_from_payload(raw.get("stages"))
+    merged = {key: list(value) for key, value in stages.items()}
+    for stage_key, chain in merged.items():
+        previous = [
+            item
+            for item in existing.get(stage_key, [])
+            if item in known
+        ]
+        if not previous:
+            continue
+        if not chain:
+            merged[stage_key] = previous
+        elif previous[:1] == chain[:1] and len(previous) > len(chain):
+            merged[stage_key] = previous
+    return merged
 
 
 def save_ai_recognition_config(
     config_path: str | Path,
     config: AiRecognitionConfig,
 ) -> AiRecognitionConfig:
-    """Persist AI recognition settings and return the normalized config."""
+    """Persist AI recognition settings and return the normalized config.
+
+    Always writes schema v2. The v1 keys are written too, as a derived mirror:
+    they cost nothing, they keep ``config/ai_recognition.example.yaml`` and
+    every reader of the raw file working, and they mean a rollback to code
+    that predates v2 finds a configuration it can still read instead of an
+    empty one.
+    """
 
     path = Path(config_path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    if config.models:
+        normalized = _save_from_v2(config)
+    else:
+        normalized = _save_from_v1(path, config)
+    payload: dict[str, Any] = {
+        "schema_version": AI_CONFIG_SCHEMA_VERSION,
+        "mode": normalized.mode,
+        "recognition_prompt": normalized.recognition_prompt,
+        "lifecycle_event_prompt": normalized.lifecycle_event_prompt,
+        "mimo_direct_prompt": normalized.mimo_direct_prompt,
+        "providers": [
+            _provider_v2_to_payload(provider) for provider in normalized.providers
+        ],
+        "models": [_model_v2_to_payload(model) for model in normalized.models],
+        "stages": {
+            stage_key: list(normalized.stages.get(stage_key, []))
+            for stage_key in AI_STAGE_KEYS
+        },
+        "active_text_model_id": normalized.active_text_model_id,
+        "active_image_model_id": normalized.active_image_model_id,
+        "context_resolution_model_id": normalized.context_resolution_model_id,
+        "ai_models": [_model_to_payload(model) for model in normalized.ai_models],
+        "text_provider": _provider_to_payload(normalized.text_provider),
+        "image_provider": _provider_to_payload(normalized.image_provider),
+    }
+    path.write_text(
+        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
+        encoding="utf-8",
+    )
+    return normalized
+
+
+def _normalized_prompts(config: AiRecognitionConfig) -> dict[str, str]:
+    return {
+        "recognition_prompt": _with_price_shorthand_instruction(
+            _with_normalized_strategy_output_instructions(
+                config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
+            )
+        ),
+        "lifecycle_event_prompt": _with_lifecycle_event_instructions(
+            config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT
+        ),
+        "mimo_direct_prompt": _with_price_shorthand_instruction(
+            _with_mimo_direct_instructions(
+                config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
+            )
+        ),
+    }
+
+
+def _save_from_v1(
+    path: Path,
+    config: AiRecognitionConfig,
+) -> AiRecognitionConfig:
+    """Normalize a config that only carries the v1 fields (unchanged rules)."""
+
     ai_models = _normalize_ai_models(
         config.ai_models,
         text_provider=config.text_provider,
@@ -518,47 +1216,175 @@ def save_ai_recognition_config(
         supports="text",
         fallback_provider=(text_model.provider if text_model else config.text_provider),
     )
-    normalized = AiRecognitionConfig(
-        recognition_prompt=_with_price_shorthand_instruction(
-            _with_normalized_strategy_output_instructions(
-                config.recognition_prompt.strip() or DEFAULT_RECOGNITION_PROMPT
-            )
-        ),
-        lifecycle_event_prompt=_with_lifecycle_event_instructions(
-            config.lifecycle_event_prompt.strip() or DEFAULT_LIFECYCLE_EVENT_PROMPT
-        ),
-        mimo_direct_prompt=_with_price_shorthand_instruction(
-            _with_mimo_direct_instructions(
-                config.mimo_direct_prompt.strip() or DEFAULT_MIMO_DIRECT_PROMPT
-            )
-        ),
-        mode=_resolve_mode(config),
-        text_provider=text_model.provider if text_model else _normalize_provider_config(config.text_provider),
-        image_provider=image_model.provider if image_model else _normalize_provider_config(config.image_provider),
-        ai_models=ai_models,
+    raw_providers, raw_models, raw_stages = migrate_v1_ai_config(
+        ai_models,
         active_text_model_id=text_model.id if text_model else "",
         active_image_model_id=image_model.id if image_model else "",
         context_resolution_model_id=(
             context_resolution_model.id if context_resolution_model else ""
         ),
     )
-    payload: dict[str, Any] = {
-        "mode": normalized.mode,
-        "recognition_prompt": normalized.recognition_prompt,
-        "lifecycle_event_prompt": normalized.lifecycle_event_prompt,
-        "mimo_direct_prompt": normalized.mimo_direct_prompt,
-        "active_text_model_id": normalized.active_text_model_id,
-        "active_image_model_id": normalized.active_image_model_id,
-        "context_resolution_model_id": normalized.context_resolution_model_id,
-        "ai_models": [_model_to_payload(model) for model in normalized.ai_models],
-        "text_provider": _provider_to_payload(normalized.text_provider),
-        "image_provider": _provider_to_payload(normalized.image_provider),
-    }
-    path.write_text(
-        yaml.safe_dump(payload, allow_unicode=True, sort_keys=False),
-        encoding="utf-8",
+    raw_stages = _preserved_stage_chains(path, raw_stages, models=raw_models)
+    providers, models, stages, warning_list, errors = normalize_ai_config_v2(
+        raw_providers, raw_models, raw_stages
     )
-    return normalized
+    if errors:
+        raise AiRecognitionConfigValidationError(errors)
+    return AiRecognitionConfig(
+        **_normalized_prompts(config),
+        mode=_resolve_mode(config),
+        text_provider=(
+            text_model.provider
+            if text_model
+            else _normalize_provider_config(config.text_provider)
+        ),
+        image_provider=(
+            image_model.provider
+            if image_model
+            else _normalize_provider_config(config.image_provider)
+        ),
+        ai_models=ai_models,
+        active_text_model_id=text_model.id if text_model else "",
+        active_image_model_id=image_model.id if image_model else "",
+        context_resolution_model_id=(
+            context_resolution_model.id if context_resolution_model else ""
+        ),
+        providers=providers,
+        models=models,
+        stages=stages,
+        config_warnings=tuple(warning_list),
+    )
+
+
+def _save_from_v2(config: AiRecognitionConfig) -> AiRecognitionConfig:
+    """Normalize a config whose v2 structure is what the caller edited."""
+
+    providers, models, stages, warning_list, errors = normalize_ai_config_v2(
+        config.providers, config.models, config.stages
+    )
+    if errors:
+        raise AiRecognitionConfigValidationError(errors)
+    stages = _promote_legacy_heads(
+        stages,
+        models=models,
+        heads={
+            stage_key: getattr(config, field_name)
+            for stage_key, field_name in _LEGACY_STAGE_FIELDS
+        },
+    )
+    derived = _derive_v1_view(
+        providers,
+        models,
+        stages,
+        fallback_text_provider=_normalize_provider_config(config.text_provider),
+        fallback_image_provider=_normalize_provider_config(config.image_provider),
+    )
+    return AiRecognitionConfig(
+        **_normalized_prompts(config),
+        mode=_resolve_mode(config),
+        providers=providers,
+        models=models,
+        stages=stages,
+        config_warnings=tuple(warning_list),
+        **derived,
+    )
+
+
+def _provider_v2_to_payload(provider: AiProvider) -> dict[str, Any]:
+    return {
+        "id": provider.id,
+        "label": provider.label,
+        "base_url": provider.base_url,
+        "api_key": provider.api_key,
+        "timeout_seconds": provider.timeout_seconds,
+        "enabled": provider.enabled,
+    }
+
+
+def _model_v2_to_payload(model: AiModel) -> dict[str, Any]:
+    return {
+        "id": model.id,
+        "provider_id": model.provider_id,
+        "model": model.model,
+        "label": model.label,
+        "supports_text": model.supports_text,
+        "supports_image": model.supports_image,
+        "enabled": model.enabled,
+    }
+
+
+def build_ai_config_view(config: AiRecognitionConfig) -> dict[str, Any]:
+    """The whole v2 structure with keys masked (CLI ``ai-config-show``, Web).
+
+    An API key is write-only everywhere in this project: a reader is told
+    whether one is set and its last four characters, never the key.
+    """
+
+    providers = [
+        {
+            "id": provider.id,
+            "label": provider.label or provider.id,
+            "base_url": provider.base_url,
+            "timeout_seconds": provider.timeout_seconds,
+            "enabled": provider.enabled,
+            "api_key_configured": provider.api_key_configured,
+            "api_key_last4": provider.api_key_last4,
+        }
+        for provider in config.providers
+    ]
+    models = [
+        {
+            "id": model.id,
+            "provider_id": model.provider_id,
+            "model": model.model,
+            "label": model.label or model.id,
+            "supports_text": model.supports_text,
+            "supports_image": model.supports_image,
+            "enabled": model.enabled,
+        }
+        for model in config.models
+    ]
+    definitions = []
+    effective: dict[str, list[dict[str, Any]]] = {}
+    for definition in AI_STAGE_DEFINITIONS:
+        definitions.append(
+            {
+                "stage_key": definition.stage_key,
+                "label": definition.label,
+                "description": definition.description,
+                "requires_text": definition.requires_text,
+                "requires_image": definition.requires_image,
+                "capability_label": definition.capability_label,
+                "production_path": definition.production_path,
+                "production_note": definition.production_note,
+                "env_fallback": definition.env_fallback,
+            }
+        )
+        effective[definition.stage_key] = [
+            {
+                "id": model.id,
+                "label": model.label or model.id,
+                "model": model.model,
+                "base_url": model.base_url,
+                "role": "主用" if index == 0 else f"备用 {index}",
+            }
+            for index, model in enumerate(
+                resolve_stage_models(config, definition.stage_key)
+            )
+        ]
+    return {
+        "schema_version": AI_CONFIG_SCHEMA_VERSION,
+        "mode": config.mode,
+        "providers": providers,
+        "models": models,
+        "definitions": definitions,
+        "stages": {
+            stage_key: list(config.stages.get(stage_key, []))
+            for stage_key in AI_STAGE_KEYS
+        },
+        "effective": effective,
+        "warnings": list(config.config_warnings),
+    }
 
 
 def _load_provider_config(value: Any) -> AiProviderConfig:
@@ -704,6 +1530,10 @@ def _resolve_mode(config: AiRecognitionConfig) -> str:
         config.text_provider.is_configured
         or config.image_provider.is_configured
         or any(model.provider.is_configured for model in config.ai_models)
+        or any(
+            provider.enabled and provider.is_configured
+            for provider in config.providers
+        )
     ):
         return "ai_provider"
     return requested

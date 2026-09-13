@@ -27,7 +27,10 @@ from sqlalchemy import create_engine, inspect, tuple_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.backfill import build_backfill_windows
-from telegram_kol_research.ai_recognition_config import load_ai_recognition_config
+from telegram_kol_research.ai_recognition_config import (
+    build_ai_config_view,
+    load_ai_recognition_config,
+)
 from telegram_kol_research.authoritative_recognition import process_authoritative_message
 from telegram_kol_research.authoritative_execution_schema import (
     REQUIRED_TABLES as RECOGNITION_EXECUTION_TABLES,
@@ -2002,6 +2005,84 @@ async def _run_telegram_sync(
         inserted_trade_ideas += trade_stats["inserted_trade_ideas"]
 
     return matched_dialogs, inserted_messages, inserted_candidates, inserted_trade_ideas
+
+
+@app.command("ai-config-show")
+def ai_config_show(
+    ai_config_path: Path = Path("config/ai_recognition.yaml"),
+    as_json: bool = typer.Option(
+        False, "--json", help="Print the masked structure as JSON."
+    ),
+) -> None:
+    """Print the AI provider / model / stage configuration, keys masked.
+
+    Read-only: loading never rewrites the file, so this is the safe way to
+    check on a server what a v1 file migrates to before anyone saves.
+    """
+
+    config = load_ai_recognition_config(ai_config_path)
+    view = build_ai_config_view(config)
+    if as_json:
+        typer.echo(json.dumps(view, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    typer.echo(f"schema_version: {view['schema_version']}  mode: {view['mode']}")
+    typer.echo("")
+    typer.echo("providers:")
+    if not view["providers"]:
+        typer.echo("  (none)")
+    for provider in view["providers"]:
+        key_state = (
+            f"key ****{provider['api_key_last4']}"
+            if provider["api_key_configured"]
+            else "key 未配置"
+        )
+        typer.echo(
+            f"  - {provider['id']}  {provider['label']}  {provider['base_url']}  "
+            f"timeout={provider['timeout_seconds']:g}s  "
+            f"enabled={provider['enabled']}  {key_state}"
+        )
+    typer.echo("")
+    typer.echo("models:")
+    if not view["models"]:
+        typer.echo("  (none)")
+    for model in view["models"]:
+        capabilities = ",".join(
+            name
+            for name, present in (
+                ("text", model["supports_text"]),
+                ("image", model["supports_image"]),
+            )
+            if present
+        ) or "none"
+        typer.echo(
+            f"  - {model['id']}  provider={model['provider_id']}  "
+            f"model={model['model']}  caps={capabilities}  "
+            f"enabled={model['enabled']}"
+        )
+    typer.echo("")
+    typer.echo("stages:")
+    for definition in view["definitions"]:
+        stage_key = definition["stage_key"]
+        bound = view["stages"].get(stage_key, [])
+        effective = view["effective"].get(stage_key, [])
+        typer.echo(f"  {stage_key}  ({definition['label']})")
+        typer.echo(
+            f"    能力要求={definition['capability_label']}  "
+            f"生产路径={definition['production_note'] or '否'}"
+        )
+        typer.echo(f"    已绑定: {', '.join(bound) if bound else '(空)'}")
+        if effective:
+            for item in effective:
+                typer.echo(f"    {item['role']}: {item['id']} -> {item['model']}")
+        elif definition["env_fallback"]:
+            typer.echo(f"    有效链: (空，沿用环境变量 {definition['env_fallback']})")
+        else:
+            typer.echo("    有效链: (空，该环节未配置可用模型)")
+    if view["warnings"]:
+        typer.echo("")
+        typer.echo("warnings:")
+        for message in view["warnings"]:
+            typer.echo(f"  - {message}")
 
 
 @app.command("mimo-experiment")
