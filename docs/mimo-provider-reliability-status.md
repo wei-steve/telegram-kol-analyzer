@@ -25,7 +25,7 @@ step_2_deployed: 0b2a4eb2bdb9d1723c12649f82df1c0e933890db   # 2026-09-13T00:32Z�
 |---|---|---|---|
 | 1 | 供应商错误分类：402/401/403/429/5xx/超时/网络 → `mimo_provider_unavailable`（首条即发、每 30 分钟一条、恢复通知），与请求内容错误分开；每次失败留一行带错误码的日志 | L1（新增告警，不改权威与交易） | **completed**：部署 `cf0a0e14`，L1 窗 00:31:33Z 达标（上线后一次真实误报，由第 3 步规则 A 修正） |
 | 2 | `ALERTED_REASONS` 遍历式守卫：凡"权威判定未产生"的 reason 必在告警集合；`mimo_authoritative_failed` 进 auto_trade 群告警 | L1 | 已部署 `0b2a4eb2`，L1 窗运行中 |
-| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知；规则 A（孤立失败不算故障）；请求总时长上限 | L2（恢复路径） | 开发完成，变异与全量验证中；入场按裁定 (b) 一律不重放 |
+| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知；规则 A（孤立失败不算故障）；请求总时长上限 | L2（恢复路径） | 开发完成：全量 8609 passed / 0 failed、变异 18/18；待第 2 步收窗后部署；入场按裁定 (b) 一律不重放 |
 | 4 | 主动巡检：连续同码失败计数告警；每日 `max_tokens=1` 探测（不进业务表）；余额接口（如有） | L1 | planned |
 | 5 | 用 step-18 的 494 次失败离线重放，验证 1–3 的判定与限流 | L0（离线） | planned |
 
@@ -67,6 +67,12 @@ step_2_deployed: 0b2a4eb2bdb9d1723c12649f82df1c0e933890db   # 2026-09-13T00:32Z�
   - **管理**：有效年龄（扣除供应商不可用时长）≤15 分钟**且**目标仓位仍在交易所 → 自动重放；否则不自动执行，进 `awaiting_user_confirmation`，
     发 `management_target_needs_confirmation`（附 /choose /dismiss），由用户决定。
   - **追加到第 1 步**：MiMo 失败必须在 journal 留一行带错误码的日志（09-12 的 494 次失败日志 0 行）。
+- **2026-09-13，指挥会话（第 1 步上线后的首次真实告警是误报）**：
+  - **规则 A**：失败请求执行期间有其他调用成功，就不算故障期；随第 3 步实现，用两条用例锁住（真实行序重放不发告警 + 连续无成功照发）。
+  - **请求总时长上限**：httpx 超时改为总时长上限，僵尸请求能在限定时间内结束；随第 3 步实现。
+  - **第 1 步观察窗**：按 (a) 记"判据未达成——真实事件，已逐行解释"，从 00:07Z 以相同判据重起 15 分钟窗，达标后部署第 2 步。
+  - 故障开始时间取最早一行、中文原文清洗两处修正随第 3 步上线。
+  - 其后指挥会话接受流式读时限与 240 秒取值，并要求把"超时那次不重试、最坏 300 秒不超过认领过期"写进本文件（见第 3 步证据）。
 
 ## 第 1 步 L1 观察窗判据（起窗前写定，收窗照此判，不放宽）
 
@@ -115,6 +121,35 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
 - **能证明**：worker 正常启动并消费（4）、第 1 步健康检查仍在跑（2）、新告警路径未吞异常（3）、没有向非 auto_trade 群发告警（5）、未换版（1）。
 - **证不了**：一次真实识别失败或过期在 auto_trade 群产生告警——取决于外界，大概率"本窗无样本"，照实记。
   这一半由遍历式守卫 + 行为用例（auto_trade 产生、notify_only 不产生）+ 7 项变异 + 第 5 步离线重放承担。
+
+## 第 3 步 L2 观察窗判据（起窗前写定，收窗照此判，不放宽）
+
+风险级别 L2（恢复路径：过期判定改用有效年龄、恢复后重放、执行关口）。窗口：连续 30 分钟，封顶 24 小时。
+**起算点 = worker 进程实际启动时刻（当前 epoch − `ps -o etimes`），每个样本核对 worker MainPID 未变。**
+每 60 秒采样，pidfile + 标记文件；读不到记 `-`，`-` 不是通过值；任一样本不满足即重置并写明原因。
+观察器 `/root/evidence/mimo_step3_observe.sh`（sha256 前 16 位 `29d89cdf36480c70`，服务器 `bash -n` PASS）；
+**所读生产表与列起窗前已用 `pragma_table_info` 核实全部存在**（`execution_events.action/created_at`、`raw_messages.created_at`、
+`message_processing_jobs.status/last_reason/completed_at`、`runtime_incidents.incident_type/created_at`）——写错一个就会每轮读成 `-`、窗口永远收不了。
+
+完成条件（每个样本）：
+1. `head_ok == 1`、`units_ok == 1`、`pid_ok == 1`。
+2. **哨兵（journal 可读 + 两个检查都在跑）**：起算点后 worker journal 中 `mimo provider health tick state=` 行数 `>= 1` 且首条 `rows_read > 0`；
+   `provider outage replay tick state=` 行数 `>= 1`（首轮状态从无到有，必记一行）。
+3. `health_failed == 0`、`replay_failed == 0`、`replay_enqueued_lines == 0`。
+4. `outage_incidents == 0`：起算点后 `incident_type LIKE 'provider_outage_%' OR LIKE 'mimo_provider_%'` 的新增行数。
+   **当前供应商健康，任何一行都是异常**，不是"样本"。按规则 A，09-13 00:02 那次僵尸请求不再构成故障期。
+5. `replay_events == 0`（`execution_events.action='provider_outage_replay'`）且 `replay_jobs == 0`（`last_reason='provider_outage_replay'` 的作业）——没有故障就不该有重放。
+6. `alert_failed == 0`、`worker_failed == 0`（沿用第 2 步）。
+
+记录项（不作门槛）：起算点后真实消息数（外界分母）；`status='expired'` 的作业数（有效年龄只对被故障耽误过的消息生效，普通消息过期行为不应变化）；
+A 线基线 `status='retired'` 保护行数（**只作记录，口径见"执行教训"**）。
+
+能证明 / 证不了：
+- **能证明**：两个检查每轮在生产上运行且不抛异常（2、3）；没有故障时不产生任何重放、通知或执行事件——即"不误触发"（4、5）；
+  worker 在 30 分钟内正常消费、未重启（1、6）；普通消息的过期行为未见异常（记录项）。
+- **证不了**：真实故障后的重放、入场拒绝、管理放行与转人工——生产上没有故障可观察，**本窗必然无样本，照实记**。
+  这一半由行为用例（每个关口同一夹具两种结局）+ 18 项变异 + 09-13 真实行序重放 + 第 5 步离线重放承担。
+- **消息数不是门槛**：它归外界管，放进完成条件等于让窗口等群里有人说话。
 
 ## 证据记录
 
@@ -176,7 +211,8 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
   **重起窗（`/root/evidence/mimo-step1-v2/`）**：起算点显式 UTC 转 epoch 并自检；worker pid 849718 全程未变；
   末样本 `hb=2 first_rows_read=5000 tick_failed=0 alerts=0 v1_total=5 v1_completed=5 bad_codes=0 fail_lines=0 a17_retired_rows=664`。
   **三次起窗失败都由"首样本必须满足哨兵"的自检或逐行核对抓住**，没有一次靠放宽判据收窗。
-  A 线基线 `status='retired'` 保护行 664 全程不变，已告知 A 线。
+  A 线基线 `status='retired'` 保护行的**记录项**全程读到 664，已告知 A 线。**这个值不能读成"历史未被改动"的证据**——
+  A 线更正：新关闭的 binding 会合法地让它增长，真正的异常是"关闭早于部署的 binding 下出现晚于部署的退役行"，要用快照法另核（见"执行教训"）。
 
 - step-2（2026-09-12，本执行会话）：分支 `mimo/step-2-alerted-reasons-guard`（工作树 `.worktrees/mimo-step-2`），
   提交 `feat(mimo): a missing authoritative decision can never be un-alerted`；变基到第 1 步部署提交 `cf0a0e14` 之上，尖端 `4001c235`
@@ -210,3 +246,74 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
   **先证实再修**：原写法读出 0 个 auto_trade 群，去掉行尾 `\r` 后读出 9 个（与此前已知数一致）。其余判据首样本全部通过。
   v3 只改这一行（sha256 前 16 位 `c34b018e4fd0d595`），同一起算点与 worker pid 重起，**首样本读出 9 个群、全部判据满足**。
   L1 窗运行中（`/root/evidence/mimo-step2/`），结果另记。
+
+- step-3（2026-09-12/13，本执行会话）：分支 `mimo/step-3-outage-aware-recovery`（工作树 `.worktrees/mimo-step-3`），
+  变基到 `9f1de979` 之上（**已核对变基无代码差异**）。提交：`a5d05550` 主体（有效年龄、重放、执行关口、故障开始取最早、中文原文）；
+  `b35018da` 补两处变异暴露的用例缺口；`0cc63c8d` 规则 A 与请求总时长上限（按 09-13 两项裁定）。
+  按指挥会话 2026-09-12 裁定实现 (b)：**入场一律不重放**。
+  **决定设计形状的事实（只读核对）**：
+  1. **重放标记不能放在作业上**：`claim_message_processing_jobs` 认领时把 `last_reason` 覆盖为 `worker_claimed` / `stale_claim_reclaimed`，
+     原值只作为内存里的 `claim.source_reason` 传给 tick，执行器拿不到；worker 重放途中崩溃、作业被重新认领后标记即丢，
+     一条 14 小时前的入场会按普通入场执行。**所以"是否被故障耽误过"在执行时由持久事实判断**：该消息名下是否有（非孤立的）
+     `mimo_provider_unavailable.*` 尝试行（run 审计 append-only）。
+  2. **两条执行路径汇合在 `_auto_process_single_message_trade_signal`**：指令项路径对每一项也调它（带 `instruction_kind`），
+     函数内先走管理分支、否则入场分支——关口放在这一个函数的两个分支里即覆盖两条路径。
+  3. **终结只接受 `executing`**：`finish_message_instruction_item` 默认 `expected_current_statuses=("executing",)`，更新落空即抛
+     `RuntimeError("instruction item is missing or not executing")`；`FINISH_STATUSES` 里没有 `awaiting_user_confirmation`。
+     所以**管理转人工不能在执行关口里做**，改为在 `auto_process_message_trade_signal` 入口、指令项尚为 `pending` 时停放；
+     `claim_next_message_instruction_item` 只认领 `pending`，停放的项不会再被认领。
+  4. **`skipped` 正常终结**：`interpret_instruction_outcome` 对 `status="skipped"`（无已提交、无 `submit_unknown` 腿）给 `verified_refusal`，旧映射得 `succeeded`。
+  5. **`request_management_target_confirmation` 没停放任何项时不发通知**（A-7b）。生产只读计数：近 30 天权威识别的管理候选 218 条，
+     **没有指令项的 0 条**——无项路径目前不会走到，但仍给它单独一条事故（`provider_outage_management_not_replayed`），不靠"生产不会发生"。
+  6. **只需改 worker 一处过期判定**：`_load_gap_recovery_candidates` 挑的是无决策行的消息，被故障耽误的消息都已有失败决策行。
+  **做了什么**：
+  - `provider_outage_replay`：按消息自己的（非孤立）不可用尝试行算故障跨度与有效年龄；`replay_verdict`；`management_replay_allowed`
+    （有效年龄 ≤15 分钟且 `verify_lifecycle_targets` 全为 verified；快照过旧 `None` 按"不知道"不执行）；入口停放；
+    重放 tick（等恢复通知已记录 → 只挑 auto_trade 群、两类"权威判定未产生"原因、名下有不可用行、**恢复时刻之后尚无新 run** 的消息 →
+    按发出时间升序 `resume_terminal_jobs=True` 入队 → 以故障期为键发一次开始补做通知）。
+  - `message_processing_worker._classify_claim_expiry`：被耽误过的消息按有效年龄判过期。
+  - `auto_trade_execution`：入口停放；入场分支拒绝并通知（原文、群、时间、价格区间）；管理分支兜底拒绝并通知。
+  - 补救循环每轮调重放 tick（状态变化记 INFO、真正入队记 WARNING、异常记日志不打断）；web_app 传入群交易模式。
+  - 三种事故类型进 `ALWAYS_NOTIFIED`；摘要词表加 `message_posted_at` / `entry_summary`；中文文案；第 1 步恢复通知里"不会自动补做"一句改为补做规则。
+  - **规则 A**：一条"不可用"失败，只有在它执行期间（开始到完成）**没有任何**"供应商回答了"的尝试完成，才计入故障期；否则是孤立失败——
+    照常写错误码、打失败日志行，但不开故障期、不告警。推导读取行改为 `(状态, 错误码, 开始, 完成)`，回答行在**整个读取范围**里找
+    （09-13 的 7249–7251 在 id 上位于 7253 之下）。**同一规则用于消息自己的故障跨度**：僵尸请求不能让正常入场被当成"故障期间入场"拒绝。
+  - **请求总时长上限**：`_call_mimo_direct_model` 改为流式逐块读取、每块后检查 `MIMO_REQUEST_TOTAL_DEADLINE_SECONDS = 240`，超出抛
+    `MimoRequestDeadlineExceeded(TimeoutError)`，分类为 `timeout`。
+  **开发中抓到的缺陷与方案取舍**：
+  (a) **中文原文被清洗掉**：`_safe_sentence` 只保留 ASCII 字母数字，"BTC 77000 多"变成"BTC 77000"。新增 `_safe_text`。
+      A-16a 的 `instruction_excerpt` 用的是同一个 `_safe_sentence`，**既有告警同样有这个限制，本步未改**，记为遗留。
+  (b) **故障开始时间取了"最后读到的行"**（第 1 步已上线代码）：id 顺序不是时间顺序，开始时间偏晚、重放 `since` 过滤掉更早完成的消息。改为开始取最早、最近失败取最晚、恢复取最早。
+  (c) **变异脚本暴露两处用例缺口**：删掉入口停放调用、按 id 排序重放，补用例前均无用例咬住；补上后两项转红。
+  (d) 开发中漏改了数据库加载函数（仍返回三元组），聚焦测试当场一串解包失败，补上后 220 passed。
+  (e) **总时长上限先实测两种做法**（本地滴流服务，对照组无时限滴流 19.2 s，证明实测有效）：
+      看门狗（到时从另一线程 `client.close()`）**失败**——计时器触发了，阻塞中的读没有被打断，拖到 61 s 才因单次读超时抛 `ReadTimeout`；
+      流式逐块读 + 每块后检查**成功**，在 2.0 s 时限处准时中止。于是改为流式；7 个只实现 `post` 的假客户端同步补 `stream`
+      （流式响应体按真实响应构造：有 `json()` 的给 JSON 原文，没有的给错误正文）。
+  **240 秒取值按生产实测校准**：近 30 天成功调用 6159 次，p95 62.8 s、p99 106.7 s、>240 s 共 11 次、其中单请求 >240 s 仅 1 次、最长单请求 259.3 s——
+  即每月约误杀 1 次本可成功的调用（该消息仍会走作业自身的重试）。指挥会话接受该取值，并要求写入本文件的原句：
+  > **超时的那次尝试不再重试：一次尝试最坏 240 s（总时限）+ 60 s（最后一次阻塞读的单次读超时）= 300 s，不超过作业认领过期的 300 s。**
+  > 若照常重试，同一消息会被重新认领、并行跑出第二个 run——正是 09-13 那次僵尸请求的来路。
+  > 此不变量由 `test_the_deadline_plus_one_blocked_read_fits_inside_the_job_claim_lease` 锁住（总时限 + 默认单次读超时 ≤ 认领过期）。
+  **锁住规则 A 的用例**：生产行序 7249–7255 分别在 00:02:47（7254 未写入）与 00:06:48 两个时刻重放，推导不出故障期，真实 tick 不调用任何捕获；
+  对照：三次失败、期间无任何成功，照开故障期，之后一次成功判恢复；消息名下只有一条孤立失败时不算"被耽误过"。
+  **验证**：变异 **18/18 PASS**（入场关口、管理兜底、入口停放、过期判定、重放去重、等恢复通知、群模式过滤、按发出时间排序、故障开始取最早、
+  中文原文、web_app 接线、循环透传、重放默认开启、`ALWAYS_NOTIFIED`、规则 A 两处、总时限检查、超时不重试）；
+  **全量（`4f7a8ed7`，变基前；完整输出 + `-rfE`）：8609 passed / 4 skipped / 0 failed**，全量后工作树 0 改动。前一候选 `2c72041a` 全量 8601 passed / 0 failed、变异 14/14。
+  **待做**：第 2 步 L1 窗收窗后按四步部署，起 30 分钟 L2 窗（判据见上）。
+
+## 执行教训（本项目执行中记下）
+
+- **zsh 把 `$VAR:refs/...` 里的 `:r` 当成修饰符，推送引用被静默改写**（2026-09-13）：`git push origin "$TIP:refs/heads/..."`
+  展开成 `9f1de9...efs/heads/...`，远端报找不到引用，`|| exit` 守卫当场停住、共享分支未被推。**若改写后的字符串恰好是另一个存在的引用，就会静默推错。**
+  部署脚本不受影响（显式用 `bash` 跑）。同一会话另一次 zsh 差异：`git add $FILES` 不分词、暂存 0 个文件，被"暂存清单必须等于预期"的守卫拦下。
+  **做法**：zsh 下拼接 git 引用一律写 `${VAR}`；多步命令整段交给 `bash`；文件列表用数组。
+- **观察器的"读不到"有三种来源，这次各撞一次**：起算点晚于被观察事件（第 1 步 v1）；时区缩写被误解析（第 1 步 v2，`CST`）；
+  数据文件行尾（第 2 步 v2，Python `csv` 写出 `\r\n`）。**三次都由"首样本必须满足全部判据"的自检当场抓住**，没有一次拖到收窗、也没有一次靠放宽判据收窗。
+  **做法**：起窗后立即核对首样本；起算点用"当前 epoch − `ps -o etimes`"；读外部数据先用已知答案（"9 个 auto_trade 群""664 行"）核一次查法；
+  观察器所读表与列起窗前用 `pragma_table_info` 核实存在。
+- **A 线基线 664 的口径**（A 线 2026-09-13 更正）：`status='retired'` 保护行数不是"永远不该变"的数——A-17 之后任何 binding 新关闭都会合法地让它增长。
+  **真正的异常只有一种**：关闭时间早于部署的 binding 下，出现 retired_at 晚于部署的行。区分用快照法（开窗时拍下已关闭 binding 的 id，只看快照之外的）。
+  所以本项目观察器里"664 不变"只是记录项读到的值，**两个方向都证明不了"历史未被改动"**；本项目各步不写交易所、不改保护行，不把它升为判据。
+- **"要检查的东西先实测再实现"比"先实现再发现"便宜**：请求总时长的看门狗方案读起来完全合理，实测却打断不了阻塞读；
+  240 秒的取值若按设计草案的 120 秒，会每月误杀约 45 次成功调用——两者都是先查了数据或先跑了原型才避开的。
