@@ -83,3 +83,9 @@ component 25/26/27 原样保留。一次按授权触发的正常 monitor 运行�
 - 本页是索引，不替代来源文档中的精确证据、ID、事务边界或验收条件。
 - “建议处理时机”不构成生产授权；涉及交易语义、schema、数据回填、归档或压缩时仍需独立范围和回滚计划。
 - 若来源文档后续证明某项已完成，应在本页更新其状态或移除；不要让历史已解决的 `Outstanding` 重新进入执行队列。
+
+## AI 识别与上下文分析
+
+| 事项 | 当前影响 | 发现来源 | 建议处理时机 | 处理前必须确认 |
+|---|---|---|---|---|
+| **上下文结合分析（`context_resolution`）触发频率偏高。** 2026-09-13 用户在设计 AI 提供商/模型选择功能时明确指出，并决定**本次只记录、不修改**。现在的触发点：权威识别判定需要时的首次解析；此外 `lifecycle_monitor` 每轮都会为每个有活跃策略的群投递 `exchange_snapshot_changed`、为每次状态迁移投递 `entry_leg_status_changed`，再加 `message_edited` / `evidence_version_changed` / `next_same_chat_message`，凡是仍为 `unresolved` / `hold` 的尝试都会被重新排队分析（`context_resolution_worker.schedule_context_reanalysis`）。 | 每次重分析都是一次完整的模型调用，直接放大 token 消耗与提供商压力；主模型故障时也会放大失败与告警量。不影响判定语义。 | 用户 2026-09-13 口头记录；`docs/plans/2026-09-13-ai-provider-model-routing-design.md` §1 第 5 条。 | AI 模型路由功能上线并稳定后单独立项：先用 `context_resolution_attempts` 按 `trigger_event` 统计一周内各触发源的次数与结果分布，再决定合并、去抖或提高触发门槛。 | 冻结统计口径与时间窗；明确哪些触发源承担了真实的判定修正（不能只看次数）；改动只影响"何时再分析"，不改分析语义与执行门槛。 |
