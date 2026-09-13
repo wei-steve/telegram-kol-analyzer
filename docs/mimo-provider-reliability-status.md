@@ -10,21 +10,22 @@ brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，
 integration_branch: codex/deepcoin-auto-trading-v1
 deploy: tg-deploy <sha>（AGENTS.md 部署一节，四步）
 worktree_pattern: .worktrees/mimo-step-N
-current_step: 2
+current_step: 3
 step_status: in_progress        # planned | claimed | in_progress | completed | blocked
 claimed_by: (本执行会话，见证据区首条)
 production_head_at_start: 0ed2d488aa5843187fa2e1e11ef9d986af7c648b
 base_commit: 8046208c277efd06d045dc2e73d6caa729e8f485   # origin 共享分支尖端，相对生产只多文档
-step_1_deployed: cf0a0e1400501236388a88a957e23b6610711526   # 2026-09-12T23:50Z，回滚参考 0ed2d488
+step_1_deployed: cf0a0e1400501236388a88a957e23b6610711526   # 2026-09-12T23:50Z，回滚参考 0ed2d488；L1 窗 2026-09-13T00:31:33Z 达标
+step_2_deployed: 0b2a4eb2bdb9d1723c12649f82df1c0e933890db   # 2026-09-13T00:32Z，回滚参考 cf0a0e14
 ```
 
 ## 步骤总览
 
 | 步 | 名称 | 风险 | 状态 |
 |---|---|---|---|
-| 1 | 供应商错误分类：402/401/403/429/5xx/超时/网络 → `mimo_provider_unavailable`（首条即发、每 30 分钟一条、恢复通知），与请求内容错误分开；每次失败留一行带错误码的日志 | L1（新增告警，不改权威与交易） | 已部署 `cf0a0e14`，L1 窗运行中 |
-| 2 | `ALERTED_REASONS` 遍历式守卫：凡"权威判定未产生"的 reason 必在告警集合；`mimo_authoritative_failed` 进 auto_trade 群告警 | L1 | 开发完成（全量 0 failed、变异 7/7），待第 1 步收窗后部署 |
-| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知 | L2（恢复路径） | 开发中；入场按裁定 (b) 一律不重放 |
+| 1 | 供应商错误分类：402/401/403/429/5xx/超时/网络 → `mimo_provider_unavailable`（首条即发、每 30 分钟一条、恢复通知），与请求内容错误分开；每次失败留一行带错误码的日志 | L1（新增告警，不改权威与交易） | **completed**：部署 `cf0a0e14`，L1 窗 00:31:33Z 达标（上线后一次真实误报，由第 3 步规则 A 修正） |
+| 2 | `ALERTED_REASONS` 遍历式守卫：凡"权威判定未产生"的 reason 必在告警集合；`mimo_authoritative_failed` 进 auto_trade 群告警 | L1 | 已部署 `0b2a4eb2`，L1 窗运行中 |
+| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知；规则 A（孤立失败不算故障）；请求总时长上限 | L2（恢复路径） | 开发完成，变异与全量验证中；入场按裁定 (b) 一律不重放 |
 | 4 | 主动巡检：连续同码失败计数告警；每日 `max_tokens=1` 探测（不进业务表）；余额接口（如有） | L1 | planned |
 | 5 | 用 step-18 的 494 次失败离线重放，验证 1–3 的判定与限流 | L0（离线） | planned |
 
@@ -154,6 +155,29 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
   **部署前检查自检**：共享分支判定式检查已用一正一反两个输入验过（`6f8c38fd` 必 FAIL、origin 尖端必 PASS）。
   **余额接口**：公开资料只指向控制台的余额页（WebSearch + 充值公告页 WebFetch），**未找到程序化接口**；第 4 步以 `max_tokens=1` 探测为主。
 
+- step-1 部署与 L1 窗（2026-09-12/13，本执行会话）：**部署 `cf0a0e14`（2026-09-12T23:50Z，四步全 PASS，回滚参考 `0ed2d488`）；
+  L1 窗 2026-09-13T00:31:33Z `WINDOW_MET`（重起后 16 采样、0 重置、连续 904 秒）。**
+  **起窗过程三次失败，各自留档**：
+  1. `/root/evidence/mimo-step1-v1-partial/`：起算点取 tg-deploy 返回后的时刻（23:50:41Z），而新 worker 23:50:32Z 已启动、23:50:39.9Z 已打出启动心跳；
+     心跳按设计只在首轮、状态变化、每约 30 分钟打，于是此后 `hb=0`——**起算点的错，不是生产问题**。查明前曾怀疑补救循环卡在健康检查上，
+     逐项排除（journal 查法能命中已知行、日志级别 INFO、生产源码含心跳文字、事件循环无卡顿）后定位到起算点。
+  2. `/root/evidence/mimo-step1-v2-bad-anchor/`：起算点用 `ExecMainStartTimestamp`（`Sun 2026-09-13 07:50:32 CST`）经 `date -d` 解析，
+     **CST 被当成美国中部时间**，起算点落在 14 小时后。**首样本自检当场判 FAIL**。此后一律用"当前 epoch − `ps -o etimes`"。
+  3. `/root/evidence/mimo-step1-v2-unmet-real-event/`：**判据 5 未达成——真实事件，已逐行解释**（18 采样 / 14 重置）：
+     - raw 16436（notify_only 群）run 7253 于 23:52:28Z 开始、00:02:34Z 以 `mimo_provider_unavailable.network_error` 失败，耗时 606 s、2 次请求
+       （配置 `timeout_seconds: 60.0`；httpx 超时按单次读写计，缓慢滴流可远超）；期间同群 run 7249/7250/7251 均成功——**供应商一直在应答**。
+     - 该消息作业 23:57:28Z 已结算，23:57:29Z 起的第二个 run 21 秒内成功；7253 是**决策产生之后才迟迟写入**的旧请求线程。
+     - 00:02:47Z 发 `mimo_provider_unavailable`（事故 2114，已投递）；00:06:30Z 下一次调用成功，00:06:48Z 发 `mimo_provider_recovered`（事故 2115，已投递）。
+     - **无重复执行**：16436 只有执行尝试 1480，`blocked / source_message_deleted`。
+     - **正面**：原判据写着"证不了"的一半在生产真实跑通——分类、错误码、失败日志行、13 秒内首条即发、恢复只发一次、投递、中文文案。
+     - **反面**：**误报**，一条挂死的旧连接不代表供应商不可用。
+  **裁定（指挥会话 2026-09-13）**：(A) 失败请求执行期间有其他调用成功即不算故障期，随第 3 步实现，并加请求总时长上限；
+  窗口按 (a) 从 00:07:00Z 以完全相同的判据重起。
+  **重起窗（`/root/evidence/mimo-step1-v2/`）**：起算点显式 UTC 转 epoch 并自检；worker pid 849718 全程未变；
+  末样本 `hb=2 first_rows_read=5000 tick_failed=0 alerts=0 v1_total=5 v1_completed=5 bad_codes=0 fail_lines=0 a17_retired_rows=664`。
+  **三次起窗失败都由"首样本必须满足哨兵"的自检或逐行核对抓住**，没有一次靠放宽判据收窗。
+  A 线基线 `status='retired'` 保护行 664 全程不变，已告知 A 线。
+
 - step-2（2026-09-12，本执行会话）：分支 `mimo/step-2-alerted-reasons-guard`（工作树 `.worktrees/mimo-step-2`），
   提交 `feat(mimo): a missing authoritative decision can never be un-alerted`；变基到第 1 步部署提交 `cf0a0e14` 之上，尖端 `4001c235`
   （变基前 `7b490c17`，**已核对变基只带进文档、无代码差异**，所以其上的全量结论仍然有效）。
@@ -176,4 +200,13 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
   **开发中测试当场抓到的缺陷**：第一版只改了 tick 签名、加了告警函数，**过期分支里调用它的那一行没加**——两条过期用例转红，补上后通过。
   **验证**：新用例 8 条；受影响现有测试 421 passed；**变异 7/7 PASS**（每项转红、还原后与 HEAD 逐字一致；锚点变基后复核各 1 次）；
   **全量（`7b490c17`，完整输出 + `-rfE`）：8572 passed / 4 skipped / 0 failed**，全量后工作树 0 改动。
-  **待做**：第 1 步 L1 窗收窗后按四步部署；观察器需先改为按 worker 启动时刻起算（见"第 2 步 L1 观察窗判据"）。
+  **部署**：第 1 步 L1 窗 00:31:33Z 达标后，2026-09-13T00:32Z 按四步部署 `0b2a4eb2`（回滚参考 `cf0a0e14`）；
+  部署前指挥会话确认无其他观察窗、本会话 `kill -0` 逐个核对 pidfile 除第 1 步自己的观察器外无存活；
+  部署前两向核对、"超出生产的代码只能是本步 5 个文件"白名单、推自己分支、tg-deploy、推共享分支、部署后两向核对，全部 PASS。
+  **L1 窗起窗**：起算点 = 当前 epoch − `ps -o etimes`（00:32:01Z，worker 862728 由本次部署重启，etimes 44 s）。
+  **第一次起窗（`/root/evidence/mimo-step2-v2-crlf-defect/`，3 采样）首样本判 FAIL，观察器缺陷**：
+  群模式 CSV（`/root/evidence/mimo-step18-replay/chat_trading_modes.csv`）由 Python `csv` 模块写出，**35/35 行以 `\r\n` 结尾**，
+  awk 读到的第二列是 `auto_trade\r`，一个群也匹配不上，于是 `alerts_outside_auto_trade` 每轮读成 `-`（按规则不算通过）。
+  **先证实再修**：原写法读出 0 个 auto_trade 群，去掉行尾 `\r` 后读出 9 个（与此前已知数一致）。其余判据首样本全部通过。
+  v3 只改这一行（sha256 前 16 位 `c34b018e4fd0d595`），同一起算点与 worker pid 重起，**首样本读出 9 个群、全部判据满足**。
+  L1 窗运行中（`/root/evidence/mimo-step2/`），结果另记。
