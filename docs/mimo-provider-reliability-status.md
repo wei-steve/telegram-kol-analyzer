@@ -10,20 +10,21 @@ brain_session_id: local_858790fe-37cd-426c-a0eb-cbf304066815   # 指挥会话，
 integration_branch: codex/deepcoin-auto-trading-v1
 deploy: tg-deploy <sha>（AGENTS.md 部署一节，四步）
 worktree_pattern: .worktrees/mimo-step-N
-current_step: 1
+current_step: 2
 step_status: in_progress        # planned | claimed | in_progress | completed | blocked
 claimed_by: (本执行会话，见证据区首条)
 production_head_at_start: 0ed2d488aa5843187fa2e1e11ef9d986af7c648b
 base_commit: 8046208c277efd06d045dc2e73d6caa729e8f485   # origin 共享分支尖端，相对生产只多文档
+step_1_deployed: cf0a0e1400501236388a88a957e23b6610711526   # 2026-09-12T23:50Z，回滚参考 0ed2d488
 ```
 
 ## 步骤总览
 
 | 步 | 名称 | 风险 | 状态 |
 |---|---|---|---|
-| 1 | 供应商错误分类：402/401/403/429/5xx/超时/网络 → `mimo_provider_unavailable`（首条即发、每 30 分钟一条、恢复通知），与请求内容错误分开 | L1（新增告警，不改权威与交易） | in_progress |
-| 2 | `ALERTED_REASONS` 遍历式守卫：凡"权威判定未产生"的 reason 必在告警集合；`mimo_authoritative_failed` 进 auto_trade 群告警 | L1 | planned |
-| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知 | L2（恢复路径） | planned（入场重放策略待裁定） |
+| 1 | 供应商错误分类：402/401/403/429/5xx/超时/网络 → `mimo_provider_unavailable`（首条即发、每 30 分钟一条、恢复通知），与请求内容错误分开；每次失败留一行带错误码的日志 | L1（新增告警，不改权威与交易） | 已部署 `cf0a0e14`，L1 窗运行中 |
+| 2 | `ALERTED_REASONS` 遍历式守卫：凡"权威判定未产生"的 reason 必在告警集合；`mimo_authoritative_failed` 进 auto_trade 群告警 | L1 | 开发完成（全量 0 failed、变异 7/7），待第 1 步收窗后部署 |
+| 3 | 补救窗口与供应商状态解耦；恢复后按序重放 auto_trade 群消息，管理类先核目标仓位；逐条记录并通知 | L2（恢复路径） | 开发中；入场按裁定 (b) 一律不重放 |
 | 4 | 主动巡检：连续同码失败计数告警；每日 `max_tokens=1` 探测（不进业务表）；余额接口（如有） | L1 | planned |
 | 5 | 用 step-18 的 494 次失败离线重放，验证 1–3 的判定与限流 | L0（离线） | planned |
 
@@ -92,6 +93,28 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
 - **09-12 那 496 行失败是旧码 `v1_authoritative_failed`，推导时属于中性行，部署后不会误报"不可用"**：
   03:00:53Z 之后生产尝试表里一条完成行都没有，若旧行被当成"不可用"，部署的第一个 tick 就会误发告警，判据 5 会抓住。
 
+## 第 2 步 L1 观察窗判据（起窗前写定，收窗照此判，不放宽）
+
+窗口：部署后连续 15 分钟；消息数是外界分母，只记录。每 60 秒采样，pidfile + 标记文件。
+**起算点用 worker 进程的实际启动时刻**（`当前 epoch − ps -o etimes`），并每个样本核对 worker MainPID 未变——
+第 1 步窗口两次栽在起算点上（见第 1 步证据），这里直接用已验证的写法。读不到的量记 `-`，`-` 不是通过值；任一样本不满足即重置并写明原因。
+观察器 `/root/evidence/mimo_step2_observe.sh`（sha256 前 16 位 `4bfbf49fcb23da10`，服务器 `bash -n` PASS），**起窗前需按上述起算点改参数**。
+
+完成条件（每个样本）：
+1. `head_ok == 1`（实时读生产 HEAD = 本步部署 sha）；`units_ok == 1`；worker MainPID 未变。
+2. **哨兵**：起算点后 worker journal 中第 1 步心跳行 `mimo provider health tick state=` 计数 `hb >= 1`，首条 `rows_read > 0`。
+3. `alert_failed == 0`：`expired recovery gap alert failed` 行数（本步新增的吞异常路径，不允许静默失败）。
+4. `worker_failed == 0`：`message processing worker task failed` 行数（本步改了 worker 启动参数）。
+5. `alerts_outside_auto_trade == 0`：本步两类 reason 的 `authoritative_recognition_failed` 告警里，chat 不属于 auto_trade 群的行数。
+   chat_id 用 `json_extract` 取，**取不到的按群外计**（`COALESCE(..., 0)`，最小回退摘要没有 chat_id；服务器 sqlite 已验证）。
+
+记录项（不作门槛，分母限定本步两类 reason）：`new_step2_alerts`、`new_failed_decisions`、`new_expired_decisions`。
+
+能证明 / 证不了：
+- **能证明**：worker 正常启动并消费（4）、第 1 步健康检查仍在跑（2）、新告警路径未吞异常（3）、没有向非 auto_trade 群发告警（5）、未换版（1）。
+- **证不了**：一次真实识别失败或过期在 auto_trade 群产生告警——取决于外界，大概率"本窗无样本"，照实记。
+  这一半由遍历式守卫 + 行为用例（auto_trade 产生、notify_only 不产生）+ 7 项变异 + 第 5 步离线重放承担。
+
 ## 证据记录
 
 格式：`- step-N (日期, 会话): 提交 SHA；做了什么；验证结果；遗留问题`。
@@ -130,3 +153,27 @@ A 线基线 `status='retired'` 的保护行数（A 线给的 664 = 账本 208 + 
   全量枚举进程时发现一个他人的等待循环 `until grep -q WINDOW_MET /root/evidence/release-gates/observe.log`，已空转约 31 小时（该目录已有 `DONE`），**非本线进程，未动**。
   **部署前检查自检**：共享分支判定式检查已用一正一反两个输入验过（`6f8c38fd` 必 FAIL、origin 尖端必 PASS）。
   **余额接口**：公开资料只指向控制台的余额页（WebSearch + 充值公告页 WebFetch），**未找到程序化接口**；第 4 步以 `max_tokens=1` 探测为主。
+
+- step-2（2026-09-12，本执行会话）：分支 `mimo/step-2-alerted-reasons-guard`（工作树 `.worktrees/mimo-step-2`），
+  提交 `feat(mimo): a missing authoritative decision can never be un-alerted`；变基到第 1 步部署提交 `cf0a0e14` 之上，尖端 `4001c235`
+  （变基前 `7b490c17`，**已核对变基只带进文档、无代码差异**，所以其上的全量结论仍然有效）。
+  **事实（只读核对）**：写"终态 `authoritative_failed` 决策"的调用点全仓只有两处——
+  `authoritative_recognition.assess_message_authoritatively`（→ `mimo_authoritative_failed`）与
+  `telegram_live_listener._record_expired_authoritative_recovery_gap_in_session`（→ `authoritative_gap_recovery_expired`）；
+  租约执行路径只在非失败时进入。过期路径所在的 worker tick **原本拿不到群交易模式**（web_app 启动 worker 时未传）。
+  `_failure_point_for` 以 `.get(reason, reason)` 结尾，缺键不会 KeyError。
+  `web_queries` 把 `ALERTED_REASONS` 展开进"系统未安全接纳"集合；过期消息本就是 `识别失败`、先命中前一分支，**页面显示不变**。
+  **做了什么**：
+  1. `recognition_failure_attribution`：`MIMO_AUTHORITATIVE_FAILED` / `GAP_RECOVERY_EXPIRED` 常量，`AUTHORITY_NOT_PRODUCED_REASONS`，
+     写入点登记表 `AUTHORITY_NOT_PRODUCED_WRITERS`，并入 `ALERTED_REASONS`。
+  2. `_failure_point_for` 补两条失败点文案。
+  3. `run_message_processing_worker_tick` 接受 `group_trading_mode_provider`；过期记录后经同一告警关口（仅 auto_trade 群、同消息一问）告警，
+     告警失败只记日志、不阻塞结算；web_app 启动 worker 时传入。
+  **守卫**：点名式（两个 reason 各在集合里）+ 遍历式（AST 扫全 src：写入调用点集合 == 登记表；`agreement_status="authoritative_failed"`
+  赋值点 ⊆ 登记函数；两个计数哨兵 ≥2；登记 reason == 集合 ⊆ 告警集合；登记 reason 字面量确实出现在写入模块里）
+  + 逐个接线（两个 reason 各走真实调用方：auto_trade 群产生事故行、notify_only 群同一夹具不产生）
+  + 链路（tick 签名、loop 以 `**tick_kwargs` 透传、web_app 启动调用处确实在传；再从 loop 走一遍证明透传）。
+  **开发中测试当场抓到的缺陷**：第一版只改了 tick 签名、加了告警函数，**过期分支里调用它的那一行没加**——两条过期用例转红，补上后通过。
+  **验证**：新用例 8 条；受影响现有测试 421 passed；**变异 7/7 PASS**（每项转红、还原后与 HEAD 逐字一致；锚点变基后复核各 1 次）；
+  **全量（`7b490c17`，完整输出 + `-rfE`）：8572 passed / 4 skipped / 0 failed**，全量后工作树 0 改动。
+  **待做**：第 1 步 L1 窗收窗后按四步部署；观察器需先改为按 worker 启动时刻起算（见"第 2 步 L1 观察窗判据"）。
