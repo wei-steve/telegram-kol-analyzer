@@ -21,9 +21,9 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定。
 |---|---|---|---|---|
 | 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | `18d62606` | 全量 8713 passed / 0 failed / 4 skipped |
 | 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | `4e5e37ad` | 全量 8746 passed / 0 failed / 4 skipped |
-| 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | 见下方证据 | 全量 8768 passed / 0 failed / 4 skipped |
-| 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | 见下方证据 | 全量 8786 passed / 0 failed / 4 skipped |
-| 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | 见下方证据 | 全量 8788 passed / 0 failed / 4 skipped |
+| 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | `0ad2b842` | 全量 8768 passed / 0 failed / 4 skipped |
+| 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | `d287038f` | 全量 8786 passed / 0 failed / 4 skipped |
+| 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | `4aadf158` | 全量 8788 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -427,8 +427,7 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 ### 阶段 3
 
-- 提交：`feat(ai-routing): phase 3 every remaining stage picks its own model`
-  （SHA 在后续文档提交里补写）
+- 提交：`0ad2b842`（`feat(ai-routing): phase 3 ...`）
 - 全量：`uv run python -m pytest -q` → **8768 passed, 4 skipped, 0 failed**（640 s）
 - 新增测试文件：`tests/test_ai_stage_routing.py`（22 例）。关键用例：
   - `test_the_async_router_decides_exactly_what_the_sync_one_decides`、
@@ -454,8 +453,7 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 ### 阶段 4
 
-- 提交：`feat(ai-routing): phase 4 the AI provider and model-selection pages`
-  （SHA 在后续文档提交里补写）
+- 提交：`d287038f`（`feat(ai-routing): phase 4 ...`）
 - 全量：`uv run python -m pytest -q` → **8786 passed, 4 skipped, 0 failed**（655 s）
 - 新增测试文件：`tests/test_ai_provider_api.py`（18 例）。关键用例：
   - `test_providers_are_listed_with_their_models_and_no_keys`
@@ -484,8 +482,7 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 ### 阶段 5
 
-- 提交：`docs(ai-routing): phase 5 architecture section, v2 example, README`
-  （SHA 在随后的收口提交里补写）
+- 提交：`4aadf158`（`docs(ai-routing): phase 5 ...`）
 - 全量：`uv run python -m pytest -q` → **8788 passed, 4 skipped, 0 failed**（644 s）
 - 新增用例：`tests/test_ai_stage_config.py::test_the_shipped_example_is_v2_and_binds_every_production_stage`、
   `::test_the_frozen_v1_sample_still_describes_a_pre_migration_file`
