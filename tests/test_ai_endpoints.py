@@ -194,9 +194,16 @@ def test_the_shipped_presets_answer_the_switch_the_way_the_design_says():
         "openai",
     ):
         assert by_id[preset_id]["append_v1"] is False, preset_id
-    # Every preset's own switch reproduces its base URL's inferred answer, so
-    # the catalogue and the fallback rule cannot drift apart.
-    for provider in by_id.values():
+    # The custom preset has no base URL to infer from, so it states its own
+    # default: on, like OpenMinis, because a hand-typed address is nearly
+    # always a bare host.
+    assert by_id["custom"]["base_url"] == ""
+    assert by_id["custom"]["append_v1"] is True
+    # Every other preset's switch reproduces its base URL's inferred answer,
+    # so the catalogue and the fallback rule cannot drift apart.
+    for preset_id, provider in by_id.items():
+        if preset_id == "custom":
+            continue
         assert provider["append_v1"] is infer_append_v1(provider["base_url"])
 
 

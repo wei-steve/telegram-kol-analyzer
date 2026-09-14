@@ -64,8 +64,12 @@ class Preset:
         source_id: str | None = _SAME_AS_PRESET_ID,
         requires_api_key: bool = True,
         note: str = "",
+        append_v1: bool | None = None,
     ):
         self.preset_id = preset_id
+        # None = derive from the base URL; a preset without a base URL (custom)
+        # states its own default because there is nothing to derive from.
+        self.append_v1 = append_v1
         self.group = group
         self.label = label
         self.base_url = base_url
@@ -183,7 +187,10 @@ PRESETS: tuple[Preset, ...] = (
         "自定义（OpenAI 兼容）",
         "",
         source_id=None,
-        note="任何 OpenAI 兼容端点",
+        note="任何 OpenAI 兼容端点；默认追加 /v1，填主机地址即可，代理已含 /v1 时关掉开关",
+        # Like OpenMinis: a hand-typed address is nearly always a bare host,
+        # so the switch starts on. The live preview shows the result either way.
+        append_v1=True,
     ),
 )
 
@@ -281,7 +288,11 @@ def build_catalogue(
                 "base_url": preset.base_url,
                 # Explicit rather than inferred at read time: the page shows it
                 # as a switch, so the catalogue has to state it.
-                "append_v1": _append_v1(preset.base_url),
+                "append_v1": (
+                    preset.append_v1
+                    if preset.append_v1 is not None
+                    else _append_v1(preset.base_url)
+                ),
                 "doc_url": str(upstream.get("doc") or ""),
                 "requires_api_key": preset.requires_api_key,
                 "note": preset.note,

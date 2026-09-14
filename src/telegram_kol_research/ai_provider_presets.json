@@ -1063,10 +1063,10 @@
       "label": "自定义（OpenAI 兼容）",
       "english_label": "",
       "base_url": "",
-      "append_v1": false,
+      "append_v1": true,
       "doc_url": "",
       "requires_api_key": true,
-      "note": "任何 OpenAI 兼容端点",
+      "note": "任何 OpenAI 兼容端点；默认追加 /v1，填主机地址即可，代理已含 /v1 时关掉开关",
       "models": []
     }
   ]

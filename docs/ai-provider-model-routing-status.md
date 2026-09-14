@@ -382,11 +382,11 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
     审阅并部署，本轮不该顺手换掉。所以只补字段、不动模型。需要刷新模型时照常跑
     `python scripts/build_ai_provider_presets.py`。
 
-41. **「自定义（OpenAI 兼容）」预设的开关默认是关。**
-    设计说「裸主机为 True，其余为 False」，自定义的 base_url 是空的，按规则算出 False。
-    考虑过把它设成开（OpenMinis 的默认是开，而自定义十有八九会填裸主机），但没有改：
-    实时预览会立刻显示「将请求 https://你填的地址/chat/completions」，看一眼就知道要不要打开，
-    比一个猜出来的默认值更明确。
+41. **「自定义（OpenAI 兼容）」预设的开关默认是开。**（指挥会话 2026-09-14 改，原实施为关）
+    自定义地址十有八九是裸主机或代理站，与 OpenMinis 默认一致；实时预览仍会显示最终 URL，
+    代理已含 `/v1` 时手动关掉即可。生成脚本的 `Preset(append_v1=...)` 是显式覆盖，只有 custom 用它，
+    其余 18 家仍按 base_url 推导，`test_the_shipped_presets_answer_the_switch_the_way_the_design_says`
+    把这两条都钉住。
 
 42. **读开关一律走 `ai_endpoints.provider_append_v1(provider)`，不是 `provider.append_v1`。**
     有 8 处调用点拿到的是「像 provider 的对象」而不是真的 `AiProvider`——测试里的
