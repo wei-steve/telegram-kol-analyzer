@@ -3923,226 +3923,510 @@ function renderPromptHistory() {
 }
 
 function bindAiRecognitionConfigForm() {
-  const form = document.querySelector('[data-ai-recognition-config-form]');
-  if (!form) {
-    return;
-  }
-  bindAiProviderPresetButtons(form);
-  bindAiProviderKeyInputs(form);
-  const status = form.querySelector('[data-ai-config-save-status]');
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const submitButton = form.querySelector('button[type="submit"]');
-    if (submitButton) {
-      submitButton.disabled = true;
-    }
-    if (status) {
-      status.textContent = '正在保存...';
-      status.classList.remove('is-error');
-    }
-    try {
-      const response = await fetch('/api/ai-recognition-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildAiRecognitionConfigPayload()),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        if (status) {
-          status.textContent = payload.detail || '保存失败';
-          status.classList.add('is-error');
-        }
-        return;
-      }
-      if (status) {
-        status.textContent = 'AI 配置已保存';
-      }
-    } catch {
-      if (status) {
-        status.textContent = '保存失败，请检查服务状态。';
-        status.classList.add('is-error');
-      }
-    } finally {
-      if (submitButton) {
-        submitButton.disabled = false;
-      }
-    }
-  });
+  // Kept under its old name because several call sites reach for it; the
+  // AI提供商 page replaced the form it used to bind.
+  bindAiProviderPage();
 }
 
 function bindAiModelSelectionForm() {
-  const form = document.querySelector('[data-ai-model-selection-form]');
-  if (!form) {
+  bindAiStagePage();
+}
+
+const AI_PROVIDER_PRESETS = {
+  deepseek: { id: 'deepseek', label: 'DeepSeek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
+  zhipu: { id: 'zhipu', label: '智谱', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-ocr' },
+  mimo: { id: 'mimo', label: 'MiMo', base_url: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.5' },
+  custom: { id: '', label: '', base_url: '', model: '' },
+};
+
+function aiElement(tag, className, text) {
+  const node = document.createElement(tag);
+  if (className) {
+    node.className = className;
+  }
+  if (text !== undefined) {
+    node.textContent = text;
+  }
+  return node;
+}
+
+function aiLabeledInput(labelText, attribute, value, options = {}) {
+  const label = aiElement('label', 'ai-field');
+  label.append(aiElement('span', null, labelText));
+  const input = document.createElement('input');
+  input.setAttribute(attribute, '');
+  input.value = value === undefined || value === null ? '' : String(value);
+  if (options.placeholder) {
+    input.placeholder = options.placeholder;
+  }
+  if (options.type) {
+    input.type = options.type;
+  }
+  if (options.readOnly) {
+    input.readOnly = true;
+  }
+  label.append(input);
+  return label;
+}
+
+function aiCheckbox(labelText, attribute, checked) {
+  const label = aiElement('label', 'ai-checkbox');
+  const input = document.createElement('input');
+  input.type = 'checkbox';
+  input.setAttribute(attribute, '');
+  input.checked = Boolean(checked);
+  label.append(input, document.createTextNode(` ${labelText}`));
+  return label;
+}
+
+function renderAiModelRow(model) {
+  const row = aiElement('div', 'ai-model-row');
+  row.setAttribute('data-ai-model-row', '');
+  row.append(
+    aiLabeledInput('模型 id', 'data-ai-model-id', model.id, { placeholder: 'deepseek-v4-flash' }),
+    aiLabeledInput('模型名', 'data-ai-model-name', model.model, { placeholder: '发给 API 的名字' }),
+    aiLabeledInput('显示名', 'data-ai-model-label', model.label || ''),
+  );
+  const capabilities = aiElement('div', 'ai-model-capabilities');
+  capabilities.append(
+    aiCheckbox('文本', 'data-ai-model-supports-text', model.supports_text !== false),
+    aiCheckbox('图片', 'data-ai-model-supports-image', Boolean(model.supports_image)),
+    aiCheckbox('启用', 'data-ai-model-enabled', model.enabled !== false),
+  );
+  row.append(capabilities);
+  const remove = aiElement('button', 'secondary-button', '删除');
+  remove.type = 'button';
+  remove.setAttribute('data-ai-model-remove', '');
+  remove.addEventListener('click', () => row.remove());
+  row.append(remove);
+  return row;
+}
+
+function renderAiProviderCard(provider, models) {
+  const card = aiElement('section', 'ai-provider-card');
+  card.setAttribute('data-ai-provider-card', '');
+  const head = aiElement('div', 'ai-provider-head');
+  head.append(
+    aiLabeledInput('提供商 id', 'data-ai-provider-id', provider.id, { placeholder: 'deepseek' }),
+    aiLabeledInput('名称', 'data-ai-provider-label', provider.label || ''),
+    aiLabeledInput('Base URL', 'data-ai-provider-base-url', provider.base_url, {
+      placeholder: 'https://api.example.com/v1',
+    }),
+    aiLabeledInput('API Key', 'data-ai-provider-api-key', '', {
+      placeholder: provider.api_key_configured
+        ? `已配置 ****${provider.api_key_last4 || ''}（留空保持不变）`
+        : 'sk-...',
+    }),
+    aiLabeledInput('超时秒数', 'data-ai-provider-timeout', provider.timeout_seconds ?? 60, { type: 'number' }),
+  );
+  head.append(aiCheckbox('启用', 'data-ai-provider-enabled', provider.enabled !== false));
+  card.append(head);
+
+  const actions = aiElement('div', 'ai-provider-actions');
+  const test = aiElement('button', 'secondary-button', '测试连接');
+  test.type = 'button';
+  test.setAttribute('data-ai-provider-test', '');
+  const testStatus = aiElement('span', 'ai-provider-test-status');
+  testStatus.setAttribute('data-ai-provider-test-status', '');
+  testStatus.setAttribute('aria-live', 'polite');
+  test.addEventListener('click', () => testAiProviderConnection(card, testStatus));
+  const addModel = aiElement('button', 'secondary-button', '添加模型');
+  addModel.type = 'button';
+  addModel.setAttribute('data-ai-model-add', '');
+  actions.append(test, addModel, testStatus);
+  card.append(actions);
+
+  const modelList = aiElement('div', 'ai-provider-model-list');
+  modelList.setAttribute('data-ai-provider-model-list', '');
+  models.forEach((model) => modelList.append(renderAiModelRow(model)));
+  card.append(modelList);
+  addModel.addEventListener('click', () => {
+    modelList.append(renderAiModelRow({ id: '', model: '', label: '', supports_text: true }));
+  });
+
+  const removeProvider = aiElement('button', 'secondary-button', '删除提供商');
+  removeProvider.type = 'button';
+  removeProvider.setAttribute('data-ai-provider-remove', '');
+  removeProvider.addEventListener('click', () => card.remove());
+  card.append(removeProvider);
+  return card;
+}
+
+function renderAiProviderList(payload) {
+  const container = document.querySelector('[data-ai-provider-list]');
+  if (!container) {
     return;
   }
-  const status = form.querySelector('[data-ai-model-selection-save-status]');
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    const submitButton = form.querySelector('button[type="submit"]');
-    if (submitButton) {
-      submitButton.disabled = true;
-    }
-    if (status) {
-      status.textContent = '正在保存...';
-      status.classList.remove('is-error');
-    }
-    try {
-      const response = await fetch('/api/ai-recognition-config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(buildAiRecognitionConfigPayload()),
-      });
-      const payload = await response.json();
-      if (!response.ok) {
-        if (status) {
-          status.textContent = payload.detail || '保存失败';
-          status.classList.add('is-error');
-        }
-        return;
-      }
-      if (status) {
-        status.textContent = 'AI 模型选择已保存';
-      }
-    } catch {
-      if (status) {
-        status.textContent = '保存失败，请检查服务状态。';
-        status.classList.add('is-error');
-      }
-    } finally {
-      if (submitButton) {
-        submitButton.disabled = false;
-      }
-    }
+  container.replaceChildren();
+  const models = Array.isArray(payload.models) ? payload.models : [];
+  (Array.isArray(payload.providers) ? payload.providers : []).forEach((provider) => {
+    container.append(
+      renderAiProviderCard(
+        provider,
+        models.filter((model) => model.provider_id === provider.id),
+      ),
+    );
   });
 }
 
-function bindAiProviderPresetButtons(form) {
-  const selectorForTarget = {
-    text: {
-      baseUrl: '[data-ai-text-base-url]',
-      apiKey: '[data-ai-text-api-key]',
-      model: '[data-ai-text-model]',
-    },
-    image: {
-      baseUrl: '[data-ai-image-base-url]',
-      apiKey: '[data-ai-image-api-key]',
-      model: '[data-ai-image-model]',
-    },
-  };
-  form.querySelectorAll('[data-ai-provider-preset]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const target = button.dataset.aiProviderTarget;
-      const selectors = selectorForTarget[target];
-      if (!selectors) {
+function collectAiProviderPayload() {
+  const providers = [];
+  const models = [];
+  document.querySelectorAll('[data-ai-provider-card]').forEach((card) => {
+    const value = (selector) => card.querySelector(selector)?.value?.trim() || '';
+    const providerId = value('[data-ai-provider-id]');
+    if (!providerId) {
+      return;
+    }
+    const timeout = Number(value('[data-ai-provider-timeout]'));
+    providers.push({
+      id: providerId,
+      label: value('[data-ai-provider-label]'),
+      base_url: value('[data-ai-provider-base-url]'),
+      api_key: card.querySelector('[data-ai-provider-api-key]')?.value || '',
+      timeout_seconds: Number.isFinite(timeout) && timeout > 0 ? timeout : 60,
+      enabled: Boolean(card.querySelector('[data-ai-provider-enabled]')?.checked),
+    });
+    card.querySelectorAll('[data-ai-model-row]').forEach((row) => {
+      const rowValue = (selector) => row.querySelector(selector)?.value?.trim() || '';
+      const modelId = rowValue('[data-ai-model-id]') || rowValue('[data-ai-model-name]');
+      if (!modelId) {
         return;
       }
-      const baseUrlInput = form.querySelector(selectors.baseUrl);
-      const apiKeyInput = form.querySelector(selectors.apiKey);
-      const modelInput = form.querySelector(selectors.model);
-      cacheAiProviderKey({
-        target,
-        baseUrl: baseUrlInput?.value || '',
-        model: modelInput?.value || '',
-        apiKey: apiKeyInput?.value || '',
+      models.push({
+        id: modelId,
+        provider_id: providerId,
+        model: rowValue('[data-ai-model-name]') || modelId,
+        label: rowValue('[data-ai-model-label]'),
+        supports_text: Boolean(row.querySelector('[data-ai-model-supports-text]')?.checked),
+        supports_image: Boolean(row.querySelector('[data-ai-model-supports-image]')?.checked),
+        enabled: Boolean(row.querySelector('[data-ai-model-enabled]')?.checked),
       });
-
-      const nextBaseUrl = button.dataset.aiProviderBaseUrl || '';
-      const nextModel = button.dataset.aiProviderModel || '';
-      if (baseUrlInput) {
-        baseUrlInput.value = nextBaseUrl;
-      }
-      if (apiKeyInput) {
-        apiKeyInput.value = loadCachedAiProviderKey({
-          target,
-          baseUrl: nextBaseUrl,
-          model: nextModel,
-        });
-      }
-      if (modelInput) {
-        modelInput.value = nextModel;
-      }
     });
   });
+  return { providers, models };
 }
 
-function bindAiProviderKeyInputs(form) {
-  form.querySelectorAll('[data-ai-text-api-key], [data-ai-image-api-key]').forEach((input) => {
-    input.addEventListener('change', () => cacheCurrentAiProviderKeys(form));
+async function testAiProviderConnection(card, status) {
+  const providerId = card.querySelector('[data-ai-provider-id]')?.value?.trim() || '';
+  const modelId = card.querySelector('[data-ai-model-row] [data-ai-model-id]')?.value?.trim() || '';
+  if (!providerId || !modelId) {
+    status.textContent = '先填好提供商 id 和至少一个模型，并保存后再测试。';
+    status.classList.add('is-error');
+    return;
+  }
+  status.classList.remove('is-error');
+  status.textContent = '正在测试...';
+  try {
+    const response = await fetch(`/api/ai-providers/${encodeURIComponent(providerId)}/test`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ model_id: modelId }),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = payload.detail || '测试失败';
+      status.classList.add('is-error');
+      return;
+    }
+    if (payload.ok) {
+      status.textContent = `可用（HTTP ${payload.http_status}，${payload.latency_ms} ms）`;
+      return;
+    }
+    const reason = payload.failure_class || payload.error_type || '未知原因';
+    const httpPart = payload.http_status ? `HTTP ${payload.http_status}，` : '';
+    status.textContent = `不可用（${httpPart}${reason}）`;
+    status.classList.add('is-error');
+  } catch {
+    status.textContent = '测试失败，请检查服务状态。';
+    status.classList.add('is-error');
+  }
+}
+
+async function saveAiProviders(status) {
+  status.classList.remove('is-error');
+  status.textContent = '正在保存...';
+  try {
+    const response = await fetch('/api/ai-providers', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collectAiProviderPayload()),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = payload.detail || '保存失败';
+      status.classList.add('is-error');
+      return;
+    }
+    renderAiProviderList(payload);
+    status.textContent = '提供商与模型已保存';
+  } catch {
+    status.textContent = '保存失败，请检查服务状态。';
+    status.classList.add('is-error');
+  }
+}
+
+function bindAiProviderPage() {
+  const page = document.querySelector('[data-ai-provider-page]');
+  if (!page) {
+    return;
+  }
+  const status = page.querySelector('[data-ai-provider-save-status]');
+  page.querySelectorAll('[data-ai-provider-preset]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const preset = AI_PROVIDER_PRESETS[button.dataset.aiProviderPreset] || AI_PROVIDER_PRESETS.custom;
+      const container = page.querySelector('[data-ai-provider-list]');
+      if (!container) {
+        return;
+      }
+      container.append(
+        renderAiProviderCard(
+          { id: preset.id, label: preset.label, base_url: preset.base_url, timeout_seconds: 60, enabled: true },
+          preset.model ? [{ id: preset.model, model: preset.model, label: preset.label, supports_text: true }] : [],
+        ),
+      );
+    });
+  });
+  const save = page.querySelector('[data-ai-provider-save]');
+  if (save && status) {
+    save.addEventListener('click', () => saveAiProviders(status));
+  }
+  // The provider table is also what the 模型选择 page picks from, so both
+  // pages re-read on open rather than keeping whatever the first page load
+  // happened to see.
+  document
+    .querySelectorAll('[data-dashboard-tab="config"]')
+    .forEach((tab) => tab.addEventListener('click', () => loadAiProviders()));
+  loadAiProviders();
+}
+
+async function loadAiProviders() {
+  try {
+    const response = await fetch('/api/ai-providers');
+    if (!response.ok) {
+      return;
+    }
+    renderAiProviderList(await response.json());
+  } catch {
+    /* leave the page empty; the save button reports the next failure */
+  }
+}
+
+function renderAiStageRow(definition, stages, models, effective, routableIds) {
+  const row = aiElement('section', 'ai-stage-row');
+  row.setAttribute('data-ai-stage-row', '');
+  row.setAttribute('data-ai-stage-key', definition.stage_key);
+
+  const head = aiElement('div', 'ai-stage-head');
+  head.append(aiElement('h3', null, definition.label));
+  const tags = aiElement('div', 'ai-stage-tags');
+  tags.append(aiElement('span', 'ai-stage-tag', definition.capability_label));
+  tags.append(
+    aiElement(
+      'span',
+      definition.production_path ? 'ai-stage-tag is-production' : 'ai-stage-tag',
+      definition.production_path ? `生产路径：${definition.production_note}` : '非生产路径',
+    ),
+  );
+  head.append(tags);
+  head.append(aiElement('p', 'ai-helper-text', definition.description));
+  row.append(head);
+
+  const chain = aiElement('div', 'ai-stage-chain');
+  chain.setAttribute('data-ai-stage-chain', '');
+  const bound = Array.isArray(stages[definition.stage_key]) ? stages[definition.stage_key] : [];
+  // Whether a model can be called at all, not whether it is already bound:
+  // a member added a second ago has no entry in `effective` yet, and greying
+  // it out would say something untrue about it.
+  const routable = new Set(routableIds);
+  const modelsById = new Map(models.map((model) => [model.id, model]));
+
+  const redraw = () => {
+    Array.from(chain.querySelectorAll('[data-ai-stage-member]')).forEach((node, index) => {
+      const role = node.querySelector('[data-ai-stage-role]');
+      if (role) {
+        role.textContent = index === 0 ? '主用' : `备用 ${index}`;
+      }
+    });
+  };
+
+  const roleSpan = () => {
+    const span = aiElement('span', 'ai-stage-role', '');
+    span.setAttribute('data-ai-stage-role', '');
+    return span;
+  };
+
+  const addMember = (modelId) => {
+    const chip = aiElement('div', 'ai-stage-member');
+    chip.setAttribute('data-ai-stage-member', '');
+    chip.setAttribute('data-ai-stage-member-id', modelId);
+    if (!routable.has(modelId)) {
+      chip.classList.add('is-inactive');
+      chip.title = '已绑定，未参与路由';
+    }
+    chip.append(roleSpan());
+    const model = modelsById.get(modelId);
+    chip.append(aiElement('span', 'ai-stage-member-name', model ? `${model.label || model.id} / ${model.model}` : modelId));
+    if (!routable.has(modelId)) {
+      chip.append(aiElement('span', 'ai-stage-member-note', '已绑定，未参与路由'));
+    }
+    const up = aiElement('button', 'link-button', '上移');
+    up.type = 'button';
+    up.setAttribute('data-ai-stage-up', '');
+    up.addEventListener('click', () => {
+      const previous = chip.previousElementSibling;
+      if (previous) {
+        chain.insertBefore(chip, previous);
+        redraw();
+      }
+    });
+    const down = aiElement('button', 'link-button', '下移');
+    down.type = 'button';
+    down.setAttribute('data-ai-stage-down', '');
+    down.addEventListener('click', () => {
+      const next = chip.nextElementSibling;
+      if (next) {
+        chain.insertBefore(next, chip);
+        redraw();
+      }
+    });
+    const remove = aiElement('button', 'link-button', '移除');
+    remove.type = 'button';
+    remove.setAttribute('data-ai-stage-remove', '');
+    remove.addEventListener('click', () => {
+      chip.remove();
+      redraw();
+    });
+    chip.append(up, down, remove);
+    chain.append(chip);
+    redraw();
+  };
+
+  bound.forEach(addMember);
+  row.append(chain);
+
+  const picker = aiElement('div', 'ai-stage-picker');
+  const select = document.createElement('select');
+  select.setAttribute('data-ai-stage-add-select', '');
+  select.append(new Option('添加备用...', ''));
+  models
+    .filter((model) => model.enabled !== false)
+    .filter((model) => (definition.requires_text ? model.supports_text : true))
+    .filter((model) => (definition.requires_image ? model.supports_image : true))
+    .forEach((model) => select.append(new Option(`${model.label || model.id} / ${model.model}`, model.id)));
+  const add = aiElement('button', 'secondary-button', '添加');
+  add.type = 'button';
+  add.setAttribute('data-ai-stage-add', '');
+  add.addEventListener('click', () => {
+    const modelId = select.value;
+    if (!modelId || chain.querySelector(`[data-ai-stage-member-id="${CSS.escape(modelId)}"]`)) {
+      return;
+    }
+    addMember(modelId);
+  });
+  picker.append(select, add);
+  row.append(picker);
+
+  const chainModels = effective[definition.stage_key] || [];
+  const effectiveLine = aiElement('p', 'ai-stage-effective');
+  effectiveLine.setAttribute('data-ai-stage-effective', '');
+  if (chainModels.length) {
+    effectiveLine.textContent = `当前生效：${chainModels[0].label || chainModels[0].id}`;
+  } else if (definition.env_fallback) {
+    effectiveLine.textContent = `未绑定，沿用环境变量 ${definition.env_fallback}`;
+  } else {
+    effectiveLine.textContent = '未绑定，该环节没有可用模型';
+  }
+  row.append(effectiveLine);
+  return row;
+}
+
+function renderAiStageList(payload) {
+  const container = document.querySelector('[data-ai-stage-list]');
+  if (!container) {
+    return;
+  }
+  container.replaceChildren();
+  const models = Array.isArray(payload.models) ? payload.models : [];
+  const stages = payload.stages || {};
+  const effective = payload.effective || {};
+  const routableIds = Array.isArray(payload.routable_model_ids) ? payload.routable_model_ids : [];
+  (Array.isArray(payload.definitions) ? payload.definitions : []).forEach((definition) => {
+    container.append(renderAiStageRow(definition, stages, models, effective, routableIds));
   });
 }
 
-function cacheCurrentAiProviderKeys(form) {
-  [
-    {
-      target: 'text',
-      baseUrl: form.querySelector('[data-ai-text-base-url]')?.value || '',
-      apiKey: form.querySelector('[data-ai-text-api-key]')?.value || '',
-      model: form.querySelector('[data-ai-text-model]')?.value || '',
-    },
-    {
-      target: 'image',
-      baseUrl: form.querySelector('[data-ai-image-base-url]')?.value || '',
-      apiKey: form.querySelector('[data-ai-image-api-key]')?.value || '',
-      model: form.querySelector('[data-ai-image-model]')?.value || '',
-    },
-  ].forEach(cacheAiProviderKey);
+function collectAiStagePayload() {
+  const stages = {};
+  document.querySelectorAll('[data-ai-stage-row]').forEach((row) => {
+    const stageKey = row.getAttribute('data-ai-stage-key');
+    if (!stageKey) {
+      return;
+    }
+    stages[stageKey] = Array.from(row.querySelectorAll('[data-ai-stage-member]')).map((chip) =>
+      chip.getAttribute('data-ai-stage-member-id'),
+    );
+  });
+  return { stages };
 }
 
-function cacheAiProviderKey({ target, baseUrl, model, apiKey }) {
-  const storageKey = getAiProviderKeyStorageKey({ target, baseUrl, model });
-  if (!storageKey) {
+async function saveAiStages(status) {
+  status.classList.remove('is-error');
+  status.textContent = '正在保存...';
+  try {
+    const response = await fetch('/api/ai-stages', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(collectAiStagePayload()),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = payload.detail || '保存失败';
+      status.classList.add('is-error');
+      return;
+    }
+    renderAiStageList(payload);
+    status.textContent = '环节模型已保存';
+  } catch {
+    status.textContent = '保存失败，请检查服务状态。';
+    status.classList.add('is-error');
+  }
+}
+
+function bindAiStagePage() {
+  const page = document.querySelector('[data-ai-stage-page]');
+  if (!page) {
     return;
   }
+  const status = page.querySelector('[data-ai-stage-save-status]');
+  const save = page.querySelector('[data-ai-stage-save]');
+  if (save && status) {
+    save.addEventListener('click', () => saveAiStages(status));
+  }
+  document
+    .querySelectorAll('[data-dashboard-tab="model-selection"]')
+    .forEach((tab) => tab.addEventListener('click', () => loadAiStages()));
+  loadAiStages();
+}
+
+async function loadAiStages() {
   try {
-    if (apiKey) {
-      window.localStorage.setItem(storageKey, apiKey);
-    } else {
-      window.localStorage.removeItem(storageKey);
+    const response = await fetch('/api/ai-stages');
+    if (!response.ok) {
+      return;
     }
+    renderAiStageList(await response.json());
   } catch {
-    // ignore local storage failures in browser privacy modes
+    /* leave the page empty; the save button reports the next failure */
   }
 }
 
-function loadCachedAiProviderKey({ target, baseUrl, model }) {
-  const storageKey = getAiProviderKeyStorageKey({ target, baseUrl, model });
-  if (!storageKey) {
-    return '';
-  }
-  try {
-    return window.localStorage.getItem(storageKey) || '';
-  } catch {
-    return '';
-  }
-}
-
-function getAiProviderKeyStorageKey({ target, baseUrl, model }) {
-  const normalizedTarget = String(target || '').trim().toLowerCase();
-  const normalizedBaseUrl = String(baseUrl || '').trim().replace(/\/+$/, '');
-  const normalizedModel = String(model || '').trim();
-  if (!normalizedTarget || !normalizedBaseUrl || !normalizedModel) {
-    return '';
-  }
-  return `telegram-workbench:ai-provider-key:${normalizedTarget}:${normalizedBaseUrl}:${normalizedModel}`;
-}
 
 function buildAiRecognitionConfigPayload() {
-  const value = (selector) => document.querySelector(selector)?.value || '';
-  const aiModels = collectAiModelConfigs();
-  const activeTextModelId = value('[data-active-text-model-id]');
-  const activeImageModelId = value('[data-active-image-model-id]');
-  const contextResolutionModelId = value('[data-context-resolution-model-id]');
-  const activeTextModel = aiModels.find((model) => model.id === activeTextModelId) || null;
-  const activeImageModel = aiModels.find((model) => model.id === activeImageModelId) || null;
-  return {
-    mode: 'ai_provider',
-    active_text_model_id: activeTextModelId,
-    active_image_model_id: activeImageModelId,
-    context_resolution_model_id: contextResolutionModelId,
-    ai_models: aiModels,
-    text_provider: modelConfigToProvider(activeTextModel),
-    image_provider: modelConfigToProvider(activeImageModel),
-  };
+  // Prompts only. The model table and the per-stage bindings belong to
+  // /api/ai-providers and /api/ai-stages, and a form that does not show them
+  // must not be able to overwrite them by submitting what it never loaded.
+  return { mode: 'ai_provider' };
 }
 
 function collectAiPromptValues() {
@@ -4153,42 +4437,6 @@ function collectAiPromptValues() {
     }
     return prompts;
   }, {});
-}
-
-function collectAiModelConfigs() {
-  return Array.from(document.querySelectorAll('[data-ai-model-row]'))
-    .map((row) => {
-      const rowValue = (selector) => row.querySelector(selector)?.value || '';
-      const parsedTimeout = Number(rowValue('[data-ai-model-timeout]'));
-      return {
-        id: rowValue('[data-ai-model-id]') || rowValue('[data-ai-model-name]'),
-        label: rowValue('[data-ai-model-label]'),
-        base_url: rowValue('[data-ai-model-base-url]'),
-        api_key: rowValue('[data-ai-model-api-key]'),
-        model: rowValue('[data-ai-model-name]'),
-        timeout_seconds: Number.isFinite(parsedTimeout) && parsedTimeout > 0 ? parsedTimeout : 60,
-        supports_text: Boolean(row.querySelector('[data-ai-model-supports-text]')?.checked),
-        supports_image: Boolean(row.querySelector('[data-ai-model-supports-image]')?.checked),
-      };
-    })
-    .filter((model) => model.id || model.model || model.base_url);
-}
-
-function modelConfigToProvider(model) {
-  if (!model) {
-    return {
-      base_url: '',
-      api_key: '',
-      model: '',
-      timeout_seconds: 60,
-    };
-  }
-  return {
-    base_url: model.base_url,
-    api_key: model.api_key,
-    model: model.model,
-    timeout_seconds: model.timeout_seconds,
-  };
 }
 
 function buildLegacyAiRecognitionConfigPayload() {

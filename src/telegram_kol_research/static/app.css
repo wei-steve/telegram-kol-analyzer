@@ -3079,11 +3079,158 @@ body {
   gap: 6px;
 }
 
+/* AI 提供商页：提供商卡片 + 它自己的模型列表 */
+.ai-provider-presets {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 12px;
+}
+
+.ai-provider-list,
+.ai-stage-list {
+  display: grid;
+  gap: 14px;
+}
+
+.ai-provider-card,
+.ai-stage-row {
+  display: grid;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid rgba(148, 163, 184, 0.22);
+  border-radius: 10px;
+  background: rgba(15, 23, 42, 0.36);
+}
+
+.ai-provider-head {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 10px;
+  align-items: end;
+}
+
+.ai-provider-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ai-provider-test-status {
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.82);
+}
+
+.ai-provider-test-status.is-error {
+  color: #fca5a5;
+}
+
+.ai-provider-model-list {
+  display: grid;
+  gap: 10px;
+  padding-left: 12px;
+  border-left: 2px solid rgba(148, 163, 184, 0.28);
+}
+
+.ai-field {
+  display: grid;
+  gap: 4px;
+  font-size: 13px;
+}
+
+.ai-checkbox {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+}
+
+/* AI 模型选择页：每个环节一条有序链 */
+.ai-stage-head h3 {
+  margin: 0 0 4px;
+  font-size: 15px;
+}
+
+.ai-stage-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.ai-stage-tag {
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  background: rgba(148, 163, 184, 0.18);
+  color: rgba(226, 232, 240, 0.9);
+}
+
+.ai-stage-tag.is-production {
+  background: rgba(56, 189, 248, 0.18);
+  color: #7dd3fc;
+}
+
+.ai-stage-chain {
+  display: grid;
+  gap: 6px;
+}
+
+.ai-stage-member {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 8px;
+  background: rgba(148, 163, 184, 0.12);
+}
+
+.ai-stage-member.is-inactive {
+  opacity: 0.55;
+}
+
+.ai-stage-role {
+  min-width: 52px;
+  font-size: 12px;
+  color: #7dd3fc;
+}
+
+.ai-stage-member.is-inactive .ai-stage-role {
+  color: rgba(226, 232, 240, 0.7);
+}
+
+.ai-stage-member-name {
+  flex: 1 1 220px;
+}
+
+.ai-stage-member-note {
+  font-size: 12px;
+  color: rgba(226, 232, 240, 0.7);
+}
+
+.ai-stage-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+
+.ai-stage-effective {
+  margin: 0;
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.82);
+}
+
 @media (max-width: 760px) {
   .ai-prompt-grid {
     grid-template-columns: 1fr;
   }
-  .ai-model-row {
+  .ai-model-row,
+  .ai-provider-head {
     grid-template-columns: 1fr;
   }
 }

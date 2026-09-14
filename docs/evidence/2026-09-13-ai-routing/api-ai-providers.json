@@ -1,0 +1,78 @@
+{
+    "providers": [
+        {
+            "id": "deepseek",
+            "label": "DeepSeek",
+            "base_url": "https://api.deepseek.com",
+            "timeout_seconds": 60.0,
+            "enabled": true,
+            "api_key_configured": true,
+            "api_key_last4": "_key"
+        },
+        {
+            "id": "zhipu",
+            "label": "\u667a\u8c31",
+            "base_url": "https://open.bigmodel.cn/api/paas/v4",
+            "timeout_seconds": 60.0,
+            "enabled": true,
+            "api_key_configured": true,
+            "api_key_last4": "_key"
+        },
+        {
+            "id": "mimo",
+            "label": "MiMo",
+            "base_url": "https://api.xiaomimimo.com/v1",
+            "timeout_seconds": 60.0,
+            "enabled": true,
+            "api_key_configured": true,
+            "api_key_last4": "_key"
+        },
+        {
+            "id": "unreachable",
+            "label": "\u4e0d\u53ef\u8fbe\u6d4b\u8bd5",
+            "base_url": "http://127.0.0.1:9/v1",
+            "timeout_seconds": 60.0,
+            "enabled": true,
+            "api_key_configured": true,
+            "api_key_last4": "test"
+        }
+    ],
+    "models": [
+        {
+            "id": "deepseek-v4-flash",
+            "provider_id": "deepseek",
+            "model": "deepseek-v4-flash",
+            "label": "DeepSeek V4 Flash",
+            "supports_text": true,
+            "supports_image": false,
+            "enabled": true
+        },
+        {
+            "id": "glm-ocr",
+            "provider_id": "zhipu",
+            "model": "glm-ocr",
+            "label": "GLM-OCR",
+            "supports_text": false,
+            "supports_image": true,
+            "enabled": true
+        },
+        {
+            "id": "mimo-v2.5",
+            "provider_id": "mimo",
+            "model": "mimo-v2.5",
+            "label": "MiMo V2.5",
+            "supports_text": true,
+            "supports_image": true,
+            "enabled": true
+        },
+        {
+            "id": "unreachable-vision",
+            "provider_id": "unreachable",
+            "model": "unreachable-vision",
+            "label": "\u4e0d\u53ef\u8fbe\u591a\u6a21\u6001",
+            "supports_text": true,
+            "supports_image": true,
+            "enabled": true
+        }
+    ]
+}

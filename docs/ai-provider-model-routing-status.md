@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 4
+current_phase: 5
 phase_status: planned        # planned | in_progress | completed | blocked
 deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 ```
@@ -22,7 +22,7 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 | 1 | 配置层：schema v2、迁移、load/save、派生兼容视图、stage 目录、`ai-config-show` | completed | `18d62606` | 全量 8713 passed / 0 failed / 4 skipped |
 | 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | `4e5e37ad` | 全量 8746 passed / 0 failed / 4 skipped |
 | 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | 见下方证据 | 全量 8768 passed / 0 failed / 4 skipped |
-| 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证截图 | planned | | |
+| 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | 见下方证据 | 全量 8786 passed / 0 failed / 4 skipped |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | planned | | |
 
 ## 阶段 1 做了什么
@@ -98,6 +98,35 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 健康线：`resolve_chain_head_model` 加了按文件身份 `(路径, mtime_ns, size)` 的缓存，
 两个 tick 每轮各问一次链首只会解析一次 YAML；页面保存后文件变了，下一轮就看到新链首。
+
+## 阶段 4 做了什么
+
+四组接口（`web_app.py`）：
+- `GET/PUT /api/ai-providers`：`{providers, models}`；Key 只写不读（GET 只给
+  `api_key_configured` + 末 4 位，PUT 留空 = 保持原值）；`AiRecognitionConfigValidationError` → 422。
+- `POST /api/ai-providers/{id}/test`：body `{model_id}`，复用
+  `mimo_provider_probe.probe_mimo_provider` 的 `max_tokens=1` 探测与分类，返回
+  `ok / http_status / latency_ms / failure_class / kind / error_type`。
+  探测器由 `create_web_app(ai_provider_prober=...)` 注入，测试里不打网络。
+- `GET/PUT /api/ai-stages`：`definitions` + `stages` + `effective` + `models` +
+  `routable_model_ids` + `warnings`。
+- 删除仍被某个 stage 引用的 provider / model → 422，并列出引用它的环节名。
+
+两页（`templates/index.html` + `static/app.js` + `static/app.css`，沿用既有
+`dashboard-tab-panel` / `ai-recognition-panel`，没引入任何新依赖）：
+- ⚙ 菜单「AI配置」改名「AI提供商」，「更多工具」底部快捷入口补上「AI 模型选择」。
+- 「AI提供商」：提供商卡片（id / 名称 / Base URL / Key 脱敏 / 超时 / 启用 / 测试连接 / 删除）
+  + 卡片下的模型列表（模型 id / 模型名 / 显示名 / 文本、图片能力 / 启用 / 删除 / 添加模型）
+  + 预设按钮 DeepSeek / 智谱 / MiMo / 自定义。
+- 「AI模型选择」：每个 stage 一行 —— 中文名、一句话说明、能力标签、生产路径标签、
+  有序链（主用 / 备用 n，上移 / 下移 / 移除）、「添加备用」下拉（只列满足能力且启用的模型）、
+  「当前生效」；`strategy_alert` / `research_chat` 空链显示「未绑定，沿用环境变量 …」；
+  不参与路由的成员画成灰色「已绑定，未参与路由」；页首注明 `runtime_incident_agent` 不在此处设置。
+- 旧 `POST /api/ai-recognition-config` 保留，`app.js` 不再用它；
+  旧的整表覆盖（`collectAiModelConfigs` 那条路径）连同它的浏览器 Key 缓存一起删掉了。
+
+`cli.py` 的 `web` 命令新增 `--ai-recognition-config-path`，这样本地预览可以指向一份
+一次性的配置而不碰真实文件；`.claude/launch.json` 里的 `ai-routing-preview` 就是它。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -213,6 +242,33 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     测试；缓存放在 `resolve_chain_head_model` 里，调用点与签名一个字都不用动，
     重复的那次只花一个 `stat()`。
 
+23. **`/api/ai-stages` 另给一个 `routable_model_ids`。**
+    设计只说 `effective` 是「解析后的模型」。但页面还要回答另一个问题：某个成员是
+    「能用但还没绑」还是「绑了但不会被路由」。`effective` 只包含**已经绑定**的成员，
+    拿它当判据会把刚添加、还没保存的备用画成灰色，说了一句不真的话。
+    `routable_model_ids` = 启用 + provider 启用且有 base_url 的所有模型 id。
+
+24. **两页在 tab 被点开时重新读一次数据。**
+    在提供商页加完模型再切到模型选择页，下拉里必须能看到新模型。绑定时只读一次做不到。
+
+25. **「测试连接」的探测器由 `create_web_app(ai_provider_prober=...)` 注入。**
+    默认就是 `mimo_provider_probe.probe_mimo_provider`。注入点让接口测试能覆盖
+    「可用 / 不可达 / 余额不足」三种回答而不打网络，也不用 monkeypatch 模块全局。
+
+26. **删除被引用的 provider / model 由后端 422 拒绝，前端不做预检。**
+    两页可以分别保存，前端的引用表随时可能是旧的；唯一可信的判断在读到当前
+    `stages` 的那一侧。报错里带上引用它的环节名，用户知道该去哪一页先解绑。
+
+27. **`web` 命令新增 `--ai-recognition-config-path`。**
+    `create_web_app` 早就支持这个参数，只是 CLI 没暴露。不加它就只能拿真实的
+    `config/ai_recognition.yaml` 做页面验证——这正是不该做的事。
+
+28. **本轮没有 PNG 截图。**
+    本会话的浏览器工具只能把截图返回到会话里，不能落盘。
+    `docs/evidence/2026-09-13-ai-routing/` 里留的是同等可核对的东西：
+    12 步操作清单、两页渲染后的实际结构、两个 API 的原样响应、保存后磁盘 YAML 的内容，
+    以及一条可复现的启动命令。没有伪造任何截图路径。
+
 ## 已知限制 / 后续课题
 
 - 主模型故障期间每条消息都先付一次主模型失败的代价；跨消息熔断/冷却未做（设计 §4）。
@@ -309,3 +365,33 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     `test_glm_ocr_is_still_decided_by_the_chain_heads_model_name`
   - `test_the_prompt_centre_deepseek_test_follows_the_batch_text_chain`
   - `test_the_chain_head_is_not_reparsed_on_every_tick`
+
+### 阶段 4
+
+- 提交：`feat(ai-routing): phase 4 the AI provider and model-selection pages`
+  （SHA 在后续文档提交里补写）
+- 全量：`uv run python -m pytest -q` → **8786 passed, 4 skipped, 0 failed**（655 s）
+- 新增测试文件：`tests/test_ai_provider_api.py`（18 例）。关键用例：
+  - `test_providers_are_listed_with_their_models_and_no_keys`
+  - `test_an_empty_key_keeps_the_stored_one` / `test_a_new_key_replaces_the_stored_one`
+  - `test_adding_a_provider_and_a_model_round_trips`
+  - `test_deleting_a_model_a_stage_still_uses_is_refused` /
+    `test_deleting_a_provider_a_stage_still_uses_is_refused`
+  - `test_a_model_on_an_unknown_provider_is_a_422_not_a_500`
+  - `test_the_connection_test_reports_a_healthy_provider` /
+    `test_the_connection_test_names_why_an_unreachable_provider_failed` /
+    `test_the_connection_test_sends_the_stored_key_without_returning_it`
+  - `test_stages_report_the_catalogue_the_bindings_and_what_routes`
+  - `test_a_fallback_can_be_added_and_reordered`
+  - `test_a_stage_left_out_of_the_body_keeps_its_binding`
+  - `test_binding_a_model_that_cannot_serve_the_stage_is_a_422`
+  - `test_a_disabled_model_stays_bound_but_stops_routing`
+  - `test_the_worker_sees_a_saved_chain_without_a_restart`
+- 改写的模板 / 资源用例：`tests/test_web_page_render.py::test_model_selection_page_hosts_one_row_per_stage`、
+  `tests/test_web_assets_smoke.py::test_app_js_drives_the_provider_and_stage_pages`。
+- 浏览器验证：`docs/evidence/2026-09-13-ai-routing/browser-verification.md`
+  （12 步操作清单 + 渲染结构 + `api-ai-providers.json` / `api-ai-stages.json`）。
+  实际走通了：改名后的 ⚙ 菜单与快捷入口、添加提供商与模型并保存、对不可达地址
+  「测试连接」返回 `不可用（provider_unavailable）`、给 `authoritative_recognition`
+  加一个备用并保存、回读一致、磁盘上升级成 `schema_version: 2` 且未填的 Key 原样保留。
+  验证中发现并修掉了三个页面 bug（角色标签不渲染、切页不刷新、新加成员被错误画灰）。

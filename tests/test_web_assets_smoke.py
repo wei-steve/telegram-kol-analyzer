@@ -185,20 +185,30 @@ def test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns(tmp_
     assert "${renderHistoryTimestamp(entry.createdAt)}" in response.text
 
 
-def test_app_js_collects_separate_ai_model_configs_and_active_selection(tmp_path):
+def test_app_js_drives_the_provider_and_stage_pages(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "bindAiModelSelectionForm" in response.text
-    assert "collectAiModelConfigs" in response.text
-    assert "active_text_model_id" in response.text
-    assert "active_image_model_id" in response.text
-    assert "context_resolution_model_id" in response.text
-    assert "data-context-resolution-model-id" in response.text
-    assert "data-ai-model-api-key" in response.text
-    assert "modelConfigToProvider(activeTextModel)" in response.text
+    assert "bindAiProviderPage" in response.text
+    assert "bindAiStagePage" in response.text
+    assert "'/api/ai-providers'" in response.text
+    assert "'/api/ai-stages'" in response.text
+    assert "/api/ai-providers/${encodeURIComponent(providerId)}/test" in response.text
+    assert "data-ai-provider-list" in response.text
+    assert "data-ai-stage-member" in response.text
+    assert "data-ai-stage-role" in response.text
+    assert "routable_model_ids" in response.text
+    # Both pages re-read when their tab is opened, so a model added on one is
+    # pickable on the other without a page reload.
+    assert "data-dashboard-tab=\"model-selection\"" in response.text
+    assert "data-dashboard-tab=\"config\"" in response.text
+    # The provider page owns the model table now, so the legacy prompt form's
+    # payload must not carry it any more.
+    assert "collectAiModelConfigs()" not in response.text
+    # Keys are write-only: nothing in the page ever puts one in storage.
+    assert "ai-provider-key" not in response.text
 
 
 def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):

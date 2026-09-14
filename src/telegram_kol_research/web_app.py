@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from contextlib import asynccontextmanager, nullcontext
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any, Callable
@@ -62,9 +62,14 @@ from telegram_kol_research.app_logging import (
 )
 from telegram_kol_research.ai_model_router import run_with_fallback
 from telegram_kol_research.ai_recognition_config import (
+    AI_STAGE_KEYS,
+    AiModel,
     AiModelConfig,
+    AiProvider,
     AiProviderConfig,
     AiRecognitionConfig,
+    AiRecognitionConfigValidationError,
+    build_ai_config_view,
     build_ai_prompt_views,
     load_ai_recognition_config,
     save_ai_recognition_config,
@@ -5417,6 +5422,7 @@ def create_web_app(
     deepcoin_reconcile_interval_seconds: int = 30,
     deepcoin_reconcile_startup_delay_seconds: int = 5,
     ai_recognition_config_path: str | Path | None = None,
+    ai_provider_prober: Callable[..., Any] | None = None,
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
     deepcoin_private_ws_runner=None,
@@ -6445,6 +6451,9 @@ def create_web_app(
         if ai_recognition_config_path is not None
         else Path("config/ai_recognition.yaml")
     )
+    # Injected so the "test connection" button can be exercised without a
+    # network: it is the same one-token probe the daily health check sends.
+    app.state.ai_provider_prober = ai_provider_prober or _default_ai_provider_prober
     seed_default_prompt_registry(
         app.state.session_factory,
         load_ai_recognition_config(app.state.ai_recognition_config_path),
@@ -9673,6 +9682,134 @@ def create_web_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
 
+    @app.get("/api/ai-providers")
+    def get_ai_providers():
+        """Providers and models, keys masked (design §5.1)."""
+
+        view = build_ai_config_view(
+            load_ai_recognition_config(app.state.ai_recognition_config_path)
+        )
+        return {"providers": view["providers"], "models": view["models"]}
+
+    @app.put("/api/ai-providers")
+    def put_ai_providers(payload: dict[str, Any]):
+        existing = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        providers = _ai_providers_from_payload(
+            payload.get("providers"), existing.providers
+        )
+        models = _ai_models_v2_from_payload(payload.get("models"))
+        _refuse_removing_referenced_members(
+            stages=existing.stages,
+            provider_ids={provider.id for provider in providers},
+            model_ids={model.id for model in models},
+            existing_models=existing.models,
+        )
+        try:
+            saved = save_ai_recognition_config(
+                app.state.ai_recognition_config_path,
+                replace(existing, providers=providers, models=models),
+            )
+        except AiRecognitionConfigValidationError as exc:
+            raise HTTPException(status_code=422, detail="; ".join(exc.errors)) from exc
+        view = build_ai_config_view(saved)
+        return {"providers": view["providers"], "models": view["models"]}
+
+    @app.post("/api/ai-providers/{provider_id}/test")
+    def test_ai_provider(provider_id: str, payload: dict[str, Any]):
+        """One ``max_tokens=1`` ping, classified like the daily probe."""
+
+        config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        provider = next(
+            (item for item in config.providers if item.id == str(provider_id)),
+            None,
+        )
+        if provider is None:
+            raise HTTPException(status_code=404, detail="provider not found")
+        model_id = str(payload.get("model_id") or "")
+        model = next(
+            (
+                item
+                for item in config.models
+                if item.id == model_id and item.provider_id == provider.id
+            ),
+            None,
+        )
+        if model is None:
+            raise HTTPException(
+                status_code=422,
+                detail="model_id must name a model of this provider",
+            )
+        outcome = app.state.ai_provider_prober(
+            AiModelConfig(
+                id=model.id,
+                label=model.label or model.id,
+                base_url=provider.base_url,
+                api_key=provider.api_key,
+                model=model.model,
+                timeout_seconds=provider.timeout_seconds,
+                supports_text=model.supports_text,
+                supports_image=model.supports_image,
+            )
+        )
+        return {
+            "ok": bool(outcome.ok),
+            "http_status": outcome.http_status,
+            "latency_ms": int(outcome.latency_ms),
+            "failure_class": outcome.failure_class,
+            "kind": outcome.kind,
+            "error_type": outcome.error_type,
+        }
+
+    @app.get("/api/ai-stages")
+    def get_ai_stages():
+        """Every stage, what it needs, what is bound, and what routes."""
+
+        view = build_ai_config_view(
+            load_ai_recognition_config(app.state.ai_recognition_config_path)
+        )
+        return {
+            "definitions": view["definitions"],
+            "stages": view["stages"],
+            "effective": view["effective"],
+            "models": view["models"],
+            "routable_model_ids": view["routable_model_ids"],
+            "warnings": view["warnings"],
+        }
+
+    @app.put("/api/ai-stages")
+    def put_ai_stages(payload: dict[str, Any]):
+        existing = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        raw_stages = payload.get("stages")
+        if not isinstance(raw_stages, dict):
+            raise HTTPException(status_code=422, detail="stages must be an object")
+        stages: dict[str, list[str]] = {}
+        for stage_key in AI_STAGE_KEYS:
+            members = raw_stages.get(stage_key, existing.stages.get(stage_key, []))
+            if isinstance(members, str):
+                members = [members]
+            if not isinstance(members, (list, tuple)):
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"stage {stage_key} must be a list of model ids",
+                )
+            stages[stage_key] = [str(item) for item in members]
+        try:
+            saved = save_ai_recognition_config(
+                app.state.ai_recognition_config_path,
+                replace(existing, stages=stages),
+            )
+        except AiRecognitionConfigValidationError as exc:
+            raise HTTPException(status_code=422, detail="; ".join(exc.errors)) from exc
+        view = build_ai_config_view(saved)
+        return {
+            "definitions": view["definitions"],
+            "stages": view["stages"],
+            "effective": view["effective"],
+            "models": view["models"],
+            "routable_model_ids": view["routable_model_ids"],
+            "warnings": view["warnings"],
+        }
+
     @app.post("/api/ai-recognition-config")
     def update_ai_recognition_config(payload: dict[str, Any]):
         existing_config = load_ai_recognition_config(app.state.ai_recognition_config_path)
@@ -11078,6 +11215,100 @@ def _load_ai_recognition_config_best_effort(path: Any) -> AiRecognitionConfig | 
             exc_info=True,
         )
         return None
+
+
+def _default_ai_provider_prober(model_config: AiModelConfig):
+    from telegram_kol_research.mimo_provider_probe import probe_mimo_provider
+
+    return probe_mimo_provider(model_config)
+
+
+def _ai_providers_from_payload(payload: Any, existing: list[AiProvider]) -> list[AiProvider]:
+    """Providers from the page, with a blank key meaning "keep the old one".
+
+    The key is write-only everywhere in this project: a GET never returns it,
+    so a save cannot echo it back, so an empty field has to mean unchanged
+    rather than erased.
+    """
+
+    if not isinstance(payload, list):
+        return list(existing)
+    previous = {item.id: item for item in existing}
+    providers: list[AiProvider] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        provider_id = str(item.get("id") or "").strip()
+        prior = previous.get(provider_id)
+        api_key = str(item.get("api_key") or "")
+        providers.append(
+            AiProvider(
+                id=provider_id,
+                label=str(item.get("label") or ""),
+                base_url=str(item.get("base_url") or ""),
+                api_key=api_key if api_key.strip() else (prior.api_key if prior else ""),
+                timeout_seconds=float(item.get("timeout_seconds") or 60),
+                enabled=bool(item.get("enabled", True)),
+            )
+        )
+    return providers
+
+
+def _ai_models_v2_from_payload(payload: Any) -> list[AiModel]:
+    if not isinstance(payload, list):
+        return []
+    models: list[AiModel] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        model_id = str(item.get("id") or item.get("model") or "").strip()
+        models.append(
+            AiModel(
+                id=model_id,
+                provider_id=str(item.get("provider_id") or "").strip(),
+                model=str(item.get("model") or "").strip(),
+                label=str(item.get("label") or ""),
+                supports_text=bool(item.get("supports_text", True)),
+                supports_image=bool(item.get("supports_image", False)),
+                enabled=bool(item.get("enabled", True)),
+            )
+        )
+    return models
+
+
+def _refuse_removing_referenced_members(
+    *,
+    stages: dict[str, list[str]],
+    provider_ids: set[str],
+    model_ids: set[str],
+    existing_models: list[AiModel],
+) -> None:
+    """Refuse a delete that would silently unbind a stage.
+
+    Saving the provider page must not be able to change which model a stage
+    calls. A model that is still bound has to be removed from the stage first,
+    on the page that owns that decision, and the message says which stages to
+    look at.
+    """
+
+    provider_of = {model.id: model.provider_id for model in existing_models}
+    referenced: dict[str, list[str]] = {}
+    for stage_key, members in stages.items():
+        for member in members:
+            gone_model = member not in model_ids
+            gone_provider = provider_of.get(member, "") not in provider_ids
+            if gone_model or gone_provider:
+                referenced.setdefault(member, []).append(stage_key)
+    if not referenced:
+        return
+    details = "; ".join(
+        f"{member} is still bound to {', '.join(sorted(set(where)))}"
+        for member, where in sorted(referenced.items())
+    )
+    raise HTTPException(
+        status_code=422,
+        detail=f"remove the binding before deleting: {details}",
+    )
 
 
 def _model_configs_from_payload(

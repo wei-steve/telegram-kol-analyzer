@@ -5930,6 +5930,15 @@ def web(
     ),
     database_path: Path = Path("data/research.db"),
     config_path: Path = Path("config/groups.yaml"),
+    ai_recognition_config_path: Path = typer.Option(
+        Path("config/ai_recognition.yaml"),
+        "--ai-recognition-config-path",
+        help=(
+            "Which AI provider/model/stage file this process reads and writes. "
+            "Point it somewhere disposable to try the AI pages without touching "
+            "the real configuration."
+        ),
+    ),
     deepcoin_contract_specs_path: Path = Path("config/deepcoin_contract_specs.yaml"),
     deepcoin_contract_specs_cache_path: Path = typer.Option(
         Path("data/deepcoin_contract_specs_cache.json"),
@@ -6044,6 +6053,7 @@ def web(
         group_labels_by_title=group_labels_by_title,
         group_config=group_config,
         group_config_path=config_path,
+        ai_recognition_config_path=ai_recognition_config_path,
         deepcoin_contract_spec_provider=deepcoin_contract_spec_provider,
     )
     try:

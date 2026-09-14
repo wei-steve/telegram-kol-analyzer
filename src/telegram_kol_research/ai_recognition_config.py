@@ -1403,6 +1403,18 @@ def build_ai_config_view(config: AiRecognitionConfig) -> dict[str, Any]:
         }
         for model in config.models
     ]
+    # "Could this model be called at all", independent of any stage: enabled,
+    # on an enabled provider, with an endpoint. The page needs it to tell a
+    # member that will not route from one that simply is not saved yet -- the
+    # per-stage ``effective`` list only names members already bound.
+    routable_model_ids = [
+        model.id
+        for model in config.models
+        if model.enabled
+        and model.provider is not None
+        and model.provider.enabled
+        and model.provider.is_configured
+    ]
     definitions = []
     effective: dict[str, list[dict[str, Any]]] = {}
     for definition in AI_STAGE_DEFINITIONS:
@@ -1442,6 +1454,7 @@ def build_ai_config_view(config: AiRecognitionConfig) -> dict[str, Any]:
             for stage_key in AI_STAGE_KEYS
         },
         "effective": effective,
+        "routable_model_ids": routable_model_ids,
         "warnings": list(config.config_warnings),
     }
 

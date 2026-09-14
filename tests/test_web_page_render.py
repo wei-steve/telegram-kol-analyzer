@@ -1434,7 +1434,9 @@ image_provider:
     assert "never-render-this-image-secret" not in response.text
 
 
-def test_model_selection_page_exposes_independent_context_selector(tmp_path):
+def test_model_selection_page_hosts_one_row_per_stage(tmp_path):
+    """The page is a host; the rows come from /api/ai-stages."""
+
     config_path = tmp_path / "ai.yaml"
     config_path.write_text(
         "\n".join(
@@ -1454,8 +1456,15 @@ def test_model_selection_page_exposes_independent_context_selector(tmp_path):
     response = TestClient(app).get("/more-panel")
 
     assert response.status_code == 200
-    assert "data-context-resolution-model-id" in response.text
-    assert re.search(r'<option value="mimo-v2\.5" selected>', response.text)
+    assert "data-ai-stage-page" in response.text
+    assert "data-ai-stage-list" in response.text
+    assert "data-ai-stage-save" in response.text
+    # The one thing the page states itself: what it does not configure.
+    assert "runtime_incident_agent" in response.text
+    # Both entry points reach both pages (⚙ menu and the 更多 shortcuts).
+    assert response.text.count('data-dashboard-tab="config"') >= 2
+    assert response.text.count('data-dashboard-tab="model-selection"') >= 2
+    assert "AI 模型选择" in response.text
 
 
 def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, monkeypatch):
@@ -1484,9 +1493,9 @@ def test_root_shell_skips_group_strategy_and_configuration_loaders(tmp_path, mon
     assert 'data-lazy-workbench="groups"' in response.text
     assert 'data-lazy-workbench="more"' in response.text
     assert "data-group-link" not in response.text
-    assert "data-ai-recognition-config" not in response.text
+    assert "data-ai-provider-page" not in response.text
     assert "data-trading-settings-form" not in response.text
-    assert "data-ai-model-api-key" not in response.text
+    assert "data-ai-provider-list" not in response.text
 
 
 def test_groups_workbench_shell_keeps_message_detail_host_on_root(tmp_path):
@@ -1519,7 +1528,7 @@ def test_groups_and_more_partials_retain_deferred_controls(tmp_path):
     assert "data-toggle-group-automation" in groups.text
     assert more.status_code == 200
     assert "data-ai-prompt-center" in more.text
-    assert "data-ai-recognition-config" in more.text
+    assert "data-ai-provider-page" in more.text
     assert "data-trading-settings-form" in more.text
 from telegram_kol_research.web_app import _exchange_order_row
 
@@ -2794,12 +2803,11 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert 'data-mobile-work-region="groups"' in response.text
     assert "data-dashboard-tab" in response.text
     assert "data-ai-prompt-center" in response.text
-    assert "data-ai-recognition-config" in response.text
+    assert "data-ai-provider-page" in response.text
     assert "data-dashboard-tab" in response.text
     assert "data-ai-recognition-prompt" not in response.text
-    assert "data-ai-recognition-config" in response.text
-    assert "data-ai-model-selection" in response.text
-    assert "data-context-resolution-model-id" in response.text
+    assert "data-ai-stage-page" in response.text
+    assert "data-ai-stage-list" in response.text
     assert "data-trading-settings-form" in response.text
     assert 'data-dashboard-tab="exchange-positions"' in response.text
     assert 'data-dashboard-panel="exchange-positions"' in response.text
@@ -2845,12 +2853,12 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "区间入场方式" not in response.text
     assert "单点“附近”市价容忍 %" in response.text
     assert "20.0" in response.text
-    assert "DeepSeek V4 Flash" in response.text
-    assert "MiMo V2.5" in response.text
-    assert "mimo-v2.5" in response.text
-    assert "data-ai-model-row" in response.text
-    assert "data-active-text-model-id" in response.text
-    assert "data-active-image-model-id" in response.text
+    assert "AI提供商" in response.text
+    assert "data-ai-provider-list" in response.text
+    assert 'data-ai-provider-preset="deepseek"' in response.text
+    assert 'data-ai-provider-preset="zhipu"' in response.text
+    assert 'data-ai-provider-preset="mimo"' in response.text
+    assert 'data-ai-provider-preset="custom"' in response.text
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text

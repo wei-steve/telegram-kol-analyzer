@@ -29,7 +29,7 @@
         <summary class="icon-button" title="设置">⚙</summary>
         <nav class="settings-menu">
           <button type="button" class="settings-menu-item" data-dashboard-tab="prompt">AI识别提示词</button>
-          <button type="button" class="settings-menu-item" data-dashboard-tab="config">AI配置</button>
+          <button type="button" class="settings-menu-item" data-dashboard-tab="config">AI提供商</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="model-selection">AI模型选择</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="recognition-profiles">识别 Profile</button>
           <button type="button" class="settings-menu-item" data-dashboard-tab="trading-settings">交易设置</button>
@@ -164,94 +164,51 @@
   </section>
 
   <section class="dashboard-tab-panel" data-dashboard-panel="config">
-    <section class="panel ai-recognition-panel" data-ai-recognition-config>
+    <section class="panel ai-recognition-panel" data-ai-provider-page>
       <div class="panel-heading">
         <div>
-          <h2>AI配置</h2>
-          <p class="ai-helper-text">管理可用模型和各自的 API Key。</p>
+          <h2>AI提供商</h2>
+          <p class="ai-helper-text">
+            提供商 = 一个 OpenAI 兼容端点 + 一把 Key；每个提供商下面挂它自己的模型。
+            API Key 只写不读：留空表示保持原值。
+          </p>
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
       </div>
-      <form class="ai-recognition-prompt-form" data-ai-recognition-config-form>
-        <div class="ai-config-grid">
-          <div>
-            <span>Recognition mode</span>
-            <strong>{{ ai_recognition_config.mode }}</strong>
-          </div>
-          <div>
-            <span>Text AI</span>
-            <strong>{{ ai_recognition_config.text_provider.model or 'Not configured' }}</strong>
-          </div>
-          <div>
-            <span>Image AI</span>
-            <strong>{{ ai_recognition_config.image_provider.model or 'Not configured' }}</strong>
-          </div>
-        </div>
-
-        <h3>Configured AI models</h3>
-        <div class="ai-model-list" data-ai-model-list>
-          {% for model in ai_recognition_config.ai_models %}
-            <section class="ai-model-row" data-ai-model-row>
-              <input type="hidden" data-ai-model-id value="{{ model.id }}" />
-              <label>Display name<input data-ai-model-label value="{{ model.label }}" placeholder="Display name" /></label>
-              <label>Base URL<input data-ai-model-base-url value="{{ model.base_url }}" placeholder="https://api.example.com/v1" /></label>
-              <label>API Key<input data-ai-model-api-key value="" placeholder="{% if model.api_key %}已配置（留空保持不变）{% else %}sk-...{% endif %}" autocomplete="off" /></label>
-              <label>Model<input data-ai-model-name value="{{ model.model }}" placeholder="model-name" /></label>
-              <label>Timeout seconds<input data-ai-model-timeout type="number" min="1" value="{{ model.timeout_seconds }}" /></label>
-              <div class="ai-model-capabilities">
-                <label><input type="checkbox" data-ai-model-supports-text {% if model.supports_text %}checked{% endif %} /> Text recognition</label>
-                <label><input type="checkbox" data-ai-model-supports-image {% if model.supports_image %}checked{% endif %} /> Image recognition</label>
-              </div>
-            </section>
-          {% endfor %}
-        </div>
-        <div class="prompt-actions">
-          <button type="submit">Save model config</button>
-          <span class="ai-recognition-save-status" data-ai-config-save-status aria-live="polite"></span>
-        </div>
-      </form>
+      <div class="ai-provider-presets">
+        <span>添加提供商：</span>
+        <button type="button" class="secondary-button" data-ai-provider-preset="deepseek">DeepSeek</button>
+        <button type="button" class="secondary-button" data-ai-provider-preset="zhipu">智谱</button>
+        <button type="button" class="secondary-button" data-ai-provider-preset="mimo">MiMo</button>
+        <button type="button" class="secondary-button" data-ai-provider-preset="custom">自定义（OpenAI 兼容）</button>
+      </div>
+      <div class="ai-provider-list" data-ai-provider-list></div>
+      <div class="prompt-actions">
+        <button type="button" data-ai-provider-save>保存提供商与模型</button>
+        <span class="ai-recognition-save-status" data-ai-provider-save-status aria-live="polite"></span>
+      </div>
     </section>
   </section>
 
   <section class="dashboard-tab-panel" data-dashboard-panel="model-selection">
-    <section class="panel ai-recognition-panel" data-ai-model-selection>
+    <section class="panel ai-recognition-panel" data-ai-stage-page>
       <div class="panel-heading">
         <div>
           <h2>AI模型选择</h2>
-          <p class="ai-helper-text">分别选择文字识别、图片识别和上下文解析模型。</p>
+          <p class="ai-helper-text">
+            每个环节一条有序模型列表：第 1 个是主用，后面是备用。主用不行会自动用下一个。
+          </p>
+          <p class="ai-helper-text" data-ai-stage-exclusion>
+            运行时事故代理（runtime_incident_agent）使用独立配置，不在此处设置。
+          </p>
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
       </div>
-      <form class="ai-recognition-prompt-form" data-ai-model-selection-form>
-        <label>
-          Text recognition model
-          <select data-active-text-model-id>
-            {% for model in ai_recognition_config.ai_models if model.supports_text %}
-              <option value="{{ model.id }}" {% if model.id == ai_recognition_config.active_text_model_id %}selected{% endif %}>{{ model.label }} / {{ model.model }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>
-          Image recognition model
-          <select data-active-image-model-id>
-            {% for model in ai_recognition_config.ai_models if model.supports_image %}
-              <option value="{{ model.id }}" {% if model.id == ai_recognition_config.active_image_model_id %}selected{% endif %}>{{ model.label }} / {{ model.model }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <label>
-          Context resolution model
-          <select data-context-resolution-model-id>
-            {% for model in ai_recognition_config.ai_models if model.supports_text %}
-              <option value="{{ model.id }}" {% if model.id == ai_recognition_config.context_resolution_model_id %}selected{% endif %}>{{ model.label }} / {{ model.model }}</option>
-            {% endfor %}
-          </select>
-        </label>
-        <div class="prompt-actions">
-          <button type="submit">Save active models</button>
-          <span class="ai-recognition-save-status" data-ai-model-selection-save-status aria-live="polite"></span>
-        </div>
-      </form>
+      <div class="ai-stage-list" data-ai-stage-list></div>
+      <div class="prompt-actions">
+        <button type="button" data-ai-stage-save>保存环节模型</button>
+        <span class="ai-recognition-save-status" data-ai-stage-save-status aria-live="polite"></span>
+      </div>
     </section>
   </section>
 
@@ -525,7 +482,8 @@
       <button type="button" data-legacy-workbench-view="management-batches">策略管理批次</button>
       <button type="button" data-dashboard-tab="trading-settings">交易设置</button>
       <button type="button" data-dashboard-tab="prompt">AI 识别提示词</button>
-      <button type="button" data-dashboard-tab="config">AI 配置</button>
+      <button type="button" data-dashboard-tab="config">AI 提供商</button>
+      <button type="button" data-dashboard-tab="model-selection">AI 模型选择</button>
       <button type="button" data-dashboard-tab="recognition-profiles">识别 Profile</button>
       <a href="/execution">执行中策略</a>
       <a href="/logs">系统日志</a>

@@ -1,0 +1,202 @@
+{
+    "definitions": [
+        {
+            "stage_key": "authoritative_recognition",
+            "label": "\u5355\u6761\u6d88\u606f\u6743\u5a01\u8bc6\u522b\uff08MiMo \u591a\u6a21\u6001\uff0cv1 / v2 \u5408\u540c\u5171\u7528\uff09",
+            "description": "worker \u4e3b\u8def\u5f84\uff1a\u6bcf\u6761\u65b0\u6d88\u606f\u7684\u6743\u5a01\u8bc6\u522b\uff0cv1 \u4e0e v2 \u5408\u540c\u5171\u7528\u540c\u4e00\u6761\u94fe\u3002",
+            "requires_text": true,
+            "requires_image": true,
+            "capability_label": "\u6587\u672c + \u56fe\u7247",
+            "production_path": true,
+            "production_note": "\u662f\uff0c\u4e3b\u8def\u5f84",
+            "env_fallback": ""
+        },
+        {
+            "stage_key": "context_resolution",
+            "label": "\u4e0a\u4e0b\u6587\u7ed3\u5408\u5206\u6790\uff08\u7b2c\u4e8c\u5c42\uff09",
+            "description": "\u6743\u5a01\u8bc6\u522b\u5224\u5b9a\u9700\u8981\u66f4\u591a\u4e0a\u4e0b\u6587\u65f6\u8c03\u7528\uff1b\u53e6\u6709\u91cd\u5206\u6790\u961f\u5217\u4f7f\u7528\u540c\u4e00\u6761\u94fe\u3002",
+            "requires_text": true,
+            "requires_image": false,
+            "capability_label": "\u6587\u672c",
+            "production_path": true,
+            "production_note": "\u662f\uff08\u6743\u5a01\u8bc6\u522b\u5224\u5b9a\u9700\u8981\u65f6\u8c03\u7528\uff1b\u53e6\u6709\u91cd\u5206\u6790\u961f\u5217\uff09",
+            "env_fallback": ""
+        },
+        {
+            "stage_key": "semantic_review",
+            "label": "\u8bed\u4e49\u5206\u6b67\u590d\u6838\uff08\u53ea\u8bfb\u987e\u95ee\uff09",
+            "description": "\u53ea\u8bfb\u987e\u95ee\uff1a\u590d\u6838\u8bed\u4e49\u5206\u6b67\uff0c\u4e0d\u6539\u53d8\u4efb\u4f55\u4ea4\u6613\u5224\u5b9a\u3002",
+            "requires_text": true,
+            "requires_image": false,
+            "capability_label": "\u6587\u672c",
+            "production_path": true,
+            "production_note": "\u662f\uff08worker semantic_review \u5355\u4f8b\u5faa\u73af\uff09",
+            "env_fallback": ""
+        },
+        {
+            "stage_key": "strategy_alert",
+            "label": "\u7b56\u7565\u63d0\u9192\u5206\u7c7b\uff08Telegram \u63d0\u9192 bot\uff09",
+            "description": "Telegram \u63d0\u9192 bot \u7684\u7b56\u7565\u63d0\u9192\u5206\u7c7b\uff1b\u672a\u7ed1\u5b9a\u65f6\u6cbf\u7528\u73af\u5883\u53d8\u91cf\u3002",
+            "requires_text": true,
+            "requires_image": false,
+            "capability_label": "\u6587\u672c",
+            "production_path": true,
+            "production_note": "\u662f\uff0c\u5f53 bot token \u914d\u7f6e\u65f6",
+            "env_fallback": "TELEGRAM_KOL_ALERT_LLM_MODEL / TELEGRAM_KOL_LLM_*"
+        },
+        {
+            "stage_key": "research_chat",
+            "label": "Web \u7fa4\u6d88\u606f\u95ee\u7b54",
+            "description": "Web \u9875\u9762\u91cc\u9488\u5bf9\u7fa4\u6d88\u606f\u7684\u95ee\u7b54\uff1b\u672a\u7ed1\u5b9a\u65f6\u6cbf\u7528\u73af\u5883\u53d8\u91cf\u3002",
+            "requires_text": true,
+            "requires_image": false,
+            "capability_label": "\u6587\u672c",
+            "production_path": false,
+            "production_note": "web",
+            "env_fallback": "TELEGRAM_KOL_LLM_*"
+        },
+        {
+            "stage_key": "batch_text_recognition",
+            "label": "\u79bb\u7ebf/\u6279\u91cf\u6587\u672c\u8bc6\u522b\uff08V1 recognize_message_now\uff0c\u542b\u751f\u547d\u5468\u671f\u4e8b\u4ef6 AI\uff09",
+            "description": "\u79bb\u7ebf\u4e0e\u6279\u91cf\u5de5\u5177\u7684\u6587\u672c\u8bc6\u522b\uff0c\u4e0d\u5728\u751f\u4ea7\u6d88\u606f\u7ba1\u7ebf\u4e0a\u3002",
+            "requires_text": true,
+            "requires_image": false,
+            "capability_label": "\u6587\u672c",
+            "production_path": false,
+            "production_note": "\u5426\uff0c\u53ea\u6709 CLI / \u6279\u91cf\u5de5\u5177",
+            "env_fallback": ""
+        },
+        {
+            "stage_key": "batch_image_recognition",
+            "label": "\u79bb\u7ebf/\u6279\u91cf\u56fe\u7247\u8bc6\u522b\uff08V1\uff1bGLM-OCR \u8d70 layout_parsing\uff0c\u5176\u4ed6\u8d70\u591a\u6a21\u6001 chat\uff09",
+            "description": "\u79bb\u7ebf\u4e0e\u6279\u91cf\u5de5\u5177\u7684\u56fe\u7247\u8bc6\u522b\uff0c\u4e0d\u5728\u751f\u4ea7\u6d88\u606f\u7ba1\u7ebf\u4e0a\u3002",
+            "requires_text": false,
+            "requires_image": true,
+            "capability_label": "\u56fe\u7247",
+            "production_path": false,
+            "production_note": "\u5426\uff0c\u53ea\u6709 CLI / \u6279\u91cf\u5de5\u5177",
+            "env_fallback": ""
+        }
+    ],
+    "stages": {
+        "authoritative_recognition": [
+            "mimo-v2.5",
+            "unreachable-vision"
+        ],
+        "context_resolution": [
+            "deepseek-v4-flash"
+        ],
+        "semantic_review": [
+            "deepseek-v4-flash"
+        ],
+        "strategy_alert": [],
+        "research_chat": [],
+        "batch_text_recognition": [
+            "deepseek-v4-flash"
+        ],
+        "batch_image_recognition": [
+            "glm-ocr"
+        ]
+    },
+    "effective": {
+        "authoritative_recognition": [
+            {
+                "id": "mimo-v2.5",
+                "label": "MiMo V2.5",
+                "model": "mimo-v2.5",
+                "base_url": "https://api.xiaomimimo.com/v1",
+                "role": "\u4e3b\u7528"
+            },
+            {
+                "id": "unreachable-vision",
+                "label": "\u4e0d\u53ef\u8fbe\u591a\u6a21\u6001",
+                "model": "unreachable-vision",
+                "base_url": "http://127.0.0.1:9/v1",
+                "role": "\u5907\u7528 1"
+            }
+        ],
+        "context_resolution": [
+            {
+                "id": "deepseek-v4-flash",
+                "label": "DeepSeek V4 Flash",
+                "model": "deepseek-v4-flash",
+                "base_url": "https://api.deepseek.com",
+                "role": "\u4e3b\u7528"
+            }
+        ],
+        "semantic_review": [
+            {
+                "id": "deepseek-v4-flash",
+                "label": "DeepSeek V4 Flash",
+                "model": "deepseek-v4-flash",
+                "base_url": "https://api.deepseek.com",
+                "role": "\u4e3b\u7528"
+            }
+        ],
+        "strategy_alert": [],
+        "research_chat": [],
+        "batch_text_recognition": [
+            {
+                "id": "deepseek-v4-flash",
+                "label": "DeepSeek V4 Flash",
+                "model": "deepseek-v4-flash",
+                "base_url": "https://api.deepseek.com",
+                "role": "\u4e3b\u7528"
+            }
+        ],
+        "batch_image_recognition": [
+            {
+                "id": "glm-ocr",
+                "label": "GLM-OCR",
+                "model": "glm-ocr",
+                "base_url": "https://open.bigmodel.cn/api/paas/v4",
+                "role": "\u4e3b\u7528"
+            }
+        ]
+    },
+    "models": [
+        {
+            "id": "deepseek-v4-flash",
+            "provider_id": "deepseek",
+            "model": "deepseek-v4-flash",
+            "label": "DeepSeek V4 Flash",
+            "supports_text": true,
+            "supports_image": false,
+            "enabled": true
+        },
+        {
+            "id": "glm-ocr",
+            "provider_id": "zhipu",
+            "model": "glm-ocr",
+            "label": "GLM-OCR",
+            "supports_text": false,
+            "supports_image": true,
+            "enabled": true
+        },
+        {
+            "id": "mimo-v2.5",
+            "provider_id": "mimo",
+            "model": "mimo-v2.5",
+            "label": "MiMo V2.5",
+            "supports_text": true,
+            "supports_image": true,
+            "enabled": true
+        },
+        {
+            "id": "unreachable-vision",
+            "provider_id": "unreachable",
+            "model": "unreachable-vision",
+            "label": "\u4e0d\u53ef\u8fbe\u591a\u6a21\u6001",
+            "supports_text": true,
+            "supports_image": true,
+            "enabled": true
+        }
+    ],
+    "routable_model_ids": [
+        "deepseek-v4-flash",
+        "glm-ocr",
+        "mimo-v2.5",
+        "unreachable-vision"
+    ],
+    "warnings": []
+}

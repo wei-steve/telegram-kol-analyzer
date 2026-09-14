@@ -1,0 +1,25 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "ai-routing-preview",
+      "runtimeExecutable": "uv",
+      "runtimeArgs": [
+        "run",
+        "telegram-kol-research",
+        "web",
+        "--runtime-role",
+        "web",
+        "--host",
+        "127.0.0.1",
+        "--port",
+        "8099",
+        "--database-path",
+        "data/ai-routing-preview.db",
+        "--ai-recognition-config-path",
+        "data/ai-routing-preview.yaml"
+      ],
+      "port": 8099
+    }
+  ]
+}
