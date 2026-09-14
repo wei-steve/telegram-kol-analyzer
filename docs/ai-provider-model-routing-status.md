@@ -606,3 +606,15 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   对 DeepSeek 点「拉取模型列表」得到 `拉取失败（HTTP 401，provider_unavailable）`
   （真的打到了 `https://api.deepseek.com/v1/models`，顺带证明 §9.3 的拼接是对的）、
   「补充预设模型」把 1 条补到 4 条且不重复。
+
+## 部署记录（2026-09-14，阶段 6，指挥会话）
+
+- 指挥会话独立复跑全量：8841 passed / 0 failed / 4 skipped（661 s）；本地预览实测 19 个预设按四组渲染，
+  点「Google Gemini」得到 8 个模型的预填卡片、图片能力自动勾选。
+- 预检：生产 HEAD `f8e8f877`，候选 `f0337b84` 是其后代；唯一的非 src 代码改动是 `pyproject.toml`
+  的 `package-data`，服务器是 editable 安装（`__editable__.telegram_kol_research-0.1.0.pth` → `src/`）
+  且三个 unit 的 `PYTHONPATH` 都指向 `/opt/telegram-kol-analyzer/src`，预设 JSON 直接从源码树读到，
+  无需重装。`/opt/telegram-kol-releases/*` 只被 monitor 系列 unit 引用，与三个角色无关。
+- `tg-deploy f0337b84`：三个 unit active；`GET /` 200；`GET /api/ai-provider-presets` 返回 19 家；
+  `/api/ai-stages` 有效链与部署前一致；重启后 2 分钟内三个角色 0 traceback；配置文件未被改写。
+- 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `f8e8f877`。
