@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 5
+current_phase: 6
 phase_status: completed      # planned | in_progress | completed | blocked
 deploy: c79db7042cc251a54a86b3a9609cfc01bae68ba6   # 2026-09-14T11:41Z tg-deploy；回滚参考 ef1688c5b4c4f291bafd10e57993502028a5f3f1
 shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-trading-v1 上，0 code files beyond production。上线步骤见「上线核对」一节
@@ -25,6 +25,7 @@ shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-tradi
 | 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | `0ad2b842` | 全量 8768 passed / 0 failed / 4 skipped |
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | `d287038f` | 全量 8786 passed / 0 failed / 4 skipped |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | `4aadf158` | 全量 8788 passed / 0 failed / 4 skipped |
+| 6 | 提供商预设目录（19 家）、拉取模型列表、统一端点拼接 | completed | 见下方证据 | 全量 8841 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -142,6 +143,29 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 - `README.md` 新增 *AI Providers and Per-Stage Models* 一节：两页、链与备用、
   v1 文件仍可用、`ai-config-show`，并指向 ARCHITECTURE 5.5。
 - 本文件加「交接摘要」与「上线核对」两节。
+
+## 阶段 6 做了什么（设计 §9）
+
+用户反馈：「提供商太少了，常见的几个提供商都没有」。
+
+**6c 统一端点拼接（先做，另外两件都依赖它）** —— 新模块 `ai_endpoints.py`：
+`chat_completions_url` / `models_url`，规则是「base_url 的路径为空或仅 `/` → 加
+`/v1/chat/completions`；否则 → 加 `/chat/completions`；已以 `/chat/completions` 结尾则原样」。
+原来 7 处各自拼 URL，三套不同规则，Gemini（`/v1beta/openai`）、Groq（`/openai/v1`）、
+百炼（`/compatible-mode/v1`）、火山（`/api/v3`）、智谱（`/api/paas/v4`）在其中任何一套下都会拼错。
+7 处全部改过去；现有三个 base_url 与 env 默认值的结果逐字不变，测试把这三条**写死**而不是推导。
+
+**6a 提供商预设目录** —— `scripts/build_ai_provider_presets.py` 从 models.dev 生成
+`src/telegram_kol_research/ai_provider_presets.json`（提交进仓库，运行时不联网；`--check` 可重算比对）。
+19 家：国内 9 / 国际 7 / 本地 2 / 自定义 1，每家带 OpenAI 兼容 base_url 与 ≤ 8 个最新聊天模型
+（图片能力读 models.dev 的 `modalities.input`，不猜）。`GET /api/ai-provider-presets` 供页面渲染，
+预设按钮不再写死在 HTML/JS 里；每张提供商卡片新增「补充预设模型」。
+
+**6b 拉取模型列表** —— `ai_provider_models.list_provider_models` + `POST /api/ai-providers/{id}/models`：
+`GET {base}/models`，15 s 超时，同时带 `Authorization: Bearer` 与 `x-api-key` / `anthropic-version`，
+失败经 `classify_provider_failure` 给出 `failure_class`。页面弹出可勾选清单，已在卡片上的置灰；
+能力按预设目录里的同 id 条目填，未知 id 只勾「文本」。探测器/列举器都由
+`create_web_app(ai_provider_prober=..., ai_model_lister=...)` 注入，接口测试不走网络。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -292,9 +316,42 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     同时新增一条断言**发出去的 example 是 v2**，且除了两个 env 兜底的环节之外
     每个环节都解析得出模型。
 
+30. **火山方舟带上了预设模型，设计表里写的是「不在 models.dev；预设不带模型」。**
+    线上 models.dev 现在**有** `volcengine`，8 个模型 id（`doubao-seed-*`、`deepseek-v4-*-ga-*`）
+    都是 Ark 可以直接当 model 名调用的。设计那句备注的事实前提已经不成立，而本轮的目的正是
+    「提供商/模型太少」，所以给了预设，并在它的 note 里写明「也可以直接填你自己创建的接入点 id（ep-...）」。
+    **这是我唯一一处与设计表不一致的地方，请指挥会话过目。**
+
+31. **Ollama / LM Studio 仍然不带预设模型，即使 models.dev 有 lmstudio 的 3 条。**
+    本机跑着什么只有本机知道；发一份猜测的清单比空着更糟。两家都 `requires_api_key: false`。
+
+32. **预设 JSON 作为包数据（`pyproject.toml` 的 `package-data`）随包安装。**
+    页面运行时要读它。只放在源码树里的话，安装后的包就没有这个文件。
+
+33. **`load_provider_presets` 读不到文件时回落到「只有自定义」，不抛错。**
+    预设只是让「新增提供商」快一点；目录坏了不该让整个提供商页打不开——那页的正事是编辑已有配置。
+
+34. **`GET /models` 一律同时带 Bearer 与 `x-api-key` / `anthropic-version`。**
+    Anthropic 兼容层认后者，其他家忽略它。发两个无害的头，比维护一张「谁要哪种头」的表可靠。
+
+35. **模型列表最多返回 500 条（`MAX_LISTED_MODELS`），并按 id 排序去重。**
+    OpenRouter 一家就有 360+；页面要能用，而且没人会往下翻更多。
+
+36. **「返回 0 个模型」按失败处理（`response_invalid`），不是一个空清单。**
+    2xx 加空 `data` 几乎总是代理配错了，显示一个空弹窗只会让人以为是页面坏了。
+
+37. **6c 先于 6a/6b 提交。** 字母对应设计的 §9.1/§9.2/§9.3，但 6b 的 `models_url` 就是 6c 的规则，
+    6a 的预设 base_url 也要靠它才拼得对。提交顺序按依赖走。
+
+38. **顺手修了一条阶段 5 之后留下的失败测试。**
+    `tests/test_runtime_role_selection.py::test_split_runtime_provisioning_grants_shared_configs_read_only_access`
+    要求两个共享配置都是 `chmod 0640`，但已部署的 `f8e8f877` 把
+    `config/ai_recognition.yaml` 改成了 `0660`（web 要能写它）。测试改成按文件分别断言，
+    并额外断言 web unit 里确实有那一条 `ReadWritePaths`。
+
 ## 交接摘要（下一个会话先读这一段）
 
-五个阶段全部完成，全量测试绿，**未部署、未推送共享分支**。
+阶段 1–5 已部署（生产 sha `f8e8f877`）。**阶段 6 已完成但未部署、未推送共享分支。**
 
 这次做完之后的事实：
 
@@ -308,6 +365,8 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 4. MiMo 供应商健康线**只统计链首模型**的尝试行：备用答上来不算主模型恢复；
    告警在有备用顶着时会说「已切换到备用模型 <id> 继续识别」。
 5. ⚙ 菜单里两页：「AI提供商」「AI模型选择」；接口 `/api/ai-providers*` 与 `/api/ai-stages`。
+6. （阶段 6）提供商预设 19 家，来自提交进仓库的 `ai_provider_presets.json`；
+   每张卡片可以「拉取模型列表」问这家提供商它自己支持什么；所有端点 URL 走 `ai_endpoints`。
 
 改动落在这些文件（按重要性）：`ai_stage_catalog.py`（新）、`ai_model_router.py`（新）、
 `ai_recognition_config.py`、`recognition_experiments.py`、`authoritative_recognition.py`、
@@ -367,6 +426,12 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 - `mimo_recognition_runs.model` 与 attempts 的 `model` 存的是**模型名**（`AiModelConfig.model`），
   不是 stage 绑定里的 model id。同名模型挂在两个 provider 下时无法区分——这和 run 表原本就有的
   歧义一样，本次没有扩大也没有解决。
+
+- 预设目录是**生成日期那天**的 models.dev 快照（`generated_at`）。模型会过时，重新生成即可：
+  `python scripts/build_ai_provider_presets.py`（可加 `--source` 指本地快照）。
+  页面上已注明「预设只是起步，模型名以「拉取模型列表」为准」。
+- `ai_provider_presets.json` 里带着各家的 base_url，但**不带 Key**；预设只填地址与模型名。
+- 「拉取模型列表」用的是**已保存的**提供商记录，所以新加的提供商要先保存一次才能拉取。
 
 ## 证据
 
@@ -521,3 +586,23 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
    `docs/server-deployment.md` 的权限说明同步改为 0660。
 3. 安装新 unit → `daemon-reload` → 只重启 web。验证：`PUT /api/ai-providers`（原样保存）200，
    文件已升级为 `schema_version: 2`（14736 字节，Key 原样保留），worker 仍可读，web 无 traceback。
+
+### 阶段 6
+
+- 提交：`09c73f23`（6c 统一端点）→ `56eab0bd`（6a 预设目录）→ `69bef96b`（6b 拉取模型列表）
+- 全量：`uv run python -m pytest -q` → **8841 passed, 4 skipped, 0 failed**（648 s）
+- 新增测试文件：
+  - `tests/test_ai_endpoints.py`（30 例）：§9.1 表里每个 base_url 的 chat/models 端点逐条钉死；
+    `test_the_urls_already_in_production_are_unchanged` 把现有三条写死；
+    `test_no_call_site_still_joins_this_url_by_hand` 扫源码防止有人再手拼一次。
+  - `tests/test_ai_provider_presets.py`（15 例）：目录与 §9.1 表逐项相等、中文显示名逐项相等、
+    每家 ≤ 8 条、本机两家不带 Key 也不带猜的模型、生成脚本的筛选与排序、目录坏掉时只剩「自定义」。
+  - `tests/test_ai_provider_models.py`（8 例）：OpenAI 形状解析与去重排序、Anthropic 头随行、
+    无 Key 不发 Authorization、401 / 连不上 / 空列表分别给出 failure_class、
+    接口按预设目录标能力、Key 不出现在响应里。
+- 浏览器验证：`docs/evidence/2026-09-13-ai-routing/browser-verification.md` 的「阶段 6 追加验证」一节
+  （9 步）+ `api-ai-provider-presets.json`。实际走通了：四组预设按钮（9/7/2/1）、
+  点「阿里百炼」得到预填卡片且图片能力标注正确、保存后磁盘上多出 `alibaba-cn` 与 8 个模型、
+  对 DeepSeek 点「拉取模型列表」得到 `拉取失败（HTTP 401，provider_unavailable）`
+  （真的打到了 `https://api.deepseek.com/v1/models`，顺带证明 §9.3 的拼接是对的）、
+  「补充预设模型」把 1 条补到 4 条且不重复。
