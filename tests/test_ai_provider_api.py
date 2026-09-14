@@ -15,7 +15,7 @@ from telegram_kol_research.web_app import create_web_app
 def _client(tmp_path, *, prober=None) -> TestClient:
     config_path = tmp_path / "ai_recognition.yaml"
     config_path.write_text(
-        Path("config/ai_recognition.example.yaml").read_text(encoding="utf-8"),
+        Path("tests/fixtures/ai_recognition_v1_sample.yaml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     return TestClient(
@@ -428,7 +428,7 @@ def test_the_worker_sees_a_saved_chain_without_a_restart(tmp_path):
 
     config_path = tmp_path / "ai_recognition.yaml"
     config_path.write_text(
-        Path("config/ai_recognition.example.yaml").read_text(encoding="utf-8"),
+        Path("tests/fixtures/ai_recognition_v1_sample.yaml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     client = TestClient(

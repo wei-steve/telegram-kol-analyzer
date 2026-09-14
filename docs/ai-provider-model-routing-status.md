@@ -11,8 +11,8 @@ base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
 current_phase: 5
-phase_status: planned        # planned | in_progress | completed | blocked
-deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
+phase_status: completed      # planned | in_progress | completed | blocked
+deploy: 未部署；部署与推送共享分支由指挥会话与用户决定。上线步骤见「上线核对」一节
 ```
 
 ## 阶段总览
@@ -23,7 +23,7 @@ deploy: 未部署；部署与推送共享分支由指挥会话与用户决定
 | 2 | 路由 + 权威识别链接线 + attempts `model` 列 + 健康线按链首过滤 + 预算/租约测试 | completed | `4e5e37ad` | 全量 8746 passed / 0 failed / 4 skipped |
 | 3 | 其余环节接线（context_resolution / semantic_review / strategy_alert / research_chat / batch_* / 探测 / 提示词测试） | completed | 见下方证据 | 全量 8768 passed / 0 failed / 4 skipped |
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | 见下方证据 | 全量 8786 passed / 0 failed / 4 skipped |
-| 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | planned | | |
+| 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | 见下方证据 | 全量 8788 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -127,6 +127,20 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 
 `cli.py` 的 `web` 命令新增 `--ai-recognition-config-path`，这样本地预览可以指向一份
 一次性的配置而不碰真实文件；`.claude/launch.json` 里的 `ai-routing-preview` 就是它。
+
+## 阶段 5 做了什么
+
+- `docs/ARCHITECTURE.md` 新增 **5.5 AI 模型路由**：schema v2 三层结构、7 个环节表
+  （stage_key / 中文名 / 能力 / 生产路径 / 取链的代码位置）、换模型的规则与时间预算、
+  健康线按链首过滤、`runtime_incident_agent` 例外、两页与 `ai-config-show`。
+  第 6 节「AI 协作提示」加一条：新代码取模型走 `resolve_stage_chain`，不要读旧字段。
+- `config/ai_recognition.example.yaml` 改成 v2 形态，带注释说明 v1 会自动迁移、
+  提示词那三段只是一次性种子。原来的 v1 内容冻结成
+  `tests/fixtures/ai_recognition_v1_sample.yaml`，迁移测试改读它 ——
+  example 已经升到 v2，再拿它当「v1 输入」就名不副实了。
+- `README.md` 新增 *AI Providers and Per-Stage Models* 一节：两页、链与备用、
+  v1 文件仍可用、`ai-config-show`，并指向 ARCHITECTURE 5.5。
+- 本文件加「交接摘要」与「上线核对」两节。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -269,11 +283,83 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     12 步操作清单、两页渲染后的实际结构、两个 API 的原样响应、保存后磁盘 YAML 的内容，
     以及一条可复现的启动命令。没有伪造任何截图路径。
 
+29. **example.yaml 升到 v2 之后，v1 样本冻结成测试 fixture。**
+    迁移测试原来读 `config/ai_recognition.example.yaml` 当「v1 输入」。example 升级后
+    这条就不成立了，但迁移路径在所有生产文件都被保存一次之前都还活着，必须继续有覆盖。
+    `tests/fixtures/ai_recognition_v1_sample.yaml` 是那份内容的逐字冻结副本，
+    另加一条用例断言它确实还是 v1（没有 `schema_version`、没有 `stages`）。
+    同时新增一条断言**发出去的 example 是 v2**，且除了两个 env 兜底的环节之外
+    每个环节都解析得出模型。
+
+## 交接摘要（下一个会话先读这一段）
+
+五个阶段全部完成，全量测试绿，**未部署、未推送共享分支**。
+
+这次做完之后的事实：
+
+1. `config/ai_recognition.yaml` 升级成 `schema_version: 2` 的三层结构
+   （providers / models / stages）。**没有 schema_version 的旧文件仍然直接可用**：
+   加载时在内存里迁移，不落盘；只有在页面上保存一次，文件才真的变成 v2。
+2. 设计 §2.1 的 7 个环节全部按「有序模型链」取模型，主用失败自动换下一个。
+   只有 `runtime_incident_agent` 有意不纳入（它有自己的 fail-closed env 配置）。
+3. 只有 `authoritative_recognition` 有链级时限：整条链共用 240 s，
+   加上最后一次阻塞读的 60 s 正好落在 300 s 的作业认领租约里。
+4. MiMo 供应商健康线**只统计链首模型**的尝试行：备用答上来不算主模型恢复；
+   告警在有备用顶着时会说「已切换到备用模型 <id> 继续识别」。
+5. ⚙ 菜单里两页：「AI提供商」「AI模型选择」；接口 `/api/ai-providers*` 与 `/api/ai-stages`。
+
+改动落在这些文件（按重要性）：`ai_stage_catalog.py`（新）、`ai_model_router.py`（新）、
+`ai_recognition_config.py`、`recognition_experiments.py`、`authoritative_recognition.py`、
+`mimo_provider_health.py`、`context_resolution.py`、`semantic_disagreement_review.py`、
+`strategy_alerts.py`、`llm_chat.py`、`message_recognition.py`、`prompt_testing.py`、
+`web_app.py`、`cli.py`、`templates/index.html`、`static/app.js`、`static/app.css`、
+`models.py` + `db.py`（attempts 的 `model` 列）。
+
+**要改这块代码之前**，先读「设计未覆盖、由实施者决定的事项」那 29 条，尤其第 1 条
+（旧字段不是 property）、第 10 条（预算按每次请求重算）、第 7 条（禁用成员保留绑定）。
+
+## 上线核对（服务器上按这个顺序）
+
+这是一次 **L1** 改动：没有 schema/数据迁移，没有交易所写语义变化，行为在单模型链上
+与改动前一致。真正的变化只有「用哪个模型 + 失败后是否换模型」。
+
+1. **tg-deploy 之后、观察窗口之前，先只读核对迁移结果。**
+   `ai-config-show` 是这次新加的命令，服务器上要等代码上去了才有，所以核对只能排在
+   部署之后；它不写文件、不需要重启，跑它本身是安全的：
+
+   ```bash
+   cd /opt/telegram-kol-analyzer   # 或当前 release 目录
+   telegram-kol-research ai-config-show --ai-config-path config/ai_recognition.yaml
+   ```
+
+   要确认三件事：`authoritative_recognition` 的链首是 `mimo-v2.5`（**不是** glm-ocr）；
+   `context_resolution` / `semantic_review` / `batch_*` 各自的链首与今天在用的一致；
+   `strategy_alert` / `research_chat` 是空链（继续沿用 env）。
+   如果哪一条对不上，先别在页面上保存（保存会把文件写成 v2），拿这份输出回来对。
+
+2. **文件这时候还是 v1，什么都不用做。** 三个进程都能读 v1，迁移只发生在内存里，
+   行为与部署前逐环节一致。
+
+3. **想用备用模型时**，在 ⚙ →「AI提供商」加提供商与模型，
+   再到「AI模型选择」把它排进对应环节的链里，保存。
+   **第一次保存会把 `config/ai_recognition.yaml` 改写成 v2。**
+   保存前先备份一份：`cp config/ai_recognition.yaml config/ai_recognition.yaml.v1.bak`。
+
+4. **回滚**：
+   - 只回滚配置：把 `.v1.bak` 拷回去即可，三个进程下一次用到时就读到它，不用重启。
+   - 回滚代码（`tg-deploy <上一个 sha>`）：v2 文件里同时写着旧 v1 字段的派生镜像，
+     旧代码读得懂，所以**代码回滚不需要同时回滚配置**。代价是备用链在旧代码里不生效
+     （旧代码只认链首那一个模型），这正是回滚该有的行为。
+
+5. **观察**：L1 的窗口（15 分钟或 5 条真实消息，先到为准）。要看的是
+   `mimo_recognition_attempts` 里新写的 `model` 列有值，且与链首一致；
+   以及 journal 里没有 `mimo provider health could not read the model chain` 这条 warning
+   （出现它说明配置读不到，健康线退回了全量统计）。
+
 ## 已知限制 / 后续课题
 
 - 主模型故障期间每条消息都先付一次主模型失败的代价；跨消息熔断/冷却未做（设计 §4）。
 - 上下文结合分析触发频率偏高，本次不改（`docs/known-issues-and-deferred-work.md`）。
-- 阶段 1 只改配置层，所有调用点仍走旧字段；行为与改动前一致。
 - 阶段 3 之后，设计 §2.1 的 7 个环节全部按链取模型。只有 `runtime_incident_agent` 有意不纳入。
 - `batch_text_recognition` / `batch_image_recognition` 只取链首、保持单次尝试（设计 §6 说 fallback
   属于加分项）。它们是 CLI / 批量工具，不在生产消息管线上。
@@ -395,3 +481,14 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   「测试连接」返回 `不可用（provider_unavailable）`、给 `authoritative_recognition`
   加一个备用并保存、回读一致、磁盘上升级成 `schema_version: 2` 且未填的 Key 原样保留。
   验证中发现并修掉了三个页面 bug（角色标签不渲染、切页不刷新、新加成员被错误画灰）。
+
+### 阶段 5
+
+- 提交：`docs(ai-routing): phase 5 architecture section, v2 example, README`
+  （SHA 在随后的收口提交里补写）
+- 全量：`uv run python -m pytest -q` → **8788 passed, 4 skipped, 0 failed**（644 s）
+- 新增用例：`tests/test_ai_stage_config.py::test_the_shipped_example_is_v2_and_binds_every_production_stage`、
+  `::test_the_frozen_v1_sample_still_describes_a_pre_migration_file`
+- 新增 fixture：`tests/fixtures/ai_recognition_v1_sample.yaml`（v1 样本的逐字冻结副本）
+- 文档：`docs/ARCHITECTURE.md` 第 5.5 节、`config/ai_recognition.example.yaml`（v2）、
+  `README.md` 的 *AI Providers and Per-Stage Models*。

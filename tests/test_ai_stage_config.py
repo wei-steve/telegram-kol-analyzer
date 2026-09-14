@@ -29,7 +29,7 @@ from telegram_kol_research.ai_recognition_config import (
 from telegram_kol_research.cli import app as cli_app
 
 
-EXAMPLE_CONFIG = Path("config/ai_recognition.example.yaml")
+EXAMPLE_CONFIG = Path("tests/fixtures/ai_recognition_v1_sample.yaml")
 
 
 def _write_v1(path: Path) -> Path:
@@ -81,6 +81,44 @@ def test_stage_catalogue_matches_the_design_table():
 
 def test_runtime_incident_agent_is_deliberately_not_a_stage():
     assert "runtime_incident_agent" not in AI_STAGE_KEYS
+
+
+def test_the_shipped_example_is_v2_and_binds_every_production_stage():
+    """What a new deployment copies has to be the shape we now write."""
+
+    example = Path("config/ai_recognition.example.yaml")
+    raw = yaml.safe_load(example.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == AI_CONFIG_SCHEMA_VERSION
+
+    with pytest.warns(DeprecationWarning):
+        config = load_ai_recognition_config(example)
+
+    assert config.stages == {
+        "authoritative_recognition": ["mimo-v2.5"],
+        "context_resolution": ["deepseek-v4-flash"],
+        "semantic_review": ["deepseek-v4-flash"],
+        "strategy_alert": [],
+        "research_chat": [],
+        "batch_text_recognition": ["deepseek-v4-flash"],
+        "batch_image_recognition": ["glm-ocr"],
+    }
+    # The two env-backed stages are the only ones allowed to resolve to nothing.
+    for definition in AI_STAGE_DEFINITIONS:
+        chain = resolve_stage_models(config, definition.stage_key)
+        assert bool(chain) is not bool(definition.env_fallback), definition.stage_key
+    assert config.config_warnings == ()
+
+
+def test_the_frozen_v1_sample_still_describes_a_pre_migration_file():
+    raw = yaml.safe_load(EXAMPLE_CONFIG.read_text(encoding="utf-8"))
+
+    assert "schema_version" not in raw
+    assert "stages" not in raw
+    assert {model["id"] for model in raw["ai_models"]} == {
+        "deepseek-v4-flash",
+        "glm-ocr",
+        "mimo-v2.5",
+    }
 
 
 # ---------------------------------------------------------------------------

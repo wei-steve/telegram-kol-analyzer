@@ -444,6 +444,85 @@ historical_state_repair.py               position_management_remediation.py
 （`web_app.py:5214` 创建 `app.state.reconcile_task`）。模块 `reconcile.py` 本身只有一个纯函数
 `build_reconcile_window`，生产代码零引用，只有 `tests/test_reconcile.py` 还 import 它。
 
+## 5.5 AI 模型路由（提供商 / 模型 / 环节链）
+
+配置文件 `config/ai_recognition.yaml`，`schema_version: 2`，三层：
+
+```yaml
+schema_version: 2
+providers:            # 提供商 = 一个 OpenAI 兼容端点 + 一把 Key
+  - {id: mimo, base_url: https://api.xiaomimimo.com/v1, api_key: ..., timeout_seconds: 60, enabled: true}
+models:               # 模型 = 某个提供商下的一个模型名
+  - {id: mimo-v2.5, provider_id: mimo, model: mimo-v2.5, supports_text: true, supports_image: true, enabled: true}
+stages:               # 环节 → 有序模型 id 列表；第 1 个主用，后面是备用
+  authoritative_recognition: [mimo-v2.5]
+```
+
+三个进程（web / ingest / worker）都是**每次用到时重新加载**这个文件，所以页面保存后
+下一条消息即生效，不需要重启。文件里还写着一份旧 v1 字段（`ai_models` / `text_provider` /
+`image_provider` / `active_*_model_id`）作为派生镜像：v2 是权威，镜像只为回滚到旧代码时
+配置仍可读。**没有 `schema_version` 的文件是 v1**，加载时在内存里迁移，不落盘——
+第一次在页面上保存才会把文件升级成 v2。
+
+### 用到 AI 模型的 7 个环节
+
+| stage_key | 中文名 | 能力要求 | 生产路径 | 取链的代码位置 |
+|---|---|---|---|---|
+| `authoritative_recognition` | 单条消息权威识别（MiMo 多模态，v1 / v2 合同共用） | 文本 + 图片 | 是，主路径 | `recognition_experiments.resolve_authoritative_chain`（`_find_mimo_model` 是它的链首包装） |
+| `context_resolution` | 上下文结合分析（第二层） | 文本 | 是 | `context_resolution.resolve_context_model_chain` |
+| `semantic_review` | 语义分歧复核（只读顾问） | 文本 | 是 | `semantic_disagreement_review.resolve_semantic_review_chain` |
+| `strategy_alert` | 策略提醒分类（Telegram 提醒 bot） | 文本 | 是，当 bot token 配置时 | `strategy_alerts.resolve_strategy_alert_chain` |
+| `research_chat` | Web 群消息问答 | 文本 | 否（web，人触发） | `llm_chat.resolve_research_chat_chain` |
+| `batch_text_recognition` | 离线/批量文本识别（V1 `recognize_message_now`，含生命周期事件 AI） | 文本 | 否，只有 CLI / 批量工具 | `message_recognition._batch_text_provider`（只取链首，单次尝试） |
+| `batch_image_recognition` | 离线/批量图片识别（V1；GLM-OCR 走 layout_parsing，其他走多模态 chat） | 图片 | 否，只有 CLI / 批量工具 | `message_recognition._batch_image_provider`（只取链首，单次尝试） |
+
+派生：每日探测（`mimo_provider_probe`）与提示词中心的 mimo 测试跟随
+`authoritative_recognition` 链首；提示词中心的 deepseek 测试跟随 `batch_text_recognition` 链首。
+
+**`runtime_incident_agent` 有意不在这张表里。** 它有自己的 fail-closed 环境配置
+（`llm_chat.load_runtime_agent_llm_config`），不从页面配置，页面上也写明了这一点。
+
+### 换模型的规则（`ai_model_router`）
+
+- `resolve_stage_chain(config, stage_key)` 给出这个环节现在能调的模型，保序。
+  被禁用、provider 被禁用、provider 没填 base_url 的成员**仍然绑定但不参与路由**——
+  临时禁用一个 provider 不该把绑定删掉。空链 = 这个环节没有可用模型，
+  行为与「provider 未配置」一直以来的行为相同；`strategy_alert` / `research_chat`
+  空链时沿用它们各自的环境变量配置。
+- `run_with_fallback` / `async_run_with_fallback`：**请求发出之后**的任何失败都换下一个模型
+  （网络错误、超时、任何 HTTP 状态、空内容、JSON 解不开、合同校验不过）；
+  **请求发出之前**的失败不换（媒体读不了、payload 拼不出来），那不是提供商的问题。
+  一个模型自己的重试先做完，才轮到下一个模型。
+- **只有 `authoritative_recognition` 有链级时限**：整条链共用
+  `MIMO_REQUEST_TOTAL_DEADLINE_SECONDS`（240 s），每次请求拿到的是「这一片预算减去已用」，
+  剩余不足 20 s 就不再起下一个模型。因为 240 s 加上最后一次阻塞读的 60 s 必须留在
+  300 s 的作业认领租约里（`message_processing_worker.DEFAULT_CLAIM_STALE_AFTER`）。
+  其余环节没有额外上限，预算就是各模型自己的 timeout 依次相加。
+- 审计：`mimo_recognition_runs.model` 是**最终答题的模型**（全失败则为链首）；
+  `mimo_recognition_attempts.model` 是**这一次尝试实际调用的模型**（`NULL` 表示这行写在
+  链存在之前，按链首算）；`ai_prompt_invocations.model` 同样是实际模型。
+
+### 供应商健康线只看链首
+
+`mimo_provider_health` 的故障期推导与连续失败计数**只统计链首模型的尝试行**
+（`model IS NULL OR model = <链首>`）。备用模型答上来**不算**主模型恢复——每条新消息都
+从链首开始，主模型真的好了自然会在下一条消息里被记为恢复。链首从
+`resolve_chain_head_model()` 读，按文件身份（路径 + mtime + 大小）缓存；读不到配置时
+**不加过滤**（也就是改动前的行为），因为一个悄悄停止计数的健康检查正是这个模块要消灭的东西。
+故障告警在备用模型正在答题时，摘要多一个 `fallback_note`（「已切换到备用模型 <id> 继续识别」），
+Telegram 文案的「影响」行随之改写，不再说「新消息无法完成权威识别」。
+
+### 页面与只读核对
+
+⚙ 设置菜单 →「AI提供商」（增删提供商与模型、测试连接）和「AI模型选择」（每个环节排链）；
+「更多工具」底部也有这两个入口。两页的接口是 `/api/ai-providers*` 与 `/api/ai-stages`，
+删除仍被某个环节引用的 provider / model 会被 422 拒绝并列出引用它的环节。
+命令行只读核对（不写文件）：
+
+```bash
+telegram-kol-research ai-config-show --ai-config-path config/ai_recognition.yaml
+```
+
 ## 6. AI 协作提示
 
 - 改任何东西之前，先看上面第 3 节的模式表：**生产和代码默认值都跑 queue**。
@@ -451,6 +530,10 @@ historical_state_repair.py               position_management_remediation.py
 - 代码里已经没有 `inline` / `shadow` 分支了（清理方案步骤 3 删除）。消息与命令路径各只有一条，
   **不要重新引入模式开关**来做灰度或回滚。`message_processing_jobs.shadow` 列还在表上，
   新行恒为 `0`，worker 认领时用 `shadow = 0` 过滤掉历史行；删列是以后的 L3 工作。
+- **新代码要取 AI 模型，走 `resolve_stage_chain`（第 5.5 节），不要读
+  `config.text_provider` / `image_provider` / `active_*_model_id`。** 那几个字段还在，
+  但它们只是 v2 结构的派生镜像，而且只在 `load_ai_recognition_config` /
+  `save_ai_recognition_config` 里被填。手工构造的 `AiRecognitionConfig` 上它们是空的。
 - `web` 角色没有执行权限。任何需要写交易所或改仓位的动作，必须经 `worker_command_jobs`
   走那四条命令之一，不要在 web 进程里直接调交易所客户端。
 - Deepcoin 读限流是进程内的、按物理请求计数的（第 4.6 节）。加新的交易所读调用时不需要自己限速，

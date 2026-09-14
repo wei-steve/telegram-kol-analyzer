@@ -641,7 +641,7 @@ def test_the_chain_head_is_not_reparsed_on_every_tick(tmp_path, monkeypatch):
 
     path = tmp_path / "ai_recognition.yaml"
     path.write_text(
-        Path("config/ai_recognition.example.yaml").read_text(encoding="utf-8"),
+        Path("tests/fixtures/ai_recognition_v1_sample.yaml").read_text(encoding="utf-8"),
         encoding="utf-8",
     )
     health._CHAIN_HEAD_CACHE.clear()

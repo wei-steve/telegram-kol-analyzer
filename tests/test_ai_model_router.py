@@ -645,7 +645,7 @@ def test_the_v1_run_model_is_the_chain_head_not_the_image_provider(tmp_path):
 
     path = tmp_path / "ai_recognition.yaml"
     path.write_text(
-        __import__("pathlib").Path("config/ai_recognition.example.yaml").read_text(
+        __import__("pathlib").Path("tests/fixtures/ai_recognition_v1_sample.yaml").read_text(
             encoding="utf-8"
         ),
         encoding="utf-8",

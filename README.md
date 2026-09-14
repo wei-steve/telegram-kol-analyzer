@@ -88,6 +88,30 @@ export TELEGRAM_KOL_LLM_TIMEOUT_SECONDS="60"
 
 These values are used server-side only. Do not expose them to the browser.
 
+## AI Providers and Per-Stage Models
+
+Every part of this system that calls an AI model picks it from
+`config/ai_recognition.yaml`, which holds providers (an OpenAI-compatible
+endpoint plus a key), the models each provider serves, and, for each stage, an
+**ordered list of models**: the first is used and the rest are fallbacks, so a
+message is still recognised when the primary model is down. Two pages in the ⚙
+settings menu edit it — **AI提供商** for endpoints, keys and models, and
+**AI模型选择** for which models each stage calls and in what order. All three
+processes re-read the file per use, so a save takes effect on the next message
+without a restart.
+
+`config/ai_recognition.example.yaml` is the shape to copy. A file without
+`schema_version` is the older single-model layout and still loads: it is
+migrated in memory and only rewritten when someone saves a page. To check what
+a server would resolve, without writing anything:
+
+```bash
+telegram-kol-research ai-config-show
+```
+
+The stage table, the fallback rules and the time budget are in
+`docs/ARCHITECTURE.md` section 5.5.
+
 ## Telegram Auth
 
 This project is designed to use your Telegram user account, not the Bot API.
