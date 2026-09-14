@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from telegram_kol_research.ai_endpoints import chat_completions_url
 from telegram_kol_research.env_file_readability import (
     note_unreadable_config_file,
 )
@@ -475,7 +476,7 @@ def request_structured_chat_turn(
     )
     try:
         response = active_client.post(
-            f"{config.base_url.rstrip('/')}/v1/chat/completions",
+            chat_completions_url(config.base_url),
             json=payload,
             headers=headers,
             timeout=timeout_seconds or config.timeout_seconds,
@@ -575,7 +576,7 @@ def _request_chat_completion(
         group_prompt=group_prompt,
     )
     response = active_client.post(
-        f"{config.base_url.rstrip('/')}/v1/chat/completions",
+        chat_completions_url(config.base_url),
         json=payload,
         headers=headers,
     )
@@ -600,7 +601,7 @@ def _request_chat_completion(
             group_prompt=group_prompt,
         )
         response = active_client.post(
-            f"{config.base_url.rstrip('/')}/v1/chat/completions",
+            chat_completions_url(config.base_url),
             json=payload,
             headers=headers,
         )

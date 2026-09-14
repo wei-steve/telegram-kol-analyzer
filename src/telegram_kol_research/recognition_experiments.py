@@ -17,6 +17,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_endpoints import chat_completions_url
 from telegram_kol_research.ai_model_router import (
     MIN_REMAINING_SECONDS,
     resolve_stage_chain,
@@ -1562,7 +1563,7 @@ def _call_mimo_direct_model(
             request_started = time.monotonic()
             with client.stream(
                 "POST",
-                f"{model_config.base_url.rstrip('/')}/chat/completions",
+                chat_completions_url(model_config.base_url),
                 json=payload,
                 headers=headers,
             ) as response:

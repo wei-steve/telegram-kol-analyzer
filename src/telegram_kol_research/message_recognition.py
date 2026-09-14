@@ -15,6 +15,7 @@ from typing import Any, Mapping
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_endpoints import chat_completions_url
 from telegram_kol_research.ai_recognition_config import (
     AiProviderConfig,
     AiRecognitionConfig,
@@ -848,10 +849,9 @@ def _build_ai_recognition_payload(
 
 
 def _chat_completions_url(base_url: str) -> str:
-    normalized = base_url.strip().rstrip("/")
-    if normalized.endswith("/v1"):
-        return f"{normalized}/chat/completions"
-    return f"{normalized}/v1/chat/completions"
+    """Kept under its old name; the rule now lives in ``ai_endpoints``."""
+
+    return chat_completions_url(base_url)
 
 
 def _apply_ai_lifecycle_event_if_matched(

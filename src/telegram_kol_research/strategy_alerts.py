@@ -13,6 +13,7 @@ import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_endpoints import chat_completions_url
 from telegram_kol_research.ai_model_router import async_run_with_fallback
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.models import (
@@ -560,7 +561,7 @@ async def request_strategy_alert_decision(
     }
     async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
         response = await client.post(
-            f"{config.llm_base_url.rstrip('/')}/v1/chat/completions",
+            chat_completions_url(config.llm_base_url),
             json=payload,
             headers=headers,
         )

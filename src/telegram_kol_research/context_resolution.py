@@ -13,6 +13,7 @@ from typing import Any, Callable, Mapping
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_endpoints import chat_completions_url
 from telegram_kol_research.ai_model_router import (
     resolve_stage_chain,
     run_with_fallback,
@@ -574,10 +575,9 @@ class _ContextAttemptFailed(RuntimeError):
 
 
 def _completion_url(base_url: str) -> str:
-    normalized = base_url.rstrip("/")
-    if normalized.endswith("/v1"):
-        return f"{normalized}/chat/completions"
-    return f"{normalized}/v1/chat/completions"
+    """Kept under its old name; the rule now lives in ``ai_endpoints``."""
+
+    return chat_completions_url(base_url)
 
 
 def _default_model_caller(
