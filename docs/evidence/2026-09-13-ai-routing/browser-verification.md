@@ -83,3 +83,26 @@ uv run telegram-kol-research web --runtime-role web --host 127.0.0.1 --port 8099
 3. 刚添加、还没保存的备用被画成灰色「已绑定，未参与路由」：原来的「能不能路由」是拿
    每个环节的 `effective` 列表判断的，而那里只有**已经绑定**的成员。改为由
    `/api/ai-stages` 另给一个 `routable_model_ids`（启用 + provider 启用且有 base_url）。
+
+---
+
+# 阶段 6 追加验证（2026-09-14）
+
+同一条启动命令（`.claude/launch.json` 的 `ai-routing-preview`，或直接跑
+`uv run telegram-kol-research web ... --ai-recognition-config-path data/ai-routing-preview.yaml`）。
+起始文件同样是 v1 的 example 快照。同样没有 PNG：浏览器工具仍然只能把截图返回到会话里。
+
+| # | 操作 | 结果 |
+|---|---|---|
+| 1 | 打开「AI提供商」 | 预设按钮分四组渲染：**国内 9**（DeepSeek / 智谱 GLM / 小米 MiMo / 阿里百炼（通义 Qwen）/ 月之暗面 Kimi / 硅基流动 / 阶跃星辰 / MiniMax / 火山方舟（豆包））、**国际 7**（OpenAI / Anthropic / Google Gemini / xAI Grok / OpenRouter / Groq / Mistral）、**本地 2**（Ollama（本机）/ LM Studio（本机））、**自定义 1** |
+| 2 | 说明行 | 「添加提供商：预设来自 models.dev（2026-09-14），只是起步，模型名以「拉取模型列表」为准。」 |
+| 3 | 每张卡片的按钮 | 测试连接 / **拉取模型列表** / 添加模型 / **补充预设模型** |
+| 4 | 点「阿里百炼（通义 Qwen）」 | 新卡片：id `alibaba-cn`、名称「阿里百炼（通义 Qwen）」、Base URL `https://dashscope.aliyuncs.com/compatible-mode/v1`、Key 占位符 `sk-...`（新卡片没有已存 Key），8 个 Qwen 系模型 |
+| 5 | 图片能力标注 | `qwen3.8-flash` / `qwen3.8-max` / `qwen3.7-flash` / `qwen3.7-plus` / `qwen3.6-flash` 勾了「图片」；`glm-5.2` / `qwen3.7-max` / `deepseek-v4-pro` 没勾 |
+| 6 | 点「保存提供商与模型」 | 「提供商与模型已保存」；磁盘上 `providers` 增加 `alibaba-cn`，8 个模型写入，**mimo 的 Key 原样保留** |
+| 7 | 对 DeepSeek 卡片点「拉取模型列表」（Key 是 example 里的占位串） | 红色 **`拉取失败（HTTP 401，provider_unavailable）`** —— 真的打到了 `https://api.deepseek.com/v1/models` 并拿回 401，不是崩溃，也说明 §9.3 的端点拼接是对的 |
+| 8 | 对 DeepSeek 卡片点「补充预设模型」 | 「已补充 3 个预设模型，记得保存。」，模型列表从 1 条变成 4 条（`deepseek-v4-flash` / `deepseek-v4-flash-vision-exp` / `deepseek-flash` / `deepseek-v4-pro`），已存在的那条没有重复 |
+| 9 | Ollama 预设 | `requires_api_key: false`，预设不带模型（本机跑什么只有本机知道） |
+
+- `api-ai-provider-presets.json` —— `GET /api/ai-provider-presets` 的原样响应（19 个提供商、113 个模型）。
+

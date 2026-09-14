@@ -212,7 +212,10 @@ def test_app_js_drives_the_provider_and_stage_pages(tmp_path):
     # Phase 6: the preset buttons come from the catalogue API, and each card
     # can ask its provider what it actually serves.
     assert "'/api/ai-provider-presets'" in response.text
+    assert "/api/ai-providers/${encodeURIComponent(providerId)}/models" in response.text
+    assert "data-ai-model-fetch" in response.text
     assert "data-ai-model-preset-add" in response.text
+    assert "data-ai-model-picker" in response.text
     # The old three-entry table is gone; nothing hard-codes a provider now.
     assert "AI_PROVIDER_PRESETS" not in response.text
 

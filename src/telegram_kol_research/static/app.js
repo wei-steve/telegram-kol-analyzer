@@ -4026,11 +4026,16 @@ function renderAiProviderCard(provider, models) {
   const addModel = aiElement('button', 'secondary-button', '添加模型');
   addModel.type = 'button';
   addModel.setAttribute('data-ai-model-add', '');
+  const listModels = aiElement('button', 'secondary-button', '拉取模型列表');
+  listModels.type = 'button';
+  listModels.setAttribute('data-ai-model-fetch', '');
+  listModels.title = '用这个提供商已保存的 Base URL 与 Key 请求 /models';
+  listModels.addEventListener('click', () => fetchAiProviderModels(card, testStatus));
   const addPreset = aiElement('button', 'secondary-button', '补充预设模型');
   addPreset.type = 'button';
   addPreset.setAttribute('data-ai-model-preset-add', '');
   addPreset.addEventListener('click', () => addPresetModelsToCard(card, testStatus));
-  actions.append(test, addModel, addPreset, testStatus);
+  actions.append(test, listModels, addModel, addPreset, testStatus);
   card.append(actions);
 
   const modelList = aiElement('div', 'ai-provider-model-list');
@@ -4313,6 +4318,97 @@ function addPresetModelsToCard(card, status) {
   const added = appendAiModelsToCard(card, presetModelRows(preset));
   status.classList.remove('is-error');
   status.textContent = added ? `已补充 ${added} 个预设模型，记得保存。` : '预设模型都已经在列表里了。';
+}
+
+function renderAiModelPicker(card, models, status) {
+  card.querySelector('[data-ai-model-picker]')?.remove();
+  const picker = aiElement('div', 'ai-model-picker');
+  picker.setAttribute('data-ai-model-picker', '');
+  const existing = new Set(
+    Array.from(card.querySelectorAll('[data-ai-model-id]')).map((input) => input.value.trim()),
+  );
+  picker.append(aiElement('p', 'ai-helper-text', `提供商返回 ${models.length} 个模型，勾选要加入的：`));
+  const list = aiElement('div', 'ai-model-picker-list');
+  models.forEach((model) => {
+    const label = aiElement('label', 'ai-checkbox');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.setAttribute('data-ai-model-pick', model.id);
+    input.dataset.supportsImage = model.supports_image ? '1' : '';
+    if (existing.has(model.id)) {
+      input.disabled = true;
+      input.checked = true;
+    }
+    label.append(
+      input,
+      document.createTextNode(
+        ` ${model.id}${model.supports_image ? '（支持图片）' : ''}${existing.has(model.id) ? '（已添加）' : ''}`,
+      ),
+    );
+    list.append(label);
+  });
+  picker.append(list);
+  const actions = aiElement('div', 'ai-provider-actions');
+  const confirm = aiElement('button', 'secondary-button', '加入选中的模型');
+  confirm.type = 'button';
+  confirm.setAttribute('data-ai-model-picker-confirm', '');
+  confirm.addEventListener('click', () => {
+    const picked = Array.from(picker.querySelectorAll('[data-ai-model-pick]'))
+      .filter((input) => input.checked && !input.disabled)
+      .map((input) => ({
+        id: input.getAttribute('data-ai-model-pick'),
+        model: input.getAttribute('data-ai-model-pick'),
+        label: input.getAttribute('data-ai-model-pick'),
+        supports_text: true,
+        supports_image: Boolean(input.dataset.supportsImage),
+        enabled: true,
+      }));
+    const added = appendAiModelsToCard(card, picked);
+    picker.remove();
+    status.classList.remove('is-error');
+    status.textContent = added ? `已加入 ${added} 个模型，记得保存。` : '没有勾选新模型。';
+  });
+  const cancel = aiElement('button', 'secondary-button', '取消');
+  cancel.type = 'button';
+  cancel.addEventListener('click', () => picker.remove());
+  actions.append(confirm, cancel);
+  picker.append(actions);
+  card.append(picker);
+}
+
+async function fetchAiProviderModels(card, status) {
+  const providerId = card.querySelector('[data-ai-provider-id]')?.value?.trim() || '';
+  if (!providerId) {
+    status.textContent = '先填好提供商 id 并保存，再拉取模型列表。';
+    status.classList.add('is-error');
+    return;
+  }
+  status.classList.remove('is-error');
+  status.textContent = '正在拉取模型列表...';
+  try {
+    const response = await fetch(`/api/ai-providers/${encodeURIComponent(providerId)}/models`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    const payload = await response.json();
+    if (!response.ok) {
+      status.textContent = payload.detail || '拉取失败，先保存这个提供商再试。';
+      status.classList.add('is-error');
+      return;
+    }
+    if (payload.error) {
+      const httpPart = payload.http_status ? `HTTP ${payload.http_status}，` : '';
+      status.textContent = `拉取失败（${httpPart}${payload.failure_class || payload.error}）`;
+      status.classList.add('is-error');
+      return;
+    }
+    status.textContent = `拉取到 ${payload.models.length} 个模型`;
+    renderAiModelPicker(card, payload.models, status);
+  } catch {
+    status.textContent = '拉取失败，请检查服务状态。';
+    status.classList.add('is-error');
+  }
 }
 
 function bindAiProviderPage() {

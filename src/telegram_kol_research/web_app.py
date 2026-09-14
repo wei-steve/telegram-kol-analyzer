@@ -61,7 +61,11 @@ from telegram_kol_research.app_logging import (
     read_log_page,
 )
 from telegram_kol_research.ai_model_router import run_with_fallback
-from telegram_kol_research.ai_provider_presets import load_provider_presets
+from telegram_kol_research.ai_provider_models import list_provider_models
+from telegram_kol_research.ai_provider_presets import (
+    load_provider_presets,
+    preset_models_by_id,
+)
 from telegram_kol_research.ai_recognition_config import (
     AI_STAGE_KEYS,
     AiModel,
@@ -5424,6 +5428,7 @@ def create_web_app(
     deepcoin_reconcile_startup_delay_seconds: int = 5,
     ai_recognition_config_path: str | Path | None = None,
     ai_provider_prober: Callable[..., Any] | None = None,
+    ai_model_lister: Callable[..., Any] | None = None,
     semantic_review_runner=None,
     semantic_review_restart_delay_seconds: float = 1.0,
     deepcoin_private_ws_runner=None,
@@ -6455,6 +6460,7 @@ def create_web_app(
     # Injected so the "test connection" button can be exercised without a
     # network: it is the same one-token probe the daily health check sends.
     app.state.ai_provider_prober = ai_provider_prober or _default_ai_provider_prober
+    app.state.ai_model_lister = ai_model_lister or list_provider_models
     seed_default_prompt_registry(
         app.state.session_factory,
         load_ai_recognition_config(app.state.ai_recognition_config_path),
@@ -9694,6 +9700,39 @@ def create_web_app(
             "group_order": catalogue.get("group_order", []),
             "group_labels": catalogue.get("group_labels", {}),
             "providers": catalogue.get("providers", []),
+        }
+
+    @app.post("/api/ai-providers/{provider_id}/models")
+    def list_ai_provider_models(provider_id: str, payload: dict[str, Any] | None = None):
+        """Ask one provider which models its key can actually call (§9.2)."""
+
+        config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        provider = next(
+            (item for item in config.providers if item.id == str(provider_id)),
+            None,
+        )
+        if provider is None:
+            raise HTTPException(status_code=404, detail="provider not found")
+        if not provider.base_url.strip():
+            raise HTTPException(
+                status_code=422, detail="provider has no base_url to ask"
+            )
+        outcome = app.state.ai_model_lister(provider)
+        known = preset_models_by_id()
+        models = [
+            {
+                **model,
+                "supports_image": bool(
+                    known.get(model["id"], {}).get("supports_image", False)
+                ),
+            }
+            for model in outcome.models
+        ]
+        return {
+            "models": models,
+            "error": outcome.error,
+            "failure_class": outcome.failure_class,
+            "http_status": outcome.http_status,
         }
 
     @app.get("/api/ai-providers")

@@ -2858,6 +2858,7 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     # Phase 6: the preset buttons are rendered from /api/ai-provider-presets,
     # so the template carries their host rather than a fixed three.
     assert "data-ai-provider-presets" in response.text
+    assert "拉取模型列表" in response.text
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text

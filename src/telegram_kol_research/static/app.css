@@ -3099,6 +3099,21 @@ body {
   color: rgba(226, 232, 240, 0.72);
 }
 
+.ai-model-picker {
+  display: grid;
+  gap: 10px;
+  padding: 12px;
+  border: 1px dashed rgba(148, 163, 184, 0.32);
+  border-radius: 8px;
+}
+
+.ai-model-picker-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  gap: 4px;
+  max-height: 280px;
+  overflow-y: auto;
+}
 
 .ai-provider-list,
 .ai-stage-list {
