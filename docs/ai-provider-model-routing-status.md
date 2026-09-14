@@ -899,3 +899,14 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
   四个视图（主界面 / 群组 / 消息列表 / AI模型选择）全程 `read_console_messages` 返回
   “No console logs.”——既没有 `is not defined`，也没有 `null` 报错；
   `window.renderConversationHistory` 与 `window.escapeHtml` 都是 `undefined`。
+
+## 部署记录（2026-09-14，阶段 8b，指挥会话）
+
+- 阶段 8b 提交 `3d5b88c9`（实施者无法写进自己那条提交的 SHA，在此补记）。
+- 指挥会话独立复跑全量：8824 passed / 0 failed / 4 skipped（690 s）；`app.js` / `app.css` 无
+  `renderConversationHistory` / `data-ai-history` / `escapeHtml` / `bindClearAiHistory` 残留，`node --check` 通过。
+- 预检：生产 HEAD `9d041a2c`，候选 `3d5b88c9` 是其后代；无依赖 / unit 变更。
+- `tg-deploy 3d5b88c9`：三个 unit active；`GET /` 200；线上 `/static/app.js` 209298 字节、
+  `renderConversationHistory` 0 命中；`/api/ai-stages` 6 个环节；重启后 2 分钟内 0 traceback。
+- 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `9d041a2c`。
+- 实施者的 `uv.lock` 改动（`uv run` 触发的既有漂移）由指挥会话还原，未提交；漂移本身另行处理。
