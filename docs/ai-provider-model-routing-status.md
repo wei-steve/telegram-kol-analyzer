@@ -699,3 +699,13 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
   实际走通了：三家的初始开关按推导正确、关掉 DeepSeek 的开关预览实时去掉 `/v1`、
   改 Base URL 预览实时跟随、根地址已是 `/v1` 时打开开关**不重复补**、MiMo 同理、
   保存后回读一致、磁盘上三家都写上了显式 `append_v1` 且 Key 原样保留。
+
+## 部署记录（2026-09-14，阶段 7，指挥会话）
+
+- 指挥会话独立复跑全量：8858 passed / 0 failed / 4 skipped（756 s）；随后把「自定义」预设的开关默认改为开
+  （决定 41 已改写），受影响的 6 个测试文件 312 passed。
+- 预检：生产 HEAD `f0337b84`，候选 `0cd18e15` 是其后代；无依赖 / unit 变更。
+- `tg-deploy 0cd18e15`：三个 unit active；`GET /` 200；`/api/ai-providers` 回读三家 `append_v1`
+  为 deepseek True / zhipu False / mimo False，最终 URL 与阶段 6 逐字相同；预设 19 家、custom 开关为开；
+  重启后 2 分钟内三个角色 0 traceback。线上配置文件仍无 `append_v1` 键，按推导走，页面下次保存才落盘显式值。
+- 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `f0337b84`。
