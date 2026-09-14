@@ -219,3 +219,79 @@ run_with_fallback(chain, attempt, *, budget_seconds, min_remaining_seconds, clas
 - `context_resolution` 与其余环节同样能配链并切换。
 - 旧 `config/ai_recognition.yaml`（v1）不经人工编辑即可加载，行为与迁移前逐环节一致（测试断言）。
 - `pytest -q` 全绿；不新增依赖。
+
+## 9. 阶段 6：提供商预设目录、模型列表拉取、统一端点拼接（2026-09-14 追加）
+
+用户反馈：预设只有 DeepSeek / 智谱 / MiMo 三个，常见提供商都没有。参照 OpenMinis：它的提供商目录
+来自 models.dev（`src/ios/Resources/models-dev-api.json` 是快照；线上 `https://models.dev/api.json`），
+每个提供商带 OpenAI 兼容 `api` 根地址，每个模型带 `modalities.input`（是否收图）、`release_date`。
+
+### 9.1 预设目录（数据文件 + 生成脚本）
+
+- 新增 `scripts/build_ai_provider_presets.py`：读 models.dev（优先线上，失败用 `--source` 指定的本地快照），
+  按下面的白名单筛选提供商，为每个提供商挑**最近发布的 ≤ 8 个聊天模型**（`modalities.output` 含 text；
+  排除 id 匹配 realtime / tts / transcribe / whisper / audio / image-gen / imagine / video / embedding /
+  moderation / sora / dall-e 的），写成 `src/telegram_kol_research/ai_provider_presets.json`
+  （提交进仓库；生成脚本是可复现的来源，不在运行时联网）。
+- 提供商白名单与 base_url（models.dev 没给 `api` 的用官方 OpenAI 兼容地址）：
+
+| 组 | preset id | 显示名 | base_url | 备注 |
+|---|---|---|---|---|
+| 国内 | deepseek | DeepSeek | https://api.deepseek.com | 现有 |
+| 国内 | zhipuai | 智谱 GLM | https://open.bigmodel.cn/api/paas/v4 | 现有 |
+| 国内 | xiaomi | 小米 MiMo | https://api.xiaomimimo.com/v1 | 现有 |
+| 国内 | alibaba-cn | 阿里百炼（通义 Qwen） | https://dashscope.aliyuncs.com/compatible-mode/v1 | |
+| 国内 | moonshotai-cn | 月之暗面 Kimi | https://api.moonshot.cn/v1 | |
+| 国内 | siliconflow-cn | 硅基流动 | https://api.siliconflow.cn/v1 | 聚合 |
+| 国内 | stepfun | 阶跃星辰 | https://api.stepfun.com/v1 | |
+| 国内 | minimax-cn | MiniMax | https://api.minimaxi.com/v1 | models.dev 给的是 Anthropic 格式地址，这里用其 OpenAI 兼容地址；模型列表取自 models.dev 的 `minimax-cn` |
+| 国内 | volcengine | 火山方舟（豆包） | https://ark.cn-beijing.volces.com/api/v3 | 不在 models.dev；模型 id 是用户自己的接入点，预设不带模型 |
+| 国际 | openai | OpenAI | https://api.openai.com/v1 | |
+| 国际 | anthropic | Anthropic | https://api.anthropic.com/v1 | 走 Anthropic 的 OpenAI 兼容层 |
+| 国际 | google | Google Gemini | https://generativelanguage.googleapis.com/v1beta/openai | OpenAI 兼容层 |
+| 国际 | xai | xAI Grok | https://api.x.ai/v1 | |
+| 国际 | openrouter | OpenRouter | https://openrouter.ai/api/v1 | 聚合，模型太多：预设只带 8 个，靠"拉取模型列表" |
+| 国际 | groq | Groq | https://api.groq.com/openai/v1 | |
+| 国际 | mistral | Mistral | https://api.mistral.ai/v1 | |
+| 本地 | ollama | Ollama（本机） | http://127.0.0.1:11434/v1 | 无 Key；模型靠拉取 |
+| 本地 | lmstudio | LM Studio（本机） | http://127.0.0.1:1234/v1 | 同上 |
+| — | custom | 自定义（OpenAI 兼容） | 空 | 现有 |
+
+- `GET /api/ai-provider-presets` 返回目录（分组、id、显示名、base_url、文档链接、模型列表含
+  `supports_image`）。前端预设按钮**从这个接口渲染**，不再写死在 HTML/JS 里。
+- 点预设：新建一张提供商卡片，预填 base_url、显示名、预设模型（用户删掉不要的再保存）；
+  provider id 取 preset id（已存在则加 `-2`）。对已存在的提供商卡片提供「补充预设模型」按钮。
+- 预设里的模型名以 models.dev 为准、随生成日期一起写进 JSON（`generated_at`、`source`），
+  页面上注明"预设仅供起步，以「拉取模型列表」为准"。
+
+### 9.2 拉取模型列表
+
+- `POST /api/ai-providers/{id}/models`：用该提供商的 base_url + Key 请求 `GET {base}/models`
+  （OpenAI 标准；Anthropic 兼容层需要额外 `x-api-key` 与 `anthropic-version` 头，一律附带，
+  对其他提供商无害），15 s 超时，返回 `{models: [{id, owned_by?}], error?}`；失败按
+  `classify_provider_failure` 给出 `failure_class`。
+- 页面：卡片上「拉取模型列表」→ 弹出可勾选清单（已存在的置灰），勾选后加入卡片，
+  能力默认只勾"文本"，若 id 与预设目录里某条一致则沿用其 `supports_image`。
+
+### 9.3 统一端点拼接（修隐患）
+
+现状有 7 处各自拼 URL，规则不一致：`message_recognition` / `context_resolution` /
+`semantic_disagreement_review` 是"base 以 `/v1` 结尾则加 `/chat/completions`，否则加
+`/v1/chat/completions`"；`strategy_alerts` / `llm_chat` 一律加 `/v1/chat/completions`；
+MiMo 直调与探测一律加 `/chat/completions`。Gemini（`/v1beta/openai`）、Groq（`/openai/v1`）、
+百炼（`/compatible-mode/v1`）、火山（`/api/v3`）、智谱（`/api/paas/v4`）在前两类规则下都会拼错。
+
+新规则，放在一个模块 `ai_endpoints.chat_completions_url(base_url)`，7 处全部改用：
+**base_url 的路径为空或仅 `/` 时加 `/v1/chat/completions`；否则加 `/chat/completions`**
+（base 已以 `/chat/completions` 结尾则原样）。对现有配置逐一核对不变：
+`https://api.deepseek.com` → `/v1/chat/completions`（同前）；`https://api.xiaomimimo.com/v1` →
+`/v1/chat/completions`（同前）；env 默认 `http://127.0.0.1:8317` → `/v1/chat/completions`（同前）。
+`{base}/models` 同理由 `ai_endpoints.models_url(base_url)` 给出。测试逐条钉死上表每个 base_url 的结果。
+
+### 9.4 验收
+
+- ⚙ →「AI提供商」看到三组预设按钮（国内 9、国际 7、本地 2、自定义 1）；点「阿里百炼」得到预填卡片，
+  带最近的 Qwen 模型且图片能力标注正确；点「Ollama」不要求 Key。
+- 对 DeepSeek 点「拉取模型列表」能列出 `deepseek-chat` 等；对不可达地址给出明确失败类别。
+- 7 处调用的 URL 全部经 `chat_completions_url`，单元测试覆盖上表全部 base_url。
+- 全量测试绿；不新增依赖；`ai_provider_presets.json` 可由脚本重新生成。
