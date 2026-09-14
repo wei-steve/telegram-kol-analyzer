@@ -295,3 +295,37 @@ MiMo 直调与探测一律加 `/chat/completions`。Gemini（`/v1beta/openai`）
 - 对 DeepSeek 点「拉取模型列表」能列出 `deepseek-chat` 等；对不可达地址给出明确失败类别。
 - 7 处调用的 URL 全部经 `chat_completions_url`，单元测试覆盖上表全部 base_url。
 - 全量测试绿；不新增依赖；`ai_provider_presets.json` 可由脚本重新生成。
+
+## 10. 阶段 7：显式「自动追加 /v1」开关 + 端点预览（2026-09-14 追加，用户指出 OpenMinis 已有此设计）
+
+OpenMinis 的提供商配置页有三样东西：「Sign in with <provider>」OAuth 登录、「自动追加 "/v1"」开关
+（`ProviderInstance.appendV1Suffix`，默认开，提示"只填主机地址"）、「API FORMAT: Chat Completions / Responses API」。
+本项目采用第二项；前两项不采用：OAuth 登录是移动端个人账号场景，服务端只用 API Key；
+Responses API 本项目所有环节都是 chat/completions 合同，改格式没有收益。
+
+### 10.1 数据
+
+- `AiProvider` 增加 `append_v1: bool | None`，YAML 键 `append_v1`。**缺省（None）时按 §9.3 的现有规则推导**
+  （路径为空或 `/` → True，否则 False），因此现有 v2 文件与 v1 迁移的结果**逐字节不变**；save 时把推导结果落盘，
+  以后就是显式值。
+- `ai_endpoints.chat_completions_url(base_url, append_v1=None)` / `models_url(...)`：`append_v1=True` 时，
+  路径不以 `/v1` 结尾则先补 `/v1`（已以 `/v1` 结尾不重复补）；`False` 时原样；`None` 时走旧推导。
+  7 处调用点传入 `provider.append_v1`。
+- 预设目录（`ai_provider_presets.json`）每家带 `append_v1`：base_url 是裸主机的（DeepSeek）为 True，
+  其余（已含 `/v1`、`/api/paas/v4`、`/v1beta/openai`、`/openai/v1`、`/compatible-mode/v1`、`/api/v3`）为 False。
+
+### 10.2 页面
+
+- 提供商卡片 Base URL 下方一个开关「自动追加 "/v1"」，说明文字：
+  「打开：只填主机地址（如 https://api.openai.com）；关闭：填完整 API 根地址（如 https://open.bigmodel.cn/api/paas/v4）」。
+- 开关旁实时显示**端点预览**：「将请求 https://…/chat/completions」（前端用与后端相同的规则算；
+  `GET /api/ai-providers` 同时返回 `chat_completions_url` 供核对）。点预设时开关按预设值设好。
+- `PUT /api/ai-providers` 接受 `append_v1`；缺省按 10.1 推导。
+
+### 10.3 验收
+
+- 现有三家与 env 默认地址的最终 URL 不变（测试逐条钉死，沿用 `test_the_urls_already_in_production_are_unchanged`）。
+- `https://proxy.example.com` + 开关关 → `https://proxy.example.com/chat/completions`；
+  `https://host/api` + 开关开 → `https://host/api/v1/chat/completions`；
+  `https://api.xiaomimimo.com/v1` + 开关开 → 不重复补 `/v1`。
+- 页面上切换开关，预览实时变化；保存后 GET 回读 `append_v1` 与预览一致。
