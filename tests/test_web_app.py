@@ -92,6 +92,29 @@ def _loop_health_endpoint(app):
     )
 
 
+_LOOP_HEALTH_CLOCK_FIELDS = frozenset(
+    {"now", "uptime_seconds", "last_stall_at", "recent_stall_stacks"}
+)
+
+
+def _loop_health_text_without_clock_fields(payload: dict) -> str:
+    """Serialize a loop-health payload with its clock-derived fields removed.
+
+    A chat id must never leak into the loop-health payload, but the wall-clock
+    timestamp, the monotonic uptime and captured stack frames carry arbitrary
+    digit runs (``.303417`` microseconds, line numbers) that can collide with
+    the id under test. Dropping those fields keeps the leak check about the
+    admission and lane fields, which are the only ones a chat id could reach.
+    """
+
+    stable = {
+        key: value
+        for key, value in payload.items()
+        if key not in _LOOP_HEALTH_CLOCK_FIELDS
+    }
+    return json.dumps(stable, sort_keys=True)
+
+
 def _seed_entry_exchange_authority_for_test(session_factory) -> None:
     result = seed_entry_revision_exchange_authority(
         session_factory,
@@ -924,8 +947,9 @@ def test_worker_loop_health_exposes_message_lane_activity_without_database(
     assert payload["total_started"] == 2
     assert payload["limit_applied_at"] == "2026-08-24T11:59:00+00:00"
     assert "active_shared_admissions" not in payload
-    assert "987654321" not in str(payload)
-    assert "876543210" not in str(payload)
+    stable_text = _loop_health_text_without_clock_fields(payload)
+    assert "987654321" not in stable_text
+    assert "876543210" not in stable_text
 
 
 def test_ingest_loop_health_exposes_admission_state_without_database(tmp_path):
@@ -952,7 +976,7 @@ def test_ingest_loop_health_exposes_admission_state_without_database(tmp_path):
     assert payload["exclusive_admission_active"] is False
     assert payload["known_key_count"] == 1
     assert "configured_max_parallel_chats" not in payload
-    assert "303" not in str(payload)
+    assert "303" not in _loop_health_text_without_clock_fields(payload)
 
 
 def test_message_pipeline_parity_reports_bounded_missing_orphan_and_stuck_jobs(
