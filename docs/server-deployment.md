@@ -127,7 +127,9 @@ find /opt/telegram-kol-analyzer/data -type f -exec chmod 0660 {} +
 chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/config/groups.yaml
 chmod 0640 /opt/telegram-kol-analyzer/config/groups.yaml
 chgrp telegram-kol-runtime /opt/telegram-kol-analyzer/config/ai_recognition.yaml
-chmod 0640 /opt/telegram-kol-analyzer/config/ai_recognition.yaml
+# 0660, not 0640: the web role saves this file in place from the AI provider /
+# model-selection pages, and its unit lists exactly this file in ReadWritePaths.
+chmod 0660 /opt/telegram-kol-analyzer/config/ai_recognition.yaml
 ```
 
 The three roles parse `config/groups.yaml` and `config/ai_recognition.yaml` at

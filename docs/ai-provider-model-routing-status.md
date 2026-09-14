@@ -505,3 +505,19 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 - 本机 `GET /` 200，`GET /api/ai-stages` 与 CLI 一致、`warnings=[]`。
 - 部署 sha 已推到共享分支，两个方向核对均 PASS。
 - 用户在真实环境测试中；测试结论待记录。
+
+## 部署后修正（2026-09-14，指挥会话）：web 沙箱写不了配置文件
+
+用户在「AI提供商」页点保存得到「保存失败，请检查服务状态」。web 日志：
+`OSError: [Errno 30] Read-only file system: 'config/ai_recognition.yaml'`。
+原因：`telegram-kol-web.service` 是 `ProtectSystem=strict` + `ReadOnlyPaths=/opt/telegram-kol-analyzer`，
+只有 `data/` 可写；文件本身又是 `root:telegram-kol-runtime 0640`。旧「AI配置」页在生产上从来没有成功写过
+这个文件（文件 mtime 停在 08-23，由 root 手工改）。设计 §2 "web 保存后其他进程按需重读"的前提是 web 能写，
+本次补上：
+
+1. `deploy/systemd/telegram-kol-web.service` 增加 `ReadWritePaths=/opt/telegram-kol-analyzer/config/ai_recognition.yaml`
+   （只放行这一个文件；`save_ai_recognition_config` 是原地 `write_text`，不做临时文件改名，所以文件级绑定挂载够用）。
+2. 服务器 `chmod 0660 config/ai_recognition.yaml`（属主仍 root，组 telegram-kol-runtime）；
+   `docs/server-deployment.md` 的权限说明同步改为 0660。
+3. 安装新 unit → `daemon-reload` → 只重启 web。验证：`PUT /api/ai-providers`（原样保存）200，
+   文件已升级为 `schema_version: 2`（14736 字节，Key 原样保留），worker 仍可读，web 无 traceback。

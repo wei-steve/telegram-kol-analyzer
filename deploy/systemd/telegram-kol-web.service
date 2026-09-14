@@ -44,6 +44,10 @@ SystemCallFilter=@system-service
 SystemCallFilter=~@mount @privileged
 ReadOnlyPaths=/opt/telegram-kol-analyzer
 ReadWritePaths=/opt/telegram-kol-analyzer/data
+# The AI provider / model-selection pages save config/ai_recognition.yaml in
+# place (no rename), so only that file is opened for writing; the rest of
+# config/ stays read-only. The file must be group-writable (root:telegram-kol-runtime 660).
+ReadWritePaths=/opt/telegram-kol-analyzer/config/ai_recognition.yaml
 InaccessiblePaths=-/opt/telegram-kol-analyzer/.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/telegram.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
