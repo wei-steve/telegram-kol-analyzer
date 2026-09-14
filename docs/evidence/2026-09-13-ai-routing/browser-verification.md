@@ -106,3 +106,25 @@ uv run telegram-kol-research web --runtime-role web --host 127.0.0.1 --port 8099
 
 - `api-ai-provider-presets.json` —— `GET /api/ai-provider-presets` 的原样响应（19 个提供商、113 个模型）。
 
+---
+
+# 阶段 7 追加验证（2026-09-14）：显式「自动追加 "/v1"」开关
+
+同一条启动命令，起始文件同样是 example（现在是 v2，**没有 `append_v1` 键**），
+所以这一遍同时验了「旧文件缺省时按推导走、行为不变」。仍然没有 PNG。
+
+| # | 操作 | 结果 |
+|---|---|---|
+| 1 | 打开「AI提供商」 | 每张卡片 Base URL 下方多了「自动追加 "/v1"」开关 + 说明「打开：只填主机地址（如 https://api.openai.com）；关闭：填完整 API 根地址（如 https://open.bigmodel.cn/api/paas/v4）」，下面一行蓝色端点预览 |
+| 2 | 三张卡片的初始状态（文件里没有 `append_v1`，按推导） | deepseek 开 →「将请求 https://api.deepseek.com/v1/chat/completions」；zhipu 关 →「…/api/paas/v4/chat/completions」；mimo 关 →「…/v1/chat/completions」。**与阶段 6 的 URL 逐字相同** |
+| 3 | 把 DeepSeek 的开关关掉 | 预览实时变成「将请求 https://api.deepseek.com/chat/completions」 |
+| 4 | 把 Base URL 改成 `https://proxy.example.com/openai/v1`（开关仍关） | 预览实时变成「…/openai/v1/chat/completions」 |
+| 5 | 同一张卡片把开关打开（根地址已经以 `/v1` 结尾） | 预览**不变**：「…/openai/v1/chat/completions」，没有补第二个 `/v1` |
+| 6 | Base URL 改回 `https://api.deepseek.com`、开关保持打开 | 预览回到「…/v1/chat/completions」 |
+| 7 | 把 MiMo 的开关打开（它的 base_url 已经是 `.../v1`） | 预览**不变**：「https://api.xiaomimimo.com/v1/chat/completions」 |
+| 8 | 点「保存提供商与模型」 | 「提供商与模型已保存」；重绘后 deepseek 开 / zhipu 关 / mimo 开，预览与保存前一致 |
+| 9 | `GET /api/ai-providers` 回读 | 三家的 `append_v1` 与 `chat_completions_url` 与页面一致 |
+| 10 | 读磁盘 `data/ai-routing-preview.yaml` | 三家都写上了显式 `append_v1`（true / false / true），**mimo 的 Key 原样保留** |
+
+- `api-ai-providers.json` 已更新为带 `append_v1` 与 `chat_completions_url` 的版本。
+

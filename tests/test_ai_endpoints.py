@@ -24,7 +24,11 @@ from telegram_kol_research import (
     semantic_disagreement_review,
     strategy_alerts,
 )
-from telegram_kol_research.ai_endpoints import chat_completions_url, models_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    infer_append_v1,
+    models_url,
+)
 
 
 # The §9.1 preset table, plus the three base URLs already in production.
@@ -106,6 +110,94 @@ def test_an_empty_base_url_produces_nothing_to_call():
     assert chat_completions_url("") == ""
     assert chat_completions_url("   ") == ""
     assert models_url("") == ""
+
+
+# ---------------------------------------------------------------------------
+# The explicit switch (§10)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "base_url,append_v1,expected",
+    [
+        # The four cases the design spells out.
+        (
+            "https://proxy.example.com",
+            False,
+            "https://proxy.example.com/chat/completions",
+        ),
+        ("https://host/api", True, "https://host/api/v1/chat/completions"),
+        (
+            "https://api.xiaomimimo.com/v1",
+            True,
+            "https://api.xiaomimimo.com/v1/chat/completions",
+        ),
+        (
+            "https://api.deepseek.com",
+            None,
+            "https://api.deepseek.com/v1/chat/completions",
+        ),
+    ],
+)
+def test_the_switch_decides_and_never_doubles_the_version(
+    base_url, append_v1, expected
+):
+    assert chat_completions_url(base_url, append_v1) == expected
+
+
+def test_the_switch_applies_to_the_model_listing_too():
+    assert models_url("https://host/api", True) == "https://host/api/v1/models"
+    assert models_url("https://host/api", False) == "https://host/api/models"
+
+
+def test_none_means_the_rule_this_module_shipped_with():
+    for base_url in BASE_URLS:
+        assert chat_completions_url(base_url, None) == chat_completions_url(
+            base_url, infer_append_v1(base_url)
+        )
+
+
+@pytest.mark.parametrize(
+    "base_url,expected",
+    [
+        ("https://api.deepseek.com", True),
+        ("https://api.deepseek.com/", True),
+        ("http://127.0.0.1:8317", True),
+        ("https://api.xiaomimimo.com/v1", False),
+        ("https://open.bigmodel.cn/api/paas/v4", False),
+        ("https://api.groq.com/openai/v1", False),
+        ("", False),
+    ],
+)
+def test_the_inferred_default_is_bare_host_only(base_url, expected):
+    assert infer_append_v1(base_url) is expected
+
+
+def test_the_shipped_presets_answer_the_switch_the_way_the_design_says():
+    """Bare host is True; everything that names an API root is False."""
+
+    from telegram_kol_research.ai_provider_presets import load_provider_presets
+
+    by_id = {
+        provider["id"]: provider
+        for provider in load_provider_presets()["providers"]
+    }
+
+    assert by_id["deepseek"]["append_v1"] is True
+    for preset_id in (
+        "zhipuai",
+        "xiaomi",
+        "alibaba-cn",
+        "google",
+        "groq",
+        "volcengine",
+        "openai",
+    ):
+        assert by_id[preset_id]["append_v1"] is False, preset_id
+    # Every preset's own switch reproduces its base URL's inferred answer, so
+    # the catalogue and the fallback rule cannot drift apart.
+    for provider in by_id.values():
+        assert provider["append_v1"] is infer_append_v1(provider["base_url"])
 
 
 def test_a_port_alone_is_not_read_as_a_path():

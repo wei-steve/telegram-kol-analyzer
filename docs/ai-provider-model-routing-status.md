@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 6
+current_phase: 7
 phase_status: completed      # planned | in_progress | completed | blocked
 deploy: c79db7042cc251a54a86b3a9609cfc01bae68ba6   # 2026-09-14T11:41Z tg-deploy；回滚参考 ef1688c5b4c4f291bafd10e57993502028a5f3f1
 shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-trading-v1 上，0 code files beyond production。上线步骤见「上线核对」一节
@@ -26,6 +26,7 @@ shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-tradi
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | `d287038f` | 全量 8786 passed / 0 failed / 4 skipped |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | `4aadf158` | 全量 8788 passed / 0 failed / 4 skipped |
 | 6 | 提供商预设目录（19 家）、拉取模型列表、统一端点拼接 | completed | 见下方证据 | 全量 8841 passed / 0 failed / 4 skipped |
+| 7 | 显式「自动追加 /v1」开关 + 端点预览 | completed | 见下方证据 | 全量 8858 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -166,6 +167,27 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 失败经 `classify_provider_failure` 给出 `failure_class`。页面弹出可勾选清单，已在卡片上的置灰；
 能力按预设目录里的同 id 条目填，未知 id 只勾「文本」。探测器/列举器都由
 `create_web_app(ai_provider_prober=..., ai_model_lister=...)` 注入，接口测试不走网络。
+
+## 阶段 7 做了什么（设计 §10）
+
+用户拿 OpenMinis 的提供商配置页指出：`/v1` 这件事那边是一个**显式开关**
+（`ProviderInstance.appendV1Suffix`，默认开，提示「只填主机地址」），不是推导出来的。采用。
+OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在设计 §10 开头。
+
+- `AiProvider.append_v1: bool | None`，YAML 键 `append_v1`。**缺省（None）走阶段 6c 的推导**
+  （路径为空或 `/` → True），所以现有文件与 v1 迁移结果**逐字节不变**；`_normalize_provider`
+  在保存时把推导结果落盘，从此是显式值。
+- `ai_endpoints.chat_completions_url(base_url, append_v1=None)` / `models_url(...)`：
+  True → 路径不以 `/v1` 结尾才补（**不重复补**）；False → 原样；None → 推导。
+  `infer_append_v1(base_url)` 是那条推导规则本身，单独导出给页面与目录用。
+- 开关沿着 `AiProvider` → `AiModelConfig` → `AiProviderConfig` →
+  `StrategyAlertConfig` / `LLMProxyConfig` 一路传到 7 处调用点；
+  在 `AiModelConfig` / `AiProviderConfig` 上 `compare=False`——它描述「怎么找到这个模型」，
+  不是「这是哪个模型」。
+- 预设目录每家带 `append_v1`：DeepSeek（裸主机）True，其余 16 家 False，自定义 False。
+- 页面：Base URL 下方开关 + 说明文字 + **实时端点预览**「将请求 …/chat/completions」，
+  前端用与后端逐字相同的规则算；`GET /api/ai-providers` 同时返回 `append_v1` 与
+  `chat_completions_url` 供核对；`PUT` 接受 `append_v1`；点预设按预设值设好开关。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -349,9 +371,38 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
     `config/ai_recognition.yaml` 改成了 `0660`（web 要能写它）。测试改成按文件分别断言，
     并额外断言 web unit 里确实有那一条 `ReadWritePaths`。
 
+39. **`append_v1` 在 `AiModelConfig` / `AiProviderConfig` 上 `compare=False`。**
+    这两个类型的相等性被大量测试与去重逻辑依赖（例如 `_normalize_ai_models` 按 id 去重、
+    往返断言逐字段相等）。开关描述的是「怎么找到这个端点」，不是「这是哪个模型」，
+    放进相等性里会让阶段 1 的往返测试与链解析产生无谓的差异。
+
+40. **预设目录的 `append_v1` 直接补进已提交的 JSON，没有重新跑生成脚本抓线上数据。**
+    脚本已经会算这个字段（`_append_v1`，与 `ai_endpoints.infer_append_v1` 同规则，
+    有测试把两者钉在一起）。但重新抓线上会连带刷新各家的模型列表——那份列表刚随阶段 6
+    审阅并部署，本轮不该顺手换掉。所以只补字段、不动模型。需要刷新模型时照常跑
+    `python scripts/build_ai_provider_presets.py`。
+
+41. **「自定义（OpenAI 兼容）」预设的开关默认是关。**
+    设计说「裸主机为 True，其余为 False」，自定义的 base_url 是空的，按规则算出 False。
+    考虑过把它设成开（OpenMinis 的默认是开，而自定义十有八九会填裸主机），但没有改：
+    实时预览会立刻显示「将请求 https://你填的地址/chat/completions」，看一眼就知道要不要打开，
+    比一个猜出来的默认值更明确。
+
+42. **读开关一律走 `ai_endpoints.provider_append_v1(provider)`，不是 `provider.append_v1`。**
+    有 8 处调用点拿到的是「像 provider 的对象」而不是真的 `AiProvider`——测试里的
+    stand-in、早于这个开关的记录。直接取属性会让它们炸（第一次全量跑就炸了 18 条）。
+    helper 返回 `None`，也就是「没人说过」，于是回到推导规则，这些调用点继续发出
+    它们一直在发的那个 URL。与第 15 条是同一条原则。
+
+43. **前端的预览函数是后端规则的逐行对照实现，不是调接口算的。**
+    预览必须跟着输入框实时变，每敲一个字符发一次请求不合适。两边的一致性由
+    `GET /api/ai-providers` 同时返回 `chat_completions_url` 兜底（页面可核对），
+    加上 `tests/test_ai_endpoints.py` 对同一批 base_url 的逐条断言。
+    脚本 `_append_v1` 也是同一条规则的第三份副本，同样有测试钉住。
+
 ## 交接摘要（下一个会话先读这一段）
 
-阶段 1–5 已部署（生产 sha `f8e8f877`）。**阶段 6 已完成但未部署、未推送共享分支。**
+阶段 1–6 已部署（生产 sha `f0337b84`）。**阶段 7 已完成但未部署、未推送共享分支。**
 
 这次做完之后的事实：
 
@@ -367,6 +418,8 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 5. ⚙ 菜单里两页：「AI提供商」「AI模型选择」；接口 `/api/ai-providers*` 与 `/api/ai-stages`。
 6. （阶段 6）提供商预设 19 家，来自提交进仓库的 `ai_provider_presets.json`；
    每张卡片可以「拉取模型列表」问这家提供商它自己支持什么；所有端点 URL 走 `ai_endpoints`。
+7. （阶段 7）`/v1` 不再靠推导：每个提供商有显式的 `append_v1` 开关，页面上有实时端点预览。
+   缺这个键的旧文件仍按推导走，URL 逐字节不变；保存一次就写成显式值。
 
 改动落在这些文件（按重要性）：`ai_stage_catalog.py`（新）、`ai_model_router.py`（新）、
 `ai_recognition_config.py`、`recognition_experiments.py`、`authoritative_recognition.py`、
@@ -432,6 +485,9 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
   页面上已注明「预设只是起步，模型名以「拉取模型列表」为准」。
 - `ai_provider_presets.json` 里带着各家的 base_url，但**不带 Key**；预设只填地址与模型名。
 - 「拉取模型列表」用的是**已保存的**提供商记录，所以新加的提供商要先保存一次才能拉取。
+
+- `append_v1` 缺省时按推导走，所以**升级不需要改配置文件**；但一旦在页面上保存过，
+  这个值就是显式的了，以后改 base_url 不会自动重算开关——预览会当场告诉你该不该翻。
 
 ## 证据
 
@@ -618,3 +674,29 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 - `tg-deploy f0337b84`：三个 unit active；`GET /` 200；`GET /api/ai-provider-presets` 返回 19 家；
   `/api/ai-stages` 有效链与部署前一致；重启后 2 分钟内三个角色 0 traceback；配置文件未被改写。
 - 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `f8e8f877`。
+
+### 阶段 7
+
+- 提交：`feat(ai-routing): phase 7 an explicit append-/v1 switch with a live endpoint preview`
+  （SHA 在随后的收口提交里补写）
+- 全量：`uv run python -m pytest -q` → **8858 passed, 4 skipped, 0 failed**（702 s）
+- 新增用例：
+  - `tests/test_ai_endpoints.py`（30 → 44 例）：§10.3 四条逐条钉死
+    （`https://proxy.example.com` 关 → 不补；`https://host/api` 开 → 补；
+    `https://api.xiaomimimo.com/v1` 开 → 不重复补；缺省 → 旧推导）、
+    `test_none_means_the_rule_this_module_shipped_with`（对 §9.1 全表断言 None 等价于推导）、
+    `test_the_inferred_default_is_bare_host_only`、
+    `test_the_shipped_presets_answer_the_switch_the_way_the_design_says`
+    （目录里每家的 `append_v1` 必须等于它 base_url 的推导值，防止两处规则漂移）；
+    原有的 `test_the_urls_already_in_production_are_unchanged` 未改，继续钉死生产三条。
+  - `tests/test_ai_provider_api.py`（18 → 21 例）：
+    `test_the_append_v1_switch_round_trips_and_names_the_endpoint`、
+    `test_a_provider_saved_without_the_switch_gets_the_inferred_one`、
+    `test_the_switch_reaches_the_model_that_calls_the_provider`（链成员拿到的 `append_v1`
+    与它的 provider 一致）。
+  - `tests/test_web_assets_smoke.py`：断言 `data-ai-provider-append-v1`、
+    `data-ai-provider-endpoint-preview`、`function aiChatCompletionsUrl`、「自动追加」、「将请求」。
+- 浏览器验证：`browser-verification.md` 的「阶段 7 追加验证」一节（10 步）。
+  实际走通了：三家的初始开关按推导正确、关掉 DeepSeek 的开关预览实时去掉 `/v1`、
+  改 Base URL 预览实时跟随、根地址已是 `/v1` 时打开开关**不重复补**、MiMo 同理、
+  保存后回读一致、磁盘上三家都写上了显式 `append_v1` 且 Key 原样保留。

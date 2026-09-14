@@ -7,7 +7,9 @@
             "timeout_seconds": 60.0,
             "enabled": true,
             "api_key_configured": true,
-            "api_key_last4": "_key"
+            "api_key_last4": "_key",
+            "append_v1": true,
+            "chat_completions_url": "https://api.deepseek.com/v1/chat/completions"
         },
         {
             "id": "zhipu",
@@ -16,7 +18,9 @@
             "timeout_seconds": 60.0,
             "enabled": true,
             "api_key_configured": true,
-            "api_key_last4": "_key"
+            "api_key_last4": "_key",
+            "append_v1": false,
+            "chat_completions_url": "https://open.bigmodel.cn/api/paas/v4/chat/completions"
         },
         {
             "id": "mimo",
@@ -25,16 +29,9 @@
             "timeout_seconds": 60.0,
             "enabled": true,
             "api_key_configured": true,
-            "api_key_last4": "_key"
-        },
-        {
-            "id": "unreachable",
-            "label": "\u4e0d\u53ef\u8fbe\u6d4b\u8bd5",
-            "base_url": "http://127.0.0.1:9/v1",
-            "timeout_seconds": 60.0,
-            "enabled": true,
-            "api_key_configured": true,
-            "api_key_last4": "test"
+            "api_key_last4": "_key",
+            "append_v1": true,
+            "chat_completions_url": "https://api.xiaomimimo.com/v1/chat/completions"
         }
     ],
     "models": [
@@ -61,15 +58,6 @@
             "provider_id": "mimo",
             "model": "mimo-v2.5",
             "label": "MiMo V2.5",
-            "supports_text": true,
-            "supports_image": true,
-            "enabled": true
-        },
-        {
-            "id": "unreachable-vision",
-            "provider_id": "unreachable",
-            "model": "unreachable-vision",
-            "label": "\u4e0d\u53ef\u8fbe\u591a\u6a21\u6001",
             "supports_text": true,
             "supports_image": true,
             "enabled": true

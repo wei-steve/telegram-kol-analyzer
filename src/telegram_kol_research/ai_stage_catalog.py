@@ -78,6 +78,11 @@ class AiProvider:
     api_key: str = ""
     timeout_seconds: float = 60.0
     enabled: bool = True
+    #: Does this base URL still need a ``/v1`` appended -- "I only filled in
+    #: the host" versus "this is already the API root". ``None`` means nobody
+    #: has said, and :func:`ai_endpoints.infer_append_v1` decides, which is
+    #: what every configuration written before this switch existed relies on.
+    append_v1: bool | None = None
 
     @property
     def is_configured(self) -> bool:

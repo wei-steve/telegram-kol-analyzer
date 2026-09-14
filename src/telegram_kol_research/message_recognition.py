@@ -15,7 +15,10 @@ from typing import Any, Mapping
 import httpx
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.ai_recognition_config import (
     AiProviderConfig,
     AiRecognitionConfig,
@@ -754,7 +757,9 @@ def _recognize_text_with_ai_provider(
 
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            _chat_completions_url(provider.base_url),
+            _chat_completions_url(
+                provider.base_url, provider_append_v1(provider)
+            ),
             json=payload,
             headers=headers,
         )
@@ -797,7 +802,9 @@ def _recognize_with_ai_provider(
         headers["Authorization"] = f"Bearer {provider.api_key}"
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            _chat_completions_url(provider.base_url),
+            _chat_completions_url(
+                provider.base_url, provider_append_v1(provider)
+            ),
             json=payload,
             headers=headers,
         )
@@ -848,10 +855,10 @@ def _build_ai_recognition_payload(
     }
 
 
-def _chat_completions_url(base_url: str) -> str:
+def _chat_completions_url(base_url: str, append_v1: bool | None = None) -> str:
     """Kept under its old name; the rule now lives in ``ai_endpoints``."""
 
-    return chat_completions_url(base_url)
+    return chat_completions_url(base_url, append_v1)
 
 
 def _apply_ai_lifecycle_event_if_matched(
@@ -1100,7 +1107,9 @@ def _call_lifecycle_event_ai(
         headers["Authorization"] = f"Bearer {provider.api_key}"
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            _chat_completions_url(provider.base_url),
+            _chat_completions_url(
+                provider.base_url, provider_append_v1(provider)
+            ),
             json=payload,
             headers=headers,
         )
@@ -2813,7 +2822,10 @@ def infer_deepseek_auxiliary(
                 headers["Authorization"] = f"Bearer {_batch_text_provider(config).api_key}"
             with httpx.Client(timeout=_batch_text_provider(config).timeout_seconds) as client:
                 response = client.post(
-                    _chat_completions_url(_batch_text_provider(config).base_url),
+                    _chat_completions_url(
+                        _batch_text_provider(config).base_url,
+                        provider_append_v1(_batch_text_provider(config)),
+                    ),
                     json=request_payload,
                     headers=headers,
                 )

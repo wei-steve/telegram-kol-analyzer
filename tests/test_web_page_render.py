@@ -2859,6 +2859,9 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     # so the template carries their host rather than a fixed three.
     assert "data-ai-provider-presets" in response.text
     assert "拉取模型列表" in response.text
+    # Phase 7: the /v1 switch and its preview are rendered per card by the
+    # browser, so the page only has to carry the host the cards go into.
+    assert "data-ai-provider-list" in response.text
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text

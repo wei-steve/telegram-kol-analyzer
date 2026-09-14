@@ -85,6 +85,117 @@ def test_a_new_key_replaces_the_stored_one(tmp_path):
     assert by_id["mimo"]["api_key_last4"] == "9876"
 
 
+def test_the_append_v1_switch_round_trips_and_names_the_endpoint(tmp_path):
+    """§10: the /v1 question is answered explicitly, and shown as a URL."""
+
+    client = _client(tmp_path)
+    current = client.get("/api/ai-providers").json()
+    by_id = {item["id"]: item for item in current["providers"]}
+
+    # A file written before the switch existed infers it, and the inferred
+    # answer is what those providers have always used.
+    assert by_id["deepseek"]["append_v1"] is True
+    assert by_id["deepseek"]["chat_completions_url"] == (
+        "https://api.deepseek.com/v1/chat/completions"
+    )
+    assert by_id["mimo"]["append_v1"] is False
+    assert by_id["mimo"]["chat_completions_url"] == (
+        "https://api.xiaomimimo.com/v1/chat/completions"
+    )
+
+    saved = client.put(
+        "/api/ai-providers",
+        json={
+            "providers": [
+                {**provider, "api_key": "", "append_v1": provider["id"] == "mimo"}
+                for provider in current["providers"]
+            ],
+            "models": current["models"],
+        },
+    ).json()
+
+    after = {item["id"]: item for item in saved["providers"]}
+    assert after["mimo"]["append_v1"] is True
+    # Already ends in /v1, so turning the switch on does not add a second one.
+    assert after["mimo"]["chat_completions_url"] == (
+        "https://api.xiaomimimo.com/v1/chat/completions"
+    )
+    assert after["deepseek"]["append_v1"] is False
+    assert after["deepseek"]["chat_completions_url"] == (
+        "https://api.deepseek.com/chat/completions"
+    )
+    # And it survives a reload rather than being re-inferred.
+    reloaded = {
+        item["id"]: item
+        for item in client.get("/api/ai-providers").json()["providers"]
+    }
+    assert reloaded["deepseek"]["append_v1"] is False
+
+
+def test_a_provider_saved_without_the_switch_gets_the_inferred_one(tmp_path):
+    client = _client(tmp_path)
+    current = client.get("/api/ai-providers").json()
+
+    saved = client.put(
+        "/api/ai-providers",
+        json={
+            "providers": current["providers"]
+            + [
+                {
+                    "id": "bare",
+                    "label": "Bare host",
+                    "base_url": "https://api.newthing.com",
+                    "api_key": "sk-bare",
+                    "timeout_seconds": 60,
+                    "enabled": True,
+                }
+            ],
+            "models": current["models"],
+        },
+    ).json()
+
+    bare = next(item for item in saved["providers"] if item["id"] == "bare")
+    assert bare["append_v1"] is True
+    assert bare["chat_completions_url"] == (
+        "https://api.newthing.com/v1/chat/completions"
+    )
+
+
+def test_the_switch_reaches_the_model_that_calls_the_provider(tmp_path):
+    """A chain member has to address the endpoint its provider asked for."""
+
+    from telegram_kol_research.ai_model_router import resolve_stage_chain
+    from telegram_kol_research.ai_endpoints import chat_completions_url
+    from telegram_kol_research.ai_recognition_config import (
+        load_ai_recognition_config,
+    )
+
+    client = _client(tmp_path)
+    current = client.get("/api/ai-providers").json()
+    client.put(
+        "/api/ai-providers",
+        json={
+            "providers": [
+                {**provider, "api_key": "", "append_v1": provider["id"] == "mimo"}
+                for provider in current["providers"]
+            ],
+            "models": current["models"],
+        },
+    )
+
+    with pytest.warns(DeprecationWarning):
+        config = load_ai_recognition_config(
+            tmp_path / "ai_recognition.yaml"
+        )
+    head = resolve_stage_chain(config, "authoritative_recognition")[0]
+
+    assert head.append_v1 is True
+    assert head.provider.append_v1 is True
+    assert chat_completions_url(head.base_url, head.append_v1) == (
+        "https://api.xiaomimimo.com/v1/chat/completions"
+    )
+
+
 def test_adding_a_provider_and_a_model_round_trips(tmp_path):
     client = _client(tmp_path)
     current = client.get("/api/ai-providers").json()

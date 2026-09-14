@@ -11,6 +11,7 @@ from typing import Any, Callable
 import httpx
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.ai_endpoints import provider_append_v1
 from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
     stage_head_provider,
@@ -307,7 +308,9 @@ def _call_configured_model(
         headers["Authorization"] = f"Bearer {provider.api_key}"
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            _chat_completions_url(provider.base_url),
+            _chat_completions_url(
+                provider.base_url, provider_append_v1(provider)
+            ),
             json=request_payload,
             headers=headers,
         )

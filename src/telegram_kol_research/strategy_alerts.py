@@ -13,7 +13,10 @@ import httpx
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.ai_model_router import async_run_with_fallback
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.models import (
@@ -50,6 +53,10 @@ class StrategyAlertConfig:
     alert_chat_id: str
     confidence_threshold: float = 0.6
     max_chars: int = 1200
+    #: The provider's ``/v1`` switch when this came from a stage chain.
+    #: ``None`` -- an environment-configured proxy -- keeps the inferred rule,
+    #: which is the URL this has always sent.
+    append_v1: bool | None = None
 
 
 @dataclass(slots=True)
@@ -129,6 +136,7 @@ def resolve_strategy_alert_chain(
                 llm_api_key=model.api_key,
                 llm_model=model.model,
                 timeout_seconds=model.timeout_seconds,
+                append_v1=model.append_v1,
             ),
         )
         for model in chain
@@ -561,7 +569,9 @@ async def request_strategy_alert_decision(
     }
     async with httpx.AsyncClient(timeout=config.timeout_seconds) as client:
         response = await client.post(
-            chat_completions_url(config.llm_base_url),
+            chat_completions_url(
+                config.llm_base_url, provider_append_v1(config)
+            ),
             json=payload,
             headers=headers,
         )

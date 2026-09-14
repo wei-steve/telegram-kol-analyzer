@@ -39,7 +39,10 @@ from typing import Any, Callable
 import httpx
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.mimo_provider_health import (
     RESPONSE_INVALID,
     _aware,
@@ -91,7 +94,9 @@ def probe_mimo_provider(
     try:
         with client_factory(timeout=timeout_seconds) as client:
             response = client.post(
-                chat_completions_url(model_config.base_url),
+                chat_completions_url(
+                    model_config.base_url, provider_append_v1(model_config)
+                ),
                 headers=headers,
                 json={
                     "model": model_config.model,

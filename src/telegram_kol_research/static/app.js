@@ -3932,6 +3932,35 @@ function bindAiModelSelectionForm() {
   bindAiStagePage();
 }
 
+function aiInferAppendV1(baseUrl) {
+  const normalized = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!normalized) {
+    return false;
+  }
+  try {
+    const path = new URL(normalized).pathname;
+    return path === '' || path === '/';
+  } catch {
+    // Not a URL yet -- somebody is still typing. A bare word has no path.
+    return !normalized.replace(/^[a-zA-Z][a-zA-Z0-9+.-]*:\/\//, '').includes('/');
+  }
+}
+
+function aiChatCompletionsUrl(baseUrl, appendV1) {
+  const normalized = String(baseUrl || '').trim().replace(/\/+$/, '');
+  if (!normalized) {
+    return '';
+  }
+  if (normalized.endsWith('/chat/completions')) {
+    return normalized;
+  }
+  const effective = appendV1 === null || appendV1 === undefined ? aiInferAppendV1(normalized) : appendV1;
+  const withVersion = effective && !normalized.replace(/\/+$/, '').endsWith('/v1')
+    ? `${normalized}/v1`
+    : normalized;
+  return `${withVersion}/chat/completions`;
+}
+
 function aiElement(tag, className, text) {
   const node = document.createElement(tag);
   if (className) {
@@ -4015,6 +4044,36 @@ function renderAiProviderCard(provider, models) {
   head.append(aiCheckbox('启用', 'data-ai-provider-enabled', provider.enabled !== false));
   card.append(head);
 
+  // The /v1 question, asked rather than inferred: "I only filled in the host"
+  // and "this is already the API root" are things the person knows and the
+  // URL cannot always tell us. The preview makes the answer checkable before
+  // anything is saved.
+  const versionRow = aiElement('div', 'ai-provider-version-row');
+  const versionToggle = aiCheckbox('自动追加 "/v1"', 'data-ai-provider-append-v1', false);
+  const versionInput = versionToggle.querySelector('[data-ai-provider-append-v1]');
+  versionInput.checked = provider.append_v1 === undefined || provider.append_v1 === null
+    ? aiInferAppendV1(provider.base_url)
+    : Boolean(provider.append_v1);
+  versionRow.append(versionToggle);
+  versionRow.append(
+    aiElement(
+      'span',
+      'ai-helper-text',
+      '打开：只填主机地址（如 https://api.openai.com）；关闭：填完整 API 根地址（如 https://open.bigmodel.cn/api/paas/v4）',
+    ),
+  );
+  const preview = aiElement('p', 'ai-provider-endpoint-preview', '');
+  preview.setAttribute('data-ai-provider-endpoint-preview', '');
+  const refreshPreview = () => {
+    const baseUrl = card.querySelector('[data-ai-provider-base-url]')?.value || '';
+    const url = aiChatCompletionsUrl(baseUrl, versionInput.checked);
+    preview.textContent = url ? `将请求 ${url}` : '填入 Base URL 后这里会显示将要请求的地址';
+  };
+  versionInput.addEventListener('change', refreshPreview);
+  card.querySelector('[data-ai-provider-base-url]')?.addEventListener('input', refreshPreview);
+  card.append(versionRow, preview);
+  refreshPreview();
+
   const actions = aiElement('div', 'ai-provider-actions');
   const test = aiElement('button', 'secondary-button', '测试连接');
   test.type = 'button';
@@ -4090,6 +4149,7 @@ function collectAiProviderPayload() {
       api_key: card.querySelector('[data-ai-provider-api-key]')?.value || '',
       timeout_seconds: Number.isFinite(timeout) && timeout > 0 ? timeout : 60,
       enabled: Boolean(card.querySelector('[data-ai-provider-enabled]')?.checked),
+      append_v1: Boolean(card.querySelector('[data-ai-provider-append-v1]')?.checked),
     });
     card.querySelectorAll('[data-ai-model-row]').forEach((row) => {
       const rowValue = (selector) => row.querySelector(selector)?.value?.trim() || '';
@@ -4215,6 +4275,7 @@ function addAiProviderFromPreset(preset) {
       base_url: preset.base_url,
       timeout_seconds: 60,
       enabled: true,
+      append_v1: preset.append_v1,
     },
     presetModelRows(preset),
   );

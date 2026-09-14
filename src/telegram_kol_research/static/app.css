@@ -3138,6 +3138,25 @@ body {
   align-items: end;
 }
 
+.ai-provider-version-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: baseline;
+}
+
+.ai-provider-version-row .ai-helper-text {
+  flex: 1 1 320px;
+  margin: 0;
+}
+
+.ai-provider-endpoint-preview {
+  margin: 0;
+  font-size: 13px;
+  color: #7dd3fc;
+  word-break: break-all;
+}
+
 .ai-provider-actions {
   display: flex;
   flex-wrap: wrap;

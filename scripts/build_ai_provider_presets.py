@@ -28,6 +28,7 @@ import sys
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 
 MODELS_DEV_URL = "https://models.dev/api.json"
@@ -194,6 +195,20 @@ GROUP_LABELS = {
 }
 
 
+def _append_v1(base_url: str) -> bool:
+    """Does this base URL still need a ``/v1``.
+
+    Same answer as ``ai_endpoints.infer_append_v1``, repeated here rather than
+    imported because this script runs from the repository root without the
+    package installed. A test pins the two against each other.
+    """
+
+    normalized = str(base_url or "").strip().rstrip("/")
+    if not normalized:
+        return False
+    return urlsplit(normalized).path in ("", "/")
+
+
 def _is_chat_model(model_id: str, record: dict[str, Any]) -> bool:
     if NON_CHAT_MODEL_ID.search(model_id):
         return False
@@ -264,6 +279,9 @@ def build_catalogue(
                 "label": preset.label,
                 "english_label": str(upstream.get("name") or ""),
                 "base_url": preset.base_url,
+                # Explicit rather than inferred at read time: the page shows it
+                # as a switch, so the catalogue has to state it.
+                "append_v1": _append_v1(preset.base_url),
                 "doc_url": str(upstream.get("doc") or ""),
                 "requires_api_key": preset.requires_api_key,
                 "note": preset.note,

@@ -13,7 +13,10 @@ from urllib.parse import urlsplit
 
 import httpx
 
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.env_file_readability import (
     note_unreadable_config_file,
 )
@@ -31,6 +34,10 @@ class LLMProxyConfig:
     model: str
     timeout_seconds: float
     egress_socket_path: str | None = None
+    #: The provider's ``/v1`` switch when this came from a stage chain.
+    #: ``None`` -- an environment-configured proxy -- keeps the inferred rule,
+    #: which is the URL this has always sent.
+    append_v1: bool | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,6 +88,7 @@ def resolve_research_chat_chain(
                 model=model.model,
                 timeout_seconds=model.timeout_seconds,
                 egress_socket_path=proxy_config.egress_socket_path,
+                append_v1=model.append_v1,
             ),
         )
         for model in chain
@@ -476,7 +484,7 @@ def request_structured_chat_turn(
     )
     try:
         response = active_client.post(
-            chat_completions_url(config.base_url),
+            chat_completions_url(config.base_url, provider_append_v1(config)),
             json=payload,
             headers=headers,
             timeout=timeout_seconds or config.timeout_seconds,
@@ -576,7 +584,7 @@ def _request_chat_completion(
         group_prompt=group_prompt,
     )
     response = active_client.post(
-        chat_completions_url(config.base_url),
+        chat_completions_url(config.base_url, provider_append_v1(config)),
         json=payload,
         headers=headers,
     )
@@ -601,7 +609,7 @@ def _request_chat_completion(
             group_prompt=group_prompt,
         )
         response = active_client.post(
-            chat_completions_url(config.base_url),
+            chat_completions_url(config.base_url, provider_append_v1(config)),
             json=payload,
             headers=headers,
         )

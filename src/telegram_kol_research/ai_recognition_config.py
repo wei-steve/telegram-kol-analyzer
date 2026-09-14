@@ -10,6 +10,10 @@ import warnings
 
 import yaml
 
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    infer_append_v1,
+)
 from telegram_kol_research.ai_stage_catalog import (
     AI_STAGE_DEFINITIONS,
     AI_STAGE_DEFINITIONS_BY_KEY,
@@ -287,6 +291,12 @@ class AiProviderConfig:
     api_key: str = ""
     model: str = ""
     timeout_seconds: float = 60.0
+    #: Carried from :class:`ai_stage_catalog.AiProvider` so the call sites that
+    #: only ever see this flat shape still address the endpoint their provider
+    #: asked for. ``None`` keeps the inferred rule
+    #: (``ai_endpoints.infer_append_v1``), which is what a hand-built config and
+    #: every file written before the switch existed rely on.
+    append_v1: bool | None = field(default=None, compare=False)
 
     @property
     def is_configured(self) -> bool:
@@ -303,6 +313,10 @@ class AiModelConfig:
     timeout_seconds: float = 60.0
     supports_text: bool = True
     supports_image: bool = False
+    #: The provider's ``/v1`` switch, carried down so a chain member knows how
+    #: to address its own endpoint. Not part of equality: it describes how to
+    #: reach the model, not which model it is.
+    append_v1: bool | None = field(default=None, compare=False)
 
     @property
     def provider(self) -> AiProviderConfig:
@@ -311,6 +325,7 @@ class AiModelConfig:
             api_key=self.api_key,
             model=self.model,
             timeout_seconds=self.timeout_seconds,
+            append_v1=self.append_v1,
         )
 
 
@@ -484,6 +499,7 @@ def _bind_model(model: AiModel, provider: AiProvider) -> AiModelConfig:
         timeout_seconds=provider.timeout_seconds,
         supports_text=model.supports_text,
         supports_image=model.supports_image,
+        append_v1=provider.append_v1,
     )
 
 
@@ -533,13 +549,22 @@ def resolve_stage_models(
 
 
 def _normalize_provider(provider: AiProvider) -> AiProvider:
+    base_url = str(provider.base_url or "").strip().rstrip("/")
     return AiProvider(
         id=str(provider.id or "").strip(),
         label=str(provider.label or "").strip(),
-        base_url=str(provider.base_url or "").strip().rstrip("/"),
+        base_url=base_url,
         api_key=str(provider.api_key or "").strip(),
         timeout_seconds=float(provider.timeout_seconds or 60),
         enabled=bool(provider.enabled),
+        # Write the guess down. A provider loaded from a file that predates the
+        # switch keeps producing the URL it always produced, and stops being a
+        # guess the moment somebody saves.
+        append_v1=(
+            bool(provider.append_v1)
+            if provider.append_v1 is not None
+            else infer_append_v1(base_url)
+        ),
     )
 
 
@@ -1005,6 +1030,7 @@ def _schema_version(raw_data: dict[str, Any]) -> int:
 
 def _provider_from_payload(value: Any) -> AiProvider:
     data = value if isinstance(value, dict) else {}
+    append_v1 = data.get("append_v1")
     return AiProvider(
         id=str(data.get("id") or ""),
         label=str(data.get("label") or ""),
@@ -1012,6 +1038,7 @@ def _provider_from_payload(value: Any) -> AiProvider:
         api_key=str(data.get("api_key") or ""),
         timeout_seconds=float(data.get("timeout_seconds") or 60),
         enabled=bool(data.get("enabled", True)),
+        append_v1=None if append_v1 is None else bool(append_v1),
     )
 
 
@@ -1357,6 +1384,11 @@ def _provider_v2_to_payload(provider: AiProvider) -> dict[str, Any]:
         "api_key": provider.api_key,
         "timeout_seconds": provider.timeout_seconds,
         "enabled": provider.enabled,
+        "append_v1": (
+            provider.append_v1
+            if provider.append_v1 is not None
+            else infer_append_v1(provider.base_url)
+        ),
     }
 
 
@@ -1388,6 +1420,16 @@ def build_ai_config_view(config: AiRecognitionConfig) -> dict[str, Any]:
             "enabled": provider.enabled,
             "api_key_configured": provider.api_key_configured,
             "api_key_last4": provider.api_key_last4,
+            "append_v1": (
+                provider.append_v1
+                if provider.append_v1 is not None
+                else infer_append_v1(provider.base_url)
+            ),
+            # What this provider will actually be asked, so the page's own
+            # preview can be checked against the server rather than trusted.
+            "chat_completions_url": chat_completions_url(
+                provider.base_url, provider.append_v1
+            ),
         }
         for provider in config.providers
     ]

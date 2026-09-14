@@ -13,7 +13,10 @@ from typing import Any, Callable, Mapping
 import httpx
 from sqlalchemy.orm import sessionmaker
 
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.ai_model_router import (
     resolve_stage_chain,
     run_with_fallback,
@@ -516,6 +519,7 @@ def model_config_from_provider(
         model=provider.model,
         timeout_seconds=provider.timeout_seconds,
         supports_text=True,
+        append_v1=provider.append_v1,
     )
 
 
@@ -574,10 +578,10 @@ class _ContextAttemptFailed(RuntimeError):
         self.request_failed = request_failed
 
 
-def _completion_url(base_url: str) -> str:
+def _completion_url(base_url: str, append_v1: bool | None = None) -> str:
     """Kept under its old name; the rule now lives in ``ai_endpoints``."""
 
-    return chat_completions_url(base_url)
+    return chat_completions_url(base_url, append_v1)
 
 
 def _default_model_caller(
@@ -598,7 +602,7 @@ def _default_model_caller(
     }
     with httpx.Client(timeout=provider.timeout_seconds) as client:
         response = client.post(
-            _completion_url(provider.base_url),
+            _completion_url(provider.base_url, provider_append_v1(provider)),
             headers=headers,
             json=payload,
         )

@@ -26,7 +26,10 @@ from telegram_kol_research.ai_recognition_config import (
     AiRecognitionConfig,
     load_ai_recognition_config,
 )
-from telegram_kol_research.ai_endpoints import chat_completions_url
+from telegram_kol_research.ai_endpoints import (
+    chat_completions_url,
+    provider_append_v1,
+)
 from telegram_kol_research.ai_model_router import (
     resolve_stage_chain,
     run_with_fallback,
@@ -191,10 +194,10 @@ def build_composite_semantic_review_input(
     }
 
 
-def _chat_completions_url(base_url: str) -> str:
+def _chat_completions_url(base_url: str, append_v1: bool | None = None) -> str:
     """Kept under its old name; the rule now lives in ``ai_endpoints``."""
 
-    return chat_completions_url(base_url)
+    return chat_completions_url(base_url, append_v1)
 
 
 def _request_openai_compatible(
@@ -441,7 +444,10 @@ def run_deepseek_semantic_review(
             headers["Authorization"] = f"Bearer {candidate_provider.api_key}"
         try:
             response = invoke(
-                url=_chat_completions_url(candidate_provider.base_url),
+                url=_chat_completions_url(
+                    candidate_provider.base_url,
+                    provider_append_v1(candidate_provider),
+                ),
                 json=request_payload,
                 headers=headers,
                 timeout=candidate_provider.timeout_seconds,

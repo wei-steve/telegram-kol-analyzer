@@ -218,6 +218,13 @@ def test_app_js_drives_the_provider_and_stage_pages(tmp_path):
     assert "data-ai-model-picker" in response.text
     # The old three-entry table is gone; nothing hard-codes a provider now.
     assert "AI_PROVIDER_PRESETS" not in response.text
+    # Phase 7: the /v1 question is a switch with a live preview, and the
+    # preview uses the same rule the server does.
+    assert "data-ai-provider-append-v1" in response.text
+    assert "data-ai-provider-endpoint-preview" in response.text
+    assert "function aiChatCompletionsUrl" in response.text
+    assert "自动追加" in response.text
+    assert "将请求 ${url}" in response.text
 
 
 def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):

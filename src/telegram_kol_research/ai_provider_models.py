@@ -20,7 +20,7 @@ from typing import Any, Callable
 
 import httpx
 
-from telegram_kol_research.ai_endpoints import models_url
+from telegram_kol_research.ai_endpoints import models_url, provider_append_v1
 
 
 #: Long enough for a cold aggregator, short enough that a person clicking a
@@ -101,7 +101,7 @@ def list_provider_models(
         classify_provider_failure,
     )
 
-    url = models_url(getattr(provider, "base_url", ""))
+    url = models_url(getattr(provider, "base_url", ""), provider_append_v1(provider))
     if not url:
         return ProviderModelListing(
             error="provider has no base_url", failure_class="not_configured"

@@ -9802,6 +9802,7 @@ def create_web_app(
                 timeout_seconds=provider.timeout_seconds,
                 supports_text=model.supports_text,
                 supports_image=model.supports_image,
+                append_v1=provider.append_v1,
             )
         )
         return {
@@ -11294,6 +11295,7 @@ def _ai_providers_from_payload(payload: Any, existing: list[AiProvider]) -> list
         provider_id = str(item.get("id") or "").strip()
         prior = previous.get(provider_id)
         api_key = str(item.get("api_key") or "")
+        append_v1 = item.get("append_v1")
         providers.append(
             AiProvider(
                 id=provider_id,
@@ -11302,6 +11304,9 @@ def _ai_providers_from_payload(payload: Any, existing: list[AiProvider]) -> list
                 api_key=api_key if api_key.strip() else (prior.api_key if prior else ""),
                 timeout_seconds=float(item.get("timeout_seconds") or 60),
                 enabled=bool(item.get("enabled", True)),
+                # Absent means "the page did not say", which normalization
+                # resolves to the inferred rule rather than to False.
+                append_v1=None if append_v1 is None else bool(append_v1),
             )
         )
     return providers
