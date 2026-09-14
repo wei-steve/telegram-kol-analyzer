@@ -52,5 +52,10 @@ norecursedirs = [
 [tool.setuptools]
 package-dir = {"" = "src"}
 
+[tool.setuptools.package-data]
+# The provider preset catalogue is data the Web page reads at runtime, so it
+# has to travel with the package rather than only with the source tree.
+telegram_kol_research = ["ai_provider_presets.json"]
+
 [tool.setuptools.packages.find]
 where = ["src"]

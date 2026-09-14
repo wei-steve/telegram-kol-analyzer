@@ -3932,13 +3932,6 @@ function bindAiModelSelectionForm() {
   bindAiStagePage();
 }
 
-const AI_PROVIDER_PRESETS = {
-  deepseek: { id: 'deepseek', label: 'DeepSeek', base_url: 'https://api.deepseek.com', model: 'deepseek-v4-flash' },
-  zhipu: { id: 'zhipu', label: '智谱', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-ocr' },
-  mimo: { id: 'mimo', label: 'MiMo', base_url: 'https://api.xiaomimimo.com/v1', model: 'mimo-v2.5' },
-  custom: { id: '', label: '', base_url: '', model: '' },
-};
-
 function aiElement(tag, className, text) {
   const node = document.createElement(tag);
   if (className) {
@@ -4033,7 +4026,11 @@ function renderAiProviderCard(provider, models) {
   const addModel = aiElement('button', 'secondary-button', '添加模型');
   addModel.type = 'button';
   addModel.setAttribute('data-ai-model-add', '');
-  actions.append(test, addModel, testStatus);
+  const addPreset = aiElement('button', 'secondary-button', '补充预设模型');
+  addPreset.type = 'button';
+  addPreset.setAttribute('data-ai-model-preset-add', '');
+  addPreset.addEventListener('click', () => addPresetModelsToCard(card, testStatus));
+  actions.append(test, addModel, addPreset, testStatus);
   card.append(actions);
 
   const modelList = aiElement('div', 'ai-provider-model-list');
@@ -4060,12 +4057,14 @@ function renderAiProviderList(payload) {
   container.replaceChildren();
   const models = Array.isArray(payload.models) ? payload.models : [];
   (Array.isArray(payload.providers) ? payload.providers : []).forEach((provider) => {
-    container.append(
-      renderAiProviderCard(
-        provider,
-        models.filter((model) => model.provider_id === provider.id),
-      ),
+    const card = renderAiProviderCard(
+      provider,
+      models.filter((model) => model.provider_id === provider.id),
     );
+    // A saved provider keeps its preset id, so 补充预设模型 still knows which
+    // catalogue entry it came from after a reload.
+    card.setAttribute('data-ai-provider-preset-id', provider.id);
+    container.append(card);
   });
 }
 
@@ -4166,27 +4165,163 @@ async function saveAiProviders(status) {
   }
 }
 
+let aiProviderPresetCatalogue = null;
+
+function aiPresetById(presetId) {
+  const providers = aiProviderPresetCatalogue?.providers || [];
+  return providers.find((item) => item.id === presetId) || null;
+}
+
+function uniqueAiProviderId(preferred) {
+  const taken = new Set(
+    Array.from(document.querySelectorAll('[data-ai-provider-id]')).map((input) => input.value.trim()),
+  );
+  const base = preferred || 'custom';
+  if (!taken.has(base)) {
+    return base;
+  }
+  let suffix = 2;
+  while (taken.has(`${base}-${suffix}`)) {
+    suffix += 1;
+  }
+  return `${base}-${suffix}`;
+}
+
+function presetModelRows(preset) {
+  return (preset.models || []).map((model) => ({
+    id: model.id,
+    model: model.id,
+    label: model.label || model.id,
+    supports_text: model.supports_text !== false,
+    supports_image: Boolean(model.supports_image),
+    enabled: true,
+  }));
+}
+
+function addAiProviderFromPreset(preset) {
+  const container = document.querySelector('[data-ai-provider-list]');
+  if (!container) {
+    return;
+  }
+  const card = renderAiProviderCard(
+    {
+      id: uniqueAiProviderId(preset.id === 'custom' ? '' : preset.id),
+      label: preset.label,
+      base_url: preset.base_url,
+      timeout_seconds: 60,
+      enabled: true,
+    },
+    presetModelRows(preset),
+  );
+  card.setAttribute('data-ai-provider-preset-id', preset.id);
+  container.append(card);
+  card.scrollIntoView({ block: 'center' });
+}
+
+function renderAiProviderPresetButtons(catalogue) {
+  const host = document.querySelector('[data-ai-provider-presets]');
+  if (!host) {
+    return;
+  }
+  host.querySelectorAll('[data-ai-preset-group]').forEach((node) => node.remove());
+  const byGroup = new Map();
+  (catalogue.providers || []).forEach((preset) => {
+    if (!byGroup.has(preset.group)) {
+      byGroup.set(preset.group, []);
+    }
+    byGroup.get(preset.group).push(preset);
+  });
+  (catalogue.group_order || Array.from(byGroup.keys())).forEach((group) => {
+    const presets = byGroup.get(group);
+    if (!presets || !presets.length) {
+      return;
+    }
+    const row = aiElement('div', 'ai-preset-group');
+    row.setAttribute('data-ai-preset-group', group);
+    row.append(
+      aiElement('span', 'ai-preset-group-label', (catalogue.group_labels || {})[group] || group),
+    );
+    presets.forEach((preset) => {
+      const button = aiElement('button', 'secondary-button', preset.label);
+      button.type = 'button';
+      button.setAttribute('data-ai-provider-preset', preset.id);
+      const counts = preset.models?.length
+        ? `${preset.models.length} 个预设模型`
+        : '模型用「拉取模型列表」';
+      button.title = [preset.english_label, preset.base_url || '自定义地址', counts, preset.note]
+        .filter(Boolean)
+        .join(' · ');
+      button.addEventListener('click', () => addAiProviderFromPreset(preset));
+      row.append(button);
+    });
+    host.append(row);
+  });
+  const note = host.querySelector('[data-ai-provider-presets-note]');
+  if (note && catalogue.generated_at) {
+    note.textContent = `添加提供商：预设来自 models.dev（${catalogue.generated_at}），只是起步，模型名以「拉取模型列表」为准。`;
+  }
+}
+
+async function loadAiProviderPresets() {
+  if (aiProviderPresetCatalogue) {
+    renderAiProviderPresetButtons(aiProviderPresetCatalogue);
+    return aiProviderPresetCatalogue;
+  }
+  try {
+    const response = await fetch('/api/ai-provider-presets');
+    if (!response.ok) {
+      return null;
+    }
+    aiProviderPresetCatalogue = await response.json();
+    renderAiProviderPresetButtons(aiProviderPresetCatalogue);
+    return aiProviderPresetCatalogue;
+  } catch {
+    return null;
+  }
+}
+
+function appendAiModelsToCard(card, rows) {
+  const list = card.querySelector('[data-ai-provider-model-list]');
+  if (!list) {
+    return 0;
+  }
+  const existing = new Set(
+    Array.from(list.querySelectorAll('[data-ai-model-id]')).map((input) => input.value.trim()),
+  );
+  let added = 0;
+  rows.forEach((row) => {
+    if (!row.id || existing.has(row.id)) {
+      return;
+    }
+    existing.add(row.id);
+    list.append(renderAiModelRow(row));
+    added += 1;
+  });
+  return added;
+}
+
+function addPresetModelsToCard(card, status) {
+  const presetId = card.getAttribute('data-ai-provider-preset-id')
+    || card.querySelector('[data-ai-provider-id]')?.value?.trim()
+    || '';
+  const preset = aiPresetById(presetId) || aiPresetById(presetId.replace(/-\d+$/, ''));
+  if (!preset || !preset.models?.length) {
+    status.textContent = '这个提供商没有预设模型，请用「拉取模型列表」。';
+    status.classList.add('is-error');
+    return;
+  }
+  const added = appendAiModelsToCard(card, presetModelRows(preset));
+  status.classList.remove('is-error');
+  status.textContent = added ? `已补充 ${added} 个预设模型，记得保存。` : '预设模型都已经在列表里了。';
+}
+
 function bindAiProviderPage() {
   const page = document.querySelector('[data-ai-provider-page]');
   if (!page) {
     return;
   }
   const status = page.querySelector('[data-ai-provider-save-status]');
-  page.querySelectorAll('[data-ai-provider-preset]').forEach((button) => {
-    button.addEventListener('click', () => {
-      const preset = AI_PROVIDER_PRESETS[button.dataset.aiProviderPreset] || AI_PROVIDER_PRESETS.custom;
-      const container = page.querySelector('[data-ai-provider-list]');
-      if (!container) {
-        return;
-      }
-      container.append(
-        renderAiProviderCard(
-          { id: preset.id, label: preset.label, base_url: preset.base_url, timeout_seconds: 60, enabled: true },
-          preset.model ? [{ id: preset.model, model: preset.model, label: preset.label, supports_text: true }] : [],
-        ),
-      );
-    });
-  });
+  loadAiProviderPresets();
   const save = page.querySelector('[data-ai-provider-save]');
   if (save && status) {
     save.addEventListener('click', () => saveAiProviders(status));

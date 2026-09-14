@@ -209,6 +209,12 @@ def test_app_js_drives_the_provider_and_stage_pages(tmp_path):
     assert "collectAiModelConfigs()" not in response.text
     # Keys are write-only: nothing in the page ever puts one in storage.
     assert "ai-provider-key" not in response.text
+    # Phase 6: the preset buttons come from the catalogue API, and each card
+    # can ask its provider what it actually serves.
+    assert "'/api/ai-provider-presets'" in response.text
+    assert "data-ai-model-preset-add" in response.text
+    # The old three-entry table is gone; nothing hard-codes a provider now.
+    assert "AI_PROVIDER_PRESETS" not in response.text
 
 
 def test_app_js_refreshes_group_list_after_live_or_manual_updates(tmp_path):

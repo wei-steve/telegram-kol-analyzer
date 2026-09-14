@@ -61,6 +61,7 @@ from telegram_kol_research.app_logging import (
     read_log_page,
 )
 from telegram_kol_research.ai_model_router import run_with_fallback
+from telegram_kol_research.ai_provider_presets import load_provider_presets
 from telegram_kol_research.ai_recognition_config import (
     AI_STAGE_KEYS,
     AiModel,
@@ -9681,6 +9682,19 @@ def create_web_app(
         except (PromptRegistryError, TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
+
+    @app.get("/api/ai-provider-presets")
+    def get_ai_provider_presets():
+        """The shipped provider catalogue the 添加提供商 buttons render from."""
+
+        catalogue = load_provider_presets()
+        return {
+            "generated_at": catalogue.get("generated_at", ""),
+            "source": catalogue.get("source", ""),
+            "group_order": catalogue.get("group_order", []),
+            "group_labels": catalogue.get("group_labels", {}),
+            "providers": catalogue.get("providers", []),
+        }
 
     @app.get("/api/ai-providers")
     def get_ai_providers():

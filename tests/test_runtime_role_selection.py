@@ -526,14 +526,24 @@ def test_split_runtime_provisioning_grants_shared_configs_read_only_access():
     deployment_guide = (repository_root / "docs" / "server-deployment.md").read_text(
         encoding="utf-8"
     )
-    shared_configs = (
-        "/opt/telegram-kol-analyzer/config/groups.yaml",
-        "/opt/telegram-kol-analyzer/config/ai_recognition.yaml",
-    )
+    # ``ai_recognition.yaml`` is the one shared config the web role *writes*:
+    # the AI provider pages save it (2026-09-14), so it is group-writable and
+    # the web unit has a ReadWritePaths entry for exactly that file. Everything
+    # else in ``config/`` stays read-only to the runtime group.
+    shared_configs = {
+        "/opt/telegram-kol-analyzer/config/groups.yaml": "0640",
+        "/opt/telegram-kol-analyzer/config/ai_recognition.yaml": "0660",
+    }
 
-    for shared_config in shared_configs:
+    for shared_config, mode in shared_configs.items():
         assert f"chgrp telegram-kol-runtime {shared_config}" in deployment_guide
-        assert f"chmod 0640 {shared_config}" in deployment_guide
+        assert f"chmod {mode} {shared_config}" in deployment_guide
+    assert (
+        "ReadWritePaths=/opt/telegram-kol-analyzer/config/ai_recognition.yaml"
+        in (repository_root / "deploy" / "systemd" / "telegram-kol-web.service").read_text(
+            encoding="utf-8"
+        )
+    )
     assert (
         "chgrp -R telegram-kol-runtime /opt/telegram-kol-analyzer/config"
         not in deployment_guide

@@ -1,0 +1,1054 @@
+{
+  "generated_at": "2026-09-14",
+  "source": "https://models.dev/api.json",
+  "max_models_per_provider": 8,
+  "group_order": [
+    "domestic",
+    "international",
+    "local",
+    "custom"
+  ],
+  "group_labels": {
+    "domestic": "国内",
+    "international": "国际",
+    "local": "本地",
+    "custom": "自定义"
+  },
+  "providers": [
+    {
+      "id": "deepseek",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "DeepSeek",
+      "english_label": "DeepSeek",
+      "base_url": "https://api.deepseek.com",
+      "doc_url": "https://api-docs.deepseek.com/quick_start/pricing",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "deepseek-v4-flash-vision-exp",
+          "label": "DeepSeek V4 Flash Vision Exp",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-10"
+        },
+        {
+          "id": "deepseek-v4-flash",
+          "label": "DeepSeek V4 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-10"
+        },
+        {
+          "id": "deepseek-flash",
+          "label": "DeepSeek V4.1 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-10"
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "label": "DeepSeek V4 Pro",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-08-12"
+        }
+      ]
+    },
+    {
+      "id": "zhipuai",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "智谱 GLM",
+      "english_label": "Zhipu AI",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "doc_url": "https://docs.z.ai/guides/overview/pricing",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "glm-5.3-flash",
+          "label": "GLM-5.3-Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-26"
+        },
+        {
+          "id": "glm-5.3",
+          "label": "GLM-5.3",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-08-14"
+        },
+        {
+          "id": "glm-5.2",
+          "label": "GLM-5.2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-13"
+        },
+        {
+          "id": "glm-5v-turbo",
+          "label": "GLM-5V-Turbo",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-01"
+        },
+        {
+          "id": "glm-5.1",
+          "label": "GLM-5.1",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-03-27"
+        },
+        {
+          "id": "glm-5",
+          "label": "GLM-5",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-02-11"
+        },
+        {
+          "id": "glm-4.7-flashx",
+          "label": "GLM-4.7-FlashX",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-01-19"
+        },
+        {
+          "id": "glm-4.7-flash",
+          "label": "GLM-4.7-Flash",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-01-19"
+        }
+      ]
+    },
+    {
+      "id": "xiaomi",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "小米 MiMo",
+      "english_label": "Xiaomi",
+      "base_url": "https://api.xiaomimimo.com/v1",
+      "doc_url": "https://platform.xiaomimimo.com/#/docs",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "mimo-v2.5-pro",
+          "label": "MiMo-V2.5-Pro",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-22"
+        },
+        {
+          "id": "mimo-v2.5",
+          "label": "MiMo-V2.5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-22"
+        },
+        {
+          "id": "mimo-v2-pro",
+          "label": "MiMo-V2-Pro",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-03-18"
+        },
+        {
+          "id": "mimo-v2-omni",
+          "label": "MiMo-V2-Omni",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-18"
+        },
+        {
+          "id": "mimo-v2-flash",
+          "label": "MiMo-V2-Flash",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-12-16"
+        },
+        {
+          "id": "mimo-v2.5-pro-ultraspeed",
+          "label": "MiMo-V2.5-Pro-UltraSpeed",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-08"
+        }
+      ]
+    },
+    {
+      "id": "alibaba-cn",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "阿里百炼（通义 Qwen）",
+      "english_label": "Alibaba (China)",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "doc_url": "https://www.alibabacloud.com/help/en/model-studio/models",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "qwen3.8-flash",
+          "label": "Qwen3.8 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-26"
+        },
+        {
+          "id": "qwen3.8-max",
+          "label": "Qwen3.8 Max",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-03"
+        },
+        {
+          "id": "qwen3.7-flash",
+          "label": "Qwen3.7 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-15"
+        },
+        {
+          "id": "glm-5.2",
+          "label": "GLM-5.2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-13"
+        },
+        {
+          "id": "qwen3.7-plus",
+          "label": "Qwen3.7 Plus",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-02"
+        },
+        {
+          "id": "qwen3.7-max",
+          "label": "Qwen3.7 Max",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-05-21"
+        },
+        {
+          "id": "qwen3.6-flash",
+          "label": "Qwen3.6 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-27"
+        },
+        {
+          "id": "deepseek-v4-pro",
+          "label": "DeepSeek V4 Pro",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-24"
+        }
+      ]
+    },
+    {
+      "id": "moonshotai-cn",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "月之暗面 Kimi",
+      "english_label": "Moonshot AI (China)",
+      "base_url": "https://api.moonshot.cn/v1",
+      "doc_url": "https://platform.moonshot.cn/docs/api/chat",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "kimi-k3",
+          "label": "Kimi K3",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-16"
+        },
+        {
+          "id": "kimi-k2.7-code-highspeed",
+          "label": "Kimi K2.7 Code HighSpeed",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-12"
+        },
+        {
+          "id": "kimi-k2.7-code",
+          "label": "Kimi K2.7 Code",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-12"
+        },
+        {
+          "id": "kimi-k2.6",
+          "label": "Kimi K2.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-21"
+        }
+      ]
+    },
+    {
+      "id": "siliconflow-cn",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "硅基流动",
+      "english_label": "SiliconFlow (China)",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "doc_url": "https://cloud.siliconflow.com/models",
+      "requires_api_key": true,
+      "note": "聚合平台，模型很多，建议用「拉取模型列表」",
+      "models": [
+        {
+          "id": "zai-org/GLM-5.2",
+          "label": "GLM-5.2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-13"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Pro",
+          "label": "deepseek-ai/DeepSeek-V4-Pro",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-24"
+        },
+        {
+          "id": "deepseek-ai/DeepSeek-V4-Flash",
+          "label": "DeepSeek V4 Flash",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-24"
+        },
+        {
+          "id": "Pro/moonshotai/Kimi-K2.6",
+          "label": "Pro/moonshotai/Kimi-K2.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-21"
+        },
+        {
+          "id": "Qwen/Qwen3.6-35B-A3B",
+          "label": "Qwen/Qwen3.6-35B-A3B",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-17"
+        },
+        {
+          "id": "Pro/zai-org/GLM-5.1",
+          "label": "Pro/zai-org/GLM-5.1",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-08"
+        },
+        {
+          "id": "Qwen/Qwen3.5-9B",
+          "label": "Qwen/Qwen3.5-9B",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-03"
+        },
+        {
+          "id": "Qwen/Qwen3.5-4B",
+          "label": "Qwen/Qwen3.5-4B",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-03"
+        }
+      ]
+    },
+    {
+      "id": "stepfun",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "阶跃星辰",
+      "english_label": "StepFun (China)",
+      "base_url": "https://api.stepfun.com/v1",
+      "doc_url": "https://platform.stepfun.com/docs/zh/overview/concept",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "step-3.7-flash",
+          "label": "Step 3.7 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-05-29"
+        },
+        {
+          "id": "step-3.5-flash",
+          "label": "Step 3.5 Flash",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-01-29"
+        },
+        {
+          "id": "step-3.5-flash-2603",
+          "label": "Step 3.5 Flash 2603",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-04-02"
+        },
+        {
+          "id": "step-2-16k",
+          "label": "Step 2 (16K)",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-01-01"
+        },
+        {
+          "id": "step-1-32k",
+          "label": "Step 1 (32K)",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-01-01"
+        }
+      ]
+    },
+    {
+      "id": "minimax-cn",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "MiniMax",
+      "english_label": "MiniMax (minimaxi.com)",
+      "base_url": "https://api.minimaxi.com/v1",
+      "doc_url": "https://platform.minimaxi.com/docs/guides/quickstart",
+      "requires_api_key": true,
+      "note": "models.dev 给的是 Anthropic 格式地址，这里用 OpenAI 兼容地址",
+      "models": [
+        {
+          "id": "MiniMax-M3",
+          "label": "MiniMax-M3",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-01"
+        },
+        {
+          "id": "MiniMax-M2.7-highspeed",
+          "label": "MiniMax-M2.7-highspeed",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-03-18"
+        },
+        {
+          "id": "MiniMax-M2.7",
+          "label": "MiniMax-M2.7",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-03-18"
+        },
+        {
+          "id": "MiniMax-M2.5-highspeed",
+          "label": "MiniMax-M2.5-highspeed",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-02-13"
+        },
+        {
+          "id": "MiniMax-M2.5",
+          "label": "MiniMax-M2.5",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-02-12"
+        },
+        {
+          "id": "MiniMax-M2.1",
+          "label": "MiniMax-M2.1",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-12-23"
+        },
+        {
+          "id": "MiniMax-M2",
+          "label": "MiniMax-M2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-10-27"
+        }
+      ]
+    },
+    {
+      "id": "volcengine",
+      "group": "domestic",
+      "group_label": "国内",
+      "label": "火山方舟（豆包）",
+      "english_label": "Volcengine Ark",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "doc_url": "https://www.volcengine.com/docs/82379/1330310",
+      "requires_api_key": true,
+      "note": "也可以直接填你自己创建的接入点 id（ep-...）",
+      "models": [
+        {
+          "id": "deepseek-v4-pro-ga-260813",
+          "label": "DeepSeek V4 Pro 0813",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-08-12"
+        },
+        {
+          "id": "deepseek-v4-flash-ga-260731",
+          "label": "DeepSeek V4 Flash 0731",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-07-31"
+        },
+        {
+          "id": "doubao-seed-evolving",
+          "label": "Seed Evolving",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-23"
+        },
+        {
+          "id": "doubao-seed-character-260628",
+          "label": "Seed Character",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-23"
+        },
+        {
+          "id": "doubao-seed-2-1-turbo-260628",
+          "label": "Seed 2.1 Turbo",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-23"
+        },
+        {
+          "id": "doubao-seed-2-1-pro-260628",
+          "label": "Seed 2.1 Pro",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-23"
+        },
+        {
+          "id": "glm-5-2-260617",
+          "label": "GLM-5.2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-13"
+        },
+        {
+          "id": "doubao-seed-2-0-pro-260215",
+          "label": "Seed 2.0 Pro",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-02-14"
+        }
+      ]
+    },
+    {
+      "id": "openai",
+      "group": "international",
+      "group_label": "国际",
+      "label": "OpenAI",
+      "english_label": "OpenAI",
+      "base_url": "https://api.openai.com/v1",
+      "doc_url": "https://platform.openai.com/docs/models",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "gpt-6-astra",
+          "label": "GPT-6 Astra",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-04"
+        },
+        {
+          "id": "gpt-5.6-terra",
+          "label": "GPT-5.6 Terra",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-09"
+        },
+        {
+          "id": "gpt-5.6-sol",
+          "label": "GPT-5.6 Sol",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-09"
+        },
+        {
+          "id": "gpt-5.6-luna",
+          "label": "GPT-5.6 Luna",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-09"
+        },
+        {
+          "id": "gpt-5.6",
+          "label": "GPT-5.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-09"
+        },
+        {
+          "id": "gpt-5.5-pro",
+          "label": "GPT-5.5 Pro",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-23"
+        },
+        {
+          "id": "gpt-5.5",
+          "label": "GPT-5.5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-23"
+        },
+        {
+          "id": "gpt-5.4-nano",
+          "label": "GPT-5.4 nano",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-17"
+        }
+      ]
+    },
+    {
+      "id": "anthropic",
+      "group": "international",
+      "group_label": "国际",
+      "label": "Anthropic",
+      "english_label": "Anthropic",
+      "base_url": "https://api.anthropic.com/v1",
+      "doc_url": "https://docs.anthropic.com/en/docs/about-claude/models",
+      "requires_api_key": true,
+      "note": "走 Anthropic 的 OpenAI 兼容层",
+      "models": [
+        {
+          "id": "claude-fable-5-1",
+          "label": "Claude Fable 5.1",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-01"
+        },
+        {
+          "id": "claude-opus-5",
+          "label": "Claude Opus 5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-24"
+        },
+        {
+          "id": "claude-sonnet-5",
+          "label": "Claude Sonnet 5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-29"
+        },
+        {
+          "id": "claude-fable-5",
+          "label": "Claude Fable 5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-07"
+        },
+        {
+          "id": "claude-opus-4-8",
+          "label": "Claude Opus 4.8",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-05-28"
+        },
+        {
+          "id": "claude-opus-4-7",
+          "label": "Claude Opus 4.7",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-14"
+        },
+        {
+          "id": "claude-sonnet-4-6",
+          "label": "Claude Sonnet 4.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-02-17"
+        },
+        {
+          "id": "claude-opus-4-6",
+          "label": "Claude Opus 4.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-02-04"
+        }
+      ]
+    },
+    {
+      "id": "google",
+      "group": "international",
+      "group_label": "国际",
+      "label": "Google Gemini",
+      "english_label": "Google",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "doc_url": "https://ai.google.dev/gemini-api/docs/models",
+      "requires_api_key": true,
+      "note": "Gemini 的 OpenAI 兼容层",
+      "models": [
+        {
+          "id": "gemini-3.8-flash",
+          "label": "Gemini 3.8 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-02"
+        },
+        {
+          "id": "gemini-flash-latest",
+          "label": "Gemini Flash Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-13"
+        },
+        {
+          "id": "gemini-3.7-flash",
+          "label": "Gemini 3.7 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-13"
+        },
+        {
+          "id": "gemini-flash-lite-latest",
+          "label": "Gemini Flash-Lite Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-21"
+        },
+        {
+          "id": "gemini-3.6-flash",
+          "label": "Gemini 3.6 Flash",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-21"
+        },
+        {
+          "id": "gemini-3.5-flash-lite",
+          "label": "Gemini 3.5 Flash Lite",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-21"
+        },
+        {
+          "id": "gemini-3.1-flash-lite-image",
+          "label": "Nano Banana 2 Lite",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-06-30"
+        },
+        {
+          "id": "gemini-3.5-live-translate-preview",
+          "label": "Gemini 3.5 Live Translate Preview",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-09"
+        }
+      ]
+    },
+    {
+      "id": "xai",
+      "group": "international",
+      "group_label": "国际",
+      "label": "xAI Grok",
+      "english_label": "xAI",
+      "base_url": "https://api.x.ai/v1",
+      "doc_url": "https://docs.x.ai/docs/models",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "grok-4.6",
+          "label": "Grok 4.6",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-12"
+        },
+        {
+          "id": "grok-4.5",
+          "label": "Grok 4.5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-07-08"
+        },
+        {
+          "id": "grok-4.3",
+          "label": "Grok 4.3",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-17"
+        },
+        {
+          "id": "grok-build-0.1",
+          "label": "Grok Build 0.1",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-16"
+        },
+        {
+          "id": "grok-4.20-multi-agent-0309",
+          "label": "Grok 4.20 Multi-Agent",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-09"
+        },
+        {
+          "id": "grok-4.20-0309-reasoning",
+          "label": "Grok 4.20 (Reasoning)",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-09"
+        },
+        {
+          "id": "grok-4.20-0309-non-reasoning",
+          "label": "Grok 4.20 (Non-Reasoning)",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-09"
+        }
+      ]
+    },
+    {
+      "id": "openrouter",
+      "group": "international",
+      "group_label": "国际",
+      "label": "OpenRouter",
+      "english_label": "OpenRouter",
+      "base_url": "https://openrouter.ai/api/v1",
+      "doc_url": "https://openrouter.ai/models",
+      "requires_api_key": true,
+      "note": "聚合平台，模型很多，建议用「拉取模型列表」",
+      "models": [
+        {
+          "id": "inference-net/schematron-v2-turbo",
+          "label": "Schematron V2 Turbo",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-09-12"
+        },
+        {
+          "id": "inference-net/schematron-v2-small",
+          "label": "Schematron V2 Small",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-09-12"
+        },
+        {
+          "id": "~openai/gpt-terra-latest",
+          "label": "GPT Terra Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        },
+        {
+          "id": "~openai/gpt-sol-latest",
+          "label": "GPT Sol Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        },
+        {
+          "id": "~openai/gpt-luna-latest",
+          "label": "GPT Luna Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        },
+        {
+          "id": "~openai/gpt-astra-latest",
+          "label": "GPT Astra Latest",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        },
+        {
+          "id": "sakana/fugu-ultra-v2",
+          "label": "Fugu Ultra v2",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        },
+        {
+          "id": "sakana/fugu-max",
+          "label": "Fugu Max",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-09-11"
+        }
+      ]
+    },
+    {
+      "id": "groq",
+      "group": "international",
+      "group_label": "国际",
+      "label": "Groq",
+      "english_label": "Groq",
+      "base_url": "https://api.groq.com/openai/v1",
+      "doc_url": "https://console.groq.com/docs/models",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "qwen/qwen3.8-27b",
+          "label": "Qwen3.8 27B",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-08-14"
+        },
+        {
+          "id": "openai/gpt-oss-safeguard-20b",
+          "label": "Safety GPT OSS 20B",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-10-29"
+        },
+        {
+          "id": "qwen/qwen3.6-27b",
+          "label": "Qwen3.6 27B",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-22"
+        },
+        {
+          "id": "openai/gpt-oss-120b",
+          "label": "GPT OSS 120B",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-08-05"
+        },
+        {
+          "id": "openai/gpt-oss-20b",
+          "label": "GPT OSS 20B",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-08-05"
+        },
+        {
+          "id": "groq/compound-mini",
+          "label": "Compound Mini",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-09-04"
+        },
+        {
+          "id": "groq/compound",
+          "label": "Compound",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-09-04"
+        },
+        {
+          "id": "meta-llama/llama-prompt-guard-2-86m",
+          "label": "Prompt Guard 2 86M",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-05-29"
+        }
+      ]
+    },
+    {
+      "id": "mistral",
+      "group": "international",
+      "group_label": "国际",
+      "label": "Mistral",
+      "english_label": "Mistral",
+      "base_url": "https://api.mistral.ai/v1",
+      "doc_url": "https://docs.mistral.ai/getting-started/models/",
+      "requires_api_key": true,
+      "note": "",
+      "models": [
+        {
+          "id": "zai-glm-5-2",
+          "label": "GLM-5.2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-06-13"
+        },
+        {
+          "id": "mistral-medium-latest",
+          "label": "Mistral Medium (latest)",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-29"
+        },
+        {
+          "id": "mistral-medium-2604",
+          "label": "Mistral Medium 3.5",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-04-29"
+        },
+        {
+          "id": "mistral-small-latest",
+          "label": "Mistral Small (latest)",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-16"
+        },
+        {
+          "id": "mistral-small-2603",
+          "label": "Mistral Small 4",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2026-03-16"
+        },
+        {
+          "id": "voxtral-mini-latest",
+          "label": "Voxtral Mini (latest)",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2026-02-01"
+        },
+        {
+          "id": "labs-devstral-small-2512",
+          "label": "Devstral Small 2",
+          "supports_text": true,
+          "supports_image": true,
+          "release_date": "2025-12-09"
+        },
+        {
+          "id": "devstral-latest",
+          "label": "Devstral 2",
+          "supports_text": true,
+          "supports_image": false,
+          "release_date": "2025-12-09"
+        }
+      ]
+    },
+    {
+      "id": "ollama",
+      "group": "local",
+      "group_label": "本地",
+      "label": "Ollama（本机）",
+      "english_label": "",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "doc_url": "",
+      "requires_api_key": false,
+      "note": "本机服务，不需要 Key；模型用「拉取模型列表」",
+      "models": []
+    },
+    {
+      "id": "lmstudio",
+      "group": "local",
+      "group_label": "本地",
+      "label": "LM Studio（本机）",
+      "english_label": "",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "doc_url": "",
+      "requires_api_key": false,
+      "note": "本机服务，不需要 Key；模型用「拉取模型列表」",
+      "models": []
+    },
+    {
+      "id": "custom",
+      "group": "custom",
+      "group_label": "自定义",
+      "label": "自定义（OpenAI 兼容）",
+      "english_label": "",
+      "base_url": "",
+      "doc_url": "",
+      "requires_api_key": true,
+      "note": "任何 OpenAI 兼容端点",
+      "models": []
+    }
+  ]
+}

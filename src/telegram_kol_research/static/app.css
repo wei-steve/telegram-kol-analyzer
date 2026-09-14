@@ -3081,12 +3081,24 @@ body {
 
 /* AI 提供商页：提供商卡片 + 它自己的模型列表 */
 .ai-provider-presets {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.ai-preset-group {
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
   align-items: center;
-  margin-bottom: 12px;
 }
+
+.ai-preset-group-label {
+  min-width: 40px;
+  font-size: 13px;
+  color: rgba(226, 232, 240, 0.72);
+}
+
 
 .ai-provider-list,
 .ai-stage-list {

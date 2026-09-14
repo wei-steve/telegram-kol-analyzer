@@ -175,12 +175,10 @@
         </div>
         <button type="button" class="secondary-button" data-dashboard-tab="main">返回主界面</button>
       </div>
-      <div class="ai-provider-presets">
-        <span>添加提供商：</span>
-        <button type="button" class="secondary-button" data-ai-provider-preset="deepseek">DeepSeek</button>
-        <button type="button" class="secondary-button" data-ai-provider-preset="zhipu">智谱</button>
-        <button type="button" class="secondary-button" data-ai-provider-preset="mimo">MiMo</button>
-        <button type="button" class="secondary-button" data-ai-provider-preset="custom">自定义（OpenAI 兼容）</button>
+      <div class="ai-provider-presets" data-ai-provider-presets>
+        <p class="ai-helper-text" data-ai-provider-presets-note>
+          添加提供商：预设只是起步，模型名以「拉取模型列表」为准。
+        </p>
       </div>
       <div class="ai-provider-list" data-ai-provider-list></div>
       <div class="prompt-actions">

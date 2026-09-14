@@ -2855,10 +2855,9 @@ def test_index_page_shows_group_list_and_messages(tmp_path):
     assert "20.0" in response.text
     assert "AI提供商" in response.text
     assert "data-ai-provider-list" in response.text
-    assert 'data-ai-provider-preset="deepseek"' in response.text
-    assert 'data-ai-provider-preset="zhipu"' in response.text
-    assert 'data-ai-provider-preset="mimo"' in response.text
-    assert 'data-ai-provider-preset="custom"' in response.text
+    # Phase 6: the preset buttons are rendered from /api/ai-provider-presets,
+    # so the template carries their host rather than a fixed three.
+    assert "data-ai-provider-presets" in response.text
     assert 'data-strategy-filter="holding"' in response.text
     assert 'data-strategy-filter="pending"' in response.text
     assert 'data-strategy-filter="exited"' in response.text
