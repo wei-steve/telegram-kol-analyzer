@@ -76,20 +76,6 @@ function setMutationBusy(control, busy) {
   control.setAttribute('aria-busy', busy ? 'true' : 'false');
 }
 
-function escapeHtml(value) {
-  return value
-    .replaceAll('&', '&amp;')
-    .replaceAll('<', '&lt;')
-    .replaceAll('>', '&gt;')
-    .replaceAll('"', '&quot;')
-    .replaceAll("'", '&#39;');
-}
-
-function getConversationKey() {
-  const chatId = getSelectedChatId() || 0;
-  return `telegram-workbench:${chatId}:current_group`;
-}
-
 function getPromptKey(chatId = null) {
   const resolvedChatId = chatId || getSelectedChatId() || '0';
   return `telegram-workbench:prompt:${resolvedChatId}`;
@@ -117,189 +103,6 @@ function applyGroupPromptToEditor(chatId = null) {
     return;
   }
   promptInput.value = loadGroupPrompt(chatId);
-}
-
-function loadConversationHistory() {
-  try {
-    const raw = window.localStorage.getItem(getConversationKey());
-    const history = raw ? JSON.parse(raw) : [];
-    const { history: migratedHistory, changed } = migrateConversationHistory(history);
-    if (changed) {
-      saveConversationHistory(migratedHistory);
-    }
-    return migratedHistory;
-  } catch {
-    return [];
-  }
-}
-
-function migrateConversationHistory(history) {
-  if (!Array.isArray(history)) {
-    return { history: [], changed: true };
-  }
-
-  let changed = false;
-  const migratedHistory = history.map((entry) => {
-    const normalizedAnswer = normalizeAiAnswerText(entry.answer || '');
-    const normalizedSources = isImageInputErrorText(normalizedAnswer) ? [] : (entry.sources || []);
-    if (normalizedAnswer !== (entry.answer || '')) {
-      changed = true;
-    }
-    if (normalizedSources !== (entry.sources || [])) {
-      changed = true;
-    }
-    return {
-      ...entry,
-      answer: normalizedAnswer,
-      sources: isImageInputErrorText(normalizedAnswer) ? [] : (entry.sources || []),
-    };
-  });
-
-  return { history: migratedHistory, changed };
-}
-
-function saveConversationHistory(history) {
-  try {
-    window.localStorage.setItem(getConversationKey(), JSON.stringify(history));
-  } catch {
-    // ignore storage failures in local-only mode
-  }
-}
-
-function clearConversationHistory() {
-  try {
-    window.localStorage.removeItem(getConversationKey());
-  } catch {
-    // ignore storage failures in local-only mode
-  }
-}
-
-function normalizeAiAnswerText(answer) {
-  const text = String(answer || '');
-  if (isImageInputErrorText(text)) {
-    return '当前模型不支持直接图片理解，本次分析会优先基于文字消息与 OCR 内容。';
-  }
-  return text;
-}
-
-function isImageInputErrorText(answer) {
-  const lowered = String(answer || '').toLowerCase();
-  return lowered.includes('does not support image input');
-}
-
-function renderConversationHistory() {
-  const container = document.querySelector('[data-ai-history]');
-  if (!container) {
-    return;
-  }
-  const history = loadConversationHistory();
-  if (history.length === 0) {
-    container.innerHTML = '<div class="history-empty">还没有分析报告。输入一个问题后，这里会生成该群的研究卡片。</div>';
-    return;
-  }
-  container.innerHTML = history
-    .map((entry) => {
-      const normalizedAnswer = normalizeAiAnswerText(entry.answer || '');
-      const shouldShowSources = !isImageInputErrorText(normalizedAnswer);
-      return `
-      <article class="history-turn ai-report-card">
-        <div class="history-question-block ai-report-meta">
-          <span class="ai-report-label">提问</span>
-          <div class="history-content">${escapeHtml(entry.question || '')}</div>
-          ${renderHistoryTimestamp(entry.createdAt)}
-        </div>
-        <div class="history-answer-block ai-report-body">
-          <div class="ai-report-kicker">AI 研究结论</div>
-          <div class="history-content">${renderCitations(normalizedAnswer, shouldShowSources ? (entry.sources || []) : [])}</div>
-          ${shouldShowSources ? renderHistorySources(entry.sources || []) : ''}
-        </div>
-      </article>
-    `;
-    })
-    .join('');
-  bindCitationClicks(container);
-  scrollAiHistoryToLatest();
-}
-
-function renderHistoryTimestamp(value) {
-  if (!value) {
-    return '';
-  }
-  const date = new Date(value);
-  if (Number.isNaN(date.getTime())) {
-    return '';
-  }
-  const year = date.getFullYear();
-  const month = String(date.getMonth() + 1).padStart(2, '0');
-  const day = String(date.getDate()).padStart(2, '0');
-  const hour = String(date.getHours()).padStart(2, '0');
-  const minute = String(date.getMinutes()).padStart(2, '0');
-  return `<div class="history-timestamp">${year}-${month}-${day} ${hour}:${minute}</div>`;
-}
-
-function renderHistorySources(sources) {
-  if (!sources || sources.length === 0) {
-    return '';
-  }
-  return `
-    <details class="history-sources">
-      <summary>引用消息 ${sources.length} 条</summary>
-      <div class="history-sources-list">${renderSourceList(sources)}</div>
-    </details>
-  `;
-}
-
-function renderCitations(answer, sources) {
-  const sourceMap = new Map((sources || []).map((source) => [String(source.index), source]));
-  const escapedAnswer = escapeHtml(answer || '');
-  return escapedAnswer.replace(/\[(\d+)\]/g, (_, index) => {
-    const source = sourceMap.get(index);
-    if (!source || !source.raw_message_id) {
-      return `[${index}]`;
-    }
-    return `<button type="button" class="citation-link" data-target-id="message-${source.raw_message_id}">[${index}]</button>`;
-  });
-}
-
-function renderSourceList(sources) {
-  if (!sources || sources.length === 0) {
-    return '';
-  }
-  return sources
-    .map((source) => {
-      const targetId = source.raw_message_id ? `message-${source.raw_message_id}` : '';
-      const button = targetId
-        ? `<button type="button" class="source-jump" data-target-id="${targetId}">${escapeHtml(source.label)}</button>`
-        : `<span>${escapeHtml(source.label)}</span>`;
-      return `<div class="source-item">${button}</div>`;
-    })
-    .join('');
-}
-
-function bindCitationClicks(container) {
-  container.querySelectorAll('[data-target-id]').forEach((element) => {
-    element.addEventListener('click', () => {
-      const target = document.getElementById(element.dataset.targetId);
-      if (!target) {
-        return;
-      }
-      target.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      target.classList.add('message-card-highlight');
-      window.setTimeout(() => target.classList.remove('message-card-highlight'), 1500);
-    });
-  });
-}
-
-function getAiHistoryScrollContainer() {
-  return document.querySelector('[data-ai-history-scroll]');
-}
-
-function scrollAiHistoryToLatest() {
-  const container = getAiHistoryScrollContainer();
-  if (!container) {
-    return;
-  }
-  container.scrollTo({ top: container.scrollHeight, behavior: 'smooth' });
 }
 
 function setAiStatus(message, isError = false) {
@@ -1419,7 +1222,6 @@ function bindGroupLinks() {
           }).catch((error) => handleGroupDetailCompanionError(error, requestId));
         }
         applyGroupPromptToEditor(String(chatId));
-        renderConversationHistory();
         document.dispatchEvent(new CustomEvent('group-context-success', { detail: { chatId } }));
         refreshGroupList().catch(() => {});
       } catch (error) {
@@ -4757,18 +4559,6 @@ function buildLegacyAiRecognitionConfigPayload() {
   };
 }
 
-function bindClearAiHistory() {
-  const clearButton = document.querySelector('[data-clear-ai-history]');
-  if (!clearButton) {
-    return;
-  }
-  clearButton.addEventListener('click', () => {
-    clearConversationHistory();
-    renderConversationHistory();
-    setAiStatus('Current group conversation cleared.');
-  });
-}
-
 function setRecoveryStatus(message, isError = false) {
   const status = document.querySelector('[data-recovery-status]');
   if (!status) {
@@ -5495,13 +5285,11 @@ window.addEventListener('DOMContentLoaded', () => {
   bindAiPromptCenter();
   bindAiModelSelectionForm();
   bindGroupPromptEditor();
-  bindClearAiHistory();
   bindBoundPositionCloseButtons();
   bindManualCloseButtons();
   bindDeepcoinPositionSync();
   initLogViewer();
   bindLivePositionAttributionButtons();
-  renderConversationHistory();
   setAiStatus('');
   resetInitialMessagePanelScroll();
   connectLiveUpdates();

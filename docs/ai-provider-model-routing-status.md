@@ -28,6 +28,7 @@ shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-tradi
 | 6 | 提供商预设目录（19 家）、拉取模型列表、统一端点拼接 | completed | 见下方证据 | 全量 8841 passed / 0 failed / 4 skipped |
 | 7 | 显式「自动追加 /v1」开关 + 端点预览 | completed | `4d69b0c0` |
 | 8 | 删掉死掉的「Web 群消息问答」环节 | completed | `60c89068` | 全量 8825 passed / 0 failed / 4 skipped | 全量 8858 passed / 0 failed / 4 skipped |
+| 8b | 删掉 `app.js` 里死掉的群问答「对话历史」渲染代码（决定 46） | completed | 见下方证据 | 全量 8824 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -222,6 +223,68 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
 
 旧配置文件里残留的 `stages.research_chat` 键：**加载时静默丢弃并 warning，不抛错**；保存后该键消失。
 这条路径本来就有（`normalize_ai_config_v2` 只遍历 `AI_STAGE_DEFINITIONS`），阶段 8 补了用例钉死。
+
+## 阶段 8b 做了什么
+
+删掉 `src/telegram_kol_research/static/app.js` 里只服务 `[data-ai-history]` 的那一簇渲染代码，
+外加 `app.css` 里只给它用的一条规则。`[data-ai-history]` / `[data-ai-history-scroll]` /
+`[data-clear-ai-history]` 从 2026-06-14 起就不在模板里了（`tests/test_web_page_render.py`
+早有反向断言钉住），阶段 8 又删掉了写入方 `submitAiQuestion` 与 `/api/chat`，
+所以这一簇既没有节点可画、也没有数据可写。
+
+**删掉的每个符号、最后一个引用是谁、为什么那个引用也死**（行号是删除前的）：
+
+| 符号 | 最后一个引用 | 为什么那个引用也死 |
+|---|---|---|
+| `renderConversationHistory` | 1422（切群）、4767（`bindClearAiHistory`）、5504（`DOMContentLoaded`） | 见下面「三个调用点逐个判定」 |
+| `loadConversationHistory` | `renderConversationHistory`:195 | 随 `renderConversationHistory` 一起删 |
+| `migrateConversationHistory` | `loadConversationHistory`:126 | 同上，唯一调用者被删 |
+| `saveConversationHistory` | `loadConversationHistory`:128（迁移后回写） | 同上；没有别的地方写这个键了（写入方 `submitAiQuestion` 阶段 8 已删） |
+| `clearConversationHistory` | `bindClearAiHistory`:4766 | `bindClearAiHistory` 整个被删 |
+| `getConversationKey` | 124 / 163 / 171 | 三处分别在 load / save / clear 里，全在簇内；localStorage 键 `telegram-workbench:${chatId}:current_group` 随之没有任何读写方 |
+| `normalizeAiAnswerText` | `migrateConversationHistory`:143、`renderConversationHistory`:202 | 两个调用者都被删 |
+| `isImageInputErrorText` | 144 / 154（migrate）、179（normalize）、203（render） | 四处全在簇内 |
+| `renderHistoryTimestamp` | `renderConversationHistory`:209 | 唯一调用者被删（阶段 8 的决定 47 保留了它，8b 里连同渲染器一起走） |
+| `renderCitations` | `renderConversationHistory`:213 | 同上 |
+| `renderHistorySources` | `renderConversationHistory`:214 | 同上 |
+| `renderSourceList` | `renderHistorySources`:247 | 唯一调用者被删 |
+| `bindCitationClicks` | `renderConversationHistory`:220 | 同上 |
+| `scrollAiHistoryToLatest` | `renderConversationHistory`:221 | 同上 |
+| `getAiHistoryScrollContainer` | `scrollAiHistoryToLatest`:298 | 唯一调用者被删；它查的 `[data-ai-history-scroll]` 同样不在模板里 |
+| `escapeHtml` | 208（render）、254（`renderCitations`）、272 / 273（`renderSourceList`） | 四处全在簇内。名字通用，但全文件只有这一簇在用 |
+| `bindClearAiHistory` | `DOMContentLoaded`:5498 | 调用点本身还活着，但这个函数第一行就是 `document.querySelector('[data-clear-ai-history]')`，模板里没有这个节点，所以它 06-14 起每次都直接 `return`——整个函数是死路径，连同 5498 那行调用一起删 |
+| `.message-card-highlight`（`app.css`） | `bindCitationClicks`:287 / 288 | 全仓只有这两行加/去这个 class，模板里也没有写死它 |
+
+**三个调用点逐个判定**（指挥会话点名要逐个查的那件事）：
+
+- **1422**，切群成功路径里 `applyGroupPromptToEditor(String(chatId))` 的下一行。
+  这条路径**活着**（提示词编辑器、消息列表、群组事件都靠它），节点不存在时
+  `renderConversationHistory` 只是空操作 → **只删这一行调用**，周围一行不动。
+- **5504**，`DOMContentLoaded` 里 `bindLivePositionAttributionButtons()` 之后、`setAiStatus('')` 之前。
+  同样**活着**、同样是空操作 → **只删这一行调用**。`setAiStatus('')` 保留（`[data-ai-status]` 还在模板里）。
+- **4767**，在 `bindClearAiHistory` 的 click 回调里。这个**调用点自己就在死路径上**：
+  `bindClearAiHistory` 只为 `[data-clear-ai-history]` 而存在 → 连同整个函数、它里面的
+  `clearConversationHistory()` 与 `setAiStatus('Current group conversation cleared.')`
+  （唯一一处还没汉化的英文提示，正好随之消失）、以及 5498 那行绑定**一并删**。
+
+**全仓 grep 的结果**（`data-ai-history` / `ai-history` / `conversation` / `citation`，
+外加 `escapeHtml` / `renderSourceList` / `message-card-highlight`）：
+
+- `src/telegram_kol_research/static/`（`app.js` + `app.css`）与 `templates/`：**零命中**。
+- `tests/test_web_page_render.py`:2886–2895 —— `"Conversation" not in`、
+  `"data-ai-history-scroll" not in`、`"data-clear-ai-history" not in` 等**反向断言**，
+  钉的是模板不许把这些节点加回来，**是活的、保留**。
+- `src/telegram_kol_research/management_target_confirmation.py`:4、
+  `strategy_management_worker.py`:226、`tests/test_management_reliability_step9.py`:4 / 268 ——
+  英文散文里的 "conversation"（讲「通知是半场对话」和「只有 SYSTEM bot 自己的会话能回答」），
+  与群问答无关，**保留**。
+
+测试改动：`tests/test_web_assets_smoke.py` 里两条正向断言的用例
+（`test_app_js_includes_conversation_history_migration_for_legacy_image_errors`、
+`test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns`，后者是阶段 8 决定 47 留下的）
+换成一条反向用例 `test_app_js_no_longer_carries_the_conversation_history_renderer`，
+逐个断言 11 个符号/属性名不再出现在 `/static/app.js` 里。
+`tests/test_prompt_center_assets.py` 不涉及这些符号，未改。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -459,6 +522,27 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
 47. **`test_web_assets_smoke` 里那条 `createdAt: new Date().toISOString()` 断言删掉了，
     渲染端的两条保留。** 写入方是 `submitAiQuestion`（已删），但渲染端还要能正确读出
     06-14 之前存进浏览器 localStorage 的那些回合——那是数据，不是代码。
+
+48. **`escapeHtml` 也删了，尽管它的名字像个通用工具。**
+    删之前逐个查过它的四处引用（208 / 254 / 272 / 273），全部在这一簇里面；
+    `app.js` 其余拼 HTML 的地方各自有转义或者用 `textContent`。留着一个没人调用的转义函数，
+    下一个读这段代码的人会以为「这里有统一的转义入口」，比没有更糟。将来真要用，一行就能加回来。
+
+49. **浏览器里已经存着的 `telegram-workbench:<chatId>:current_group` 不清理。**
+    那是用户浏览器 localStorage 里的数据，不是代码。现在没有任何代码再读它，留着不影响任何行为；
+    为了删它反而要在每次页面加载时跑一段一次性清理逻辑——为了擦掉一个没人读的键，
+    给活着的启动路径加代码，不划算。和「数据库里已有的 registry 行不要删」是同一条理由。
+
+50. **`.message-card-highlight` 这条 CSS 规则一并删。**
+    它只被 `bindCitationClicks` 的两行 `classList.add/remove` 用过，模板里没有写死这个 class。
+    引用消息跳转是群问答的功能，跳转没了，高亮样式也就没有触发者了。
+
+51. **浏览器验证没有用 `.claude/launch.json` 的 8099 端口，改成在 worktree 里直接起 8098。**
+    按 `preview_start` 起的 8099 进程实际是从**主检出**（`/Users/steven/Documents/telegram获取消息/.venv/...`）
+    启动的，`/static/app.js` 回的是主检出那份旧文件（215989 字节、仍含 `renderConversationHistory`），
+    验的不是本轮的改动。改成 `.venv/bin/telegram-kol-research web --port 8098`（cwd = 本 worktree）之后，
+    `/static/app.js` 回的是 209298 字节、零命中的新文件。**提醒指挥会话**：以后各阶段的浏览器验证
+    都该先核对一次 `/static/app.js` 的大小或者某个新符号，确认打到的是自己的代码。
 
 ## 交接摘要（下一个会话先读这一段）
 
@@ -799,3 +883,19 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
   worker 日志里该 warning 出现 3 次（三处加载各一次），符合预期。
 - 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `0cd18e15`。
 - 后续可选清理：`app.js` 里 `renderConversationHistory` 一簇群问答历史 UI 代码（决定 46），未纳入本轮。
+
+### 阶段 8b
+
+- 提交：`refactor(web): phase 8b remove the dead conversation-history UI code`（SHA 见指挥会话的合入记录；提交不能包含自己的 SHA）
+- 全量：`uv run python -m pytest -q` → **8824 passed, 4 skipped, 0 failed**（730 s）
+  —— 阶段 8 是 8825，8b 删掉 2 条正向用例、加回 1 条反向用例，净 -1，对得上
+- `app.js`：212 行删除（`node --check` 通过），文件从 215989 字节降到 209298 字节。
+- `app.css`：删掉 `.message-card-highlight` 一条规则（6 行 + 一行注释）。
+- 测试：`tests/test_web_assets_smoke.py` 的两条正向用例换成一条反向用例
+  `test_app_js_no_longer_carries_the_conversation_history_renderer`。
+  三个相关文件先跑了一遍：`test_web_assets_smoke` + `test_web_page_render` +
+  `test_prompt_center_assets` = 206 passed。
+- 浏览器验证：`browser-verification.md` 的「阶段 8b 追加验证」一节（7 步）。
+  四个视图（主界面 / 群组 / 消息列表 / AI模型选择）全程 `read_console_messages` 返回
+  “No console logs.”——既没有 `is not defined`，也没有 `null` 报错；
+  `window.renderConversationHistory` 与 `window.escapeHtml` 都是 `undefined`。

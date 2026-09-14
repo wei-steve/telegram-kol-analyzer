@@ -162,30 +162,30 @@ def test_management_batch_assets_only_load_read_only_api(tmp_path):
         assert forbidden not in js
 
 
-def test_app_js_includes_conversation_history_migration_for_legacy_image_errors(tmp_path):
+def test_app_js_no_longer_carries_the_conversation_history_renderer(tmp_path):
+    """The group-chat answer feed left the templates on 2026-06-14 and the
+    endpoint behind it went in phase 8; phase 8b deleted the renderer that had
+    kept drawing into a ``[data-ai-history]`` node no page emits any more."""
+
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
 
     response = client.get("/static/app.js")
 
     assert response.status_code == 200
-    assert "migrateConversationHistory" in response.text
-    assert "saveConversationHistory(migratedHistory);" in response.text
-    assert "normalizeAiAnswerText(entry.answer || '')" in response.text
-    assert "sources: isImageInputErrorText(normalizedAnswer) ? [] : (entry.sources || [])" in response.text
-
-
-def test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns(tmp_path):
-    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
-
-    response = client.get("/static/app.js")
-
-    assert response.status_code == 200
-    assert "renderHistoryTimestamp" in response.text
-    # The turn that wrote ``createdAt`` was ``submitAiQuestion``, deleted with
-    # the Web group chat in phase 8. The renderer still has to read a stored
-    # timestamp correctly: a browser that used the feature before 2026-06-14
-    # still has those turns in local storage.
-    assert "${renderHistoryTimestamp(entry.createdAt)}" in response.text
+    for removed in (
+        "renderConversationHistory",
+        "data-ai-history",
+        "loadConversationHistory",
+        "saveConversationHistory",
+        "migrateConversationHistory",
+        "renderHistoryTimestamp",
+        "renderHistorySources",
+        "renderCitations",
+        "bindCitationClicks",
+        "scrollAiHistoryToLatest",
+        "bindClearAiHistory",
+    ):
+        assert removed not in response.text
 
 
 def test_app_js_drives_the_provider_and_stage_pages(tmp_path):

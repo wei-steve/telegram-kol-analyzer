@@ -4207,13 +4207,6 @@ body {
   padding: 0;
 }
 
-/* ── Message card highlight ── */
-.message-card-highlight {
-  background: rgba(59, 130, 246, 0.16);
-  box-shadow: 0 0 0 1px rgba(96, 165, 250, 0.55);
-  border-radius: 8px;
-}
-
 /* ── Media ── */
 .media-list { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 8px; }
 .media-item { display: grid; gap: 6px; }

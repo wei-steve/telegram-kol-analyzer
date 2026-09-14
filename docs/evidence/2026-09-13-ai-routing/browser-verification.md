@@ -145,3 +145,23 @@ uv run telegram-kol-research web --runtime-role web --host 127.0.0.1 --port 8099
 | 6 | 浏览器控制台 | 没有 `is not defined` 一类错误；`window.submitAiQuestion` 为 `undefined` |
 | 7 | 从页面 `fetch('/api/chat')` | 404 |
 
+
+---
+
+# 阶段 8b 追加验证（2026-09-14）：删掉 app.js 里死掉的「对话历史」渲染
+
+起始文件同样是 example（v2）。这一遍**没有用 `.claude/launch.json` 的 8099 端口**：
+那条命令被解析到了主检出目录（`/Users/steven/Documents/telegram获取消息/.venv/...`），
+`/static/app.js` 回的是主检出的旧文件（215989 字节，仍含 `renderConversationHistory`）。
+改成在本 worktree 里直接起 `.venv/bin/telegram-kol-research web --port 8098`，
+`/static/app.js` 回的才是改过的文件（209298 字节，0 处命中）。仍然没有 PNG：浏览器工具只能把截图返回到会话里。
+
+| # | 操作 | 结果 |
+|---|---|---|
+| 1 | `fetch('/static/app.js')` 后查 5 个符号 | `renderConversationHistory` / `data-ai-history` / `escapeHtml` / `bindClearAiHistory` / `renderCitations` **一个都没有** |
+| 2 | 打开主界面（策略视图） | 正常渲染；控制台**一条消息都没有**（无 log/warn/error） |
+| 3 | 切到「群组」页 | 16 个群组卡片正常渲染；控制台仍然空 |
+| 4 | 点「比特智 智哥 11分组」切群 | 切群成功（中栏标题变成该群、消息列表面板渲染出「最新消息 - · 共 0 条」＋筛选条）。这条路径就是原来 1422 行 `renderConversationHistory()` 的调用点，删掉调用后**没有 `is not defined`、没有 `null` 报错** |
+| 5 | 切群后查页面 | `window.renderConversationHistory` = `undefined`、`window.escapeHtml` = `undefined`；`[data-ai-history]` / `[data-clear-ai-history]` 都不存在 |
+| 6 | 打开「AI模型选择」页 | 6 个环节全部渲染，逐行「当前生效」正确；`strategy_alert` 仍显示「未绑定，沿用环境变量 TELEGRAM_KOL_ALERT_LLM_MODEL / TELEGRAM_KOL_LLM_*」；控制台仍然空 |
+| 7 | 四个视图合计的控制台 | `read_console_messages` 全程返回 “No console logs.” |
