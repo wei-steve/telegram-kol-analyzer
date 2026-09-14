@@ -27,7 +27,7 @@ shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-tradi
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | `4aadf158` | 全量 8788 passed / 0 failed / 4 skipped |
 | 6 | 提供商预设目录（19 家）、拉取模型列表、统一端点拼接 | completed | 见下方证据 | 全量 8841 passed / 0 failed / 4 skipped |
 | 7 | 显式「自动追加 /v1」开关 + 端点预览 | completed | `4d69b0c0` |
-| 8 | 删掉死掉的「Web 群消息问答」环节 | completed | 见下方证据 | 全量 8825 passed / 0 failed / 4 skipped | 全量 8858 passed / 0 failed / 4 skipped |
+| 8 | 删掉死掉的「Web 群消息问答」环节 | completed | `60c89068` | 全量 8825 passed / 0 failed / 4 skipped | 全量 8858 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -774,8 +774,7 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
 
 ### 阶段 8
 
-- 提交：`refactor(ai-routing): phase 8 remove the dead research chat stage`
-  （SHA 在随后的收口提交里补写）
+- 提交：`60c89068`（`refactor(ai-routing): phase 8 ...`）
 - 全量：`uv run python -m pytest -q` → **8825 passed, 4 skipped, 0 failed**（712 s）
 - 删除的测试文件：`tests/test_web_chat_api.py`、`tests/test_llm_chat_scope.py`、
   `tests/test_llm_chat_references.py`（整文件只覆盖被删的接口与函数）；
