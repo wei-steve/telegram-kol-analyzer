@@ -788,3 +788,14 @@ display_name / category / validation_profile 全部存在行上（`ai_prompt_def
   实际走通了：`ai-config-show` 对含 `research_chat` 的旧文件正常输出 6 个环节 + 一条 warning；
   `POST /api/chat` 返回 404；模型选择页只剩 6 行；页面里没有 `[data-ai-form]` / `[data-ai-history]`；
   控制台没有 `is not defined`；`window.submitAiQuestion` 为 `undefined`。
+
+## 部署记录（2026-09-14，阶段 8，指挥会话）
+
+- 指挥会话独立复跑全量：8825 passed / 0 failed / 4 skipped（680 s）；全仓 grep 无 `research_chat` /
+  `/api/chat` / `submitAiQuestion` / `llm_proxy_config` 残留引用。
+- 预检：生产 HEAD `0cd18e15`，候选 `9d041a2c` 是其后代；无依赖 / unit 变更；线上配置仍含 `research_chat: []`。
+- `tg-deploy 9d041a2c`：三个 unit active；`GET /` 200；`POST /api/chat` 404；`/api/ai-stages` 6 个环节，
+  `warnings=["dropped unknown stage 'research_chat'"]`（下次页面保存后消失）；重启后 2 分钟内 0 traceback，
+  worker 日志里该 warning 出现 3 次（三处加载各一次），符合预期。
+- 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `0cd18e15`。
+- 后续可选清理：`app.js` 里 `renderConversationHistory` 一簇群问答历史 UI 代码（决定 46），未纳入本轮。
