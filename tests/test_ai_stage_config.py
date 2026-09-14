@@ -53,7 +53,6 @@ def test_stage_catalogue_matches_the_design_table():
         "context_resolution",
         "semantic_review",
         "strategy_alert",
-        "research_chat",
         "batch_text_recognition",
         "batch_image_recognition",
     )
@@ -70,13 +69,41 @@ def test_stage_catalogue_matches_the_design_table():
         "context_resolution",
         "semantic_review",
         "strategy_alert",
-        "research_chat",
         "batch_text_recognition",
     ):
         assert by_key[text_stage].requires_text
         assert not by_key[text_stage].requires_image
     assert by_key["strategy_alert"].env_fallback
-    assert by_key["research_chat"].env_fallback
+
+
+def test_a_stage_that_was_removed_is_dropped_with_a_warning(tmp_path):
+    """Production's file still says ``research_chat: []`` (phase 8 removed it).
+
+    A stage key the catalogue no longer knows has to be dropped and reported,
+    never raised: the file is written by a page that has since changed, and a
+    configuration that refuses to load stops recognition entirely.
+    """
+
+    path = tmp_path / "ai_recognition.yaml"
+    raw = yaml.safe_load(
+        Path("config/ai_recognition.example.yaml").read_text(encoding="utf-8")
+    )
+    raw["stages"]["research_chat"] = []
+    path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
+    )
+
+    with pytest.warns(DeprecationWarning):
+        config = load_ai_recognition_config(path)
+
+    assert "research_chat" not in config.stages
+    assert list(config.stages) == list(AI_STAGE_KEYS)
+    assert any("research_chat" in item for item in config.config_warnings)
+
+    # And saving takes the key out of the file rather than writing it back.
+    save_ai_recognition_config(path, config)
+    reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert "research_chat" not in reloaded["stages"]
 
 
 def test_runtime_incident_agent_is_deliberately_not_a_stage():
@@ -98,7 +125,6 @@ def test_the_shipped_example_is_v2_and_binds_every_production_stage():
         "context_resolution": ["deepseek-v4-flash"],
         "semantic_review": ["deepseek-v4-flash"],
         "strategy_alert": [],
-        "research_chat": [],
         "batch_text_recognition": ["deepseek-v4-flash"],
         "batch_image_recognition": ["glm-ocr"],
     }
@@ -144,7 +170,6 @@ def test_example_v1_config_migrates_every_stage_to_production_behaviour(tmp_path
         "context_resolution": ["deepseek-v4-flash"],
         "semantic_review": ["deepseek-v4-flash"],
         "strategy_alert": [],
-        "research_chat": [],
         "batch_text_recognition": ["deepseek-v4-flash"],
         "batch_image_recognition": ["glm-ocr"],
     }

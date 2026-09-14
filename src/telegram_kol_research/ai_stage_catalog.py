@@ -17,6 +17,12 @@ config loader without an import cycle.
 ``runtime_incident_agent`` is intentionally absent: it keeps its own
 fail-closed environment configuration (``llm_chat.load_runtime_agent_llm_config``)
 and must not become steerable from a Web page.
+
+``research_chat`` was here until 2026-09-14. Its page entry had been deleted
+from every template on 06-14, production logged zero calls to its endpoint in
+thirty days, and ``ai_prompt_invocations`` never held a single row for it. A
+stage nobody can reach is a stage that misleads whoever reads this table, so
+phase 8 removed it along with the endpoint behind it.
 """
 
 from __future__ import annotations
@@ -188,15 +194,6 @@ AI_STAGE_DEFINITIONS: tuple[AiStageDefinition, ...] = (
         env_fallback="TELEGRAM_KOL_ALERT_LLM_MODEL / TELEGRAM_KOL_LLM_*",
     ),
     AiStageDefinition(
-        stage_key="research_chat",
-        label="Web 群消息问答",
-        description="Web 页面里针对群消息的问答；未绑定时沿用环境变量。",
-        requires_text=True,
-        production_path=False,
-        production_note="web",
-        env_fallback="TELEGRAM_KOL_LLM_*",
-    ),
-    AiStageDefinition(
         stage_key="batch_text_recognition",
         label="离线/批量文本识别（V1 recognize_message_now，含生命周期事件 AI）",
         description="离线与批量工具的文本识别，不在生产消息管线上。",
@@ -229,7 +226,6 @@ AUTHORITATIVE_STAGE = "authoritative_recognition"
 CONTEXT_RESOLUTION_STAGE = "context_resolution"
 SEMANTIC_REVIEW_STAGE = "semantic_review"
 STRATEGY_ALERT_STAGE = "strategy_alert"
-RESEARCH_CHAT_STAGE = "research_chat"
 BATCH_TEXT_STAGE = "batch_text_recognition"
 BATCH_IMAGE_STAGE = "batch_image_recognition"
 

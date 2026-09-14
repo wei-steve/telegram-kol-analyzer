@@ -209,12 +209,9 @@ from telegram_kol_research.prompt_composition import (
     validate_prompt_content,
 )
 from telegram_kol_research.prompt_defaults import (
-    GROUP_RESEARCH_PROMPT,
     MIMO_VISION_PROMPT,
-    RESEARCH_CHAT_SYSTEM_PROMPT,
     SHARED_TRADING_PROMPT,
     seed_default_prompt_registry,
-    seed_group_research_prompt,
 )
 from telegram_kol_research.prompt_registry import (
     PromptDetail,
@@ -232,15 +229,6 @@ from telegram_kol_research.prompt_registry import (
 )
 from telegram_kol_research.prompt_testing import run_prompt_draft_test
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
-from telegram_kol_research.llm_chat import (
-    build_proxy_chat_payload,
-    build_scope_context,
-    build_source_reference_map,
-    extract_recent_message_limit,
-    load_llm_proxy_config,
-    resolve_research_chat_chain,
-    request_grounded_chat_answer,
-)
 from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_lifecycle
 from telegram_kol_research.execution_bindings import list_active_positions
 from telegram_kol_research.execution_bindings import reconcile_deepcoin_execution_bindings
@@ -6263,11 +6251,6 @@ def create_web_app(
         )
     app.state.media_root = resolved_media_root.resolve()
     app.state.live_update_broker = LiveUpdateBroker()
-    app.state.llm_proxy_config = (
-        load_llm_proxy_config(env_file_paths=[])
-        if split_runtime
-        else load_llm_proxy_config()
-    )
     loaded_strategy_alert_config = (
         load_strategy_alert_config(env_file_paths=[])
         if split_runtime
@@ -6373,7 +6356,6 @@ def create_web_app(
         _message_operation_supervisor_watermark_is_valid(app)
     )
     app.state.monitor_incident_capture_lock = threading.Lock()
-    app.state.chat_requester = request_grounded_chat_answer
     app.state.prompt_test_runner = run_prompt_draft_test
     app.state.live_target_titles = live_target_titles or set()
     app.state.live_listener_runner = live_listener_runner or run_live_listener
@@ -9450,11 +9432,6 @@ def create_web_app(
         payload: dict[str, Any],
         chat_id: int | None = None,
     ):
-        if prompt_key == GROUP_RESEARCH_PROMPT and chat_id is None:
-            raise HTTPException(
-                status_code=422,
-                detail="chat_id is required for group research prompts",
-            )
         try:
             detail = save_prompt_draft(
                 app.state.session_factory,
@@ -9470,19 +9447,7 @@ def create_web_app(
                 ),
             )
         except PromptRegistryNotFound as exc:
-            if prompt_key != GROUP_RESEARCH_PROMPT or chat_id is None:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
-            seed_group_research_prompt(
-                app.state.session_factory,
-                chat_id=chat_id,
-            )
-            detail = save_prompt_draft(
-                app.state.session_factory,
-                prompt_key,
-                content=str(payload.get("content") or ""),
-                change_note=str(payload.get("change_note") or ""),
-                chat_id=chat_id,
-            )
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
         except PromptRegistryConflict as exc:
             raise HTTPException(status_code=409, detail=str(exc)) from exc
         except (PromptRegistryError, TypeError, ValueError) as exc:
@@ -10067,112 +10032,6 @@ def create_web_app(
             await ensure_live_tasks_match_targets()
             status = build_monitor_status()
         return status
-
-    @app.post("/api/chat")
-    def chat(payload: dict[str, Any]):
-        question = str(payload.get("question") or "").strip()
-        if not question:
-            raise HTTPException(status_code=422, detail="question is required")
-
-        chat_id_value = payload.get("chat_id")
-        if chat_id_value is None:
-            raise HTTPException(status_code=422, detail="chat_id is required")
-
-        chat_id = int(chat_id_value)
-        message_limit = extract_recent_message_limit(question) or 50
-        messages = load_group_messages(
-            app.state.session_factory,
-            chat_id=chat_id,
-            limit=message_limit,
-        )
-        scope_context = build_scope_context(list(reversed(messages)))
-        chat_chain = resolve_research_chat_chain(
-            app.state.llm_proxy_config,
-            _load_ai_recognition_config_best_effort(
-                app.state.ai_recognition_config_path
-            ),
-        )
-        config = chat_chain[0].proxy_config
-        system = render_registered_prompt(
-            app.state.session_factory,
-            RESEARCH_CHAT_SYSTEM_PROMPT,
-        )
-        group = None
-        try:
-            group = render_registered_prompt(
-                app.state.session_factory,
-                GROUP_RESEARCH_PROMPT,
-                chat_id=chat_id,
-            )
-        except PromptRegistryNotFound:
-            pass
-        group_prompt = group.content if group is not None else None
-        version_map = dict(system.version_map)
-        if group is not None:
-            version_map.update(group.version_map)
-        invocation_status = "success"
-        invocation_error = None
-        chat_errors: list[BaseException] = []
-
-        def _ask_model(candidate, *, deadline_seconds: float | None = None):
-            try:
-                return app.state.chat_requester(
-                    config=candidate.proxy_config,
-                    question=question,
-                    scope_context=scope_context,
-                    system_prompt=system.content,
-                    group_prompt=group_prompt,
-                )
-            except Exception as exc:
-                chat_errors.append(exc)
-                raise
-
-        try:
-            routed = run_with_fallback(chat_chain, _ask_model)
-            if not routed.succeeded:
-                # A single-model chain raises exactly what it always raised,
-                # so the 502 detail keeps naming the proxy's own error.
-                if len(chat_errors) == 1:
-                    raise chat_errors[0]
-                raise httpx.HTTPError(
-                    routed.error_message or "chat proxy request failed"
-                )
-            answer = routed.value
-            if routed.model is not None:
-                config = routed.model.proxy_config
-        except httpx.HTTPError as exc:
-            invocation_status = "error"
-            invocation_error = str(exc)
-            raise HTTPException(
-                status_code=502,
-                detail=_build_chat_proxy_error_detail(exc),
-            ) from exc
-        finally:
-            record_prompt_invocation(
-                app.state.session_factory,
-                PromptInvocationRecord(
-                    feature="research_chat",
-                    correlation_key=f"research_chat:{chat_id}:{time.time_ns()}",
-                    chat_id=chat_id,
-                    model=config.model,
-                    prompt_versions=version_map,
-                    status=invocation_status,
-                    error_message=invocation_error,
-                ),
-            )
-        return {
-            "answer": answer,
-            "scope_mode": "current_group",
-            "scope_message_count": len(messages),
-            "proxy_payload": build_proxy_chat_payload(
-                question=question,
-                scope_context=scope_context,
-                model=config.model,
-                system_prompt=system.content,
-                group_prompt=group_prompt,
-            ),
-            "sources": build_source_reference_map(messages),
-        }
 
     @app.post("/api/refresh")
     async def refresh():

@@ -128,3 +128,20 @@ uv run telegram-kol-research web --runtime-role web --host 127.0.0.1 --port 8099
 
 - `api-ai-providers.json` 已更新为带 `append_v1` 与 `chat_completions_url` 的版本。
 
+---
+
+# 阶段 8 追加验证（2026-09-14）：删掉「Web 群消息问答」环节
+
+起始文件是 example（v2）**再手工加回一个 `stages.research_chat: []`**，
+模拟生产文件现在的样子。仍然没有 PNG。
+
+| # | 操作 | 结果 |
+|---|---|---|
+| 1 | `ai-config-show --ai-config-path <含 research_chat 的文件>` | 正常输出 **6 个环节**（authoritative_recognition / context_resolution / semantic_review / strategy_alert / batch_text_recognition / batch_image_recognition），末尾多一行 `warnings: - dropped unknown stage 'research_chat'`。没有报错 |
+| 2 | `GET /api/ai-stages` | `definitions` 6 条，`warnings` 含同一条 |
+| 3 | `POST /api/chat` | **404**（路由已删除） |
+| 4 | 打开「AI模型选择」页 | 6 行，逐行「当前生效」正确；`strategy_alert` 仍显示「未绑定，沿用环境变量 TELEGRAM_KOL_ALERT_LLM_MODEL / TELEGRAM_KOL_LLM_*」 |
+| 5 | 页面里找 `[data-ai-form]` / `[data-ai-history]` | 都不存在（06-14 起模板里就没有了） |
+| 6 | 浏览器控制台 | 没有 `is not defined` 一类错误；`window.submitAiQuestion` 为 `undefined` |
+| 7 | 从页面 `fetch('/api/chat')` | 404 |
+

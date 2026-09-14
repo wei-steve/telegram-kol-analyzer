@@ -10,7 +10,7 @@ integration_branch: codex/deepcoin-auto-trading-v1
 base_commit: 869b7a06   # 设计文档提交；实施从这里起
 implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
-current_phase: 7
+current_phase: 8
 phase_status: completed      # planned | in_progress | completed | blocked
 deploy: c79db7042cc251a54a86b3a9609cfc01bae68ba6   # 2026-09-14T11:41Z tg-deploy；回滚参考 ef1688c5b4c4f291bafd10e57993502028a5f3f1
 shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-trading-v1 上，0 code files beyond production。上线步骤见「上线核对」一节
@@ -26,7 +26,8 @@ shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-tradi
 | 4 | Web：`/api/ai-providers*`、`/api/ai-stages`、两页模板 + JS + CSS、旧接口兼容、浏览器验证 | completed | `d287038f` | 全量 8786 passed / 0 failed / 4 skipped |
 | 5 | 文档：ARCHITECTURE 新节、example.yaml v2、README、本文件收口 | completed | `4aadf158` | 全量 8788 passed / 0 failed / 4 skipped |
 | 6 | 提供商预设目录（19 家）、拉取模型列表、统一端点拼接 | completed | 见下方证据 | 全量 8841 passed / 0 failed / 4 skipped |
-| 7 | 显式「自动追加 /v1」开关 + 端点预览 | completed | `4d69b0c0` | 全量 8858 passed / 0 failed / 4 skipped |
+| 7 | 显式「自动追加 /v1」开关 + 端点预览 | completed | `4d69b0c0` |
+| 8 | 删掉死掉的「Web 群消息问答」环节 | completed | 见下方证据 | 全量 8825 passed / 0 failed / 4 skipped | 全量 8858 passed / 0 failed / 4 skipped |
 
 ## 阶段 1 做了什么
 
@@ -188,6 +189,39 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
 - 页面：Base URL 下方开关 + 说明文字 + **实时端点预览**「将请求 …/chat/completions」，
   前端用与后端逐字相同的规则算；`GET /api/ai-providers` 同时返回 `append_v1` 与
   `chat_completions_url` 供核对；`PUT` 接受 `append_v1`；点预设按预设值设好开关。
+
+## 阶段 8 做了什么
+
+`research_chat` 是一个**没有入口的环节**：它的表单 `[data-ai-form]` 2026-06-14 的交易执行台改版
+就从所有模板删掉了，`POST /api/chat` 在删除前 30 天零调用，`ai_prompt_invocations` 里从未有过
+一条 `research_chat` 记录。环节表里留着它，只会让读表的人以为这条路还在跑。用户已同意删除。
+
+删掉的东西（每个都先 grep 全仓确认无其他引用）：
+
+| 符号 | 在哪 | 为什么确认可删 |
+|---|---|---|
+| `AiStageDefinition(stage_key="research_chat")` | `ai_stage_catalog` | 环节表唯一定义处；`AI_STAGE_KEYS` 随之 7 → 6 |
+| `RESEARCH_CHAT_STAGE` | `ai_stage_catalog` | 唯一引用是已删的 `resolve_research_chat_chain` |
+| `POST /api/chat` | `web_app` | 前端唯一调用方 `submitAiQuestion` 同时删除；生产 30 天零调用 |
+| `app.state.llm_proxy_config` / `app.state.chat_requester` | `web_app` | 只被 `/api/chat` 读 |
+| `submitAiQuestion` + `[data-ai-form]` 的 `DOMContentLoaded` 绑定 | `app.js` | 模板里 06-14 起就没有 `[data-ai-form]`，绑定永远拿到 `null` |
+| `ResearchChatChainEntry` / `resolve_research_chat_chain` | `llm_chat` | 只被 `/api/chat` 与它的两条测试用 |
+| `load_llm_proxy_config` | `llm_chat` | 三处引用：`web_app` 的上面那行、两条测试。**运行时事故代理走的是 `load_runtime_agent_llm_config`**，未动 |
+| `build_scope_context` / `extract_recent_message_limit` / `build_proxy_chat_payload` / `build_source_reference_map` | `llm_chat` | 引用只有 `/api/chat` 与 `test_llm_chat_scope` / `test_llm_chat_references` |
+| `request_grounded_chat_answer` 及其私有簇 `_request_chat_completion` / `_is_unknown_model_error` / `_resolve_supported_model` / `_raise_for_error_like_answer` | `llm_chat` | 这四个私有函数在模块内只被 `request_grounded_chat_answer` 调用（逐个 grep 过行号）；`request_structured_chat_turn`（运行时代理用）不碰它们 |
+| `RESEARCH_CHAT_SYSTEM_PROMPT` / `GROUP_RESEARCH_PROMPT` 常量、两段默认文案、`seed_group_research_prompt`、提示词中心里 `GROUP_RESEARCH_PROMPT` 的按群草稿特判 | `prompt_defaults` / `web_app` | 只为这个功能存在 |
+
+**保留**：`LLMProxyConfig`（`load_runtime_agent_llm_config` 的返回类型）、
+`load_runtime_agent_llm_config`、`_build_runtime_agent_http_client`、`request_structured_chat_turn`、
+`_load_env_file_values`（还被 config / deepcoin_client / strategy_alerts / system_operator_bot /
+telegram_client 用）、`TELEGRAM_KOL_LLM_*` 四个环境变量（`strategy_alert` 空链时的回退）。
+
+**数据库里已有的 `research.chat.system` / `research.chat.group` 行没有删**：提示词定义的
+display_name / category / validation_profile 全部存在行上（`ai_prompt_definitions` 表），
+所以种子定义消失不影响既有行的加载与显示，有用例证明。
+
+旧配置文件里残留的 `stages.research_chat` 键：**加载时静默丢弃并 warning，不抛错**；保存后该键消失。
+这条路径本来就有（`normalize_ai_config_v2` 只遍历 `AI_STAGE_DEFINITIONS`），阶段 8 补了用例钉死。
 
 ## 设计未覆盖、由实施者决定的事项
 
@@ -400,17 +434,44 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
     加上 `tests/test_ai_endpoints.py` 对同一批 base_url 的逐条断言。
     脚本 `_append_v1` 也是同一条规则的第三份副本，同样有测试钉住。
 
+44. **`llm_chat.py` 从「必须走提示词注册表」的清单里移出，但仍在「不得内嵌业务提示词」的扫描里。**
+    `tests/test_ai_prompt_inventory` 原来把它当成一个 AI 调用点，靠
+    `"system_prompt: str" in source` 这条特例放行。删掉群问答之后它不再发送任何业务提示词——
+    运行时代理的 messages 是 `cli.py` 组好再传进来的。清单拆成两个：
+    `AI_CALL_MODULES`（必须走注册表）与 `NO_EMBEDDED_PROMPT_MODULES`（= 前者 + `llm_chat.py`）。
+    `test_chat_call_site_requires_explicit_registered_system_prompt` 随被删的调用点一起删。
+
+45. **提示词中心的「发布流程」测试改用 `strategy.alert.classifier`。**
+    它原来用 `research.chat.system`——那是唯一一个 `plain_system`、没有发布门槛的种子。
+    剩下的 `trading.*` 提示词发布时要求「当前的历史消息测试」（试过 `trading.analysis.mimo_vision`，
+    返回 409 `requires current historical tests`），那是另一条行为，不该混进这条流程测试。
+    `strategy.alert.classifier` 属于 notification 类、没有那道门槛，只要求四个模板变量。
+
+46. **`app.js` 里还剩一簇死掉的群问答 UI 代码，本轮没有删。**
+    `renderConversationHistory` / `renderCitations` / `renderHistorySources` /
+    `bindCitationClicks` / `scrollAiHistoryToLatest` / `loadConversationHistory` /
+    `saveConversationHistory` 这一串只服务 `[data-ai-history]`，那个节点和 `[data-ai-form]` 一样
+    06-14 起就不在模板里了。但 `renderConversationHistory` 还有三个调用点，要一个个确认它们
+    自己是不是也死的；本轮的范围是指挥会话点名的 `submitAiQuestion` 与绑定，把这一簇一起动
+    会把改动面铺到整个前端文件、还要再走一遍浏览器验证。**已单独开一个后台任务**，
+    请指挥会话决定是否要在下一轮清掉。
+
+47. **`test_web_assets_smoke` 里那条 `createdAt: new Date().toISOString()` 断言删掉了，
+    渲染端的两条保留。** 写入方是 `submitAiQuestion`（已删），但渲染端还要能正确读出
+    06-14 之前存进浏览器 localStorage 的那些回合——那是数据，不是代码。
+
 ## 交接摘要（下一个会话先读这一段）
 
-阶段 1–6 已部署（生产 sha `f0337b84`）。**阶段 7 已完成但未部署、未推送共享分支。**
+阶段 1–7 已部署（生产 sha `0cd18e15`）。**阶段 8 已完成但未部署、未推送共享分支。**
 
 这次做完之后的事实：
 
 1. `config/ai_recognition.yaml` 升级成 `schema_version: 2` 的三层结构
    （providers / models / stages）。**没有 schema_version 的旧文件仍然直接可用**：
    加载时在内存里迁移，不落盘；只有在页面上保存一次，文件才真的变成 v2。
-2. 设计 §2.1 的 7 个环节全部按「有序模型链」取模型，主用失败自动换下一个。
-   只有 `runtime_incident_agent` 有意不纳入（它有自己的 fail-closed env 配置）。
+2. **6 个**环节按「有序模型链」取模型，主用失败自动换下一个。
+   `runtime_incident_agent` 有意不纳入（它有自己的 fail-closed env 配置）；
+   `research_chat` 在阶段 8 连同它的接口一起删除（页面入口 06-14 已不存在，30 天零调用）。
 3. 只有 `authoritative_recognition` 有链级时限：整条链共用 240 s，
    加上最后一次阻塞读的 60 s 正好落在 300 s 的作业认领租约里。
 4. MiMo 供应商健康线**只统计链首模型**的尝试行：备用答上来不算主模型恢复；
@@ -473,7 +534,8 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
 
 - 主模型故障期间每条消息都先付一次主模型失败的代价；跨消息熔断/冷却未做（设计 §4）。
 - 上下文结合分析触发频率偏高，本次不改（`docs/known-issues-and-deferred-work.md`）。
-- 阶段 3 之后，设计 §2.1 的 7 个环节全部按链取模型。只有 `runtime_incident_agent` 有意不纳入。
+- 设计 §2.1 的环节里，6 个按链取模型。`runtime_incident_agent` 有意不纳入；
+  `research_chat` 阶段 8 已删除。
 - `batch_text_recognition` / `batch_image_recognition` 只取链首、保持单次尝试（设计 §6 说 fallback
   属于加分项）。它们是 CLI / 批量工具，不在生产消息管线上。
 - `mimo_recognition_runs.model` 与 attempts 的 `model` 存的是**模型名**（`AiModelConfig.model`），
@@ -709,3 +771,21 @@ OpenMinis 的 OAuth 登录与 Responses API 格式**不采用**，理由写在�
   为 deepseek True / zhipu False / mimo False，最终 URL 与阶段 6 逐字相同；预设 19 家、custom 开关为开；
   重启后 2 分钟内三个角色 0 traceback。线上配置文件仍无 `append_v1` 键，按推导走，页面下次保存才落盘显式值。
 - 部署 sha 已推到共享分支，两个方向核对 PASS。回滚参考 `f0337b84`。
+
+### 阶段 8
+
+- 提交：`refactor(ai-routing): phase 8 remove the dead research chat stage`
+  （SHA 在随后的收口提交里补写）
+- 全量：`uv run python -m pytest -q` → **8825 passed, 4 skipped, 0 failed**（712 s）
+- 删除的测试文件：`tests/test_web_chat_api.py`、`tests/test_llm_chat_scope.py`、
+  `tests/test_llm_chat_references.py`（整文件只覆盖被删的接口与函数）；
+  `tests/test_llm_chat_request.py` 删掉 5 条只测群问答的用例，运行时代理的 16 条全部保留。
+- 新增用例：`tests/test_ai_stage_config.py::test_a_stage_that_was_removed_is_dropped_with_a_warning`
+  —— 拿生产形态（带 `stages.research_chat: []`）的文件加载：键被丢掉、`config_warnings` 里有一条、
+  保存后该键从文件里消失。
+- 改成 6 个环节的用例：`test_ai_stage_config` 的目录断言、`test_ai_provider_api` 的
+  `test_stages_report_the_catalogue_the_bindings_and_what_routes`。
+- 浏览器验证：`browser-verification.md` 的「阶段 8 追加验证」一节（7 步）。
+  实际走通了：`ai-config-show` 对含 `research_chat` 的旧文件正常输出 6 个环节 + 一条 warning；
+  `POST /api/chat` 返回 404；模型选择页只剩 6 行；页面里没有 `[data-ai-form]` / `[data-ai-history]`；
+  控制台没有 `is not defined`；`window.submitAiQuestion` 为 `undefined`。

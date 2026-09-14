@@ -1,4 +1,10 @@
-"""Grounded chat helpers for the Telegram web workbench."""
+"""The LLM proxy the runtime incident agent talks to.
+
+This module used to also serve the Web group-message chat. That feature's
+page entry was deleted on 2026-06-14 and its endpoint logged zero calls in
+the thirty days before 2026-09-14, so phase 8 removed it; what is left is
+the runtime agent's own fail-closed provider and the structured tool-call
+turn it takes."""
 
 from __future__ import annotations
 
@@ -38,61 +44,6 @@ class LLMProxyConfig:
     #: ``None`` -- an environment-configured proxy -- keeps the inferred rule,
     #: which is the URL this has always sent.
     append_v1: bool | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ResearchChatChainEntry:
-    """One chain member for the Web group-message chat.
-
-    The router identifies members by ``id`` / ``model``; the requester takes an
-    :class:`LLMProxyConfig`, which also carries the egress socket the proxy
-    needs and which has nothing to do with which model answers.
-    """
-
-    id: str
-    model: str
-    proxy_config: "LLMProxyConfig"
-
-
-def resolve_research_chat_chain(
-    proxy_config: "LLMProxyConfig",
-    ai_config: Any,
-) -> list[ResearchChatChainEntry]:
-    """The models bound to ``research_chat``, ready to call.
-
-    Resolved per question rather than at process start. An empty chain means
-    nothing is bound and the environment-configured proxy stays in charge;
-    the egress socket is carried over, because it describes how this process
-    reaches the network, not which model it asks.
-    """
-
-    from telegram_kol_research.ai_model_router import resolve_stage_chain
-    from telegram_kol_research.ai_stage_catalog import RESEARCH_CHAT_STAGE
-
-    chain = resolve_stage_chain(ai_config, RESEARCH_CHAT_STAGE) if ai_config else []
-    if not chain:
-        return [
-            ResearchChatChainEntry(
-                id=proxy_config.model or "env",
-                model=proxy_config.model,
-                proxy_config=proxy_config,
-            )
-        ]
-    return [
-        ResearchChatChainEntry(
-            id=model.id,
-            model=model.model,
-            proxy_config=LLMProxyConfig(
-                base_url=model.base_url,
-                api_key=model.api_key,
-                model=model.model,
-                timeout_seconds=model.timeout_seconds,
-                egress_socket_path=proxy_config.egress_socket_path,
-                append_v1=model.append_v1,
-            ),
-        )
-        for model in chain
-    ]
 
 
 class RuntimeAgentLLMConfigError(ValueError):
@@ -152,22 +103,6 @@ _FINAL_DIAGNOSIS_TOOL = {
         },
     },
 }
-
-
-def load_llm_proxy_config(
-    environ: dict[str, str] | None = None,
-    env_file_paths: list[str | os.PathLike[str]] | None = None,
-) -> LLMProxyConfig:
-    """Load LLM proxy settings from environment variables."""
-
-    env = dict(_load_env_file_values(env_file_paths))
-    env.update(environ or os.environ)
-    return LLMProxyConfig(
-        base_url=env.get("TELEGRAM_KOL_LLM_BASE_URL", "http://127.0.0.1:8317"),
-        api_key=env.get("TELEGRAM_KOL_LLM_API_KEY", ""),
-        model=env.get("TELEGRAM_KOL_LLM_MODEL", "gpt-4.1-mini"),
-        timeout_seconds=float(env.get("TELEGRAM_KOL_LLM_TIMEOUT_SECONDS", "60")),
-    )
 
 
 def load_runtime_agent_llm_config(
@@ -301,145 +236,6 @@ def _load_env_file_values(
     return values
 
 
-def build_scope_context(messages: list[dict[str, Any]]) -> str:
-    """Render scoped message records into a bounded prompt context."""
-
-    parts: list[str] = [
-        "Messages are ordered chronologically. Later entries are newer and should be weighted more heavily for the latest state and recent changes.",
-        "",
-    ]
-    for index, message in enumerate(messages, start=1):
-        parts.append(f"Source [{index}] raw_message_id={message.get('raw_message_id')}")
-        parts.append(f"message_id={message.get('message_id')}")
-        parts.append(f"sender={message.get('sender_name') or 'Unknown'}")
-        text = (message.get("text") or "").strip()
-        if text:
-            parts.append(f"text={text}")
-        reply_context = message.get("reply_context") or {}
-        if reply_context:
-            reply_text = reply_context.get("text")
-            if reply_text:
-                parts.append(f"reply_context={reply_text}")
-        media_assets = message.get("media_assets") or []
-        for media_asset in media_assets:
-            ocr_text = (media_asset.get("ocr_text") or "").strip()
-            if ocr_text:
-                parts.append(f"ocr_text={ocr_text}")
-        parts.append("")
-    return "\n".join(parts).strip()
-
-
-def extract_recent_message_limit(question: str) -> int | None:
-    """Extract an explicit recent-message count override from question text."""
-
-    patterns = (
-        r"最近\s*(\d+)\s*条",
-        r"recent\s+(\d+)\s+messages?",
-    )
-    for pattern in patterns:
-        match = re.search(pattern, question, flags=re.IGNORECASE)
-        if match:
-            return int(match.group(1))
-    return None
-
-
-def build_proxy_chat_payload(
-    *, question: str, scope_context: str, model: str, system_prompt: str,
-    group_prompt: str | None = None
-) -> dict[str, Any]:
-    """Build an OpenAI-compatible chat payload for the proxy."""
-
-    messages: list[dict[str, str]] = [
-        {
-            "role": "system",
-            "content": system_prompt.strip(),
-        }
-    ]
-    if group_prompt and group_prompt.strip():
-        messages.append(
-            {
-                "role": "system",
-                "content": f"Group prompt:\n{group_prompt.strip()}",
-            }
-        )
-    messages.extend(
-        [
-            {
-                "role": "user",
-                "content": f"Source context:\n{scope_context}",
-            },
-            {
-                "role": "user",
-                "content": question,
-            },
-        ]
-    )
-    return {
-        "model": model,
-        "messages": messages,
-    }
-
-
-def build_source_reference_map(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    """Build source reference metadata for UI citation rendering."""
-
-    references: list[dict[str, Any]] = []
-    for index, message in enumerate(messages, start=1):
-        preview_text = (message.get("text") or "").strip()
-        preview = preview_text[:120] if preview_text else "(no text)"
-        references.append(
-            {
-                "index": index,
-                "label": f"[{index}] {message.get('sender_name') or 'Unknown'}",
-                "raw_message_id": message.get("raw_message_id"),
-                "message_id": message.get("message_id"),
-                "preview": preview,
-            }
-        )
-    return references
-
-
-def request_grounded_chat_answer(
-    *,
-    config: LLMProxyConfig,
-    question: str,
-    scope_context: str,
-    system_prompt: str,
-    group_prompt: str | None = None,
-    client: httpx.Client | None = None,
-) -> str:
-    """Send a grounded chat request through an OpenAI-compatible proxy."""
-    headers = {"Content-Type": "application/json"}
-    if config.api_key:
-        headers["Authorization"] = f"Bearer {config.api_key}"
-
-    created_client = client is None
-    active_client = client or httpx.Client(timeout=config.timeout_seconds)
-    try:
-        data = _request_chat_completion(
-            active_client=active_client,
-            config=config,
-            question=question,
-            scope_context=scope_context,
-            system_prompt=system_prompt,
-            group_prompt=group_prompt,
-            headers=headers,
-        )
-    finally:
-        if created_client:
-            active_client.close()
-
-    choices = data.get("choices") or []
-    if not choices:
-        return ""
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if not isinstance(content, str):
-        return ""
-    _raise_for_error_like_answer(content)
-    return content
-
-
 def request_structured_chat_turn(
     *,
     config: LLMProxyConfig,
@@ -564,113 +360,3 @@ def request_structured_chat_turn(
             "structured chat final response is invalid"
         )
     return {"final": final}
-
-
-def _request_chat_completion(
-    *,
-    active_client: httpx.Client,
-    config: LLMProxyConfig,
-    question: str,
-    scope_context: str,
-    system_prompt: str,
-    group_prompt: str | None,
-    headers: dict[str, str],
-) -> dict[str, Any]:
-    payload = build_proxy_chat_payload(
-        question=question,
-        scope_context=scope_context,
-        model=config.model,
-        system_prompt=system_prompt,
-        group_prompt=group_prompt,
-    )
-    response = active_client.post(
-        chat_completions_url(config.base_url, provider_append_v1(config)),
-        json=payload,
-        headers=headers,
-    )
-    try:
-        response.raise_for_status()
-    except httpx.HTTPStatusError as exc:
-        if not _is_unknown_model_error(exc):
-            raise
-        fallback_model = _resolve_supported_model(
-            active_client=active_client,
-            config=config,
-            headers=headers,
-        )
-        if not fallback_model or fallback_model == config.model:
-            raise
-        config.model = fallback_model
-        payload = build_proxy_chat_payload(
-            question=question,
-            scope_context=scope_context,
-            model=config.model,
-            system_prompt=system_prompt,
-            group_prompt=group_prompt,
-        )
-        response = active_client.post(
-            chat_completions_url(config.base_url, provider_append_v1(config)),
-            json=payload,
-            headers=headers,
-        )
-        response.raise_for_status()
-    return response.json()
-
-
-def _is_unknown_model_error(exc: httpx.HTTPStatusError) -> bool:
-    try:
-        payload = exc.response.json()
-    except ValueError:
-        return False
-    error = payload.get("error") if isinstance(payload, dict) else None
-    message = error.get("message") if isinstance(error, dict) else None
-    return isinstance(message, str) and "unknown provider for model" in message.lower()
-
-
-def _resolve_supported_model(
-    *,
-    active_client: httpx.Client,
-    config: LLMProxyConfig,
-    headers: dict[str, str],
-) -> str | None:
-    response = active_client.get(
-        f"{config.base_url.rstrip('/')}/v1/models",
-        headers=headers,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    raw_models = payload.get("data") if isinstance(payload, dict) else None
-    if not isinstance(raw_models, list):
-        return None
-    available_models = [
-        model_id
-        for item in raw_models
-        if isinstance(item, dict)
-        for model_id in [item.get("id")]
-        if isinstance(model_id, str) and model_id
-    ]
-    if config.model in available_models:
-        return config.model
-
-    preferred_models = (
-        "gpt-5.4-mini",
-        "gpt-5.4",
-        "gpt-5.2",
-        "gpt-4.1-mini",
-        "gpt-4.1",
-    )
-    for candidate in preferred_models:
-        if candidate in available_models:
-            return candidate
-
-    for candidate in available_models:
-        if "codex" not in candidate.lower():
-            return candidate
-
-    return available_models[0] if available_models else None
-
-
-def _raise_for_error_like_answer(content: str) -> None:
-    lowered = content.lower()
-    if "does not support image input" in lowered:
-        raise httpx.HTTPError(content)

@@ -20,9 +20,7 @@ from telegram_kol_research.prompt_registry import (
 SHARED_TRADING_PROMPT = "trading.analysis.shared"
 MIMO_VISION_PROMPT = "trading.analysis.mimo_vision"
 MIMO_V2_AUTHORITATIVE_PROMPT = "trading.analysis.mimo_v2_authoritative"
-RESEARCH_CHAT_SYSTEM_PROMPT = "research.chat.system"
 STRATEGY_ALERT_PROMPT = "strategy.alert.classifier"
-GROUP_RESEARCH_PROMPT = "research.chat.group"
 SEMANTIC_DISAGREEMENT_REVIEW_PROMPT = "trading.disagreement.semantic_review"
 
 
@@ -275,15 +273,6 @@ DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT = """
 """.strip()
 
 
-DEFAULT_RESEARCH_CHAT_SYSTEM_PROMPT = (
-    "你是 Telegram 交易群研究助手。只能依据提供的消息来源上下文回答，"
-    "并使用 [1]、[2] 这样的编号引用证据。消息按时间正序排列，后面的消息更新；"
-    "分析最新状态时优先考虑后续变化，并明确区分事实、推断和不确定性。"
-)
-
-DEFAULT_GROUP_RESEARCH_PROMPT = "本群组暂无额外研究规则，继续遵守全局系统提示词。"
-
-
 DEFAULT_STRATEGY_ALERT_PROMPT = """
 Classify one Telegram trading-group message.
 Goal: identify entry or exit strategy messages. Prefer recall over precision.
@@ -443,16 +432,6 @@ def build_prompt_seeds_from_legacy(
             content=DEFAULT_MIMO_V2_AUTHORITATIVE_PROMPT,
         ),
         PromptSeed(
-            prompt_key=RESEARCH_CHAT_SYSTEM_PROMPT,
-            display_name="群组研究系统提示词",
-            description="Web 群组研究问答的系统规则。",
-            category="research",
-            consumers=("research_chat",),
-            required_variables=(),
-            validation_profile="plain_system",
-            content=DEFAULT_RESEARCH_CHAT_SYSTEM_PROMPT,
-        ),
-        PromptSeed(
             prompt_key=STRATEGY_ALERT_PROMPT,
             display_name="策略通知分类提示词",
             description="策略提醒二次分类和字段提取。",
@@ -491,22 +470,3 @@ def seed_default_prompt_registry(
     ]
 
 
-def seed_group_research_prompt(
-    session_factory: sessionmaker,
-    *,
-    chat_id: int,
-) -> PromptDetail:
-    return seed_prompt_definition(
-        session_factory,
-        PromptSeed(
-            prompt_key=GROUP_RESEARCH_PROMPT,
-            display_name="群组专属研究提示词",
-            description="仅对指定 Telegram 群组生效的附加研究规则。",
-            category="research",
-            consumers=("research_chat",),
-            required_variables=(),
-            validation_profile="plain_system",
-            content=DEFAULT_GROUP_RESEARCH_PROMPT,
-            scope_chat_id=chat_id,
-        ),
-    )

@@ -19,8 +19,3 @@ def test_prompt_center_javascript_uses_registry_lifecycle_and_stale_request_guar
     assert "导入为草稿" in source
 
 
-def test_chat_request_no_longer_sends_unversioned_group_prompt():
-    source = (ROOT / "src/telegram_kol_research/static/app.js").read_text(encoding="utf-8")
-    submit_section = source[source.index("async function submitAiQuestion"):]
-
-    assert "group_prompt:" not in submit_section.split("function ", 1)[0]

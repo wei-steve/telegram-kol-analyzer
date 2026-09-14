@@ -100,7 +100,6 @@ def test_non_owner_roles_fail_closed_before_authoritative_processing(
 def test_explicit_empty_env_file_paths_disable_checkout_secret_fallbacks(
     tmp_path, monkeypatch
 ):
-    from telegram_kol_research.llm_chat import load_llm_proxy_config
     from telegram_kol_research.strategy_alerts import load_strategy_alert_config
     from telegram_kol_research.telegram_client import load_telegram_auth_config
 
@@ -115,16 +114,11 @@ def test_explicit_empty_env_file_paths_disable_checkout_secret_fallbacks(
     monkeypatch.chdir(tmp_path)
     isolated_environ = {"UNRELATED_SENTINEL": "1"}
 
-    llm_config = load_llm_proxy_config(
-        environ=isolated_environ,
-        env_file_paths=[],
-    )
     alert_config = load_strategy_alert_config(
         environ=isolated_environ,
         env_file_paths=[],
     )
 
-    assert llm_config.api_key == ""
     assert alert_config.bot_token == ""
     assert alert_config.alert_chat_id == ""
     with pytest.raises(ValueError, match="TELEGRAM_API_ID is required"):
@@ -161,7 +155,6 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
         MultiTargetManagementConfig,
         RuntimeIncidentConfig,
     )
-    from telegram_kol_research.llm_chat import LLMProxyConfig
     from telegram_kol_research.strategy_alerts import StrategyAlertConfig
     from telegram_kol_research.system_operator_bot import SystemOperatorBotConfig
 
@@ -171,15 +164,6 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
         calls[name] = kwargs
         return value
 
-    monkeypatch.setattr(
-        web_app,
-        "load_llm_proxy_config",
-        lambda **kwargs: record(
-            "llm",
-            LLMProxyConfig("http://127.0.0.1:8317", "", "model", 1.0),
-            **kwargs,
-        ),
-    )
     monkeypatch.setattr(
         web_app,
         "load_strategy_alert_config",
@@ -237,7 +221,6 @@ def test_split_runtime_app_loads_secrets_from_process_environment_only(
     )
 
     assert calls == {
-        "llm": {"env_file_paths": []},
         "strategy_alert": {"env_file_paths": []},
         "system_bot": {"env_file_paths": []},
         "notification_bot": {"env_file_paths": []},

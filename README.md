@@ -52,7 +52,6 @@ The workbench shows:
 - Reverse-chronological message timeline with text and media
 - Message filtering by free-text search and sender name
 - Incremental history browsing with a Load more button for older messages
-- Grounded AI chat panel that defaults to the current group's latest 50 messages
 - Database freshness and refresh-mode status in the message header
 - SSE-based browser live updates for new messages
 - Periodic reconcile replay to reduce missed-message gaps after reconnects
@@ -66,18 +65,11 @@ Inside the message panel you can:
 - Filter the current timeline by sender name
 - Load older messages while keeping the current filter state
 
-Inside the AI panel you can:
-
-- Ask natural-language questions without choosing scope controls manually
-- Let the system default to the current group's recent 50 messages
-- Override the default by asking for a different count, such as `总结最近 200 条`
-- Review grouped conversation turns instead of a flat history list
-- Edit a per-group default prompt that takes effect on the next question
-- Let the backend send message context to the model in chronological order for better trend-aware answers
-
 ## LLM Proxy Configuration
 
-To use the AI panel with your CLIProxyAPI deployment, set:
+The strategy-alert bot falls back to these when its stage has no model bound,
+and the runtime incident agent reads its own dedicated
+`TELEGRAM_KOL_RUNTIME_AGENT_LLM_*` variables instead:
 
 ```bash
 export TELEGRAM_KOL_LLM_BASE_URL="http://127.0.0.1:8317"

@@ -504,46 +504,6 @@ def test_an_unreadable_ai_config_does_not_lose_the_alert():
 
 
 # ---------------------------------------------------------------------------
-# research_chat
-# ---------------------------------------------------------------------------
-
-
-def _proxy_config():
-    from telegram_kol_research.llm_chat import LLMProxyConfig
-
-    return LLMProxyConfig(
-        base_url="http://127.0.0.1:8317",
-        api_key="env-key",
-        model="env-model",
-        timeout_seconds=60.0,
-        egress_socket_path="/run/egress.sock",
-    )
-
-
-def test_an_unbound_research_chat_keeps_the_environment_proxy():
-    from telegram_kol_research.llm_chat import resolve_research_chat_chain
-
-    config = _proxy_config()
-
-    chain = resolve_research_chat_chain(config, AiRecognitionConfig())
-
-    assert len(chain) == 1
-    assert chain[0].proxy_config is config
-
-
-def test_a_bound_research_chat_uses_the_chain_and_keeps_the_egress_socket():
-    from telegram_kol_research.llm_chat import resolve_research_chat_chain
-
-    chain = resolve_research_chat_chain(
-        _proxy_config(), _chain_config("research_chat", PRIMARY, BACKUP)
-    )
-
-    assert [item.model for item in chain] == [PRIMARY, BACKUP]
-    assert chain[0].proxy_config.base_url == f"https://{PRIMARY}.example.com/v1"
-    assert chain[1].proxy_config.egress_socket_path == "/run/egress.sock"
-
-
-# ---------------------------------------------------------------------------
 # batch_* and the prompt centre
 # ---------------------------------------------------------------------------
 

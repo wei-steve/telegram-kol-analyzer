@@ -181,7 +181,10 @@ def test_app_js_includes_ai_history_timestamps_for_saved_and_rendered_turns(tmp_
 
     assert response.status_code == 200
     assert "renderHistoryTimestamp" in response.text
-    assert "createdAt: new Date().toISOString()" in response.text
+    # The turn that wrote ``createdAt`` was ``submitAiQuestion``, deleted with
+    # the Web group chat in phase 8. The renderer still has to read a stored
+    # timestamp correctly: a browser that used the feature before 2026-06-14
+    # still has those turns in local storage.
     assert "${renderHistoryTimestamp(entry.createdAt)}" in response.text
 
 

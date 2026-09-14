@@ -464,7 +464,7 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 配置仍可读。**没有 `schema_version` 的文件是 v1**，加载时在内存里迁移，不落盘——
 第一次在页面上保存才会把文件升级成 v2。
 
-### 用到 AI 模型的 7 个环节
+### 用到 AI 模型的 6 个环节
 
 | stage_key | 中文名 | 能力要求 | 生产路径 | 取链的代码位置 |
 |---|---|---|---|---|
@@ -472,12 +472,16 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 | `context_resolution` | 上下文结合分析（第二层） | 文本 | 是 | `context_resolution.resolve_context_model_chain` |
 | `semantic_review` | 语义分歧复核（只读顾问） | 文本 | 是 | `semantic_disagreement_review.resolve_semantic_review_chain` |
 | `strategy_alert` | 策略提醒分类（Telegram 提醒 bot） | 文本 | 是，当 bot token 配置时 | `strategy_alerts.resolve_strategy_alert_chain` |
-| `research_chat` | Web 群消息问答 | 文本 | 否（web，人触发） | `llm_chat.resolve_research_chat_chain` |
 | `batch_text_recognition` | 离线/批量文本识别（V1 `recognize_message_now`，含生命周期事件 AI） | 文本 | 否，只有 CLI / 批量工具 | `message_recognition._batch_text_provider`（只取链首，单次尝试） |
 | `batch_image_recognition` | 离线/批量图片识别（V1；GLM-OCR 走 layout_parsing，其他走多模态 chat） | 图片 | 否，只有 CLI / 批量工具 | `message_recognition._batch_image_provider`（只取链首，单次尝试） |
 
 派生：每日探测（`mimo_provider_probe`）与提示词中心的 mimo 测试跟随
 `authoritative_recognition` 链首；提示词中心的 deepseek 测试跟随 `batch_text_recognition` 链首。
+
+曾经有第 7 个环节 `research_chat`（Web 群消息问答）。它的页面入口 2026-06-14 就从所有模板里
+删掉了，`POST /api/chat` 在删除前 30 天零调用，`ai_prompt_invocations` 里从未有过它的记录，
+2026-09-14 连同接口一起删除。旧配置文件里残留的 `stages.research_chat` 键**加载时静默丢弃并
+warning**，保存后消失。
 
 **`runtime_incident_agent` 有意不在这张表里。** 它有自己的 fail-closed 环境配置
 （`llm_chat.load_runtime_agent_llm_config`），不从页面配置，页面上也写明了这一点。
@@ -487,8 +491,9 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 - `resolve_stage_chain(config, stage_key)` 给出这个环节现在能调的模型，保序。
   被禁用、provider 被禁用、provider 没填 base_url 的成员**仍然绑定但不参与路由**——
   临时禁用一个 provider 不该把绑定删掉。空链 = 这个环节没有可用模型，
-  行为与「provider 未配置」一直以来的行为相同；`strategy_alert` / `research_chat`
-  空链时沿用它们各自的环境变量配置。
+  行为与「provider 未配置」一直以来的行为相同；`strategy_alert`
+  空链时沿用它自己的环境变量配置（`strategy_alert` → `TELEGRAM_KOL_ALERT_LLM_MODEL` /
+  `TELEGRAM_KOL_LLM_*`）。
 - `run_with_fallback` / `async_run_with_fallback`：**请求发出之后**的任何失败都换下一个模型
   （网络错误、超时、任何 HTTP 状态、空内容、JSON 解不开、合同校验不过）；
   **请求发出之前**的失败不换（媒体读不了、payload 拼不出来），那不是提供商的问题。

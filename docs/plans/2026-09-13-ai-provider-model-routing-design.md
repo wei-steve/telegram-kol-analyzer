@@ -38,7 +38,7 @@ Key）和「AI模型选择」（三个下拉）两个 tab，入口在右上角 �
 | `context_resolution` | 上下文结合分析（第二层） | 文本 | 是（权威识别判定需要时调用；另有重分析队列） | `context_resolution._select_provider`（`context_resolution_model_id`，否则 `text_provider`） |
 | `semantic_review` | 语义分歧复核（只读顾问） | 文本 | 是（worker `semantic_review` 单例循环） | `semantic_disagreement_review.run_semantic_review_for_message`（`config.text_provider`） |
 | `strategy_alert` | 策略提醒分类（Telegram 提醒 bot） | 文本 | 是，当 bot token 配置时 | `strategy_alerts.load_strategy_alert_config`（**环境变量** `TELEGRAM_KOL_ALERT_LLM_MODEL` / `TELEGRAM_KOL_LLM_*`，启动时加载一次） |
-| `research_chat` | Web 群消息问答 | 文本 | web | `web_app` `app.state.llm_proxy_config`（**环境变量** `TELEGRAM_KOL_LLM_*`，启动时加载一次） |
+| `research_chat` | Web 群消息问答 | 文本 | web | `web_app` `app.state.llm_proxy_config`（**环境变量** `TELEGRAM_KOL_LLM_*`，启动时加载一次）。**2026-09-14 阶段 8 删除**（页面入口 06-14 已不存在，30 天零调用） |
 | `batch_text_recognition` | 离线/批量文本识别（V1 `recognize_message_now`，含生命周期事件 AI） | 文本 | 否，只有 CLI / 批量工具 | `message_recognition`（`config.text_provider`） |
 | `batch_image_recognition` | 离线/批量图片识别（V1；GLM-OCR 走 layout_parsing，其他走多模态 chat） | 图片 | 否，只有 CLI / 批量工具 | `message_recognition`（`config.image_provider`，`_is_glm_ocr_model`） |
 | （派生）`provider_probe` | 每日 `max_tokens=1` 探测 | — | 是 | 跟随 `authoritative_recognition` 链首模型 |

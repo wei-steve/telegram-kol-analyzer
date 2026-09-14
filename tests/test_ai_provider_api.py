@@ -394,7 +394,6 @@ def test_stages_report_the_catalogue_the_bindings_and_what_routes(tmp_path):
         "context_resolution",
         "semantic_review",
         "strategy_alert",
-        "research_chat",
         "batch_text_recognition",
         "batch_image_recognition",
     ]

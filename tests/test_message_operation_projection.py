@@ -502,7 +502,6 @@ def test_projection_does_not_reach_any_provider_entry_point(tmp_path, monkeypatc
         raise AssertionError("provider or recognition path must not be called")
 
     monkeypatch.setattr(llm_chat, "request_structured_chat_turn", forbidden)
-    monkeypatch.setattr(llm_chat, "request_grounded_chat_answer", forbidden)
     monkeypatch.setattr(
         authoritative_recognition,
         "process_authoritative_message",

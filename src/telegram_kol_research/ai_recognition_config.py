@@ -804,7 +804,6 @@ def migrate_v1_ai_config(
         ),
         "semantic_review": _chain(text_id),
         "strategy_alert": [],
-        "research_chat": [],
         "batch_text_recognition": _chain(text_id),
         "batch_image_recognition": _chain(
             str(active_image_model_id or "").strip()

@@ -156,10 +156,10 @@ async def async_run_with_fallback(
     """:func:`run_with_fallback` for an ``await``-able attempt.
 
     Same decisions, same :class:`RouterResult`; the only difference is that
-    ``attempt`` is awaited. It exists because ``strategy_alert`` and
-    ``research_chat`` run on the event loop, and pushing their HTTP call
-    through ``to_thread`` only to get a fallback would put a blocking client
-    where an async one already works. A test pins the two against each other.
+    ``attempt`` is awaited. It exists because ``strategy_alert`` runs on the
+    event loop, and pushing its HTTP call through ``to_thread`` only to get a
+    fallback would put a blocking client where an async one already works. A
+    test pins the two against each other.
     """
 
     started = monotonic()

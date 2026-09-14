@@ -13,21 +13,33 @@ def test_prompt_api_lists_every_registered_ai_prompt_with_active_content(tmp_pat
     assert {
         "trading.analysis.shared",
         "trading.analysis.mimo_vision",
-        "research.chat.system",
         "strategy.alert.classifier",
     }.issubset(by_key)
     assert "lifecycle_event" in by_key["trading.analysis.shared"]["active_version"]["content"]
 
 
+ALERT_DRAFT = (
+    "Classify one message.\n"
+    "chat_title={chat_title}\n"
+    "sender_name={sender_name}\n"
+    "first_line={first_line}\n"
+    "message_text:\n{message_text}"
+)
+
+
 def test_prompt_api_requires_validation_before_publish_and_supports_rollback(tmp_path):
     client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
-    detail = client.get("/api/ai-prompts/research.chat.system").json()
+    detail = client.get("/api/ai-prompts/strategy.alert.classifier").json()
     original = detail["active_version"]
 
     draft_response = client.put(
-        "/api/ai-prompts/research.chat.system/draft",
+        "/api/ai-prompts/strategy.alert.classifier/draft",
         json={
-            "content": "Published research prompt v2",
+            # The alert profile only asks for its four template variables.
+            # The trading prompts cannot stand in here: publishing one is
+            # gated on current historical tests, which is a different
+            # behaviour from the draft/validate/publish flow under test.
+            "content": ALERT_DRAFT,
             "change_note": "clarify evidence rules",
             "expected_active_version_id": original["id"],
         },
@@ -37,20 +49,20 @@ def test_prompt_api_requires_validation_before_publish_and_supports_rollback(tmp
     assert draft_response.json()["active_version"]["id"] == original["id"]
 
     blocked = client.post(
-        "/api/ai-prompts/research.chat.system/publish",
+        "/api/ai-prompts/strategy.alert.classifier/publish",
         json={"expected_draft_version_id": draft["id"]},
     )
     assert blocked.status_code == 409
 
     validation = client.post(
-        "/api/ai-prompts/research.chat.system/validate",
+        "/api/ai-prompts/strategy.alert.classifier/validate",
         json={"expected_draft_version_id": draft["id"]},
     )
     assert validation.status_code == 200
     assert validation.json()["success"] is True
 
     published = client.post(
-        "/api/ai-prompts/research.chat.system/publish",
+        "/api/ai-prompts/strategy.alert.classifier/publish",
         json={
             "expected_draft_version_id": draft["id"],
             "expected_active_version_id": original["id"],
@@ -58,10 +70,10 @@ def test_prompt_api_requires_validation_before_publish_and_supports_rollback(tmp
     )
     assert published.status_code == 200
     current = published.json()["active_version"]
-    assert current["content"] == "Published research prompt v2"
+    assert current["content"] == ALERT_DRAFT
 
     rolled_back = client.post(
-        "/api/ai-prompts/research.chat.system/rollback",
+        "/api/ai-prompts/strategy.alert.classifier/rollback",
         json={
             "source_version_id": original["id"],
             "expected_active_version_id": current["id"],
@@ -92,21 +104,3 @@ def test_prompt_api_reports_template_validation_errors(tmp_path):
     assert response.status_code == 200
     assert response.json()["success"] is False
     assert any("缺少必需模板变量" in error for error in response.json()["errors"])
-
-
-def test_prompt_api_can_create_a_group_scoped_draft_without_making_it_live(tmp_path):
-    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
-
-    response = client.put(
-        "/api/ai-prompts/research.chat.group/draft?chat_id=88",
-        json={
-            "content": "Prioritize lifecycle changes for this group.",
-            "change_note": "add group-specific research focus",
-        },
-    )
-
-    assert response.status_code == 200
-    detail = response.json()
-    assert detail["scope_chat_id"] == 88
-    assert detail["active_version"]["content"] != detail["draft_version"]["content"]
-    assert detail["draft_version"]["content"] == "Prioritize lifecycle changes for this group."

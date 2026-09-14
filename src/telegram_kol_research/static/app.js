@@ -4968,70 +4968,6 @@ function bindRecoverySubmitGateButtons() {
   });
 }
 
-async function submitAiQuestion(event) {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const questionInput = form.querySelector('[name="question"]');
-  const chatId = getSelectedChatId();
-  const question = questionInput ? questionInput.value.trim() : '';
-
-  if (!question) {
-    setAiStatus('Please enter a question before sending.', true);
-    return;
-  }
-
-  setAiStatus('Analyzing the latest context...');
-  const submitButton = form.querySelector('button[type="submit"]');
-  if (submitButton) {
-    submitButton.disabled = true;
-  }
-  if (questionInput) {
-    questionInput.disabled = true;
-  }
-
-  try {
-    const response = await fetch('/api/chat', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        question,
-        chat_id: Number(chatId),
-      }),
-    });
-    const payload = await response.json();
-    if (!response.ok) {
-      const detail = payload && typeof payload.detail === 'string'
-        ? payload.detail
-        : 'AI request failed. Please check the proxy connection and try again.';
-      setAiStatus(detail, true);
-      return;
-    }
-    const history = loadConversationHistory();
-    const normalizedAnswer = normalizeAiAnswerText(payload.answer || '');
-    const normalizedSources = isImageInputErrorText(normalizedAnswer) ? [] : (payload.sources || []);
-    history.push({
-      question,
-      answer: normalizedAnswer,
-      sources: normalizedSources,
-      createdAt: new Date().toISOString(),
-    });
-    saveConversationHistory(history);
-    renderConversationHistory();
-    setAiStatus('Analysis added to the conversation.');
-    questionInput.value = '';
-  } catch {
-    setAiStatus('AI request failed. Please check the proxy connection and try again.', true);
-  } finally {
-    if (submitButton) {
-      submitButton.disabled = false;
-    }
-    if (questionInput) {
-      questionInput.disabled = false;
-      questionInput.focus();
-    }
-  }
-}
-
 async function refreshCurrentGroupPanel(options = {}) {
   const chatId = getSelectedChatId();
   if (!chatId) return;
@@ -5532,10 +5468,6 @@ function bindLivePositionAttributionButtons() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  const form = document.querySelector('[data-ai-form]');
-  if (form) {
-    form.addEventListener('submit', submitAiQuestion);
-  }
   bindGroupLinks();
   bindGroupAutomationToggles();
   bindDetailPanelControls();
