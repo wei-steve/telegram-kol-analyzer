@@ -12,7 +12,8 @@ implementer: 子代理 opus-implementer（Opus 5 / high）
 commander: Claude Fable 5.1 指挥会话
 current_phase: 5
 phase_status: completed      # planned | in_progress | completed | blocked
-deploy: 未部署；部署与推送共享分支由指挥会话与用户决定。上线步骤见「上线核对」一节
+deploy: c79db7042cc251a54a86b3a9609cfc01bae68ba6   # 2026-09-14T11:41Z tg-deploy；回滚参考 ef1688c5b4c4f291bafd10e57993502028a5f3f1
+shared_branch_verified: PASS   # 部署 sha 在 origin/codex/deepcoin-auto-trading-v1 上，0 code files beyond production。上线步骤见「上线核对」一节
 ```
 
 ## 阶段总览
@@ -489,3 +490,18 @@ provider id 的 host 映射与 slug 规则。该模块不 import 包内任何其
 - 新增 fixture：`tests/fixtures/ai_recognition_v1_sample.yaml`（v1 样本的逐字冻结副本）
 - 文档：`docs/ARCHITECTURE.md` 第 5.5 节、`config/ai_recognition.example.yaml`（v2）、
   `README.md` 的 *AI Providers and Per-Stage Models*。
+
+## 部署记录（2026-09-14，指挥会话）
+
+- 预检：生产 HEAD `ef1688c5`，候选 `c79db704` 是其后代（PASS）；无 `pyproject` / `uv.lock` 变更；
+  服务器 `config/ai_recognition.yaml` 为 v1（无 `schema_version`），部署前备份为
+  `config/ai_recognition.yaml.v1.bak-20260914T114144Z`。
+- `tg-deploy c79db704`：HEAD 一致，worker / web / ingest 三个 unit 均 active。
+- 部署后只读核对 `ai-config-show`：providers deepseek / zhipu / mimo 三个，模型三条，
+  `authoritative_recognition=[mimo-v2.5]`、`context_resolution=[mimo-v2.5]`（生产原本就把
+  `context_resolution_model_id` 指到 mimo-v2.5，迁移照实保留）、`semantic_review=[deepseek-v4-flash]`、
+  `strategy_alert` / `research_chat` 空链沿用 env、`batch_text=[deepseek-v4-flash]`、`batch_image=[mimo-v2.5]`。
+  磁盘文件未被改写（仍 v1，等页面第一次保存）。
+- 本机 `GET /` 200，`GET /api/ai-stages` 与 CLI 一致、`warnings=[]`。
+- 部署 sha 已推到共享分支，两个方向核对均 PASS。
+- 用户在真实环境测试中；测试结论待记录。
