@@ -1,7 +1,7 @@
 # 上下文二次判断：同一条消息被重分析 19 次的原因
 
 日期：2026-09-15
-状态：4.1 + 4.2 + 4.3 已于 2026-09-15 部署生产 `ae43312a`（回滚 `fa1e0c09`）
+状态：4.1 + 4.2 + 4.3 已于 2026-09-15 部署生产 `ae43312a`；第 8 节（关闭「同群新消息」代用路径）用户已批准，实施中
 关联：`docs/plans/2026-09-15-context-trigger-tightening-analysis.md` 第 2.5 / 5 节记录了这个现象。
 数据来源：生产库 `data/research.db` 只读查询；worker 日志已过保留期，9 月 3 日的记录拿不到。
 
@@ -299,3 +299,33 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
   worker / web / ingest 均 active，启动无异常；共享分支 `origin/codex/deepcoin-auto-trading-v1` = 部署 SHA。
 - 验证方式：只读查 `context_resolution_attempts`，一周后看是否还有单条消息 24 小时内 > 5 行；
   以及 worker 日志 `context reanalysis capped` 的出现次数（每次封顶一行 WARNING）。
+
+## 8. 追加：关闭「同群新消息」代用路径（用户 2026-09-15 批准）
+
+### 8.1 依据（生产库 60 天只读统计）
+
+- 声明 `reply_target_available` 的记录 66 条：32 条消息根本没有 `reply_to_message_id`；34 条回复目标在分析前就已入库；
+  **0 条**目标是分析之后才入库。用户的判断成立：KOL 人为发消息，回复目标一定早已入库，「同群新消息」不可能让回复目标变得可用。
+- `next_same_chat_message` 事件 60 天重排 203 次；重分析产出动作的 21 次里紧跟其后的只有 2 次，其中 1 次是同一消息重复同一结论。
+- 真正有价值的重分析来自精确事件（`entry_leg_status_changed`、`exchange_snapshot_changed`）与错误重试路径。
+- Telegram 监听器 `telegram_live_listener.py:336-356` 在「回复目标不在库里 → 主动拉取成功」时发**显式** `reply_target_available` 事件。
+  这是回复目标真正「从无到有」的唯一途径，**保留**。
+
+### 8.2 改动
+
+1. `message_processing_worker.py:181-186`：删除对每条新消息发 `next_same_chat_message` 事件的调用；`message_edited` 的发送保留。
+2. `context_resolution_worker.schedule_context_reanalysis`：删除 `next_same_chat_message` 的全部特殊分支。
+   未知事件（不在 `EVENT_TRIGGER_MAP`）按现有逻辑 `return 0`，所以即使旧代码路径仍传入该事件名也只是空操作。
+3. 删除 6.2 新增的 `_reply_target_now_available` 及其 import（`ACTIVE_LIFECYCLE_STATUSES` 若无其他使用则一并删）。
+4. **不改**：`EVENT_TRIGGER_MAP["reply_target_available"]`（显式事件路径）、`REANALYSIS_TRIGGERS`、提示词、`CONTEXT_RESOLUTION_PROMPT_VERSION`、
+   6.1 的封顶、6.3 的指纹、`telegram_live_listener.py` 的发送方。
+
+### 8.3 测试
+
+- `tests/test_context_resolution_worker.py`：删除 `test_next_same_chat_message_schedules_unresolved_attempt`、
+  `test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen`、
+  `test_next_same_chat_message_ignores_rows_waiting_on_another_trigger`（及只为它们服务的 helper）；
+  新增 `test_next_same_chat_message_event_is_a_no_op`：声明了任意触发条件的 unresolved 行，收到 `next_same_chat_message` → 返回 0、状态不变。
+  新增 `test_explicit_reply_target_event_still_schedules`：声明 `reply_target_available` 的行收到显式 `reply_target_available` 事件 → 排队（若已有等价用例则不重复）。
+- `tests/test_message_processing_worker.py:96` 附近断言事件名的用例：改为断言**不再**发 `next_same_chat_message`，`message_edited` 在有 `edit_date` 时仍发。
+- 全量 `PYTHONPATH=. uv run pytest -q` 通过。
