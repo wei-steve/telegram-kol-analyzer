@@ -329,3 +329,67 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
   新增 `test_explicit_reply_target_event_still_schedules`：声明 `reply_target_available` 的行收到显式 `reply_target_available` 事件 → 排队（若已有等价用例则不重复）。
 - `tests/test_message_processing_worker.py:96` 附近断言事件名的用例：改为断言**不再**发 `next_same_chat_message`，`message_edited` 在有 `edit_date` 时仍发。
 - 全量 `PYTHONPATH=. uv run pytest -q` 通过。
+
+### 8.4 实施记录
+
+日期：2026-09-15。实施范围：第 8 节（8.2 + 8.3）。基线 `f4a820db`。
+
+#### 改动文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/telegram_kol_research/message_processing_worker.py` | 删除每条新消息发 `next_same_chat_message` 的调用（原 181-186 行）；`message_edited` 的分支与 `event_time` 计算原样保留 |
+| `src/telegram_kol_research/context_resolution_worker.py` | `schedule_context_reanalysis` 的两处 `next_same_chat_message` 特殊分支删除：函数开头改为 `if trigger is None: return 0`（不在 `EVENT_TRIGGER_MAP` 的事件名一律空操作），循环内改为 `if trigger not in declared: continue`；删除 `_reply_target_now_available` 与 `from …strategy_thread_candidates import ACTIVE_LIFECYCLE_STATUSES` |
+| `tests/test_context_resolution_worker.py` | 删除 3 例 + 1 个 helper + 1 个 import；新增 2 例 |
+| `tests/test_message_processing_worker.py` | 改 1 例断言；新增 1 例 |
+
+未改动（与 8.2 第 4 条一致）：`EVENT_TRIGGER_MAP`（含 `reply_target_available` 这条显式事件路径）、`REANALYSIS_TRIGGERS`、
+提示词与 `CONTEXT_RESOLUTION_PROMPT_VERSION`、6.1 的封顶逻辑与 `reanalysis_capped` 状态、6.3 的指纹口径、
+`telegram_live_listener.py` 的显式 `reply_target_available` 发送方、`web_queries.py` / 模板 / `app.css`。
+
+`grep -rn "next_same_chat_message\|_reply_target_now_available" src tests` 的剩余命中只有三处，都是新断言本身：
+`tests/test_context_resolution_worker.py` 的空操作用例名与它传入的事件名，
+以及 `tests/test_message_processing_worker.py` 里「不再发这个事件」的否定断言。`docs/` 下的历史记录按要求保留。
+
+#### 删除 / 修改的既有测试
+
+| 文件::用例 | 处理 | 原因 |
+| --- | --- | --- |
+| `tests/test_context_resolution_worker.py::test_next_same_chat_message_schedules_unresolved_attempt` | 删除 | 6.2 保留的那条代用路径整条取消，它断言的「仍被排队」不再成立 |
+| `tests/test_context_resolution_worker.py::test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen` | 删除 | 它断言的是 6.2 的生命周期过滤；过滤随分支一起消失，行为被更强的「整个事件都是空操作」覆盖 |
+| `tests/test_context_resolution_worker.py::test_next_same_chat_message_ignores_rows_waiting_on_another_trigger` | 删除 | 同上；其「`evidence_version_changed` 事件仍排队」的一半已由参数化用例 `test_reanalysis_is_scheduled_for_supported_context_changes` 覆盖 |
+| `tests/test_context_resolution_worker.py::_persist_reply_target_thread`（helper） | 删除 | 只为上面三例而建；随之 `StrategyMessageLink` 在该测试文件再无使用，import 一并删 |
+| `tests/test_message_processing_worker.py::test_process_message_job_runs_the_post_persist_chain_from_raw_id` | 修改断言 | 事件名列表由 `["next_same_chat_message", "evidence_version_changed"]` 改为 `["evidence_version_changed"]` |
+
+#### 新增用例
+
+- `tests/test_context_resolution_worker.py::test_next_same_chat_message_event_is_a_no_op`：声明了全部五个触发条件的 unresolved 行，
+  收到 `next_same_chat_message` → 返回 0，行仍是 `completed`，且 `trigger_event_json` / `next_attempt_at` 都没被写过。
+- `tests/test_context_resolution_worker.py::test_explicit_reply_target_event_still_schedules`：只声明 `reply_target_available` 的行，
+  收到**显式** `reply_target_available` 事件 → 排队，`trigger` 落 `reply_target_available`。
+- `tests/test_message_processing_worker.py::test_an_edited_message_still_schedules_the_message_edited_event`：
+  带 `edit_date` 的消息 → 调度事件里没有 `next_same_chat_message`、有 `message_edited` 且带正确的 `raw_message_id`。
+
+#### 全量测试
+
+`PYTHONPATH=. uv run pytest -q`：`8875 passed, 4 skipped, 107 warnings in 888.30s (0:14:48)`。
+用例总数与 8.2 改动前持平（删 3 例、增 3 例），skip 数与改动前一致。最后三行原样：
+
+```
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8875 passed, 4 skipped, 107 warnings in 888.30s (0:14:48)
+```
+
+#### 规格未覆盖之处的取舍
+
+- 8.3 允许在 `test_reanalysis_is_scheduled_for_supported_context_changes` 已覆盖时跳过
+  `test_explicit_reply_target_event_still_schedules`。该参数化用例确实覆盖了「显式事件 → 排队」，但它的行同时声明了五个触发条件；
+  这里仍新增了一例，把行收窄到只声明 `reply_target_available`、且其 `reply_to_message_id` 指向的消息根本不在库里——
+  6.2 的可用性门会拒绝它，删除后必须排队。它因此不是重复，而是 8.2 第 4 条「显式事件路径保持原样」的回归锚点。
+- `trigger_event_json` 里的 `"trigger": trigger or "next_same_chat_message"` 简化为 `"trigger": trigger`：
+  函数开头已保证 `trigger` 非空，回退分支成了死代码。落库内容对所有仍存在的事件完全不变。
+- `_persist_unresolved` 的 `reply_to_message_id=` 参数（6.2 时加入）保留：新增的两例都用它造「回复了某条消息」的行；
+  默认 `None`，其余用例行为不变。
+- `message_processing_worker` 中 `if context_resolution_scheduler is not None:` 与 `if raw_message.edit_date is not None:`
+  保持两层嵌套，不合并成一个条件，使本次 diff 只是删除、不重排既有结构。

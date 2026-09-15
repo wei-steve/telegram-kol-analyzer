@@ -34,9 +34,6 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_context_worker_state,
     capture_runtime_incident_best_effort,
 )
-from telegram_kol_research.strategy_thread_candidates import (
-    ACTIVE_LIFECYCLE_STATUSES,
-)
 
 
 EVENT_TRIGGER_MAP = {
@@ -378,47 +375,6 @@ def _is_unresolved(attempt: ContextResolutionAttempt) -> bool:
     )
 
 
-def _reply_target_now_available(session, raw_message: RawMessage) -> bool:
-    """Is the message this row replies to a legal candidate right now?
-
-    ``reply_target_available`` is the only trigger a model can declare that has
-    no precise event of its own, so ``next_same_chat_message`` stands in for it.
-    That stand-in is only worth a reanalysis when the target actually exists and
-    its thread is in a lifecycle state candidate generation would accept; a
-    target whose lifecycle has left ``ACTIVE_LIFECYCLE_STATUSES`` can never
-    become selectable, so re-asking the model is pure waste.
-    """
-
-    reply_to_message_id = raw_message.reply_to_message_id
-    if reply_to_message_id is None:
-        return False
-    target = (
-        session.query(RawMessage)
-        .filter(
-            RawMessage.chat_id == int(raw_message.chat_id),
-            RawMessage.message_id == int(reply_to_message_id),
-        )
-        .order_by(RawMessage.id.asc())
-        .first()
-    )
-    if target is None:
-        return False
-    statuses = (
-        session.query(StrategyLifecycle.lifecycle_status)
-        .join(
-            StrategyThread,
-            StrategyThread.current_lifecycle_id == StrategyLifecycle.id,
-        )
-        .join(
-            StrategyMessageLink,
-            StrategyMessageLink.strategy_thread_id == StrategyThread.id,
-        )
-        .filter(StrategyMessageLink.raw_message_id == int(target.id))
-        .all()
-    )
-    return any(str(row[0]) in ACTIVE_LIFECYCLE_STATUSES for row in statuses)
-
-
 def schedule_context_reanalysis(
     session_factory: sessionmaker,
     *,
@@ -431,7 +387,7 @@ def schedule_context_reanalysis(
 
     normalized_event = str(event_type)
     trigger = EVENT_TRIGGER_MAP.get(normalized_event)
-    if normalized_event != "next_same_chat_message" and trigger is None:
+    if trigger is None:
         return 0
     with session_factory() as session:
         query = session.query(ContextResolutionAttempt).filter(
@@ -450,32 +406,18 @@ def schedule_context_reanalysis(
             ).filter(RawMessage.chat_id == int(chat_id))
         rows = query.order_by(ContextResolutionAttempt.id.asc()).all()
         scheduled = 0
-        reply_target_available_by_raw_message: dict[int, bool] = {}
         for row in rows:
             if not _is_unresolved(row):
                 continue
             declared = set(_json_list(row.reanalysis_triggers_json))
-            if normalized_event != "next_same_chat_message" and trigger not in declared:
+            if trigger not in declared:
                 continue
-            if normalized_event == "next_same_chat_message":
-                if "reply_target_available" not in declared:
-                    continue
-                raw_id = int(row.raw_message_id)
-                available = reply_target_available_by_raw_message.get(raw_id)
-                if available is None:
-                    raw = session.get(RawMessage, raw_id)
-                    available = raw is not None and _reply_target_now_available(
-                        session, raw
-                    )
-                    reply_target_available_by_raw_message[raw_id] = available
-                if not available:
-                    continue
             row.status = "pending_reanalysis"
             row.next_attempt_at = occurred_at
             row.trigger_event_json = json.dumps(
                 {
                     "event_type": normalized_event,
-                    "trigger": trigger or "next_same_chat_message",
+                    "trigger": trigger,
                     "occurred_at": occurred_at.isoformat(),
                 },
                 ensure_ascii=False,

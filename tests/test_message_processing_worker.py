@@ -92,11 +92,51 @@ def test_process_message_job_runs_the_post_persist_chain_from_raw_id(tmp_path):
 
     assert processed == [raw_message_id]
     assert result.recognition.status == "非策略"
+    # A new message no longer stands in for `reply_target_available`: only the
+    # precise events survive.
     assert [event["event_type"] for event in scheduled] == [
-        "next_same_chat_message",
         "evidence_version_changed",
     ]
     assert context_runs == ["ran"]
+
+
+def test_an_edited_message_still_schedules_the_message_edited_event(tmp_path):
+    """Editing a message really does change its text, so that event stays."""
+
+    session_factory = create_session_factory(tmp_path / "edited-worker.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=123,
+            message_id=42,
+            sender_name="Alice Trader",
+            text="BTC 多",
+            posted_at=NOW,
+            edit_date=NOW + timedelta(minutes=3),
+        )
+        session.add(raw)
+        session.commit()
+        session.refresh(raw)
+        raw_message_id = raw.id
+
+    scheduled = []
+
+    asyncio.run(
+        process_message_job(
+            session_factory,
+            raw_message_id=raw_message_id,
+            authoritative_processor=lambda candidate_id: _processing_result(),
+            context_resolution_scheduler=lambda **event: scheduled.append(event),
+            context_resolution_worker=lambda: None,
+        )
+    )
+
+    event_types = [event["event_type"] for event in scheduled]
+    assert "next_same_chat_message" not in event_types
+    assert "message_edited" in event_types
+    edited = next(
+        event for event in scheduled if event["event_type"] == "message_edited"
+    )
+    assert edited["raw_message_id"] == raw_message_id
 
 
 def test_legacy_nested_context_reanalysis_failure_is_re_raised_to_outer_job(

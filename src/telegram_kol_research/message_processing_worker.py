@@ -179,12 +179,6 @@ async def process_message_job(
         raw_message.edit_date or raw_message.posted_at or utc_now()
     )
     if context_resolution_scheduler is not None:
-        await asyncio.to_thread(
-            context_resolution_scheduler,
-            event_type="next_same_chat_message",
-            chat_id=int(raw_message.chat_id),
-            occurred_at=event_time,
-        )
         if raw_message.edit_date is not None:
             await asyncio.to_thread(
                 context_resolution_scheduler,

@@ -25,7 +25,6 @@ from telegram_kol_research.models import (
     RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
-    StrategyMessageLink,
     StrategyThread,
 )
 from telegram_kol_research.recognition_decisions import (
@@ -94,59 +93,6 @@ def _persist_unresolved(
         return raw.id, attempt.id
 
 
-def _persist_reply_target_thread(
-    session_factory,
-    *,
-    chat_id,
-    target_message_id,
-    lifecycle_status,
-):
-    """The message a later row replies to, linked to one strategy thread."""
-
-    with session_factory() as session:
-        target = RawMessage(
-            chat_id=chat_id,
-            message_id=target_message_id,
-            text="BTC 多单，市价进",
-            posted_at=NOW - timedelta(hours=1),
-        )
-        lifecycle = StrategyLifecycle(
-            chat_id=chat_id,
-            message_id=target_message_id,
-            symbol="BTC",
-            side="long",
-            lifecycle_status=lifecycle_status,
-            signal_at=NOW - timedelta(hours=1),
-        )
-        session.add_all([target, lifecycle])
-        session.flush()
-        thread = StrategyThread(
-            chat_id=chat_id,
-            root_message_id=target_message_id,
-            symbol="BTC",
-            side="long",
-            status="active",
-            current_lifecycle_id=lifecycle.id,
-        )
-        session.add(thread)
-        session.flush()
-        lifecycle.strategy_thread_id = thread.id
-        session.add(
-            StrategyMessageLink(
-                strategy_thread_id=thread.id,
-                raw_message_id=target.id,
-                relation_kind="root",
-                resolver="test",
-                confidence=1.0,
-                evidence_json="{}",
-                decision_version="v1",
-                status="active",
-            )
-        )
-        session.commit()
-        return int(thread.id)
-
-
 def _add_completed_attempts(
     session_factory,
     *,
@@ -210,55 +156,14 @@ def test_reanalysis_is_scheduled_for_supported_context_changes(
         assert json.loads(attempt.trigger_event_json)["trigger"] == expected_trigger
 
 
-def test_next_same_chat_message_schedules_unresolved_attempt(tmp_path):
-    """The stand-in event only pays for a row that is really waiting on it."""
+def test_next_same_chat_message_event_is_a_no_op(tmp_path):
+    """The stand-in event is retired; nothing reschedules on a new message."""
 
     session_factory = create_session_factory(tmp_path / "same-chat.db")
-    _persist_reply_target_thread(
-        session_factory,
-        chat_id=88,
-        target_message_id=4,
-        lifecycle_status="entered",
-    )
     _, attempt_id = _persist_unresolved(
         session_factory,
         chat_id=88,
         reply_to_message_id=4,
-        triggers=("reply_target_available",),
-    )
-
-    scheduled = schedule_context_reanalysis(
-        session_factory,
-        event_type="next_same_chat_message",
-        chat_id=88,
-        occurred_at=NOW + timedelta(minutes=1),
-    )
-
-    assert scheduled == 1
-    with session_factory() as session:
-        assert (
-            session.get(ContextResolutionAttempt, attempt_id).status
-            == "pending_reanalysis"
-        )
-
-
-def test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen(
-    tmp_path,
-):
-    """An exited reply target never re-enters the candidate set."""
-
-    session_factory = create_session_factory(tmp_path / "same-chat-exited.db")
-    _persist_reply_target_thread(
-        session_factory,
-        chat_id=88,
-        target_message_id=4,
-        lifecycle_status="exited",
-    )
-    _, attempt_id = _persist_unresolved(
-        session_factory,
-        chat_id=88,
-        reply_to_message_id=4,
-        triggers=("reply_target_available",),
     )
 
     scheduled = schedule_context_reanalysis(
@@ -270,55 +175,37 @@ def test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen(
 
     assert scheduled == 0
     with session_factory() as session:
-        assert (
-            session.get(ContextResolutionAttempt, attempt_id).status == "completed"
-        )
+        attempt = session.get(ContextResolutionAttempt, attempt_id)
+        assert attempt.status == "completed"
+        assert attempt.trigger_event_json is None
+        assert attempt.next_attempt_at is None
 
 
-def test_next_same_chat_message_ignores_rows_waiting_on_another_trigger(tmp_path):
-    """Every other trigger has its own precise event and must wait for it."""
+def test_explicit_reply_target_event_still_schedules(tmp_path):
+    """The listener's own event is trusted on its word, with no extra gate."""
 
-    session_factory = create_session_factory(tmp_path / "same-chat-other.db")
-    _persist_reply_target_thread(
-        session_factory,
-        chat_id=88,
-        target_message_id=4,
-        lifecycle_status="entered",
-    )
+    session_factory = create_session_factory(tmp_path / "explicit-reply.db")
     raw_id, attempt_id = _persist_unresolved(
         session_factory,
         chat_id=88,
         reply_to_message_id=4,
-        triggers=("evidence_version_changed",),
+        triggers=("reply_target_available",),
     )
 
-    assert (
-        schedule_context_reanalysis(
-            session_factory,
-            event_type="next_same_chat_message",
-            chat_id=88,
-            occurred_at=NOW + timedelta(minutes=1),
-        )
-        == 0
+    scheduled = schedule_context_reanalysis(
+        session_factory,
+        event_type="reply_target_available",
+        raw_message_id=raw_id,
+        occurred_at=NOW + timedelta(minutes=1),
     )
-    with session_factory() as session:
-        assert (
-            session.get(ContextResolutionAttempt, attempt_id).status == "completed"
-        )
 
-    assert (
-        schedule_context_reanalysis(
-            session_factory,
-            event_type="evidence_version_changed",
-            raw_message_id=raw_id,
-            occurred_at=NOW + timedelta(minutes=2),
-        )
-        == 1
-    )
+    assert scheduled == 1
     with session_factory() as session:
+        attempt = session.get(ContextResolutionAttempt, attempt_id)
+        assert attempt.status == "pending_reanalysis"
         assert (
-            session.get(ContextResolutionAttempt, attempt_id).status
-            == "pending_reanalysis"
+            json.loads(attempt.trigger_event_json)["trigger"]
+            == "reply_target_available"
         )
 
 
