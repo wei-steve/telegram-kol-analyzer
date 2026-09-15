@@ -265,6 +265,18 @@ def requires_context_resolution(
         )
     ):
         reasons.add("apparent_entry_may_be_revision")
+    # Option A of docs/plans/2026-09-15-context-trigger-tightening-analysis.md.
+    # "multiple_same_source_candidates" only observes that this source already
+    # has >= 2 live candidate threads; it says nothing about the message at
+    # hand. Over 14 production days it fired as the *only* trigger on 1373
+    # messages the first pass had read as neither a strategy nor a lifecycle
+    # event, and changed the outcome 4 times (0.3%). So the structural signal
+    # is counted only when the first pass already made this message
+    # actionable. The wording signals and management_without_exact_target
+    # (which already requires an event) keep their current behaviour.
+    actionable = recognition_result == "是策略" or event_type != "none"
+    if not actionable:
+        reasons.discard("multiple_same_source_candidates")
     ordered = tuple(reason for reason in CONTEXT_TRIGGER_ORDER if reason in reasons)
     return bool(ordered), ordered
 

@@ -144,3 +144,100 @@ actionable = recognition_result == "是策略" or lifecycle_event.event_type != 
 - 请求体 74 KB 中位数，上下文窗口可能过大。
 - 第一次识别对「ETH 睡觉挂单多 挂2367…」「比特币 方向：做空 入场：…」这类格式漏判为非策略（2.3 节），
   应作为识别提示词的回归样本。
+
+## 6. 实施记录
+
+实施日期：2026-09-15。基线提交 `1a6cac74`；本节所在提交即方案甲的实施提交，
+提交标题 `feat(recognition): gate the multiple-candidate context trigger on actionability`
+（提交自身的 SHA 无法写进自己的内容，由指挥会话在合入记录里补齐）。
+
+### 6.1 代码改动
+
+只有一处逻辑改动，在 `src/telegram_kol_research/authoritative_recognition.py`
+的 `requires_context_resolution` 里，位置在 `apparent_entry_may_be_revision` 判定之后、
+组装 `ordered` 之前：
+
+```
+actionable = recognition_result == "是策略" or event_type != "none"
+if not actionable:
+    reasons.discard("multiple_same_source_candidates")
+```
+
+- 8 个信号自身的检测逻辑、`CONTEXT_TRIGGER_ORDER`、返回值形状均未改动。
+- `discard` 放在 `apparent_entry_may_be_revision` 之后。该判定只依赖
+  `recognition_result == "是策略"`、`candidates` 非空、以及
+  `"revision_language" in reasons` 或候选的 `overlapping_entry`，与
+  `multiple_same_source_candidates` 无关；且 `discard` 之后除 `ordered` 外再无读取
+  `reasons` 的逻辑，因此两者先后顺序不影响结果。
+- 影子判定 `context_resolution_shadow.py` 按要求未改动。
+
+### 6.2 既有测试
+
+`grep -rn "requires_context_resolution\|multiple_same_source_candidates" tests/` 的全部命中
+逐条核对后，**没有任何既有断言需要修改**：
+
+- `tests/test_authoritative_recognition.py:873`
+  （`test_context_resolution_triggers_are_closed_and_auditable`）：第一层为
+  `是策略`，`actionable` 为真，六个信号的期望元组不变。
+- `tests/test_authoritative_recognition.py:905`
+  （`test_unambiguous_independent_entry_does_not_require_second_resolution`）：
+  `candidates=[]`，本来就不会产生该信号。
+- `tests/test_context_resolution.py`（369/417/462/514）、
+  `tests/test_recognition_context_gate.py`（73/514/519）：把触发原因当**输入数据**传给
+  记录与渲染路径，不调用 `requires_context_resolution`。
+- `tests/test_context_resolution_shadow.py`：直接测影子函数，按要求不动。
+
+第 4 节点名的 `tests/test_recognition_authority_architecture.py` 在本仓库中没有对该函数的
+断言（文件内无相关命中），故无改动。
+
+### 6.3 新增用例
+
+新文件 `tests/test_context_trigger_actionable_gate.py`，5 例：
+
+1. `test_non_actionable_message_ignores_multiple_candidates` —
+   非策略 + `event_type=none` + 2 候选 → `(False, ())`。
+2. `test_lifecycle_event_without_target_keeps_multiple_candidates` —
+   非策略 + `position_update`（target 为空）+ 2 候选 → 触发，
+   `management_without_exact_target` 与 `multiple_same_source_candidates` 都在。
+3. `test_strategy_message_keeps_multiple_candidates` —
+   是策略 + 2 候选 → 触发，`reasons == ("multiple_same_source_candidates",)`。
+4. `test_wording_signal_still_triggers_without_the_structural_one` —
+   非策略 + none + 2 候选 + 正文含「持仓」→ 触发，含 `entered_holder_language`，
+   不含 `multiple_same_source_candidates`。
+5. `test_apparent_entry_revision_is_unchanged_for_non_strategy_messages` —
+   非策略 + none + 2 候选 + 正文含「修改」+ 候选带 `overlapping_entry` →
+   `apparent_entry_may_be_revision` 行为与改动前一致（它要求 `是策略`，故不出现），
+   `revision_language` 仍在，结果为 `("revision_language",)`。
+
+### 6.4 全量测试
+
+`PYTHONPATH=. uv run pytest -q`（裸跑会在收集阶段报 `No module named 'tests'`）：
+
+```
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8867 passed, 4 skipped, 107 warnings in 848.92s (0:14:08)
+```
+
+退出码 0，新增的 5 例包含在内。4 条 skip 未单独与基线对比。
+
+### 6.5 实施中发现：影子判定无法充当方案甲的校验信号
+
+第 4 节最后一条设想「部署后一周看 `shadow_would_extra_trigger` 的分布，校验方案甲是否过紧」。
+按当前实现，这个信号**结构上恒为 0**，改动前后都是：
+
+- `evaluate_context_resolution_shadow` 只在 `context_resolution.py:748` 被调用，
+  而该调用点位于上下文调用**已经发生**之后的落库路径里，参数写死
+  `authoritative_would_trigger=True`。权威没触发的消息根本不会产生 shadow 行。
+- 因此 `disagreement_direction` 只可能取 `shadow_would_skip`，
+  取不到 `shadow_would_extra_trigger`。`docs/ai-context-observation-log.md` 第 1 节
+  记录的生产数据也正是 `shadow_would_extra_trigger 0`。
+- 影子的 `multiple_allowed` 分支还以 `authoritative_triggers` 里存在
+  `multiple_same_source_candidates` 为前提。方案甲上线后该信号只会在 `actionable`
+  时出现，影子必然同时命中 `first_pass_strategy` 或 `lifecycle_event_present`，
+  于是 `shadow_would_skip` 也会趋近 0——已记录的 65 条 would-skip 全部是
+  「非策略 / none / target=NULL」，正是方案甲要掐掉的那一组。
+
+按指令未改动影子判定。若确实需要「方案甲是否过紧」的校验信号，需要另行决定：
+在权威未触发的路径上也记录一次影子评估（并传入真实的
+`authoritative_would_trigger`），这超出本次改动范围。
