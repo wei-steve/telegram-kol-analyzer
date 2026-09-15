@@ -12,14 +12,14 @@ implementer: 子代理（Opus 5 / high），worktree agent-ac81bdd9ea04920bd
 commander: 指挥会话
 current_phase: 1
 phase_status: completed      # planned | in_progress | completed | blocked
-deploy: 未部署               # 本次只做本地实施与全量测试，未 push、未 tg-deploy
+deploy: 已部署 1fe25a04      # 2026-09-15 20:03 CST tg-deploy；回滚 SHA d968f254
 ```
 
 ## 阶段总览
 
 | 阶段 | 内容 | 状态 | 提交 | 测试 |
 |---|---|---|---|---|
-| 1（一批） | 数据层新列 + 门结论写入 + 查询层 `execution_state` + 模板/前端 | completed | 见下方 | 全量 8861 passed / 0 failed / 4 skipped（933s） |
+| 1（一批） | 数据层新列 + 门结论写入 + 查询层 `execution_state` + 模板/前端 | completed | `661c260e`（子代理）+ `1fe25a04`（指挥会话审阅修订） | 指挥会话独立复跑全量 8862 passed / 0 failed / 4 skipped（903s） |
 
 全量命令：`PYTHONPATH=<repo root> uv run pytest -q`。
 注意：裸 `uv run pytest -q` 在本仓库会因 `tests/test_management_reliability_step5e.py` 与
@@ -111,3 +111,23 @@ CSS 类名/Python 标识符/`mimo_analysis` 字段名。未回填历史行。
 「`recognition_result == "是策略"` 或 `lifecycle_event.event_type != "none"`」之下。
 本次未做任何改动；新加的触发原因分布统计行正是为量化这一点而存在，
 建议先看一周真实分布再决定。
+
+## 部署记录
+
+- 2026-09-15 20:03 CST：`tg-deploy 1fe25a044f15949fb7e462e3d9e7363c27c662b3`，回滚 SHA `d968f25425ecf1bc88b0133bf1f57361da80bf2b`。
+- 部署前核对：候选是生产 HEAD 的直系后代；非文档差异只含本项目文件。
+- 部署后核对：worker/web/ingest 三个单元 active；共享分支 `origin/codex/deepcoin-auto-trading-v1` = 部署 SHA；
+  生产库 `data/research.db` 的 `recognition_decisions` 已自动补列 `context_resolution_gate_json`
+  （`data/telegram_kol.db`、`data/db.sqlite3` 是 0 字节的空文件，不是生产库）。
+- 重启后 worker 日志里的 `recognition execution finding … observe_uncertain` 与「event loop stalled」栈采样
+  都是既有行为（部署前两小时同类日志 1740 条），与本次无关。
+- 部署后 10 分钟内没有新消息进入权威识别，`context_resolution_gate_json` 的线上首写要等下一条消息；
+  写路径由 `tests/test_recognition_context_gate.py` 覆盖。
+
+## 下一步（待用户观察后决定）
+
+用户报告 100 次上下文调用里真正需要的不到 10 次。页面统计行现在按触发信号汇总次数；
+观察几天分布后再决定收紧哪些信号。子代理的观察线索见上文第 7 节：
+`revision_language`（子串匹配「调整」「更新」）、`entered_holder_language`（含「持仓」）、
+`multiple_same_source_candidates`（只看候选数，不看本条是否策略）三者在「非策略」消息上也会触发，
+最可能是浪费大头；最小改法是把这些信号收到 `recognition_result == "是策略"` 或有管理事件之下。

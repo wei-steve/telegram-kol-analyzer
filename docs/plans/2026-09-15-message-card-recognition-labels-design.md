@@ -1,7 +1,7 @@
 # 消息卡片：识别结果标题去 MiMo 化 + 上下文二次判断状态明示
 
 日期：2026-09-15
-状态：用户 2026-09-15 批准（「按方案做」），实施完成待部署（审阅后追加 `invoked_unrecorded` 状态）
+状态：已实施并于 2026-09-15 部署生产 `1fe25a04`（审阅后追加 `invoked_unrecorded` 状态）；进度见 `docs/message-card-recognition-labels-status.md`
 实施方式：Opus 5 (high) 子代理在 worktree 实施，指挥会话审阅
 
 ## 1. 问题
