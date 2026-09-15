@@ -1,7 +1,7 @@
 # 消息处理任务：守护重启、锁异常容错、队列停摆告警
 
 日期：2026-09-16
-状态：用户 2026-09-16 批准，实施中（子代理）
+状态：已于 2026-09-16 部署生产 `6cce08b1`（回滚 `d8714c48`）
 关联：`docs/plans/2026-09-15-context-reanalysis-loop-analysis.md`（同一晚的部署重启暴露了本问题）
 
 ## 1. 事故
@@ -230,3 +230,15 @@
 8. **未做**：没有为新事故类型写专门的 Telegram 渲染分支，通用渲染器
    （`format_runtime_incident_notification`）会输出组件、源状态、原因代码，足够定位；
    第 3.3 节也只要求监视器自己那条消息的文案。
+
+## 8. 部署记录（指挥会话补记）
+
+- 子代理提交 `6cce08b1`；指挥会话独立复跑全量 8890 passed / 0 failed / 4 skipped（783 s）。
+- 2026-09-16 `tg-deploy 6cce08b1398a4a8de6357f22ece9bbe4c039feae`，回滚 SHA `d8714c48`。
+  worker / web / ingest 均 active，启动无异常；共享分支 = 部署 SHA；部署后 2 小时内的 job 全部 succeeded，
+  无超过 3 分钟未认领的 pending。
+- 验证方式：journal 里 `Supervised background task message_processing_worker_task failed` /
+  `message processing claim skipped` 出现即说明容错生效；系统操作机器人收到「消息处理队列停摆」即说明监视器生效；
+  `message_processing_jobs.last_reason='expired_stale_instruction'` 应不再成批出现。
+- 子代理审阅要点：一次停摆会产生两条 Telegram 消息（监视器直发 + 事故台账通用渲染），保留；
+  守护包装的连续失败计数按任务名跨重启累积（3.4 禁止改包装），已记录为已知边角。
