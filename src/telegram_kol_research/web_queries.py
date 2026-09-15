@@ -1822,10 +1822,12 @@ def _context_execution_state(
         if status in _CONTEXT_IN_PROGRESS_STATUSES:
             return "in_progress"
         return _CONTEXT_TERMINAL_STATE_BY_STATUS.get(status, "unknown")
-    # No attempt row: the gate is the only witness. An outcome the mapping does
-    # not cover -- including a gate that recorded ``invoked`` but whose resolver
-    # raised before writing its attempt -- reads as unrecorded rather than
-    # claiming a reason that was never observed.
+    # No attempt row: the gate is the only witness. A gate that recorded
+    # ``invoked`` with no attempt behind it means the resolver raised before
+    # writing one; that is its own state so an operator does not mistake it
+    # for a historical row. Anything else unmapped reads as unrecorded.
+    if gate_outcome == "invoked":
+        return "invoked_unrecorded"
     return _CONTEXT_STATE_BY_GATE_OUTCOME.get(str(gate_outcome or ""), "unknown")
 
 

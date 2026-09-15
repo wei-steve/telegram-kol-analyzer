@@ -482,6 +482,7 @@ def test_execution_state_from_attempt_status(status, expected):
         ("not_needed", "not_needed"),
         ("resolver_disabled", "disabled"),
         ("recognition_failed", "not_evaluated"),
+        ("invoked", "invoked_unrecorded"),
         (None, "unknown"),
     ],
 )

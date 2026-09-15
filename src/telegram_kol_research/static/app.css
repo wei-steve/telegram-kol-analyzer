@@ -3761,7 +3761,8 @@ body {
 .context-exec-state.is-in_progress { background: rgba(245, 158, 11, 0.16); color: #fde68a; }
 .context-exec-state.is-exhausted,
 .context-exec-state.is-blocked_disabled,
-.context-exec-state.is-blocked_terminal { background: rgba(239, 68, 68, 0.16); color: #fecaca; }
+.context-exec-state.is-blocked_terminal,
+.context-exec-state.is-invoked_unrecorded { background: rgba(239, 68, 68, 0.16); color: #fecaca; }
 .context-exec-state.is-superseded { background: rgba(148, 163, 184, 0.16); color: #cbd5e1; }
 
 .context-trigger-reasons {

@@ -168,7 +168,8 @@ def test_unknown_model_id_falls_back_to_the_raw_id(tmp_path):
     # A model that has left the configuration keeps its id rather than
     # rendering as an empty badge.
     assert '<span class="mimo-runtime-model">retired-model-7</span>' in unknown
-    assert "模型 retired-model-7（retired-model-7）" in unknown
+    assert "模型 retired-model-7 · 合约" in unknown
+    assert "retired-model-7（retired-model-7）" not in unknown
 
 
 def test_configured_model_label_replaces_the_raw_id_in_the_heading(tmp_path):

@@ -1,7 +1,7 @@
 # 消息卡片：识别结果标题去 MiMo 化 + 上下文二次判断状态明示
 
 日期：2026-09-15
-状态：用户 2026-09-15 批准（「按方案做」），实施中
+状态：用户 2026-09-15 批准（「按方案做」），实施完成待部署（审阅后追加 `invoked_unrecorded` 状态）
 实施方式：Opus 5 (high) 子代理在 worktree 实施，指挥会话审阅
 
 ## 1. 问题
@@ -63,7 +63,7 @@
 | `status_label` | `识别进行中` / `识别失败` / `v2 失败，已用 v1 结果` / `识别成功` |
 | 标题行 | 在 `<strong>` 后新增模型徽章 `<span class="mimo-runtime-model">{{ model_label }}</span>` |
 | 折叠态 `_messages.html:219` | `AI识别结果 · {{ model_label }}：{{ status_label }}` |
-| 技术明细 `_messages.html:415` | `模型 {{ model_label }}（{{ runtime.model }}）· 合约 …` |
+| 技术明细 `_messages.html:415` | `模型 {{ model_label }}（{{ runtime.model }}）· 合约 …`；显示名与 id 相同时不重复括号 |
 
 **模型显示名的来源**：`ai_recognition_config.AiRecognitionConfig.models_by_id`
 （`ai_recognition_config.py:375`）里每个 `AiModel` 有 `label`。
@@ -119,6 +119,7 @@
     | 无 attempt 且 gate_outcome == not_needed | `not_needed` | 未执行：未命中触发条件 |
     | 无 attempt 且 gate_outcome == resolver_disabled | `disabled` | 未执行：群组未启用上下文 |
     | 无 attempt 且 gate_outcome == recognition_failed | `not_evaluated` | 未评估：第一次识别失败 |
+    | 无 attempt 且 gate_outcome == invoked | `invoked_unrecorded` | 已调用，但未留下尝试记录（调用异常） |
     | 无 attempt 且 gate_outcome 为空 | `unknown` | 未执行（历史消息，未记录原因） |
 
 - 返回 `None` 的条件放宽：只要有 decision 行（消息经过权威识别），就返回对象，
@@ -155,7 +156,7 @@
   这样用户一眼能看出哪个信号触发最多。
 - `open` 条件不变（进行中/未解决/耗尽时默认展开）。
 - 徽章样式：`completed` 绿、`in_progress` 黄、`exhausted`/`blocked_*` 红、
-  `not_needed`/`disabled`/`unknown` 灰。复用 `.mimo-runtime-status.is-*` 的配色变量。
+  `invoked_unrecorded` 红、`not_needed`/`disabled`/`unknown` 灰。复用 `.mimo-runtime-status.is-*` 的配色变量。
 
 **统计与筛选**：顶部「上下文调用 N」与「用了上下文」筛选继续以 `context_called`
 （有 attempt）为准，不改。
@@ -189,7 +190,7 @@
   - `process_authoritative_message`：群组门关 → `resolver_disabled`；无信号 → `not_needed`；
     识别失败 → `recognition_failed`；调用成功 → `invoked` 且 attempt 存在；
     解析器抛异常 → 仍是 `invoked`。
-  - `_serialize_context_resolution`：10 种 `execution_state` 各一条。
+  - `_serialize_context_resolution`：11 种 `execution_state` 各一条。
   - `_serialize_context_resolution`：gate 列为空但 attempt 有 `invocation_triggers_json` 时，`gate_triggers` 取自 attempt。
   - 路由渲染：触发原因以中文芯片出现在卡片体第一行；「已结合」芯片带首个触发原因；
     `data-message-context-triggers` 属性正确；统计行出现触发原因分布。

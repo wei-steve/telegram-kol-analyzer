@@ -117,6 +117,7 @@
     'not_needed': '未执行：未命中触发条件',
     'disabled': '未执行：群组未启用上下文',
     'not_evaluated': '未评估：第一次识别失败',
+    'invoked_unrecorded': '已调用，但未留下尝试记录（调用异常）',
     'unknown': '未执行（历史消息，未记录原因）'
   } %}
 
@@ -442,7 +443,7 @@
                 <details class="mimo-technical-details">
                   <summary>运行技术明细</summary>
                   <div class="mimo-runtime-facts">
-                    <small>模型 {{ runtime.model_label }}（{{ runtime.model }}）· 合约 {{ runtime.contract_version }} · 输入 {{ runtime.input_kind }}</small>
+                    <small>模型 {{ runtime.model_label }}{% if runtime.model_label != runtime.model %}（{{ runtime.model }}）{% endif %} · 合约 {{ runtime.contract_version }} · 输入 {{ runtime.input_kind }}</small>
                     <small>尝试 {{ runtime.attempt_count }} 次 · 整次重试 {{ runtime.whole_run_retry_count }} 次 · 耗时 {{ runtime.duration_ms if runtime.duration_ms is not none else '-' }} ms</small>
                     <small>{{ '当前运行已成为权威结果' if runtime.became_authoritative else '当前运行未成为权威结果' }}</small>
                     {% if runtime.fallback_source %}

@@ -66,7 +66,7 @@ CSS 类名/Python 标识符/`mimo_analysis` 字段名。未回填历史行。
 1. **`invoked` 但没有 attempt 行**：设计的 `execution_state` 表只列了 `无 attempt` 且
    outcome 为 `not_needed`/`resolver_disabled`/`recognition_failed`/空 四种。解析器在写 attempt 行
    之前就抛异常时会出现「gate=invoked 且无 attempt」。为把枚举保持在设计规定的 10 个值内，
-   这种情况落到 `unknown`（「未执行（历史消息，未记录原因）」）。
+   子代理原本落到 `unknown`；指挥会话审阅时改为独立状态 `invoked_unrecorded`（「已调用，但未留下尝试记录（调用异常）」，红色），设计文档已同步为 11 种。
 2. **无门结论的写入者不清空该列**：`telegram_live_listener.py:687` 的 recovery guard 不评估两道门，
    传 `None`。两条 **更新** 路径在 `context_resolution_gate is None` 时不写该列，
    以免把先前已记录的门结论抹成 NULL。新建路径仍按 `None` 写 NULL。
@@ -81,7 +81,7 @@ CSS 类名/Python 标识符/`mimo_analysis` 字段名。未回填历史行。
 6. **`load_selected_messages` / `load_messages_in_time_window` 未加 `model_labels`**：
    这两个入口不渲染消息卡片，保持原状；`model_label` 在无 map 时回落原始 id，无空白风险。
 7. **技术明细在模型未配置显示名时会重复**：如 `gpt-5.6-luna（gpt-5.6-luna）`。
-   这是设计第 3.1 节 `模型 {{ model_label }}（{{ runtime.model }}）` 的字面结果，未做去重。
+   指挥会话审阅时已改为显示名与 id 相同则不加括号（模板 `{% if runtime.model_label != runtime.model %}`）。
 
 ## 被迫改动的既有测试
 
