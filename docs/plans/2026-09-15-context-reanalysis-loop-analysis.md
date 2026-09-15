@@ -1,7 +1,7 @@
 # 上下文二次判断：同一条消息被重分析 19 次的原因
 
 日期：2026-09-15
-状态：分析完成，修复方案待用户拍板；未改代码
+状态：用户 2026-09-15 拍板做 4.1 + 4.2 + 4.3，实施中（子代理）
 关联：`docs/plans/2026-09-15-context-trigger-tightening-analysis.md` 第 2.5 / 5 节记录了这个现象。
 数据来源：生产库 `data/research.db` 只读查询；worker 日志已过保留期，9 月 3 日的记录拿不到。
 
@@ -141,3 +141,71 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
 - 4.2：`schedule_context_reanalysis` + `tests/test_context_resolution_worker.py`。
 - 4.3：`context_resolution.py` `_upsert_attempt` 的 `state_fingerprint=` 一行 + 一个「落库与重算指纹相等」的测试。
 - 全量测试同前：`PYTHONPATH=. uv run pytest -q`。
+
+## 6. 已批准的实施规格（4.1 + 4.2 + 4.3）
+
+用户 2026-09-15 拍板「做 1 2 3」。以下是给子代理的精确规格；4.4 / 4.5 不做。
+
+### 6.1 按消息的重分析上限（4.1）
+
+- 位置：`context_resolution_worker.py` 的 `run_context_resolution_once`，在 `is_eligible` 检查之后、
+  `_has_terminal_instruction` 之前。
+- 规则：统计 `context_resolution_attempts` 中 `raw_message_id == claim.raw_message_id` 且
+  `created_at >= now - 24h` 的行数（**不含**正在认领的这一行以外的过滤，就是全部行）。
+  行数 `>= max_reanalysis_per_message`（新参数，默认 5）时：
+  `_finish_claim(status="reanalysis_capped", now=current)`，返回
+  `{"status": "reanalysis_capped", "raw_message_id": ...}`，**不调用** `reanalyze`，不调模型。
+- 常量 `DEFAULT_MAX_REANALYSIS_PER_MESSAGE = 5` 放在 worker 模块顶部，与 `DEFAULT_RETRY_DELAY` 并列。
+- `reanalysis_capped` 是终态：不在 `_claimable` 里，也不在 `schedule_context_reanalysis` 的
+  `status.in_(("completed","pending_reanalysis"))` 里，天然不会再被排队。
+- 同一消息其余仍为 `completed`+unresolved 的旧行被事件重排后，认领时同样会被这条规则封顶，不产生模型调用。
+- 页面：`web_queries._CONTEXT_TERMINAL_STATE_BY_STATUS` 加 `"reanalysis_capped": "reanalysis_capped"`；
+  模板 `context_state_labels` 加 `'reanalysis_capped': '重分析已达上限'`；`app.css` 该状态用灰色
+  （与 `not_needed` 同款）。设计文档 `2026-09-15-message-card-recognition-labels-design.md` 的状态表不改，
+  在本文档记录即可。
+- 运行时事件：封顶时 `logger.warning("context reanalysis capped raw_message_id=%s attempts_24h=%s cap=%s")`，
+  不发通知、不记 runtime incident。
+
+### 6.2 「下一条同群消息」只重排真正等它的行（4.2）
+
+- 位置：`context_resolution_worker.schedule_context_reanalysis`，`normalized_event == "next_same_chat_message"` 分支。
+- 现状：只要行声明了任意 `reanalysis_triggers` 就重排。
+- 改为：只重排声明了 `reply_target_available` 的行（`next_same_chat_message` 不是模型可声明的触发名，
+  `REANALYSIS_TRIGGERS` 里没有它；其余四个触发名各有自己的精确事件，见 `EVENT_TRIGGER_MAP`），
+  **且**该行对应消息的回复目标此刻「可用」：
+  - `raw_messages.reply_to_message_id` 非空；
+  - 同 `chat_id` 下存在 `message_id == reply_to_message_id` 的原始消息；
+  - 该原始消息有 `strategy_message_links` 指向的线程，其 `current_lifecycle_id` 的
+    `lifecycle_status` ∈ `strategy_thread_candidates.ACTIVE_LIFECYCLE_STATUSES`（直接 import 这个常量，
+    与候选生成保持同一口径，包括 `expired`）。
+  - 任一条不满足 → 不重排（回复目标要么还没来、要么永远不合法，两种情况重分析都没有意义；
+    前者等它真来时 `message_processing_worker` 会再发一次事件，那时就满足了）。
+- 把这个判断抽成 `_reply_target_now_available(session, raw_message) -> bool`，便于测试。
+- `EVENT_TRIGGER_MAP["reply_target_available"]` 这条**显式事件**路径保持原样（谁显式发这个事件就信谁）。
+
+### 6.3 让「上下文没变就跳过」真正生效（4.3）
+
+- 位置：`context_resolution.py` `_upsert_attempt` 中 `state_fingerprint = build_context_state_fingerprint(...)`
+  （约 718-724 行）。
+- 改为 `candidate_thread_ids=set(collect_candidate_thread_ids(request_payload))`
+  （从 `context_request_storage` 导入；就是同一函数在几行之后算 `candidate_thread_ids_json` 用的那个）。
+  这样落库值与 worker 重算（`_attempt_candidate_thread_ids` 读 `candidate_thread_ids_json`）用同一集合。
+- 只改这一处；`build_context_state_fingerprint` 本身不动。
+
+### 6.4 测试
+
+- `tests/test_context_resolution_worker.py`：
+  - 既有 `test_next_same_chat_message_schedules_unresolved_attempt` 要按 6.2 调整：让它声明
+    `reply_target_available` 且回复目标链接到活跃生命周期线程 → 仍被排队；
+    新增反例：声明 `reply_target_available` 但回复目标线程生命周期为 `exited` → 不排队；
+    声明 `evidence_version_changed`（无 `reply_target_available`）→ `next_same_chat_message` 不排队，
+    但 `evidence_version_changed` 事件仍排队。
+  - 新增：同一消息 24 小时内已有 5 行 → 第 6 次认领被标 `reanalysis_capped`，`reanalyze` 未被调用；
+    4 行 → 正常调用。跨 24 小时的旧行不计入。
+  - 新增：`_upsert_attempt` 落库后，`build_context_state_fingerprint(session_factory, raw_message_id)`
+    （不传 candidate_thread_ids，走 `_attempt_candidate_thread_ids` 路径）与落库的 `state_fingerprint` 相等；
+    请求体里回复链带一个不在 `candidate_strategy_threads` 的线程 id 也要相等（这正是修的场景）。
+  - 既有 `test_unchanged_fingerprint_does_not_call_ai` 保持通过。
+- `tests/test_recognition_context_gate.py` 的 `execution_state` 参数化加 `("reanalysis_capped","reanalysis_capped")`。
+- `tests/test_web_recognition_card_labels.py` 或同类：渲染一条 `reanalysis_capped` 卡片，徽章文案「重分析已达上限」。
+- 全量 `PYTHONPATH=. uv run pytest -q` 通过。
