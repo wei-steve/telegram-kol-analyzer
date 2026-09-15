@@ -183,9 +183,9 @@ def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_p
     assert response.status_code == 200
     body = response.text
     assert body.index("移动止损到1940，最近震荡很大") < body.index(
-        "MiMo第一次识别"
+        "权威识别结果"
     )
-    assert body.index("MiMo第一次识别") < body.index("图片证据")
+    assert body.index("权威识别结果") < body.index("图片证据")
     assert body.index("图片证据") < body.index("系统接纳与自动交易")
     assert body.index("系统接纳与自动交易") < body.index(
         "DeepSeek辅助复核"
@@ -208,7 +208,7 @@ def test_group_messages_route_renders_mimo_first_multidimensional_analysis(tmp_p
         re.S,
     )
     assert collapsed is not None
-    assert "MiMo识别结果" in collapsed.group(1)
+    assert "AI识别结果" in collapsed.group(1)
     assert "仓位管理" in collapsed.group(1)
     assert "市场评论" in collapsed.group(1)
     assert "AI识别结果：非策略" not in collapsed.group(1)
@@ -307,7 +307,7 @@ def test_group_messages_route_labels_current_v1_without_marking_it_historical(
         "/groups/88/messages"
     ).text
 
-    assert "MiMo v1结果" in body
+    assert "权威识别结果" in body
     assert "MiMo 历史结果 · v1格式" not in body
 
 

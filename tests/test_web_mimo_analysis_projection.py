@@ -310,7 +310,7 @@ def test_web_projection_exposes_failed_v2_run_before_authoritative_v1_fallback(
 
     assert analysis["format"] == "v1"
     assert analysis["history_label"] is None
-    assert analysis["version_label"] == "MiMo v1回退结果"
+    assert analysis["version_label"] == "权威识别结果（v2 失败，已回退 v1 合约）"
     assert analysis["projection"] == {"status": "v1", "reason_code": None}
     assert analysis["runtime"]["status"] == "fallback"
     assert analysis["runtime"]["retry_count"] == 1
@@ -522,7 +522,7 @@ def test_web_projection_keeps_running_mimo_distinct_from_success(tmp_path):
     analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
 
     assert analysis["runtime"]["status"] == "running"
-    assert analysis["runtime"]["status_label"] == "MiMo识别进行中"
+    assert analysis["runtime"]["status_label"] == "识别进行中"
     assert analysis["projection"] == {
         "status": "not_available",
         "reason_code": "canonical_result_not_persisted",
@@ -557,7 +557,7 @@ def test_web_projection_does_not_label_current_v1_run_as_history(tmp_path):
     analysis = load_group_messages(factory, chat_id=88, limit=10)[0]["mimo_analysis"]
 
     assert analysis["format"] == "v1"
-    assert analysis["version_label"] == "MiMo v1结果"
+    assert analysis["version_label"] == "权威识别结果"
     assert analysis["history_label"] is None
     assert analysis["projection"] == {"status": "v1", "reason_code": None}
 

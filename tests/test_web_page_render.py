@@ -583,7 +583,9 @@ def test_message_ai_chips_cover_runtime_image_context_and_shadow_states(tmp_path
     assert "重试 1 次" in image_card
     assert "未成为权威结果" in image_card
     assert 'class="message-card is-ai-danger"' in image_card
-    assert "模型 mimo-v2.5" in image_card
+    # The technical details now name the configured display name first and keep
+    # the raw id beside it, so an audit can still match the stored run.
+    assert "模型 MiMo V2.5（mimo-v2.5）" in image_card
     assert "合约 v1" in image_card
     assert "输入 text" in image_card
     assert "耗时 240 ms" in image_card

@@ -1347,6 +1347,11 @@ def assess_message_authoritatively(
             )
     context_decision = None
     context_triggers: tuple[str, ...] = ()
+    # The two gates that decide the contextual second pass are otherwise
+    # memory-only, which left the Web card unable to tell "never ran" from
+    # "ran and changed nothing". The default stands for the case where the
+    # first pass failed and neither gate was ever evaluated.
+    context_gate_outcome = "recognition_failed"
     if not mimo.error_message and mimo.status != "识别失败":
         (
             evidence,
@@ -1387,6 +1392,17 @@ def assess_message_authoritatively(
             context_window=context_window,
             candidates=candidates,
         )
+        if not needs_resolution:
+            context_gate_outcome = "not_needed"
+        elif context_resolver is None:
+            context_gate_outcome = "resolver_disabled"
+        else:
+            # Settled before the call, not after it: the ``except`` below
+            # rewrites ``mimo`` into a recognition failure, so deciding the
+            # outcome afterwards would record a resolver that raised as
+            # "recognition_failed" -- exactly the case an operator most needs
+            # to see as invoked.
+            context_gate_outcome = "invoked"
         if needs_resolution and context_resolver is not None:
             try:
                 context_decision = context_resolver(
@@ -1463,6 +1479,10 @@ def assess_message_authoritatively(
         agreement_status=agreement_status,
         differences=differences,
         prompt_versions={"mimo": mimo.prompt_versions},
+        context_resolution_gate={
+            "outcome": context_gate_outcome,
+            "triggers": list(context_triggers),
+        },
     )
     if agreement_status == "authoritative_failed":
         # A failed authority is auditable and alertable, but there is no valid

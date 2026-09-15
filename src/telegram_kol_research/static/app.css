@@ -3737,6 +3737,51 @@ body {
 }
 .mimo-runtime-status.is-failed { background: rgba(239, 68, 68, 0.16); color: #fecaca; }
 .mimo-runtime-status.is-fallback { background: rgba(245, 158, 11, 0.16); color: #fde68a; }
+
+/* Which model actually produced the authoritative result. The stage is
+   model-agnostic since the AI routing work, so the heading names the stage and
+   this badge names the model. */
+.mimo-runtime-model {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  color: #e2e8f0;
+  font-size: 12px;
+}
+
+/* Did the contextual second pass run, and why or why not. */
+.context-exec-state {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+  font-size: 12px;
+}
+.context-exec-state.is-completed { background: rgba(34, 197, 94, 0.16); color: #bbf7d0; }
+.context-exec-state.is-in_progress { background: rgba(245, 158, 11, 0.16); color: #fde68a; }
+.context-exec-state.is-exhausted,
+.context-exec-state.is-blocked_disabled,
+.context-exec-state.is-blocked_terminal { background: rgba(239, 68, 68, 0.16); color: #fecaca; }
+.context-exec-state.is-superseded { background: rgba(148, 163, 184, 0.16); color: #cbd5e1; }
+
+.context-trigger-reasons {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 10px;
+  color: #e2e8f0;
+  font-size: 0.82rem;
+}
+.context-trigger-chip {
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: rgba(56, 189, 248, 0.16);
+  color: #bae6fd;
+  font-size: 12px;
+}
+.context-trigger-chip.is-empty { background: rgba(148, 163, 184, 0.16); color: #cbd5e1; }
+.context-model-line { margin-top: 6px; color: #94a3b8; }
 .mimo-runtime-warning,
 .mimo-projection-error { color: #fecaca; }
 .mimo-projection-note,

@@ -49,6 +49,10 @@ class RecognitionDecisionRecord:
     agreement_status: str
     differences: list[str]
     prompt_versions: dict[str, dict[str, int]] = field(default_factory=dict)
+    #: Outcome of the two gates that decide the contextual second pass, as
+    #: ``{"outcome": ..., "triggers": [...]}``. ``None`` means the caller did
+    #: not evaluate them, and the stored column stays NULL.
+    context_resolution_gate: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -67,6 +71,14 @@ class CriticalNotificationClaim:
 
 def _json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True)
+
+
+def _context_resolution_gate_json(record: RecognitionDecisionRecord) -> str | None:
+    """The gate column value for ``record``, or ``None`` when unevaluated."""
+
+    if record.context_resolution_gate is None:
+        return None
+    return _json(record.context_resolution_gate)
 
 
 def _canonical_json(value: Any) -> str:
@@ -101,6 +113,7 @@ def _save_terminal_authoritative_decision_in_session(
             differences_json=_json(record.differences),
             prompt_versions_json=_json(record.prompt_versions),
             comparison_status="completed",
+            context_resolution_gate_json=_context_resolution_gate_json(record),
             created_at=now,
             updated_at=now,
         )
@@ -121,6 +134,38 @@ def _save_terminal_authoritative_decision_in_session(
         if observed_token is None
         else RecognitionDecision.comparison_claim_token == observed_token
     )
+    terminal_values: dict[str, Any] = {
+        "input_kind": record.input_kind,
+        "authoritative_model": record.authoritative_model,
+        "authoritative_status": record.authoritative_status,
+        "authoritative_payload_json": _json(record.authoritative_payload),
+        "auxiliary_model": record.auxiliary_model,
+        "auxiliary_status": record.auxiliary_status,
+        "auxiliary_payload_json": (
+            _json(record.auxiliary_payload)
+            if record.auxiliary_payload is not None
+            else None
+        ),
+        "agreement_status": record.agreement_status,
+        "differences_json": _json(record.differences),
+        "prompt_versions_json": _json(record.prompt_versions),
+        "comparison_status": "completed",
+        "disagreement_severity": None,
+        "comparison_model": None,
+        "comparison_payload_json": None,
+        "comparison_error": None,
+        "comparison_next_attempt_at": None,
+        "comparison_started_at": None,
+        "comparison_claim_token": None,
+        "compared_at": None,
+        "updated_at": now,
+    }
+    # A caller that did not evaluate the gates (the recovery guard) must not
+    # erase the gate an earlier recognition recorded for the same message.
+    if record.context_resolution_gate is not None:
+        terminal_values["context_resolution_gate_json"] = (
+            _context_resolution_gate_json(record)
+        )
     result = session.execute(
         update(RecognitionDecision)
         .where(
@@ -128,32 +173,7 @@ def _save_terminal_authoritative_decision_in_session(
             RecognitionDecision.comparison_status == observed_status,
             expected_token,
         )
-        .values(
-            input_kind=record.input_kind,
-            authoritative_model=record.authoritative_model,
-            authoritative_status=record.authoritative_status,
-            authoritative_payload_json=_json(record.authoritative_payload),
-            auxiliary_model=record.auxiliary_model,
-            auxiliary_status=record.auxiliary_status,
-            auxiliary_payload_json=(
-                _json(record.auxiliary_payload)
-                if record.auxiliary_payload is not None
-                else None
-            ),
-            agreement_status=record.agreement_status,
-            differences_json=_json(record.differences),
-            prompt_versions_json=_json(record.prompt_versions),
-            comparison_status="completed",
-            disagreement_severity=None,
-            comparison_model=None,
-            comparison_payload_json=None,
-            comparison_error=None,
-            comparison_next_attempt_at=None,
-            comparison_started_at=None,
-            comparison_claim_token=None,
-            compared_at=None,
-            updated_at=now,
-        )
+        .values(**terminal_values)
     )
     if result.rowcount != 1:
         raise RuntimeError(
@@ -214,6 +234,7 @@ def save_pending_authoritative_decision(
                 comparison_status="execution_pending",
                 comparison_claim_token=authoritative_generation,
                 comparison_attempts=0,
+                context_resolution_gate_json=_context_resolution_gate_json(record),
                 created_at=now,
                 updated_at=now,
             )
@@ -244,6 +265,11 @@ def save_pending_authoritative_decision(
             "automation_reason": None,
             "updated_at": now,
         }
+        # As above: only a caller that actually evaluated the gates writes them.
+        if record.context_resolution_gate is not None:
+            values["context_resolution_gate_json"] = (
+                _context_resolution_gate_json(record)
+            )
         if preserve_completed_review:
             prompt_versions = json.loads(row.prompt_versions_json)
             prompt_versions.update(record.prompt_versions)

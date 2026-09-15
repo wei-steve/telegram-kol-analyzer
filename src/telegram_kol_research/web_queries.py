@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import re
 from datetime import UTC, datetime
-from typing import Iterable
+from typing import Iterable, Mapping
 
 from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
@@ -427,6 +427,7 @@ def load_group_messages(
     search_text: str | None = None,
     sender_name: str | None = None,
     include_recognition_labels: bool = False,
+    model_labels: Mapping[str, str] | None = None,
 ) -> list[dict[str, object | None]]:
     """Load message timeline rows for a single group."""
 
@@ -447,6 +448,7 @@ def load_group_messages(
             session,
             raw_messages,
             include_recognition_labels=include_recognition_labels,
+            model_labels=model_labels,
         )
 
 
@@ -459,6 +461,7 @@ def load_group_message_page(
     search_text: str | None = None,
     sender_name: str | None = None,
     include_recognition_labels: bool = False,
+    model_labels: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, object | None]], bool]:
     """Load one message page and report whether an older matching page exists."""
 
@@ -480,6 +483,7 @@ def load_group_message_page(
                 session,
                 raw_messages[:page_size],
                 include_recognition_labels=include_recognition_labels,
+                model_labels=model_labels,
             ),
             has_more,
         )
@@ -539,6 +543,7 @@ def _serialize_raw_messages(
     raw_messages: list[RawMessage],
     *,
     include_recognition_labels: bool = False,
+    model_labels: Mapping[str, str] | None = None,
 ) -> list[dict[str, object | None]]:
     if not raw_messages:
         return []
@@ -902,6 +907,7 @@ def _serialize_raw_messages(
             runs=mimo_runs_by_msg_id.get(raw_message.id, []),
             attempts_by_run_id=mimo_attempts_by_run_id,
             media_by_id=evidence_media_by_id,
+            model_labels=model_labels,
         )
         recognition_label = recognition_label_by_msg_id.get(raw_message.id)
         serialized_recognition_label = (
@@ -1055,9 +1061,11 @@ def _serialize_raw_messages(
                 "context_resolution": _serialize_context_resolution(
                     raw_message=raw_message,
                     attempt=context_attempt_by_msg_id.get(raw_message.id),
+                    decision=decision,
                     evidence=evidence_by_msg_id.get(raw_message.id),
                     links=context_links_by_msg_id.get(raw_message.id, []),
                     thread_history_by_thread_id=thread_history_by_thread_id,
+                    model_labels=model_labels,
                 ),
                 "historical_context_analysis": _serialize_historical_context_analysis(
                     context_backfill_by_msg_id.get(raw_message.id)
@@ -1133,6 +1141,7 @@ def _serialize_mimo_analysis(
     runs: list[MimoRecognitionRun],
     attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
     media_by_id: dict[int, MediaAsset],
+    model_labels: Mapping[str, str] | None = None,
 ) -> dict[str, object] | None:
     """Serialize stored MiMo facts without reinterpreting source prose."""
 
@@ -1174,6 +1183,7 @@ def _serialize_mimo_analysis(
         run=linked_run,
         runs=runs,
         attempts_by_run_id=attempts_by_run_id,
+        model_labels=model_labels,
     )
     is_v2 = contract_version == "mimo-authoritative-v2" or (
         linked_run is not None
@@ -1248,12 +1258,13 @@ def _serialize_mimo_analysis(
         projected_conflicts = []
     return {
         "format": result_format,
+        # ``v1``/``v2`` name the MiMo *contract shape*, not the model, so the
+        # heading says what the stage is and the model badge says who ran it.
+        # A v1 fallback still has to be visible: it means the v2 contract failed.
         "version_label": (
-            "MiMo v1回退结果"
+            "权威识别结果（v2 失败，已回退 v1 合约）"
             if linked_run is not None and linked_run.run_kind == "v1_fallback"
-            else "MiMo v1结果"
-            if result_format == "v1"
-            else None
+            else "权威识别结果"
         ),
         "history_label": (
             "MiMo 历史结果 · v1格式"
@@ -1342,11 +1353,31 @@ def _serialize_mimo_projection(
     return {"status": "completed", "reason_code": None}
 
 
+def _model_display_label(
+    model_id: str | None,
+    model_labels: Mapping[str, str] | None,
+) -> str | None:
+    """The configured display name for ``model_id``, else the raw id.
+
+    The authoritative stage is model-agnostic since the AI routing work, so the
+    card shows whichever model actually ran. A model that has since left the
+    configuration -- every historical ``mimo-v2.5`` row -- keeps its raw id
+    rather than rendering as a blank badge.
+    """
+
+    if not model_id:
+        return None
+    if not model_labels:
+        return str(model_id)
+    return str(model_labels.get(str(model_id)) or model_id)
+
+
 def _serialize_mimo_runtime(
     *,
     run: MimoRecognitionRun | None,
     runs: list[MimoRecognitionRun],
     attempts_by_run_id: dict[int, list[MimoRecognitionAttempt]],
+    model_labels: Mapping[str, str] | None = None,
 ) -> dict[str, object] | None:
     if run is None:
         return None
@@ -1383,18 +1414,21 @@ def _serialize_mimo_runtime(
                 "error_code": previous.final_error_code,
                 "error_message": previous.final_error_message,
             }
+    # Display text only. The table, contract and CSS identifiers keep the
+    # ``mimo`` name; the badge must not, because any configured model can run
+    # this stage.
     if run.status == "running":
         status = "running"
-        status_label = "MiMo识别进行中"
+        status_label = "识别进行中"
     elif run.status == "failed":
         status = "failed"
-        status_label = "MiMo识别失败"
+        status_label = "识别失败"
     elif run.run_kind == "v1_fallback":
         status = "fallback"
-        status_label = "MiMo v2失败，已使用v1结果"
+        status_label = "v2 失败，已用 v1 结果"
     else:
         status = "completed"
-        status_label = "MiMo识别成功"
+        status_label = "识别成功"
     duration_ms = None
     first_started_at = lineage[0].started_at
     if run.completed_at is not None and first_started_at is not None:
@@ -1406,6 +1440,7 @@ def _serialize_mimo_runtime(
         "status": status,
         "status_label": status_label,
         "model": run.model,
+        "model_label": _model_display_label(run.model, model_labels),
         "contract_version": run.contract_version,
         "input_kind": run.input_kind,
         "attempt_count": attempt_count,
@@ -1732,19 +1767,104 @@ def _candidate_action_kind(candidate: SignalCandidate) -> str:
     }.get(event_type, event_type)
 
 
+#: Attempt statuses that mean the second pass is still on its way to an answer.
+_CONTEXT_IN_PROGRESS_STATUSES = frozenset(
+    {"pending", "running", "retry_pending", "pending_reanalysis"}
+)
+#: Terminal attempt statuses mapped straight onto the card's state enum.
+_CONTEXT_TERMINAL_STATE_BY_STATUS = {
+    "exhausted": "exhausted",
+    "blocked_disabled": "blocked_disabled",
+    "blocked_execution_terminal": "blocked_terminal",
+    "superseded": "superseded",
+    "completed": "completed",
+}
+#: Gate outcomes mapped onto the card's state enum when no attempt row exists.
+_CONTEXT_STATE_BY_GATE_OUTCOME = {
+    "not_needed": "not_needed",
+    "resolver_disabled": "disabled",
+    "recognition_failed": "not_evaluated",
+}
+
+
+def _context_gate_triggers(
+    *,
+    gate: dict[str, object],
+    attempt: ContextResolutionAttempt | None,
+) -> list[str]:
+    """Trigger signals from the gate column, else from the attempt row.
+
+    The gate column only exists from this change onward. Messages resolved
+    before it can still show why they were resolved, because every real
+    invocation already recorded its triggers on the attempt.
+    """
+
+    raw = gate.get("triggers")
+    triggers = [str(value) for value in raw] if isinstance(raw, list) else []
+    if triggers or attempt is None:
+        return triggers
+    try:
+        parsed = json.loads(attempt.invocation_triggers_json or "[]")
+    except (TypeError, ValueError):
+        return []
+    return [str(value) for value in parsed] if isinstance(parsed, list) else []
+
+
+def _context_execution_state(
+    *,
+    attempt: ContextResolutionAttempt | None,
+    gate_outcome: str | None,
+) -> str:
+    """One closed state for the card, so "did it run?" has a visible answer."""
+
+    if attempt is not None:
+        status = str(attempt.status or "")
+        if status in _CONTEXT_IN_PROGRESS_STATUSES:
+            return "in_progress"
+        return _CONTEXT_TERMINAL_STATE_BY_STATUS.get(status, "unknown")
+    # No attempt row: the gate is the only witness. An outcome the mapping does
+    # not cover -- including a gate that recorded ``invoked`` but whose resolver
+    # raised before writing its attempt -- reads as unrecorded rather than
+    # claiming a reason that was never observed.
+    return _CONTEXT_STATE_BY_GATE_OUTCOME.get(str(gate_outcome or ""), "unknown")
+
+
 def _serialize_context_resolution(
     *,
     raw_message: RawMessage,
     attempt: ContextResolutionAttempt | None,
+    decision: RecognitionDecision | None,
     evidence: MessageEvidenceVersion | None,
     links: list[tuple[StrategyMessageLink, StrategyThread]],
     thread_history_by_thread_id: dict[
         int, list[tuple[StrategyMessageLink, RawMessage]]
     ],
+    model_labels: Mapping[str, str] | None = None,
 ) -> dict[str, object] | None:
-    if attempt is None and evidence is None and not links and raw_message.reply_to_message_id is None:
+    # A message that went through authoritative recognition always gets a card,
+    # even with no attempt row: "the second pass did not run, and here is why"
+    # is the answer this card exists to give. A message never recognised at all
+    # still has nothing to say.
+    if (
+        attempt is None
+        and decision is None
+        and evidence is None
+        and not links
+        and raw_message.reply_to_message_id is None
+    ):
         return None
-    decision = _safe_json_dict(attempt.decision_json) if attempt is not None else {}
+    gate = (
+        _safe_json_dict(decision.context_resolution_gate_json)
+        if decision is not None
+        else {}
+    )
+    gate_outcome = str(gate.get("outcome") or "") or None
+    gate_triggers = _context_gate_triggers(gate=gate, attempt=attempt)
+    # Renamed off ``decision``: that name now belongs to the recognition row
+    # this function reads the gate from.
+    attempt_decision = (
+        _safe_json_dict(attempt.decision_json) if attempt is not None else {}
+    )
     request = _safe_json_dict(attempt.request_summary_json) if attempt is not None else {}
     message_refs = (
         _safe_json_dict(attempt.context_message_refs_json)
@@ -1791,17 +1911,31 @@ def _serialize_context_resolution(
         "evidence_input_kind": (
             "text+image" if image_evidence else "text"
         ) if evidence is not None else None,
-        "decision": str(decision.get("decision") or "") or None,
-        "confidence": decision.get("confidence"),
-        "supporting_message_ids": decision.get("supporting_message_ids") or [],
-        "opposing_message_ids": decision.get("opposing_message_ids") or [],
+        "decision": str(attempt_decision.get("decision") or "") or None,
+        "confidence": attempt_decision.get("confidence"),
+        "supporting_message_ids": (
+            attempt_decision.get("supporting_message_ids") or []
+        ),
+        "opposing_message_ids": attempt_decision.get("opposing_message_ids") or [],
         "unresolved_reason": (
-            decision.get("reason")
-            if str(decision.get("decision") or "") in {"unresolved", "hold"}
+            attempt_decision.get("reason")
+            if str(attempt_decision.get("decision") or "")
+            in {"unresolved", "hold"}
             else None
         ),
         "next_triggers": triggers,
         "attempt_status": attempt.status if attempt is not None else None,
+        "execution_state": _context_execution_state(
+            attempt=attempt,
+            gate_outcome=gate_outcome,
+        ),
+        "gate_outcome": gate_outcome,
+        "gate_triggers": gate_triggers,
+        "model": attempt.model if attempt is not None else None,
+        "model_label": _model_display_label(
+            attempt.model if attempt is not None else None,
+            model_labels,
+        ),
         "shadow_would_trigger": (
             attempt.shadow_would_trigger if attempt is not None else None
         ),

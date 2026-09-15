@@ -538,6 +538,10 @@ SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
         "updated_at": "ALTER TABLE recognition_experiments ADD COLUMN updated_at DATETIME",
     },
     "recognition_decisions": {
+        "context_resolution_gate_json": (
+            "ALTER TABLE recognition_decisions "
+            "ADD COLUMN context_resolution_gate_json TEXT"
+        ),
         "prompt_versions_json": (
             "ALTER TABLE recognition_decisions "
             "ADD COLUMN prompt_versions_json TEXT NOT NULL DEFAULT '{}'"

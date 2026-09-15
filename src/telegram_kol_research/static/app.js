@@ -231,6 +231,39 @@ function restoreDefaultMessageCardState(panel) {
   });
 }
 
+// Mirrors context_trigger_labels in templates/_messages.html, which mirrors
+// authoritative_recognition.CONTEXT_TRIGGER_ORDER. An id with no entry here is
+// shown raw rather than dropped.
+const CONTEXT_TRIGGER_LABELS = {
+  revision_language: '修改措辞',
+  cancellation_language: '取消措辞',
+  entered_holder_language: '已入场/持有措辞',
+  management_without_exact_target: '管理指令无明确目标',
+  multiple_same_source_candidates: '同来源多个候选策略',
+  reply_target_disagreement: '回复目标与识别目标不一致',
+  text_image_conflict: '图文冲突',
+  apparent_entry_may_be_revision: '疑似入场实为修改',
+};
+
+// "Which signal is spending the tokens?" -- the whole point of surfacing the
+// triggers, so the answer belongs in the one line the user always sees.
+function summarizeContextTriggers(cards) {
+  const counts = new Map();
+  cards.forEach((card) => {
+    (card.dataset.messageContextTriggers || '')
+      .split(',')
+      .map((value) => value.trim())
+      .filter(Boolean)
+      .forEach((trigger) => {
+        counts.set(trigger, (counts.get(trigger) || 0) + 1);
+      });
+  });
+  return Array.from(counts.entries())
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .map(([trigger, count]) => `${CONTEXT_TRIGGER_LABELS[trigger] || trigger} ${count}`)
+    .join(' · ');
+}
+
 function messageMatchesInsightFilter(card, filterName) {
   if (filterName === 'error') return card.dataset.messageAiError === 'true';
   if (filterName === 'low-confidence') return card.dataset.messageLowConfidence === 'true';
@@ -272,9 +305,13 @@ function updateMessageInsightView(panel) {
   const labeled = cards.filter(
     (card) => card.dataset.messageLabeled === 'true',
   ).length;
+  const triggerSummary = summarizeContextTriggers(cards);
   const stats = panel.querySelector('[data-message-insight-stats]');
   if (stats) {
-    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · 上下文调用 ${contextCalls} · 需关注 ${attention} · 已标注 ${labeled} 条`;
+    const contextPart = triggerSummary
+      ? `上下文调用 ${contextCalls}（${triggerSummary}）`
+      : `上下文调用 ${contextCalls}`;
+    stats.textContent = `已加载 ${cards.length} 条：识别成功 ${recognized} · 平均置信度 ${averageConfidence} · ${contextPart} · 需关注 ${attention} · 已标注 ${labeled} 条`;
   }
 }
 

@@ -8644,6 +8644,7 @@ def create_web_app(
             chat_id=chat_id,
             page_size=MESSAGE_PAGE_SIZE,
             include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
         )
         messages_ms = _elapsed_ms(step_started_at)
         step_started_at = time.perf_counter()
@@ -8740,6 +8741,7 @@ def create_web_app(
             chat_id=chat_id,
             page_size=MESSAGE_PAGE_SIZE,
             include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
         )
         monitor_status = build_monitor_status()
         freshness = load_database_freshness(
@@ -9900,6 +9902,7 @@ def create_web_app(
             search_text=search_text,
             sender_name=sender_name,
             include_recognition_labels=app.state.runtime_role in {"all", "web"},
+            model_labels=_ai_model_labels(app.state.ai_recognition_config_path),
         )
         freshness = load_database_freshness(
             app.state.session_factory,
@@ -11128,6 +11131,24 @@ def _load_ai_recognition_config_best_effort(path: Any) -> AiRecognitionConfig | 
             exc_info=True,
         )
         return None
+
+
+def _ai_model_labels(path: Any) -> dict[str, str]:
+    """``{model id: display name}`` for the message cards.
+
+    Loaded once per request here rather than inside ``web_queries``, which has
+    no file IO of its own and must keep it that way. An unreadable config
+    yields an empty map, and every card then shows raw model ids -- degraded
+    but never blank.
+    """
+
+    config = _load_ai_recognition_config_best_effort(path)
+    if config is None:
+        return {}
+    return {
+        str(model_id): str(model.label or model_id)
+        for model_id, model in config.models_by_id.items()
+    }
 
 
 def _default_ai_provider_prober(model_config: AiModelConfig):

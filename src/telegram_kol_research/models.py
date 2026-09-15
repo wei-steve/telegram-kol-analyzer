@@ -1749,6 +1749,15 @@ class RecognitionDecision(Base):
     compared_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
     notification_fingerprint: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     notification_payload_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    #: Why the contextual second pass did or did not run for this message:
+    #: ``{"outcome": "invoked" | "not_needed" | "resolver_disabled" |
+    #: "recognition_failed", "triggers": [...]}``. Both gates deciding the
+    #: second pass used to live only in memory, so "never ran" and "ran and
+    #: changed nothing" were indistinguishable in the Web card. Historical
+    #: rows stay NULL and are never backfilled.
+    context_resolution_gate_json: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utc_now, nullable=False)
 
