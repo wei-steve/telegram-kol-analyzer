@@ -1,7 +1,7 @@
 # 上下文二次判断触发条件：生产数据分析与收紧方案
 
 日期：2026-09-15
-状态：用户 2026-09-15 拍板方案甲，实施中（子代理）
+状态：方案甲已于 2026-09-15 部署生产 `fa1e0c09`（回滚 `1fe25a04`）
 数据来源：生产库 `data/research.db` 只读查询，窗口 2026-09-01 13:03 UTC → 2026-09-15（14 天），
 表 `context_resolution_attempts` × `recognition_decisions` × `raw_messages`。
 分析脚本在指挥会话 scratchpad（`ctx_audit.py` / `ctx_audit2.py` / `ctx_audit3.py`），一次性使用，不入库。
@@ -241,3 +241,14 @@ if not actionable:
 按指令未改动影子判定。若确实需要「方案甲是否过紧」的校验信号，需要另行决定：
 在权威未触发的路径上也记录一次影子评估（并传入真实的
 `authoritative_would_trigger`），这超出本次改动范围。
+
+### 6.7 部署记录（指挥会话补记）
+
+- 子代理提交 `fa1e0c09`；指挥会话独立复跑全量 8867 passed / 0 failed / 4 skipped（710 s）。
+- 2026-09-15 21:39 CST `tg-deploy fa1e0c092c4d4c815f2e801c5aa15d2dce5181d0`，回滚 SHA `1fe25a04`。
+  worker / web / ingest 均 active；共享分支 `origin/codex/deepcoin-auto-trading-v1` = 部署 SHA。
+- 重启后 worker 日志的 `transaction.rollback` 栈帧属于「event loop stall stack」采样，不是异常；
+  `source deletion exits stuck alerted=[310]` 是部署前就有的告警，与本次无关。
+- 校验方式修正：影子判定的 `shadow_would_extra_trigger` 结构上恒为 0（6.5 节），不能用来校验方案甲。
+  改用页面统计行：部署后一周对比「上下文调用 N」与触发原因分布；以及只读查询
+  `context_resolution_attempts` 的日均次数（部署前 14 天日均约 136 次，预估降到约 40 次）。
