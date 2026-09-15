@@ -1,7 +1,7 @@
 # 上下文二次判断：同一条消息被重分析 19 次的原因
 
 日期：2026-09-15
-状态：4.1 + 4.2 + 4.3 已于 2026-09-15 部署生产 `ae43312a`；第 8 节（关闭「同群新消息」代用路径）用户已批准，实施中
+状态：4.1 + 4.2 + 4.3 部署 `ae43312a`；第 8 节（关闭「同群新消息」代用路径）已于 2026-09-15 部署生产 `d8714c48`（回滚 `ae43312a`）
 关联：`docs/plans/2026-09-15-context-trigger-tightening-analysis.md` 第 2.5 / 5 节记录了这个现象。
 数据来源：生产库 `data/research.db` 只读查询；worker 日志已过保留期，9 月 3 日的记录拿不到。
 
@@ -393,3 +393,12 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
   默认 `None`，其余用例行为不变。
 - `message_processing_worker` 中 `if context_resolution_scheduler is not None:` 与 `if raw_message.edit_date is not None:`
   保持两层嵌套，不合并成一个条件，使本次 diff 只是删除、不重排既有结构。
+
+### 8.5 部署记录（指挥会话补记）
+
+- 子代理提交 `d8714c48`；指挥会话独立复跑全量 8875 passed / 0 failed / 4 skipped（860 s）。
+- 2026-09-15 深夜 `tg-deploy d8714c488d4953e1c825927d11db741fffefe72f`，回滚 SHA `ae43312a`。
+  worker / web / ingest 均 active，启动无异常；共享分支 = 部署 SHA。
+- 至此上下文二次判断的重分析只剩四条精确事件路径（message_edited / evidence_version_changed /
+  entry_leg_status_changed / exchange_snapshot_changed）+ 显式 reply_target_available（监听器拉取到缺失回复目标时）
+  + 错误重试（2 分钟、每行 3 次），并受按消息 24h 内 5 次封顶。
