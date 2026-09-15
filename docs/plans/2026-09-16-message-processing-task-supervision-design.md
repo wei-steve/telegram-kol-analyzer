@@ -114,3 +114,119 @@
   `strategy_management_notification_loop` 在事件循环线程上做同步 DB 写（stall stack 指向它）。
   `runtime_loop_health` 记录的 >15 s 卡顿：09-13 两次、09-14 三次、09-15 九次，在上升。值得单独查。
 - `expired_stale_instruction` 08-31 的 281 条与 09-12 的 45 条是否同一机制，未核。
+
+## 7. 实施记录
+
+日期：2026-09-15（子代理实施，worktree `.claude/worktrees/agent-afd774a5c9c55fd0d`，起点 `d81394be`）。
+3.1 / 3.2 / 3.3 全部按第 3 节实施；3.4 一条未动。
+
+### 7.1 改动文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/telegram_kol_research/message_processing_worker.py` | 3.2 循环容错；`MessageProcessingActivity.last_claim_at`；3.3 新增 `count_stalled_message_processing_jobs`、`run_message_processing_queue_stall_monitor`、`_queue_stall_instant_label`；新增常量 `MESSAGE_PROCESSING_CLAIM_LOCK_FAILURE_LIMIT=20`、`MESSAGE_PROCESSING_CLAIM_LOCK_MAX_BACKOFF_SECONDS=5.0`、`DEFAULT_QUEUE_STALL_MONITOR_INTERVAL_SECONDS=60.0`、`DEFAULT_QUEUE_STALL_AFTER=3min`、`DEFAULT_QUEUE_STALL_ALERT_COOLDOWN=15min` |
+| `src/telegram_kol_research/web_app.py` | 3.1 两个任务纳入 `_supervise_restartable_background_task`；3.3 起 `message_processing_queue_stall_monitor_task`（同样守护、仅 worker 角色）、`app.state.message_processing_queue_stall_monitor_task` 初始化与关停取消；新增 `_capture_message_processing_queue_stall` / `_notify_message_processing_queue_stall` 两个 sink 工厂 |
+| `src/telegram_kol_research/runtime_incident_adapters.py` | 新增 `capture_message_processing_queue_stalled`（照 `capture_context_worker_state` 写法，severity `high`） |
+| `src/telegram_kol_research/config.py` | `ALWAYS_NOTIFIED_INCIDENT_TYPES` 增加 `message_processing_queue_stalled` |
+| `src/telegram_kol_research/runtime_incidents.py` | `_SUMMARY_FIELDS` 增加 `stalled_jobs` / `oldest_enqueued_at` / `last_claim_at` |
+| `tests/test_message_processing_worker.py` | 9 个新用例 + 日志采集辅助 |
+| `tests/test_web_app.py` | 3 个新用例 |
+| `tests/test_runtime_incident_adapters.py` | 3 个新用例 |
+| `tests/test_runtime_event_loop_blocking_census.py` | 允许清单加 2 条（见 7.3） |
+
+`_supervise_restartable_background_task`、`busy_timeout`、`BEGIN IMMEDIATE`、gap-recovery 15 分钟规则，一行未改。
+
+### 7.2 新增用例
+
+`tests/test_message_processing_worker.py`：
+
+- `test_one_lock_error_only_skips_that_claim_and_the_loop_keeps_running`
+- `test_twenty_consecutive_lock_errors_leave_the_loop_to_the_supervisor`
+- `test_one_failing_tick_does_not_stop_the_next_message_from_running`
+- `test_cancelling_the_loop_still_stops_it`
+- `test_a_stalled_queue_is_captured_and_announced_once`
+- `test_the_stall_alert_is_not_repeated_inside_its_cooldown`
+- `test_a_queue_that_drains_and_stalls_again_alerts_again`
+- `test_a_message_younger_than_the_threshold_is_not_a_stall`
+- `test_a_deferred_retry_and_a_shadow_row_are_not_counted_as_stalled`（第 4 节之外补的，见 7.5 第 1 条）
+
+`tests/test_web_app.py`：
+
+- `test_the_message_processing_worker_task_is_restarted_after_it_fails`
+- `test_the_worker_command_worker_task_is_restarted_after_it_fails`
+- `test_the_queue_stall_monitor_runs_only_in_the_worker_role`
+
+`tests/test_runtime_incident_adapters.py`：
+
+- `test_a_stalled_message_processing_queue_is_recorded_with_its_numbers`
+- `test_a_queue_stall_is_not_recorded_when_the_type_is_not_captured`
+- `test_the_queue_stall_type_is_captured_without_an_environment_list`
+
+### 7.3 既有测试调整
+
+只有一处，且不是为了让测试变绿而改语义：
+
+- `tests/test_runtime_event_loop_blocking_census.py` 的 `KNOWN_BLOCKING_CALLS` 增加
+  `message_processing_queue_stall_monitor -> utc_now` 与 `-> _queue_stall_instant_label`。
+  该清单是「async while 循环里直接调用同步函数」的静态普查白名单，按其文件头的规定，
+  新增项必须写明为何可以留下。监视器每轮读一次时钟，只有在要告警时才用 `strftime`
+  格式化两个时间；两者都不碰 session / client / 网络，与清单里已有的
+  `run_semantic_review_loop -> utc_now` 同类。监视器唯一的数据库读走 `asyncio.to_thread`，
+  普查未报，也没有进清单。
+
+没有其他既有用例需要改：守护包装让 `app.state.message_processing_worker_task` /
+`worker_command_worker_task` 从 runner 协程变成了 supervisor 协程，但既有断言只看
+「是不是 None」「有没有被取消」「runner 收到了哪些 kwargs」，形态变化没有影响。
+`tests/test_mimo_step2_authority_not_produced.py` 里按源码切片检查
+`group_trading_mode_provider` 的那条断言，在 runner 调用被包进
+`start_message_processing_worker_runner()` 之后仍然成立。
+
+（实施过程中这两条曾一度失败：`tests/test_message_processing_worker.py` 新增的两个用例
+用 `caplog` 断言日志，单跑通过、全量跑失败——全量跑时前面的用例已经调用过
+`configure_application_logging`，worker logger 有了自己的 handler，记录不再落到
+`caplog` 的 root handler 上。改为在测试内直接给 worker logger 挂一个采集 handler，
+这是新代码自身的问题，不是既有测试的调整。）
+
+### 7.4 全量测试
+
+`PYTHONPATH=. uv run pytest -q`，最后三行原样：
+
+```
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8890 passed, 4 skipped, 107 warnings in 743.25s (0:12:23)
+```
+
+改动前基线同一命令为 8887 passed / 4 skipped（首轮 3 个失败，均由本次改动引入，已在 7.3 说明并修好）。
+
+### 7.5 取舍与设计未覆盖之处
+
+1. **「待认领」的判定范围**。第 3.3 节写的是 `status='pending'` 且 `claim_token IS NULL` 且
+   `enqueued_at <= now - stall_after`。按指挥会话「以 `claim_message_processing_jobs` 的 SQL 为准」的
+   要求，实现另加了该 SQL 自己的两个限定：`shadow = 0`（历史行，worker 本来就不认领）与
+   `next_attempt_at IS NULL OR next_attempt_at <= now`（重试退避最长 300 s，超过 3 分钟阈值；
+   不加这一条，一次正常退避就会被误报成停摆）。两者都只让告警更保守，不会漏掉真正无人认领的消息。
+2. **事故类型白名单的落点**。`captures()` 只读环境变量 `TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES`
+   加 `ALWAYS_NOTIFIED_INCIDENT_TYPES`。`READ_ONLY_CAPTURE_PROFILE` 是封闭的历史集合
+   （有逐字断言的测试），不是运行时白名单，故未动；新类型加进 `ALWAYS_NOTIFIED_INCIDENT_TYPES`，
+   这样服务器上手写的清单忘记它也照样落库。副作用：该事故也会被运行时事故通知任务发一条，
+   于是一次停摆最多两条消息——监视器直发的那条（内容按第 3.3 节）与事故台账的通用渲染。
+   保留，因为第 3.3 节明确要求 `capture` 与 `notify` 都调。
+3. **摘要字段**。事故摘要有封闭词表，`stalled` 数、最老入队时间、最近认领时间在词表里都没有
+   合适的现成字段（硬套 `retry_count` / `last_failure_at` 会让台账读起来是错的）。
+   按该文件既有的做法（每次为新告警补字段并写明理由）增加了三个字段。
+   这让改动多碰了 `runtime_incidents.py` 一个第 5 节没列的文件。
+4. **监视器的数据库读放在 `asyncio.to_thread`**。第 3.3 节未规定。事故本身就是事件循环被
+   同步 DB 写卡住，监视器在循环上做同步读会重复同一类问题。
+5. **监视器的异常不自吞**。`capture` 已经是 fail-open 的（`capture_runtime_incident_best_effort`），
+   `notify` 或数据库读若抛异常，交给 3.1 的同一个守护包装退避重启。代价是重启后冷却状态
+   （进程内变量）归零，下一轮停摆会立刻再告一次；相对「监视器静默死掉」这是更安全的一侧。
+6. **关停时取消新任务**。第 3.3 节未提。若不取消，lifespan 关停会被这个 `while True` 挂住，
+   所以按 `loop_lag_monitor_task` 的写法加了取消块。
+7. **守护包装的放弃计数是按任务名跨重启累积的**。`ensure_message_processing_worker_mode`
+   在设置刷新时会重新起一次 supervisor，但 `_task_supervision` 返回的是同一条记录：
+   若上一轮已经连续失败 10 次放弃，新 supervisor 起来后第一次失败就会再次放弃。
+   未改——第 3.4 节禁止改动包装的参数与行为，且这条只在「已经彻底坏掉」之后才生效。
+8. **未做**：没有为新事故类型写专门的 Telegram 渲染分支，通用渲染器
+   （`format_runtime_incident_notification`）会输出组件、源状态、原因代码，足够定位；
+   第 3.3 节也只要求监视器自己那条消息的文案。

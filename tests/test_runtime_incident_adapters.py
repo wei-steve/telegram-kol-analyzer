@@ -27,6 +27,7 @@ from telegram_kol_research.runtime_incident_adapters import (
     capture_context_worker_state,
     capture_management_state,
     capture_message_operation_failure,
+    capture_message_processing_queue_stalled,
     capture_monitor_state,
     capture_notification_failure,
     capture_protection_state,
@@ -699,6 +700,66 @@ def test_contextual_business_outcomes_never_create_runtime_incidents(
 
     assert captured is None
     assert _rows(session_factory) == []
+
+
+def test_a_stalled_message_processing_queue_is_recorded_with_its_numbers(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "queue-stalled.db")
+
+    captured = capture_message_processing_queue_stalled(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"message_processing_queue_stalled"})
+        ),
+        stalled=3,
+        oldest_enqueued_at=datetime(2026, 9, 16, 0, 35, tzinfo=UTC),
+        last_claim_at=datetime(2026, 9, 16, 0, 7, tzinfo=UTC),
+        occurred_at=NOW,
+    )
+
+    rows = _rows(session_factory)
+    assert captured is not None
+    assert len(rows) == 1
+    assert rows[0].incident_type == "message_processing_queue_stalled"
+    assert rows[0].severity == "high"
+    assert '"stalled_jobs":3' in rows[0].redacted_summary
+    assert '"oldest_enqueued_at":"2026-09-16T00:35Z"' in rows[0].redacted_summary
+    assert '"last_claim_at":"2026-09-16T00:07Z"' in rows[0].redacted_summary
+
+
+def test_a_queue_stall_is_not_recorded_when_the_type_is_not_captured(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-not-captured.db")
+
+    captured = capture_message_processing_queue_stalled(
+        session_factory,
+        config=RuntimeIncidentConfig(capture_types=frozenset()),
+        stalled=3,
+        oldest_enqueued_at=NOW,
+        last_claim_at=None,
+        occurred_at=NOW,
+    )
+
+    assert captured is None
+    assert _rows(session_factory) == []
+
+
+def test_the_queue_stall_type_is_captured_without_an_environment_list(tmp_path):
+    """A hand-edited server list must not be what decides this alert exists."""
+
+    assert (
+        "message_processing_queue_stalled" in ALWAYS_NOTIFIED_INCIDENT_TYPES
+    )
+    config = load_runtime_incident_config(
+        environ={
+            "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES": (
+                "context_worker_exhausted"
+            ),
+        },
+        env_file_paths=[],
+    )
+
+    assert config.captures("message_processing_queue_stalled") is True
 
 
 def test_context_worker_exhaustion_is_deduplicated_from_stable_source_state(

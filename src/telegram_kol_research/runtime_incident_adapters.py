@@ -380,6 +380,49 @@ def capture_context_worker_state(
     )
 
 
+def capture_message_processing_queue_stalled(
+    session_factory: sessionmaker,
+    *,
+    config: RuntimeIncidentConfig,
+    stalled: int,
+    oldest_enqueued_at: datetime | None,
+    last_claim_at: datetime | None,
+    occurred_at: datetime,
+    recorder: Callable[..., Any] | None = None,
+):
+    """Capture queued messages that nobody is claiming.
+
+    On 2026-09-16 the claim loop died on one lock error and three messages sat
+    unclaimed for 64 minutes; the process stayed ``active`` and every page said
+    "monitoring". Nothing in the ledger said otherwise, which is what this row
+    is for. Both instants are bare minute-resolution labels, for the
+    opaque-secret reason ``_deadline_label`` explains.
+    """
+
+    if not config.captures("message_processing_queue_stalled"):
+        return None
+    return _capture(
+        session_factory,
+        config=config,
+        source_kind="message_processing_queue",
+        source_record_id="message_processing_jobs",
+        incident_type="message_processing_queue_stalled",
+        severity="high",
+        redacted_summary=_summary(
+            component="message_processing_worker",
+            worker_kind="message_processing",
+            source_status="queue_stalled",
+            reason_code="message_processing_queue_stalled",
+            operation="claim_message_processing_jobs",
+            stalled_jobs=int(stalled),
+            oldest_enqueued_at=_deadline_label(oldest_enqueued_at),
+            last_claim_at=_deadline_label(last_claim_at),
+        ),
+        occurred_at=occurred_at,
+        recorder=recorder,
+    )
+
+
 #: A-10e. Environment flag, read per call rather than at import, so a test can
 #: turn it on and off around a case that deliberately exercises failing open.
 STRICT_CAPTURE_ENV_VAR = "TELEGRAM_KOL_RUNTIME_INCIDENT_STRICT_CAPTURE"

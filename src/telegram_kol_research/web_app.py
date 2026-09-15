@@ -150,10 +150,12 @@ from telegram_kol_research.message_recognition_labels import (
 )
 from telegram_kol_research.message_processing_worker import (
     MessageProcessingActivity,
+    run_message_processing_queue_stall_monitor,
     run_message_processing_worker_loop,
 )
 from telegram_kol_research.runtime_incident_adapters import (
     capture_background_task_restart_exhausted,
+    capture_message_processing_queue_stalled,
     capture_monitor_state,
     capture_notification_failure,
     capture_recognition_execution_state,
@@ -1367,6 +1369,45 @@ def _observe_runtime_incident_delivery(app: FastAPI):
         ).isoformat()
 
     return _sink
+
+
+def _capture_message_processing_queue_stall(app: FastAPI):
+    """Return the ledger sink for the queue stall monitor."""
+
+    def _capture(
+        *,
+        stalled: int,
+        oldest_enqueued_at,
+        last_claim_at,
+        occurred_at,
+    ) -> None:
+        capture_runtime_incident_best_effort(
+            capture_message_processing_queue_stalled,
+            app.state.session_factory,
+            config_loader=app.state.runtime_incident_config_loader,
+            stalled=stalled,
+            oldest_enqueued_at=oldest_enqueued_at,
+            last_claim_at=last_claim_at,
+            occurred_at=occurred_at,
+        )
+
+    return _capture
+
+
+def _notify_message_processing_queue_stall(app: FastAPI):
+    """Return the operator-bot sink for the queue stall monitor.
+
+    Silent when the bot is not configured, exactly like every other system
+    operator notification.
+    """
+
+    async def _notify(text: str) -> None:
+        config = app.state.system_operator_bot_config
+        if not system_operator_bot_enabled(config):
+            return
+        await send_system_operator_bot_message(config=config, text=text)
+
+    return _notify
 
 
 def _task_supervision(app: FastAPI, task_name: str) -> BackgroundTaskSupervision:
@@ -5509,6 +5550,43 @@ def create_web_app(
                 )
             if (
                 runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "message_processing_worker"
+                )
+                and app.state.message_processing_queue_stall_monitor_task
+                is None
+            ):
+                # Its own coroutine on purpose: the condition it reports is the
+                # claim loop no longer running, so it cannot live inside it.
+                app.state.message_processing_queue_stall_monitor_task = (
+                    asyncio.create_task(
+                        _supervise_restartable_background_task(
+                            "message_processing_queue_stall_monitor_task",
+                            lambda: run_message_processing_queue_stall_monitor(
+                                app.state.session_factory,
+                                activity=app.state.message_processing_activity,
+                                capture=_capture_message_processing_queue_stall(
+                                    app
+                                ),
+                                notify=_notify_message_processing_queue_stall(
+                                    app
+                                ),
+                            ),
+                            session_factory=app.state.session_factory,
+                            runtime_config=app.state.runtime_incident_config,
+                            supervision=_task_supervision(
+                                app,
+                                "message_processing_queue_stall_monitor_task",
+                            ),
+                        )
+                    )
+                )
+                app.state.message_processing_queue_stall_monitor_task.add_done_callback(
+                    _log_background_task_result(
+                        "message_processing_queue_stall_monitor_task"
+                    )
+                )
+            if (
+                runtime_role_starts_singleton_task(
                     app.state.runtime_role, "contract_spec_refresh"
                 )
                 and
@@ -5876,12 +5954,22 @@ def create_web_app(
                 )
                 and app.state.worker_command_worker_task is None
             ):
+                # Supervised for the same reason as the claim loop: the same
+                # lock at 2026-09-16 00:18:26 ended this one one second earlier.
                 app.state.worker_command_worker_task = asyncio.create_task(
-                    app.state.worker_command_worker_runner(
+                    _supervise_restartable_background_task(
+                        "worker_command_worker_task",
+                        lambda: app.state.worker_command_worker_runner(
+                            session_factory=app.state.session_factory,
+                            dependencies=app.state.worker_command_dependencies,
+                            interval_seconds=(
+                                app.state.worker_command_worker_interval_seconds
+                            ),
+                        ),
                         session_factory=app.state.session_factory,
-                        dependencies=app.state.worker_command_dependencies,
-                        interval_seconds=(
-                            app.state.worker_command_worker_interval_seconds
+                        runtime_config=app.state.runtime_incident_config,
+                        supervision=_task_supervision(
+                            app, "worker_command_worker_task"
                         ),
                     )
                 )
@@ -5979,6 +6067,18 @@ def create_web_app(
                 logger.critical(
                     "recognition execution process-wide drain timed out; active ownership remains fenced"
                 )
+            queue_stall_monitor_task = (
+                app.state.message_processing_queue_stall_monitor_task
+            )
+            if queue_stall_monitor_task is not None:
+                queue_stall_monitor_task.cancel()
+                try:
+                    await queue_stall_monitor_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.message_processing_queue_stall_monitor_task = None
             loop_lag_monitor_task = app.state.loop_lag_monitor_task
             if loop_lag_monitor_task is not None:
                 loop_lag_monitor_task.cancel()
@@ -6477,6 +6577,7 @@ def create_web_app(
     )
     app.state.message_processing_activity = MessageProcessingActivity()
     app.state.message_processing_worker_task = None
+    app.state.message_processing_queue_stall_monitor_task = None
     app.state.worker_command_worker_runner = (
         worker_command_worker_runner or supervise_worker_command_mode
     )
@@ -6670,8 +6771,8 @@ def create_web_app(
                 ),
             )
 
-        app.state.message_processing_worker_task = asyncio.create_task(
-            app.state.message_processing_worker_runner(
+        def start_message_processing_worker_runner():
+            return app.state.message_processing_worker_runner(
                 session_factory=app.state.session_factory,
                 interval_seconds=(
                     app.state.message_processing_worker_interval_seconds
@@ -6710,6 +6811,20 @@ def create_web_app(
                 # alert is silently skipped.
                 group_trading_mode_provider=lambda chat: _group_trading_mode(
                     app.state.group_config, chat
+                ),
+            )
+
+        # The claim loop is supervised rather than bare: on 2026-09-16 a single
+        # ``database is locked`` ended it, the process stayed up, and the queue
+        # was not claimed again until the next deploy.
+        app.state.message_processing_worker_task = asyncio.create_task(
+            _supervise_restartable_background_task(
+                "message_processing_worker_task",
+                start_message_processing_worker_runner,
+                session_factory=app.state.session_factory,
+                runtime_config=app.state.runtime_incident_config,
+                supervision=_task_supervision(
+                    app, "message_processing_worker_task"
                 ),
             )
         )

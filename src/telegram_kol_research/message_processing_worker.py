@@ -11,6 +11,7 @@ from typing import Any, Awaitable, Callable
 from uuid import uuid4
 
 from sqlalchemy import DateTime, bindparam, or_, text
+from sqlalchemy.exc import OperationalError
 
 from telegram_kol_research.authoritative_recognition import (
     AutomaticRetryBlocked,
@@ -25,6 +26,19 @@ from telegram_kol_research.trading_settings import load_trading_settings
 logger = logging.getLogger(__name__)
 DEFAULT_CLAIM_STALE_AFTER = timedelta(minutes=5)
 DEFAULT_MAX_ATTEMPTS = 5
+# One transient ``database is locked`` used to end the claim loop for good
+# (2026-09-16 00:18:27: three messages sat unclaimed for 64 minutes and then
+# expired). A lock is retried on a short ladder instead; a lock that has held
+# for this many consecutive ticks -- roughly 100 seconds -- is no longer
+# transient and is raised so the supervisor restarts and counts it.
+MESSAGE_PROCESSING_CLAIM_LOCK_FAILURE_LIMIT = 20
+MESSAGE_PROCESSING_CLAIM_LOCK_MAX_BACKOFF_SECONDS = 5.0
+# Queue stall monitor defaults. Thresholds live here rather than in the
+# environment: the alert exists because nobody was watching, and a value that
+# has to be set on a server is a value that can be forgotten.
+DEFAULT_QUEUE_STALL_MONITOR_INTERVAL_SECONDS = 60.0
+DEFAULT_QUEUE_STALL_AFTER = timedelta(minutes=3)
+DEFAULT_QUEUE_STALL_ALERT_COOLDOWN = timedelta(minutes=15)
 DEFAULT_RETRY_BASE_SECONDS = 15.0
 DEFAULT_RETRY_MAX_SECONDS = 300.0
 _EMPTY_INPUT_AUTHORITATIVE_FAILURE_REASON = (
@@ -65,6 +79,7 @@ class MessageProcessingActivity:
         self._last_refill_claimed = 0
         self._total_started = 0
         self._limit_applied_at: datetime | None = None
+        self._last_claim_at: datetime | None = None
 
     def apply_limit(self, limit: int, *, applied_at: datetime) -> None:
         normalized = int(limit)
@@ -98,7 +113,17 @@ class MessageProcessingActivity:
         self._active -= 1
 
     def note_refill(self, claimed: int) -> None:
-        self._last_refill_claimed = max(0, int(claimed))
+        normalized = max(0, int(claimed))
+        self._last_refill_claimed = normalized
+        if normalized > 0:
+            # "When did this worker last actually take work off the queue" is
+            # the one fact that separates "the queue is busy" from "the
+            # claimant is dead", and the stall alert has to say which.
+            self._last_claim_at = utc_now()
+
+    @property
+    def last_claim_at(self) -> datetime | None:
+        return self._last_claim_at
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -766,29 +791,54 @@ async def run_message_processing_worker_loop(
     lane_activity = activity or MessageProcessingActivity()
     in_flight: set[asyncio.Task[MessageProcessingWorkerResult]] = set()
     interval = max(0.01, float(interval_seconds))
+    consecutive_claim_lock_failures = 0
     try:
         while True:
-            settings, observed_at = await asyncio.to_thread(
-                _load_trading_settings_with_observed_at,
-                session_factory,
-            )
-            cap = settings.message_processing_max_parallel_chats
-            lane_activity.apply_limit(cap, applied_at=observed_at)
-
-            available = max(0, cap - len(in_flight))
-            claims: list[MessageProcessingClaim] = []
-            if available:
-                claims = await asyncio.to_thread(
-                    claim_message_processing_jobs,
+            try:
+                settings, observed_at = await asyncio.to_thread(
+                    _load_trading_settings_with_observed_at,
                     session_factory,
-                    claimed_at=tick_kwargs.get("now") or observed_at,
-                    stale_after=tick_kwargs.get(
-                        "stale_after",
-                        DEFAULT_CLAIM_STALE_AFTER,
-                    ),
-                    limit=available,
                 )
-                lane_activity.note_refill(len(claims))
+                cap = settings.message_processing_max_parallel_chats
+                lane_activity.apply_limit(cap, applied_at=observed_at)
+
+                available = max(0, cap - len(in_flight))
+                claims: list[MessageProcessingClaim] = []
+                if available:
+                    claims = await asyncio.to_thread(
+                        claim_message_processing_jobs,
+                        session_factory,
+                        claimed_at=tick_kwargs.get("now") or observed_at,
+                        stale_after=tick_kwargs.get(
+                            "stale_after",
+                            DEFAULT_CLAIM_STALE_AFTER,
+                        ),
+                        limit=available,
+                    )
+                    lane_activity.note_refill(len(claims))
+            except OperationalError as exc:
+                # A write lock held past ``busy_timeout`` is a transient
+                # condition of the store, not a fault of this loop. Ending the
+                # loop here is what left the queue unclaimed on 2026-09-16.
+                consecutive_claim_lock_failures += 1
+                logger.warning(
+                    "message processing claim skipped: %s (consecutive=%d)",
+                    type(exc).__name__,
+                    consecutive_claim_lock_failures,
+                )
+                if (
+                    consecutive_claim_lock_failures
+                    >= MESSAGE_PROCESSING_CLAIM_LOCK_FAILURE_LIMIT
+                ):
+                    raise
+                await asyncio.sleep(
+                    min(
+                        interval * 2 ** consecutive_claim_lock_failures,
+                        MESSAGE_PROCESSING_CLAIM_LOCK_MAX_BACKOFF_SECONDS,
+                    )
+                )
+                continue
+            consecutive_claim_lock_failures = 0
 
             for claim in claims:
                 in_flight.add(
@@ -813,12 +863,129 @@ async def run_message_processing_worker_loop(
             )
             in_flight = set(pending)
             for task in done:
-                task.result()
+                try:
+                    task.result()
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    # One message's tick failing is already classified and
+                    # settled inside the tick; it must not take the claimant
+                    # for every other chat down with it.
+                    logger.exception("message processing tick failed")
     finally:
         for task in in_flight:
             task.cancel()
         if in_flight:
             await asyncio.gather(*in_flight, return_exceptions=True)
+
+
+def _queue_stall_instant_label(value: datetime | None) -> str:
+    """A bare minute-resolution instant, for the alert text and the summary.
+
+    Kept bare for the same reason as
+    ``runtime_incident_adapters._deadline_label``: an instant welded into a
+    longer label reads to the incident ledger's opaque-secret heuristic as one
+    high-entropy token and gets the whole summary refused.
+    """
+
+    if value is None:
+        return "unknown"
+    return f"{_aware_utc(value).strftime('%Y-%m-%dT%H:%M')}Z"
+
+
+def count_stalled_message_processing_jobs(
+    session_factory,
+    *,
+    now: datetime,
+    stall_after: timedelta = DEFAULT_QUEUE_STALL_AFTER,
+) -> tuple[int, datetime | None]:
+    """Count claimable jobs nobody has taken, and name the oldest one.
+
+    "Claimable" is exactly what ``claim_message_processing_jobs`` treats as
+    claimable -- a live, non-shadow ``pending`` row whose retry backoff has
+    come due -- so a job the worker is deliberately holding back is never
+    reported as a stall.
+    """
+
+    observed_at = _naive_utc(now)
+    stalled_before = observed_at - stall_after
+    with session_factory() as session:
+        enqueued_at_values = [
+            row[0]
+            for row in session.query(MessageProcessingJob.enqueued_at)
+            .filter(
+                MessageProcessingJob.status == "pending",
+                MessageProcessingJob.shadow.is_(False),
+                MessageProcessingJob.claim_token.is_(None),
+                or_(
+                    MessageProcessingJob.next_attempt_at.is_(None),
+                    MessageProcessingJob.next_attempt_at <= observed_at,
+                ),
+                MessageProcessingJob.enqueued_at <= stalled_before,
+            )
+            .all()
+        ]
+    oldest = min(
+        (value for value in enqueued_at_values if value is not None),
+        default=None,
+    )
+    return len(enqueued_at_values), oldest
+
+
+async def run_message_processing_queue_stall_monitor(
+    session_factory,
+    *,
+    activity: MessageProcessingActivity | None,
+    interval_seconds: float = DEFAULT_QUEUE_STALL_MONITOR_INTERVAL_SECONDS,
+    stall_after: timedelta = DEFAULT_QUEUE_STALL_AFTER,
+    cooldown: timedelta = DEFAULT_QUEUE_STALL_ALERT_COOLDOWN,
+    capture: Callable[..., Any],
+    notify: Callable[[str], Awaitable[None] | None],
+) -> None:
+    """Say out loud that queued messages are not being claimed.
+
+    Deliberately a separate coroutine from the claim loop: the case it exists
+    for is the claim loop being gone. It only observes -- it never claims,
+    settles or expires anything.
+    """
+
+    interval = max(0.01, float(interval_seconds))
+    stall_minutes = max(1, int(stall_after.total_seconds() // 60))
+    last_alert_at: datetime | None = None
+    while True:
+        now = utc_now()
+        stalled, oldest_enqueued_at = await asyncio.to_thread(
+            count_stalled_message_processing_jobs,
+            session_factory,
+            now=now,
+            stall_after=stall_after,
+        )
+        if stalled <= 0:
+            # The queue moved, so the next stall is a new one and is announced
+            # at once rather than waiting out this one's cooldown.
+            last_alert_at = None
+        elif last_alert_at is None or now - last_alert_at >= cooldown:
+            last_alert_at = now
+            last_claim_at = (
+                activity.last_claim_at if activity is not None else None
+            )
+            capture(
+                stalled=stalled,
+                oldest_enqueued_at=oldest_enqueued_at,
+                last_claim_at=last_claim_at,
+                occurred_at=now,
+            )
+            notification = notify(
+                "⚠️ 消息处理队列停摆\n"
+                f"待认领: {stalled} 条消息超过 {stall_minutes} 分钟无人认领\n"
+                "最老一条入队: "
+                f"{_queue_stall_instant_label(oldest_enqueued_at)} (UTC)\n"
+                "最近一次认领: "
+                f"{_queue_stall_instant_label(last_claim_at)} (UTC)"
+            )
+            if inspect.isawaitable(notification):
+                await notification
+        await asyncio.sleep(interval)
 
 
 def _classify_claim_expiry(

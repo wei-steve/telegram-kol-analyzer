@@ -1,10 +1,15 @@
 import asyncio
+import contextlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+import logging
+import sqlite3
 import threading
+import time
 from types import SimpleNamespace
 
 import pytest
+from sqlalchemy.exc import OperationalError
 from sqlalchemy.orm import Query
 
 import telegram_kol_research.message_processing_worker as worker_module
@@ -20,8 +25,11 @@ from telegram_kol_research.models import (
     RecognitionDecision,
 )
 from telegram_kol_research.message_processing_worker import (
+    MessageProcessingActivity,
     claim_message_processing_jobs,
+    count_stalled_message_processing_jobs,
     process_message_job,
+    run_message_processing_queue_stall_monitor,
     run_message_processing_worker_loop,
     run_message_processing_worker_tick,
 )
@@ -1606,3 +1614,393 @@ def test_empty_input_terminal_outcome_releases_same_chat_lane(tmp_path):
         "terminal_authoritative_failure:empty_input",
         "worker_completed",
     ]
+
+
+# --------------------------------------------------------------------------
+# 2026-09-16: one transient lock ended the claim loop and three messages
+# expired unclaimed. The loop now survives the lock, survives one tick's
+# failure, and a separate monitor says so when the queue stops moving.
+# --------------------------------------------------------------------------
+
+
+class _RecordingLogHandler(logging.Handler):
+    """Collect this module's own log lines.
+
+    ``caplog`` attaches to the root logger, and by the time the whole suite has
+    run something has already called ``configure_application_logging``, which
+    gives this module's logger its own handlers. Reading the worker logger
+    directly is what the assertion actually means anyway.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(level=logging.DEBUG)
+        self.messages: list[str] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.messages.append(record.getMessage())
+
+
+@contextlib.contextmanager
+def _worker_log_messages():
+    handler = _RecordingLogHandler()
+    logger = logging.getLogger(worker_module.__name__)
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        yield handler.messages
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
+
+
+def _locked_error() -> OperationalError:
+    return OperationalError(
+        "BEGIN IMMEDIATE",
+        {},
+        sqlite3.OperationalError("database is locked"),
+    )
+
+
+def test_one_lock_error_only_skips_that_claim_and_the_loop_keeps_running(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "claim-lock-once.db")
+    raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    real_claim = worker_module.claim_message_processing_jobs
+    calls = {"count": 0}
+    processed: list[int] = []
+    processed_event = threading.Event()
+
+    def flaky_claim(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 1:
+            raise _locked_error()
+        return real_claim(*args, **kwargs)
+
+    monkeypatch.setattr(
+        worker_module, "claim_message_processing_jobs", flaky_claim
+    )
+
+    async def processor(_session_factory, *, raw_message_id, **_kwargs):
+        processed.append(raw_message_id)
+        processed_event.set()
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+                job_processor=processor,
+            )
+        )
+        try:
+            await _wait_until(lambda: processed_event.is_set(), turns=20000)
+        finally:
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    with _worker_log_messages() as messages:
+        asyncio.run(scenario())
+
+    assert processed == [raw_id]
+    assert calls["count"] >= 2
+    assert any(
+        "message processing claim skipped" in message
+        and "consecutive=1" in message
+        for message in messages
+    )
+
+
+def test_twenty_consecutive_lock_errors_leave_the_loop_to_the_supervisor(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "claim-lock-forever.db")
+    _add_job(session_factory, chat_id=1, message_id=1)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 3,
+        },
+    )
+    calls = {"count": 0}
+
+    def always_locked(*_args, **_kwargs):
+        calls["count"] += 1
+        raise _locked_error()
+
+    monkeypatch.setattr(
+        worker_module, "claim_message_processing_jobs", always_locked
+    )
+    monkeypatch.setattr(
+        worker_module,
+        "MESSAGE_PROCESSING_CLAIM_LOCK_MAX_BACKOFF_SECONDS",
+        0.001,
+    )
+
+    async def scenario():
+        await run_message_processing_worker_loop(
+            session_factory,
+            interval_seconds=0.001,
+            now=NOW,
+        )
+
+    with pytest.raises(OperationalError):
+        asyncio.run(scenario())
+
+    assert calls["count"] == (
+        worker_module.MESSAGE_PROCESSING_CLAIM_LOCK_FAILURE_LIMIT
+    )
+
+
+def test_one_failing_tick_does_not_stop_the_next_message_from_running(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "tick-failure.db")
+    first_raw_id = _add_job(session_factory, chat_id=1, message_id=1)
+    second_raw_id = _add_job(session_factory, chat_id=2, message_id=2)
+    save_trading_settings(
+        session_factory,
+        {
+            "message_pipeline_mode": "queue",
+            "message_processing_max_parallel_chats": 1,
+        },
+    )
+    ran: list[int] = []
+    second_ran = threading.Event()
+
+    async def exploding_tick(_session_factory, *, _preclaimed_jobs, **_kwargs):
+        claim = _preclaimed_jobs[0]
+        ran.append(int(claim.raw_message_id))
+        if int(claim.raw_message_id) == first_raw_id:
+            raise RuntimeError("tick blew up")
+        second_ran.set()
+        return worker_module.MessageProcessingWorkerResult(claimed=1)
+
+    monkeypatch.setattr(
+        worker_module, "run_message_processing_worker_tick", exploding_tick
+    )
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+            )
+        )
+        try:
+            await _wait_until(lambda: second_ran.is_set(), turns=20000)
+            assert not loop_task.done()
+        finally:
+            loop_task.cancel()
+            await asyncio.gather(loop_task, return_exceptions=True)
+
+    with _worker_log_messages() as messages:
+        asyncio.run(scenario())
+
+    assert ran == [first_raw_id, second_raw_id]
+    assert any(
+        "message processing tick failed" in message for message in messages
+    )
+
+
+def test_cancelling_the_loop_still_stops_it(tmp_path):
+    session_factory = create_session_factory(tmp_path / "cancel-loop.db")
+    save_trading_settings(
+        session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    async def scenario():
+        loop_task = asyncio.create_task(
+            run_message_processing_worker_loop(
+                session_factory,
+                interval_seconds=0.01,
+                now=NOW,
+            )
+        )
+        await asyncio.sleep(0.05)
+        loop_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await loop_task
+
+    asyncio.run(scenario())
+
+
+async def _wait_for(predicate, *, timeout: float = 10.0):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("condition was not reached")
+
+
+def _run_stall_monitor(
+    session_factory,
+    *,
+    driver,
+    activity=None,
+    stall_after=timedelta(minutes=3),
+    cooldown=timedelta(minutes=15),
+):
+    captured: list[dict] = []
+    notified: list[str] = []
+
+    def capture(**kwargs):
+        captured.append(kwargs)
+
+    async def notify(text):
+        notified.append(text)
+
+    async def scenario():
+        monitor_task = asyncio.create_task(
+            run_message_processing_queue_stall_monitor(
+                session_factory,
+                activity=activity,
+                interval_seconds=0.01,
+                stall_after=stall_after,
+                cooldown=cooldown,
+                capture=capture,
+                notify=notify,
+            )
+        )
+        try:
+            await driver(captured, notified)
+        finally:
+            monitor_task.cancel()
+            await asyncio.gather(monitor_task, return_exceptions=True)
+
+    asyncio.run(scenario())
+    return captured, notified
+
+
+def _set_all_job_statuses(session_factory, status: str) -> None:
+    with session_factory() as session:
+        session.query(MessageProcessingJob).update(
+            {MessageProcessingJob.status: status},
+            synchronize_session=False,
+        )
+        session.commit()
+
+
+def test_a_stalled_queue_is_captured_and_announced_once(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-stalled.db")
+    for chat_id in (1, 2, 3):
+        _add_job(session_factory, chat_id=chat_id, message_id=chat_id)
+    activity = MessageProcessingActivity()
+    activity.note_refill(1)
+
+    async def driver(captured, notified):
+        await _wait_for(lambda: bool(captured) and bool(notified))
+
+    captured, notified = _run_stall_monitor(
+        session_factory,
+        activity=activity,
+        driver=driver,
+    )
+
+    assert len(captured) == 1
+    assert len(notified) == 1
+    assert captured[0]["stalled"] == 3
+    assert captured[0]["oldest_enqueued_at"] is not None
+    assert captured[0]["last_claim_at"] == activity.last_claim_at
+    assert "消息处理队列停摆" in notified[0]
+    assert "3 条消息超过 3 分钟无人认领" in notified[0]
+
+
+def test_the_stall_alert_is_not_repeated_inside_its_cooldown(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-cooldown.db")
+    _add_job(session_factory, chat_id=1, message_id=1)
+
+    async def driver(captured, notified):
+        await _wait_for(lambda: bool(captured))
+        # Many more ticks at 10 ms each, all inside the 15 minute cooldown.
+        await asyncio.sleep(0.3)
+
+    captured, notified = _run_stall_monitor(session_factory, driver=driver)
+
+    assert len(captured) == 1
+    assert len(notified) == 1
+
+
+def test_a_queue_that_drains_and_stalls_again_alerts_again(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-again.db")
+    _add_job(session_factory, chat_id=1, message_id=1)
+
+    async def driver(captured, notified):
+        await _wait_for(lambda: len(captured) == 1)
+        _set_all_job_statuses(session_factory, "succeeded")
+        # Long enough for the monitor to observe an empty queue, which is what
+        # clears the cooldown.
+        await asyncio.sleep(0.2)
+        assert len(captured) == 1
+        _set_all_job_statuses(session_factory, "pending")
+        await _wait_for(lambda: len(captured) == 2)
+
+    captured, notified = _run_stall_monitor(session_factory, driver=driver)
+
+    assert len(captured) == 2
+    assert len(notified) == 2
+
+
+def test_a_message_younger_than_the_threshold_is_not_a_stall(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-young.db")
+    now = datetime.now(UTC)
+    _add_job(session_factory, chat_id=1, message_id=1)
+    with session_factory() as session:
+        session.query(MessageProcessingJob).update(
+            {
+                MessageProcessingJob.enqueued_at: (
+                    now.replace(tzinfo=None) - timedelta(minutes=1)
+                )
+            },
+            synchronize_session=False,
+        )
+        session.commit()
+
+    stalled, oldest = count_stalled_message_processing_jobs(
+        session_factory,
+        now=now,
+        stall_after=timedelta(minutes=3),
+    )
+
+    assert stalled == 0
+    assert oldest is None
+
+
+def test_a_deferred_retry_and_a_shadow_row_are_not_counted_as_stalled(tmp_path):
+    session_factory = create_session_factory(tmp_path / "queue-not-claimable.db")
+    now = datetime.now(UTC)
+    _add_job(session_factory, chat_id=1, message_id=1)
+    _add_job(session_factory, chat_id=2, message_id=2)
+    with session_factory() as session:
+        jobs = (
+            session.query(MessageProcessingJob)
+            .order_by(MessageProcessingJob.id.asc())
+            .all()
+        )
+        jobs[0].next_attempt_at = now.replace(tzinfo=None) + timedelta(
+            minutes=5
+        )
+        jobs[1].shadow = True
+        session.commit()
+
+    stalled, oldest = count_stalled_message_processing_jobs(
+        session_factory,
+        now=now,
+        stall_after=timedelta(minutes=3),
+    )
+
+    assert stalled == 0
+    assert oldest is None

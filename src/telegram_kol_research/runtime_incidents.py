@@ -145,6 +145,15 @@ _SUMMARY_FIELDS = frozenset(
         # how fast they have to. The note is one fixed sentence plus a model
         # id, through ``_safe_text``; the scan below still runs over it.
         "fallback_note",
+        # The message-processing queue stall alert. "Messages are queued and
+        # nobody is claiming them" is only actionable with how many, since
+        # when, and when the claimant last took anything -- the three facts
+        # that separate a busy worker from a dead one. The count is an
+        # integer; both instants are bare minute-resolution labels, for the
+        # same opaque-secret reason as ``deadline_at`` above.
+        "stalled_jobs",
+        "oldest_enqueued_at",
+        "last_claim_at",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(

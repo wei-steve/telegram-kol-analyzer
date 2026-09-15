@@ -226,6 +226,13 @@ ALWAYS_NOTIFIED_INCIDENT_TYPES = frozenset(
         # A-2: a supervised background task gave up restarting, which means the
         # loop stays down until the process does.
         "background_task_restart_exhausted",
+        # Messages are queued and nobody is claiming them. The 2026-09-16
+        # claim-loop death was invisible to every existing signal -- the
+        # process stayed ``active``, the page said "monitoring", and the three
+        # messages were only noticed after gap recovery expired them. Left to
+        # the hand-edited environment list this alert would be forgotten
+        # exactly like the A-2 ones were.
+        "message_processing_queue_stalled",
         # A-3: a management stop was refused by the price gate. Production's
         # first one (incident 2069, 2026-09-08 06:26:24Z, high) was never
         # delivered, so a rejected stop looked exactly like an accepted one.

@@ -9432,3 +9432,109 @@ def test_runtime_agent_telegram_evidence_endpoint_is_single_flight(
     assert again.status_code == 200
     assert max_active == 1
     assert calls == 2
+
+
+# --------------------------------------------------------------------------
+# 2026-09-16: the claim loop and the worker command loop were started bare, so
+# one ``database is locked`` each ended them for the life of the process.
+# --------------------------------------------------------------------------
+
+
+def _restarting_runner(restarted: threading.Event):
+    starts = []
+
+    async def runner(**_kwargs):
+        starts.append(True)
+        if len(starts) == 1:
+            raise RuntimeError("database is locked")
+        restarted.set()
+        await asyncio.Event().wait()
+
+    return runner, starts
+
+
+def test_the_message_processing_worker_task_is_restarted_after_it_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        web_app_module, "_SUPERVISED_RESTART_INITIAL_DELAY_SECONDS", 0.001
+    )
+    restarted = threading.Event()
+    runner, starts = _restarting_runner(restarted)
+    app = create_web_app(
+        database_path=tmp_path / "message-worker-restart.db",
+        runtime_role="worker",
+        message_processing_worker_runner=runner,
+    )
+    save_trading_settings(
+        app.state.session_factory,
+        {"message_pipeline_mode": "queue"},
+    )
+
+    with TestClient(app):
+        assert restarted.wait(timeout=5)
+        supervision = app.state.background_task_supervision[
+            "message_processing_worker_task"
+        ]
+        assert supervision.restarts >= 1
+        assert supervision.last_error_type == "RuntimeError"
+
+    assert len(starts) >= 2
+
+
+def test_the_worker_command_worker_task_is_restarted_after_it_fails(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(
+        web_app_module, "_SUPERVISED_RESTART_INITIAL_DELAY_SECONDS", 0.001
+    )
+    restarted = threading.Event()
+    runner, starts = _restarting_runner(restarted)
+    app = create_web_app(
+        database_path=tmp_path / "worker-command-restart.db",
+        runtime_role="worker",
+        worker_command_worker_runner=runner,
+    )
+
+    with TestClient(app):
+        assert restarted.wait(timeout=5)
+        supervision = app.state.background_task_supervision[
+            "worker_command_worker_task"
+        ]
+        assert supervision.restarts >= 1
+        assert supervision.last_error_type == "RuntimeError"
+
+    assert len(starts) >= 2
+
+
+def test_the_queue_stall_monitor_runs_only_in_the_worker_role(tmp_path):
+    async def dormant_worker(**_kwargs):
+        await asyncio.Event().wait()
+
+    worker_app = create_web_app(
+        database_path=tmp_path / "stall-monitor-worker.db",
+        runtime_role="worker",
+        message_processing_worker_runner=dormant_worker,
+    )
+    web_only_app = create_web_app(
+        database_path=tmp_path / "stall-monitor-web.db",
+        runtime_role="web",
+        message_processing_worker_runner=dormant_worker,
+    )
+
+    with TestClient(worker_app):
+        assert (
+            worker_app.state.message_processing_queue_stall_monitor_task
+            is not None
+        )
+        assert (
+            "message_processing_queue_stall_monitor_task"
+            in worker_app.state.background_task_supervision
+        )
+    assert worker_app.state.message_processing_queue_stall_monitor_task is None
+
+    with TestClient(web_only_app):
+        assert (
+            web_only_app.state.message_processing_queue_stall_monitor_task
+            is None
+        )
