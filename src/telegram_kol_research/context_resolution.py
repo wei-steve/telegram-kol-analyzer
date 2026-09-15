@@ -715,13 +715,13 @@ def _upsert_attempt(
     )
 
     now = utc_now()
+    # The same recursive projection the worker reads back from
+    # ``candidate_thread_ids_json``; a narrower set here made the stored and
+    # recomputed fingerprints differ forever, so "context unchanged" never held.
     state_fingerprint = build_context_state_fingerprint(
         session_factory,
         int(raw_message_id),
-        candidate_thread_ids=_collect_ids(
-            request_payload.get("candidate_strategy_threads"),
-            {"thread_id", "strategy_thread_id"},
-        ),
+        candidate_thread_ids=set(collect_candidate_thread_ids(request_payload)),
     )
     request_summary_json = _canonical_json(request_payload)
     if request_summary_json == "{}":

@@ -1777,6 +1777,7 @@ _CONTEXT_TERMINAL_STATE_BY_STATUS = {
     "blocked_disabled": "blocked_disabled",
     "blocked_execution_terminal": "blocked_terminal",
     "superseded": "superseded",
+    "reanalysis_capped": "reanalysis_capped",
     "completed": "completed",
 }
 #: Gate outcomes mapped onto the card's state enum when no attempt row exists.

@@ -12,6 +12,7 @@ from telegram_kol_research.context_resolution_worker import (
     run_context_resolution_once,
     schedule_context_reanalysis,
 )
+from telegram_kol_research.context_resolution import _upsert_attempt
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ContextResolutionAttempt,
@@ -24,6 +25,7 @@ from telegram_kol_research.models import (
     RuntimeIncident,
     SignalCandidate,
     StrategyLifecycle,
+    StrategyMessageLink,
     StrategyThread,
 )
 from telegram_kol_research.recognition_decisions import (
@@ -42,6 +44,7 @@ def _persist_unresolved(
     chat_id=100,
     message_id=10,
     fingerprint="sha256:old",
+    reply_to_message_id=None,
     triggers=(
         "reply_target_available",
         "exchange_state_changed",
@@ -56,6 +59,7 @@ def _persist_unresolved(
             message_id=message_id,
             text="更新策略",
             posted_at=NOW,
+            reply_to_message_id=reply_to_message_id,
         )
         session.add(raw)
         session.flush()
@@ -88,6 +92,90 @@ def _persist_unresolved(
         session.add(attempt)
         session.commit()
         return raw.id, attempt.id
+
+
+def _persist_reply_target_thread(
+    session_factory,
+    *,
+    chat_id,
+    target_message_id,
+    lifecycle_status,
+):
+    """The message a later row replies to, linked to one strategy thread."""
+
+    with session_factory() as session:
+        target = RawMessage(
+            chat_id=chat_id,
+            message_id=target_message_id,
+            text="BTC 多单，市价进",
+            posted_at=NOW - timedelta(hours=1),
+        )
+        lifecycle = StrategyLifecycle(
+            chat_id=chat_id,
+            message_id=target_message_id,
+            symbol="BTC",
+            side="long",
+            lifecycle_status=lifecycle_status,
+            signal_at=NOW - timedelta(hours=1),
+        )
+        session.add_all([target, lifecycle])
+        session.flush()
+        thread = StrategyThread(
+            chat_id=chat_id,
+            root_message_id=target_message_id,
+            symbol="BTC",
+            side="long",
+            status="active",
+            current_lifecycle_id=lifecycle.id,
+        )
+        session.add(thread)
+        session.flush()
+        lifecycle.strategy_thread_id = thread.id
+        session.add(
+            StrategyMessageLink(
+                strategy_thread_id=thread.id,
+                raw_message_id=target.id,
+                relation_kind="root",
+                resolver="test",
+                confidence=1.0,
+                evidence_json="{}",
+                decision_version="v1",
+                status="active",
+            )
+        )
+        session.commit()
+        return int(thread.id)
+
+
+def _add_completed_attempts(
+    session_factory,
+    *,
+    raw_message_id,
+    count,
+    created_at,
+):
+    """Historical rows for one message; each real reanalysis writes one."""
+
+    with session_factory() as session:
+        for index in range(count):
+            session.add(
+                ContextResolutionAttempt(
+                    raw_message_id=int(raw_message_id),
+                    context_fingerprint=(
+                        f"sha256:history-{created_at.isoformat()}-{index}"
+                    ),
+                    model="deepseek",
+                    prompt_versions_json="{}",
+                    request_summary_json="{}",
+                    decision_json='{"decision":"unresolved"}',
+                    status="completed",
+                    reanalysis_triggers_json="[]",
+                    attempts=1,
+                    created_at=created_at,
+                    updated_at=created_at,
+                )
+            )
+        session.commit()
 
 
 @pytest.mark.parametrize(
@@ -123,8 +211,21 @@ def test_reanalysis_is_scheduled_for_supported_context_changes(
 
 
 def test_next_same_chat_message_schedules_unresolved_attempt(tmp_path):
+    """The stand-in event only pays for a row that is really waiting on it."""
+
     session_factory = create_session_factory(tmp_path / "same-chat.db")
-    _, attempt_id = _persist_unresolved(session_factory, chat_id=88)
+    _persist_reply_target_thread(
+        session_factory,
+        chat_id=88,
+        target_message_id=4,
+        lifecycle_status="entered",
+    )
+    _, attempt_id = _persist_unresolved(
+        session_factory,
+        chat_id=88,
+        reply_to_message_id=4,
+        triggers=("reply_target_available",),
+    )
 
     scheduled = schedule_context_reanalysis(
         session_factory,
@@ -134,6 +235,86 @@ def test_next_same_chat_message_schedules_unresolved_attempt(tmp_path):
     )
 
     assert scheduled == 1
+    with session_factory() as session:
+        assert (
+            session.get(ContextResolutionAttempt, attempt_id).status
+            == "pending_reanalysis"
+        )
+
+
+def test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen(
+    tmp_path,
+):
+    """An exited reply target never re-enters the candidate set."""
+
+    session_factory = create_session_factory(tmp_path / "same-chat-exited.db")
+    _persist_reply_target_thread(
+        session_factory,
+        chat_id=88,
+        target_message_id=4,
+        lifecycle_status="exited",
+    )
+    _, attempt_id = _persist_unresolved(
+        session_factory,
+        chat_id=88,
+        reply_to_message_id=4,
+        triggers=("reply_target_available",),
+    )
+
+    scheduled = schedule_context_reanalysis(
+        session_factory,
+        event_type="next_same_chat_message",
+        chat_id=88,
+        occurred_at=NOW + timedelta(minutes=1),
+    )
+
+    assert scheduled == 0
+    with session_factory() as session:
+        assert (
+            session.get(ContextResolutionAttempt, attempt_id).status == "completed"
+        )
+
+
+def test_next_same_chat_message_ignores_rows_waiting_on_another_trigger(tmp_path):
+    """Every other trigger has its own precise event and must wait for it."""
+
+    session_factory = create_session_factory(tmp_path / "same-chat-other.db")
+    _persist_reply_target_thread(
+        session_factory,
+        chat_id=88,
+        target_message_id=4,
+        lifecycle_status="entered",
+    )
+    raw_id, attempt_id = _persist_unresolved(
+        session_factory,
+        chat_id=88,
+        reply_to_message_id=4,
+        triggers=("evidence_version_changed",),
+    )
+
+    assert (
+        schedule_context_reanalysis(
+            session_factory,
+            event_type="next_same_chat_message",
+            chat_id=88,
+            occurred_at=NOW + timedelta(minutes=1),
+        )
+        == 0
+    )
+    with session_factory() as session:
+        assert (
+            session.get(ContextResolutionAttempt, attempt_id).status == "completed"
+        )
+
+    assert (
+        schedule_context_reanalysis(
+            session_factory,
+            event_type="evidence_version_changed",
+            raw_message_id=raw_id,
+            occurred_at=NOW + timedelta(minutes=2),
+        )
+        == 1
+    )
     with session_factory() as session:
         assert (
             session.get(ContextResolutionAttempt, attempt_id).status
@@ -789,3 +970,206 @@ def test_exhausted_worker_records_incident_only_after_source_state_commits(
         assert incident.incident_type == "context_worker_exhausted"
         assert incident.generation == 1
         assert incident.repeat_count == 3
+
+
+def _raise_on_reanalyze(*_args, **_kwargs):
+    raise AssertionError("capped message must not call AI")
+
+
+def test_sixth_reanalysis_of_one_message_in_24_hours_is_capped(tmp_path):
+    """A semantic dead end re-asks the same question; five rows is the ceiling."""
+
+    session_factory = create_session_factory(tmp_path / "cap-reached.db")
+    raw_id, attempt_id = _persist_unresolved(session_factory)
+    _add_completed_attempts(
+        session_factory,
+        raw_message_id=raw_id,
+        count=4,
+        created_at=NOW - timedelta(hours=1),
+    )
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:new",
+        reanalyze=_raise_on_reanalyze,
+        now=NOW,
+    )
+
+    assert result == {"status": "reanalysis_capped", "raw_message_id": raw_id}
+    with session_factory() as session:
+        assert (
+            session.get(ContextResolutionAttempt, attempt_id).status
+            == "reanalysis_capped"
+        )
+
+
+def test_reanalysis_below_the_per_message_cap_still_runs(tmp_path):
+    session_factory = create_session_factory(tmp_path / "cap-not-reached.db")
+    raw_id, _ = _persist_unresolved(session_factory)
+    _add_completed_attempts(
+        session_factory,
+        raw_message_id=raw_id,
+        count=3,
+        created_at=NOW - timedelta(hours=1),
+    )
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+    calls = []
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:new",
+        reanalyze=lambda message_id, fingerprint, **_: calls.append(
+            (message_id, fingerprint)
+        )
+        or {"status": "completed"},
+        now=NOW,
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [(raw_id, "sha256:new")]
+
+
+def test_attempts_older_than_the_cap_window_do_not_count(tmp_path):
+    """The cap bounds one burst, it does not retire a message forever."""
+
+    session_factory = create_session_factory(tmp_path / "cap-window.db")
+    raw_id, _ = _persist_unresolved(session_factory)
+    _add_completed_attempts(
+        session_factory,
+        raw_message_id=raw_id,
+        count=6,
+        created_at=NOW - timedelta(hours=25),
+    )
+    schedule_context_reanalysis(
+        session_factory,
+        event_type="message_edited",
+        raw_message_id=raw_id,
+        occurred_at=NOW,
+    )
+    calls = []
+
+    result = run_context_resolution_once(
+        session_factory,
+        context_fingerprint_factory=lambda _: "sha256:new",
+        reanalyze=lambda message_id, fingerprint, **_: calls.append(
+            (message_id, fingerprint)
+        )
+        or {"status": "completed"},
+        now=NOW,
+    )
+
+    assert result["status"] == "completed"
+    assert calls == [(raw_id, "sha256:new")]
+
+
+def test_stored_state_fingerprint_matches_the_worker_recomputation(tmp_path):
+    """Both sides must hash the same thread set or "unchanged" never holds."""
+
+    session_factory = create_session_factory(tmp_path / "fingerprint-parity.db")
+    with session_factory() as session:
+        raw = RawMessage(
+            chat_id=100,
+            message_id=14636,
+            text="第二止盈位到了",
+            posted_at=NOW,
+            reply_to_message_id=4474,
+        )
+        candidate_lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=1400,
+            symbol="ETH",
+            side="long",
+            lifecycle_status="expired",
+            signal_at=NOW - timedelta(days=35),
+        )
+        exited_lifecycle = StrategyLifecycle(
+            chat_id=100,
+            message_id=4474,
+            symbol="BTC",
+            side="long",
+            lifecycle_status="exited",
+            signal_at=NOW - timedelta(hours=3),
+        )
+        session.add_all([raw, candidate_lifecycle, exited_lifecycle])
+        session.flush()
+        candidate_thread = StrategyThread(
+            chat_id=100,
+            root_message_id=1400,
+            symbol="ETH",
+            side="long",
+            status="active",
+            current_lifecycle_id=candidate_lifecycle.id,
+        )
+        reply_target_thread = StrategyThread(
+            chat_id=100,
+            root_message_id=4474,
+            symbol="BTC",
+            side="long",
+            status="closed",
+            current_lifecycle_id=exited_lifecycle.id,
+        )
+        session.add_all([candidate_thread, reply_target_thread])
+        session.commit()
+        raw_id = int(raw.id)
+        candidate_thread_id = int(candidate_thread.id)
+        reply_target_thread_id = int(reply_target_thread.id)
+
+    # The production shape: the reply chain names a thread the candidate set
+    # rejects, so the two projections used to disagree forever.
+    request_payload = {
+        "candidate_strategy_threads": [{"thread_id": candidate_thread_id}],
+        "message_context": {
+            "reply_chain": [
+                {
+                    "message_id": 4474,
+                    "strategy_links": [
+                        {"strategy_thread_id": reply_target_thread_id}
+                    ],
+                }
+            ]
+        },
+    }
+    _upsert_attempt(
+        session_factory,
+        raw_message_id=raw_id,
+        evidence_version_id=None,
+        context_fingerprint="sha256:request",
+        model="deepseek",
+        request_payload=request_payload,
+        decision=None,
+        status="completed",
+        error_class=None,
+        attempts=1,
+    )
+
+    with session_factory() as session:
+        stored = session.query(ContextResolutionAttempt).one()
+        stored_fingerprint = str(stored.state_fingerprint)
+        assert json.loads(stored.candidate_thread_ids_json) == sorted(
+            [candidate_thread_id, reply_target_thread_id]
+        )
+
+    assert build_context_state_fingerprint(session_factory, raw_id) == (
+        stored_fingerprint
+    )
+    # Guard against a vacuous assertion: the narrower candidate-only set that
+    # used to be stored really does hash differently.
+    assert (
+        build_context_state_fingerprint(
+            session_factory,
+            raw_id,
+            candidate_thread_ids={candidate_thread_id},
+        )
+        != stored_fingerprint
+    )

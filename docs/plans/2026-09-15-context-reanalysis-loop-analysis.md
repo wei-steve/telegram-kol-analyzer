@@ -209,3 +209,85 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
 - `tests/test_recognition_context_gate.py` 的 `execution_state` 参数化加 `("reanalysis_capped","reanalysis_capped")`。
 - `tests/test_web_recognition_card_labels.py` 或同类：渲染一条 `reanalysis_capped` 卡片，徽章文案「重分析已达上限」。
 - 全量 `PYTHONPATH=. uv run pytest -q` 通过。
+
+## 7. 实施记录
+
+日期：2026-09-15。实施范围：第 6 节（6.1 + 6.2 + 6.3 + 6.4），4.4 / 4.5 未做。
+
+### 7.1 改动文件
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/telegram_kol_research/context_resolution_worker.py` | 6.1 封顶 + 6.2 事件收紧 |
+| `src/telegram_kol_research/context_resolution.py` | 6.3 指纹集合（`_upsert_attempt` 一处） |
+| `src/telegram_kol_research/web_queries.py` | `_CONTEXT_TERMINAL_STATE_BY_STATUS` 加 `reanalysis_capped` |
+| `src/telegram_kol_research/templates/_messages.html` | `context_state_labels` 加「重分析已达上限」 |
+| `src/telegram_kol_research/static/app.css` | `.is-reanalysis_capped` 与 `.is-superseded` 同一条灰色规则 |
+| `tests/test_context_resolution_worker.py` | 既有 1 例调整 + 新增 6 例 + 2 个 helper |
+| `tests/test_recognition_context_gate.py` | 状态参数化加一行 |
+| `tests/test_web_recognition_card_labels.py` | 新增 1 例 + `_build` 多一张卡片 |
+
+6.1 实现要点：模块顶部新增 `DEFAULT_MAX_REANALYSIS_PER_MESSAGE = 5` 与 `REANALYSIS_CAP_WINDOW = timedelta(hours=24)`（与 `DEFAULT_RETRY_DELAY` 并列）；
+`run_context_resolution_once` 新增关键字参数 `max_reanalysis_per_message`，默认取上述常量，位置在 `is_eligible` 之后、`_has_terminal_instruction` 之前；
+计数走新的 `_recent_attempt_count(session_factory, *, raw_message_id, since)`（`created_at >= now - 24h` 的全部行，含被认领的这一行）；
+封顶时按第 6 节写 `logger.warning("context reanalysis capped raw_message_id=%s attempts_24h=%s cap=%s")`，`_finish_claim(status="reanalysis_capped")`，
+返回 `{"status": "reanalysis_capped", "raw_message_id": ...}`，不调用 `reanalyze`。`cli.py` 与 `web_app.py` 两个调用点不传该参数，即用默认 5。
+
+6.2 实现要点：新增 `_reply_target_now_available(session, raw_message) -> bool`（`reply_to_message_id` 非空 → 同 `chat_id` 下存在该 `message_id` 的原始消息 →
+该消息经 `strategy_message_links` 指向的线程，其 `current_lifecycle_id` 的 `lifecycle_status` ∈ `strategy_thread_candidates.ACTIVE_LIFECYCLE_STATUSES`，
+常量直接 import，与候选生成同一口径）。`schedule_context_reanalysis` 的 `next_same_chat_message` 分支由「声明了任意触发条件就重排」改为
+「声明了 `reply_target_available` 且此刻可用才重排」。`EVENT_TRIGGER_MAP` 未动，显式 `reply_target_available` 事件路径未动。
+
+6.3 实现要点：`_upsert_attempt` 的 `state_fingerprint=build_context_state_fingerprint(...)` 的 `candidate_thread_ids=` 由
+`_collect_ids(request_payload["candidate_strategy_threads"], …)` 改为 `set(collect_candidate_thread_ids(request_payload))`（该函数原本已在本模块 import，
+几行之后就用它算 `candidate_thread_ids_json`）。`build_context_state_fingerprint` 本身未动；`_collect_ids` 在同文件另有使用，保留。
+
+### 7.2 既有测试的调整
+
+| 位置 | 原断言 | 新断言 | 原因 |
+| --- | --- | --- | --- |
+| `tests/test_context_resolution_worker.py::test_next_same_chat_message_schedules_unresolved_attempt` | 仅 `_persist_unresolved(chat_id=88)`（消息无 `reply_to_message_id`，声明 5 个触发条件），断言 `scheduled == 1` | 先建回复目标（`entered` 生命周期线程 + `strategy_message_links`），消息 `reply_to_message_id=4`、只声明 `reply_target_available`，仍断言 `scheduled == 1` | 6.2 后「声明任意条件就重排」不再成立；这一例的语义变成「真正等回复目标、且目标此刻可用 → 仍重排」，正是规格要求的保留路径 |
+| `tests/test_context_resolution_worker.py::_persist_unresolved`（helper） | 建 `RawMessage` 时不设 `reply_to_message_id` | 新增关键字参数 `reply_to_message_id=None` 并透传 | 6.2 的用例需要造「回复了某条消息」的行；默认 `None` 时既有全部用例行为不变 |
+
+除上述两处，`grep -rn "next_same_chat_message\|state_fingerprint\|reanalysis_triggers" tests/` 命中的其余文件均无需改动：
+`tests/test_message_processing_worker.py` 只断言调度器被传入了哪些事件名（用假调度器，不进 `schedule_context_reanalysis`）；
+其余命中处要么是显式事件路径（`message_edited` / `exchange_snapshot_changed` / `evidence_version_changed` 等，6.2 未触及），
+要么直接调用 `build_context_state_fingerprint`（6.3 未改该函数），要么只是造数据时写 `reanalysis_triggers_json`。
+既有 `test_unchanged_fingerprint_does_not_call_ai` 未改动且仍通过。没有既有测试与第 6 节规格冲突。
+
+### 7.3 新增用例
+
+`tests/test_context_resolution_worker.py`（新增 helper `_persist_reply_target_thread`、`_add_completed_attempts`）：
+
+- `test_next_same_chat_message_skips_a_reply_target_that_can_never_be_chosen`：回复目标线程生命周期 `exited` → `scheduled == 0`，行仍是 `completed`。
+- `test_next_same_chat_message_ignores_rows_waiting_on_another_trigger`：只声明 `evidence_version_changed` → `next_same_chat_message` 不排队；随后 `evidence_version_changed` 事件仍排队。
+- `test_sixth_reanalysis_of_one_message_in_24_hours_is_capped`：24 小时内共 5 行 → 第 6 次认领返回 `reanalysis_capped`，行落 `reanalysis_capped`，`reanalyze` 被断言为不可调用。
+- `test_reanalysis_below_the_per_message_cap_still_runs`：共 4 行 → 正常调用 `reanalyze`。
+- `test_attempts_older_than_the_cap_window_do_not_count`：6 行落在 25 小时前 → 不计入，正常调用。
+- `test_stored_state_fingerprint_matches_the_worker_recomputation`：请求体的回复链带一个不在 `candidate_strategy_threads` 的线程 id（对应本案例的 432），
+  `_upsert_attempt` 落库后 `build_context_state_fingerprint(session_factory, raw_message_id)`（不传 candidate_thread_ids）与落库的 `state_fingerprint` 相等；
+  同时断言旧的「只取候选集」投影得到的哈希与之不同，避免这条断言变成恒真。
+
+`tests/test_recognition_context_gate.py`：`execution_state` 参数化加 `("reanalysis_capped", "reanalysis_capped")`。
+
+`tests/test_web_recognition_card_labels.py`：`_build` 增加一条状态为 `reanalysis_capped` 的上下文尝试卡片，新增
+`test_capped_context_card_says_the_reanalysis_ceiling_was_reached` 断言渲染出 `<span class="context-exec-state is-reanalysis_capped">重分析已达上限`。
+
+### 7.4 全量测试
+
+`PYTHONPATH=. uv run pytest -q`：全量 `8875 passed, 4 skipped, 107 warnings in 758.17s (0:12:38)`，无失败、无新增跳过（4 个 skip 与改动前一致）。最后三行原样：
+
+```
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+
+8875 passed, 4 skipped, 107 warnings in 758.17s (0:12:38)
+```
+
+### 7.5 规格未覆盖之处的取舍
+
+- 24 小时窗口以模块常量 `REANALYSIS_CAP_WINDOW = timedelta(hours=24)` 表达（第 6 节只点名了 `DEFAULT_MAX_REANALYSIS_PER_MESSAGE`）；
+  与既有 `DEFAULT_STALE_AFTER` / `DEFAULT_RETRY_DELAY` 同一写法，不引入配置项，运行时语义与文字规格一致。
+- 上限值不经配置下发：`cli.py` 和 `web_app.py` 两个调用点都用默认值，改动对现有运行时参数面零影响。
+- `app.css` 里 `is-not_needed` 没有独立规则（它走 `.context-exec-state` 基础样式的灰色）；为了状态名显式可见，
+  `is-reanalysis_capped` 与 `is-superseded` 合并成同一条规则，颜色值与基础灰色完全相同，视觉上即「与 not_needed 同款」。
+- `schedule_context_reanalysis` 对同一 `raw_message_id` 的多行只算一次回复目标可用性（本地 dict 缓存），纯粹避免同一事件内重复查询，不改变判定结果。

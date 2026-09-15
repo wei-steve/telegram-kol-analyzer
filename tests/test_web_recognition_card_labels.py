@@ -128,6 +128,31 @@ def _build(tmp_path):
             model="gpt-5.6-luna",
             gate={"outcome": "not_needed", "triggers": []},
         )
+        ids["capped"] = _add_recognised_message(
+            session,
+            message_id=906,
+            text="第二止盈位到了",
+            model="gpt-5.6-luna",
+            gate={"outcome": "invoked", "triggers": ["revision_language"]},
+        )
+        session.add(
+            ContextResolutionAttempt(
+                raw_message_id=ids["capped"],
+                context_fingerprint="sha256:ctx-906",
+                model="gpt-5.6-luna",
+                status="reanalysis_capped",
+                invocation_triggers_json=json.dumps(["revision_language"]),
+                request_summary_json=json.dumps({"message_context": []}),
+                decision_json=json.dumps(
+                    {
+                        "decision": "unresolved",
+                        "confidence": 0.5,
+                        "supporting_message_ids": [],
+                        "opposing_message_ids": [],
+                    }
+                ),
+            )
+        )
         ids["unknown_model"] = _add_recognised_message(
             session,
             message_id=903,
@@ -215,6 +240,22 @@ def test_executed_context_card_shows_state_and_chinese_trigger_chips(tmp_path):
     # The trigger chips are the first line of the body, not buried in details.
     assert executed.index("context-trigger-reasons") < executed.index(
         "上下文技术明细"
+    )
+
+
+def test_capped_context_card_says_the_reanalysis_ceiling_was_reached(tmp_path):
+    """A capped message stops costing tokens, and the card says so."""
+
+    database_path, ids = _build(tmp_path)
+
+    body = TestClient(create_web_app(database_path=database_path)).get(
+        "/groups/88/messages"
+    ).text
+    capped = _card(body, ids["capped"])
+
+    assert (
+        '<span class="context-exec-state is-reanalysis_capped">重分析已达上限'
+        in capped
     )
 
 

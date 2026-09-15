@@ -467,6 +467,7 @@ def _decision_with_gate(outcome: str | None, triggers: list[str] | None = None):
         ("blocked_disabled", "blocked_disabled"),
         ("blocked_execution_terminal", "blocked_terminal"),
         ("superseded", "superseded"),
+        ("reanalysis_capped", "reanalysis_capped"),
         ("completed", "completed"),
     ],
 )
