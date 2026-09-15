@@ -1,7 +1,7 @@
 # 上下文二次判断：同一条消息被重分析 19 次的原因
 
 日期：2026-09-15
-状态：用户 2026-09-15 拍板做 4.1 + 4.2 + 4.3，实施中（子代理）
+状态：4.1 + 4.2 + 4.3 已于 2026-09-15 部署生产 `ae43312a`（回滚 `fa1e0c09`）
 关联：`docs/plans/2026-09-15-context-trigger-tightening-analysis.md` 第 2.5 / 5 节记录了这个现象。
 数据来源：生产库 `data/research.db` 只读查询；worker 日志已过保留期，9 月 3 日的记录拿不到。
 
@@ -291,3 +291,11 @@ raw_message 14636，群 -1003048800035，2026-09-03 13:45:36 UTC：
 - `app.css` 里 `is-not_needed` 没有独立规则（它走 `.context-exec-state` 基础样式的灰色）；为了状态名显式可见，
   `is-reanalysis_capped` 与 `is-superseded` 合并成同一条规则，颜色值与基础灰色完全相同，视觉上即「与 not_needed 同款」。
 - `schedule_context_reanalysis` 对同一 `raw_message_id` 的多行只算一次回复目标可用性（本地 dict 缓存），纯粹避免同一事件内重复查询，不改变判定结果。
+
+### 7.6 部署记录（指挥会话补记）
+
+- 子代理提交 `ae43312a`；指挥会话独立复跑全量 8875 passed / 0 failed / 4 skipped（851 s）。
+- 2026-09-15 深夜 `tg-deploy ae43312a2881c37663cacd7217ffa055374917fa`，回滚 SHA `fa1e0c09`。
+  worker / web / ingest 均 active，启动无异常；共享分支 `origin/codex/deepcoin-auto-trading-v1` = 部署 SHA。
+- 验证方式：只读查 `context_resolution_attempts`，一周后看是否还有单条消息 24 小时内 > 5 行；
+  以及 worker 日志 `context reanalysis capped` 的出现次数（每次封顶一行 WARNING）。
