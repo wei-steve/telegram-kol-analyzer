@@ -2966,7 +2966,10 @@ async def deliver_strategy_management_notifications(
                 capture_runtime_incident_best_effort,
             )
 
-            capture_runtime_incident_best_effort(
+            # Also synchronous SQLite work: the incident ledger write must not
+            # stall the event loop any more than the status write-back above.
+            await asyncio.to_thread(
+                capture_runtime_incident_best_effort,
                 capture_notification_failure,
                 session_factory,
                 source_kind="strategy_management_notification",
