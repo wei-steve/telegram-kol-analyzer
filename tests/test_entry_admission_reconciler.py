@@ -696,3 +696,79 @@ def test_the_deadline_never_costs_us_the_detailed_summary():
             impact="entry_never_submitted",
         )
         _validate_redacted_json_contract("redacted_summary", summary)
+
+
+def _complete_blocker_with_expected_action(session_factory, blocker_id):
+    """Evidence that looks like it wants something, with no candidate yet."""
+
+    with session_factory() as session:
+        claim = session.get(MessageEvidenceExtractionClaim, blocker_id)
+        input_fingerprint = claim.input_fingerprint
+        session.delete(claim)
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=blocker_id,
+                version=1,
+                input_fingerprint=input_fingerprint,
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=(
+                    '{"recognition_result":"非策略","strategy":null,'
+                    '"lifecycle_event":{"event_type":"exit_position"}}'
+                ),
+            )
+        )
+        session.commit()
+
+
+def test_terminal_blocker_decision_wakes_attempt_on_next_pass(tmp_path):
+    from telegram_kol_research.models import RecognitionDecision
+
+    session_factory = create_session_factory(tmp_path / "terminal-decision-wake.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker_with_expected_action(session_factory, blocker_id)
+
+    held = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=10),
+        limit=10,
+        execution_contract_mode="live",
+    )
+
+    assert held.released == 0
+    with session_factory() as session:
+        assert session.query(EntryAssemblyAttempt).one().status == "pending"
+        session.add(
+            RecognitionDecision(
+                raw_message_id=blocker_id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="completed",
+                authoritative_payload_json="{}",
+                agreement_status="agree",
+                differences_json="[]",
+                prompt_versions_json="{}",
+                automation_status="skipped",
+                automation_reason="mimo_no_action",
+            )
+        )
+        session.commit()
+
+    result = reconcile_due_entry_admissions(
+        session_factory,
+        now=NOW + timedelta(seconds=60),
+        limit=10,
+        execution_contract_mode="live",
+    )
+
+    assert result.released == 1
+    with session_factory() as session:
+        assert session.query(EntryAssemblyAttempt).one().status == "woken"
+        assert (
+            session.get(MessageInstructionItem, item_id).visibility_next_attempt_at
+            is None
+        )

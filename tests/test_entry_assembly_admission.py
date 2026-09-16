@@ -718,3 +718,167 @@ def test_live_admission_blocks_ready_item_after_execution_deadline(tmp_path):
 
     assert decision.status == "blocked"
     assert decision.reason_code == "entry_admission_deadline_expired"
+
+
+_LIFECYCLE_NO_CANDIDATE_EVIDENCE = (
+    '{"recognition_result":"非策略","strategy":null,'
+    '"lifecycle_event":{"event_type":"exit_position"}}'
+)
+_MATERIAL_STRATEGY_NO_CANDIDATE_EVIDENCE = (
+    '{"recognition_result":"非策略",'
+    '"strategy":{"entry":"市价77700附近","side":"long","symbol":"BTC"},'
+    '"lifecycle_event":{"event_type":"none"}}'
+)
+
+
+def _persist_neighbor_evidence_and_decision(
+    session_factory,
+    *,
+    later_id: int,
+    normalized_evidence_json: str,
+    automation_status: str | None,
+    automation_reason: str | None,
+) -> None:
+    from telegram_kol_research.models import RecognitionDecision
+
+    with session_factory() as session:
+        session.query(MessageEvidenceExtractionClaim).filter_by(
+            raw_message_id=later_id
+        ).delete()
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=later_id,
+                version=1,
+                input_fingerprint="later-input",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=normalized_evidence_json,
+            )
+        )
+        if automation_status is not None:
+            session.add(
+                RecognitionDecision(
+                    raw_message_id=later_id,
+                    input_kind="text",
+                    authoritative_model="mimo",
+                    authoritative_status="completed",
+                    authoritative_payload_json="{}",
+                    agreement_status="agree",
+                    differences_json="[]",
+                    prompt_versions_json="{}",
+                    automation_status=automation_status,
+                    automation_reason=automation_reason,
+                )
+            )
+        session.commit()
+
+
+@pytest.mark.parametrize(
+    "automation_status,automation_reason,expected_deferred",
+    [
+        ("skipped", "mimo_no_action", False),
+        ("skipped", "no_actionable_intent", False),
+        ("blocked", "source_message_deleted", False),
+        ("skipped", "mimo_authoritative_failed", True),
+        ("deferred", "source_message_deletion_hold", True),
+    ],
+)
+def test_neighbor_terminal_decision_releases_completed_lifecycle_evidence(
+    tmp_path,
+    automation_status,
+    automation_reason,
+    expected_deferred,
+):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(
+        tmp_path / f"lifecycle-decision-{automation_status}-{automation_reason}.db"
+    )
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    _persist_neighbor_evidence_and_decision(
+        session_factory,
+        later_id=later_id,
+        normalized_evidence_json=_LIFECYCLE_NO_CANDIDATE_EVIDENCE,
+        automation_status=automation_status,
+        automation_reason=automation_reason,
+    )
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    if expected_deferred:
+        assert decision.status == "deferred"
+        assert decision.reason_code == "adjacent_entry_context_pending"
+        assert decision.blocking_raw_message_ids == (later_id,)
+    else:
+        assert decision.status != "deferred"
+
+
+def test_neighbor_terminal_decision_releases_material_strategy_evidence(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "material-strategy-decision.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    _persist_neighbor_evidence_and_decision(
+        session_factory,
+        later_id=later_id,
+        normalized_evidence_json=_MATERIAL_STRATEGY_NO_CANDIDATE_EVIDENCE,
+        automation_status="skipped",
+        automation_reason="mimo_no_action",
+    )
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status != "deferred"
+
+
+def test_neighbor_without_decision_row_still_stays_deferred(tmp_path):
+    from telegram_kol_research.entry_assembly_admission import (
+        assess_entry_assembly_admission,
+    )
+
+    session_factory = create_session_factory(tmp_path / "lifecycle-no-decision.db")
+    strategy_id, candidate_id, later_id = _persist_strategy_and_later_claim(
+        session_factory
+    )
+    _persist_neighbor_evidence_and_decision(
+        session_factory,
+        later_id=later_id,
+        normalized_evidence_json=_LIFECYCLE_NO_CANDIDATE_EVIDENCE,
+        automation_status=None,
+        automation_reason=None,
+    )
+
+    decision = assess_entry_assembly_admission(
+        session_factory,
+        strategy_raw_message_id=strategy_id,
+        signal_candidate_id=candidate_id,
+        mode="live",
+        assessed_at=NOW + timedelta(seconds=2),
+    )
+
+    assert decision.status == "deferred"
+    assert decision.blocking_raw_message_ids == (later_id,)

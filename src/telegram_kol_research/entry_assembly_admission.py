@@ -31,6 +31,7 @@ from telegram_kol_research.models import (
     MessageEvidenceVersion,
     MessageInstructionItem,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
 )
 from telegram_kol_research.message_evidence import (
@@ -42,6 +43,18 @@ from telegram_kol_research.message_evidence import (
 ADJACENT_ENTRY_MAX_AGE = timedelta(minutes=30)
 ADJACENT_ENTRY_MAX_MESSAGES_PER_SIDE = 20
 ENTRY_ADMISSION_EXECUTION_DEADLINE = timedelta(hours=6)
+
+#: Terminal ``automation_status`` values of an adjacent message's authoritative
+#: decision. ``blocked`` is the source-message deletion barrier, which has its
+#: own closure path (``source_message_deletion_worker``) and leaves the row at
+#: ``raw_messages.source_status='deleted'``; ``completed`` means the
+#: authoritative processor already ran whatever the message asked for.
+_TERMINAL_NO_ACTION_STATUSES = frozenset({"completed", "blocked"})
+#: ``skipped`` is terminal for every reason except this one: an authoritative
+#: failure is retried by the message processing job, so a candidate may still
+#: arrive. See ``authoritative_recognition.py`` (the automation branch around
+#: lines 2570-2590) for the full vocabulary.
+_NON_TERMINAL_SKIP_REASONS = frozenset({"mimo_authoritative_failed"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -93,6 +106,27 @@ def _fragment_signature(
         str(side).lower(),
         _canonical_json(normalized_payload),
     )
+
+
+def _decision_is_terminal_no_action(decision: RecognitionDecision | None) -> bool:
+    """Whether an adjacent message's authoritative decision can still act.
+
+    Evidence only says "this message looks like it wants something"; the
+    authoritative decision is what says "and we decided not to do it". When the
+    decision is terminal and produced no candidate, the candidate the admission
+    barrier waits for will never arrive, and the entry stays deferred until its
+    six-hour deadline elapses. See section 3 of
+    ``docs/plans/2026-09-16-adjacent-entry-deadlock-and-market-entry-geometry-analysis.md``
+    for the six production entries killed this way between 2026-09-04 and 09-16.
+    """
+
+    if decision is None:
+        return False
+    status = str(decision.automation_status or "").strip().lower()
+    reason = str(decision.automation_reason or "").strip().lower()
+    if status in _TERMINAL_NO_ACTION_STATUSES:
+        return True
+    return status == "skipped" and reason not in _NON_TERMINAL_SKIP_REASONS
 
 
 def _is_adjacent_entry_context_defer(result_json: str | None) -> bool:
@@ -236,6 +270,12 @@ def _load_source_facts(
         if int(row.raw_message_id) not in item_raw_ids
         or int(row.id) in current_item_candidate_ids
     ]
+    decisions_by_raw = {
+        int(row.raw_message_id): row
+        for row in session.query(RecognitionDecision)
+        .filter(RecognitionDecision.raw_message_id.in_(raw_ids))
+        .all()
+    }
     evidence_rows = (
         session.query(MessageEvidenceVersion)
         .filter(
@@ -426,9 +466,15 @@ def _load_source_facts(
                         and str(lifecycle.get("event_type") or "none") != "none"
                     )
                 )
-                application_pending = (
-                    fragment_application_pending
-                    or (action_expected and raw_id not in candidate_raw_ids)
+                # ``fragment_application_pending`` is decided by the evidence
+                # alone (fragment rows are persisted straight from it), so it
+                # deliberately stays outside the decision test.
+                application_pending = fragment_application_pending or (
+                    action_expected
+                    and raw_id not in candidate_raw_ids
+                    and not _decision_is_terminal_no_action(
+                        decisions_by_raw.get(raw_id)
+                    )
                 )
             facts.append(
                 AdjacentEntryFact(
