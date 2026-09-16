@@ -1,7 +1,7 @@
 # 谁占了 30 秒写锁 · 事件循环卡顿为什么在上升
 
 日期：2026-09-16
-状态：分析完成，修复方案待用户拍板；未改代码
+状态：用户 2026-09-16 拍板做 4.1 + 4.2 + 4.3，实施中（子代理）
 关联：`docs/plans/2026-09-16-message-processing-task-supervision-design.md` 第 6 节「另议」的两项。
 数据来源：worker journal（保留期 08-24 起）、生产库 `data/research.db` 只读查询。
 
@@ -161,3 +161,66 @@ WAL 模式下只读不阻塞写入，但 I/O 争用一样会把在事件循环�
   60 天里因此重排 85 次；在方案甲和封顶之后影响有限，先观察。
 - `source_deletion_exit_timeout` 每 5 秒对 exit 310/311 记一次「卡住」告警并尝试捕获事故（被 bounds 拒绝），只刷日志不写库，
   但把 journal 灌成噪音。exit 310/311 本身为什么卡了两天，值得单独看。
+
+## 6. 已批准的实施规格（4.1 + 4.2 + 4.3）
+
+用户 2026-09-16 拍板「做 1 2 3」。以下是给子代理的精确规格；4.4 不做，第 5 节不做。
+
+### 6.1 通知挪到 commit 之后（4.1）
+
+- 文件 `src/telegram_kol_research/management_target_confirmation.py`，函数 `expire_stale_management_confirmations`（约 372-465 行）。
+- 事务块内（`with session_factory() as session:`）**删除**两处 `notify(...)` 调用（超时分支约 425 行、提醒分支约 453 行），
+  改为把参数追加到局部列表 `deferred_notifies: list[dict]`（键：`raw_message_id`、`kind`、`item_ids`，与现有调用参数一致）。
+- `session.commit()` 之后、`return` 之前：`for call in deferred_notifies: notify(**call)`，每个调用单独 `try/except Exception`
+  → `logger.exception("management confirmation notify failed raw_message_id=%s kind=%s", ...)`，一个失败不影响其余。
+- 返回值形状不变。`_audit` 的写入位置不变（仍在事务内）。
+- 注释写明原因：事务内调 `notify` 会经 `capture_runtime_incident_best_effort` 用第二个连接写库，同线程自锁 `busy_timeout` 30 s
+  （引用本文档 2.2）。
+
+### 6.2 通知循环的 DB 段挪出事件循环线程（4.2）
+
+- 文件 `src/telegram_kol_research/system_operator_bot.py`。
+- `deliver_strategy_management_notifications`（约 2840-2925 行）是 `async def`，内部 `resolve_delivery_after_id`、
+  `enqueue_strategy_management_notifications`、`claim_next_strategy_management_notification`、以及发送后写回状态的
+  `with session_factory() as session:` 块都是**同步 DB**；Telegram 发送是 `await send_system_operator_bot_message`（异步，不动）。
+  把每一段同步 DB 调用改为 `await asyncio.to_thread(...)`：
+  - `after_id = await asyncio.to_thread(resolve_delivery_after_id, session_factory, field_name=..., supplied=...)`
+  - `await asyncio.to_thread(enqueue_strategy_management_notifications, session_factory, group_labels=group_labels)`
+  - `claim = await asyncio.to_thread(claim_next_strategy_management_notification, session_factory, ...)`
+  - 发送成功/失败后写回状态的两个 `with session_factory()` 块各抽成模块级同步函数
+    （如 `_mark_strategy_management_notification_delivered(session_factory, *, notification_id, claim_token, now)` /
+    `_mark_..._failed(...)`），用 `await asyncio.to_thread(...)` 调用。函数体逻辑逐字搬移，不改 SQL。
+- `run_strategy_management_notification_loop`（约 2930-2943 行）：`except Exception: pass` 改为
+  `except Exception: logger.exception("strategy management notification loop tick failed")`。循环节奏不变。
+- `tests/test_runtime_event_loop_blocking_census.py` 的 `KNOWN_BLOCKING_CALLS`：若普查对上述改动有新增/减少命中，按该文件头部的规则处理并在汇报里列出。
+
+### 6.3 写事务内再开写连接的告警（4.3）
+
+- 文件 `src/telegram_kol_research/db.py`。在 `create_session_factory` / `create_existing_session_factory` 返回的 engine 上
+  （两个工厂共用一个安装函数，如 `_install_nested_write_guard(engine)`）挂 SQLAlchemy 事件：
+  - `event.listens_for(engine, "begin")` 无法区分读写；改用 `before_cursor_execute`：对语句做前缀判断
+    （`INSERT` / `UPDATE` / `DELETE` / `BEGIN IMMEDIATE` / `REPLACE`，大小写不敏感，去掉前导空白与 `WITH … ` CTE 时按首个非 CTE 关键字判断即可，
+    做不到的情况按「非写」处理，宁漏勿误）。
+  - 线程局部状态 `threading.local()`：`writing_connections: set[int]`（连接 id 集合）。
+    `before_cursor_execute` 遇到写语句：若集合非空且**不含当前连接 id** → `logger.warning("nested write on a second connection while this thread holds a write transaction; statement=%s", 前 80 字符, stack_info=True)`；
+    然后把当前连接 id 加入集合。
+  - `event.listens_for(engine, "commit")` 与 `"rollback"`（`ConnectionEvents`）：从集合移除该连接 id。
+    连接 `close`/`checkin` 也移除，防泄漏。
+  - 每线程每分钟最多 1 条 WARNING（简单的 `last_warned_at` 线程局部节流），避免刷屏。
+  - 只记不拦，不改任何 SQL 行为；`engine.dialect.name != "sqlite"` 时不安装。
+- 部署后一周看 journal 里 `nested write on a second connection` 的出现次数与栈，确认除 6.1 之外没有漏网路径。
+
+### 6.4 测试
+
+- `tests/test_management_reliability_step5.py` / `step9.py` / `test_system_operator_bot.py` 里对 `expire_stale_management_confirmations`
+  与 `notify` 的既有断言应保持不变（调用次数、参数）。新增：
+  - `notify` 在 `commit` 之后被调用：用会记录顺序的 `session_factory` 包装（commit 时打点）+ 记录 `notify` 调用时刻，断言顺序。
+  - `notify` 抛异常 → 审计事件已提交、函数正常返回、其余 `notify` 仍被调用。
+  - 同线程自锁回归：用真实 SQLite 文件库（`busy_timeout` 设 1 s 以免测试慢），`notify` 内部用第二个 `session_factory()` 写一行；
+    改动前会抛 `OperationalError`（或等 1 s），改动后 100 ms 内完成且两行都在库里。
+- 通知循环：`deliver_strategy_management_notifications` 用假 `send` 跑一次，断言 DB 步骤发生在非事件循环线程
+  （在假 `session_factory` 里记录 `threading.get_ident()` 与事件循环线程对比）；`run_strategy_management_notification_loop`
+  tick 抛异常时有 `logger.exception` 记录且循环继续。
+- 守卫：同线程两个连接嵌套写 → 恰好一条 WARNING 且 `stack_info`；同一连接连续写 → 无 WARNING；
+  只读嵌套 → 无 WARNING；commit 后再写 → 无 WARNING；节流生效。
+- 全量 `PYTHONPATH=. uv run pytest -q` 通过。
