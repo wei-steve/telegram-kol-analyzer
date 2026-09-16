@@ -224,3 +224,117 @@ WAL 模式下只读不阻塞写入，但 I/O 争用一样会把在事件循环�
 - 守卫：同线程两个连接嵌套写 → 恰好一条 WARNING 且 `stack_info`；同一连接连续写 → 无 WARNING；
   只读嵌套 → 无 WARNING；commit 后再写 → 无 WARNING；节流生效。
 - 全量 `PYTHONPATH=. uv run pytest -q` 通过。
+
+## 7. 实施记录
+
+日期：2026-09-16。实施者：子代理（worktree `agent-aac3bd5f8cc17f435`，起点 `5eaaaedc`）。
+第 1-6 节未改动；本节只记录按第 6 节实施的结果。
+
+### 7.1 改动文件
+
+| 文件 | 规格 | 内容 |
+| --- | --- | --- |
+| `src/telegram_kol_research/management_target_confirmation.py` | 6.1 | `expire_stale_management_confirmations` 事务内两处 `notify(...)` 改为收集进 `deferred_notifies: list[dict[str, Any]]`（键 `raw_message_id` / `kind` / `item_ids`，与原调用参数逐字一致），`with session_factory()` 块结束后逐个调用，每个单独 `try/except Exception` → `logger.exception("management confirmation notify failed raw_message_id=%s kind=%s", ...)`。新增 `import logging` 与模块级 `logger`。`_audit` 位置、`_fail_items`、返回值形状全部不变。函数 docstring 写明自锁机制并引用本文档 2.2。 |
+| `src/telegram_kol_research/system_operator_bot.py` | 6.2 | `deliver_strategy_management_notifications` 的 `resolve_delivery_after_id`、`enqueue_strategy_management_notifications`、`claim_next_strategy_management_notification` 改为 `await asyncio.to_thread(...)`；发送成功/失败后写回状态的两个 `with session_factory()` 块抽成模块级同步函数 `_mark_strategy_management_notification_delivered` / `_mark_strategy_management_notification_failed`，同样经 `asyncio.to_thread` 调用。`await send_system_operator_bot_message` 不动。`run_strategy_management_notification_loop` 的 `except Exception: pass` 改为 `logger.exception("strategy management notification loop tick failed")`，循环节奏与 `CancelledError` 处理不变。 |
+| `src/telegram_kol_research/db.py` | 6.3 | 新增 `statement_is_write`、`_strip_leading_sql_comments`、`_top_level_sql_tokens`、`_dbapi_connection_id`、`_install_nested_write_guard`；`create_session_factory`（在 `init_db` 之后）与 `create_existing_session_factory`（在 `create_engine` 之后）各调用一次安装函数。新增 `logging` / `threading` / `time` 导入与 `sqlalchemy.event`。 |
+| `tests/test_db_lock_holder_and_loop_stall.py` | 6.4 | 新增测试文件，31 个用例，覆盖 6.1 / 6.2 / 6.3 三段。 |
+
+### 7.2 守卫的实现细节（6.3）
+
+- **写语句判断**（`statement_is_write`）：去掉前导 `--` / `/* */` 注释后，按括号深度 0 取词元。
+  首词元属于 `{INSERT, UPDATE, DELETE, REPLACE}` → 写；`BEGIN` 且第二词元为 `IMMEDIATE` → 写；
+  `WITH` 则走 CTE 列表（`名字 [列表] AS [NOT] [MATERIALIZED] (…)`，逗号可重复），判断 CTE 之后的第一个动词。
+  其余一律按非写处理（含 DDL、`PRAGMA`、普通 `SELECT`、以及任何解析不出来的形状）。
+  因为括号内整体跳过，`WITH update AS (SELECT 1) SELECT …`（CTE 名叫 `update`）不会误判为写。
+- **连接身份**：`id(conn.connection.dbapi_connection)`（`_dbapi_connection_id` 对 `Connection` 与已经是
+  DBAPI 连接的两种入参都能取到）。同一连接在池中被复用时 id 稳定，因此同一连接连续写不会误报——有专门用例。
+- **移除时机**：`ConnectionEvents` 的 `commit` / `rollback`（engine 级，参数是 `conn`），加上 `PoolEvents`
+  的 `checkin` / `close`（参数是 DBAPI 连接本身）。四个都往同一个线程局部集合里 `discard`。
+- **节流**：线程局部 `last_warned_at` + `time.monotonic()`，每线程每 60 秒最多一条 WARNING。
+  命中时机在「确认要告警之后、写日志之前」，所以被节流掉的那次仍然会把连接 id 加进集合，状态不会漂。
+- **只记不拦**：监听器没有任何 `raise`，也不改语句。`engine.dialect.name != "sqlite"` 直接返回，不注册任何监听器。
+- 安装点选在 `create_session_factory` 的 `init_db(engine)` **之后**，让引导期的建表/回填完全不经过守卫；
+  `create_existing_session_factory` 没有引导期，紧跟 `create_engine`。
+
+### 7.3 既有测试
+
+**一处都没有改。** 具体核对：
+
+- `tests/test_management_reliability_step9.py::test_an_unanswered_question_expires_after_a_reminder`
+  对 `notify` 的调用次数与 `kind` 顺序的断言原样通过（顺序仍是提醒在前、超时在后，只是每次都发生在各自的 commit 之后）。
+- `tests/test_management_reliability_step5.py` 与 `tests/test_system_operator_bot.py` 里
+  `deliver_strategy_management_notifications` 的 5 处调用（含 `asyncio.CancelledError` 那条）全部原样通过：
+  `CancelledError` 是 `BaseException`，不被 `except Exception` 拦，租约语义不变。
+- `tests/test_runtime_event_loop_blocking_census.py::KNOWN_BLOCKING_CALLS` **无需调整**。普查只看 `async def`
+  里 `while` 循环内的直接同步调用；`deliver_strategy_management_notifications` 的同步段在 `for` 循环里，
+  本来就不在普查范围内，而 `run_strategy_management_notification_loop` 的 `while` 里唯一的调用是
+  `await deliver_...`（既是 `await` 又是 `async def`，双重豁免）。新抽出的两个模块级同步函数同理不在 `while` 里。
+  改动前后 `discover_blocking_calls()` 的结果集合完全相同。
+
+### 7.4 新增用例（`tests/test_db_lock_holder_and_loop_stall.py`，31 个）
+
+6.1（5 个）：
+- `test_the_confirmation_notification_is_sent_after_the_commit` —— 用包装 `session_factory` 在 `commit` 打点，
+  断言 `trace == ["commit", "notify:confirmation_reminder"]`。
+- `test_a_failing_notification_does_not_cost_the_committed_audit` —— `notify` 抛异常，审计事件仍有 1 条、
+  `confirmation_reminded_at` 已落库、返回值正常、有 `logger.exception`。
+- `test_one_failing_notification_does_not_silence_the_others` —— 两条待确认消息，第一个 `notify` 抛异常，第二个照发。
+- `test_a_notifier_that_writes_on_its_own_connection_no_longer_self_locks` —— 真实 SQLite 文件库的自锁回归：
+  `notify` 内部用第二个 `session_factory()` 写一行，断言整体耗时 < 0.9 s 且两边的行都在库里。
+- `test_the_timeout_branch_also_notifies_after_the_commit` —— 超时分支同样在 commit 之后通知（`notify` 内部
+  用新连接读到的 item 状态已经是 `failed`）。
+
+6.2（3 个）：
+- `test_management_delivery_runs_its_database_work_off_the_event_loop` —— 包装 `session_factory` 记录
+  `threading.get_ident()`，断言事件循环线程 id 不在其中，且投递结果与行状态不变。
+- `test_a_failed_management_delivery_also_writes_back_off_the_event_loop` —— 失败分支的写回同样不在事件循环线程；
+  行落到 `failed`、`delivery_error="RuntimeError"`、租约释放。
+- `test_a_failing_notification_loop_tick_is_logged_and_the_loop_continues` —— tick 抛异常时有 `logger.exception`
+  （带 `exc_info`），且循环继续跑第二个 tick，`cancel()` 仍抛 `CancelledError`。
+
+6.3（23 个）：
+- `test_the_write_statement_test_errs_towards_silence` —— 16 条参数化语句（含 `BEGIN IMMEDIATE`、三种 CTE、
+  名叫 `update` 的 CTE、注释前缀、`PRAGMA`、DDL、`None`）。
+- `test_repeated_writes_on_one_connection_never_warn` —— 同一连接连续 5 次写：0 条 WARNING（防误报）。
+- `test_a_nested_read_never_warns` / `test_a_write_after_the_commit_never_warns` /
+  `test_a_write_after_a_rollback_never_warns` —— 三种不该告警的情形。
+- `test_a_nested_write_on_a_second_connection_warns_once_with_a_stack` —— 恰好 1 条 WARNING，带 `stack_info`。
+- `test_the_nested_write_warning_is_throttled_per_thread` —— 一分钟内 3 次嵌套写只出 1 条。
+- `test_the_guard_is_only_installed_on_sqlite` —— 非 sqlite 方言不注册任何 `before_cursor_execute` 监听器。
+
+**一个实现上的坑，记在这里免得下一个人再踩**：断言日志不能用 `caplog`。
+`app_logging.configure_application_logging` 会把 `telegram_kol_research` 这个 logger 的 `propagate` 置为 `False`，
+只要全量跑里先有任何一个用例调过它，后面 `caplog` 装在 root 上的 handler 就再也收不到东西。
+两条日志断言因此单文件跑通、全量跑挂（日志明明出现在 captured stderr 里）。
+现在改成直接往具体 logger 上挂 handler（文件里的 `_captured` 上下文管理器），与谁先跑无关。
+
+### 7.5 取舍与判断
+
+1. **`notify` 循环放在 `with` 块之外而不是块内 `commit()` 之后。** 6.1 的字面要求是「`session.commit()` 之后、
+   `return` 之前」，两种写法都满足。选块外是因为那时连接已经归还连接池，内层通知连到的可能就是同一个连接，
+   自锁的可能性被彻底消掉而不是只缩短。`_audit` 仍在事务内，返回值形状不变。
+2. **`if notify is not None` 的守卫保留在收集处**，而不是改成无条件收集、调用前再判断。语义等价，改动更小。
+3. **`notified_at` 与 `updated_at` 现在用同一个时间戳。** 原代码是 `notified_at=datetime.now(UTC),
+   updated_at=datetime.now(UTC)` 两次取时钟，会得到相差微秒的两个值。6.2 给出的函数签名本身就只带一个
+   时间参数（`now=`），抽函数后统一为一个 `delivered_at`。这是唯一一处行为上的（微秒级）差异。
+4. **失败分支里的 `capture_runtime_incident_best_effort` 没有挪进线程。** 它也是事件循环线程上的同步写库调用，
+   但 6.2 的清单没有列它（只列了 `resolve_delivery_after_id`、`enqueue_…`、`claim_next_…`、两个写回块），
+   按「不扩大」处理，保持原样。**这是已知的遗留项**：Telegram 发送失败时，这一次 `runtime_incidents` 写入
+   仍然会阻塞事件循环。要不要补，留给指挥会话决定——补的话是一行 `await asyncio.to_thread(...)` 包装。
+5. **守卫的写语句判断宁漏勿误。** CTE 解析只在能确定形状时才判写，任何一步对不上就返回「非写」。
+   代价是某些 `WITH … DELETE` 变体可能漏报；收益是日志里不会出现假警报——守卫的全部价值就在于它的告警可信。
+6. **守卫用 `id(dbapi_connection)` 作连接身份。** 理论上对象被回收后 id 可复用，但四个移除事件
+   （commit / rollback / checkin / close）覆盖了连接离开线程的所有路径，集合不会长期持有失效 id。
+7. **没有碰 `busy_timeout`、`BEGIN IMMEDIATE`、守护包装，以及 `6cce08b1` 的任何内容**；4.4 与第 5 节未实施。
+
+### 7.6 全量测试
+
+`PYTHONPATH=. uv run pytest -q`：
+
+最后 3 行：
+
+```
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+8921 passed, 4 skipped, 107 warnings in 1359.82s (0:22:39)
+```

@@ -2831,6 +2831,72 @@ async def deliver_runtime_incident_notifications(
     return delivered
 
 
+def _mark_strategy_management_notification_failed(
+    session_factory,
+    *,
+    notification_id: int,
+    claim_token: str,
+    error_type: str,
+    failed_at: datetime,
+) -> None:
+    """Release the lease and record why, so a later tick retries the row.
+
+    Extracted verbatim from ``deliver_strategy_management_notifications`` so it
+    can run through ``asyncio.to_thread``: this is synchronous SQLite work and
+    on the event loop it froze the whole process for the length of any lock
+    contention. See
+    ``docs/plans/2026-09-16-db-lock-holder-and-loop-stall-analysis.md`` 3.3 and 6.2.
+    """
+
+    from telegram_kol_research.models import StrategyManagementNotification
+
+    with session_factory() as session:
+        session.execute(
+            update(StrategyManagementNotification)
+            .where(
+                StrategyManagementNotification.id == notification_id,
+                StrategyManagementNotification.status == "delivering",
+                StrategyManagementNotification.claim_token == claim_token,
+            )
+            .values(
+                status="failed", claim_token=None,
+                lease_expires_at=None,
+                delivery_error=error_type,
+                updated_at=failed_at,
+            )
+        )
+        session.commit()
+
+
+def _mark_strategy_management_notification_delivered(
+    session_factory,
+    *,
+    notification_id: int,
+    claim_token: str,
+    delivered_at: datetime,
+) -> int:
+    """Close out a delivered row; returns 1 when this claim still owned it."""
+
+    from telegram_kol_research.models import StrategyManagementNotification
+
+    with session_factory() as session:
+        result = session.execute(
+            update(StrategyManagementNotification)
+            .where(
+                StrategyManagementNotification.id == notification_id,
+                StrategyManagementNotification.status == "delivering",
+                StrategyManagementNotification.claim_token == claim_token,
+            )
+            .values(
+                status="delivered", claim_token=None, delivery_error=None,
+                lease_expires_at=None,
+                notified_at=delivered_at, updated_at=delivered_at,
+            )
+        )
+        session.commit()
+        return int(result.rowcount == 1)
+
+
 async def deliver_strategy_management_notifications(
     session_factory, *, config: SystemOperatorBotConfig, group_labels=None, limit: int = 20,
     claimed_at: datetime | None = None, lease_seconds: float = 120.0,
@@ -2843,21 +2909,32 @@ async def deliver_strategy_management_notifications(
     cause one repeat after lease expiry. The stable notification ID embedded in
     the text is the dedup marker; committed successes are never reclaimed.
     """
-    from telegram_kol_research.models import StrategyManagementNotification
-
-    after_id = resolve_delivery_after_id(
+    # Every synchronous database step below runs through ``asyncio.to_thread``.
+    # This coroutine is driven every five seconds from
+    # ``run_strategy_management_notification_loop`` on the event loop thread,
+    # so a blocking SQLite call here stalls the whole process for as long as
+    # the database is contended -- the 25-30 second freezes attributed in
+    # ``docs/plans/2026-09-16-db-lock-holder-and-loop-stall-analysis.md`` 3.3.
+    # The Telegram send stays a plain ``await``: it is already asynchronous.
+    after_id = await asyncio.to_thread(
+        resolve_delivery_after_id,
         session_factory,
         field_name="strategy_management_notification_delivery_after_id",
         supplied=delivery_after_id,
     )
     # Enqueue regardless of the gate: the rows are the durable ledger and must
     # keep being written whether or not anyone is listening yet.
-    enqueue_strategy_management_notifications(session_factory, group_labels=group_labels)
+    await asyncio.to_thread(
+        enqueue_strategy_management_notifications,
+        session_factory,
+        group_labels=group_labels,
+    )
     if after_id is None:
         return 0
     delivered = 0
     for _ in range(max(1, min(int(limit), 100))):
-        claim = claim_next_strategy_management_notification(
+        claim = await asyncio.to_thread(
+            claim_next_strategy_management_notification,
             session_factory,
             claimed_at=claimed_at,
             lease_seconds=lease_seconds,
@@ -2876,22 +2953,14 @@ async def deliver_strategy_management_notifications(
                 await send_system_operator_bot_message(config=config, text=message)
         except Exception as exc:
             failed_at = datetime.now(UTC)
-            with session_factory() as session:
-                session.execute(
-                    update(StrategyManagementNotification)
-                    .where(
-                        StrategyManagementNotification.id == claim["id"],
-                        StrategyManagementNotification.status == "delivering",
-                        StrategyManagementNotification.claim_token == claim["claim_token"],
-                    )
-                    .values(
-                        status="failed", claim_token=None,
-                        lease_expires_at=None,
-                        delivery_error=type(exc).__name__,
-                        updated_at=failed_at,
-                    )
-                )
-                session.commit()
+            await asyncio.to_thread(
+                _mark_strategy_management_notification_failed,
+                session_factory,
+                notification_id=claim["id"],
+                claim_token=claim["claim_token"],
+                error_type=type(exc).__name__,
+                failed_at=failed_at,
+            )
             from telegram_kol_research.runtime_incident_adapters import (
                 capture_notification_failure,
                 capture_runtime_incident_best_effort,
@@ -2908,22 +2977,13 @@ async def deliver_strategy_management_notifications(
             # Retry on a later worker tick. Reclaiming the just-failed row in the
             # same tick would create an unbounded hot loop during an outage.
             break
-        with session_factory() as session:
-            result = session.execute(
-                update(StrategyManagementNotification)
-                .where(
-                    StrategyManagementNotification.id == claim["id"],
-                    StrategyManagementNotification.status == "delivering",
-                    StrategyManagementNotification.claim_token == claim["claim_token"],
-                )
-                .values(
-                    status="delivered", claim_token=None, delivery_error=None,
-                    lease_expires_at=None,
-                    notified_at=datetime.now(UTC), updated_at=datetime.now(UTC),
-                )
-            )
-            session.commit()
-            delivered += int(result.rowcount == 1)
+        delivered += await asyncio.to_thread(
+            _mark_strategy_management_notification_delivered,
+            session_factory,
+            notification_id=claim["id"],
+            claim_token=claim["claim_token"],
+            delivered_at=datetime.now(UTC),
+        )
     return delivered
 
 
@@ -2939,7 +2999,10 @@ async def run_strategy_management_notification_loop(
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
+            # Was ``pass``. Ten 25-second event-loop freezes between 09-13 and
+            # 09-16 left no trace here because of it; the cause had to be found
+            # from stack sampling instead.
+            logger.exception("strategy management notification loop tick failed")
         await asyncio.sleep(max(0.1, float(interval_seconds)))
 
 

@@ -27,6 +27,7 @@ gate the worker already applies still applies afterwards.
 from __future__ import annotations
 
 import json
+import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -45,6 +46,8 @@ from telegram_kol_research.models import (
     RawMessage,
     SignalCandidate,
 )
+
+logger = logging.getLogger(__name__)
 
 CHOOSE_COMMAND = "choose"
 DISMISS_COMMAND = "dismiss"
@@ -376,7 +379,20 @@ def expire_stale_management_confirmations(
     timeout_minutes: int = DEFAULT_CONFIRMATION_TIMEOUT_MINUTES,
     notify=None,
 ) -> dict[str, Any]:
-    """Remind once, then fail. Never execute on a question nobody answered."""
+    """Remind once, then fail. Never execute on a question nobody answered.
+
+    ``notify`` is deliberately *not* called inside the transaction. It reaches
+    ``capture_runtime_incident_best_effort``, which opens a **second** database
+    connection to write ``runtime_incidents``. Called from inside this write
+    transaction that is one thread holding a write lock on connection A while
+    waiting for the same lock on connection B: a self-deadlock that can only
+    end when ``busy_timeout`` (30 s in production) expires. Every other writer
+    in the process queues behind it for those 30 seconds, which is how a single
+    confirmation reminder killed the message-claim task on 2026-09-16. See
+    ``docs/plans/2026-09-16-db-lock-holder-and-loop-stall-analysis.md`` 2.2.
+    So the calls are collected here and made after the commit, once the write
+    lock is gone.
+    """
 
     moment = now or datetime.now(UTC)
     naive = moment.replace(tzinfo=None) if moment.tzinfo is not None else moment
@@ -384,6 +400,7 @@ def expire_stale_management_confirmations(
     reminder_at = deadline + timedelta(minutes=REMINDER_LEAD_MINUTES)
     reminded: list[int] = []
     expired: list[int] = []
+    deferred_notifies: list[dict[str, Any]] = []
     with session_factory() as session:
         rows = (
             session.query(MessageInstructionItem)
@@ -419,10 +436,12 @@ def expire_stale_management_confirmations(
                     },
                 )
                 if notify is not None:
-                    notify(
-                        raw_message_id=raw_message_id,
-                        kind=CONFIRMATION_TIMEOUT,
-                        item_ids=tuple(failed),
+                    deferred_notifies.append(
+                        {
+                            "raw_message_id": raw_message_id,
+                            "kind": CONFIRMATION_TIMEOUT,
+                            "item_ids": tuple(failed),
+                        }
                     )
                 continue
             if waiting_since > reminder_at:
@@ -450,10 +469,23 @@ def expire_stale_management_confirmations(
                 after={"minutes_left": REMINDER_LEAD_MINUTES},
             )
             if notify is not None:
-                notify(
-                    raw_message_id=raw_message_id,
-                    kind="confirmation_reminder",
-                    item_ids=tuple(int(item.id) for item in items),
+                deferred_notifies.append(
+                    {
+                        "raw_message_id": raw_message_id,
+                        "kind": "confirmation_reminder",
+                        "item_ids": tuple(int(item.id) for item in items),
+                    }
                 )
         session.commit()
+    # The write lock is released; a notifier may now open its own connection.
+    # One failing notification must not cost the others theirs.
+    for call in deferred_notifies:
+        try:
+            notify(**call)
+        except Exception:
+            logger.exception(
+                "management confirmation notify failed raw_message_id=%s kind=%s",
+                call.get("raw_message_id"),
+                call.get("kind"),
+            )
     return {"reminded": tuple(reminded), "expired": tuple(expired)}

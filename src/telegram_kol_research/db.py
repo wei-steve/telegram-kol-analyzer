@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import logging
+import threading
+import time
 from pathlib import Path
 
-from sqlalchemy import create_engine, text
+from sqlalchemy import create_engine, event, text
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import sessionmaker
 
@@ -1107,6 +1110,207 @@ def ensure_position_ownership_unique_index(connection) -> None:
     connection.execute(text(POSITION_OWNERSHIP_UNIQUE_INDEX_SQL))
 
 
+# ---------------------------------------------------------------------------
+# Nested-write guard
+# ---------------------------------------------------------------------------
+#
+# 2026-09-16: a single thread held a write transaction on one connection and,
+# from inside it, opened a *second* connection to write another table. SQLite
+# allows one writer at a time, so the inner write waited on a lock the outer
+# write would only release once the inner one returned -- a self-deadlock that
+# ended when ``busy_timeout`` expired 30 seconds later, with every other writer
+# in the process queued behind it. See
+# ``docs/plans/2026-09-16-db-lock-holder-and-loop-stall-analysis.md`` 2.2.
+#
+# One such path was found and fixed by hand. This guard exists to find the ones
+# an AST sweep could not: it *observes only*, never blocks a statement, and
+# warns at most once a minute per thread.
+
+_NESTED_WRITE_KEYWORDS = frozenset({"INSERT", "UPDATE", "DELETE", "REPLACE"})
+_NESTED_WRITE_CTE_MODIFIERS = frozenset({"NOT", "MATERIALIZED"})
+_NESTED_WRITE_WARN_INTERVAL_SECONDS = 60.0
+
+logger = logging.getLogger(__name__)
+
+
+def _strip_leading_sql_comments(statement: str) -> str:
+    text_value = statement.lstrip()
+    while True:
+        if text_value.startswith("--"):
+            newline = text_value.find("\n")
+            if newline < 0:
+                return ""
+            text_value = text_value[newline + 1 :].lstrip()
+            continue
+        if text_value.startswith("/*"):
+            end = text_value.find("*/")
+            if end < 0:
+                return ""
+            text_value = text_value[end + 2 :].lstrip()
+            continue
+        return text_value
+
+
+def _top_level_sql_tokens(statement: str, *, limit: int = 64) -> list[str]:
+    """Words and commas at parenthesis depth zero, upper-cased.
+
+    Everything inside parentheses is skipped, so a CTE body cannot be mistaken
+    for the statement's own verb.
+    """
+
+    tokens: list[str] = []
+    depth = 0
+    word: list[str] = []
+    for char in statement:
+        if char == "(":
+            if word:
+                tokens.append("".join(word).upper())
+                word = []
+            depth += 1
+            continue
+        if char == ")":
+            if word:
+                tokens.append("".join(word).upper())
+                word = []
+            depth = max(0, depth - 1)
+            continue
+        if depth:
+            continue
+        if char.isalnum() or char in "_$":
+            word.append(char)
+            continue
+        if word:
+            tokens.append("".join(word).upper())
+            word = []
+        if char == ",":
+            tokens.append(",")
+        if len(tokens) >= limit:
+            return tokens
+    if word:
+        tokens.append("".join(word).upper())
+    return tokens
+
+
+def statement_is_write(statement: str) -> bool:
+    """Whether a statement takes SQLite's single write lock.
+
+    Deliberately conservative: anything this cannot parse with confidence is
+    reported as *not* a write. A missed warning costs one diagnostic; a false
+    one would train readers to ignore the log.
+    """
+
+    if not isinstance(statement, str):
+        return False
+    text_value = _strip_leading_sql_comments(statement)
+    if not text_value:
+        return False
+    tokens = _top_level_sql_tokens(text_value)
+    if not tokens:
+        return False
+    head = tokens[0]
+    if head in _NESTED_WRITE_KEYWORDS:
+        return True
+    if head == "BEGIN":
+        return len(tokens) > 1 and tokens[1] == "IMMEDIATE"
+    if head != "WITH":
+        return False
+    # ``WITH a AS (...), b AS (...) <verb> ...`` -- walk the CTE list and judge
+    # the verb that follows it. Bail out as a non-write on anything unexpected.
+    index = 1
+    if index < len(tokens) and tokens[index] == "RECURSIVE":
+        index += 1
+    while True:
+        index += 1  # step past this CTE's name
+        if index >= len(tokens) or tokens[index] != "AS":
+            return False
+        index += 1
+        while index < len(tokens) and tokens[index] in _NESTED_WRITE_CTE_MODIFIERS:
+            index += 1
+        if index < len(tokens) and tokens[index] == ",":
+            index += 1  # onto the next CTE's name
+            continue
+        break
+    return index < len(tokens) and tokens[index] in _NESTED_WRITE_KEYWORDS
+
+
+def _dbapi_connection_id(connection) -> int | None:
+    """A stable identity for the underlying SQLite connection, or ``None``."""
+
+    candidate = getattr(connection, "dbapi_connection", None)
+    if candidate is None:
+        proxy = getattr(connection, "connection", None)
+        candidate = getattr(proxy, "dbapi_connection", proxy)
+    if candidate is None:
+        return None
+    return id(candidate)
+
+
+def _install_nested_write_guard(engine: Engine) -> None:
+    """Warn when one thread writes on a second connection mid-write-transaction.
+
+    Observes only. Non-SQLite engines get nothing: the hazard is SQLite's
+    database-wide write lock.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+
+    state = threading.local()
+
+    def _writing_connections() -> set[int]:
+        connections = getattr(state, "writing_connections", None)
+        if connections is None:
+            connections = set()
+            state.writing_connections = connections
+        return connections
+
+    def _forget(connection_id: int | None) -> None:
+        if connection_id is None:
+            return
+        _writing_connections().discard(connection_id)
+
+    def _throttled() -> bool:
+        now = time.monotonic()
+        last = getattr(state, "last_warned_at", None)
+        if last is not None and (now - last) < _NESTED_WRITE_WARN_INTERVAL_SECONDS:
+            return True
+        state.last_warned_at = now
+        return False
+
+    @event.listens_for(engine, "before_cursor_execute")
+    def _note_write(conn, cursor, statement, parameters, context, executemany):
+        if not statement_is_write(statement):
+            return
+        connection_id = _dbapi_connection_id(conn)
+        if connection_id is None:
+            return
+        writing = _writing_connections()
+        if writing and connection_id not in writing and not _throttled():
+            logger.warning(
+                "nested write on a second connection while this thread holds a "
+                "write transaction; statement=%s",
+                statement[:80],
+                stack_info=True,
+            )
+        writing.add(connection_id)
+
+    @event.listens_for(engine, "commit")
+    def _forget_on_commit(conn):
+        _forget(_dbapi_connection_id(conn))
+
+    @event.listens_for(engine, "rollback")
+    def _forget_on_rollback(conn):
+        _forget(_dbapi_connection_id(conn))
+
+    @event.listens_for(engine, "checkin")
+    def _forget_on_checkin(dbapi_connection, connection_record):
+        _forget(id(dbapi_connection) if dbapi_connection is not None else None)
+
+    @event.listens_for(engine, "close")
+    def _forget_on_close(dbapi_connection, connection_record):
+        _forget(id(dbapi_connection) if dbapi_connection is not None else None)
+
+
 def create_session_factory(database_path: str | Path) -> sessionmaker:
     """Create a SQLite session factory and initialize core tables."""
 
@@ -1118,6 +1322,7 @@ def create_session_factory(database_path: str | Path) -> sessionmaker:
         future=True,
     )
     init_db(engine)
+    _install_nested_write_guard(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
 
 
@@ -1130,4 +1335,5 @@ def create_existing_session_factory(database_path: str | Path) -> sessionmaker:
         connect_args={"timeout": 30},
         future=True,
     )
+    _install_nested_write_guard(engine)
     return sessionmaker(bind=engine, autoflush=False, autocommit=False, future=True)
