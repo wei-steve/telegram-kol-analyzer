@@ -89,3 +89,26 @@ C 的关键断言是"recorder 只被调用一次 = 没有退回最小摘要"。�
 故意命中 `_looks_like_opaque_secret` 的 40 字符单 token，结果：recorder 被调用 **2 次**，
 日志出现 `RuntimeIncidentBoundsError ... retrying minimal`，最终落的是最小摘要。
 真实实现下是 1 次。断言两个方向都能区分。
+
+## 部署与 L2 观察窗（指挥会话，2026-09-16/17）
+
+- 审查：三处代码改动逐行对照规格第 8 节，一致。规格外的 `runtime_incidents.py` 改动只是把两个新摘要键登记进封闭字段表，
+  否则详细告警会被边界检查打回最小摘要，属于实现 8.3 的必要条件，接受。
+- 主检出快进合并到 `7a8e67c1`；聚焦测试 228 passed（admission / reconciler / geometry / incident adapters / incidents）。
+- 预检：候选是生产 HEAD `5f26e721` 的直系后代；代码文件 5 个源文件 + 5 个测试文件；无 `pyproject.toml` / `uv.lock` 变更；
+  交易所无在途入场腿；两条 pending 入场项（1112、1161）都不是相邻挂起，部署不会立即放行旧单。
+- 部署：候选先推到 `origin/claude/entry-admission-deadlock`，`tg-deploy 7a8e67c138cc6a4d25cc7586959942b6d1258f3a`
+  于 2026-09-16 21:25 UTC 完成，worker/web/ingest 全部 active；随后把同一 SHA 推到 `origin/codex/deepcoin-auto-trading-v1`。
+  双向核对：`PASS: deployed sha is on the shared branch`、`PASS: 0 code files beyond production`。**回退点 `5f26e721`。**
+- 部署后健康：三角色 loop-health 正常，Deepcoin WS `connected/healthy`，web `/login` 200，worker 日志无新错误
+  （`recognition execution finding` 是部署前每 6 小时 5000+ 行的既有扫描输出，不计）。
+- 观察窗：服务器只读监控（`/root/tg_observe_entry_admission.py`，每分钟采样，任一异常重置 30 分钟窗）。
+  21:49:37 UTC 一次 4.5 s 事件循环停顿重置过一次窗口；栈在 `selector.poll`，同一天 worker 已有 6 次、ingest 4 次、web 6 次同类停顿，
+  主机 2 GB 内存已用 swap 684 MB，判定为既有主机压力，与本次改动无关（见 `docs/plans/2026-09-16-db-lock-holder-and-loop-stall-analysis.md`）。
+  **21:50:21 → 23:26:34 UTC 连续 1 h 36 min 无异常，5 条真实消息（2 个群），全部 `worker_completed` / 非策略 / mimo_no_action。**
+  窗内：新增相邻挂起 0、几何拒单事件 0、交易所写入 0、`entry_admission_expired` 0。
+- 证据：`/root/entry-admission-observation-2026-09-16.events`、`/root/entry-admission-observation-2026-09-16.samples.jsonl`（服务器）。
+- 未在窗内出现的样本：没有自然到达的「无动作邻居 + 完整入场」序列，也没有「市价进场/价格」形状的入场。
+  窗口证明的是真实流量下无回归；两条正向路径此刻只有单元/集成测试作证，**下一条命中这两种形状的自动交易群入场就是首个实盘样本**，
+  届时核对 `entry_assembly_attempts`（应 woken 而非 pending 到期）与 `execution_events`（不应再有 `市价进场/…` 的几何拒单）。
+- 范围外遗留（另议）：纯「市价」无数字的入场文本仍一律 indeterminate；主机内存压力导致的周期性事件循环停顿。
