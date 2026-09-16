@@ -1,7 +1,7 @@
 # 相邻消息准入死锁与「市价进场/价格」几何拒单：根因分析与修复选项
 
 日期：2026-09-16
-状态：分析完成，等待拍板修复方案
+状态：用户 2026-09-16 拍板做 A + B + C（第 5 节默认值），实施中（子代理）；规格见第 8 节
 触发：峰哥高级会员群 2026-09-15 14:45 UTC「以太坊现价2415做多 / 止损2355 / 止盈2620」
 识别成功、群为 auto_trade，但交易所上既无持仓也无挂单；6 小时后入场指令过期。
 
@@ -254,3 +254,155 @@ A 与 B 都**改变交易所写入的准入语义**：原本一定不下单的�
 2. B 的动作词与分隔符白名单是否按第 5 节列的范围。
 3. 已过期的 6 条入场确认不补单。
 4. 验证按 L2，观察窗样本要求是否接受「自然到达、上限 24 小时」。
+
+用户 2026-09-16 确认：四条全部按第 5 节默认值。
+
+## 8. 已批准的实施规格（A + B + C）
+
+给子代理的精确规格。三项各自独立成 commit，顺序 A → B → C。
+不做的事：不补已过期的 6 笔入场；不改识别提示词；不碰纯「市价」无价格的形状（见 8.2 末尾）；
+不部署、不推送、不发 Telegram。
+
+### 8.1 A：邻居的权威决策已终态且无动作 ⇒ 视为已处理
+
+文件 `src/telegram_kol_research/entry_assembly_admission.py`，函数 `_load_source_facts`。
+
+- 在加载 `candidates` 之后（约 259 行附近）新增一次点查：
+  `RecognitionDecision`（`models.py:1710`，`raw_message_id` 唯一）按 `raw_message_id.in_(raw_ids)` 读出，
+  建 `decisions_by_raw: dict[int, RecognitionDecision]`。`raw_ids` 最多 41 条，走索引。
+- 新增模块级纯函数：
+
+  ```python
+  _TERMINAL_NO_ACTION_STATUSES = frozenset({"completed", "blocked"})
+  _NON_TERMINAL_SKIP_REASONS = frozenset({"mimo_authoritative_failed"})
+
+  def _decision_is_terminal_no_action(decision) -> bool:
+      if decision is None:
+          return False
+      status = str(decision.automation_status or "").strip().lower()
+      reason = str(decision.automation_reason or "").strip().lower()
+      if status in _TERMINAL_NO_ACTION_STATUSES:
+          return True
+      return status == "skipped" and reason not in _NON_TERMINAL_SKIP_REASONS
+  ```
+
+  取值依据 `authoritative_recognition.py` 2570–2590 行：`blocked`（源消息删除屏障）、`completed`、
+  `skipped/<lifecycle_not_applied>`、`skipped/mimo_no_action`、`skipped/auto_trade_not_configured` 都是终态；
+  `deferred`（屏障 hold）、`failed`、`uncertain`、`skipped/mimo_authoritative_failed`（随后作业重试）不是。
+- 在 `extraction_status == "completed"` 分支里，把
+
+  ```python
+  application_pending = (
+      fragment_application_pending
+      or (action_expected and raw_id not in candidate_raw_ids)
+  )
+  ```
+
+  改为
+
+  ```python
+  application_pending = fragment_application_pending or (
+      action_expected
+      and raw_id not in candidate_raw_ids
+      and not _decision_is_terminal_no_action(decisions_by_raw.get(raw_id))
+  )
+  ```
+
+  `fragment_application_pending` 与决策无关（碎片行直接由证据落库），**不**接入决策判断。
+  `extraction_status != completed`、活跃提取租约、malformed JSON、无证据版本四个 fail-closed 分支一行不改。
+- 注释写明：证据只说「这条消息像有事」，权威决策才说「决定不做」；两者都终态时候选永远不会来，
+  引用本文档第 3 节与 6 条历史命中。
+- `select_adjacent_entry_fragments`、`_persist_attempt`、`assess_entry_assembly_admission`、reconciler 不改。
+  已 deferred 的 attempt 会在 reconciler 下一轮（`ENTRY_ADMISSION_RECHECK_DELAY` 5 秒后可重查）自然读到新分类并 woken。
+
+测试 `tests/test_entry_assembly_admission.py`，复用 `_persist_strategy_and_later_claim`：
+
+- 现有 `test_completed_strategy_evidence_without_candidate_stays_deferred`（422 行）与
+  `test_completed_lifecycle_evidence_without_candidate_stays_deferred`（462 行）**原样保留**：它们没有决策行，是瞬态窗口。
+- 新增五个用例，形状与 462 行相同（非策略 + `lifecycle_event.event_type` 非 none + 无候选），只多插一行 `RecognitionDecision`：
+  1. `skipped / mimo_no_action` ⇒ `decision.status != "deferred"`（16972 形状）；
+  2. `skipped / no_actionable_intent` ⇒ 不 deferred（17018 形状）；
+  3. `blocked / source_message_deleted` ⇒ 不 deferred（16915 形状）；
+  4. `skipped / mimo_authoritative_failed` ⇒ 仍 deferred；
+  5. `deferred / <任意>` ⇒ 仍 deferred。
+- 新增一个用例：`recognition_result=非策略`、`strategy` 有实质字段（`{"entry":"市价77700附近","side":"long","symbol":"BTC"}`）、
+  无候选、决策 `skipped / mimo_no_action` ⇒ 不 deferred（15808 形状）。
+- `tests/test_entry_admission_reconciler.py` 新增一个用例：attempt 先因邻居 deferred；随后只写入邻居的终态决策行
+  （不写候选、不改证据），`reconcile_due_entry_admissions` 一轮后 attempt 变 `woken`、`released == 1`。
+  可仿照 77 行 `test_live_admission_persists_defer_and_wakes_once_on_terminal_evidence` 的骨架。
+
+### 8.2 B：市价标签后接动作词再接单个价格 ⇒ 有价的市价腿
+
+文件 `src/telegram_kol_research/entry_price_geometry.py`，函数 `_has_unpriced_market_leg`（约 498 行）。
+
+- 新增模块级正则：
+
+  ```python
+  _MARKET_ACTION_PRICE_AFTER_RE = re.compile(
+      r"^\s*(?:进场|入场|开仓|开单|建仓|介入|entry|open)"
+      r"\s*[:：=/]?\s*\$?\s*\d+(?:,\d{3})*(?:\.\d+)?(?:万)?",
+      re.IGNORECASE,
+  )
+  ```
+
+  与批准范围的一处细化：分隔符为**可选**（`市价进场2415`、`市价进场：2415`、`市价进场/2415` 三种都放行），
+  因为三者语义相同，只放行带 `/` 的会把同一 KOL 的不同标点写法分成两种结局。动作词**必须**存在：
+  `market / 2`、`现价/挂单67000` 没有动作词，继续走现有判据 → 仍是无价市价腿。
+- `_has_unpriced_market_leg` 的循环里，在现有两个 `continue` 之后加第三个：
+  `if _MARKET_ACTION_PRICE_AFTER_RE.search(text[match.end():]): continue`。
+  函数其余不改；`_proves_absolute_candidate_field`、`extract_normalized_prices`、`_FIELD_LABELS` 不改
+  （「进场」「市价」本来就在 entry 标签表里，剥掉后剩 `/` 落在 `_FIELD_SEPARATORS_RE`，2415 会被正常抽出。
+  已在本地验证：只要该函数放行，`市价进场/2415` 得 `valid`、`normalized_entry_prices == ("2415",)`）。
+- 调用方 `auto_trade_execution.py` 867 行与 1133 行不改：第一次候选几何通过后，1133 行会再带 `reference_price` 与
+  `resolved_entry_prices=entry_range` 重算一次，`_infer_entry_execution_type` 见「市价」返回 `market`，走市价腿。
+
+测试 `tests/test_entry_price_geometry.py`：
+
+- `test_proven_absolute_market_and_multi_leg_entries_are_accepted`（390 行）参数表追加：
+  `市价进场/68000`、`市价进场/68000附近`、`市价进场68000`、`市价进场：68000`、`现价入场/68000`、`market entry/68000`。
+- `test_market_relative_entry_expression_is_not_treated_as_absolute`（365 行）参数表**原样保留**，追加：
+  `市价进场`（无价格）、`市价进场/挂单67000`（动作词后是另一条腿的标签）。
+- 新增断言用例：`市价进场/2415`，SL 2355，TP 2620，long，ETH ⇒ `status == "valid"`，`normalized_entry_prices == ("2415",)`；
+  同文 short ⇒ `invalid`（方向几何仍在管）。
+- `tests/test_auto_trade_execution.py` 若已有「候选几何拒单」的集成用例可低成本复制，则加一条：`entry_text="市价进场/2415"`
+  不再产生 `entry_price_geometry_rejected` 事件；没有现成骨架就不加，在状态文档里写明。
+
+**明确不在范围内、要写进状态文档的发现**：纯「市价」「市价进场」「现价做多」「market」这类**没有任何数字**的入场文本，
+现在也全部 indeterminate（本地已验证），而调用方只在第一次几何通过后才把参考价传进去，
+所以纯市价入场从来过不了这道门。生产上成功的市价入场全是带价格的文本（`76700附近`、`77300`）。
+这是独立问题，另议，本次不改。
+
+### 8.3 C：过期告警带上阻塞消息及其决策
+
+文件 `src/telegram_kol_research/entry_admission_reconciler.py` 与 `runtime_incident_adapters.py`。
+
+- `reconcile_due_entry_admissions` 相邻准入的过期分支（约 148–166 行）已经持有 `attempt` 快照：
+  解析 `attempt.blocking_raw_message_ids_json`（坏 JSON 当空列表），作为新关键字参数
+  `blocking_raw_message_ids` 传给 `_report_entry_admission_expired`。ws 观测那条分支（约 293 行）传 `None`。
+- `_report_entry_admission_expired` 新增 `blocking_raw_message_ids: list[int] | None = None`。
+  在已有的 `with session_factory() as session:` 里，若列表非空，取前 5 个 id 点查 `RecognitionDecision`，组装
+  `blockers = [{"raw_message_id": id, "automation_status": ..., "automation_reason": ...}]`
+  （没有决策行的写 `"absent"`），作为 `blockers=` 传给 `incident_reporter`。
+- `capture_entry_admission_expired` 新增 `blockers: list[dict] | None = None`。详细摘要（`_summary(...)`）追加两个键：
+  `blocking_raw_message_ids`（int 列表，最多 5 个）和 `blocker_decisions`
+  （`f"{id}:{status}/{reason}"` 经 `_safe_label` 后的字符串列表，最多 5 个）。最小摘要（fallback）不改。
+  写之前读 `runtime_incidents.py` 270–340 行的边界检查，摘要必须在边界内；
+  journal 里每天都有 `RuntimeIncidentBoundsError ... retrying minimal` 的例子，这次不能再多一个。
+- 指纹（`_fingerprint`）由摘要算出，摘要加键会改变指纹。这是可接受的：过期事件按 `message_instruction_item` 每项恰好一次。
+
+测试：
+
+- `tests/test_entry_admission_reconciler.py` 约 560–585 行的 alert 断言追加：`alert["blockers"][0]["raw_message_id"]` 等于阻塞消息 id，
+  `automation_status/automation_reason` 与写入的决策一致；没有决策行时为 `"absent"`。
+- `tests/test_runtime_incident_adapters.py`（或该模块现有测试文件）新增：5 个 blockers 的详细摘要通过边界检查、
+  `redacted_summary` 含 `blocker_decisions`；用假 `recorder` 断言**没有**退回最小摘要。
+
+### 8.4 状态文档、测试与提交
+
+- 状态文档：`docs/entry-admission-and-market-entry-geometry-status.md`，记录每项的 commit、测试数、
+  规格未覆盖处的自选决定、8.2 末尾的范围外发现。
+- 每项完成后跑对应聚焦测试；三项装配完的最终候选跑一次全套 `PYTHONPATH=. uv run pytest -q`，
+  把通过 / 跳过数写进状态文档。
+- 三个 commit，只 `git add` 明确路径，提交前 `git diff --cached --name-only` 核对；
+  提交信息分别以 `fix(entry):`、`fix(geometry):`、`fix(incident):` 开头。
+- 不推送、不部署、不发 Telegram；完成后向指挥会话汇报。部署、L2 观察窗由指挥会话负责。
