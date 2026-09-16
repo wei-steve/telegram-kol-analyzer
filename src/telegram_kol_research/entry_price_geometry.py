@@ -57,6 +57,20 @@ _DIRECT_PRICE_AFTER_RE = re.compile(
     r"^\s*[:：=]?\s*\$?\s*\d+(?:,\d{3})*(?:\.\d+)?(?:万)?",
     re.IGNORECASE,
 )
+#: One market leg carrying its own reference price: the market label, an action
+#: word, an optional separator, then a single absolute price -- ``市价进场/2415``.
+#: The recognition prompt requires exactly this shape whenever the source text
+#: has both a market entry and a concrete level, so refusing it contradicted the
+#: prompt contract. The action word is mandatory, which is what keeps the
+#: genuinely two-legged ``现价/挂单67000`` and the priceless ``market / 2``
+#: indeterminate: neither has one. A label belonging to another leg after the
+#: separator (``市价进场/挂单67000``) is not a digit, so it does not match here
+#: either.
+_MARKET_ACTION_PRICE_AFTER_RE = re.compile(
+    r"^\s*(?:进场|入场|开仓|开单|建仓|介入|entry|open)"
+    r"\s*[:：=/]?\s*\$?\s*\d+(?:,\d{3})*(?:\.\d+)?(?:万)?",
+    re.IGNORECASE,
+)
 _FIELD_LABELS = {
     "entry_prices": re.compile(
         r"entry\s*prices?|entries|entry|open(?:ing)?\s*prices?|"
@@ -500,6 +514,8 @@ def _has_unpriced_market_leg(text: str) -> bool:
         if _DIRECT_PRICE_BEFORE_RE.search(text[: match.start()]):
             continue
         if _DIRECT_PRICE_AFTER_RE.search(text[match.end() :]):
+            continue
+        if _MARKET_ACTION_PRICE_AFTER_RE.search(text[match.end() :]):
             continue
         return True
     return False

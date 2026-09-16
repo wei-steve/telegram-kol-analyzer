@@ -1026,6 +1026,41 @@ def test_wrong_geometry_candidate_alerts_even_when_entry_submission_is_disabled(
     assert geometry_events[0].notification_status == "pending"
 
 
+def test_market_entry_with_reference_price_raises_no_geometry_alert(tmp_path):
+    """``市价进场/2415`` is the prompt's own shape; the gate must not refuse it."""
+
+    session_factory = create_session_factory(tmp_path / "geometry-market-entry.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="redacted fixture",
+        entry_text="市价进场/2415",
+        stop_loss_text="2355",
+        take_profit_text="2620",
+        symbol="ETH",
+        side="long",
+        message_id=16979,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-8",
+    )
+    save_trading_settings(session_factory, {"auto_trade_enabled": False})
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=None,
+    )
+
+    assert result["reason"] == "auto_trade_disabled"
+    with session_factory() as session:
+        geometry_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .all()
+        )
+    assert geometry_events == []
+
+
 def _persist_half_risk_preamble_before(session_factory, *, strategy_raw_message_id):
     from decimal import Decimal
 

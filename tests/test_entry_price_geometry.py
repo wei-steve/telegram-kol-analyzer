@@ -360,6 +360,8 @@ def test_malformed_decimal_syntax_is_not_silently_reinterpreted_as_prices(
         "current price below 100U",
         "market / 2",
         "现价/挂单67000",
+        "市价进场",
+        "市价进场/挂单67000",
     ],
 )
 def test_market_relative_entry_expression_is_not_treated_as_absolute(entry_text):
@@ -385,6 +387,12 @@ def test_market_relative_entry_expression_is_not_treated_as_absolute(entry_text)
         "加仓点位 68000",
         "首仓68000/补仓67000",
         "入场1:68000 入场2:67000",
+        "市价进场/68000",
+        "市价进场/68000附近",
+        "市价进场68000",
+        "市价进场：68000",
+        "现价入场/68000",
+        "market entry/68000",
     ],
 )
 def test_proven_absolute_market_and_multi_leg_entries_are_accepted(entry_text):
@@ -416,6 +424,36 @@ def test_spaced_ascii_hyphen_entry_range_is_not_mistaken_for_negative_price(
 
     assert result.status == "valid"
     assert result.normalized_entry_prices == ("68000", "67000")
+
+
+def test_market_entry_with_reference_price_keeps_its_price_and_direction():
+    """``市价进场/2415`` is the shape the recognition prompt asks MiMo for.
+
+    It is one leg -- market, reference price 2415 -- not a priceless market leg
+    beside a priced limit leg, so the price survives into ``entry_values`` and
+    the long/short geometry still decides the outcome.
+    """
+
+    result = validate_candidate_entry_price_geometry(
+        side="long",
+        entry_text="市价进场/2415",
+        stop_loss_text="2355",
+        take_profit_text="2620",
+        symbol="ETH",
+    )
+
+    assert result.status == "valid"
+    assert result.normalized_entry_prices == ("2415",)
+
+    inverted = validate_candidate_entry_price_geometry(
+        side="short",
+        entry_text="市价进场/2415",
+        stop_loss_text="2355",
+        take_profit_text="2620",
+        symbol="ETH",
+    )
+
+    assert inverted.status == "invalid"
 
 
 def test_proven_absolute_hybrid_market_and_limit_legs_are_accepted():
