@@ -1144,6 +1144,7 @@ def capture_entry_admission_expired(
     defer_reason_code: str,
     deadline_at: datetime | None,
     occurred_at: datetime,
+    blockers: list[dict] | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
     """Capture an entry that reached its execution deadline without submitting.
@@ -1156,6 +1157,12 @@ def capture_entry_admission_expired(
     between 2026-08-17 and 2026-09-04 -- all in ``auto_trade`` groups, all
     silent, one of them the entry behind a lifecycle that still read
     ``entered`` on the dashboard.
+
+    ``blockers`` names the adjacent messages the entry was waiting on and what
+    their authoritative decisions said. ``adjacent_entry_context_pending`` on
+    its own cannot distinguish a neighbour that is genuinely mid-flight from
+    one whose decision is terminal and will never produce anything -- the
+    second kind is a deadlock, and it is only visible here.
     """
 
     if not config.captures("entry_admission_expired"):
@@ -1167,6 +1174,7 @@ def capture_entry_admission_expired(
         "operation": f"instruction_item_{int(message_instruction_item_id)}",
         "raw_message_id": int(raw_message_id),
     }
+    blocker_ids, blocker_decisions = _blocker_labels(blockers)
     return _capture_with_minimal_fallback(
         session_factory,
         config=config,
@@ -1179,11 +1187,64 @@ def capture_entry_admission_expired(
             chat_id=int(chat_id),
             deadline_at=_deadline_label(deadline_at),
             impact="entry_never_submitted",
+            blocking_raw_message_ids=blocker_ids,
+            blocker_decisions=blocker_decisions,
         ),
         minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,
         recorder=recorder,
     )
+
+
+#: At most this many blocking messages travel in the alert. The admission
+#: barrier looks at 20 messages per side; an operator reading a Telegram alert
+#: needs the head of that list, not all of it.
+MAX_REPORTED_BLOCKERS = 5
+
+
+def _blocker_token(value: Any, *, fallback: str, limit: int) -> str:
+    """A label no single token of which can read as an opaque secret.
+
+    ``record_runtime_incident`` refuses a whole summary when one run of
+    ``[A-Za-z0-9_+/=-]`` reaches 32 characters with three character classes and
+    twelve distinct characters, and the refusal only logs -- the alert then
+    falls back to the minimal summary, which is the thing these fields exist to
+    improve on. Splitting on the underscores and bounding what survives keeps
+    every token short whatever an automation reason turns out to say.
+    """
+
+    label = _safe_label(value, fallback=fallback, limit=limit)
+    if len(label) < 32:
+        return label
+    parts = [part[:31] for part in label.replace("_", " ").split() if part]
+    return " ".join(parts) or fallback
+
+
+def _blocker_labels(blockers: list[dict] | None) -> tuple[str, str]:
+    """Render the blocking messages as two scalar summary fields.
+
+    Scalar, not lists: ``_validate_redacted_json_contract`` rejects a summary
+    field holding a dict or a list outright.
+    """
+
+    ids: list[str] = []
+    labels: list[str] = []
+    for blocker in list(blockers or [])[:MAX_REPORTED_BLOCKERS]:
+        if not isinstance(blocker, dict):
+            continue
+        try:
+            raw_message_id = int(blocker.get("raw_message_id"))
+        except (TypeError, ValueError):
+            continue
+        status = _blocker_token(
+            blocker.get("automation_status"), fallback="unknown", limit=48
+        )
+        reason = _blocker_token(
+            blocker.get("automation_reason"), fallback="none", limit=48
+        )
+        ids.append(str(raw_message_id))
+        labels.append(f"{raw_message_id} {status} {reason}")
+    return ",".join(ids), ", ".join(labels)
 
 
 def capture_management_recovery_timeout(

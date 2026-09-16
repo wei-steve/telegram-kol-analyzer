@@ -109,6 +109,17 @@ _SUMMARY_FIELDS = frozenset(
         # both pass the scan that still runs over the assembled JSON.
         "chat_id",
         "deadline_at",
+        # Same alert, 2026-09-16: ``reason_code=adjacent_entry_context_pending``
+        # alone cannot tell "the neighbour really is still being processed"
+        # apart from "the neighbour is terminal and will never produce
+        # anything", and the second kind killed six auto-trade entries before
+        # anyone could name the shape. Both fields are scalar strings, not
+        # lists, because the summary contract above rejects a non-scalar field:
+        # ids are digits and commas, and each decision label is written with
+        # spaces so no single token reaches the opaque-secret heuristic's
+        # 32-character floor.
+        "blocking_raw_message_ids",
+        "blocker_decisions",
         # A-16a. A management instruction the resolver could not tie to a single
         # thread used to end in silence: three of them arrived on 2026-09-11,
         # the model named the action correctly each time ("part take-profit,

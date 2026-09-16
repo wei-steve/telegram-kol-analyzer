@@ -1056,3 +1056,115 @@ def test_split_runtime_source_adapter_uses_environment_only_config(
 
     assert result is config
     assert calls == [{"environment_only": True}]
+
+
+def _blocker(raw_message_id: int, status: str, reason: str) -> dict:
+    return {
+        "raw_message_id": raw_message_id,
+        "automation_status": status,
+        "automation_reason": reason,
+    }
+
+
+def _capture_expiry_with_blockers(session_factory, blockers, *, summaries):
+    from telegram_kol_research.runtime_incident_adapters import (
+        capture_entry_admission_expired,
+    )
+
+    def recorder(factory, **kwargs):
+        summaries.append(kwargs["redacted_summary"])
+        return record_runtime_incident(factory, **kwargs)
+
+    return capture_entry_admission_expired(
+        session_factory,
+        config=RuntimeIncidentConfig(
+            capture_types=frozenset({"entry_admission_expired"})
+        ),
+        message_instruction_item_id=1164,
+        raw_message_id=16979,
+        chat_id=-1002409877375,
+        defer_reason_code="adjacent_entry_context_pending",
+        deadline_at=datetime(2026, 9, 15, 20, 46, tzinfo=UTC),
+        occurred_at=NOW,
+        blockers=blockers,
+        recorder=recorder,
+    )
+
+
+def test_expired_entry_alert_names_five_blockers_without_a_minimal_fallback(
+    tmp_path,
+):
+    """Five blockers must fit the summary contract on the first attempt.
+
+    A detailed summary the bounds check refuses is only logged, and the alert
+    silently degrades to the minimal one -- which carries none of this. So the
+    test asserts the recorder was called exactly once.
+    """
+
+    session_factory = create_session_factory(tmp_path / "entry-admission-blockers.db")
+    summaries: list[str] = []
+
+    captured = _capture_expiry_with_blockers(
+        session_factory,
+        [
+            _blocker(16972, "skipped", "mimo_no_action"),
+            _blocker(16915, "blocked", "source_message_deleted"),
+            _blocker(17018, "skipped", "no_actionable_intent"),
+            _blocker(15808, "skipped", "mimo_authoritative_not_safely_applied"),
+            _blocker(14837, "completed", None),
+        ],
+        summaries=summaries,
+    )
+
+    assert captured is not None
+    assert len(summaries) == 1
+    summary = captured.redacted_summary
+    assert '"blocking_raw_message_ids":"16972,16915,17018,15808,14837"' in summary
+    assert "16972 skipped mimo_no_action" in summary
+    assert "16915 blocked source_message_deleted" in summary
+    assert "14837 completed none" in summary
+    assert '"impact":"entry_never_submitted"' in summary
+
+
+def test_expired_entry_alert_reports_at_most_five_blockers(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-admission-sixth.db")
+    summaries: list[str] = []
+
+    captured = _capture_expiry_with_blockers(
+        session_factory,
+        [_blocker(16970 + offset, "skipped", "mimo_no_action") for offset in range(6)],
+        summaries=summaries,
+    )
+
+    assert captured is not None
+    assert len(summaries) == 1
+    assert "16975" not in captured.redacted_summary
+
+
+def test_expired_entry_alert_survives_an_unusually_long_automation_reason(tmp_path):
+    """No single token may reach the opaque-secret heuristic's floor."""
+
+    session_factory = create_session_factory(tmp_path / "entry-admission-long.db")
+    summaries: list[str] = []
+
+    captured = _capture_expiry_with_blockers(
+        session_factory,
+        [_blocker(16972, "skipped", "lifecycle3not4applied5" * 3)],
+        summaries=summaries,
+    )
+
+    assert captured is not None
+    assert len(summaries) == 1
+    assert '"blocking_raw_message_ids":"16972"' in captured.redacted_summary
+
+
+def test_expired_entry_alert_without_blockers_keeps_its_previous_summary(tmp_path):
+    session_factory = create_session_factory(tmp_path / "entry-admission-none.db")
+    summaries: list[str] = []
+
+    captured = _capture_expiry_with_blockers(session_factory, None, summaries=summaries)
+
+    assert captured is not None
+    assert len(summaries) == 1
+    assert "blocking_raw_message_ids" not in captured.redacted_summary
+    assert "blocker_decisions" not in captured.redacted_summary

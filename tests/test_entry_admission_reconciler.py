@@ -584,6 +584,65 @@ def test_an_expired_entry_reports_an_incident_instead_of_dying_silently(tmp_path
     # afterwards this reason exists nowhere else.
     assert alert["defer_reason_code"] == "adjacent_entry_context_pending"
     assert alert["deadline_at"] == NOW + timedelta(seconds=5)
+    # A blocker with no decision row of its own is named as ``absent`` rather
+    # than left out: "we waited on this message and it never got a decision" is
+    # itself the finding.
+    assert alert["blockers"] == [
+        {
+            "raw_message_id": blocker_id,
+            "automation_status": "absent",
+            "automation_reason": "absent",
+        }
+    ]
+
+
+def test_an_expired_entry_names_its_blockers_and_their_decisions(tmp_path):
+    """``adjacent_entry_context_pending`` alone cannot tell a deadlock apart.
+
+    A neighbour that is still mid-flight and one whose decision is terminal
+    produce the same reason code, and only the second is a deadlock. The
+    decisions travel with the alert so the difference is readable without a
+    database session.
+    """
+
+    from telegram_kol_research.models import RecognitionDecision
+
+    session_factory = create_session_factory(tmp_path / "expiry-alert-blockers.db")
+    _, _, blocker_id, item_id = _persist_deferred_entry(session_factory)
+    _complete_blocker(session_factory, blocker_id)
+    with session_factory() as session:
+        session.add(
+            RecognitionDecision(
+                raw_message_id=blocker_id,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="completed",
+                authoritative_payload_json="{}",
+                agreement_status="agree",
+                differences_json="[]",
+                prompt_versions_json="{}",
+                automation_status="skipped",
+                automation_reason="mimo_no_action",
+            )
+        )
+        session.commit()
+    captured = []
+
+    result = _expire_under(
+        session_factory,
+        mode="shadow",
+        item_id=item_id,
+        reporter=lambda **kwargs: captured.append(kwargs) or object(),
+    )
+
+    assert (result.expired, result.incidents) == (1, 1)
+    assert captured[0]["blockers"] == [
+        {
+            "raw_message_id": blocker_id,
+            "automation_status": "skipped",
+            "automation_reason": "mimo_no_action",
+        }
+    ]
 
 
 def test_a_failing_alert_never_undoes_the_expiry(tmp_path):

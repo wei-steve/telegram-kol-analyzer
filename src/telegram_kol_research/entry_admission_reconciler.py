@@ -27,7 +27,9 @@ from telegram_kol_research.models import (
     InstructionExecutionTransition,
     MessageInstructionItem,
     RawMessage,
+    RecognitionDecision,
 )
+from telegram_kol_research.runtime_incident_adapters import MAX_REPORTED_BLOCKERS
 
 
 logger = logging.getLogger(__name__)
@@ -165,6 +167,9 @@ def reconcile_due_entry_admissions(
                     deadline_at=deadline,
                     now=now,
                     incident_reporter=incident_reporter,
+                    blocking_raw_message_ids=_blocking_raw_message_ids(
+                        attempt.blocking_raw_message_ids_json
+                    ),
                 ):
                     counts["incidents"] += 1
             continue
@@ -307,6 +312,7 @@ def _reconcile_ws_observation_defers(
                     deadline_at=deadline,
                     now=now,
                     incident_reporter=incident_reporter,
+                    blocking_raw_message_ids=None,
                 ):
                     counts["incidents"] += 1
             continue
@@ -385,21 +391,54 @@ def _report_entry_admission_expired(
     deadline_at: datetime,
     now: datetime,
     incident_reporter: Callable[..., object] | None,
+    blocking_raw_message_ids: list[int] | None = None,
 ) -> bool:
     """Alert on one expired entry. Never lets a failed alert undo the expiry.
 
     ``item`` is the detached snapshot taken before the expiry wrote
     ``result_json`` away, so the defer reason it was holding is still readable
     here and nowhere else afterwards.
+
+    ``blocking_raw_message_ids`` is the adjacent-context defer's own blocker
+    list. Their authoritative decisions are read here so the alert can say
+    whether the neighbours were still being processed or had already decided to
+    do nothing -- the difference between a slow entry and a deadlocked one.
     """
 
     reason_code = _defer_reason_code(item.result_json)
+    blockers: list[dict] | None = None
     with session_factory() as session:
         chat_id = (
             session.query(RawMessage.chat_id)
             .filter(RawMessage.id == int(item.raw_message_id))
             .scalar()
         )
+        reported_ids = list(blocking_raw_message_ids or [])[:MAX_REPORTED_BLOCKERS]
+        if reported_ids:
+            decisions = {
+                int(row.raw_message_id): row
+                for row in session.query(RecognitionDecision)
+                .filter(RecognitionDecision.raw_message_id.in_(reported_ids))
+                .all()
+            }
+            blockers = []
+            for raw_message_id in reported_ids:
+                decision = decisions.get(int(raw_message_id))
+                blockers.append(
+                    {
+                        "raw_message_id": int(raw_message_id),
+                        "automation_status": (
+                            str(decision.automation_status or "unknown")
+                            if decision is not None
+                            else "absent"
+                        ),
+                        "automation_reason": (
+                            str(decision.automation_reason or "none")
+                            if decision is not None
+                            else "absent"
+                        ),
+                    }
+                )
     if incident_reporter is None:
         from telegram_kol_research.runtime_incident_adapters import (
             capture_entry_admission_expired,
@@ -421,6 +460,7 @@ def _report_entry_admission_expired(
             defer_reason_code=reason_code,
             deadline_at=deadline_at,
             occurred_at=now,
+            blockers=blockers,
         )
     except Exception:
         # The expiry is already committed and is the durable fact. An alert
@@ -432,6 +472,28 @@ def _report_entry_admission_expired(
         )
         return False
     return recorded is not None
+
+
+def _blocking_raw_message_ids(blocking_json: str | None) -> list[int]:
+    """The attempt's blocker list, or an empty list if it cannot be read.
+
+    A summary field is worth nothing next to the expiry itself, so malformed
+    stored JSON degrades to "no blockers named" rather than raising here.
+    """
+
+    try:
+        parsed = json.loads(blocking_json or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return []
+    if not isinstance(parsed, list):
+        return []
+    ids: list[int] = []
+    for value in parsed:
+        try:
+            ids.append(int(value))
+        except (TypeError, ValueError):
+            continue
+    return ids
 
 
 def _defer_reason_code(result_json: str | None) -> str:
