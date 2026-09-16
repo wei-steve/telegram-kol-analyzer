@@ -1,7 +1,7 @@
 # 谁占了 30 秒写锁 · 事件循环卡顿为什么在上升
 
 日期：2026-09-16
-状态：用户 2026-09-16 拍板做 4.1 + 4.2 + 4.3，实施中（子代理）
+状态：4.1 + 4.2 + 4.3 已于 2026-09-16 部署生产 `5f26e721`（回滚 `6cce08b1`）
 关联：`docs/plans/2026-09-16-message-processing-task-supervision-design.md` 第 6 节「另议」的两项。
 数据来源：worker journal（保留期 08-24 起）、生产库 `data/research.db` 只读查询。
 
@@ -338,3 +338,14 @@ WAL 模式下只读不阻塞写入，但 I/O 争用一样会把在事件循环�
 -- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
 8921 passed, 4 skipped, 107 warnings in 1359.82s (0:22:39)
 ```
+
+## 8. 部署记录（指挥会话补记）
+
+- 子代理提交 `9467fc4e`；指挥会话审阅后追加 `5f26e721`：把投递失败分支里的 `capture_runtime_incident_best_effort`
+  也包进 `asyncio.to_thread`（子代理按「不扩大」原则留在了事件循环线程，与 6.2 的意图不符）。
+- 指挥会话独立复跑全量 8921 passed / 0 failed / 4 skipped（1005 s）。
+- 2026-09-16 `tg-deploy 5f26e721b12205b9a11c764a7ee64fd30896729b`，回滚 SHA `6cce08b1`。
+  worker / web / ingest 均 active，启动无异常；共享分支 = 部署 SHA；启动后 3 分钟内无 `nested write on a second connection` 告警。
+- 验证方式（一周）：journal 里 `nested write on a second connection` 的出现次数与栈（期望 0，若有即漏网路径）；
+  `runtime_loop_health` ≥15 s 卡顿应不再出现在确认提醒/超时的时刻；`Runtime incident capture failed open: type=management_target_needs_confirmation`
+  应不再出现。
