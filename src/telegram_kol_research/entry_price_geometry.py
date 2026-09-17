@@ -17,6 +17,12 @@ TAKE_PROFIT_SIDE_INVALID = "entry_price_geometry_take_profit_side_invalid"
 EQUAL_BOUNDARY = "entry_price_geometry_equal_boundary"
 AMBIGUOUS = "entry_price_geometry_ambiguous"
 REQUIRED_VALUE_MISSING = "entry_price_geometry_required_value_missing"
+#: A price-less market entry was admitted against the live price, but by the
+#: time the order path reached the exchange the message was too old for the
+#: live price to still be the one the KOL meant. 43 characters, which leaves
+#: room under the 64-character ``reason_code`` truncation in the notification
+#: payload (``execution_events.py``).
+MARKET_REFERENCE_STALE = "entry_price_geometry_market_reference_stale"
 
 _RELATIVE_MARKERS = (
     "%",
@@ -113,6 +119,10 @@ class EntryPriceGeometryResult:
     normalized_explicit_average_entry: str | None = None
     offending_field: str | None = None
     offending_value: str | None = None
+    #: True only for a ``valid`` result that proved the protection side alone:
+    #: the entry text named a market entry and no price at all, so the caller
+    #: still owes this candidate a live reference price before it may submit.
+    reference_entry_required: bool = False
 
     @property
     def passed(self) -> bool:
@@ -129,6 +139,7 @@ class EntryPriceGeometryResult:
             "explicit_average_entry": self.normalized_explicit_average_entry,
             "offending_field": self.offending_field,
             "offending_value": self.offending_value,
+            "reference_entry_required": self.reference_entry_required,
         }
 
 
@@ -271,32 +282,44 @@ def validate_candidate_entry_price_geometry(
     reference_price: float | None = None,
     resolved_entry_prices: Iterable[Any] | None = None,
     price_tick: Any = None,
+    allow_reference_entry: bool = False,
 ) -> EntryPriceGeometryResult:
-    """Strictly parse one candidate and delegate to the shared validator."""
+    """Strictly parse one candidate and delegate to the shared validator.
 
-    normalized_entry_text = _strip_entry_ordinals(entry_text)
-    if not _proves_absolute_candidate_field(
-        normalized_entry_text,
-        field="entry_prices",
-        symbol=symbol,
-    ):
-        return _indeterminate(AMBIGUOUS, "entry_prices", entry_text)
-    entry_values = extract_normalized_prices(
-        normalized_entry_text,
-        symbol=symbol,
-        reference_price=reference_price,
+    ``allow_reference_entry`` opts one caller -- and only the live order path,
+    which owns both a live price and a clock -- into admitting a *price-less*
+    market entry (``市价``, ``现价做多``). Every other entry text takes exactly
+    the path it took before, byte for byte, whatever this flag says.
+    """
+
+    reference_entry = allow_reference_entry and is_pure_market_entry_text(
+        entry_text, symbol=symbol
     )
+    entry_values: list[Any] = []
     average = None
-    explicit_average = _parse_explicit_average(
-        normalized_entry_text,
-        symbol=symbol,
-        reference_price=reference_price,
-    )
-    if len(entry_values) == 3 and explicit_average is not None:
-        entry_values, average = explicit_average
-    elif len(entry_values) > 2:
-        return _indeterminate(AMBIGUOUS, "entry_prices", entry_text)
-    elif not entry_values and resolved_entry_prices is not None:
+    if not reference_entry:
+        normalized_entry_text = _strip_entry_ordinals(entry_text)
+        if not _proves_absolute_candidate_field(
+            normalized_entry_text,
+            field="entry_prices",
+            symbol=symbol,
+        ):
+            return _indeterminate(AMBIGUOUS, "entry_prices", entry_text)
+        entry_values = extract_normalized_prices(
+            normalized_entry_text,
+            symbol=symbol,
+            reference_price=reference_price,
+        )
+        explicit_average = _parse_explicit_average(
+            normalized_entry_text,
+            symbol=symbol,
+            reference_price=reference_price,
+        )
+        if len(entry_values) == 3 and explicit_average is not None:
+            entry_values, average = explicit_average
+        elif len(entry_values) > 2:
+            return _indeterminate(AMBIGUOUS, "entry_prices", entry_text)
+    if not entry_values and resolved_entry_prices is not None:
         resolved = _bounded_iterable(resolved_entry_prices)
         if resolved is None:
             return _indeterminate(AMBIGUOUS, "entry_prices", resolved_entry_prices)
@@ -332,6 +355,14 @@ def validate_candidate_entry_price_geometry(
     if take_profit_text not in (None, "") and not take_profits:
         return _indeterminate(AMBIGUOUS, "take_profit", take_profit_text)
 
+    if reference_entry and resolved_entry_prices is None:
+        return _reference_entry_protection_geometry(
+            side=side,
+            stop_loss=stop,
+            take_profit_prices=take_profits,
+            price_tick=price_tick,
+        )
+
     return validate_entry_price_geometry(
         side=side,
         entry_prices=entry_values,
@@ -339,6 +370,109 @@ def validate_candidate_entry_price_geometry(
         stop_loss=stop,
         take_profit_prices=take_profits,
         price_tick=price_tick,
+    )
+
+
+def is_pure_market_entry_text(entry_text: Any, *, symbol: str | None) -> bool:
+    """True only for an entry text that names a market entry and no price.
+
+    ``市价``, ``市价进场``, ``现价做多``, ``market``, ``BTC市价进场`` qualify:
+    a market label, optionally an action word and the instrument's own name,
+    and nothing else. Anything carrying a digit is excluded up front, which is
+    what keeps ``市价进场/2415`` (one market leg with a reference price),
+    ``现价/挂单67000`` (two legs) and ``市价-100U`` (relative) out; anything
+    with leftover prose -- ``等回调再市价`` -- is excluded by the remainder
+    check, because the text then says something this module cannot read. An
+    empty entry text is never a market entry: the recognition result has to
+    say so itself, and nothing is inferred from the message body.
+    """
+
+    text = str(entry_text or "").strip().lower()
+    if not text:
+        return False
+    if not _MARKET_LABEL_RE.search(text):
+        return False
+    if any(character.isdigit() for character in text):
+        return False
+    remainder = _strip_matching_symbol_aliases(text, symbol=symbol)
+    remainder = _FIELD_LABELS["entry_prices"].sub(" ", remainder)
+    remainder = _ABSOLUTE_CURRENCY_RE.sub(" ", remainder)
+    return not _FIELD_SEPARATORS_RE.sub("", remainder).strip()
+
+
+def stale_market_reference_result(entry_text: Any) -> EntryPriceGeometryResult:
+    """Refuse a price-less market entry whose live reference price is too old."""
+
+    return _indeterminate(MARKET_REFERENCE_STALE, "entry_prices", entry_text)
+
+
+def _reference_entry_protection_geometry(
+    *,
+    side: Any,
+    stop_loss: Any,
+    take_profit_prices: Iterable[Any] | None,
+    price_tick: Any = None,
+) -> EntryPriceGeometryResult:
+    """Prove the protection side of a price-less market entry, nothing else.
+
+    There is no entry price to check a direction against yet, so this answers
+    the only question that can be answered without one: does the stop exist,
+    and does every target sit on the profitable side of it. The result carries
+    ``reference_entry_required`` so the caller cannot mistake it for a full
+    geometry proof -- the entry/stop and entry/target relations are still owed,
+    and the caller re-runs this validator with the live price to get them.
+    """
+
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"long", "short"}:
+        return _indeterminate(AMBIGUOUS, "side", side)
+
+    tick = _positive_decimal(price_tick) if price_tick is not None else None
+    if price_tick is not None and tick is None:
+        return _indeterminate(AMBIGUOUS, "price_tick", price_tick)
+
+    if stop_loss in (None, ""):
+        return _indeterminate(REQUIRED_VALUE_MISSING, "stop_loss", None)
+    stop = _normalize_value(stop_loss, tick=tick)
+    if stop is None:
+        return _indeterminate(AMBIGUOUS, "stop_loss", stop_loss)
+
+    raw_take_profits = _bounded_iterable(
+        () if take_profit_prices is None else take_profit_prices
+    )
+    if raw_take_profits is None:
+        return _indeterminate(AMBIGUOUS, "take_profit", take_profit_prices)
+    take_profits = _normalize_values(raw_take_profits, tick=tick)
+    if take_profits is None:
+        return _indeterminate(AMBIGUOUS, "take_profit", take_profit_prices)
+
+    common = {
+        "entries": (),
+        "stop": stop,
+        "take_profits": take_profits,
+        "average": None,
+    }
+    for take_profit in take_profits:
+        if take_profit == stop:
+            return _invalid(EQUAL_BOUNDARY, "take_profit", take_profit, **common)
+        take_profit_valid = (
+            take_profit > stop if normalized_side == "long" else take_profit < stop
+        )
+        if not take_profit_valid:
+            return _invalid(
+                TAKE_PROFIT_SIDE_INVALID,
+                "take_profit",
+                take_profit,
+                **common,
+            )
+
+    return _result(
+        status="valid",
+        reason_code=None,
+        entries=(),
+        stop=stop,
+        take_profits=take_profits,
+        reference_entry_required=True,
     )
 
 
@@ -629,6 +763,7 @@ def _result(
     average: Decimal | None = None,
     offending_field: str | None = None,
     offending_value: Any = None,
+    reference_entry_required: bool = False,
 ) -> EntryPriceGeometryResult:
     return EntryPriceGeometryResult(
         status=status,
@@ -643,6 +778,7 @@ def _result(
         normalized_explicit_average_entry=_display(average),
         offending_field=offending_field,
         offending_value=_display(offending_value),
+        reference_entry_required=reference_entry_required,
     )
 
 

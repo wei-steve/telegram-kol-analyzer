@@ -5,6 +5,9 @@ from pathlib import Path
 import pytest
 
 from telegram_kol_research.entry_price_geometry import (
+    MARKET_REFERENCE_STALE,
+    is_pure_market_entry_text,
+    stale_market_reference_result,
     validate_candidate_entry_price_geometry,
     validate_entry_price_geometry,
     validate_order_draft_price_geometry,
@@ -566,6 +569,248 @@ def test_final_draft_rejects_conflicting_direction_aliases(direction_override):
     assert result.status == "indeterminate"
     assert result.reason_code == "entry_price_geometry_ambiguous"
     assert result.offending_field == "side"
+
+
+@pytest.mark.parametrize(
+    "entry_text",
+    ["市价", "市价进场", "现价做多", "market", "BTC市价进场"],
+)
+def test_price_less_market_entry_text_is_recognised(entry_text):
+    assert is_pure_market_entry_text(entry_text, symbol="BTC") is True
+
+
+@pytest.mark.parametrize(
+    "entry_text",
+    [
+        "",
+        None,
+        "市价-100U",
+        "现价/挂单67000",
+        "market / 2",
+        "等回调再市价",
+        "市价进场/2415",
+        "68000-68200",
+    ],
+)
+def test_texts_that_are_not_a_price_less_market_entry(entry_text):
+    """An empty entry text is never a market entry, whatever the body says."""
+
+    assert is_pure_market_entry_text(entry_text, symbol="BTC") is False
+
+
+@pytest.mark.parametrize(
+    "entry_text",
+    ["市价", "市价进场", "现价做多", "market"],
+)
+def test_price_less_market_entry_stays_indeterminate_by_default(entry_text):
+    """The opt-in is the only thing that admits a price-less market entry."""
+
+    result = validate_candidate_entry_price_geometry(
+        side="long",
+        entry_text=entry_text,
+        stop_loss_text="67500",
+        take_profit_text="69000",
+        symbol="BTC",
+    )
+
+    assert result.status == "indeterminate"
+    assert result.reason_code == "entry_price_geometry_ambiguous"
+    assert result.offending_field == "entry_prices"
+    assert result.reference_entry_required is False
+
+
+def test_price_less_market_entry_with_a_stop_proves_the_protection_side():
+    result = validate_candidate_entry_price_geometry(
+        side="long",
+        entry_text="市价",
+        stop_loss_text="76000",
+        take_profit_text=None,
+        symbol="BTC",
+        allow_reference_entry=True,
+    )
+
+    assert result.status == "valid"
+    assert result.reason_code is None
+    assert result.reference_entry_required is True
+    assert result.normalized_stop_loss == "76000"
+    assert result.normalized_entry_prices == ()
+    assert result.bounded_evidence()["reference_entry_required"] is True
+
+
+@pytest.mark.parametrize(
+    ("side", "stop_loss_text", "take_profit_text", "status", "reason", "field"),
+    [
+        (
+            "long",
+            "76000",
+            "75000",
+            "invalid",
+            "entry_price_geometry_take_profit_side_invalid",
+            "take_profit",
+        ),
+        (
+            "long",
+            "76000",
+            "76000",
+            "invalid",
+            "entry_price_geometry_equal_boundary",
+            "take_profit",
+        ),
+        (
+            "long",
+            None,
+            "78000",
+            "indeterminate",
+            "entry_price_geometry_required_value_missing",
+            "stop_loss",
+        ),
+        (
+            "long",
+            "5%",
+            None,
+            "indeterminate",
+            "entry_price_geometry_ambiguous",
+            "stop_loss",
+        ),
+        (
+            "short",
+            "76000",
+            "78000",
+            "invalid",
+            "entry_price_geometry_take_profit_side_invalid",
+            "take_profit",
+        ),
+        (
+            "sideways",
+            "76000",
+            None,
+            "indeterminate",
+            "entry_price_geometry_ambiguous",
+            "side",
+        ),
+    ],
+)
+def test_price_less_market_entry_still_refuses_a_broken_protection_side(
+    side, stop_loss_text, take_profit_text, status, reason, field
+):
+    result = validate_candidate_entry_price_geometry(
+        side=side,
+        entry_text="市价",
+        stop_loss_text=stop_loss_text,
+        take_profit_text=take_profit_text,
+        symbol="BTC",
+        allow_reference_entry=True,
+    )
+
+    assert result.status == status
+    assert result.reason_code == reason
+    assert result.offending_field == field
+    assert result.reference_entry_required is False
+
+
+@pytest.mark.parametrize(
+    ("side", "stop_loss_text", "take_profit_text", "reference"),
+    [
+        ("long", "76000", "78000", 76500.0),
+        ("short", "76000", "74000", 75740.0),
+    ],
+)
+def test_price_less_market_entry_takes_the_live_price_as_its_entry(
+    side, stop_loss_text, take_profit_text, reference
+):
+    result = validate_candidate_entry_price_geometry(
+        side=side,
+        entry_text="市价",
+        stop_loss_text=stop_loss_text,
+        take_profit_text=take_profit_text,
+        symbol="BTC",
+        reference_price=reference,
+        resolved_entry_prices=(reference, reference),
+        allow_reference_entry=True,
+    )
+
+    rendered = format(Decimal(str(reference)).normalize(), "f")
+    assert result.status == "valid"
+    assert result.normalized_entry_prices == (rendered, rendered)
+    assert result.entry_min == rendered
+    assert result.entry_max == rendered
+    # The proof is complete once the live price is in hand, so the caller is no
+    # longer owed anything: the flag exists to say "still owed", not "was".
+    assert result.reference_entry_required is False
+
+
+@pytest.mark.parametrize(
+    ("side", "reference"),
+    [("long", 75740.0), ("short", 76500.0)],
+)
+def test_price_less_market_entry_is_refused_when_the_live_price_crossed_the_stop(
+    side, reference
+):
+    """The 17019 shape: a long whose stop already sits above the live price."""
+
+    result = validate_candidate_entry_price_geometry(
+        side=side,
+        entry_text="市价",
+        stop_loss_text="76000",
+        take_profit_text=None,
+        symbol="BTC",
+        reference_price=reference,
+        resolved_entry_prices=(reference, reference),
+        allow_reference_entry=True,
+    )
+
+    assert result.status == "invalid"
+    assert result.reason_code == "entry_price_geometry_stop_side_invalid"
+    assert result.offending_field == "stop_loss"
+
+
+@pytest.mark.parametrize(
+    ("entry_text", "stop_loss_text", "take_profit_text"),
+    [
+        ("市价进场/2415", "2355", "2620"),
+        ("77300", "76000", "79000"),
+        ("现价/挂单67000", "66000", "69000"),
+        ("68000-68200", "67500", "69000 / 70000"),
+        ("市价 68000", "67500", "69000"),
+        ("市价-100U", "67500", "69000"),
+        ("market / 2", "67500", "69000"),
+        ("市价进场/挂单67000", "66000", "69000"),
+        ("等回调再市价", "67500", "69000"),
+        ("", "67500", "69000"),
+        (None, "67500", "69000"),
+    ],
+)
+@pytest.mark.parametrize("reference", [None, 68100.0])
+def test_opt_in_changes_nothing_for_a_text_that_is_not_a_price_less_market_entry(
+    entry_text, stop_loss_text, take_profit_text, reference
+):
+    """Every non-pure-market text answers identically with the flag either way."""
+
+    kwargs = dict(
+        side="long",
+        entry_text=entry_text,
+        stop_loss_text=stop_loss_text,
+        take_profit_text=take_profit_text,
+        symbol="BTC",
+        reference_price=reference,
+        resolved_entry_prices=None if reference is None else (reference, reference),
+    )
+
+    assert validate_candidate_entry_price_geometry(
+        **kwargs, allow_reference_entry=True
+    ) == validate_candidate_entry_price_geometry(**kwargs)
+
+
+def test_stale_market_reference_result_is_a_bounded_refusal():
+    result = stale_market_reference_result("市价")
+
+    assert result.status == "indeterminate"
+    assert result.reason_code == MARKET_REFERENCE_STALE
+    assert result.offending_field == "entry_prices"
+    assert result.offending_value == "市价"
+    # ``execution_events`` truncates the reason code at 64 characters, and a
+    # truncated code would not match any branch that reads it back.
+    assert len(MARKET_REFERENCE_STALE) <= 64
 
 
 def test_final_draft_without_contract_tick_is_indeterminate():
