@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from collections.abc import Callable
 from decimal import Decimal
 from typing import Any
@@ -30,6 +30,7 @@ from telegram_kol_research.execution_events import (
 from telegram_kol_research.execution_events import record_execution_event
 from telegram_kol_research.entry_price_geometry import (
     EntryPriceGeometryResult,
+    stale_market_reference_result,
     validate_candidate_entry_price_geometry,
 )
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
@@ -111,6 +112,16 @@ from telegram_kol_research.strategy_revision_planner import (
 
 
 logger = logging.getLogger(__name__)
+
+#: How long a price-less market entry (``市价``, ``现价做多``) may wait before
+#: the live price stops being the price the KOL meant. Such an entry carries no
+#: quote of its own to anchor against, so the ticker read at submission time is
+#: the only anchor there is; once the message is this old -- the typical cause
+#: is an adjacent-message hold -- the market has moved on and chasing it is a
+#: different trade from the one that was posted. Deliberately a constant and
+#: not a runtime setting: it is part of what makes admitting a price-less entry
+#: safe, not an operational dial.
+PURE_MARKET_ENTRY_MAX_AGE = timedelta(minutes=3)
 
 
 def execute_strategy_revision(
@@ -870,6 +881,7 @@ def _auto_process_single_message_trade_signal(
         stop_loss_text=candidate.stop_loss_text,
         take_profit_text=candidate.take_profit_text,
         symbol=candidate.symbol,
+        allow_reference_entry=True,
     )
     if not candidate_geometry.passed:
         _enqueue_entry_geometry_rejection(
@@ -1130,6 +1142,31 @@ def _auto_process_single_message_trade_signal(
             message_instruction_item_id=message_instruction_item_id,
             execution_contract_mode=execution_contract_mode,
         )
+    # A price-less market entry was admitted on its stop loss alone, so the
+    # entry price it is about to use is the ticker read a moment ago rather
+    # than anything the KOL wrote. That substitution only holds while the
+    # message is fresh, and only for a leg that really goes to market.
+    if candidate_geometry.passed and candidate_geometry.reference_entry_required:
+        posted_at = _as_utc(raw_message.posted_at)
+        age = (_as_utc(now) - posted_at) if posted_at is not None else None
+        if age is not None and age < timedelta(0):
+            # Clock skew between the ingest host and this one, not a future
+            # message: treat it as having just arrived.
+            age = timedelta(0)
+        if (
+            entry_execution_type != "market"
+            or age is None
+            or age > PURE_MARKET_ENTRY_MAX_AGE
+        ):
+            return _record_entry_geometry_rejection(
+                session_factory,
+                raw_message=raw_message,
+                candidate=candidate,
+                geometry=stale_market_reference_result(candidate.entry_text),
+                processed_at=now,
+                message_instruction_item_id=message_instruction_item_id,
+                execution_contract_mode=execution_contract_mode,
+            )
     geometry = candidate_geometry
     if geometry.passed:
         geometry = validate_candidate_entry_price_geometry(
@@ -1145,6 +1182,7 @@ def _auto_process_single_message_trade_signal(
                 if capability.contract_spec is not None
                 else None
             ),
+            allow_reference_entry=True,
         )
     if not geometry.passed:
         return _record_entry_geometry_rejection(
@@ -2409,6 +2447,14 @@ def _load_active_execution_bindings(
         for row in rows:
             session.expunge(row)
         return rows
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Read a stored naive timestamp as the UTC it was written as."""
+
+    if value is None:
+        return None
+    return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
 def _infer_entry_execution_type(

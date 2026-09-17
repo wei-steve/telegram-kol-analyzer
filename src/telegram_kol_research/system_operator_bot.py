@@ -23,6 +23,7 @@ from telegram_kol_research.config import (
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
+from telegram_kol_research.entry_price_geometry import MARKET_REFERENCE_STALE
 from telegram_kol_research.entry_revision_exchange_authority import (
     release_authority_for_finished_batches,
     release_authority_for_finished_trade_signals,
@@ -2245,6 +2246,12 @@ def format_terminal_entry_cleanup_notification(event) -> str:
         entry_domain = payload.get("entry_domain")
         if not isinstance(entry_domain, list) or len(entry_domain) != 2:
             entry_domain = ["unknown", "unknown"]
+        # A stale price-less market entry is the one geometry refusal that is
+        # not about the numbers being wrong, so the reason code alone reads
+        # like a parser complaint. Say what actually happened.
+        explanation = ""
+        if payload.get("reason_code") == MARKET_REFERENCE_STALE:
+            explanation = "说明: 纯市价入场超过 3 分钟未执行，已放弃追价\n"
         return (
             "【入场方向/价格几何拒绝】\n"
             f"Raw message: {payload.get('raw_message_id')}\n"
@@ -2256,6 +2263,7 @@ def format_terminal_entry_cleanup_notification(event) -> str:
             f"冲突字段/值: {_safe_management_text(payload.get('offending_field'), limit=64)} / "
             f"{_safe_management_text(payload.get('offending_value'), limit=64)}\n"
             f"原因: {_safe_management_text(payload.get('reason_code'), limit=64)}\n"
+            f"{explanation}"
             f"识别来源/代: {_safe_management_text(payload.get('parse_source'), limit=32)} / "
             f"{_safe_management_text(payload.get('authoritative_generation'), limit=64)}\n"
             "自动执行: 已 fail-closed，需人工复核"

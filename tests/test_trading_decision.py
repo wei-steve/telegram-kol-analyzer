@@ -88,6 +88,22 @@ def test_real_wrong_geometry_candidates_require_manual_review(signal):
     ]
 
 
+def test_price_less_market_entry_still_requires_manual_review_here():
+    """``trading_decision`` has no clock, so it never admits a bare market entry.
+
+    The live order path admits one against the ticker under a three-minute age
+    limit. Nothing in this module can measure that age, so the relaxation is
+    deliberately not passed here and the answer stays what it always was.
+    """
+
+    decision = evaluate_trading_decision(
+        _signal(entry_text="市价", stop_loss_text="67500", take_profit_text=None)
+    )
+
+    assert decision.action == "manual_review"
+    assert decision.reason_codes == ["entry_price_geometry_ambiguous"]
+
+
 def test_indeterminate_candidate_geometry_requires_manual_review():
     decision = evaluate_trading_decision(
         _signal(entry_text="现价入场", stop_loss_text="止损 2%")

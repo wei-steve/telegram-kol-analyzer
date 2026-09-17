@@ -1061,6 +1061,156 @@ def test_market_entry_with_reference_price_raises_no_geometry_alert(tmp_path):
     assert geometry_events == []
 
 
+def test_fresh_price_less_market_entry_with_a_stop_submits_at_the_live_price(
+    tmp_path,
+):
+    """``市价`` plus a stop is enough; the live price is the entry price."""
+
+    session_factory = create_session_factory(tmp_path / "pure-market-fresh.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="比特现价加一层仓，止损放67500",
+        entry_text="市价",
+        stop_loss_text="67500",
+        message_id=15832,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-9",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient(session_factory)
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "submitted"
+    assert result["entry_execution_type"] == "market"
+    assert fake_client.orders[0]["ordType"] == "market"
+    with session_factory() as session:
+        geometry_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .all()
+        )
+    assert geometry_events == []
+
+
+def test_stale_price_less_market_entry_is_refused_without_an_exchange_write(
+    tmp_path,
+):
+    """Four minutes on, the live price is no longer the price that was meant."""
+
+    session_factory = create_session_factory(tmp_path / "pure-market-stale.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="比特现价加一层仓，止损放67500",
+        entry_text="市价",
+        stop_loss_text="67500",
+        message_id=15833,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-9",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient(session_factory)
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 12, 8, 4, tzinfo=UTC),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "entry_price_geometry_market_reference_stale"
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    assert fake_client.protections == []
+    with session_factory() as session:
+        geometry_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .all()
+        )
+    assert len(geometry_events) == 1
+    payload = json.loads(geometry_events[0].response_json)
+    assert payload["reason_code"] == "entry_price_geometry_market_reference_stale"
+    assert payload["offending_field"] == "entry_prices"
+    assert payload["offending_value"] == "市价"
+    assert "entry_text" not in payload
+    assert "比特现价加一层仓" not in geometry_events[0].response_json
+
+
+def test_price_less_market_entry_is_refused_when_the_live_price_crossed_the_stop(
+    tmp_path,
+):
+    """The 17019 shape: the stop already sits above the price a long would pay."""
+
+    session_factory = create_session_factory(tmp_path / "pure-market-crossed.db")
+    raw_message_id = _persist_candidate(
+        session_factory,
+        text="比特现价加一层仓，止损放76000",
+        entry_text="市价",
+        stop_loss_text="76000",
+        take_profit_text=None,
+        message_id=17019,
+        parse_source="mimo_authoritative",
+        recognition_generation="generation-9",
+    )
+    save_trading_settings(
+        session_factory,
+        {
+            "auto_trade_enabled": True,
+            "default_max_loss_usdt": 20,
+            "allowed_symbols": ["BTC", "ETH"],
+        },
+    )
+    fake_client = _FakeDeepcoinClient(session_factory)
+    fake_client.ticker_prices["BTC-USDT-SWAP"] = 75740.0
+
+    result = auto_process_message_trade_signal(
+        session_factory,
+        raw_message_id=raw_message_id,
+        group_config=_group_config(),
+        deepcoin_client=fake_client,
+        contract_spec_provider=_StaticContractSpecProvider(),
+        processed_at=datetime(2026, 6, 12, 8, 1, tzinfo=UTC),
+    )
+
+    assert result["status"] == "skipped"
+    assert result["reason"] == "entry_price_geometry_stop_side_invalid"
+    assert fake_client.orders == []
+    assert fake_client.trigger_orders == []
+    assert fake_client.protections == []
+    with session_factory() as session:
+        geometry_events = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .all()
+        )
+    assert len(geometry_events) == 1
+
+
 def _persist_half_risk_preamble_before(session_factory, *, strategy_raw_message_id):
     from decimal import Decimal
 

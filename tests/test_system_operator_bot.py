@@ -347,6 +347,39 @@ def test_entry_geometry_operator_alert_is_bounded_and_redacted():
     assert "entry_price_geometry_stop_side_invalid" in rendered
     assert "entry_text" not in rendered
     assert "API" not in rendered
+    # Every other reason code keeps its wording to the character.
+    assert "说明" not in rendered
+
+
+def test_stale_market_reference_alert_says_why_the_entry_was_dropped():
+    rendered = operator_bot_module.format_terminal_entry_cleanup_notification(
+        SimpleNamespace(
+            id=11,
+            action="entry_price_geometry_rejected",
+            status="manual_review",
+            response_json=json.dumps(
+                {
+                    "raw_message_id": 15832,
+                    "candidate_id": 2293,
+                    "chat_id": 100,
+                    "symbol": "BTC",
+                    "side": "long",
+                    "entry_domain": [None, None],
+                    "offending_field": "entry_prices",
+                    "offending_value": "市价",
+                    "reason_code": "entry_price_geometry_market_reference_stale",
+                    "parse_source": "mimo_authoritative",
+                    "authoritative_generation": "generation-9",
+                }
+            ),
+        )
+    )
+
+    assert "入场方向/价格几何拒绝" in rendered
+    assert "entry_price_geometry_market_reference_stale" in rendered
+    assert "说明: 纯市价入场超过 3 分钟未执行，已放弃追价" in rendered
+    assert "自动执行: 已 fail-closed，需人工复核" in rendered
+    assert "API" not in rendered
 
 
 def test_entry_geometry_alert_is_actively_delivered_by_durable_outbox(

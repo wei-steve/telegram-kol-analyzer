@@ -1,3 +1,4 @@
+import json
 from datetime import UTC, datetime
 
 from telegram_kol_research.recovery_scan import (
@@ -252,6 +253,67 @@ def test_recovery_loader_actively_alerts_wrong_geometry_candidate(tmp_path):
             .one()
         )
     assert event.notification_status == "pending"
+
+
+def test_recovery_loader_still_alerts_a_price_less_market_entry(tmp_path):
+    """Recovery is late execution by definition, so it never chases the market.
+
+    The live order path may now take ``市价`` against the ticker while the
+    message is under three minutes old. This scan runs over messages that are
+    already old, so it does not opt in and the candidate stays a geometry alert.
+    """
+
+    session_factory = create_session_factory(tmp_path / "recovery-pure-market.db")
+    with session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=9001,
+            message_id=15832,
+            posted_at=datetime(2026, 6, 12, 8, 0),
+            text="redacted fixture",
+        )
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message.id,
+                symbol="BTC",
+                side="long",
+                event_type="entry_signal",
+                entry_text="市价",
+                stop_loss_text="76000",
+                take_profit_text=None,
+                parse_source="mimo_authoritative",
+                recognition_generation="generation-9",
+                confidence=0.9,
+                review_status="confirmed",
+            )
+        )
+        session.commit()
+
+    load_recovery_signals_from_db(
+        session_factory,
+        group_config=GroupConfig(
+            groups=[
+                TargetGroupConfig(
+                    chat_title="VIP BTC Room",
+                    chat_id=9001,
+                    trading_mode="auto_trade",
+                    symbol_whitelist=["BTC"],
+                )
+            ]
+        ),
+        start_at=datetime(2026, 6, 10, 8, 0),
+        end_at=datetime(2026, 6, 12, 18, 0),
+    )
+
+    with session_factory() as session:
+        event = (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.action == "entry_price_geometry_rejected")
+            .one()
+        )
+    payload = json.loads(event.response_json)
+    assert payload["reason_code"] == "entry_price_geometry_ambiguous"
 
 
 def test_load_recovery_signals_from_db_uses_symbol_specific_group_risk(tmp_path):
