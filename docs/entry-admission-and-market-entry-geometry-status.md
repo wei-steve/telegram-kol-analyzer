@@ -215,3 +215,30 @@ C 的关键断言是"recorder 只被调用一次 = 没有退回最小摘要"。�
 - **`PURE_MARKET_ENTRY_MAX_AGE` 没有做成运行时设置**，规格明令是常量。
 - 正向路径此刻只有单元/集成测试作证。**下一条真实的纯市价 + 止损入场就是首个实盘样本**，
   届时核对 `execution_events` 是否有 `open_market_position` 而非几何拒单，以及仓位是否在成交后拿到止损。
+
+## D 的部署与 L2 观察窗（指挥会话，2026-09-17）
+
+- 审查：`entry_price_geometry.py`、`auto_trade_execution.py`、`system_operator_bot.py` 三处源码改动逐行对照规格第 9 节，一致。
+  `allow_reference_entry` 默认 False 时校验路径与此前等价（子代理用结果对象相等证明，11 种非纯市价文本 × 2 种参考价设置）；
+  `recovery_scan` / `trading_decision` 未放宽；时效闸门位于相邻准入之后、终局几何之前。
+- 全套（子代理，`523daaf8`）：9000 passed, 4 skipped, **1 failed**。失败用例
+  `tests/test_authoritative_gap_recovery_loop.py::test_message_enqueued_within_one_fast_loop_interval` 是 3 秒墙钟期限的计时用例，
+  被测代码 `telegram_live_listener.py` 不在本次差异内，跑全套时主机负载 11–22。指挥会话在主检出上单独重跑该文件 9 passed，
+  判定为负载导致的计时抖动，与本次改动无关。主检出聚焦测试合计 404 passed
+  （gap recovery loop / geometry / trading decision / recovery scan 186；auto trade execution / operator bot 218）。
+- 预检：候选 `72313b0e` 是生产 HEAD `7a8e67c1` 的直系后代；3 个源文件 + 5 个测试文件；无依赖变更；交易所无在途入场腿。
+- 部署：候选先推 `origin/claude/entry-admission-deadlock`，`tg-deploy 72313b0e9cd63ebfb9e24c9c16f042e210a2261f`
+  于 2026-09-17 13:40 UTC 完成，三服务 active；同一 SHA 推到共享分支。双向核对：
+  `PASS: deployed sha is on the shared branch`、`PASS: 0 code files beyond production`。**回退点 `7a8e67c1`。**
+- 部署后健康：worker 无新错误，Deepcoin WS `connected/healthy`，web `/login` 200，无作业积压。
+  worker 启动阶段（uptime < 47 s）记了 1 次事件循环停顿，发生在监控起算之前，之后未再增加。
+- 观察窗：服务器只读监控（`/root/tg_observe_entry_d.py`，临时 systemd 单元 `tg-observe-entry-d`），
+  判据在上一轮基础上增加「带市价标签、无数字的入场文本仍以 `entry_price_geometry_ambiguous` 被拒 ⇒ 异常」。
+  **13:41:29 → 14:27:36 UTC 连续 46 min 无异常，5 条真实消息（4 个群），全部 `worker_completed`。**
+  窗内：新增相邻挂起 0、几何拒单事件 0、交易所写入 0、`entry_admission_expired` 0。
+- 证据：`/root/entry-market-d-observation-2026-09-17.events`、`/root/entry-market-d-observation-2026-09-17.samples.jsonl`（服务器）。
+- 窗内没有自然到达的「纯市价 + 止损」入场。正向路径目前只有单元 / 集成测试作证；首个实盘样本到达时核对：
+  `execution_events` 应出现市价开仓动作而不是 `entry_price_geometry_rejected`；若被相邻消息挂起超过 3 分钟，
+  应出现一条 `entry_price_geometry_market_reference_stale` 拒单告警且无交易所写入。
+- 已知小瑕疵（不修）：英文 `current price` / `market price` 被几何模块认作市价标签，但不在 `_infer_entry_execution_type`
+  的词表里，这种入场会以 `market_reference_stale` 被拒，文案「超过 3 分钟」不准确；方向安全，中文群不出现。
