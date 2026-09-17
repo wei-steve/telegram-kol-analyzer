@@ -1,7 +1,7 @@
 # 相邻消息准入死锁与「市价进场/价格」几何拒单：根因分析与修复选项
 
 日期：2026-09-16
-状态：用户 2026-09-16 拍板做 A + B + C（第 5 节默认值），实施中（子代理）；规格见第 8 节
+状态：A + B + C 已于 2026-09-16 部署 `7a8e67c1` 并通过 L2 观察窗（见状态文档）；用户 2026-09-17 追加拍板 D（纯市价入场，有止损即可下单），规格见第 9 节，实施中（子代理）
 触发：峰哥高级会员群 2026-09-15 14:45 UTC「以太坊现价2415做多 / 止损2355 / 止盈2620」
 识别成功、群为 auto_trade，但交易所上既无持仓也无挂单；6 小时后入场指令过期。
 
@@ -406,3 +406,107 @@ A 与 B 都**改变交易所写入的准入语义**：原本一定不下单的�
 - 三个 commit，只 `git add` 明确路径，提交前 `git diff --cached --name-only` 核对；
   提交信息分别以 `fix(entry):`、`fix(geometry):`、`fix(incident):` 开头。
 - 不推送、不部署、不发 Telegram；完成后向指挥会话汇报。部署、L2 观察窗由指挥会话负责。
+
+## 9. 追加：纯市价入场，有止损即可下单（D）
+
+用户 2026-09-17 拍板：「市价入场，如果有止损价格也是可以的」；时效上限 **3 分钟**；
+**入场字段为空不算纯市价**（只认识别结果里明确写了市价标签的，不从正文里猜）。
+
+### 9.1 现状
+
+识别结果的入场字段是 `市价`、`市价进场`、`现价做多`、`market` 这类**没有任何数字**的文本时，
+`validate_candidate_entry_price_geometry` 在 `_has_unpriced_market_leg` 处判 `indeterminate`。
+`auto_trade_execution.py` 867 行的候选校验不带参考价；1133 行 `geometry = candidate_geometry`，
+第一次没过就不再带 `resolved_entry_prices` 重算，直接拒单。所以纯市价入场从来过不了这道门。
+生产命中：2026-09-10 军长「比特现价加一层仓，止损放76000」（raw 15832，候选 2293：BTC long，entry `市价`，SL 76000）
+结局 `entry_price_geometry_ambiguous`。
+
+入场字段为空的几条（16274、16702、16802）结局是 `missing_entry_range`，它们的正文本来就不是市价开仓指令，保持拒绝。
+
+### 9.2 几何模块 `src/telegram_kol_research/entry_price_geometry.py`
+
+- 新常量 `MARKET_REFERENCE_STALE = "entry_price_geometry_market_reference_stale"`（43 字符，通知 payload 截断上限 64）。
+- `EntryPriceGeometryResult` 新增字段 `reference_entry_required: bool = False`；`bounded_evidence()` 增加同名键；
+  `_result()` 增加同名关键字参数（默认 False）并透传。`passed` 语义不变（`status == "valid"`）。
+- 新公共函数 `is_pure_market_entry_text(entry_text, *, symbol) -> bool`，同时满足才为真：
+  1. 文本非空；2. `_MARKET_LABEL_RE` 命中；3. 全文**没有任何数字字符**（`any(ch.isdigit())` 为假）；
+  4. 依次剥掉匹配的币种别名（`_strip_matching_symbol_aliases`）、入场标签（`_FIELD_LABELS["entry_prices"]`）、
+     货币符号（`_ABSOLUTE_CURRENCY_RE`）、分隔符（`_FIELD_SEPARATORS_RE`）后**剩余为空**。
+  期望：`市价`、`市价进场`、`现价做多`、`market`、`BTC市价进场` 为真；
+  空串、`市价-100U`、`现价/挂单67000`、`market / 2`、`等回调再市价`、`市价进场/2415` 为假。
+- `validate_candidate_entry_price_geometry` 新增关键字参数 `allow_reference_entry: bool = False`。
+  仅当 `allow_reference_entry` 为真且 `is_pure_market_entry_text(...)` 为真时走新分支，其余路径**逐字节不变**：
+  - 跳过入场字段的 `_proves_absolute_candidate_field` 检查，`entry_values = []`；
+  - 止损、止盈的解析与现有代码完全一致（绝对性检查、恰好一个止损、止盈非空即须解析出价格）；
+  - **带了 `resolved_entry_prices`**：沿用现有 `elif not entry_values and resolved_entry_prices is not None` 分支，
+    把它当入场价交给 `validate_entry_price_geometry` 做完整方向校验（多单 SL < 入场 < 每个 TP）；
+  - **没带 `resolved_entry_prices`**（候选阶段）：只做保护侧校验——止损缺失 ⇒
+    `_indeterminate(REQUIRED_VALUE_MISSING, "stop_loss", None)`；对每个止盈，多单要求 `TP > SL`、空单要求 `TP < SL`，
+    相等 ⇒ `_invalid(EQUAL_BOUNDARY, "take_profit", tp, ...)`，方向反 ⇒ `_invalid(TAKE_PROFIT_SIDE_INVALID, "take_profit", tp, ...)`；
+    全部通过 ⇒ `_result(status="valid", reason_code=None, entries=(), stop=stop, take_profits=tps, reference_entry_required=True)`。
+    side 不是 long/short ⇒ 与共享校验器一致返回 `_indeterminate(AMBIGUOUS, "side", side)`。
+- 新公共函数 `stale_market_reference_result(entry_text) -> EntryPriceGeometryResult`：
+  返回 `_indeterminate(MARKET_REFERENCE_STALE, "entry_prices", entry_text)`。
+
+### 9.3 下单路径 `src/telegram_kol_research/auto_trade_execution.py`
+
+- 模块常量 `PURE_MARKET_ENTRY_MAX_AGE = timedelta(minutes=3)`，注释写明：纯市价没有 KOL 报价做锚，
+  超过这个时长（典型来源是相邻消息挂起）现价已不是 KOL 说的现价；是常量不是运行时开关。
+- 867 行与 1135 行两处调用都加 `allow_reference_entry=True`。
+- 在 1121 行市价分支算出 `entry_range = (market_price, market_price)` 之后、1133 行 `geometry = candidate_geometry` 之前插入：
+
+  ```python
+  if candidate_geometry.passed and candidate_geometry.reference_entry_required:
+      posted_at = _as_utc(raw_message.posted_at)   # 复用模块里已有的 UTC 归一化工具；没有就照邻近代码写一个局部的
+      age = (now - posted_at) if posted_at is not None else None
+      if entry_execution_type != "market" or age is None or age > PURE_MARKET_ENTRY_MAX_AGE:
+          return _record_entry_geometry_rejection(
+              session_factory,
+              raw_message=raw_message,
+              candidate=candidate,
+              geometry=stale_market_reference_result(candidate.entry_text),
+              processed_at=now,
+              message_instruction_item_id=message_instruction_item_id,
+              execution_contract_mode=execution_contract_mode,
+          )
+  ```
+
+  `age` 为负（时钟偏差）按 0 处理。`_record_entry_geometry_rejection` 自带持久告警与合约拒绝投影，不另起通道。
+- 1133–1150 行现有逻辑不改：候选校验通过后带 `resolved_entry_prices=entry_range` 重算，
+  现价已越过止损或止盈 ⇒ `invalid` ⇒ 拒单 + 告警。这是 2026-09-15 军长 17019 那种形状（多单止损 76000 高于现价 75740）的拦截点。
+- 仓位、腿的构造、`slTriggerPx`、市价腿 `clOrdId` 等一律不动。
+- `src/telegram_kol_research/system_operator_bot.py` 2244 行几何拒绝通知：当 `reason_code == MARKET_REFERENCE_STALE` 时，
+  在「原因」行后追加一行 `说明: 纯市价入场超过 3 分钟未执行，已放弃追价`。其余文案不改。
+
+### 9.4 明确不放宽的调用方
+
+`recovery_scan.py:239` 与 `trading_decision.py:78` **不传** `allow_reference_entry`（默认 False），行为不变：
+恢复路径按定义就是迟到执行，`trading_decision` 里没有时钟，两处都无法执行 3 分钟时效，所以纯市价入场继续在那里判
+`indeterminate`。下单前的三处 `validate_order_draft_price_geometry`（`deepcoin_execution_actions`、`recovery_live_submit`、
+`entry_revision_executor`）按订单草稿的腿价格校验，不受影响，仍是最后一道门。
+
+### 9.5 测试
+
+- `tests/test_entry_price_geometry.py`：
+  - `is_pure_market_entry_text` 的真假参数表（9.2 列出的全部样例）。
+  - 默认参数下纯市价仍 `indeterminate`（`市价进场` 现有回归用例保持不动）。
+  - `allow_reference_entry=True` 无参考价：long SL 76000 无 TP ⇒ valid 且 `reference_entry_required`；
+    long SL 76000 TP 75000 ⇒ invalid/TP side；SL 缺失 ⇒ indeterminate/required_value_missing(stop_loss)；
+    SL `5%` ⇒ indeterminate/ambiguous(stop_loss)；TP == SL ⇒ equal_boundary。
+  - `allow_reference_entry=True` 带参考价：long SL 76000 参考 76500 TP 78000 ⇒ valid、`normalized_entry_prices == ("76500","76500")` 或去重后的等价形式（以实现为准，写进状态文档）；
+    long SL 76000 参考 75740 ⇒ invalid/stop_side（17019 形状）；short 镜像各一条。
+  - `allow_reference_entry=True` 对非纯市价文本（`市价进场/2415`、`77300`、`现价/挂单67000`）结果与默认参数逐项相同。
+- `tests/test_auto_trade_execution.py`（复用上一轮加的几何集成骨架）：
+  - 纯市价 + 止损、消息 1 分钟前 ⇒ 不产生 `entry_price_geometry_rejected`，走到市价下单（按该文件现有市价用例的断言方式）。
+  - 同上但消息 4 分钟前 ⇒ 一条 `entry_price_geometry_rejected`，`reason == MARKET_REFERENCE_STALE`，无交易所写入。
+  - 同上 1 分钟前但现价低于多单止损 ⇒ `entry_price_geometry_stop_side_invalid`，无交易所写入。
+- `tests/test_recovery_scan.py` / `tests/test_trading_decision.py`：纯市价候选仍产生几何告警 / `manual_review`（钉住 9.4）。
+- `tests/test_system_operator_bot.py`：新原因码的通知含「说明」行；其他原因码文案逐字不变。
+
+### 9.6 提交与范围
+
+- 两个代码 commit：`fix(geometry): admit a price-less market entry that carries a stop loss`（9.2 + 其测试）、
+  `fix(entry): submit a fresh price-less market entry against the live price`（9.3 + 9.4/9.5 其余测试）；
+  状态文档 `docs/entry-admission-and-market-entry-geometry-status.md` 追加「D」一节，可并入第二个 commit 或单独 `docs(entry):`。
+- 最终候选跑一次全套 `PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=. uv run pytest -q`。
+- 不推送、不部署、不发 Telegram。验证等级 L2（改变交易所写入准入语义），部署与观察窗由指挥会话负责；回退点 `7a8e67c1`。
