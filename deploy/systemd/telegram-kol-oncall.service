@@ -1,0 +1,71 @@
+[Unit]
+Description=Telegram KOL on-call watcher (read-only detection and Chinese alerts)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/telegram-kol-oncall.env
+
+[Service]
+Type=notify
+NotifyAccess=main
+WatchdogSec=300
+Restart=always
+RestartSec=10
+# Dormancy is a clean exit, not a crash: with TELEGRAM_KOL_ONCALL_MODE=off the
+# process sends READY=1 and exits 0, and without this line Restart=always would
+# spin it back up every ten seconds forever. A crash, a kill or any non-zero
+# exit still restarts.
+RestartPreventExitStatus=0
+User=telegram-kol-oncall
+Group=telegram-kol-oncall
+SupplementaryGroups=systemd-journal
+UMask=0077
+StateDirectory=telegram-kol-oncall
+WorkingDirectory=/var/lib/telegram-kol-oncall
+EnvironmentFile=/etc/telegram-kol-oncall.env
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research oncall-watch --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-oncall/state.db --poll-seconds 60
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+InaccessiblePaths=-/run/dbus/system_bus_socket
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+
+# The release tree is invisible except for the four things the watcher needs:
+# the interpreter, the source, and the production database with its sidecars.
+# Everything is bound read-only, so the unit cannot write to production even
+# if a future change tried to.
+TemporaryFileSystem=/opt/telegram-kol-analyzer:ro
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/data/research.db
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-wal
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-shm
+BindReadOnlyPaths=-/opt/telegram-kol-analyzer/data/research.db-journal
+ReadWritePaths=/var/lib/telegram-kol-oncall
+
+# Network is needed for api.telegram.org and for the worker's loop-health
+# endpoint on 127.0.0.1:8002, so no IPAddressDeny here.
+
+[Install]
+WantedBy=multi-user.target

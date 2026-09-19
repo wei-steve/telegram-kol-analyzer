@@ -1,0 +1,640 @@
+"""Plain-Chinese on-call alerts: wording, throttling and delivery.
+
+Phase 1 of the Codex on-call remediation program
+(``docs/plans/2026-09-19-codex-oncall-phase1-spec.md``, section 5).
+
+Three things this module is careful about.
+
+**The reader is not an engineer.** Every line is written for somebody looking
+at a phone: what the message asked for, how long ago, what the system is stuck
+on, and whether the position is still open. Reason codes are translated; an
+untranslated one is shown verbatim and marked as such rather than silently
+dropped, because a missing translation must never turn into a missing fact.
+
+**The KOL message is untrusted external text.** It is truncated, stripped of
+newlines and quoted -- and sent with no ``parse_mode``, so nothing inside it
+can be interpreted as formatting, a link, or anything else.
+
+**The bot token never leaves memory.** It is not logged, not stored, and a
+delivery failure records only the exception's *class name*: urllib puts the
+full request URL -- token included -- into the text of an ``HTTPError``.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import urllib.error
+import urllib.request
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+from typing import Any, Callable, Sequence
+from zoneinfo import ZoneInfo
+
+from telegram_kol_research.oncall_state import (
+    CaseRecord,
+    OncallStateStore,
+    isoformat,
+    parse_isoformat,
+)
+
+
+logger = logging.getLogger(__name__)
+
+BEIJING = ZoneInfo("Asia/Shanghai")
+
+#: How much of an untrusted message body ever reaches the alert.
+MESSAGE_EXCERPT_LIMIT = 80
+
+ALERT_KIND_CASE_OPEN = "case_open"
+ALERT_KIND_CASE_RESOLVED = "case_resolved"
+ALERT_KIND_HEALTH_OPEN = "health_open"
+ALERT_KIND_HEALTH_RESOLVED = "health_resolved"
+ALERT_KIND_GROUP_MERGED = "group_merged"
+ALERT_KIND_CAP_REACHED = "cap_reached"
+ALERT_KIND_DAILY_SUMMARY = "daily_summary"
+
+#: Alerts that count against the daily cap.
+CAPPED_ALERT_KINDS = (
+    ALERT_KIND_CASE_OPEN,
+    ALERT_KIND_CASE_RESOLVED,
+    ALERT_KIND_HEALTH_OPEN,
+    ALERT_KIND_HEALTH_RESOLVED,
+    ALERT_KIND_GROUP_MERGED,
+)
+
+GROUP_MERGE_WINDOW = timedelta(minutes=10)
+GROUP_MERGE_THRESHOLD = 3
+HEALTH_ALERT_COOLDOWN = timedelta(minutes=15)
+
+ACTION_LABELS = {
+    "full_exit": "全部平仓 / 离场",
+    "partial_take_profit": "部分止盈",
+    "partial_then_break_even": "部分止盈后保本",
+    "move_stop_to_break_even": "止损移到保本",
+    "adjust_stop_loss": "调整止损",
+    "adjust_take_profit": "调整止盈",
+    "replace_entry": "改挂入场单",
+    "cancel_pending_entry": "撤掉挂单",
+}
+
+SIDE_LABELS = {"long": "多", "short": "空", "buy": "多", "sell": "空"}
+
+#: Reason code -> plain Chinese. Covers every code the phase 0 production
+#: study (design 7.1) turned up, plus the translations that already existed in
+#: ``web_queries._execution_reason_label``.
+REASON_LABELS = {
+    # --- what phase 0 actually found in production ---
+    "prior_partial_batch_unresolved": "上一笔部分平仓还没结清",
+    "confirmation_timeout": "等你确认目标仓位，超时了",
+    "protection_missing_cancellable_order_id": "找不到可撤销的保护单编号",
+    "protection_price_or_size_mismatch": "保护单的价格或数量对不上",
+    "management_stop_action_conflict": "同一仓位有两个互相冲突的止损动作",
+    "target_strategy_binding_visibility_retry_expired": "一直没找到对应的持仓记录，重试超时",
+    "close_final_preflight_failed": "最终仓位或合约规格校验失败",
+    "protection_recovery_bypassed_for_full_exit": "全平时跳过了保护单恢复",
+    "revision_replacement_incomplete": "旧单撤销 / 新单挂出没做完",
+    "recovery_timeout": "异常恢复超时，没有重跑",
+    "target_not_verifiable": "目标仓位无法验证，已转人工确认",
+    "target_ambiguous": "有多个可能的目标仓位，分不清是哪一个",
+    "no_verifiable_target": "找不到可核实的目标仓位",
+    "snapshot_stale": "交易所仓位快照过期，不敢下判断",
+    "lifecycle_apply_failed": "目标已验证但生命周期事件未落地",
+    "contract_invalid": "指令契约校验未通过",
+    "management_fraction_invalid": "减仓比例无法读取，已拒绝",
+    "symbol_price_scale_conflict": "标的与价格区间矛盾，已转人工复核",
+    "media_unreadable": "图片无法读取（未下载或 OCR 无内容）",
+    "no_target_named": "消息没有说清楚是哪一个仓位",
+    "no_actionable_intent": "消息未要求任何动作",
+    "mimo_authoritative_not_safely_applied": "识别结果未能安全落地",
+    "management_close_result_requires_recovery": "平仓结果需要人工复核",
+    "management_execution_disabled": "自动持仓管理未启用",
+    "management_disabled_plan_only": "只做了计划，没有执行（管理开关未打开）",
+    "unknown_exchange_outcome": "交易所返回结果不明",
+    "unknown": "原因不明",
+    # --- the watcher's own codes ---
+    "instruction_stuck_pending": "指令一直排队，没有开始执行",
+    "instruction_stuck_executing": "指令开始执行后没有下文",
+    "instruction_stuck_submitted": "已提交给交易所，但一直没有确认",
+    "batch_blocked": "执行批次被拦下",
+    "batch_partial_failed": "执行批次只做成了一部分",
+    "batch_recovery_required": "执行批次需要人工恢复",
+    "batch_submit_unknown": "已提交但结果不明",
+}
+
+#: Families whose codes carry a variable suffix.
+REASON_PREFIX_LABELS = (
+    ("stale_pending_voided", "系统停摆期间这条指令被作废"),
+    ("protection_authority_frozen", "保护单权限被冻结"),
+    ("protection_order_unattributable", "保护单归属不明"),
+    ("exact_position_write_gate", "仓位写入闸门拒绝了这次操作"),
+    ("ownership_not_verified", "仓位归属没有验证通过"),
+)
+
+
+class AlertDeliveryError(RuntimeError):
+    """Delivery failed. Carries the exception *type name* and nothing else."""
+
+    def __init__(self, error_type: str):
+        self.error_type = str(error_type)[:64]
+        super().__init__(self.error_type)
+
+
+def reason_label(reason_code: str | None) -> str:
+    """Chinese for a reason code; unknown codes are shown and flagged."""
+
+    code = str(reason_code or "").strip()
+    if not code:
+        return "原因未记录"
+    if code in REASON_LABELS:
+        return REASON_LABELS[code]
+    for prefix, label in REASON_PREFIX_LABELS:
+        if code.startswith(prefix) or prefix in code:
+            return label
+    return f"{code}（未收录原因）"
+
+
+def action_label(action: str | None) -> str:
+    code = str(action or "").strip()
+    return ACTION_LABELS.get(code, code or "未知动作")
+
+
+def side_label(side: str | None) -> str:
+    return SIDE_LABELS.get(str(side or "").strip().lower(), "")
+
+
+def message_excerpt(text: str | None, limit: int = MESSAGE_EXCERPT_LIMIT) -> str:
+    """Untrusted text, made safe to read: one line, bounded, never executed."""
+
+    collapsed = " ".join(str(text or "").split())
+    if len(collapsed) <= limit:
+        return collapsed
+    return collapsed[:limit] + "…"
+
+
+def beijing_time(moment: datetime | None) -> str:
+    if moment is None:
+        return "时间不详"
+    return moment.astimezone(BEIJING).strftime("%H:%M")
+
+
+def beijing_date(moment: datetime) -> str:
+    return moment.astimezone(BEIJING).strftime("%Y-%m-%d")
+
+
+def format_case_alert(case: CaseRecord) -> str:
+    """The opening alert for one "asked for but not done" case (spec 5.2)."""
+
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    symbol = str(evidence.get("symbol") or "").upper()
+    side = side_label(evidence.get("side"))
+    instrument = " ".join(part for part in (symbol, side) if part)
+    stop_text = str(evidence.get("stop_loss_text") or "").strip()
+    minutes = evidence.get("minutes_since_message")
+    posted_at = parse_isoformat(evidence.get("posted_at"))
+    excerpt = message_excerpt(evidence.get("message_text"))
+
+    request_line = f"消息要求：{action_label(evidence.get('action'))}"
+    if instrument:
+        request_line += f"（{instrument}）"
+    if stop_text:
+        request_line += f" 止损→{stop_text}"
+
+    if minutes is None:
+        status_line = "现状：交易所没有对应操作。"
+    else:
+        status_line = f"现状：已过 {int(minutes)} 分钟，交易所没有对应操作。"
+
+    position_line = "仓位：仍在持仓中"
+    if case.target_uncertain:
+        open_positions = evidence.get("group_open_positions") or []
+        listed = " / ".join(str(item) for item in open_positions[:4])
+        position_line += "；目标仓位未确定"
+        if listed:
+            position_line += f"，群内在仓：{listed}"
+    if evidence.get("position_state") == "open_snapshot_stale":
+        position_line += "（仓位快照未及时更新，按仍在持仓处理）"
+
+    message_number = case.raw_message_id if case.raw_message_id is not None else "?"
+    return "\n".join(
+        [
+            f"⚠️ 值守提醒 #{case.id}",
+            f"群：{group}    消息 #{message_number}（{beijing_time(posted_at)}）",
+            request_line,
+            f"原文：「{excerpt}」",
+            status_line,
+            f"卡在：{reason_label(case.reason_code)}（{case.reason_code or '未记录'}）",
+            position_line,
+        ]
+    )
+
+
+def format_case_resolved_alert(case: CaseRecord) -> str:
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    return "\n".join(
+        [
+            f"✅ 值守提醒 #{case.id} 已自行恢复",
+            f"群：{group}    消息 #{case.raw_message_id}",
+            f"{action_label(evidence.get('action'))} 后来执行成功了，不用处理。",
+        ]
+    )
+
+
+def format_health_alert(case: CaseRecord) -> str:
+    evidence = case.evidence or {}
+    rule = case.rule
+    if rule.startswith("D4"):
+        body = (
+            f"消息处理停摆：有 {evidence.get('stalled_jobs', '?')} 条消息排队超过 "
+            f"{evidence.get('minutes', '?')} 分钟还没被处理。\n"
+            f"最早一条是消息 #{evidence.get('oldest_raw_message_id', '?')}。\n"
+            "新消息现在很可能不会被识别，也不会下单。"
+        )
+    elif rule.startswith("D5a"):
+        body = (
+            f"值守读不到生产数据库，已经连续 {evidence.get('consecutive_failures', '?')} 轮失败。\n"
+            "现在无法判断系统是否正常——这不等于系统没问题。"
+        )
+    elif rule.startswith("D5b"):
+        body = (
+            f"worker 的健康检查连续 {evidence.get('consecutive_failures', '?')} 轮没有响应，"
+            "可能已经卡住。"
+        )
+    else:  # pragma: no cover - defensive
+        body = "值守发现一个健康问题。"
+    return f"⚠️ 值守提醒 #{case.id}（系统健康）\n{body}"
+
+
+def format_health_resolved_alert(case: CaseRecord) -> str:
+    rule = case.rule
+    what = {
+        "D4": "消息处理已经恢复，排队的消息都处理掉了。",
+        "D5a": "值守又能读到生产数据库了。",
+        "D5b": "worker 的健康检查恢复响应了。",
+    }
+    body = next(
+        (text for prefix, text in what.items() if rule.startswith(prefix)),
+        "刚才报的健康问题已经消失。",
+    )
+    return f"✅ 值守提醒 #{case.id} 已恢复\n{body}"
+
+
+def format_group_merged_alert(group_name: str, case_ids: Sequence[int]) -> str:
+    numbers = " ".join(f"#{case_id}" for case_id in case_ids)
+    return f"⚠️ {group_name} 另有 {len(case_ids)} 条类似情况（案件号 {numbers}）。"
+
+
+def format_cap_reached_alert(cap: int, suppressed: int) -> str:
+    return (
+        f"⚠️ 今日告警已达上限（{cap} 条），其余 {suppressed} 条只记在值守状态库里，"
+        "明天 0 点后恢复发送。"
+    )
+
+
+def format_daily_summary(
+    *,
+    opened: int,
+    resolved: int,
+    skipped_no_position: int,
+    read_failed_rounds: int,
+) -> str:
+    return "\n".join(
+        [
+            "🟢 值守正常",
+            f"过去 24 小时：新建案件 {opened} 条，已恢复 {resolved} 条，"
+            f"因为没有真实仓位而忽略 {skipped_no_position} 条，读库失败 {read_failed_rounds} 轮。",
+            "（这条每天发一次。哪天没收到，就说明值守本身可能停了。）",
+        ]
+    )
+
+
+# --------------------------------------------------------------------------
+# Delivery
+# --------------------------------------------------------------------------
+
+
+class TelegramAlertSender:
+    """Synchronous Telegram Bot API sender. No dependency, no token leak."""
+
+    def __init__(self, *, bot_token: str, chat_id: str, timeout: float = 10.0):
+        self._bot_token = str(bot_token)
+        self._chat_id = str(chat_id)
+        self._timeout = float(timeout)
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial, but a token guard
+        return f"TelegramAlertSender(chat_id={self._chat_id!r})"
+
+    def send(self, text: str) -> None:
+        payload = json.dumps(
+            {
+                "chat_id": self._chat_id,
+                "text": str(text),
+                "disable_web_page_preview": True,
+            }
+        ).encode("utf-8")
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{self._bot_token}/sendMessage",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self._timeout) as response:
+                if int(response.status) >= 300:
+                    raise AlertDeliveryError(f"HTTP{int(response.status)}")
+        except AlertDeliveryError:
+            raise
+        except urllib.error.HTTPError as exc:
+            # ``str(exc)`` would carry the request URL, and the URL carries the
+            # bot token. Only the status ever escapes.
+            raise AlertDeliveryError(f"HTTP{int(exc.code)}") from None
+        except Exception as exc:  # noqa: BLE001 - any failure is a retry
+            raise AlertDeliveryError(type(exc).__name__) from None
+
+
+def deliver_pending_alerts(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    sender: Callable[[str], None] | None,
+    max_attempts: int = 5,
+) -> tuple[int, int]:
+    """Send what is queued. Returns ``(sent, failed)``; never raises.
+
+    ``sender`` of ``None`` is dry-run: the alert stays in the state database
+    and the log, and nothing is sent.
+    """
+
+    sent = 0
+    failed = 0
+    for alert in store.pending_alerts(max_attempts=max_attempts):
+        if sender is None:
+            store.mark_alert_dry_run(alert.id, now)
+            logger.info("oncall dry-run alert id=%s kind=%s", alert.id, alert.kind)
+            continue
+        try:
+            sender(alert.body)
+        except AlertDeliveryError as exc:
+            failed += 1
+            store.mark_alert_failed(
+                alert.id, error_type=exc.error_type, max_attempts=max_attempts
+            )
+            logger.warning(
+                "oncall alert delivery failed id=%s error_type=%s",
+                alert.id,
+                exc.error_type,
+            )
+            continue
+        except Exception as exc:  # noqa: BLE001 - delivery never breaks the loop
+            failed += 1
+            store.mark_alert_failed(
+                alert.id,
+                error_type=type(exc).__name__,
+                max_attempts=max_attempts,
+            )
+            logger.warning(
+                "oncall alert delivery failed id=%s error_type=%s",
+                alert.id,
+                type(exc).__name__,
+            )
+            continue
+        sent += 1
+        store.mark_alert_sent(alert.id, now)
+    return sent, failed
+
+
+# --------------------------------------------------------------------------
+# Throttling policy
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class AlertPolicy:
+    daily_cap: int = 30
+    group_merge_window: timedelta = GROUP_MERGE_WINDOW
+    group_merge_threshold: int = GROUP_MERGE_THRESHOLD
+    health_cooldown: timedelta = HEALTH_ALERT_COOLDOWN
+
+
+def _daily_counter_key(now: datetime) -> str:
+    return f"daily_alerts:{beijing_date(now)}"
+
+
+def _daily_suppressed_key(now: datetime) -> str:
+    return f"daily_suppressed:{beijing_date(now)}"
+
+
+def _cap_reached(store: OncallStateStore, now: datetime, policy: AlertPolicy) -> bool:
+    return store.get_int_meta(_daily_counter_key(now), 0) >= policy.daily_cap
+
+
+def _note_capped_alert(store: OncallStateStore, now: datetime) -> None:
+    store.bump_counter(_daily_counter_key(now))
+
+
+def _suppress_for_cap(store: OncallStateStore, now: datetime, policy: AlertPolicy) -> None:
+    suppressed = store.bump_counter(_daily_suppressed_key(now))
+    body = format_cap_reached_alert(policy.daily_cap, suppressed)
+    dedupe_key = f"cap:{beijing_date(now)}"
+    if store.enqueue_alert(
+        kind=ALERT_KIND_CAP_REACHED,
+        body=body,
+        now=now,
+        dedupe_key=dedupe_key,
+    ) is None:
+        # One notice a day, but its count must be right when it is sent.
+        store.update_pending_alert_body(dedupe_key, body)
+
+
+def compose_case_alerts(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    new_case_ids: Sequence[int],
+    resolved_case_ids: Sequence[int],
+    policy: AlertPolicy | None = None,
+) -> int:
+    """Turn this round's case changes into queued alerts. Returns how many."""
+
+    settings = policy or AlertPolicy()
+    queued = 0
+    merged: dict[str, list[int]] = {}
+
+    for case_id in new_case_ids:
+        case = store.get_case(case_id)
+        if case is None:
+            continue
+        is_health = case.case_key.startswith("health:")
+        if is_health and _health_in_cooldown(store, case, now, settings):
+            continue
+        if _cap_reached(store, now, settings):
+            _suppress_for_cap(store, now, settings)
+            continue
+        if not is_health and _should_merge_into_group_notice(
+            store, case, now, settings
+        ):
+            group = str((case.evidence or {}).get("group_name") or case.chat_id or "未知群")
+            merged.setdefault(group, []).append(case.id)
+            store.mark_case_alerted(case.id, now)
+            continue
+        body = format_health_alert(case) if is_health else format_case_alert(case)
+        kind = ALERT_KIND_HEALTH_OPEN if is_health else ALERT_KIND_CASE_OPEN
+        if store.enqueue_alert(
+            kind=kind,
+            body=body,
+            now=now,
+            case_id=case.id,
+            dedupe_key=_episode_key(kind, case),
+        ) is not None:
+            queued += 1
+            _note_capped_alert(store, now)
+            if is_health:
+                store.set_meta(f"health_alerted:{case.rule}", isoformat(now))
+        store.mark_case_alerted(case.id, now)
+
+    for group, case_ids in merged.items():
+        if store.enqueue_alert(
+            kind=ALERT_KIND_GROUP_MERGED,
+            body=format_group_merged_alert(group, case_ids),
+            now=now,
+            dedupe_key=f"merged:{group}:{min(case_ids)}",
+        ) is not None:
+            queued += 1
+            _note_capped_alert(store, now)
+
+    for case_id in resolved_case_ids:
+        case = store.get_case(case_id)
+        if case is None or case.alerted_at is None:
+            # Never announce the recovery of a problem nobody was told about.
+            continue
+        is_health = case.case_key.startswith("health:")
+        if _cap_reached(store, now, settings):
+            _suppress_for_cap(store, now, settings)
+            continue
+        kind = ALERT_KIND_HEALTH_RESOLVED if is_health else ALERT_KIND_CASE_RESOLVED
+        body = (
+            format_health_resolved_alert(case)
+            if is_health
+            else format_case_resolved_alert(case)
+        )
+        if store.enqueue_alert(
+            kind=kind,
+            body=body,
+            now=now,
+            case_id=case.id,
+            dedupe_key=_episode_key(kind, case),
+        ) is not None:
+            queued += 1
+            _note_capped_alert(store, now)
+    return queued
+
+
+def _episode_key(kind: str, case: CaseRecord) -> str:
+    """One alert per case *episode*.
+
+    A health case is re-opened when its condition returns, and each episode
+    deserves its own notice; an instruction case never re-opens, so its key is
+    constant and the unique index does the de-duplication across restarts.
+    """
+
+    started = isoformat(case.first_seen_at) if case.first_seen_at else "?"
+    return f"{kind}:{case.id}:{started}"
+
+
+def _health_in_cooldown(
+    store: OncallStateStore, case: CaseRecord, now: datetime, policy: AlertPolicy
+) -> bool:
+    """Cooldown is per *rule*: D4 coming and going must not page repeatedly."""
+
+    last = parse_isoformat(store.get_meta(f"health_alerted:{case.rule}"))
+    if last is None:
+        return False
+    return (now - last) < policy.health_cooldown
+
+
+def _should_merge_into_group_notice(
+    store: OncallStateStore, case: CaseRecord, now: datetime, policy: AlertPolicy
+) -> bool:
+    if case.chat_id is None:
+        return False
+    already = store.count_cases_alerted_since(
+        chat_id=case.chat_id, since=now - policy.group_merge_window
+    )
+    return already >= policy.group_merge_threshold
+
+
+META_DAILY_SUMMARY_DATE = "daily_summary_date"
+META_DAILY_SUMMARY_AT = "daily_summary_at"
+_SUMMARY_SNAPSHOT = "daily_summary_snapshot"
+
+
+def maybe_compose_daily_summary(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    counters: dict[str, int],
+    hour: int = 9,
+) -> bool:
+    """One "the watch is fine" message a day, after 09:00 Beijing.
+
+    Silence is the failure signal the user is asked to watch for, so this is
+    the one alert that is not subject to the daily cap.
+    """
+
+    local = now.astimezone(BEIJING)
+    today = beijing_date(now)
+    if local.hour < hour:
+        return False
+    if store.get_meta(META_DAILY_SUMMARY_DATE) == today:
+        return False
+    previous_at = parse_isoformat(store.get_meta(META_DAILY_SUMMARY_AT)) or (
+        now - timedelta(hours=24)
+    )
+    snapshot = _summary_snapshot(store)
+    body = format_daily_summary(
+        opened=store.count_cases_since(since=previous_at),
+        resolved=store.count_cases_since(since=previous_at, status="resolved"),
+        skipped_no_position=max(
+            0, int(counters.get("skipped_no_position", 0)) - snapshot.get("skipped_no_position", 0)
+        ),
+        read_failed_rounds=max(
+            0, int(counters.get("read_failed_rounds", 0)) - snapshot.get("read_failed_rounds", 0)
+        ),
+    )
+    store.enqueue_alert(
+        kind=ALERT_KIND_DAILY_SUMMARY,
+        body=body,
+        now=now,
+        dedupe_key=f"daily:{today}",
+    )
+    store.set_meta(META_DAILY_SUMMARY_DATE, today)
+    store.set_meta(META_DAILY_SUMMARY_AT, isoformat(now))
+    store.set_meta(
+        _SUMMARY_SNAPSHOT,
+        json.dumps({key: int(value) for key, value in counters.items()}),
+    )
+    return True
+
+
+def _summary_snapshot(store: OncallStateStore) -> dict[str, int]:
+    try:
+        parsed = json.loads(store.get_meta(_SUMMARY_SNAPSHOT) or "{}")
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(parsed, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, value in parsed.items():
+        try:
+            result[str(key)] = int(value)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def redact_for_log(value: Any) -> str:  # pragma: no cover - used by callers
+    """Never let a configuration value reach a log line by accident."""
+
+    return "<redacted>" if value else "<empty>"

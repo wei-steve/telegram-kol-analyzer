@@ -218,6 +218,7 @@ from telegram_kol_research.models import (
     SignalCandidate,
 )
 from telegram_kol_research.models import SyncCheckpoint
+from telegram_kol_research.oncall_service import run_oncall_watch
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.semantic_review_control import (
     SemanticReviewControlError,
@@ -6933,6 +6934,47 @@ def web_login_password_hash() -> None:
         raise typer.Exit(code=1)
 
     typer.echo(build_web_login_password_hash(password))
+
+
+@app.command("oncall-watch")
+def oncall_watch(
+    database_path: Path = typer.Option(
+        Path("data/research.db"),
+        "--database-path",
+        help="Production database, opened read-only.",
+    ),
+    state_path: Path = typer.Option(
+        Path("/var/lib/telegram-kol-oncall/state.db"),
+        "--state-path",
+        help="The watcher's own SQLite state database (cases, alerts).",
+    ),
+    poll_seconds: int = typer.Option(60, "--poll-seconds", min=1, max=3600),
+    once: bool = typer.Option(False, "--once", help="Run one round and exit."),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Detect and record alerts without sending any Telegram message.",
+    ),
+) -> None:
+    """Run the dormant-by-default on-call watcher.
+
+    It reads the production database read-only, opens cases for management
+    instructions that asked for something the exchange never saw, and sends
+    its own Chinese Telegram alerts. It never writes to the production
+    database, never talks to an exchange, and never commands the worker.
+
+    ``TELEGRAM_KOL_ONCALL_MODE`` decides everything: absent or ``off`` and the
+    process exits immediately.
+    """
+
+    summary = run_oncall_watch(
+        database_path=database_path,
+        state_path=state_path,
+        poll_seconds=poll_seconds,
+        once=once,
+        dry_run=dry_run,
+    )
+    typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 
 def main() -> None:
