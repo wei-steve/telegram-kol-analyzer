@@ -57,10 +57,21 @@ VALID_MODES = (MODE_OFF, MODE_DRY_RUN, MODE_NOTIFY)
 ENV_MODE = "TELEGRAM_KOL_ONCALL_MODE"
 ENV_BOT_TOKEN = "TELEGRAM_KOL_ONCALL_BOT_TOKEN"
 ENV_CHAT_ID = "TELEGRAM_KOL_ONCALL_CHAT_ID"
+#: The existing system operator bot (``config/system_operator_bot.env``, a file
+#: that holds exactly these two keys). The unit loads that file directly, so
+#: nobody has to copy a token; the watcher still sends on its own, from its own
+#: process, which is the independence that matters.
+ENV_SYSTEM_BOT_TOKEN = "TELEGRAM_KOL_SYSTEM_BOT_TOKEN"
+ENV_SYSTEM_BOT_CHAT_ID = "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID"
+EXIT_CONFIG = 78  # EX_CONFIG; the unit lists it in RestartPreventExitStatus
 ENV_WORKER_HEALTH_URL = "TELEGRAM_KOL_ONCALL_WORKER_HEALTH_URL"
 ENV_DAILY_CAP = "TELEGRAM_KOL_ONCALL_DAILY_ALERT_CAP"
 
 WORKER_HEALTH_TIMEOUT_SECONDS = 2.0
+
+
+class OncallConfigError(RuntimeError):
+    """The watcher was told to notify but has nothing to notify with."""
 HEARTBEAT_FILENAME = "heartbeat.json"
 
 
@@ -91,8 +102,14 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
         cap = 30
     return OncallConfig(
         mode=mode,
-        bot_token=str(source.get(ENV_BOT_TOKEN, "") or "").strip(),
-        chat_id=str(source.get(ENV_CHAT_ID, "") or "").strip(),
+        bot_token=(
+            str(source.get(ENV_BOT_TOKEN, "") or "").strip()
+            or str(source.get(ENV_SYSTEM_BOT_TOKEN, "") or "").strip()
+        ),
+        chat_id=(
+            str(source.get(ENV_CHAT_ID, "") or "").strip()
+            or str(source.get(ENV_SYSTEM_BOT_CHAT_ID, "") or "").strip()
+        ),
         worker_health_url=str(source.get(ENV_WORKER_HEALTH_URL, "") or "").strip(),
         daily_alert_cap=max(1, cap),
     )
@@ -220,6 +237,12 @@ def run_oncall_watch(
         return {"mode": MODE_OFF, "rounds": 0, "stopped": "mode_off"}
 
     detector = detector_config or DetectorConfig()
+    if settings.mode == MODE_NOTIFY and sender is None and not settings.can_send:
+        # A watcher that detects and then cannot speak is the exact failure it
+        # exists to prevent; refuse to run rather than run silently.
+        raise OncallConfigError(
+            "oncall mode is notify but no bot token / chat id is configured"
+        )
     if sender is None and settings.can_send:
         sender = TelegramAlertSender(
             bot_token=settings.bot_token, chat_id=settings.chat_id

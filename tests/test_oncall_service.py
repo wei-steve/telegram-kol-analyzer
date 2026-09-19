@@ -309,3 +309,45 @@ def test_the_cli_runs_one_dry_run_round(production, tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["rounds"] == 1
     assert (tmp_path / "state.db").exists()
+
+
+def test_the_existing_system_bot_is_used_when_no_oncall_bot_is_configured():
+    from telegram_kol_research.oncall_service import load_oncall_config
+
+    config = load_oncall_config(
+        {
+            "TELEGRAM_KOL_ONCALL_MODE": "notify",
+            "TELEGRAM_KOL_SYSTEM_BOT_TOKEN": "system-token",
+            "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID": "42",
+        }
+    )
+    assert (config.bot_token, config.chat_id, config.can_send) == ("system-token", "42", True)
+
+    explicit = load_oncall_config(
+        {
+            "TELEGRAM_KOL_ONCALL_MODE": "notify",
+            "TELEGRAM_KOL_ONCALL_BOT_TOKEN": "oncall-token",
+            "TELEGRAM_KOL_ONCALL_CHAT_ID": "7",
+            "TELEGRAM_KOL_SYSTEM_BOT_TOKEN": "system-token",
+            "TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID": "42",
+        }
+    )
+    assert (explicit.bot_token, explicit.chat_id) == ("oncall-token", "7")
+
+
+def test_notify_mode_without_any_bot_refuses_to_run_silently(tmp_path):
+    import pytest
+
+    from telegram_kol_research.oncall_service import (
+        OncallConfig,
+        OncallConfigError,
+        run_oncall_watch,
+    )
+
+    with pytest.raises(OncallConfigError):
+        run_oncall_watch(
+            database_path=tmp_path / "missing.db",
+            state_path=tmp_path / "state.db",
+            once=True,
+            config=OncallConfig(mode="notify"),
+        )

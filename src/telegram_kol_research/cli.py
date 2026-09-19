@@ -218,7 +218,11 @@ from telegram_kol_research.models import (
     SignalCandidate,
 )
 from telegram_kol_research.models import SyncCheckpoint
-from telegram_kol_research.oncall_service import run_oncall_watch
+from telegram_kol_research.oncall_service import (
+    EXIT_CONFIG,
+    OncallConfigError,
+    run_oncall_watch,
+)
 from telegram_kol_research.recognition_decisions import update_recognition_execution_outcome
 from telegram_kol_research.semantic_review_control import (
     SemanticReviewControlError,
@@ -6967,13 +6971,17 @@ def oncall_watch(
     process exits immediately.
     """
 
-    summary = run_oncall_watch(
-        database_path=database_path,
-        state_path=state_path,
-        poll_seconds=poll_seconds,
-        once=once,
-        dry_run=dry_run,
-    )
+    try:
+        summary = run_oncall_watch(
+            database_path=database_path,
+            state_path=state_path,
+            poll_seconds=poll_seconds,
+            once=once,
+            dry_run=dry_run,
+        )
+    except OncallConfigError as exc:
+        typer.echo(str(exc), err=True)
+        raise typer.Exit(code=EXIT_CONFIG) from None
     typer.echo(json.dumps(summary, ensure_ascii=False, sort_keys=True))
 
 

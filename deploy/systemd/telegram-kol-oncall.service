@@ -13,8 +13,10 @@ RestartSec=10
 # Dormancy is a clean exit, not a crash: with TELEGRAM_KOL_ONCALL_MODE=off the
 # process sends READY=1 and exits 0, and without this line Restart=always would
 # spin it back up every ten seconds forever. A crash, a kill or any non-zero
-# exit still restarts.
-RestartPreventExitStatus=0
+# exit still restarts. 78 (EX_CONFIG) is "told to notify with no bot to notify
+# through": restarting cannot fix a missing setting, so it stays failed and
+# visible instead of looping.
+RestartPreventExitStatus=0 78
 User=telegram-kol-oncall
 Group=telegram-kol-oncall
 SupplementaryGroups=systemd-journal
@@ -22,6 +24,12 @@ UMask=0077
 StateDirectory=telegram-kol-oncall
 WorkingDirectory=/var/lib/telegram-kol-oncall
 EnvironmentFile=/etc/telegram-kol-oncall.env
+# The existing system operator bot: a root-owned file holding exactly the bot
+# token and the chat id. systemd reads it as root before dropping to the
+# watcher's user, so the token is never copied and the watcher's user never
+# needs to read the file. TELEGRAM_KOL_ONCALL_BOT_TOKEN / _CHAT_ID in the file
+# above still win when set.
+EnvironmentFile=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research oncall-watch --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-oncall/state.db --poll-seconds 60
 
 AmbientCapabilities=
