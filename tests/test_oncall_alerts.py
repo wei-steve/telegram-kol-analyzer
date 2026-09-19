@@ -138,7 +138,7 @@ def test_an_uncertain_target_names_the_groups_open_positions(store):
     text = format_case_alert(case)
 
     assert "目标仓位未确定" in text
-    assert "群内在仓：BTC long / ETH short" in text
+    assert "群内在仓：BTC 多 / ETH 空" in text
 
 
 def test_the_excerpt_helper_collapses_every_kind_of_whitespace():
@@ -402,3 +402,22 @@ def test_the_sender_turns_an_http_error_into_a_status_only_failure():
     assert caught.value.error_type == "HTTP401"
     assert "secret-token" not in str(caught.value)
     assert "secret-token" not in repr(sender)
+
+
+def test_case_alert_shows_stop_price_only_for_a_stop_instruction() -> None:
+    """A full exit carrying the strategy's old stop must not read as "move the stop"."""
+
+    from telegram_kol_research.oncall_alerts import _position_label
+
+    assert _position_label("ETH short") == "ETH 空"
+    assert _position_label("BTC long") == "BTC 多"
+    assert _position_label("odd") == "odd"
+
+
+def test_a_full_exit_alert_does_not_print_the_strategys_old_stop(store):
+    case = open_case(store, key="mgmt:2:full_exit", action="full_exit")
+
+    text = format_case_alert(case)
+
+    assert "消息要求：全部平仓 / 离场（ETH 空）" in text
+    assert "止损→" not in text

@@ -163,6 +163,19 @@ def side_label(side: str | None) -> str:
     return SIDE_LABELS.get(str(side or "").strip().lower(), "")
 
 
+STOP_PRICE_ACTIONS = frozenset({"adjust_stop_loss"})
+
+
+def _position_label(summary: Any) -> str:
+    """``"ETH short"`` as the detector records it -> ``"ETH 空"`` for the reader."""
+
+    symbol, _, side = str(summary or "").strip().rpartition(" ")
+    translated = side_label(side)
+    if not symbol or not translated:
+        return str(summary or "").strip()
+    return f"{symbol.upper()} {translated}"
+
+
 def message_excerpt(text: str | None, limit: int = MESSAGE_EXCERPT_LIMIT) -> str:
     """Untrusted text, made safe to read: one line, bounded, never executed."""
 
@@ -198,7 +211,9 @@ def format_case_alert(case: CaseRecord) -> str:
     request_line = f"消息要求：{action_label(evidence.get('action'))}"
     if instrument:
         request_line += f"（{instrument}）"
-    if stop_text:
+    # A full exit or a partial take-profit may still carry the strategy's old
+    # stop on its candidate; only a stop instruction is *about* that price.
+    if stop_text and str(evidence.get("action") or "") in STOP_PRICE_ACTIONS:
         request_line += f" 止损→{stop_text}"
 
     if minutes is None:
@@ -209,7 +224,7 @@ def format_case_alert(case: CaseRecord) -> str:
     position_line = "仓位：仍在持仓中"
     if case.target_uncertain:
         open_positions = evidence.get("group_open_positions") or []
-        listed = " / ".join(str(item) for item in open_positions[:4])
+        listed = " / ".join(_position_label(item) for item in open_positions[:4])
         position_line += "；目标仓位未确定"
         if listed:
             position_line += f"，群内在仓：{listed}"
