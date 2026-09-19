@@ -118,8 +118,11 @@ Deepcoin 密钥只在 `/etc/telegram-kol-worker.env`，只有 `telegram-kol-work
 - 消息原文在 `case.json` 里标注为**不可信外部文本**；只读沙箱里命令无网络、不能写文件；
   Codex 唯一的产出是 schema 约束的 JSON，而这份 JSON 还要过④的闸门。注入的最坏结果被限制在闸门白名单之内。
 - **Codex 可用性判断（用户 2026-09-19 要求）**，三层，任何一层失败都绝不静默：
-  1. **启动自检 + 每 6 小时例行自检**：`codex login status`（不耗额度）+ 一次最小 `codex exec`（"Reply with exactly: OK"，
-     证明凭据真的能换到回答，而不只是文件存在）。失败 → 告警"Codex 不可用：<类别>"，值守进程继续跑检测和即时告警。
+  1. **例行自检（用户 2026-09-19 关心 token 消耗后收紧）**：每 6 小时只跑 `codex login status`（本地检查，**不耗 token**）；
+     真正的最小 `codex exec`（"Reply with exactly: OK"，证明凭据真的能换到回答，而不只是文件存在）**每天只 1 次**，
+     与 09:00 报平安合并。失败 → 告警"Codex 不可用：<类别>"，值守进程继续跑检测和即时告警。
+     **token 只花在真实案件上**：每 60 秒的检测是纯 Python + SQLite，不调用任何模型；Codex 仅在建案时按需调用
+     （阶段 0 数据：约每两天 1 条 + 偶发停摆），另有每日 20 次硬上限。
   2. **每次调用的失败分类**：复用 `scripts/codex_exec_smoke_test.py` 的 `classify_failure`——
      `登录凭据失效`（not logged in / 401 / token expired / refresh failed）、`额度用尽或限流`（usage limit / 429）、
      `网络不通`、`超时`、`输出不满足裁决契约`、`其他`。案件标 `codex_unavailable:<类别>`，告警里写明类别和"需人工"。
