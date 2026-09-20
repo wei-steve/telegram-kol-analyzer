@@ -7,7 +7,7 @@
 ```yaml
 current_phase: 2
 phase_name: codex-diagnosis-only
-phase_status: implemented_not_deployed
+phase_status: implemented_server_acceptance_passed_not_deployed
 verification_level: L1
 production_deployed: false           # 阶段 2 尚未部署
 phase1_production_commit: 76ddb91d4498534ad24b8bd92248942bd0d7e9a5
@@ -271,6 +271,39 @@ calls_codex: "only the new root-side unit, and only when CODEX_MODE is not off"
    这是阶段 1 就留下的缺口（值守当时已上线却没进这张表），本阶段没有顺手补：那份文件的约定是
    「只描述当前生产运行的样子」，而阶段 2 尚未部署。**等 runner 真的启用之后，请把这两个单元补进第 1 节**，
    否则下一个读架构文档的人会以为生产上只有三个进程。
+
+### 8.7 服务器验收记录（指挥会话，2026-09-20/21，未部署代码，全部用 `/tmp` 副本 + `systemd-run`）
+
+验收对象是**单元文件的沙箱属性本身**（探针从单元文件解析属性拼 `systemd-run -p`），所以结论对正式单元同样成立。
+
+**隔离（`scripts/oncall_codex_sandbox_probe.py`）最终 28 / 28 PASS。** 途中探针逐项抓到并已修正（`7c8aa2a6`）：
+
+| 发现 | 处理 |
+|---|---|
+| `/run` 下 `docker.sock`、containerd、systemd private、system bus 对 uid 0 **无需任何 capability 即可连接**（docker.sock = 整台机器） | `TemporaryFileSystem=/run:ro`（本机 `resolv.conf` 是普通文件，DNS 不受影响） |
+| 整棵 `/etc/ssl`、`/etc/pki` 含私钥目录 | 只挂 CA 证书：`/etc/ssl/certs`、`/etc/pki/ca-trust`、`/etc/pki/tls/certs`、`cert.pem` |
+| 根目录有未遮盖的 `/www`、隐藏的 `/.__gmssh`（SSH 管理工具的数据库）、`/.Recycle_bin` | 逐个 `TemporaryFileSystem=`；探针新增"根目录逐项检查"，今后出现未知顶层目录会 FAIL |
+| 试过 `TemporaryFileSystem=/:ro`（空根）想一劳永逸 | 在本机 systemd 255 上**不生效**（探针看到整台机器），放弃，保留显式清单 |
+| `ProcSubset=pid` 藏掉 `/proc/sys/kernel/overflowuid` → codex 自带的 bubblewrap 起不来，**所有命令失败** | 去掉 `ProcSubset`，保留 `ProtectProc=invisible`（探针确认读不到其他进程环境里的密钥键名） |
+| 空 capability 集 → `bwrap: setting up uid map: Operation not permitted` | 用 `codex sandbox id`（不耗 token）二分：**只需 `CAP_SETFCAP`**（Linux ≥ 5.12 映射 uid 0 的要求；SETUID / SETGID / SYS_ADMIN 既不需要也不够）。配合 `NoNewPrivileges`，文件 capability 在 exec 时不生效 |
+
+**教训**：命令全部跑不起来时，冒烟测试第 6 步"写入被拦住"**照样 PASS**（因为什么都没发生）。第 6 步现在要求先读出一个标记文件的内容，读不到即 FAIL。
+
+**沙箱内实测**：`codex sandbox` 执行 `id` 正常；`cat /etc/telegram-kol-worker.env` → No such file；写 spool → Read-only file system；`curl` 无输出。
+**冒烟测试在沙箱内 6 / 6 PASS**（最小调用 4 s，两次带注入文本的裁决 11 s / 10 s，方向都对）。
+
+**首个真实回放：raw 17813**（案件 #2）。案件包 12.3 KB、脱敏命中 0、无裁剪；runner 在沙箱内 52–63 s 完成，裁决通过值守侧全量校验，六行中文消息渲染正常。
+
+- 事实（指挥会话逐字核对原文与库）：原文"在这个成本开的空可以**减仓移动止损到成本**做无风险持仓"。识别为 `partial_then_break_even`（0.5）是对的，
+  但候选的 `stop_loss_text` 同时填了成本价 `81200`，`management_stop_action_conflict` 把"保本"与"明确止损价"当成冲突拦下；
+  空单带着 82300 的止损多挂了 6 个多小时，直到 KOL 喊离场（北京时间 9 月 20 日 18:01）。**真实漏操作。**
+- 提示词 `2026-09-20.1` 的裁决：根因找对了，结论却是"拒得对 / 不该执行 / 无需处理"——把"规则触发"当成"拒绝合理"，并用一天后的"已平仓"决定紧急度。**不可接受。**
+- 提示词 `2026-09-21.1`（`fc33893a`）：按 `case.first_seen_at` 判断；`should_have_executed` 以消息本意为准；`legitimate_refusal` 必须说出拒绝防住了什么具体危害；时间写北京时间。
+  同一案件包重跑 → **误识别 / 应该执行 / 需要马上看**，并写明"仓位已平、现在无需补操作，应修正字段映射"。与人工结论一致。
+- 局限：提示词只在一个真实样本上调过，存在矫枉过正（把合理拒绝判成误识别）的风险；冒烟测试里的"放宽止损应判合理拒绝"是目前唯一的反向样本。
+  `shadow` 期间每个真实案件都要人工评审，攒成回放语料后再转 `on`。
+- 顺带得到的主链路缺陷线索（不属于本项目范围，待单独立项）：`management_stop_price_gate` 对 `partial_then_break_even` + `stop_loss_text == 开仓成本` 的组合做封闭式拒绝；
+  识别环节把背景价格写进止损字段。
 
 ## 9. 下一阶段
 
