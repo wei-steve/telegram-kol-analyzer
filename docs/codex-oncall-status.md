@@ -7,7 +7,7 @@
 ```yaml
 current_phase: 2
 phase_name: codex-diagnosis-only
-phase_status: implemented_server_acceptance_passed_not_deployed
+phase_status: deployed_codex_shadow_watcher_dry_run
 verification_level: L1
 production_deployed: false           # 阶段 2 尚未部署
 phase1_production_commit: 76ddb91d4498534ad24b8bd92248942bd0d7e9a5
@@ -304,6 +304,24 @@ calls_codex: "only the new root-side unit, and only when CODEX_MODE is not off"
   `shadow` 期间每个真实案件都要人工评审，攒成回放语料后再转 `on`。
 - 顺带得到的主链路缺陷线索（不属于本项目范围，待单独立项）：`management_stop_price_gate` 对 `partial_then_break_even` + `stop_loss_text == 开仓成本` 的组合做封闭式拒绝；
   识别环节把背景价格写进止损字段。
+
+### 8.8 部署记录（2026-09-21 05:47 CST）——不重启交易服务的部署
+
+用户要求"部署，但不希望停止真实交易"。候选 `840c83ba` 相对生产 `76ddb91d` 的非文档改动**只有**值守自己的文件
+（7 个 `oncall_*.py`、runner 单元、两个脚本、`config/oncall.env.example`；`cli.py` 未变，其他模块不 import `oncall_*`），
+worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `tg-deploy`**（它的最后一步是重启这三个服务）：
+
+- 服务器上 `git fetch` → 脚本化断言"除值守文件外无其他文件变化"（PASS，否则中止）→ `git reset --hard 840c83ba…` → 只删 `oncall_*.pyc`。
+- **worker=3517778 / web=3517793 / ingest=3517818，更新前后 PID 完全一致，交易零中断。**
+- `/etc/telegram-kol-oncall.env` 追加 `CODEX_MODE=shadow`、spool 路径、每日上限 20（仍无任何密钥）；安装并 `enable --now`
+  `telegram-kol-oncall-codex.service`；重装值守单元并只重启 `telegram-kol-oncall`。
+- 验证：两个值守单元 active、`NRestarts=0`；runner 在**正式单元**内自检 `login_ok=true`、最小 exec 返回 OK；`health.json` 为
+  `root:telegram-kol-oncall 0660`，值守用户实测可读；值守状态库 `codex:state=up`、新增 `diagnoses` 表；心跳正常。
+- 同时上线了 `2da96cd9`（同一消息拆成两个案件的修复）。
+- 回滚：`systemctl disable --now telegram-kol-oncall-codex`，把 env 的 `CODEX_MODE` 改回 `off` 并重启 `telegram-kol-oncall`；
+  代码回滚 `git reset --hard 76ddb91d…`（同样无需重启交易服务）。
+- 注意：生产检出的 HEAD 现为 `840c83ba`，而三个交易进程启动于 `76ddb91d`——对它们加载的每个模块而言两者内容相同。下一次常规 `tg-deploy` 会自然对齐。
+- 现状：值守 `dry_run`（不发 Telegram）+ Codex `shadow`（真实调用、裁决只入库）。转正顺序：先核对 dry_run 结果切 `notify`，再人工评审若干 shadow 裁决后切 `CODEX_MODE=on`。
 
 ## 9. 下一阶段
 
