@@ -42,7 +42,7 @@ SCHEMA_VERSION = 1
 
 #: Bumped whenever the prompt changes, so a stored verdict can be traced back
 #: to the words that produced it.
-PROMPT_VERSION = "2026-09-20.1"
+PROMPT_VERSION = "2026-09-21.1"
 
 #: Nothing the runner reads out of the spool may be larger than this.
 MAX_INPUT_BYTES = 128 * 1024
@@ -320,14 +320,40 @@ Rules you must follow:
 - Answer with one JSON object matching the provided schema, and nothing else.
 - Every *_zh field is plain Simplified Chinese for a reader who cannot program:
   no function names, no class names, no English jargon, no code identifiers.
+- Any clock time inside a *_zh field is Beijing time (UTC+8), written as
+  "北京时间 9月20日 18:01". The timestamps in case.json are UTC; convert them.
 - what_message_wanted_zh: what the message was asking the system to do.
 - explanation_zh: why the system did not do it.
 - recommended_action_zh: what the human reader should do now.
 - root_cause_zh: the technical root cause, for whoever fixes the code later.
 - code_paths: up to 8 repository-relative paths under src/ or tests/ that a
   maintainer should read first. An empty list is a valid answer.
+- Judge the case AS OF case.first_seen_at, the moment the watcher opened it,
+  when the position was still open. You may be reading this hours later and the
+  position may since have closed: that changes recommended_action_zh (say what
+  is still worth doing now, and say plainly that the position has already
+  closed if it has), but it must NOT change category, should_have_executed or
+  urgency. urgency is the money that was at risk while the instruction went
+  unexecuted: "now" if the position stayed exposed to exactly what the message
+  was trying to remove (a stop left further away, a size left larger).
+- should_have_executed is about the MESSAGE, not about the system's rules: would
+  a careful human trader reading this message, holding this position, have done
+  it? A safety rule having fired does not make the answer "no".
+- legitimate_refusal is reserved for a refusal that protected the account:
+  doing what the message said would have loosened a stop, touched a position
+  whose ownership is unproven, acted on a deleted or ambiguous message, or
+  traded at an implausible price. It is NOT the right category when the rule
+  fired because of how the system recorded the message -- for example two
+  fields that a rule reads as conflicting but that mean the same thing (a
+  break-even instruction whose stop field also carries the entry price), a
+  value copied into the wrong field, or a target that was resolved wrongly.
+  Those are "misrecognition" when the recorded instruction is wrong, or
+  "suspected_bug" when the recorded instruction is right and the code still
+  refused it. Before you settle on legitimate_refusal, read the code that
+  produces the reason code and state in root_cause_zh which concrete harm the
+  refusal prevented; if you cannot name one, it is not a legitimate refusal.
 - category is your judgement of what kind of problem this is; urgency is about
-  the money at risk right now, not about how interesting the bug is.
+  the money at risk, not about how interesting the bug is.
 - If the evidence does not support a conclusion, say so with
   category "insufficient_evidence" and confidence "low". Do not guess."""
 
