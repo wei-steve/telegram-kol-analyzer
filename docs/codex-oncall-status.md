@@ -6,10 +6,13 @@
 ```yaml
 current_phase: 1
 phase_name: standalone-oncall-watcher
-phase_status: completed_local_not_deployed
+phase_status: deployed_dry_run_observation
 verification_level: L1
-production_deployed: false
-systemd_unit_installed: false
+production_deployed: true
+production_commit: 76ddb91d4498534ad24b8bd92248942bd0d7e9a5
+rollback_commit: 72313b0e9cd63ebfb9e24c9c16f042e210a2261f
+systemd_unit_installed: true
+production_mode: "dry_run since 2026-09-20 07:39 CST; switch to notify after one clean day"
 default_mode: "off (TELEGRAM_KOL_ONCALL_MODE absent means the process exits at once)"
 writes_production_database: false
 writes_exchange: false
@@ -103,7 +106,10 @@ calls_codex: false
 ## 7. 部署前需要人工确认的事
 
 - 建 `telegram-kol-oncall` 系统用户与 `/var/lib/telegram-kol-oncall`；写 `/etc/telegram-kol-oncall.env`（0600，root 所有）。
-- **值守要用自己的 bot**，不能复用 worker 的：worker 挂掉时值守还得能说话。
+- ~~值守要用自己的 bot~~ **用户 2026-09-19 决定沿用现有系统 bot**：独立性来自"独立进程自己发"，不来自 token 不同。
+  单元直接加载 `config/system_operator_bot.env`（该文件只有 token 与 chat id 两个键，systemd 以 root 读入），
+  代码在未配置 `TELEGRAM_KOL_ONCALL_BOT_TOKEN` 时回退到 `TELEGRAM_KOL_SYSTEM_BOT_TOKEN / _CHAT_ID`；没有人复制或填写 token。
+  `notify` 模式而两处都没有凭据 → 进程以 78 退出且不重启循环（`76ddb91d`）。
 - 先 `TELEGRAM_KOL_ONCALL_MODE=dry_run` 跑一天，看 `state.db` 的 `cases` / `alerts` 两张表里
   建了哪些案件、文案长什么样、`counter:skipped_no_position` 有多大，再转 `notify`。
 - 单元文件只把 `.venv`、`src`、`research.db`（及 `-wal`/`-shm`/`-journal`）只读挂进来；
@@ -111,6 +117,23 @@ calls_codex: false
 - 阶段 2 引入 Codex 时，设计 4.2 要求的 `InaccessiblePaths=`（挡住 `/etc/telegram-kol-*.env`、
   `data/telegram.session*`、`data/backups`）还没有加进这个单元——阶段 1 不跑 Codex，所以没加；
   **阶段 2 必须先加。**
+
+## 7.1 部署记录（2026-09-20 07:39 CST）
+
+- 候选 `76ddb91d`（`f48f6d03` 子代理实现 + `b0a232e0` 文案修补 + `3e08c4cc` 设计 / 冒烟脚本 + `76ddb91d` 沿用系统 bot），
+  最终候选全量 `uv run python -m pytest`：**9097 passed / 4 skipped / 0 failed**。
+- 部署前：候选是生产 HEAD `72313b0e` 的后代、共享分支 tip 是候选的祖先（两项 PASS）；零在途
+  （管理批次 / mutation intent / claimed job / worker command 均为 0），无在仓绑定。
+- `tg-deploy 76ddb91d…` → worker / web / ingest 均 active，web 200；回滚 = `tg-deploy 72313b0e…`。
+- 部署后：同一 SHA 推到共享分支；`PASS: 0 code files beyond production`、`PASS: deployed sha is on the shared branch`。
+- 值守安装：建系统用户 `telegram-kol-oncall`；`/etc/telegram-kol-oncall.env`（root 0600，**不含任何密钥**：
+  `MODE=dry_run`、worker 健康 URL、每日上限 30）；单元安装并 `enable --now`。
+- 值守验证：`NRestarts=0`；心跳逐轮推进（`last_error: null`）；状态库水位线 = 当时各表 max(id)
+  （items 1235 / batches 168 / jobs 6002），**0 案件 0 告警**（未回放历史）；只读打开 WAL 生产库正常（读失败 0 轮）；
+  worker 健康探针正常；bot token 在状态库与 journal 中出现次数均为 **0**。
+- 待办：dry_run 满一天后核对 `cases` / `alerts` / `counter:skipped_no_position`，干净则把
+  `/etc/telegram-kol-oncall.env` 的 `MODE` 改为 `notify` 并 `systemctl restart telegram-kol-oncall`（不需要 tg-deploy）。
+  停用：`systemctl disable --now telegram-kol-oncall`（对交易主链路零影响）。
 
 ## 8. 下一阶段
 
