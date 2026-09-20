@@ -526,6 +526,46 @@ def test_d1_and_d2_on_the_same_message_are_one_case(production, store):
     assert case.batch_ids == (batch_id,)
 
 
+def test_a_batch_whose_exchange_verb_differs_from_its_intent_is_still_one_case(
+    production, store
+):
+    """Production, 2026-09-20, raw 17813: ``partial_then_break_even`` planned as
+    ``partial_close``. Keyed on the verb, one message became two alerts."""
+
+    run_round(production, store)
+    production.add_group_name()
+    raw_message_id = production.add_raw_message(text="现在你就移动止损")
+    binding_id = production.add_binding()
+    lifecycle_id = production.add_lifecycle(execution_binding_id=binding_id)
+    candidate_id = production.add_candidate(
+        raw_message_id=raw_message_id,
+        target_lifecycle_id=lifecycle_id,
+        management_action="partial_then_break_even",
+    )
+    production.add_instruction_item(
+        raw_message_id=raw_message_id,
+        signal_candidate_id=candidate_id,
+        status="failed",
+        error={"reason": "management_stop_action_conflict"},
+    )
+    production.add_management_batch(
+        raw_message_id=raw_message_id,
+        target_lifecycle_id=lifecycle_id,
+        execution_binding_id=binding_id,
+        status="blocked",
+        reason_code="management_stop_action_conflict",
+        intent="partial_then_break_even",
+        effective_action="partial_close",
+    )
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert len(outcome.new_case_ids) == 1
+    assert case.case_key == f"mgmt:{raw_message_id}:partial_then_break_even"
+    assert case.rule == "D1a+D2"
+
+
 # ------------------------------------------------------ resolution, stale
 
 

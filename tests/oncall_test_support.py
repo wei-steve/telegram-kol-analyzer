@@ -223,6 +223,7 @@ class ProductionFixture:
         status: str = "blocked",
         reason_code: str | None = None,
         effective_action: str = "adjust_stop_loss",
+        intent: str | None = None,
         updated_at: datetime | None = None,
         strategy_instance_id: str = "strategy-1",
     ) -> int:
@@ -235,7 +236,7 @@ class ProductionFixture:
                 target_lifecycle_id=target_lifecycle_id,
                 strategy_instance_id=strategy_instance_id,
                 execution_binding_id=execution_binding_id,
-                intent=effective_action,
+                intent=intent or effective_action,
                 effective_action=effective_action,
                 status=status,
                 reason_code=reason_code,

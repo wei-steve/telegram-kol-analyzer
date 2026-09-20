@@ -965,7 +965,12 @@ def _evaluate_management_batch(
     """Rule D2. A batch exists only for a position, so 4.1 is not re-run."""
 
     status = str(row["status"] or "").lower()
-    action = str(row["effective_action"] or row["intent"] or "").strip()
+    # ``intent`` is the instruction's own vocabulary (what the candidate's
+    # ``management_action`` says, and therefore what rule D1 keys on);
+    # ``effective_action`` is the planner's exchange verb (``partial_close`` for
+    # a ``partial_then_break_even``). Keying on the verb split one message into
+    # two cases in production on 2026-09-20 (raw 17813), so the intent wins.
+    action = str(row["intent"] or row["effective_action"] or "").strip()
     case_key = _management_case_key(row["raw_message_id"], action)
     if status in {"succeeded", "resolved"}:
         return _Observation(
