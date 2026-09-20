@@ -17,14 +17,22 @@ from typing import Any
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.models import (
     ExecutionBinding,
+    ExecutionEvent,
+    ExecutionOrderLeg,
     MessageInstructionItem,
     MessageProcessingJob,
+    PositionMutationIntent,
+    PositionProtectionLedger,
     RawMessage,
+    RecognitionDecision,
+    RuntimeIncident,
     SignalCandidate,
     Source,
     StrategyAlert,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementComponent,
+    StrategyManagementLeg,
 )
 
 
@@ -50,11 +58,14 @@ class ProductionFixture:
     # ------------------------------------------------------------- writers
 
     def add_group_name(self, *, chat_id: int = CHAT_ID, title: str = GROUP_NAME) -> None:
+        # ``strategy_alerts`` is unique on (chat_id, message_id), so repeated
+        # calls have to move the message id along rather than collide.
+        self._message_id += 1
         with self.session_factory() as session:
             session.add(
                 StrategyAlert(
                     chat_id=chat_id,
-                    message_id=1,
+                    message_id=self._message_id,
                     chat_title=title,
                     status="forwarded",
                 )
@@ -281,6 +292,224 @@ class ProductionFixture:
             row = session.get(MessageProcessingJob, int(job_id))
             row.status = status
             session.commit()
+
+    # ------------------------------------------- phase 2: case-file sources
+
+    def add_recognition_decision(
+        self,
+        *,
+        raw_message_id: int,
+        authoritative_status: str = "succeeded",
+        automation_status: str = "blocked",
+        automation_reason: str = "management_stop_action_conflict",
+        payload: dict[str, Any] | None = None,
+    ) -> int:
+        with self.session_factory() as session:
+            row = RecognitionDecision(
+                raw_message_id=raw_message_id,
+                input_kind="text",
+                authoritative_model="mimo-7b",
+                authoritative_status=authoritative_status,
+                # The prompt and the model's raw reply live here. The case
+                # file must never select this column; a test asserts it.
+                authoritative_payload_json=json.dumps(
+                    payload or {"secret_prompt": "do not export me"}
+                ),
+                agreement_status="agree",
+                automation_status=automation_status,
+                automation_reason=automation_reason,
+                prompt_versions_json=json.dumps({"authoritative": "v9"}),
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_order_leg(
+        self,
+        *,
+        execution_binding_id: int,
+        pos_id: str = "pos-1",
+        purpose: str = "entry",
+    ) -> int:
+        with self.session_factory() as session:
+            row = ExecutionOrderLeg(
+                execution_binding_id=execution_binding_id,
+                strategy_instance_id="strategy-1",
+                leg_index=0,
+                purpose=purpose,
+                order_kind="limit",
+                pos_id=pos_id,
+                venue="deepcoin",
+                attribution_status="assigned",
+                status="filled",
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_management_leg(
+        self,
+        *,
+        management_batch_id: int,
+        execution_order_leg_id: int,
+        pos_id: str = "pos-1",
+        status: str = "planned",
+        last_error: str | None = None,
+    ) -> int:
+        with self.session_factory() as session:
+            row = StrategyManagementLeg(
+                management_batch_id=management_batch_id,
+                execution_order_leg_id=execution_order_leg_id,
+                pos_id=pos_id,
+                leg_index=0,
+                status=status,
+                planned_close_size="0.5",
+                avg_entry_price="2500",
+                last_error=last_error,
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_management_component(
+        self,
+        *,
+        management_batch_id: int,
+        component_kind: str = "replace_protection",
+        status: str = "blocked",
+        reason_code: str | None = "management_stop_action_conflict",
+        sequence: int = 1,
+    ) -> int:
+        with self.session_factory() as session:
+            row = StrategyManagementComponent(
+                management_batch_id=management_batch_id,
+                strategy_management_leg_id=None,
+                strategy_management_leg_scope=-1,
+                component_kind=component_kind,
+                sequence=sequence,
+                status=status,
+                idempotency_key=f"component-{management_batch_id}-{sequence}",
+                desired_json=json.dumps({"stop_price": "2484"}),
+                evidence_json="[]",
+                reason_code=reason_code,
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_mutation_intent(
+        self,
+        *,
+        execution_binding_id: int,
+        execution_order_leg_id: int,
+        operation: str = "cancel_protection",
+        status: str = "failed",
+        pos_id: str = "pos-1",
+        sequence: int = 1,
+    ) -> int:
+        with self.session_factory() as session:
+            row = PositionMutationIntent(
+                idempotency_key=f"intent-{execution_binding_id}-{sequence}",
+                venue="deepcoin",
+                operation=operation,
+                strategy_instance_id="strategy-1",
+                execution_binding_id=execution_binding_id,
+                execution_order_leg_id=execution_order_leg_id,
+                pos_id=pos_id,
+                authority_fingerprint="af-1",
+                request_fingerprint=f"rf-{sequence}",
+                status=status,
+                request_json=json.dumps({"operation": operation}),
+                error_json=json.dumps({"reason": "protection_authority_frozen"}),
+                reserved_at=naive(NOW - timedelta(minutes=5)),
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_execution_event(
+        self,
+        *,
+        execution_binding_id: int | None = None,
+        message_id: int | None = None,
+        action: str = "adjust_stop_loss",
+        status: str = "failed",
+        reason: str | None = "management_stop_action_conflict",
+        created_at: datetime | None = None,
+    ) -> int:
+        with self.session_factory() as session:
+            row = ExecutionEvent(
+                execution_binding_id=execution_binding_id,
+                venue="deepcoin",
+                action=action,
+                status=status,
+                symbol="ETH",
+                side="short",
+                message_id=message_id,
+                reason=reason,
+                created_at=naive(created_at or NOW - timedelta(minutes=3)),
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_protection_ledger_row(
+        self,
+        *,
+        execution_binding_id: int,
+        execution_order_leg_id: int,
+        purpose: str = "stop_loss",
+        trigger_price: str = "2500",
+        status: str = "verified",
+        order_id: str = "order-1",
+    ) -> int:
+        with self.session_factory() as session:
+            row = PositionProtectionLedger(
+                venue="deepcoin",
+                execution_binding_id=execution_binding_id,
+                execution_order_leg_id=execution_order_leg_id,
+                strategy_instance_id="strategy-1",
+                pos_id="pos-1",
+                instrument_id="ETH-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text="1.0",
+                status=status,
+                evidence_source="reconcile",
+                evidence_json="{}",
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def add_runtime_incident(
+        self,
+        *,
+        source_kind: str,
+        source_record_id: str,
+        incident_type: str = "management_stop_rejected",
+        severity: str = "high",
+        summary: str = "管理批次被拦下：同仓位有冲突的止损动作。",
+    ) -> int:
+        with self.session_factory() as session:
+            row = RuntimeIncident(
+                source_kind=source_kind,
+                source_record_id=source_record_id,
+                incident_type=incident_type,
+                severity=severity,
+                fingerprint=f"fp-{source_kind}-{source_record_id}",
+                first_occurred_at=naive(NOW - timedelta(minutes=20)),
+                last_occurred_at=naive(NOW - timedelta(minutes=2)),
+                redacted_summary=summary,
+                feature_policy_version="v1",
+                prompt_version="v1",
+                tool_policy_version="v1",
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
 
 
 def build_open_position_case(

@@ -1,0 +1,78 @@
+[Unit]
+Description=Telegram KOL on-call Codex runner (read-only diagnosis, allowlist namespace)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/telegram-kol-oncall.env
+
+[Service]
+Type=simple
+Restart=always
+RestartSec=15
+# Codex is logged in under root and its credentials live in /root/.codex, so
+# this unit runs as root -- and then gives that root nothing. It has no
+# capabilities, cannot gain any, and sees a filesystem built from an allowlist
+# rather than one with holes punched in it: the production database, every
+# environment file, the settings and data directories, the git history and
+# every other project on this machine are simply not present in its
+# namespace. Codex's own read-only sandbox does not stop it from *reading*,
+# so hiding is the only control that actually works.
+User=root
+Group=root
+UMask=0077
+WorkingDirectory=/var/lib/telegram-kol-oncall/codex-spool
+EnvironmentFile=/etc/telegram-kol-oncall.env
+ExecStartPre=+/bin/mkdir -p /var/lib/telegram-kol-oncall/codex-spool
+ExecStartPre=+/bin/chown root:telegram-kol-oncall /var/lib/telegram-kol-oncall/codex-spool
+ExecStartPre=+/bin/chmod 2770 /var/lib/telegram-kol-oncall/codex-spool
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/python -B -m telegram_kol_research.oncall_codex_runner --spool /var/lib/telegram-kol-oncall/codex-spool
+
+AmbientCapabilities=
+CapabilityBoundingSet=
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=tmpfs
+PrivateTmp=true
+PrivateDevices=true
+ProtectControlGroups=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+
+# The allowlist. Each TemporaryFileSystem replaces a whole tree with an empty
+# read-only one; the BindReadOnlyPaths below then put back the few things that
+# have to be visible. Anything not named here does not exist for this process.
+TemporaryFileSystem=/etc:ro
+TemporaryFileSystem=/opt:ro
+TemporaryFileSystem=/var:ro
+TemporaryFileSystem=/srv:ro
+TemporaryFileSystem=/data:ro
+TemporaryFileSystem=/mnt:ro
+TemporaryFileSystem=/media:ro
+
+# TLS trust and name resolution, so the HTTPS call to OpenAI can be made.
+BindReadOnlyPaths=-/etc/ssl
+BindReadOnlyPaths=-/etc/pki
+BindReadOnlyPaths=-/etc/ca-certificates
+BindReadOnlyPaths=-/etc/resolv.conf
+BindReadOnlyPaths=-/etc/hosts
+BindReadOnlyPaths=-/etc/nsswitch.conf
+BindReadOnlyPaths=-/etc/passwd
+BindReadOnlyPaths=-/etc/group
+BindReadOnlyPaths=-/etc/localtime
+# The deployed source, which is what Codex reads to explain a reason code, and
+# the interpreter that runs this module. Neither is writable.
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/src
+BindReadOnlyPaths=/opt/telegram-kol-analyzer/.venv
+# Writable: the credential store (the token refreshes itself) and the spool.
+BindPaths=/root/.codex
+BindPaths=/var/lib/telegram-kol-oncall/codex-spool
+
+# Deliberately NOT set: RestrictNamespaces, SystemCallFilter, PrivateUsers,
+# MemoryDenyWriteExecute. This kernel (6.6.92) has no landlock, so codex's own
+# read-only sandbox falls back to user namespaces and seccomp; those four
+# options are exactly what would stop it from starting. Whether any of them
+# can be added is a question for the sandbox probe on the server, not a guess
+# made here.
+
+[Install]
+WantedBy=multi-user.target

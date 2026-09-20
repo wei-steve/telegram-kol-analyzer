@@ -34,6 +34,18 @@ CASE_STATUSES = frozenset({"open", "resolved", "stale"})
 ALERT_STATUSES = frozenset({"pending", "sent", "dry_run", "failed"})
 WATCH_STATUSES = frozenset({"open", "retired"})
 
+DIAGNOSIS_QUEUED = "queued"
+DIAGNOSIS_DONE = "done"
+DIAGNOSIS_FAILED = "failed"
+DIAGNOSIS_SKIPPED = "skipped"
+DIAGNOSIS_STATUSES = frozenset(
+    {DIAGNOSIS_QUEUED, DIAGNOSIS_DONE, DIAGNOSIS_FAILED, DIAGNOSIS_SKIPPED}
+)
+
+MESSAGE_NONE = "none"
+MESSAGE_QUEUED = "queued"
+MESSAGE_SUPPRESSED = "suppressed"
+
 #: Evidence is bounded so one pathological message cannot grow the state file.
 MAX_EVIDENCE_BYTES = 8192
 
@@ -94,6 +106,26 @@ SCHEMA_STATEMENTS = (
     )
     """,
     "CREATE INDEX IF NOT EXISTS ix_alerts_pending ON alerts (status, id)",
+    # Phase 2. One row per case that Codex was, or was deliberately not,
+    # asked about. ``verdict_json`` holds the *validated* answer only, so a
+    # rejected answer is remembered as a failure and never as a diagnosis.
+    """
+    CREATE TABLE IF NOT EXISTS diagnoses (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        case_id INTEGER NOT NULL UNIQUE,
+        status TEXT NOT NULL DEFAULT 'queued',
+        attempts INTEGER NOT NULL DEFAULT 0,
+        request_fingerprint TEXT,
+        prompt_version TEXT,
+        failure_class TEXT,
+        skip_reason TEXT,
+        verdict_json TEXT,
+        message_state TEXT NOT NULL DEFAULT 'none',
+        requested_at TEXT,
+        completed_at TEXT
+    )
+    """,
+    "CREATE INDEX IF NOT EXISTS ix_diagnoses_status ON diagnoses (status, id)",
 )
 
 
@@ -166,6 +198,23 @@ class AlertRecord:
     status: str
     attempts: int
     delivery_error: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class DiagnosisRecord:
+    """What the watcher asked Codex about this case, and what came back."""
+
+    case_id: int
+    status: str
+    attempts: int
+    request_fingerprint: str | None
+    prompt_version: str | None
+    failure_class: str | None
+    skip_reason: str | None
+    verdict: dict[str, Any] | None
+    message_state: str
+    requested_at: datetime | None
+    completed_at: datetime | None
 
 
 @dataclass(frozen=True, slots=True)
@@ -628,6 +677,94 @@ class OncallStateStore:
                 (str(error_type)[:64], int(max_attempts), int(alert_id)),
             )
 
+    # ----------------------------------------------------------- diagnoses
+
+    def get_diagnosis(self, case_id: int) -> DiagnosisRecord | None:
+        row = self.connection.execute(
+            "SELECT * FROM diagnoses WHERE case_id = ?", (int(case_id),)
+        ).fetchone()
+        return _diagnosis_from_row(row) if row is not None else None
+
+    def queued_diagnoses(self) -> tuple[DiagnosisRecord, ...]:
+        rows = self.connection.execute(
+            "SELECT * FROM diagnoses WHERE status = ? ORDER BY id",
+            (DIAGNOSIS_QUEUED,),
+        ).fetchall()
+        return tuple(_diagnosis_from_row(row) for row in rows)
+
+    def record_diagnosis_request(
+        self,
+        *,
+        case_id: int,
+        attempt: int,
+        fingerprint: str,
+        prompt_version: str,
+        now: datetime,
+    ) -> None:
+        """One row per case; a second attempt updates it rather than adding."""
+
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO diagnoses (case_id, status, attempts, "
+                "request_fingerprint, prompt_version, requested_at) "
+                "VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(case_id) DO UPDATE SET status = excluded.status, "
+                "attempts = excluded.attempts, "
+                "request_fingerprint = excluded.request_fingerprint, "
+                "prompt_version = excluded.prompt_version, "
+                "requested_at = excluded.requested_at, "
+                "failure_class = NULL, skip_reason = NULL",
+                (
+                    int(case_id),
+                    DIAGNOSIS_QUEUED,
+                    int(attempt),
+                    str(fingerprint),
+                    str(prompt_version),
+                    isoformat(now),
+                ),
+            )
+
+    def record_diagnosis_result(
+        self,
+        *,
+        case_id: int,
+        status: str,
+        now: datetime,
+        verdict: dict[str, Any] | None = None,
+        failure_class: str | None = None,
+        skip_reason: str | None = None,
+    ) -> None:
+        with self.connection:
+            self.connection.execute(
+                "INSERT INTO diagnoses (case_id, status, attempts, verdict_json, "
+                "failure_class, skip_reason, completed_at) "
+                "VALUES (?, ?, 0, ?, ?, ?, ?) "
+                "ON CONFLICT(case_id) DO UPDATE SET status = excluded.status, "
+                "verdict_json = COALESCE(excluded.verdict_json, diagnoses.verdict_json), "
+                "failure_class = excluded.failure_class, "
+                "skip_reason = excluded.skip_reason, "
+                "completed_at = excluded.completed_at",
+                (
+                    int(case_id),
+                    str(status),
+                    (
+                        json.dumps(verdict, ensure_ascii=False, sort_keys=True)
+                        if verdict is not None
+                        else None
+                    ),
+                    failure_class,
+                    skip_reason,
+                    isoformat(now),
+                ),
+            )
+
+    def set_diagnosis_message_state(self, case_id: int, state: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE diagnoses SET message_state = ? WHERE case_id = ?",
+                (str(state), int(case_id)),
+            )
+
     def count_alerts_since(self, *, since: datetime, kinds: Sequence[str] | None = None) -> int:
         if kinds:
             placeholders = ",".join("?" for _ in kinds)
@@ -642,6 +779,22 @@ class OncallStateStore:
                 (isoformat(since),),
             ).fetchone()
         return int(row["total"]) if row is not None else 0
+
+
+def _diagnosis_from_row(row: sqlite3.Row) -> DiagnosisRecord:
+    return DiagnosisRecord(
+        case_id=int(row["case_id"]),
+        status=str(row["status"]),
+        attempts=int(row["attempts"]),
+        request_fingerprint=row["request_fingerprint"],
+        prompt_version=row["prompt_version"],
+        failure_class=row["failure_class"],
+        skip_reason=row["skip_reason"],
+        verdict=_json_dict(row["verdict_json"]) or None,
+        message_state=str(row["message_state"]),
+        requested_at=parse_isoformat(row["requested_at"]),
+        completed_at=parse_isoformat(row["completed_at"]),
+    )
 
 
 def _combine_rules(existing: str, incoming: str) -> str:

@@ -25,26 +25,56 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 from telegram_kol_research.oncall_alerts import (
     AlertPolicy,
     TelegramAlertSender,
+    beijing_date,
+    codex_daily_cap_note,
+    codex_unavailable_note,
     compose_case_alerts,
+    compose_codex_state_alert,
+    compose_diagnosis_alert,
     deliver_pending_alerts,
     maybe_compose_daily_summary,
+)
+from telegram_kol_research.oncall_casefile import CasefileConfig, build_case_file
+from telegram_kol_research.oncall_codex import (
+    CODEX_DOWN,
+    CODEX_UP,
+    DEFAULT_SPOOL,
+    FAILURE_CONTRACT,
+    FAILURE_TIMEOUT,
+    MAX_ATTEMPTS,
+    PROMPT_VERSION,
+    RUN_OK,
+    Spool,
+    VerdictContractError,
+    next_availability,
+    validate_verdict,
 )
 from telegram_kol_research.oncall_detector import (
     COUNTER_READ_FAILED_ROUNDS,
     COUNTER_SKIPPED_NO_POSITION,
+    WATCH_PROCESSING_JOB,
     DetectorConfig,
+    ProductionReadError,
     ProductionReader,
     RoundOutcome,
     run_detection_round,
 )
-from telegram_kol_research.oncall_state import OncallStateStore, isoformat
+from telegram_kol_research.oncall_state import (
+    DIAGNOSIS_DONE,
+    DIAGNOSIS_FAILED,
+    DIAGNOSIS_SKIPPED,
+    MESSAGE_QUEUED,
+    MESSAGE_SUPPRESSED,
+    OncallStateStore,
+    isoformat,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -67,6 +97,33 @@ EXIT_CONFIG = 78  # EX_CONFIG; the unit lists it in RestartPreventExitStatus
 ENV_WORKER_HEALTH_URL = "TELEGRAM_KOL_ONCALL_WORKER_HEALTH_URL"
 ENV_DAILY_CAP = "TELEGRAM_KOL_ONCALL_DAILY_ALERT_CAP"
 
+#: Phase 2. ``off`` is the default in code, so an environment that has never
+#: heard of Codex behaves exactly like phase 1.
+ENV_CODEX_MODE = "TELEGRAM_KOL_ONCALL_CODEX_MODE"
+ENV_CODEX_SPOOL = "TELEGRAM_KOL_ONCALL_CODEX_SPOOL"
+ENV_CODEX_DAILY_CAP = "TELEGRAM_KOL_ONCALL_CODEX_DAILY_CAP"
+
+CODEX_MODE_OFF = "off"
+CODEX_MODE_SHADOW = "shadow"
+CODEX_MODE_ON = "on"
+VALID_CODEX_MODES = (CODEX_MODE_OFF, CODEX_MODE_SHADOW, CODEX_MODE_ON)
+
+#: A health case that fixes itself in four minutes is not worth a token: both
+#: 2026-09-20 stalls recovered on their own (spec 6.1).
+HEALTH_DIAGNOSIS_DELAY = timedelta(minutes=10)
+
+#: How long a queued request may go unanswered before the watcher writes it
+#: off. The runner's own call timeout is 480 s, so this is not a race with a
+#: slow answer -- it is what stops a stopped runner from silently holding the
+#: single-flight slot forever.
+DIAGNOSIS_ABANDON_AFTER = timedelta(minutes=30)
+
+META_CODEX_STATE = "codex:state"
+META_CODEX_FAILURES = "codex:consecutive_failures"
+META_CODEX_DOWN_CLASS = "codex:down_class"
+META_CODEX_EPISODE = "codex:episode"
+META_CODEX_HEALTH_AT = "codex:health_checked_at"
+
 WORKER_HEALTH_TIMEOUT_SECONDS = 2.0
 
 
@@ -82,10 +139,25 @@ class OncallConfig:
     chat_id: str = ""
     worker_health_url: str = ""
     daily_alert_cap: int = 30
+    codex_mode: str = CODEX_MODE_OFF
+    codex_spool: str = DEFAULT_SPOOL
+    codex_daily_cap: int = 20
 
     @property
     def can_send(self) -> bool:
         return self.mode == MODE_NOTIFY and bool(self.bot_token) and bool(self.chat_id)
+
+    def effective_codex_mode(self) -> str:
+        """``on`` while the watcher itself is rehearsing means ``shadow``.
+
+        A dry-run watcher composes alerts it never sends; a dry-run watcher
+        that queued diagnosis messages would be claiming to have told somebody
+        something it did not.
+        """
+
+        if self.codex_mode == CODEX_MODE_ON and self.mode != MODE_NOTIFY:
+            return CODEX_MODE_SHADOW
+        return self.codex_mode
 
 
 def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
@@ -100,6 +172,16 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
         cap = int(str(source.get(ENV_DAILY_CAP, "30") or "30"))
     except ValueError:
         cap = 30
+    codex_mode = str(
+        source.get(ENV_CODEX_MODE, CODEX_MODE_OFF) or CODEX_MODE_OFF
+    ).strip().lower()
+    if codex_mode not in VALID_CODEX_MODES:
+        logger.warning("oncall codex mode is not recognised, treating as off: %r", codex_mode)
+        codex_mode = CODEX_MODE_OFF
+    try:
+        codex_cap = int(str(source.get(ENV_CODEX_DAILY_CAP, "20") or "20"))
+    except ValueError:
+        codex_cap = 20
     return OncallConfig(
         mode=mode,
         bot_token=(
@@ -112,6 +194,9 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
         ),
         worker_health_url=str(source.get(ENV_WORKER_HEALTH_URL, "") or "").strip(),
         daily_alert_cap=max(1, cap),
+        codex_mode=codex_mode,
+        codex_spool=str(source.get(ENV_CODEX_SPOOL, "") or "").strip() or DEFAULT_SPOOL,
+        codex_daily_cap=max(0, codex_cap),
     )
 
 
@@ -172,6 +257,400 @@ def write_heartbeat(
     return heartbeat_path
 
 
+# --------------------------------------------------------------------------
+# Codex diagnosis (phase 2). Everything here is optional, bounded, and
+# incapable of delaying or suppressing the phase 1 alert.
+# --------------------------------------------------------------------------
+
+
+def _codex_daily_key(now: datetime) -> str:
+    return f"codex:daily_calls:{beijing_date(now)}"
+
+
+def codex_state(store: OncallStateStore) -> str:
+    state = store.get_meta(META_CODEX_STATE, CODEX_UP) or CODEX_UP
+    return state if state in {CODEX_UP, CODEX_DOWN} else CODEX_UP
+
+
+def codex_note_for_new_cases(
+    store: OncallStateStore, *, config: OncallConfig, now: datetime
+) -> str | None:
+    """The extra line an opening alert carries when no diagnosis is coming.
+
+    Derived from state the watcher already holds: no call, no file read, no
+    way for this to slow the alert down.
+    """
+
+    if config.effective_codex_mode() == CODEX_MODE_OFF:
+        return None
+    if codex_state(store) == CODEX_DOWN:
+        return codex_unavailable_note(store.get_meta(META_CODEX_DOWN_CLASS))
+    if store.get_int_meta(_codex_daily_key(now), 0) >= config.codex_daily_cap:
+        return codex_daily_cap_note(config.codex_daily_cap)
+    return None
+
+
+def _record_availability(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    success: bool,
+    failure_class: str | None,
+) -> None:
+    """Fold one observation in, and say so out loud when the state flips."""
+
+    decision = next_availability(
+        state=codex_state(store),
+        consecutive_failures=store.get_int_meta(META_CODEX_FAILURES, 0),
+        success=success,
+        failure_class=failure_class,
+    )
+    store.set_meta(META_CODEX_STATE, decision.state)
+    store.set_meta(META_CODEX_FAILURES, str(decision.consecutive_failures))
+    if not decision.changed:
+        return
+    if decision.state == CODEX_DOWN:
+        episode = isoformat(now)
+        store.set_meta(META_CODEX_EPISODE, episode)
+        store.set_meta(META_CODEX_DOWN_CLASS, str(failure_class or ""))
+        compose_codex_state_alert(
+            store, now=now, down=True, failure_class=failure_class, episode=episode
+        )
+        logger.warning("oncall codex is down class=%s", failure_class)
+        return
+    compose_codex_state_alert(
+        store,
+        now=now,
+        down=False,
+        episode=store.get_meta(META_CODEX_EPISODE) or isoformat(now),
+    )
+    store.set_meta(META_CODEX_DOWN_CLASS, "")
+    logger.info("oncall codex recovered")
+
+
+def _consume_health_report(
+    store: OncallStateStore, spool: Spool, *, now: datetime
+) -> None:
+    """Read the runner's self-check, once per report it writes."""
+
+    payload = spool.read_health()
+    if not isinstance(payload, dict):
+        return
+    checked_at = str(payload.get("checked_at") or "")
+    if not checked_at or store.get_meta(META_CODEX_HEALTH_AT) == checked_at:
+        return
+    store.set_meta(META_CODEX_HEALTH_AT, checked_at)
+    _record_availability(
+        store,
+        now=now,
+        success=bool(payload.get("available")),
+        failure_class=payload.get("failure_class"),
+    )
+
+
+def _is_abandoned(record: Any, *, now: datetime) -> bool:
+    """A queued request nobody answered within the give-up window.
+
+    The window is comfortably longer than the runner's own 480-second call
+    timeout plus its polling interval, so a slow answer is never mistaken for
+    a missing one.
+    """
+
+    requested = record.requested_at
+    return requested is not None and (now - requested) > DIAGNOSIS_ABANDON_AFTER
+
+
+def _diagnosis_candidates(store: OncallStateStore, *, now: datetime) -> list[Any]:
+    """Open cases with no diagnosis row yet, oldest first.
+
+    A management case is eligible the moment it opens; a health case has to
+    survive ten minutes first.
+    """
+
+    candidates = []
+    for case in store.open_cases():
+        if store.get_diagnosis(case.id) is not None:
+            continue
+        if case.case_key.startswith("health:"):
+            opened = case.first_seen_at
+            if opened is None or (now - opened) < HEALTH_DIAGNOSIS_DELAY:
+                continue
+        candidates.append(case)
+    return candidates
+
+
+def _build_and_enqueue(
+    store: OncallStateStore,
+    spool: Spool,
+    *,
+    case: Any,
+    attempt: int,
+    database_path: Path,
+    now: datetime,
+    casefile_config: CasefileConfig | None = None,
+    journal_runner: Callable[..., str] | None = None,
+) -> bool:
+    is_health = case.case_key.startswith("health:")
+    stalled_job_ids: list[int] = []
+    try:
+        with ProductionReader(database_path) as reader:
+            if is_health:
+                stalled_job_ids = [
+                    item.object_id
+                    for item in store.open_watch_items(WATCH_PROCESSING_JOB, 20)
+                ]
+            payload = build_case_file(
+                reader,
+                case=case,
+                now=now,
+                config=casefile_config,
+                stalled_job_ids=stalled_job_ids,
+                journal_runner=journal_runner,
+            )
+    except ProductionReadError as exc:
+        logger.warning("oncall case file could not be exported: %s", exc)
+        return False
+
+    try:
+        fingerprint = spool.enqueue(
+            case_id=case.id,
+            attempt=attempt,
+            kind="health" if is_health else "management",
+            case_payload=payload,
+            now=now,
+        )
+    except OSError as exc:
+        # A spool the watcher cannot write to (wrong owner, wrong mode, not
+        # created yet) is a deployment problem, not a reason to stop watching.
+        logger.warning(
+            "oncall could not write to the codex spool: %s", type(exc).__name__
+        )
+        return False
+    store.record_diagnosis_request(
+        case_id=case.id,
+        attempt=attempt,
+        fingerprint=fingerprint,
+        prompt_version=PROMPT_VERSION,
+        now=now,
+    )
+    store.bump_counter(_codex_daily_key(now))
+    logger.info(
+        "oncall queued a diagnosis case=%s attempt=%s redactions=%s",
+        case.id,
+        attempt,
+        payload.get("redactions"),
+    )
+    return True
+
+
+def _handle_finished_run(
+    store: OncallStateStore,
+    spool: Spool,
+    *,
+    record: Any,
+    run: Mapping[str, Any],
+    config: OncallConfig,
+    now: datetime,
+    policy: AlertPolicy,
+    database_path: Path,
+    casefile_config: CasefileConfig | None,
+    journal_runner: Callable[..., str] | None,
+) -> str:
+    """Turn one finished run into a stored verdict, a retry, or a failure."""
+
+    case = store.get_case(record.case_id)
+    failure_class: str | None = None
+    verdict_payload: dict[str, Any] | None = None
+
+    if str(run.get("status")) == RUN_OK:
+        try:
+            verdict_payload = validate_verdict(
+                spool.read_verdict(record.case_id), case_id=record.case_id
+            ).as_dict()
+        except VerdictContractError as exc:
+            logger.warning(
+                "oncall rejected a verdict case=%s reason=%s", record.case_id, exc
+            )
+            failure_class = FAILURE_CONTRACT
+    else:
+        failure_class = str(run.get("failure_class") or "other")
+
+    if failure_class is None and verdict_payload is not None:
+        store.record_diagnosis_result(
+            case_id=record.case_id,
+            status=DIAGNOSIS_DONE,
+            now=now,
+            verdict=verdict_payload,
+        )
+        _record_availability(store, now=now, success=True, failure_class=None)
+        _maybe_send_diagnosis(
+            store,
+            case=case,
+            verdict=verdict_payload,
+            config=config,
+            now=now,
+            policy=policy,
+        )
+        return "done"
+
+    _record_availability(store, now=now, success=False, failure_class=failure_class)
+    retry_allowed = (
+        record.attempts < MAX_ATTEMPTS
+        and codex_state(store) != CODEX_DOWN
+        and store.get_int_meta(_codex_daily_key(now), 0) < config.codex_daily_cap
+        and case is not None
+        and case.status == "open"
+    )
+    if retry_allowed and _build_and_enqueue(
+        store,
+        spool,
+        case=case,
+        attempt=record.attempts + 1,
+        database_path=database_path,
+        now=now,
+        casefile_config=casefile_config,
+        journal_runner=journal_runner,
+    ):
+        return "retried"
+    store.record_diagnosis_result(
+        case_id=record.case_id,
+        status=DIAGNOSIS_FAILED,
+        now=now,
+        failure_class=failure_class,
+    )
+    return "failed"
+
+
+def _maybe_send_diagnosis(
+    store: OncallStateStore,
+    *,
+    case: Any,
+    verdict: Mapping[str, Any],
+    config: OncallConfig,
+    now: datetime,
+    policy: AlertPolicy,
+) -> None:
+    if case is None:
+        return
+    if config.effective_codex_mode() != CODEX_MODE_ON:
+        store.set_diagnosis_message_state(case.id, MESSAGE_SUPPRESSED)
+        return
+    if case.status != "open":
+        # The problem fixed itself while Codex was thinking. The diagnosis is
+        # still worth keeping; telling somebody about a solved problem is not.
+        store.set_diagnosis_message_state(case.id, MESSAGE_SUPPRESSED)
+        return
+    if compose_diagnosis_alert(
+        store, case=case, verdict=verdict, now=now, policy=policy
+    ):
+        store.set_diagnosis_message_state(case.id, MESSAGE_QUEUED)
+
+
+def run_codex_cycle(
+    store: OncallStateStore,
+    *,
+    config: OncallConfig,
+    database_path: Path,
+    now: datetime,
+    policy: AlertPolicy | None = None,
+    spool: Spool | None = None,
+    casefile_config: CasefileConfig | None = None,
+    journal_runner: Callable[..., str] | None = None,
+) -> dict[str, int]:
+    """Poll finished diagnoses, then queue at most one new one.
+
+    Order matters: reading a result can free the single-flight slot, and a
+    result that arrives while the case is still open is the whole point.
+    """
+
+    settings = policy or AlertPolicy(daily_cap=config.daily_alert_cap)
+    mode = config.effective_codex_mode()
+    counters = {"polled": 0, "queued": 0, "failed": 0, "skipped": 0}
+    if mode == CODEX_MODE_OFF:
+        return counters
+
+    # ``Path("")`` is the current directory, which is the last place a case
+    # file should ever be written; fall back to the real spool instead.
+    shared = spool or Spool(root=Path(config.codex_spool or DEFAULT_SPOOL))
+    _consume_health_report(store, shared, now=now)
+
+    for record in store.queued_diagnoses():
+        run = shared.read_run(record.case_id)
+        answered = isinstance(run, dict) and str(
+            run.get("request_fingerprint") or ""
+        ) == str(record.request_fingerprint or "")
+        if not answered:
+            if _is_abandoned(record, now=now):
+                # Nobody answered. The runner may be stopped, may have been
+                # killed mid-call, or may never have been installed -- and a
+                # request nobody will ever answer would otherwise hold the
+                # single-flight slot for good and silently end diagnosis for
+                # every later case. Three of these take Codex down loudly,
+                # which is the behaviour the user asked for: never silent.
+                store.record_diagnosis_result(
+                    case_id=record.case_id,
+                    status=DIAGNOSIS_FAILED,
+                    now=now,
+                    failure_class=FAILURE_TIMEOUT,
+                )
+                _record_availability(
+                    store, now=now, success=False, failure_class=FAILURE_TIMEOUT
+                )
+                counters["failed"] += 1
+                logger.warning(
+                    "oncall diagnosis was never answered case=%s", record.case_id
+                )
+            continue
+        counters["polled"] += 1
+        result = _handle_finished_run(
+            store,
+            shared,
+            record=record,
+            run=run,
+            config=config,
+            now=now,
+            policy=settings,
+            database_path=database_path,
+            casefile_config=casefile_config,
+            journal_runner=journal_runner,
+        )
+        if result == "failed":
+            counters["failed"] += 1
+        elif result == "retried":
+            counters["queued"] += 1
+
+    if codex_state(store) == CODEX_DOWN:
+        # New cases wait for recovery rather than burning an eight-minute
+        # timeout each; the opening alert already says so.
+        return counters
+    if store.queued_diagnoses():
+        return counters  # single flight
+
+    for case in _diagnosis_candidates(store, now=now):
+        if store.get_int_meta(_codex_daily_key(now), 0) >= config.codex_daily_cap:
+            store.record_diagnosis_result(
+                case_id=case.id,
+                status=DIAGNOSIS_SKIPPED,
+                now=now,
+                skip_reason="daily_cap",
+            )
+            counters["skipped"] += 1
+            continue
+        if _build_and_enqueue(
+            store,
+            shared,
+            case=case,
+            attempt=1,
+            database_path=database_path,
+            now=now,
+            casefile_config=casefile_config,
+            journal_runner=journal_runner,
+        ):
+            counters["queued"] += 1
+            break  # single flight: one outstanding call at a time
+    return counters
+
+
 def run_oncall_round(
     *,
     store: OncallStateStore,
@@ -181,9 +660,20 @@ def run_oncall_round(
     now: datetime,
     sender: Callable[[str], None] | None,
     worker_health_probe: Callable[[], bool] | None,
+    spool: Spool | None = None,
+    casefile_config: CasefileConfig | None = None,
+    journal_runner: Callable[..., str] | None = None,
 ) -> RoundOutcome:
-    """Detect, compose, deliver. One round, no sleeping, no process concerns."""
+    """Detect, compose, deliver. One round, no sleeping, no process concerns.
 
+    The Codex step sits *between* composing the phase 1 alerts and delivering
+    them, and every failure inside it is swallowed. So a diagnosis can join
+    the same delivery pass when it is ready, while nothing Codex does -- being
+    down, being slow, throwing -- can delay or suppress the alert that says a
+    message was not carried out. The tests assert both halves of that.
+    """
+
+    policy = AlertPolicy(daily_cap=config.daily_alert_cap)
     outcome = run_detection_round(
         reader_factory=lambda: ProductionReader(database_path),
         store=store,
@@ -191,13 +681,34 @@ def run_oncall_round(
         config=detector_config,
         worker_health_probe=worker_health_probe,
     )
+    try:
+        codex_note = codex_note_for_new_cases(store, config=config, now=now)
+    except Exception:  # noqa: BLE001 - a note is never worth a missed alert
+        logger.exception("oncall could not derive the codex note")
+        codex_note = None
     compose_case_alerts(
         store,
         now=now,
         new_case_ids=outcome.new_case_ids,
         resolved_case_ids=outcome.resolved_case_ids,
-        policy=AlertPolicy(daily_cap=config.daily_alert_cap),
+        policy=policy,
+        codex_note=codex_note,
     )
+    try:
+        run_codex_cycle(
+            store,
+            config=config,
+            database_path=Path(database_path),
+            now=now,
+            policy=policy,
+            spool=spool,
+            casefile_config=casefile_config,
+            journal_runner=journal_runner,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - diagnosis is an extra, never a gate
+        logger.exception("oncall codex cycle failed")
     maybe_compose_daily_summary(
         store,
         now=now,
@@ -222,6 +733,8 @@ def run_oncall_watch(
     clock: Callable[[], datetime] = lambda: datetime.now(UTC),
     sleeper: Callable[[float], None] = time.sleep,
     sender: Callable[[str], None] | None = None,
+    spool: Spool | None = None,
+    journal_runner: Callable[..., str] | None = None,
 ) -> dict[str, Any]:
     """The watcher's main loop. Returns a small summary when it stops."""
 
@@ -271,6 +784,8 @@ def run_oncall_watch(
                     now=now,
                     sender=sender,
                     worker_health_probe=probe,
+                    spool=spool,
+                    journal_runner=journal_runner,
                 )
                 last_error = None
             except (KeyboardInterrupt, SystemExit):

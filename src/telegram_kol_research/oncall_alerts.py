@@ -28,9 +28,17 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
+from telegram_kol_research.oncall_codex import (
+    CATEGORY_LABELS_ZH,
+    CONFIDENCE_LABELS_ZH,
+    FAILURE_AUTH,
+    FAILURE_LABELS_ZH,
+    SHOULD_LABELS_ZH,
+    URGENCY_LABELS_ZH,
+)
 from telegram_kol_research.oncall_state import (
     CaseRecord,
     OncallStateStore,
@@ -53,6 +61,10 @@ ALERT_KIND_HEALTH_RESOLVED = "health_resolved"
 ALERT_KIND_GROUP_MERGED = "group_merged"
 ALERT_KIND_CAP_REACHED = "cap_reached"
 ALERT_KIND_DAILY_SUMMARY = "daily_summary"
+#: Phase 2.
+ALERT_KIND_DIAGNOSIS = "diagnosis"
+ALERT_KIND_CODEX_DOWN = "codex_down"
+ALERT_KIND_CODEX_RECOVERED = "codex_recovered"
 
 #: Alerts that count against the daily cap.
 CAPPED_ALERT_KINDS = (
@@ -61,6 +73,7 @@ CAPPED_ALERT_KINDS = (
     ALERT_KIND_HEALTH_OPEN,
     ALERT_KIND_HEALTH_RESOLVED,
     ALERT_KIND_GROUP_MERGED,
+    ALERT_KIND_DIAGNOSIS,
 )
 
 GROUP_MERGE_WINDOW = timedelta(minutes=10)
@@ -296,6 +309,57 @@ def format_health_resolved_alert(case: CaseRecord) -> str:
     return f"✅ 值守提醒 #{case.id} 已恢复\n{body}"
 
 
+def format_diagnosis_message(case: CaseRecord, verdict: Mapping[str, Any]) -> str:
+    """The six lines of spec 6.4. Plain text, no formatting, no code names.
+
+    Everything here came back from a model that read untrusted KOL text, so it
+    only reaches this function after ``oncall_codex.validate_verdict`` has
+    checked every field, every length and every redaction pattern.
+    """
+
+    urgency = URGENCY_LABELS_ZH.get(str(verdict.get("urgency")), "无需处理")
+    category = CATEGORY_LABELS_ZH.get(str(verdict.get("category")), "无法归类")
+    should = SHOULD_LABELS_ZH.get(str(verdict.get("should_have_executed")), "说不准是否应该")
+    confidence = CONFIDENCE_LABELS_ZH.get(str(verdict.get("confidence")), "低")
+    return "\n".join(
+        [
+            f"🔎 值守诊断 #{case.id}（{urgency}）",
+            f"消息本意：{verdict.get('what_message_wanted_zh', '')}",
+            f"没执行的原因：{verdict.get('explanation_zh', '')}",
+            f"结论：{category}；按消息本意{should}执行",
+            f"建议：{verdict.get('recommended_action_zh', '')}",
+            f"把握：{confidence}",
+        ]
+    )
+
+
+def format_codex_down_alert(failure_class: str | None) -> str:
+    """Going dark is itself news, and an auth failure names its own fix."""
+
+    label = FAILURE_LABELS_ZH.get(str(failure_class or ""), "原因不明")
+    lines = [
+        "⚠️ Codex 当前不可用，新案件暂时没有自动诊断。",
+        f"原因：{label}",
+        "值守本身照常检测和提醒，只是少了「为什么没执行」这一段。",
+    ]
+    if str(failure_class or "") == FAILURE_AUTH:
+        lines.append("请在服务器上以 root 执行：codex login")
+    return "\n".join(lines)
+
+
+def format_codex_recovered_alert() -> str:
+    return "✅ Codex 已恢复，之前没诊断的未结案件会补上。"
+
+
+def codex_unavailable_note(failure_class: str | None) -> str:
+    label = FAILURE_LABELS_ZH.get(str(failure_class or ""), "原因不明")
+    return f"Codex 当前不可用（{label}），本案无自动诊断。"
+
+
+def codex_daily_cap_note(cap: int) -> str:
+    return f"今日自动诊断已达上限（{cap} 次），本案无自动诊断。"
+
+
 def format_group_merged_alert(group_name: str, case_ids: Sequence[int]) -> str:
     numbers = " ".join(f"#{case_id}" for case_id in case_ids)
     return f"⚠️ {group_name} 另有 {len(case_ids)} 条类似情况（案件号 {numbers}）。"
@@ -470,8 +534,14 @@ def compose_case_alerts(
     new_case_ids: Sequence[int],
     resolved_case_ids: Sequence[int],
     policy: AlertPolicy | None = None,
+    codex_note: str | None = None,
 ) -> int:
-    """Turn this round's case changes into queued alerts. Returns how many."""
+    """Turn this round's case changes into queued alerts. Returns how many.
+
+    ``codex_note`` is one extra line for the opening alert, saying that this
+    case will get no automatic diagnosis and why. It is derived from state the
+    watcher already holds, so composing an alert never waits on Codex.
+    """
 
     settings = policy or AlertPolicy()
     queued = 0
@@ -495,6 +565,8 @@ def compose_case_alerts(
             store.mark_case_alerted(case.id, now)
             continue
         body = format_health_alert(case) if is_health else format_case_alert(case)
+        if codex_note:
+            body = f"{body}\n{codex_note}"
         kind = ALERT_KIND_HEALTH_OPEN if is_health else ALERT_KIND_CASE_OPEN
         if store.enqueue_alert(
             kind=kind,
@@ -544,6 +616,64 @@ def compose_case_alerts(
             queued += 1
             _note_capped_alert(store, now)
     return queued
+
+
+def compose_diagnosis_alert(
+    store: OncallStateStore,
+    *,
+    case: CaseRecord,
+    verdict: Mapping[str, Any],
+    now: datetime,
+    policy: AlertPolicy | None = None,
+) -> bool:
+    """Queue the follow-up diagnosis for one case. At most one, ever."""
+
+    settings = policy or AlertPolicy()
+    if _cap_reached(store, now, settings):
+        _suppress_for_cap(store, now, settings)
+        return False
+    queued = store.enqueue_alert(
+        kind=ALERT_KIND_DIAGNOSIS,
+        body=format_diagnosis_message(case, verdict),
+        now=now,
+        case_id=case.id,
+        dedupe_key=f"{ALERT_KIND_DIAGNOSIS}:{case.id}",
+    )
+    if queued is None:
+        return False
+    _note_capped_alert(store, now)
+    return True
+
+
+def compose_codex_state_alert(
+    store: OncallStateStore,
+    *,
+    now: datetime,
+    down: bool,
+    failure_class: str | None = None,
+    episode: str = "",
+) -> bool:
+    """"Codex went dark" / "Codex is back". Never subject to the daily cap.
+
+    Silence about the diagnosis layer would look exactly like a quiet day, and
+    the whole point of this phase is that a failure is never silent.
+    """
+
+    if down:
+        body = format_codex_down_alert(failure_class)
+        kind = ALERT_KIND_CODEX_DOWN
+    else:
+        body = format_codex_recovered_alert()
+        kind = ALERT_KIND_CODEX_RECOVERED
+    return (
+        store.enqueue_alert(
+            kind=kind,
+            body=body,
+            now=now,
+            dedupe_key=f"{kind}:{episode or beijing_date(now)}",
+        )
+        is not None
+    )
 
 
 def _episode_key(kind: str, case: CaseRecord) -> str:
