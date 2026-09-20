@@ -27,7 +27,14 @@ ExecStartPre=+/bin/chmod 2770 /var/lib/telegram-kol-oncall/codex-spool
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/python -B -m telegram_kol_research.oncall_codex_runner --spool /var/lib/telegram-kol-oncall/codex-spool
 
 AmbientCapabilities=
-CapabilityBoundingSet=
+# One capability, not none: codex runs every command through its bundled
+# bubblewrap, and since Linux 5.12 mapping uid 0 into a user namespace needs
+# CAP_SETFCAP in the parent. With an empty set every command died with "bwrap:
+# setting up uid map: Operation not permitted" (bisected on the server with
+# `codex sandbox id`, 2026-09-20; SETUID/SETGID/SYS_ADMIN were neither needed nor
+# sufficient). Under NoNewPrivileges a file capability confers nothing on exec,
+# and the only writable places here are the spool and /root/.codex.
+CapabilityBoundingSet=CAP_SETFCAP
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=tmpfs
@@ -37,11 +44,32 @@ ProtectControlGroups=true
 ProtectKernelLogs=true
 ProtectKernelModules=true
 ProtectKernelTunables=true
+# Other uid-0 processes' /proc/<pid>/environ is readable by uid 0 without any
+# capability; keep the process list down to this unit's own.
+ProtectProc=invisible
+# Not ProcSubset=pid: codex runs every command through its bundled bubblewrap,
+# which needs /proc/sys/kernel/overflowuid. With /proc/sys hidden every command
+# failed, Codex could read nothing, and the smoke test's "write was blocked"
+# step passed for the wrong reason (server acceptance, 2026-09-20).
 
 # The allowlist. Each TemporaryFileSystem replaces a whole tree with an empty
 # read-only one; the BindReadOnlyPaths below then put back the few things that
 # have to be visible. Anything not named here does not exist for this process.
 TemporaryFileSystem=/etc:ro
+# Server acceptance, 2026-09-20: /run holds docker.sock, containerd, the systemd
+# private socket and the system bus, every one of them connectable by uid 0 even
+# with an empty capability set -- docker.sock alone is the whole host. /www is a
+# non-standard top-level directory on this machine. resolv.conf is a plain file
+# here, so hiding /run does not take DNS with it.
+TemporaryFileSystem=/run:ro
+TemporaryFileSystem=/www:ro
+# Hidden top-level directories found by the probe on this host (an SSH
+# manager's database lives in the first). `TemporaryFileSystem=/:ro` would make
+# this list unnecessary, but on this systemd 255 it did not take effect -- the
+# probe saw the whole machine -- so the overlays stay explicit and the probe
+# fails on any top-level entry it does not know.
+TemporaryFileSystem=/.__gmssh:ro
+TemporaryFileSystem=/.Recycle_bin:ro
 TemporaryFileSystem=/opt:ro
 TemporaryFileSystem=/var:ro
 TemporaryFileSystem=/srv:ro
@@ -50,8 +78,11 @@ TemporaryFileSystem=/mnt:ro
 TemporaryFileSystem=/media:ro
 
 # TLS trust and name resolution, so the HTTPS call to OpenAI can be made.
-BindReadOnlyPaths=-/etc/ssl
-BindReadOnlyPaths=-/etc/pki
+# CA bundles only: /etc/pki/tls/private and /etc/ssl/private hold private keys.
+BindReadOnlyPaths=-/etc/ssl/certs
+BindReadOnlyPaths=-/etc/pki/ca-trust
+BindReadOnlyPaths=-/etc/pki/tls/certs
+BindReadOnlyPaths=-/etc/pki/tls/cert.pem
 BindReadOnlyPaths=-/etc/ca-certificates
 BindReadOnlyPaths=-/etc/resolv.conf
 BindReadOnlyPaths=-/etc/hosts

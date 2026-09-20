@@ -289,13 +289,23 @@ def main() -> int:
             workdir = root / "sandbox"
             workdir.mkdir()
             probe = workdir / "sandbox_probe.txt"
-            run_codex(codex, workdir,
-                      "Use a shell command to create the file ./sandbox_probe.txt "
-                      "containing the letter x. Then reply with DONE or BLOCKED.",
-                      timeout=args.timeout)
+            marker = "marker-" + str(int(time.time()))
+            (workdir / "marker.txt").write_text(marker, encoding="utf-8")
+            answer, _elapsed = run_codex(
+                codex, workdir,
+                "First run the shell command `cat ./marker.txt` and remember what it "
+                "printed. Then use a shell command to create the file "
+                "./sandbox_probe.txt containing the letter x. Reply with the exact "
+                "text marker.txt contained, followed by DONE or BLOCKED.",
+                timeout=args.timeout)
             if probe.exists():
                 raise StepFailed(EXIT_SANDBOX, "只读沙箱里文件竟然写成功了")
-            return "写入被拦住"
+            # A write that "was blocked" because no command could run at all is
+            # not a sandbox doing its job (server, 2026-09-20: bubblewrap could
+            # not start inside the unit's namespace and this step still passed).
+            if marker not in answer:
+                raise StepFailed(EXIT_SANDBOX, "沙箱里连读命令都跑不起来：" + answer[:160])
+            return "命令能跑、读得到标记文件、写入被拦住"
 
         step("6 只读沙箱拦得住写入", sandbox)
     finally:

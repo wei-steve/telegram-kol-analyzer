@@ -302,13 +302,15 @@ CODEX_UNIT = (
 
 
 @pytest.mark.architecture
-def test_the_codex_unit_gives_root_an_allowlist_and_no_capabilities():
+def test_the_codex_unit_gives_root_an_allowlist_and_one_capability():
     unit = CODEX_UNIT.read_text(encoding="utf-8")
 
     for required in (
         "User=root",
-        "CapabilityBoundingSet=",
-        "AmbientCapabilities=",
+        # Exactly one: bubblewrap cannot map uid 0 without it (Linux >= 5.12).
+        "CapabilityBoundingSet=CAP_SETFCAP\n",
+        "AmbientCapabilities=\n",
+        "ProtectProc=invisible",
         "NoNewPrivileges=true",
         "ProtectSystem=strict",
         "ProtectHome=tmpfs",
@@ -326,12 +328,30 @@ def test_the_codex_unit_gives_root_an_allowlist_and_no_capabilities():
     ):
         assert required in unit, required
 
-    for tree in ("/etc", "/opt", "/var", "/srv", "/data", "/mnt", "/media"):
+    # /run carries docker.sock, containerd and the systemd private socket, all
+    # connectable by uid 0 with no capability at all; /www and the two hidden
+    # directories are this host's own (server acceptance, 2026-09-20).
+    for tree in (
+        "/etc", "/run", "/opt", "/var", "/srv", "/data", "/mnt", "/media",
+        "/www", "/.__gmssh", "/.Recycle_bin",
+    ):
         assert f"TemporaryFileSystem={tree}:ro" in unit, tree
 
+    directives = [
+        line.strip() for line in unit.splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    # bubblewrap needs /proc/sys/kernel/overflowuid; hiding /proc/sys made every
+    # Codex command fail while the smoke test's write check still "passed".
+    assert not any(line.startswith("ProcSubset=") for line in directives)
+    # Whole certificate trees include private keys; only CA bundles come in.
+    assert "BindReadOnlyPaths=-/etc/ssl\n" not in unit
+    assert "BindReadOnlyPaths=-/etc/pki\n" not in unit
+
     for path in (
-        "/etc/ssl",
-        "/etc/pki",
+        "/etc/ssl/certs",
+        "/etc/pki/ca-trust",
+        "/etc/pki/tls/certs",
         "/etc/ca-certificates",
         "/etc/resolv.conf",
         "/etc/hosts",
@@ -404,7 +424,8 @@ def test_the_sandbox_probe_reuses_the_units_own_properties():
     unit = CODEX_UNIT.read_text(encoding="utf-8")
     properties = module.parse_sandbox_properties(unit)
 
-    assert "CapabilityBoundingSet=" in properties
+    assert "CapabilityBoundingSet=CAP_SETFCAP" in properties
+    assert "ProtectProc=invisible" in properties
     assert "TemporaryFileSystem=/etc:ro" in properties
     assert "BindPaths=/root/.codex" in properties
     assert not any(prop.startswith(("ExecStart", "Restart", "Description")) for prop in properties)

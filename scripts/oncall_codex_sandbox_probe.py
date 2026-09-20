@@ -49,6 +49,8 @@ SANDBOX_DIRECTIVES = (
     "ProtectKernelLogs",
     "ProtectKernelModules",
     "ProtectKernelTunables",
+    "ProtectProc",
+    "ProcSubset",
     "UMask",
     "TemporaryFileSystem",
     "BindReadOnlyPaths",
@@ -62,29 +64,82 @@ set -u
 fail=0
 say() { if [ "$1" = 0 ]; then echo "PASS  $2"; else echo "FAIL  $2"; fail=1; fi }
 
-unreadable() {
-    if cat "$1" >/dev/null 2>&1 || ls "$1" >/dev/null 2>&1; then
+# A TemporaryFileSystem= mount leaves an empty, readable directory behind; what
+# matters is that nothing from the real one shows through.
+hidden() {
+    if [ -f "$1" ] && cat "$1" >/dev/null 2>&1; then
         say 1 "$2 应当看不见，却读到了：$1"
+    elif [ -d "$1" ] && [ -n "$(ls -A "$1" 2>/dev/null)" ]; then
+        say 1 "$2 应当是空的，却看到了内容：$1"
     else
         say 0 "$2 看不见：$1"
     fi
 }
 
-unreadable /etc/telegram-kol-worker.env "worker 环境文件"
-unreadable /opt/telegram-kol-analyzer/config "应用配置目录"
-unreadable /opt/telegram-kol-analyzer/data "应用数据目录"
-unreadable /opt/frp "frp 目录"
-unreadable /home "home 目录"
-unreadable /data "data 目录"
+hidden /etc/telegram-kol-worker.env "worker 环境文件"
+hidden /etc/telegram-kol-oncall.env "值守环境文件"
+hidden /opt/telegram-kol-analyzer/config "应用配置目录"
+hidden /opt/telegram-kol-analyzer/data "应用数据目录"
+hidden /opt/telegram-kol-analyzer/.git "git 目录"
+hidden /opt/frp "frp 目录"
+hidden /opt/telegram-kol-releases "历史 release 目录"
+hidden /home "home 目录"
+hidden /data "data 目录"
+hidden /www "www 目录"
+hidden /root/.ssh "root 的 ssh 目录"
+hidden /etc/pki/tls/private "TLS 私钥目录"
+hidden /etc/ssl/private "TLS 私钥目录"
 
-if [ -r /opt/telegram-kol-analyzer/src/telegram_kol_research/oncall_codex.py ]; then
+# The overlays are an explicit list, so the list can fall behind the machine.
+# Anything at the top level that is not a system tree must show up empty.
+for entry in $(ls -A /); do
+    case "$entry" in
+        bin|boot|dev|etc|lib|lib64|opt|proc|root|run|sbin|sys|tmp|usr|var) continue ;;
+    esac
+    if [ -d "/$entry" ] && [ -n "$(ls -A "/$entry" 2>/dev/null)" ]; then
+        say 1 "根目录下有未遮盖的目录：/$entry"
+    elif [ -f "/$entry" ] && [ -s "/$entry" ] && [ -r "/$entry" ]; then
+        say 1 "根目录下有未遮盖的文件：/$entry"
+    fi
+done
+say 0 "根目录逐项检查完成"
+
+for sock in /run/docker.sock /run/containerd/containerd.sock /run/systemd/private /run/dbus/system_bus_socket; do
+    if [ -e "$sock" ]; then
+        say 1 "root 可连接的 socket 仍然可见：$sock"
+    else
+        say 0 "socket 看不见：$sock"
+    fi
+done
+
+# Names only, never values: does any other process leak its environment to us?
+leaks=0
+for environ in /proc/[0-9]*/environ; do
+    pid=${environ#/proc/}; pid=${pid%/environ}
+    [ "$pid" = "$$" ] && continue
+    if tr '\0' '\n' < "$environ" 2>/dev/null | grep -qE '^(DEEPCOIN_|TELEGRAM_API_|TELEGRAM_KOL_[A-Z_]*(TOKEN|KEY|SECRET))'; then
+        leaks=$((leaks + 1))
+    fi
+done
+if [ "$leaks" = 0 ]; then
+    say 0 "读不到其它进程环境里的密钥"
+else
+    say 1 "能从 /proc 读到 $leaks 个进程环境里的密钥键名"
+fi
+
+if [ -r /opt/telegram-kol-analyzer/src/telegram_kol_research/__init__.py ]; then
     say 0 "部署源码可读"
 else
     say 1 "部署源码不可读——runner 无法解释原因码"
 fi
 
-found=$(find / -xdev \( -name "*.env" -o -name "*.session" -o -name "auth.json" \) \
-        -readable 2>/dev/null | grep -v '^/root/.codex/auth.json$' || true)
+# No -xdev: the bind mounts and tmpfs overlays are exactly what needs searching.
+# System trees that hold toolchain files such as golang's go.env are pruned.
+found=$(find / \( -path /proc -o -path /sys -o -path /dev -o -path /usr -o -path /lib \
+        -o -path /lib64 -o -path /bin -o -path /sbin -o -path /boot \) -prune -o \
+        \( -name "*.env" -o -name "*.session" -o -name "auth.json" -o -name "id_rsa*" \
+        -o -name "id_ed25519*" -o -name "*.db" \) -readable -print 2>/dev/null \
+        | grep -v -e '^/root/.codex/' -e '^/opt/telegram-kol-analyzer/.venv/' || true)
 if [ -z "$found" ]; then
     say 0 "全盘没有其它可读的密钥形状文件"
 else
