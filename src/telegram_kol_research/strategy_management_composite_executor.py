@@ -149,6 +149,29 @@ def execute_composite_management_batch(
     if batch.status != "executing":
         raise ValueError(f"composite_batch_not_executable:{batch.status}")
 
+    # The contract has always said `cancel_deferred_entries` for this intent
+    # and the non-composite reduce path has always honoured it; the composite
+    # path never did. A KOL who says "reduce and move the stop to cost" must
+    # not have a resting second entry leg fill afterwards and re-grow the
+    # position. Same point in the sequence as `execute_management_batch`:
+    # after the batch is claimed, before any write it makes.
+    try:
+        if load_management_contract(
+            batch.management_contract_json or ""
+        ).cancel_deferred_entries:
+            _cancel_batch_deferred_entry_legs(
+                session_factory,
+                batch_id=batch.id,
+                deepcoin_client=deepcoin_client,
+                now=now_provider(),
+            )
+    except Exception as exc:  # noqa: BLE001 - same failure semantics as above
+        _freeze_composite_batch(
+            session_factory, batch.id, now_provider(),
+            _deferred_entry_cancel_freeze_reason(exc),
+        )
+        return load_management_batch(session_factory, batch.id)
+
     executors = {
         "consume_take_profit_stage": execute_take_profit_consumption_component,
         "converge_partial_close": execute_partial_close_component,
@@ -275,6 +298,16 @@ def _composite_component_topology_is_exact(batch) -> bool:
     except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
         return False
     return bool(batch.legs and required) and len(actual) == len(expected) and set(actual) == expected
+
+
+def _deferred_entry_cancel_freeze_reason(exc: Exception) -> str:
+    """The reason codes `execute_management_batch` writes, for the same causes."""
+
+    from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
+
+    if isinstance(exc, DeepcoinDefiniteRejection):
+        return "deferred_entry_cancel_race_detected"
+    return "deferred_entry_cancel_preflight_failed"
 
 
 def _freeze_composite_batch(session_factory, batch_id, now, reason):
@@ -1603,7 +1636,7 @@ def _run_remainder_close(
     # the very position the instruction just asked us to leave.
     if not plan.get("deferred_entries_cancelled"):
         try:
-            cancelled_leg_ids = _cancel_remainder_deferred_entries(
+            cancelled_leg_ids = _cancel_batch_deferred_entry_legs(
                 session_factory,
                 batch_id=batch.id,
                 deepcoin_client=deepcoin_client,
@@ -1958,19 +1991,52 @@ def _record_remainder_close_incident(
         )
 
 
-def _cancel_remainder_deferred_entries(
+def _cancel_batch_deferred_entry_legs(
     session_factory, *, batch_id: int, deepcoin_client: Any, now: Any
 ) -> list[int]:
-    """Reuse the full-exit path's own cancel, identity checks included."""
+    """Cancel this batch's own unfilled entry orders, at most once.
 
+    Reuses the full-exit path's cancel verbatim -- identity checks, per-leg
+    diagnostics and all. The one thing added here is idempotency: the composite
+    batch executor is re-entered on every worker tick, while the non-composite
+    path runs its cancel exactly once per execution, so a second tick would
+    otherwise find the legs already cancelled and fail closed on them.
+
+    A snapshot that cannot be parsed still fails closed, because the caller
+    must not be able to mistake "no deferred legs" for "we could not tell".
+    """
+
+    from telegram_kol_research.models import ExecutionOrderLeg
     from telegram_kol_research.strategy_management_executor import (
         _cancel_deferred_entry_legs,
+        _is_management_cancelled_deferred_entry_leg,
         _load_exact_binding,
+        _parse_exact_deferred_entry_leg_ids,
     )
 
+    with session_factory() as session:
+        row = session.get(StrategyManagementBatch, int(batch_id))
+        snapshot_json = getattr(row, "target_snapshot_json", None)
+    leg_ids = _parse_exact_deferred_entry_leg_ids(
+        snapshot_json, error_code="deferred_entry_cancel_identity_drift"
+    )
+    if not leg_ids:
+        return []
+    with session_factory() as session:
+        rows = [
+            session.get(ExecutionOrderLeg, int(leg_id)) for leg_id in leg_ids
+        ]
+        already_done = all(
+            row is not None and _is_management_cancelled_deferred_entry_leg(row)
+            for row in rows
+        )
+    if already_done:
+        # An earlier tick of this same batch cancelled them. A *partial*
+        # completion deliberately does not qualify: it goes through the real
+        # cancel below, which fails closed on it.
+        return leg_ids
     record = load_management_batch(session_factory, int(batch_id))
     binding = _load_exact_binding(session_factory, record)
-    leg_ids = _snapshot_deferred_entry_leg_ids(session_factory, batch_id)
     _cancel_deferred_entry_legs(
         session_factory,
         batch=record,
@@ -1979,20 +2045,6 @@ def _cancel_remainder_deferred_entries(
         cancelled_at=now,
     )
     return leg_ids
-
-
-def _snapshot_deferred_entry_leg_ids(session_factory, batch_id: int) -> list[int]:
-    """Evidence only. The authoritative parse stays in the executor's cancel."""
-
-    with session_factory() as session:
-        row = session.get(StrategyManagementBatch, int(batch_id))
-        raw = getattr(row, "target_snapshot_json", None)
-    try:
-        snapshot = json.loads(raw or "{}")
-        values = snapshot["identity"]["deferred_entry_leg_ids"]
-        return [int(value) for value in values]
-    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return []
 
 
 def _unresolved_close_intent_exists(

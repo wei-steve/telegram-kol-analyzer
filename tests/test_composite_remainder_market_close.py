@@ -1809,6 +1809,181 @@ def test_an_unreadable_position_never_reaches_the_fallback(tmp_path, mutate, rea
     assert client.close_calls == []
 
 
+# ---------------------------------------------------------------------------
+# Design 9.2: the composite path honours `cancel_deferred_entries` on its
+# normal route too, not only on the market-close fallback.
+# ---------------------------------------------------------------------------
+
+
+def test_a_resting_entry_leg_is_cancelled_before_any_write_of_the_batch(tmp_path):
+    """Design 9.2.
+
+    The contract for `partial_then_break_even` has always carried
+    `cancel_deferred_entries=True`, and the non-composite reduce path has
+    always honoured it. The composite path never did: a KOL who says "reduce
+    and move the stop to cost" could have the pending second entry leg fill
+    afterwards and re-grow the position that was just reduced.
+
+    The cancel goes where the non-composite path puts it -- after the batch is
+    claimed, before any write the batch makes.
+    """
+
+    from telegram_kol_research.models import ExecutionOrderLeg
+
+    session_factory = create_session_factory(tmp_path / "taskb-normal.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, deferred_id = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+
+    result = _run_production_batch(session_factory, batch_id, client)
+
+    assert result.status == "succeeded"
+    names = [name for name, _ in client.calls]
+    assert names.index("cancel_order") < names.index("cancel_position_sltp")
+    assert names.index("cancel_order") < names.index("place_order")
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, deferred_id)
+    assert leg.status == "cancelled"
+    assert leg.terminal_reason == (
+        "management_full_close_cancelled_unfilled_entry_leg"
+    )
+
+
+def test_the_entry_cancel_runs_once_across_the_batchs_many_ticks(tmp_path):
+    """The batch executor is re-entered every tick; the cancel is not.
+
+    This is the one thing the non-composite path never had to solve, because
+    it runs its cancel once per execution and then leaves. Here a second tick
+    would find the legs already cancelled and fail closed on them.
+    """
+
+    session_factory = create_session_factory(tmp_path / "taskb-idempotent.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, _deferred = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+
+    first = _run_production_batch(session_factory, batch_id, client)
+    second = _run_production_batch(session_factory, batch_id, client)
+
+    assert first.status == second.status == "succeeded"
+    assert len([name for name, _ in client.calls if name == "cancel_order"]) == 1
+
+
+def test_a_batch_with_no_resting_entry_leg_reads_and_cancels_nothing(tmp_path):
+    session_factory = create_session_factory(tmp_path / "taskb-none.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, deferred_id = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    _forget_deferred_entry_leg(session_factory, batch_id)
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+    open_order_reads = []
+    client.list_open_orders = (
+        lambda *, inst_id=None: open_order_reads.append(1) or []
+    )
+
+    result = _run_production_batch(session_factory, batch_id, client)
+
+    assert result.status == "succeeded"
+    assert open_order_reads == []
+    assert [name for name, _ in client.calls if name == "cancel_order"] == []
+
+
+def test_a_refused_entry_cancel_freezes_the_batch_before_any_position_write(
+    tmp_path,
+):
+    """The non-composite path's failure semantics, verbatim: stop, tell a person."""
+
+    session_factory = create_session_factory(tmp_path / "taskb-refused.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, _deferred = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+
+    def refuse(payload):
+        client.calls.append(("cancel_order", dict(payload)))
+        raise DeepcoinDefiniteRejection("cancel refused")
+
+    client.cancel_order = refuse
+
+    result = _run_production_batch(session_factory, batch_id, client)
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "deferred_entry_cancel_race_detected"
+    assert [name for name, _ in client.calls if name == "place_order"] == []
+    assert [
+        name for name, _ in client.calls if name == "cancel_position_sltp"
+    ] == []
+
+
+def test_an_entry_leg_that_already_filled_freezes_the_batch(tmp_path):
+    """A leg that filled between planning and now is a race, not a cancel."""
+
+    from telegram_kol_research.models import ExecutionOrderLeg
+
+    session_factory = create_session_factory(tmp_path / "taskb-filled.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, deferred_id = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    with session_factory() as session:
+        leg = session.get(ExecutionOrderLeg, deferred_id)
+        leg.status = "active"
+        leg.pos_id = "pos-short-late"
+        leg.attribution_status = "verified"
+        session.commit()
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+
+    result = _run_production_batch(session_factory, batch_id, client)
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "deferred_entry_cancel_preflight_failed"
+    assert [name for name, _ in client.calls if name == "place_order"] == []
+
+
+def test_an_unreadable_identity_snapshot_fails_closed(tmp_path):
+    """"No deferred legs" and "we could not tell" must not look the same."""
+
+    session_factory = create_session_factory(tmp_path / "taskb-drift.db")
+    shape = {**SHORT_SHAPE, "mark_price": "80450"}
+    batch_id, _leg_ids, _filled, _deferred = (
+        _persist_production_composite_batch(session_factory, shape)
+    )
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        snapshot = json.loads(batch.target_snapshot_json)
+        del snapshot["identity"]["deferred_entry_leg_ids"]
+        batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+    client = _ProductionCompositeClient(shape)
+    client.arm_stops_instead_of_refusing()
+
+    result = _run_production_batch(session_factory, batch_id, client)
+
+    assert result.status == "recovery_required"
+    assert result.reason_code == "deferred_entry_cancel_preflight_failed"
+    assert client.calls == []
+
+
+def _forget_deferred_entry_leg(session_factory, batch_id):
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, batch_id)
+        snapshot = json.loads(batch.target_snapshot_json)
+        snapshot["identity"]["deferred_entry_leg_ids"] = []
+        batch.target_snapshot_json = json.dumps(snapshot)
+        session.commit()
+
+
 def test_a_position_row_without_a_price_never_reaches_the_fallback(tmp_path):
     session_factory = create_session_factory(tmp_path / "no-mark-price.db")
     batch_id, component_id = _prepare_passed_reference_component(session_factory)

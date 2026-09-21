@@ -416,3 +416,71 @@
 7. `runtime_incidents` 里恰好一条 `composite_break_even_remainder_closed`（low）。
 8. 尝试次数：看组件 `attempt_count`。若第一次就消耗在
    `remainder_close_waiting_partial_close_confirmation` 上，记下来（见 12.7 第 3 条）。
+
+## 13. 追加：复合路径在正常路线上也执行 `cancel_deferred_entries`（设计 9.2）
+
+**单独一次提交**，在第 12 节之后。指挥可以只部署第 12 节而不带这一节。
+
+### 13.1 问题
+
+合约对 `partial_then_break_even` 恒为 `cancel_deferred_entries=True`
+（`management_directives.py:481-486`，按 intent 判定，不是写死的 True），
+非复合减仓路径无条件调用 `_cancel_deferred_entry_legs`
+（`strategy_management_executor.py:1497`），**复合执行器里一行相关代码都没有**。
+后果：KOL 说"减仓并把止损移到成本"，减仓照做，但挂着的第二条入场腿仍然有效，
+它之后成交就会把刚刚减掉的仓位重新加回去。
+
+### 13.2 改动
+
+`execute_composite_management_batch` 里新增一处调用，位置与非复合路径同构：
+**批次认领之后、组件循环（任何写入）之前**。
+
+- 读合约的 `cancel_deferred_entries`，为假则什么都不做（不是写死 True——
+  该字段按 intent 取值，复合合约今天恒为 True，但判据留在合约里）。
+- 复用 `_cancel_batch_deferred_entry_legs`（由第 12 节的
+  `_cancel_remainder_deferred_entries` 改名而来），兜底全平路线也走同一个函数。
+- 失败语义与非复合路径逐字相同：`DeepcoinDefiniteRejection` →
+  `deferred_entry_cancel_race_detected`，其余 →
+  `deferred_entry_cancel_preflight_failed`；批次 `recovery_required`，
+  此刻尚未发生任何写入。
+
+### 13.3 唯一新增的东西：幂等
+
+非复合路径每次执行只跑一次撤单然后就离开了；**复合批次执行器每个 worker tick 都会重入**。
+所以第二个 tick 会看到腿已经是 `cancelled`，而
+`_load_exact_deferred_entry_legs` 对此是 fail-closed 的（`deferred_entry_cancel_leg_not_pending`），
+批次会被无辜冻结。因此加了一道守卫：
+
+- 用**权威解析器** `_parse_exact_deferred_entry_leg_ids` 读快照——
+  快照坏掉仍然 fail closed，"没有挂单腿"和"读不出来"不会长得一样；
+- 名单为空 → 真正的空操作（零读、不加载 binding）；
+- 名单里**每一条**都已是 `_is_management_cancelled_deferred_entry_leg`
+  （`cancelled` + 我们自己的 `terminal_reason` + 无 pos_id）→ 跳过；
+- **部分完成不算**：那会落到真正的撤单里，由它 fail closed。
+
+### 13.4 语义变化（上线即生效）
+
+一个今天能跑完的复合批次，若其挂单入场腿撤不干净（撤单被拒、腿刚成交、
+身份漂移），**现在会在做任何事之前冻结**。这正是非复合路径的行为，
+也正是合约要求的；而"撤不掉"这个状态下继续减仓、同时可能有第二条腿成交，
+是真正无法判断的局面。
+
+### 13.5 测试
+
+先写、先看它们因正确的原因失败（把那行判定临时改成 `if False and ...`，
+五条红、两条绿），再放开：
+
+| 用例 | 钉住 |
+|---|---|
+| `test_a_resting_entry_leg_is_cancelled_before_any_write_of_the_batch` | 撤单发生在第一次 `cancel_position_sltp` 与 `place_order` 之前；腿落 `cancelled` + 正确的 `terminal_reason` |
+| `test_the_entry_cancel_runs_once_across_the_batchs_many_ticks` | 跑两遍批次，`cancel_order` 恰好一次，两次都 `succeeded` |
+| `test_a_batch_with_no_resting_entry_leg_reads_and_cancels_nothing` | 名单为空 → `list_open_orders` 零次 |
+| `test_a_refused_entry_cancel_freezes_the_batch_before_any_position_write` | `deferred_entry_cancel_race_detected`，零 `place_order`、零 `cancel_position_sltp` |
+| `test_an_entry_leg_that_already_filled_freezes_the_batch` | `deferred_entry_cancel_preflight_failed`，零写入 |
+| `test_an_unreadable_identity_snapshot_fails_closed` | 快照缺 `deferred_entry_leg_ids` → 冻结，零调用 |
+
+### 13.6 首笔实盘样本追加两项
+
+9. 正常路线（保本止损**挂得上**）的复合批次：确认挂单入场腿已撤、
+   交易所挂单表里确实没有了，且撤单发生在减仓之前。
+10. 若该批次没有挂单入场腿：确认日志/事件里没有任何多余的挂单读取。

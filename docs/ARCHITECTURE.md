@@ -387,6 +387,16 @@ REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两�
 本地由 `retire_protection_for_closed_binding` 退役。先撤再平会制造裸仓窗口，
 而这里的全部意义就是不要那个窗口。
 
+**同一天补上的另一半：复合路径过去从不撤自己的挂单入场腿。** 合约对
+`partial_then_break_even` 恒为 `cancel_deferred_entries=True`，非复合减仓路径一直
+无条件执行它，复合执行器却一行都没有——减仓做完，挂着的第二条入场腿仍然有效，
+它之后成交就把刚减掉的仓位加了回来。现在复合批次在**认领之后、任何写入之前**
+按合约撤掉这些腿，位置与非复合路径同构，失败语义也一样
+（`deferred_entry_cancel_race_detected` / `deferred_entry_cancel_preflight_failed`，
+批次冻结，此刻尚未发生任何写入）。唯一新增的是幂等：批次执行器每个 tick 都重入，
+而 `_load_exact_deferred_entry_legs` 对已撤的腿是 fail-closed 的，
+所以"名单里每条都已是我们自己撤的"才跳过——**部分完成不算**，那仍要 fail closed。
+
 ## 5. 模块分类（已核实）
 
 `src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见
