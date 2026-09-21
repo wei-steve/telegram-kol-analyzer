@@ -2433,11 +2433,27 @@ def read_composite_management_invariants(
                 if retained > live_size:
                     reasons.add("live_position_retained_tp_oversized")
             elif str(component[3]) == "replace_remaining_protection":
-                # A component that ended by closing the remaining position at
-                # market has no stop to verify, by construction: the position
-                # is gone and the exchange invalidated its TPSL with it. Asking
-                # for two verified stops here would report a critical fault for
-                # every such batch, permanently.
+                # A position that is no longer open has no stop to verify, by
+                # construction: the exchange voids a position's TPSL with the
+                # position, and `retire_protection_for_closed_binding` retires
+                # the ledger rows to match -- which is precisely what this
+                # check reads as "no verified stop". Without this skip every
+                # composite batch reports a critical fault forever, starting
+                # the first time one of them succeeds.
+                #
+                # Only a live read may excuse the check. No live read at all is
+                # unknown, not "the position is gone", so the check still runs
+                # (hard rule 4).
+                if (
+                    live_position_sizes is not None
+                    or live_position_snapshot_path is not None
+                ) and observed_live_position_sizes.get(
+                    str(leg[3]), Decimal("0")
+                ) <= 0:
+                    continue
+                # The remainder-close route closes the position on purpose and
+                # is marked as such, so it is skipped even before a live read
+                # is available.
                 try:
                     history = json.loads(component[6] or "[]")
                 except (TypeError, ValueError, json.JSONDecodeError):
