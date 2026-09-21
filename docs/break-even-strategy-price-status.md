@@ -225,3 +225,14 @@
 `target_price`、`market_price`、以及每行的
 `order_id / purpose / old_trigger_price / trigger_price / kept`。
 先于任何交易所写入落库，所以写失败时也查得到。
+
+## 部署记录（2026-09-21 20:06 CST）
+
+- 用户 2026-09-21 明确批准部署。候选 `81fdc58a`（`d9fc6300` 实现 → `6938fcbc` 不得改松护栏 → 文档），最终候选全量 **9393 passed / 4 skipped / 0 failed**。
+- 部署前：候选是生产 HEAD `840c83ba` 的后代、共享分支 tip 是候选的祖先（两项 PASS）；零在途（管理批次 / mutation intent / claimed job / worker command 均为 0）；
+  当时在仓：BTC 多 1、ETH 多 1。
+- `tg-deploy 81fdc58a…` → worker / web / ingest 均 active，web 200。**回滚 = `tg-deploy 840c83ba8e563a23f67708c7ed481e73bc667597`。**
+- **自动交易开关未动**：`auto_trade_enabled=true`、`management_execution_mode=live`、`composite_management_v2_mode=live`，设置行 `updated_at` 仍为 2026-09-08。
+- 部署后：新消息照常处理（raw 18151 之后的作业 succeeded），worker 自重启起错误行 0；值守两个单元 active、心跳正常。
+- 待办：首笔命中新规则的真实保本消息按本文件的清单逐项核对（减仓数量、新止损 = 参考价按 tick 归一、旧止损撤净、`avg_entry_price` 仍等于交易所 `avgPx`、disposition）。
+- 用户同日追加两项决定（另行实施）：①复合指令（减仓后保本）止损挂不上时，剩余仓位也按市价全平；②TP1 成交后的系统自动保本也改用策略价。
