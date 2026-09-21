@@ -248,7 +248,10 @@ authority 边界覆盖（`test_protection_authority.py`）。
 
 ### 全量结果
 
-`uv run python -m pytest -q` —— **9520 passed, 4 skipped**（`72f4ab2f`）。
+`uv run python -m pytest -q` 在最终树 `7dfe786a` 上跑一次：
+**9530 passed, 4 skipped, 107 warnings, 785.10s (0:13:05)，退出码 0。**
+对基线 9457 passed / 4 skipped 净增 73 条（新增 81 条，重写的消费规划器
+文件用例数从 8 变成 26，净差由此而来）。
 （`uv run pytest` 会在收集阶段失败，是既有问题，与本次改动无关。）
 
 ## 9. 首个实盘样本清单
