@@ -2,14 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 from dataclasses import dataclass
 from datetime import timedelta
+from decimal import Decimal, InvalidOperation, ROUND_CEILING, ROUND_FLOOR
 from typing import Any, Callable
 
 from telegram_kol_research.management_stop_price_gate import validate_batch_stops, reject_execution_stop
 
 from telegram_kol_research.models import (
+    PositionMutationIntent,
     PositionProtectionLedger,
     RawMessage,
     StrategyManagementBatch,
@@ -67,6 +71,22 @@ from telegram_kol_research.strategy_records import (
 )
 
 
+logger = logging.getLogger(__name__)
+
+# The break-even remainder close (design
+# ``docs/plans/2026-09-21-composite-remainder-market-close-design.md``). All of
+# these names are free text in their own columns; none of them is a new status
+# value, a new component kind, or a schema change, so the previous release can
+# read every row this branch writes.
+REMAINDER_CLOSE_EXECUTION_KEY = "remainder_close_execution"
+REMAINDER_CLOSE_OUTCOME = "remainder_closed_at_market"
+REMAINDER_CLOSE_BATCH_REASON = "composite_remainder_market_closed"
+REMAINDER_CLOSE_INCIDENT_TYPE = "composite_break_even_remainder_closed"
+_UNRESOLVED_CLOSE_INTENT_STATUSES = (
+    "reserved", "submitting", "submitted", "recovery_required",
+)
+
+
 @dataclass(frozen=True, slots=True)
 class CompositeComponentExecutionResult:
     status: str
@@ -75,6 +95,15 @@ class CompositeComponentExecutionResult:
     proven_filled_quantity: str = "0"
     cancel_intent_ids: tuple[int, ...] = ()
     close_intent_ids: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class _RemainderCloseQuote:
+    """One fresh ticker read, and what it says about the break-even side."""
+
+    price: str | None = None
+    price_field: str | None = None
+    reason: str | None = None
 
 
 @serialized_position_authority_mutation
@@ -310,8 +339,27 @@ def _complete_composite_batch(
         flattened = [item for rows in evidence for item in rows if isinstance(item, dict)]
         remaining = [item.get("remaining_size") for item in flattened if item.get("remaining_size") is not None]
         retained = [item.get("retained_take_profit_total") for item in flattened if item.get("retained_take_profit_total") is not None]
+        closed = _remainder_closed_legs(session, batch=batch, components=components)
+        if closed.rows:
+            # Design 3.4. The books must be terminalized in the same
+            # transaction that makes the batch ``succeeded``: the moment the
+            # batch leaves a managed state the manual-close scan stops skipping
+            # this position, and a position that is flat on the exchange but
+            # still open on our side is recorded as a manual exit within ~90s.
+            _require_remainder_terminalization_identity(session, batch=batch)
+            from telegram_kol_research.strategy_management_reconciliation import (
+                _terminalize_full_close,
+            )
+
+            _terminalize_full_close(
+                session, batch=batch, legs=closed.rows, now=completed_at
+            )
         batch.status = "succeeded"
-        batch.reason_code = "composite_management_exchange_confirmed"
+        batch.reason_code = (
+            REMAINDER_CLOSE_BATCH_REASON
+            if closed.rows
+            else "composite_management_exchange_confirmed"
+        )
         batch.reconciled_at = completed_at
         batch.completed_at = completed_at
         batch.updated_at = completed_at
@@ -323,14 +371,91 @@ def _complete_composite_batch(
                 "overall_state": "succeeded",
                 "first_take_profit": "已消费并核验",
                 "partial_close": (
-                    f"剩余 {','.join(map(str, remaining))}" if remaining else "已核验"
+                    f"剩余 0（保本价 {closed.requested_stop} 已被市价 "
+                    f"{closed.market_price} 越过，剩余仓位已市价全平）"
+                    if closed.rows
+                    else (
+                        f"剩余 {','.join(map(str, remaining))}"
+                        if remaining
+                        else "已核验"
+                    )
                 ),
-                "protection": "主备止损已核验",
+                "protection": (
+                    "未挂保本止损：仓位已全平，原保护单随仓位失效"
+                    if closed.rows
+                    else "主备止损已核验"
+                ),
                 "retained_take_profit_total": ",".join(map(str, retained)) or "0",
             },
         )
         session.commit()
         return load_management_batch(session_factory, batch.id)
+
+
+@dataclass(frozen=True, slots=True)
+class _RemainderClosedLegs:
+    rows: tuple[Any, ...] = ()
+    requested_stop: str = "-"
+    market_price: str = "-"
+
+
+def _remainder_closed_legs(session, *, batch, components) -> _RemainderClosedLegs:
+    """The legs whose protection component ended by closing the remainder."""
+
+    leg_ids: list[int] = []
+    requested_stop = "-"
+    market_price = "-"
+    for component in components:
+        if str(component.component_kind) != "replace_remaining_protection":
+            continue
+        try:
+            history = json.loads(component.evidence_json or "[]")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        match = next(
+            (
+                item
+                for item in (history if isinstance(history, list) else [])
+                if isinstance(item, dict)
+                and item.get("outcome") == REMAINDER_CLOSE_OUTCOME
+            ),
+            None,
+        )
+        if match is None or component.strategy_management_leg_id is None:
+            continue
+        leg_ids.append(int(component.strategy_management_leg_id))
+        requested_stop = str(match.get("requested_stop") or requested_stop)
+        market_price = str(match.get("ticker_last") or market_price)
+    if not leg_ids:
+        return _RemainderClosedLegs()
+    rows = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.id.in_(leg_ids))
+        .order_by(StrategyManagementLeg.id.asc())
+        .all()
+    )
+    if len(rows) != len(set(leg_ids)):
+        raise RuntimeError("composite_remainder_terminalization_identity_mismatch")
+    return _RemainderClosedLegs(
+        rows=tuple(rows),
+        requested_stop=requested_stop,
+        market_price=market_price,
+    )
+
+
+def _require_remainder_terminalization_identity(session, *, batch) -> None:
+    from telegram_kol_research.models import ExecutionBinding, StrategyLifecycle
+
+    binding = session.get(ExecutionBinding, batch.execution_binding_id)
+    lifecycle = session.get(StrategyLifecycle, batch.target_lifecycle_id)
+    if (
+        binding is None
+        or lifecycle is None
+        or str(lifecycle.lifecycle_status or "") != "entered"
+        or lifecycle.exit_reason is not None
+        or str(binding.status or "").lower() not in {"open", "active", "stale"}
+    ):
+        raise RuntimeError("composite_remainder_terminalization_identity_mismatch")
 
 
 def execute_take_profit_consumption_component(
@@ -902,10 +1027,30 @@ def execute_protection_replacement_component(
         if claimed is None or claimed.status != "preflighting":
             return _current_result(session_factory, component_id)
         attempt_number = int(claimed.attempt_count)
+    live_position: Any = None
+    requested_stop: Any = None
+    market_price: Any = None
     try:
         positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
         if not isinstance(positions, list):
             raise RuntimeError("positions_snapshot_incomplete")
+        if desired.get(REMAINDER_CLOSE_EXECUTION_KEY):
+            # A persisted decision to close the remainder is sticky, and it is
+            # resumed ahead of every other preflight judgement -- including the
+            # unique-position check, because "this position is already gone" is
+            # one of the outcomes only this branch knows how to read.
+            return _resume_remainder_close(
+                session_factory,
+                batch=batch,
+                component=component,
+                leg=leg,
+                desired=desired,
+                positions=positions,
+                deepcoin_client=deepcoin_client,
+                live_execution_gate=live_execution_gate,
+                now_provider=now_provider,
+                attempt_number=attempt_number,
+            )
         live_position = _unique_live_position(positions, desired["pos_id"])
         if live_position is None:
             raise RuntimeError("target_live_position_not_unique")
@@ -968,6 +1113,33 @@ def execute_protection_replacement_component(
         )
     except (ValueError, ManagementSizingError, BreakEvenMarketPolicyError, RuntimeError) as exc:
         reason = str(exc)
+        if (
+            reason == "requested_stop_market_side_invalid"
+            and live_position is not None
+            and requested_stop is not None
+            and market_price is not None
+            and _break_even_fallback_applies(contract=contract, desired=desired)
+        ):
+            # Design 3.1/3.2. The break-even stop can never be armed, so the
+            # remaining position leaves at market instead of sitting behind a
+            # stop the instruction has already disowned. Every other reason,
+            # and every unmet condition, keeps today's disposition exactly.
+            return _begin_remainder_close(
+                session_factory,
+                batch=batch,
+                component=component,
+                leg=leg,
+                contract=contract,
+                desired=desired,
+                requested_stop=requested_stop,
+                market_price=market_price,
+                price_tick=price_tick,
+                backup_buffer_bps=backup_buffer_bps,
+                attempt_number=attempt_number,
+                deepcoin_client=deepcoin_client,
+                live_execution_gate=live_execution_gate,
+                now_provider=now_provider,
+            )
         terminal = reason in {
             "retained_take_profit_exceeds_position",
             "position_size_increased_after_snapshot",
@@ -1180,6 +1352,786 @@ def execute_protection_replacement_component(
         },
     )
     return _current_result(session_factory, component.id)
+
+
+def _break_even_fallback_applies(*, contract, desired) -> bool:
+    """Design 3.1, the two conditions that can be answered without any I/O.
+
+    ``explicit_price`` contracts are deliberately excluded: a price a person
+    put in a message is not a break-even instruction, so a stop that cannot be
+    armed there still stops for a person. And a component that has already
+    started creating replacement stops has written to the exchange on the
+    protection route; it never crosses over to the close route.
+    """
+
+    return (
+        str(getattr(contract, "stop_mode", "") or "") == "actual_entry_price"
+        and not desired.get("protection_replacement_execution")
+        and not desired.get(REMAINDER_CLOSE_EXECUTION_KEY)
+    )
+
+
+def _confirm_market_side_invalid(
+    *,
+    deepcoin_client: Any,
+    instrument_id: str,
+    side: Any,
+    requested_stop: Any,
+    price_tick: Any,
+    backup_buffer_bps: Any,
+) -> _RemainderCloseQuote:
+    """Design 3.1 condition 6: a second opinion from a price that is not cached.
+
+    The position row's ``markPx`` can be up to one reconcile round old and is
+    not the price the stop would have triggered on. This read is the same one
+    ``break_even_by_market`` uses -- ``last``, never cached -- and the same
+    validation, verbatim. Only when it *also* says the requested stop is on the
+    wrong side of the market does anything get closed.
+    """
+
+    try:
+        quote = deepcoin_client.get_ticker_quote(inst_id=instrument_id)
+    except Exception:  # noqa: BLE001 - any failure is "we do not know"
+        return _RemainderCloseQuote(reason="break_even_market_quote_unavailable")
+    if (
+        not isinstance(quote, dict)
+        or str(quote.get("instrument_id") or "").upper()
+        != str(instrument_id or "").upper()
+        or quote.get("price") in (None, "")
+        or quote.get("price_field") not in {"last", "lastPx"}
+    ):
+        return _RemainderCloseQuote(reason="break_even_market_quote_unavailable")
+    try:
+        plan_composite_stop_replacement(
+            side=side,
+            requested_stop=requested_stop,
+            market_price=quote["price"],
+            price_tick=price_tick,
+            backup_buffer_bps=backup_buffer_bps,
+            # No existing stop is consulted here. This call answers one
+            # question only -- can this stop be armed at all -- and
+            # ``keep_tighter_stop`` is provably unreachable whenever the answer
+            # is no (design 1.2).
+            existing_stop_prices=(),
+        )
+    except BreakEvenMarketPolicyError as exc:
+        if str(exc) == "requested_stop_market_side_invalid":
+            return _RemainderCloseQuote(
+                price=str(quote["price"]),
+                price_field=str(quote["price_field"]),
+            )
+        return _RemainderCloseQuote(reason="break_even_market_quote_unavailable")
+    return _RemainderCloseQuote(reason="break_even_market_side_disagreement")
+
+
+def _begin_remainder_close(
+    session_factory,
+    *,
+    batch,
+    component,
+    leg,
+    contract,
+    desired: dict[str, Any],
+    requested_stop: Any,
+    market_price: Any,
+    price_tick: Any,
+    backup_buffer_bps: Any,
+    attempt_number: int,
+    deepcoin_client: Any,
+    live_execution_gate: Callable[[], bool],
+    now_provider: Callable[[], Any],
+) -> CompositeComponentExecutionResult:
+    """Design 3.2 step 1: prove the last two conditions, then make it durable."""
+
+    component_id = int(component.id)
+    now = now_provider()
+    if not live_execution_gate():
+        _transition(
+            session_factory, component_id, "preflighting", "recovery_required",
+            now, "live_execution_disabled", {"phase": "remainder_close_gate"},
+        )
+        return _current_result(session_factory, component_id)
+    quote = _confirm_market_side_invalid(
+        deepcoin_client=deepcoin_client,
+        instrument_id=desired["instrument_id"],
+        side=contract.side,
+        requested_stop=requested_stop,
+        price_tick=price_tick,
+        backup_buffer_bps=backup_buffer_bps,
+    )
+    if quote.reason is not None:
+        _transition(
+            session_factory, component_id, "preflighting", "recovery_required",
+            now, quote.reason, {"phase": "remainder_close_quote"},
+        )
+        return _current_result(session_factory, component_id)
+    plan = {
+        "reason": "requested_stop_market_side_invalid",
+        "requested_stop": str(requested_stop),
+        "primary_stop": _tick_normalized_stop(
+            requested_stop, side=contract.side, price_tick=price_tick
+        ),
+        "position_market_price": str(market_price),
+        "ticker_last": str(quote.price),
+        "ticker_field": str(quote.price_field),
+        "decided_at": str(now),
+        "phase": "cancel_deferred_entries",
+        "deferred_entries_cancelled": False,
+        "intent_ids": [],
+    }
+    try:
+        _persist_remainder_close_plan_and_enter_submitting(
+            session_factory, component_id=component_id, plan=plan, now=now,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _transition(
+            session_factory, component_id, "preflighting", "recovery_required",
+            now_provider(), "remainder_close_plan_not_persisted",
+            {"error_type": type(exc).__name__},
+        )
+        return _current_result(session_factory, component_id)
+    return _run_remainder_close(
+        session_factory,
+        batch=batch,
+        component=component,
+        leg=leg,
+        desired=desired,
+        deepcoin_client=deepcoin_client,
+        live_execution_gate=live_execution_gate,
+        now_provider=now_provider,
+        attempt_number=attempt_number,
+    )
+
+
+def _resume_remainder_close(
+    session_factory,
+    *,
+    batch,
+    component,
+    leg,
+    desired: dict[str, Any],
+    positions: list,
+    deepcoin_client: Any,
+    live_execution_gate: Callable[[], bool],
+    now_provider: Callable[[], Any],
+    attempt_number: int,
+) -> CompositeComponentExecutionResult:
+    """Design 3.2 step 6: re-enter a decision that is already durable."""
+
+    component_id = int(component.id)
+    now = now_provider()
+    plan = dict(desired.get(REMAINDER_CLOSE_EXECUTION_KEY) or {})
+    try:
+        _persist_remainder_close_plan_and_enter_submitting(
+            session_factory, component_id=component_id, plan=plan, now=now,
+        )
+    except Exception as exc:  # noqa: BLE001
+        _transition(
+            session_factory, component_id, "preflighting", "recovery_required",
+            now_provider(), "remainder_close_resume_conflict",
+            {"error_type": type(exc).__name__},
+        )
+        return _current_result(session_factory, component_id)
+    matches = [
+        row for row in positions
+        if str(row.get("posId") or "") == str(desired["pos_id"])
+    ]
+    if len(matches) > 1:
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "target_live_position_not_unique",
+        )
+        return _current_result(session_factory, component_id)
+    flat = _position_is_flat(matches[0]) if matches else True
+    if flat is None:
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "remainder_close_position_size_invalid",
+        )
+        return _current_result(session_factory, component_id)
+    if flat:
+        return _finish_absent_remainder_position(
+            session_factory,
+            batch=batch,
+            component=component,
+            leg=leg,
+            desired=desired,
+            now_provider=now_provider,
+        )
+    if not plan.get("deferred_entries_cancelled"):
+        # We crashed while cancelling this batch's own unfilled entry orders.
+        # Whether one of them was cancelled, or filled in the meantime, is not
+        # knowable from here, and re-running the cancel could race a fill, so
+        # this stops for a person. The original stop is still armed.
+        _transition(
+            session_factory, component_id, "submitting", "operator_required",
+            now_provider(), "remainder_close_interrupted_before_close",
+            {"phase": str(plan.get("phase") or "")},
+        )
+        return _current_result(session_factory, component_id)
+    return _run_remainder_close(
+        session_factory,
+        batch=batch,
+        component=component,
+        leg=leg,
+        desired=desired,
+        deepcoin_client=deepcoin_client,
+        live_execution_gate=live_execution_gate,
+        now_provider=now_provider,
+        attempt_number=attempt_number,
+    )
+
+
+def _run_remainder_close(
+    session_factory,
+    *,
+    batch,
+    component,
+    leg,
+    desired: dict[str, Any],
+    deepcoin_client: Any,
+    live_execution_gate: Callable[[], bool],
+    now_provider: Callable[[], Any],
+    attempt_number: int,
+) -> CompositeComponentExecutionResult:
+    """Design 3.2 steps 2-5. The component is durably ``submitting`` already."""
+
+    component_id = int(component.id)
+    plan = _load_remainder_close_plan(session_factory, component_id)
+
+    # Step 2. An unfilled entry leg that fills after this close would re-grow
+    # the very position the instruction just asked us to leave.
+    if not plan.get("deferred_entries_cancelled"):
+        try:
+            cancelled_leg_ids = _cancel_remainder_deferred_entries(
+                session_factory,
+                batch_id=batch.id,
+                deepcoin_client=deepcoin_client,
+                now=now_provider(),
+            )
+        except Exception as exc:  # noqa: BLE001
+            _transition(
+                session_factory, component_id, "submitting", "operator_required",
+                now_provider(), "remainder_close_deferred_entry_cancel_failed",
+                {
+                    "phase": "cancel_deferred_entries",
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:120],
+                },
+            )
+            return _current_result(session_factory, component_id)
+        plan = _update_remainder_close_plan(
+            session_factory,
+            component_id,
+            {
+                "deferred_entries_cancelled": True,
+                "cancelled_deferred_entry_leg_ids": cancelled_leg_ids,
+                "phase": "close",
+            },
+        )
+
+    # Step 3. The reduction confirms on position size, so its own close intent
+    # is usually still ``submitted``; the gateway would block this close over
+    # it (design 9.3). Reconcile first, and wait rather than block.
+    try:
+        snapshot = _exchange_snapshot(deepcoin_client, desired["instrument_id"])
+    except Exception as exc:  # noqa: BLE001
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "remainder_close_snapshot_incomplete",
+            {"error_type": type(exc).__name__},
+        )
+        return _current_result(session_factory, component_id)
+    reconcile_submitted_position_mutation_intents(
+        session_factory,
+        pending_trigger_orders=snapshot["pending"],
+        order_history=snapshot["history"],
+        trade_fills=snapshot["fills"],
+        reconciled_at=now_provider(),
+    )
+    if _unresolved_close_intent_exists(
+        session_factory,
+        pos_id=desired["pos_id"],
+        execution_order_leg_id=leg.execution_order_leg_id,
+    ):
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "remainder_close_waiting_partial_close_confirmation",
+        )
+        return _current_result(session_factory, component_id)
+
+    # Step 4. Rebuild authority from a fresh read; the ownership gate, the
+    # position fingerprint recheck and the live gate all stay the gateway's.
+    matches = [
+        row for row in snapshot["positions"]
+        if str(row.get("posId") or "") == str(desired["pos_id"])
+    ]
+    if len(matches) != 1:
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "target_live_position_not_unique",
+        )
+        return _current_result(session_factory, component_id)
+    live_position = matches[0]
+    flat = _position_is_flat(live_position)
+    if flat is None:
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "remainder_close_position_size_invalid",
+        )
+        return _current_result(session_factory, component_id)
+    if flat:
+        return _finish_absent_remainder_position(
+            session_factory, batch=batch, component=component, leg=leg,
+            desired=desired, now_provider=now_provider,
+        )
+    try:
+        with session_factory() as session:
+            authority = build_position_mutation_authority(
+                session, venue="deepcoin", pos_id=desired["pos_id"],
+                live_position=live_position,
+            )
+    except PositionMutationAuthorityError as exc:
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), str(exc), {"phase": "remainder_close_authority"},
+        )
+        return _current_result(session_factory, component_id)
+
+    size = str(live_position.get("pos"))
+    # ``R`` instead of the reduction's ``A``: the gateway falls back to the
+    # client order id when a response carries no ordId, so the two writes of
+    # one batch/leg must never collide.
+    client_order_id = f"CM{batch.id}L{leg.id}R{attempt_number}"
+    intent_ids: list[int] = []
+
+    def protect_before_write(intent_id: int) -> None:
+        _append_remainder_close_intent(
+            session_factory,
+            component_id,
+            intent_id=intent_id,
+            pre_submit_size=size,
+            client_order_id=client_order_id,
+        )
+        intent_ids.append(int(intent_id))
+
+    try:
+        result = PositionMutationGateway(
+            session_factory=session_factory,
+            deepcoin_client=deepcoin_client,
+            live_execution_gate=live_execution_gate,
+            now_provider=now_provider,
+        ).close_exact_position(
+            authority=authority,
+            size=size,
+            client_order_id=client_order_id,
+            # ``:close:`` is kept verbatim so the production monitor's
+            # duplicate-close check covers this write too, and the
+            # ``{component id}:`` prefix keeps it visible to the reconciler.
+            idempotency_key=(
+                f"{component_id}:close:remainder:attempt:{attempt_number}"
+            ),
+            before_submit=protect_before_write,
+        )
+    except Exception as exc:  # noqa: BLE001 - an unknown outcome is never resent
+        _transition(
+            session_factory, component_id, "submitting", "awaiting_exchange",
+            now_provider(), "remainder_close_outcome_unknown",
+            {"error_type": type(exc).__name__},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    if result.intent_id not in intent_ids:
+        intent_ids.append(int(result.intent_id))
+        _append_remainder_close_intent(
+            session_factory, component_id, intent_id=result.intent_id,
+            pre_submit_size=size, client_order_id=client_order_id,
+            require_submitting=False,
+        )
+
+    # Step 5.
+    if result.status == "recovery_required":
+        _transition(
+            session_factory, component_id, "submitting", "awaiting_exchange",
+            now_provider(), "remainder_close_outcome_unknown",
+            {"intent_id": result.intent_id, "close_size": size},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    if result.status == "rejected":
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), "remainder_close_definitely_rejected",
+            {"intent_id": result.intent_id, "close_size": size},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    if result.status != "submitted":
+        _transition(
+            session_factory, component_id, "submitting", "recovery_required",
+            now_provider(), result.reason or f"remainder_close_{result.status}",
+            {"intent_id": result.intent_id},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    try:
+        refreshed = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
+        if not isinstance(refreshed, list):
+            raise RuntimeError("positions_snapshot_incomplete")
+    except Exception as exc:  # noqa: BLE001
+        _transition(
+            session_factory, component_id, "submitting", "awaiting_exchange",
+            now_provider(), "remainder_close_post_write_snapshot_incomplete",
+            {"intent_id": result.intent_id, "error_type": type(exc).__name__},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    remaining = [
+        row for row in refreshed
+        if str(row.get("posId") or "") == str(desired["pos_id"])
+    ]
+    if remaining and _position_is_flat(remaining[0]) is not True:
+        _transition(
+            session_factory, component_id, "submitting", "awaiting_exchange",
+            now_provider(), "remainder_close_not_yet_flat",
+            {"intent_id": result.intent_id, "close_size": size},
+        )
+        return _current_result(
+            session_factory, component_id, close_intent_ids=intent_ids
+        )
+    _confirm_remainder_close(
+        session_factory,
+        batch=batch,
+        component_id=component_id,
+        leg=leg,
+        desired=desired,
+        close_intent_id=int(result.intent_id),
+        evidence_tier="exact_position_absent_after_accepted_close",
+        now=now_provider(),
+    )
+    return _current_result(
+        session_factory, component_id, close_intent_ids=intent_ids
+    )
+
+
+def _finish_absent_remainder_position(
+    session_factory, *, batch, component, leg, desired, now_provider,
+) -> CompositeComponentExecutionResult:
+    """The position is gone. Only a confirmed close of ours may claim it."""
+
+    component_id = int(component.id)
+    intents = _remainder_close_intents(session_factory, component_id)
+    latest = intents[-1] if intents else None
+    if latest is not None and str(latest.status) == "confirmed":
+        _confirm_remainder_close(
+            session_factory,
+            batch=batch,
+            component_id=component_id,
+            leg=leg,
+            desired=desired,
+            close_intent_id=int(latest.id),
+            evidence_tier="exact_close_intent_confirmed",
+            now=now_provider(),
+        )
+        return _current_result(session_factory, component_id)
+    _transition(
+        session_factory, component_id, "submitting", "operator_required",
+        now_provider(), "remainder_position_absent_without_confirmed_close",
+        {"intent_id": int(latest.id) if latest is not None else None},
+    )
+    return _current_result(session_factory, component_id)
+
+
+def _confirm_remainder_close(
+    session_factory, *, batch, component_id, leg, desired, close_intent_id,
+    evidence_tier, now,
+) -> None:
+    plan = _load_remainder_close_plan(session_factory, component_id)
+    evidence = {
+        "outcome": REMAINDER_CLOSE_OUTCOME,
+        "close_intent_id": int(close_intent_id),
+        "remaining_size": "0",
+        "requested_stop": plan.get("requested_stop"),
+        "primary_stop": plan.get("primary_stop"),
+        "position_market_price": plan.get("position_market_price"),
+        "ticker_last": plan.get("ticker_last"),
+        "cancelled_deferred_entry_leg_ids": list(
+            plan.get("cancelled_deferred_entry_leg_ids") or []
+        ),
+        "evidence_tier": str(evidence_tier),
+    }
+    _transition(
+        session_factory, component_id, "submitting", "confirmed", now,
+        evidence=evidence,
+    )
+    _record_remainder_close_incident(
+        session_factory,
+        batch=batch,
+        component_id=component_id,
+        leg=leg,
+        desired=desired,
+        plan=plan,
+        now=now,
+    )
+
+
+def _record_remainder_close_incident(
+    session_factory, *, batch, component_id, leg, desired, plan, now
+) -> None:
+    """Design 3.7: a low-severity ledger row, best effort, never a blocker."""
+
+    from telegram_kol_research.runtime_incidents import record_runtime_incident
+
+    summary = json.dumps(
+        {
+            "component": "strategy_management",
+            "reason_code": REMAINDER_CLOSE_INCIDENT_TYPE,
+            "raw_message_id": int(batch.raw_message_id),
+            # ``_SUMMARY_FIELDS`` is a closed allowlist of scalars, so the
+            # numbers ride inside ``impact``; the colons also keep every run
+            # short enough that the opaque-value guard cannot fire.
+            "impact": (
+                "remainder:closed:"
+                f"stop:{plan.get('primary_stop') or plan.get('requested_stop')}:"
+                f"last:{plan.get('ticker_last')}"
+            ),
+            "operation": f"management_batch_{int(batch.id)}",
+        },
+        ensure_ascii=True,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    try:
+        record_runtime_incident(
+            session_factory,
+            source_kind="strategy_management_component",
+            source_record_id=str(int(component_id)),
+            incident_type=REMAINDER_CLOSE_INCIDENT_TYPE,
+            severity="low",
+            fingerprint=hashlib.sha256(
+                f"{REMAINDER_CLOSE_INCIDENT_TYPE}:{int(component_id)}".encode()
+            ).hexdigest(),
+            redacted_summary=summary,
+            occurred_at=now,
+            feature_policy_version="composite-remainder-market-close-v1",
+            prompt_version="none",
+            tool_policy_version="exact-position-close",
+            diagnosis_json=json.dumps(
+                {
+                    "observed_state": {
+                        "management_batch_id": int(batch.id),
+                        "pos_id": str(desired.get("pos_id") or ""),
+                        "execution_order_leg_id": int(
+                            leg.execution_order_leg_id
+                        ),
+                        **{
+                            key: plan.get(key)
+                            for key in (
+                                "requested_stop", "primary_stop",
+                                "position_market_price", "ticker_last",
+                                "ticker_field",
+                                "cancelled_deferred_entry_leg_ids",
+                            )
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            evidence_refs_json=json.dumps(
+                [
+                    f"raw_message:{int(batch.raw_message_id)}",
+                    f"management_batch:{int(batch.id)}",
+                ]
+            ),
+        )
+    except Exception:  # noqa: BLE001 - the close must survive a ledger failure
+        logger.warning(
+            "failed to record %s for component_id=%s",
+            REMAINDER_CLOSE_INCIDENT_TYPE,
+            component_id,
+            exc_info=True,
+        )
+
+
+def _cancel_remainder_deferred_entries(
+    session_factory, *, batch_id: int, deepcoin_client: Any, now: Any
+) -> list[int]:
+    """Reuse the full-exit path's own cancel, identity checks included."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        _cancel_deferred_entry_legs,
+        _load_exact_binding,
+    )
+
+    record = load_management_batch(session_factory, int(batch_id))
+    binding = _load_exact_binding(session_factory, record)
+    leg_ids = _snapshot_deferred_entry_leg_ids(session_factory, batch_id)
+    _cancel_deferred_entry_legs(
+        session_factory,
+        batch=record,
+        binding=binding,
+        deepcoin_client=deepcoin_client,
+        cancelled_at=now,
+    )
+    return leg_ids
+
+
+def _snapshot_deferred_entry_leg_ids(session_factory, batch_id: int) -> list[int]:
+    """Evidence only. The authoritative parse stays in the executor's cancel."""
+
+    with session_factory() as session:
+        row = session.get(StrategyManagementBatch, int(batch_id))
+        raw = getattr(row, "target_snapshot_json", None)
+    try:
+        snapshot = json.loads(raw or "{}")
+        values = snapshot["identity"]["deferred_entry_leg_ids"]
+        return [int(value) for value in values]
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        return []
+
+
+def _unresolved_close_intent_exists(
+    session_factory, *, pos_id: Any, execution_order_leg_id: Any
+) -> bool:
+    """The exact predicate ``PositionMutationGateway`` would block on."""
+
+    with session_factory() as session:
+        return session.query(PositionMutationIntent.id).filter(
+            PositionMutationIntent.pos_id == str(pos_id),
+            PositionMutationIntent.execution_order_leg_id
+            == int(execution_order_leg_id),
+            PositionMutationIntent.operation == "close_position",
+            PositionMutationIntent.status.in_(_UNRESOLVED_CLOSE_INTENT_STATUSES),
+        ).first() is not None
+
+
+def _remainder_close_intents(session_factory, component_id: int) -> list[Any]:
+    with session_factory() as session:
+        rows = session.query(PositionMutationIntent).filter(
+            PositionMutationIntent.idempotency_key.like(
+                f"{int(component_id)}:close:remainder:%"
+            )
+        ).order_by(PositionMutationIntent.id.asc()).all()
+        for row in rows:
+            session.expunge(row)
+        return rows
+
+
+def _persist_remainder_close_plan_and_enter_submitting(
+    session_factory, *, component_id: int, plan: dict[str, Any], now: Any
+) -> None:
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, int(component_id))
+        if component is None or component.status != "preflighting":
+            raise RuntimeError("management_component_not_preflighting")
+        desired = json.loads(component.desired_json)
+        stored = dict(desired.get(REMAINDER_CLOSE_EXECUTION_KEY) or {})
+        stored.update(plan)
+        desired[REMAINDER_CLOSE_EXECUTION_KEY] = stored
+        component.desired_json = json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        if not transition_management_component(
+            session, component_id=int(component_id),
+            expected_status="preflighting", new_status="submitting", now=now,
+            evidence={
+                "phase": "remainder_close_decided",
+                "requested_stop": stored.get("requested_stop"),
+                "ticker_last": stored.get("ticker_last"),
+            },
+        ):
+            raise RuntimeError("management_component_submit_claim_lost")
+        session.commit()
+
+
+def _load_remainder_close_plan(session_factory, component_id: int) -> dict[str, Any]:
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, int(component_id))
+        desired = json.loads(getattr(component, "desired_json", None) or "{}")
+    return dict(desired.get(REMAINDER_CLOSE_EXECUTION_KEY) or {})
+
+
+def _update_remainder_close_plan(
+    session_factory, component_id: int, values: dict[str, Any]
+) -> dict[str, Any]:
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, int(component_id))
+        if component is None:
+            raise RuntimeError("management_component_missing")
+        desired = json.loads(component.desired_json or "{}")
+        stored = dict(desired.get(REMAINDER_CLOSE_EXECUTION_KEY) or {})
+        stored.update(values)
+        desired[REMAINDER_CLOSE_EXECUTION_KEY] = stored
+        component.desired_json = json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        session.commit()
+        return stored
+
+
+def _append_remainder_close_intent(
+    session_factory,
+    component_id: int,
+    *,
+    intent_id: int,
+    pre_submit_size: str,
+    client_order_id: str,
+    require_submitting: bool = True,
+) -> None:
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, int(component_id))
+        if component is None or (
+            require_submitting and component.status != "submitting"
+        ):
+            raise RuntimeError("management_component_not_submitting")
+        desired = json.loads(component.desired_json or "{}")
+        stored = dict(desired.get(REMAINDER_CLOSE_EXECUTION_KEY) or {})
+        intent_ids = [int(value) for value in stored.get("intent_ids") or []]
+        if int(intent_id) not in intent_ids:
+            intent_ids.append(int(intent_id))
+        stored.update(
+            intent_ids=intent_ids,
+            intent_id=int(intent_id),
+            pre_submit_size=str(pre_submit_size),
+            client_order_id=str(client_order_id),
+        )
+        desired[REMAINDER_CLOSE_EXECUTION_KEY] = stored
+        component.desired_json = json.dumps(
+            desired, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+        )
+        session.commit()
+
+
+def _position_is_flat(row: Any) -> bool | None:
+    """``True`` flat, ``False`` still open, ``None`` unreadable."""
+
+    try:
+        return Decimal(str((row or {}).get("pos"))) == 0
+    except (InvalidOperation, TypeError, ValueError):
+        return None
+
+
+def _tick_normalized_stop(requested_stop: Any, *, side: Any, price_tick: Any):
+    """Evidence only: the price the stop would have taken. Never written out."""
+
+    try:
+        requested = Decimal(str(requested_stop))
+        tick = Decimal(str(price_tick))
+        if not (requested.is_finite() and tick.is_finite() and tick > 0):
+            return None
+        rounding = (
+            ROUND_FLOOR if str(side or "").lower() == "long" else ROUND_CEILING
+        )
+        value = (requested / tick).to_integral_value(rounding=rounding) * tick
+        text = format(value.normalize(), "f")
+        return "0" if text == "-0" else text
+    except (InvalidOperation, TypeError, ValueError):
+        return None
 
 
 def _load_component(

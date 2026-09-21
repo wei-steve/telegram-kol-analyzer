@@ -2081,6 +2081,107 @@ def test_composite_monitor_reader_detects_persisted_faults_without_writes(tmp_pa
     assert database.read_bytes() == before
 
 
+def _composite_monitor_schema(database):
+    connection = sqlite3.connect(database)
+    connection.executescript(
+        """
+        CREATE TABLE strategy_management_batches (
+          id INTEGER PRIMARY KEY, status TEXT, management_contract_json TEXT
+        );
+        CREATE TABLE strategy_management_legs (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          execution_order_leg_id INTEGER, pos_id TEXT
+        );
+        CREATE TABLE strategy_management_components (
+          id INTEGER PRIMARY KEY, management_batch_id INTEGER,
+          strategy_management_leg_id INTEGER, component_kind TEXT,
+          status TEXT, desired_json TEXT, evidence_json TEXT,
+          last_progress_at TEXT, updated_at TEXT
+        );
+        CREATE TABLE position_mutation_intents (
+          id INTEGER PRIMARY KEY, idempotency_key TEXT, operation TEXT,
+          status TEXT
+        );
+        CREATE TABLE position_protection_ledger (
+          id INTEGER PRIMARY KEY, execution_order_leg_id INTEGER, pos_id TEXT,
+          purpose TEXT, size_text TEXT, status TEXT
+        );
+        """
+    )
+    return connection
+
+
+@pytest.mark.parametrize(
+    ("evidence", "expected"),
+    [
+        pytest.param(
+            json.dumps(
+                [
+                    {"phase": "remainder_close_decided"},
+                    {
+                        "outcome": "remainder_closed_at_market",
+                        "remaining_size": "0",
+                        "evidence_tier": (
+                            "exact_position_absent_after_accepted_close"
+                        ),
+                    },
+                ]
+            ),
+            (),
+            id="closed_at_market_has_no_stop_to_verify",
+        ),
+        pytest.param(
+            json.dumps([{"new_stop_order_ids": ["stop-new-primary"]}]),
+            ("composite_position_without_verified_stop",),
+            id="an_ordinary_confirmed_replacement_still_needs_two_stops",
+        ),
+    ],
+)
+def test_composite_monitor_skips_a_remainder_that_left_at_market(
+    tmp_path, evidence, expected
+):
+    """Design 3.6.
+
+    A component that ended by closing the remaining position has no stop to
+    verify by construction: the position is gone and the exchange voided its
+    TPSL with it. Without this skip every such batch would report a critical
+    fault forever. The second row is the guard on the guard -- an ordinary
+    confirmed replacement with a retired ledger still reports.
+    """
+
+    database = tmp_path / f"composite-remainder-{len(expected)}.db"
+    connection = _composite_monitor_schema(database)
+    contract = json.dumps(
+        {"required_components": ["replace_remaining_protection"]}
+    )
+    now_text = "2026-08-05 00:00:00"
+    connection.execute(
+        "INSERT INTO strategy_management_batches VALUES (1, 'succeeded', ?)",
+        (contract,),
+    )
+    connection.execute(
+        "INSERT INTO strategy_management_legs VALUES (1, 1, 11, 'pos-1')"
+    )
+    connection.execute(
+        "INSERT INTO strategy_management_components "
+        "VALUES (1, 1, 1, 'replace_remaining_protection', 'confirmed', '{}', ?, ?, ?)",
+        (evidence, now_text, now_text),
+    )
+    connection.executemany(
+        "INSERT INTO position_protection_ledger VALUES (?, 11, 'pos-1', ?, '3', 'retired')",
+        [(1, "stop_loss"), (2, "backup_stop")],
+    )
+    connection.commit()
+    before = database.read_bytes()
+
+    codes = read_composite_management_invariants(
+        database, now=datetime(2026, 8, 5, tzinfo=UTC)
+    )
+
+    assert codes == expected
+    assert database.read_bytes() == before
+
+
 def test_composite_monitor_allows_confirmed_partial_fill_attempt_history(tmp_path):
     database = tmp_path / "composite-retry-monitor.db"
     connection = sqlite3.connect(database)

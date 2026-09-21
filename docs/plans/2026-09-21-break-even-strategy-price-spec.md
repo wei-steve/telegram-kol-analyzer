@@ -97,6 +97,14 @@ def break_even_target_price(leg) -> str:
 - `move_stop_to_break_even`：逻辑不变，只是参考价换成 3.3 的目标价 → 越过则该仓位市价全平（现有行为）。
 - `partial_then_break_even`（复合）：**本规格不改**——减仓后止损挂不上仍是 `operator_required` + 告警。是否改为"剩余仓位也市价全平"见第 7 节，待用户决定后另行实施。
 
+> **2026-09-21 追加（已实施，另行提交）**：用户已拍板"剩余仓位也市价全平"。
+> 设计见 `docs/plans/2026-09-21-composite-remainder-market-close-design.md`（方案 A），
+> 实施状态见 `docs/break-even-strategy-price-status.md` 第 12 节。
+> 触发条件收得很紧：只有 `requested_stop_market_side_invalid`、
+> 只有 `actual_entry_price` 合约、本组件从未开始挂新止损、闸门为真、
+> 且一次**不进缓存的新鲜 ticker** 二次确认同样越过，才会全平。
+> 兜底路径上不撤、不改任何保护单；原止损一直武装到仓位变平为止。
+
 ## 4. 测试
 
 1. `resolve_break_even_reference`：上表每一行 × 多 / 空；端点、`low == high`、`low > high`、None、负数、非数字、腿序号 0 / 3 / 空集；永不抛错。
@@ -132,7 +140,11 @@ def break_even_target_price(leg) -> str:
 
 ## 7. 待用户决定（不阻塞本规格的实施）
 
-1. **复合指令（减仓后保本）里止损挂不上时**：现状是减仓完成、剩余仓位保持原止损并等人工（值守会告警）。按原则 2，是否改为"剩余仓位也市价全平"？
+1. ~~**复合指令（减仓后保本）里止损挂不上时**：现状是减仓完成、剩余仓位保持原止损并等人工（值守会告警）。按原则 2，是否改为"剩余仓位也市价全平"？~~
+   **2026-09-21 用户已决定：改为剩余仓位市价全平。** 设计
+   `docs/plans/2026-09-21-composite-remainder-market-close-design.md`，
+   状态 `docs/break-even-strategy-price-status.md` 第 12 节；本地已实施，
+   未推送未部署。原文保留作为记录。
 2. **TP1 成交后的系统自动保本**（`break_even_convergence`）目前用我们的实际均价。是否也改用策略价？
 
 ## 8. 提交与汇报

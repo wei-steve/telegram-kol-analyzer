@@ -45,6 +45,7 @@ from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
     PositionBackupStopOrder,
+    PositionMutationIntent,
     PositionProtectionLeg,
     PositionProtectionLedger,
     PositionProtectionRevision,
@@ -52,6 +53,7 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     StrategyLifecycle,
     StrategyManagementBatch,
+    StrategyManagementComponent,
     StrategyManagementLeg,
     StrategyManagementMarketDecision,
 )
@@ -6228,6 +6230,14 @@ def _persist_composite_consumption_component(session_factory):
             target_fingerprint="target-composite",
             target_snapshot_json=json.dumps(
                 {
+                    # Production always writes this block (planner.py:1272); the
+                    # composite remainder-close fallback reads it to cancel the
+                    # batch's own unfilled entry legs.
+                    "identity": {
+                        "target_lifecycle_id": 1,
+                        "deferred_entry_leg_ids": [],
+                        "capability_deferred_entry_leg_ids": [],
+                    },
                     "positions": [
                         {
                             "pos_id": "pos-composite",
@@ -6237,7 +6247,7 @@ def _persist_composite_consumption_component(session_factory):
                             "quantity_step": "1",
                             "min_quantity": "1",
                         }
-                    ]
+                    ],
                 }
             ),
             planned_at=NOW,
@@ -7003,6 +7013,9 @@ class _CompositeProtectionClient(_CompositeCloseClient):
         self.cancel_rejected = cancel_rejected
         self.cancel_unknown_once = cancel_unknown_once
         self.events = []
+        # Production reads a fresh, uncached ``last`` before it will act on the
+        # position row's own mark price.
+        self.quote_price = "65000"
         self.pending = [
             {
                 "ordId": "tp-retained", "posId": "pos-composite",
@@ -7047,6 +7060,14 @@ class _CompositeProtectionClient(_CompositeCloseClient):
         self.events.append("readback")
         return list(self.pending)
 
+    def get_ticker_quote(self, *, inst_id):
+        self.events.append("ticker")
+        return {
+            "instrument_id": "BTC-USDT-SWAP",
+            "price": self.quote_price,
+            "price_field": "last",
+        }
+
     def cancel_position_sltp(self, payload):
         order_id = payload["ordId"]
         self.events.append(f"cancel_{order_id}")
@@ -7057,6 +7078,55 @@ class _CompositeProtectionClient(_CompositeCloseClient):
             self.cancel_unknown_once = False
             raise DeepcoinRequestOutcomeUnknown("cancel timeout")
         return {"code": "0", "data": {"ordId": order_id}}
+
+
+class _CompositeRemainderCloseClient(_CompositeProtectionClient):
+    """The protection fixture's client plus what the fallback route touches.
+
+    Closing here actually empties the position, which the reduction-shaped
+    ``_CompositeCloseClient`` deliberately does not do.
+    """
+
+    def __init__(self, *, close_outcome="confirmed", **kwargs):
+        super().__init__(**kwargs)
+        self.remainder_close_outcome = close_outcome
+        self.position_size = "5"
+        self.open_orders: list[dict] = []
+        self.cancel_order_calls: list[dict] = []
+
+    def list_positions(self, *, inst_id=None):
+        if self.position_size in (None, "0"):
+            return []
+        self.current_size = self.position_size
+        return super().list_positions(inst_id=inst_id)
+
+    def list_open_orders(self, *, inst_id=None):
+        return list(self.open_orders)
+
+    def place_order(self, payload):
+        self.close_calls.append(dict(payload))
+        self.events.append("close")
+        if self.remainder_close_outcome == "unknown":
+            raise DeepcoinRequestOutcomeUnknown("close timeout")
+        if self.remainder_close_outcome == "rejected":
+            raise DeepcoinDefiniteRejection("close rejected")
+        if self.remainder_close_outcome == "confirmed":
+            self.position_size = "0"
+        return {
+            "code": "0",
+            "data": {"ordId": f"close-remainder-{len(self.close_calls)}"},
+        }
+
+    def cancel_order(self, payload):
+        self.cancel_order_calls.append(dict(payload))
+        self.events.append("cancel_entry")
+        self.open_orders = [
+            row
+            for row in self.open_orders
+            if row.get("clOrdId") != payload.get("clOrdId")
+            and row.get("ordId") != payload.get("ordId")
+        ]
+        return {"code": "0", "data": {"ordId": "entry-leg-2"}}
 
 
 def _execute_composite_protection(session_factory, batch_id, component_id, client):
@@ -7131,23 +7201,75 @@ def test_composite_protection_replaces_at_the_strategy_price(tmp_path):
     ] == "64000"
 
 
-def test_composite_protection_operator_required_when_the_reference_is_passed(
+def test_composite_protection_closes_the_remainder_when_the_reference_is_passed(
     tmp_path,
 ):
-    """3.5 unchanged: a stop the market has passed still stops for a person."""
+    """2026-09-21: a break-even stop that can never arm becomes a market exit.
+
+    Was ``test_composite_protection_operator_required_when_the_reference_is_passed``.
+    The remaining position used to keep its original far-away stop and wait for
+    a person; the instruction had already said to reduce risk, so it now leaves
+    at market instead -- the same disposition the single-position
+    ``break_even_by_market`` path has always reached.
+
+    What must not happen on this route is just as load-bearing: no
+    set-position-sltp, no cancel of any protection order, exactly one close.
+    """
 
     session_factory = create_session_factory(tmp_path / "protection-passed.db")
     batch_id, component_id = _prepare_composite_protection_component(session_factory)
     _stamp_composite_break_even_reference(session_factory, batch_id, price="65500")
-    client = _CompositeProtectionClient()
+    client = _CompositeRemainderCloseClient()
 
     result = _execute_composite_protection(
         session_factory, batch_id, component_id, client
     )
 
-    assert result.status == "operator_required"
-    assert result.reason_code == "requested_stop_market_side_invalid"
-    assert client.events == []
+    assert result.status == "confirmed"
+    assert [event for event in client.events if event.startswith("set_")] == []
+    assert [event for event in client.events if event.startswith("cancel_")] == []
+    assert client.events.count("close") == 1
+    assert client.close_calls[0]["closePosId"] == "pos-composite"
+    assert client.close_calls[0]["sz"] == "5"
+    with session_factory() as session:
+        component = session.get(StrategyManagementComponent, component_id)
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch_id)
+            .one()
+        )
+        intent = (
+            session.query(PositionMutationIntent)
+            .filter(PositionMutationIntent.operation == "close_position")
+            .one()
+        )
+        # The original stops were never cancelled; they die with the position.
+        old_stops = {
+            row.order_id: row.status
+            for row in session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.order_id.in_(
+                    ("stop-old-primary", "stop-old-backup")
+                )
+            )
+        }
+    assert intent.idempotency_key == f"{component_id}:close:remainder:attempt:1"
+    assert json.loads(intent.request_json)["clOrdId"] == (
+        f"CM{batch_id}L{leg.id}R1"
+    )
+    assert old_stops == {
+        "stop-old-primary": "verified", "stop-old-backup": "verified"
+    }
+    assert json.loads(component.evidence_json)[-1] == {
+        "outcome": "remainder_closed_at_market",
+        "close_intent_id": intent.id,
+        "remaining_size": "0",
+        "requested_stop": "65500",
+        "primary_stop": "65500",
+        "position_market_price": "65000",
+        "ticker_last": "65000",
+        "cancelled_deferred_entry_leg_ids": [],
+        "evidence_tier": "exact_position_absent_after_accepted_close",
+    }
 
 
 def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(

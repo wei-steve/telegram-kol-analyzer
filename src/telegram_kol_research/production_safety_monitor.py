@@ -2433,6 +2433,21 @@ def read_composite_management_invariants(
                 if retained > live_size:
                     reasons.add("live_position_retained_tp_oversized")
             elif str(component[3]) == "replace_remaining_protection":
+                # A component that ended by closing the remaining position at
+                # market has no stop to verify, by construction: the position
+                # is gone and the exchange invalidated its TPSL with it. Asking
+                # for two verified stops here would report a critical fault for
+                # every such batch, permanently.
+                try:
+                    history = json.loads(component[6] or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    history = []
+                if any(
+                    isinstance(item, dict)
+                    and item.get("outcome") == "remainder_closed_at_market"
+                    for item in (history if isinstance(history, list) else [])
+                ):
+                    continue
                 verified_stops = {
                     str(row[0]) for row in ledger
                     if row[0] in {"stop_loss", "backup_stop"}

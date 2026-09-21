@@ -373,6 +373,20 @@ REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两�
 `protection_authority_refused`。理由是从外面看，"止损没被移动"和"止损不需要移动"长得一模一样，
 一次沉默的拒绝没人会发现。
 
+**有一种"改止损"最后不是改止损，而是平仓。** 2026-09-21：`partial_then_break_even`
+减仓完成后，保本价可能已经被市价越过——多单的目标价高于现价、空单的低于现价——
+那张止损在交易所上**挂不上去**，再试多少次都一样。这时剩余仓位按市价全平
+（`strategy_management_composite_executor` 的 `replace_remaining_protection` 组件内，
+设计 `docs/plans/2026-09-21-composite-remainder-market-close-design.md`），
+与单仓位 `break_even_by_market` 的 `full_exit` 同一处置、同一 `exit_reason='kol_signal'`。
+触发条件收得很紧：原因恰为 `requested_stop_market_side_invalid`、合约是
+`actual_entry_price`、本组件从未开始挂新止损、实盘闸门为真，且一次**不进轮内缓存**的
+`get_ticker_quote`（`last`，与止损的 `slTriggerPxType` 同口径）二次确认同样越过。
+任何一条不成立就退回原来的 `operator_required` / `recovery_required`。
+**这条路径不撤也不改任何保护单**：原止损一直武装到仓位变平，然后随仓位被交易所作废，
+本地由 `retire_protection_for_closed_binding` 退役。先撤再平会制造裸仓窗口，
+而这里的全部意义就是不要那个窗口。
+
 ## 5. 模块分类（已核实）
 
 `src/telegram_kol_research/` 共 240 个业务模块（另有 3 个 `__init__.py`）。分类方法与逐条判定见
