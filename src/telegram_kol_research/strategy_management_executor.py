@@ -98,6 +98,7 @@ from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     assess_break_even_market,
 )
+from telegram_kol_research.break_even_reference import break_even_target_price
 from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
 from telegram_kol_research.trading_settings import load_trading_settings
 
@@ -618,7 +619,11 @@ def reserve_break_even_market_actions(
         try:
             market = assess_break_even_market(
                 side=binding.side,
-                entry_price=leg.avg_entry_price,
+                # The *target* of the break-even stop: the strategy's price
+                # when this batch carries one, our own fill otherwise. The
+                # economics preflight above still compares the exchange's
+                # ``avgPx`` against ``leg.avg_entry_price``.
+                entry_price=break_even_target_price(leg),
                 market_price=quote["price"],
             )
         except BreakEvenMarketPolicyError as exc:
@@ -3660,10 +3665,13 @@ def _planned_stop_price(*, batch: ManagementBatchRecord, leg: Any) -> str:
         return str(explicit).strip()
 
     if break_even_action:
-        parsed = _decimal_or_none(leg.avg_entry_price)
+        # Same accessor as the market decision above, so the price that was
+        # reserved is the price that gets written.
+        target = break_even_target_price(leg)
+        parsed = _decimal_or_none(target)
         if parsed is None or parsed <= 0:
             raise ManagementBatchExecutionError("planned_stop_loss_missing")
-        return str(leg.avg_entry_price).strip()
+        return str(target).strip()
 
     raise ManagementBatchExecutionError("planned_stop_loss_missing")
 

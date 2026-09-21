@@ -206,6 +206,85 @@ def test_reserve_market_decision_is_sorted_fingerprinted_and_idempotent(tmp_path
     ) == first
 
 
+def _stamp_reference(session_factory, batch_id, *, pos_id, price):
+    import json
+
+    with session_factory() as session:
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter(
+                StrategyManagementLeg.management_batch_id == batch_id,
+                StrategyManagementLeg.pos_id == pos_id,
+            )
+            .one()
+        )
+        leg.planned_tpsl_json = json.dumps(
+            {
+                "intent": "move_stop_to_break_even",
+                "stop_loss_text": None,
+                "break_even_reference_price": price,
+                "break_even_reference_source": "strategy_first_leg",
+            }
+        )
+        session.commit()
+
+
+def test_a_reserved_decision_is_checked_against_the_break_even_target(tmp_path):
+    """2026-09-21: the decision names the target price, not our fill.
+
+    A batch that carries a strategy reference must reserve, reload and
+    fingerprint against that reference; the fill it happens to sit on is
+    identity evidence and no longer has to match.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch_id, leg_ids = _persist_batch(session_factory)
+    _stamp_reference(session_factory, batch_id, pos_id="pos-b", price="64800")
+    decisions = _decisions(leg_ids)
+    decisions[0]["entry_price"] = "64800"
+    decisions[0]["comparison"] = "entry_above_market"
+    decisions[0]["action"] = "set_break_even"
+    decisions[0]["protection"] = decisions[1]["protection"]
+
+    reserved = reserve_break_even_market_decision(
+        session_factory,
+        batch_id=batch_id,
+        instrument_id="BTC-USDT-SWAP",
+        quote_price="64688.6",
+        quote_price_field="last",
+        observed_at=NOW,
+        decisions=decisions,
+    )
+
+    assert {
+        row["pos_id"]: row["entry_price"] for row in reserved.decisions
+    } == {"pos-a": "64700", "pos-b": "64800"}
+    assert load_break_even_market_decision(
+        session_factory, batch_id=batch_id
+    ) == reserved
+
+
+def test_a_reserved_decision_on_our_fill_conflicts_once_a_reference_exists(
+    tmp_path,
+):
+    """The same guard, still closed: the leg and the decision must agree."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch_id, leg_ids = _persist_batch(session_factory)
+    _stamp_reference(session_factory, batch_id, pos_id="pos-b", price="64800")
+
+    with pytest.raises(BreakEvenMarketDecisionConflict):
+        reserve_break_even_market_decision(
+            session_factory,
+            batch_id=batch_id,
+            instrument_id="BTC-USDT-SWAP",
+            quote_price="64688.6",
+            quote_price_field="last",
+            observed_at=NOW,
+            decisions=_decisions(leg_ids),
+        )
+
+
 def test_reserve_market_decision_rejects_conflicting_second_choice(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     batch_id, leg_ids = _persist_batch(session_factory)

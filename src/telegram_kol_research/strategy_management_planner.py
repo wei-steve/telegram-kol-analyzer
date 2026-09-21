@@ -89,7 +89,13 @@ from telegram_kol_research.strategy_management_sizing import (
     allocate_close_sizes,
     effective_action,
 )
+from telegram_kol_research.break_even_reference import (
+    planned_tpsl_reference_fields,
+    resolve_break_even_reference,
+)
 from telegram_kol_research.management_price_plausibility import (
+    dispose_pending_break_even_prices,
+    record_price_disposed,
     record_price_implausible,
     sanitize_management_prices,
 )
@@ -516,7 +522,11 @@ def _plan_strategy_management_batch_locked(
             planned_at=now,
             execution_mode=execution_mode,
         )
-    identity, price_plausibility = _identity_without_implausible_prices(
+    (
+        identity,
+        price_plausibility,
+        break_even_quote,
+    ) = _identity_without_explicit_break_even_prices(
         session_factory,
         identity=identity,
         intent=intent,
@@ -1198,6 +1208,21 @@ def _plan_strategy_management_batch_locked(
                 execution_mode=execution_mode,
             )
 
+    break_even_reference = None
+    if intent in IMPLICIT_STOP_ACTIONS:
+        break_even_reference, price_plausibility = _break_even_reference_for_batch(
+            session_factory,
+            identity=identity,
+            lifecycle=lifecycle,
+            economics=economics,
+            legs_by_pos_id=target_legs_by_pos_id,
+            instrument_id=instrument_id,
+            price_plausibility=price_plausibility,
+            quote=break_even_quote,
+            checked_at=checked_at,
+            now=now,
+        )
+
     planned_close_sizes: tuple[str | None, ...]
     if effective_fraction is None:
         planned_close_sizes = tuple(None for _ in economics)
@@ -1277,6 +1302,10 @@ def _plan_strategy_management_batch_locked(
         target_snapshot["stop_price_gate"] = stop_gate_evidence
     if price_plausibility is not None:
         target_snapshot["price_plausibility"] = price_plausibility.as_evidence()
+    if break_even_reference is not None:
+        target_snapshot["break_even_reference"] = (
+            break_even_reference.as_evidence()
+        )
     if contract_spec_resolution.snapshot is not None:
         target_snapshot["contract_spec_snapshot"] = (
             contract_spec_resolution.snapshot
@@ -1348,6 +1377,35 @@ def _plan_strategy_management_batch_locked(
         }
     target_fingerprint = management_target_fingerprint(target_snapshot)
     legs_by_pos_id = target_legs_by_pos_id
+    # One planned-TPSL payload for the whole batch: nothing in it varies by
+    # position, and the break-even reference in particular is a fact about the
+    # strategy rather than about any one leg.
+    break_even_reference_fields = planned_tpsl_reference_fields(
+        break_even_reference
+    )
+    planned_tpsl_payload: dict[str, Any] | None = None
+    if (
+        intent in PROTECTION_INTENTS or partial_protection_maintenance
+    ) and effective_action_name not in {"full_close", "full_exit"}:
+        if (
+            effective_action_name != BREAK_EVEN_BY_MARKET_ACTION
+            or break_even_reference_fields
+            or (
+                candidate.stop_loss_text not in (None, "")
+                and candidate.stop_price_source == "current_message_text"
+            )
+        ):
+            planned_tpsl_payload = {
+                "intent": intent,
+                "stop_loss_text": candidate.stop_loss_text,
+                **(
+                    {"stop_price_source": candidate.stop_price_source}
+                    if candidate.stop_loss_text not in (None, "")
+                    and candidate.stop_price_source not in (None, "")
+                    else {}
+                ),
+                **break_even_reference_fields,
+            }
     batch_legs = [
         ManagementLegCreate(
             execution_order_leg_id=legs_by_pos_id[position["pos_id"]].id,
@@ -1359,30 +1417,8 @@ def _plan_strategy_management_batch_locked(
             quantity_step=str(contract_spec.quantity_step),
             old_tpsl=protection_by_pos_id.get(position["pos_id"]),
             planned_tpsl=(
-                {
-                    "intent": intent,
-                    "stop_loss_text": candidate.stop_loss_text,
-                    **(
-                        {"stop_price_source": candidate.stop_price_source}
-                        if candidate.stop_loss_text not in (None, "")
-                        and candidate.stop_price_source not in (None, "")
-                        else {}
-                    ),
-                }
-                if (
-                    intent in PROTECTION_INTENTS
-                    or partial_protection_maintenance
-                )
-                and effective_action_name not in {"full_close", "full_exit"}
-                and (
-                    effective_action_name != BREAK_EVEN_BY_MARKET_ACTION
-                    or (
-                        candidate.stop_loss_text not in (None, "")
-                        and candidate.stop_price_source
-                        == "current_message_text"
-                    )
-                )
-                else None
+                None if planned_tpsl_payload is None
+                else dict(planned_tpsl_payload)
             ),
             last_exchange_snapshot=position,
         )
@@ -1603,7 +1639,110 @@ class _PriceSanitizedCandidate:
         return getattr(object.__getattribute__(self, "_candidate"), name)
 
 
-def _identity_without_implausible_prices(
+def _most_protective_entry_price(economics, *, side) -> str | None:
+    """The one fill that can stand in for all of them without relaxing any.
+
+    Only the fallback reference needs this, and only to decide whether a price
+    the message named is *tighter* than breaking even would be.  Legs that
+    filled at different prices would each break even at their own, so the
+    comparison has to be made against the tightest of them -- otherwise a
+    number tighter than one leg but looser than another would be adopted for
+    both and quietly give protection away on the second.
+    """
+
+    normalized_side = str(side or "").strip().lower()
+    prices = []
+    for position in economics:
+        try:
+            price = Decimal(str(position["avg_entry_price"]))
+        except (InvalidOperation, KeyError, TypeError, ValueError):
+            continue
+        if price.is_finite() and price > 0:
+            prices.append(price)
+    if not prices:
+        return None
+    # A short's stop sits above the market, so its tightest stop is the lowest.
+    chosen = max(prices) if normalized_side == "long" else min(prices)
+    return _decimal_text(chosen)
+
+
+def _break_even_reference_for_batch(
+    session_factory: sessionmaker,
+    *,
+    identity: _PlanningIdentity,
+    lifecycle: StrategyLifecycle,
+    economics,
+    legs_by_pos_id,
+    instrument_id: str,
+    price_plausibility,
+    quote,
+    checked_at,
+    now: datetime,
+):
+    """Where this batch's break-even stop goes, and what the message's number was.
+
+    "Entry legs that still hold a position" is read off the batch's own
+    targets: every position that survived the exchange preflight maps back to
+    one ``execution_order_legs`` row, and that row's ``leg_index`` is the
+    strategy leg it was planned as.  One reference serves the whole batch --
+    "both legs filled" is a fact about the strategy, not about one position.
+    """
+
+    reference = resolve_break_even_reference(
+        side=lifecycle.side,
+        entry_range_low=lifecycle.entry_range_low,
+        entry_range_high=lifecycle.entry_range_high,
+        open_entry_leg_indexes=[
+            legs_by_pos_id[str(position["pos_id"])].leg_index
+            for position in economics
+        ],
+        actual_avg_entry_price=_most_protective_entry_price(
+            economics, side=lifecycle.side
+        ),
+    )
+    if price_plausibility is None:
+        return reference, price_plausibility
+
+    side = str(lifecycle.side).lower()
+
+    def validate_explicit_price(value: str, source: str | None) -> str | None:
+        # The explicit-price half of the gate, deliberately asked for under
+        # ``adjust_stop_loss``: provenance, deviation and direction are what
+        # decide whether a KOL-named stop is placeable, and the action-conflict
+        # rule this function also owns is the very rule being answered here.
+        return validate_management_stop(
+            action="adjust_stop_loss",
+            stop_mode="explicit_price",
+            stop_price=value,
+            stop_price_source=source,
+            current_message_text=identity.raw_message.text,
+            side=side,
+            entry_prices=[
+                position["avg_entry_price"] for position in economics
+            ],
+            instrument_id=instrument_id,
+            quote=quote,
+            settings=load_trading_settings(session_factory),
+            now=checked_at(),
+        ).reason_code
+
+    price_plausibility, reference = dispose_pending_break_even_prices(
+        price_plausibility,
+        side=side,
+        reference=reference,
+        explicit_price_validator=validate_explicit_price,
+    )
+    record_price_disposed(
+        session_factory,
+        raw_message_id=int(identity.raw_message.id),
+        candidate_id=int(identity.candidate.id),
+        sanitized=price_plausibility,
+        now=now,
+    )
+    return reference, price_plausibility
+
+
+def _identity_without_explicit_break_even_prices(
     session_factory: sessionmaker,
     *,
     identity: _PlanningIdentity,
@@ -1611,23 +1750,31 @@ def _identity_without_implausible_prices(
     deepcoin_client,
     now: datetime,
 ):
-    """Drop explicit prices the instrument's own market contradicts.
+    """Remove every explicit price an implicit-stop instruction carries.
 
     Only the implicit-stop actions are in scope.  For those, any explicit price
-    at all is a semantic conflict that refuses the whole instruction, so a
-    number that is not a price silently costs the KOL both the reduction and
-    the protection they asked for.  ``adjust_stop_loss`` is deliberately left
-    to the stop gate: there the price *is* the instruction, the gate already
-    compares it against the same market, and refusing is the right answer --
-    never invent a stop the message did not name.
+    at all used to be a semantic conflict that refused the whole instruction,
+    so a number that was not a new stop silently cost the KOL both the
+    reduction and the protection they asked for.  ``adjust_stop_loss`` is
+    deliberately left to the stop gate: there the price *is* the instruction,
+    the gate already compares it against the same market, and refusing is the
+    right answer -- never invent a stop the message did not name.
 
-    Returns the identity planning should use and, when something was removed,
-    the evidence to record on the batch.  No explicit price means no market
-    read at all, and an unusable quote leaves every value exactly as it was.
+    Removal is unconditional here because a break-even stop has exactly one
+    source of truth, the break-even reference.  What the number *meant* is
+    only half decided at this point: the magnitude and market-side rows need
+    the quote this reads once, while the last two rows need the strategy's
+    break-even price, which depends on which entry legs still hold a position
+    and so cannot be known until the exchange preflight below has run.
+    :func:`dispose_pending_break_even_prices` finishes that judgement, and the
+    per-price order 1-2-3-4 is preserved across the two halves.
+
+    Returns the identity planning should use, the evidence so far, and the one
+    quote both halves share.  No explicit price means no market read at all.
     """
 
     if intent not in IMPLICIT_STOP_ACTIONS:
-        return identity, None
+        return identity, None, None
     candidate = identity.candidate
     contract_payload = _json_dict(candidate.management_contract_json)
     has_explicit_price = (
@@ -1635,8 +1782,9 @@ def _identity_without_implausible_prices(
         and contract_payload.get("stop_price") not in (None, "")
     ) or candidate.stop_loss_text not in (None, "")
     if not has_explicit_price:
-        return identity, None
+        return identity, None, None
     instrument_id = f"{str(identity.lifecycle.symbol).upper()}-USDT-SWAP"
+    quote = read_stop_quote(deepcoin_client, instrument_id)
     sanitized = sanitize_management_prices(
         stop_loss_text=candidate.stop_loss_text,
         stop_price_source=candidate.stop_price_source,
@@ -1644,10 +1792,15 @@ def _identity_without_implausible_prices(
         management_contract_fingerprint_value=(
             candidate.management_contract_fingerprint
         ),
-        quote=read_stop_quote(deepcoin_client, instrument_id),
+        quote=quote,
+        side=str(identity.lifecycle.side).lower(),
     )
     if not sanitized.changed:
-        return identity, None
+        return identity, None, quote
+    # The magnitude alert is raised here rather than with the rest, so that an
+    # instruction blocked by the preflight below still reports the number the
+    # system refused to believe. Its low-severity counterpart is recorded once
+    # every disposition is final.
     record_price_implausible(
         session_factory,
         raw_message_id=int(identity.raw_message.id),
@@ -1669,6 +1822,7 @@ def _identity_without_implausible_prices(
             ),
         ),
         sanitized,
+        quote,
     )
 
 

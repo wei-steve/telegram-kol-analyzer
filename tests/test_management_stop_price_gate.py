@@ -62,7 +62,94 @@ def test_reasonable_and_profit_locking_explicit_stops_pass(stop, side):
     "action", ["partial_then_break_even", "move_stop_to_break_even"]
 )
 def test_implicit_target_action_cannot_choose_explicit_price(action):
+    """Kept as defence in depth.
+
+    Since 2026-09-21 a break-even instruction is not supposed to *reach* this
+    branch: every explicit price it carries is disposed of before planning
+    persists anything, and the batch stores the neutralised contract. This
+    rule stays exactly as it was so that a break-even batch which somehow
+    still names a price is refused rather than executed.
+    """
+
     assert check(action=action).reason_code == "management_stop_action_conflict"
+
+
+class _Batch:
+    def __init__(self, *, contract_json, legs, intent="partial_then_break_even"):
+        self.intent = intent
+        self.management_contract_json = contract_json
+        self.legs = legs
+        self.id = 1
+        self.raw_message_id = 1
+        self.execution_binding_id = 1
+        self.status = "executing"
+
+
+class _Leg:
+    def __init__(self, planned_tpsl):
+        self.planned_tpsl = planned_tpsl
+        self.avg_entry_price = "80436"
+
+
+def test_a_neutralised_break_even_batch_passes_the_execution_recheck():
+    """The batch a disposed price produces must not conflict at write time.
+
+    The reference travels in ``planned_tpsl_json`` and is not a stop the gate
+    has to judge: there is no explicit-price target left, so the recheck
+    returns without reading a ticker or opening a session.
+    """
+
+    from telegram_kol_research import management_stop_price_gate as gate
+    from telegram_kol_research.strategy_management_contracts import (
+        ManagementInstructionContract,
+        management_contract_fingerprint,
+        serialize_management_contract,
+    )
+
+    contract = ManagementInstructionContract(
+        version=2,
+        target_lifecycle_id=1,
+        strategy_instance_id="deepcoin:1:1:BTC:short",
+        symbol="BTC",
+        side="short",
+        close_fraction="0.5",
+        stop_mode="actual_entry_price",
+        stop_price=None,
+        stop_price_source=None,
+        take_profit_consumption="consume_first_stage",
+        cancel_deferred_entries=True,
+        required_components=(
+            "consume_take_profit_stage",
+            "converge_partial_close",
+            "replace_remaining_protection",
+        ),
+        current_message_text="减仓移动止损到成本",
+    )
+    batch = _Batch(
+        contract_json=serialize_management_contract(contract),
+        legs=[
+            _Leg(
+                {
+                    "intent": "partial_then_break_even",
+                    "stop_loss_text": None,
+                    "break_even_reference_price": "80500",
+                    "break_even_reference_source": "strategy_first_leg",
+                }
+            )
+        ],
+    )
+
+    def refuse_any_session():
+        raise AssertionError("a neutralised batch must need no identity read")
+
+    assert (
+        gate.validate_batch_stops(
+            refuse_any_session, batch=batch, client=None, now=NOW
+        )
+        is None
+    )
+    # The fingerprint the batch would carry names exactly this contract.
+    assert len(management_contract_fingerprint(contract)) == 64
 
 
 def test_percentage_configuration_and_boundary():

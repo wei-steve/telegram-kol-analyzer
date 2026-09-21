@@ -762,6 +762,8 @@ def _persist_exact_management_target(
     stop_price_source=None,
     management_text="B strategy exit",
     composite_contract=False,
+    entry_range=None,
+    leg_indexes=None,
 ):
     with session_factory() as session:
         entry_a = RawMessage(
@@ -800,6 +802,8 @@ def _persist_exact_management_target(
             lifecycle_status="entered",
             signal_at=PLANNED_AT,
             stop_loss=current_stop_loss,
+            entry_range_low=None if entry_range is None else entry_range[0],
+            entry_range_high=None if entry_range is None else entry_range[1],
         )
         session.add_all([lifecycle_a, lifecycle_b])
         session.flush()
@@ -842,7 +846,9 @@ def _persist_exact_management_target(
                     ExecutionOrderLeg(
                         execution_binding_id=binding_b.id,
                         strategy_instance_id=strategy_instance_id,
-                        leg_index=index,
+                        leg_index=(
+                            index if leg_indexes is None else leg_indexes[index]
+                        ),
                         purpose="entry",
                         order_kind="market",
                         order_id=pos_id,
@@ -2059,77 +2065,176 @@ def test_break_even_planning_defers_open_protection_incident_to_market_decision(
     assert client.ticker_reads == []
 
 
-def test_explicit_break_even_stop_must_tighten_exact_live_position(
-    monkeypatch, tmp_path
+def _plan_break_even_with_message_price(
+    monkeypatch, tmp_path, *, name, stop_loss_text, market_price,
+    entry_range=None, leg_indexes=None,
 ):
     planner = _planner()
-    session_factory = create_session_factory(tmp_path / "explicit-risk.db")
+    session_factory = create_session_factory(tmp_path / name)
     raw_id, _, _ = _persist_exact_management_target(
         session_factory,
         intent="move_stop_to_break_even",
+        entry_range=entry_range,
+        leg_indexes=leg_indexes,
     )
     with session_factory() as session:
         raw = session.get(RawMessage, raw_id)
-        raw.text = "BTC 空单移动保护到 65000"
+        raw.text = f"BTC 空单移动保护到 {stop_loss_text}"
         candidate = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_id)
             .one()
         )
-        candidate.stop_loss_text = "65000"
+        candidate.stop_loss_text = stop_loss_text
         candidate.stop_price_source = "current_message_text"
         session.commit()
     _disable_reconciliation(monkeypatch, planner)
+    positions = [_position(avg_px="64103.8", side="short")]
+    client = (
+        _ReadOnlyDeepcoin(positions)
+        if market_price is None
+        else _quoting_client(positions, price=market_price)
+    )
 
     result = planner.plan_strategy_management_batch(
         session_factory,
         raw_message_id=raw_id,
-        deepcoin_client=_ReadOnlyDeepcoin(
-            [_position(avg_px="64103.8", side="short")]
-        ),
+        deepcoin_client=client,
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
     )
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+        snapshot = json.loads(batch.target_snapshot_json)
+    return result, snapshot
 
-    assert result.status == "blocked"
-    assert result.reason_code == "management_stop_action_conflict"
 
-
-def test_even_safe_explicit_break_even_stop_is_rejected_as_conflict(
+def test_a_looser_explicit_break_even_stop_is_superseded_not_refused(
     monkeypatch, tmp_path
 ):
+    """A short stop above our own break-even price gives away protection.
+
+    This is the shape of raw 17813's 81200: placeable, correctly directed,
+    and looser than the price the break-even is aimed at.  Before 2026-09-21
+    it refused the whole instruction; now it is dropped and the instruction
+    runs.
+    """
+
+    result, snapshot = _plan_break_even_with_message_price(
+        monkeypatch, tmp_path,
+        name="explicit-looser.db", stop_loss_text="65000", market_price="63000",
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert result.batch.effective_action == "break_even_by_market"
+    assert [
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    ] == ["superseded_by_strategy_price"]
+    # No entry range on this strategy, so break-even stays on our own fill.
+    assert snapshot["break_even_reference"]["price"] == "64103.8"
+    assert result.batch.legs[0].planned_tpsl is None
+
+
+def test_a_tighter_explicit_break_even_stop_becomes_the_reference(
+    monkeypatch, tmp_path
+):
+    """The one case the number wins: the KOL named more protection than R1."""
+
+    result, snapshot = _plan_break_even_with_message_price(
+        monkeypatch, tmp_path,
+        name="explicit-tighter.db", stop_loss_text="64000", market_price="63000",
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert [
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    ] == ["explicit_tighter_adopted"]
+    assert snapshot["break_even_reference"] == {
+        "price": "64000",
+        "source": "message_explicit_tighter",
+        "evidence": {
+            "side": "short",
+            "entry_range_low": None,
+            "entry_range_high": None,
+            "open_entry_leg_indexes": [0],
+            "superseded_source": "actual_fill_no_strategy_price",
+            "superseded_price": "64103.8",
+        },
+    }
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "move_stop_to_break_even",
+        "stop_loss_text": None,
+        "break_even_reference_price": "64000",
+        "break_even_reference_source": "message_explicit_tighter",
+    }
+
+
+def test_a_tighter_price_the_explicit_gate_refuses_falls_back_to_the_reference(
+    monkeypatch, tmp_path
+):
+    """Same number, provenance the gate will not accept: drop it, break even."""
+
     planner = _planner()
-    session_factory = create_session_factory(tmp_path / "explicit-safe.db")
+    session_factory = create_session_factory(tmp_path / "explicit-provenance.db")
     raw_id, _, _ = _persist_exact_management_target(
-        session_factory,
-        intent="move_stop_to_break_even",
+        session_factory, intent="move_stop_to_break_even",
     )
     with session_factory() as session:
-        raw = session.get(RawMessage, raw_id)
-        raw.text = "BTC 空单移动保护到 64000"
         candidate = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.raw_message_id == raw_id)
             .one()
         )
         candidate.stop_loss_text = "64000"
-        candidate.stop_price_source = "current_message_text"
+        candidate.stop_price_source = "recognition_context"
         session.commit()
     _disable_reconciliation(monkeypatch, planner)
 
     result = planner.plan_strategy_management_batch(
         session_factory,
         raw_message_id=raw_id,
-        deepcoin_client=_ReadOnlyDeepcoin(
-            [_position(avg_px="64103.8", side="short")]
+        deepcoin_client=_quoting_client(
+            [_position(avg_px="64103.8", side="short")], price="63000"
         ),
         contract_spec_provider=_ContractSpecs(),
         planned_at=PLANNED_AT,
     )
 
-    assert result.status == "blocked"
-    assert result.reason_code == "management_stop_action_conflict"
-    assert result.batch.legs == ()
+    assert (result.status, result.reason_code) == ("ready", None)
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    assert [
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    ] == ["superseded_by_strategy_price"]
+    assert snapshot["break_even_reference"]["price"] == "64103.8"
+
+
+def test_an_unreadable_quote_breaks_even_instead_of_refusing(
+    monkeypatch, tmp_path
+):
+    """The user's rule: never hold a position because we could not judge."""
+
+    result, snapshot = _plan_break_even_with_message_price(
+        monkeypatch, tmp_path,
+        name="explicit-no-quote.db", stop_loss_text="64000", market_price=None,
+        entry_range=(64500, 65500), leg_indexes=(1,),
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert [
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    ] == ["ignored_quote_unavailable"]
+    assert snapshot["break_even_reference"]["price"] == "64500"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "move_stop_to_break_even",
+        "stop_loss_text": None,
+        "break_even_reference_price": "64500",
+        "break_even_reference_source": "strategy_first_leg",
+    }
 
 
 @pytest.mark.parametrize("stop,expected_status", [("61900", "blocked"), ("62700", "ready")])
@@ -4359,7 +4464,10 @@ def test_final_competing_owner_error_returns_blocked_without_leaking(
     # ``test_implausible_composite_stop_is_dropped_instead_of_refusing_the_batch``.
     # ``adjust_stop_loss`` is deliberately unchanged -- there the price is the
     # instruction, and refusing it is the correct answer.
-    ("move_stop_to_break_even", "79519", "long", "management_stop_action_conflict"),
+    # 2026-09-21 removed the last implicit-stop row for the same reason: a
+    # break-even action no longer reaches the conflict branch at all, because
+    # every explicit price it carries is disposed of before the gate. See
+    # ``test_a_looser_explicit_break_even_stop_is_superseded_not_refused``.
 ])
 def test_stop_gate_blocks_before_components_and_records_incident(monkeypatch, tmp_path, intent, stop, side, expected):
     from telegram_kol_research.models import RuntimeIncident
@@ -4542,14 +4650,20 @@ def test_implausible_composite_stop_is_dropped_instead_of_refusing_the_batch(
     assert snapshot["price_plausibility"]["max_ratio"] == "10"
 
 
-def test_plausible_composite_stop_still_conflicts_and_reads_no_ticker(
+def test_plausible_composite_stop_is_disposed_and_the_reduction_still_runs(
     monkeypatch, tmp_path
 ):
-    """Magnitude is the only thing this check judges; the gate keeps the rest."""
+    """The composite shape of the same rule, and the contract it leaves behind.
+
+    Before 2026-09-21 a believable, correctly directed price on a composite
+    break-even refused the batch outright. It is now judged against the
+    break-even reference -- here our own fill, 62000 -- found looser, and
+    dropped, so the half-close and the stop move both happen.
+    """
 
     planner = _planner()
     session_factory = create_session_factory(tmp_path / "plausible-stop.db")
-    raw_id, _, _ = _persist_exact_management_target(
+    raw_id, _, binding_id = _persist_exact_management_target(
         session_factory,
         intent="partial_then_break_even",
         management_fraction=None,
@@ -4559,13 +4673,13 @@ def test_plausible_composite_stop_still_conflicts_and_reads_no_ticker(
         management_text="减仓一半，止损移到 63000",
     )
     _disable_reconciliation(monkeypatch, planner)
-    client = _ReadOnlyDeepcoin([_position()])
-    client.get_ticker_quote = lambda **kwargs: {
-        "instrument_id": "BTC-USDT-SWAP",
-        "price": "62000",
-        "price_field": "last",
-        "observed_at": PLANNED_AT.isoformat(),
-    }
+    tpsl = _short_protection_evidence(
+        session_factory, binding_id=binding_id,
+        stop_price="63500", take_profit_price="61000", size_text="10",
+    )
+    client = _quoting_client(
+        [_position()], price="62000", tpsl_orders=tpsl
+    )
 
     result = planner.plan_strategy_management_batch(
         session_factory,
@@ -4575,7 +4689,23 @@ def test_plausible_composite_stop_still_conflicts_and_reads_no_ticker(
         planned_at=PLANNED_AT,
     )
 
-    assert result.reason_code == "management_stop_action_conflict"
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert result.batch.legs[0].planned_close_size == "5"
+    batch_contract = load_management_contract(
+        result.batch.management_contract_json
+    )
+    assert batch_contract.stop_mode == "actual_entry_price"
+    assert batch_contract.stop_price is None
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    assert {
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    } == {"superseded_by_strategy_price"}
+    assert client.write_calls == []
 
 
 def test_no_explicit_price_reads_no_ticker_at_all(monkeypatch, tmp_path):
@@ -4618,3 +4748,392 @@ def test_stop_provenance_rejection_has_runtime_incident(monkeypatch, tmp_path):
     assert client.write_calls == []
     with factory() as session:
         assert "management_stop_provenance_invalid" in session.query(RuntimeIncident).one().redacted_summary
+
+
+# ---------------------------------------------------------------------------
+# 2026-09-21: the break-even stop follows the *strategy's* price, and a number
+# carried along by a break-even message no longer refuses the whole
+# instruction.  Spec: docs/plans/2026-09-21-break-even-strategy-price-spec.md
+# ---------------------------------------------------------------------------
+
+
+def _short_protection_evidence(
+    session_factory,
+    *,
+    binding_id,
+    pos_id="pos-b",
+    stop_price="82300",
+    take_profit_price="79000",
+    size_text="0",
+):
+    """One verified stop/take-profit pair, on the exchange and in the ledger."""
+
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id=pos_id)
+            .one()
+        )
+        for order_id, purpose, trigger_price in (
+            ("tp-old", "take_profit", take_profit_price),
+            ("sl-old", "stop_loss", stop_price),
+        ):
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose=purpose,
+                trigger_price=trigger_price,
+                size_text=size_text,
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.commit()
+    return [
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "tp-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": pos_id,
+            "tpTriggerPx": take_profit_price,
+            "sz": size_text,
+            "cTime": "1721000000000",
+        },
+        {
+            "triggerOrderType": "TPSL",
+            "ordId": "sl-old",
+            "instId": "BTC-USDT-SWAP",
+            "posSide": "short",
+            "posId": pos_id,
+            "slTriggerPx": stop_price,
+            "sz": size_text,
+            "cTime": "1721000000000",
+        },
+    ]
+
+
+def _quoting_client(positions, *, price, tpsl_orders=None):
+    client = _ReadOnlyDeepcoin(positions, tpsl_orders=tpsl_orders)
+    client.get_ticker_quote = lambda **kwargs: {
+        "instrument_id": "BTC-USDT-SWAP",
+        "price": price,
+        "price_field": "last",
+        "observed_at": PLANNED_AT.isoformat(),
+    }
+    return client
+
+
+def test_raw_17813_restates_cost_and_breaks_even_at_the_strategy_price(
+    monkeypatch, tmp_path
+):
+    """The 2026-09-20 incident (raw 17813, batch 169), end to end.
+
+    "在这个成本开的空可以减仓移动止损到成本" was recognised correctly as
+    ``partial_then_break_even``, but the 81200 it also carried made the gate
+    refuse the whole instruction: no reduction, no stop move, and a BTC short
+    left on its 82300 stop for six hours.  81200 is looser than the strategy's
+    own first-leg price, so it is now dropped, and the break-even target is
+    80500 -- the strategy's price, not our greedy 80436 fill.
+    """
+
+    from telegram_kol_research.models import RuntimeIncident
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "raw-17813.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+        composite_contract=True,
+        requested_stop_loss="81200",
+        stop_price_source="current_message_text",
+        management_text="在这个成本开的空可以减仓移动止损到成本做无风险持仓",
+        entry_range=(80500, 81600),
+        leg_indexes=(1,),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    tpsl = _short_protection_evidence(session_factory, binding_id=binding_id)
+    client = _quoting_client(
+        [_position(avg_px="80436")], price="80450", tpsl_orders=tpsl
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert result.batch.effective_fraction == 0.5
+    assert result.batch.legs[0].planned_close_size == "5"
+    # Our own fill is still what identity is checked against; it is no longer
+    # what the break-even stop is aimed at.
+    assert result.batch.legs[0].avg_entry_price == "80436"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "partial_then_break_even",
+        "stop_loss_text": None,
+        "break_even_reference_price": "80500",
+        "break_even_reference_source": "strategy_first_leg",
+    }
+    batch_contract = load_management_contract(
+        result.batch.management_contract_json
+    )
+    assert batch_contract.stop_mode == "actual_entry_price"
+    assert batch_contract.stop_price is None
+    assert client.write_calls == []
+
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+        incidents = session.query(RuntimeIncident).all()
+    snapshot = json.loads(batch.target_snapshot_json)
+    assert snapshot["break_even_reference"]["price"] == "80500"
+    assert snapshot["break_even_reference"]["source"] == "strategy_first_leg"
+    assert snapshot["break_even_reference"]["evidence"] == {
+        "side": "short",
+        "entry_range_low": "80500",
+        "entry_range_high": "81600",
+        "open_entry_leg_indexes": [1],
+    }
+    assert [
+        (row["field"], row["disposition"])
+        for row in snapshot["price_plausibility"]["removed"]
+    ] == [
+        ("contract_stop_price", "superseded_by_strategy_price"),
+        ("stop_loss_text", "superseded_by_strategy_price"),
+    ]
+    # "The system did the right thing" is a low note, not a Telegram alert.
+    assert [
+        (row.incident_type, row.severity) for row in incidents
+    ] == [("management_price_disposed", "low")]
+
+
+@pytest.mark.parametrize(
+    "pos_ids,leg_indexes,expected_price,expected_source",
+    [
+        (("pos-b",), (1,), "80500", "strategy_first_leg"),
+        (("pos-b",), (2,), "81600", "strategy_second_leg"),
+        (("pos-b", "pos-c"), (1, 2), "81050", "strategy_midpoint"),
+        # Leg indexes this strategy never planned say nothing about the range.
+        (("pos-b",), (0,), "80436", "actual_fill_no_strategy_price"),
+    ],
+)
+def test_which_entry_legs_still_hold_decides_the_break_even_price(
+    monkeypatch, tmp_path, pos_ids, leg_indexes, expected_price, expected_source
+):
+    """One reference for the whole batch: it is a fact about the strategy."""
+
+    planner = _planner()
+    session_factory = create_session_factory(
+        tmp_path / f"legs-{'-'.join(map(str, leg_indexes))}.db"
+    )
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        pos_ids=pos_ids,
+        leg_indexes=leg_indexes,
+        entry_range=(80500, 81600),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin(
+        [_position(pos_id, avg_px="80436") for pos_id in pos_ids]
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    assert snapshot["break_even_reference"]["price"] == expected_price
+    assert snapshot["break_even_reference"]["source"] == expected_source
+    expected_planned = (
+        None
+        if expected_source == "actual_fill_no_strategy_price"
+        else {
+            "intent": "move_stop_to_break_even",
+            "stop_loss_text": None,
+            "break_even_reference_price": expected_price,
+            "break_even_reference_source": expected_source,
+        }
+    )
+    assert [leg.planned_tpsl for leg in result.batch.legs] == [
+        expected_planned for _ in pos_ids
+    ]
+    # No explicit price anywhere in this message, so no market read at all.
+    assert client.ticker_reads == []
+
+
+def test_a_fallback_reference_uses_the_tightest_fill_of_the_open_positions(
+    monkeypatch, tmp_path
+):
+    """Two legs at different prices break even at their own, so adoption has
+    to be judged against the tightest of them -- a number between the two
+    would otherwise be adopted for both and relax the second one's stop."""
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "tightest-fill.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        pos_ids=("pos-b", "pos-c"),
+        requested_stop_loss="81000",
+        stop_price_source="current_message_text",
+        management_text="移动止损到 81000",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _quoting_client(
+        [
+            _position("pos-b", avg_px="80436"),
+            _position("pos-c", avg_px="81510"),
+        ],
+        price="79000",
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    # 81000 is tighter than 81510 but looser than 80436, so it is refused.
+    assert [
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    ] == ["superseded_by_strategy_price"]
+    assert snapshot["break_even_reference"]["price"] == "80436"
+    assert [leg.planned_tpsl for leg in result.batch.legs] == [None, None]
+
+
+def test_raw_15475_low_of_the_move_is_not_a_possible_short_stop(
+    monkeypatch, tmp_path
+):
+    """raw 15475 (2026-09-08): "最低2450" is the low just printed, not a stop.
+
+    On a short, a stop at or below the market triggers the moment it is
+    placed, so this number could never have been the protection the KOL
+    asked for.  It is dropped and the break-even runs on the strategy price.
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "raw-15475.db")
+    raw_id, _, _ = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        management_fraction=None,
+        requested_stop_loss="2450",
+        stop_price_source="current_message_text",
+        management_text="最低2450，第二止盈位已到，注意锁定利润，及时移动止损",
+        entry_range=(2480, 2520),
+        leg_indexes=(1,),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _quoting_client([_position(avg_px="2468")], price="2455")
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert (result.status, result.reason_code) == ("ready", None)
+    assert result.batch.effective_action == "break_even_by_market"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "move_stop_to_break_even",
+        "stop_loss_text": None,
+        "break_even_reference_price": "2480",
+        "break_even_reference_source": "strategy_first_leg",
+    }
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+    removed = json.loads(batch.target_snapshot_json)["price_plausibility"][
+        "removed"
+    ]
+    assert [row["disposition"] for row in removed] == ["not_a_possible_stop"]
+    assert removed[0]["field"] == "stop_loss_text"
+
+
+def test_raw_15402_signature_number_keeps_its_own_high_severity_disposition(
+    monkeypatch, tmp_path
+):
+    """raw 15402 (2026-09-08): the QQ number path is unchanged by this work."""
+
+    from telegram_kol_research.models import RuntimeIncident
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "raw-15402.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="partial_then_break_even",
+        management_fraction=None,
+        composite_contract=True,
+        requested_stop_loss="158241758",
+        stop_price_source="current_message_text",
+        management_text="第一止盈位已过，及时移动止损！ @Tarderfengge QQ:158241758",
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    tpsl = _short_protection_evidence(
+        session_factory, binding_id=binding_id,
+        stop_price="63000", take_profit_price="61000", size_text="10",
+    )
+    client = _quoting_client(
+        [_position(avg_px="62000")], price="62000", tpsl_orders=tpsl
+    )
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    # No entry range on this strategy, so the reference falls back to our own
+    # fill exactly as before, and nothing is written into the planned TPSL.
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "partial_then_break_even",
+        "stop_loss_text": None,
+    }
+    with session_factory() as session:
+        batch = session.get(StrategyManagementBatch, result.batch.id)
+        incidents = session.query(RuntimeIncident).all()
+    snapshot = json.loads(batch.target_snapshot_json)
+    assert snapshot["break_even_reference"]["source"] == (
+        "actual_fill_no_strategy_price"
+    )
+    assert {
+        row["disposition"] for row in snapshot["price_plausibility"]["removed"]
+    } == {"implausible_magnitude"}
+    assert [
+        (row.incident_type, row.severity) for row in incidents
+    ] == [("management_price_implausible", "high")]

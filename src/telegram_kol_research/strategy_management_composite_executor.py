@@ -55,6 +55,7 @@ from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     plan_composite_stop_replacement,
 )
+from telegram_kol_research.break_even_reference import break_even_target_price
 from telegram_kol_research.protection_ledger import retained_take_profit_total
 from telegram_kol_research.protection_replacement_persistence import (
     VerifiedProtectionReplacement,
@@ -947,7 +948,10 @@ def execute_protection_replacement_component(
         requested_stop = (
             contract.stop_price
             if contract.stop_mode == "explicit_price"
-            else desired["avg_entry_price"]
+            # The break-even target: the strategy's price when this batch
+            # carries one, and otherwise ``desired["avg_entry_price"]``
+            # verbatim, which is the same value this leg's column holds.
+            else break_even_target_price(leg)
         )
         market_price = (
             live_position.get("markPx")

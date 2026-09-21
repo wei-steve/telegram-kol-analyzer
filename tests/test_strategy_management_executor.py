@@ -1373,6 +1373,173 @@ def test_break_even_by_market_all_invalid_market_closes_exact_positions(
     assert client.set_calls == []
 
 
+def _stamp_break_even_reference(
+    session_factory, batch, *, price, source="strategy_first_leg"
+):
+    """Plan this batch the way the planner does for a strategy with a range."""
+
+    with session_factory() as session:
+        for leg in (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch.id)
+            .all()
+        ):
+            leg.planned_tpsl_json = json.dumps(
+                {
+                    "intent": "move_stop_to_break_even",
+                    "stop_loss_text": None,
+                    "break_even_reference_price": price,
+                    "break_even_reference_source": source,
+                }
+            )
+        session.commit()
+    return load_management_batch(session_factory, batch.id)
+
+
+def test_break_even_by_market_aims_at_the_strategy_price_not_our_fill(tmp_path):
+    """2026-09-21: the reference decides both the choice and the price written.
+
+    Our fills are 64000 and 64500 against a 64200 market, so on our own cost
+    this short would have market-closed the first position and broken even at
+    64500 on the second.  The strategy's own first-leg price is 64800, which
+    is a placeable short stop for both, so both positions keep their size and
+    get the same stop.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    batch = _stamp_break_even_reference(session_factory, batch, price="64800")
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert client.close_calls == []
+    assert {
+        call["posId"]: call["slTriggerPx"]
+        for call in client.set_calls
+        if call.get("slTriggerPx") not in (None, "")
+    } == {"pos-1": "64800", "pos-2": "64800"}
+    with session_factory() as session:
+        # The identity column is untouched: it still says what we actually
+        # paid, which is what the economics preflight compares against.
+        assert sorted(
+            leg.avg_entry_price
+            for leg in session.query(StrategyManagementLeg).all()
+        ) == ["64000", "64500"]
+
+
+def test_break_even_by_market_full_exits_when_the_strategy_price_is_passed(
+    tmp_path,
+):
+    """R3 is unchanged: a target the market has passed still exits at market.
+
+    Here it is the reference that has been passed, not our fill -- 64500 would
+    still have been placeable.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    batch = _stamp_break_even_reference(session_factory, batch, price="63000")
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.pending = []
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "reconciling"
+    assert [
+        (call["closePosId"], call["sz"]) for call in client.close_calls
+    ] == [("pos-1", "2"), ("pos-2", "4")]
+    assert client.set_calls == []
+
+
+def test_identity_still_compares_the_exchange_avg_px_to_our_own_fill(tmp_path):
+    """The two meanings of ``avg_entry_price`` stayed separated.
+
+    A batch carrying a strategy reference whose position has drifted must
+    still be refused: the economics preflight compares the exchange's
+    ``avgPx`` against the leg's own fill, and the reference must not be able
+    to talk it into accepting a different position.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        ManagementBatchExecutionError,
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_protection_batch(
+        session_factory, action="move_stop_to_break_even", stop_loss=None
+    )
+    batch = _stamp_break_even_reference(session_factory, batch, price="64800")
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    # The exchange now says this position was opened at the reference price.
+    client.positions[0]["avgPx"] = "64800"
+
+    with pytest.raises(ManagementBatchExecutionError) as excinfo:
+        execute_management_batch(
+            session_factory,
+            batch_id=batch.id,
+            deepcoin_client=client,
+            executed_at=NOW,
+        )
+
+    assert "protection_preflight_position_economics_drift" in str(excinfo.value)
+    assert client.set_calls == []
+
+
+def test_a_batch_planned_without_a_reference_still_breaks_even_on_our_fill(
+    tmp_path,
+):
+    """Batches planned before 2026-09-21 carry no reference and must not move."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    with session_factory() as session:
+        assert all(
+            leg.planned_tpsl_json is None
+            for leg in session.query(StrategyManagementLeg).all()
+        )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+    client.quote["price"] = "63000"
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert {
+        call["posId"]: call["slTriggerPx"]
+        for call in client.set_calls
+        if call.get("slTriggerPx") not in (None, "")
+    } == {"pos-1": "64000", "pos-2": "64500"}
+
+
 def test_break_even_by_market_cancels_deferred_entry_before_market_close(
     tmp_path,
 ):
@@ -6542,6 +6709,80 @@ def _execute_composite_protection(session_factory, batch_id, component_id, clien
         price_tick="0.1",
         backup_buffer_bps="20",
     )
+
+
+def _stamp_composite_break_even_reference(session_factory, batch_id, *, price):
+    with session_factory() as session:
+        leg = (
+            session.query(StrategyManagementLeg)
+            .filter(StrategyManagementLeg.management_batch_id == batch_id)
+            .one()
+        )
+        leg.planned_tpsl_json = json.dumps(
+            {
+                "intent": "partial_then_break_even",
+                "stop_loss_text": None,
+                "break_even_reference_price": price,
+                "break_even_reference_source": "strategy_first_leg",
+            }
+        )
+        session.commit()
+
+
+def test_composite_protection_replaces_at_the_strategy_price(tmp_path):
+    """2026-09-21: the remaining position's stop follows the strategy's price.
+
+    This long's fill was 64000 and the strategy's own leg price 64300; the
+    market is 65000, so both are placeable and the reference is what gets
+    written -- primary and the backup derived from it.
+    """
+
+    session_factory = create_session_factory(tmp_path / "protection-strategy.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    _stamp_composite_break_even_reference(session_factory, batch_id, price="64300")
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "confirmed"
+    with session_factory() as session:
+        stops = {
+            row.purpose: row.trigger_price
+            for row in session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.order_id.in_(
+                    ("stop-new-primary", "stop-new-backup")
+                )
+            )
+        }
+        # The snapshot's own ``avg_entry_price`` is identity evidence and is
+        # left exactly as planned.
+        batch = session.get(StrategyManagementBatch, batch_id)
+    assert stops["stop_loss"] == "64300"
+    assert stops["backup_stop"] == "64171.4"
+    assert json.loads(batch.target_snapshot_json)["positions"][0][
+        "avg_entry_price"
+    ] == "64000"
+
+
+def test_composite_protection_operator_required_when_the_reference_is_passed(
+    tmp_path,
+):
+    """3.5 unchanged: a stop the market has passed still stops for a person."""
+
+    session_factory = create_session_factory(tmp_path / "protection-passed.db")
+    batch_id, component_id = _prepare_composite_protection_component(session_factory)
+    _stamp_composite_break_even_reference(session_factory, batch_id, price="65500")
+    client = _CompositeProtectionClient()
+
+    result = _execute_composite_protection(
+        session_factory, batch_id, component_id, client
+    )
+
+    assert result.status == "operator_required"
+    assert result.reason_code == "requested_stop_market_side_invalid"
+    assert client.events == []
 
 
 def test_composite_protection_creates_and_owns_both_stops_before_cancelling_old(

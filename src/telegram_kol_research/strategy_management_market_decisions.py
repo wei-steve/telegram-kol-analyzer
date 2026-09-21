@@ -17,6 +17,7 @@ from telegram_kol_research.models import (
     StrategyManagementLeg,
     StrategyManagementMarketDecision,
 )
+from telegram_kol_research.break_even_reference import break_even_target_price
 from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     assess_break_even_market,
@@ -260,9 +261,13 @@ def _normalize_decisions(
             }
             or comparison != policy.comparison
             or action != expected_action
+            # ``entry_price`` is the reserved *target* of the break-even stop,
+            # so it is checked against the same accessor the executor used to
+            # choose it -- the strategy's price when the batch carries one.
             or entry_price
             != _positive_decimal(
-                leg.avg_entry_price, reason="break_even_leg_entry_price_invalid"
+                break_even_target_price(leg),
+                reason="break_even_leg_entry_price_invalid",
             )
         ):
             raise BreakEvenMarketDecisionConflict(
