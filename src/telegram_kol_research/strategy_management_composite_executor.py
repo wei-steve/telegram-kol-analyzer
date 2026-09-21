@@ -15,11 +15,13 @@ from telegram_kol_research.management_stop_price_gate import validate_batch_stop
 from telegram_kol_research.models import (
     PositionMutationIntent,
     PositionProtectionLedger,
+    PositionTakeProfitOrder,
     RawMessage,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
 )
+from telegram_kol_research.protection_authority import resolve_protection_authority
 from telegram_kol_research.position_authority_lock import (
     serialized_position_authority_mutation,
 )
@@ -788,9 +790,25 @@ def execute_take_profit_consumption_component(
             )
     _transition(
         session_factory, component_id, "submitting", "confirmed",
-        now_provider(), None, {"intent_id": result.intent_id},
+        now_provider(), None,
+        {
+            "intent_id": result.intent_id,
+            # Additive evidence only: nothing reads this to decide anything.
+            # It is here because when a stage filled by itself, what this
+            # component believed had already been taken is otherwise
+            # unrecoverable from the record -- and that is precisely the number
+            # a person needs to judge whether component two's fraction, which
+            # is taken of the *current* position, is the intended one.
+            "proven_filled_quantity": plan.proven_filled_quantity,
+            "evidence_tier": plan.evidence_tier,
+        },
     )
-    return _current_result(session_factory, component_id, intent_ids=intent_ids)
+    return _current_result(
+        session_factory,
+        component_id,
+        proven_filled_quantity=plan.proven_filled_quantity,
+        intent_ids=intent_ids,
+    )
 
 
 def execute_partial_close_component(
@@ -2231,15 +2249,34 @@ def _load_component(
             )
         # The instrument is persisted by the exact owned protection ledger;
         # differing instruments fail closed.
-        instruments = {
-            str(row.instrument_id or "").upper()
-            for row in session.query(PositionProtectionLedger).filter(
-                PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
-                PositionProtectionLedger.execution_order_leg_id == leg.execution_order_leg_id,
-                PositionProtectionLedger.pos_id == leg.pos_id,
-                PositionProtectionLedger.purpose == "take_profit",
+        #
+        # It used to be read from this leg's ``take_profit`` rows only, so a
+        # position that never had a staged take profit -- batch 129's and batch
+        # 159's shape, a stop and nothing else -- could not start *any* of the
+        # three components: all three refused with
+        # ``take_profit_order_identity_conflict`` for want of an instrument
+        # name, and component one has nothing to consume there anyway. The
+        # narrowest widening that fixes it is to fall back to this leg's other
+        # protection rows and then to the binding's, both of which name the
+        # same instrument by construction; disagreement still fails closed.
+        instruments = _distinct_ledger_instruments(
+            session,
+            binding_id=batch.execution_binding_id,
+            leg_id=leg.execution_order_leg_id,
+            pos_id=leg.pos_id,
+            purpose="take_profit",
+        )
+        if not instruments:
+            instruments = _distinct_ledger_instruments(
+                session,
+                binding_id=batch.execution_binding_id,
+                leg_id=leg.execution_order_leg_id,
+                pos_id=leg.pos_id,
             )
-        }
+        if not instruments:
+            instruments = _distinct_ledger_instruments(
+                session, binding_id=batch.execution_binding_id
+            )
         if len(instruments) != 1 or "" in instruments:
             return CompositeComponentExecutionResult(
                 status="operator_required", component_id=component.id,
@@ -2251,6 +2288,28 @@ def _load_component(
         return batch, component, leg, contract, desired
 
 
+def _distinct_ledger_instruments(
+    session,
+    *,
+    binding_id,
+    leg_id=None,
+    pos_id=None,
+    purpose: str | None = None,
+) -> set[str]:
+    query = session.query(PositionProtectionLedger.instrument_id).filter(
+        PositionProtectionLedger.execution_binding_id == binding_id
+    )
+    if leg_id is not None:
+        query = query.filter(
+            PositionProtectionLedger.execution_order_leg_id == leg_id
+        )
+    if pos_id is not None:
+        query = query.filter(PositionProtectionLedger.pos_id == pos_id)
+    if purpose is not None:
+        query = query.filter(PositionProtectionLedger.purpose == purpose)
+    return {str(row[0] or "").upper() for row in query}
+
+
 def _exchange_snapshot(client: Any, instrument_id: str) -> dict[str, list]:
     def read(name: str):
         fn = getattr(client, name, None)
@@ -2260,13 +2319,20 @@ def _exchange_snapshot(client: Any, instrument_id: str) -> dict[str, list]:
         if not isinstance(value, list):
             raise RuntimeError(f"{name}_snapshot_incomplete")
         return value
+    trigger_history = read("list_trigger_order_history")
+    order_history = read("list_order_history")
     return {
         "positions": read("list_positions"),
         "pending": read("list_trigger_orders_pending"),
-        "history": [
-            *read("list_trigger_order_history"),
-            *read("list_order_history"),
-        ],
+        # ``history`` stays the merged list the intent reconciler already
+        # consumes. The two endpoints are kept apart as well because they speak
+        # different vocabularies: ``trigger-orders-history`` has no ``state``
+        # and answers with ``triggerTime``/``errorCode``, ``orders-history``
+        # has ``state`` and no trigger fields. Merging them and then asking one
+        # question of the result is how a single order can look like two.
+        "history": [*trigger_history, *order_history],
+        "trigger_history": trigger_history,
+        "order_history": order_history,
         "fills": read("list_trade_fills"),
     }
 
@@ -2286,16 +2352,42 @@ def _plan(session_factory, batch, leg, contract, desired, snapshot):
             "instrument_id": desired["instrument_id"],
             "side": contract.side,
         }
+        # Which of the instrument's resting protection orders are this
+        # position's, by ordId -> ledger or ``TU == posId``. A pending TPSL row
+        # carries no position id at all, so nothing else can answer it.
+        authority = resolve_protection_authority(
+            session,
+            venue="deepcoin",
+            pos_id=str(leg.pos_id),
+            instrument_id=str(desired["instrument_id"]),
+            side=str(contract.side),
+            pending_rows=snapshot["pending"],
+        )
+        recorded_statuses: dict[str, tuple[str, ...]] = {}
+        for row in session.query(PositionTakeProfitOrder).filter(
+            PositionTakeProfitOrder.execution_binding_id == batch.execution_binding_id,
+            PositionTakeProfitOrder.execution_order_leg_id == leg.execution_order_leg_id,
+            PositionTakeProfitOrder.pos_id == leg.pos_id,
+        ):
+            order_id = str(row.order_id or "").strip()
+            if order_id:
+                recorded_statuses.setdefault(order_id, ())
+                recorded_statuses[order_id] += (str(row.status or ""),)
         return plan_take_profit_consumption(
             contract=contract,
             target_leg=target,
             pending_orders=snapshot["pending"],
-            trigger_history=snapshot["history"],
-            order_history=(),
+            trigger_history=snapshot["trigger_history"],
+            order_history=snapshot["order_history"],
             trade_fills=snapshot["fills"],
             protection_ledger=ledger,
             trusted_start_size=desired["trusted_start_size"],
             target_remaining_size=desired["target_remaining_size"],
+            protection_authority=authority,
+            # ``_exchange_snapshot`` raises unless every read returned a list,
+            # so reaching here means the pending read was complete.
+            pending_snapshot_complete=True,
+            recorded_order_statuses=recorded_statuses,
         )
 
 

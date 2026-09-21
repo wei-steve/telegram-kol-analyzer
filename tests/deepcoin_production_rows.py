@@ -298,7 +298,7 @@ def position_row(
         "lastPx": str(avg_price),
         "tpTriggerPx": "",
         "slTriggerPx": "",
-        "mrgPosition": "1",
+        "mrgPosition": "split",
         "isLeading": False,
         "isFollow": False,
         "ccy": "USDT",

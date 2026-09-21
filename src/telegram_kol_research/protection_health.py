@@ -17,6 +17,7 @@ from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionProtectionRevision
 from telegram_kol_research.models import PositionTakeProfitOrder
 from telegram_kol_research.protection_snapshot import build_position_protection_audit
+from telegram_kol_research.take_profit_fill_predicate import take_profit_fill_proven
 
 
 CURRENT_PROTECTION_HEALTH_CLASSIFICATIONS = frozenset(
@@ -605,14 +606,78 @@ def reconcile_position_protection_health(
                 observed_at=observed_at,
             )
             continue
-        if order_id and not any(_successful_close(item) for item in histories):
-            row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
+        if not order_id or any(_successful_close(item) for item in histories):
+            continue
+        filled = _proven_filled_take_profit(
+            session, row=row, order_id=order_id, histories=histories
+        )
+        if filled is not None:
+            # A take profit that actually traded is not missing protection.
+            # ``trigger-orders-history`` has no ``state`` field, so
+            # ``_successful_close`` could never see one and every filled take
+            # profit was recorded as ``protection_missing`` with a critical
+            # incident beside it (production leg 579, eight seconds after TP1
+            # filled). ``filled`` is terminal: it is in no reader's active set,
+            # so nothing tries to cancel or replace it afterwards.
+            row.status = "filled"
             row.updated_at = observed_at
-            created += _incident(
-                session, row=row, incident_type="protection_missing",
-                evidence={"order_id": order_id}, observed_at=observed_at,
+            row.evidence_json = _merged_evidence(
+                row.evidence_json,
+                take_profit_fill={
+                    "evidence_tier": filled.evidence_tier,
+                    "order_id": order_id,
+                    "evidence": dict(filled.evidence),
+                },
             )
+            continue
+        row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
+        row.updated_at = observed_at
+        created += _incident(
+            session, row=row, incident_type="protection_missing",
+            evidence={"order_id": order_id}, observed_at=observed_at,
+        )
     return created
+
+
+def _proven_filled_take_profit(session, *, row, order_id, histories):
+    """The verdict for a take-profit ledger row that filled, or ``None``.
+
+    Only ``position_protection_ledger`` take-profit rows are considered. A
+    stop that triggered closes the position, and a closed position has already
+    left ``live_ids`` before this function can be reached.
+    """
+
+    if not isinstance(row, PositionProtectionLedger):
+        return None
+    if str(row.purpose or "").lower() not in {"take_profit", "tp", "profit"}:
+        return None
+    recorded = [
+        str(value[0] or "")
+        for value in session.query(PositionTakeProfitOrder.status)
+        .filter(PositionTakeProfitOrder.venue == str(row.venue or "deepcoin").lower())
+        .filter(PositionTakeProfitOrder.order_id == order_id)
+        .all()
+    ]
+    verdict = take_profit_fill_proven(
+        order_id=order_id,
+        recorded_order_statuses=recorded,
+        trigger_history=histories,
+        # Reaching here means ``snapshot_errors`` was empty, so both the
+        # pending and the history reads for this round succeeded.
+        pending_snapshot_complete=True,
+    )
+    return verdict if verdict.proven else None
+
+
+def _merged_evidence(existing: str | None, **added: Any) -> str:
+    try:
+        loaded = json.loads(existing or "{}")
+    except (TypeError, ValueError):
+        loaded = {}
+    if not isinstance(loaded, dict):
+        loaded = {}
+    loaded.update(added)
+    return json.dumps(loaded, ensure_ascii=False, sort_keys=True)
 
 
 def _incident(session, *, row, incident_type, evidence, observed_at) -> int:

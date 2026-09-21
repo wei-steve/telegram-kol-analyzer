@@ -20,6 +20,10 @@ from telegram_kol_research.models import (
     PositionMutationIntent,
     PositionProtectionLedger,
 )
+from telegram_kol_research.native_tpsl import (
+    protection_order_position_sides,
+    protection_order_sides_consistent,
+)
 from telegram_kol_research.position_mutation_authority import (
     PositionMutationAuthority,
     PositionMutationAuthorityError,
@@ -728,20 +732,34 @@ def _pending_cancel_retry_matches_authority(
     authority: PositionMutationAuthority,
     order_id: str,
 ) -> bool:
+    """Is this fresh pending row the exact order the authority already named?
+
+    Two readings used to make this impossible to satisfy for a real row:
+
+    * it demanded ``posId``. A ``trigger-orders-pending`` TPSL row **never**
+      carries one (ARCHITECTURE 4.8), so re-arming a rejected cancel could
+      never happen in production. Identity is the order id, and the authority
+      -- built from the verified leg and its ledger -- is what says the order
+      is ours; this row corroborates instrument, direction and type. When a row
+      does carry a position id it must still be ours.
+    * it read ``side`` as a position-direction alias. On a protection row
+      ``side`` is the *closing* direction, so a long position's stop reads
+      ``sell`` and the comparison failed on every real row.
+    """
+
     observed_order_id = str(
         row.get("ordId") or row.get("orderId") or row.get("order_id") or ""
     )
-    observed_side = str(row.get("posSide") or row.get("side") or "").lower()
-    observed_side = {"buy": "long", "sell": "short"}.get(
-        observed_side, observed_side
-    )
+    explicit_pos_id = str(
+        row.get("posId") or row.get("pos_id") or row.get("positionId") or ""
+    ).strip()
     return (
         observed_order_id == str(order_id)
-        and str(row.get("posId") or row.get("pos_id") or "")
-        == authority.pos_id
+        and (not explicit_pos_id or explicit_pos_id == authority.pos_id)
         and str(row.get("instId") or row.get("instrument_id") or "").upper()
         == authority.instrument_id.upper()
-        and observed_side == authority.side.lower()
+        and protection_order_position_sides(dict(row)) == {authority.side.lower()}
+        and protection_order_sides_consistent(dict(row))
         and str(row.get("triggerOrderType") or "TPSL").upper() == "TPSL"
     )
 

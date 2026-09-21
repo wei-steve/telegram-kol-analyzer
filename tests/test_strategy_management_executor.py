@@ -32,6 +32,11 @@ def test_entry_revision_reduction_delegates_to_management_path_only():
 
 from threading import Event, Thread
 
+from deepcoin_production_rows import (
+    pending_take_profit_row,
+    trigger_history_row,
+)
+
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.deepcoin_client import (
     DeepcoinDefiniteRejection,
@@ -6330,16 +6335,17 @@ def _persist_composite_consumption_component(session_factory):
 class _CompositeConsumptionClient:
     def __init__(self, outcome="success"):
         self.outcomes = [outcome]
+        # The venue's own 23-key shape: `side` is the closing direction, and
+        # there is no `posId` at all. Ownership comes from the order id and the
+        # binding chain, never from a field on the row.
         self.pending = [
-            {
-                "ordId": "tp-first",
-                "posId": "pos-composite",
-                "instId": "BTC-USDT-SWAP",
-                "posSide": "long",
-                "triggerOrderType": "TPSL",
-                "tpTriggerPx": "65000",
-                "sz": "5",
-            }
+            pending_take_profit_row(
+                ord_id="tp-first",
+                inst_id="BTC-USDT-SWAP",
+                pos_side="long",
+                trigger_price="65000",
+                size="5",
+            )
         ]
         self.history = []
         self.fills = []
@@ -6381,7 +6387,17 @@ class _CompositeConsumptionClient:
             raise DeepcoinRequestOutcomeUnknown("cancel timeout")
         if outcome == "filled_race":
             self.pending = []
-            self.history = [{"ordId": "tp-first", "state": "filled", "posId": "pos-composite"}]
+            # `trigger-orders-history` has no `state` field. A fill is
+            # `triggerTime != 0` with a clean `errorCode`.
+            self.history = [
+                trigger_history_row(
+                    ord_id="tp-first",
+                    inst_id="BTC-USDT-SWAP",
+                    pos_side="long",
+                    trigger_price="65000",
+                    size="5",
+                )
+            ]
             self.fills = [{"ordId": "tp-first", "posId": "pos-composite", "fillSz": "5"}]
             raise DeepcoinDefiniteRejection("already filled")
         if outcome == "rejected":
