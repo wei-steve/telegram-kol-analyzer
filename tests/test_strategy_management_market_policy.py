@@ -7,7 +7,49 @@ from telegram_kol_research.strategy_management_market_policy import (
     assess_break_even_market,
     assess_break_even_with_existing_stop,
     plan_composite_stop_replacement,
+    stop_is_at_least_as_protective,
 )
+
+
+@pytest.mark.parametrize(
+    "existing,target,side,market,expected",
+    [
+        # 2026-09-21, the raw 17813 geometry. Our own fill already carries the
+        # stop; the strategy price the break-even aims at is looser than it.
+        ("80436", "80500", "short", "80000", True),
+        ("82300", "80500", "short", "80000", False),
+        # Equal is "at least as protective", and there is nothing to write.
+        ("80500", "80500", "short", "80000", True),
+        # Long is the mirror image: its stop sits below the market.
+        ("80500", "80436", "long", "81000", True),
+        ("78000", "80436", "long", "81000", False),
+        ("80436", "80436", "long", "81000", True),
+        # A stop the market has already passed protects nothing, however
+        # tight it looks on paper.
+        ("79000", "80500", "short", "79500", False),
+        ("81500", "80436", "long", "81000", False),
+        # Unreadable is never good enough to keep.
+        ("", "80500", "short", "80000", False),
+        (None, "80500", "short", "80000", False),
+        ("not-a-price", "80500", "short", "80000", False),
+        ("0", "80500", "short", "80000", False),
+        ("-80436", "80500", "short", "80000", False),
+        ("NaN", "80500", "short", "80000", False),
+        ("80436", None, "short", "80000", False),
+        ("80436", "80500", "short", None, False),
+        ("80436", "80500", "buy", "80000", False),
+        ("80436", "80500", None, "80000", False),
+    ],
+)
+def test_an_existing_stop_is_kept_only_when_it_protects_at_least_as_much(
+    existing, target, side, market, expected
+):
+    assert (
+        stop_is_at_least_as_protective(
+            existing=existing, target=target, side=side, market_price=market
+        )
+        is expected
+    )
 
 
 @pytest.mark.parametrize(

@@ -130,6 +130,204 @@ def test_break_even_stop_accepts_only_explicit_current_message_price() -> None:
     assert _planned_stop_price(batch=batch, leg=leg) == "64500"
 
 
+def _break_even_rows(*, target, side, market, rows):
+    from telegram_kol_research.strategy_management_executor import (
+        _adjusted_protection_rows,
+    )
+
+    batch = SimpleNamespace(effective_action="move_stop_to_break_even")
+    leg = SimpleNamespace(
+        avg_entry_price=target,
+        planned_tpsl={
+            "intent": "move_stop_to_break_even",
+            "stop_loss_text": None,
+        },
+    )
+    return _adjusted_protection_rows(
+        batch=batch,
+        leg=leg,
+        old_rows=rows,
+        side=side,
+        market_price=market,
+    )
+
+
+def _stop_row(order_id, price, purpose="stop_loss"):
+    return {
+        "order_id": order_id,
+        "purpose": purpose,
+        "trigger_price": price,
+        "size": "0",
+    }
+
+
+@pytest.mark.parametrize(
+    "side,market,existing,target,expected",
+    [
+        # The raw 17813 geometry: our fill already carries the stop.
+        ("short", "80000", "80436", "80500", "80436"),
+        ("short", "80000", "82300", "80500", "80500"),
+        ("short", "80000", "80500", "80500", "80500"),
+        ("long", "81000", "80500", "80436", "80500"),
+        ("long", "81000", "78000", "80436", "80436"),
+        ("long", "81000", "80436", "80436", "80436"),
+        # A price nobody can read is not evidence of anything.
+        ("short", "80000", "", "80500", "80500"),
+        ("short", "80000", "not-a-price", "80500", "80500"),
+        ("short", "80000", "0", "80500", "80500"),
+        # A stop the market has already passed protects nothing.
+        ("short", "80600", "80436", "80500", "80500"),
+    ],
+)
+def test_a_break_even_row_takes_whichever_price_protects_more(
+    side, market, existing, target, expected
+):
+    rows = _break_even_rows(
+        target=target,
+        side=side,
+        market=market,
+        rows=[_stop_row("sl-1", existing)],
+    )
+
+    assert [row["trigger_price"] for row in rows] == [expected]
+
+
+def test_without_a_market_price_a_break_even_row_is_replaced_as_before():
+    """Fail closed: the guard needs both halves of its comparison."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        _adjusted_protection_rows,
+    )
+
+    batch = SimpleNamespace(effective_action="move_stop_to_break_even")
+    leg = SimpleNamespace(
+        avg_entry_price="80500",
+        planned_tpsl={"intent": "move_stop_to_break_even", "stop_loss_text": None},
+    )
+
+    assert [
+        row["trigger_price"]
+        for row in _adjusted_protection_rows(
+            batch=batch, leg=leg, old_rows=[_stop_row("sl-1", "80436")]
+        )
+    ] == ["80500"]
+
+
+def test_each_stop_row_is_judged_on_its_own_so_none_is_ever_loosened():
+    """Primary and backup can part company, but only protectively.
+
+    The backup sits deliberately looser than the primary, so the two rows do
+    not have the same answer.  Judging them together from the primary would
+    have to either keep a backup that protects less than the target or replace
+    a backup that protects more -- and the second one is a loosening.
+    """
+
+    rows = _break_even_rows(
+        target="80500",
+        side="short",
+        market="80000",
+        rows=[
+            _stop_row("sl-1", "80436"),
+            _stop_row("bk-1", "80600", purpose="backup_stop"),
+            {
+                "order_id": "tp-1",
+                "purpose": "take_profit",
+                "trigger_price": "79000",
+                "size": "4",
+            },
+        ],
+    )
+
+    assert [(row["order_id"], row["trigger_price"]) for row in rows] == [
+        # More protective than the target: kept.
+        ("sl-1", "80436"),
+        # Less protective than the target: tightened to it, never past it.
+        ("bk-1", "80500"),
+        # Take profits are not this rule's business.
+        ("tp-1", "79000"),
+    ]
+
+
+def test_a_combined_row_keeps_the_more_protective_stop_half():
+    rows = _break_even_rows(
+        target="80500",
+        side="short",
+        market="80000",
+        rows=[
+            {
+                "order_id": "cb-1",
+                "purpose": "combined",
+                "size": "4",
+                "take_profit": {"trigger_price": "79000"},
+                "stop_loss": {"trigger_price": "80436"},
+            }
+        ],
+    )
+
+    assert rows[0]["stop_loss"]["trigger_price"] == "80436"
+    assert rows[0]["take_profit"]["trigger_price"] == "79000"
+
+
+def test_a_stop_only_combined_row_reports_its_nested_old_price_as_kept():
+    """It comes back out as a plain stop row, so the evidence must follow it."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        _break_even_stop_evidence,
+    )
+
+    old_rows = [
+        {
+            "order_id": "cb-1",
+            "purpose": "combined",
+            "size": "4",
+            "stop_loss": {"trigger_price": "80436"},
+        }
+    ]
+    new_rows = _break_even_rows(
+        target="80500", side="short", market="80000", rows=old_rows
+    )
+
+    assert new_rows[0]["purpose"] == "stop_loss"
+    assert _break_even_stop_evidence(
+        old_rows=old_rows,
+        new_rows=new_rows,
+        target_price="80500",
+        market_price="80000",
+    ) == {
+        "disposition": "kept_tighter_existing_stop",
+        "target_price": "80500",
+        "market_price": "80000",
+        "rows": [
+            {
+                "order_id": "cb-1",
+                "purpose": "stop_loss",
+                "old_trigger_price": "80436",
+                "trigger_price": "80436",
+                "kept": True,
+            }
+        ],
+    }
+
+
+def test_a_combined_row_whose_stop_protects_less_still_moves_to_the_target():
+    rows = _break_even_rows(
+        target="80500",
+        side="short",
+        market="80000",
+        rows=[
+            {
+                "order_id": "cb-1",
+                "purpose": "combined",
+                "size": "4",
+                "take_profit": {"trigger_price": "79000"},
+                "stop_loss": {"trigger_price": "82300"},
+            }
+        ],
+    )
+
+    assert rows[0]["stop_loss"]["trigger_price"] == "80500"
+
+
 def test_legacy_executor_rejects_contract_batch_before_exchange_write(tmp_path):
     from telegram_kol_research.strategy_management_executor import (
         ManagementBatchExecutionError,
@@ -1469,6 +1667,173 @@ def test_break_even_by_market_full_exits_when_the_strategy_price_is_passed(
         (call["closePosId"], call["sz"]) for call in client.close_calls
     ] == [("pos-1", "2"), ("pos-2", "4")]
     assert client.set_calls == []
+
+
+def _set_existing_stop_prices(session_factory, rows_by_pos, prices):
+    """Move the fixture's live stops to the prices a scenario needs.
+
+    Both sides of the truth have to move together: the rows the stub exchange
+    reports as pending, and the ledger rows that prove they are ours.
+    """
+
+    for pos_id, price in prices.items():
+        for row in rows_by_pos[pos_id]:
+            if row.get("slTriggerPx"):
+                row["slTriggerPx"] = price
+    with session_factory() as session:
+        for pos_id, price in prices.items():
+            for row in session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.pos_id == pos_id,
+                PositionProtectionLedger.purpose.in_(
+                    ("stop_loss", "backup_stop")
+                ),
+            ):
+                row.trigger_price = price
+        session.commit()
+
+
+def test_break_even_never_loosens_a_stop_that_is_already_more_protective(
+    tmp_path,
+):
+    """2026-09-21 risk 1: R1 makes the target routinely looser than our fill.
+
+    When only the greedy leg filled, the strategy's price is worse than what
+    we actually paid, so a position that already carries a stop at our fill --
+    from the TP1 auto-convergence or an earlier break-even -- would have had
+    that stop moved further away. It must not: the stop that protects more
+    stays, and only the one that protects less is replaced.
+    """
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    batch = _stamp_break_even_reference(session_factory, batch, price="65600")
+    _set_existing_stop_prices(
+        session_factory, rows_by_pos, {"pos-1": "65500", "pos-2": "65700"}
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    # pos-1's 65500 already protects more than the 65600 target, so it is left
+    # alone: neither cancelled nor re-placed.
+    assert [call["ordId"] for call in client.cancel_calls] == ["sl-2"]
+    assert {
+        call["posId"]: call["slTriggerPx"]
+        for call in client.set_calls
+        if call.get("slTriggerPx") not in (None, "")
+    } == {"pos-2": "65600"}
+    with session_factory() as session:
+        stops = {
+            row.pos_id: row.trigger_price
+            for row in session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.purpose == "stop_loss",
+                PositionProtectionLedger.status == "verified",
+            )
+        }
+    assert stops == {"pos-1": "65500", "pos-2": "65600"}
+
+
+def test_break_even_succeeds_without_a_write_when_every_stop_is_kept(tmp_path):
+    """Nothing to do is a success, not an error and not a no-op leg."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    batch = _stamp_break_even_reference(session_factory, batch, price="65600")
+    _set_existing_stop_prices(
+        session_factory, rows_by_pos, {"pos-1": "65500", "pos-2": "65400"}
+    )
+    client = _ProtectionClient(session_factory, rows_by_pos)
+
+    result = execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=client,
+        executed_at=NOW,
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["reason"] == "all_position_protection_replaced"
+    assert client.set_calls == []
+    assert client.cancel_calls == []
+    assert {leg["status"] for leg in result["legs"]} == {"succeeded"}
+    with session_factory() as session:
+        stops = {
+            row.pos_id: (row.trigger_price, row.status)
+            for row in session.query(PositionProtectionLedger).filter(
+                PositionProtectionLedger.purpose == "stop_loss"
+            )
+        }
+    # The armed orders are still the ones that were already there.
+    assert stops == {
+        "pos-1": ("65500", "verified"),
+        "pos-2": ("65400", "verified"),
+    }
+
+
+def test_the_kept_or_replaced_decision_is_recorded_on_the_leg(tmp_path):
+    """The first live sample has to be auditable without the exchange."""
+
+    from telegram_kol_research.strategy_management_executor import (
+        execute_management_batch,
+    )
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    batch, rows_by_pos = _persist_market_break_even_batch(session_factory)
+    batch = _stamp_break_even_reference(session_factory, batch, price="65600")
+    _set_existing_stop_prices(
+        session_factory, rows_by_pos, {"pos-1": "65500", "pos-2": "65700"}
+    )
+
+    execute_management_batch(
+        session_factory,
+        batch_id=batch.id,
+        deepcoin_client=_ProtectionClient(session_factory, rows_by_pos),
+        executed_at=NOW,
+    )
+
+    with session_factory() as session:
+        requests = {
+            leg.pos_id: json.loads(leg.request_json)["break_even_stop"]
+            for leg in session.query(StrategyManagementLeg).all()
+        }
+    assert requests["pos-1"] == {
+        "disposition": "kept_tighter_existing_stop",
+        "target_price": "65600",
+        "market_price": "64200",
+        "rows": [
+            {
+                "order_id": "sl-1",
+                "purpose": "stop_loss",
+                "old_trigger_price": "65500",
+                "trigger_price": "65500",
+                "kept": True,
+            }
+        ],
+    }
+    assert requests["pos-2"]["disposition"] == "replaced_with_break_even_target"
+    assert requests["pos-2"]["rows"] == [
+        {
+            "order_id": "sl-2",
+            "purpose": "stop_loss",
+            "old_trigger_price": "65700",
+            "trigger_price": "65600",
+            "kept": False,
+        }
+    ]
 
 
 def test_identity_still_compares_the_exchange_avg_px_to_our_own_fill(tmp_path):

@@ -37,6 +37,41 @@ class CompositeStopReplacementDecision:
     backup_stop: str
 
 
+def stop_is_at_least_as_protective(
+    *, existing: Any, target: Any, side: Any, market_price: Any
+) -> bool:
+    """Whether an existing stop already protects at least as much as ``target``.
+
+    Two conditions, both required, and they are the two the composite path has
+    always used to decide whether to keep a stop instead of replacing it:
+
+    * it protects at least as much -- a long's stop is below the market so a
+      higher one is tighter, a short's is above so a lower one is tighter; and
+    * it is still on the side of the market a stop can live on, because an
+      order the market has already passed protects nothing.
+
+    Anything that will not parse answers ``False``: not being able to read the
+    existing price is not evidence that it is good enough to keep.
+    """
+
+    normalized_side = str(side or "").strip().lower()
+    if normalized_side not in {"long", "short"}:
+        return False
+    try:
+        stop = Decimal(str(existing))
+        goal = Decimal(str(target))
+        market = Decimal(str(market_price))
+    except (InvalidOperation, TypeError, ValueError):
+        return False
+    if not all(
+        value.is_finite() and value > 0 for value in (stop, goal, market)
+    ):
+        return False
+    if normalized_side == "long":
+        return stop >= goal and stop < market
+    return stop <= goal and stop > market
+
+
 def plan_composite_stop_replacement(
     *,
     side: Any,
@@ -67,10 +102,13 @@ def plan_composite_stop_replacement(
         for value in existing_stop_prices
     ]
     tighter = [
-        stop for stop in existing
-        if (stop >= primary if normalized_side == "long" else stop <= primary)
-        and (
-            stop < market if normalized_side == "long" else stop > market
+        stop
+        for stop in existing
+        if stop_is_at_least_as_protective(
+            existing=stop,
+            target=primary,
+            side=normalized_side,
+            market_price=market,
         )
     ]
     action = "replace"

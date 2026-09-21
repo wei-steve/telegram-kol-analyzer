@@ -97,6 +97,7 @@ from telegram_kol_research.strategy_management_market_decisions import (
 from telegram_kol_research.strategy_management_market_policy import (
     BreakEvenMarketPolicyError,
     assess_break_even_market,
+    stop_is_at_least_as_protective,
 )
 from telegram_kol_research.break_even_reference import break_even_target_price
 from telegram_kol_research.trigger_protection_intents import transition_trigger_protection_intent
@@ -1011,15 +1012,23 @@ def _execute_break_even_by_market_batch(
                 }
             ),
         )
+        break_even_batch = replace(
+            batch, effective_action="move_stop_to_break_even"
+        )
         new_rows = _adjusted_protection_rows(
-            batch=replace(
-                batch, effective_action="move_stop_to_break_even"
-            ),
+            batch=break_even_batch,
             leg=execution_leg,
             old_rows=old_rows,
+            side=binding.side,
+            # The one price this decision was reserved against, so the guard
+            # judges "still placeable" against the same market the break-even
+            # itself was judged against.
+            market_price=decision.quote_price,
         )
         replacement_rows, retained_rows = _partition_replacement_rows(
-            old_rows=old_rows, new_rows=new_rows
+            old_rows=old_rows,
+            new_rows=new_rows,
+            retain_unchanged_stops=True,
         )
         retained_order_ids = {str(item["order_id"]) for item in retained_rows}
         old_replaced_order_ids = [
@@ -1036,6 +1045,14 @@ def _execute_break_even_by_market_batch(
             request={
                 "cancel_order_ids": old_replaced_order_ids,
                 "expected_replacement_count": len(replacement_rows),
+                "break_even_stop": _break_even_stop_evidence(
+                    old_rows=old_rows,
+                    new_rows=new_rows,
+                    target_price=_planned_stop_price(
+                        batch=break_even_batch, leg=execution_leg
+                    ),
+                    market_price=decision.quote_price,
+                ),
             },
         ):
             raise ManagementBatchExecutionError(
@@ -3596,21 +3613,138 @@ def _decimal_or_none(value: Any) -> Decimal | None:
     return result if result.is_finite() else None
 
 
+def _break_even_row_stop_price(
+    *, stop_price: str, existing: Any, side: Any, market_price: Any
+) -> str:
+    """The more protective of the break-even target and what is already there.
+
+    A break-even target is now the strategy's own price, and when only the
+    greedy entry leg filled that price is *worse* than what we actually paid.
+    A position already carrying a stop at our fill -- from the TP1 auto
+    convergence, or from an earlier break-even -- would otherwise have that
+    stop pushed further away, which is the one thing a risk-reducing
+    instruction must never do.  Judged per row, so no row can be loosened;
+    fails closed to the target whenever the comparison cannot be made.
+    """
+
+    if market_price is None:
+        return str(stop_price)
+    if stop_is_at_least_as_protective(
+        existing=existing,
+        target=stop_price,
+        side=side,
+        market_price=market_price,
+    ):
+        return str(existing).strip()
+    return str(stop_price)
+
+
+def _break_even_stop_evidence(
+    *,
+    old_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+    target_price: str,
+    market_price: Any,
+) -> dict[str, Any]:
+    """What the never-loosen guard decided, durable on the leg before any write.
+
+    Written into the leg's request at reservation time so that the first live
+    sample can be audited from the database alone -- which stop was kept, which
+    was moved, and against which target and market it was judged.
+    """
+
+    old_by_order_id = {
+        str(row.get("order_id") or ""): row for row in old_rows
+    }
+    rows: list[dict[str, Any]] = []
+    for row in new_rows:
+        purpose = str(row.get("purpose") or "")
+        if purpose not in {"stop_loss", "backup_stop", "combined"}:
+            continue
+        old = old_by_order_id.get(str(row.get("order_id") or "")) or {}
+        # A combined row keeps its stop nested, and one carrying only a stop
+        # comes back out of the adjuster as a plain ``stop_loss`` row, so where
+        # each price lives is decided by that row's own shape.
+        old_price = (
+            (old.get("stop_loss") or {}).get("trigger_price")
+            if old.get("purpose") == "combined"
+            else old.get("trigger_price")
+        )
+        new_price = (
+            (row.get("stop_loss") or {}).get("trigger_price")
+            if purpose == "combined"
+            else row.get("trigger_price")
+        )
+        rows.append(
+            {
+                "order_id": str(row.get("order_id") or ""),
+                "purpose": purpose,
+                "old_trigger_price": (
+                    None if old_price is None else str(old_price)
+                ),
+                "trigger_price": (
+                    None if new_price is None else str(new_price)
+                ),
+                "kept": old_price is not None
+                and str(old_price) == str(new_price),
+            }
+        )
+    return {
+        "disposition": (
+            "kept_tighter_existing_stop"
+            if rows and all(row["kept"] for row in rows)
+            else "replaced_with_break_even_target"
+        ),
+        "target_price": str(target_price),
+        "market_price": (
+            None if market_price is None else str(market_price)
+        ),
+        "rows": rows,
+    }
+
+
 def _adjusted_protection_rows(
-    *, batch: ManagementBatchRecord, leg: Any, old_rows: list[dict[str, Any]]
+    *,
+    batch: ManagementBatchRecord,
+    leg: Any,
+    old_rows: list[dict[str, Any]],
+    side: Any = None,
+    market_price: Any = None,
 ) -> list[dict[str, Any]]:
+    """Rewrite every stop this position carries to the planned stop price.
+
+    ``side`` and ``market_price`` arm the never-loosen guard above.  They are
+    supplied only by the break-even-by-market path, which is the only caller
+    that has a proven market price at this point; without them every stop is
+    rewritten exactly as before, which is what ``adjust_stop_loss`` -- whose
+    price *is* the instruction, and which has its own tightening gate --
+    continues to do.
+    """
+
     stop_price = _planned_stop_price(batch=batch, leg=leg)
     adjusted: list[dict[str, Any]] = []
     found_stop = False
+
+    def stop_for(existing: Any) -> str:
+        return _break_even_row_stop_price(
+            stop_price=stop_price,
+            existing=existing,
+            side=side,
+            market_price=market_price,
+        )
+
     for old in old_rows:
         row = dict(old)
         if row.get("purpose") in {"stop_loss", "backup_stop"}:
-            row["trigger_price"] = str(stop_price)
+            row["trigger_price"] = stop_for(row.get("trigger_price"))
             found_stop = True
             adjusted.append(row)
         elif row.get("purpose") == "combined":
             adjusted_row, includes_stop = _adjusted_combined_protection_row(
-                row=row, stop_price=str(stop_price)
+                row=row,
+                stop_price=stop_for(
+                    (row.get("stop_loss") or {}).get("trigger_price")
+                ),
             )
             found_stop = found_stop or includes_stop
             adjusted.append(adjusted_row)
@@ -3621,8 +3755,24 @@ def _adjusted_protection_rows(
     return adjusted
 
 
-def _partition_replacement_rows(*, old_rows, new_rows):
-    """Retain only exact unchanged TPs; every other row must be replaced."""
+def _partition_replacement_rows(*, old_rows, new_rows, retain_unchanged_stops=False):
+    """Retain only exact unchanged TPs; every other row must be replaced.
+
+    ``retain_unchanged_stops`` extends that to a stop the never-loosen guard
+    left alone.  Retaining is the *absence* of both writes: the armed order is
+    never cancelled, so the position is never momentarily unprotected, and no
+    second order is placed, so there is no duplicate to reconcile.  The ledger
+    row is re-affirmed under the same order id, exactly as a retained take
+    profit's already is.  Only the break-even path passes it, because there
+    alone can a row come back unchanged; ``adjust_stop_loss`` reaches this
+    with a price its own gate proved to be strictly tighter than every
+    existing stop.
+
+    ``combined`` rows are deliberately never retained.  The comparison below
+    reads a top-level ``trigger_price``, and a combined row keeps its stop
+    nested under ``stop_loss``, so an unchanged combined row is re-placed at
+    the price it already had: one wasted write, and no behaviour to get wrong.
+    """
 
     old_by_order_id = {
         str(row.get("order_id")): row
@@ -3631,17 +3781,21 @@ def _partition_replacement_rows(*, old_rows, new_rows):
     }
     retained = []
     replacement = []
+    retainable = {"take_profit"}
+    if retain_unchanged_stops:
+        retainable |= {"stop_loss", "backup_stop"}
     for row in new_rows:
         old = old_by_order_id.get(str(row.get("order_id") or ""))
-        unchanged_take_profit = (
-            row.get("purpose") == "take_profit"
+        purpose = row.get("purpose")
+        unchanged = (
+            purpose in retainable
             and old is not None
-            and old.get("purpose") == "take_profit"
+            and old.get("purpose") == purpose
             and str(old.get("trigger_price") or "")
             == str(row.get("trigger_price") or "")
             and str(old.get("size") or "") == str(row.get("size") or "")
         )
-        (retained if unchanged_take_profit else replacement).append(row)
+        (retained if unchanged else replacement).append(row)
     return replacement, retained
 
 
