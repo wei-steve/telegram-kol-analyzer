@@ -159,4 +159,20 @@
 
 ## 9. 全量测试与提交
 
-见提交信息与最终汇报。
+- 提交：`d9fc6300`（单个提交，13 个文件）。
+- 全量（最终候选 `d9fc6300` 的代码内容）：
+  `uv run python -m pytest -q` → **9357 passed, 4 skipped, 0 failed**（711.71 s / 11 分 52 秒）。
+  注：`uv run pytest`（不带 `python -m`）在收集阶段即失败，是既有问题，与本次无关。
+- 未推送、未部署。回滚即"不部署本提交"；若已部署，回滚为 `tg-deploy <上一个生产 sha>`，
+  要求零在途批次（跨版本执行同一批次会让参考价字段被旧代码忽略）。
+
+## 10. 首笔实盘样本必须逐项手工核对的项
+
+1. 该策略的 `entry_range_low/high` 与成交的入场腿 `leg_index`，对照
+   `target_snapshot["break_even_reference"]` 的 `source` / `price` 是否符合 R1。
+2. 交易所上新挂的止损触发价 = 参考价按 tick 归一后的值（不是我们的 `avgPx`）。
+3. 旧止损已撤净；减仓数量与 `planned_close_size` 一致。
+4. `strategy_management_legs.avg_entry_price` 仍等于交易所 `avgPx`（身份未被污染）。
+5. 若消息带了数字：`price_plausibility.removed[*].disposition` 是否为预期的那一行；
+   若是 `explicit_tighter_adopted`，确认挂出去的正是消息里的价格。
+6. 风险 1 的场景（已有止损比参考价更紧）是否出现——若出现，记录下来作为加护栏的依据。
