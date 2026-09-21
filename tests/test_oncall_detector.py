@@ -808,3 +808,37 @@ def test_a_case_seen_again_every_round_keeps_a_bounded_rule_name(production, sto
     assert _combine_rules("D1a+D2", "D1a+D2") == "D1a+D2"
     assert _combine_rules("D1a+D1a+D1a", "D1a") == "D1a"  # heals a row that already grew
     assert _combine_rules("", "D4") == "D4"
+
+
+def test_an_item_left_in_submitted_is_not_a_case_once_its_batch_succeeded(production, store):
+    """Production, 2026-09-21, raw 18089: stop moved, item status never updated."""
+
+    run_round(production, store)
+    production.add_group_name()
+    raw_message_id = production.add_raw_message(text="及时移动止损")
+    binding_id = production.add_binding()
+    lifecycle_id = production.add_lifecycle(execution_binding_id=binding_id)
+    candidate_id = production.add_candidate(
+        raw_message_id=raw_message_id,
+        target_lifecycle_id=lifecycle_id,
+        management_action="move_stop_to_break_even",
+    )
+    production.add_instruction_item(
+        raw_message_id=raw_message_id,
+        signal_candidate_id=candidate_id,
+        status="submitted",
+        updated_at=NOW - timedelta(minutes=30),
+    )
+    production.add_management_batch(
+        raw_message_id=raw_message_id,
+        target_lifecycle_id=lifecycle_id,
+        execution_binding_id=binding_id,
+        status="succeeded",
+        intent="move_stop_to_break_even",
+        effective_action="break_even_by_market",
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()

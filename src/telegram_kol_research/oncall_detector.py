@@ -837,6 +837,12 @@ def _evaluate_instruction_item(
         age = _age(now, updated_at)
         if age is None or age < config.in_flight_after:
             return _Observation(case_key=None, rule=None)
+        if _message_has_a_successful_batch(reader, row["raw_message_id"], candidate):
+            # Production, 2026-09-21, raw 18089: the batch had succeeded and the
+            # stop was already at the new price, but the instruction item was
+            # never moved on from ``submitted``. The exchange did what the
+            # message asked; a stale item status is not a missed instruction.
+            return _clear_observation(row, candidate)
         rule = "D1d"
         severity = "medium"
         reason_code = f"instruction_stuck_{status}"
@@ -902,6 +908,28 @@ def _evaluate_instruction_item(
         # spec asks for a "recovered by itself" notice when a later run makes
         # it succeed. The six-hour watch expiry is what ends it.
         retire=False,
+    )
+
+
+def _message_has_a_successful_batch(
+    reader: ProductionReader,
+    raw_message_id: Any,
+    candidate: sqlite3.Row | None,
+) -> bool:
+    """Whether a management batch for this message and action already succeeded."""
+
+    if raw_message_id is None:
+        return False
+    action = str(candidate["management_action"] or "").strip() if candidate else ""
+    rows = reader.query(
+        "SELECT id, intent, status FROM strategy_management_batches "
+        "WHERE raw_message_id = ? ORDER BY id DESC LIMIT 10",
+        (int(raw_message_id),),
+    )
+    return any(
+        str(row["status"] or "") in {"succeeded", "resolved"}
+        and (not action or str(row["intent"] or "") == action)
+        for row in rows
     )
 
 
