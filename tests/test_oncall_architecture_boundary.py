@@ -307,6 +307,8 @@ def test_the_codex_unit_gives_root_an_allowlist_and_one_capability():
 
     for required in (
         "User=root",
+        # Without it the capability-stripped root cannot read the watcher's requests.
+        "SupplementaryGroups=telegram-kol-oncall",
         # Exactly one: bubblewrap cannot map uid 0 without it (Linux >= 5.12).
         "CapabilityBoundingSet=CAP_SETFCAP\n",
         "AmbientCapabilities=\n",

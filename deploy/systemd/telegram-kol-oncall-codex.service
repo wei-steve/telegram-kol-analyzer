@@ -18,6 +18,14 @@ RestartSec=15
 # so hiding is the only control that actually works.
 User=root
 Group=root
+# The watcher writes each request as telegram-kol-oncall:telegram-kol-oncall
+# 0660 inside a 0770 directory. With the capability set cut down to
+# CAP_SETFCAP, uid 0 has no DAC override, so without this group the runner is
+# "other" and cannot read a single request -- which is what happened in
+# production on 2026-09-21: every real case went unanswered and the watcher
+# recorded it as a timeout. The acceptance run had only tested the other
+# direction (runner writes, watcher reads).
+SupplementaryGroups=telegram-kol-oncall
 UMask=0077
 WorkingDirectory=/var/lib/telegram-kol-oncall/codex-spool
 EnvironmentFile=/etc/telegram-kol-oncall.env

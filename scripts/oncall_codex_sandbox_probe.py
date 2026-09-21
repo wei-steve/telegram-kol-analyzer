@@ -52,6 +52,7 @@ SANDBOX_DIRECTIVES = (
     "ProtectProc",
     "ProcSubset",
     "UMask",
+    "SupplementaryGroups",
     "TemporaryFileSystem",
     "BindReadOnlyPaths",
     "BindPaths",
@@ -144,6 +145,19 @@ if [ -z "$found" ]; then
     say 0 "全盘没有其它可读的密钥形状文件"
 else
     say 1 "出现了不该可读的文件：$(echo "$found" | tr '\n' ' ')"
+fi
+
+# Both directions of the hand-over, because the first acceptance run tested only
+# one: the watcher's user writes the request, this unit must be able to read it
+# and to write its answer next to it.
+handover=$(ls -d SPOOL_PLACEHOLDER/case-* 2>/dev/null | head -1)
+if [ -z "$handover" ]; then
+    say 0 "spool 里暂无值守写入的案件目录（跨用户读取未能实测）"
+elif cat "$handover/request.json" >/dev/null 2>&1 && touch "$handover/.probe" 2>/dev/null; then
+    rm -f "$handover/.probe"
+    say 0 "读得到值守用户写的请求，也能在其目录里回写：$handover"
+else
+    say 1 "读不到值守用户写的请求或无法回写：$handover（检查 SupplementaryGroups）"
 fi
 
 if touch SPOOL_PLACEHOLDER/.probe 2>/dev/null; then

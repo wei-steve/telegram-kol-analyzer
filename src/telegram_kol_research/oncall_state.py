@@ -798,9 +798,20 @@ def _diagnosis_from_row(row: sqlite3.Row) -> DiagnosisRecord:
 
 
 def _combine_rules(existing: str, incoming: str) -> str:
-    parts = [part for part in str(existing).split("+") if part]
-    if incoming not in parts:
-        parts.append(str(incoming))
+    """The union of both sides, each split on ``+`` first.
+
+    ``incoming`` is itself a joined string whenever one round merges several
+    observations. Compared whole against the parts of ``existing`` it never
+    matched, so it was appended again every round: production, 2026-09-21,
+    case 4 grew to several hundred ``D1a+`` in a day.
+    """
+
+    parts = {
+        part
+        for side in (existing, incoming)
+        for part in str(side or "").split("+")
+        if part
+    }
     return "+".join(sorted(parts))
 
 

@@ -796,3 +796,15 @@ def test_an_unreadable_database_raises_the_watchers_own_error(tmp_path):
 
     with pytest.raises(ProductionReadError):
         ProductionReader(tmp_path / "does-not-exist.db")
+
+
+def test_a_case_seen_again_every_round_keeps_a_bounded_rule_name(production, store):
+    """Production, 2026-09-21: case 4's rule grew by one ``D1a+`` per round."""
+
+    from telegram_kol_research.oncall_state import _combine_rules
+
+    assert _combine_rules("D1a", "D1a") == "D1a"
+    assert _combine_rules("D1a", "D1a+D2") == "D1a+D2"
+    assert _combine_rules("D1a+D2", "D1a+D2") == "D1a+D2"
+    assert _combine_rules("D1a+D1a+D1a", "D1a") == "D1a"  # heals a row that already grew
+    assert _combine_rules("", "D4") == "D4"
