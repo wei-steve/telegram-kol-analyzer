@@ -35,7 +35,7 @@ POS_ID = "1001125231241310"
 
 
 def _session_factory(tmp_path):
-    return create_session_factory(f"sqlite:///{tmp_path / 'health.db'}")
+    return create_session_factory(tmp_path / "health.db")
 
 
 def _seed(session, *, purpose, order_id, trigger_price, size_text, status="verified"):
