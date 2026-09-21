@@ -17,9 +17,10 @@
 | `src/telegram_kol_research/break_even_reference.py` | 新增。纯函数：`resolve_break_even_reference`、`break_even_target_price`、`planned_tpsl_reference_fields`、`adopted_break_even_reference` |
 | `src/telegram_kol_research/management_price_plausibility.py` | 扩展为五种 disposition + 两级事故台账 |
 | `src/telegram_kol_research/strategy_management_planner.py` | 参考价解析、数字处置、`planned_tpsl` 与 `target_snapshot` 写入 |
-| `src/telegram_kol_research/strategy_management_executor.py` | 两处目标价 |
+| `src/telegram_kol_research/strategy_management_executor.py` | 两处目标价；`6938fcbc` 追加"不得改松"护栏 |
 | `src/telegram_kol_research/strategy_management_composite_executor.py` | 一处目标价 |
 | `src/telegram_kol_research/strategy_management_market_decisions.py` | 一处目标价 |
+| `src/telegram_kol_research/strategy_management_market_policy.py` | `6938fcbc` 新增共用比较 `stop_is_at_least_as_protective` |
 | `tests/test_break_even_reference.py` | 新增，49 例 |
 | `tests/test_management_price_plausibility.py`、`tests/test_management_stop_price_gate.py`、`tests/test_strategy_management_planner.py`、`tests/test_strategy_management_executor.py`、`tests/test_strategy_management_market_decisions.py` | 回归与既有断言更新 |
 
@@ -60,8 +61,10 @@
 - 复合路径 `plan_composite_stop_replacement` 的 `keep_tighter_stop` **原样保留**：
   参考价按 tick 归一后若有一张"更紧且仍在现价有效一侧"的已有止损，仍然保留那一张。
   所以复合路径上 R1 不可能把止损改松——这是本次改动安全性的主要护栏。
-- `break_even_by_market` 路径（`_adjusted_protection_rows`）**没有**这道护栏，今天也没有：
-  它把已有止损行的触发价直接改写成目标价。详见第 8 节风险 1。
+- `break_even_by_market` 路径（`_adjusted_protection_rows`）原本**没有**这道护栏，
+  今天也没有：它把已有止损行的触发价直接改写成目标价。
+  **`6938fcbc` 补上了**，并且两条路径现在共用同一个比较函数
+  `stop_is_at_least_as_protective`——详见第 11 节。
 - `assess_break_even_with_existing_stop` 只被 `break_even_convergence_executor` 与
   `break_even_shadow` 使用，两者均不在范围，行为逐字不变。
 
@@ -133,19 +136,18 @@
 
 ## 8. 我认为规格里有问题 / 有风险 / 缺失的地方
 
-1. **（最重要）`break_even_by_market` 路径没有"不得改松"的护栏。**
+1. ~~**（最重要）`break_even_by_market` 路径没有"不得改松"的护栏。**~~
+   **已由 `6938fcbc` 关闭**，见第 11 节。原文保留作为记录：
    `_adjusted_protection_rows` 把已有止损行的触发价直接改写成目标价，
    路径上只有 `_require_explicit_stop_write_boundary` 做收紧检查，而它只对
-   `adjust_stop_loss` 生效。今天该路径就可能把一张更紧的已有止损改松（用我们的均价），
-   R1 让这件事**更容易发生**：只成交贪婪腿的空单，策略价（区间下沿）必然高于我们的成交价，
-   也就是更松。典型触发场景：同一策略先收到过一次保本（止损已在 80436），
-   再收到第二条保本消息 → 止损被改到 80500。
-   这与用户原则"不放宽止损"冲突，但规格 R3/3.5 明确要求这条路径"行为不变、不改"，
-   所以**本次没有加护栏**。建议后续单独立项：把复合路径已有的
-   `keep_tighter_stop` 语义搬到 `break_even_by_market` 上。
+   `adjust_stop_loss` 生效。R1 让这件事更容易发生：只成交贪婪腿的空单，
+   策略价（区间下沿）必然高于我们的成交价，也就是更松。典型触发场景：
+   同一策略先收到过一次保本或 TP1 自动保本（止损已在 80436），
+   再收到第二条保本消息 → 止损会被改到 80500。
 2. **规格 7.1 的"待决"与 R1 的关系没写死。** R1 等价于选项"甲"（跟 KOL 的价位），
-   但 7.1 的选项"丙"（取 min(P, A) 中可挂的）恰好能消掉风险 1。
-   若用户接受丙，风险 1 自动消失。
+   第 11 节的护栏把落地结果变成了 7.1 选项"丙"的一个更强版本：挂出去的止损取
+   "已有止损与策略价中更保护的那个"，且**逐行**判定。用户若仍想明确拍板 7.1，
+   现状已经是丙。
 3. **`lifecycle.stop_loss` 不会被保本更新。** `_confirm_protection_lifecycle` 只在
    `planned_tpsl["stop_loss_text"]` 非空时回写 `lifecycle.stop_loss`，而保本类动作下它恒为 None。
    这是既有行为，规格未提，本次未改：改了会影响所有读 `lifecycle.stop_loss` 的展示与判定。
@@ -159,9 +161,10 @@
 
 ## 9. 全量测试与提交
 
-- 提交：`d9fc6300`（单个提交，13 个文件）。
-- 全量（最终候选 `d9fc6300` 的代码内容）：
-  `uv run python -m pytest -q` → **9357 passed, 4 skipped, 0 failed**（711.71 s / 11 分 52 秒）。
+- 提交：`d9fc6300`（主体，13 个文件）、`6938fcbc`（第 11 节的护栏，4 个文件）。
+- 全量（`d9fc6300`）：**9357 passed, 4 skipped, 0 failed**（711.71 s）。
+- 全量（最终候选 `6938fcbc`）：
+  `uv run python -m pytest -q` → **9393 passed, 4 skipped, 0 failed**（704.12 s / 11 分 44 秒）。
   注：`uv run pytest`（不带 `python -m`）在收集阶段即失败，是既有问题，与本次无关。
 - 未推送、未部署。回滚即"不部署本提交"；若已部署，回滚为 `tg-deploy <上一个生产 sha>`，
   要求零在途批次（跨版本执行同一批次会让参考价字段被旧代码忽略）。
@@ -175,4 +178,50 @@
 4. `strategy_management_legs.avg_entry_price` 仍等于交易所 `avgPx`（身份未被污染）。
 5. 若消息带了数字：`price_plausibility.removed[*].disposition` 是否为预期的那一行；
    若是 `explicit_tighter_adopted`，确认挂出去的正是消息里的价格。
-6. 风险 1 的场景（已有止损比参考价更紧）是否出现——若出现，记录下来作为加护栏的依据。
+6. 若已有止损比参考价更保护：确认**交易所上那张单一个字都没动**（没有撤、没有新单），
+   且 `strategy_management_legs.request_json` 的 `break_even_stop.disposition` =
+   `kept_tighter_existing_stop`，`rows[*].kept` 与实际相符。
+   若是 `replaced_with_break_even_target`，确认新价 = `target_price` 且严格比
+   `old_trigger_price` 更保护或相等。
+
+## 11. 追加：`break_even_by_market` 的"不得改松"护栏（2026-09-21，关闭第 8 节风险 1）
+
+指挥会话确认："规格 R3 的'不要改'针对的是目标价挂不上时的行为，不是放宽止损的许可"，
+因此该护栏纳入范围。
+
+### 规则
+
+逐行判定，只在 `break_even_by_market` 路径生效：
+对每一条带止损的已有行（`stop_loss`、`backup_stop`、以及 `combined` 行的止损半边），
+若其现价**至少与保本目标同样保护**（空单 old ≤ target；多单 old ≥ target）
+**且**仍在现价的有效一侧（空单 old > 现价；多单 old < 现价）→ **保留原价**；
+否则照旧写入目标价。比较用 `Decimal`；无法解析的旧价一律不算"更紧"（走目标价）。
+
+### 共用比较
+
+新增 `strategy_management_market_policy.stop_is_at_least_as_protective(existing, target, side, market_price)`，
+并把 `plan_composite_stop_replacement` 里原来那段 `tighter = [...]` 列表推导改为调用它
+（**逐字等价**，复合路径行为不变，其既有测试全部原样通过）。
+执行器侧由 `_break_even_row_stop_price` 调用，market_price 取
+`BreakEvenMarketDecisionRecord.quote_price`——即该批次保本决策本身预约时用的那个报价。
+**没有 market_price 就不保留**（fail closed），因此通用保护路径与 `adjust_stop_loss` 逐字未变。
+
+### 不写交易所
+
+`_partition_replacement_rows` 增加 `retain_unchanged_stops`（只有保本路径传 True）：
+被护栏留下的止损行与旧行逐字相同 → 进 `retained_rows` → **既不撤旧、也不挂新**，
+账本按同一个 `order_id` 重新确认一次（与今天"未变的止盈"完全同一套机制）。
+全部保留时 `replacement_rows` 为空，`_cancel_old_protection_after_replacement` 空转，
+腿仍走 `reserved → succeeded`，批次 `succeeded / all_position_protection_replaced`。
+
+`combined` 行**不纳入保留**：`_partition_replacement_rows` 比的是顶层 `trigger_price`，
+而 combined 行的止损嵌在 `stop_loss` 里；为它写第二套相等判据不值得。
+价格仍按护栏取（不会改松），只是会以同一个价格重挂一次——一次浪费的写入，没有行为风险。
+
+### 证据
+
+腿预约时写进 `request_json.break_even_stop`：
+`disposition`（`kept_tighter_existing_stop` / `replaced_with_break_even_target`）、
+`target_price`、`market_price`、以及每行的
+`order_id / purpose / old_trigger_price / trigger_price / kept`。
+先于任何交易所写入落库，所以写失败时也查得到。
