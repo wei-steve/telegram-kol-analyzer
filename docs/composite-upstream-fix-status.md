@@ -305,3 +305,18 @@ F1+F2 上线之后，这条路径**第一次**会真的写交易所。逐项人�
   `evidence_tier = "trigger_history_clean_trigger"`。
   修 `_prove_exact_terminal`（让它改用 `take_profit_fill_predicate`，
   并且"字段缺失"应当继续而不是终止）是一项独立后续项，不在本次范围内。
+
+## 部署记录（2026-09-22 07:19 CST）
+
+- 用户 2026-09-22 明确批准部署。候选 `fa72cf76` = 共享分支 `3dca05d6` + A `3efceae3`（复合指令止损挂不上时剩余仓位市价全平）
+  + B `5e201ce1`（复合路径撤未成交入场腿）+ F1 `3393fd68` + F2 `5b8b0405` + F3 `72f4ab2f`；最终候选全量 **9530 passed / 4 skipped / 0 failed**。
+- 部署前：候选是交易进程代码 `81fdc58a` 与服务器检出 `c1de56ce` 的后代，共享分支 tip 是候选的祖先（均 PASS）；**当时无任何在仓仓位**
+  （因此没有仓位停在历史 `protection_missing` 的恢复分支里）。
+- 零在途闸门第一次报 1：是 2026-08-12 的历史组件（批次 119，`consume_take_profit_stage / recovery_required`，其批次早已 `resolved`）。
+  闸门改为"组件所属批次未终结才算在途"后为 0。**今后的部署闸门沿用这一口径。**
+- `tg-deploy fa72cf76…` → worker / web / ingest 均 active，web 200。**回滚 = `tg-deploy c1de56ce120e4e2eebc8f1a10d16a27dc6eb23a0`**
+  （交易相关代码等同 `81fdc58a`）。
+- **自动交易开关未动**：`auto_trade_enabled=true`、`management_execution_mode=live`、`composite_management_v2_mode=live`，设置 `updated_at` 仍为 2026-09-08。
+- 部署后：最近 15 个消息处理作业全部 succeeded，worker 自重启起错误行 0，值守两个单元 active、心跳正常。
+- 待办：首个真实的"减仓后保本 / 部分止盈 / 调整止损价"样本，按本文件的首笔实盘清单逐项核对（批次不再 `blocked`；组件一证据里出现 `intent_id` 或
+  `evidence_tier=trigger_history_clean_trigger`；只撤了本仓位的单；新止损读回后才撤旧止损；仓位离场后无 `composite_position_without_verified_stop`）。
