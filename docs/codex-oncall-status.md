@@ -323,6 +323,31 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 - 注意：生产检出的 HEAD 现为 `840c83ba`，而三个交易进程启动于 `76ddb91d`——对它们加载的每个模块而言两者内容相同。下一次常规 `tg-deploy` 会自然对齐。
 - 现状：值守 `dry_run`（不发 Telegram）+ Codex `shadow`（真实调用、裁决只入库）。转正顺序：先核对 dry_run 结果切 `notify`，再人工评审若干 shadow 裁决后切 `CODEX_MODE=on`。
 
+### 8.9 上线第一天暴露的三个缺陷与修复（2026-09-21，均为值守专属改动、不重启交易服务部署）
+
+生产检出现为 `c1de56ce`（交易进程启动于 `81fdc58a`，两者对交易进程加载的每个模块内容相同）。
+
+1. **runner 读不到值守写的请求**（`76fe0e38`）。runner 是 capability 只剩 `CAP_SETFCAP` 的 uid 0，没有 DAC override；值守以
+   `telegram-kol-oncall:telegram-kol-oncall 0660` 写请求、目录 `0770`，runner 成了"other"。journal 每 10 秒三条 `Permission denied`，
+   三个真实案件全部无人应答，值守侧 30 分钟后记成 `timeout`。**这是指挥会话验收的漏项**：8.7 只实测了"runner 写、值守读"这一个方向
+   （子代理当时明确提醒过"spool 权限跨用户必须实测"）。修复：单元加 `SupplementaryGroups=telegram-kol-oncall`（先用 `systemd-run` 在主机上验证读写均 OK）；
+   探针新增"读得到值守用户写的请求，也能在其目录里回写"，现为 29 / 29。修复后三个积压案件依次应答：95 s / 72 s / 74 s。
+2. **案件规则名无限增长**（同一提交）。`_combine_rules` 拿整串 incoming 去比 existing 的分片，永远不相等，每轮追加一次；
+   案件 4 一天内长到几百个 `D1a+`。改为两边拆分后取并集，已长坏的行下一轮自愈（实测恢复为 `D1a+D2`）。
+3. **D1d 误报**（`c1de56ce`）。raw 18089：批次 173 `succeeded / all_position_protection_replaced`、止损已在 2662，但指令项停在 `submitted`，
+   D1d 报"卡住"。**是 Codex 的 shadow 诊断指出这是误报。** 现在同消息同动作已有 `succeeded / resolved` 批次时清案。
+   （指令项状态不回写是主链路的既有问题，30 天统计里的 15 条 `submitted / reconciling` 多半同源，未在此处理。）
+
+**shadow 裁决样本（人工评审）**：
+- 案件 4 / raw 18021（大镖客"第一止盈位已到，注意锁定利润，及时移动止损"，ETH 多单，`protection_price_or_size_mismatch`）：
+  Codex 判 `should_have_executed=yes / urgency=now`，原因说得对（保护单与账本逐项对不上，计划器在任何写入前阻断）；
+  但 `category=legitimate_refusal` 与"应该执行"并列，标签口径仍不够干净——提示词还需要一个"拒绝保护了账户、但指令仍应被执行 → 需要人工 / 补救"的出口。
+- 案件 5 / raw 18089：`suspected_bug`、误报，判断完全正确，并直接促成了上面第 3 条修复。
+
+**更大的发现（不属于值守范围，已转交用户）**：`partial_then_break_even` 在生产上自 8 月中旬起 **0 次成功**（最近 14 个批次：
+`protection_price_or_size_mismatch` ×3、`protection_visibility_retry_expired` ×2、`management_stop_action_conflict` ×2（已修）、
+`explicit_break_even_stop_not_risk_tightening` ×1；进入执行的 3 个都死在第一个组件 `take_profit_cancel_retry_exhausted`）。
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
