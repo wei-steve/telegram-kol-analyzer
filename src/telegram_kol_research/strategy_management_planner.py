@@ -50,6 +50,10 @@ from telegram_kol_research.position_attribution import (
     require_equivalent_live_position_economics,
     require_verified_position_ownership,
 )
+from telegram_kol_research.native_tpsl import (
+    protection_order_position_sides,
+    protection_order_sides_consistent,
+)
 from telegram_kol_research.protection_attribution import (
     PositionProtection,
     match_position_protection,
@@ -943,6 +947,7 @@ def _plan_strategy_management_batch_locked(
             tpsl_orders
         )
         seen_protection_order_ids: set[str] = set()
+        protection_mismatches: list[dict[str, str]] = []
         for position in economics:
             protection = matches.by_pos_id.get(position["pos_id"])
             position_only_without_order_ids = bool(
@@ -963,6 +968,7 @@ def _plan_strategy_management_batch_locked(
                     tpsl_orders=tpsl_orders,
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
                     global_order_id_counts=global_protection_order_id_counts,
+                    mismatches=protection_mismatches,
                 )
             elif protection.evidence.get("match") == "ledger_confirmed_current_order":
                 ledger_protection = _ledger_confirmed_position_protection(
@@ -972,6 +978,7 @@ def _plan_strategy_management_batch_locked(
                     tpsl_orders=tpsl_orders,
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
                     global_order_id_counts=global_protection_order_id_counts,
+                    mismatches=protection_mismatches,
                 )
                 protection = (
                     ledger_protection
@@ -987,6 +994,7 @@ def _plan_strategy_management_batch_locked(
                     tpsl_orders=tpsl_orders,
                     ledger_rows=ledger_rows_by_pos_id.get(position["pos_id"], []),
                     global_order_id_counts=global_protection_order_id_counts,
+                    mismatches=protection_mismatches,
                 )
                 if ledger_protection is not None:
                     protection = ledger_protection
@@ -1004,6 +1012,7 @@ def _plan_strategy_management_batch_locked(
                     reason_code=reason_code,
                     planned_at=now,
                     execution_mode=execution_mode,
+                    protection_mismatches=protection_mismatches,
                 )
             protection_row_ids = [
                 _exact_protection_order_id(row) for row in protection.rows
@@ -2501,6 +2510,50 @@ def _persist_stop_gate_rejection(session_factory, *, identity, raw_message_id,
     return result
 
 
+#: How many disagreeing protection orders one blocked batch records. The
+#: snapshot is fingerprinted and persisted on every refusal, so it stays small;
+#: the count of everything found is kept beside the sample.
+MAX_RECORDED_PROTECTION_MISMATCHES = 6
+
+
+def _blocked_target_snapshot(
+    *,
+    execution_mode: str,
+    lifecycle_id: int,
+    binding_id: int,
+    strategy_instance_id: Any,
+    reason_code: str,
+    stop_gate_evidence: dict | None,
+    protection_mismatches: list[dict[str, str]] | None,
+) -> dict[str, Any]:
+    """The snapshot a refused batch leaves behind.
+
+    Batches 157 and 159 left ``positions: []`` and no comparison material, so
+    "which field disagreed" could not be answered from the database at all --
+    the same fail-closed-without-attribution gap the 2026-09-07 server notes
+    recorded. The mismatch sample closes it without widening what is stored.
+    """
+
+    snapshot: dict[str, Any] = {
+        "execution_mode": execution_mode,
+        "identity": {
+            "target_lifecycle_id": lifecycle_id,
+            "execution_binding_id": binding_id,
+            "strategy_instance_id": strategy_instance_id,
+        },
+        "positions": [],
+        "blocked_reason": reason_code,
+    }
+    if stop_gate_evidence is not None:
+        snapshot["stop_price_gate"] = stop_gate_evidence
+    if protection_mismatches:
+        snapshot["protection_mismatches"] = list(
+            protection_mismatches[:MAX_RECORDED_PROTECTION_MISMATCHES]
+        )
+        snapshot["protection_mismatch_count"] = len(protection_mismatches)
+    return snapshot
+
+
 def _persist_blocked(
     session_factory: sessionmaker,
     *,
@@ -2511,6 +2564,7 @@ def _persist_blocked(
     planned_at: datetime,
     execution_mode: str = "live",
     stop_gate_evidence: dict | None = None,
+    protection_mismatches: list[dict[str, str]] | None = None,
 ) -> ManagementPlanningResult:
     candidate = identity.candidate
     binding = identity.binding
@@ -2541,18 +2595,15 @@ def _persist_blocked(
                 )
         elif intent == "full_exit":
             effective_fraction = 1.0
-        target_snapshot = {
-            "execution_mode": execution_mode,
-            "identity": {
-                "target_lifecycle_id": lifecycle.id,
-                "execution_binding_id": binding.id,
-                "strategy_instance_id": binding.strategy_instance_id,
-            },
-            "positions": [],
-            "blocked_reason": reason_code,
-        }
-        if stop_gate_evidence is not None:
-            target_snapshot["stop_price_gate"] = stop_gate_evidence
+        target_snapshot = _blocked_target_snapshot(
+            execution_mode=execution_mode,
+            lifecycle_id=lifecycle.id,
+            binding_id=binding.id,
+            strategy_instance_id=binding.strategy_instance_id,
+            reason_code=reason_code,
+            stop_gate_evidence=stop_gate_evidence,
+            protection_mismatches=protection_mismatches,
+        )
         existing = create_management_batch(
             session_factory,
             idempotency_fingerprint=idempotency_fingerprint,
@@ -3310,6 +3361,7 @@ def _ledger_confirmed_position_protection(
     tpsl_orders: list[dict[str, Any]],
     ledger_rows: list[PositionProtectionLedger],
     global_order_id_counts: Counter,
+    mismatches: list[dict[str, str]] | None = None,
 ) -> PositionProtection | None:
     if not ledger_rows:
         return None
@@ -3334,9 +3386,14 @@ def _ledger_confirmed_position_protection(
         ):
             continue
         row = rows_by_order_id.get(order_id)
-        if row is None or not _ledger_row_matches_current_protection(
-            ledger, row, position=position
-        ):
+        if row is None:
+            # A ledger row whose order is no longer pending is history, not a
+            # disagreement: a take profit that filled leaves exactly this.
+            continue
+        mismatch = _ledger_row_protection_mismatch(ledger, row, position=position)
+        if mismatch is not None:
+            if mismatches is not None:
+                mismatches.append(mismatch)
             continue
         confirmed_rows.append(dict(row))
         order_ids.append(order_id)
@@ -3365,12 +3422,64 @@ def _ledger_confirmed_position_protection(
     )
 
 
+#: Ledger purposes whose price lives in the row's **stop** keys. ``backup_stop``
+#: belongs here: the composite replacement writes one (``composite_executor``),
+#: and reading its price out of ``tpTriggerPrice`` could never match.
+STOP_LEDGER_PURPOSES = frozenset({"stop_loss", "sl", "loss", "backup_stop"})
+
+
 def _ledger_row_matches_current_protection(
     ledger: PositionProtectionLedger,
     row: dict[str, Any],
     *,
     position: dict[str, Any],
 ) -> bool:
+    return (
+        _ledger_row_protection_mismatch(ledger, row, position=position) is None
+    )
+
+
+def _ledger_row_protection_mismatch(
+    ledger: PositionProtectionLedger,
+    row: dict[str, Any],
+    *,
+    position: dict[str, Any],
+) -> dict[str, str] | None:
+    """Why this exchange row is not the order the ledger names, or ``None``.
+
+    Returning the reason rather than a bare ``False`` is the whole point: the
+    refusals this comparison produced in production (batches 159, 166, 172)
+    persisted ``positions: []`` and nothing else, so the disagreeing field was
+    not recoverable from the database afterwards.
+
+    Nothing here is relaxed except the two readings that were wrong about the
+    venue's vocabulary:
+
+    * ``side`` on a ``TPSL`` row is the **closing** direction -- ``sell``
+      protects a long -- so the position's direction comes from ``posSide``
+      alone (``native_tpsl.protection_order_position_sides``) and ``side`` is
+      validated as the closing direction
+      (``native_tpsl.protection_order_sides_consistent``).  This is the same
+      correction ``356630dd`` made in the convergence and backup-stop
+      executors; the planner was the site it missed.
+    * ``"0"`` in a price key means "this leg is unused", the rule
+      ``deepcoin_trigger_rows`` already applies everywhere else.  An
+      *unparseable* price is still a refusal -- unreadable is not absent.
+
+    ordId attribution, global uniqueness, the ``explicit_pos_ids`` conflict and
+    exact price/size equality are unchanged.
+    """
+
+    order_id = _exact_protection_order_id(row) or str(ledger.order_id or "")
+
+    def mismatch(field: str, ledger_value: Any, exchange_value: Any) -> dict[str, str]:
+        return {
+            "order_id": str(order_id),
+            "field": field,
+            "ledger": _bounded_text(ledger_value),
+            "exchange": _bounded_text(exchange_value),
+        }
+
     order_types = {
         value.upper()
         for value in _protection_alias_values(
@@ -3378,52 +3487,69 @@ def _ledger_row_matches_current_protection(
         )
     }
     if order_types != {"TPSL"}:
-        return False
+        return mismatch("order_type", "TPSL", sorted(order_types))
     explicit_pos_ids = _protection_alias_values(
         row, "posId", "pos_id", "positionId", "closePosId"
     )
     if explicit_pos_ids and explicit_pos_ids != {str(ledger.pos_id or "")}:
-        return False
+        return mismatch("pos_id", ledger.pos_id, sorted(explicit_pos_ids))
+    ledger_instrument = str(ledger.instrument_id or "").upper()
     instrument_aliases = {
         value.upper()
         for value in _protection_alias_values(
             row, "instId", "instrument_id", "instrumentId"
         )
     }
-    if instrument_aliases != {str(ledger.instrument_id or "").upper()}:
-        return False
-    side_aliases = {
-        {"buy": "long", "sell": "short"}.get(value.lower(), value.lower())
-        for value in _protection_alias_values(row, "posSide", "pos_side", "side")
-    }
-    if side_aliases != {str(ledger.side or "").lower()}:
-        return False
-    if _instrument_id(row) != str(ledger.instrument_id or "").upper():
-        return False
-    if _instrument_id(position) != str(ledger.instrument_id or "").upper():
-        return False
-    if _position_side(row) != str(ledger.side or "").lower():
-        return False
-    if _position_side(position) != str(ledger.side or "").lower():
-        return False
+    if instrument_aliases != {ledger_instrument}:
+        return mismatch("instrument_id", ledger_instrument, sorted(instrument_aliases))
+    ledger_side = str(ledger.side or "").lower()
+    row_position_sides = protection_order_position_sides(row)
+    if row_position_sides != {ledger_side}:
+        return mismatch("position_side", ledger_side, sorted(row_position_sides))
+    if not protection_order_sides_consistent(row):
+        return mismatch(
+            "closing_side",
+            "sell" if ledger_side == "long" else "buy",
+            row.get("side"),
+        )
+    if _instrument_id(row) != ledger_instrument:
+        return mismatch("instrument_id", ledger_instrument, _instrument_id(row))
+    if _instrument_id(position) != ledger_instrument:
+        return mismatch(
+            "position_instrument_id", ledger_instrument, _instrument_id(position)
+        )
+    if _position_side(position) != ledger_side:
+        return mismatch("position_side", ledger_side, _position_side(position))
     ledger_price = _to_float(ledger.trigger_price)
     if ledger_price is not None:
         price_keys = (
             ("slTriggerPx", "slTriggerPrice", "closeSLTriggerPrice")
-            if str(ledger.purpose or "") in {"stop_loss", "sl", "loss"}
+            if str(ledger.purpose or "") in STOP_LEDGER_PURPOSES
             else ("tpTriggerPx", "tpTriggerPrice", "closeTPTriggerPrice")
         )
         price_aliases = _protection_alias_values(row, *price_keys)
-        parsed_prices = {_to_float(value) for value in price_aliases}
-        if not price_aliases or None in parsed_prices or parsed_prices != {ledger_price}:
-            return False
+        parsed = [_to_float(value) for value in price_aliases]
+        present = {value for value in parsed if value not in (None, 0.0)}
+        if None in parsed or present != {ledger_price}:
+            return mismatch("trigger_price", ledger_price, sorted(present))
     ledger_size = _to_float(ledger.size_text)
-    row_size_aliases = _protection_alias_values(row, "sz", "size", "orderSize")
     if ledger_size is not None:
+        row_size_aliases = _protection_alias_values(row, "sz", "size", "orderSize")
         parsed_sizes = {_to_float(value) for value in row_size_aliases}
         if not row_size_aliases or None in parsed_sizes or parsed_sizes != {ledger_size}:
-            return False
-    return True
+            return mismatch("size", ledger_size, sorted(row_size_aliases))
+    return None
+
+
+def _bounded_text(value: Any) -> str:
+    """One field value, short enough to persist inside a batch snapshot."""
+
+    if isinstance(value, (list, tuple, set)):
+        values = sorted(str(item) for item in value)
+        text = values[0] if len(values) == 1 else ",".join(values)
+    else:
+        text = "" if value is None else str(value)
+    return text[:64]
 
 
 def _protection_alias_values(row: dict[str, Any], *keys: str) -> set[str]:
