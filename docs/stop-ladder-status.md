@@ -208,3 +208,10 @@ F2 已经让 `protection_health` 对证成成交的止盈账本行写 `filled`�
    - `strategy_break_even_convergences` 是否出现 `tp1_fill` 行（见风险 1）；
    - 若同一轮里有两张止盈单一起消失：核对交易所到底成交了几档（见风险 4）；
    - 值守计数器 `counter:stop_ladder_level_unrecorded` 是否长期上涨（涨 = 影子没跟上，不是故障）。
+
+## 部署记录（2026-09-23）
+
+- 用户批准部署。候选 `9ce48d37`（`680791fc` 读取缺陷修复 → `70c4d277` 阶梯/设置/影子 → `9ce48d37` 文档），最终候选全量 **9650 passed / 4 skipped / 0 failed**。
+- 零在途、无在仓仓位；`tg-deploy 9ce48d37…` → 五个服务 active、web 200、worker 错误行 0；自动交易开关未动。**回滚 = `tg-deploy a79a387bf20d85e032a728b95fe42f28b1ae2934`**。
+- `/api/runtime/release-gates` 仍报告旧的两个按仓位常量（阶段 3 才替换）。
+- 部署后把 `stop_ladder_mode` 设为 `shadow`（见下一条记录）。
