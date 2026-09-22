@@ -19,6 +19,7 @@ from telegram_kol_research import web_app as web_app_module
 from telegram_kol_research import system_operator_bot as operator_bot_module
 from telegram_kol_research.config import (
     ALWAYS_NOTIFIED_INCIDENT_TYPES,
+    TELEGRAM_QUIET_INCIDENT_TYPES,
     RuntimeIncidentConfig,
     load_runtime_incident_config,
 )
@@ -55,7 +56,8 @@ def test_management_failure_types_are_folded_into_a_configured_whitelist():
     for incident_type in (
         "management_recovery_required",
         "management_submit_unknown",
-        "context_worker_exhausted",
+        # context_worker_exhausted moved to TELEGRAM_QUIET_INCIDENT_TYPES on
+        # 2026-09-23: still captured, delivered by the on-call watcher instead.
         "authoritative_execution_uncertain",
         "background_task_restart_exhausted",
         # A-3 additions: a stop the price gate refused, and an instruction that
@@ -104,7 +106,7 @@ def test_every_always_notified_type_survives_the_production_selector():
     # set going empty is one of the failures the traversal exists to catch.
     assert len(ALWAYS_NOTIFIED_INCIDENT_TYPES) >= 10
 
-    for incident_type in sorted(ALWAYS_NOTIFIED_INCIDENT_TYPES):
+    for incident_type in sorted(ALWAYS_NOTIFIED_INCIDENT_TYPES - TELEGRAM_QUIET_INCIDENT_TYPES):
         assert config.captures(incident_type) is True, incident_type
         assert config.notifies(incident_type) is True, incident_type
         assert incident_type in (config.telegram_notification_types or frozenset()), (
@@ -863,3 +865,29 @@ def test_last_notified_probe_fails_open_when_the_database_is_unusable():
         web_app_module.latest_runtime_incident_notified_at(broken_factory)
         is None
     )
+
+
+
+def test_recognition_and_context_failures_are_captured_but_quiet_on_telegram():
+    """2026-09-23: the on-call watcher alerts for these in Chinese; the ledger
+    keeps them, Telegram stops repeating them unless a person names them."""
+
+    from telegram_kol_research.config import load_runtime_incident_config
+
+    env = {
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_CAPTURE_TYPES": "management_partial_failed",
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_ENABLED": "true",
+        "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": "management_partial_failed",
+    }
+    config = load_runtime_incident_config(env, environment_only=True)
+    for quiet in ("authoritative_recognition_failed", "context_worker_exhausted"):
+        assert config.captures(quiet)
+        assert not config.notifies(quiet)
+    assert config.notifies("management_recovery_required")  # baseline survives
+
+    named = load_runtime_incident_config(
+        {**env, "TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES": "management_partial_failed,context_worker_exhausted"},
+        environment_only=True,
+    )
+    assert named.notifies("context_worker_exhausted")
+    assert not named.notifies("authoritative_recognition_failed")

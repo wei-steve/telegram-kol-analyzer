@@ -562,6 +562,26 @@ def _deployed_code_version(env: dict[str, str]) -> str:
     return value if re.fullmatch(r"[A-Za-z0-9._-]{1,64}", value) else "unknown"
 
 
+#: Always captured in the ledger, but no longer pushed to Telegram by default:
+#: since 2026-09-22 the on-call watcher covers "the message asked for something
+#: and the exchange never saw it" with a Chinese alert that names the message,
+#: and these two types were most of the ~100 English "AI agent通知" a week
+#: (30 + 18 in the seven days before). Listing one of them explicitly in
+#: TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES turns it back on.
+TELEGRAM_QUIET_INCIDENT_TYPES = frozenset(
+    {"authoritative_recognition_failed", "context_worker_exhausted"}
+)
+
+
+def _with_always_telegram_types(selected: frozenset[str]) -> frozenset[str]:
+    """The Telegram fold: the baseline minus the quiet types, unless named."""
+
+    folded = _with_always_notified_types(selected)
+    if not folded:
+        return folded
+    return folded - (TELEGRAM_QUIET_INCIDENT_TYPES - selected)
+
+
 def _with_always_notified_types(selected: frozenset[str]) -> frozenset[str]:
     """Fold the always-notified baseline into a non-empty operator selector.
 
@@ -615,7 +635,7 @@ def load_runtime_incident_config(
         # with entries in it is a filter someone maintains by hand, and the
         # always-notified types are added to it so that forgetting one cannot
         # turn a critical alert into silence.
-        _with_always_notified_types(configured_notification_types)
+        _with_always_telegram_types(configured_notification_types)
         if configured_notification_types
         else (frozenset() if telegram_types_key in env else None)
     )
