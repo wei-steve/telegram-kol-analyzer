@@ -7,8 +7,10 @@ from telegram_kol_research.take_profit_fill_predicate import (
     REASON_HISTORY_AMBIGUOUS,
     REASON_NOT_TRIGGERED,
     REASON_ORDER_IDENTITY_MISSING,
+    REASON_POSITION_NOT_DECREASED,
     REASON_SNAPSHOT_INCOMPLETE,
     REASON_TRIGGER_FAILED,
+    TIER_POSITION_DECREASE,
     TIER_RECORDED_ORDER_STATUS,
     TIER_TRIGGER_HISTORY,
     take_profit_fill_proven,
@@ -148,3 +150,89 @@ def test_an_untriggered_row_has_not_failed():
 
     assert not trigger_row_fired(row)
     assert not trigger_row_failed(row)
+
+
+# --------------------------------------------------------------------------
+# Form B -- the order is gone from a complete pending read, nothing in the
+# history explains it, and the position got smaller between two complete
+# observations (stop-ladder phase 1 spec 2.2).
+# --------------------------------------------------------------------------
+
+
+def test_a_position_decrease_proves_a_fill_when_the_history_is_silent():
+    verdict = take_profit_fill_proven(
+        order_id="tp-1",
+        trigger_history=[],
+        pending_snapshot_complete=True,
+        position_decrease_proven=True,
+    )
+
+    assert verdict.proven
+    assert verdict.evidence_tier == TIER_POSITION_DECREASE
+
+
+def test_form_b_needs_no_particular_amount_only_a_decrease():
+    """Quantity is never compared: the caller answers "smaller", not "by how much"."""
+
+    assert take_profit_fill_proven(
+        order_id="tp-1",
+        pending_snapshot_complete=True,
+        position_decrease_proven=True,
+    ).proven
+
+
+def test_form_b_refuses_on_an_incomplete_pending_read():
+    verdict = take_profit_fill_proven(
+        order_id="tp-1",
+        pending_snapshot_complete=False,
+        position_decrease_proven=True,
+    )
+
+    assert not verdict.proven
+    assert verdict.reason_code == REASON_SNAPSHOT_INCOMPLETE
+
+
+def test_form_b_refuses_when_the_position_did_not_shrink():
+    verdict = take_profit_fill_proven(
+        order_id="tp-1",
+        pending_snapshot_complete=True,
+        position_decrease_proven=False,
+    )
+
+    assert not verdict.proven
+    assert verdict.reason_code == REASON_POSITION_NOT_DECREASED
+
+
+def test_without_delta_evidence_the_answer_is_still_history_absent():
+    """Every caller that predates form B keeps its exact reason code."""
+
+    verdict = take_profit_fill_proven(
+        order_id="tp-1", pending_snapshot_complete=True
+    )
+
+    assert not verdict.proven
+    assert verdict.reason_code == REASON_HISTORY_ABSENT
+
+
+def test_a_failed_trigger_is_never_rescued_by_a_position_decrease():
+    verdict = take_profit_fill_proven(
+        order_id="tp-1",
+        trigger_history=[_history(error_code="51004", error_message="rejected")],
+        pending_snapshot_complete=True,
+        position_decrease_proven=True,
+    )
+
+    assert not verdict.proven
+    assert verdict.reason_code == REASON_TRIGGER_FAILED
+
+
+def test_an_untriggered_history_row_is_never_rescued_by_a_position_decrease():
+    verdict = take_profit_fill_proven(
+        order_id="tp-1",
+        trigger_history=[_history(trigger_time="0")],
+        pending_snapshot_complete=True,
+        position_decrease_proven=True,
+    )
+
+    assert not verdict.proven
+    assert verdict.reason_code == REASON_NOT_TRIGGERED

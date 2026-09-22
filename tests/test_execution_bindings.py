@@ -7,6 +7,11 @@ import pytest
 from sqlalchemy import text
 from sqlalchemy.exc import IntegrityError
 
+from deepcoin_production_rows import (
+    pending_take_profit_row,
+    position_row,
+)
+
 import telegram_kol_research.execution_bindings as execution_bindings_module
 from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.execution_bindings import (
@@ -52,6 +57,7 @@ from telegram_kol_research.models import PositionBackupStopOrder
 from telegram_kol_research.models import PositionProtectionIncident
 from telegram_kol_research.position_attribution import AttributionResult, FillEvidence
 from telegram_kol_research.position_protection_legs import create_or_get_protection_leg
+from telegram_kol_research.protection_ledger import upsert_protection_ledger_row
 from telegram_kol_research.trigger_backup_stop_executor import (
     submit_verified_trigger_backup_stops,
 )
@@ -8541,6 +8547,199 @@ def test_reconcile_records_complete_owned_position_observation(tmp_path):
         assert [
             item["order_id"] for item in json.loads(row.pending_tpsl_json)
         ] == ["tp-observed"]
+
+
+def test_observation_buckets_a_real_tpsl_row_through_the_ledger(tmp_path):
+    """A TPSL row carries no ``posId``; the ledger says whose order it is.
+
+    ``pending_tpsl_json`` was empty on every observation ever recorded
+    (production query Q4: 50 of 50 rows ``[]``) because the bucketing keyed on
+    a field the venue never sends.  The ledger's ``order_id -> pos_id`` is the
+    attribution that exists, and it is the same one
+    ``protection_authority`` uses.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="1001125216121996",
+            status="active",
+            strategy_instance_id="deepcoin:100:55:BTC:short",
+            side="short",
+        ),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="1001125216121996",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg_id,
+            strategy_instance_id="deepcoin:100:55:BTC:short",
+            pos_id="1001125216121996",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="tp-79800",
+            purpose="take_profit",
+            trigger_price="79800",
+            size_text="3",
+            status="verified",
+            evidence_source="test",
+            evidence={},
+            seen_at=datetime(2026, 8, 2, 7, 0),
+        )
+        session.commit()
+
+    pending_row = pending_take_profit_row(
+        ord_id="tp-79800",
+        inst_id="BTC-USDT-SWAP",
+        pos_side="short",
+        trigger_price="79800",
+        size="3",
+    )
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                position_row(
+                    pos_id="1001125216121996",
+                    inst_id="BTC-USDT-SWAP",
+                    pos_side="short",
+                    size="7",
+                    avg_price="80436",
+                )
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [dict(pending_row)]
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": self.list_trigger_orders_pending(inst_id=inst_id)}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 8, 2, 8, 0),
+    )
+
+    with session_factory() as session:
+        row = session.query(PositionReconciliationObservation).one()
+        assert row.pos_id == "1001125216121996"
+        assert row.snapshot_complete is True
+        assert [
+            item["order_id"] for item in json.loads(row.pending_tpsl_json)
+        ] == ["tp-79800"]
+
+
+def test_observation_never_buckets_an_order_the_ledger_gives_another_position(
+    tmp_path,
+):
+    """Attribution is the ledger's, not a guess: another position's order stays out."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    binding_id = upsert_execution_binding(
+        session_factory,
+        _binding(
+            pos_id="1001125216121996",
+            status="active",
+            strategy_instance_id="deepcoin:100:55:BTC:short",
+            side="short",
+        ),
+    )
+    leg_id = _add_entry_leg(
+        session_factory,
+        binding_id,
+        pos_id="1001125216121996",
+        status="active",
+        attribution_status="verified",
+    )
+    with session_factory() as session:
+        upsert_protection_ledger_row(
+            session,
+            venue="deepcoin",
+            execution_binding_id=binding_id,
+            execution_order_leg_id=leg_id,
+            strategy_instance_id="deepcoin:100:55:BTC:short",
+            pos_id="1001125216153672",
+            instrument_id="BTC-USDT-SWAP",
+            side="short",
+            order_id="tp-other",
+            purpose="take_profit",
+            trigger_price="79800",
+            size_text="3",
+            status="verified",
+            evidence_source="test",
+            evidence={},
+            seen_at=datetime(2026, 8, 2, 7, 0),
+        )
+        session.commit()
+
+    class FakeClient:
+        def list_positions(self):
+            return [
+                position_row(
+                    pos_id="1001125216121996",
+                    inst_id="BTC-USDT-SWAP",
+                    pos_side="short",
+                    size="7",
+                    avg_price="80436",
+                )
+            ]
+
+        def list_open_orders(self):
+            return []
+
+        def list_trigger_orders_pending(self, *, inst_id):
+            return [
+                pending_take_profit_row(
+                    ord_id="tp-other",
+                    inst_id="BTC-USDT-SWAP",
+                    pos_side="short",
+                    trigger_price="79800",
+                    size="3",
+                )
+            ]
+
+        def read_trigger_orders_pending(self, *, inst_id):
+            return {"code": "0", "data": self.list_trigger_orders_pending(inst_id=inst_id)}
+
+        def list_order_history(self, *, inst_id=None):
+            return []
+
+        def list_trade_fills(self, *, inst_id=None):
+            return []
+
+        def list_trigger_order_history(self, *, inst_id=None):
+            return []
+
+    reconcile_deepcoin_execution_bindings(
+        session_factory,
+        client=FakeClient(),
+        recovered_at=datetime(2026, 8, 2, 8, 0),
+    )
+
+    with session_factory() as session:
+        row = session.query(PositionReconciliationObservation).one()
+        assert json.loads(row.pending_tpsl_json) == []
 
 
 def test_sync_missing_position_cleans_pending_entry_before_lifecycle_exit(tmp_path):

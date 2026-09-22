@@ -7,6 +7,8 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from typing import Any, Iterable, Mapping
 
+from telegram_kol_research.take_profit_fill_predicate import trigger_row_failed
+
 
 @dataclass(frozen=True, slots=True)
 class TakeProfitFillEvidence:
@@ -144,18 +146,36 @@ def _prove_exact_terminal(
                 matching_rows.append((source, row, fill_source))
     if not matching_rows:
         return None
+    decidable_sources: set[str] = set()
     for source, row, fill_source in matching_rows:
+        # A trigger that fired and errored is the one thing no later layer may
+        # reinterpret: whatever else happened to the position, this order did
+        # not close it.  Checked before the identity fields, because a failed
+        # row is a verdict even when it is missing half of them.
+        if trigger_row_failed(row):
+            return _failure(
+                "tp1_exact_trigger_failed",
+                order_id=order_id,
+                evidence={
+                    "source": source,
+                    "error_code": _first_text(row, "errorCode", "error_code", "sCode"),
+                },
+            )
         row_pos_id = _first_text(row, "posId", "pos_id", "closePosId")
         row_side = _first_text(row, "posSide", "pos_side")
         row_size = _positive_decimal_text(
             _first_value(row, "fillSz", "actualSz", "sz", "size")
         )
         if row_pos_id is None or row_side is None or row_size is None:
-            return _failure(
-                "tp1_exact_history_incomplete",
-                order_id=order_id,
-                evidence={"source": source},
-            )
+            # The venue's real ``trigger-orders-history`` rows carry no
+            # ``posId`` at all, so this is the ordinary case and not a
+            # conflict.  Refusing here used to end the whole proof and hide
+            # the position-delta layer below (``docs/composite-upstream-fix-
+            # status.md`` section 10): having actually triggered made a fill
+            # *less* provable than never triggering.  An undecidable row is
+            # skipped; the layers below get their turn.
+            continue
+        decidable_sources.add(source)
         if (
             row_pos_id != pos_id
             or side is None
@@ -182,10 +202,14 @@ def _prove_exact_terminal(
                 reason_code="tp1_fill_proven",
                 evidence={"source": source, "order_id": order_id},
             )
+    if not decidable_sources:
+        # Every matching row was unreadable for this question. That is not
+        # "not filled"; it is "this layer has no answer".
+        return None
     return _failure(
         "tp1_exact_not_filled",
         order_id=order_id,
-        evidence={"sources": sorted({item[0] for item in matching_rows})},
+        evidence={"sources": sorted(decidable_sources)},
     )
 
 

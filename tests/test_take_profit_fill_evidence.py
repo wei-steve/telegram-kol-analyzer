@@ -1,3 +1,5 @@
+from deepcoin_production_rows import trigger_history_row
+
 from telegram_kol_research.take_profit_fill_evidence import (
     prove_first_take_profit_fill,
 )
@@ -91,7 +93,17 @@ def test_rejects_exact_terminal_row_with_wrong_position_or_size():
     assert result.reason_code == "tp1_exact_history_conflict"
 
 
-def test_rejects_exact_terminal_row_missing_required_identity_fields():
+def test_a_row_missing_identity_fields_falls_through_instead_of_refusing():
+    """The venue's own history rows carry no ``posId``, and that is not a verdict.
+
+    Before the stop-ladder phase 1 fix, one incomplete matching row returned
+    ``tp1_exact_history_incomplete`` and the position-delta layer below was
+    never reached -- so *having actually triggered* made a fill less provable
+    than never triggering at all (``docs/composite-upstream-fix-status.md``
+    section 10).  An undecidable row is now skipped: the answer comes from the
+    next layer, which here has no observations to look at.
+    """
+
     base = {
         "ordId": "tp-1",
         "posId": "pos-1",
@@ -115,7 +127,71 @@ def test_rejects_exact_terminal_row_missing_required_identity_fields():
         )
 
         assert result.proven is False
-        assert result.reason_code == "tp1_exact_history_incomplete"
+        assert result.reason_code == "tp1_observation_missing"
+
+
+def test_a_real_trigger_history_row_reaches_the_position_delta_layer():
+    """The production shape end to end: no ``posId``, no ``state``, and proven."""
+
+    history = trigger_history_row(
+        ord_id="tp-1",
+        inst_id="BTC-USDT-SWAP",
+        pos_side="short",
+        trigger_price="62400",
+        size="5",
+    )
+    previous = _observation(
+        10, [("tp-1", 5, 62400), ("tp-2", 3, 61700), ("tp-3", 2, 61000)]
+    )
+    current = _observation(5, [("tp-2", 3, 61700), ("tp-3", 2, 61000)])
+
+    result = prove_first_take_profit_fill(
+        tp_order=_tp_order(),
+        protection_leg=_protection_leg(),
+        expected_side="short",
+        previous_observation=previous,
+        current_observation=current,
+        trigger_history=[history],
+        order_history=[],
+        trade_fills=[],
+        conflicting_mutations=[],
+    )
+
+    assert result.proven is True
+    assert result.evidence_tier == "exchange_position_delta"
+
+
+def test_a_failed_trigger_is_refused_and_never_falls_through():
+    """A trigger that errored must not become a fill by way of a size change."""
+
+    history = trigger_history_row(
+        ord_id="tp-1",
+        inst_id="BTC-USDT-SWAP",
+        pos_side="short",
+        trigger_price="62400",
+        size="5",
+        error_code="51004",
+        error_message="insufficient position",
+    )
+    previous = _observation(
+        10, [("tp-1", 5, 62400), ("tp-2", 3, 61700), ("tp-3", 2, 61000)]
+    )
+    current = _observation(5, [("tp-2", 3, 61700), ("tp-3", 2, 61000)])
+
+    result = prove_first_take_profit_fill(
+        tp_order=_tp_order(),
+        protection_leg=_protection_leg(),
+        expected_side="short",
+        previous_observation=previous,
+        current_observation=current,
+        trigger_history=[history],
+        order_history=[],
+        trade_fills=[],
+        conflicting_mutations=[],
+    )
+
+    assert result.proven is False
+    assert result.reason_code == "tp1_exact_trigger_failed"
 
 
 def test_proves_tp1_from_complete_exact_position_delta():

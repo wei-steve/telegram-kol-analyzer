@@ -31,9 +31,23 @@ produce.  Two forms of proof, both fail-closed:
    that showed the order gone was complete.  This is the same reading
    ``partial_take_profit_explanation`` form (i) already uses.
 
-**A smaller position is never proof.**  A position shrinks for a manual close,
-a liquidation, another strategy's leg or a stop, and the one thing this
-predicate must never do is let one of those be spent as a take-profit fill.
+3. **A position decrease under form B** (stop-ladder phase 1 spec 2.2), and
+   only when the caller has already established the whole conjunction the
+   account owner approved: the order is absent from a **complete** pending
+   read, its ledger row is not ``retired``/``cancelled``/``superseded``, we
+   hold no cancel intent for it, and the trigger history says nothing about it
+   at all.  The caller answers "did the position get smaller between two
+   complete observations" as a boolean -- ``position_decrease_proven`` -- and
+   quantity is never compared, because a partially filled stage would
+   otherwise be indistinguishable from an unexplained one.
+
+**A smaller position is not proof on its own.**  A position shrinks for a
+manual close, a liquidation, another strategy's leg or a stop, so form B is
+available only to a caller that has ruled those out by the conjunction above;
+passing nothing (the default ``None``) keeps every caller that predates it on
+forms 1 and 2 exactly as it was.  A history row that exists always decides:
+a failed trigger is a refusal and an untriggered one is a refusal, never
+rescued by a size change.
 
 The stop-ladder work (``docs/plans/2026-09-21-stop-ladder-design.md`` section
 1) needs exactly this question answered -- "which take-profit stage has really
@@ -60,6 +74,14 @@ CLEAN_ERROR_CODES = frozenset({"", "0", "00000"})
 
 TIER_RECORDED_ORDER_STATUS = "recorded_take_profit_order_status"
 TIER_TRIGGER_HISTORY = "trigger_history_clean_trigger"
+#: Form B. The history is silent and the position got smaller between two
+#: complete observations, with every exclusion already established by the
+#: caller (stop-ladder phase 1 spec 2.2).
+TIER_POSITION_DECREASE = "position_decrease_between_complete_observations"
+
+#: What the two forms are called in order-level evidence.
+EVIDENCE_FORM_TRIGGER_HISTORY = "trigger_history"
+EVIDENCE_FORM_POSITION_DECREASE = "position_decrease"
 
 REASON_ORDER_IDENTITY_MISSING = "take_profit_order_identity_missing"
 REASON_HISTORY_ABSENT = "take_profit_trigger_history_absent"
@@ -67,6 +89,14 @@ REASON_HISTORY_AMBIGUOUS = "take_profit_trigger_history_ambiguous"
 REASON_TRIGGER_FAILED = "take_profit_trigger_failed"
 REASON_NOT_TRIGGERED = "take_profit_not_triggered"
 REASON_SNAPSHOT_INCOMPLETE = "take_profit_pending_snapshot_incomplete"
+REASON_POSITION_NOT_DECREASED = "take_profit_position_not_decreased"
+
+#: Which evidence form each proving tier is recorded as.
+EVIDENCE_FORM_BY_TIER = {
+    TIER_RECORDED_ORDER_STATUS: EVIDENCE_FORM_TRIGGER_HISTORY,
+    TIER_TRIGGER_HISTORY: EVIDENCE_FORM_TRIGGER_HISTORY,
+    TIER_POSITION_DECREASE: EVIDENCE_FORM_POSITION_DECREASE,
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,14 +115,23 @@ def take_profit_fill_proven(
     recorded_order_statuses: Iterable[str] = (),
     trigger_history: Iterable[Mapping[str, Any]] = (),
     pending_snapshot_complete: bool = False,
+    position_decrease_proven: bool | None = None,
 ) -> TakeProfitFillVerdict:
-    """Prove that ``order_id`` filled, from durable record or clean history.
+    """Prove that ``order_id`` filled, from durable record, history or delta.
 
     ``recorded_order_statuses`` are the ``position_take_profit_orders.status``
     values recorded for this exact order id -- usually none or one.
     ``pending_snapshot_complete`` says whether the ``trigger-orders-pending``
     read that showed the order gone actually succeeded; an incomplete read
     means "unknown", never "gone".
+
+    ``position_decrease_proven`` is form B and is only consulted when the
+    history has nothing to say about this order: ``True`` means the caller
+    compared two consecutive complete observations of this exact position and
+    the size went down, having already excluded a retired/cancelled ledger row
+    and any cancel intent of our own.  ``None``, the default, means the caller
+    offers no such evidence and the verdict is unchanged from before form B
+    existed.
     """
 
     identity = str(order_id or "").strip()
@@ -134,10 +173,34 @@ def take_profit_fill_proven(
             },
         )
     if not rows:
+        if position_decrease_proven is None:
+            return TakeProfitFillVerdict(
+                proven=False,
+                reason_code=REASON_HISTORY_ABSENT,
+                evidence={"order_id": identity, "recorded_statuses": statuses},
+            )
+        if not pending_snapshot_complete:
+            # The order is missing from a read nobody can vouch for, so
+            # "gone" is not established and neither is anything that follows
+            # from it.
+            return TakeProfitFillVerdict(
+                proven=False,
+                reason_code=REASON_SNAPSHOT_INCOMPLETE,
+                evidence={"order_id": identity},
+            )
+        if not position_decrease_proven:
+            return TakeProfitFillVerdict(
+                proven=False,
+                reason_code=REASON_POSITION_NOT_DECREASED,
+                evidence={"order_id": identity},
+            )
         return TakeProfitFillVerdict(
-            proven=False,
-            reason_code=REASON_HISTORY_ABSENT,
-            evidence={"order_id": identity, "recorded_statuses": statuses},
+            proven=True,
+            evidence_tier=TIER_POSITION_DECREASE,
+            evidence={
+                "order_id": identity,
+                "evidence_form": EVIDENCE_FORM_POSITION_DECREASE,
+            },
         )
     if len(rows) > 1:
         return TakeProfitFillVerdict(

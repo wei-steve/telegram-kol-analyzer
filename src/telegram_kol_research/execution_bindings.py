@@ -1324,9 +1324,24 @@ def _record_owned_position_observations(
     completeness_by_instrument = _pending_tpsl_snapshot_completeness(
         snapshot.pending_tpsl_observations
     )
+    owned_pos_ids = {
+        str(leg.pos_id or "").strip()
+        for leg in legs
+        if str(leg.pos_id or "").strip()
+    }
+    ledger_pos_id_by_order_id = _ledger_position_by_order_id(
+        session, pos_ids=owned_pos_ids
+    )
     pending_by_position: dict[str, list[dict[str, Any]]] = {}
     for row in snapshot.pending_trigger_orders:
         pos_id = _first_string(row, "posId", "pos_id", "closePosId")
+        if not pos_id:
+            # A TPSL row carries no ``posId`` at all (ARCHITECTURE 4.8), so
+            # bucketing on that field left ``pending_tpsl_json`` empty on
+            # every observation ever recorded -- 50 of 50 rows in the 09-21
+            # production check. Attribution for such a row is the order id,
+            # exactly as ``protection_authority`` resolves it.
+            pos_id = _ledger_position_for_row(row, ledger_pos_id_by_order_id)
         if pos_id:
             pending_by_position.setdefault(pos_id, []).append(row)
     for leg in legs:
@@ -1369,6 +1384,56 @@ def _record_owned_position_observations(
             snapshot_complete=snapshot_complete,
             observed_at=observed_at,
         )
+
+
+def _ledger_position_by_order_id(
+    session, *, pos_ids: set[str], venue: str = "deepcoin"
+) -> dict[str, str]:
+    """``order_id -> pos_id`` for the protection orders these positions own.
+
+    Every status is included deliberately: the question is whose order this
+    is, not whether it is still active, and ``(venue, order_id)`` is unique so
+    one order id can never name two positions.
+    """
+
+    if not pos_ids:
+        return {}
+    from telegram_kol_research.models import PositionProtectionLedger
+
+    rows = (
+        session.query(
+            PositionProtectionLedger.order_id, PositionProtectionLedger.pos_id
+        )
+        .filter(PositionProtectionLedger.venue == venue)
+        .filter(PositionProtectionLedger.pos_id.in_(sorted(pos_ids)))
+        .all()
+    )
+    return {
+        str(order_id).strip(): str(pos_id).strip()
+        for order_id, pos_id in rows
+        if str(order_id or "").strip() and str(pos_id or "").strip()
+    }
+
+
+def _ledger_position_for_row(
+    row: dict[str, Any], ledger_pos_id_by_order_id: dict[str, str]
+) -> str | None:
+    """The position this pending row belongs to, by order id, or ``None``."""
+
+    if not ledger_pos_id_by_order_id:
+        return None
+    from telegram_kol_research.position_take_profit_orders import (
+        _order_identity_ids,
+    )
+
+    owners = {
+        ledger_pos_id_by_order_id[order_id]
+        for order_id in _order_identity_ids(row)
+        if order_id in ledger_pos_id_by_order_id
+    }
+    # Two owners for one row would be the ledger contradicting itself; the
+    # safe reading of a contradiction is "no attribution", not "pick one".
+    return next(iter(owners)) if len(owners) == 1 else None
 
 
 def _pending_tpsl_snapshot_completeness(
