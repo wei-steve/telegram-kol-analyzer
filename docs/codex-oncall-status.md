@@ -13,7 +13,7 @@ production_deployed: false           # 阶段 2 尚未部署
 phase1_production_commit: 76ddb91d4498534ad24b8bd92248942bd0d7e9a5
 rollback_commit: 72313b0e9cd63ebfb9e24c9c16f042e210a2261f
 systemd_unit_installed: false        # telegram-kol-oncall-codex.service 只提交，未安装
-production_mode: "watcher notify since 2026-09-22 ~23:10 CST; Codex shadow"
+production_mode: "watcher notify since 2026-09-22; Codex on since 2026-09-23 07:20 CST"
 default_codex_mode: "off (TELEGRAM_KOL_ONCALL_CODEX_MODE absent = phase 1 behaviour exactly)"
 writes_production_database: false
 writes_exchange: false
@@ -364,6 +364,13 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
   之后的"保本"指令因仓位不存在被拒——两次拒绝都合理，Codex 案件 8 判得对；案件 7 判 `suspected_bug` 也不算错：
   批次 175 确实提交了平仓（`strategy_management_close_submit` 14:08Z），却被记成 `position_closed_before_management`、入场腿记成
   `manually_closed / manual_position_missing`——**我们自己的平仓被账面当成了人工平仓**（不影响资金，是记账缺陷，待单独处理）。
+### 8.11 Codex 切 on（2026-09-23 07:20 CST）
+
+- shadow 期共 5 条真实裁决人工评审（案件 2/4/5/7/8）：全部找对根因，2 条 category 标签口径偏软（合理拒绝 vs 应执行并列），无一条会误导操作。满足"≥3 个真实案件"的转正标准。
+- `TELEGRAM_KOL_ONCALL_CODEX_MODE=on`，只重启值守进程。此后每个案件的建案提醒之后会追发一条"值守诊断"。
+- 截至切换时 `alerts.status=sent` 为 0：notify 打开后尚无新案件，首条真实发送预计是 09:00 的"值守正常"。**通道尚未被真实发送验证过。**
+- 现状与设计第 8 节对照：阶段 1、2 完成；阶段 3（worker 回环端点 + 闸门 + `/fix` 人工批准的补救）与阶段 4（A 线自动补救）未开始——**Codex 目前只诊断，不执行任何补救。**
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
