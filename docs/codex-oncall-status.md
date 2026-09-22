@@ -371,6 +371,14 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 - 截至切换时 `alerts.status=sent` 为 0：notify 打开后尚无新案件，首条真实发送预计是 09:00 的"值守正常"。**通道尚未被真实发送验证过。**
 - 现状与设计第 8 节对照：阶段 1、2 完成；阶段 3（worker 回环端点 + 闸门 + `/fix` 人工批准的补救）与阶段 4（A 线自动补救）未开始——**Codex 目前只诊断，不执行任何补救。**
 
+### 8.12 旧 agent 侧车退役与旧通知降噪（2026-09-23）
+
+- 用户确认后 `disable --now` 了 `telegram-kol-runtime-agent.service`、`telegram-kol-agent-model-egress.socket/.service`（`telegram-kol-runtime-scanner` 保留）。
+- 截图核实：Telegram 里的「AI agent通知」由 worker 的事故通知循环发出，与侧车无关；近 7 天 99 条，其中 `authoritative_recognition_failed` 30、`context_worker_exhausted` 18。
+  这两类正是值守用中文覆盖的情形，遂加入 `config.TELEGRAM_QUIET_INCIDENT_TYPES`：仍捕获入台账，默认不发 Telegram，可在 `TELEGRAM_TYPES` 里点名重新打开。
+  【AI识别分歧告警】与其余交易所侧类型（`management_target_refused`、`position_marked_manually_closed`、`protection_adopted_from_exchange` 等）保留。
+- 该改动需 `tg-deploy`（worker 读配置），见下一条部署记录。
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：

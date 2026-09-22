@@ -1,5 +1,10 @@
 # Runtime Incident AI Agent Status
 
+> **2026-09-23 已退役。** `telegram-kol-runtime-agent.service` 与 `telegram-kol-agent-model-egress.socket/.service` 已 `disable --now`；
+> 事故台账表保留（worker 仍写入并按 `config.py` 的基线发 Telegram）。它的诊断职责由 Codex 值守取代（`docs/codex-oncall-status.md`）。
+> 全部历史上该侧车只诊断过 2 条、模型调用 0 次。以下为历史记录。
+
+
 This is the canonical cross-conversation checkpoint. Chat history must not be
 used to advance or reinterpret the rollout.
 
@@ -10,6 +15,7 @@ design_authority_status: original_runtime_agent_complete_extended_by_message_ope
 current_phase: 8
 phase_name: cost-quality-and-continuous-improvement
 phase_status: completed
+sidecar_status: retired_2026-09-23_replaced_by_codex_oncall
 position_compliance_rules_status: dormant_non_deployable
 position_compliance_rollout_status: multi_target_live_new_natural_messages_only
 multi_target_projection_status: live_partial_take_profit_future_natural_messages_only
