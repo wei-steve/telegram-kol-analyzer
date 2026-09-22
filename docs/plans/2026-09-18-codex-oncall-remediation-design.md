@@ -263,3 +263,10 @@ Deepcoin 密钥只在 `/etc/telegram-kol-worker.env`，只有 `telegram-kol-work
 
 **你要的"第一版能补救"= 阶段 0–4**（A 线 live），B 线与调止盈紧随其后。
 实施方式沿用现行约定：指挥会话出规格，Opus 子代理在 worktree 里实现，指挥会话审阅后部署。
+
+## 9. 补充决定（2026-09-23）
+
+- 值守 / Codex 诊断使用的 bot 已向用户确认：`@steve_kol_event_bot`（"Kol事件处理"），会话即 `config/system_operator_bot.env` 里的 `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID`；2026-09-23 已用它发过一条测试消息（HTTP 200）。
+- 阶段 3 的 `/fix` 改为 **Telegram 内联按钮**（用户提议）：诊断消息末尾附「✅ 执行补救」「❌ 忽略」两个按钮，按下走 `callback_query`，由现有系统 bot 命令循环
+  （今天处理 `/choose`、`/dismiss` 的那条循环）接收；只接受来自 `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID` 且 `from.id` 等于用户本人 id 的回调，其余一律忽略；
+  按钮携带案件号 + 动作指纹，按下后先回一条"确认执行 X？"再要第二次点击，避免误触；按钮 30 分钟后失效。保留 `/fix <案件号>` 文本命令作为兜底。
