@@ -215,3 +215,6 @@ F2 已经让 `protection_health` 对证成成交的止盈账本行写 `filled`�
 - 零在途、无在仓仓位；`tg-deploy 9ce48d37…` → 五个服务 active、web 200、worker 错误行 0；自动交易开关未动。**回滚 = `tg-deploy a79a387bf20d85e032a728b95fe42f28b1ae2934`**。
 - `/api/runtime/release-gates` 仍报告旧的两个按仓位常量（阶段 3 才替换）。
 - 部署后把 `stop_ladder_mode` 设为 `shadow`（见下一条记录）。
+- 2026-09-23 06:5x CST：经 `POST /api/trading-settings` 把 `stop_ladder_mode` 从 `disabled` 设为 `shadow`（其他键回读未变：`auto_trade_enabled=true`、
+  `management_execution_mode=live`、`move_stop_to_breakeven_after_tp1=true`）。当时无在仓仓位，影子事件 0 条、收敛行仍为历史 2 条、worker 无报错——符合预期，
+  等首个真实止盈成交样本。
