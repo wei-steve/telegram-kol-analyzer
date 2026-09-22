@@ -54,11 +54,42 @@ GATE_DESCRIPTIONS = {
         "place a backup stop beside a primary stop that was adopted from the "
         "exchange rather than submitted here"
     ),
+    "stop_ladder": (
+        "move a position's stop one take-profit rung behind the stage that "
+        "actually filled -- nothing in phase 1, where every mode is shadow"
+    ),
 }
 
+#: What the ladder's fingerprint says when this process has not read the
+#: setting.  It is a *setting*, not a constant, so "not read" is a third
+#: answer and rendering it as ``disabled`` would claim knowledge nobody has.
+STOP_LADDER_MODE_UNREAD = "unread"
 
-def current_release_gates() -> dict[str, Any]:
-    """Every release gate's current value, as this process holds it."""
+
+def _stop_ladder_shape(
+    stop_ladder_mode: str | None,
+    stop_ladder_activation_after_binding_id: int | None,
+) -> str:
+    mode = str(stop_ladder_mode or STOP_LADDER_MODE_UNREAD)
+    after = (
+        "none"
+        if stop_ladder_activation_after_binding_id is None
+        else str(int(stop_ladder_activation_after_binding_id))
+    )
+    return f"{mode}(after:{after})"
+
+
+def current_release_gates(
+    *,
+    stop_ladder_mode: str | None = None,
+    stop_ladder_activation_after_binding_id: int | None = None,
+) -> dict[str, Any]:
+    """Every release gate's current value, as this process holds it.
+
+    The ladder arrives as a setting rather than a constant, so its value has
+    to be handed in by a caller that read the database; this module still
+    decides nothing and reads nothing.
+    """
 
     values = {
         "break_even_replacement": BREAK_EVEN_REPLACEMENT_RELEASED_POS_IDS,
@@ -86,6 +117,12 @@ def current_release_gates() -> dict[str, Any]:
             "blocked_pos_ids": source_shaped["blocked_pos_ids"],
             "permits": GATE_DESCRIPTIONS[name],
         }
+    gates["stop_ladder"] = {
+        "shape": "setting",
+        "mode": str(stop_ladder_mode or STOP_LADDER_MODE_UNREAD),
+        "activation_after_binding_id": stop_ladder_activation_after_binding_id,
+        "permits": GATE_DESCRIPTIONS["stop_ladder"],
+    }
     return {
         "gates": gates,
         "total_released": sum(
@@ -93,11 +130,20 @@ def current_release_gates() -> dict[str, Any]:
         ),
         # A single line an observation script can compare against, so a window
         # notices a gate changing under it the way it notices the sha changing.
-        "fingerprint": release_gate_fingerprint(),
+        "fingerprint": release_gate_fingerprint(
+            stop_ladder_mode=stop_ladder_mode,
+            stop_ladder_activation_after_binding_id=(
+                stop_ladder_activation_after_binding_id
+            ),
+        ),
     }
 
 
-def release_gate_fingerprint() -> str:
+def release_gate_fingerprint(
+    *,
+    stop_ladder_mode: str | None = None,
+    stop_ladder_activation_after_binding_id: int | None = None,
+) -> str:
     """One short stable string naming every released id.
 
     Deliberately readable rather than hashed: a mismatch should say *what*
@@ -123,13 +169,28 @@ def release_gate_fingerprint() -> str:
     )
     for name in sorted(("adopted_primary_backup_stop", "take_profit_limit_entry")):
         parts.append(f"{name}=by-source(blocked:{blocked or 'none'})")
+    parts.append(
+        "stop_ladder="
+        + _stop_ladder_shape(
+            stop_ladder_mode, stop_ladder_activation_after_binding_id
+        )
+    )
     return ";".join(sorted(parts))
 
 
-def format_release_gates_for_log() -> str:
+def format_release_gates_for_log(
+    *,
+    stop_ladder_mode: str | None = None,
+    stop_ladder_activation_after_binding_id: int | None = None,
+) -> str:
     """The one line the worker logs at startup."""
 
-    return f"release_gates {release_gate_fingerprint()}"
+    return "release_gates " + release_gate_fingerprint(
+        stop_ladder_mode=stop_ladder_mode,
+        stop_ladder_activation_after_binding_id=(
+            stop_ladder_activation_after_binding_id
+        ),
+    )
 
 
 __all__ = [

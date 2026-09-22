@@ -1196,6 +1196,30 @@ def _apply_reconcile_snapshot(
             # stage's trigger price within two ticks, so it needs the tick.
             contract_spec_provider=contract_spec_provider,
         )
+        # Stop ladder phase 1. Order-level fill evidence for every take-profit
+        # rung this round can prove, immediately after the take-profit
+        # reconcile whose vocabulary it shares and before protection health,
+        # so a rung proven here is already ``filled`` when health looks at it
+        # and cannot be reported as missing protection. Read-only against the
+        # exchange; it creates no intent and writes nothing that any live
+        # path acts on.
+        from telegram_kol_research.stop_ladder_records import (
+            reconcile_take_profit_fill_levels,
+        )
+
+        reconcile_take_profit_fill_levels(
+            session,
+            positions=snapshot.positions,
+            pending_orders=snapshot.pending_trigger_orders,
+            trigger_history=snapshot.trigger_history,
+            pending_snapshot_complete_by_instrument=(
+                _pending_tpsl_snapshot_completeness(
+                    snapshot.pending_tpsl_observations
+                )
+            ),
+            snapshot_errors=snapshot.errors,
+            observed_at=recovered_at,
+        )
         from telegram_kol_research.protection_health import (
             reconcile_position_protection_health,
         )
@@ -1324,10 +1348,14 @@ def _record_owned_position_observations(
     completeness_by_instrument = _pending_tpsl_snapshot_completeness(
         snapshot.pending_tpsl_observations
     )
+    # Only the positions this round is actually observing: the ledger lookup
+    # below is per position id, and every leg this process has ever held
+    # would make it an unbounded read for no gain (feedback of 2026-09-15 on
+    # heavy reads against the production database).
     owned_pos_ids = {
         str(leg.pos_id or "").strip()
         for leg in legs
-        if str(leg.pos_id or "").strip()
+        if str(leg.pos_id or "").strip() in positions_by_id
     }
     ledger_pos_id_by_order_id = _ledger_position_by_order_id(
         session, pos_ids=owned_pos_ids

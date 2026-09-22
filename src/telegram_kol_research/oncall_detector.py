@@ -86,10 +86,18 @@ POSITION_ATTRIBUTION_UNKNOWN = "attribution_unknown"
 WATCH_INSTRUCTION_ITEM = "instruction_item"
 WATCH_MANAGEMENT_BATCH = "management_batch"
 WATCH_PROCESSING_JOB = "processing_job"
+#: Stop ladder phase 1. Take-profit ledger rows are watched only so that
+#: "the orders say stage N, the shadow says stage N-1" can be **counted**.
+WATCH_PROTECTION_LEDGER = "protection_ledger"
 
 COUNTER_SKIPPED_NO_POSITION = "counter:skipped_no_position"
 COUNTER_SKIPPED_ATTRIBUTION_UNKNOWN = "counter:skipped_position_attribution_unknown"
 COUNTER_READ_FAILED_ROUNDS = "counter:read_failed_rounds"
+#: The one ladder observable, and it is a counter on purpose. The account
+#: owner ruled out alerting on it: a take profit whose level the shadow has
+#: not recorded is a gap in an observation, not a position at risk -- the
+#: position keeps the stop it already has either way.
+COUNTER_STOP_LADDER_LEVEL_UNRECORDED = "counter:stop_ladder_level_unrecorded"
 META_CONSECUTIVE_READ_FAILURES = "consecutive_read_failures"
 META_CONSECUTIVE_WORKER_HEALTH_FAILURES = "consecutive_worker_health_failures"
 
@@ -97,11 +105,17 @@ HEALTH_CASE_DB_READ = "health:D5a_database_unreadable"
 HEALTH_CASE_WORKER_LOOP = "health:D5b_worker_loop_health"
 HEALTH_CASE_STALLED_JOBS = "health:D4_message_processing_stalled"
 
-#: The only three query shapes this module is allowed to send to production.
+#: The only query shapes this module is allowed to send to production. The
+#: stop-ladder read is registered here as its own line rather than folded into
+#: the generic bounded lookup: ``execution_events`` is a large table and the
+#: index this relies on (``ix_execution_events_pos``) is the whole reason the
+#: read is affordable, so naming it is what keeps a later change honest.
 ALLOWED_QUERY_SHAPES = (
     "watermark: WHERE id > ? ORDER BY id LIMIT n",
     "point: WHERE id = ? / WHERE id IN (?, ...)",
     "bounded indexed lookup: WHERE <indexed column> = ? ... LIMIT n",
+    "stop ladder: SELECT id, action, after_json FROM execution_events "
+    "WHERE pos_id = ? ORDER BY id DESC LIMIT 20",
 )
 
 
@@ -130,6 +144,9 @@ class DetectorConfig:
     #: verified fact rather than an assumption. Matches
     #: ``management_target_verification.DEFAULT_SNAPSHOT_MAX_AGE``.
     position_snapshot_max_age: timedelta = timedelta(minutes=5)
+    #: How long order-level fill evidence may sit ahead of the ladder shadow
+    #: before it is counted. Counted, never alerted (spec section 1 item 6).
+    stop_ladder_unrecorded_after: timedelta = timedelta(minutes=5)
     read_failure_alert_rounds: int = 5
     worker_health_failure_rounds: int = 3
     intake_limit: int = 200
@@ -525,10 +542,14 @@ _CANDIDATE_COLUMNS = (
 )
 _RAW_MESSAGE_COLUMNS = "id, chat_id, message_id, sender_name, posted_at, text"
 
+_LEDGER_COLUMNS = "id, venue, pos_id, purpose, status, evidence_json, updated_at"
+_LADDER_EVENT_ACTION_PREFIX = "stop_ladder"
+
 _WATERMARK_TABLES = (
     ("message_instruction_items", WATCH_INSTRUCTION_ITEM),
     ("strategy_management_batches", WATCH_MANAGEMENT_BATCH),
     ("message_processing_jobs", WATCH_PROCESSING_JOB),
+    ("position_protection_ledger", WATCH_PROTECTION_LEDGER),
 )
 
 
@@ -611,6 +632,7 @@ def run_detection_round(
                     store.resolve_case(case.id, now)
                     resolved.append(case.id)
             resolved.extend(_evaluate_stalled_jobs(reader, store, now, settings, new_cases))
+            _count_stop_ladder_levels_unrecorded(reader, store, now, settings)
             store.set_meta(META_CONSECUTIVE_READ_FAILURES, "0")
             _resolve_health_case(store, HEALTH_CASE_DB_READ, now, resolved)
     except ProductionReadError as exc:
@@ -730,6 +752,126 @@ def _intake(
         )
     if rows:
         store.set_watermark("message_processing_jobs", int(rows[-1]["id"]))
+
+    last_ledger = store.get_watermark("position_protection_ledger") or 0
+    rows = reader.read_forward(
+        "position_protection_ledger", _LEDGER_COLUMNS, last_ledger, config.intake_limit
+    )
+    for row in rows:
+        if str(row["purpose"] or "").lower() in _TAKE_PROFIT_PURPOSES:
+            store.add_watch_item(
+                kind=WATCH_PROTECTION_LEDGER,
+                object_id=int(row["id"]),
+                chat_id=None,
+                now=now,
+            )
+    if rows:
+        store.set_watermark("position_protection_ledger", int(rows[-1]["id"]))
+
+
+#: ``position_protection_ledger.purpose`` values that are take profits.
+_TAKE_PROFIT_PURPOSES = frozenset({"take_profit", "tp", "profit"})
+
+
+def _count_stop_ladder_levels_unrecorded(
+    reader: ProductionReader,
+    store: OncallStateStore,
+    now: datetime,
+    config: DetectorConfig,
+) -> int:
+    """Count take-profit fills the ladder shadow has not caught up with.
+
+    **This never opens a case and never alerts**, by the account owner's
+    explicit instruction, and it is not a safety mechanism: whichever way the
+    comparison comes out, the position keeps the stop it already has.  What it
+    is for is the one thing an observation window otherwise cannot see -- the
+    shadow going quiet while real fills happen -- and a counter is enough for
+    that.
+
+    It also never fails the round.  A ladder read that goes wrong is logged
+    and dropped, because turning a counter's read into the round's verdict
+    would let a diagnostic put the watcher into ``read_failed`` and raise
+    D5a after five rounds.
+    """
+
+    try:
+        watch_items = store.open_watch_items(
+            WATCH_PROTECTION_LEDGER, config.watch_limit
+        )
+        if not watch_items:
+            return 0
+        expired = _expired_watch_ids(watch_items, now, config)
+        store.retire_watch_items(WATCH_PROTECTION_LEDGER, expired)
+        ids = [item.object_id for item in watch_items if item.object_id not in expired]
+        if not ids:
+            return 0
+        rows = reader.read_by_ids("position_protection_ledger", _LEDGER_COLUMNS, ids)
+        store.touch_watch_items(WATCH_PROTECTION_LEDGER, ids, now)
+        found = {int(row["id"]) for row in rows}
+        store.retire_watch_items(
+            WATCH_PROTECTION_LEDGER, [value for value in ids if value not in found]
+        )
+        counted = 0
+        retire: list[int] = []
+        for row in rows:
+            verdict = _stop_ladder_row_verdict(reader, row, now=now, config=config)
+            if verdict is None:
+                continue  # keep watching: the evidence may still arrive
+            retire.append(int(row["id"]))
+            counted += int(verdict)
+        store.retire_watch_items(WATCH_PROTECTION_LEDGER, retire)
+        if counted:
+            store.bump_counter(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, counted)
+        return counted
+    except Exception:  # pragma: no cover - a counter never decides a round
+        logger.warning("oncall stop-ladder count failed", exc_info=True)
+        return 0
+
+
+def _stop_ladder_row_verdict(
+    reader: ProductionReader,
+    row: sqlite3.Row,
+    *,
+    now: datetime,
+    config: DetectorConfig,
+) -> bool | None:
+    """``True`` counted, ``False`` settled, ``None`` still worth watching."""
+
+    if str(row["purpose"] or "").lower() not in _TAKE_PROFIT_PURPOSES:
+        return False
+    evidence = _json_object(row["evidence_json"]).get("take_profit_fill")
+    if not isinstance(evidence, Mapping):
+        return None
+    try:
+        level = int(evidence.get("level"))
+    except (TypeError, ValueError):
+        # Written by ``protection_health``, which knows the order filled but
+        # not where it sits in the ladder. Nothing to compare, nothing to say.
+        return False
+    pos_id = str(row["pos_id"] or "").strip()
+    if not pos_id or level <= 0:
+        return False
+    age = _age(now, as_utc(row["updated_at"]))
+    if age is None or age < config.stop_ladder_unrecorded_after:
+        return None
+    return level > _recorded_stop_ladder_level(reader, pos_id=pos_id)
+
+
+def _recorded_stop_ladder_level(reader: ProductionReader, *, pos_id: str) -> int:
+    rows = reader.query(
+        "SELECT id, action, after_json FROM execution_events "
+        "WHERE pos_id = ? ORDER BY id DESC LIMIT 20",
+        (pos_id,),
+    )
+    levels = [0]
+    for row in rows:
+        if not str(row["action"] or "").startswith(_LADDER_EVENT_ACTION_PREFIX):
+            continue
+        try:
+            levels.append(int(_json_object(row["after_json"]).get("filled_level")))
+        except (TypeError, ValueError):
+            continue
+    return max(levels)
 
 
 def _recheck(

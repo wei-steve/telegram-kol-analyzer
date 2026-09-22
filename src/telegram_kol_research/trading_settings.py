@@ -79,6 +79,16 @@ class TradingSettings:
         "disabled", "shadow", "live"
     ] = "disabled"
     trigger_protection_lineage_activation_after_intent_id: int | None = None
+    #: Stop ladder (``docs/plans/2026-09-23-stop-ladder-phase1-spec.md``).
+    #: ``live`` parses in phase 1 and **behaves as ``shadow``**: the executor
+    #: half does not exist yet, so accepting the word while refusing the
+    #: behaviour is the honest reading, and it is logged every time it is
+    #: consulted rather than silently downgraded.
+    stop_ladder_mode: Literal["disabled", "shadow", "live"] = "disabled"
+    #: Phase 3's watermark, parsed now so that setting it never needs a
+    #: deploy: only bindings newer than this id will be in scope for the
+    #: automatic column. Nothing reads it for a decision in phase 1.
+    stop_ladder_activation_after_binding_id: int | None = None
     entry_preamble_mode: Literal["disabled", "shadow", "live"] = "disabled"
     entry_message_assembly_v2_mode: Literal[
         "disabled", "shadow", "live"
@@ -250,6 +260,27 @@ class TradingSettings:
             and self.trigger_protection_lineage_activation_after_intent_id >= 0
         ):
             return "live"
+        return "disabled"
+
+    @property
+    def effective_stop_ladder_mode(self) -> Literal["disabled", "shadow"]:
+        """What the ladder may actually do right now.
+
+        Phase 1 has no live half at all -- no exchange write exists in any
+        mode -- so ``live`` resolves to ``shadow`` and says so in the log.
+        Mapping it to ``disabled`` instead would answer "somebody asked for
+        more than shadow" by doing less than they already had, and mapping it
+        to a live that does not exist would be a lie.
+        """
+
+        if self.stop_ladder_mode == "live":
+            logger.warning(
+                "stop_ladder_mode=live is not released yet; behaving as shadow "
+                "(phase 1 writes nothing to the exchange in any mode)"
+            )
+            return "shadow"
+        if self.stop_ladder_mode == "shadow":
+            return "shadow"
         return "disabled"
 
     def context_resolution_enabled_for_chat(self, chat_id: int) -> bool:
@@ -508,6 +539,17 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             field_name="trigger_protection_lineage_activation_after_intent_id",
         )
     )
+    stop_ladder_mode = _rollout_mode(
+        raw.get("stop_ladder_mode", defaults.stop_ladder_mode),
+        field_name="stop_ladder_mode",
+    )
+    stop_ladder_activation_after_binding_id = _optional_nonnegative_int_setting(
+        raw.get(
+            "stop_ladder_activation_after_binding_id",
+            defaults.stop_ladder_activation_after_binding_id,
+        ),
+        field_name="stop_ladder_activation_after_binding_id",
+    )
     entry_preamble_mode = _entry_preamble_mode(
         raw.get("entry_preamble_mode", defaults.entry_preamble_mode)
     )
@@ -652,6 +694,10 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         trigger_protection_lineage_activation_after_intent_id=(
             trigger_protection_lineage_activation_after_intent_id
+        ),
+        stop_ladder_mode=stop_ladder_mode,
+        stop_ladder_activation_after_binding_id=(
+            stop_ladder_activation_after_binding_id
         ),
         entry_preamble_mode=entry_preamble_mode,
         entry_message_assembly_v2_mode=entry_message_assembly_v2_mode,

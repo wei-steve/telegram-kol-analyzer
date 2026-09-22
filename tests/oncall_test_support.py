@@ -436,6 +436,8 @@ class ProductionFixture:
         status: str = "failed",
         reason: str | None = "management_stop_action_conflict",
         created_at: datetime | None = None,
+        pos_id: str | None = None,
+        after: dict[str, Any] | None = None,
     ) -> int:
         with self.session_factory() as session:
             row = ExecutionEvent(
@@ -446,7 +448,13 @@ class ProductionFixture:
                 symbol="ETH",
                 side="short",
                 message_id=message_id,
+                pos_id=pos_id,
                 reason=reason,
+                after_json=(
+                    json.dumps(after, ensure_ascii=False, sort_keys=True)
+                    if after is not None
+                    else None
+                ),
                 created_at=naive(created_at or NOW - timedelta(minutes=3)),
             )
             session.add(row)
@@ -462,6 +470,9 @@ class ProductionFixture:
         trigger_price: str = "2500",
         status: str = "verified",
         order_id: str = "order-1",
+        pos_id: str = "pos-1",
+        evidence: dict[str, Any] | None = None,
+        updated_at: datetime | None = None,
     ) -> int:
         with self.session_factory() as session:
             row = PositionProtectionLedger(
@@ -469,7 +480,7 @@ class ProductionFixture:
                 execution_binding_id=execution_binding_id,
                 execution_order_leg_id=execution_order_leg_id,
                 strategy_instance_id="strategy-1",
-                pos_id="pos-1",
+                pos_id=pos_id,
                 instrument_id="ETH-USDT-SWAP",
                 side="short",
                 order_id=order_id,
@@ -478,7 +489,10 @@ class ProductionFixture:
                 size_text="1.0",
                 status=status,
                 evidence_source="reconcile",
-                evidence_json="{}",
+                evidence_json=json.dumps(
+                    evidence or {}, ensure_ascii=False, sort_keys=True
+                ),
+                updated_at=naive(updated_at or NOW),
             )
             session.add(row)
             session.commit()

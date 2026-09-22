@@ -711,6 +711,73 @@ def test_entry_revision_activation_generation_changes_only_with_mode(tmp_path):
         assert activation.updated_at == activated_at.replace(tzinfo=None)
 
 
+@pytest.mark.parametrize("mode", ["disabled", "shadow", "live"])
+def test_stop_ladder_settings_round_trip(tmp_path, mode):
+    session_factory = create_session_factory(tmp_path / f"ladder-{mode}.db")
+
+    saved = save_trading_settings(
+        session_factory,
+        {
+            "stop_ladder_mode": mode,
+            "stop_ladder_activation_after_binding_id": 361,
+        },
+    )
+
+    assert saved.stop_ladder_mode == mode
+    assert saved.stop_ladder_activation_after_binding_id == 361
+    loaded = load_trading_settings(session_factory)
+    assert loaded.stop_ladder_mode == mode
+    assert loaded.stop_ladder_activation_after_binding_id == 361
+
+
+def test_the_stop_ladder_is_off_until_somebody_turns_it_on(tmp_path):
+    session_factory = create_session_factory(tmp_path / "ladder-default.db")
+
+    settings = load_trading_settings(session_factory)
+
+    assert settings.stop_ladder_mode == "disabled"
+    assert settings.stop_ladder_activation_after_binding_id is None
+    assert settings.effective_stop_ladder_mode == "disabled"
+
+
+def test_stop_ladder_live_behaves_as_shadow_and_warns():
+    """Phase 1 has no live half, so ``live`` is accepted and downgraded loudly."""
+
+    settings = trading_settings_from_payload({"stop_ladder_mode": "live"})
+    logger = logging.getLogger("telegram_kol_research.trading_settings")
+    records: list[logging.LogRecord] = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record)
+
+    handler = _Capture()
+    logger.addHandler(handler)
+    try:
+        assert settings.effective_stop_ladder_mode == "shadow"
+    finally:
+        logger.removeHandler(handler)
+
+    assert any(
+        "stop_ladder_mode=live is not released" in record.getMessage()
+        for record in records
+    )
+
+
+@pytest.mark.parametrize("value", ["on", "enabled", True, 1, None, [], {}])
+def test_stop_ladder_mode_fails_closed(value):
+    with pytest.raises(ValueError, match="stop_ladder_mode"):
+        trading_settings_from_payload({"stop_ladder_mode": value})
+
+
+@pytest.mark.parametrize("value", [-1, True, "42", 1.5])
+def test_stop_ladder_watermark_fails_closed(value):
+    with pytest.raises(ValueError, match="stop_ladder_activation_after_binding_id"):
+        trading_settings_from_payload(
+            {"stop_ladder_activation_after_binding_id": value}
+        )
+
+
 def test_entry_preamble_rollout_settings_ignore_legacy_allowlist(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
 

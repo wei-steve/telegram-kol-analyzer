@@ -1218,8 +1218,13 @@ def _plan_strategy_management_batch_locked(
             )
 
     break_even_reference = None
+    stop_ladder_evidence = None
     if intent in IMPLICIT_STOP_ACTIONS:
-        break_even_reference, price_plausibility = _break_even_reference_for_batch(
+        (
+            break_even_reference,
+            price_plausibility,
+            stop_ladder_evidence,
+        ) = _break_even_reference_for_batch(
             session_factory,
             identity=identity,
             lifecycle=lifecycle,
@@ -1315,6 +1320,12 @@ def _plan_strategy_management_batch_locked(
         target_snapshot["break_even_reference"] = (
             break_even_reference.as_evidence()
         )
+    if stop_ladder_evidence is not None:
+        # Evidence only, in phase 1. The batch still aims at the entry
+        # reference above; this records where the ladder *would* have aimed
+        # it, so the two can be compared against real fills before anything
+        # is allowed to act on the difference (spec section 1 item 5).
+        target_snapshot["stop_ladder"] = stop_ladder_evidence
     if contract_spec_resolution.snapshot is not None:
         target_snapshot["contract_spec_snapshot"] = (
             contract_spec_resolution.snapshot
@@ -1709,8 +1720,14 @@ def _break_even_reference_for_batch(
             economics, side=lifecycle.side
         ),
     )
+    ladder_evidence = _stop_ladder_evidence_for_batch(
+        session_factory,
+        lifecycle=lifecycle,
+        economics=economics,
+        reference=reference,
+    )
     if price_plausibility is None:
-        return reference, price_plausibility
+        return reference, price_plausibility, ladder_evidence
 
     side = str(lifecycle.side).lower()
 
@@ -1748,7 +1765,66 @@ def _break_even_reference_for_batch(
         sanitized=price_plausibility,
         now=now,
     )
-    return reference, price_plausibility
+    return reference, price_plausibility, ladder_evidence
+
+
+def _stop_ladder_evidence_for_batch(
+    session_factory: sessionmaker,
+    *,
+    lifecycle: StrategyLifecycle,
+    economics,
+    reference,
+):
+    """Where the ladder *would* aim this batch's stop.  Evidence, not a decision.
+
+    The message column keeps behaving exactly as it does today -- the batch
+    aims at the entry reference -- while this records the level the position's
+    own order-level evidence proves and the target that level implies.  The
+    two can then be compared on a real fill before phase 2 lets the difference
+    matter.  ``disabled`` records nothing at all, and nothing here may raise:
+    a management batch must never fail because a piece of evidence could not
+    be assembled.
+    """
+
+    try:
+        settings = load_trading_settings(session_factory)
+        mode = settings.effective_stop_ladder_mode
+        if mode == "disabled":
+            return None
+        binding_id = getattr(lifecycle, "execution_binding_id", None)
+        pos_ids = [str(position["pos_id"]) for position in economics]
+        if binding_id is None or not pos_ids:
+            return None
+        from telegram_kol_research.stop_ladder import ladder_target
+        from telegram_kol_research.stop_ladder_records import (
+            derive_filled_tp_level,
+        )
+
+        with session_factory() as session:
+            ladder = derive_filled_tp_level(
+                session,
+                execution_binding_id=int(binding_id),
+                pos_ids=pos_ids,
+            )
+        target = ladder_target(
+            side=lifecycle.side,
+            filled_level=ladder.filled_level,
+            rungs_by_position=ladder.rungs_by_position,
+            levels_by_position=ladder.levels_by_position,
+            break_even_reference_price=reference.price,
+            break_even_reference_source=reference.source,
+        )
+        return {
+            "mode": mode,
+            "applied": False,
+            "reference_price": reference.price,
+            "reference_source": reference.source,
+            "target": target.as_evidence(),
+            "ladder": ladder.as_evidence(),
+        }
+    except Exception:  # pragma: no cover - evidence never blocks a batch
+        logger.warning("stop ladder evidence unavailable", exc_info=True)
+        return None
 
 
 def _identity_without_explicit_break_even_prices(

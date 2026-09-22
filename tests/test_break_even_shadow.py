@@ -386,10 +386,19 @@ def test_the_summary_carries_every_field_the_round_log_needs(tmp_path):
     assert set(summary) == {
         "positions_seen", "counts_by_action", "stops_examined", "stops_resolved",
         "legacy_would_refuse", "would_cancel_total", "would_close_positions",
-        "read_failures", "rows",
+        "read_failures", "rows", "stop_ladder",
     }
     assert summary["rows"][0]["pos_id"] == POS
     assert summary["legacy_would_refuse"] == 1
+    # The ladder rides along in the same round and is off by default, so a
+    # round in a database that never set the mode says exactly that.
+    assert summary["stop_ladder"] == {
+        "mode": "disabled",
+        "configured_mode": "disabled",
+        "events_written": 0,
+        "counts_by_action": {},
+        "rows": [],
+    }
 
 
 @pytest.mark.parametrize(

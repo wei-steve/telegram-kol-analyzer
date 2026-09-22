@@ -17,7 +17,10 @@ from telegram_kol_research.models import PositionProtectionLedger
 from telegram_kol_research.models import PositionProtectionRevision
 from telegram_kol_research.models import PositionTakeProfitOrder
 from telegram_kol_research.protection_snapshot import build_position_protection_audit
-from telegram_kol_research.take_profit_fill_predicate import take_profit_fill_proven
+from telegram_kol_research.take_profit_fill_predicate import (
+    EVIDENCE_FORM_BY_TIER,
+    take_profit_fill_proven,
+)
 
 
 CURRENT_PROTECTION_HEALTH_CLASSIFICATIONS = frozenset(
@@ -619,15 +622,17 @@ def reconcile_position_protection_health(
             # incident beside it (production leg 579, eight seconds after TP1
             # filled). ``filled`` is terminal: it is in no reader's active set,
             # so nothing tries to cancel or replace it afterwards.
-            row.status = "filled"
-            row.updated_at = observed_at
-            row.evidence_json = _merged_evidence(
-                row.evidence_json,
-                take_profit_fill={
+            record_take_profit_ledger_fill(
+                row,
+                order_id=order_id,
+                evidence={
                     "evidence_tier": filled.evidence_tier,
-                    "order_id": order_id,
+                    "evidence_form": EVIDENCE_FORM_BY_TIER.get(
+                        filled.evidence_tier or ""
+                    ),
                     "evidence": dict(filled.evidence),
                 },
+                observed_at=observed_at,
             )
             continue
         row.status = "protection_missing" if isinstance(row, PositionProtectionLedger) else "missing"
@@ -637,6 +642,37 @@ def reconcile_position_protection_health(
             evidence={"order_id": order_id}, observed_at=observed_at,
         )
     return created
+
+
+def record_take_profit_ledger_fill(
+    row: PositionProtectionLedger,
+    *,
+    order_id: str,
+    evidence: dict[str, Any],
+    observed_at: datetime,
+) -> None:
+    """Mark one take-profit ledger row as filled.  **The only writer of this.**
+
+    Two callers reach the same conclusion by different routes -- this module's
+    reconcile round, which sees one order's history, and
+    ``stop_ladder_records.reconcile_take_profit_fill_levels``, which knows
+    where that order sits in the position's ladder -- and both share one
+    predicate (:mod:`take_profit_fill_predicate`) and one write.  Two writers
+    with two spellings of "filled" would be two sets of rules for the same
+    word, and the ladder derives its level from whatever is written here.
+
+    ``filled`` is a terminal status in every reader's eyes: the audit in
+    ``docs/composite-upstream-fix-status.md`` section 3 checked each
+    ``status.in_(...)`` and none of the active sets contains it, so a row that
+    filled stops being cancelled, replaced or re-verified.
+    """
+
+    row.status = "filled"
+    row.updated_at = observed_at
+    row.evidence_json = _merged_evidence(
+        row.evidence_json,
+        take_profit_fill={"order_id": str(order_id), **dict(evidence)},
+    )
 
 
 def _proven_filled_take_profit(session, *, row, order_id, histories):

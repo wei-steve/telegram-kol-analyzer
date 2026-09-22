@@ -19,6 +19,7 @@ from telegram_kol_research.oncall_detector import (
     COUNTER_READ_FAILED_ROUNDS,
     COUNTER_SKIPPED_ATTRIBUTION_UNKNOWN,
     COUNTER_SKIPPED_NO_POSITION,
+    COUNTER_STOP_LADDER_LEVEL_UNRECORDED,
     HEALTH_CASE_DB_READ,
     HEALTH_CASE_STALLED_JOBS,
     HEALTH_CASE_WORKER_LOOP,
@@ -716,6 +717,120 @@ def test_a_probe_that_raises_counts_as_a_failure(production, store):
     assert store.get_case_by_key(HEALTH_CASE_WORKER_LOOP) is not None
 
 
+# ------------------------------------------------------- stop ladder count
+
+
+def _ladder_fill(production, *, level=2, updated_at=NOW - timedelta(minutes=10)):
+    binding_id = production.add_binding()
+    leg_id = production.add_order_leg(execution_binding_id=binding_id)
+    production.add_protection_ledger_row(
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        purpose="take_profit",
+        order_id="tp-2",
+        status="filled",
+        pos_id="pos-1",
+        evidence={
+            "take_profit_fill": {
+                "level": level,
+                "evidence_form": "trigger_history",
+                "order_id": "tp-2",
+            }
+        },
+        updated_at=updated_at,
+    )
+    return binding_id
+
+
+def test_the_ladder_counts_a_fill_the_shadow_has_not_recorded(production, store):
+    run_round(production, store)
+    _ladder_fill(production)
+
+    outcome = run_round(production, store)
+
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 1
+    # A counter, not a case: the user ruled out alerting on this entirely.
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_a_shadow_that_recorded_the_same_level_counts_nothing(production, store):
+    run_round(production, store)
+    binding_id = _ladder_fill(production)
+    production.add_execution_event(
+        execution_binding_id=binding_id,
+        action="stop_ladder_would_replace",
+        status="shadow",
+        reason=None,
+        pos_id="pos-1",
+        after={"filled_level": 2, "target_price": "79800"},
+    )
+
+    run_round(production, store)
+
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 0
+
+
+def test_fresh_evidence_is_given_five_minutes_before_it_counts(production, store):
+    run_round(production, store)
+    _ladder_fill(production, updated_at=NOW - timedelta(minutes=1))
+
+    run_round(production, store)
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 0
+
+    run_round(production, store, now=NOW + timedelta(minutes=10))
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 1
+
+
+def test_one_fill_is_counted_once_however_many_rounds_run(production, store):
+    run_round(production, store)
+    _ladder_fill(production)
+
+    for minute in range(3):
+        run_round(production, store, now=NOW + timedelta(minutes=minute))
+
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 1
+
+
+def test_a_ledger_row_without_a_ladder_level_is_never_counted(production, store):
+    """``protection_health`` writes the fill without a level; nothing to compare."""
+
+    run_round(production, store)
+    binding_id = production.add_binding()
+    leg_id = production.add_order_leg(execution_binding_id=binding_id)
+    production.add_protection_ledger_row(
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        purpose="take_profit",
+        order_id="tp-9",
+        status="filled",
+        evidence={"take_profit_fill": {"evidence_tier": "trigger_history_clean_trigger"}},
+        updated_at=NOW - timedelta(minutes=30),
+    )
+
+    run_round(production, store)
+
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 0
+
+
+def test_a_stop_ledger_row_is_not_a_ladder_rung(production, store):
+    run_round(production, store)
+    binding_id = production.add_binding()
+    leg_id = production.add_order_leg(execution_binding_id=binding_id)
+    production.add_protection_ledger_row(
+        execution_binding_id=binding_id,
+        execution_order_leg_id=leg_id,
+        purpose="stop_loss",
+        order_id="sl-1",
+        evidence={"take_profit_fill": {"level": 3}},
+        updated_at=NOW - timedelta(minutes=30),
+    )
+
+    run_round(production, store)
+
+    assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 0
+
+
 # ------------------------------------------------------- read discipline
 
 
@@ -732,6 +847,10 @@ _BOUNDED_SHAPES = (
                r"ORDER BY message_id DESC LIMIT 1$"),
     re.compile(r"^SELECT custom_label, display_name FROM sources WHERE chat_id = \? "
                r"ORDER BY id LIMIT 1$"),
+    re.compile(
+        r"^SELECT id, action, after_json FROM execution_events "
+        r"WHERE pos_id = \? ORDER BY id DESC LIMIT 20$"
+    ),
 )
 
 
@@ -748,12 +867,15 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
     run_round(production, store)
     build_open_position_case(production)
     production.add_processing_job(raw_message_id=production.add_raw_message())
+    _ladder_fill(production)
     readers: list[ProductionReader] = []
     run_round(production, store, readers=readers)
     run_round(production, store, now=NOW + timedelta(minutes=20), readers=readers)
 
     statements = [sql for reader in readers for sql in reader.statements]
     assert statements
+    # The ladder's own read is in there, not just the shapes that predate it.
+    assert any("FROM execution_events" in sql for sql in statements)
     offenders = [sql for sql in statements if not _statement_is_allowed(sql)]
     assert offenders == []
     assert all("SELECT" in sql.upper() for sql in statements)

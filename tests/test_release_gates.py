@@ -68,6 +68,7 @@ def test_every_release_constant_in_the_codebase_is_reported():
         "break_even_full_exit",
         "take_profit_limit_entry",
         "adopted_primary_backup_stop",
+        "stop_ladder",
     }
     # The two predicate-shaped ones must render their conditions, not a list.
     for name in ("take_profit_limit_entry", "adopted_primary_backup_stop"):
@@ -89,8 +90,45 @@ def test_every_gate_says_what_releasing_it_permits():
             # the widest possible permission.
             assert gate["conditions"] not in ("", "all"), name
             assert isinstance(gate["blocked_pos_ids"], list), name
+        elif gate.get("shape") == "setting":
+            # A setting has no constant to read, so the report says which
+            # value this process was handed -- including "unread".
+            assert gate["mode"], name
         else:
             assert gate["count"] == len(gate["released_pos_ids"])
+
+
+def test_the_stop_ladder_reports_the_mode_it_was_handed():
+    report = current_release_gates(
+        stop_ladder_mode="shadow", stop_ladder_activation_after_binding_id=361
+    )
+
+    gate = report["gates"]["stop_ladder"]
+    assert gate == {
+        "shape": "setting",
+        "mode": "shadow",
+        "activation_after_binding_id": 361,
+        "permits": GATE_DESCRIPTIONS["stop_ladder"],
+    }
+    assert "stop_ladder=shadow(after:361)" in report["fingerprint"]
+
+
+def test_an_unread_stop_ladder_setting_is_never_reported_as_disabled():
+    """"Nobody read it" and "it is off" are different facts."""
+
+    text = release_gate_fingerprint()
+
+    assert "stop_ladder=unread(after:none)" in text
+    assert "stop_ladder=disabled" not in text
+
+
+def test_the_stop_ladder_fingerprint_moves_with_the_setting():
+    disabled = release_gate_fingerprint(stop_ladder_mode="disabled")
+    shadow = release_gate_fingerprint(stop_ladder_mode="shadow")
+
+    assert disabled != shadow
+    assert "stop_ladder=disabled(after:none)" in disabled
+    assert "stop_ladder=shadow(after:none)" in shadow
 
 
 def test_the_fingerprint_changes_when_a_gate_changes(monkeypatch):

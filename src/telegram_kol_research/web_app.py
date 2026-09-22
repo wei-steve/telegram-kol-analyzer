@@ -4699,6 +4699,27 @@ def _group_ai_strategy_enabled(group_config: GroupConfig, chat_title: str) -> bo
     )
 
 
+def _stop_ladder_gate_values(session_factory) -> dict[str, Any]:
+    """The ladder's two settings, for the release-gate report.
+
+    A settings read that fails leaves the report saying ``unread`` rather than
+    ``disabled``: the gate report exists so nobody has to guess what a process
+    is holding, and a guess in it would be worse than the silence it replaced.
+    """
+
+    try:
+        settings = load_trading_settings(session_factory)
+    except Exception:
+        logger.warning("release gate report could not read settings", exc_info=True)
+        return {}
+    return {
+        "stop_ladder_mode": settings.stop_ladder_mode,
+        "stop_ladder_activation_after_binding_id": (
+            settings.stop_ladder_activation_after_binding_id
+        ),
+    }
+
+
 def _run_auto_trade_executor(app: FastAPI, *, raw_message_id: int):
     """Run the legacy adapter while preserving a typed exchange boundary."""
 
@@ -5655,7 +5676,12 @@ def create_web_app(
                 # deployed it -- a released gate announces itself to nobody,
                 # which on 2026-09-11 cost a round of two sessions disagreeing
                 # about whether one was open.
-                logger.info("%s", format_release_gates_for_log())
+                logger.info(
+                    "%s",
+                    format_release_gates_for_log(
+                        **_stop_ladder_gate_values(app.state.session_factory)
+                    ),
+                )
                 app.state.lifecycle_monitor = LifecycleMonitor(
                     session_factory=app.state.session_factory,
                     broker=app.state.live_update_broker,
@@ -7081,10 +7107,13 @@ def create_web_app(
         Read-only and process-local: it reports the constants this process
         imported, which is exactly the question an operator or an observation
         script needs answered -- not what the repository says, but what the
-        running worker holds.
+        running worker holds.  The stop ladder is a setting rather than a
+        constant, so its value is read here and handed in.
         """
 
-        return current_release_gates()
+        return current_release_gates(
+            **_stop_ladder_gate_values(app.state.session_factory)
+        )
 
     @app.get("/api/runtime/deployment-identity")
     async def api_runtime_deployment_identity():

@@ -4918,6 +4918,161 @@ def test_raw_17813_restates_cost_and_breaks_even_at_the_strategy_price(
     ] == [("management_price_disposed", "low")]
 
 
+def _fill_take_profit_rungs(session_factory, *, binding_id, pos_id, prices, filled):
+    """Give the position a take-profit ladder, with some rungs already filled."""
+
+    from telegram_kol_research.protection_health import (
+        record_take_profit_ledger_fill,
+    )
+
+    with session_factory() as session:
+        leg = (
+            session.query(ExecutionOrderLeg)
+            .filter_by(execution_binding_id=binding_id, pos_id=pos_id)
+            .one()
+        )
+        for order_id, price in prices:
+            upsert_protection_ledger_row(
+                session,
+                venue="deepcoin",
+                execution_binding_id=binding_id,
+                execution_order_leg_id=leg.id,
+                strategy_instance_id=leg.strategy_instance_id,
+                pos_id=pos_id,
+                instrument_id="BTC-USDT-SWAP",
+                side="short",
+                order_id=order_id,
+                purpose="take_profit",
+                trigger_price=price,
+                size_text="3",
+                status="verified",
+                evidence_source="entry_protection_response",
+                evidence={"match": "exact_written_order"},
+                seen_at=PLANNED_AT,
+            )
+        session.flush()
+        for level, order_id in enumerate(filled, start=1):
+            row = (
+                session.query(PositionProtectionLedger)
+                .filter_by(order_id=order_id, pos_id=pos_id)
+                .one()
+            )
+            record_take_profit_ledger_fill(
+                row,
+                order_id=order_id,
+                evidence={"level": level, "evidence_form": "trigger_history"},
+                observed_at=PLANNED_AT,
+            )
+        session.commit()
+
+
+def test_the_message_column_records_the_ladder_target_without_using_it(
+    monkeypatch, tmp_path
+):
+    """Shadow: the batch still breaks even at the entry price, and says so.
+
+    The production shape -- BTC short, range 80500-81600, only leg 1 holding,
+    take profits 79800 / 79100 / 78400.  With the first two rungs proven
+    filled the ladder's answer is 79800 (rung N-1), while the batch that is
+    actually planned keeps aiming at 80500, exactly as it does today.  Phase 2
+    is what makes the difference matter; phase 1 only has to make it visible.
+    """
+
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "ladder-shadow.db")
+    save_trading_settings(session_factory, {"stop_ladder_mode": "shadow"})
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        pos_ids=("pos-b",),
+        leg_indexes=(1,),
+        entry_range=(80500, 81600),
+    )
+    _fill_take_profit_rungs(
+        session_factory,
+        binding_id=binding_id,
+        pos_id="pos-b",
+        prices=(("tp-1", "79800"), ("tp-2", "79100"), ("tp-3", "78400")),
+        filled=("tp-1", "tp-2"),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position("pos-b", avg_px="80436")])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    assert result.status == "ready"
+    assert result.batch.legs[0].planned_tpsl == {
+        "intent": "move_stop_to_break_even",
+        "stop_loss_text": None,
+        "break_even_reference_price": "80500",
+        "break_even_reference_source": "strategy_first_leg",
+    }
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    ladder = snapshot["stop_ladder"]
+    assert ladder["mode"] == "shadow"
+    assert ladder["applied"] is False
+    assert ladder["reference_price"] == "80500"
+    assert ladder["target"]["price"] == "79800"
+    assert ladder["target"]["source"] == "strategy_take_profit_level_1"
+    assert ladder["ladder"]["filled_level"] == 2
+    assert [rung["trigger_price"] for rung in ladder["ladder"]["positions"][0]["rungs"]] == [
+        "79800",
+        "79100",
+        "78400",
+    ]
+
+
+def test_the_message_column_records_no_ladder_while_the_setting_is_disabled(
+    monkeypatch, tmp_path
+):
+    planner = _planner()
+    session_factory = create_session_factory(tmp_path / "ladder-disabled.db")
+    raw_id, _, binding_id = _persist_exact_management_target(
+        session_factory,
+        intent="move_stop_to_break_even",
+        pos_ids=("pos-b",),
+        leg_indexes=(1,),
+        entry_range=(80500, 81600),
+    )
+    _fill_take_profit_rungs(
+        session_factory,
+        binding_id=binding_id,
+        pos_id="pos-b",
+        prices=(("tp-1", "79800"), ("tp-2", "79100")),
+        filled=("tp-1", "tp-2"),
+    )
+    _disable_reconciliation(monkeypatch, planner)
+    client = _ReadOnlyDeepcoin([_position("pos-b", avg_px="80436")])
+
+    result = planner.plan_strategy_management_batch(
+        session_factory,
+        raw_message_id=raw_id,
+        deepcoin_client=client,
+        contract_spec_provider=_ContractSpecs(),
+        planned_at=PLANNED_AT,
+    )
+
+    with session_factory() as session:
+        snapshot = json.loads(
+            session.get(
+                StrategyManagementBatch, result.batch.id
+            ).target_snapshot_json
+        )
+    assert "stop_ladder" not in snapshot
+    assert snapshot["break_even_reference"]["price"] == "80500"
+
+
 @pytest.mark.parametrize(
     "pos_ids,leg_indexes,expected_price,expected_source",
     [
