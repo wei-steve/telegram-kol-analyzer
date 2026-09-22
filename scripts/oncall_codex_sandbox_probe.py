@@ -154,8 +154,13 @@ handover=$(ls -d SPOOL_PLACEHOLDER/case-* 2>/dev/null | head -1)
 if [ -z "$handover" ]; then
     say 0 "spool 里暂无值守写入的案件目录（跨用户读取未能实测）"
 elif cat "$handover/request.json" >/dev/null 2>&1 && touch "$handover/.probe" 2>/dev/null; then
+    dir_group=$(stat -c %G "$handover"); file_group=$(stat -c %G "$handover/.probe")
     rm -f "$handover/.probe"
-    say 0 "读得到值守用户写的请求，也能在其目录里回写：$handover"
+    if [ "$dir_group" = "$file_group" ]; then
+        say 0 "读得到值守用户写的请求，回写的文件也带上了值守的组（$file_group）：$handover"
+    else
+        say 1 "回写的文件组是 $file_group 而不是 $dir_group：值守读不到 runner 的结果（案件目录缺 setgid）"
+    fi
 else
     say 1 "读不到值守用户写的请求或无法回写：$handover（检查 SupplementaryGroups）"
 fi

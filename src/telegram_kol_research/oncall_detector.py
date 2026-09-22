@@ -120,7 +120,11 @@ class DetectorConfig:
     awaiting_confirmation_after: timedelta = timedelta(minutes=10)
     in_flight_after: timedelta = timedelta(minutes=5)
     batch_fault_after: timedelta = timedelta(minutes=2)
-    processing_job_stalled_after: timedelta = timedelta(minutes=3)
+    #: Spec 4.2 said 3 minutes. Three production days showed ten stalls of one
+    #: or two messages, each over inside 1-14 minutes -- one message in AI
+    #: context resolution, not a stuck queue. Ten minutes keeps the real
+    #: 2026-09-16 shape (queue dead for an hour) and drops that noise.
+    processing_job_stalled_after: timedelta = timedelta(minutes=10)
     case_stale_after: timedelta = timedelta(hours=6)
     #: How recently reconcile must have rewritten a binding for "open" to be a
     #: verified fact rather than an assumption. Matches

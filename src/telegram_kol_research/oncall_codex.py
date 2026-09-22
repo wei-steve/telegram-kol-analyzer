@@ -575,6 +575,15 @@ def atomic_write(path: Path, text: str, *, mode: int = 0o660) -> None:
         os.chmod(temporary, mode)
     except OSError:  # pragma: no cover - a filesystem that refuses chmod
         pass
+    # Belt and braces for the cross-user hand-over: give the file the parent
+    # directory's group. Changing to a group the process belongs to needs no
+    # capability, and the runner is a member of the watcher's group.
+    try:
+        parent_gid = os.stat(target.parent).st_gid
+        if os.stat(temporary).st_gid != parent_gid:
+            os.chown(temporary, -1, parent_gid)
+    except OSError:  # pragma: no cover - not a member of that group
+        pass
     os.replace(temporary, target)
 
 
@@ -613,7 +622,11 @@ class Spool:
 
     root: Path
     file_mode: int = 0o660
-    dir_mode: int = 0o770
+    #: setgid on the case directory: the runner is uid 0 with no DAC override,
+    #: so a result it writes here must inherit this group or the watcher can
+    #: never read it (production, 2026-09-22: every verdict recorded as a
+    #: timeout while sitting on disk as root:root).
+    dir_mode: int = 0o2770
 
     def case_dir(self, case_id: int) -> Path:
         return Path(self.root) / case_dir_name(case_id)

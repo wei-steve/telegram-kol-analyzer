@@ -601,11 +601,11 @@ def test_a_case_open_for_six_hours_goes_stale(production, store):
 # ---------------------------------------------------------------------- D4
 
 
-def test_d4_fires_when_a_job_has_been_queued_for_three_minutes(production, store):
+def test_d4_fires_when_a_job_has_been_queued_for_ten_minutes(production, store):
     run_round(production, store)
     raw_message_id = production.add_raw_message()
     job_id = production.add_processing_job(
-        raw_message_id=raw_message_id, enqueued_at=NOW - timedelta(minutes=9)
+        raw_message_id=raw_message_id, enqueued_at=NOW - timedelta(minutes=12)
     )
 
     run_round(production, store)
@@ -625,7 +625,7 @@ def test_a_stall_that_comes_back_opens_the_health_case_again(production, store):
     run_round(production, store)
     job_id = production.add_processing_job(
         raw_message_id=production.add_raw_message(),
-        enqueued_at=NOW - timedelta(minutes=9),
+        enqueued_at=NOW - timedelta(minutes=12),
     )
     run_round(production, store)
     production.set_job_status(job_id, status="succeeded")
@@ -635,7 +635,7 @@ def test_a_stall_that_comes_back_opens_the_health_case_again(production, store):
     later = NOW + timedelta(minutes=40)
     production.add_processing_job(
         raw_message_id=production.add_raw_message(),
-        enqueued_at=later - timedelta(minutes=5),
+        enqueued_at=later - timedelta(minutes=12),
     )
     outcome = run_round(production, store, now=later)
 

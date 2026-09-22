@@ -515,3 +515,20 @@ def test_this_module_imports_only_the_standard_library():
         stripped = line.strip()
         if stripped.startswith(("import ", "from ")) and "telegram_kol_research" in stripped:
             pytest.fail(f"oncall_codex imports a package module: {stripped}")
+
+
+def test_case_directories_carry_setgid_and_results_take_the_directory_group(tmp_path):
+    """Production, 2026-09-22: root-written verdicts were root:root, unreadable
+    by the watcher, and every diagnosis was recorded as a timeout."""
+
+    import os, stat
+
+    from telegram_kol_research.oncall_codex import Spool, atomic_write
+
+    spool = Spool(tmp_path / "spool")
+    spool.enqueue(case_id=1, attempt=1, kind="management", case_payload={"a": 1},
+                  now=__import__("datetime").datetime(2026, 9, 22, tzinfo=__import__("datetime").UTC))
+    directory = spool.case_dir(1)
+    assert stat.S_IMODE(os.stat(directory).st_mode) & stat.S_ISGID
+    atomic_write(directory / "run.json", "{}")
+    assert os.stat(directory / "run.json").st_gid == os.stat(directory).st_gid
