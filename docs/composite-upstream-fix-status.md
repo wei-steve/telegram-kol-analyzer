@@ -320,3 +320,119 @@ F1+F2 上线之后，这条路径**第一次**会真的写交易所。逐项人�
 - 部署后：最近 15 个消息处理作业全部 succeeded，worker 自重启起错误行 0，值守两个单元 active、心跳正常。
 - 待办：首个真实的"减仓后保本 / 部分止盈 / 调整止损价"样本，按本文件的首笔实盘清单逐项核对（批次不再 `blocked`；组件一证据里出现 `intent_id` 或
   `evidence_tier=trigger_history_clean_trigger`；只撤了本仓位的单；新止损读回后才撤旧止损；仓位离场后无 `composite_position_without_verified_stop`）。
+
+---
+
+## 11. 第 7 节策略问题的裁决与实施（2026-09-22，未部署）
+
+用户（账户所有者）2026-09-22 给出的规则，取代第 7 节记录的现状：
+
+> 形如"第一止盈位已到，锁定利润，及时移动止损"、被识别为 `partial_then_break_even` 的消息——
+> **若系统的第一张止盈单在交易所已经成交**（由 F2 的成交判据证成，`evidence_tier` 为
+> `trigger_history_clean_trigger` 或账本/状态那一类证据）→ **不再减仓**：组件二不平任何仓（目标剩余
+> = 当前实时仓位），组件三照旧把止损移到保本目标。
+> **若第一张止盈还挂着**（未成交）→ 按分数减仓（今天的行为）**并撤掉那张止盈单**（组件一本来就计划了这次撤单，保留）。
+
+其余一律不变：**绝不单凭仓位数量推断成交**；只收紧不放宽；策略价基准；remainder-close 兜底；
+归属/authority 闸门；止盈"先撤后挂"、止损"先挂两张—读回—再撤旧"的顺序全部原样。
+
+### 11.1 判定在哪里做、存在哪里
+
+| 位置 | 做什么 |
+|---|---|
+| `strategy_management_take_profit_consumption.plan_take_profit_consumption`（纯函数） | 唯一做判定的地方，因为**这里也是唯一证成成交的地方**。新增 `first_stage_consumed_by_fill`（仅当第一档不在挂单里且 `take_profit_fill_proven` 成立时为真；`exact_terminal_no_fill`（撤单/过期）与 `no_take_profit_ledger_row` 都是假）与 `effective_target_remaining_size`。 |
+| `strategy_management_composite_executor._first_stage_evidence` | 组件一**三个**确认出口（`no_cancel_required` 直确认、`fill_race` 确认、撤单后的正常确认）统一写入证据：`proven_filled_quantity` / `evidence_tier` / `first_stage_consumed_by_fill` / `effective_target_remaining_size`。 |
+| `_first_stage_consumed_by_fill(session_factory, batch_id, leg_id)` | 组件二与组件三**从库里读回**这个布尔值，绝不重算。组件一与组件二之间重启、组件二与组件三之间重启，都得到同一答案（`tests/...::test_batch_172_restart_between_components_keeps_the_same_decision`）。旧版本确认的组件没有这个键，缺键即 `False`，也就是旧版本的行为。 |
+
+**合约一个字都没改。** `close_fraction` 仍是 `0.5`，`required_components` 仍是三件，
+`management_contract_fingerprint` / `desired_json.contract_fingerprint` 的比对
+（`_validated_candidate_composite_contract`、`create_composite_components_in_session`、
+`management_component_set_is_complete_in_session`、`_load_component`）全部原样通过。
+`desired_json` 也没有被改写——判定走证据，不走 desired。
+
+### 11.2 "有效目标剩余量"为什么是实时仓位，不是 `trusted_start_size`
+
+`trusted_start_size` 是**规划那一刻**的实时仓位。批次 172 形态里它等于实时仓位（0.8），但
+"计划之后、组件一之前 TP1 才成交"这一路（组件一的 `fill_race` 分支）里它是成交**前**的 1.5。
+用它当目标会有两种坏结果：组件二把 `current < target` 判成 `position_below_target_remaining`
+直接 operator_required；组件一的超额计算以 1.5 为界，可能留下**总量大于仓位**的止盈。
+所以 `_plan` 把 `snapshot["positions"]` 里本 posId 的实时数量传给纯函数，
+纯函数在"第一档已成交"时以它为目标；**读不到实时数量就拒绝**
+（`target_live_position_not_unique`，recovery_required 可重试），不退回合约目标——
+读不到不等于没变。组件二、组件三同样各自用自己那次实时读取。
+
+### 11.3 超额止盈的撤单口径怎么变的
+
+`plan_take_profit_consumption` 里
+`excess = max(0, retained_total - target_remaining)` 变成
+`excess = max(0, retained_total - effective_target_remaining)`。
+
+- 批次 172：TP2+TP3 = 0.8，实时仓位 0.8 → excess = 0 → **一张都不撤**（此前按 0.4 的目标撤掉 TP2）。
+- TP1 仍挂着：目标仍是合约目标 0.8（1.5 的一半按 0.1 步长向下取整是 0.7），excess = 0 → 只撤 TP1。
+- 阶梯超过仓位（TP2 0.4 + TP3 0.7 vs 实时 0.8）：excess = 0.3 → 仍然释放较早的 TP2。
+  **"不再减仓"从不意味着留下比仓位还多的止盈。**
+
+### 11.4 组件三也必须跟着走
+
+组件三原来三处直接用 `desired["target_remaining_size"]`：收敛校验（`partial_close_component_not_converged`）、
+新止损 payload 的 `sz`、以及写账本的 `size_text`。跳过减仓之后这三处若仍是 0.4，
+**新止损只会保护半个仓位**。三处一并改用同一个 `effective_target_remaining`
+（跳过时 = 本次实时读取的仓位数量，否则逐字等于原值）。
+`retained_take_profit_total(..., live_position_size=...)` 这道
+"止盈总量不得超过仓位"的终检原样保留。
+
+### 11.5 完成校验与通知看到什么
+
+- `validate_composite_management_completion` 只要求每个组件 `confirmed` 且证据非空，
+  跳过路径照样写两条证据，通过。
+- 组件二跳过时：`reason_code = partial_close_skipped_first_take_profit_filled`（`confirmed` 状态上带
+  reason，`execute_composite_management_batch` 只看 status，不受影响），
+  证据 `{"remaining_size": <实时仓位>, "planned_close_size": "0", "first_take_profit_filled": true,
+  "evidence_tier": "first_take_profit_already_filled"}`。
+- `_complete_composite_batch` 从所有组件证据里收 `remaining_size`，所以完成通知的
+  `partial_close` 一栏显示的是"剩余 0.8"（真实剩余），不是旧目标 0.4。
+
+### 11.6 设计未覆盖、由我决定的事项
+
+1. **判定的存放形式**：写进组件一 `evidence_json` 的追加项，而不是改 `desired_json`。
+   理由：`desired_json` 参与 `_load_component` 的身份校验与 `create_management_component`
+   的不可变身份比较，证据列表则已有同构先例（`_remainder_closed_legs` 就是按证据里的
+   `outcome` 标记回读的）。
+2. **"有效目标剩余量"取实时仓位**（第 11.2 节），并在读不到时拒绝而不是回退。
+3. **组件二仍然调用 `target_remaining_close_delta`**（只是把目标换成实时仓位），
+   而不是另起一条完全绕过它的分支：这样"仓位不得变大""仓位必须为正""唯一仓位"
+   三道既有闸门在跳过路径上继续生效，delta 必为 `"0"` 则由构造保证。
+4. **`exact_terminal_no_fill` 不算成交**：第一档被撤销/过期没有落袋任何利润，
+   分数照旧作用。`no_take_profit_ledger_row`（批次 159 形态）同理，行为不变。
+5. **组件二的 reason code 记在 `confirmed` 上**。设计要求"显式原因"；
+   现有代码没有"确认且带原因"的先例，但没有任何读取者把 `confirmed` + 非空 reason 当失败
+   （批次执行器只看 status）。
+
+### 11.7 已知风险（本次未修，非本次引入）
+
+**止盈成交与账本状态之间有一个窗口。** 组件一证成成交**不写保护账本**——把成交的止盈行写成
+`filled` 的是 `protection_health` 的对账轮（F2）。因此在"TP1 在本批次执行中途才成交"
+（`fill_race`）这一路，TP1 的账本行此刻仍是 `verified`，三档相加超过实时仓位，
+组件三的 `retained_take_profit_total` 抛 `retained_take_profit_exceeds_position`，批次停下。
+**这与本次策略改动无关，改动前同一形态经"已在目标"路径停在同一处**；
+测试 `test_batch_172_first_take_profit_filling_mid_cancel_does_not_reduce` 把它逐项钉住了。
+停下来的那一刻**没有写过任何新止损，原 1.5 的止损仍然武装**，所以这是安全的一侧。
+真正修它需要让组件一（或它调用的某处）在证成成交时就落账本状态，那是独立的一项。
+
+### 11.8 测试
+
+| 文件 | 新增/改写 |
+|---|---|
+| `tests/test_composite_production_batch_shapes.py` | 172 形态改为新策略（不撤任何止盈、不减仓、止损按 0.8 挂两张再撤旧）；TP1 仍挂着的同形态（撤 TP1、减 0.7、剩 0.8）；组件一与组件二之间**重启**后决策不变；**空单镜像**（2610/2580/2550，市价 2600）；阶梯超过仓位时仍释放较早一档；`fill_race`（撤单被拒 + 刚刚成交）路径。夹具新增 `side` 与 `tp1_pending` / `tp_sizes` 参数，`set_position_sltp` 的回读行改用 payload 的 `posSide`。 |
+| `tests/test_strategy_management_take_profit_consumption.py` | 纯函数层：已成交的第一档以实时仓位为目标且不释放后续档；超过仓位时仍释放；**没有实时数量则拒绝**；仍挂着的第一档保持合约目标；`exact_terminal_no_fill` 不算成交。`_plan` 夹具新增 `live` 参数（默认 `"6"`）。 |
+
+### 11.9 全量结果
+
+`uv run python -m pytest -q` 在最终候选上跑一次：
+**9540 passed, 4 skipped, 107 warnings, 830.43s (0:13:50)，退出码 0。**
+对第 8 节记录的 9530 / 4 净增 10 条（批次形态文件 +6，消费规划器纯函数 +5，
+原 172 的两条断言被改写而非新增，其中一条更名）。
+（`uv run pytest` 仍在收集阶段失败，既有问题，与本次改动无关。）
+
+**未部署、未推送、未连服务器、未触碰真实交易所、未发任何 Telegram/MQTT 通知。**
+基线 `f807a79f`（生产运行 `fa72cf76`，其后均为文档提交）。

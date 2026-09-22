@@ -142,6 +142,7 @@ def _plan(
     authority=None,
     recorded_order_statuses=None,
     pending_snapshot_complete=True,
+    live="6",
 ):
     pending = list(pending)
     return plan_take_profit_consumption(
@@ -159,6 +160,7 @@ def _plan(
         ),
         pending_snapshot_complete=pending_snapshot_complete,
         recorded_order_statuses=recorded_order_statuses,
+        live_position_size=live,
     )
 
 
@@ -226,6 +228,135 @@ def test_recorded_order_status_is_accepted_as_durable_fill_proof():
     assert result.refusal_code is None
     assert result.proven_filled_quantity == "4"
     assert result.evidence_tier == "recorded_take_profit_order_status"
+
+
+# --- The account owner's rule of 2026-09-22 ----------------------------------
+
+
+def test_a_filled_first_stage_targets_the_live_position_not_the_fraction():
+    """A filled TP1 *is* the reduction, so nothing later is excess."""
+
+    result = _plan(
+        ledger=[
+            _ledger("tp-1", 4, stage=1, status="filled"),
+            _ledger("tp-2", 3, stage=2),
+            _ledger("tp-3", 3, stage=3),
+        ],
+        pending=[_pending("tp-2", 3), _pending("tp-3", 3)],
+        trigger_history=[
+            trigger_history_row(
+                ord_id="tp-1",
+                inst_id=INSTRUMENT,
+                pos_side="long",
+                trigger_price="65000",
+                size="4",
+            )
+        ],
+        target="5",
+        live="6",
+    )
+
+    assert result.refusal_code is None
+    assert result.first_stage_consumed_by_fill is True
+    assert result.effective_target_remaining_size == "6"
+    # Against the contract's 5 the pair would have been 1 over and tp-2 would
+    # have been released for a reduction that is not going to happen.
+    assert result.cancel_order_ids == ()
+    assert [row["order_id"] for row in result.retained_rows] == ["tp-2", "tp-3"]
+
+
+def test_a_filled_first_stage_still_releases_stages_beyond_the_position():
+    """Not reducing never means leaving more take profit than position."""
+
+    result = _plan(
+        ledger=[
+            _ledger("tp-1", 4, stage=1, status="filled"),
+            _ledger("tp-2", 3, stage=2),
+            _ledger("tp-3", 4, stage=3),
+        ],
+        pending=[_pending("tp-2", 3), _pending("tp-3", 4)],
+        trigger_history=[
+            trigger_history_row(
+                ord_id="tp-1",
+                inst_id=INSTRUMENT,
+                pos_side="long",
+                trigger_price="65000",
+                size="4",
+            )
+        ],
+        target="5",
+        live="6",
+    )
+
+    assert result.refusal_code is None
+    assert result.cancel_order_ids == ("tp-2",)
+    assert [row["order_id"] for row in result.retained_rows] == ["tp-3"]
+
+
+def test_a_filled_first_stage_without_a_live_size_refuses():
+    """The live size is what the rule means; unread is not "unchanged"."""
+
+    result = _plan(
+        ledger=[
+            _ledger("tp-1", 4, stage=1, status="filled"),
+            _ledger("tp-2", 3, stage=2),
+        ],
+        pending=[_pending("tp-2", 3)],
+        trigger_history=[
+            trigger_history_row(
+                ord_id="tp-1",
+                inst_id=INSTRUMENT,
+                pos_side="long",
+                trigger_price="65000",
+                size="4",
+            )
+        ],
+        live=None,
+    )
+
+    assert result.refusal_code == "target_live_position_not_unique"
+    assert result.cancel_order_ids == ()
+
+
+def test_a_pending_first_stage_keeps_the_contract_target():
+    """The other half of the rule: still resting means reduce as planned."""
+
+    result = _plan(
+        ledger=[
+            _ledger("tp-1", 4, stage=1),
+            _ledger("tp-2", 3, stage=2),
+            _ledger("tp-3", 3, stage=3),
+        ],
+        pending=[_pending("tp-1", 4), _pending("tp-2", 3), _pending("tp-3", 3)],
+        target="5",
+        live="10",
+    )
+
+    assert result.first_stage_consumed_by_fill is False
+    assert result.effective_target_remaining_size == "5"
+    assert result.cancel_order_ids == ("tp-1", "tp-2")
+
+
+def test_a_cancelled_first_stage_is_not_a_fill():
+    """``exact_terminal_no_fill`` took no profit, so the fraction stands."""
+
+    result = _plan(
+        ledger=[
+            _ledger("tp-1", 4, stage=1),
+            _ledger("tp-2", 3, stage=2),
+            _ledger("tp-3", 3, stage=3),
+        ],
+        pending=[_pending("tp-2", 3), _pending("tp-3", 3)],
+        order_history=[{"ordId": "tp-1", "state": "cancelled"}],
+        target="5",
+        live="10",
+    )
+
+    assert result.refusal_code is None
+    assert result.evidence_tier == "exact_terminal_no_fill"
+    assert result.first_stage_consumed_by_fill is False
+    assert result.effective_target_remaining_size == "5"
+    assert result.cancel_order_ids == ("tp-2",)
 
 
 def test_pending_first_take_profit_produces_exact_cancel_action():

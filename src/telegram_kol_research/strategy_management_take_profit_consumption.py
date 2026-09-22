@@ -21,6 +21,15 @@ established and the one batch 173's successful path already goes through.  The
 caller resolves it (it needs a session); this module stays pure and is handed
 the result.
 
+One policy lives here too, because this is where the fill is proven.  The
+account owner's rule of 2026-09-22: for an instruction like
+"第一止盈位已到，锁定利润，及时移动止损", a first take-profit stage that has
+**already filled on the exchange** is the reduction, and the position must not
+be reduced a second time.  A first stage still resting is cancelled and the
+fraction applies as before.  The verdict is ``first_stage_consumed_by_fill``;
+the caller persists it so components two and three reach the same answer after
+a restart.
+
 What did **not** change: an order this module cannot place is never cancelled.
 Orders proven to belong to another position are skipped; an unplaceable order
 on our own side freezes the component
@@ -85,6 +94,19 @@ class TakeProfitConsumptionPlan:
     retained_rows: tuple[dict[str, str], ...] = ()
     resize_rows: tuple[dict[str, str], ...] = ()
     evidence_tier: str = "none"
+    #: Whether the first staged take profit was already filled on the exchange,
+    #: proven by ``take_profit_fill_predicate`` rather than inferred from the
+    #: position's size. The account owner's rule of 2026-09-22 hangs on exactly
+    #: this: a "第一止盈位已到，锁定利润" instruction whose first stage has
+    #: already filled must not reduce the position a second time.
+    first_stage_consumed_by_fill: bool = False
+    #: The remaining size this leg is actually converging on, which is the
+    #: contract's target unless the first stage filled, in which case it is the
+    #: live position -- nothing further is taken. Components two and three read
+    #: the *decision* back from the durable record and re-derive this from
+    #: their own live read; it is carried here so the number a person needs is
+    #: in the evidence beside the decision that produced it.
+    effective_target_remaining_size: str = ""
     refusal_code: str | None = None
 
 
@@ -102,6 +124,7 @@ def plan_take_profit_consumption(
     protection_authority: ProtectionAuthority | None = None,
     pending_snapshot_complete: bool = True,
     recorded_order_statuses: dict[str, tuple[str, ...]] | None = None,
+    live_position_size=None,
 ) -> TakeProfitConsumptionPlan:
     if contract.take_profit_consumption != "consume_first_stage":
         return _refusal("take_profit_consumption_policy_missing")
@@ -203,8 +226,12 @@ def plan_take_profit_consumption(
     if not owned_rows:
         # No live take-profit stage to consume. Every resting take profit on
         # this position has already been accounted for above, so there is
-        # nothing to cancel and nothing unknown.
-        return TakeProfitConsumptionPlan(evidence_tier="no_take_profit_ledger_row")
+        # nothing to cancel and nothing unknown. There is also no filled first
+        # stage, so the contract's target stands (batch 159's shape).
+        return TakeProfitConsumptionPlan(
+            evidence_tier="no_take_profit_ledger_row",
+            effective_target_remaining_size=_decimal_text(target_remaining),
+        )
 
     first = owned_rows[0]
     first_order_id = str(first["order_id"])
@@ -212,6 +239,7 @@ def plan_take_profit_consumption(
 
     cancel_ids: list[str] = []
     filled_quantity = Decimal("0")
+    first_stage_consumed_by_fill = False
     if first_order_id in pending_by_id:
         cancel_ids.append(first_order_id)
         evidence_tier = "exact_pending_owned_order"
@@ -248,6 +276,7 @@ def plan_take_profit_consumption(
             if filled_quantity > first_size:
                 return _refusal("take_profit_order_identity_conflict")
             evidence_tier = verdict.evidence_tier or "exact_terminal_fill"
+            first_stage_consumed_by_fill = True
         elif _terminal_no_fill(first_order_id, order_history):
             evidence_tier = "exact_terminal_no_fill"
         else:
@@ -268,10 +297,25 @@ def plan_take_profit_consumption(
             }
         )
 
+    # The account owner's rule of 2026-09-22: when the first stage has already
+    # filled, that fill *is* the reduction this instruction asked for, so the
+    # position converges on what is live now rather than on the contract's
+    # fraction of it. The later stages must be bounded by that same number --
+    # against the contract's target they would look like excess and be
+    # cancelled for a reduction that is no longer going to happen, and against
+    # the pre-fill start size they could outsize the position that is left.
+    # The live size is the only one that is both.
+    effective_target_remaining = target_remaining
+    if first_stage_consumed_by_fill:
+        live_size = _decimal_or_none(live_position_size)
+        if live_size is None or live_size <= 0:
+            return _refusal("target_live_position_not_unique")
+        effective_target_remaining = live_size
+
     retained_total = sum(
         (Decimal(row["desired_size"]) for row in retained), Decimal("0")
     )
-    excess = max(Decimal("0"), retained_total - target_remaining)
+    excess = max(Decimal("0"), retained_total - effective_target_remaining)
     resize_rows = []
     bounded_retained = []
     for row in retained:
@@ -304,6 +348,8 @@ def plan_take_profit_consumption(
         retained_rows=tuple(bounded_retained),
         resize_rows=tuple(resize_rows),
         evidence_tier=evidence_tier,
+        first_stage_consumed_by_fill=first_stage_consumed_by_fill,
+        effective_target_remaining_size=_decimal_text(effective_target_remaining),
     )
 
 

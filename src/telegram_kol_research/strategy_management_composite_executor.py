@@ -84,6 +84,15 @@ REMAINDER_CLOSE_EXECUTION_KEY = "remainder_close_execution"
 REMAINDER_CLOSE_OUTCOME = "remainder_closed_at_market"
 REMAINDER_CLOSE_BATCH_REASON = "composite_remainder_market_closed"
 REMAINDER_CLOSE_INCIDENT_TYPE = "composite_break_even_remainder_closed"
+# The account owner's rule of 2026-09-22: a "第一止盈位已到，锁定利润" whose
+# first take profit has already filled on the exchange has had its reduction,
+# so component two closes nothing and says so in its own reason code rather
+# than looking like an ordinary already-at-target confirmation. Free text in
+# its own column, like the names above: no new status, no schema change.
+PARTIAL_CLOSE_SKIPPED_BY_FILL_REASON = (
+    "partial_close_skipped_first_take_profit_filled"
+)
+
 _UNRESOLVED_CLOSE_INTENT_STATUSES = (
     "reserved", "submitting", "submitted", "recovery_required",
 )
@@ -493,6 +502,84 @@ def _require_remainder_terminalization_identity(session, *, batch) -> None:
         raise RuntimeError("composite_remainder_terminalization_identity_mismatch")
 
 
+def _first_stage_evidence(plan: TakeProfitConsumptionPlan) -> dict[str, Any]:
+    """What component one leaves behind about the first take-profit stage.
+
+    ``proven_filled_quantity`` and ``evidence_tier`` are audit only -- when a
+    stage filled by itself, what this component believed had already been taken
+    is otherwise unrecoverable from the record.
+
+    ``first_stage_consumed_by_fill`` is **not** audit only: it is the decision
+    itself, taken here because this is the one place the fill is proven, and
+    written down here because a restart between components must reach the same
+    answer.  Components two and three read it back with
+    ``_first_stage_consumed_by_fill``; they never re-derive it.
+    """
+
+    return {
+        "proven_filled_quantity": plan.proven_filled_quantity,
+        "evidence_tier": plan.evidence_tier,
+        "first_stage_consumed_by_fill": bool(plan.first_stage_consumed_by_fill),
+        "effective_target_remaining_size": plan.effective_target_remaining_size,
+    }
+
+
+def _first_stage_consumed_by_fill(session_factory, *, batch_id, leg_id) -> bool:
+    """Whether component one confirmed because the first stage had filled.
+
+    Read from the durable record, never recomputed: component one is the only
+    place that proves a fill, and a batch that restarts between components must
+    not be able to answer this differently the second time.  A component
+    confirmed by an earlier release carries no such key, and the absent key is
+    ``False`` -- exactly the behaviour that release had.
+    """
+
+    with session_factory() as session:
+        rows = (
+            session.query(StrategyManagementComponent)
+            .filter(
+                StrategyManagementComponent.management_batch_id == int(batch_id),
+                StrategyManagementComponent.strategy_management_leg_id == leg_id,
+                StrategyManagementComponent.component_kind
+                == "consume_take_profit_stage",
+            )
+            .all()
+        )
+        for row in rows:
+            if str(row.status) != "confirmed":
+                continue
+            try:
+                history = json.loads(row.evidence_json or "[]")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+            if not isinstance(history, list):
+                continue
+            if any(
+                isinstance(item, dict)
+                and item.get("first_stage_consumed_by_fill") is True
+                for item in history
+            ):
+                return True
+    return False
+
+
+def _live_position_size_text(live_position: Any) -> str:
+    """The live position's size as an exact decimal string.
+
+    Used as the remaining-size target when the first take profit already filled
+    and nothing further is being closed.  Unreadable is an error, never zero.
+    """
+
+    try:
+        size = Decimal(str(live_position.get("pos")))
+    except (InvalidOperation, TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("target_live_position_size_invalid") from exc
+    if not size.is_finite() or size <= 0:
+        raise ValueError("target_live_position_size_invalid")
+    normalized = format(size.normalize(), "f")
+    return "0" if normalized in {"", "-0"} else normalized
+
+
 def execute_take_profit_consumption_component(
     session_factory,
     *,
@@ -585,7 +672,7 @@ def execute_take_profit_consumption_component(
             "confirmed",
             now,
             None,
-            {"proven_filled_quantity": plan.proven_filled_quantity},
+            _first_stage_evidence(plan),
         )
         return _current_result(
             session_factory,
@@ -677,7 +764,11 @@ def execute_take_profit_consumption_component(
             _transition(
                 session_factory, component_id, "submitting", "confirmed",
                 now_provider(), None,
-                {"intent_id": result.intent_id, "fill_race": True},
+                {
+                    "intent_id": result.intent_id,
+                    "fill_race": True,
+                    **_first_stage_evidence(refreshed_plan),
+                },
             )
             return _current_result(
                 session_factory, component_id,
@@ -791,17 +882,7 @@ def execute_take_profit_consumption_component(
     _transition(
         session_factory, component_id, "submitting", "confirmed",
         now_provider(), None,
-        {
-            "intent_id": result.intent_id,
-            # Additive evidence only: nothing reads this to decide anything.
-            # It is here because when a stage filled by itself, what this
-            # component believed had already been taken is otherwise
-            # unrecoverable from the record -- and that is precisely the number
-            # a person needs to judge whether component two's fraction, which
-            # is taken of the *current* position, is the intended one.
-            "proven_filled_quantity": plan.proven_filled_quantity,
-            "evidence_tier": plan.evidence_tier,
-        },
+        {"intent_id": result.intent_id, **_first_stage_evidence(plan)},
     )
     return _current_result(
         session_factory,
@@ -844,6 +925,11 @@ def execute_partial_close_component(
                 status="recovery_required", component_id=component.id,
                 reason_code="composite_predecessor_not_confirmed",
             )
+    skip_close = _first_stage_consumed_by_fill(
+        session_factory,
+        batch_id=batch.id,
+        leg_id=component.strategy_management_leg_id,
+    )
     if component.attempt_count >= 3:
         _terminalize_retry_exhausted(
             session_factory, component_id, now,
@@ -869,9 +955,19 @@ def execute_partial_close_component(
         live_position = _unique_live_position(positions, desired["pos_id"])
         if live_position is None:
             raise RuntimeError("target_live_position_not_unique")
+        # The first stage having filled makes the live position the target: the
+        # profit this instruction asked to lock in has already been taken, so
+        # the delta below is zero by construction and no close is submitted.
+        # Every other guard the sizing function applies -- the position may not
+        # have grown, it must still be positive -- is kept.
+        effective_target_remaining = (
+            _live_position_size_text(live_position)
+            if skip_close
+            else desired["target_remaining_size"]
+        )
         delta = target_remaining_close_delta(
             trusted_start_size=desired["trusted_start_size"],
-            target_remaining_size=desired["target_remaining_size"],
+            target_remaining_size=effective_target_remaining,
             current_size=live_position.get("pos"),
             quantity_step=desired["quantity_step"],
             min_quantity=desired["min_quantity"],
@@ -896,7 +992,17 @@ def execute_partial_close_component(
         )
         _transition(
             session_factory, component_id, "submitting", "confirmed", now,
-            evidence={"remaining_size": desired["target_remaining_size"]},
+            reason=(PARTIAL_CLOSE_SKIPPED_BY_FILL_REASON if skip_close else None),
+            evidence=(
+                {
+                    "remaining_size": effective_target_remaining,
+                    "planned_close_size": "0",
+                    "first_take_profit_filled": True,
+                    "evidence_tier": "first_take_profit_already_filled",
+                }
+                if skip_close
+                else {"remaining_size": desired["target_remaining_size"]}
+            ),
         )
         return _current_result(session_factory, component_id)
     try:
@@ -1065,6 +1171,9 @@ def execute_protection_replacement_component(
                 status="recovery_required", component_id=component.id,
                 reason_code="composite_predecessor_not_confirmed",
             )
+    skipped_close = _first_stage_consumed_by_fill(
+        session_factory, batch_id=batch.id, leg_id=leg.id
+    )
     with session_factory() as session:
         if not claim_management_component(
             session, component_id=component.id, now=now,
@@ -1081,6 +1190,11 @@ def execute_protection_replacement_component(
     live_position: Any = None
     requested_stop: Any = None
     market_price: Any = None
+    # The size the replacement stops must cover. Normally the converged target;
+    # when the filled first stage cancelled the second reduction it is the
+    # whole live position, because a stop written for the old target would
+    # leave the rest of the position unprotected.
+    effective_target_remaining = desired["target_remaining_size"]
     try:
         positions = deepcoin_client.list_positions(inst_id=desired["instrument_id"])
         if not isinstance(positions, list):
@@ -1105,9 +1219,11 @@ def execute_protection_replacement_component(
         live_position = _unique_live_position(positions, desired["pos_id"])
         if live_position is None:
             raise RuntimeError("target_live_position_not_unique")
+        if skipped_close:
+            effective_target_remaining = _live_position_size_text(live_position)
         if target_remaining_close_delta(
             trusted_start_size=desired["trusted_start_size"],
-            target_remaining_size=desired["target_remaining_size"],
+            target_remaining_size=effective_target_remaining,
             current_size=live_position.get("pos"),
             quantity_step=desired["quantity_step"],
             min_quantity=desired["min_quantity"],
@@ -1217,7 +1333,7 @@ def execute_protection_replacement_component(
         "instId": desired["instrument_id"],
         "posSide": contract.side,
         "posId": desired["pos_id"],
-        "sz": desired["target_remaining_size"],
+        "sz": effective_target_remaining,
         "slTriggerPxType": "last",
         "slOrdPx": "-1",
     }
@@ -1375,13 +1491,13 @@ def execute_protection_replacement_component(
                         role="primary_stop",
                         order_id=created_order_ids[0],
                         trigger_price=decision.primary_stop,
-                        size_text=desired["target_remaining_size"],
+                        size_text=effective_target_remaining,
                     ),
                     VerifiedProtectionReplacement(
                         role="backup_stop",
                         order_id=created_order_ids[1],
                         trigger_price=decision.backup_stop,
-                        size_text=desired["target_remaining_size"],
+                        size_text=effective_target_remaining,
                     ),
                     *retained_take_profits,
                 ),
@@ -2338,6 +2454,7 @@ def _exchange_snapshot(client: Any, instrument_id: str) -> dict[str, list]:
 
 
 def _plan(session_factory, batch, leg, contract, desired, snapshot):
+    live_position = _unique_live_position(snapshot["positions"], leg.pos_id)
     with session_factory() as session:
         ledger = session.query(PositionProtectionLedger).filter(
             PositionProtectionLedger.execution_binding_id == batch.execution_binding_id,
@@ -2388,6 +2505,12 @@ def _plan(session_factory, batch, leg, contract, desired, snapshot):
             # so reaching here means the pending read was complete.
             pending_snapshot_complete=True,
             recorded_order_statuses=recorded_statuses,
+            # Only consulted when the first stage is proven filled, where the
+            # position this leg converges on is the live one rather than the
+            # contract's fraction of it.
+            live_position_size=(
+                live_position.get("pos") if live_position is not None else None
+            ),
         )
 
 

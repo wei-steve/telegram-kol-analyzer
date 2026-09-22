@@ -30,6 +30,7 @@ from deepcoin_production_rows import (
 )
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deepcoin_client import DeepcoinDefiniteRejection
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
@@ -100,6 +101,7 @@ def _build_batch(
     *,
     legs,
     avg_entry_price="2650",
+    side="long",
 ):
     """One batch with one management leg per entry in ``legs``.
 
@@ -107,7 +109,7 @@ def _build_batch(
     and ``ledger`` (a list of ``(order_id, purpose, price, size, status)``).
     """
 
-    contract = _contract()
+    contract = _contract(side=side)
     contract_json = serialize_management_contract(contract)
     fingerprint = management_contract_fingerprint(contract)
     with session_factory() as session:
@@ -128,7 +130,7 @@ def _build_batch(
             chat_id=701,
             message_id=1,
             symbol="ETH",
-            side="long",
+            side=side,
             lifecycle_status="entered",
             signal_at=NOW,
         )
@@ -138,7 +140,7 @@ def _build_batch(
             chat_id=701,
             message_id=1,
             symbol="ETH",
-            side="long",
+            side=side,
             venue="deepcoin",
             margin_mode="cross",
             position_mode="split",
@@ -255,7 +257,7 @@ def _build_batch(
                         strategy_instance_id=binding.strategy_instance_id,
                         pos_id=leg["pos_id"],
                         instrument_id=INSTRUMENT,
-                        side="long",
+                        side=side,
                         order_id=order_id,
                         purpose=purpose,
                         trigger_price=price,
@@ -341,7 +343,7 @@ class _ProductionShapeClient:
             pending_stop_row(
                 ord_id=order_id,
                 inst_id=INSTRUMENT,
-                pos_side="long",
+                pos_side=str(payload["posSide"]),
                 trigger_price=str(payload["slTriggerPx"]),
                 size=str(payload["sz"]),
             )
@@ -365,63 +367,106 @@ def _run(session_factory, batch_id, client):
 
 BATCH_172_POS = "1001125231241310"
 
+#: The ladder the strategy staged on the original 1.5, and the market price at
+#: the moment the instruction arrived.  The short row is the long row mirrored
+#: across the 2650 entry, so a break-even stop at 2650 is legal on both sides.
+_BATCH_172_LADDER = {
+    "long": {
+        "stops": (("stop-primary", "2600"), ("stop-backup", "2595")),
+        "take_profit_prices": ("2690", "2720", "2750"),
+        "market": "2700",
+    },
+    "short": {
+        "stops": (("stop-primary", "2700"), ("stop-backup", "2705")),
+        "take_profit_prices": ("2610", "2580", "2550"),
+        "market": "2600",
+    },
+}
+_BATCH_172_TP_IDS = ("tp-1", "tp-2", "tp-3")
 
-def _batch_172_ledger():
-    return [
-        ("stop-primary", "stop_loss", "2600", "1.5", "verified"),
-        ("stop-backup", "backup_stop", "2595", "1.5", "verified"),
+
+def _batch_172_ledger(side, *, tp1_pending, tp_sizes):
+    ladder = _BATCH_172_LADDER[side]
+    rows = [
+        (order_id, purpose, price, "1.5", "verified")
+        for (order_id, price), purpose in zip(
+            ladder["stops"], ("stop_loss", "backup_stop"), strict=True
+        )
+    ]
+    for index, order_id in enumerate(_BATCH_172_TP_IDS):
         # TP1 filled by itself before the instruction arrived. Production
         # recorded it as `protection_missing`; the fill predicate is what
         # decides, not the status.
-        ("tp-1", "take_profit", "2690", "0.7", "protection_missing"),
-        ("tp-2", "take_profit", "2720", "0.4", "verified"),
-        ("tp-3", "take_profit", "2750", "0.4", "verified"),
-    ]
+        status = "verified" if index or tp1_pending else "protection_missing"
+        rows.append(
+            (
+                order_id,
+                "take_profit",
+                ladder["take_profit_prices"][index],
+                tp_sizes[index],
+                status,
+            )
+        )
+    return rows
 
 
-def _batch_172_pending():
-    return [
+def _batch_172_pending(side, *, tp1_pending, tp_sizes):
+    ladder = _BATCH_172_LADDER[side]
+    rows = [
         pending_stop_row(
-            ord_id="stop-primary",
+            ord_id=order_id,
             inst_id=INSTRUMENT,
-            pos_side="long",
-            trigger_price="2600",
+            pos_side=side,
+            trigger_price=price,
             size="1.5",
-        ),
-        pending_stop_row(
-            ord_id="stop-backup",
-            inst_id=INSTRUMENT,
-            pos_side="long",
-            trigger_price="2595",
-            size="1.5",
-        ),
-        pending_take_profit_row(
-            ord_id="tp-2",
-            inst_id=INSTRUMENT,
-            pos_side="long",
-            trigger_price="2720",
-            size="0.4",
-        ),
-        pending_take_profit_row(
-            ord_id="tp-3",
-            inst_id=INSTRUMENT,
-            pos_side="long",
-            trigger_price="2750",
-            size="0.4",
-        ),
+        )
+        for order_id, price in ladder["stops"]
     ]
+    for index, order_id in enumerate(_BATCH_172_TP_IDS):
+        if index == 0 and not tp1_pending:
+            continue
+        rows.append(
+            pending_take_profit_row(
+                ord_id=order_id,
+                inst_id=INSTRUMENT,
+                pos_side=side,
+                trigger_price=ladder["take_profit_prices"][index],
+                size=tp_sizes[index],
+            )
+        )
+    return rows
 
 
-def _batch_172(tmp_path, name="batch-172.db"):
+def _batch_172(
+    tmp_path,
+    name="batch-172.db",
+    *,
+    side="long",
+    tp1_pending=False,
+    tp_sizes=("0.7", "0.4", "0.4"),
+):
+    """Batch 172's shape, with or without TP1 already filled.
+
+    ``target_size`` is what the planner would have written for this live size:
+    ``allocate_close_sizes`` floors the aggregate to the 0.1 quantity step, so
+    half of 1.5 is 0.7 (not 0.75), leaving 0.8, and half of 0.8 is 0.4.
+    """
+
+    ladder = _BATCH_172_LADDER[side]
+    live_size = "1.5" if tp1_pending else "0.8"
+    target_size = "0.8" if tp1_pending else "0.4"
     session_factory = create_session_factory(tmp_path / name)
     batch_id, components = _build_batch(
         session_factory,
+        side=side,
         legs=[
             {
                 "pos_id": BATCH_172_POS,
-                "start_size": "0.8",
-                "target_size": "0.4",
-                "ledger": _batch_172_ledger(),
+                "start_size": live_size,
+                "target_size": target_size,
+                "ledger": _batch_172_ledger(
+                    side, tp1_pending=tp1_pending, tp_sizes=tp_sizes
+                ),
             }
         ],
     )
@@ -431,31 +476,47 @@ def _batch_172(tmp_path, name="batch-172.db"):
                 **position_row(
                     pos_id=BATCH_172_POS,
                     inst_id=INSTRUMENT,
-                    pos_side="long",
-                    size="0.8",
+                    pos_side=side,
+                    size=live_size,
                     avg_price="2650",
                 ),
-                # The market is above the long's entry, so a break-even stop at
-                # 2650 is a legal stop and the remainder-close fallback must
-                # stay out of the way.
-                "lastPx": "2700",
+                # The market is on the profitable side of the entry, so a
+                # break-even stop at 2650 is a legal stop and the
+                # remainder-close fallback must stay out of the way.
+                "lastPx": ladder["market"],
             }
         ],
-        pending=_batch_172_pending(),
-        trigger_history=[
-            trigger_history_row(
-                ord_id="tp-1",
-                inst_id=INSTRUMENT,
-                pos_side="long",
-                trigger_price="2690",
-                size="0.7",
-            )
-        ],
+        pending=_batch_172_pending(
+            side, tp1_pending=tp1_pending, tp_sizes=tp_sizes
+        ),
+        trigger_history=(
+            []
+            if tp1_pending
+            else [
+                trigger_history_row(
+                    ord_id="tp-1",
+                    inst_id=INSTRUMENT,
+                    pos_side=side,
+                    trigger_price=ladder["take_profit_prices"][0],
+                    size=tp_sizes[0],
+                )
+            ]
+        ),
     )
     return session_factory, batch_id, components, client
 
 
+def _component(batch, kind):
+    return next(row for row in batch.components if row.component_kind == kind)
+
+
+def _evidence(component):
+    return [item for item in (component.evidence or []) if isinstance(item, dict)]
+
+
 def test_batch_172_shape_runs_all_three_components_to_succeeded(tmp_path):
+    """The user's policy of 2026-09-22: a filled TP1 is the reduction."""
+
     session_factory, batch_id, _components, client = _batch_172(tmp_path)
 
     batch = _run(session_factory, batch_id, client)
@@ -463,28 +524,36 @@ def test_batch_172_shape_runs_all_three_components_to_succeeded(tmp_path):
     assert batch.status == "succeeded", batch.reason_code
     assert [row.status for row in batch.components] == ["confirmed"] * 3
 
-    # Component one: TP1 is gone and proven filled, so nothing cancels it. TP2
-    # and TP3 together are 0.8 against a 0.4 target, so exactly one stage is
-    # released -- the earlier one.
+    # Component one: TP1 is gone and proven filled, so nothing cancels it --
+    # and because no second reduction follows, the target remaining is the live
+    # 0.8, which TP2 + TP3 (0.4 + 0.4) exactly meet. Neither is excess.
     assert "tp-1" not in client.cancel_calls
-    assert "tp-2" in client.cancel_calls
+    assert "tp-2" not in client.cancel_calls
     assert "tp-3" not in client.cancel_calls
 
-    # Component two: one reduction to the immutable target.
-    assert [call["sz"] for call in client.close_calls] == ["0.4"]
-    assert client._positions[BATCH_172_POS]["pos"] == "0.4"
+    # Component two: the first take profit already took the profit. Nothing is
+    # closed a second time, and no exchange write happens at all.
+    assert client.close_calls == []
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
+    partial = _component(batch, "converge_partial_close")
+    assert partial.reason_code == "partial_close_skipped_first_take_profit_filled"
+    assert any(
+        item.get("planned_close_size") == "0" and item.get("remaining_size") == "0.8"
+        for item in _evidence(partial)
+    )
 
-    # Component three: two new stops written and read back, then -- and only
-    # then -- the two old ones cancelled.
+    # Component three: the stops still move to the break-even target, sized to
+    # the whole remaining position, and only then are the old ones cancelled.
     assert len(client.set_calls) == 2
-    assert client.cancel_calls[-2:] == ["stop-backup", "stop-primary"] or set(
-        client.cancel_calls[-2:]
-    ) == {"stop-primary", "stop-backup"}
-    first_set = client.cancel_calls.index("stop-primary")
-    assert first_set > client.cancel_calls.index("tp-2")
+    assert [call["sz"] for call in client.set_calls] == ["0.8", "0.8"]
+    assert client.set_calls[0]["slTriggerPx"] == "2650"
+    assert len({call["slTriggerPx"] for call in client.set_calls}) == 2
+    assert sorted(client.cancel_calls) == ["stop-backup", "stop-primary"]
 
 
-def test_batch_172_component_one_proves_the_fill_without_cancelling_it(tmp_path):
+def test_batch_172_component_one_proves_the_fill_without_cancelling_anything(
+    tmp_path,
+):
     session_factory, batch_id, components, client = _batch_172(
         tmp_path, "batch-172-one.db"
     )
@@ -500,7 +569,167 @@ def test_batch_172_component_one_proves_the_fill_without_cancelling_it(tmp_path)
 
     assert result.status == "confirmed", result.reason_code
     assert result.proven_filled_quantity == "0.7"
-    assert client.cancel_calls == ["tp-2"]
+    assert client.cancel_calls == []
+    with session_factory() as session:
+        component = session.get(
+            StrategyManagementComponent,
+            components["consume_take_profit_stage"][0],
+        )
+        history = json.loads(component.evidence_json)
+    assert any(
+        item.get("first_stage_consumed_by_fill") is True
+        and item.get("evidence_tier") == "trigger_history_clean_trigger"
+        and item.get("effective_target_remaining_size") == "0.8"
+        for item in history
+        if isinstance(item, dict)
+    )
+
+
+def test_batch_172_with_the_first_take_profit_still_pending_reduces(tmp_path):
+    """The other half of the policy: not filled yet -> cancel TP1 and reduce."""
+
+    session_factory, batch_id, _components, client = _batch_172(
+        tmp_path, "batch-172-pending.db", tp1_pending=True
+    )
+
+    batch = _run(session_factory, batch_id, client)
+
+    assert batch.status == "succeeded", batch.reason_code
+    # Component one cancels the first stage and nothing else: TP2 + TP3 = 0.8
+    # is exactly the 0.8 target remaining.
+    assert client.cancel_calls[0] == "tp-1"
+    assert "tp-2" not in client.cancel_calls
+    assert "tp-3" not in client.cancel_calls
+    # Component two reduces by the contract fraction, floored to the step.
+    assert [call["sz"] for call in client.close_calls] == ["0.7"]
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
+    partial = _component(batch, "converge_partial_close")
+    assert partial.reason_code is None
+    assert [call["sz"] for call in client.set_calls] == ["0.8", "0.8"]
+
+
+def test_batch_172_restart_between_components_keeps_the_same_decision(tmp_path):
+    """Component two reads the decision from the record, not from memory."""
+
+    session_factory, batch_id, components, client = _batch_172(
+        tmp_path, "batch-172-restart.db"
+    )
+    result = execute_take_profit_consumption_component(
+        session_factory,
+        batch_id=batch_id,
+        component_id=components["consume_take_profit_stage"][0],
+        deepcoin_client=client,
+        live_execution_gate=lambda: True,
+        now_provider=lambda: NOW,
+    )
+    assert result.status == "confirmed", result.reason_code
+
+    # A restart between component one and component two: nothing but the rows
+    # survives.
+    restarted = create_session_factory(tmp_path / "batch-172-restart.db")
+    batch = _run(restarted, batch_id, client)
+
+    assert batch.status == "succeeded", batch.reason_code
+    assert client.close_calls == []
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
+
+
+def test_batch_172_short_mirror_does_not_reduce_again(tmp_path):
+    session_factory, batch_id, _components, client = _batch_172(
+        tmp_path, "batch-172-short.db", side="short"
+    )
+
+    batch = _run(session_factory, batch_id, client)
+
+    assert batch.status == "succeeded", batch.reason_code
+    # Only the two old stops were cancelled: the short's take-profit ladder is
+    # 2610 / 2580 / 2550, TP1 filled, and TP2 + TP3 are exactly the live 0.8.
+    assert client.cancel_calls == ["stop-backup", "stop-primary"]
+    assert client.close_calls == []
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
+    assert [call["sz"] for call in client.set_calls] == ["0.8", "0.8"]
+    assert client.set_calls[0]["slTriggerPx"] == "2650"
+
+
+def test_batch_172_first_take_profit_filling_mid_cancel_does_not_reduce(tmp_path):
+    """The race: TP1 was resting when planned and filled before the cancel."""
+
+    session_factory, batch_id, _components, client = _batch_172(
+        tmp_path, "batch-172-race.db", tp1_pending=True
+    )
+    resting_cancel = client.cancel_position_sltp
+
+    def cancel_position_sltp(payload):
+        if str(payload["ordId"]) != "tp-1":
+            return resting_cancel(payload)
+        # The stage filled between the plan and the write, so the venue refuses
+        # the cancel outright and the position is already 0.8.
+        client.cancel_calls.append("tp-1")
+        client.pending = [row for row in client.pending if row["ordId"] != "tp-1"]
+        client._positions[BATCH_172_POS]["pos"] = "0.8"
+        client.history = [
+            trigger_history_row(
+                ord_id="tp-1",
+                inst_id=INSTRUMENT,
+                pos_side="long",
+                trigger_price="2690",
+                size="0.7",
+            )
+        ]
+        raise DeepcoinDefiniteRejection("order does not exist")
+
+    client.cancel_position_sltp = cancel_position_sltp
+
+    batch = _run(session_factory, batch_id, client)
+
+    # The fill is still a fill, so the second reduction is still skipped even
+    # though ``trusted_start_size`` is the pre-fill 1.5 -- the effective target
+    # is what is live, not what the snapshot said.
+    assert client.close_calls == []
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
+    assert "tp-2" not in client.cancel_calls
+    assert "tp-3" not in client.cancel_calls
+    consume = _component(batch, "consume_take_profit_stage")
+    assert consume.status == "confirmed"
+    assert any(
+        item.get("fill_race") is True
+        and item.get("first_stage_consumed_by_fill") is True
+        for item in _evidence(consume)
+    )
+    partial = _component(batch, "converge_partial_close")
+    assert partial.status == "confirmed"
+    assert partial.reason_code == "partial_close_skipped_first_take_profit_filled"
+
+    # Component three then stops, and for a reason that has nothing to do with
+    # this policy and predates it: only ``protection_health``'s reconciliation
+    # round marks a filled take profit's ledger row, so within the race window
+    # TP1's row is still ``verified`` and the three stages add up to more than
+    # the position. Before this change the same shape reached the same place by
+    # the already-at-target path. Writing no stop is the safe half of it: the
+    # original 1.5 stop is still armed.
+    assert batch.status == "recovery_required"
+    assert batch.reason_code == "retained_take_profit_exceeds_position"
+    assert client.set_calls == []
+
+
+def test_batch_172_over_staged_ladder_still_releases_the_excess(tmp_path):
+    """Not reducing never means leaving more take profit than position."""
+
+    session_factory, batch_id, _components, client = _batch_172(
+        tmp_path,
+        "batch-172-overstaged.db",
+        tp_sizes=("0.7", "0.4", "0.7"),
+    )
+
+    batch = _run(session_factory, batch_id, client)
+
+    assert batch.status == "succeeded", batch.reason_code
+    # TP2 + TP3 would be 1.1 against a live 0.8, so the earlier stage is
+    # released and TP3 (0.7) is retained.
+    assert client.cancel_calls[0] == "tp-2"
+    assert "tp-3" not in client.cancel_calls
+    assert client.close_calls == []
+    assert client._positions[BATCH_172_POS]["pos"] == "0.8"
 
 
 def test_batch_172_without_fill_evidence_refuses_instead_of_guessing(tmp_path):
