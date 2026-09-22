@@ -387,6 +387,40 @@ REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两�
 本地由 `retire_protection_for_closed_binding` 退役。先撤再平会制造裸仓窗口，
 而这里的全部意义就是不要那个窗口。
 
+**止损阶梯（影子，2026-09-23）：止损跟着"真的成交了的止盈"走，一档一档往回挪。**
+规则是账户所有者的：到第一档止盈 → 止损移到策略入场价；到第二档 → 移到第一止盈价；
+第 N 档 → 第 N−1 档，"第 0 档"= 入场价。**阶段 1 只算不做**——
+`stop_ladder_mode` 默认 `disabled`，`live` 被解析器接受但行为等同 `shadow`，
+任何模式下都零交易所写入。
+
+这里有三个容易写错的地方，都写在 `stop_ladder.py` 的判据里：
+
+- **档位是账本行，不是消息里的价格。** 某仓位的阶梯 = 它自己的
+  `position_protection_ledger` 里 `purpose='take_profit'` 的行，剔除
+  `retired/cancelled/superseded`，按盈利方向排序（多单升序、空单降序）。
+  KOL 改止盈价时系统撤旧挂新，序列自然跟随，**不对照 `lifecycle.take_profit`
+  也不对照 binding draft**；`lifecycle_monitor._parse_take_profits` 对空单也按升序排，
+  档位顺序是反的，不得复用。
+- **"已到"不看数量。** 一档已到 = 该单号不在一次**完整**的挂单快照里、账本行不是历史态、
+  没有我们的 cancel 类 `PositionMutationIntent`，且 **(A)** trigger 历史里
+  `triggerTime ≠ 0` 且 `errorCode` 干净，或 **(B)** 历史查不到该单号但相邻两条
+  `snapshot_complete` 观测显示仓位**有减少（任意数量）**。部分成交仍算已到。
+  历史行一旦存在就由它决断：**失败触发与未触发都拒绝**，不会被仓位变小翻案。
+- **证明不了 = 不动 + 计数，永不告警。** 用户明确不要这类告警；无论判成什么，
+  仓位都保留它已有的止损，安全方向不变。
+
+判据只有一份（`take_profit_fill_predicate.take_profit_fill_proven`），
+账本 `filled` 的写入点也只有一个（`protection_health.record_take_profit_ledger_fill`，
+`protection_health` 的对账轮与 `stop_ladder_records` 共用）。
+`filled` 是终态：所有读取点的活跃集合都不含它，所以成交的止盈不会再被撤、被替换、被补挂
+（逐点审计见 `docs/composite-upstream-fix-status.md` 第 3 节）。无 schema 变更。
+
+顺带修掉的两处读取缺陷，都属于本节反复讲的"词汇"问题：
+`take_profit_fill_evidence._prove_exact_terminal` 以前对缺 `posId` 的真实历史行直接判失败，
+于是**止盈真的触发过反而比没触发更难证明**；`execution_bindings` 的观测归桶按 TPSL 行的
+`posId` 分桶，而 TPSL 行根本不带 `posId`，`pending_tpsl_json` 因此恒为 `[]`
+（09-21 生产点查：50 条观测无一例外），现在按账本 `order_id → pos_id` 归属。
+
 **同一天补上的另一半：复合路径过去从不撤自己的挂单入场腿。** 合约对
 `partial_then_break_even` 恒为 `cancel_deferred_entries=True`，非复合减仓路径一直
 无条件执行它，复合执行器却一行都没有——减仓做完，挂着的第二条入场腿仍然有效，
