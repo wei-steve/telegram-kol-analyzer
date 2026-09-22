@@ -13,7 +13,7 @@ production_deployed: false           # 阶段 2 尚未部署
 phase1_production_commit: 76ddb91d4498534ad24b8bd92248942bd0d7e9a5
 rollback_commit: 72313b0e9cd63ebfb9e24c9c16f042e210a2261f
 systemd_unit_installed: false        # telegram-kol-oncall-codex.service 只提交，未安装
-production_mode: "phase 1 dry_run since 2026-09-20 07:39 CST"
+production_mode: "watcher notify since 2026-09-22 ~23:10 CST; Codex shadow"
 default_codex_mode: "off (TELEGRAM_KOL_ONCALL_CODEX_MODE absent = phase 1 behaviour exactly)"
 writes_production_database: false
 writes_exchange: false
@@ -348,6 +348,22 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 `protection_price_or_size_mismatch` ×3、`protection_visibility_retry_expired` ×2、`management_stop_action_conflict` ×2（已修）、
 `explicit_break_even_stop_not_risk_tightening` ×1；进入执行的 3 个都死在第一个组件 `take_profit_cancel_retry_exhausted`）。
 
+### 8.10 切换正式（2026-09-22 晚）与第二个 spool 权限缺陷
+
+- 用户 2026-09-22 决定"切换正式"。切换前核对：dry_run 三天共 8 个管理案件（其中 2 个是已修的拆案/误报）、`skipped_no_position=6`、待发告警 0（切换不会放出积压）。
+- **切换前发现第二个跨用户缺陷**（`c028ddad`）：8.9 的 `SupplementaryGroups` 修好了"runner 读请求"，但 runner 写回的 `verdict.json / run.json`
+  落成 `root:root 0660`——spool 根目录有 setgid，值守建的 `case-N` 目录没有，于是 root 写的文件不继承组。值守读不到答案，案件 6/7/8 又被记成 30 分钟超时，
+  而 runner 其实 42–95 s 就答完了。修复：案件目录 `0o2770`（setgid）+ `atomic_write` 把文件 chgrp 成父目录的组；探针改为核对回写文件的组；
+  服务器上把已有案件目录一并 `chmod g+s` / `chgrp -R`。**教训：跨用户交接要两个方向、目录与文件都实测，8.7 的验收只测了半个方向。**
+- 同一提交把 D4（消息处理停摆）阈值从 3 分钟提到 10 分钟：三天 10 次停摆告警全是 1–2 条消息、1–14 分钟内自愈（单条消息在上下文解析里），不是队列死掉；
+  规格 4.2 的 3 分钟据此修订。
+- 部署方式仍是"只更新值守文件、不重启交易服务"（worker/web/ingest PID 不变），随后 `MODE=notify`、重启两个值守单元，探针 29/29。
+- 现状：**值守 notify + Codex shadow**。首条真实 Telegram 发送将是下一个案件或次日 09:00 的"值守正常"；届时核对 `alerts.status=sent`。
+- 案件 6/7/8 的 `diagnoses` 行仍是历史的 `failed/timeout`（裁决文件其实在磁盘上，已可读）；不回填，新案件起正常。
+- 两个 shadow 裁决（2026-09-22，raw 18371 全平 / 18375 保本，大镖客 BTC 空单，binding 368）：仓位在 14:08Z 已按 KOL 的离场指令平掉，
+  之后的"保本"指令因仓位不存在被拒——两次拒绝都合理，Codex 案件 8 判得对；案件 7 判 `suspected_bug` 也不算错：
+  批次 175 确实提交了平仓（`strategy_management_close_submit` 14:08Z），却被记成 `position_closed_before_management`、入场腿记成
+  `manually_closed / manual_position_missing`——**我们自己的平仓被账面当成了人工平仓**（不影响资金，是记账缺陷，待单独处理）。
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
