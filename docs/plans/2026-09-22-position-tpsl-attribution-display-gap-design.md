@@ -132,3 +132,65 @@ Deepcoin 官方 TriggerOrder 结构的订单号字段就是 `OrderSysID`
 `protection_status` / `can_mutate` 在 PascalCase 响应下失准。归入阶段 7
 （`docs/plans/2026-09-06-deepcoin-rest-ws/phase-7-retire-legacy-matcher.md`），
 或在用户单独批准改交易所写入语义时处理。
+
+---
+
+## 7. 部署记录（2026-09-22）
+
+| 项 | 值 |
+|---|---|
+| 部署 sha | `75da0b4ef2fc3890e9ea565ef52a67c7724cdf7d` |
+| 回滚 sha | `d4b77b23347a1524dbe1426743a07dd5b87cc257` |
+| 回滚命令 | `tg-deploy d4b77b23347a1524dbe1426743a07dd5b87cc257` |
+| 候选分支 | `origin/claude/tpsl-attribution-display-2026-09-22` |
+| 全套测试 | 9685 passed / 4 skipped |
+
+四步都做了：推自己分支 → `tg-deploy` → 把**同一个 sha** 推共享分支 → 双向核对。
+部署前核对候选是生产 HEAD 的直系后代（PASS）；部署后 `PROD == SHARED` 且
+`OFFENDERS` 为空（PASS）。**该 `OFFENDERS` 检查另用一个必然 FAIL 的输入
+（旧生产 sha 对候选）验过它自己会说 FAIL**，不是只跑了会 PASS 的那一半。
+
+重启后 worker / web / ingest 三个单元均 `active`，`/positions-panel` 与
+`/positions-panel/tabs/open-orders` 均 200，窗口内 web 与 worker 日志无
+traceback / CRITICAL。
+
+### 正向实盘样本：未到达，照实记
+
+部署时生产 **0 持仓**，历史 `verified` 账本行 345 条**全部**落在
+`leg=manually_closed|closed` + `binding=closed` 上。也就是说本次修复针对的那三种
+活跃状态（`partially_filled` / `filled` / 绑定 `open`）此刻在生产数据里一个样本都没有，
+**修复的正向效果尚未被实盘证明**，只被测试证明。下一个真实持仓 + 保护单到达时，
+要用 `audit-tpsl-ownership` 与页面逐笔对照，两者必须给出同一个答案。
+
+账本 `status` 直方图（只读）：`verified` 345、`retired` 266、`cancelled` 102、
+`protection_missing` 47、`stop_trigger_failed` 1，**`protected` 为 0**——
+所以把页面放宽到 `{verified, protected}` 目前不改变任何一行的结果，
+它修的是判据一致性，不是当下的数据。
+
+## 8. 部署当天发现的另一个缺口（未修）
+
+当时挂在交易所上的四张单（ETH-USDT-SWAP，群「大漂亮社区-11分组」）：
+
+- 两张**未成交的限价开空单** `…417342` / `…417388` —— 页面显示「已绑定」，正确。
+- 两张**它们各自自带的止损** `…417341` / `…417387`（触发价 3100）——
+  页面显示「未归属 · 缺少 position_protection_ledger 强证据」。
+
+只读核对确认：这两个 order_id 在 `position_protection_ledger` 里**没有行**。
+原因是结构性的，不是本次修的那个 bug：`position_protection_ledger.pos_id`
+是 `NOT NULL`，而入场尚未成交时**根本没有 posId**，所以一张「未成交入场单自带的
+保护单」在今天的账本里没有任何可落脚的载体。于是它必然落到未归属，
+而页面的「自动管理已冻结」是**诚实的失败关闭**，不是误判。
+
+**观察窗内它又发生了一次。** 2026-09-23 11:22，群「大镖客-11分组」的两腿限价开多
+`…572797` / `…572807` 连同各自自带的止损 `…572796` / `…572806`（触发价 2700）挂上，
+形态与前一组逐字相同：入场单「已绑定」，自带止损「未归属」。**两腿入场每发生一次，
+就多出两条这样的行。** 在无持仓期间，页面上的「未归属保护单」几乎全部是这一类，
+所以用户看到的「经常归属不上」，主要来源大概率是这个缺口，而不是本次修的那个。
+两者都是真的，但它们是两件事，本次只修了其中一件。
+
+注意这两对 id 相差 1（`…341`/`…342`、`…387`/`…388`），正是 `README` §硬性禁止
+第 1 条点名的分配模式——**不可以据此认领归属**。要修只能新增一个「入场腿自带保护」
+的归属载体（按 `client_order_id` 或入场腿 id 记账，成交后回填 posId），
+那是一次独立的、需要单独批准的改动——而且**要先查清一件事**：下单回执里到底给不给
+这张自带 TPSL 的 order_id。若不给，我们就根本无从记账，能走的只剩回读挂单表，
+而按 id 相邻去认领是明令禁止的。所以这件事的第一步是只读调研，不是改代码。
