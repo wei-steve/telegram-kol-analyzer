@@ -7,7 +7,7 @@ import json
 import logging
 import mimetypes
 import re
-from datetime import timedelta
+from datetime import datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -39,12 +39,22 @@ from telegram_kol_research.config import (
     load_multi_target_management_config,
 )
 from telegram_kol_research.contact_digit_scrubbing import scrub_contact_identifiers
+from telegram_kol_research.entry_confirmation_candidates import (
+    ENTRY_CONFIRMATION_MANAGEMENT_ACTION,
+)
+from telegram_kol_research.entry_position_sizing_terms import (
+    entry_position_risk_multiplier,
+)
+from telegram_kol_research.entry_preambles import persist_entry_preamble_in_session
+from telegram_kol_research.entry_price_geometry import text_names_market_entry
+from telegram_kol_research.message_evidence import EntryPreambleEvidence
 from telegram_kol_research import recognition_failure_attribution as recognition_attribution
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionEvent,
     ExecutionOrderLeg,
     MediaAsset,
+    MessageEvidenceVersion,
     MessageInstructionItem,
     MessageRecognition,
     ManagementMessageEnvelope,
@@ -1149,6 +1159,7 @@ def _apply_lifecycle_event_decision(
     applied_candidate_ids: set[int] | None = None,
     current_message_text: str | None = None,
     multi_target_management_config: MultiTargetManagementConfig | None = None,
+    authoritative_payload: Mapping[str, Any] | None = None,
 ) -> bool:
     instruction_text = (
         raw_message.text or ""
@@ -1195,6 +1206,7 @@ def _apply_lifecycle_event_decision(
                 applied_candidate_ids=applied_candidate_ids,
                 current_message_text=instruction_text,
                 multi_target_management_config=multi_target_management_config,
+                authoritative_payload=authoritative_payload,
             ) or applied
         return applied
 
@@ -1332,10 +1344,43 @@ def _apply_lifecycle_event_decision(
 
     event_at = raw_message.posted_at or utc_now()
     if event_type == "entry_confirm" and target.lifecycle_status == "pending_entry":
+        entry_price = _number_or_none(decision.get("entry_price"))
+        # 2026-09-23, design section 4.1.3. A message that names a market entry
+        # *and* carries its own stop loss is a strategy in its own right, not a
+        # confirmation of somebody else's. It is keyed on itself, so the binding
+        # and the lifecycle share (chat_id, message_id, symbol, side) and a later
+        # close message can reach it. The stop must come from this message: the
+        # inherited one is exactly what let 10696 through the "a pure market
+        # entry must carry a stop" gate on its way to 29 unowned contracts.
+        own_stop_loss = _own_message_stop_loss(decision, authoritative_payload)
+        if own_stop_loss is not None and text_names_market_entry(
+            decision.get("entry"), instruction_text
+        ):
+            candidate = _upsert_entry_signal_candidate(
+                session,
+                raw_message,
+                strategy={
+                    "symbol": decision.get("symbol") or target.symbol,
+                    "side": decision.get("side") or target.side,
+                    "entry": (
+                        _format_number(entry_price)
+                        if entry_price is not None
+                        else _MARKET_ENTRY_CANONICAL_TEXT
+                    ),
+                    "stop_loss": own_stop_loss,
+                    "take_profit": _string_or_none(decision.get("take_profit")),
+                    "leverage": None,
+                },
+                confidence=confidence,
+                parse_source=parse_source,
+            )
+            _ensure_lifecycle_record(session, raw_message, candidate)
+            _remember_applied_candidate(session, candidate, applied_candidate_ids)
+            return True
+
         target.lifecycle_status = "entered"
         target.entered_at = event_at
         target.entry_signal_message_id = raw_message.message_id
-        entry_price = _number_or_none(decision.get("entry_price"))
         if entry_price is not None:
             target.entry_price_actual = entry_price
         target.exit_reason = None
@@ -1349,6 +1394,19 @@ def _apply_lifecycle_event_decision(
             parse_source=parse_source,
         )
         _remember_applied_candidate(session, candidate, applied_candidate_ids)
+        # 2026-09-23, design section 4.2.2. The sizing word this message carries
+        # has nowhere else to go: MiMo only emits ``entry_context`` for messages
+        # it cannot map onto an existing strategy, and this one it could. Writing
+        # the preamble inside the same transaction as the lifecycle update is
+        # what lets the next adjacent strategy size itself from it.
+        _persist_entry_confirmation_preamble(
+            session,
+            raw_message=raw_message,
+            lifecycle=target,
+            confidence=confidence,
+            recognition_generation=authoritative_generation,
+            now=event_at,
+        )
         return True
 
     if event_type == "cancel_entry" and target.lifecycle_status == "pending_entry":
@@ -3123,6 +3181,7 @@ def apply_authoritative_mimo_payload(
                     multi_target_management_config=(
                         active_multi_target_management_config
                     ),
+                    authoritative_payload=payload,
                 )
 
         lifecycle_event.pop("_exact_context_risk_reduction_authorized", None)
@@ -4530,6 +4589,121 @@ def _upsert_close_signal_candidate(
     return candidate
 
 
+#: What a price-less market entry is written as when a confirmation message
+#: turns out to be a strategy of its own (design section 4.1.3). The order path
+#: recognises this exact shape as "go to market against the live price" through
+#: ``entry_price_geometry.is_pure_market_entry_text``; it is a normalisation of
+#: what the message said, never an entry price nobody wrote.
+_MARKET_ENTRY_CANONICAL_TEXT = "市价"
+
+
+def _own_message_stop_loss(
+    decision: Mapping[str, Any],
+    authoritative_payload: Mapping[str, Any] | None,
+) -> str | None:
+    """Return the stop loss *this message* states, as a single absolute price.
+
+    Never falls back to the target lifecycle's stop. That fallback is the whole
+    defect: on 2026-09-23 a message carrying no price of its own passed the
+    "a pure market entry must carry a stop" gate on an inherited 87200.
+    """
+
+    for raw_value in (
+        decision.get("stop_loss"),
+        _evidence_text_field(authoritative_payload, "stop_loss"),
+    ):
+        text = _string_or_none(raw_value)
+        if not text:
+            continue
+        if "%" in text or "％" in text:
+            continue
+        numbers = re.findall(r"\d+(?:\.\d+)?", text)
+        if len(numbers) != 1:
+            continue
+        try:
+            value = float(numbers[0])
+        except ValueError:
+            continue
+        if value > 0:
+            return numbers[0]
+    return None
+
+
+def _evidence_text_field(
+    authoritative_payload: Mapping[str, Any] | None,
+    field: str,
+) -> Any:
+    """Read one ``evidence.text.fields.<field>.value`` from an authority payload."""
+
+    if not isinstance(authoritative_payload, Mapping):
+        return None
+    evidence = authoritative_payload.get("evidence")
+    if not isinstance(evidence, Mapping):
+        return None
+    text_block = evidence.get("text")
+    if not isinstance(text_block, Mapping):
+        return None
+    fields = text_block.get("fields")
+    if not isinstance(fields, Mapping):
+        return None
+    entry = fields.get(field)
+    if not isinstance(entry, Mapping):
+        return None
+    return entry.get("value")
+
+
+def _persist_entry_confirmation_preamble(
+    session,
+    *,
+    raw_message: RawMessage,
+    lifecycle: StrategyLifecycle,
+    confidence: float,
+    recognition_generation: str | None,
+    now: datetime,
+) -> None:
+    """Carry this message's sizing word forward as a pending entry preamble.
+
+    Fails closed and silently: without a current evidence version or an
+    authoritative generation there is nothing to key the row on (both columns
+    are NOT NULL), and a confirmation that writes no preamble simply leaves the
+    next strategy at full size, which is what happens today.
+    """
+
+    multiplier = entry_position_risk_multiplier(raw_message.text)
+    if multiplier is None:
+        return
+    if not recognition_generation:
+        return
+    if not lifecycle.symbol or not lifecycle.side:
+        return
+    evidence_version_id = (
+        session.query(MessageEvidenceVersion.id)
+        .filter(
+            MessageEvidenceVersion.raw_message_id == int(raw_message.id),
+            MessageEvidenceVersion.superseded_at.is_(None),
+        )
+        .order_by(MessageEvidenceVersion.version.desc())
+        .limit(1)
+        .scalar()
+    )
+    if evidence_version_id is None:
+        return
+    persist_entry_preamble_in_session(
+        session,
+        raw_message=raw_message,
+        evidence_version_id=int(evidence_version_id),
+        recognition_generation=str(recognition_generation),
+        evidence=EntryPreambleEvidence(
+            symbol=str(lifecycle.symbol).upper(),
+            side=str(lifecycle.side).lower(),
+            risk_multiplier=multiplier,
+            confidence=max(0.0, min(float(confidence or 0.0), 1.0)),
+            reason=f"入场确认消息的仓位词：{(raw_message.text or '').strip()[:180]}",
+        ),
+        now=now,
+    )
+
+
 def _upsert_entry_confirmation_candidate(
     session,
     *,
@@ -4543,7 +4717,13 @@ def _upsert_entry_confirmation_candidate(
         "side": lifecycle.side,
         "event_type": "entry_signal",
         "target_lifecycle_id": None,
-        "management_action": None,
+        # 2026-09-23, design section 4.1.1. The row keeps the entry shape so
+        # the instruction, alert and audit machinery still carries it, and the
+        # marker is what four execution and alert gates read to know it must
+        # never open a position of its own. It is not a management action: the
+        # event type stays ``entry_signal`` and the target stays NULL, so no
+        # management loader can select it.
+        "management_action": ENTRY_CONFIRMATION_MANAGEMENT_ACTION,
         "management_fraction": None,
         "entry_text": _format_number(entry_price) if entry_price is not None else None,
         "stop_loss_text": _format_number(lifecycle.stop_loss),

@@ -55,6 +55,29 @@ _MARKET_LABEL_RE = re.compile(
     r"市价|现价|market(?:\s+price)?|current\s+price",
     re.IGNORECASE,
 )
+#: The one word list that says "this entry goes to market". It is wider than
+#: ``_MARKET_LABEL_RE`` on purpose: the regex above answers "is this entry text
+#: *only* a market label", which needs the strict form, while this list answers
+#: "does this message say market at all", which is what
+#: ``auto_trade_execution._infer_entry_execution_type`` has always asked and
+#: what section 4.1.3 of the 2026-09-23 design reuses rather than restating.
+MARKET_ENTRY_LABEL_TOKENS: tuple[str, ...] = (
+    "market",
+    "市价",
+    "现价",
+    "直接",
+    "马上",
+    "立即",
+)
+
+
+def text_names_market_entry(*texts: Any) -> bool:
+    """Whether any of these texts names a market entry."""
+
+    joined = " ".join(str(part or "") for part in texts).lower()
+    return any(token in joined for token in MARKET_ENTRY_LABEL_TOKENS)
+
+
 _DIRECT_PRICE_BEFORE_RE = re.compile(
     r"\d+(?:,\d{3})*(?:\.\d+)?(?:万)?\s*(?:u|usdt|usd|美元)?\s*$",
     re.IGNORECASE,

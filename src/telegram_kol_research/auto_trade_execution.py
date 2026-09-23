@@ -28,9 +28,14 @@ from telegram_kol_research.execution_events import (
     enqueue_entry_price_geometry_rejection_notification,
 )
 from telegram_kol_research.execution_events import record_execution_event
+from telegram_kol_research.entry_confirmation_candidates import (
+    is_entry_confirmation_candidate,
+    is_entry_confirmation_signature,
+)
 from telegram_kol_research.entry_price_geometry import (
     EntryPriceGeometryResult,
     stale_market_reference_result,
+    text_names_market_entry,
     validate_candidate_entry_price_geometry,
 )
 from telegram_kol_research.execution_bindings import build_strategy_instance_id
@@ -923,7 +928,7 @@ def _auto_process_single_message_trade_signal(
         )
     if deepcoin_client is None:
         return {"status": "blocked", "reason": "deepcoin_client_unavailable"}
-    if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+    if is_entry_confirmation_candidate(candidate):
         return _record_entry_auto_trade_skip(
             session_factory,
             raw_message=raw_message,
@@ -1111,6 +1116,7 @@ def _auto_process_single_message_trade_signal(
         candidate.entry_text,
         raw_message.text,
         candidate.parse_source,
+        candidate.management_action,
     )
     entry_range = _parse_entry_range(
         candidate.entry_text,
@@ -2461,11 +2467,15 @@ def _infer_entry_execution_type(
     entry_text: str | None,
     message_text: str | None,
     parse_source: str | None,
+    management_action: str | None = None,
 ) -> str:
-    if parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+    if is_entry_confirmation_signature(
+        event_type="entry_signal",
+        parse_source=parse_source,
+        management_action=management_action,
+    ):
         return "market"
-    text = " ".join(str(part or "") for part in (entry_text, message_text)).lower()
-    if any(token in text for token in ["market", "市价", "现价", "直接", "马上", "立即"]):
+    if text_names_market_entry(entry_text, message_text):
         return "market"
     return "limit"
 

@@ -18,6 +18,10 @@ from telegram_kol_research.ai_endpoints import (
     provider_append_v1,
 )
 from telegram_kol_research.ai_model_router import async_run_with_fallback
+from telegram_kol_research.entry_confirmation_candidates import (
+    is_entry_confirmation_candidate,
+    is_entry_confirmation_signature,
+)
 from telegram_kol_research.llm_chat import _load_env_file_values
 from telegram_kol_research.models import (
     EntryRevisionReplacement,
@@ -497,6 +501,7 @@ def build_strategy_alert_event_from_recognition(
         candidate.entry_text,
         event_type=event_type,
         parse_source=parse_source,
+        management_action=candidate.management_action,
     )
     management_action = lifecycle.management_action if lifecycle is not None else None
     strategy_kind = _strategy_kind_for_candidate(candidate, lifecycle)
@@ -889,7 +894,7 @@ def _alert_type_for_candidate(
     management_action: str | None,
 ) -> str | None:
     if candidate.event_type == "entry_signal":
-        if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+        if is_entry_confirmation_candidate(candidate):
             return "临时入场"
         return _entry_alert_type(order_type)
     if candidate.event_type == "close_signal":
@@ -978,11 +983,16 @@ def _resolve_order_type(
     *,
     event_type: str,
     parse_source: str,
+    management_action: str | None = None,
 ) -> str | None:
     normalized = _normalize_order_type(raw_order_type)
     if normalized is not None:
         return normalized
-    if event_type == "entry_signal" and parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
+    if is_entry_confirmation_signature(
+        event_type=event_type,
+        parse_source=parse_source,
+        management_action=management_action,
+    ):
         return "market"
     return _infer_order_type_from_entry(entry_text)
 

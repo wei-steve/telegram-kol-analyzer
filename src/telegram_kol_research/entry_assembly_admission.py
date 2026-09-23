@@ -22,6 +22,9 @@ from telegram_kol_research.adjacent_entry_assembly import (
     select_adjacent_entry_fragments,
     source_order_key,
 )
+from telegram_kol_research.entry_confirmation_candidates import (
+    is_entry_confirmation_candidate,
+)
 from telegram_kol_research.models import (
     EntryAssemblyAttempt,
     EntryAssemblyWakeupExecution,
@@ -368,7 +371,17 @@ def _load_source_facts(
     candidate_raw_ids = {int(row.raw_message_id) for row in candidates}
     for other_candidate in candidates:
         raw = raw_by_id[int(other_candidate.raw_message_id)]
-        if other_candidate.event_type == "entry_signal":
+        if is_entry_confirmation_candidate(other_candidate):
+            # 2026-09-23, design section 4.2.3. A confirmation candidate is an
+            # ``entry_signal`` row, so it used to be read as ``complete_entry``
+            # -- a hard boundary that cut off everything at and before its own
+            # source key, including the sizing preamble hanging on that very
+            # message. It represents no entry of its own (the execution gate
+            # refuses it outright), so it is neither a boundary nor a fragment
+            # here. It still produces a fact so the message counts as resolved
+            # rather than falling through to ``unresolved``.
+            kind = "entry_confirm"
+        elif other_candidate.event_type == "entry_signal":
             other_side = str(other_candidate.side or "").lower()
             same_symbol = str(other_candidate.symbol or "").upper() == str(
                 candidate.symbol or ""

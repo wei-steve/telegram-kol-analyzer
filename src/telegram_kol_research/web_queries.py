@@ -11,6 +11,9 @@ from sqlalchemy import func, or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research import recognition_failure_attribution as recognition_attribution
+from telegram_kol_research.entry_confirmation_candidates import (
+    is_entry_confirmation_candidate,
+)
 from telegram_kol_research.models import (
     ContextAnalysisBackfill,
     ContextResolutionAttempt,
@@ -1748,7 +1751,16 @@ def _candidate_matches_mimo_intent(
 
 
 def _candidate_action_kind(candidate: SignalCandidate) -> str:
-    management_action = str(candidate.management_action or "")
+    # 2026-09-23: an entry confirmation now carries
+    # ``management_action='entry_confirm'`` as a refusal marker, not as an
+    # action. Reading it as one here would flip the message card's acceptance
+    # banner for every confirmation message, so the marker is stepped over and
+    # the event type answers, exactly as it did before the marker existed.
+    management_action = (
+        ""
+        if is_entry_confirmation_candidate(candidate)
+        else str(candidate.management_action or "")
+    )
     aliases = {
         "cancel_entry": "cancel_pending_entry",
         "exit_full": "full_exit",
