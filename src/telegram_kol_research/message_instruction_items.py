@@ -40,6 +40,16 @@ FINISH_STATUSES = frozenset(
 ERROR_STATUSES = frozenset({"failed", "unknown"})
 SUMMARY_NOTIFICATION_LEASE = timedelta(minutes=5)
 VISIBILITY_RETRY_DELAYS = (5, 15, 30, 60, 120, 300)
+#: How long a *management* item may keep failing to find its target position.
+#: Deliberately the same six hours as
+#: ``entry_assembly_admission.ENTRY_ADMISSION_EXECUTION_DEADLINE``, and until
+#: 2026-09-24 that coincidence was load-bearing in the wrong way: the sweep in
+#: ``claim_next_visibility_retry_instruction_item`` had no ``instruction_kind``
+#: filter, so an entry item raced its own deadline against this one and
+#: whichever fired first decided the reason code the operator saw. The sweep now
+#: filters on ``management``, so the two deadlines govern disjoint sets of items
+#: and can no longer collide. Changing either number is safe on its own; making
+#: them differ is what the old code could not survive.
 VISIBILITY_RETRY_DEADLINE = timedelta(hours=6)
 VISIBILITY_RETRY_CLAIM_LEASE = timedelta(minutes=5)
 def should_defer_instruction_result(result: dict) -> bool:

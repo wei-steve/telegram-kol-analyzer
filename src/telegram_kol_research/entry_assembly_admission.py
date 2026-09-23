@@ -45,6 +45,14 @@ from telegram_kol_research.message_evidence import (
 
 ADJACENT_ENTRY_MAX_AGE = timedelta(minutes=30)
 ADJACENT_ENTRY_MAX_MESSAGES_PER_SIDE = 20
+#: How long a deferred entry may wait for its adjacent context. The same six
+#: hours as ``message_instruction_items.VISIBILITY_RETRY_DEADLINE``, and before
+#: 2026-09-24 the two were in a race an entry could only lose: that sweep ran
+#: over every instruction kind, so an entry was as likely to be expired by the
+#: management deadline -- reported as "no matching position record was ever
+#: found" -- as by its own. The sweep is now management-only and this deadline
+#: is enforced solely by ``entry_admission_reconciler``, so the equal values no
+#: longer meet. They are two independent numbers that happen to agree.
 ENTRY_ADMISSION_EXECUTION_DEADLINE = timedelta(hours=6)
 
 #: Terminal ``automation_status`` values of an adjacent message's authoritative

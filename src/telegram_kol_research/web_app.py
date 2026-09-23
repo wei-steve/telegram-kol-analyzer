@@ -55,6 +55,9 @@ from telegram_kol_research.authoritative_recognition import (
     assess_message_authoritatively,
     process_authoritative_message,
 )
+from telegram_kol_research.entry_admission_reconciler import (
+    reconcile_due_entry_admissions,
+)
 from telegram_kol_research.message_evidence import build_message_input_fingerprint
 from telegram_kol_research.mimo_contract_circuit import load_mimo_contract_circuit
 from telegram_kol_research.app_logging import (
@@ -5175,12 +5178,71 @@ async def _run_recognition_execution_scanner_loop(app: FastAPI) -> None:
             await asyncio.sleep(60.0)
             continue
         try:
+            # Reconcile first, claim second: an entry this pass promotes to
+            # ``ready`` is then executed in the same pass rather than waiting
+            # another minute.
+            await _run_entry_admission_reconcile_cycle_async(
+                app, observed_at=observed_at
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("entry admission reconcile cycle failed")
+        try:
             await _run_entry_assembly_ready_wakeup_cycle_async(app)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("entry assembly ready wakeup cycle failed")
         await asyncio.sleep(60.0)
+
+
+async def _run_entry_admission_reconcile_cycle_async(
+    app: FastAPI, *, observed_at: datetime
+) -> None:
+    """Give the entry reconciler a second, message-independent trigger.
+
+    Design 1.4 hands the expiry of a deferred entry to this reconciler, and
+    phase 2.1 takes it away from the management visibility sweep that used to
+    kill it with the wrong reason code. A reconciler that only runs inside
+    ``apply_authoritative_assessment`` cannot hold up that half of the bargain:
+    a quiet group means no message is processed, and an entry past its deadline
+    would then sit ``pending`` forever -- neither executed nor expired nor
+    alerted. Trading a wrong alert for a silent stall is the wrong direction,
+    so the timer runs it too.
+
+    It also picks up the ``pending`` attempts that were never woken at all --
+    nine of the twenty-one losses between 2026-08-17 and 2026-09-22 -- because
+    re-assessing admission on a timer is what those rows were always missing.
+
+    The parameters are the message-driven call site's
+    (``apply_authoritative_assessment``): the same bounded limit and the same
+    two rollout settings, read rather than hard-coded, so one gate governs both
+    triggers. It never writes to the exchange (A-3d).
+    """
+
+    if (
+        app.state.runtime_role not in {"worker", "all"}
+        or app.state.recognition_execution_owner is None
+    ):
+        return
+    await _run_monitor_capture_writer(
+        lambda: _run_entry_admission_reconcile_cycle(app, observed_at=observed_at)
+    )
+
+
+def _run_entry_admission_reconcile_cycle(
+    app: FastAPI, *, observed_at: datetime
+) -> int:
+    settings = load_trading_settings(app.state.session_factory)
+    result = reconcile_due_entry_admissions(
+        app.state.session_factory,
+        now=observed_at,
+        limit=10,
+        execution_contract_mode=settings.instruction_execution_contract_mode,
+        entry_after_item_id=settings.instruction_execution_entry_after_item_id,
+    )
+    return int(result.released + result.expired)
 
 
 async def _run_entry_assembly_ready_wakeup_cycle_async(app: FastAPI) -> None:

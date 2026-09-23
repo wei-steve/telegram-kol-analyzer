@@ -8901,12 +8901,20 @@ def test_worker_scanner_loop_also_claims_reconciler_ready_entry_wakeups(
 
     monkeypatch.setattr(web_app_module, "_run_entry_assembly_wakeups", record)
 
+    def record_reconcile(session_factory, **kwargs):
+        seen.append("reconcile")
+        return SimpleNamespace(released=0, expired=0, incidents=0, skipped=0)
+
+    monkeypatch.setattr(
+        web_app_module, "reconcile_due_entry_admissions", record_reconcile
+    )
+
     async def scenario():
         task = asyncio.create_task(
             web_app_module._run_recognition_execution_scanner_loop(app)
         )
-        for _ in range(200):
-            if seen:
+        for _ in range(500):
+            if len(seen) >= 2:
                 break
             await asyncio.sleep(0.001)
         task.cancel()
@@ -8917,13 +8925,16 @@ def test_worker_scanner_loop_also_claims_reconciler_ready_entry_wakeups(
 
     asyncio.run(scenario())
 
-    assert len(seen) == 1
-    assert seen[0]["completed_raw_message_id"] is None
-    assert seen[0]["execution_owner"] is app.state.recognition_execution_owner
-    assert seen[0]["execution_registry"] is (
+    # Reconcile first, claim second: an attempt promoted this pass must be
+    # executable in the same pass.
+    assert seen[0] == "reconcile"
+    assert len(seen) == 2
+    assert seen[1]["completed_raw_message_id"] is None
+    assert seen[1]["execution_owner"] is app.state.recognition_execution_owner
+    assert seen[1]["execution_registry"] is (
         app.state.recognition_execution_registry
     )
-    assert seen[0]["auto_trade_executor"] is app.state.auto_trade_executor
+    assert seen[1]["auto_trade_executor"] is app.state.auto_trade_executor
 
 
 def test_web_role_scanner_cycle_never_claims_an_entry_wakeup(tmp_path):
