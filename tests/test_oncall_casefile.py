@@ -19,6 +19,7 @@ from oncall_test_support import (
     NOW,
     ProductionFixture,
     build_open_position_case,
+    build_recognition_failure_case,
     sqlite_write_authorizer,
 )
 from telegram_kol_research.oncall_casefile import (
@@ -477,6 +478,44 @@ def test_a_query_only_connection_refuses_a_write(production):
 
 
 # ------------------------------------------------------------ health cases
+
+
+def test_a_recognition_case_exports_without_candidates_items_or_batches(
+    production, store
+):
+    """Rule D3's cases have none of the three, and the export must still work.
+
+    A recognition that produced nothing is exactly a message with no
+    candidate, no instruction item and no batch, so every ``next(...)`` in the
+    management sections falls through to ``None``. That is the whole reason
+    this case is worth asserting.
+    """
+
+    run_detection_round(
+        reader_factory=lambda: ProductionReader(production.path), store=store, now=NOW
+    )
+    built = build_recognition_failure_case(production)
+    run_detection_round(
+        reader_factory=lambda: ProductionReader(production.path),
+        store=store,
+        now=NOW + timedelta(minutes=1),
+    )
+    case = store.get_case_by_key(f"recog:{built['raw_message_id']}")
+    assert case is not None and case.rule == "D3"
+
+    payload = export(production, case, now=NOW + timedelta(minutes=1))
+
+    assert payload["case"]["kind"] == "management"
+    assert payload["case"]["rule"] == "D3"
+    assert payload["candidates"] == []
+    assert payload["instruction_items"] == []
+    assert payload["batches"] == []
+    assert payload["lifecycle"] is None
+    assert payload["execution_binding"] is None
+    # The one section that must be there: why recognition failed.
+    assert payload["recognition"]["agreement_status"] == "authoritative_failed"
+    assert payload["recognition"]["automation_reason"] == "mimo_authoritative_failed"
+    assert payload["source_message"]["text"].startswith("ETH 这波先减一半")
 
 
 def test_a_health_case_carries_jobs_incidents_and_a_filtered_journal(

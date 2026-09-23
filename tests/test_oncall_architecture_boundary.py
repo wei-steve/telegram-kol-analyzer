@@ -174,6 +174,30 @@ def test_the_production_database_is_opened_read_only_and_query_only():
 
 
 @pytest.mark.architecture
+def test_every_production_read_shape_the_detector_uses_is_declared():
+    """``ALLOWED_QUERY_SHAPES`` is the human-readable half of the read rule.
+
+    ``tests/test_oncall_detector.py`` proves that every statement the detector
+    actually sends matches one of a small set of regexes. That test is the
+    enforcement; this one stops the declared list from quietly falling behind
+    it, because a reviewer reads the list and not the regexes.
+    """
+
+    from telegram_kol_research.oncall_detector import ALLOWED_QUERY_SHAPES
+
+    declared = "\n".join(ALLOWED_QUERY_SHAPES)
+    assert "WHERE id > ?" in declared
+    assert "WHERE id = ?" in declared
+    assert "WHERE pos_id = ?" in declared
+    # D3 reads recognition decisions forward, then asks whether the message
+    # already produced management work. Both are new shapes.
+    assert "raw_message_id = ?" in declared
+
+    source = (SOURCE_ROOT / "oncall_detector.py").read_text(encoding="utf-8")
+    assert "recognition_decisions" in source
+
+
+@pytest.mark.architecture
 @pytest.mark.parametrize("filename", PHASE_ONE_MODULES)
 def test_phase_one_runs_no_command_and_restarts_no_service(filename):
     code = code_without_prose(filename)

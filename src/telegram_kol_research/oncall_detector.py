@@ -36,7 +36,10 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
-from telegram_kol_research.oncall_state import OncallStateStore
+from telegram_kol_research.oncall_state import (
+    RECOGNITION_CASE_PREFIX,
+    OncallStateStore,
+)
 
 
 logger = logging.getLogger(__name__)
@@ -64,6 +67,35 @@ BENIGN_SKIP_REASONS = frozenset(
     }
 )
 
+#: Rule D3 (design 4.1). The automation reasons that mean a real message was
+#: *lost* rather than deliberately passed over. Four of them are named by
+#: ``recognition_failure_attribution`` -- this module may not import it (the
+#: architecture boundary allows no application import but ``oncall_state``), so
+#: the strings are repeated here and a test pins them to that module's values.
+#:
+#: ``management_recognition_unresolved`` is the fifth the design names ("上下文
+#: unresolved / exhausted"). In this codebase that string is currently a
+#: *runtime incident type*, not an automation reason, and the context failure
+#: that does reach a decision row arrives as ``agreement_status =
+#: 'authoritative_failed'`` (``authoritative_recognition`` rewrites the result
+#: to 识别失败 with "context resolution failed"). It is listed anyway so that a
+#: decision row that ever does carry it is not missed.
+LOSSY_RECOGNITION_REASONS = frozenset(
+    {
+        "target_not_verifiable",
+        "mimo_authoritative_failed",
+        "authoritative_gap_recovery_expired",
+        "lifecycle_apply_failed",
+        "management_recognition_unresolved",
+    }
+)
+
+#: The agreement status that means no authoritative decision was produced.
+RECOGNITION_FAILED_STATUS = "authoritative_failed"
+
+#: ``agreement_status`` while the pipeline has not finished with the message.
+RECOGNITION_PENDING_STATUS = "pending"
+
 MANAGEMENT_BATCH_FAULT_STATUSES = frozenset(
     {"blocked", "partial_failed", "recovery_required", "submit_unknown"}
 )
@@ -86,6 +118,7 @@ POSITION_ATTRIBUTION_UNKNOWN = "attribution_unknown"
 WATCH_INSTRUCTION_ITEM = "instruction_item"
 WATCH_MANAGEMENT_BATCH = "management_batch"
 WATCH_PROCESSING_JOB = "processing_job"
+WATCH_RECOGNITION_DECISION = "recognition_decision"
 #: Stop ladder phase 1. Take-profit ledger rows are watched only so that
 #: "the orders say stage N, the shadow says stage N-1" can be **counted**.
 WATCH_PROTECTION_LEDGER = "protection_ledger"
@@ -116,6 +149,10 @@ ALLOWED_QUERY_SHAPES = (
     "bounded indexed lookup: WHERE <indexed column> = ? ... LIMIT n",
     "stop ladder: SELECT id, action, after_json FROM execution_events "
     "WHERE pos_id = ? ORDER BY id DESC LIMIT 20",
+    # D3 asks whether a message already produced management work, and D1d asks
+    # whether its batch succeeded. Both are index-seeking on raw_message_id,
+    # which carries its own index on both tables.
+    "message scope: WHERE raw_message_id = ? ORDER BY id [DESC] LIMIT n",
 )
 
 
@@ -139,6 +176,13 @@ class DetectorConfig:
     #: context resolution, not a stuck queue. Ten minutes keeps the real
     #: 2026-09-16 shape (queue dead for an hour) and drops that noise.
     processing_job_stalled_after: timedelta = timedelta(minutes=10)
+    #: Rule D3. The main pipeline retries a failed authoritative recognition
+    #: by itself after 60 seconds
+    #: (``telegram_live_listener.AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS``),
+    #: so a case opened the instant a failure lands would page for something
+    #: that heals on its own a minute later. The design names no threshold;
+    #: five minutes is D1d's, and it leaves room for several retries.
+    recognition_failure_after: timedelta = timedelta(minutes=5)
     case_stale_after: timedelta = timedelta(hours=6)
     #: How recently reconcile must have rewritten a binding for "open" to be a
     #: verified fact rather than an assumption. Matches
@@ -541,6 +585,12 @@ _CANDIDATE_COLUMNS = (
     "management_fraction, stop_loss_text, take_profit_text, entry_text"
 )
 _RAW_MESSAGE_COLUMNS = "id, chat_id, message_id, sender_name, posted_at, text"
+#: Deliberately narrow: the model's prompt and raw reply live in
+#: ``authoritative_payload_json`` and this module never selects that column.
+_DECISION_COLUMNS = (
+    "id, raw_message_id, agreement_status, automation_status, "
+    "automation_reason, created_at, updated_at"
+)
 
 _LEDGER_COLUMNS = "id, venue, pos_id, purpose, status, evidence_json, updated_at"
 _LADDER_EVENT_ACTION_PREFIX = "stop_ladder"
@@ -550,6 +600,7 @@ _WATERMARK_TABLES = (
     ("strategy_management_batches", WATCH_MANAGEMENT_BATCH),
     ("message_processing_jobs", WATCH_PROCESSING_JOB),
     ("position_protection_ledger", WATCH_PROTECTION_LEDGER),
+    ("recognition_decisions", WATCH_RECOGNITION_DECISION),
 )
 
 
@@ -753,6 +804,24 @@ def _intake(
     if rows:
         store.set_watermark("message_processing_jobs", int(rows[-1]["id"]))
 
+    # Every decision row is watched, not only the ones that already look
+    # lossy: ``automation_reason`` is written by a *later* update than the one
+    # that inserts the row, so filtering at intake would drop exactly the rows
+    # D3 exists for. The re-check retires a row the moment it settles clean.
+    last_decision = store.get_watermark("recognition_decisions") or 0
+    rows = reader.read_forward(
+        "recognition_decisions", _DECISION_COLUMNS, last_decision, config.intake_limit
+    )
+    for row in rows:
+        store.add_watch_item(
+            kind=WATCH_RECOGNITION_DECISION,
+            object_id=int(row["id"]),
+            chat_id=None,
+            now=now,
+        )
+    if rows:
+        store.set_watermark("recognition_decisions", int(rows[-1]["id"]))
+
     last_ledger = store.get_watermark("position_protection_ledger") or 0
     rows = reader.read_forward(
         "position_protection_ledger", _LEDGER_COLUMNS, last_ledger, config.intake_limit
@@ -883,6 +952,7 @@ def _recheck(
     observations: list[_Observation] = []
     observations.extend(_recheck_instruction_items(reader, store, now, config))
     observations.extend(_recheck_management_batches(reader, store, now, config))
+    observations.extend(_recheck_recognition_decisions(reader, store, now, config))
     return observations
 
 
@@ -1208,6 +1278,210 @@ def _evaluate_management_batch(
     )
 
 
+def _recheck_recognition_decisions(
+    reader: ProductionReader,
+    store: OncallStateStore,
+    now: datetime,
+    config: DetectorConfig,
+) -> list[_Observation]:
+    watch_items = store.open_watch_items(WATCH_RECOGNITION_DECISION, config.watch_limit)
+    if not watch_items:
+        return []
+    expired = _expired_watch_ids(watch_items, now, config)
+    ids = [item.object_id for item in watch_items if item.object_id not in expired]
+    store.retire_watch_items(WATCH_RECOGNITION_DECISION, expired)
+    if not ids:
+        return []
+    rows = reader.read_by_ids("recognition_decisions", _DECISION_COLUMNS, ids)
+    store.touch_watch_items(WATCH_RECOGNITION_DECISION, ids, now)
+    found = {int(row["id"]) for row in rows}
+    store.retire_watch_items(
+        WATCH_RECOGNITION_DECISION, [value for value in ids if value not in found]
+    )
+    observations: list[_Observation] = []
+    retire: list[int] = []
+    for row in rows:
+        observation = _evaluate_recognition_decision(reader, row, now=now, config=config)
+        if observation is None:
+            retire.append(int(row["id"]))
+            continue
+        if observation.retire:
+            retire.append(int(row["id"]))
+        observations.append(observation)
+    store.retire_watch_items(WATCH_RECOGNITION_DECISION, retire)
+    return observations
+
+
+def lossy_recognition_reason(
+    agreement_status: Any, automation_reason: Any
+) -> str | None:
+    """The reason code D3 opens under, or ``None`` when nothing was lost.
+
+    A decision is lossy when the authority produced no usable answer at all
+    (``agreement_status = 'authoritative_failed'``, which is also where a
+    failed context resolution lands) or when the automation reason is one of
+    the skips the design names. Every other skip -- the user's own switches,
+    "the message asked for nothing", "no target was named" -- is a decision,
+    not a loss, and alerting on those is what buried the real cases before.
+    """
+
+    code = str(automation_reason or "").strip()
+    if code in LOSSY_RECOGNITION_REASONS:
+        return code
+    if str(agreement_status or "").strip().lower() == RECOGNITION_FAILED_STATUS:
+        return code or RECOGNITION_FAILED_STATUS
+    return None
+
+
+def _message_has_management_work(reader: ProductionReader, raw_message_id: Any) -> bool:
+    """Whether D1 or D2 already owns this message.
+
+    A recognition that produced a management instruction item or a management
+    batch is one the rest of the chain can see and rule on. D3 exists for the
+    messages that produced *nothing*, so it stands down here rather than
+    paging a second time for the same failure.
+    """
+
+    if raw_message_id is None:
+        return False
+    rows = reader.query(
+        "SELECT id, instruction_kind FROM message_instruction_items "
+        "WHERE raw_message_id = ? ORDER BY id LIMIT 10",
+        (int(raw_message_id),),
+    )
+    if any(str(row["instruction_kind"] or "") == "management" for row in rows):
+        return True
+    rows = reader.query(
+        "SELECT id, status FROM strategy_management_batches "
+        "WHERE raw_message_id = ? ORDER BY id LIMIT 10",
+        (int(raw_message_id),),
+    )
+    return bool(rows)
+
+
+def _evaluate_recognition_decision(
+    reader: ProductionReader,
+    row: sqlite3.Row,
+    *,
+    now: datetime,
+    config: DetectorConfig,
+) -> _Observation | None:
+    """Rule D3: the message was never read, and the group holds a position."""
+
+    raw_message_id = row["raw_message_id"]
+    if raw_message_id is None:
+        return None
+    case_key = _recognition_case_key(raw_message_id)
+    reason_code = lossy_recognition_reason(
+        row["agreement_status"], row["automation_reason"]
+    )
+    if reason_code is None:
+        if (
+            str(row["agreement_status"] or "").strip().lower()
+            == RECOGNITION_PENDING_STATUS
+            and not str(row["automation_status"] or "").strip()
+        ):
+            # The chain has not finished with this message yet. Neither a case
+            # nor a clear: keep watching until it settles or the watch expires.
+            return _Observation(case_key=None, rule=None)
+        # Recognised, or re-recognised after a failure. Either way the case is
+        # over, which is how "a later decision succeeds" resolves it.
+        return _Observation(
+            case_key=case_key,
+            rule=None,
+            cleared=True,
+            raw_message_id=int(raw_message_id),
+            retire=True,
+        )
+
+    if _message_has_management_work(reader, raw_message_id):
+        return _Observation(
+            case_key=case_key,
+            rule=None,
+            cleared=True,
+            raw_message_id=int(raw_message_id),
+            retire=True,
+        )
+
+    age = _age(now, as_utc(row["updated_at"]) or as_utc(row["created_at"]))
+    if age is None or age < config.recognition_failure_after:
+        return _Observation(case_key=None, rule=None)
+
+    raw_message = reader.read_one("raw_messages", _RAW_MESSAGE_COLUMNS, raw_message_id)
+    chat_id = int(raw_message["chat_id"]) if raw_message is not None else None
+    open_rows = (
+        read_chat_open_bindings(
+            reader,
+            chat_id=chat_id,
+            now=now,
+            snapshot_max_age=config.position_snapshot_max_age,
+        )
+        if chat_id is not None
+        else []
+    )
+    if not open_rows:
+        # No position, no case -- the same noise filter rule D1 applies.
+        return _Observation(
+            case_key=None,
+            rule=None,
+            reason_code="__no_position__",
+            retire=True,
+        )
+    summaries = tuple(
+        dict.fromkeys(f"{row_['symbol']} {row_['side']}" for row_, _state in open_rows)
+    )[:8]
+    return _Observation(
+        case_key=case_key,
+        rule="D3",
+        severity="high",
+        raw_message_id=int(raw_message_id),
+        chat_id=chat_id,
+        reason_code=reason_code,
+        evidence=_build_recognition_evidence(
+            raw_message=raw_message,
+            reason_code=reason_code,
+            agreement_status=str(row["agreement_status"] or ""),
+            automation_status=str(row["automation_status"] or ""),
+            automation_reason=str(row["automation_reason"] or ""),
+            position_state=open_rows[0][1],
+            group_open_positions=summaries,
+            now=now,
+        ),
+        retire=False,
+    )
+
+
+def _build_recognition_evidence(
+    *,
+    raw_message: sqlite3.Row | None,
+    reason_code: str,
+    agreement_status: str,
+    automation_status: str,
+    automation_reason: str,
+    position_state: str,
+    group_open_positions: Sequence[str],
+    now: datetime,
+) -> dict[str, Any]:
+    """What the D3 alert needs. The excerpt is untrusted text, bounded here."""
+
+    posted_at = as_utc(raw_message["posted_at"]) if raw_message is not None else None
+    return {
+        "kind": "recognition",
+        "reason_code": reason_code,
+        "agreement_status": agreement_status,
+        "automation_status": automation_status,
+        "automation_reason": automation_reason,
+        "message_id": int(raw_message["message_id"]) if raw_message is not None else None,
+        "posted_at": posted_at.isoformat() if posted_at is not None else None,
+        "message_text": (
+            str(raw_message["text"] or "")[:400] if raw_message is not None else ""
+        ),
+        "minutes_since_message": _minutes(_age(now, posted_at)),
+        "position_state": position_state,
+        "group_open_positions": list(group_open_positions),
+    }
+
+
 def _evaluate_stalled_jobs(
     reader: ProductionReader,
     store: OncallStateStore,
@@ -1361,6 +1635,10 @@ def _merge_observations(observations: Sequence[_Observation]) -> _Observation:
 
 def _management_case_key(raw_message_id: Any, action: str) -> str:
     return f"mgmt:{int(raw_message_id)}:{action or 'unknown'}"
+
+
+def _recognition_case_key(raw_message_id: Any) -> str:
+    return f"{RECOGNITION_CASE_PREFIX}{int(raw_message_id)}"
 
 
 def _minutes(delta: timedelta | None) -> int | None:

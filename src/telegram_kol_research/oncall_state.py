@@ -31,6 +31,16 @@ from typing import Any, Iterable, Sequence
 
 
 CASE_STATUSES = frozenset({"open", "resolved", "stale"})
+
+#: Case-key namespaces. The key decides which story an alert tells and which
+#: evidence a case file carries, so the prefixes live here -- one vocabulary
+#: shared by the detector that writes them and the alerts that read them.
+HEALTH_CASE_PREFIX = "health:"
+MANAGEMENT_CASE_PREFIX = "mgmt:"
+#: Rule D3: one case per message, because a recognition that produced nothing
+#: has no action to key on.
+RECOGNITION_CASE_PREFIX = "recog:"
+
 ALERT_STATUSES = frozenset({"pending", "sent", "dry_run", "failed"})
 WATCH_STATUSES = frozenset({"open", "retired"})
 

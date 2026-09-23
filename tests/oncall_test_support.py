@@ -300,9 +300,11 @@ class ProductionFixture:
         *,
         raw_message_id: int,
         authoritative_status: str = "succeeded",
-        automation_status: str = "blocked",
-        automation_reason: str = "management_stop_action_conflict",
+        automation_status: str | None = "blocked",
+        automation_reason: str | None = "management_stop_action_conflict",
+        agreement_status: str = "agree",
         payload: dict[str, Any] | None = None,
+        updated_at: datetime | None = None,
     ) -> int:
         with self.session_factory() as session:
             row = RecognitionDecision(
@@ -315,14 +317,34 @@ class ProductionFixture:
                 authoritative_payload_json=json.dumps(
                     payload or {"secret_prompt": "do not export me"}
                 ),
-                agreement_status="agree",
+                agreement_status=agreement_status,
                 automation_status=automation_status,
                 automation_reason=automation_reason,
                 prompt_versions_json=json.dumps({"authoritative": "v9"}),
+                created_at=naive(updated_at or NOW - timedelta(minutes=30)),
+                updated_at=naive(updated_at or NOW - timedelta(minutes=30)),
             )
             session.add(row)
             session.commit()
             return int(row.id)
+
+    def set_recognition_decision(
+        self,
+        decision_id: int,
+        *,
+        agreement_status: str | None = None,
+        automation_status: str | None = None,
+        automation_reason: str | None = None,
+        updated_at: datetime | None = None,
+    ) -> None:
+        with self.session_factory() as session:
+            row = session.get(RecognitionDecision, int(decision_id))
+            if agreement_status is not None:
+                row.agreement_status = agreement_status
+            row.automation_status = automation_status
+            row.automation_reason = automation_reason
+            row.updated_at = naive(updated_at or NOW)
+            session.commit()
 
     def add_order_leg(
         self,
@@ -558,6 +580,36 @@ def build_open_position_case(
         "lifecycle_id": lifecycle_id,
         "candidate_id": candidate_id,
         "item_id": item_id,
+    }
+
+
+def build_recognition_failure_case(
+    fixture: ProductionFixture,
+    *,
+    agreement_status: str = "authoritative_failed",
+    automation_status: str | None = "skipped",
+    automation_reason: str | None = "mimo_authoritative_failed",
+    with_binding: bool = True,
+    text: str = "ETH 这波先减一半，止损拉到成本",
+    updated_at: datetime | None = None,
+) -> dict[str, int]:
+    """Rule D3's canonical shape: a recognition that lost a live position's message."""
+
+    fixture.add_group_name()
+    raw_message_id = fixture.add_raw_message(text=text)
+    binding_id = fixture.add_binding() if with_binding else None
+    decision_id = fixture.add_recognition_decision(
+        raw_message_id=raw_message_id,
+        authoritative_status="识别失败",
+        agreement_status=agreement_status,
+        automation_status=automation_status,
+        automation_reason=automation_reason,
+        updated_at=updated_at,
+    )
+    return {
+        "raw_message_id": raw_message_id,
+        "binding_id": binding_id or 0,
+        "decision_id": decision_id,
     }
 
 

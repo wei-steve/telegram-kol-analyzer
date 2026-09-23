@@ -13,6 +13,7 @@ from oncall_test_support import (
     NOW,
     ProductionFixture,
     build_open_position_case,
+    build_recognition_failure_case,
     sqlite_write_authorizer,
 )
 from telegram_kol_research.oncall_detector import (
@@ -831,6 +832,229 @@ def test_a_stop_ledger_row_is_not_a_ladder_rung(production, store):
     assert store.get_int_meta(COUNTER_STOP_LADDER_LEVEL_UNRECORDED, 0) == 0
 
 
+# -------------------------------------------------------------------- D3
+
+
+def test_d3_opens_a_case_when_recognition_failed_over_a_live_position(
+    production, store
+):
+    run_round(production, store)
+    built = build_recognition_failure_case(production)
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"recog:{built['raw_message_id']}"
+    assert case.rule == "D3"
+    assert case.severity == "high"
+    assert case.reason_code == "mimo_authoritative_failed"
+    assert case.chat_id == CHAT_ID
+    assert case.evidence["group_name"] == "龚有财群"
+    assert case.evidence["group_open_positions"] == ["ETH short"]
+    assert case.evidence["message_text"].startswith("ETH 这波先减一半")
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "target_not_verifiable",
+        "authoritative_gap_recovery_expired",
+        "lifecycle_apply_failed",
+        "management_recognition_unresolved",
+    ],
+)
+def test_d3_opens_a_case_for_every_lossy_skip_the_design_names(
+    production, store, reason
+):
+    run_round(production, store)
+    build_recognition_failure_case(
+        production,
+        agreement_status="pending",
+        automation_status="skipped",
+        automation_reason=reason,
+    )
+
+    run_round(production, store)
+
+    case = only_case(store)
+    assert case.rule == "D3"
+    assert case.reason_code == reason
+
+
+def test_d3_falls_back_to_the_agreement_status_when_no_reason_was_recorded(
+    production, store
+):
+    run_round(production, store)
+    build_recognition_failure_case(
+        production, automation_status=None, automation_reason=None
+    )
+
+    run_round(production, store)
+
+    assert only_case(store).reason_code == "authoritative_failed"
+
+
+def test_d3_does_not_open_a_case_when_the_group_has_no_real_position(
+    production, store
+):
+    run_round(production, store)
+    build_recognition_failure_case(production, with_binding=False)
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+    assert outcome.skipped_no_position == 1
+    assert store.get_int_meta(COUNTER_SKIPPED_NO_POSITION, 0) == 1
+
+
+def test_d3_stands_down_when_a_management_instruction_item_already_exists(
+    production, store
+):
+    """D1 owns that message; two rules must not page twice for one failure."""
+
+    run_round(production, store)
+    built = build_recognition_failure_case(production)
+    candidate_id = production.add_candidate(raw_message_id=built["raw_message_id"])
+    production.add_instruction_item(
+        raw_message_id=built["raw_message_id"],
+        signal_candidate_id=candidate_id,
+        status="succeeded",
+        result={"status": "completed"},
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_d3_stands_down_when_a_management_batch_already_exists(production, store):
+    run_round(production, store)
+    built = build_recognition_failure_case(production)
+    lifecycle_id = production.add_lifecycle(execution_binding_id=built["binding_id"])
+    production.add_management_batch(
+        raw_message_id=built["raw_message_id"],
+        target_lifecycle_id=lifecycle_id,
+        execution_binding_id=built["binding_id"],
+        status="succeeded",
+    )
+
+    outcome = run_round(production, store)
+
+    assert [case.case_key for case in store.open_cases()] == []
+    assert outcome.new_case_ids == ()
+
+
+def test_d3_ignores_a_decision_that_recognised_the_message_normally(production, store):
+    run_round(production, store)
+    build_recognition_failure_case(
+        production,
+        agreement_status="pending",
+        automation_status="skipped",
+        automation_reason="auto_trade_not_configured",
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+    assert outcome.skipped_no_position == 0
+
+
+def test_d3_waits_for_the_pipelines_own_retry_before_opening(production, store):
+    """The main pipeline retries a failed recognition after 60 seconds."""
+
+    run_round(production, store)
+    build_recognition_failure_case(production, updated_at=NOW - timedelta(minutes=1))
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+    # And it does open once the grace period has passed.
+    later = run_round(production, store, now=NOW + timedelta(minutes=10))
+    assert len(later.new_case_ids) == 1
+
+
+def test_d3_resolves_when_the_message_is_later_recognised(production, store):
+    run_round(production, store)
+    built = build_recognition_failure_case(production)
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    production.set_recognition_decision(
+        built["decision_id"],
+        agreement_status="pending",
+        automation_status="completed",
+        automation_reason=None,
+    )
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+    assert store.get_case(opened.new_case_ids[0]).status == "resolved"
+
+
+def test_d3_resolves_when_an_instruction_item_finally_appears(production, store):
+    run_round(production, store)
+    built = build_recognition_failure_case(production)
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    candidate_id = production.add_candidate(raw_message_id=built["raw_message_id"])
+    production.add_instruction_item(
+        raw_message_id=built["raw_message_id"],
+        signal_candidate_id=candidate_id,
+        status="succeeded",
+        result={"status": "completed"},
+    )
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+
+
+def test_d3_goes_stale_after_six_hours_like_every_other_case(production, store):
+    run_round(production, store)
+    build_recognition_failure_case(production)
+    opened = run_round(production, store)
+
+    outcome = run_round(production, store, now=NOW + timedelta(hours=7))
+
+    assert outcome.stale_case_ids == opened.new_case_ids
+
+
+def test_the_lossy_reason_codes_are_the_pipelines_own_spelling():
+    """The watcher may not import the pipeline, so the strings are copied.
+
+    A copy drifts silently, and a drifted code means D3 goes quiet for the
+    exact failure it exists for. This test is the link the import cannot be.
+    """
+
+    from telegram_kol_research import recognition_failure_attribution as attribution
+    from telegram_kol_research.oncall_detector import LOSSY_RECOGNITION_REASONS
+
+    assert attribution.TARGET_NOT_VERIFIABLE in LOSSY_RECOGNITION_REASONS
+    assert attribution.MIMO_AUTHORITATIVE_FAILED in LOSSY_RECOGNITION_REASONS
+    assert attribution.GAP_RECOVERY_EXPIRED in LOSSY_RECOGNITION_REASONS
+    assert attribution.APPLY_FAILED in LOSSY_RECOGNITION_REASONS
+    # And the benign outcomes stay out: alerting on them is what buried the
+    # real losses for two months (see that module's own docstring).
+    assert attribution.NO_ACTIONABLE_INTENT not in LOSSY_RECOGNITION_REASONS
+    assert attribution.NO_TARGET_NAMED not in LOSSY_RECOGNITION_REASONS
+
+
+def test_d3_never_replays_the_recognition_history_that_predates_the_watcher(
+    production, store
+):
+    build_recognition_failure_case(production)
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.get_watermark("recognition_decisions") is not None
+
+
 # ------------------------------------------------------- read discipline
 
 
@@ -851,6 +1075,9 @@ _BOUNDED_SHAPES = (
         r"^SELECT id, action, after_json FROM execution_events "
         r"WHERE pos_id = \? ORDER BY id DESC LIMIT 20$"
     ),
+    # D3's "has this message already produced management work?" lookups, and
+    # D1d's batch check, which share one shape.
+    re.compile(r"WHERE raw_message_id = \? ORDER BY id (?:DESC )?LIMIT \d+$"),
 )
 
 
@@ -866,6 +1093,7 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
 ):
     run_round(production, store)
     build_open_position_case(production)
+    build_recognition_failure_case(production)
     production.add_processing_job(raw_message_id=production.add_raw_message())
     _ladder_fill(production)
     readers: list[ProductionReader] = []
@@ -876,6 +1104,12 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
     assert statements
     # The ladder's own read is in there, not just the shapes that predate it.
     assert any("FROM execution_events" in sql for sql in statements)
+    # So are D3's, which are the newest.
+    assert any("FROM recognition_decisions" in sql for sql in statements)
+    assert any(
+        "FROM message_instruction_items WHERE raw_message_id" in " ".join(sql.split())
+        for sql in statements
+    )
     offenders = [sql for sql in statements if not _statement_is_allowed(sql)]
     assert offenders == []
     assert all("SELECT" in sql.upper() for sql in statements)

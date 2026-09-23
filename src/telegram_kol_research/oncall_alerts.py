@@ -40,6 +40,7 @@ from telegram_kol_research.oncall_codex import (
     URGENCY_LABELS_ZH,
 )
 from telegram_kol_research.oncall_state import (
+    RECOGNITION_CASE_PREFIX,
     CaseRecord,
     OncallStateStore,
     isoformat,
@@ -119,6 +120,12 @@ REASON_LABELS = {
     "media_unreadable": "图片无法读取（未下载或 OCR 无内容）",
     "no_target_named": "消息没有说清楚是哪一个仓位",
     "no_actionable_intent": "消息未要求任何动作",
+    # --- rule D3: the message was never read at all ---
+    "authoritative_failed": "识别失败，权威模型没有产出可用结果",
+    "mimo_authoritative_failed": "权威模型调用失败，这条消息没有被识别",
+    "authoritative_gap_recovery_expired": "补识别窗口已过，这条消息始终没有被识别",
+    "context_resolution_failed": "上下文解析失败",
+    "management_recognition_unresolved": "上下文解析失败，认不出这条消息管的是哪个仓位",
     "mimo_authoritative_not_safely_applied": "识别结果未能安全落地",
     "management_close_result_requires_recovery": "平仓结果需要人工复核",
     "management_execution_disabled": "自动持仓管理未启用",
@@ -254,6 +261,51 @@ def format_case_alert(case: CaseRecord) -> str:
             status_line,
             f"卡在：{reason_label(case.reason_code)}（{case.reason_code or '未记录'}）",
             position_line,
+        ]
+    )
+
+
+def format_recognition_case_alert(case: CaseRecord) -> str:
+    """Rule D3's opening alert (design 4.1/4.5).
+
+    A different story from :func:`format_case_alert` and so a different shape:
+    nothing was asked of the exchange, because nothing was read. The lines say
+    what came back instead, quote the message, and state the one fact that
+    makes it urgent -- the group is holding a position right now.
+    """
+
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    posted_at = parse_isoformat(evidence.get("posted_at"))
+    excerpt = message_excerpt(evidence.get("message_text"))
+    open_positions = evidence.get("group_open_positions") or []
+    listed = " / ".join(_position_label(item) for item in open_positions[:4])
+
+    status_line = "现状：群内有持仓"
+    if listed:
+        status_line += f"（{listed}）"
+    status_line += "，这条消息没有被自动处理。"
+
+    message_number = case.raw_message_id if case.raw_message_id is not None else "?"
+    return "\n".join(
+        [
+            f"⚠️ 值守提醒 #{case.id}",
+            f"群：{group}    消息 #{message_number}（{beijing_time(posted_at)}）",
+            f"识别结果：识别失败（{reason_label(case.reason_code)}）",
+            f"原文：「{excerpt}」",
+            status_line,
+        ]
+    )
+
+
+def format_recognition_case_resolved_alert(case: CaseRecord) -> str:
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    return "\n".join(
+        [
+            f"✅ 值守提醒 #{case.id} 已自行恢复",
+            f"群：{group}    消息 #{case.raw_message_id}",
+            "这条消息后来被正常识别处理了，不用处理。",
         ]
     )
 
@@ -564,7 +616,7 @@ def compose_case_alerts(
             merged.setdefault(group, []).append(case.id)
             store.mark_case_alerted(case.id, now)
             continue
-        body = format_health_alert(case) if is_health else format_case_alert(case)
+        body = _format_open_alert(case, is_health=is_health)
         if codex_note:
             body = f"{body}\n{codex_note}"
         kind = ALERT_KIND_HEALTH_OPEN if is_health else ALERT_KIND_CASE_OPEN
@@ -601,11 +653,7 @@ def compose_case_alerts(
             _suppress_for_cap(store, now, settings)
             continue
         kind = ALERT_KIND_HEALTH_RESOLVED if is_health else ALERT_KIND_CASE_RESOLVED
-        body = (
-            format_health_resolved_alert(case)
-            if is_health
-            else format_case_resolved_alert(case)
-        )
+        body = _format_resolved_alert(case, is_health=is_health)
         if store.enqueue_alert(
             kind=kind,
             body=body,
@@ -674,6 +722,24 @@ def compose_codex_state_alert(
         )
         is not None
     )
+
+
+def _format_open_alert(case: CaseRecord, *, is_health: bool) -> str:
+    """The case key decides which of the three stories this case is."""
+
+    if is_health:
+        return format_health_alert(case)
+    if case.case_key.startswith(RECOGNITION_CASE_PREFIX):
+        return format_recognition_case_alert(case)
+    return format_case_alert(case)
+
+
+def _format_resolved_alert(case: CaseRecord, *, is_health: bool) -> str:
+    if is_health:
+        return format_health_resolved_alert(case)
+    if case.case_key.startswith(RECOGNITION_CASE_PREFIX):
+        return format_recognition_case_resolved_alert(case)
+    return format_case_resolved_alert(case)
 
 
 def _episode_key(kind: str, case: CaseRecord) -> str:

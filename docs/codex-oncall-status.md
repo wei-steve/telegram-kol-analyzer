@@ -379,6 +379,50 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
   【AI识别分歧告警】与其余交易所侧类型（`management_target_refused`、`position_marked_manually_closed`、`protection_adopted_from_exchange` 等）保留。
 - 已于 2026-09-23 部署：候选 `2a0da6eb`（代码提交 `3d66a488`），全量 **9652 passed / 0 failed**；零在途；worker/web/ingest 重启后 active、web 200、错误行 0；自动交易开关未动。**回滚 = `tg-deploy 9ce48d37…`**。
 
+### 8.13 规则 D3：识别失败不再静默（2026-09-23，仅值守，未部署）
+
+设计第 4.1 节的 D3 补上：**群里有真实持仓、但这条消息压根没被识别**时建案并用中文提醒。
+阶段 1 规格 4.2 曾把 D3 推迟到"阶段 2 之后"，现在补齐。只改值守文件，**交易进程不需要重启**。
+
+- **进料**：`recognition_decisions` 按主键水位线增量读（首启取 `max(id)`，不回放历史），watch 种类 `recognition_decision`。
+  新行**全部**入 watch，不在进料时过滤——`automation_reason` 是后一次 UPDATE 才写的，进料时过滤会正好丢掉 D3 要的行；
+  复查时一旦判明"正常"立刻退役。只选 7 个列，`authoritative_payload_json`（提示词与模型原文）不在其中。
+- **建案条件（全部成立）**：
+  1. `agreement_status = 'authoritative_failed'`，**或** `automation_reason ∈ {target_not_verifiable, mimo_authoritative_failed,
+     authoritative_gap_recovery_expired, lifecycle_apply_failed, management_recognition_unresolved}`；
+  2. 该状态已持续 ≥ 5 分钟（主链路自己 60 秒后会重试一次，见 `AUTHORITATIVE_FAILURE_RETRY_DELAY_SECONDS`；设计没给阈值，取 D1d 的 5 分钟）；
+  3. 消息所在群此刻**确有在仓仓位**（复用 `read_chat_open_bindings`）——否则不建案、不告警，`counter:skipped_no_position` +1；
+  4. 该 `raw_message_id` **没有**管理类指令项、也**没有**管理批次（有的话 D1/D2 已经覆盖，不能为同一次失败提醒两遍）。
+- **案件键** `recog:<raw_message_id>`，规则 `D3`，严重度高，kind 仍是 `management`（Codex 案件文件走 `_management_sections`，
+  该消息没有候选 / 指令项 / 批次时各段为空，`recognition` 段照常带出——已加测试）。
+- **销案**：同一行后来被重新识别成功（`agreement_status` 不再失败且原因不在有损集合），或该消息终于产生了管理指令项 / 批次 → `resolved`，
+  发一条"这条消息后来被正常识别处理了"。6 小时仍未恢复 → `stale`，与其它案件一致。
+- **文案**（新模板，不复用 D1 的「消息要求 / 卡在」）：
+
+  ```
+  ⚠️ 值守提醒 #N
+  群：<群名>    消息 #<raw_message_id>（<北京时间>）
+  识别结果：识别失败（<原因中文>）
+  原文：「<前 80 字，去换行>」
+  现状：群内有持仓（ETH 空），这条消息没有被自动处理。
+  ```
+
+  `REASON_LABELS` 新增 `authoritative_failed`、`mimo_authoritative_failed`、`authoritative_gap_recovery_expired`、
+  `context_resolution_failed`、`management_recognition_unresolved`。原文仍是不可信外部文本：截断、去换行、无 `parse_mode`。
+- **新查询形状**（已登记进 `ALLOWED_QUERY_SHAPES` 并在形状测试里断言）：
+  `WHERE raw_message_id = ? ORDER BY id [DESC] LIMIT n`（D3 的两次"是否已有管理动作"点查，以及 D1d 早就在用、
+  但此前**没有**被形状测试覆盖到的批次查询——顺手补上）。其余复用既有水位线 / 主键点查形状。
+- **口径说明（与设计的差异）**：设计 D3 的第五项写的是"上下文 `unresolved / exhausted`"。仓库里没有对应的 `automation_reason`：
+  上下文解析抛错时 `authoritative_recognition` 会把结果改写成 `识别失败` + `context resolution failed`，因此落到
+  `agreement_status='authoritative_failed'` 这一支，已被第 1 条覆盖；而 `management_recognition_unresolved` 在本仓库是
+  **事故类型**（`capture_management_recognition_unresolved`），不是决策行的原因码，仍列入集合以防将来写到决策行上。
+  上下文 `hold/unresolved` 的降级路径最终是 `mimo_no_action`，**不建案**——按事故台账自己的测算那是每天 100–200 条，等于没有告警。
+- 测试：`tests/test_oncall_detector.py` 新增 D3 一节（命中 / 不命中 / 无仓位 / D1 D2 已覆盖 / 宽限期 / 两条销案路径 / 6 小时 stale /
+  首启不回放 / 原因码与 `recognition_failure_attribution` 对齐），`tests/test_oncall_alerts.py` 新增文案与词典，
+  `tests/test_oncall_casefile.py` 新增"无候选无指令项无批次也能导出"，`tests/test_oncall_architecture_boundary.py` 新增
+  `ALLOWED_QUERY_SHAPES` 不得落后于实际读法。值守 7 个套件共 310 通过。
+- **未做**：没有动任何自动交易 / 执行开关；值守仍不写生产库；无 schema 变更；未部署。
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：

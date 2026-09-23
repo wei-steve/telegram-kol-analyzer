@@ -21,6 +21,7 @@ from telegram_kol_research.oncall_alerts import (
     compose_case_alerts,
     deliver_pending_alerts,
     format_case_alert,
+    format_recognition_case_alert,
     maybe_compose_daily_summary,
     message_excerpt,
     reason_label,
@@ -80,6 +81,85 @@ def test_the_case_alert_is_plain_chinese_with_group_message_action_and_reason(st
     assert "已过 3 分钟，交易所没有对应操作。" in text
     assert "卡在：上一笔部分平仓还没结清（prior_partial_batch_unresolved）" in text
     assert "仓位：仍在持仓中" in text
+
+
+def open_recognition_case(store, *, now=NOW, reason="mimo_authoritative_failed", **evidence):
+    payload = {
+        "group_name": "龚有财群",
+        "message_text": "ETH 这波先减一半\n止损拉到成本",
+        "posted_at": "2026-09-19T05:52:00+00:00",
+        "minutes_since_message": 8,
+        "position_state": "verified_open",
+        "group_open_positions": ["ETH short"],
+    }
+    payload.update(evidence)
+    case, _created = store.upsert_case(
+        case_key="recog:15660",
+        rule="D3",
+        severity="high",
+        now=now,
+        raw_message_id=15660,
+        chat_id=-100,
+        reason_code=reason,
+        evidence=payload,
+    )
+    return case
+
+
+def test_the_recognition_case_alert_says_what_was_lost_in_plain_chinese(store):
+    case = open_recognition_case(store)
+
+    text = format_recognition_case_alert(case)
+
+    assert text.splitlines()[0] == f"⚠️ 值守提醒 #{case.id}"
+    assert "群：龚有财群    消息 #15660（13:52）" in text
+    assert "识别结果：识别失败（权威模型调用失败，这条消息没有被识别）" in text
+    assert "原文：「ETH 这波先减一半 止损拉到成本」" in text
+    assert "现状：群内有持仓（ETH 空），这条消息没有被自动处理。" in text
+    # It is a recognition failure, not an instruction that did not execute.
+    assert "消息要求" not in text
+    assert "卡在" not in text
+
+
+def test_a_recognition_case_is_composed_with_its_own_wording_not_the_d1_template(store):
+    case = open_recognition_case(store)
+
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+
+    body = store.pending_alerts()[0].body
+    assert "识别结果：识别失败" in body
+    assert "消息要求" not in body
+
+
+def test_a_recovered_recognition_case_says_the_message_was_recognised_later(store):
+    case = open_recognition_case(store)
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+
+    compose_case_alerts(
+        store,
+        now=NOW + timedelta(minutes=5),
+        new_case_ids=[],
+        resolved_case_ids=[case.id],
+    )
+
+    bodies = [alert.body for alert in store.pending_alerts()]
+    assert any("后来被正常识别" in body for body in bodies)
+
+
+@pytest.mark.parametrize(
+    "code,fragment",
+    [
+        ("mimo_authoritative_failed", "权威模型调用失败"),
+        ("authoritative_gap_recovery_expired", "补识别窗口"),
+        ("authoritative_failed", "识别失败"),
+        ("context_resolution_failed", "上下文解析失败"),
+        ("management_recognition_unresolved", "上下文解析失败"),
+    ],
+)
+def test_every_new_recognition_reason_code_has_a_chinese_label(code, fragment):
+    label = reason_label(code)
+    assert fragment in label
+    assert "未收录原因" not in label
 
 
 def test_the_message_excerpt_is_one_line_and_bounded_at_eighty_characters(store):
