@@ -454,6 +454,13 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
   `telegram_live_listener.py`、`management_fraction_gate.py`（只改 `pending`→`suppressed`）读写；
   模板、静态资源、`web_queries`、`strategy_records`、`scripts/` 都不读它，没有看板受影响。
 
+### 8.15 部署记录（2026-09-23 08:51 CST）
+
+- 用户批准。候选 `d4b77b23`（`1e0c961f` D3 + `d4b77b23` 无辅助模型不发【AI识别分歧告警】），全量 **9680 passed / 0 failed**。
+- 零在途；`tg-deploy` → worker/web/ingest active、web 200、worker 错误行 0；值守重启后心跳正常，新增水位线 `recognition_decisions=18419`。
+- **回滚 = `tg-deploy 2a0da6eb…`**；自动交易开关未动。
+- 遗留：`parse`/`fetch` 人工命令里的第三个发送点未改；Codex 提示词没有针对"消息没被识别"的专门指引（独立小项）。
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
