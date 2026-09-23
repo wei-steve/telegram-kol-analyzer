@@ -63,11 +63,37 @@ if candidate.parse_source in {"entry_confirm_heuristic", "lifecycle_ai"}:
 **同群、策略消息前后 30 分钟、每侧最多 20 条**的窗口里作为 `risk_multiplier` 片段被下一条策略消费。
 陈哥群 8 月的「半仓入场」都正确进了这张表（10084 / 10126 / 10185 / 10201，倍率 0.5）。
 
-但 preamble 只有一条产生途径：MiMo 在权威输出里给出 `entry_context`
-（[`entry_strategy_assembly.py:338`](../../src/telegram_kol_research/entry_strategy_assembly.py) 的
-`has_entry_context`）。而 MiMo 一旦能把消息对应到已有策略，就会走 `lifecycle_event`/`entry_confirm`
-路径，不再输出 `entry_context`。**能对应上已有策略的仓位提示，注定拿不到 preamble** ——
-这正是 10696 的处境。`entry_preambles` 表最后一条记录停在 2026-09-16。
+**这一节最初的诊断是错的，2026-09-23 审阅阶段 1+2 实现时用线上证据纠正如下。**
+
+原判断是「MiMo 一旦能对应上已有策略就不再输出 `entry_context`」。线上负载证明相反——10696 的
+`normalized_evidence_json` 里三样东西都在：
+
+```json
+"entry_context": {"kind":"entry_preamble","risk_multiplier":"0.5","side":"short","symbol":"BTC", ...},
+"entry_fragments": [{"kind":"risk_multiplier","risk_multiplier":"0.5", ...}],
+"evidence.text.fields.position_size": {"value":"半仓","confidence":1.0,"source":"text"}
+```
+
+**模型把半仓认出来了，是我们自己拒收的。** 写入侧
+[`entry_preambles.py:140`](../../src/telegram_kol_research/entry_preambles.py) 的
+`persist_authoritative_entry_preamble` 要求：
+
+```python
+payload.get("recognition_result") == "非策略"
+and not _has_meaningful_value(strategy)
+and str(lifecycle.get("event_type") or "") == "none"     # ← 10696 是 "entry_confirm"
+```
+
+只要 MiMo 同时判出**任何**生命周期事件，`entry_context` 就被丢掉。
+`entry_strategy_fragments.py:82` 的 `lifecycle_is_entry_context` 是逐字相同的守卫，后果更彻底：
+生产库 `entry_strategy_fragments` 表**至今 0 行**，v2 的片段通道（不止 `risk_multiplier`，
+还有 `leg_allocation` 与补充价格）从上线起就没写过一行。`entry_preambles` 有 18 行，最后一条停在 2026-09-16。
+
+这不改变阶段 2 的做法——2.1/2.2 在 `entry_confirm` 分支里自己写 preamble，绕开这道守卫，
+拿到的倍率与 MiMo 给的 0.5 一致，且与消费侧
+`has_entry_context and not current_preamble_persisted` 的时序检查正好对上。
+**放宽守卫是另一个专题**：它会同时打开那条从未在生产跑过的 fragment 通道，而 `leg_allocation`
+直接改变下单腿的分配，需要自己的 shadow 观察窗，不该搭在本稿里。见第 7 节。
 
 ### 3.3 即使有了 preamble，也传不到下一条策略
 
@@ -272,6 +298,11 @@ confidence=<本次识别置信度>, reason="<本条消息的仓位词，注明�
   不放进本稿是因为它与入场语义无关，且没有交易所写入风险；建议随手捎在下一个触碰该模块的专题里。
   交易所侧已确认无残留：用户 2026-09-23 核对，两张触发单都不在了——**绑定持仓的止损单在该持仓平仓离场时
   由交易所自动撤销**。所以这个缺口纯粹是库内记录问题，不会留下裸触发单。
+- **放宽 `event_type == "none"` 守卫**（见 3.2 的更正）：让带 `lifecycle_event` 的消息也能落下
+  `entry_context` / `entry_fragments`。价值是让 MiMo 已经算对的东西不再被丢，代价是第一次真正打开
+  v2 的 fragment 通道（`leg_allocation` 会改变下单腿分配）。独立专题，先 shadow。
+  顺带记一笔：`evidence.text.fields.position_size` 是结构化的「半仓」，比 2.1 的正则更可靠，
+  那个专题里应当把它排在词表之前作为首选来源。
 - 提示词不改。
 
 ## 8. 存量数据与手动干预的留痕（实证）
