@@ -135,6 +135,14 @@ execution_owner / execution_registry 的唤醒路径上**，对账器继续不�
 运维面板都改读 `entry_assembly_wakeup_executions` 是否有对应行。**两者选一，不要都做。**
 我建议前者：让状态字段自己说实话，比要求所有读者都记得绕开它更可靠。
 
+**3.1 补充理由（2026-09-24 实施阶段 1+2 时发现）。** `_persist_attempt`
+（`entry_assembly_admission.py:559`）在 `existing.status in {"shadow","pending","woken"}` 时把 attempt 重置回
+`pending`——**`woken` 在这个集合里**，也就是一条已经下过单的 attempt 可以被一次重新识别重新武装，
+再执行一次。本次改动没有让它更容易发生（对账器只选 `pending`/`ready`，`ready` 又在评估前短路），
+它一直只能由消息驱动的重新识别触发，和从前一样。但这是一条真实的重复下单路径，
+**3.1 选「拆出 `executed` 终态」会顺带修掉它**（`executed` 不在那个集合里）；选另一个方案则修不掉，
+还得单独把 `woken` 从那个集合里摘出来。这是我建议选前者的第二个理由。
+
 **3.2** 一条 attempt 进入 `ready` 后超过 N 分钟（建议 10）仍未产生
 `entry_assembly_wakeup_executions` 行 → runtime incident 告警一次。这是这套机制唯一的活检：
 上面所有改动如果哪天又被绕开，这条告警会说话，而不是六小时后一句「找不到持仓记录」。
