@@ -12,7 +12,11 @@ from typing import Any, Iterable, Mapping
 from telegram_kol_research.models import PositionProtectionLedger, utc_now
 
 
-_ACTIVE_OWNERSHIP_STATUSES = frozenset({"verified", "protected"})
+#: The sole judgement of whether a ledger row still names an owner. Callers
+#: that need the same answer must read this set rather than restate it: a
+#: reader that narrows it to ``"verified"`` alone drops every ``"protected"``
+#: row and reports an owned protection order as unattributable.
+ACTIVE_OWNERSHIP_STATUSES = frozenset({"verified", "protected"})
 
 
 def retained_take_profit_total(
@@ -36,7 +40,7 @@ def retained_take_profit_total(
     for row in rows:
         purpose = str(_field(row, "purpose") or "").lower()
         status = str(_field(row, "status") or "").lower()
-        if purpose != "take_profit" or status not in _ACTIVE_OWNERSHIP_STATUSES:
+        if purpose != "take_profit" or status not in ACTIVE_OWNERSHIP_STATUSES:
             continue
         order_id = str(_field(row, "order_id") or "")
         if (
@@ -142,7 +146,7 @@ def build_account_protection_ownership(
         pos_id = str(_field(row, "pos_id") or "").strip()
         if (
             row_venue != normalized_venue
-            or status not in _ACTIVE_OWNERSHIP_STATUSES
+            or status not in ACTIVE_OWNERSHIP_STATUSES
             or not order_id
             or not pos_id
         ):

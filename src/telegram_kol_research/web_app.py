@@ -240,9 +240,11 @@ from telegram_kol_research.position_attribution import has_authoritative_persist
 from telegram_kol_research.position_attribution import require_manual_position_attribution_allowed
 from telegram_kol_research.deepcoin_trigger_rows import (
     any_trigger_price_including_entry_attached,
+    order_id_or_none,
 )
 from telegram_kol_research.protection_attribution import match_position_protection
 from telegram_kol_research.protection_ledger import (
+    ACTIVE_OWNERSHIP_STATUSES,
     build_account_protection_ownership,
 )
 from telegram_kol_research.recovery_decisions import apply_recovery_review_decision
@@ -2104,6 +2106,9 @@ def _load_deepcoin_live_position_rows(
             if verified_live_leg_ids
             else []
         )
+        # The mutation scope stays exactly as narrow as it was: this set feeds
+        # `match_position_protection`, whose answer reaches `can_mutate` and so
+        # decides which protection order may be cancelled or rewritten.
         account_ownership = build_account_protection_ownership(
             ledger_rows,
             venue="deepcoin",
@@ -2113,11 +2118,26 @@ def _load_deepcoin_live_position_rows(
             order_id: owner.pos_id
             for order_id, owner in account_ownership.by_order_id.items()
         }
+        # Display asks a different question -- "whose order is this?" -- and the
+        # ledger answers it by order id alone. Asking it through the entry leg
+        # instead made the answer depend on whether that leg happened to be
+        # `active`, so a `partially_filled` two-leg entry, a leg an entry
+        # revision had marked `filled`, or a binding still `open` lost every one
+        # of its protection orders to "无法归属" while the ledger held the exact
+        # ordId -> posId row all along. A TPSL row carries no posId, so nothing
+        # downstream could recover it. Look the pending orders up by their own
+        # ids, on the ledger's own terms.
+        display_ownership = _load_display_protection_ownership(
+            session,
+            pending_orders=tpsl_orders,
+            live_pos_ids=active_pos_ids,
+        )
         direct_protection_rows, pending_unattributed_rows = (
             _split_exchange_protection_display_rows(
                 positions=active_positions,
                 pending_orders=tpsl_orders,
-                account_ownership=account_ownership,
+                account_ownership=display_ownership,
+                mutation_scoped_order_ids=set(exact_order_position_ids),
                 contract_spec_provider=contract_spec_provider,
             )
         )
@@ -3344,15 +3364,10 @@ def _exchange_order_row(order: dict[str, Any], *, source: str) -> dict[str, Any]
         "side": position_side,
         "order_direction_label": direction_label,
         "order_direction_side": direction_side,
-        "order_id": _first_position_string(
-            order,
-            "ordId",
-            "orderId",
-            "order_id",
-            "algoId",
-            "triggerOrderId",
-            "id",
-        ),
+        # Read every spelling the venue uses, `OrderSysID` included: this id is
+        # what the protection ledger is keyed by, so a narrower read here shows
+        # an owned trigger order as unattributed.
+        "order_id": order_id_or_none(order),
         "client_order_id": _first_position_string(
             order,
             "clOrdId",
@@ -3473,7 +3488,11 @@ def _attach_exchange_order_bindings(
                 ExecutionOrderLeg.id == PositionProtectionLedger.execution_order_leg_id,
             )
             .filter(PositionProtectionLedger.venue == "deepcoin")
-            .filter(PositionProtectionLedger.status == "verified")
+            .filter(
+                PositionProtectionLedger.status.in_(
+                    sorted(ACTIVE_OWNERSHIP_STATUSES)
+                )
+            )
             .filter(PositionProtectionLedger.order_id.in_(wanted_ids))
             .all()
         )
@@ -3759,92 +3778,41 @@ def _load_deepcoin_pending_tpsl_orders(
     return result, evidence_available
 
 
-def _exchange_protection_display_rows(
+def _load_display_protection_ownership(
+    session,
     *,
-    position: dict[str, Any],
     pending_orders: list[dict[str, Any]],
-) -> list[dict[str, str]]:
-    """Return every exchange TPSL side relevant to a live-position card.
+    live_pos_ids: set[str],
+):
+    """Read the ledger owner of each pending protection order, by order id.
 
-    This is intentionally a display-only view.  It must not be used to infer
-    strategy ownership or relax the conservative protection-mutation checks.
+    Read-only, and deliberately not scoped by entry leg or binding: a ledger
+    row already names one exact position, and whether the leg that opened it is
+    still `active` says nothing about whose order this is. The query is bounded
+    by the orders actually on screen and hits the unique
+    `venue + order_id` index, so it never scans the ledger.
     """
 
-    position_id = _first_position_string(position, "posId", "pos_id", "id")
-    instrument_id = str(position.get("instId") or "").upper()
-    side = _normalize_deepcoin_position_side(
-        position.get("posSide") or position.get("side")
-    )
-    display_rows: list[dict[str, str]] = []
-    for order in pending_orders:
-        if str(order.get("triggerOrderType") or "").upper() != "TPSL":
-            continue
-        order_position_id = _first_position_string(
-            order,
-            "closePosId",
-            "close_pos_id",
-            "closePositionId",
-            "posId",
-            "pos_id",
-            "positionId",
+    order_ids = {
+        order_id
+        for order in pending_orders
+        if (order_id := order_id_or_none(order))
+    }
+    if not order_ids:
+        return build_account_protection_ownership(
+            [], venue="deepcoin", live_pos_ids=live_pos_ids
         )
-        if order_position_id:
-            if order_position_id != position_id:
-                continue
-            ownership_state = "已验证归属"
-        elif str(order.get("instId") or "").upper() != instrument_id:
-            continue
-        else:
-            explicit_position_side = _position_text_value(order.get("posSide"))
-            if (
-                explicit_position_side is not None
-                and _normalize_deepcoin_position_side(explicit_position_side) != side
-            ):
-                continue
-            # A TPSL's plain `side` is its closing-order direction, not reliable
-            # position-side evidence. Without `posSide`, show it as a candidate
-            # instead of either dropping it or claiming a verified association.
-            ownership_state = "无法归属"
-
-        # A-14: same keys, same order, same zero-as-absent rule, now named.
-        for kind, row_kind in (("take_profit", "tp"), ("stop_loss", "sl")):
-            trigger_price = any_trigger_price_including_entry_attached(
-                order, kind=row_kind
-            )
-            trigger_price_text = _position_text_value(trigger_price)
-            if trigger_price_text is None:
-                continue
-            display_rows.append(
-                {
-                    "kind": kind,
-                    "trigger_price_text": trigger_price_text,
-                    "size_text": _position_text_value(
-                        order.get("sz") or order.get("size")
-                    )
-                    or "0",
-                    "order_id": _first_position_string(
-                        order,
-                        "ordId",
-                        "orderId",
-                        "order_id",
-                        "algoId",
-                        "triggerOrderId",
-                        "id",
-                    )
-                    or "-",
-                    "ownership_state": ownership_state,
-                }
-            )
-    state_sort = {"已验证归属": 0, "无法归属": 1}
-    kind_sort = {"take_profit": 0, "stop_loss": 1}
-    return sorted(
-        display_rows,
-        key=lambda row: (
-            state_sort[row["ownership_state"]],
-            kind_sort[row["kind"]],
-            _float_or_none(row["trigger_price_text"]) or float("inf"),
-            row["order_id"],
-        ),
+    rows = (
+        session.query(PositionProtectionLedger)
+        .filter(PositionProtectionLedger.venue == "deepcoin")
+        .filter(PositionProtectionLedger.order_id.in_(sorted(order_ids)))
+        .filter(PositionProtectionLedger.status.in_(sorted(ACTIVE_OWNERSHIP_STATUSES)))
+        .all()
+    )
+    return build_account_protection_ownership(
+        rows,
+        venue="deepcoin",
+        live_pos_ids=live_pos_ids,
     )
 
 
@@ -3872,6 +3840,7 @@ def _split_exchange_protection_display_rows(
     pending_orders: list[dict[str, Any]],
     exact_order_position_ids: dict[str, str] | None = None,
     account_ownership=None,
+    mutation_scoped_order_ids: set[str] | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> tuple[dict[str, list[dict[str, str]]], list[dict[str, str]]]:
     """Separate exact position TPSL rows from exchange rows without an owner."""
@@ -3882,6 +3851,7 @@ def _split_exchange_protection_display_rows(
         pending_orders=pending_orders,
         exact_order_position_ids=exact_order_position_ids or {},
         account_ownership=account_ownership,
+        mutation_scoped_order_ids=mutation_scoped_order_ids,
         contract_spec_provider=contract_spec_provider,
     )
     return (

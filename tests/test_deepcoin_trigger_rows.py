@@ -142,3 +142,22 @@ def test_unreadable_take_profit_still_counts_as_present():
     assert present({"tpTriggerPrice": "0", "closeTPTriggerPrice": "0"}) is False
     assert present({"tpTriggerPx": "-1"}) is False
     assert present(LIVE_POSITION_ROW) is False
+
+
+def test_order_id_reads_every_spelling_the_venue_uses():
+    """One reader, so the ledger and the page cannot drift apart on this key.
+
+    A TPSL row carries no posId, so its order id is the only thing that can
+    attribute it. `OrderSysID` is the name in the venue's own TriggerOrder
+    structure and was missing from the page's reader, which is how an owned
+    protection order came out as 无法归属.
+    """
+
+    from telegram_kol_research.deepcoin_trigger_rows import order_id_or_none
+
+    assert order_id_or_none({"OrderSysID": "sys-1"}) == "sys-1"
+    assert order_id_or_none({"ordId": "ord-1"}) == "ord-1"
+    assert order_id_or_none({"algoId": "algo-1"}) == "algo-1"
+    assert order_id_or_none({"OrderSysID": "sys-1", "ordId": "ord-1"}) == "sys-1"
+    assert order_id_or_none({"OrderSysID": "  ", "ordId": "ord-1"}) == "ord-1"
+    assert order_id_or_none({"instId": "BTC-USDT-SWAP"}) is None

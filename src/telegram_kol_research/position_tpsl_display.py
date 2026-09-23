@@ -4,12 +4,29 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation
-from typing import Any, Literal, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 from telegram_kol_research.deepcoin_contract_specs import (
     DeepcoinContractSpecProvider,
 )
+from telegram_kol_research.deepcoin_trigger_rows import order_id_or_none
 from telegram_kol_research.protection_ledger import AccountProtectionOwnership
+
+#: An order the ledger names an owner for, whose owning entry leg is also still
+#: the live, verified, mutation-scoped leg for that position.
+OWNERSHIP_VERIFIED = "已验证归属"
+#: The ledger names this order's exact position, but the entry leg behind it is
+#: no longer the mutation-scoped one -- it may be `partially_filled`, `filled`,
+#: `closed`, or its binding may have moved on. Whose order this is, is known;
+#: whether it still protects the position the exchange is reporting under that
+#: posId is not, because a venue may reuse a posId. So the row is shown on the
+#: position's own card rather than dumped into the unattributed list, and it is
+#: deliberately excluded from the "does this position have a stop" summary,
+#: which fails closed.
+OWNERSHIP_OUT_OF_SCOPE = "已归属（未计入保护）"
+#: No ledger row and no exchange position id. A TPSL row carries no posId, so
+#: there is nothing left to attribute it with.
+OWNERSHIP_UNATTRIBUTED = "无法归属"
 
 
 @dataclass(frozen=True, slots=True)
@@ -58,12 +75,20 @@ def build_position_tpsl_display(
     pending_orders: list[dict[str, Any]],
     exact_order_position_ids: Mapping[str, object] | None = None,
     account_ownership: AccountProtectionOwnership | None = None,
+    mutation_scoped_order_ids: Iterable[str] | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
 ) -> PositionTpslDisplayResult:
     """Join TPSL rows only by exchange position ID or verified local order ID.
 
     Price, size, direction and creation time are display fields.  They never
     establish ownership, so an unscoped full-position stop remains global.
+
+    ``account_ownership`` answers "whose order is this", which the ledger keys
+    by order id alone.  ``mutation_scoped_order_ids`` is the narrower set whose
+    owning entry leg is also still live and verified; only those rows are
+    reported as :data:`OWNERSHIP_VERIFIED` and so reach the protection summary.
+    Passing no scope keeps the previous behaviour, where every attributed row
+    counted as verified.
     """
 
     positions_by_id = {
@@ -82,6 +107,9 @@ def build_position_tpsl_display(
     by_pos_id = {position_id: [] for position_id in positions_by_id}
     unattributed: list[PositionTpslDisplayRow] = []
     legacy_exact_ids = exact_order_position_ids or {}
+    scoped_order_ids = (
+        None if mutation_scoped_order_ids is None else set(mutation_scoped_order_ids)
+    )
     conflicting_order_ids = (
         {conflict.order_id for conflict in account_ownership.conflicts}
         if account_ownership is not None
@@ -91,16 +119,7 @@ def build_position_tpsl_display(
     for order in pending_orders:
         if str(order.get("triggerOrderType") or "").upper() != "TPSL":
             continue
-        order_id = _first_text(
-            order,
-            "OrderSysID",
-            "ordId",
-            "orderId",
-            "order_id",
-            "algoId",
-            "triggerOrderId",
-            "id",
-        )
+        order_id = order_id_or_none(order)
         exchange_position_id = _first_text(
             order,
             "PositionID",
@@ -132,6 +151,15 @@ def build_position_tpsl_display(
             order,
             order_id=order_id or "-",
             position=position,
+            in_mutation_scope=(
+                # An exchange-stated position id is exact evidence in its own
+                # right, so a row carrying one keeps counting as verified
+                # whatever the ledger scope says. Only ledger-attributed rows
+                # can fall outside it.
+                True
+                if scoped_order_ids is None or exchange_position_id is not None
+                else bool(order_id) and order_id in scoped_order_ids
+            ),
             contract_spec_provider=contract_spec_provider,
         )
         if position_id in by_pos_id:
@@ -142,7 +170,7 @@ def build_position_tpsl_display(
         unattributed.extend(
             replace(
                 row,
-                ownership_state="无法归属",
+                ownership_state=OWNERSHIP_UNATTRIBUTED,
                 instrument_id=instrument_id,
                 side=side,
             )
@@ -160,6 +188,7 @@ def _split_order(
     *,
     order_id: str,
     position: dict[str, Any] | None,
+    in_mutation_scope: bool,
     contract_spec_provider: DeepcoinContractSpecProvider | None,
 ) -> list[PositionTpslDisplayRow]:
     size_mode, raw_size_text, size_display_text, current_size = _size_fields(
@@ -181,7 +210,11 @@ def _split_order(
                     size_text=raw_size_text,
                     order_id=order_id,
                     ownership_state=(
-                        "已验证归属" if position is not None else "无法归属"
+                        OWNERSHIP_UNATTRIBUTED
+                        if position is None
+                        else OWNERSHIP_VERIFIED
+                        if in_mutation_scope
+                        else OWNERSHIP_OUT_OF_SCOPE
                     ),
                     size_mode=size_mode,
                     raw_size_text=raw_size_text,
@@ -297,7 +330,11 @@ def _base_symbol(instrument_id: str) -> str | None:
 
 
 def _sorted(rows: list[PositionTpslDisplayRow]) -> list[PositionTpslDisplayRow]:
-    state_sort = {"已验证归属": 0, "无法归属": 1}
+    state_sort = {
+        OWNERSHIP_VERIFIED: 0,
+        OWNERSHIP_OUT_OF_SCOPE: 1,
+        OWNERSHIP_UNATTRIBUTED: 2,
+    }
     kind_sort = {"take_profit": 0, "stop_loss": 1}
     return sorted(
         rows,

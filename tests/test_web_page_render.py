@@ -3585,6 +3585,216 @@ def test_ledger_order_position_fallback_renders_tpsl_on_exact_position(tmp_path)
     assert "order unknown-tp-1" in summary
 
 
+@pytest.mark.parametrize(
+    ("leg_status", "binding_status", "ledger_status"),
+    [
+        # A two-leg entry whose second leg has not filled yet. `execution_bindings`
+        # preserves this status on purpose, so it is a steady state, not a blip.
+        ("partially_filled", "active", "verified"),
+        # What an entry revision writes once it reads the fill back.
+        ("filled", "active", "verified"),
+        # `binding_is_live` counts "open" as live twenty lines further down the
+        # same function; the ledger query used to demand "active".
+        ("active", "open", "verified"),
+        # The other half of the ledger's own ACTIVE_OWNERSHIP_STATUSES.
+        ("active", "active", "protected"),
+    ],
+)
+def test_ledger_attribution_survives_leg_binding_and_ledger_state(
+    tmp_path, leg_status, binding_status, ledger_status
+):
+    """Whose order this is depends on the ledger row, not on the leg's state.
+
+    Every one of these is a live position with an exact ordId -> posId row in
+    the ledger. Scoping the ledger read by "is the entry leg still active"
+    dropped the row, and since a TPSL row carries no posId, the page had
+    nothing left to attribute it with and reported 无法归属.
+    """
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="BTC",
+            side="long", venue="deepcoin", status=binding_status, pos_id="pos-a",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            order_kind="market", pos_id="pos-a", venue="deepcoin",
+            attribution_status="verified", status=leg_status,
+            response_json=json.dumps({"posId": "pos-a"}),
+            attribution_evidence_json=json.dumps({"evidence_type": "exact_regular_order_id"}),
+        )
+        session.add(leg)
+        session.flush()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id="pos-a",
+            instrument_id="BTC-USDT-SWAP", side="long", order_id="ledger-stop-1",
+            purpose="stop_loss", trigger_price="62000", status=ledger_status,
+            evidence_source="native_tpsl_readback",
+        ))
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [{"instId": "BTC-USDT-SWAP", "posId": "pos-a", "posSide": "long", "pos": "3", "avgPx": "64000"}]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {"ordId": "ledger-stop-1", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "3", "slTriggerPx": "62000"},
+            ]
+
+    response = TestClient(create_web_app(
+        database_path=database_path, deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    assert response.status_code == 200
+    card = re.search(
+        r'<article class="exchange-position-card" data-position-pos-id="pos-a".*?</article>',
+        response.text,
+        re.DOTALL,
+    ).group(0)
+    assert "order ledger-stop-1" in card
+    assert "无法归属" not in card
+    assert "data-unattributed-protection-orders" not in response.text
+
+
+def test_ledger_row_for_a_closed_entry_leg_is_named_but_kept_out_of_protection(tmp_path):
+    """Knowing whose order it is must not become a claim that it still protects.
+
+    A venue may reuse a posId, so once the entry leg that opened the position
+    is closed, the ledger still names the order's owner but no longer proves
+    that the position the exchange reports under that id is the same one. The
+    row therefore stays on the card, labelled, and stays out of the summary
+    that answers "does this position have a stop" -- which fails closed.
+    """
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="BTC",
+            side="long", venue="deepcoin", status="active", pos_id="pos-a",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            order_kind="market", pos_id="pos-a", venue="deepcoin",
+            attribution_status="verified", status="closed",
+            response_json=json.dumps({"posId": "pos-a"}),
+            attribution_evidence_json=json.dumps({"evidence_type": "exact_regular_order_id"}),
+        )
+        session.add(leg)
+        session.flush()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id="pos-a",
+            instrument_id="BTC-USDT-SWAP", side="long", order_id="closed-leg-stop",
+            purpose="stop_loss", trigger_price="62000", status="verified",
+            evidence_source="management_tpsl_replacement",
+        ))
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [{"instId": "BTC-USDT-SWAP", "posId": "pos-a", "posSide": "long", "pos": "3", "avgPx": "64000"}]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                {"ordId": "closed-leg-stop", "triggerOrderType": "TPSL", "instId": inst_id, "side": "sell", "sz": "3", "slTriggerPrice": "62000"},
+            ]
+
+    response = TestClient(create_web_app(
+        database_path=database_path, deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    assert response.status_code == 200
+    card = re.search(
+        r'<article class="exchange-position-card" data-position-pos-id="pos-a".*?</article>',
+        response.text,
+        re.DOTALL,
+    ).group(0)
+    assert "order closed-leg-stop" in card
+    assert "已归属（未计入保护）" in card
+    assert "已验证归属" not in card
+    assert "data-unattributed-protection-orders" not in response.text
+
+
+def test_open_orders_tab_attributes_a_tpsl_identified_only_by_order_sys_id(tmp_path):
+    """The venue's TriggerOrder structure names the order id ``OrderSysID``.
+
+    The protection ledger is keyed by that id, so the 当前委托 row has to read
+    the same spellings the ledger was written with. Reading only ``ordId`` left
+    the row with no id to look up, and an owned stop rendered as 未归属.
+    """
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="BTC",
+            side="long", venue="deepcoin", status="active", pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
+        leg = ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=1, purpose="entry",
+            order_kind="market", pos_id="pos-live", venue="deepcoin",
+            attribution_status="verified", status="active",
+            response_json=json.dumps({"posId": "pos-live"}),
+            attribution_evidence_json=json.dumps({"evidence_type": "exact_regular_order_id"}),
+        )
+        session.add(leg)
+        session.flush()
+        session.add(PositionProtectionLedger(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id="pos-live",
+            instrument_id="BTC-USDT-SWAP", side="long", order_id="sys-stop-1",
+            purpose="stop_loss", trigger_price="58000", status="verified",
+            evidence_source="native_tpsl_readback",
+        ))
+        session.commit()
+
+    class PascalCaseTriggerClient(_RecordingExchangePositionsClient):
+        def list_trigger_orders_pending(self, *, inst_id):
+            self.calls.append(("list_trigger_orders_pending", inst_id))
+            return [
+                {
+                    "OrderSysID": "sys-stop-1",
+                    "instId": inst_id,
+                    "triggerOrderType": "TPSL",
+                    "posSide": "long",
+                    "slTriggerPrice": "58000",
+                }
+            ]
+
+    exchange = PascalCaseTriggerClient()
+    response = TestClient(
+        create_web_app(
+            database_path=database_path,
+            deepcoin_client_factory=lambda: exchange,
+        )
+    ).get("/positions-panel/tabs/open-orders")
+
+    assert response.status_code == 200
+    assert "order sys-stop-1" in response.text
+    assert "已验证保护" in response.text
+
+
 def test_bound_position_close_renders_exact_context_for_bound_exchange_position(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)

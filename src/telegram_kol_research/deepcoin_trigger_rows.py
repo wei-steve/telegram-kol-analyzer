@@ -75,6 +75,21 @@ _ENTRY_ATTACHED_TAKE_PROFIT_KEYS = ("closeTPTriggerPrice",)
 #: repository has persisted itself.
 _POSITION_ID_KEYS = ("posId", "pos_id", "id")
 _TRIGGER_PRICE_KEYS = ("triggerPx", "triggerPrice")
+#: Every spelling the venue uses for an order's own id, in the order the
+#: repository already reads them (``position_tpsl_display``,
+#: ``tpsl_ownership_audit``, ``native_tpsl``, ``deepcoin_order_matching``).
+#: ``OrderSysID`` is first because it is the name in the venue's own
+#: TriggerOrder structure, and ``id`` is last because rows this repository
+#: persisted itself are the only ones that carry it.
+_ORDER_ID_KEYS = (
+    "OrderSysID",
+    "ordId",
+    "orderId",
+    "order_id",
+    "algoId",
+    "triggerOrderId",
+    "id",
+)
 
 
 def _first_present_text(row: Mapping[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -142,6 +157,22 @@ def trigger_price(row: Mapping[str, Any]) -> str | None:
     """The price at which a conditional order triggers."""
 
     return _first_present_text(row, _TRIGGER_PRICE_KEYS)
+
+
+def order_id_or_none(row: Mapping[str, Any]) -> str | None:
+    """The row's exchange order id, under any of the venue's spellings.
+
+    This is the string the protection ledger stores, and for a TPSL row it is
+    the *only* key by which the row can be attributed at all, since such a row
+    carries no position id (see :func:`position_id_or_none`). So both sides of
+    that lookup have to read the same spellings: a reader that omits one
+    answers ``None`` where the ledger holds a row, and the page then reports a
+    perfectly owned stop as unattributable. ``web_app._exchange_order_row`` did
+    exactly that by omitting ``OrderSysID`` -- the name the venue's own
+    TriggerOrder structure uses for the order id.
+    """
+
+    return _first_present_text(row, _ORDER_ID_KEYS)
 
 
 # --- The union reader, and why it is named the way it is ---------------------
