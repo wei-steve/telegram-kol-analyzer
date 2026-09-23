@@ -10,6 +10,15 @@
 - **约束性文档**：`docs/plans/2026-09-23-entry-confirm-sizing-and-lifecycle-integrity-design.md`
   （冲突时以它为准）。
 
+| 提交 | 主题 |
+|---|---|
+| `006972e1` | 阶段 1 + 阶段 2 全部代码与用例（两个阶段必须一起部署，合成一个提交） |
+| （本提交） | 本文档补记提交 sha 与全量结果 |
+
+**最终候选全量**：`uv run python -m pytest -q` → **9721 passed, 4 skipped, 107 warnings,
+834.10s (0:13:54)，退出码 0**。基线（`eb5923a2`）收集 9685 条，本次净增 40 条（27 + 13），零回归。
+（`uv run pytest` 不加 `python -m` 仍在收集阶段报 `No module named 'tests'`，既有问题，与本次无关。）
+
 ---
 
 ## 1. 阶段 1 做了什么
@@ -137,6 +146,24 @@
 双双失败（`risk_multiplier` 退回 `Decimal('1')`，`boundary_evidence` 非空）；改回 `entry_confirm` 后两条都通过。
 
 第 5 条（真正的新策略不受影响）由既有全量套件覆盖。
+
+---
+
+## 4.5 一个设计稿没有覆盖、部署前必须确认的前提
+
+**阶段 2 只在 `entry_message_assembly_v2_mode` 为 `live` 时生效。**
+
+设计稿 3.3 与 4.2.3 只点名了 `entry_assembly_admission._load_source_facts`（v2 相邻组装路径），
+实施也只改了它。但 `entry_strategy_assembly._load_prior_facts`（v2 非 live 时走的旧 preamble 路径，
+`:294` 附近）有**逐字相同的缺陷**：它同样把任何 `event_type == "entry_signal"` 的在先候选归为
+`complete_entry`，而 `select_entry_preamble` 在硬边界处 `candidates.clear()`；preamble 与确认候选
+挂在同一条消息上、排序键相同、preamble 先入列，于是照样被清掉。
+
+也就是说：若生产的 `entry_message_assembly_v2_mode` 不是 `live`，本次阶段 2 写出的 preamble
+仍然会被同一条消息的确认候选挡掉，「半仓」依旧到不了下一条策略。阶段 1 不受影响，任何模式下都生效。
+
+**没有自行修改旧路径**：设计稿没写，改它属于额外的运行语义变更。部署前请核对生产设置；
+若不是 `live`，需要主会话决定是同样修旧路径、还是先推进开关。
 
 ---
 
