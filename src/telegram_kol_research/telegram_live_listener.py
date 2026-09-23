@@ -12,7 +12,7 @@ from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from functools import wraps
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+from typing import Any, Awaitable, Callable, Mapping
 
 from sqlalchemy import and_, or_
 from sqlalchemy import tuple_
@@ -400,6 +400,19 @@ def _build_authoritative_notification_payload(
         if isinstance(assessment.deepseek_payload, dict)
         else {}
     )
+    # An absent auxiliary result is an empty section, not three dashes. The
+    # dashes were indistinguishable from a second model that answered with
+    # nothing, and ``auxiliary_review_disagrees`` has to tell those apart.
+    auxiliary = (
+        {
+            "model": deepseek_payload.get("model") or "",
+            "status": deepseek_payload.get("recognition_result") or "-",
+            "kind": "auxiliary",
+            "reason": deepseek_payload.get("reason") or "-",
+        }
+        if deepseek_payload
+        else {}
+    )
     return {
         "chat_title": chat_title,
         "chat_id": raw_message.chat_id,
@@ -408,11 +421,7 @@ def _build_authoritative_notification_payload(
         "text": raw_message.text,
         "agreement_status": assessment.agreement_status,
         "differences": assessment.differences,
-        "deepseek": {
-            "status": deepseek_payload.get("recognition_result") or "-",
-            "kind": "auxiliary",
-            "reason": deepseek_payload.get("reason") or "-",
-        },
+        "deepseek": auxiliary,
         "mimo": {
             "status": assessment.mimo.status,
             "kind": "authoritative",
@@ -502,6 +511,28 @@ def _handle_authoritative_failure_notification(
             notification_status=notification_status,
         )
         return False
+    if not auxiliary_review_disagrees(payload):
+        # No second model ran, so there is no disagreement to report. The
+        # decision row still records what happened and why nothing was sent.
+        update_recognition_execution_outcome(
+            session_factory,
+            raw_message_id=raw_message_id,
+            automation_status=str(
+                payload.get("automation", {}).get("status") or "unknown"
+            ),
+            automation_reason=payload.get("automation", {}).get("reason"),
+            notification_status=SUPPRESSED_NO_AUXILIARY,
+        )
+        # The retry is a separate decision from the alert, and it stays. A
+        # message about a live position is still worth re-reading sixty
+        # seconds later whether or not anyone was told about the failure.
+        if retry_processor is not None:
+            _schedule_authoritative_failure_retry(
+                raw_message_id=raw_message_id,
+                retry_processor=retry_processor,
+                retry_delay_seconds=retry_delay_seconds,
+            )
+        return False
     _schedule_authoritative_notification(
         session_factory=session_factory,
         raw_message_id=raw_message_id,
@@ -533,6 +564,53 @@ def _schedule_authoritative_failure_retry(
             logger.exception("authoritative recognition delayed retry failed")
 
     asyncio.create_task(retry_in_background())
+
+
+#: What the decision row records when 【AI识别分歧告警】 is withheld because no
+#: second model ran. A ``suppressed_*`` code, so every existing reader that
+#: already distinguishes "suppressed" from "sent"/"failed" keeps working.
+SUPPRESSED_NO_AUXILIARY = "suppressed_no_auxiliary"
+
+#: Agreement statuses that mean the two models did not land in the same place.
+#: ``authoritative_failed`` is one of them: with a working auxiliary result in
+#: hand, "the authority produced nothing and the auxiliary produced something"
+#: is exactly the comparison the alert was written for.
+_DISAGREEING_AGREEMENT_STATUSES = frozenset({"disagreed", "authoritative_failed"})
+
+#: What ``_build_authoritative_notification_payload`` writes into an auxiliary
+#: field it has no value for.
+_EMPTY_FIELD = "-"
+
+
+def auxiliary_review_disagrees(payload: Mapping[str, Any]) -> bool:
+    """Is this failure a *two-model disagreement* somebody should be told about?
+
+    【AI识别分歧告警】 was written for a two-model setup: MiMo decides, DeepSeek
+    reviews, and a person is paged when they differ. The auxiliary model was
+    removed -- ``authoritative_recognition`` builds every decision with
+    ``auxiliary_model=None``, and every assessment carries
+    ``deepseek_payload=None`` -- so the alert became an English-ish "MiMo
+    recognition failed" notice with two empty DeepSeek lines. The account
+    owner ruled that it must not be sent while no auxiliary model is in use.
+
+    This is the one predicate both senders ask, so the worker path and
+    ``POST /api/messages/{id}/recognize`` cannot drift apart. The formatter
+    is deliberately untouched: restore a second model and the alert returns
+    with the wording it always had.
+    """
+
+    auxiliary = payload.get("deepseek")
+    if not isinstance(auxiliary, Mapping):
+        return False
+    carries_a_result = any(
+        str(auxiliary.get(field) or "").strip() not in {"", _EMPTY_FIELD}
+        for field in ("model", "status", "reason")
+    )
+    if not carries_a_result:
+        return False
+    return (
+        str(payload.get("agreement_status") or "") in _DISAGREEING_AGREEMENT_STATUSES
+    )
 
 
 def _classify_authoritative_failure_notification(payload: dict[str, Any]) -> str:

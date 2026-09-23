@@ -747,6 +747,14 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
     tmp_path,
     monkeypatch,
 ):
+    """A slow alert must not hold up the intake path.
+
+    The assessment below carries an auxiliary result, because that is what it
+    now takes for this alert to be sent at all (see
+    ``auxiliary_review_disagrees``). What is under test here is unchanged: the
+    delivery runs in its own task.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
     alert_started = asyncio.Event()
@@ -771,7 +779,11 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
                     model="mimo-v2.5",
                     error_message="timeout",
                 ),
-                deepseek_payload=None,
+                deepseek_payload={
+                    "model": "deepseek-chat",
+                    "recognition_result": "是策略",
+                    "reason": "读出的是移动止损",
+                },
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -939,10 +951,78 @@ def test_authoritative_mimo_failure_suppresses_empty_input_noise(
     assert audit[0]["automation_reason"] == "mimo_authoritative_failed"
 
 
-def test_authoritative_mimo_failure_still_alerts_position_management_text(
+def test_the_conflict_alert_is_sent_when_an_auxiliary_model_actually_disagrees(
+    monkeypatch,
+):
+    """The formatter's two-model shape is kept, and so is its trigger.
+
+    ``auxiliary_model`` is ``None`` on every path today, which is why the
+    alert is suppressed below. It is suppressed because there is no second
+    opinion, not because the alert was retired: a payload that does carry one
+    still goes out, unchanged.
+    """
+
+    from telegram_kol_research.telegram_live_listener import (
+        _handle_authoritative_failure_notification,
+    )
+
+    scheduled: list[dict] = []
+    audited: list[dict] = []
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener."
+        "_schedule_authoritative_notification",
+        lambda **kwargs: scheduled.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener."
+        "update_recognition_execution_outcome",
+        lambda *args, **kwargs: audited.append(kwargs),
+    )
+
+    payload = {
+        "chat_title": "峰哥",
+        "chat_id": 7,
+        "message_id": 3346,
+        "posted_at": None,
+        "text": "止损上移到 2484",
+        "agreement_status": "authoritative_failed",
+        "differences": ["lifecycle_event.management_action"],
+        "deepseek": {
+            "model": "deepseek-chat",
+            "status": "是策略",
+            "kind": "auxiliary",
+            "reason": "读出的是移动止损",
+        },
+        "mimo": {"status": "识别失败", "kind": "authoritative", "reason": "timeout"},
+        "automation": {"status": "skipped", "reason": "mimo_authoritative_failed"},
+    }
+
+    handled = _handle_authoritative_failure_notification(
+        session_factory=None,
+        raw_message_id=11,
+        sender=None,
+        config=None,
+        payload=payload,
+    )
+
+    assert handled is True
+    assert len(scheduled) == 1
+    assert audited == []
+
+
+def test_the_conflict_alert_is_not_sent_while_no_auxiliary_model_runs(
     tmp_path,
     monkeypatch,
 ):
+    """The account owner's ruling: no second model, no disagreement alert.
+
+    ``authoritative_recognition`` builds every decision with
+    ``auxiliary_model=None``, so 【AI识别分歧告警】 has been an English-ish
+    "MiMo failed" notice with two empty DeepSeek lines. Nothing is sent and
+    nothing is scheduled; the decision row records why.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
     sent: list[dict] = []
@@ -974,12 +1054,9 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     async def sender(**kwargs):
         sent.append(kwargs)
 
-    def record_audit(*args, **kwargs):
-        audit.append(kwargs)
-
     monkeypatch.setattr(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
-        record_audit,
+        lambda *args, **kwargs: audit.append(kwargs),
     )
     monkeypatch.setattr(
         "telegram_kol_research.telegram_live_listener.claim_authoritative_failure_notification",
@@ -987,6 +1064,7 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
     )
 
     text = "移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情"
+
     async def scenario():
         await _persist_then_process(
             event=_FakeEvent(text=text),
@@ -1003,24 +1081,30 @@ def test_authoritative_mimo_failure_still_alerts_position_management_text(
             system_operator_conflict_sender=sender,
         )
         for _ in range(100):
-            if len(audit) >= 2:
-                break
             await asyncio.sleep(0.001)
 
     asyncio.run(scenario())
 
-    assert len(sent) == 1
-    assert sent[0]["payload"]["agreement_status"] == "authoritative_failed"
-    assert sent[0]["payload"]["text"] == text
-    assert len(notification_claims) == 1
-    assert notification_claims[0]["automation_reason"] == "mimo_authoritative_failed"
-    assert [row["notification_status"] for row in audit] == ["sent"]
+    assert sent == []
+    # Nothing is scheduled either: no delivery is reserved on the decision row.
+    assert notification_claims == []
+    assert [row["notification_status"] for row in audit] == ["suppressed_no_auxiliary"]
+    assert audit[0]["automation_reason"] == "mimo_authoritative_failed"
 
 
-def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
+def test_authoritative_mimo_failure_retries_high_risk_message_without_alerting(
     tmp_path,
     monkeypatch,
 ):
+    """Suppressing the alert must not take the re-recognition with it.
+
+    The two decisions used to be one: ``_handle_authoritative_failure_notification``
+    returned early on any ``suppressed_*`` verdict and the delayed retry never
+    got scheduled. Silencing a Telegram message is not a reason to stop
+    re-reading a message about a live position, so the "no auxiliary model"
+    suppression schedules the retry exactly as the alerting path did.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
     calls: list[int] = []
@@ -1109,5 +1193,5 @@ def test_authoritative_mimo_failure_retries_high_risk_message_after_alert(
 
     asyncio.run(scenario())
 
-    assert len(sent) == 1
+    assert sent == []
     assert len(calls) == 2

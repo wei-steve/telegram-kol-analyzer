@@ -423,6 +423,37 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
   `ALLOWED_QUERY_SHAPES` 不得落后于实际读法。值守 7 个套件共 310 通过。
 - **未做**：没有动任何自动交易 / 执行开关；值守仍不写生产库；无 schema 变更；未部署。
 
+### 8.14 主链路：【AI识别分歧告警】在没有辅助模型时不再发送（2026-09-23，**需重启交易进程**）
+
+与 8.13 同一批，但部署方式不同：这条改的是主链路（`telegram_live_listener` / `web_app`），要重启 worker/web。
+
+- **问题**：这条告警是为"MiMo 判、DeepSeek 复核、两者不一致就叫人"设计的。辅助模型早已下线——
+  `authoritative_recognition` 构造 `RecognitionDecisionRecord` 时 `auxiliary_model` / `auxiliary_status` / `auxiliary_payload`
+  全部写死 `None`，每个 `AuthoritativeAssessment` 的 `deepseek_payload` 也恒为 `None`。于是发出去的其实是一条
+  "MiMo 识别失败"的半英文通知，DeepSeek 两行永远是 `-`。账号所有者裁定：**没有辅助模型时不发**。
+- **判据**（`telegram_live_listener.auxiliary_review_disagrees(payload)`，两个调用点共用）：
+  payload 的 `deepseek` 段必须**真的带结果**（`model` / `status` / `reason` 任一非空且不是 `-`），
+  **且** `agreement_status ∈ {disagreed, authoritative_failed}`。不满足 → 不发、不排任务。
+  `_build_authoritative_notification_payload` 相应改为：没有辅助结果时 `deepseek` 段是空字典 `{}`，
+  而不是三个 `-`——"没有第二个模型"和"第二个模型答了个空"必须能分开。
+- **决策行记什么**：`notification_status='suppressed_no_auxiliary'`（`automation_status` / `automation_reason` 照常写入，
+  `notification_error` 不动，`notification_fingerprint` 不动，不建台账、不占 `claim_authoritative_failure_notification` 的名额）。
+  沿用 `suppressed_` 前缀，既有的 `suppressed_low_value` / `suppressed_empty_input` 判定仍排在前面、结果不变。
+- **重要：重试保留**。原先 `_handle_authoritative_failure_notification` 一旦判为 `suppressed_*` 就直接 return，
+  **连 60 秒后的重新识别也一起取消**。若照搬，这次的"全面静默"会把主链路的识别重试一并废掉——那不是所有者要的。
+  所以新判据只静默告警：`retry_processor` 存在时照常 `_schedule_authoritative_failure_retry`。
+  （`suppressed_low_value` / `suppressed_empty_input` 的旧行为一字未动。）
+- **格式化函数保留**：`format_ai_recognition_conflict_review_message` 原样不动，将来恢复双模型即可复用。
+- **未改的第三个发送点**：`cli.py:1863`（`telegram-kol-research parse` / `fetch` 的
+  `_deliver_cli_authoritative_failure_notification`）仍会发。它是人工命令，没有任何 systemd 单元跑它，
+  设计只点名了 worker 与 `/api/messages/{id}/recognize` 两处，故按"改动最小"保留并在此记录。
+- 测试：`tests/test_telegram_live_listener.py`（无辅助→不发不排、有辅助且分歧→照发、静默后重试仍在、
+  原"仍会告警"用例已被前者取代并删除）、`tests/test_web_app.py`（`/recognize` 返回 `notification_scheduled: false`
+  且记 `suppressed_no_auxiliary`）。
+- 其它消费者核查：`RecognitionDecision.notification_status` 只有 `recognition_decisions.py`、
+  `telegram_live_listener.py`、`management_fraction_gate.py`（只改 `pending`→`suppressed`）读写；
+  模板、静态资源、`web_queries`、`strategy_records`、`scripts/` 都不读它，没有看板受影响。
+
 ## 9. 下一阶段
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：

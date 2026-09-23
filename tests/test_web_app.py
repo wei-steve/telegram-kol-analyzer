@@ -6322,6 +6322,81 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
     ]
 
 
+def test_message_recognition_api_does_not_alert_without_an_auxiliary_model(
+    tmp_path, monkeypatch
+):
+    """The manual re-recognition path shares the worker path's one predicate.
+
+    The message here is a live position-management instruction, so neither the
+    low-value nor the empty-input filter applies: before the account owner's
+    ruling this response said ``notification_scheduled: true`` and Telegram
+    got a 【AI识别分歧告警】 with two empty DeepSeek lines.
+    """
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
+    )
+    app.state.system_operator_bot_config = SystemOperatorBotConfig(
+        bot_token="system-token",
+        chat_id="system-chat",
+    )
+    audit: list[dict] = []
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
+        lambda *args, **kwargs: audit.append(kwargs),
+    )
+    monkeypatch.setattr(
+        "telegram_kol_research.web_app._schedule_authoritative_notification",
+        lambda **kwargs: (_ for _ in ()).throw(
+            AssertionError("no auxiliary model means no disagreement alert")
+        ),
+    )
+
+    with app.state.session_factory() as session:
+        raw_message = RawMessage(
+            chat_id=88,
+            message_id=3347,
+            sender_name="峰哥高级会员群-11分组",
+            text="移动保本损 剩余30%挂65000全部止盈 我怕后半夜搞事情",
+        )
+        session.add(raw_message)
+        session.commit()
+        raw_message_id = raw_message.id
+
+    def fake_authoritative_processor(message_id):
+        return SimpleNamespace(
+            recognition=MessageRecognitionResult(
+                raw_message_id=message_id,
+                status="识别失败",
+                summary=None,
+                reason="timeout",
+                parse_source="mimo_authoritative",
+            ),
+            assessment=SimpleNamespace(
+                agreement_status="authoritative_failed",
+                semantic_review_status="completed",
+                differences=[],
+                mimo=SimpleNamespace(
+                    model="mimo-v2.5",
+                    status="识别失败",
+                    payload={},
+                    error_message="The read operation timed out",
+                ),
+                deepseek_payload=None,
+            ),
+            automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
+        )
+
+    app.state.authoritative_processor = fake_authoritative_processor
+
+    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
+
+    assert response.status_code == 200
+    assert response.json()["notification_scheduled"] is False
+    assert [row["notification_status"] for row in audit] == ["suppressed_no_auxiliary"]
+
+
 @pytest.mark.parametrize("semantic_review_status", ["execution_pending", "execution_running"])
 def test_message_recognition_api_preserves_execution_review_state(
     tmp_path, semantic_review_status
