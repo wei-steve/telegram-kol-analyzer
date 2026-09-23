@@ -624,14 +624,73 @@ def _sole_position_trade_unit(trade_units: set[str]) -> str | None:
     return next(iter(positions))
 
 
+def resting_entry_stop_owners(
+    session, *, venue: str = "deepcoin"
+) -> dict[tuple[str, str, str, str], int]:
+    """``(instId, posSide, sz, slTriggerPx)`` -> the resting entry leg id.
+
+    The same rule as :func:`_pending_entry_stop_signatures`, keeping the leg
+    rather than discarding it. Read from our own durable leg rows, never from
+    the exchange: the question is "did we ask for this stop as part of an
+    entry", and only our record can answer it.
+
+    A signature shared by two resting legs maps to neither -- with the legs
+    indistinguishable, naming one would be a guess, and this returns only what
+    it can prove.
+
+    **This is for display.** It says which entry leg asked for a stop that the
+    venue has already placed; it does not make that stop a live position's
+    protection, because the position does not exist yet. Authority still runs
+    through :func:`resolve_protection_authority`, which excludes these orders.
+    """
+
+    rows = (
+        session.query(ExecutionOrderLeg)
+        .filter(ExecutionOrderLeg.venue == str(venue or "deepcoin").lower())
+        .filter(ExecutionOrderLeg.purpose == "entry")
+        .filter(ExecutionOrderLeg.status.in_(sorted(PENDING_ENTRY_LEG_STATUSES)))
+        .all()
+    )
+    owners: dict[tuple[str, str, str, str], int] = {}
+    ambiguous: set[tuple[str, str, str, str]] = set()
+    for row in rows:
+        signature = _leg_stop_signature(row)
+        if signature is None:
+            continue
+        if signature in owners and owners[signature] != int(row.id):
+            ambiguous.add(signature)
+            continue
+        owners[signature] = int(row.id)
+    for signature in ambiguous:
+        owners.pop(signature, None)
+    return owners
+
+
+def _leg_stop_signature(row: Any) -> tuple[str, str, str, str] | None:
+    try:
+        request = json.loads(getattr(row, "request_json", None) or "{}")
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(request, dict):
+        return None
+    instrument = str(request.get("instId") or "").strip().upper()
+    pos_side = str(request.get("posSide") or "").strip().lower()
+    size = _text(request.get("sz"))
+    stop = _text(request.get("slTriggerPx"))
+    if instrument and pos_side and size and stop:
+        return (instrument, pos_side, size, stop)
+    return None
+
+
 def _pending_entry_stop_signatures(
     session, *, venue: str
 ) -> set[tuple[str, str, str, str]]:
     """``(instId, posSide, sz, slTriggerPx)`` of every resting entry leg's stop.
 
-    Read from our own durable leg rows, never from the exchange: the question
-    is "did we ask for this stop as part of an entry", and only our record can
-    answer it.
+    Authority's own read, which needs only membership. It deliberately keeps a
+    signature that two resting legs share: for excluding an order, "one of our
+    resting legs asked for this" is the whole question, and which leg it was
+    does not change the answer.
     """
 
     rows = (
@@ -643,18 +702,9 @@ def _pending_entry_stop_signatures(
     )
     signatures: set[tuple[str, str, str, str]] = set()
     for row in rows:
-        try:
-            request = json.loads(row.request_json or "{}")
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(request, dict):
-            continue
-        instrument = str(request.get("instId") or "").strip().upper()
-        pos_side = str(request.get("posSide") or "").strip().lower()
-        size = _text(request.get("sz"))
-        stop = _text(request.get("slTriggerPx"))
-        if instrument and pos_side and size and stop:
-            signatures.add((instrument, pos_side, size, stop))
+        signature = _leg_stop_signature(row)
+        if signature is not None:
+            signatures.add(signature)
     return signatures
 
 

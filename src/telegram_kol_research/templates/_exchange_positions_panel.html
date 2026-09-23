@@ -305,10 +305,36 @@
       <div class="exchange-view-panel" data-exchange-view-panel="grouped">
         {{ grouped_list(exchange_snapshot.grouped.positions, '暂无持仓', 'position') }}
       </div>
-      {% if exchange_snapshot.unattributed_protection_orders %}
+      {% set resting_entry_stops = exchange_snapshot.unattributed_protection_orders | selectattr('resting_entry_leg_id', 'defined') | list %}
+      {% set ownerless_protection_orders = exchange_snapshot.unattributed_protection_orders | rejectattr('resting_entry_leg_id', 'defined') | list %}
+      {% if resting_entry_stops %}
+        <section class="exchange-protection-orders" data-resting-entry-stops>
+          <strong>挂单入场自带止损（入场尚未成交）</strong>
+          <small class="ai-helper-text">这些止损由我们自己的挂单带上交易所，入场成交后会自动归属到新仓位。</small>
+          {% for instrument_id, orders in resting_entry_stops | groupby('instrument_id') %}
+            <div>
+              <strong>{{ instrument_id }}</strong>
+              <ul>
+                {% for order in orders %}
+                  <li>
+                    <span>{{ '多' if order.side == 'long' else '空' if order.side == 'short' else '方向未知' }}</span>
+                    <span>止损</span>
+                    <span>{{ order.trigger_price_text }}</span>
+                    <span>{{ order.size_display_text }}</span>
+                    <code>order {{ order.order_id }}</code>
+                    <span class="exchange-attribution-chip">{{ order.resting_entry_group_name }}</span>
+                    <span>{{ order.resting_entry_summary }}</span>
+                  </li>
+                {% endfor %}
+              </ul>
+            </div>
+          {% endfor %}
+        </section>
+      {% endif %}
+      {% if ownerless_protection_orders %}
         <section class="exchange-protection-orders" data-unattributed-protection-orders>
           <strong>未归属交易所保护单</strong>
-          {% for instrument_id, orders in exchange_snapshot.unattributed_protection_orders | groupby('instrument_id') %}
+          {% for instrument_id, orders in ownerless_protection_orders | groupby('instrument_id') %}
             <div>
               <strong>{{ instrument_id }}</strong>
               <ul>

@@ -3667,6 +3667,127 @@ def test_ledger_attribution_survives_leg_binding_and_ledger_state(
     assert "data-unattributed-protection-orders" not in response.text
 
 
+def test_resting_entry_attached_stop_is_named_not_reported_unattributed(tmp_path):
+    """Our own resting entry asked for this stop, so the page must say whose it is.
+
+    The venue places a migrated limit entry's attached stop while the entry is
+    still unfilled: no posId, no ledger row, identical in shape to a genuinely
+    ownerless stop. Authority excludes such an order from the position's
+    protection set -- correctly, the position does not exist yet -- but the
+    page had no such notion and filed it under 未归属, which is what made the
+    panel look full of unknown stops while flat.
+    """
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="ETH",
+            side="long", venue="deepcoin", status="active", pos_id="pos-live",
+            strategy_instance_id="deepcoin:-100:7:ETH:long",
+        )
+        session.add(binding)
+        session.flush()
+        session.add(ExecutionOrderLeg(
+            execution_binding_id=binding.id, leg_index=2, purpose="entry",
+            order_kind="limit", venue="deepcoin", status="pending",
+            request_json=json.dumps({
+                "instId": "ETH-USDT-SWAP", "posSide": "long",
+                "sz": "1.6", "slTriggerPx": "2700.0",
+            }),
+        ))
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [{"instId": "ETH-USDT-SWAP", "posId": "pos-live", "posSide": "long", "pos": "1.5", "avgPx": "2762"}]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [
+                # The resting entry's own attached stop: venue spells the price
+                # "2700" where our stored request says "2700.0".
+                {"ordId": "resting-stop-1", "triggerOrderType": "TPSL", "instId": inst_id,
+                 "posSide": "long", "sz": "1.6", "slTriggerPrice": "2700"},
+                # A stop matching no resting leg stays genuinely unattributed.
+                {"ordId": "ownerless-1", "triggerOrderType": "TPSL", "instId": inst_id,
+                 "posSide": "long", "sz": "9.9", "slTriggerPrice": "2500"},
+            ]
+
+    response = TestClient(create_web_app(
+        database_path=database_path, deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    assert response.status_code == 200
+    resting = re.search(
+        r'<section[^>]*data-resting-entry-stops[^>]*>.*?</section>',
+        response.text, re.DOTALL,
+    ).group(0)
+    ownerless = re.search(
+        r'<section[^>]*data-unattributed-protection-orders[^>]*>.*?</section>',
+        response.text, re.DOTALL,
+    ).group(0)
+
+    assert "order resting-stop-1" in resting
+    assert "entry leg #2" in resting
+    assert "order resting-stop-1" not in ownerless
+    assert "order ownerless-1" in ownerless
+    assert "order ownerless-1" not in resting
+
+
+def test_resting_entry_stop_shared_by_two_legs_is_not_guessed(tmp_path):
+    """Two indistinguishable legs mean the owner is unproven, so do not name one."""
+
+    database_path = tmp_path / "research.db"
+    session_factory = create_session_factory(database_path)
+    with session_factory() as session:
+        binding = ExecutionBinding(
+            kol_id="group:100", chat_id=100, message_id=1, symbol="ETH",
+            side="long", venue="deepcoin", status="active", pos_id="pos-live",
+        )
+        session.add(binding)
+        session.flush()
+        for leg_index in (2, 3):
+            session.add(ExecutionOrderLeg(
+                execution_binding_id=binding.id, leg_index=leg_index, purpose="entry",
+                order_kind="limit", venue="deepcoin", status="pending",
+                request_json=json.dumps({
+                    "instId": "ETH-USDT-SWAP", "posSide": "long",
+                    "sz": "1.6", "slTriggerPx": "2700.0",
+                }),
+            ))
+        session.commit()
+
+    class FakeDeepcoinClient:
+        def list_positions(self, *, inst_id=None):
+            return [{"instId": "ETH-USDT-SWAP", "posId": "pos-live", "posSide": "long", "pos": "1.5", "avgPx": "2762"}]
+
+        def list_open_orders(self, *, inst_id=None): return []
+        def list_order_history(self, *, inst_id=None): return []
+        def list_trigger_order_history(self, *, inst_id=None): return []
+        def list_position_history(self, *, inst_id=None): return []
+
+        def list_trigger_orders_pending(self, *, inst_id=None):
+            return [{"ordId": "ambiguous-stop-1", "triggerOrderType": "TPSL", "instId": inst_id,
+                     "posSide": "long", "sz": "1.6", "slTriggerPrice": "2700"}]
+
+    response = TestClient(create_web_app(
+        database_path=database_path, deepcoin_client_factory=FakeDeepcoinClient,
+    )).get("/positions-panel")
+
+    assert response.status_code == 200
+    assert "data-resting-entry-stops" not in response.text
+    ownerless = re.search(
+        r'<section[^>]*data-unattributed-protection-orders[^>]*>.*?</section>',
+        response.text, re.DOTALL,
+    ).group(0)
+    assert "order ambiguous-stop-1" in ownerless
+
+
 def test_ledger_row_for_a_closed_entry_leg_is_named_but_kept_out_of_protection(tmp_path):
     """Knowing whose order it is must not become a claim that it still protects.
 

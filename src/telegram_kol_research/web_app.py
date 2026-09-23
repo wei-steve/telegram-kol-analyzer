@@ -243,6 +243,7 @@ from telegram_kol_research.deepcoin_trigger_rows import (
     order_id_or_none,
 )
 from telegram_kol_research.protection_attribution import match_position_protection
+from telegram_kol_research.protection_authority import resting_entry_stop_owners
 from telegram_kol_research.protection_ledger import (
     ACTIVE_OWNERSHIP_STATUSES,
     build_account_protection_ownership,
@@ -2141,6 +2142,20 @@ def _load_deepcoin_live_position_rows(
                 contract_spec_provider=contract_spec_provider,
             )
         )
+        # A resting entry carries its stop on the order itself, so the venue
+        # places that stop while the entry is still unfilled. Such a row has no
+        # ledger owner and no posId -- no position exists yet -- and it used to
+        # land in "未归属交易所保护单" beside genuinely ownerless stops. It is
+        # not ownerless: our own leg asked for it, and the leg says which group
+        # and strategy. Name it. Authority still excludes these orders
+        # (`resolve_protection_authority`), because a stop for a position that
+        # does not exist is not that position's protection; this only stops the
+        # page from reporting a known owner as unknown.
+        _name_resting_entry_stops(
+            session,
+            rows=pending_unattributed_rows,
+            group_label_by_chat_id=group_label_by_chat_id,
+        )
         if unattributed_protection_rows is not None:
             unattributed_protection_rows.extend(pending_unattributed_rows)
         protection_match = match_position_protection(
@@ -3776,6 +3791,94 @@ def _load_deepcoin_pending_tpsl_orders(
                 continue
             result.append(order)
     return result, evidence_available
+
+
+def _name_resting_entry_stops(
+    session,
+    *,
+    rows: list[dict[str, str]],
+    group_label_by_chat_id: dict[int, str],
+) -> None:
+    """Label each stop that one of our own resting entry legs asked for.
+
+    Read-only, and it mutates only display fields. The rule is the one
+    `protection_authority` already applies to exclude these orders, read
+    through `resting_entry_stop_owners` so the two cannot drift apart.
+    """
+
+    stop_rows = [row for row in rows if str(row.get("kind") or "") == "stop_loss"]
+    if not stop_rows:
+        return
+    owners = resting_entry_stop_owners(session, venue="deepcoin")
+    if not owners:
+        return
+    legs = {
+        int(leg.id): leg
+        for leg in (
+            session.query(ExecutionOrderLeg)
+            .filter(ExecutionOrderLeg.id.in_(sorted(set(owners.values()))))
+            .all()
+        )
+    }
+    bindings = {
+        int(binding.id): binding
+        for binding in (
+            session.query(ExecutionBinding)
+            .filter(
+                ExecutionBinding.id.in_(
+                    sorted({int(leg.execution_binding_id) for leg in legs.values()})
+                )
+            )
+            .all()
+        )
+    }
+    for row in stop_rows:
+        signature = (
+            str(row.get("instrument_id") or "").upper(),
+            str(row.get("side") or "").lower(),
+            str(row.get("raw_size_text") or ""),
+            _decimal_signature_text(row.get("trigger_price_text")),
+        )
+        leg = legs.get(owners.get(signature, -1))
+        if leg is None:
+            continue
+        binding = bindings.get(int(leg.execution_binding_id))
+        if binding is None:
+            continue
+        chat_id = binding.chat_id
+        row["ownership_state"] = "挂单入场自带止损"
+        row["resting_entry_leg_id"] = str(leg.id)
+        row["resting_entry_group_name"] = group_label_by_chat_id.get(
+            chat_id, str(chat_id)
+        )
+        row["resting_entry_summary"] = " · ".join(
+            part
+            for part in (
+                binding.strategy_instance_id,
+                f"{binding.symbol} {binding.side}",
+                f"entry leg #{leg.leg_index}",
+            )
+            if part
+        )
+
+
+def _decimal_signature_text(value: object) -> str:
+    """Match the leg request's own number formatting, not its spelling.
+
+    The venue answers ``"3100"`` where the stored request says ``"3100.0"``;
+    both are the same stop and a string comparison would say otherwise.
+    """
+
+    if value in (None, ""):
+        return ""
+    try:
+        parsed = Decimal(str(value))
+    except (InvalidOperation, TypeError, ValueError):
+        return str(value)
+    if not parsed.is_finite():
+        return str(value)
+    normalized = format(parsed.normalize(), "f")
+    return "0" if normalized == "-0" else normalized
 
 
 def _load_display_protection_ownership(
