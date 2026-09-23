@@ -377,7 +377,7 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 - 截图核实：Telegram 里的「AI agent通知」由 worker 的事故通知循环发出，与侧车无关；近 7 天 99 条，其中 `authoritative_recognition_failed` 30、`context_worker_exhausted` 18。
   这两类正是值守用中文覆盖的情形，遂加入 `config.TELEGRAM_QUIET_INCIDENT_TYPES`：仍捕获入台账，默认不发 Telegram，可在 `TELEGRAM_TYPES` 里点名重新打开。
   【AI识别分歧告警】与其余交易所侧类型（`management_target_refused`、`position_marked_manually_closed`、`protection_adopted_from_exchange` 等）保留。
-- 该改动需 `tg-deploy`（worker 读配置），见下一条部署记录。
+- 已于 2026-09-23 部署：候选 `2a0da6eb`（代码提交 `3d66a488`），全量 **9652 passed / 0 failed**；零在途；worker/web/ingest 重启后 active、web 200、错误行 0；自动交易开关未动。**回滚 = `tg-deploy 9ce48d37…`**。
 
 ## 9. 下一阶段
 
