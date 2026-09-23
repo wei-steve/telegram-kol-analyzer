@@ -178,7 +178,7 @@ def test_lost_wakeup_releases_only_exact_item_without_exchange_call(tmp_path):
     assert result.released == 1
     with session_factory() as session:
         assert session.get(MessageInstructionItem, item_id).visibility_next_attempt_at is None
-        assert session.query(EntryAssemblyAttempt).one().status == "woken"
+        assert session.query(EntryAssemblyAttempt).one().status == "ready"
         assert session.get(MessageInstructionItem, unrelated_id).visibility_next_attempt_at == (
             NOW + timedelta(minutes=2)
         ).replace(tzinfo=None)
@@ -250,7 +250,7 @@ def test_historical_pending_attempt_cannot_starve_future_live_item(tmp_path):
             EntryAssemblyAttempt.id
         ).all()
         assert attempts[0].status == "pending"
-        assert attempts[1].status == "woken"
+        assert attempts[1].status == "ready"
 
 
 def test_failed_future_item_cannot_starve_next_live_deferred_item(tmp_path):
@@ -286,7 +286,7 @@ def test_failed_future_item_cannot_starve_next_live_deferred_item(tmp_path):
             EntryAssemblyAttempt.id
         ).all()
         assert attempts[0].status == "pending"
-        assert attempts[1].status == "woken"
+        assert attempts[1].status == "ready"
 
 
 def test_malformed_deferred_item_is_expired_instead_of_occupying_batch(tmp_path):
@@ -523,7 +523,7 @@ def test_shadow_releases_a_due_deferred_entry(tmp_path):
         # Cleared, so the entry is immediately claimable again -- the same
         # state the event-driven wakeup produces, which already runs in shadow.
         assert item.visibility_next_attempt_at is None
-        assert session.query(EntryAssemblyAttempt).one().status == "woken"
+        assert session.query(EntryAssemblyAttempt).one().status == "ready"
 
 
 def test_disabled_still_releases_nothing(tmp_path):
@@ -826,7 +826,7 @@ def test_terminal_blocker_decision_wakes_attempt_on_next_pass(tmp_path):
 
     assert result.released == 1
     with session_factory() as session:
-        assert session.query(EntryAssemblyAttempt).one().status == "woken"
+        assert session.query(EntryAssemblyAttempt).one().status == "ready"
         assert (
             session.get(MessageInstructionItem, item_id).visibility_next_attempt_at
             is None

@@ -488,6 +488,48 @@ def test_expired_visibility_retry_is_failed_before_it_can_be_claimed(tmp_path):
         )
 
 
+def test_management_expiry_sweep_never_rewrites_an_entry_item(tmp_path):
+    """Design 2.1: the bulk expiry must match the claim SELECT's kind filter.
+
+    Before this, the sweep expired every kind while the retry claimed only
+    management, so an entry item could never be retried by this loop but was
+    guaranteed to be killed by it six hours later -- with the management
+    reason code ``target_strategy_binding_visibility_retry_expired``, which
+    on-call renders as "no matching position record was ever found".
+    """
+
+    session_factory = create_session_factory(tmp_path / "visibility-kind.db")
+    raw_id, _, _, _ = _persist_dual_instruction_message(session_factory)
+    with session_factory() as session:
+        items = create_message_instruction_items_in_session(
+            session, raw_message_id=raw_id
+        )
+        management, entry = items[0], items[1]
+        assert management.instruction_kind == "management"
+        assert entry.instruction_kind == "entry"
+        for item in (management, entry):
+            item.status = "pending"
+            item.visibility_first_failed_at = NOW - timedelta(hours=7)
+            item.visibility_retry_attempts = 20
+            item.visibility_next_attempt_at = NOW - timedelta(hours=6)
+        session.commit()
+        management_id, entry_id = management.id, entry.id
+
+    claim_next_visibility_retry_instruction_item(session_factory, now=NOW)
+
+    with session_factory() as session:
+        expired = session.get(MessageInstructionItem, management_id)
+        untouched = session.get(MessageInstructionItem, entry_id)
+        assert expired.status == "failed"
+        assert (
+            json.loads(expired.error_json)["reason"]
+            == "target_strategy_binding_visibility_retry_expired"
+        )
+        assert untouched.status == "pending"
+        assert untouched.error_json is None
+        assert untouched.visibility_next_attempt_at is not None
+
+
 def test_racing_claim_cannot_bypass_pending_or_executing_management(
     tmp_path, monkeypatch
 ):

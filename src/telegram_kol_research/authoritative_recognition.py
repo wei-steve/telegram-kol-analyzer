@@ -2882,18 +2882,30 @@ def _capture_terminalization_failure(
 def _run_entry_assembly_wakeups(
     session_factory,
     *,
-    completed_raw_message_id: int,
+    completed_raw_message_id: int | None,
     auto_trade_executor,
     execution_owner,
     execution_registry,
 ) -> None:
+    """Drain every deferred entry this caller is allowed to execute.
+
+    ``completed_raw_message_id`` names the message that just finished, for the
+    blocker trigger. The worker's periodic cycle passes ``None``: it speaks for
+    no message and can only take attempts the reconciler already marked
+    ``ready``.
+    """
+
     from telegram_kol_research.entry_assembly_admission import (
         claim_ready_entry_assembly_wakeups,
     )
 
     wake_now = utc_now()
     wake_kwargs = {
-        "completed_raw_message_id": completed_raw_message_id,
+        "completed_raw_message_id": (
+            int(completed_raw_message_id)
+            if completed_raw_message_id is not None
+            else None
+        ),
         "now": wake_now,
     }
     if execution_owner is None:

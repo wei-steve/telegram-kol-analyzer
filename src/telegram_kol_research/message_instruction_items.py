@@ -399,6 +399,15 @@ def claim_next_visibility_retry_instruction_item(
             update(MessageInstructionItem)
             .where(
                 MessageInstructionItem.retired_at.is_(None),
+                # Same kind filter as the claim SELECT below. Without it this
+                # sweep expired every kind while the retry claimed only
+                # management, so an entry item could never be retried by this
+                # loop yet was guaranteed to be killed by it after six hours --
+                # carrying a management reason code that on-call renders as
+                # "no matching position record was ever found". An entry's own
+                # deadline is the reconciler's, and its reason code is
+                # ``entry_admission_deadline_expired``.
+                MessageInstructionItem.instruction_kind == "management",
                 MessageInstructionItem.visibility_first_failed_at.is_not(None),
                 MessageInstructionItem.visibility_first_failed_at <= expiry_cutoff,
                 or_(

@@ -796,3 +796,89 @@ def test_composite_management_schema_is_added_to_existing_database(tmp_path):
     }
     assert indexes["uq_strategy_management_components_idempotency"]["unique"]
     assert indexes["uq_strategy_management_components_batch_leg_kind"]["unique"]
+
+
+def test_legacy_entry_assembly_attempt_status_check_gains_ready(tmp_path):
+    """A pre-existing database must accept the new ``ready`` status.
+
+    SQLite carries a CHECK constraint inside the table definition, so
+    ``create_all`` on an existing table cannot widen it: without an explicit
+    rebuild every reconciler release would fail closed on production data
+    while passing on every fresh test database.
+    """
+
+    database_path = tmp_path / "legacy-entry-attempts.db"
+    with sqlite3.connect(database_path) as connection:
+        connection.execute(
+            "CREATE TABLE entry_assembly_attempts ("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "strategy_raw_message_id INTEGER NOT NULL, "
+            "signal_candidate_id INTEGER NOT NULL, "
+            "candidate_generation VARCHAR(128) NOT NULL, "
+            "cutoff_posted_at DATETIME NOT NULL, "
+            "cutoff_message_id INTEGER NOT NULL, "
+            "cutoff_raw_message_id INTEGER NOT NULL, "
+            "blocking_raw_message_ids_json TEXT NOT NULL, "
+            "status VARCHAR(32) NOT NULL, "
+            "fingerprint VARCHAR(64) NOT NULL UNIQUE, "
+            "wake_claim_token VARCHAR(64), "
+            "wake_claimed_at DATETIME, "
+            "woken_at DATETIME, "
+            "created_at DATETIME NOT NULL, "
+            "updated_at DATETIME NOT NULL, "
+            "CONSTRAINT ck_entry_assembly_attempts_status CHECK ("
+            "status IN ('shadow', 'pending', 'claimed', 'woken', 'expired')))"
+        )
+        connection.execute(
+            "INSERT INTO entry_assembly_attempts ("
+            "id, strategy_raw_message_id, signal_candidate_id, "
+            "candidate_generation, cutoff_posted_at, cutoff_message_id, "
+            "cutoff_raw_message_id, blocking_raw_message_ids_json, status, "
+            "fingerprint, created_at, updated_at) VALUES "
+            "(7, 1, 1, 'gen', '2026-09-01 00:00:00', 2, 2, '[2]', 'woken', "
+            "'fp-7', '2026-09-01 00:00:00', '2026-09-01 00:00:00')"
+        )
+
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        definition = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='entry_assembly_attempts'"
+        ).fetchone()[0]
+        assert "'ready'" in definition
+        preserved = connection.execute(
+            "SELECT status, fingerprint FROM entry_assembly_attempts WHERE id = 7"
+        ).fetchone()
+        assert preserved == ("woken", "fp-7")
+        connection.execute(
+            "UPDATE entry_assembly_attempts SET status = 'ready' WHERE id = 7"
+        )
+        indexes = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='index' AND tbl_name='entry_assembly_attempts'"
+            ).fetchall()
+        }
+    assert "ix_entry_assembly_attempts_status_updated" in indexes
+
+
+def test_entry_assembly_attempt_status_rebuild_is_idempotent(tmp_path):
+    database_path = tmp_path / "fresh-entry-attempts.db"
+    create_session_factory(database_path)
+    with sqlite3.connect(database_path) as connection:
+        first = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='entry_assembly_attempts'"
+        ).fetchone()[0]
+
+    create_session_factory(database_path)
+
+    with sqlite3.connect(database_path) as connection:
+        second = connection.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='entry_assembly_attempts'"
+        ).fetchone()[0]
+    assert first == second
+    assert "'ready'" in second

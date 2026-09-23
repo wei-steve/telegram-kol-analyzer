@@ -104,7 +104,13 @@ REASON_LABELS = {
     "protection_missing_cancellable_order_id": "找不到可撤销的保护单编号",
     "protection_price_or_size_mismatch": "保护单的价格或数量对不上",
     "management_stop_action_conflict": "同一仓位有两个互相冲突的止损动作",
-    "target_strategy_binding_visibility_retry_expired": "一直没找到对应的持仓记录，重试超时",
+    # Management only since 2026-09-24: the sweep that writes this code now
+    # filters on ``instruction_kind == "management"``. An entry that timed out
+    # never had a position to find, and used to be reported with this line.
+    "target_strategy_binding_visibility_retry_expired": "改仓位时一直没找到对应的持仓记录，重试超时",
+    "entry_admission_deadline_expired": "入场被相邻消息推迟，等到超时都没能下单",
+    "entry_admission_recheck_blocked": "入场推迟期间被重新判定为不可入场",
+    "entry_admission_recheck_state_mismatch": "入场推迟记录与指令状态对不上，已作废",
     "close_final_preflight_failed": "最终仓位或合约规格校验失败",
     "protection_recovery_bypassed_for_full_exit": "全平时跳过了保护单恢复",
     "revision_replacement_incomplete": "旧单撤销 / 新单挂出没做完",

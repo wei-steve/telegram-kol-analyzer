@@ -875,6 +875,7 @@ def init_db(engine: Engine) -> None:
         ],
     )
     _make_sqlite_entry_assembly_preamble_nullable(engine)
+    _widen_sqlite_entry_assembly_attempt_status_check(engine)
     _backfill_sqlite_columns(engine)
     _backfill_sqlite_expiry_review_state(engine)
     _backfill_sqlite_indexes(engine)
@@ -961,6 +962,104 @@ def _make_sqlite_entry_assembly_preamble_nullable(engine: Engine) -> None:
         if foreign_keys_enabled:
             cursor.execute("PRAGMA foreign_keys=ON")
         raw_connection.close()
+
+
+#: Statuses ``entry_assembly_attempts`` accepts after the 2026-09-24 phase 1
+#: change. Kept next to the rebuild so the two cannot drift.
+ENTRY_ASSEMBLY_ATTEMPT_STATUSES = (
+    "shadow",
+    "pending",
+    "ready",
+    "claimed",
+    "woken",
+    "expired",
+)
+
+
+def _widen_sqlite_entry_assembly_attempt_status_check(engine: Engine) -> None:
+    """Teach an existing database the ``ready`` status.
+
+    SQLite keeps a CHECK constraint inside the table definition, so
+    ``create_all`` -- which skips tables that already exist -- can never widen
+    one. Without this rebuild the new status would pass on every fresh test
+    database and fail closed on the only database that matters.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+    table = Base.metadata.tables["entry_assembly_attempts"]
+    raw_connection = engine.raw_connection()
+    cursor = raw_connection.cursor()
+    foreign_keys_enabled = False
+    try:
+        definition_row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='entry_assembly_attempts'"
+        ).fetchone()
+        if definition_row is None or definition_row[0] is None:
+            return
+        if "'ready'" in str(definition_row[0]):
+            return
+        unknown = cursor.execute(
+            "SELECT COUNT(*) FROM entry_assembly_attempts WHERE status NOT IN "
+            "({})".format(
+                ",".join("'%s'" % value for value in ENTRY_ASSEMBLY_ATTEMPT_STATUSES)
+            )
+        ).fetchone()[0]
+        if int(unknown or 0) > 0:
+            # Keep the database readable rather than refusing to start. The
+            # rows that would violate the new constraint are exactly the ones
+            # an audited repair has to look at first.
+            logger.error(
+                "entry_assembly_attempts holds %s rows with an unknown status; "
+                "the 'ready' status rebuild was skipped",
+                int(unknown),
+            )
+            return
+        from sqlalchemy.schema import CreateTable
+
+        # Compiled from the live model rather than hand-written, so the rebuild
+        # cannot drift from the declared columns. Only the CREATE TABLE header
+        # is renamed: copying the table into a bare MetaData would strip the
+        # foreign keys, whose target tables live in ``Base.metadata``.
+        create_sql = str(CreateTable(table).compile(dialect=engine.dialect))
+        header = "CREATE TABLE entry_assembly_attempts "
+        if header not in create_sql:
+            raise RuntimeError("entry_assembly_attempts rebuild DDL unrecognised")
+        create_sql = create_sql.replace(
+            header, "CREATE TABLE entry_assembly_attempts_rebuild ", 1
+        )
+        columns = ", ".join(column.name for column in table.columns)
+        foreign_keys_enabled = bool(
+            int(cursor.execute("PRAGMA foreign_keys").fetchone()[0])
+        )
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute("DROP TABLE IF EXISTS entry_assembly_attempts_rebuild")
+        cursor.execute(create_sql)
+        cursor.execute(
+            f"INSERT INTO entry_assembly_attempts_rebuild ({columns}) "
+            f"SELECT {columns} FROM entry_assembly_attempts"
+        )
+        cursor.execute("DROP TABLE entry_assembly_attempts")
+        cursor.execute(
+            "ALTER TABLE entry_assembly_attempts_rebuild "
+            "RENAME TO entry_assembly_attempts"
+        )
+        raw_connection.commit()
+    except Exception:
+        raw_connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        raw_connection.close()
+    # The rebuild dropped the table's indexes with it; recreate exactly the
+    # ones the model declares.
+    with engine.begin() as connection:
+        for index in table.indexes:
+            index.create(bind=connection, checkfirst=True)
 
 
 def _backfill_sqlite_columns(engine: Engine) -> None:

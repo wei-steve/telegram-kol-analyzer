@@ -8874,6 +8874,74 @@ def test_monitor_incident_writer_cancellation_waits_for_worker_completion():
     asyncio.run(scenario())
 
 
+def test_worker_scanner_loop_also_claims_reconciler_ready_entry_wakeups(
+    tmp_path,
+    monkeypatch,
+):
+    """Design 1.3: the periodic claim rides the loop that already owns the lease.
+
+    It must pass no completed message -- it speaks for none -- and must hand
+    over the very owner and registry ``_run_authoritative_processor`` uses,
+    because only that ownership may reach the exchange writer.
+    """
+
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="worker",
+    )
+    monkeypatch.setattr(
+        web_app_module,
+        "scan_recognition_execution_cycle",
+        lambda *args, **kwargs: (),
+    )
+    seen = []
+
+    def record(session_factory, **kwargs):
+        seen.append(kwargs)
+
+    monkeypatch.setattr(web_app_module, "_run_entry_assembly_wakeups", record)
+
+    async def scenario():
+        task = asyncio.create_task(
+            web_app_module._run_recognition_execution_scanner_loop(app)
+        )
+        for _ in range(200):
+            if seen:
+                break
+            await asyncio.sleep(0.001)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(scenario())
+
+    assert len(seen) == 1
+    assert seen[0]["completed_raw_message_id"] is None
+    assert seen[0]["execution_owner"] is app.state.recognition_execution_owner
+    assert seen[0]["execution_registry"] is (
+        app.state.recognition_execution_registry
+    )
+    assert seen[0]["auto_trade_executor"] is app.state.auto_trade_executor
+
+
+def test_web_role_scanner_cycle_never_claims_an_entry_wakeup(tmp_path):
+    app = create_web_app(
+        database_path=tmp_path / "research.db",
+        runtime_role="web",
+    )
+    called = []
+
+    async def scenario():
+        await web_app_module._run_entry_assembly_ready_wakeup_cycle_async(app)
+
+    asyncio.run(scenario())
+
+    assert called == []
+    assert app.state.recognition_execution_owner is None
+
+
 def test_recognition_execution_scanner_cancellation_waits_for_cycle_writes(
     tmp_path,
     monkeypatch,

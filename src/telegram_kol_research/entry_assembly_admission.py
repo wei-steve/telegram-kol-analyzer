@@ -702,16 +702,121 @@ def assess_entry_assembly_admission(
         )
 
 
+def _finish_entry_assembly_wake_claim(
+    session,
+    *,
+    attempt,
+    claim_token: str,
+    trigger_raw_message_id: int,
+    now: datetime,
+    execution_owner,
+    revert_status: str,
+) -> EntryAssemblyWakeClaim | None:
+    """Turn a won compare-and-set into a durable child fence, or give it back.
+
+    Shared by both triggers so the hand-off to
+    ``run_claimed_entry_assembly_wakeup`` is identical whether the blocker
+    finished or the reconciler admitted it. ``revert_status`` is the status the
+    attempt came from, so one whose instruction item has moved on is put back
+    exactly where it was rather than silently demoted.
+    """
+
+    released = _release_adjacent_entry_visibility_delay(
+        session,
+        attempt=attempt,
+        now=now,
+    )
+    if released is False:
+        session.execute(
+            update(EntryAssemblyAttempt)
+            .where(
+                EntryAssemblyAttempt.id == int(attempt.id),
+                EntryAssemblyAttempt.status == "claimed",
+                EntryAssemblyAttempt.wake_claim_token == claim_token,
+            )
+            .values(
+                status=revert_status,
+                wake_claim_token=None,
+                wake_claimed_at=None,
+                updated_at=now,
+            )
+        )
+        session.commit()
+        return None
+    wake_generation = int(
+        session.query(
+            func.coalesce(
+                func.max(EntryAssemblyWakeupExecution.wake_generation),
+                0,
+            )
+        )
+        .filter(
+            EntryAssemblyWakeupExecution.entry_assembly_attempt_id
+            == int(attempt.id)
+        )
+        .scalar()
+    ) + 1
+    child = EntryAssemblyWakeupExecution(
+        entry_assembly_attempt_id=int(attempt.id),
+        wake_generation=wake_generation,
+        strategy_raw_message_id=int(attempt.strategy_raw_message_id),
+        trigger_raw_message_id=int(trigger_raw_message_id),
+        status="claimed",
+        claim_token=claim_token,
+        owner_runtime_role=execution_owner.runtime_role,
+        owner_instance_id=execution_owner.instance_id[:64],
+        owner_pid=int(execution_owner.pid),
+        owner_boot_id=execution_owner.boot_id[:128],
+        owner_process_start_ticks=execution_owner.process_start_ticks[:64],
+        owner_systemd_invocation_id=(
+            execution_owner.systemd_invocation_id[:128]
+            if execution_owner.systemd_invocation_id
+            else None
+        ),
+        claimed_at=now,
+        heartbeat_at=now,
+        lease_expires_at=now + timedelta(minutes=2),
+        created_at=now,
+        updated_at=now,
+    )
+    session.add(child)
+    session.flush()
+    child_execution_id = int(child.id)
+    session.commit()
+    return EntryAssemblyWakeClaim(
+        attempt_id=int(attempt.id),
+        strategy_raw_message_id=int(attempt.strategy_raw_message_id),
+        trigger_raw_message_id=int(trigger_raw_message_id),
+        claim_token=claim_token,
+        child_execution_id=child_execution_id,
+        wake_generation=wake_generation,
+    )
+
+
 def claim_ready_entry_assembly_wakeups(
     session_factory: sessionmaker,
     *,
-    completed_raw_message_id: int,
+    completed_raw_message_id: int | None = None,
     now: datetime,
     limit: int = 20,
     execution_owner=None,
     execution_registry=None,
 ) -> tuple[EntryAssemblyWakeClaim, ...]:
-    """Claim each strategy whose final unresolved source fact just became terminal."""
+    """Claim one deferred entry the wakeup path may now execute.
+
+    Two independent triggers reach this function and only one of them can win,
+    because both end in a compare-and-set on the same ``status`` column:
+
+    * a blocker message finished -- ``pending``, and the completed message is
+      the attempt's last blocker;
+    * the reconciler re-assessed admission and it passed -- ``ready``, which
+      needs no ``completed_raw_message_id`` because no blocker is left to name.
+      The worker's periodic cycle calls it with none.
+
+    A ``ready`` attempt carries the strategy message itself as its trigger. A
+    real blocker is never the strategy message (``_load_source_facts`` excludes
+    it), so that value also says which trigger produced the claim.
+    """
 
     claimed: list[EntryAssemblyWakeClaim] = []
     if execution_owner is None:
@@ -726,13 +831,13 @@ def claim_ready_entry_assembly_wakeups(
     if execution_registry is not None:
         execution_registry.require_accepting()
     with session_factory() as session:
-        pending_rows = (
+        claimable_rows = (
             session.query(EntryAssemblyAttempt.id)
-            .filter(EntryAssemblyAttempt.status == "pending")
+            .filter(EntryAssemblyAttempt.status.in_(("pending", "ready")))
             .order_by(EntryAssemblyAttempt.id.asc())
             .all()
         )
-        attempt_ids = [int(row_id) for (row_id,) in pending_rows]
+        attempt_ids = [int(row_id) for (row_id,) in claimable_rows]
         session.commit()
     # Claim exactly one child at a time. A batch of durable claims made before
     # adapter admission can strand the unvisited children when the first child
@@ -744,7 +849,43 @@ def claim_ready_entry_assembly_wakeups(
         for _ in range(3):
             with session_factory() as session:
                 attempt = session.get(EntryAssemblyAttempt, int(attempt_id))
-                if attempt is None or attempt.status != "pending":
+                if attempt is None or attempt.status not in {"pending", "ready"}:
+                    break
+                if attempt.status == "ready":
+                    claim_token = uuid.uuid4().hex
+                    result = session.execute(
+                        update(EntryAssemblyAttempt)
+                        .where(
+                            EntryAssemblyAttempt.id == int(attempt.id),
+                            EntryAssemblyAttempt.status == "ready",
+                        )
+                        .values(
+                            status="claimed",
+                            wake_claim_token=claim_token,
+                            wake_claimed_at=now,
+                            updated_at=now,
+                        )
+                    )
+                    if int(result.rowcount or 0) != 1:
+                        session.commit()
+                        continue
+                    claim = _finish_entry_assembly_wake_claim(
+                        session,
+                        attempt=attempt,
+                        claim_token=claim_token,
+                        trigger_raw_message_id=int(
+                            attempt.strategy_raw_message_id
+                        ),
+                        now=now,
+                        execution_owner=execution_owner,
+                        revert_status="ready",
+                    )
+                    if claim is not None:
+                        claimed.append(claim)
+                    break
+                if completed_raw_message_id is None:
+                    # The periodic cycle names no completed message, so it has
+                    # nothing to say about an attempt still waiting on one.
                     break
                 old_blockers_json = attempt.blocking_raw_message_ids_json or "[]"
                 try:
@@ -794,86 +935,17 @@ def claim_ready_entry_assembly_wakeups(
                     )
                 )
                 if int(result.rowcount or 0) == 1:
-                    released = _release_adjacent_entry_visibility_delay(
+                    claim = _finish_entry_assembly_wake_claim(
                         session,
                         attempt=attempt,
-                        now=now,
-                    )
-                    if released is False:
-                        session.execute(
-                            update(EntryAssemblyAttempt)
-                            .where(
-                                EntryAssemblyAttempt.id == int(attempt.id),
-                                EntryAssemblyAttempt.status == "claimed",
-                                EntryAssemblyAttempt.wake_claim_token == claim_token,
-                            )
-                            .values(
-                                status="pending",
-                                wake_claim_token=None,
-                                wake_claimed_at=None,
-                                updated_at=now,
-                            )
-                        )
-                        session.commit()
-                        break
-                    child_execution_id = None
-                    wake_generation = None
-                    wake_generation = int(
-                        session.query(
-                            func.coalesce(
-                                func.max(
-                                    EntryAssemblyWakeupExecution.wake_generation
-                                ),
-                                0,
-                            )
-                        )
-                        .filter(
-                            EntryAssemblyWakeupExecution.entry_assembly_attempt_id
-                            == int(attempt.id)
-                        )
-                        .scalar()
-                    ) + 1
-                    child = EntryAssemblyWakeupExecution(
-                        entry_assembly_attempt_id=int(attempt.id),
-                        wake_generation=wake_generation,
-                        strategy_raw_message_id=int(attempt.strategy_raw_message_id),
-                        trigger_raw_message_id=int(completed_raw_message_id),
-                        status="claimed",
                         claim_token=claim_token,
-                        owner_runtime_role=execution_owner.runtime_role,
-                        owner_instance_id=execution_owner.instance_id[:64],
-                        owner_pid=int(execution_owner.pid),
-                        owner_boot_id=execution_owner.boot_id[:128],
-                        owner_process_start_ticks=(
-                            execution_owner.process_start_ticks[:64]
-                        ),
-                        owner_systemd_invocation_id=(
-                            execution_owner.systemd_invocation_id[:128]
-                            if execution_owner.systemd_invocation_id
-                            else None
-                        ),
-                        claimed_at=now,
-                        heartbeat_at=now,
-                        lease_expires_at=now + timedelta(minutes=2),
-                        created_at=now,
-                        updated_at=now,
+                        trigger_raw_message_id=int(completed_raw_message_id),
+                        now=now,
+                        execution_owner=execution_owner,
+                        revert_status="pending",
                     )
-                    session.add(child)
-                    session.flush()
-                    child_execution_id = int(child.id)
-                    session.commit()
-                    claimed.append(
-                        EntryAssemblyWakeClaim(
-                            attempt_id=int(attempt.id),
-                            strategy_raw_message_id=int(
-                                attempt.strategy_raw_message_id
-                            ),
-                            trigger_raw_message_id=int(completed_raw_message_id),
-                            claim_token=claim_token,
-                            child_execution_id=child_execution_id,
-                            wake_generation=wake_generation,
-                        )
-                    )
+                    if claim is not None:
+                        claimed.append(claim)
                     break
                 session.commit()
     return tuple(claimed)

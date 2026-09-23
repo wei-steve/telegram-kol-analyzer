@@ -51,6 +51,7 @@ from telegram_kol_research.db import create_session_factory
 from telegram_kol_research.auto_trade_execution import auto_process_message_trade_signal
 from telegram_kol_research.auto_trade_execution import disabled_management_message_needs_no_client
 from telegram_kol_research.authoritative_recognition import (
+    _run_entry_assembly_wakeups,
     assess_message_authoritatively,
     process_authoritative_message,
 )
@@ -5173,7 +5174,49 @@ async def _run_recognition_execution_scanner_loop(app: FastAPI) -> None:
             logger.exception("recognition execution scanner cycle failed")
             await asyncio.sleep(60.0)
             continue
+        try:
+            await _run_entry_assembly_ready_wakeup_cycle_async(app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("entry assembly ready wakeup cycle failed")
         await asyncio.sleep(60.0)
+
+
+async def _run_entry_assembly_ready_wakeup_cycle_async(app: FastAPI) -> None:
+    """Give a reconciler-admitted entry a timer-driven way to be executed.
+
+    The reconciler decides an entry may proceed but never places an order
+    (A-3d). Until 2026-09-24 nothing then claimed it, and the entry was lost.
+    This is the second trigger: the same owner and registry
+    ``_run_authoritative_processor`` uses, in the one worker-only loop that
+    already holds them, so no second ownership source is invented.
+
+    It runs in the scanner's own drain-on-cancel worker thread because the
+    claim it may win ends in an exchange write that must not be abandoned
+    half-way, and must not block the event loop while it happens.
+    """
+
+    if (
+        app.state.runtime_role not in {"worker", "all"}
+        or app.state.recognition_execution_owner is None
+        or app.state.auto_trade_executor is None
+    ):
+        return
+    await _run_monitor_capture_writer(
+        lambda: _run_entry_assembly_ready_wakeup_cycle(app)
+    )
+
+
+def _run_entry_assembly_ready_wakeup_cycle(app: FastAPI) -> int:
+    _run_entry_assembly_wakeups(
+        app.state.session_factory,
+        completed_raw_message_id=None,
+        auto_trade_executor=app.state.auto_trade_executor,
+        execution_owner=app.state.recognition_execution_owner,
+        execution_registry=app.state.recognition_execution_registry,
+    )
+    return 0
 
 
 async def _run_recognition_execution_scanner_cycle_async(

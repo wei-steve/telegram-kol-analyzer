@@ -573,12 +573,21 @@ class EntryAssemblyFragment(Base):
 
 
 class EntryAssemblyAttempt(Base):
-    """Durable admission wait keyed to one source-order assembly cutoff."""
+    """Durable admission wait keyed to one source-order assembly cutoff.
+
+    ``ready`` means the reconciler re-assessed admission and found it passed;
+    it is a claimable hand-off to the wakeup path and never an execution. Only
+    a successful ``run_claimed_entry_assembly_wakeup`` writes ``woken``. Before
+    2026-09-24 the reconciler wrote ``woken`` too, so the row could not say
+    whether the entry had been submitted or would never be submitted, and the
+    claimer -- which only ever looked for ``pending`` -- skipped it forever.
+    """
 
     __tablename__ = "entry_assembly_attempts"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('shadow', 'pending', 'claimed', 'woken', 'expired')",
+            "status IN ('shadow', 'pending', 'ready', 'claimed', 'woken', "
+            "'expired')",
             name="ck_entry_assembly_attempts_status",
         ),
         Index(

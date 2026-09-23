@@ -101,7 +101,13 @@ def reconcile_due_entry_admissions(
                     == MessageInstructionItem.id,
                 )
                 .filter(
-                    EntryAssemblyAttempt.status == "pending",
+                    # ``ready`` attempts are carried along so the deadline
+                    # branch below can still expire them through the entry's
+                    # own channel. Before 2026-09-24 an admitted-but-unexecuted
+                    # entry left this selection entirely and was killed six
+                    # hours later by the *management* visibility expirer, which
+                    # reported it as "no matching position record found".
+                    EntryAssemblyAttempt.status.in_(("pending", "ready")),
                     EntryAssemblyAttempt.updated_at
                     <= now - ENTRY_ADMISSION_RECHECK_DELAY,
                     MessageInstructionItem.id > int(entry_after_item_id),
@@ -173,6 +179,12 @@ def reconcile_due_entry_admissions(
                 ):
                     counts["incidents"] += 1
             continue
+        if attempt.status == "ready":
+            # Admission was already decided in its favour and the wakeup path
+            # owns it from here. Re-assessing would let a neighbour that
+            # arrived afterwards block an entry this loop already released,
+            # which is a power the release branch never had.
+            continue
 
         decision = assess_entry_assembly_admission(
             session_factory,
@@ -207,9 +219,25 @@ def reconcile_due_entry_admissions(
             if not released:
                 session.rollback()
                 continue
-            current_attempt.status = "woken"
-            current_attempt.woken_at = now
-            current_attempt.updated_at = now
+            # ``ready``, never ``woken``: this loop has no exchange writer and
+            # must not claim an execution it cannot perform. The blocker list
+            # is emptied in the same statement so the row cannot later be read
+            # as still waiting on a neighbour.
+            promoted = session.execute(
+                update(EntryAssemblyAttempt)
+                .where(
+                    EntryAssemblyAttempt.id == int(attempt_id),
+                    EntryAssemblyAttempt.status == "pending",
+                )
+                .values(
+                    status="ready",
+                    blocking_raw_message_ids_json="[]",
+                    updated_at=now,
+                )
+            )
+            if int(promoted.rowcount or 0) != 1:
+                session.rollback()
+                continue
             session.commit()
             counts["released"] += 1
 
@@ -509,7 +537,7 @@ def _defer_reason_code(result_json: str | None) -> str:
 def _load_attempt_snapshot(session_factory, *, attempt_id: int):
     with session_factory() as session:
         attempt = session.get(EntryAssemblyAttempt, int(attempt_id))
-        if attempt is None or attempt.status != "pending":
+        if attempt is None or attempt.status not in {"pending", "ready"}:
             return None
         item = (
             session.query(MessageInstructionItem)
@@ -606,7 +634,12 @@ def _expire_deferred_entry_truth(
                 update(EntryAssemblyAttempt)
                 .where(
                     EntryAssemblyAttempt.id == int(attempt_id),
-                    EntryAssemblyAttempt.status == "pending",
+                    # ``ready`` too: an admitted entry that never got claimed
+                    # still has to expire here rather than be swept up by the
+                    # management expirer. A ``claimed`` one is deliberately
+                    # excluded -- the wakeup owns it, and this rowcount check
+                    # rolls the whole expiry back if it raced with a claim.
+                    EntryAssemblyAttempt.status.in_(("pending", "ready")),
                 )
                 .values(status="expired", updated_at=now)
             ).rowcount
