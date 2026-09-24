@@ -18,7 +18,7 @@
 
 | 阶段 | 风险级别 | 状态 |
 |---|---|---|
-| 阶段 1 · 影子 | L1（additive dormant） | `completed`（本地；**未部署、未发布提示词版本**） |
+| 阶段 1 · 影子 | L1（additive dormant） | `completed`（已部署 `08380650`，观察窗通过；**提示词版本仍是 v8，未发布新版本**） |
 | 阶段 2 · 观察与人工核准 | L0 | `planned` |
 | 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `planned` |
 | 阶段 4 · 收口 | 以后 | `planned` |
@@ -96,6 +96,40 @@
 **这段说明本身是有寿命的**：等阶段 3/4 让 `recognition_result` 与新判据统一或退役，
 它就必须一起删掉，否则会变成一条描述已不存在的矛盾的错误说明。
 已登记为设计稿 §11 的 **R10**。
+
+### 部署与观察窗（2026-09-25，L1 通过）
+
+| | |
+|---|---|
+| 部署 sha | `08380650a136d28507cd105e09b85838a9ffacd7` |
+| 回滚 sha | `6c7d9ebeeed9ac19dea7edcc9b2dfcdebe1def78`（`tg-deploy` 它即可回滚） |
+| 自有分支 | `origin/claude/first-pass-message-classes-phase1` |
+| 观察窗 | 2026-09-25 07:17:01 – 07:31:03 +0800，连续 15 分钟 15 个采样点 |
+| 证据文件 | 服务器 `/root/phase1-observation.log`（采集脚本 `/root/phase1_observe.sh`，只读） |
+
+部署前核对：候选是生产 HEAD 的后代；`pyproject.toml` 只动 pytest 配置，**无依赖变更**，
+服务器不需要 `pip install`。部署后核对：生产 HEAD = `origin/main` = 部署 sha，
+offenders 检查 `PASS: 0 code files beyond production`。
+
+窗口结果：worker / ingest / web 全程 `active`；1 条真实消息（`raw_message_id 18918`）；
+错误行计数 15 个采样点全程平稳，与部署前基线一致；日志里 `message_class` 出现 0 次。
+
+**这一批要证明的那件事，被一条真实消息证明了**：18918 的识别决策
+`非策略 / text / completed`，证据行 `version 1 / completed / gpt-5.6-luna` 由新代码写入，
+而它的 `normalized_evidence_json` **不含** `message_classes`，权威 payload 的顶层键也只有
+`confidence / entry_context / evidence / input_reading / lifecycle_event / reason /
+recognition_result / strategy` 八个。也就是说：新的写入点与回读点都在生产上跑过了，
+在 v8 提示词下**什么都没写、什么都没改**——正是设计要求的「缺字段记 missing 而不是违规」。
+`/api/runtime/loop-health` 与首页均 HTTP 200，含改动模板的页面渲染正常。
+
+**顺带发现的两处既有噪声**（速率跨越部署点完全未变，与本批次无关）：
+- `Runtime incident capture failed open: type=source_deletion_exit_stuck ...
+  error=RuntimeIncidentBoundsError`，约 2850 条/小时，最早样本在部署前 24 小时。
+  这类运行时事件**根本没被记录**，是一个监控盲区，已单开任务跟踪。
+- `recognition execution finding ... action=observe_only/observe_uncertain`，
+  稳定 1170 条/小时，内容全是基线以下的历史消息，以 ERROR 级别打出观察结论。
+
+部署后零 `Traceback`。
 
 ### 落地时的自主判断（设计稿未写明的地方）
 
