@@ -155,3 +155,27 @@ active**。代码已不再读它，留着无害，但要「删干净」需一条
 **在首次分析上做四分类**：`新策略` / `策略管理` / `仓位管理` / `闲话`，
 外加一个配合分类的字段，并明确空值语义。现在这条链路只剩一套契约
 （`trading.analysis.shared` v8 + `lifecycle_event`），改造有了干净的起点。
+
+### L1 观察窗（17 分钟）与窗口内那一条 traceback
+
+HEAD `6c7d9ebe`，三个单元 active，窗口内**新消息 0**（群静默，按 L1 规则照实记，
+不放宽、不重跑）。最近三条识别结果形态正常。
+
+窗口内出现 **1 条 traceback**，查清如下，**不是本次删除的回归**：
+
+```
+web_app.py:2034 _load_deepcoin_live_position_rows
+  → deepcoin_client_factory()
+  → build_deepcoin_client_from_env
+  → DeepcoinClientError: missing Deepcoin credentials
+```
+
+它由**我自己的验证请求** `GET /execution` 触发：`web` 角色本就没有交易所凭据
+（`AGENTS.md`：web 角色没有执行权限），该页要读实时仓位，必然失败，
+而代码用 `except Exception` 捕获并降级——**页面确实返回了 200**。
+
+**证据的限度要说清楚**：7 天内 `/execution` 只被访问过 **1 次**（就是这一次），
+所以没有「同样访问、没有报错」的对照样本可比。判断依据是代码路径：
+`deepcoin_client_factory()` 这一段**本次一行未改**，本次改动都落在它成功返回之后，
+且与 v2 契约无关。按此判为既有降级路径而非回归；
+**若将来 `web` 角色被赋予凭据或该页改走 worker，这条应当消失。**
