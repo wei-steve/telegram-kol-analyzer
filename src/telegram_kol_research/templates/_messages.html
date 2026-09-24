@@ -393,6 +393,36 @@
               aria-expanded="false"
             >{{ '修改标注' if recognition_label else '标注' }}</button>
           </div>
+          {# 首次分析分类契约 · 阶段 1（影子）。显式分类与推导分类并排展示，
+             两者都不参与上面的 display_classification，也不改变卡片主标签。 #}
+          {% set message_classes = message.message_classes if message.message_classes is defined else none %}
+          {% set message_classes_derived = message.message_classes_derived if message.message_classes_derived is defined else [] %}
+          {% set message_classes_agrees = message.message_classes_agrees if message.message_classes_agrees is defined else none %}
+          {% set message_classes_violations = message.message_classes_violations if message.message_classes_violations is defined else [] %}
+          {% if message_classes is not none or message_classes_derived %}
+            <div class="message-classes-row" data-message-classes-row aria-label="首次分析分类（影子对照）">
+              <span class="message-classes-label">显式分类</span>
+              {% if message_classes is none %}
+                <span class="message-ai-chip is-neutral" data-message-classes-missing>未输出（旧提示词版本）</span>
+              {% elif not message_classes %}
+                <span class="message-ai-chip is-neutral">空</span>
+              {% else %}
+                {% for item in message_classes %}
+                  <span class="message-ai-chip is-observation" data-message-class-explicit>{{ item['class'] }}{% if item.target %} · {{ item.target.resolution }}{% if item.target.lifecycle_id is not none %} #{{ item.target.lifecycle_id }}{% endif %}{% endif %}</span>
+                {% endfor %}
+              {% endif %}
+              <span class="message-classes-label">推导分类</span>
+              {% for item in message_classes_derived %}
+                <span class="message-ai-chip is-neutral" data-message-class-derived>{{ item['class'] }}{% if item.target %} · {{ item.target.resolution }}{% if item.target.lifecycle_id is not none %} #{{ item.target.lifecycle_id }}{% endif %}{% endif %}</span>
+              {% endfor %}
+              {% if message_classes_agrees is sameas false %}
+                <span class="message-ai-chip is-warning" data-message-classes-disagreement title="这是观测记录，当前行为未改变">显式与推导不一致</span>
+              {% endif %}
+              {% if message_classes_violations %}
+                <span class="message-ai-chip is-danger" data-message-classes-violations title="{{ message_classes_violations | join(', ') }}">契约违规 {{ message_classes_violations | length }} 项</span>
+              {% endif %}
+            </div>
+          {% endif %}
           <form
             class="recognition-label-form"
             data-recognition-label-form

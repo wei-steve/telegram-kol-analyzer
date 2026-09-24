@@ -3490,6 +3490,20 @@ body {
   margin-top: 9px;
 }
 
+/* 首次分析分类契约 · 阶段 1（影子）：显式与推导并排，纯观测。 */
+.message-classes-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+}
+
+.message-classes-label {
+  font-size: 11px;
+  opacity: 0.7;
+}
+
 .message-ai-chip {
   display: inline-flex;
   align-items: center;

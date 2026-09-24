@@ -117,6 +117,16 @@ def validate_prompt_content(
             '"input_reading"', '"observed_text"', '"image_quality"',
             '"confidence"',
             '"entry_fragments"',
+            # The first-pass classification contract (design §2). A shared
+            # trading template without these cannot be published, so no prompt
+            # version can silently drop the field once it exists. This runs on
+            # the draft validate/publish path only -- ``compose_trading_prompt``
+            # renders the active version without validating it, so the currently
+            # active production version is never rejected at recognition time.
+            '"message_classes"',
+            '"class"',
+            '"target"',
+            '"resolution"',
         )
         for marker in required_schema_markers:
             if marker not in normalized:
@@ -124,6 +134,8 @@ def validate_prompt_content(
         for enum_value in (
             "entry_confirm", "cancel_entry", "exit_position", "position_update",
             "none", "market", "limit", "long", "short",
+            "新策略", "策略管理", "仓位管理", "闲话", "图片不可读",
+            "exact", "forthcoming", "unknown",
         ):
             if enum_value not in normalized:
                 errors.append(f"统一交易模板缺少必需枚举 {enum_value}")

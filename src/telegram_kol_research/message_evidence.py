@@ -16,6 +16,7 @@ from sqlalchemy import delete, func, or_, text, update
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.orm import sessionmaker
 
+from telegram_kol_research.message_classification import parse_message_classes
 from telegram_kol_research.models import (
     MediaAsset,
     MessageEvidenceExtractionClaim,
@@ -448,6 +449,19 @@ def normalize_mimo_evidence(
         "summary": payload.get("summary"),
         "confidence": confidence,
     }
+    # First-pass classification contract, phase 1 (shadow). The evidence row is
+    # the only immutable record of what the first pass concluded, so the field
+    # and its violations are stored here even though nothing reads them to make
+    # a decision yet. ``authoritative_recognition._load_current_mimo_evidence_result``
+    # reads both back; writing without reading would drop the field silently on
+    # the replay/recovery path (design §10 B1/B2).
+    parsed_classes = parse_message_classes(payload)
+    if parsed_classes.present:
+        normalized_evidence["message_classes"] = parsed_classes.to_payload()
+        if parsed_classes.violations:
+            normalized_evidence["message_classes_violations"] = list(
+                parsed_classes.violations
+            )
     if "entry_context" in payload:
         entry_context = normalize_entry_preamble_evidence(
             payload.get("entry_context")

@@ -37,6 +37,7 @@ from telegram_kol_research.contextual_message_window import (
     render_authoritative_context,
 )
 from telegram_kol_research.media_retention import resolve_media_path
+from telegram_kol_research.message_classification import parse_message_classes
 from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
     build_message_input_fingerprint,
@@ -740,6 +741,14 @@ def _validate_authoritative_payload(payload: dict[str, Any]) -> None:
     for field in ("strategy", "lifecycle_event", "input_reading"):
         if not isinstance(payload.get(field), dict):
             raise ValueError(f"MiMo response missing {field}")
+    # Phase 1 (shadow) of the first-pass classification contract: read
+    # ``message_classes`` but never fail on it. Neither a missing field nor a
+    # violated rule may raise here -- the production prompt (v8) does not emit
+    # the field at all, and rolling a newer version back to v8 must leave
+    # recognition working. A raise would turn a prompt rollback into a
+    # recognition outage. Promoting violations to a hard failure, and skipping
+    # the same-model retry for them, is phase 3 (design §6, §8).
+    parse_message_classes(payload)
 
 
 def _load_experiment_messages(

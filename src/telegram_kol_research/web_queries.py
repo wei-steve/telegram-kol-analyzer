@@ -14,6 +14,10 @@ from telegram_kol_research import recognition_failure_attribution as recognition
 from telegram_kol_research.entry_confirmation_candidates import (
     is_entry_confirmation_candidate,
 )
+from telegram_kol_research.message_classification import (
+    compare_message_classes,
+    derive_message_classes,
+)
 from telegram_kol_research.models import (
     ContextAnalysisBackfill,
     ContextResolutionAttempt,
@@ -900,6 +904,28 @@ def _serialize_raw_messages(
             if isinstance(lifecycle_event_type, str) and lifecycle_event_type.strip()
             else None
         )
+        # First-pass classification contract, phase 1 (shadow). The explicit
+        # list comes off the stored payload; the derived list is recomputed here
+        # from the two existing fields and is deliberately not persisted (design
+        # §4, §10 E1). Read-only: nothing downstream branches on any of these.
+        raw_message_classes = authoritative_payload.get("message_classes")
+        message_classes = (
+            raw_message_classes if isinstance(raw_message_classes, list) else None
+        )
+        message_classes_derived = derive_message_classes(authoritative_payload)
+        message_classes_agrees = (
+            compare_message_classes(message_classes, message_classes_derived)["agrees"]
+            if message_classes is not None
+            else None
+        )
+        raw_message_classes_violations = authoritative_payload.get(
+            "message_classes_violations"
+        )
+        message_classes_violations = (
+            [str(code) for code in raw_message_classes_violations]
+            if isinstance(raw_message_classes_violations, list)
+            else []
+        )
         semantic_review = _serialize_semantic_review(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
@@ -1016,6 +1042,10 @@ def _serialize_raw_messages(
                 "media_assets": media_asset_rows,
                 "recognition_result": recognition_result,
                 "lifecycle_event_type": lifecycle_event_type,
+                "message_classes": message_classes,
+                "message_classes_derived": message_classes_derived,
+                "message_classes_agrees": message_classes_agrees,
+                "message_classes_violations": message_classes_violations,
                 "signal_candidate_count": len(
                     candidates_by_msg_id.get(raw_message.id, [])
                 ),

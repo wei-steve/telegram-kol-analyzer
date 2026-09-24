@@ -45,6 +45,9 @@ from telegram_kol_research.instruction_execution_projection import (
 from telegram_kol_research.message_instruction_items import (
     create_message_instruction_items_in_session,
 )
+from telegram_kol_research.message_classification import (
+    message_class_identities,
+)
 from telegram_kol_research.message_evidence import (
     build_current_message_input_fingerprint,
     claim_message_evidence_extraction,
@@ -283,7 +286,35 @@ def compare_assessments(
             deepseek_payload, "lifecycle_event", field
         ):
             differences.append(f"lifecycle_event.{field}")
+    # The prompt centre's draft A/B test reuses this comparison
+    # (``prompt_testing``), so without this the classification difference between
+    # an old and a new prompt version would be invisible on the page -- which is
+    # what phase 1 debugging runs on (design §10 E5).
+    if _message_classes_differ(mimo_payload, deepseek_payload):
+        differences.append("message_classes")
     return ("disagreed" if differences else "agreed"), differences
+
+
+def _message_classes_identity(payload: dict[str, Any]) -> tuple[Any, ...] | None:
+    """The comparable form of one payload's classification, or ``None`` if absent.
+
+    Absent on both sides is not a difference: a prompt version that predates the
+    contract simply does not answer this question.
+    """
+
+    classes = payload.get("message_classes")
+    if not isinstance(classes, list):
+        return None
+    return message_class_identities(classes)
+
+
+def _message_classes_differ(
+    mimo_payload: dict[str, Any],
+    deepseek_payload: dict[str, Any],
+) -> bool:
+    return _message_classes_identity(mimo_payload) != _message_classes_identity(
+        deepseek_payload
+    )
 
 
 def _value(payload: dict[str, Any], field: str) -> str:
@@ -484,6 +515,16 @@ def _load_current_mimo_evidence_result(
             "conflicts": normalized.get("conflicts", []),
         },
     }
+    # First-pass classification contract, phase 1 (shadow). ``message_evidence``
+    # writes these two; a reconstruction that did not read them back would drop
+    # the classification silently on the replay/recovery path, with nothing
+    # raising to say so (design §10 B1/B2).
+    message_classes = normalized.get("message_classes")
+    if isinstance(message_classes, list):
+        payload["message_classes"] = message_classes
+    message_classes_violations = normalized.get("message_classes_violations")
+    if isinstance(message_classes_violations, list):
+        payload["message_classes_violations"] = message_classes_violations
     entry_context = normalized.get("entry_context")
     if isinstance(entry_context, dict):
         payload["entry_context"] = entry_context
