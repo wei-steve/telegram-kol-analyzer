@@ -14,9 +14,18 @@
   `PYTHONDONTWRITEBYTECODE=1`. A source-adjacent `__pycache__`/`.pyc` write changes
   the release content digest and can make that otherwise valid release unusable
   as a rollback target.
-- Push reviewed local commits to GitHub on `codex/deepcoin-auto-trading-v1` when
-  the active plan or user request calls for integration. Deploy when the
-  approved phase requires production verification.
+- **The shared branch is `main`.** It was `codex/deepcoin-auto-trading-v1`
+  until 2026-09-24, when `main` was fast-forwarded onto it and the old name
+  frozen. `main` had no commit the trading branch lacked, so the promotion was
+  a pure fast-forward and nothing was rewritten or lost. The old name still
+  exists at the commit where it stopped; **do not push to it**, and if you find
+  yourself on it, move to `main`. The reason for the change: this repository
+  began as a research project on `main` and the trading system grew on a side
+  branch, so every new checkout and every new worktree opened 2920 commits
+  behind the work, on a tree where most of these modules do not exist.
+- Push reviewed local commits to GitHub on `main` when the active plan or user
+  request calls for integration. Deploy when the approved phase requires
+  production verification.
 - Treat a user-approved phase as one coherent execution scope. Normal steps
   explicitly included in that scope do not require repeated confirmation.
   Pause only when the work materially expands beyond the approved phase or an
@@ -41,7 +50,7 @@
   response.
 - Deployment path (since 2026-09-06, when the deployment gates were retired;
   see `docs/2026-09-05-codex-handover-closeout.md` section 7): push the exact
-  reviewed commit to `origin/codex/deepcoin-auto-trading-v1` first, then run
+  reviewed commit to `origin/main` first, then run
   `/usr/local/bin/tg-deploy <full-40-character-sha>` on the server. It fetches,
   hard-resets the server checkout (branch `live`) to that SHA, clears bytecode,
   and restarts worker → web → ingest, printing the resulting HEAD and PIDs.
@@ -57,7 +66,7 @@
   verifications are still required and they answer different questions --
   before deploying, that the candidate is a descendant of the current
   production HEAD; after, that the deployed sha is on
-  `origin/codex/deepcoin-auto-trading-v1`.** Both directions were needed on 2026-09-10, one each way: the A line
+  `origin/main`.** Both directions were needed on 2026-09-10, one each way: the A line
   nearly deployed a commit that did not contain the B line's just-observed
   phase, and the B line's released candidate turned out not to contain the A
   line's. Neither was caught by tooling; both were caught by someone running
