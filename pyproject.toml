@@ -31,7 +31,13 @@ telegram-kol-research = "telegram_kol_research.cli:main"
 markers = [
   "architecture: static safety boundaries that must pass in normal CI",
 ]
-pythonpath = ["src"]
+# "." is the repository root. Three test modules import their siblings as
+# `from tests.test_x import ...`, which needs the root importable; without it
+# `uv run pytest` dies at collection with `No module named 'tests'` and only
+# `uv run python -m pytest` works, because `-m` adds the cwd itself. This key
+# affects pytest only -- the server installs the package into its own venv and
+# never reads it.
+pythonpath = ["src", "."]
 testpaths = ["tests"]
 # tests/archive holds retired acceptance tooling kept only for traceability
 # (cleanup step 5); it must not run in the normal suite. Setting this key
