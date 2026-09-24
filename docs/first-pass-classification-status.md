@@ -3,14 +3,16 @@
 **设计稿（规格）**：`docs/plans/2026-09-24-first-pass-classification-contract-design.md`
 **背景交接**：`docs/plans/2026-09-25-first-pass-classification-design-handoff.md`
 **基线**：全套 9533 passed / 4 skipped
-**阶段 1 最终候选**：`9623 passed, 4 skipped`（`uv run python -m pytest -q`，738.83s）。
+**阶段 1 最终候选**：`71143e2b043e65959791775744b9613c981912f3`（分支 `phase1-message-classes-shadow`，已变基到 `origin/main`）。
+全套 `9623 passed, 4 skipped`（751.99s）。此前在 `634ccd20` 的等价提交上由指挥会话独立复跑，
+结果一字不同：`9623 passed, 4 skipped`（755.10s）。
 差额 +90 恰好等于本批次新增的 90 条用例（`tests/test_message_classification.py` 56 条 +
 `tests/test_message_classes_shadow.py` 34 条），**一条既有用例都没有被改动或打破**。
 
-> 跑全套要用 `python -m pytest`（`uv run python -m pytest -q`）。
-> 直接 `uv run pytest -q` 会在收集阶段报 3 个 `ModuleNotFoundError: No module named 'tests'`：
-> 有三个测试模块 `from tests.test_x import ...`，靠的是 `python -m` 把仓库根目录放进 `sys.path`，
-> 而 `pyproject.toml` 的 `pythonpath` 只有 `src`。这与本批次无关，是既有性质。
+> 跑全套两种写法都可以：`uv run pytest -q` 或 `uv run python -m pytest -q`，都收集 9627 条。
+> 曾经只有后者能跑（前者在收集阶段报 3 个 `ModuleNotFoundError: No module named 'tests'`），
+> 本批次把 `pyproject.toml` 的 `pythonpath` 从 `["src"]` 改成 `["src", "."]` 修掉了。
+> 这条改动是代码，按部署规则不能单独上共享分支，所以挂在阶段 1 分支上随它一起部署。
 
 > 归档的历史计划（`docs/archive/plans/`）里有多份已被取代的设计，**不要读**。
 
@@ -20,6 +22,11 @@
 | 阶段 2 · 观察与人工核准 | L0 | `planned` |
 | 阶段 3 · 切换 | L2（须用户单独批准后才能部署） | `planned` |
 | 阶段 4 · 收口 | 以后 | `planned` |
+
+**仓库层面的一件事（2026-09-24，与本设计无关但影响所有会话）**：
+共享分支已从 `codex/deepcoin-auto-trading-v1` 改为 **`main`**（`4e526b61`，纯 fast-forward，
+`AGENTS.md` 已同步）。旧分支名停在同一个 sha 上冻结，不再推送。
+起因就是本批次：agent worktree 默认开在 `main` 上，落后 2920 个提交，要改的模块在那棵树上根本不存在。
 
 ---
 
