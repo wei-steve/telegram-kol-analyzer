@@ -624,6 +624,54 @@ def _sole_position_trade_unit(trade_units: set[str]) -> str | None:
     return next(iter(positions))
 
 
+def resting_entry_attached_stop_order_ids(
+    session, *, venue: str = "deepcoin", rows: Iterable[Any]
+) -> frozenset[str]:
+    """Of these pending rows, which are a resting entry leg's own attached stop.
+
+    The same two conditions :func:`resolve_protection_authority` excludes on,
+    exposed so that other readers of the pending table answer this question the
+    same way instead of each inventing one:
+
+    * the order's ``TriggerOrder`` frames carry ``TU`` and nothing but
+      ``"default"`` -- the venue saying no position exists for it yet; and
+    * ``(instId, posSide, sz, slTriggerPx)`` equals one of our own resting
+      entry legs' requests, read from our durable rows, never from the venue.
+
+    Both must hold. An order with no frame at all is not excluded: "no position
+    yet" and "we never heard" are different facts and only the first one may
+    exclude (`_trade_unit_values`).
+
+    Naming such an order is not claiming it. It protects nothing today: before
+    the fill there is no position for it to close, and after the fill it
+    belongs to a *new* posId. That is why excluding it from a live position's
+    protection set is safe in both directions.
+    """
+
+    signatures: set[tuple[str, str, str, str]] | None = None
+    found: set[str] = set()
+    for row in rows:
+        if not isinstance(row, Mapping):
+            continue
+        if native_tpsl_row_order_types(dict(row)) != {"TPSL"}:
+            continue
+        normalized = normalize_native_tpsl(dict(row))
+        if normalized is None:
+            continue
+        order_id = str(normalized.ord_id or "").strip()
+        if not order_id:
+            continue
+        if _trade_unit_values(session, venue=venue, order_id=order_id) != {
+            TRADE_UNIT_BEFORE_POSITION
+        }:
+            continue
+        if signatures is None:
+            signatures = _pending_entry_stop_signatures(session, venue=venue)
+        if _row_signature(normalized) in signatures:
+            found.add(order_id)
+    return frozenset(found)
+
+
 def resting_entry_stop_owners(
     session, *, venue: str = "deepcoin"
 ) -> dict[tuple[str, str, str, str], int]:

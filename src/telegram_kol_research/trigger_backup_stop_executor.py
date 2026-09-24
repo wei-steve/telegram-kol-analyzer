@@ -18,6 +18,7 @@ from telegram_kol_research.source_release import (
 )
 from telegram_kol_research.protection_authority import (
     ADOPTION_EVIDENCE_SOURCE as ADOPTED_EVIDENCE_SOURCE,
+    resting_entry_attached_stop_order_ids,
 )
 
 #: Phase 6f. Positions whose adopted primary stop may actually receive a backup
@@ -514,6 +515,19 @@ def _plan_submission(
             and _live_position_aliases_consistent(row)
         },
     )
+    # A resting entry leg's own attached stop sits in this table looking
+    # exactly like an ownerless stop on an open position: same instrument, same
+    # side, no ledger row, because no position exists for it yet. Counting it
+    # as unknown is how a two-leg entry blocked its own first leg's backup stop
+    # -- 16 positions between 2026-09-07 and 09-23, one of which held a single
+    # stop for hours. `resolve_protection_authority` already excludes these
+    # orders on exactly two conditions; read the same predicate rather than
+    # deciding again here, so the two cannot drift.
+    resting_entry_stops = resting_entry_attached_stop_order_ids(
+        session,
+        venue=str(binding.venue or "deepcoin").lower(),
+        rows=pending_before_submit,
+    )
     if _unowned_pending_stop_can_affect_position(
         pending=pending_before_submit,
         instrument_id=instrument_id,
@@ -521,6 +535,7 @@ def _plan_submission(
         pos_id=pos_id,
         primary_order_id=primary_order_id,
         ownership=ownership,
+        resting_entry_stop_order_ids=resting_entry_stops,
     ):
         return _blocked_plan(
             binding_id, leg_id, pos_id, "unowned_pending_stop_present"
@@ -799,7 +814,14 @@ def _read_pending_trigger_orders(client: Any, *, instrument_id: str) -> list[dic
 
 
 def _unowned_pending_stop_can_affect_position(
-    *, pending, instrument_id, side, pos_id, primary_order_id, ownership
+    *,
+    pending,
+    instrument_id,
+    side,
+    pos_id,
+    primary_order_id,
+    ownership,
+    resting_entry_stop_order_ids=frozenset(),
 ) -> bool:
     for raw in pending:
         if not _row_has_stop_fields(raw):
@@ -844,6 +866,13 @@ def _unowned_pending_stop_can_affect_position(
         if known_owner is not None and known_owner.pos_id != pos_id:
             continue
         if known_owner is None:
+            if str(order.ord_id) in resting_entry_stop_order_ids:
+                # Our own resting entry asked for this one. It cannot close
+                # this position: before that entry fills there is no position
+                # for it to act on, and once it fills it belongs to a new
+                # posId. Proven by the venue's own TU plus our durable leg
+                # request, not by price or timing.
+                continue
             return True
     return False
 

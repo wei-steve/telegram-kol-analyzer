@@ -273,3 +273,136 @@ def test_nothing_is_held_back_by_the_blacklist_in_production():
     from telegram_kol_research.source_release import SOURCE_RELEASE_BLOCKED_POS_IDS
 
     assert SOURCE_RELEASE_BLOCKED_POS_IDS == frozenset()
+
+
+def _seed_resting_second_leg(session_factory, binding_id, *, sz, stop_px, leg_index=2):
+    """Add a second entry leg that is still resting, with its attached stop.
+
+    This is the shape that blocked the first leg's backup stop in production:
+    leg 1 fills and opens the position, leg 2 keeps sitting on the book, and
+    the venue is already holding leg 2's attached stop -- same instrument, same
+    side, no ledger row, because no position exists for it yet.
+    """
+
+    leg_id = upsert_execution_order_leg(
+        session_factory,
+        ExecutionOrderLegRecord(
+            execution_binding_id=binding_id, leg_index=leg_index, purpose="entry",
+            order_kind="limit", strategy_instance_id="deepcoin:1:1:BTC:long",
+            venue="deepcoin", status="pending",
+            request={
+                "instId": INST, "posSide": "long", "sz": sz, "slTriggerPx": stop_px,
+            },
+        ),
+    )
+    return leg_id
+
+
+def _record_trigger_frame(session_factory, *, order_id, trade_unit_id):
+    from telegram_kol_research.models import DeepcoinWsEvent
+
+    with session_factory() as session:
+        session.add(DeepcoinWsEvent(
+            venue="deepcoin", channel="TriggerOrder", action="PushTriggerOrder",
+            order_sys_id=order_id, trade_unit_id=trade_unit_id,
+            instrument_raw="BTCUSDT", received_at=NOW, received_ms=1,
+            raw_payload="{}", payload_hash=order_id, processed_state="processed",
+        ))
+        session.commit()
+
+
+class _ClientWithRestingLegStop(_Client):
+    """The account also holds a resting second leg's attached stop."""
+
+    def read_trigger_orders_pending(self, *, inst_id):
+        rows = super().read_trigger_orders_pending(inst_id=inst_id)["data"]
+        rows.append({
+            "ordId": "resting-leg-stop", "instId": INST, "posSide": "long",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "74000",
+            "slTriggerPx": "74000", "sz": "9",
+        })
+        return {"code": "0", "data": rows}
+
+
+def test_a_resting_legs_attached_stop_does_not_block_the_backup_stop(tmp_path):
+    """A two-leg entry must not block its own first leg's backup stop.
+
+    The second leg's attached stop is indistinguishable from an ownerless stop
+    by shape alone, so this check used to refuse -- leaving the position on a
+    single stop, against the 2026-07-26 rule that every filled auto entry leg
+    carries a verified second stop. Authority already excludes such orders on
+    two conditions; this reads the same predicate.
+    """
+
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="position_mutation_intent_readback"
+    )
+    _seed_resting_second_leg(session_factory, binding_id, sz="9", stop_px="74000")
+    # The venue says no position exists for it yet.
+    _record_trigger_frame(session_factory, order_id="resting-leg-stop", trade_unit_id="default")
+    client = _ClientWithRestingLegStop()
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id="pos-1",
+            client=client, contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert plan.reason_code != "unowned_pending_stop_present"
+    # Not merely "not refused for that reason": the plan is ready to send, and
+    # it carries the same backup price it would have without the resting leg.
+    assert plan.status == "ready"
+    assert plan.payload["slTriggerPx"] == "75548.6"
+
+
+def test_a_genuinely_unowned_stop_still_blocks_the_backup_stop(tmp_path):
+    """The exclusion is narrow: both conditions, or the check still refuses.
+
+    Same shape as the test above but with nothing tying the order to a resting
+    leg of ours, which is the case the check exists for -- an unknown stop that
+    may itself close this position, where adding a backup risks closing twice.
+    """
+
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="position_mutation_intent_readback"
+    )
+    # A resting leg exists, but its request does not match this order, and no
+    # TU frame says the order has no position.
+    _seed_resting_second_leg(session_factory, binding_id, sz="3", stop_px="70000")
+    client = _ClientWithRestingLegStop()
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id="pos-1",
+            client=client, contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert plan.reason_code == "unowned_pending_stop_present"
+
+
+def test_a_matching_signature_without_a_default_tu_frame_still_blocks(tmp_path):
+    """"No frame ever arrived" is not "the venue says no position exists".
+
+    Excluding on the signature alone would let any order that happens to match
+    a resting leg's numbers through, including one the stream never described.
+    """
+
+    session_factory, binding_id, leg_id = _seed(
+        tmp_path, evidence_source="position_mutation_intent_readback"
+    )
+    _seed_resting_second_leg(session_factory, binding_id, sz="9", stop_px="74000")
+    # A frame exists but carries a real posId: the position does exist, so this
+    # is not a resting leg's stop any more.
+    _record_trigger_frame(session_factory, order_id="resting-leg-stop", trade_unit_id="pos-other")
+    client = _ClientWithRestingLegStop()
+
+    with session_factory() as session:
+        plan = _plan_submission(
+            session, binding_id=binding_id, leg_id=leg_id, pos_id="pos-1",
+            client=client, contract_spec_provider=_spec_provider(),
+            backup_stop_buffer_bps=20.0, submitted_at=NOW,
+        )
+
+    assert plan.reason_code == "unowned_pending_stop_present"
