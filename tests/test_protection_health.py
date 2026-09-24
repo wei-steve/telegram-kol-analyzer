@@ -261,3 +261,163 @@ def test_complete_snapshot_with_missing_take_profit_requires_recovery(tmp_path):
 
     assert result.classification == "recovery_required"
     assert "verified_take_profit_missing" in result.reason_codes
+
+
+def _position_with_stops(session, *, pos_id, stops, first_seen_at):
+    """One live position and its ledger stop rows, as the scan will see them."""
+
+    binding = ExecutionBinding(
+        strategy_instance_id="single-stop", kol_id="k", chat_id=1, message_id=1,
+        symbol="BTC", side="long", status="active", pos_id=pos_id,
+    )
+    session.add(binding)
+    session.flush()
+    leg = ExecutionOrderLeg(
+        execution_binding_id=binding.id, leg_index=1, purpose="entry",
+        order_kind="market", venue="deepcoin", pos_id=pos_id,
+        status="active", attribution_status="verified",
+    )
+    session.add(leg)
+    session.flush()
+    for index, (purpose, price) in enumerate(stops):
+        session.add(PositionProtectionLedger(
+            venue="deepcoin", execution_binding_id=binding.id,
+            execution_order_leg_id=leg.id, pos_id=pos_id,
+            instrument_id="BTC-USDT-SWAP", side="long",
+            order_id=f"{pos_id}-stop-{index}", purpose=purpose,
+            trigger_price=str(price), status="verified",
+            evidence_source="entry_protection_response",
+            first_seen_at=first_seen_at, last_seen_at=first_seen_at,
+        ))
+    session.flush()
+
+
+def _run_health(session, *, pos_id, observed_at):
+    from telegram_kol_research.protection_health import (
+        reconcile_position_protection_health,
+    )
+
+    return reconcile_position_protection_health(
+        session,
+        positions=[{
+            "instId": "BTC-USDT-SWAP", "posId": pos_id, "posSide": "long",
+            "pos": "5", "avgPx": "77000",
+        }],
+        pending_orders=[{
+            "ordId": f"{pos_id}-stop-0", "instId": "BTC-USDT-SWAP", "posSide": "long",
+            "triggerOrderType": "TPSL", "slTriggerPrice": "75000", "posId": pos_id,
+        }],
+        trigger_history=[],
+        snapshot_errors={},
+        observed_at=observed_at,
+    )
+
+
+def _incident_types(session, pos_id):
+    return {
+        row.incident_type
+        for row in session.query(PositionProtectionIncident)
+        .filter(PositionProtectionIncident.pos_id == pos_id).all()
+    }
+
+
+def test_a_single_stop_held_past_the_window_is_reported(tmp_path):
+    """The rule says two stops; nothing used to check that it was being met.
+
+    A position carried one stop for 16.5 hours on 2026-09-23 and the system
+    never said so -- a person found it by looking at a page.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _position_with_stops(
+            session, pos_id="pos-single", stops=[("stop_loss", 75000)],
+            first_seen_at=(NOW - timedelta(minutes=30)).replace(tzinfo=None),
+        )
+        _run_health(session, pos_id="pos-single", observed_at=NOW)
+        session.commit()
+        assert "single_stop_coverage" in _incident_types(session, "pos-single")
+
+
+def test_a_single_stop_inside_the_window_is_not_reported_yet(tmp_path):
+    """The executor gets its chance every 30s; reporting at once is noise."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _position_with_stops(
+            session, pos_id="pos-fresh", stops=[("stop_loss", 75000)],
+            first_seen_at=(NOW - timedelta(minutes=2)).replace(tzinfo=None),
+        )
+        _run_health(session, pos_id="pos-fresh", observed_at=NOW)
+        session.commit()
+        assert "single_stop_coverage" not in _incident_types(session, "pos-fresh")
+
+
+def test_a_position_holding_both_stops_is_not_reported(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _position_with_stops(
+            session, pos_id="pos-pair",
+            stops=[("stop_loss", 75000), ("backup_stop", 74850)],
+            first_seen_at=(NOW - timedelta(hours=3)).replace(tzinfo=None),
+        )
+        _run_health(session, pos_id="pos-pair", observed_at=NOW)
+        session.commit()
+        assert "single_stop_coverage" not in _incident_types(session, "pos-pair")
+
+
+def test_a_take_profit_does_not_count_as_the_second_stop(tmp_path):
+    """Counting a take-profit as coverage would hide exactly the loss-side gap."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _position_with_stops(
+            session, pos_id="pos-tp",
+            stops=[("stop_loss", 75000), ("take_profit", 82000)],
+            first_seen_at=(NOW - timedelta(hours=3)).replace(tzinfo=None),
+        )
+        _run_health(session, pos_id="pos-tp", observed_at=NOW)
+        session.commit()
+        assert "single_stop_coverage" in _incident_types(session, "pos-tp")
+
+
+def test_repeated_scans_report_the_single_stop_once(tmp_path):
+    """Every 30 seconds for hours must not become an incident every 30 seconds."""
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        _position_with_stops(
+            session, pos_id="pos-once", stops=[("stop_loss", 75000)],
+            first_seen_at=(NOW - timedelta(minutes=30)).replace(tzinfo=None),
+        )
+        session.commit()
+    # Each reconcile pass runs in its own transaction, as it does in the worker.
+    for minutes in (0, 5, 10):
+        with session_factory() as session:
+            _run_health(session, pos_id="pos-once", observed_at=NOW + timedelta(minutes=minutes))
+            session.commit()
+    with session_factory() as session:
+        rows = session.query(PositionProtectionIncident).filter(
+            PositionProtectionIncident.pos_id == "pos-once",
+            PositionProtectionIncident.incident_type == "single_stop_coverage",
+        ).all()
+        assert len(rows) == 1
+
+
+def test_the_operator_message_says_what_is_actually_wrong(tmp_path):
+    """The generic wording claims a freeze and an exchange error; neither applies."""
+
+    from telegram_kol_research.system_operator_bot import (
+        format_position_protection_incident_message,
+    )
+
+    text = format_position_protection_incident_message({
+        "venue": "deepcoin", "pos_id": "pos-single",
+        "incident_type": "single_stop_coverage",
+        "evidence": {"order_id": "stop-1", "primary_stop": "75000",
+                     "stop_count": 1, "since": "2026-09-23T14:24:11"},
+    })
+
+    assert "单重止损" in text
+    assert "75000" in text
+    assert "自动管理已冻结" not in text

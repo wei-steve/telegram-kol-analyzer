@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -523,6 +523,98 @@ def current_protection_incident_health_status(
     return "resolved_by_verified_replacement" if backup else "current_risk"
 
 
+#: How long a live position may hold a single stop before a person is told.
+#: The reconcile loop runs every 30 seconds and the backup-stop executor gets
+#: its chance on each pass, so ten minutes is twenty missed opportunities --
+#: comfortably past "it is being worked on" and well short of the 16.5 hours a
+#: position actually went uncovered on 2026-09-23 without anyone being told.
+SINGLE_STOP_ALERT_AFTER_SECONDS = 600
+
+#: Ledger purposes that count as a stop for coverage. Take-profit rows are not
+#: protection against the loss side and must never make a position look covered.
+_STOP_COVERAGE_PURPOSES = frozenset({"stop_loss", "backup_stop"})
+
+
+def _naive_utc(value: datetime | None) -> datetime | None:
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(UTC).replace(tzinfo=None)
+
+
+def _report_single_stop_coverage(
+    session: Session,
+    *,
+    live_ids: set[str],
+    ledgers: list[Any],
+    backups: list[Any],
+    observed_at: datetime,
+) -> int:
+    """Tell a person when a live position has been holding one stop too long.
+
+    The 2026-07-26 design requires a verified second stop on every filled auto
+    entry leg and keeps no feature flag for it, but nothing ever checked that
+    the requirement was being met. When it silently stopped being met, the gap
+    ran for over two weeks and was found by a person looking at a page.
+
+    Read-only: it records an incident and submits nothing. A position with *no*
+    stop at all is deliberately left to ``protection_missing`` -- that is a
+    different, louder fact and reporting it twice under two names would make
+    both harder to act on.
+    """
+
+    stops_by_pos: dict[str, list[Any]] = {}
+    for row in ledgers:
+        if str(getattr(row, "status", "") or "").lower() not in {
+            "verified",
+            "protected",
+        }:
+            continue
+        if str(getattr(row, "purpose", "") or "").lower() not in _STOP_COVERAGE_PURPOSES:
+            continue
+        stops_by_pos.setdefault(str(row.pos_id), []).append(row)
+    backups_by_pos: dict[str, list[Any]] = {}
+    for row in backups:
+        backups_by_pos.setdefault(str(row.pos_id), []).append(row)
+
+    deadline = _naive_utc(observed_at)
+    created = 0
+    for pos_id in sorted(live_ids):
+        stops = stops_by_pos.get(pos_id, [])
+        if not stops:
+            # No stop at all -- `protection_missing` owns this case.
+            continue
+        if len(stops) + len(backups_by_pos.get(pos_id, [])) >= 2:
+            continue
+        oldest = min(
+            stops,
+            key=lambda row: _naive_utc(getattr(row, "first_seen_at", None))
+            or deadline,
+        )
+        since = _naive_utc(getattr(oldest, "first_seen_at", None))
+        if since is None or deadline is None:
+            continue
+        if (deadline - since).total_seconds() < SINGLE_STOP_ALERT_AFTER_SECONDS:
+            continue
+        created += _incident(
+            session,
+            row=oldest,
+            incident_type="single_stop_coverage",
+            # Deliberately without an age: the fingerprint covers the evidence,
+            # so a value that changes every pass would file a fresh incident
+            # every thirty seconds instead of one that stays reported.
+            evidence={
+                "order_id": str(getattr(oldest, "order_id", "") or ""),
+                "primary_stop": str(getattr(oldest, "trigger_price", "") or ""),
+                "stop_count": len(stops) + len(backups_by_pos.get(pos_id, [])),
+                "since": since.isoformat(),
+            },
+            observed_at=observed_at,
+        )
+    return created
+
+
 def reconcile_position_protection_health(
     session: Session,
     *,
@@ -557,7 +649,13 @@ def reconcile_position_protection_health(
         .filter(PositionBackupStopOrder.status.in_(("active", "submitting", "unknown_exchange_outcome")))
         .all()
     )
-    created = 0
+    created = _report_single_stop_coverage(
+        session,
+        live_ids=live_ids,
+        ledgers=ledgers,
+        backups=backups,
+        observed_at=observed_at,
+    )
     for row in [*ledgers, *backups]:
         order_id = str(getattr(row, "order_id", "") or "")
         pos_id = str(row.pos_id)

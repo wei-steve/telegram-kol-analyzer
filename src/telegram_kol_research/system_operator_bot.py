@@ -1467,6 +1467,20 @@ def format_position_protection_incident_message(payload: dict[str, Any]) -> str:
             f"原因: {evidence.get('reason_code') or '-'}",
             f"人工处理: {evidence.get('manual_action') or '只读核对交易所状态后再决定。'}",
         ])
+    if str(payload.get("incident_type") or "") == "single_stop_coverage":
+        # Not the generic wording: nothing is frozen here and there is no
+        # exchange error. The position is protected, by one stop instead of the
+        # two the rule requires, and the executor keeps retrying every pass.
+        return "\n".join([
+            "【仓位只剩单重止损】",
+            f"交易所: {payload.get('venue') or 'deepcoin'}",
+            f"仓位ID: {payload.get('pos_id') or '-'}",
+            f"现有止损: {evidence.get('primary_stop') or '-'}（order {evidence.get('order_id') or '-'}）",
+            f"止损张数: {evidence.get('stop_count') or '-'}（规则要求 2）",
+            f"自: {evidence.get('since') or '-'}",
+            "处理状态: 仓位仍有止损，但第二止损缺失已超过十分钟；系统每轮仍在尝试补挂，"
+            "持续告警请人工到交易所核对。",
+        ])
     exchange = evidence.get("exchange") if isinstance(evidence.get("exchange"), dict) else {}
     return "\n".join([
         "【止损保护严重异常】",
