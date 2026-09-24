@@ -83,3 +83,79 @@ lifecycle 1319 在 **14:45:39** 就是 `entered`。**无持仓的描述在任何
 3. **`reanalysis_capped` 应当告警到人**。一条明确的管理指令被静默丢弃了
    1.6 小时，无人知晓——与 2026-09-23 双重止损缺口同一类问题：
    机制失败了，但没有任何东西会说出来。
+
+---
+
+## 6. 定性：不是模型能力，不是提示词，是系统逻辑
+
+### 首次分析（`first_pass`）两件事都判对了
+
+它的输出完整保存在 `recognition_decisions.authoritative_payload_json`
+的 `_context_resolution.first_pass` 里：
+
+```json
+{
+  "recognition_result": "非策略",
+  "lifecycle_event": {
+    "confidence": 0.99,
+    "event_type": "position_update",
+    "management_action": "partial_take_profit, move_stop_to_protect",
+    "reason": "BTC空单止盈50%，剩余仓位止损位下移至84500，明确为部分止盈并移动止损至保护位。",
+    "side": "short", "symbol": "BTC", "stop_loss": "84500",
+    "target_lifecycle_id": 1319
+  }
+}
+```
+
+**两个字段各司其职，而且都对**：
+`recognition_result="非策略"` 是对的——这条消息不开新仓，它不是新策略；
+`lifecycle_event.event_type="position_update"` 才是回答「是不是仓位管理」的字段，
+它判了 `position_update`，动作、方向、标的、止损价全对，
+**并且自己就给出了 `target_lifecycle_id: 1319`**——正是米娅这笔活仓的 lifecycle。
+
+所以提示词要它判的两件事，它都判了，也都判对了。**这两处都没有问题。**
+
+### 抹除发生在一行代码
+
+`authoritative_recognition.py:663-674`：
+
+```python
+if (decision.confidence < 0.7 and not exact_risk_reduction_authorized) \
+   or decision.decision in {"hold", "unresolved"}:
+    payload.update(
+        recognition_result="非策略",
+        reason=decision.reason or "context resolution produced no executable action",
+        strategy={},
+        lifecycle_event={"event_type": "none", "confidence": 0.0},   # ← 首次分析在这里被抹平
+        confidence=decision.confidence,
+    )
+    return replace(mimo, payload=payload, status="非策略")
+```
+
+6675 返回 `unresolved`，命中这个分支，于是那个带着 `target_lifecycle_id: 1319`、
+`partial_take_profit`、`stop_loss: 84500` 的判断，被整体替换成
+`{"event_type": "none"}`。下游再也看不到有过管理意图这件事。
+
+### 这个降级本身是有意的，但它这次关错了东西
+
+失败关闭的用意很正当：目标不确定就不要动仓位，动错仓位比不动更糟。
+代码注释（A-16e）也说明作者**清楚**这一步会抹掉首次分析，所以特地把四个字段
+存进 `first_pass` 留证——**但那是为了事后可查，不是为了执行**。
+
+问题在于它**只认上下文解析这一个来源**：
+
+- 首次分析给出了 `target_lifecycle_id = 1319`——**它根本不需要上下文解析去找目标**；
+- 两次 `reanalysis`（6671、6674）已 `completed` 且判定一致；
+- 只有最后一次 initial_resolution 说「不确定」，而它看到的是一份把
+  `thread 688` 与 `msg 688` 混淆的交易所状态。
+
+三个来源里两个（实为三次判定）指向同一个正确目标，降级却由第三个决定。
+**这不是「不知道目标」，是「知道，但问错了人」。**
+
+### 因此修的方向也变了
+
+比第 5 节的三条更靠前的一条：**降级判据不该只看上下文解析的 decision**。
+当首次分析已给出 `target_lifecycle_id`，且该 lifecycle 通过
+`verify_lifecycle_targets` 验证为活仓时，`unresolved` 至少不应把
+`lifecycle_event` 抹成 `none`——可以不执行，但要让它以「待确认的管理指令」
+的形态留下来并告警，而不是伪装成「这条消息与交易无关」。
