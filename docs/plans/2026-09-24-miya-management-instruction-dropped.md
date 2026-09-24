@@ -159,3 +159,108 @@ if (decision.confidence < 0.7 and not exact_risk_reduction_authorized) \
 `verify_lifecycle_targets` 验证为活仓时，`unresolved` 至少不应把
 `lifecycle_event` 抹成 `none`——可以不执行，但要让它以「待确认的管理指令」
 的形态留下来并告警，而不是伪装成「这条消息与交易无关」。
+
+---
+
+## 7. 与设计意图的逐条核对（用户 2026-09-24 提出）
+
+### 7.1 首次分析的任务：记忆基本完整，可补两类
+
+实际契约（`ai_recognition_config.py:134`）是**两个字段**分工：
+
+- `recognition_result`：是策略 / 非策略 —— 只回答「这是不是一条**新开仓**策略」
+- `lifecycle_event.event_type`：`none | entry_confirm | cancel_entry | exit_position | position_update`
+
+用户的三分法映射过来：
+
+| 用户说的 | 契约里的位置 | 备注 |
+|---|---|---|
+| 新策略 | `recognition_result = 是策略` | 标的 + 入场 + 止损（止盈可缺） |
+| 策略管理 | `cancel_entry`（撤未入场的）、`entry_confirm`（「半仓入场」定量） | 用户举的两个例子都属 `entry_confirm` |
+| 仓位管理 | `position_update` | 部分止盈、移止损保护、调价、继续持有 |
+| **（补）完全离场** | **`exit_position`** | 与 `position_update` 分开，提示词专门强调过不可混淆 |
+
+`ai_recognition_config.py:154` 有一条针对性的规则：
+「"第一止盈位 60950 移动止损至成本价"这类表达只是部分止盈并把止损推到成本保护，
+**不是全量平仓/离场；必须判定为 position_update，不能判定为 exit_position**。」
+
+用户举的「BTC准备87500做空，半仓入场」（有标的有入场价、无止损）与
+「完整策略 + 下一条『半仓入场』」两种，都是 `entry_confirm`。
+**这一块今天已由另一个会话实现**（`006972e1`
+"a confirmation message sizes the next entry instead of opening its own"）。
+
+### 7.2 「首次分析明确目标就不该再做上下文分析」——判据已存在，但被别的触发条件盖过
+
+`requires_context_resolution()` 的触发原因是一个**或**集合，其中确实有用户说的那条：
+
+```python
+if event_type != "none" and target_lifecycle_id in (None, ""):
+    reasons.add("management_without_exact_target")     # 管理动作 + 没有确切目标
+if len(candidates) > 1:
+    reasons.add("multiple_same_source_candidates")     # 候选多于一个
+```
+
+**但另有三条是纯文本关键词匹配**：
+
+```python
+REVISION_LANGUAGE     = ("更新", "修改", "改为", "调整", "replace", "update")
+CANCELLATION_LANGUAGE = ("取消", "撤销", "撤单", "cancel")
+ENTERED_HOLDER_LANGUAGE = ("有入场", "已入场", "持仓", "保护成本", "保本", "继续持有")
+```
+
+**msg 696 命中的正是 `entered_holder_language`**——就因为文末写了
+「做无风险**持仓**」这四个字。而此时首次分析**已经给出
+`target_lifecycle_id = 1319`**，`management_without_exact_target` 并不成立，
+候选虽有 5 个但目标已定。
+
+也就是说：**这次上下文解析本来就不必发生**。它不仅多花了 token
+（该次请求 28,274 字节、两次模型调用），还因为看到一份错误的交易所状态
+而把正确答案覆盖掉。用户的判断在这里是对的，且代码里已有正确判据，
+只是关键词那几条优先级上盖过了它。
+
+### 7.3 上下文分析的初衷：比「多策略选一个」更早、更具体
+
+`docs/archive/plans/2026-07-27-contextual-strategy-thread-resolution-design.md` 开篇：
+
+> 部分 Telegram 群组会连续发布同一策略的开仓、更新、取消和持仓管理消息，
+> 并大量使用"更新""先取消""有入场的""保护成本"等**依赖上下文的表达**……
+> **结果是同一策略的"更新"可能被创建为独立策略，后续"取消"只作用于新策略，
+> 旧挂单仍可能成交。**
+
+所以最初要解决的是**修订链断裂**（更新被当成新策略，取消打偏），
+「同群多个策略要选哪个」是其中一种情形（对应今天的
+`multiple_same_source_candidates`），不是全部。用户记的方向对，范围更窄一些。
+
+### 7.4 「不该重试」——要把两种重试分开
+
+**六次尝试的输入指纹两两不同**（`context_fingerprint` 与 `rendered_prompt_sha256`
+均各不相同），所以那不是「同一个问题问六遍」：
+
+```
+6670 15:04:34  ctx=d92390507  6671 15:06:07  ctx=b38cc7b33
+6672 15:07:04  ctx=4ab0bb13e  6673 15:09:52  ctx=2475554b5
+6674 15:10:40  ctx=42f8cae9a  6675 15:12:06  ctx=e57885709
+```
+
+这是原设计第 5 条：「**歧义不应立即升级人工。系统先等待后续消息或状态变化
+并自动重分析。**」——`reanalysis` 是有意设计。
+
+**但用户说的那种重试确实存在，在 attempt 内部**：
+`terminal = attempt_number == 2`，同一份输入连问模型两次，两次都被同一个
+契约校验拒绝才罢休。对 `target_outside_candidate_set` 这种**确定性契约错误**，
+第二次问不会有任何新信息——这一次就白白多花了三次（6670/6672/6673 各两问）。
+
+值得分开处置：
+- **契约类失败**（`target_outside_candidate_set`、`unknown_decision` 等）→ 不该重问，
+  它不是网络抖动，是答案结构不合法；
+- **网络/供应商失败** → 该重试（现有 `ContextNetworkRetryPolicy` 已区分对待）。
+
+### 7.5 八分钟里六份不同的上下文，是另一条值得查的线
+
+同一条消息在 15:04–15:12 之间产生了六份互不相同的上下文，其中交易所状态
+从「与交换状态一致」变成「pending_entry、无持仓」。而这笔仓位的保护单账本行
+（`exchange_adopted_by_tu`）直到 **16:17** 才写入。
+
+也就是说，解析发生在「仓位已建立、但保护归属尚未建立」的窗口里，
+而 `redacted_exchange_state` 在这个窗口里描述同一个对象的说法会变。
+**这条线本文未展开**，但它决定了 7.2 之外还要不要修状态快照本身。
