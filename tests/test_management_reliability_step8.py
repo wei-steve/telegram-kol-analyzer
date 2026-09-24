@@ -323,30 +323,6 @@ def test_an_entry_without_a_stop_loss_is_still_refused():
     ) == CONTRACT_INVALID
 
 
-def test_the_v2_contract_relaxes_the_same_field():
-    from telegram_kol_research.mimo_v2_contract import _parse_complete_strategy
-
-    parsed = _parse_complete_strategy(
-        {"symbol": "eth", "side": "long", "entry": "2370", "stop_loss": "2335"},
-        ordinal=0,
-    )
-    assert parsed["symbol"] == "ETH"
-    assert parsed["take_profit"] is None
-
-
-def test_the_v2_contract_still_requires_a_stop_loss():
-    from telegram_kol_research.mimo_v2_contract import (
-        MimoV2ContractError,
-        _parse_complete_strategy,
-    )
-
-    with pytest.raises(MimoV2ContractError):
-        _parse_complete_strategy(
-            {"symbol": "ETH", "side": "long", "entry": "2464", "take_profit": "3200"},
-            ordinal=0,
-        )
-
-
 def test_a_relaxed_entry_still_faces_every_risk_gate():
     """Relaxing the contract admits messages to the pipeline, not to trading.
 

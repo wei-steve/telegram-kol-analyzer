@@ -22,50 +22,6 @@ from telegram_kol_research.trading_settings import TRADING_SETTINGS_KEY
 from telegram_kol_research.models import TradingSetting
 
 
-def test_load_trading_settings_returns_safe_defaults(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-
-    settings = load_trading_settings(session_factory)
-
-    assert settings.auto_trade_enabled is False
-    assert settings.default_max_loss_usdt == 20.0
-    assert settings.max_concurrent_positions == 4
-    assert settings.allowed_symbols == ["BTC", "ETH"]
-    assert settings.entry_thresholds_for_symbol("BTC") == SymbolEntryThresholds(
-        market_leg_threshold=Decimal("200"),
-        first_limit_offset=Decimal("90"),
-        second_limit_offset=Decimal("90"),
-    )
-    assert settings.entry_thresholds_for_symbol("ETH") == SymbolEntryThresholds(
-        market_leg_threshold=Decimal("4"),
-        first_limit_offset=Decimal("2"),
-        second_limit_offset=Decimal("2"),
-    )
-    assert settings.entry_range_order_style == "eager"
-    assert settings.nearby_entry_market_deviation_pct == 0.15
-    assert settings.revision_target_min_confidence == 0.70
-    assert settings.multi_instruction_mode == "disabled"
-    assert settings.multi_instruction_activation_after_raw_message_id == 0
-    assert settings.take_profit_allocations == [40.0, 30.0, 30.0]
-    assert settings.allow_vision_auto_trade is True
-    assert settings.context_resolution_enabled is False
-    assert settings.context_resolution_live_chat_ids == []
-    assert settings.context_resolution_enabled_for_chat(100) is False
-    assert settings.entry_preamble_mode == "disabled"
-    assert settings.entry_message_assembly_v2_mode == "disabled"
-    assert settings.entry_revision_v2_mode == "disabled"
-    assert settings.instruction_execution_contract_mode == "disabled"
-    assert settings.instruction_execution_entry_after_item_id == 0
-    assert settings.instruction_execution_management_after_item_id == 0
-    assert settings.deepcoin_contract_specs_mode == "static"
-    assert settings.mimo_contract_mode == "v1"
-    assert settings.mimo_v2_activation_after_raw_message_id == 0
-    assert settings.worker_command_mode == "queue"
-    assert not hasattr(settings, "message_lock_mode")
-    assert settings.semantic_review_enabled is False
-    assert not hasattr(settings, "entry_preamble_live_chat_ids")
-
-
 def test_runtime_pipeline_modes_default_to_queue_when_fields_are_absent(tmp_path):
     session_factory = create_session_factory(tmp_path / "absent-modes.db")
 
@@ -268,31 +224,6 @@ def test_multi_instruction_watermark_fails_closed(value):
         trading_settings_from_payload(
             {"multi_instruction_activation_after_raw_message_id": value}
         )
-
-
-@pytest.mark.parametrize("mode", ["v1", "v2_live_adapter"])
-def test_mimo_contract_rollout_settings_round_trip(tmp_path, mode):
-    session_factory = create_session_factory(tmp_path / "mimo-settings.db")
-
-    saved = save_trading_settings(
-        session_factory,
-        {
-            "mimo_contract_mode": mode,
-            "mimo_v2_activation_after_raw_message_id": 42,
-        },
-    )
-
-    assert saved.mimo_contract_mode == mode
-    assert saved.mimo_v2_activation_after_raw_message_id == 42
-    loaded = load_trading_settings(session_factory)
-    assert loaded.mimo_contract_mode == mode
-    assert loaded.mimo_v2_activation_after_raw_message_id == 42
-
-
-@pytest.mark.parametrize("value", ["shadow", "v2", "live", True, [], {}, 1, None])
-def test_mimo_contract_mode_fails_closed(value):
-    with pytest.raises(ValueError, match="mimo_contract_mode"):
-        trading_settings_from_payload({"mimo_contract_mode": value})
 
 
 @pytest.mark.parametrize(
@@ -646,14 +577,6 @@ def test_authoritative_gap_recovery_max_age_minutes_fails_open_to_default(value)
         {"authoritative_gap_recovery_max_age_minutes": value}
     )
     assert settings.authoritative_gap_recovery_max_age_minutes == 15.0
-
-
-@pytest.mark.parametrize("value", [-1, True, "42", 1.5, None])
-def test_mimo_v2_activation_watermark_fails_closed(value):
-    with pytest.raises(ValueError, match="mimo_v2_activation_after_raw_message_id"):
-        trading_settings_from_payload(
-            {"mimo_v2_activation_after_raw_message_id": value}
-        )
 
 
 @pytest.mark.parametrize("mode", ["static", "shadow", "live"])

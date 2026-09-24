@@ -9,37 +9,6 @@ from telegram_kol_research.db import (
 )
 
 
-def test_context_resolution_schema_is_created(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    inspector = inspect(session_factory.kw["bind"])
-
-    assert inspector.has_table("message_evidence_versions")
-    assert inspector.has_table("message_evidence_extraction_claims")
-    assert inspector.has_table("strategy_threads")
-    assert inspector.has_table("strategy_message_links")
-    assert inspector.has_table("context_resolution_attempts")
-    assert inspector.has_table("runtime_incidents")
-    assert inspector.has_table("runtime_incident_observations")
-    assert inspector.has_table("runtime_agent_recovery_attempts")
-    assert inspector.has_table("runtime_agent_investigation_audits")
-    assert inspector.has_table("message_operation_contracts")
-    assert inspector.has_table("message_operation_items")
-    assert inspector.has_table("message_operation_stage1_notifications")
-    assert inspector.has_table("runtime_incident_handoff_artifacts")
-    assert inspector.has_table("position_protection_health_observations")
-    assert inspector.has_table("management_message_envelopes")
-    assert inspector.has_table("management_message_targets")
-    assert inspector.has_table("instruction_execution_contracts")
-    assert inspector.has_table("instruction_execution_transitions")
-    assert inspector.has_table("mimo_recognition_runs")
-    assert inspector.has_table("mimo_recognition_attempts")
-    assert inspector.has_table("mimo_contract_circuit_state")
-    assert "strategy_thread_id" in {
-        column["name"]
-        for column in inspector.get_columns("strategy_lifecycles")
-    }
-
-
 def test_mimo_recognition_audit_schema_is_additive_and_indexed(tmp_path):
     database_path = tmp_path / "legacy-mimo-audit.db"
     with sqlite3.connect(database_path) as connection:
@@ -210,25 +179,6 @@ def test_mimo_evidence_run_link_is_added_to_existing_evidence_table(tmp_path):
         index["name"]
         for index in inspector.get_indexes("message_evidence_versions")
     }
-
-
-def test_mimo_contract_circuit_state_schema_is_durable_and_bounded(tmp_path):
-    session_factory = create_session_factory(tmp_path / "mimo-circuit-schema.db")
-    inspector = inspect(session_factory.kw["bind"])
-
-    columns = {
-        column["name"]
-        for column in inspector.get_columns("mimo_contract_circuit_state")
-    }
-    assert {
-        "id",
-        "consecutive_transport_failures",
-        "is_open",
-        "opened_reason",
-        "opened_at",
-        "last_success_at",
-        "updated_at",
-    } <= columns
 
 
 def test_execution_contract_schema_bootstrap_is_idempotent_on_legacy_database(

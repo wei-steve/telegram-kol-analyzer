@@ -9,7 +9,6 @@ from typing import Any
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.prompt_defaults import (
-    MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
 )
@@ -50,23 +49,10 @@ def compose_trading_prompt(
         raise PromptCompositionError(
             f"unsupported trading model kind: {model_kind}"
         )
-    if contract_version not in {"v1", "v2"}:
+    if contract_version != "v1":
         raise PromptCompositionError(
             f"unsupported trading contract version: {contract_version}"
         )
-    if contract_version == "v2":
-        if model_kind != "mimo":
-            raise PromptCompositionError("MiMo v2 contract is only available to MiMo")
-        prompt = resolve_active_prompt(
-            session_factory,
-            MIMO_V2_AUTHORITATIVE_PROMPT,
-        )
-        return PromptComposition(
-            system_prompt=prompt.content.strip(),
-            context=context,
-            version_map={prompt.prompt_key: prompt.version_id},
-        )
-
     shared = resolve_active_prompt(session_factory, SHARED_TRADING_PROMPT)
     prompts = [shared]
     if model_kind == "mimo":

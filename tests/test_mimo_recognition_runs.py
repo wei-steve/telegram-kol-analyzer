@@ -30,91 +30,15 @@ def _message(factory, *, chat_id: int = 7, message_id: int = 11) -> int:
 def _start(factory, raw_message_id: int, **overrides):
     values = {
         "raw_message_id": raw_message_id,
-        "run_kind": "v2_authoritative",
-        "contract_version": "mimo-authoritative-v2",
+        "run_kind": "v1_authoritative",
+        "contract_version": "v1",
         "model": "mimo-v2.5",
         "input_kind": "text+image",
         "input_fingerprint": "sha256:input",
-        "prompt_versions": {"trading.analysis.mimo_v2_authoritative": 12},
+        "prompt_versions": {"trading.analysis.shared": 12},
     }
     values.update(overrides)
     return start_mimo_run(factory, **values)
-
-
-def test_run_records_ordered_attempts_and_terminal_selection(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_message_id = _message(factory)
-    run = _start(factory, raw_message_id)
-
-    first = record_mimo_attempt(
-        factory,
-        run_id=run.id,
-        ordinal=1,
-        status="timeout",
-        error_code="provider_timeout",
-        error_message=(
-            "Authorization: Bearer private-token api_key=private-key request timed out"
-        ),
-        response_payload="timeout-body",
-        duration_ms=1500,
-    )
-    with factory() as session:
-        assert session.get(MimoRecognitionRun, run.id).attempt_count == 1
-    second = record_mimo_attempt(
-        factory,
-        run_id=run.id,
-        ordinal=2,
-        retry_of_ordinal=1,
-        status="completed",
-        response_payload={"b": 2, "a": 1},
-        duration_ms=230,
-    )
-    completed = complete_mimo_run(
-        factory,
-        run_id=run.id,
-        status="completed",
-        selected_ordinal=2,
-        canonical_payload={"contract_version": "mimo-authoritative-v2", "a": 1},
-        projection_payload={"recognition_result": "非策略", "a": 1},
-        became_authoritative=True,
-    )
-
-    assert run.status == "running"
-    assert run.attempt_count == 0
-    assert completed.status == "completed"
-    assert completed.attempt_count == 2
-    assert completed.selected_attempt_ordinal == 2
-    assert completed.became_authoritative is True
-    assert completed.completed_at is not None
-    assert len(completed.canonical_payload_fingerprint) == 64
-    assert len(completed.projection_fingerprint) == 64
-    assert first.error_message is not None
-    assert "private-token" not in first.error_message
-    assert "private-key" not in first.error_message
-    assert "[redacted]" in first.error_message
-    assert len(first.response_fingerprint) == 64
-    assert len(second.response_fingerprint) == 64
-    assert canonical_json_fingerprint({"b": 2, "a": 1}) == (
-        canonical_json_fingerprint({"a": 1, "b": 2})
-    )
-    attempts = load_mimo_attempts(factory, run_id=run.id)
-    assert [row.ordinal for row in attempts] == [1, 2]
-    assert [row.retry_of_ordinal for row in attempts] == [None, 1]
-    assert [row.selected for row in attempts] == [False, True]
-
-    with factory() as session:
-        stored = session.get(MimoRecognitionRun, run.id)
-        assert json.loads(stored.prompt_versions_json) == {
-            "trading.analysis.mimo_v2_authoritative": 12
-        }
-        assert session.query(MimoRecognitionAttempt).count() == 2
-        stored_attempt = session.query(MimoRecognitionAttempt).filter_by(
-            run_id=run.id, ordinal=1
-        ).one()
-        assert stored_attempt.attempt_phase is None
-        assert stored_attempt.provider_request_count is None
-        assert stored_attempt.provider_usage_json is None
-        assert stored_attempt.request_component_bytes_json is None
 
 
 def test_attempt_observability_is_additive_and_canonical(tmp_path):

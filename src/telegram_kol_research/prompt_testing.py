@@ -25,9 +25,7 @@ from telegram_kol_research.message_recognition import (
     _parse_ai_result_json,
 )
 from telegram_kol_research.models import AiPromptTestRun, MediaAsset, RawMessage
-from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 from telegram_kol_research.prompt_defaults import (
-    MIMO_V2_AUTHORITATIVE_PROMPT,
     MIMO_VISION_PROMPT,
     SHARED_TRADING_PROMPT,
 )
@@ -74,40 +72,30 @@ def run_prompt_draft_test(
     if prompt_key not in {
         SHARED_TRADING_PROMPT,
         MIMO_VISION_PROMPT,
-        MIMO_V2_AUTHORITATIVE_PROMPT,
     }:
         raise ValueError("historical recognition tests support trading prompts only")
     if model_kind not in {"mimo", "deepseek"}:
         raise ValueError(f"unsupported model kind: {model_kind}")
     if prompt_key == MIMO_VISION_PROMPT and model_kind != "mimo":
         raise ValueError("MiMo vision prompt can only be tested with MiMo")
-    if prompt_key == MIMO_V2_AUTHORITATIVE_PROMPT and model_kind != "mimo":
-        raise ValueError("MiMo v2 prompt can only be tested with MiMo")
 
     detail = get_prompt_detail(session_factory, prompt_key)
     if detail.draft_version is None or detail.draft_version.id != draft_version_id:
         raise ValueError("draft version changed")
 
-    if prompt_key == MIMO_V2_AUTHORITATIVE_PROMPT:
-        active_prompt_versions = {
-            MIMO_V2_AUTHORITATIVE_PROMPT: detail.active_version.id,
-        }
-        active_parts = [detail.active_version.content]
-        draft_parts = [detail.draft_version.content]
+    shared = resolve_active_prompt(session_factory, SHARED_TRADING_PROMPT)
+    vision = resolve_active_prompt(session_factory, MIMO_VISION_PROMPT)
+    active_prompt_versions = {SHARED_TRADING_PROMPT: shared.version_id}
+    active_parts = [shared.content]
+    draft_parts = [shared.content]
+    if model_kind == "mimo":
+        active_prompt_versions[MIMO_VISION_PROMPT] = vision.version_id
+        active_parts.append(vision.content)
+        draft_parts.append(vision.content)
+    if prompt_key == SHARED_TRADING_PROMPT:
+        draft_parts[0] = detail.draft_version.content
     else:
-        shared = resolve_active_prompt(session_factory, SHARED_TRADING_PROMPT)
-        vision = resolve_active_prompt(session_factory, MIMO_VISION_PROMPT)
-        active_prompt_versions = {SHARED_TRADING_PROMPT: shared.version_id}
-        active_parts = [shared.content]
-        draft_parts = [shared.content]
-        if model_kind == "mimo":
-            active_prompt_versions[MIMO_VISION_PROMPT] = vision.version_id
-            active_parts.append(vision.content)
-            draft_parts.append(vision.content)
-        if prompt_key == SHARED_TRADING_PROMPT:
-            draft_parts[0] = detail.draft_version.content
-        else:
-            draft_parts[1] = detail.draft_version.content
+        draft_parts[1] = detail.draft_version.content
 
     with session_factory() as session:
         raw_message = session.get(RawMessage, raw_message_id)
@@ -160,13 +148,7 @@ def run_prompt_draft_test(
                 media_root=media_root,
             )
             _validate_prompt_test_payload(prompt_key, draft_payload)
-            if prompt_key == MIMO_V2_AUTHORITATIVE_PROMPT:
-                differences = _json_difference_paths(
-                    active_payload,
-                    draft_payload,
-                )
-            else:
-                _, differences = compare_assessments(active_payload, draft_payload)
+            _, differences = compare_assessments(active_payload, draft_payload)
         except Exception as exc:
             error_message = str(exc)
         duration_ms = max(0, round((time.perf_counter() - started) * 1000))
@@ -200,9 +182,6 @@ def run_prompt_draft_test(
 
 
 def _validate_prompt_test_payload(prompt_key: str, payload: dict[str, Any]) -> None:
-    if prompt_key == MIMO_V2_AUTHORITATIVE_PROMPT:
-        parse_mimo_v2_payload(payload)
-        return
     _validate_authoritative_payload(payload)
 
 

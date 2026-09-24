@@ -44,7 +44,6 @@ from telegram_kol_research.models import (
     TriggerProtectionStopRescue,
     utc_now,
 )
-from telegram_kol_research.mimo_v2_contract import parse_mimo_v2_payload
 from telegram_kol_research.time_utils import normalize_to_utc_naive, utc_naive_to_local
 from telegram_kol_research.reporting import (
     format_entry_assembly_summary,
@@ -1188,22 +1187,10 @@ def _serialize_mimo_analysis(
         attempts_by_run_id=attempts_by_run_id,
         model_labels=model_labels,
     )
-    is_v2 = contract_version == "mimo-authoritative-v2" or (
-        linked_run is not None
-        and linked_run.contract_version == "mimo-authoritative-v2"
-    )
     projection = _serialize_mimo_projection(
-        is_v2=is_v2,
         is_historical_v1=linked_run is None,
-        evidence=evidence,
-        normalized=normalized,
-        text_evidence=text_evidence,
-        image_evidence=image_evidence,
     )
-    semantic_projection_allowed = (
-        not is_v2 or projection.get("status") == "completed"
-    )
-    raw_images = image_evidence.get("images") if semantic_projection_allowed else []
+    raw_images = image_evidence.get("images")
     raw_images = raw_images if isinstance(raw_images, list) else []
     images = [
         _serialize_mimo_image(
@@ -1216,12 +1203,9 @@ def _serialize_mimo_analysis(
         for item in raw_images
         if isinstance(item, dict)
     ]
-    raw_intents = (
-        normalized.get("intents")
-        if is_v2 and semantic_projection_allowed
-        else []
-    )
-    raw_intents = raw_intents if isinstance(raw_intents, list) else []
+    # The multi-intent v2 contract was retired without ever running in
+    # production, so no stored result carries ``intents``.
+    raw_intents: list[Any] = []
     attempts_recorded = any(attempts_by_run_id.get(int(run.id), []) for run in runs)
     per_image_recorded = bool(
         raw_images
@@ -1231,13 +1215,7 @@ def _serialize_mimo_analysis(
             for item in raw_images
         )
     )
-    result_format = (
-        "v2"
-        if is_v2
-        else "v1"
-        if linked_run is not None
-        else "historical_v1"
-    )
+    result_format = "v1" if linked_run is not None else "historical_v1"
     projected_summary = (
         normalized.get("summary")
         or normalized.get("reason")
@@ -1255,10 +1233,6 @@ def _serialize_mimo_analysis(
         if isinstance(image_evidence.get("conflicts"), list)
         else []
     )
-    if is_v2 and not semantic_projection_allowed:
-        projected_summary = None
-        projected_confidence = None
-        projected_conflicts = []
     return {
         "format": result_format,
         # ``v1``/``v2`` name the MiMo *contract shape*, not the model, so the
@@ -1309,51 +1283,22 @@ def _serialize_mimo_analysis(
                     else recognition.engine if recognition is not None else None
                 ),
             }
-            if not is_v2
-            else None
         ),
-        "legacy_image_evidence": image_evidence if not is_v2 else None,
+        "legacy_image_evidence": image_evidence,
     }
 
 
-def _serialize_mimo_projection(
-    *,
-    is_v2: bool,
-    is_historical_v1: bool,
-    evidence: MessageEvidenceVersion | None,
-    normalized: dict[str, object],
-    text_evidence: dict[str, object],
-    image_evidence: dict[str, object],
-) -> dict[str, object]:
-    if not is_v2:
-        return {
-            "status": "historical" if is_historical_v1 else "v1",
-            "reason_code": None,
-        }
-    if evidence is None:
-        return {
-            "status": "not_available",
-            "reason_code": "canonical_result_not_persisted",
-        }
-    canonical = {
-        "contract_version": normalized.get("contract_version"),
-        "summary": normalized.get("summary"),
-        "confidence": normalized.get("confidence"),
-        "intents": normalized.get("intents"),
-        "evidence": {
-            "text": text_evidence,
-            "images": image_evidence.get("images") or [],
-            "conflicts": image_evidence.get("conflicts") or [],
-        },
+def _serialize_mimo_projection(*, is_historical_v1: bool) -> dict[str, object]:
+    """Which contract shape produced this stored result.
+
+    Only v1 shapes exist: the multi-intent v2 contract never ran in production
+    (9796 of 9796 authoritative runs are v1) and was retired on 2026-09-24.
+    """
+
+    return {
+        "status": "historical" if is_historical_v1 else "v1",
+        "reason_code": None,
     }
-    try:
-        parse_mimo_v2_payload(canonical)
-    except ValueError:
-        return {
-            "status": "failed",
-            "reason_code": "stored_v2_contract_invalid",
-        }
-    return {"status": "completed", "reason_code": None}
 
 
 def _model_display_label(

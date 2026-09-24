@@ -43,12 +43,9 @@ from telegram_kol_research.models import (
 from telegram_kol_research.recognition_experiments import (
     MimoProviderAttemptTelemetry,
     _find_mimo_model,
-    infer_mimo_authoritative_v2,
     resolve_authoritative_chain,
     run_mimo_authoritative_for_message,
 )
-
-
 PRIMARY = "mimo-v2.5"
 BACKUP = "backup-vision"
 
@@ -122,28 +119,6 @@ def _message(factory, *, text: str = "BTC 偏多观点") -> int:
         session.add(row)
         session.commit()
         return int(row.id)
-
-
-def _v2_payload(observed_text: str = "BTC 偏多观点") -> dict:
-    return {
-        "contract_version": "mimo-authoritative-v2",
-        "summary": "普通市场观点",
-        "confidence": 0.82,
-        "intents": [
-            {
-                "intent_type": "market_commentary",
-                "action": None,
-                "reason": "没有完整交易动作",
-                "confidence": 0.82,
-                "evidence_refs": ["text:observed_text"],
-            }
-        ],
-        "evidence": {
-            "text": {"observed_text": observed_text, "fields": {}},
-            "images": [],
-            "conflicts": [],
-        },
-    }
 
 
 def _status_error(code: int) -> RuntimeError:
@@ -339,196 +314,6 @@ def test_a_slow_first_attempt_does_not_hand_its_retry_a_fresh_deadline():
 # ---------------------------------------------------------------------------
 # v2: the whole chain, audited
 # ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize(
-    "primary_failure",
-    [
-        pytest.param(_status_error(402), id="http_402"),
-        pytest.param(TimeoutError("mimo timed out"), id="timeout"),
-        pytest.param("not-json", id="bad_json"),
-    ],
-)
-def test_v2_falls_back_to_the_backup_model_and_records_both(tmp_path, primary_failure):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_id = _message(factory)
-    requester = _by_model({PRIMARY: primary_failure, BACKUP: _v2_payload()})
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY, BACKUP),
-        media_root=tmp_path,
-        context_text="",
-        requester=requester,
-        max_attempts=1,
-        retry_delay_seconds=0,
-    )
-
-    assert result.succeeded is True
-    assert result.model == BACKUP
-    assert result.parsed_result.evidence.text.observed_text == "BTC 偏多观点"
-    run = _run(factory)
-    assert run.model == BACKUP
-    assert run.status == "completed"
-    rows = _attempt_rows(factory)
-    assert rows[0][:2] == (1, PRIMARY)
-    assert rows[0][2] != "completed"
-    assert rows[1] == (2, BACKUP, "completed")
-    assert run.selected_attempt_ordinal == 2
-    assert requester.calls == [PRIMARY, BACKUP]
-
-
-def test_v2_retries_the_primary_within_itself_before_changing_model(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_id = _message(factory)
-    failures = iter([_status_error(500), _status_error(500)])
-
-    def request(**kwargs):
-        model = kwargs["model_config"].model
-        if model == PRIMARY:
-            raise next(failures)
-        return _v2_payload()
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY, BACKUP),
-        media_root=tmp_path,
-        context_text="",
-        requester=request,
-        max_attempts=2,
-        retry_delay_seconds=0,
-    )
-
-    assert result.model == BACKUP
-    rows = _attempt_rows(factory)
-    assert [(row[0], row[1]) for row in rows] == [
-        (1, PRIMARY),
-        (2, PRIMARY),
-        (3, BACKUP),
-    ]
-    attempts = load_mimo_attempts(factory, run_id=_run(factory).id)
-    # Only a repeat of the same model is a retry of the one before it.
-    assert attempts[1].retry_of_ordinal == 1
-    assert attempts[2].retry_of_ordinal is None
-
-
-def test_v2_reports_both_models_when_the_whole_chain_fails(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_id = _message(factory)
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY, BACKUP),
-        media_root=tmp_path,
-        context_text="",
-        requester=_by_model(
-            {PRIMARY: _status_error(402), BACKUP: _status_error(503)}
-        ),
-        max_attempts=1,
-        retry_delay_seconds=0,
-    )
-
-    assert result.succeeded is False
-    assert f"model {PRIMARY}" in result.error_message
-    assert f"model {BACKUP}" in result.error_message
-    assert "402" in result.error_message and "503" in result.error_message
-    run = _run(factory)
-    assert run.status == "failed"
-    # The run keeps the chain head: that is the model this message started on.
-    assert run.model == PRIMARY
-    assert [(row[0], row[1]) for row in _attempt_rows(factory)] == [
-        (1, PRIMARY),
-        (2, BACKUP),
-    ]
-
-
-def test_v2_does_not_change_model_for_an_unreadable_image(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    with factory() as session:
-        row = RawMessage(chat_id=900, message_id=18, text="")
-        session.add(row)
-        session.commit()
-        raw_id = int(row.id)
-        from telegram_kol_research.models import MediaAsset
-
-        session.add(
-            MediaAsset(
-                raw_message_id=raw_id,
-                kind="photo",
-                mime_type="image/jpeg",
-                local_path="missing/never-written.jpg",
-            )
-        )
-        session.commit()
-
-    def never_called(**kwargs):
-        raise AssertionError("no request should be made")
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY, BACKUP),
-        media_root=tmp_path,
-        context_text="",
-        requester=never_called,
-        max_attempts=1,
-        retry_delay_seconds=0,
-    )
-
-    assert result.error_code == "image_unavailable"
-    assert result.model == PRIMARY
-    assert _attempt_rows(factory) == []
-
-
-def test_v2_does_not_change_model_when_the_request_never_left(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_id = _message(factory)
-    calls: list[str] = []
-
-    def request(**kwargs):
-        calls.append(kwargs["model_config"].model)
-        error = RuntimeError("payload assembly failed")
-        error.mimo_provider_attempt_telemetry = MimoProviderAttemptTelemetry(
-            provider_request_made=False
-        )
-        raise error
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY, BACKUP),
-        media_root=tmp_path,
-        context_text="",
-        requester=request,
-        max_attempts=1,
-        retry_delay_seconds=0,
-    )
-
-    assert result.succeeded is False
-    assert calls == [PRIMARY]
-
-
-def test_a_single_model_chain_records_exactly_one_attempt(tmp_path):
-    factory = create_session_factory(tmp_path / "research.db")
-    raw_id = _message(factory)
-
-    result = infer_mimo_authoritative_v2(
-        factory,
-        raw_message_id=raw_id,
-        config=_chain_config(PRIMARY),
-        media_root=tmp_path,
-        context_text="",
-        requester=lambda **kwargs: _v2_payload(),
-        max_attempts=1,
-        retry_delay_seconds=0,
-    )
-
-    assert result.model == PRIMARY
-    assert _attempt_rows(factory) == [(1, PRIMARY, "completed")]
-    assert _run(factory).model == PRIMARY
 
 
 # ---------------------------------------------------------------------------

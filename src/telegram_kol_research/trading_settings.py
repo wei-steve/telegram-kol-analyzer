@@ -102,7 +102,6 @@ class TradingSettings:
     instruction_execution_entry_after_item_id: int = 0
     instruction_execution_management_after_item_id: int = 0
     deepcoin_contract_specs_mode: Literal["static", "shadow", "live"] = "static"
-    mimo_contract_mode: Literal["v1", "v2_live_adapter"] = "v1"
     message_processing_max_parallel_chats: int = 20
     message_pipeline_mode: Literal["queue"] = "queue"
     worker_command_mode: Literal["queue"] = "queue"
@@ -131,7 +130,6 @@ class TradingSettings:
     position_protection_incident_delivery_after_id: int | None = None
     strategy_management_notification_delivery_after_id: int | None = None
     position_attribution_audit_delivery_after_id: int | None = None
-    mimo_v2_activation_after_raw_message_id: int = 0
     default_max_loss_usdt: float = 20.0
     daily_max_loss_usdt: float = 500.0
     max_concurrent_positions: int = 4
@@ -602,9 +600,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             defaults.deepcoin_contract_specs_mode,
         )
     )
-    mimo_contract_mode = _mimo_contract_mode(
-        raw.get("mimo_contract_mode", defaults.mimo_contract_mode)
-    )
     message_processing_max_parallel_chats = _bounded_int_setting(
         raw.get(
             "message_processing_max_parallel_chats",
@@ -667,13 +662,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             field_name="position_attribution_audit_delivery_after_id",
         )
     )
-    mimo_v2_activation_after_raw_message_id = _nonnegative_int_setting(
-        raw.get(
-            "mimo_v2_activation_after_raw_message_id",
-            defaults.mimo_v2_activation_after_raw_message_id,
-        ),
-        field_name="mimo_v2_activation_after_raw_message_id",
-    )
     return TradingSettings(
         auto_trade_enabled=_boolean_setting(
             raw,
@@ -714,10 +702,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
             instruction_execution_management_after_item_id
         ),
         deepcoin_contract_specs_mode=deepcoin_contract_specs_mode,
-        mimo_contract_mode=mimo_contract_mode,
-        mimo_v2_activation_after_raw_message_id=(
-            mimo_v2_activation_after_raw_message_id
-        ),
         message_processing_max_parallel_chats=(
             message_processing_max_parallel_chats
         ),
@@ -889,17 +873,6 @@ def _deepcoin_contract_specs_mode(
         raise ValueError(
             "deepcoin_contract_specs_mode must be static, shadow, or live"
         )
-    return normalized
-
-
-def _mimo_contract_mode(
-    value: Any,
-) -> Literal["v1", "v2_live_adapter"]:
-    if not isinstance(value, str):
-        raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
-    normalized = value.strip().lower()
-    if normalized not in {"v1", "v2_live_adapter"}:
-        raise ValueError("mimo_contract_mode must be v1 or v2_live_adapter")
     return normalized
 
 

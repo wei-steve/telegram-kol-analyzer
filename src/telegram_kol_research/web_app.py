@@ -59,7 +59,6 @@ from telegram_kol_research.entry_admission_reconciler import (
     reconcile_due_entry_admissions,
 )
 from telegram_kol_research.message_evidence import build_message_input_fingerprint
-from telegram_kol_research.mimo_contract_circuit import load_mimo_contract_circuit
 from telegram_kol_research.app_logging import (
     configure_application_logging,
     read_log_page,
@@ -5447,70 +5446,7 @@ def _message_operation_supervisor_watermark_is_valid(app: FastAPI) -> bool:
 
 
 def _trading_settings_response(session_factory) -> dict[str, Any]:
-    payload = load_trading_settings(session_factory).to_dict()
-    payload["mimo_contract_circuit"] = asdict(
-        load_mimo_contract_circuit(session_factory)
-    )
-    return payload
-
-
-def _validate_mimo_contract_activation(
-    session_factory,
-    *,
-    payload: dict[str, Any],
-) -> None:
-    current = load_trading_settings(session_factory)
-    candidate = trading_settings_from_payload({**current.to_dict(), **payload})
-    if (
-        candidate.mimo_contract_mode == "v1"
-        and candidate.mimo_v2_activation_after_raw_message_id
-        != current.mimo_v2_activation_after_raw_message_id
-    ):
-        raise ValueError("mimo v1 rollback must preserve the activation watermark")
-    if candidate.mimo_contract_mode != "v2_live_adapter":
-        return
-    is_activation = current.mimo_contract_mode != "v2_live_adapter"
-    watermark_changed = (
-        candidate.mimo_v2_activation_after_raw_message_id
-        != current.mimo_v2_activation_after_raw_message_id
-    )
-    if not is_activation and not watermark_changed:
-        return
-    with session_factory() as session:
-        latest_raw_id = session.execute(select(func.max(RawMessage.id))).scalar_one()
-    safe_minimum = int(latest_raw_id or 0)
-    watermark = candidate.mimo_v2_activation_after_raw_message_id
-    if watermark <= 0 or watermark < safe_minimum:
-        raise ValueError(
-            "mimo v2 requires an explicit future-message watermark at or above "
-            f"the current maximum raw message ID ({safe_minimum})"
-        )
-
-
-def _require_expected_mimo_contract_state(
-    current,
-    *,
-    payload: dict[str, Any],
-) -> None:
-    if (
-        "mimo_contract_expected_mode" not in payload
-        or "mimo_contract_expected_watermark" not in payload
-    ):
-        raise ValueError("mimo contract changes require the expected current state")
-    expected_mode = str(payload["mimo_contract_expected_mode"])
-    try:
-        expected_watermark = int(payload["mimo_contract_expected_watermark"])
-    except (TypeError, ValueError) as exc:
-        raise ValueError("mimo contract expected watermark must be an integer") from exc
-    if (
-        expected_mode != current.mimo_contract_mode
-        or expected_watermark
-        != current.mimo_v2_activation_after_raw_message_id
-    ):
-        raise HTTPException(
-            status_code=409,
-            detail="mimo contract settings changed; reload before saving",
-        )
+    return load_trading_settings(session_factory).to_dict()
 
 
 WORKER_COMMAND_WAIT_SECONDS = 30.0
@@ -8855,9 +8791,6 @@ def create_web_app(
                 "ai_prompt_views": build_ai_prompt_views(ai_recognition_config),
                 "recognition_profiles": list_recognition_profiles(),
                 "trading_settings": load_trading_settings(app.state.session_factory),
-                "mimo_contract_circuit": load_mimo_contract_circuit(
-                    app.state.session_factory
-                ),
             },
         )
 
@@ -9530,36 +9463,12 @@ def create_web_app(
             candidate = trading_settings_from_payload(
                 {**current.to_dict(), **payload_for_local_save}
             )
-            mimo_contract_change = (
-                candidate.mimo_contract_mode != current.mimo_contract_mode
-                or candidate.mimo_v2_activation_after_raw_message_id
-                != current.mimo_v2_activation_after_raw_message_id
-            )
-            if mimo_contract_change or explicit_concurrency_request:
+            if explicit_concurrency_request:
                 # No process-local lock is taken here. Neither setting is read
                 # by this process's message path (the worker consumes both),
                 # so an ingest-side lock would have quiesced nothing. The
                 # compare-and-swap that does hold is the BEGIN IMMEDIATE plus
                 # expected-value guard inside the two writers below.
-                locked_current = load_trading_settings(app.state.session_factory)
-                locked_candidate = trading_settings_from_payload(
-                    {**locked_current.to_dict(), **payload_for_local_save}
-                )
-                locked_mimo_change = (
-                    locked_candidate.mimo_contract_mode
-                    != locked_current.mimo_contract_mode
-                    or locked_candidate.mimo_v2_activation_after_raw_message_id
-                    != locked_current.mimo_v2_activation_after_raw_message_id
-                )
-                if locked_mimo_change:
-                    _require_expected_mimo_contract_state(
-                        locked_current,
-                        payload=payload_for_local_save,
-                    )
-                    _validate_mimo_contract_activation(
-                        app.state.session_factory,
-                        payload=payload_for_local_save,
-                    )
                 if explicit_concurrency_request:
                     response = transition_message_concurrency_settings(
                         app.state.session_factory,
@@ -9573,23 +9482,9 @@ def create_web_app(
                         updated_at=app.state.now_provider(),
                     ).to_dict()
             else:
-                payload_without_unchanged_mimo = dict(payload_for_local_save)
-                payload_without_unchanged_mimo.pop("mimo_contract_mode", None)
-                payload_without_unchanged_mimo.pop(
-                    "mimo_v2_activation_after_raw_message_id",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "mimo_contract_expected_mode",
-                    None,
-                )
-                payload_without_unchanged_mimo.pop(
-                    "mimo_contract_expected_watermark",
-                    None,
-                )
                 response = save_trading_settings(
                     app.state.session_factory,
-                    payload_without_unchanged_mimo,
+                    payload_for_local_save,
                     updated_at=app.state.now_provider(),
                 ).to_dict()
         except TradingSettingsConcurrencyConflict as exc:
@@ -9599,9 +9494,6 @@ def create_web_app(
         await ensure_message_processing_worker_mode()
         if refresh_status is not None:
             response["contract_specs"] = refresh_status
-        response["mimo_contract_circuit"] = asdict(
-            load_mimo_contract_circuit(app.state.session_factory)
-        )
         return response
 
     def require_recognition_label_role() -> None:
