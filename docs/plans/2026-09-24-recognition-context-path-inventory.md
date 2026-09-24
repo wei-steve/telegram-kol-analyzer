@@ -97,3 +97,61 @@ msg 696 因文末「做无风险**持仓**」命中第三条而触发解析，�
   `message_recognition` 的依赖一起处理，需要先看这两个调用方是否仍在线。
 - `context_resolution` 的 8 条触发原因里，除 (a) 之外的几条是否都仍有必要，
   需要按真实消息统计触发分布后再决定，不能凭读代码删。
+
+---
+
+## 8. 第一步完成：v2 契约已删除并上线（2026-09-24）
+
+**生产 `6c7d9ebeeed9ac19dea7edcc9b2dfcdebe1def78`**，回滚参考
+`6495fee139ee354d510a7d6a17720cddff2ca3a3`。净删除 **10,059 行**。
+四步流程走完，双向核对 PASS。
+
+### 为什么删而不是启用
+
+v2 是**主动放弃**的，不是忘了开：2026-08-11 的隔离重放在 raw message 10505 上
+**两次**失败，`unsafe_evidence_mismatch` / `text_field_attribution_changed`——
+v1 已有字段被 v2 改了归属。用户的判断（「可能就是分类太细，所以识别率出错」）
+与这个失败模式吻合：意图切得越碎，同一句话被拆进不同意图、字段跟着跑偏的机会越多。
+**这也是四分类比 v2 的十一类更可取的实证依据。**
+
+生产从未产生过任何 v2 数据：9796 / 9796 次权威识别都是 v1，
+`recognition_decisions` 里 v2 契约行 0 条，熔断器表 0 行。所以删的是一条
+**从未执行过的路径**，不改变任何生产行为，也不需要保留读取历史 v2 数据的能力。
+
+### 删除范围
+
+四个模块（`mimo_v2_contract`、`mimo_v2_execution_adapter`、`mimo_v2_replay`、
+`mimo_contract_circuit`）；`authoritative_recognition` 的启用判据、v2 推理、
+v1 回退、熔断记录与历史证据 v2 读取分支；`recognition_experiments` 的 8 个函数
+与 3 个数据类；`message_evidence` 的 v2 持久化；`web_queries` 的投影分支；
+`web_app` 的熔断展示、激活水位线校验与设置分支；`trading_settings` 的
+`mimo_contract_mode` 与 `mimo_v2_activation_after_raw_message_id`；
+提示词种子与组装分支；CLI `replay-mimo-v2`；设置表单与其 JavaScript；
+6 个 v2 测试文件与 88 个 v2 测试定义。
+
+**保留** `contract_version` 列与使用它的 9796 条 v1 记录——那是历史事实。
+
+### 过程中的一次误伤，值得记下
+
+按「定义体含 v2 关键词」整块删，会把同一条 `import` 语句里的非 v2 符号
+（`SHARED_TRADING_PROMPT` 等）和两个只是「提到 v2」的 fixture 一起带走。
+第一次全套跑出 **101 个失败**，逐条恢复后才归零。
+**「删干净」不能只靠关键词匹配，要靠测试验收。**
+
+### 上线验证
+
+三个单元 active，3 分钟内 0 条 traceback / CRITICAL，
+`/`、`/positions-panel`、`/execution` 与交易设置 API 均 200，
+设置页残留 v2 控件 **0** 个。
+
+### 遗留一项
+
+提示词 `trading.analysis.mimo_v2_authoritative`（def=6）在**生产数据库里仍是
+active**。代码已不再读它，留着无害，但要「删干净」需一条独立的数据库操作，
+**建议单独做、单独确认**。
+
+## 9. 下一步（按用户指定的顺序）
+
+**在首次分析上做四分类**：`新策略` / `策略管理` / `仓位管理` / `闲话`，
+外加一个配合分类的字段，并明确空值语义。现在这条链路只剩一套契约
+（`trading.analysis.shared` v8 + `lifecycle_event`），改造有了干净的起点。
