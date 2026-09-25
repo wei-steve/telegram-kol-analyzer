@@ -272,6 +272,20 @@ function messageMatchesInsightFilter(card, filterName) {
   if (filterName === 'missing-candidate') return card.dataset.messageMissingCandidate === 'true';
   if (filterName === 'labeled') return card.dataset.messageLabeled === 'true';
   if (filterName === 'unlabeled') return card.dataset.messageLabeled !== 'true';
+  // 首次分析分类契约 · 阶段 2 的人工核准入口。显式分类与推导分类不一致的那些，
+  // 是唯一能回答「模型在补漏还是在过度触发」的样本，散在几百条里翻不动。
+  if (filterName === 'classes-disagree') return card.dataset.messageClassesDisagree === 'true';
+  if (filterName === 'classes-violation') return card.dataset.messageClassesViolation === 'true';
+  if (filterName === 'classes-management') {
+    const names = (card.dataset.messageClassNames || '').split(',');
+    return names.includes('仓位管理') || names.includes('策略管理');
+  }
+  if (filterName === 'classes-unknown') {
+    return (card.dataset.messageClassResolutions || '').split(',').includes('unknown');
+  }
+  if (filterName === 'classes-exact') {
+    return (card.dataset.messageClassResolutions || '').split(',').includes('exact');
+  }
   return true;
 }
 

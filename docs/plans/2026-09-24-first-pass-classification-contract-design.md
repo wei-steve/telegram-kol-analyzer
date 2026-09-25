@@ -306,6 +306,13 @@
   `labeled_event_type` 已足以反推分类列表），**本阶段不加数据库列**，避免无谓的 L3。
 
 - **阶段 3 · 切换（L2，须用户单独批准后才能部署）**
+  **§5 的触发判据必须改写（2026-09-25 阶段 2 实测）**：只按 `resolution == unknown` 触发是不够的。
+  实测 4 条 `exact` 里上下文分析纠正了 2 条（目标已 expired / 已不在候选集合），
+  而**触发它们的正是本设计打算删掉的那几条判据**。新判据至少要加上
+  「`exact` 的目标不在候选集合内」——这一条是确定性的、零模型调用，
+  而且 `parse_message_classes` 的 `lifecycle_id_outside_candidate_set` 已经写好了，
+  只是**没有任何生产调用点传 `allowed_lifecycle_ids`**，接上即可。
+  详见 `docs/plans/2026-09-25-first-pass-classification-phase2-measurement.md` §4.5。
   **前置条件（2026-09-25 首个观察窗发现）**：`resolution == exact` 时跳过上下文分析，
   其可信度上限由**候选集合**决定，不由模型决定。首个样本里模型给出的 `exact` 指向一条
   2026-08-20 的、早已 `expiry_review_requested` 的 `pending_entry`——而它是那个群里唯一的

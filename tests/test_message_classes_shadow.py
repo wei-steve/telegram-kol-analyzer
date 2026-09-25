@@ -742,3 +742,86 @@ def test_the_card_template_shows_both_lists_and_leaves_the_main_chip_alone(tmp_p
     # The pre-existing single-value derivation still drives the card label.
     assert 'data-message-ai-classification="management"' in rendered
     assert "data-message-classes-disagreement" not in rendered
+
+
+def _render_card(row):
+    from pathlib import Path
+
+    from jinja2 import Environment, FileSystemLoader
+
+    import telegram_kol_research
+
+    environment = Environment(
+        loader=FileSystemLoader(
+            str(Path(telegram_kol_research.__file__).parent / "templates")
+        ),
+        autoescape=True,
+    )
+    return environment.get_template("_messages.html").render(
+        messages=[row],
+        has_more=False,
+        message_page_size=50,
+        selected_chat_id=77,
+        selected_group=None,
+        search_text="",
+        sender_name="",
+        before_message_id=None,
+        live_listener_enabled=False,
+        monitor_status={"state": "idle"},
+        live_listener_status_reason=None,
+        live_listener_delegated=False,
+        database_latest_message_at=None,
+        database_stale_hours=None,
+        refresh_mode_label="仅本地快照",
+    )
+
+
+def test_the_card_carries_the_attributes_phase_2_filters_on(tmp_path):
+    """阶段 2 的人工核准要能只看不一致的那些，所以判据得挂在卡片上。
+
+    第一次测量里 18 条不一致散在 109 条中间，而一天就有 150-300 条；
+    没有筛选入口，人工核准实际上做不动。
+    """
+
+    row = _projected_row(tmp_path, _with_classes())
+
+    rendered = _render_card(row)
+
+    # 这一条显式与推导一致，所以不该被「分类不一致」筛出来。
+    assert 'data-message-classes-disagree="false"' in rendered
+    assert 'data-message-classes-violation="false"' in rendered
+    assert "仓位管理" in rendered
+    assert 'data-message-class-resolutions="exact"' in rendered
+
+
+def test_a_disagreeing_card_is_marked_for_the_filter(tmp_path):
+    payload = _base_payload()
+    payload["message_classes"] = [{"class": "闲话", "target": None}]
+
+    rendered = _render_card(_projected_row(tmp_path, payload))
+
+    assert 'data-message-classes-disagree="true"' in rendered
+    assert 'data-message-class-names="闲话"' in rendered
+    # 闲话 没有 target，所以 resolution 是空的 -- 「目标未知」筛选不该命中它。
+    assert 'data-message-class-resolutions=""' in rendered
+
+
+def test_every_filter_button_has_a_handler():
+    """按钮和 JS 分支必须一一对应，少一边就是个点了没反应的按钮。"""
+
+    from pathlib import Path
+
+    import telegram_kol_research
+
+    root = Path(telegram_kol_research.__file__).parent
+    template = (root / "templates" / "_messages.html").read_text(encoding="utf-8")
+    script = (root / "static" / "app.js").read_text(encoding="utf-8")
+
+    import re
+
+    buttons = set(re.findall(r'data-message-ai-filter="([a-z-]+)"', template))
+    handled = set(re.findall(r"filterName === '([a-z-]+)'", script))
+
+    assert {"classes-disagree", "classes-management", "classes-unknown",
+            "classes-exact", "classes-violation"} <= buttons
+    assert buttons - {"all"} == handled, (buttons - {"all"}) ^ handled
