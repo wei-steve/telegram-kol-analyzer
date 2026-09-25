@@ -7,12 +7,20 @@
 
 ## 阶段
 
-| 阶段 | 内容 | 状态 |
-|---|---|---|
-| 1 | 审计 `comparison_*` 归属，建本状态文档 | completed |
-| 2 | 退役运行路径（两个模块、worker 单例、设置、CLI、stage、提示词、通知、dataclass 字段） | completed |
-| 3 | 退役页面展示（`web_queries` / 模板 / JS / CSS） | completed |
-| 4 | 文档收口（`docs/ARCHITECTURE.md`） | completed |
+| 阶段 | 内容 | commit | 全套 | 状态 |
+|---|---|---|---|---|
+| 1 | 审计 `comparison_*` 归属，建本状态文档 | `b251da2f` | 未改代码 | completed |
+| 2 | 退役运行路径（两个模块、worker 单例、设置、CLI、stage、提示词、通知、dataclass 字段） | `7283e9e0` | 9530 passed / 4 skipped / 1 计时用例偶发 | completed |
+| 3 | 退役页面展示（`web_queries` / 模板 / CSS） | `31023602` | 9520 passed / 4 skipped / 0 failed | completed |
+| 4 | 文档收口（`ARCHITECTURE` / `runbook` §10 / `context/ai-prompt-registry`） | 本次提交 | 只改文档（L0） | completed |
+
+**测试数：9670 → 9524（−146）。** 逐项账在阶段 2 与阶段 3 的 commit message 里，
+两段加起来正好 −146：阶段 2 −135，阶段 3 −11。
+
+阶段 2 的那条失败是
+`test_web_page_render.py::test_positions_panel_stale_snapshot_does_not_wait_for_background_refresh`
+——它量的是墙钟耗时、卡在一个 2 秒屏障上，与本批无关；单跑与单模块跑都过，阶段 3 的全套
+（同样 12 分钟）也过。
 
 ---
 
@@ -83,3 +91,42 @@
   `deepseek` provider 预设 —— 那是一个真实可选的提供商，不是命名债。
 - `scripts/archive/per_chat_phase7_observer.py` 读 `settings["semantic_review_enabled"]` ——
   已归档脚本，不 import 本包模块，靠 `.get(..., False)` 兜底，删设置项不会让它报错。
+
+## 5. 部署
+
+**尚未部署。** 本批只做代码，本地完成。设计稿 §4 要求按 L2 部署、**须用户单独批准**，
+观察窗 30 分钟 / ≥5 条真实消息。分支 `semantic-review-retirement`，未 push、未开 PR。
+
+回滚边界：本批不改数据库 schema、不改任何 `comparison_*` 列、不写生产库，回滚就是
+`tg-deploy <部署前 HEAD>`。
+
+## 6. 本批做的自主判断（设计稿没写的）
+
+1. **`finalize_authoritative_automation_outcome` / `finalize_recorded_authoritative_execution`
+   保留"复核关闭"那条分支的全部写入**，包括 `agreement_status = "review_disabled"` 字面量。
+   生产恒走这条分支，保留它等于零行为改变；换个名字会改变
+   `message_operation_supervisor` / `message_operation_contracts` 读到的值。
+2. **执行路径在重新分析时把复核字段写回 `None` / `0` 的那些写入全部保留。** 删掉它们会让
+   历史复核数据在重新分析后留存，那是行为改变。
+3. **`save_pending_authoritative_decision` 的 `preserve_completed_review` 分支保留。**
+   它的名字来自复核，但它决定的是"重新分析遇到未变更 payload 时怎么合并
+   `agreement_status` / `prompt_versions`"，属于重新分析语义。
+4. **`comparison_status == "execution_uncertain"` 的页面提示保下来了。** 它原先长在复核控件里
+   （文案「AI复核：执行结果未知」），但它讲的是执行租约被冻结、无人重试、需要人看，
+   不是复核。整块删掉会让这条安全提示从页面消失，而 `_serialize_execution_outcome`
+   接不住它（uncertain 行的 `automation_status` 是 `uncertain`，会落到「未执行」）。
+   现在是 `web_queries._serialize_execution_uncertainty`，独立的键与独立的告警块，
+   去掉了「AI复核」字样。
+5. **`AuthoritativeAssessment.deepseek_payload` 确实有读者**，与交接说明相反：
+   `telegram_live_listener._build_authoritative_notification_payload` 读它来填告警的辅助段。
+   由于所有构造点一直传 `None`，那一段本来恒为空、`auxiliary_review_disagrees` 恒返回
+   `False`。删字段后 payload 仍保留一个空的 `"deepseek"` 键，所以判据、格式化函数和
+   「没有第二个模型就不发」的规则一个字没动。
+6. **`/api/messages/{id}/recognize` 的 `semantic_review_status` 响应字段删除。**
+   设计稿 §3.1 点名要删它的产生与传递；页面 JS 与模板都没有消费者。
+7. **`scripts/archive/per_chat_phase7_observer.py` 不动。** 已归档脚本，不 import 本包，
+   读设置走 `.get(..., False)` 兜底。
+8. **`docs/runbook.md` §10 重写而不是删除**：那一节的 SQL 现在讲执行认领租约怎么查，
+   因为列还在、租约还在跑，只有复核那部分作废。
+9. **`docs/context/ai-prompt-registry.md` 只改复核相关的三处**，没顺手修它里面
+   `research.chat.*`（2026-09-14 已删）那类更早的陈旧内容——那是另一批的事。

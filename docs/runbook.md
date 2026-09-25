@@ -951,13 +951,33 @@ Run the current automated test suite:
 python3 -m pytest tests -v
 ```
 
-## 10. Audit Semantic Disagreement Review
+## 10. Audit the Execution Claim Lease on `recognition_decisions`
 
-The Web service runs DeepSeek semantic review in the background after MiMo has persisted the real automation outcome. `execution_pending` and `execution_running` belong to MiMo execution ownership; `pending`, `running`, `completed`, and `failed` belong to later semantic review. Do not change a row, replay recognition, or place an order merely to clear an audit state.
+This section used to describe auditing the semantic disagreement review. **That
+review was retired on 2026-09-25** -- its modules, its worker singleton, its
+setting, its CLI commands and its notifications are gone, and production never
+ran it (`trading_settings` had no `semantic_review_enabled` row, so the code
+default `False` applied for its whole life). What is left on this table is the
+part that was never a review.
 
-Only `critical` review results are eligible for a system-operator bot message. `normal` and `none` remain Web-visible/database-only. A completed historical row with no severity appears as `待重新复核` (`unclassified`); it is not evidence that the models agreed. DeepSeek errors retry at most three times, then remain `failed` without changing the MiMo decision or automation result. A `running` claim older than five minutes can be recovered by the worker. Notification `scheduled`, `sent`, and `failed` are at-most-once terminal claims and must not be reset for an automatic resend.
+**`comparison_status` and `comparison_claim_token` carry the execution claim
+lease**, in spite of their names: which process may write to the exchange for a
+given message. The lease values are `execution_pending` (authority persisted,
+nobody has claimed it), `execution_running` (claimed, a side effect may be in
+flight), `execution_uncertain` (a side effect started and its outcome is
+unknown -- **frozen on purpose, nothing retries it**) and `completed`. The
+retired review used the same two columns for its own lease, with the values
+`pending`, `running` and `failed`; nothing writes those any more, and a row
+still sitting in one of them predates the retirement.
 
-Run the following on the production server only, from `/opt/telegram-kol-analyzer`. `sqlite3 -readonly` prevents accidental writes, and these grouped queries return counts/timestamps only: they do not select Telegram message text, model payloads, exception text, or credentials.
+Never change a row, replay recognition, or place an order to clear an audit
+state. An `execution_uncertain` row in particular is a question for a person,
+not a state to reset.
+
+Run the following on the production server only, from
+`/opt/telegram-kol-analyzer`. `sqlite3 -readonly` prevents accidental writes,
+and these grouped queries return counts and timestamps only: no Telegram
+message text, model payloads, exception text, or credentials.
 
 ```bash
 sqlite3 -readonly data/research.db <<'SQL'
@@ -969,45 +989,26 @@ FROM recognition_decisions
 GROUP BY comparison_status
 ORDER BY comparison_status;
 
-SELECT COALESCE(disagreement_severity, 'unclassified') AS severity,
-       COUNT(*) AS row_count
-FROM recognition_decisions
-WHERE comparison_status = 'completed'
-GROUP BY COALESCE(disagreement_severity, 'unclassified')
-ORDER BY severity;
-
-SELECT COUNT(*) AS pending_count,
-       MIN(updated_at) AS oldest_pending_updated_at,
+SELECT COUNT(*) AS held_count,
+       MIN(updated_at) AS oldest_held_updated_at,
        ROUND((julianday('now') - julianday(MIN(updated_at))) * 1440, 1)
-         AS oldest_pending_age_minutes,
-       SUM(CASE
-             WHEN comparison_next_attempt_at IS NOT NULL
-              AND comparison_next_attempt_at > CURRENT_TIMESTAMP
-             THEN 1 ELSE 0
-           END) AS retry_delayed_count
+         AS oldest_held_age_minutes
 FROM recognition_decisions
-WHERE comparison_status = 'pending';
+WHERE comparison_status IN ('execution_pending', 'execution_running');
 
-SELECT comparison_attempts,
-       COUNT(*) AS failed_count,
-       SUM(CASE WHEN comparison_error IS NOT NULL THEN 1 ELSE 0 END)
-         AS rows_with_error
+SELECT raw_message_id, automation_status, automation_reason, updated_at
 FROM recognition_decisions
-WHERE comparison_status = 'failed'
-GROUP BY comparison_attempts
-ORDER BY comparison_attempts;
-
-SELECT COALESCE(notification_status, 'not_scheduled') AS notification_status,
-       COUNT(*) AS critical_count
-FROM recognition_decisions
-WHERE comparison_status = 'completed'
-  AND disagreement_severity = 'critical'
-GROUP BY COALESCE(notification_status, 'not_scheduled')
-ORDER BY notification_status;
+WHERE comparison_status = 'execution_uncertain'
+ORDER BY updated_at DESC;
 SQL
 ```
 
-Interpret a growing pending age, repeated `failed` rows, or critical `scheduled`/`failed` delivery as an operational investigation signal. Keep investigation read-only until service logs, provider health, and the exact ownership/notification state are understood. Production rollout and controlled latency/notification verification must follow `docs/server-deployment.md` and the semantic-review plan; do not use live trading as a test fixture.
+A held lease that keeps ageing means a worker claimed a message and never
+finalized it; `recognition_execution_scanner` is the loop that finds those, so
+check its findings and the worker's logs before touching anything. Any
+`execution_uncertain` row needs the exchange checked by hand. Keep the
+investigation read-only until the service logs and the exact ownership state
+are understood; do not use live trading as a test fixture.
 
 ## 11. Operate Equivalent Entry-Leg Attribution Repair
 

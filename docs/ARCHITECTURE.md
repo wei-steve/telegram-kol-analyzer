@@ -30,13 +30,13 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "authoritative_gap_recovery_loop",
             "break_even_convergence_worker",
             "contract_spec_refresh",
+            "deepcoin_private_ws",
             "deepcoin_reconcile",
             "lifecycle_monitor",
             "message_operation_supervisor",
             "message_processing_worker",
             "position_snapshot_startup",
             "runtime_incident_notification",
-            "semantic_review",
             "source_message_deletion_worker",
             "strategy_management_notification",
             "strategy_management_worker",
@@ -456,7 +456,7 @@ REST 也从不在一个返回里同时给出 ordId 与 posId，所以新旧两�
 - 摄入与生命周期：`telegram_live_listener.py`、`web_app.py`、`cli.py`
 - 队列与执行边界：`message_processing_worker.py`、`worker_command_executor.py`、
   `worker_command_jobs.py`、`recovery_execution_queue.py`
-- 识别与解析：`authoritative_recognition.py`、`context_resolution.py`、`semantic_review*.py`
+- 识别与解析：`authoritative_recognition.py`、`context_resolution.py`
 - 交易与保护：`deepcoin_*.py`、`trading_settings.py`、`position_*.py`、
   `strategy_management_*.py`、`entry_*.py`、`protection_*.py`
 - 通知与运维：`system_operator_bot.py`、`telegram_bot*.py`、
@@ -534,13 +534,12 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 配置仍可读。**没有 `schema_version` 的文件是 v1**，加载时在内存里迁移，不落盘——
 第一次在页面上保存才会把文件升级成 v2。
 
-### 用到 AI 模型的 6 个环节
+### 用到 AI 模型的 5 个环节
 
 | stage_key | 中文名 | 能力要求 | 生产路径 | 取链的代码位置 |
 |---|---|---|---|---|
 | `authoritative_recognition` | 单条消息权威识别（MiMo 多模态，v1 / v2 合同共用） | 文本 + 图片 | 是，主路径 | `recognition_experiments.resolve_authoritative_chain`（`_find_mimo_model` 是它的链首包装） |
 | `context_resolution` | 上下文结合分析（第二层） | 文本 | 是 | `context_resolution.resolve_context_model_chain` |
-| `semantic_review` | 语义分歧复核（只读顾问） | 文本 | 是 | `semantic_disagreement_review.resolve_semantic_review_chain` |
 | `strategy_alert` | 策略提醒分类（Telegram 提醒 bot） | 文本 | 是，当 bot token 配置时 | `strategy_alerts.resolve_strategy_alert_chain` |
 | `batch_text_recognition` | 离线/批量文本识别（V1 `recognize_message_now`，含生命周期事件 AI） | 文本 | 否，只有 CLI / 批量工具 | `message_recognition._batch_text_provider`（只取链首，单次尝试） |
 | `batch_image_recognition` | 离线/批量图片识别（V1；GLM-OCR 走 layout_parsing，其他走多模态 chat） | 图片 | 否，只有 CLI / 批量工具 | `message_recognition._batch_image_provider`（只取链首，单次尝试） |
@@ -558,6 +557,25 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 删掉了，`POST /api/chat` 在删除前 30 天零调用，`ai_prompt_invocations` 里从未有过它的记录，
 2026-09-14 连同接口一起删除。旧配置文件里残留的 `stages.research_chat` 键**加载时静默丢弃并
 warning**，保存后消失。
+
+还曾有一个 `semantic_review`（语义分歧复核，只读顾问）。它由 worker 的 `semantic_review`
+单例循环驱动，只写审计行、不改任何交易判定；`trading_settings` 里从来没有
+`semantic_review_enabled` 这一行，取代码默认 `False`，所以**生产从头到尾没跑过它**。
+2026-09-25 整条退役：两个专用模块、worker 单例、设置项、两条 CLI 命令、提示词种子、
+Telegram 通知与页面展示一起删除。旧配置文件里残留的 `stages.semantic_review` 键
+与 `research_chat` 同样处理——**加载时静默丢弃并 warning**，保存后消失。
+`recognition_decisions` 上那组 `comparison_*` 列**一列都没删**：其中
+`comparison_status` / `comparison_claim_token` 承载的是**执行认领租约**，与复核无关
+（见下一段）。生产库里 `trading.disagreement.semantic_review` 的提示词定义行也还在，
+下线它是独立的数据库操作。
+
+**`recognition_decisions.comparison_*` 这组列名来自一套早已不存在的设计，不要按前缀清理。**
+`comparison_status` 是执行认领租约的状态机（`execution_pending` → `execution_running` →
+`completed`，另有冻结态 `execution_uncertain`），`comparison_claim_token` 就是租约 token
+本身，十四个模块在读写它们。复核曾用同两列跑自己的租约，取值是
+`pending` / `running` / `failed`，与执行那组不重叠；复核退役后这三个值已经没有任何写入方。
+`disagreement_severity` 现在恒为 NULL，`strategy_records` 推 `recognition_disagreement`
+健康码时把 NULL 当作"正常"，所以那条判据恒不触发。删这些列是以后的 L3 工作。
 
 **`runtime_incident_agent` 有意不在这张表里。** 它有自己的 fail-closed 环境配置
 （`llm_chat.load_runtime_agent_llm_config`），不从页面配置，页面上也写明了这一点。
