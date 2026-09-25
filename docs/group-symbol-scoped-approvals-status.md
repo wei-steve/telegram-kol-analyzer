@@ -2,7 +2,7 @@
 
 设计稿：`docs/plans/2026-09-25-group-symbol-scoped-approvals-design.md`（2026-09-25 用户已批准）
 分支：`group-symbol-scoped-approvals`，基线 `origin/main` = `bf52fbd9`（生产 HEAD `f2fa9d9f`）
-状态：甲（1/2/3）已完成；乙、丙 进行中
+状态：甲（1/2/3）、乙 已完成；丙 进行中
 
 本文件是下一个读者的唯一进度依据。每块记落点、为什么这么选、测试、以及上线时人工要做的事。
 
@@ -78,6 +78,82 @@
   不能因此丢掉 503 自己那句话），失败时把 `detail` 同时写进
   `setRecoveryStatus` 和**按钮自己的 `title`**——侧栏那条状态行离按钮很远。
   成功时把按钮原来的 title 还回去。失败时按钮状态一律不动（原状如此，加注释固定下来）。
+
+---
+
+## 乙 超时审批按「群 × 标的」收窄 + 出局的直接收口
+
+**落点**：`src/telegram_kol_research/lifecycle_monitor.py`
+
+| 名字 | 作用 |
+|---|---|
+| `EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION = "expiry_auto_expired_out_of_scope"` | 出局收口写的 `management_action`（仍以 `expiry_` 开头，现有 `startswith("expiry_")` 过滤自动把它排除在后续复核外） |
+| `EXPIRY_OUT_OF_SCOPE_CLOSEOUT_NOTE_PREFIX = "不在自动交易范围（非人工判定）"` | note 前缀 |
+| `_expiry_review_allowed_symbols()` | 每轮扫描读一次数据库 `trading_settings.global.allowed_symbols` |
+| `_expiry_review_scope(session, row, *, allowed_symbols)` | 返回 `(in_scope, reason)` |
+| `_lifecycle_has_unsettled_exchange_leg(session, row)` | 复用 A1 的 `_binding_context` + `_has_unsettled_exchange_leg` |
+| `_claim_expiry_out_of_scope_closeout(...)` | 照 A2 形状的单条条件 UPDATE |
+
+范围判定：`trading_mode == "auto_trade"` **且** `symbol ∈ 全局白名单`。
+群模式取已注入的 `self._group_trading_mode_provider`；**配置里没有这个 chat（返回 ""）算不在范围**
+——没配置过的群下不了单，替它猜 `auto_trade` 是往吵的方向猜。
+白名单读数据库而非 YAML 的 `symbol_whitelist`：运行时
+`apply_trading_settings_to_group_config` 会把每个群的白名单整体替换成全局白名单，
+YAML 那份不是真正把关下单的值。
+
+**fail-closed 例外**（凌驾上面两条）：这条 lifecycle 只要还可能有未了结的交易所腿，
+一律照发审批。判定**复用** A1 在 `strategy_thread_candidates.py` 的
+`_binding_context` + `_has_unsettled_exchange_leg`（两个都是那边的模块私有名，
+故意直接 import：同一条规则推导两遍必然漂移，然后安全的那遍会输）。
+
+出局的收场：不在范围且无交易所腿 → 不发通知、**直接按超时收口**
+（`expired` / `exit_reason=expired` / 新动作 / 新 note，note 正文写明群模式与标的为何出局、
+当时的全局白名单是什么）。只对 `pending_entry` 做；`entered` 的行只是不通知，状态不动
+（A2 的边界也是这样，理由同样是生产上存在无绑定的 `entered` 行）。
+
+### 三处我自己拍的决定（设计稿没写到这一层）
+
+1. **范围判定放在 `_expiry_review_due` 之后，而不是之前。** 指令原话是「在
+   `_expiry_review_due` 之前插一道」，我没照字面做，原因是：`_expiry_review_due`
+   的含义就是「这条已经超过 `max_age_hours` 该问人了」。放在它之前，等于对**任何年龄**的
+   `pending_entry` 生效——notify_only 群里一条刚到 10 分钟的新信号会当场被标记过期，
+   于是这些群赖以存在的 K 线回放（pending_entry → entered 模拟）再也不会发生，
+   侧栏「待入场」对大多数群直接归零。那不是用户要的，也超出了设计稿里「超时审批」的范围。
+   放在之后，命中的正好是「本轮本来会发通知的那些行」，「按超时收口」这句话也才成立。
+   已有专门一条测试固定这个边界（`test_a_row_not_yet_timed_out_is_left_alone_even_out_of_scope`）。
+2. **人工按过「继续等待」的行不收口，只是不再问。** 收口的认领条件里带
+   `expiry_review_notified_at IS NULL` 和 `expiry_review_next_at IS NULL`，
+   所以 `expiry_review_continued` 的行状态一律不动。理由照 A2 的先例：
+   「人工选择继续等待」不该被一次配置变更悄悄推翻。代价是这类行会停在 `pending_entry`
+   不再被处理（生产上属少数），比替人改主意可接受。
+   顺带的好处：这两个条件让 **A2 与本条按谓词互斥**而不是靠顺序互斥——
+   A2 只碰「通知过且 7 天无人答」的行，本条只碰「从未通知过」的行，交集为空。
+3. **读不到范围就不收窄。** provider 没注入（部署里根本没有群配置）、
+   provider 抛异常、`load_trading_settings` 抛异常、白名单读出来是空集合——
+   四种情况都当作「本轮不收窄」，照旧发通知。这里 fail-closed 的方向是「照样问人」而不是
+   「直接收口」：多一条通知只花掉一条消息，少一条可能留下一张没人看的交易所挂单；
+   白名单为空更要防，否则一行坏设置就能把库里所有超时行全部过期掉。
+
+### 乙 的测试
+
+`tests/test_expiry_review_group_symbol_scope.py`（10 项，全绿）：
+
+- 四种组合同一轮扫描：开×白名单 → 发通知；开×非白名单（HBAR，军长那条的形状）/
+  关×白名单 / 关×非白名单 → 不通知且收口，动作与 note 前缀都对，`notified_at` 仍为空；
+- note 分别写出「群组未开启自动交易」与「标的不在全局白名单 + 当时白名单 BTC,ETH,SOL」，
+  且不以 `人工` / `超时自动收口` 开头；
+- 关×有绑定 → 照发（同一轮里关×无绑定的兄弟行被收口，证明扫描真的跑过）；
+- 配置里没有的 chat → 出局收口；
+- `entered` 出局 → 不通知、状态/动作/exited_at 全不动；
+- 人工「继续等待」的行 → 不通知、状态不动；
+- A2 与本条不重复处理同一行（通知过 9 天的 notify_only 行只被 A2 收口，且只发一条 A2 汇总）；
+- 未超时的行即便出局也不动；
+- 没有 provider → 完全照旧；
+- `load_trading_settings` 抛异常 → 照旧发通知、不收口。
+
+回归：`tests/test_lifecycle_monitor.py`、`tests/test_lifecycle_expiry_review_auto_closeout.py`、
+`tests/test_lifecycle_exit_intents.py`、`tests/test_candidates.py`、
+`tests/test_entry_confirm_sizing_and_lifecycle.py` 全绿（60 项）。
 
 ---
 

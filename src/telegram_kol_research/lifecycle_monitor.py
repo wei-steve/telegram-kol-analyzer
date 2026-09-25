@@ -42,9 +42,18 @@ from telegram_kol_research.models import (
     TradeIdea,
     utc_now,
 )
+from telegram_kol_research.strategy_thread_candidates import (
+    # 乙 (2026-09-25) reuses A1's binding verdict rather than deriving a second
+    # one: two derivations of "is anything of ours still live on the exchange"
+    # drift, and then the safe one loses. Both names are module-private there
+    # and imported on purpose -- the alternative is a copy of the same rule.
+    _binding_context,
+    _has_unsettled_exchange_leg,
+)
 from telegram_kol_research.system_operator_bot import (
     PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_KIND,
 )
+from telegram_kol_research.trading_settings import load_trading_settings
 
 logger = logging.getLogger(__name__)
 
@@ -68,6 +77,19 @@ EXPIRY_REVIEW_AUTO_CLOSEOUT_ACTION = "expiry_auto_expired_review_timeout"
 #: note is the human-readable half of that same distinction, and every manual
 #: note in ``telegram_bot_commands`` starts with 人工.
 EXPIRY_REVIEW_AUTO_CLOSEOUT_NOTE_PREFIX = "超时自动收口（非人工判定）"
+
+#: 乙 (2026-09-25). The ``management_action`` written when a timed-out pending
+#: entry is closed out because it was never in the auto-trade scope at all --
+#: its group does not trade, or its symbol is not in the global whitelist --
+#: rather than because a person was asked and did not answer. Distinct from
+#: ``EXPIRY_REVIEW_AUTO_CLOSEOUT_ACTION`` so the two are still tellable apart
+#: afterwards, and still prefixed ``expiry_``, which is what keeps the existing
+#: ``management_action.startswith("expiry_")`` filter excluding it from later
+#: reviews.
+EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION = "expiry_auto_expired_out_of_scope"
+#: The human-readable half of the same distinction. Manual notes start with
+#: 人工, A2's with 超时自动收口, this one says which scope it fell outside.
+EXPIRY_OUT_OF_SCOPE_CLOSEOUT_NOTE_PREFIX = "不在自动交易范围（非人工判定）"
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -995,6 +1017,9 @@ class LifecycleMonitor:
         auto_closeout_summary = self._auto_close_out_timed_out_expiry_reviews(now)
         if auto_closeout_summary is not None:
             review_payloads.append(auto_closeout_summary)
+        # 乙: one settings read per scan, not per row.
+        allowed_symbols = self._expiry_review_allowed_symbols()
+        out_of_scope_closed: list[int] = []
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
@@ -1023,6 +1048,28 @@ class LifecycleMonitor:
                         state_changed = True
                     continue
                 if not self._expiry_review_due(row, now):
+                    continue
+                # 乙: this row has timed out and is about to ask a person. Only
+                # now does the scope question arise -- the gate sits *after*
+                # ``_expiry_review_due`` rather than before it, which is the one
+                # place this implementation departs from the letter of the
+                # instruction, for the reason written on
+                # ``_expiry_review_scope``.
+                in_scope, scope_reason = self._expiry_review_scope(
+                    session,
+                    row,
+                    allowed_symbols=allowed_symbols,
+                )
+                if not in_scope:
+                    if self._claim_expiry_out_of_scope_closeout(
+                        session,
+                        row,
+                        now=now,
+                        scope_reason=scope_reason,
+                        allowed_symbols=allowed_symbols,
+                    ):
+                        state_changed = True
+                        out_of_scope_closed.append(int(row.id))
                     continue
                 continued_review = row.expiry_review_next_at is not None
                 expiry_at = self._next_expiry_review_at(row)
@@ -1075,7 +1122,220 @@ class LifecycleMonitor:
                 )
             if state_changed:
                 session.commit()
+        if out_of_scope_closed:
+            # No notification by design (the user's ruling: do not be told about
+            # groups that do not trade), so this log line is the only place the
+            # batch announces itself; the durable record is each row's action
+            # and note.
+            logger.info(
+                "Expired %d timed-out pending entries outside the auto-trade scope, unnotified: %s",
+                len(out_of_scope_closed),
+                out_of_scope_closed,
+            )
         return review_payloads
+
+    def _expiry_review_allowed_symbols(self) -> frozenset[str] | None:
+        """The global symbol whitelist, read once per scan.
+
+        Deliberately the database's ``global.allowed_symbols`` and not the
+        YAML's per-group ``symbol_whitelist``: at runtime
+        ``apply_trading_settings_to_group_config`` replaces every group's list
+        with this one, so the YAML value is not what gates an order and must not
+        be what gates the review either.
+
+        ``None`` means "could not be read, or read empty", and the caller then
+        narrows nothing. That is the right direction here: an extra
+        notification costs one message, and a suppressed one can cost an
+        unattended exchange order. An empty whitelist in particular must not
+        read as "no symbol qualifies", which would expire every timed-out row in
+        the database on a bad settings row.
+        """
+
+        try:
+            settings = load_trading_settings(self._session_factory)
+        except Exception:
+            logger.warning(
+                "trading settings unavailable; expiry review scope not narrowed",
+                exc_info=True,
+            )
+            return None
+        symbols = frozenset(
+            str(symbol).strip().upper()
+            for symbol in (settings.allowed_symbols or [])
+            if str(symbol).strip()
+        )
+        return symbols or None
+
+    def _expiry_review_scope(
+        self,
+        session,
+        row: StrategyLifecycle,
+        *,
+        allowed_symbols: frozenset[str] | None,
+    ) -> tuple[bool, str]:
+        """Whether this timed-out lifecycle is one the user wants to be asked about.
+
+        In scope means: the chat's ``trading_mode`` is ``auto_trade`` **and** the
+        symbol is in the global whitelist. An unknown chat -- one the group
+        config does not mention -- is out of scope, because a chat nobody
+        configured cannot place an order, and inventing ``auto_trade`` for it
+        would be a guess in the noisy direction.
+
+        **The fail-closed exception, which outranks both:** if anything of ours
+        may still be live on the exchange for this lifecycle, the review goes
+        out regardless of mode and symbol. 峰哥's group was switched from
+        ``auto_trade`` to ``notify_only`` on 2026-09-25 with two unfinished
+        strategies in it; "the group no longer trades" is not a reason to stop
+        telling someone that an order is still resting on the exchange, and the
+        撤单 button lives on exactly that notification. The user asked not to be
+        bothered by groups that do not place orders, not to be kept from the
+        orders that already exist.
+
+        Called only for rows that are already due, i.e. rows that would have
+        produced a notification in this cycle. Placing it before
+        ``_expiry_review_due`` -- as the instruction's wording says -- would
+        apply it to every ``pending_entry`` row at any age, so a minutes-old
+        signal in a ``notify_only`` group would be expired on arrival; that
+        would end the candle replay these groups exist for and empty the 待入场
+        panel for most of the sidebar. Restricting it to timed-out rows is what
+        "按超时收口" means and keeps the change inside the reviewed behaviour.
+
+        Returns ``(in_scope, reason)``; the reason ends up in the close-out note.
+        """
+
+        provider = self._group_trading_mode_provider
+        if provider is None or allowed_symbols is None:
+            # No way to answer the question in this deployment: behave exactly
+            # as before 乙.
+            return True, "scope_unavailable"
+        chat_id = row.chat_id
+        if chat_id is None:
+            return True, "chat_unknown"
+        try:
+            mode = str(provider(int(chat_id)) or "").lower()
+        except Exception:
+            logger.warning(
+                "group trading mode unavailable for lifecycle_id=%s; expiry review not narrowed",
+                row.id,
+                exc_info=True,
+            )
+            return True, "mode_unavailable"
+        symbol = str(row.symbol or "").strip().upper()
+        if mode == "auto_trade" and symbol in allowed_symbols:
+            return True, "auto_trade_allowed_symbol"
+        if self._lifecycle_has_unsettled_exchange_leg(session, row):
+            return True, "unsettled_exchange_leg"
+        if mode != "auto_trade":
+            return False, "group_not_auto_trade"
+        return False, "symbol_not_allowed"
+
+    @staticmethod
+    def _lifecycle_has_unsettled_exchange_leg(
+        session, row: StrategyLifecycle
+    ) -> bool:
+        """A1's verdict on whether the exchange may still hold something of ours."""
+
+        try:
+            (
+                binding_summary,
+                _verified_legs,
+                risk_state,
+                live_verified_pos_ids,
+                pending_entry_leg_ids,
+                uncertain_entry_leg_ids,
+            ) = _binding_context(session, row)
+        except Exception:
+            logger.warning(
+                "binding state unavailable for lifecycle_id=%s; treating it as unsettled",
+                row.id,
+                exc_info=True,
+            )
+            return True
+        return _has_unsettled_exchange_leg(
+            row,
+            binding_summary,
+            risk_state,
+            live_verified_pos_ids,
+            pending_entry_leg_ids,
+            uncertain_entry_leg_ids,
+        )
+
+    def _claim_expiry_out_of_scope_closeout(
+        self,
+        session,
+        row: StrategyLifecycle,
+        *,
+        now: datetime,
+        scope_reason: str,
+        allowed_symbols: frozenset[str] | None,
+    ) -> bool:
+        """Expire one out-of-scope timed-out row as one conditional UPDATE.
+
+        Written in A2's shape, with A2's reasons:
+
+        * ``pending_entry`` only. An ``entered`` lifecycle is merely not
+          notified; its status is not touched, because some of them carry no
+          execution binding and expiring one would mean declaring a position we
+          believe is open to be over.
+        * ``execution_binding_id IS NULL`` repeated at the moment of the write,
+          not only at the moment of the read. Between the two an executor may
+          have attached a binding, and the difference is "no exchange orders
+          exist" versus "no exchange orders existed".
+        * ``expiry_review_notified_at IS NULL`` and ``expiry_review_next_at IS
+          NULL``. This is what makes 乙 and A2 **provably** disjoint rather than
+          disjoint by ordering: A2 only ever touches rows that *were* notified,
+          this one only rows that never were. It also means a person who pressed
+          继续等待 keeps their decision -- their row carries a next_at, so it is
+          left alone here and simply stops being re-notified.
+        * the ``management_action`` still reads as it did, so a concurrent
+          claimant cannot be overwritten.
+        """
+
+        if row.lifecycle_status != "pending_entry":
+            return False
+        mode_label = {
+            "group_not_auto_trade": "群组未开启自动交易（或未在配置中）",
+            "symbol_not_allowed": "标的不在全局白名单",
+        }.get(scope_reason, scope_reason)
+        whitelist_label = (
+            ",".join(sorted(allowed_symbols)) if allowed_symbols else "未知"
+        )
+        note = (
+            f"{EXPIRY_OUT_OF_SCOPE_CLOSEOUT_NOTE_PREFIX}："
+            f"{mode_label}；标的 {row.symbol or '未知'}，"
+            f"全局白名单 {whitelist_label}。"
+            f"该策略已超过 {self._config.max_age_hours} 小时未入场，"
+            "且无执行绑定（交易所无挂单可撤），"
+            "未发人工审批，由系统按超时直接标记过期并停止跟踪。"
+        )
+        claim = session.query(StrategyLifecycle).filter(
+            StrategyLifecycle.id == row.id,
+            StrategyLifecycle.lifecycle_status == "pending_entry",
+            StrategyLifecycle.execution_binding_id.is_(None),
+            StrategyLifecycle.expiry_review_notified_at.is_(None),
+            StrategyLifecycle.expiry_review_next_at.is_(None),
+        )
+        if row.management_action is None:
+            claim = claim.filter(StrategyLifecycle.management_action.is_(None))
+        else:
+            claim = claim.filter(
+                StrategyLifecycle.management_action == row.management_action
+            )
+        claimed = claim.update(
+            {
+                StrategyLifecycle.lifecycle_status: "expired",
+                StrategyLifecycle.exit_reason: "expired",
+                StrategyLifecycle.exited_at: now,
+                StrategyLifecycle.management_action: (
+                    EXPIRY_OUT_OF_SCOPE_CLOSEOUT_ACTION
+                ),
+                StrategyLifecycle.management_note: note,
+                StrategyLifecycle.last_checked_at: now,
+                StrategyLifecycle.updated_at: now,
+            },
+            synchronize_session=False,
+        )
+        return claimed == 1
 
     @staticmethod
     def _claim_expiry_review(
