@@ -48,6 +48,14 @@ ReadWritePaths=/opt/telegram-kol-analyzer/data
 # place (no rename), so only that file is opened for writing; the rest of
 # config/ stays read-only. The file must be group-writable (root:telegram-kol-runtime 660).
 ReadWritePaths=/opt/telegram-kol-analyzer/config/ai_recognition.yaml
+# The group list's 「AI识别」/「自动交易」 switches save config/groups.yaml the
+# same way, in place and with no rename, so only that file is opened for
+# writing and the rest of config/ stays read-only. It too must be
+# group-writable (root:telegram-kol-runtime 660); with the mount opened and the
+# mode left at 0640 the write still fails, and the two conditions are
+# independent. Without this line the POST /api/groups/{chat_id}/automation
+# endpoint answered EROFS -- every call between 2026-08-22 and 2026-09-25.
+ReadWritePaths=/opt/telegram-kol-analyzer/config/groups.yaml
 InaccessiblePaths=-/opt/telegram-kol-analyzer/.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/telegram.env
 InaccessiblePaths=-/opt/telegram-kol-analyzer/config/system_operator_bot.env

@@ -11,6 +11,7 @@ from typing import Any, Callable
 import asyncio
 import base64
 import concurrent.futures
+import errno
 import grp
 import hashlib
 import hmac
@@ -187,6 +188,7 @@ from telegram_kol_research.production_safety_monitor import (
 )
 from telegram_kol_research.gate_market_data import GateMarketDataProvider
 from telegram_kol_research.group_config import GroupConfig
+from telegram_kol_research.group_config import load_group_config
 from telegram_kol_research.group_config import update_group_automation_settings
 from telegram_kol_research.live_updates import LiveUpdateBroker
 from telegram_kol_research.live_position_snapshot import LivePositionSnapshotStore
@@ -5116,6 +5118,167 @@ def _run_context_resolution_worker_for_app(app: FastAPI) -> dict[str, Any]:
     }
 
 
+#: 甲-2 (2026-09-25). How often every role re-``stat``s the group config file.
+#: The group list's switches write ``config/groups.yaml`` from the *web*
+#: process, while the process that places orders is the *worker*, which until
+#: now held nothing but the copy it parsed at startup. Opening the write
+#: permission without this poll would have produced the one outcome worse than
+#: the 500 it replaces: a page that says 自动交易 已关闭 over a worker still
+#: trading on the old value. Five seconds is the upper bound on "clicked" to
+#: "the worker agrees" -- below notice, and one ``stat`` per five seconds is
+#: not a load on anything.
+GROUP_CONFIG_RELOAD_INTERVAL_SECONDS = 5.0
+
+
+def _group_config_stat_signature(path: Path | None) -> tuple[int, int] | None:
+    """``(st_mtime_ns, st_size)`` for the group config, or ``None`` if unreadable.
+
+    Two fields rather than a digest: the file is small but it is read on a
+    timer, and mtime alone misses a same-nanosecond rewrite of a different
+    length. Reading the content to hash it would defeat the point of the cheap
+    check.
+    """
+
+    if path is None:
+        return None
+    try:
+        stat_result = os.stat(path)
+    except OSError:
+        return None
+    return (stat_result.st_mtime_ns, stat_result.st_size)
+
+
+def _refresh_group_config_from_disk(app: FastAPI) -> str:
+    """Replace ``app.state.group_config`` iff the file changed and still parses.
+
+    One object assignment, never a field-by-field update, so every reader --
+    and there are dozens of ``app.state.group_config`` read sites -- sees one
+    complete configuration or the previous one, never half of each.
+
+    Fails closed in the direction that keeps trading as last configured. A
+    failed ``stat``, a YAML error, a half-written file (``_write_group_config``
+    writes in place and without a rename, because the systemd unit opens the
+    *file* and not its directory, so a reader really can see one) or a parse
+    that yields zero groups all keep the loaded copy and leave the baseline
+    untouched, so the next tick tries again. None of those may be allowed to
+    turn a configured group into an unconfigured one: "unknown chat" reads as
+    "not auto_trade" all over the execution path, so an unreadable file would
+    silently retire a group's switches rather than report a problem.
+
+    Returns the outcome as a short string, for the caller's logs and tests.
+    """
+
+    path = getattr(app.state, "group_config_path", None)
+    if path is None:
+        return "unconfigured"
+    signature = _group_config_stat_signature(path)
+    if signature is None:
+        logger.warning(
+            "group config stat failed path=%s; keeping the loaded copy", path
+        )
+        return "stat_failed"
+    if signature == getattr(app.state, "group_config_stat_signature", None):
+        return "unchanged"
+    try:
+        new_config = load_group_config(path)
+    except Exception:
+        logger.warning(
+            "group config reload failed to parse path=%s; keeping the loaded copy",
+            path,
+            exc_info=True,
+        )
+        return "parse_failed"
+    if not new_config.groups:
+        logger.warning(
+            "group config reload read 0 groups path=%s; keeping the loaded copy",
+            path,
+        )
+        return "empty"
+    app.state.group_config = new_config
+    app.state.group_config_stat_signature = signature
+    # The auto-trade ids are in the line on purpose: this log is what answers
+    # "did the worker pick up the switch I just flipped" without a database or
+    # an exchange query.
+    logger.info(
+        "group config reloaded path=%s groups=%d auto_trade_chat_ids=%s",
+        path,
+        len(new_config.groups),
+        sorted(
+            int(group.chat_id)
+            for group in new_config.groups
+            if group.chat_id is not None and group.trading_mode == "auto_trade"
+        ),
+    )
+    return "reloaded"
+
+
+async def _run_group_config_reload_loop(
+    app: FastAPI,
+    *,
+    interval_seconds: float = GROUP_CONFIG_RELOAD_INTERVAL_SECONDS,
+) -> None:
+    """Poll the group config file for this process, for every runtime role.
+
+    Sleeps first: the copy in memory was parsed from this same file moments
+    ago, and the baseline recorded beside it says so.
+    """
+
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            await asyncio.to_thread(_refresh_group_config_from_disk, app)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("group config reload tick failed")
+
+
+def _group_config_write_check(path: Path | None) -> dict[str, Any]:
+    """Whether this process could save a group switch, decided at startup.
+
+    Two probes, because they answer different questions and production had both
+    problems at once. ``os.access`` answers the ownership/mode half; opening the
+    file ``r+`` answers the mount half, which a read-only bind mount reports
+    only when something actually asks for write access. ``r+`` neither
+    truncates nor writes, so the file's content and mtime are untouched.
+    """
+
+    if path is None:
+        return {"exists": False, "writable": False, "reason": "not_configured"}
+    if not os.path.exists(path):
+        return {"exists": False, "writable": False, "reason": "missing"}
+    if not os.access(path, os.W_OK):
+        return {"exists": True, "writable": False, "reason": "no_write_permission"}
+    try:
+        with open(path, "r+", encoding="utf-8"):
+            pass
+    except OSError as exc:
+        return {
+            "exists": True,
+            "writable": False,
+            "reason": errno.errorcode.get(exc.errno or 0, "oserror"),
+        }
+    return {"exists": True, "writable": True, "reason": "ok"}
+
+
+def _format_group_config_write_check_for_log(path: Path | None) -> str:
+    """The one line the web role logs at startup.
+
+    Modelled on ``format_release_gates_for_log``: a switch whose state lives
+    only in a systemd unit and a file mode is a switch nobody can confirm
+    afterwards, and this one was dead for two months without saying so.
+    """
+
+    report = _group_config_write_check(path)
+    return (
+        "group_config_write_check "
+        f"path={path if path is not None else '-'};"
+        f"exists={'true' if report['exists'] else 'false'};"
+        f"writable={'true' if report['writable'] else 'false'};"
+        f"reason={report['reason']}"
+    )
+
+
 async def _run_recognition_execution_scanner_loop(app: FastAPI) -> None:
     """Worker-only bounded orphan scan with durable per-family cursors."""
 
@@ -5636,6 +5799,29 @@ def create_web_app(
                 )
                 app.state.loop_lag_monitor_task.add_done_callback(
                     _log_background_task_result("loop_lag_monitor_task")
+                )
+            # 甲-2. Every role, not only the one serving the switch: the process
+            # that reads ``trading_mode`` to decide whether to place an order is
+            # the worker, and it is the one that must not keep a stale copy.
+            if (
+                app.state.group_config_path is not None
+                and app.state.group_config_reload_task is None
+            ):
+                app.state.group_config_reload_task = asyncio.create_task(
+                    _run_group_config_reload_loop(app)
+                )
+                app.state.group_config_reload_task.add_done_callback(
+                    _log_background_task_result("group_config_reload_task")
+                )
+            # 甲-3. The role that serves the switch says on every start whether
+            # saving it can work at all, so the next "the button does nothing"
+            # is one log line away from an answer instead of two months away.
+            if app.state.runtime_role in {"web", "all"}:
+                logger.info(
+                    "%s",
+                    _format_group_config_write_check_for_log(
+                        app.state.group_config_path
+                    ),
                 )
             if (
                 runtime_role_starts_singleton_task(
@@ -6171,6 +6357,16 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.loop_lag_monitor_task = None
+            group_config_reload_task = app.state.group_config_reload_task
+            if group_config_reload_task is not None:
+                group_config_reload_task.cancel()
+                try:
+                    await group_config_reload_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.group_config_reload_task = None
             contract_spec_refresh_task = app.state.contract_spec_refresh_task
             if contract_spec_refresh_task is not None:
                 contract_spec_refresh_task.cancel()
@@ -6548,6 +6744,13 @@ def create_web_app(
     app.state.group_labels_by_title = group_labels_by_title or {}
     app.state.group_config = group_config or GroupConfig()
     app.state.group_config_path = Path(group_config_path) if group_config_path else None
+    # 甲-2 baseline. The configuration handed in above was parsed from this same
+    # file a moment ago, so the reload poll must start by agreeing with it
+    # rather than re-parsing on its first tick.
+    app.state.group_config_stat_signature = _group_config_stat_signature(
+        app.state.group_config_path
+    )
+    app.state.group_config_reload_task = None
     app.state.strategy_alert_enabled_for_title = lambda title: _group_ai_strategy_enabled(
         app.state.group_config,
         title,
@@ -9247,12 +9450,37 @@ def create_web_app(
                 status_code=503,
                 detail="group config path is not configured",
             )
-        app.state.group_config = update_group_automation_settings(
-            config_path,
-            chat_id=chat_id,
-            chat_title=str(payload.get("chat_title") or chat_id),
-            ai_strategy_enabled=payload.get("ai_strategy_enabled"),
-            auto_trade_enabled=payload.get("auto_trade_enabled"),
+        try:
+            app.state.group_config = update_group_automation_settings(
+                config_path,
+                chat_id=chat_id,
+                chat_title=str(payload.get("chat_title") or chat_id),
+                ai_strategy_enabled=payload.get("ai_strategy_enabled"),
+                auto_trade_enabled=payload.get("auto_trade_enabled"),
+            )
+        except OSError as exc:
+            # 甲-3. This was an uncaught exception until 2026-09-25, so the page
+            # showed FastAPI's "Internal Server Error" and the user read it as
+            # "the button does nothing". The errno belongs in the log, where
+            # EROFS (read-only mount) and EACCES (file mode) are the two
+            # separate server-side fixes, and the page gets the sentence that
+            # tells the user the switch was *not* saved.
+            logger.error(
+                "group automation switch not saved chat_id=%s path=%s errno=%s(%s) strerror=%s",
+                chat_id,
+                config_path,
+                exc.errno,
+                errno.errorcode.get(exc.errno or 0, "unknown"),
+                exc.strerror,
+            )
+            raise HTTPException(
+                status_code=503,
+                detail="群组配置文件不可写（服务器只读挂载或权限），开关未保存",
+            ) from exc
+        # This process is already correct; the baseline keeps the 5-second poll
+        # from re-parsing the file it has just been told the contents of.
+        app.state.group_config_stat_signature = _group_config_stat_signature(
+            config_path
         )
         group = next(
             item for item in app.state.group_config.groups if item.chat_id == chat_id

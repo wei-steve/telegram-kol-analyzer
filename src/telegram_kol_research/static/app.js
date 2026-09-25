@@ -1345,6 +1345,17 @@ async function loadGroupDetailCompanion({
 
 function bindGroupAutomationToggles() {
   document.querySelectorAll('[data-toggle-group-automation]').forEach((button) => {
+    // 甲-3: the sidebar status line is nowhere near this button, so a failure
+    // also lands on the button itself as its tooltip. Captured at bind time so
+    // a later success can put the original description back.
+    const originalTitle = button.getAttribute('title');
+    const restoreTitle = () => {
+      if (originalTitle === null) {
+        button.removeAttribute('title');
+      } else {
+        button.title = originalTitle;
+      }
+    };
     button.addEventListener('click', async (event) => {
       event.stopPropagation();
       const setting = button.dataset.setting || '';
@@ -1361,19 +1372,28 @@ function bindGroupAutomationToggles() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload),
         });
-        const result = await response.json();
+        // A refusal may answer with something other than JSON (a proxy, a
+        // gateway); losing the body must not cost us the 503's own sentence.
+        const result = await response.json().catch(() => ({}));
         if (!response.ok) {
-          setRecoveryStatus(result.detail || '群组开关保存失败', true);
+          const detail = (result && result.detail) || '群组开关保存失败';
+          button.title = detail;
+          setRecoveryStatus(detail, true);
           return;
         }
+        restoreTitle();
         const resolvedEnabled = Boolean(result[setting]);
         button.dataset.enabled = resolvedEnabled ? 'true' : 'false';
         button.classList.toggle('is-enabled', resolvedEnabled);
         await refreshMonitorStatus();
         setRecoveryStatus('群组开关已保存');
       } catch {
+        button.title = '群组开关保存失败，请检查服务状态。';
         setRecoveryStatus('群组开关保存失败，请检查服务状态。', true);
       } finally {
+        // The button's own state is deliberately left alone on every failure
+        // path: it still shows what the server last confirmed, not what the
+        // click asked for.
         button.disabled = false;
         button.classList.remove('is-updating');
       }
