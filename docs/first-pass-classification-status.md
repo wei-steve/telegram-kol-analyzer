@@ -215,6 +215,65 @@ recognition_result / strategy` 八个。也就是说：新的写入点与回读�
   代价是 `deepseek` 这个 kind 名与实际模型进一步脱节。
 - **丙**：改闸门，当某个 kind 没有可用提供商时不再强制要求它。改的是安全闸门本身，须谨慎。
 
+### 用户 2026-09-25 的三条指示与处置
+
+用户在发布被 402 挡住时给了三条指示，前两条已批准执行方式，第三条另开一批。
+**原话要点**：
+> 你说的部署闸门，我是不同意的，因为项目还没完善，过早设置太多闸门，有些改动让原来思路
+> 完全变了，闸门却还没跟着改，那么 agent 就要一直循环自证，无意义的无法通过的自证检验。
+> …现在系统已经是可以选择切换不同的模型，为什么还留着一些 mimo 分析 deepseek 复核的字眼，
+> 这以后还会继续造成误导。…分析复核已弃用。
+
+#### 处置 1 · 发布闸门已删除（本批次完成）
+
+`POST /api/ai-prompts/{key}/publish` 里对 `category = trading` 要求「mimo 与 deepseek 两个
+model_kind 都有 completed 历史测试」的那段整块删掉。保留的是**读草稿本身**的检查：
+内容校验、必填 change_note、draft/active 版本号的比较交换。
+新测试 `test_a_trading_prompt_publishes_on_validation_alone` 证明：
+中间不跑 `/test` 也能发布，而未校验仍然 409——删掉的是厂商闸门，没有放松其余部分。
+
+#### 处置 2 · 提示词测试改成按 stage 取模型（**下一批，已批准方向**）
+
+现状：`prompt_testing` 有两个硬编码 kind，`mimo` 走 `_find_mimo_model`、
+`deepseek` 走 `_deepseek_provider`（= `batch_text_recognition` 链首）。两个名字都已脱离现实——
+2026-09-25 的实测里 `mimo` 这个 kind 实际调用的是 `gpt-5.6-luna`。
+**要改成：测试直接用相关 stage 当前绑定的模型**，换模型自动跟随，不再产生新的命名债。
+
+波及面（已核实）：
+
+| 位置 | 内容 |
+|---|---|
+| `prompt_testing.py` | `model_kind` 参数、`_model_name`、`_deepseek_provider`、`_find_mimo_model`、`_call_configured_model` |
+| `web_app.py` | `/api/ai-prompts/{key}/test` 的 `model_kinds` 校验；`MIMO_VISION_PROMPT` 那条 kind 限制 |
+| `models.py` / `db.py` | `ai_prompt_test_runs.model_kind` 列（**留列，删列是 L3**） |
+| `templates/_ai_prompt_center.html:11-12,63-64` | 「DeepSeek = A + C」「MiMo = A + B + C」说明行，以及两个 kind 勾选框 |
+| `templates/index.html:103,118,133,138` | 提示词标签「DeepSeek / 文本策略识别」等 |
+| `ai_recognition_config.py:413,420,427` | `AI_PROMPT_DEFINITIONS` 的 `tag=` 文案 |
+| `static/app.js` | `promptCenterState.tested`、model kind 勾选框读取 |
+
+#### 处置 3 · 分析复核整条退役（**单独一批，已批准**）
+
+生产状态：`trading_settings` 里**没有** `semantic_review_enabled` 行，取代码默认 `False`——
+生产是关着的，与用户说的一致。
+
+规模（已核实，供下一个会话估工）：
+
+| 类别 | 清单 |
+|---|---|
+| 专用模块 | `semantic_disagreement_review.py`（1312 行）、`semantic_review_control.py`（427 行） |
+| 引用它的生产模块（15 个） | `ai_endpoints` `ai_recognition_config` `ai_stage_catalog` `authoritative_execution_attempts` `authoritative_recognition` `cli` `prompt_composition` `prompt_defaults` `recognition_decisions` `recognition_execution_scanner` `trading_settings` `web_app` `web_queries` + 两个专用模块自身 |
+| worker 单例 | `RUNTIME_ROLE_SINGLETON_TASKS["worker"]` 里的 `semantic_review` |
+| AI stage | `semantic_review`（`ai_stage_catalog`、`config/ai_recognition.yaml`） |
+| 提示词 | `trading.disagreement.semantic_review`（代码种子 + 生产库里的定义行） |
+| 设置项 | `semantic_review_enabled` |
+| 页面 | `index.html:299`「开启 DeepSeek 辅助复核」、`_messages.html:640`「DeepSeek辅助复核」、`app.js`、`app.css` |
+| 测试 | 30 个文件（`grep -rl "semantic_review\|semantic_disagreement" tests/`） |
+| 数据库 | `recognition_decisions` 上的复核相关列**留着**，删列是 L3 |
+
+**验收方式按 2026-09-24 的教训**：靠测试验收，不靠关键词匹配。MiMo v2 那次按
+「定义体含关键词」整块删，把同一条 `import` 里的无关符号和只是「提到」它的 fixture 一起带走，
+全套跑出 101 个失败。
+
 ### 落地时的自主判断（设计稿未写明的地方）
 
 1. **缺字段 vs 显式 `null`。** §2.1 说「缺字段 = 违规」，§8 又说阶段 1 必须容忍没有新字段的
