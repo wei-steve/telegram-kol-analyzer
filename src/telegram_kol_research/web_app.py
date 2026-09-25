@@ -196,7 +196,6 @@ from telegram_kol_research.authoritative_recognition import (
     AutomaticRetryBlocked,
 )
 from telegram_kol_research.models import (
-    AiPromptTestRun,
     ExecutionBinding,
     InstructionExecutionContract,
     ExecutionOrderLeg,
@@ -9724,44 +9723,20 @@ def create_web_app(
             )
             expected_draft_id = int(payload.get("expected_draft_version_id"))
             expected_active_id = int(payload.get("expected_active_version_id"))
-            if current.category == "trading":
-                shared = get_prompt_detail(
-                    app.state.session_factory, SHARED_TRADING_PROMPT
-                )
-                vision = get_prompt_detail(
-                    app.state.session_factory, MIMO_VISION_PROMPT
-                )
-                expected_by_model = {
-                    "deepseek": {SHARED_TRADING_PROMPT: shared.active_version.id},
-                    "mimo": {
-                        SHARED_TRADING_PROMPT: shared.active_version.id,
-                        MIMO_VISION_PROMPT: vision.active_version.id,
-                    },
-                }
-                required_models = (
-                    {"mimo", "deepseek"}
-                    if prompt_key == SHARED_TRADING_PROMPT
-                    else {"mimo"}
-                )
-                with app.state.session_factory() as session:
-                    completed_tests = (
-                        session.query(AiPromptTestRun)
-                        .filter(AiPromptTestRun.draft_version_id == expected_draft_id)
-                        .filter(AiPromptTestRun.status == "completed")
-                        .all()
-                    )
-                covered_models = {
-                    row.model_kind
-                    for row in completed_tests
-                    if row.model_kind in required_models
-                    and json.loads(row.active_prompt_versions_json or "{}")
-                    == expected_by_model[row.model_kind]
-                }
-                if not required_models.issubset(covered_models):
-                    raise PromptRegistryConflict(
-                        "trading prompt draft requires current historical tests "
-                        f"for: {', '.join(sorted(required_models - covered_models))}"
-                    )
+            # A trading draft used to be publishable only after completed
+            # historical A/B runs for two hard-coded model kinds, "mimo" and
+            # "deepseek". The gate is gone on purpose. It named two vendors in a
+            # system that now picks its models from the stage bindings, and the
+            # second kind resolved to ``batch_text_recognition`` -- a stage
+            # ARCHITECTURE §5.5 says is not on the production path at all. On
+            # 2026-09-25 that account started answering 402 and the gate became
+            # unpassable: a correct draft, validated, could not be published for
+            # a reason that had nothing to do with the draft. A gate written
+            # against an architecture the project has already moved past does
+            # not protect anything; it just makes the next change prove itself
+            # against a world that no longer exists. Validation (which reads the
+            # draft itself) and the version compare-and-swap in
+            # ``publish_prompt_draft`` remain.
             detail = publish_prompt_draft(
                 app.state.session_factory,
                 prompt_key,
