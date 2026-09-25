@@ -221,67 +221,6 @@ def validate_prompt_content(
                 errors.append(f"MiMo v2 模板缺少必需契约 {marker}")
         if normalized.count('"contract_version": "mimo-authoritative-v2"') != 1:
             errors.append("MiMo v2 模板必须且只能定义一次契约版本")
-    elif validation_profile == "semantic_disagreement_review":
-        required_schema_markers = (
-            '"independent_action"',
-            '"action_type"',
-            '"target_lifecycle_id"',
-            '"symbol"',
-            '"side"',
-            '"stop_loss"',
-            '"take_profit"',
-            '"management_action"',
-            '"evidence"',
-            '"conflict_types"',
-            '"material_disagreement"',
-            '"suggested_severity"',
-            '"confidence"',
-            '"reason"',
-        )
-        required_contract_markers = (
-            "none",
-            "entry",
-            "entry_confirm",
-            "cancel_entry",
-            "exit_full",
-            "exit_partial",
-            "position_update",
-            "normal",
-            "critical",
-            "actionability",
-            "action_family",
-            "full_vs_partial_exit",
-            "target_lifecycle",
-            "stop_intent",
-            "urgent_exit_missed",
-            "execution_unresolved",
-            "non_material_price_detail",
-            "wording_only",
-            "独立解读当前消息",
-            "必须引用当前消息中的证据",
-            "不得修改交易",
-            "不得声称能够读取图片像素",
-            "只输出一个 JSON 对象",
-            "不得添加额外字段",
-        )
-        required_closed_contracts = (
-            "none | entry | entry_confirm | cancel_entry | exit_full | "
-            "exit_partial | position_update",
-            "none | normal | critical",
-            "actionability, action_family, full_vs_partial_exit, symbol, side, "
-            "target_lifecycle, stop_intent, urgent_exit_missed, "
-            "execution_unresolved, non_material_price_detail, wording_only",
-        )
-        for marker in required_schema_markers:
-            if marker not in normalized:
-                errors.append(f"语义分歧复核模板缺少必需字段 {marker}")
-        for marker in required_contract_markers:
-            if marker not in normalized:
-                errors.append(f"语义分歧复核模板缺少必需契约 {marker}")
-        for contract in required_closed_contracts:
-            if contract not in normalized:
-                errors.append(f"语义分歧复核模板缺少闭合枚举 {contract}")
-
     if required_variables:
         try:
             referenced = _template_variables(normalized)

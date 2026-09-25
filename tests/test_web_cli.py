@@ -64,7 +64,7 @@ def test_web_server_closes_live_update_streams_before_uvicorn_shutdown(monkeypat
     assert server.config.kwargs["timeout_graceful_shutdown"] == 10
 
 
-def test_web_command_starts_app_for_semantic_review_without_telegram_credentials(
+def test_web_command_starts_app_without_telegram_credentials(
     tmp_path, monkeypatch
 ):
     config_path = tmp_path / "groups.yaml"

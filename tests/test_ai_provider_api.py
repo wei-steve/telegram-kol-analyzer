@@ -392,7 +392,6 @@ def test_stages_report_the_catalogue_the_bindings_and_what_routes(tmp_path):
     assert keys == [
         "authoritative_recognition",
         "context_resolution",
-        "semantic_review",
         "strategy_alert",
         "batch_text_recognition",
         "batch_image_recognition",
@@ -403,7 +402,7 @@ def test_stages_report_the_catalogue_the_bindings_and_what_routes(tmp_path):
     assert payload["stages"]["authoritative_recognition"] == ["mimo-v2.5"]
     assert payload["effective"]["authoritative_recognition"][0]["role"] == "主用"
     assert payload["stages"]["strategy_alert"] == []
-    assert payload["definitions"][3]["env_fallback"]
+    assert payload["definitions"][2]["env_fallback"]
 
 
 def test_a_fallback_can_be_added_and_reordered(tmp_path):
@@ -474,10 +473,10 @@ def test_a_stage_left_out_of_the_body_keeps_its_binding(tmp_path):
     client = _client(tmp_path)
 
     saved = client.put(
-        "/api/ai-stages", json={"stages": {"semantic_review": []}}
+        "/api/ai-stages", json={"stages": {"strategy_alert": ["mimo-v2.5"]}}
     ).json()
 
-    assert saved["stages"]["semantic_review"] == []
+    assert saved["stages"]["strategy_alert"] == ["mimo-v2.5"]
     assert saved["stages"]["authoritative_recognition"] == ["mimo-v2.5"]
 
 
@@ -502,7 +501,7 @@ def test_a_malformed_stage_body_is_a_422(tmp_path):
     assert client.put("/api/ai-stages", json={"stages": []}).status_code == 422
     assert (
         client.put(
-            "/api/ai-stages", json={"stages": {"semantic_review": 7}}
+            "/api/ai-stages", json={"stages": {"strategy_alert": 7}}
         ).status_code
         == 422
     )
@@ -550,11 +549,11 @@ def test_the_worker_sees_a_saved_chain_without_a_restart(tmp_path):
 
     client.put(
         "/api/ai-stages",
-        json={"stages": {"semantic_review": ["mimo-v2.5"]}},
+        json={"stages": {"strategy_alert": ["mimo-v2.5"]}},
     )
 
     with pytest.warns(DeprecationWarning):
         config = load_ai_recognition_config(config_path)
     assert [
-        model.id for model in resolve_stage_chain(config, "semantic_review")
+        model.id for model in resolve_stage_chain(config, "strategy_alert")
     ] == ["mimo-v2.5"]

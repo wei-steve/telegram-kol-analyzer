@@ -449,7 +449,6 @@ def test_dabiaoke_4168_projects_exact_exit_despite_ghost_lifecycle(tmp_path):
     assessment = AuthoritativeAssessment(
         raw_message_id=raw_id,
         mimo=resolved,
-        deepseek_payload=None,
         agreement_status="pending",
         differences=[],
         authoritative_generation="dabiaoke-4168",
@@ -900,7 +899,6 @@ def test_authoritative_apply_projects_future_shadow_contract_idempotently(
     assessment = AuthoritativeAssessment(
         raw_message_id=raw_id,
         mimo=mimo,
-        deepseek_payload=None,
         agreement_status="pending",
         differences=[],
         authoritative_generation="shadow-generation",
@@ -1333,7 +1331,6 @@ def test_fengge_exit_applies_mimo_while_execution_gate_is_pending(tmp_path, monk
     result = apply_authoritative_assessment(session_factory, assessment)
 
     assert assessment.agreement_status == "pending"
-    assert assessment.deepseek_payload is None
     assert assessment.differences == []
     assert result.parse_source == "mimo_authoritative"
     with session_factory() as session:
@@ -1510,7 +1507,6 @@ def test_mimo_cancel_entry_for_entered_strategy_creates_full_exit_candidate(
             status="非策略",
             prompt_versions={},
         ),
-        deepseek_payload=None,
         agreement_status="pending",
         differences=[],
         authoritative_generation="generation-1",
@@ -1687,10 +1683,8 @@ def test_unchanged_rerecognition_preserves_completed_review_through_execution_ga
         media_root=tmp_path,
     )
 
-    assert first.semantic_review_status == "execution_pending"
+    assert first.authoritative_generation
     assert second.agreement_status == "agreed"
-    assert second.semantic_review_status == "execution_pending"
-    assert second.deepseek_payload is None
     assert claim_authoritative_execution(
         session_factory,
         raw_message_id=raw_id,
@@ -1702,7 +1696,6 @@ def test_unchanged_rerecognition_preserves_completed_review_through_execution_ga
         authoritative_generation=second.authoritative_generation,
         automation_status="skipped",
         automation_reason="test",
-        semantic_review_enabled=True,
     )
     assert finalized.comparison_status == "completed"
     with session_factory() as session:
@@ -1765,11 +1758,11 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         lambda *args, **kwargs: events.append("claim_execution") or True,
         raising=False,
     )
-    finalization_policies = []
+    finalization_kwargs: list[dict] = []
 
     def finalize(*args, **kwargs):
         events.append("persist_automation")
-        finalization_policies.append(kwargs.get("semantic_review_enabled"))
+        finalization_kwargs.append(kwargs)
         return SimpleNamespace(
             agreement_status="pending",
             differences_json="[]",
@@ -1803,9 +1796,15 @@ def test_process_authoritative_message_persists_pending_before_mimo_and_auto_tra
         "persist_automation",
     ]
     assert events.index("auto_trade") < events.index("persist_automation")
-    assert finalization_policies == [False]
+    # The retired review used to decide how this call finalized; it takes no
+    # such argument any more, and the caller must not invent one.
+    assert set(finalization_kwargs[0]) == {
+        "raw_message_id",
+        "authoritative_generation",
+        "automation_status",
+        "automation_reason",
+    }
     assert result.assessment.agreement_status == "pending"
-    assert result.assessment.deepseek_payload is None
     assert result.automation == {"status": "executed", "reason": "close_submitted"}
 
 
@@ -2704,7 +2703,6 @@ def test_process_authoritative_message_skips_auto_trade_when_mimo_fails(
             status="识别失败",
             error_message="timeout",
         ),
-        deepseek_payload=None,
         agreement_status="authoritative_failed",
         differences=[],
     )

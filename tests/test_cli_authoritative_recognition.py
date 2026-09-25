@@ -135,7 +135,7 @@ def test_cli_parse_fails_closed_when_execution_schema_is_partially_installed(
         )
 
 
-def test_cli_authoritative_result_leaves_semantic_review_pending(
+def test_cli_authoritative_result_sends_no_conflict_alert(
     tmp_path,
     monkeypatch,
 ):
@@ -157,7 +157,6 @@ def test_cli_authoritative_result_leaves_semantic_review_pending(
                 payload={"reason": "立即出局"},
                 error_message=None,
             ),
-            deepseek_payload=None,
         ),
         automation={"status": "skipped", "reason": "auto_trade_not_configured"},
     )
@@ -172,7 +171,7 @@ def test_cli_authoritative_result_leaves_semantic_review_pending(
     monkeypatch.setattr(
         "telegram_kol_research.cli.send_ai_recognition_conflict_review",
         lambda **kwargs: (_ for _ in ()).throw(
-            AssertionError("CLI parse must not run semantic review inline")
+            AssertionError("CLI parse must not send a conflict alert inline")
         ),
     )
     bot_config = SimpleNamespace(bot_token="token", chat_id="chat")
@@ -220,7 +219,6 @@ def test_cli_mimo_failure_notification_does_not_block_later_messages(
                     payload={},
                     error_message="timeout",
                 ),
-                deepseek_payload=None,
             ),
             automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
         )
@@ -307,7 +305,6 @@ def test_cli_drains_scheduled_failure_alert_when_later_processing_raises(
                     payload={},
                     error_message="timeout",
                 ),
-                deepseek_payload=None,
             ),
             automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
         )

@@ -57,7 +57,6 @@ def _processing_result():
                 payload={},
                 error_message=None,
             ),
-            deepseek_payload=None,
         ),
         automation={"status": "skipped", "reason": "mimo_no_action"},
     )

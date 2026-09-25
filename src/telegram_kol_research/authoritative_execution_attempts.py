@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable
 
-from sqlalchemy import case, update
+from sqlalchemy import update
 from sqlalchemy.exc import IntegrityError
 
 from telegram_kol_research.authoritative_execution_schema import (
@@ -608,7 +608,6 @@ def finalize_recorded_authoritative_execution(
     *,
     attempt_id: int,
     claim_token: str,
-    semantic_review_enabled: bool,
     finalized_at: datetime,
     adapter: Callable[[], Any] | None = None,
 ):
@@ -624,27 +623,16 @@ def finalize_recorded_authoritative_execution(
             or row.status != "outcome_recorded"
         ):
             raise RuntimeError("authoritative outcome is not finalizeable")
-        review_values = (
-            {
-                "comparison_status": case(
-                    (
-                        RecognitionDecision.agreement_status == "pending",
-                        "pending",
-                    ),
-                    else_="completed",
-                ),
-                "comparison_claim_token": None,
-                "comparison_started_at": None,
-            }
-            if semantic_review_enabled
-            else {
-                "agreement_status": "review_disabled",
-                "comparison_status": "completed",
-                "comparison_next_attempt_at": None,
-                "comparison_started_at": None,
-                "comparison_claim_token": None,
-            }
-        )
+        # The semantic-disagreement review was retired on 2026-09-25, and
+        # production ran with it switched off for its whole life, so this is
+        # the only branch that ever executed here.
+        lease_release_values = {
+            "agreement_status": "review_disabled",
+            "comparison_status": "completed",
+            "comparison_next_attempt_at": None,
+            "comparison_started_at": None,
+            "comparison_claim_token": None,
+        }
         result = session.execute(
             update(RecognitionDecision)
             .where(
@@ -657,7 +645,7 @@ def finalize_recorded_authoritative_execution(
                 automation_status=row.automation_status,
                 automation_reason=row.automation_reason,
                 updated_at=finalized_at,
-                **review_values,
+                **lease_release_values,
             )
         )
         if int(result.rowcount or 0) != 1:

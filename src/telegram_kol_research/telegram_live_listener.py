@@ -395,24 +395,14 @@ def _build_authoritative_notification_payload(
     if assessment.agreement_status != "authoritative_failed":
         return None
     mimo_payload = assessment.mimo.payload if isinstance(assessment.mimo.payload, dict) else {}
-    deepseek_payload = (
-        assessment.deepseek_payload
-        if isinstance(assessment.deepseek_payload, dict)
-        else {}
-    )
     # An absent auxiliary result is an empty section, not three dashes. The
     # dashes were indistinguishable from a second model that answered with
     # nothing, and ``auxiliary_review_disagrees`` has to tell those apart.
-    auxiliary = (
-        {
-            "model": deepseek_payload.get("model") or "",
-            "status": deepseek_payload.get("recognition_result") or "-",
-            "kind": "auxiliary",
-            "reason": deepseek_payload.get("reason") or "-",
-        }
-        if deepseek_payload
-        else {}
-    )
+    # ``AuthoritativeAssessment`` stopped carrying an auxiliary payload at all
+    # when the semantic-disagreement review was retired (2026-09-25); every
+    # construction site had been passing ``None`` since long before that, so
+    # the section this builds was already always empty.
+    auxiliary: dict[str, Any] = {}
     return {
         "chat_title": chat_title,
         "chat_id": raw_message.chat_id,
@@ -588,10 +578,11 @@ def auxiliary_review_disagrees(payload: Mapping[str, Any]) -> bool:
     【AI识别分歧告警】 was written for a two-model setup: MiMo decides, DeepSeek
     reviews, and a person is paged when they differ. The auxiliary model was
     removed -- ``authoritative_recognition`` builds every decision with
-    ``auxiliary_model=None``, and every assessment carries
-    ``deepseek_payload=None`` -- so the alert became an English-ish "MiMo
-    recognition failed" notice with two empty DeepSeek lines. The account
-    owner ruled that it must not be sent while no auxiliary model is in use.
+    ``auxiliary_model=None``, and an assessment no longer carries an auxiliary
+    payload field at all (retired 2026-09-25) -- so the alert became an
+    English-ish "MiMo recognition failed" notice with two empty DeepSeek
+    lines. The account owner ruled that it must not be sent while no auxiliary
+    model is in use.
 
     This is the one predicate both senders ask, so the worker path and
     ``POST /api/messages/{id}/recognize`` cannot drift apart. The formatter

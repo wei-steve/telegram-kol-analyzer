@@ -515,15 +515,15 @@ def test_persist_live_message_event_triggers_strategy_alert_processor(tmp_path):
     assert processed[0]["record"].message_id == 42
 
 
-def test_authoritative_live_path_returns_without_starting_semantic_review(
+def test_authoritative_live_path_returns_without_sending_a_conflict_alert(
     tmp_path,
     monkeypatch,
 ):
     session_factory = create_session_factory(tmp_path / "research.db")
     broker = LiveUpdateBroker()
     events: list[str] = []
-    reviewer_started = asyncio.Event()
-    semantic_review_blocker = asyncio.Event()
+    sender_started = asyncio.Event()
+    sender_blocker = asyncio.Event()
     monkeypatch.setattr(
         "telegram_kol_research.telegram_live_listener.update_recognition_execution_outcome",
         lambda *args, **kwargs: None,
@@ -544,7 +544,6 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
                     model="mimo-v2.5",
                     error_message=None,
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -555,9 +554,9 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
             automation={"status": "executed", "reason": "close_submitted"},
         )
 
-    async def blocked_semantic_reviewer(**kwargs):
-        reviewer_started.set()
-        await semantic_review_blocker.wait()
+    async def blocked_conflict_sender(**kwargs):
+        sender_started.set()
+        await sender_blocker.wait()
 
     async def scenario():
         await _persist_then_process(
@@ -572,10 +571,10 @@ def test_authoritative_live_path_returns_without_starting_semantic_review(
                 bot_token="system-token",
                 chat_id="system-chat",
             ),
-            system_operator_conflict_sender=blocked_semantic_reviewer,
+            system_operator_conflict_sender=blocked_conflict_sender,
         )
         assert events == ["apply_mimo", "auto_trade"]
-        assert not reviewer_started.is_set()
+        assert not sender_started.is_set()
 
     asyncio.run(scenario())
 
@@ -632,7 +631,6 @@ def test_live_intake_fetches_a_missing_reply_target_before_enqueueing(
                     model="mimo-v2.5",
                     error_message=None,
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -696,7 +694,6 @@ def test_authoritative_live_path_delivers_instruction_summary_once_after_complet
                     model="mimo-v2.5",
                     error_message=None,
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -749,10 +746,12 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
 ):
     """A slow alert must not hold up the intake path.
 
-    The assessment below carries an auxiliary result, because that is what it
-    now takes for this alert to be sent at all (see
-    ``auxiliary_review_disagrees``). What is under test here is unchanged: the
-    delivery runs in its own task.
+    The payload is stubbed to carry an auxiliary section, because that is what
+    it takes for this alert to be sent at all (see
+    ``auxiliary_review_disagrees``), and no assessment can produce one any more:
+    ``AuthoritativeAssessment`` stopped carrying an auxiliary payload when the
+    semantic-disagreement review was retired on 2026-09-25. What is under test
+    here is unchanged: the delivery runs in its own task.
     """
 
     session_factory = create_session_factory(tmp_path / "research.db")
@@ -779,11 +778,6 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
                     model="mimo-v2.5",
                     error_message="timeout",
                 ),
-                deepseek_payload={
-                    "model": "deepseek-chat",
-                    "recognition_result": "是策略",
-                    "reason": "读出的是移动止损",
-                },
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -793,6 +787,29 @@ def test_authoritative_mimo_failure_keeps_independent_nonblocking_alert(
             ),
             automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
         )
+
+    from telegram_kol_research import telegram_live_listener
+
+    real_payload_builder = (
+        telegram_live_listener._build_authoritative_notification_payload
+    )
+
+    def payload_with_an_auxiliary_section(**kwargs):
+        payload = real_payload_builder(**kwargs)
+        assert payload is not None
+        payload["deepseek"] = {
+            "model": "some-auxiliary-model",
+            "status": "是策略",
+            "kind": "auxiliary",
+            "reason": "读出的是移动止损",
+        }
+        return payload
+
+    monkeypatch.setattr(
+        "telegram_kol_research.telegram_live_listener."
+        "_build_authoritative_notification_payload",
+        payload_with_an_auxiliary_section,
+    )
 
     async def blocked_failure_sender(**kwargs):
         assert kwargs["payload"]["agreement_status"] == "authoritative_failed"
@@ -841,7 +858,6 @@ def test_authoritative_mimo_failure_suppresses_obvious_external_stock_noise(
                     model="mimo-v2.5",
                     error_message="The read operation timed out",
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -908,7 +924,6 @@ def test_authoritative_mimo_failure_suppresses_empty_input_noise(
                     model="mimo-v2.5",
                     error_message="message has no readable text or image",
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -1040,7 +1055,6 @@ def test_the_conflict_alert_is_not_sent_while_no_auxiliary_model_runs(
                     model="mimo-v2.5",
                     error_message="The read operation timed out",
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,
@@ -1131,7 +1145,6 @@ def test_authoritative_mimo_failure_retries_high_risk_message_without_alerting(
                         model="mimo-v2.5",
                         error_message="The read operation timed out",
                     ),
-                    deepseek_payload=None,
                 ),
                 recognition=MessageRecognitionResult(
                     raw_message_id=raw_message_id,
@@ -1156,7 +1169,6 @@ def test_authoritative_mimo_failure_retries_high_risk_message_without_alerting(
                     model="mimo-v2.5",
                     error_message=None,
                 ),
-                deepseek_payload=None,
             ),
             recognition=MessageRecognitionResult(
                 raw_message_id=raw_message_id,

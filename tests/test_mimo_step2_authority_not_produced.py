@@ -223,7 +223,6 @@ def test_a_failed_authoritative_call_alerts_in_a_trading_group_only(
             status="识别失败",
             error_message="MiMo failed after 2 attempts: 402 Payment Required",
         ),
-        deepseek_payload=None,
         agreement_status="authoritative_failed",
         differences=[],
     )

@@ -261,7 +261,6 @@ from telegram_kol_research.runtime_agent_exchange_snapshot import (
     build_read_only_exchange_snapshot,
     incomplete_read_only_exchange_snapshot,
 )
-from telegram_kol_research.semantic_disagreement_review import run_semantic_review_loop
 from telegram_kol_research.strategy_management_worker import (
     run_strategy_management_worker_loop,
 )
@@ -309,7 +308,6 @@ from telegram_kol_research.system_operator_bot import (
     probe_system_operator_bot_evidence,
     send_ai_recognition_conflict_review,
     send_pending_entry_expiry_review,
-    send_semantic_disagreement_notification,
     send_system_operator_bot_message,
     run_runtime_incident_notification_loop,
     run_strategy_management_notification_loop,
@@ -432,7 +430,6 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "message_processing_worker",
             "position_snapshot_startup",
             "runtime_incident_notification",
-            "semantic_review",
             "source_message_deletion_worker",
             "strategy_management_notification",
             "strategy_management_worker",
@@ -1562,48 +1559,6 @@ def _deepcoin_shadow_instrument_map_provider(app: FastAPI):
         return instrument_map
 
     return _provider
-
-
-def _build_semantic_review_notifier(app: FastAPI):
-    config = app.state.notification_bot_config
-    if not isinstance(config, SystemOperatorBotConfig):
-        return None
-
-    async def notify(*, raw_message_id: int, payload: dict[str, Any]) -> None:
-        await send_semantic_disagreement_notification(config=config, payload=payload)
-
-    return notify
-
-
-async def _supervise_semantic_review_runner(app: FastAPI) -> None:
-    while True:
-        try:
-            await app.state.semantic_review_runner(
-                session_factory=app.state.session_factory,
-                config_path=app.state.ai_recognition_config_path,
-                notifier=_build_semantic_review_notifier(app),
-            )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Semantic review runner exited with error; restarting")
-        else:
-            logger.error("Semantic review runner exited unexpectedly; restarting")
-        await asyncio.sleep(app.state.semantic_review_restart_delay_seconds)
-
-
-async def _stop_semantic_review_task(app: FastAPI) -> None:
-    task = app.state.semantic_review_task
-    if task is None:
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception:
-        pass
-    app.state.semantic_review_task = None
 
 
 async def _disconnect_shared_telegram_client(app: FastAPI) -> None:
@@ -5594,8 +5549,6 @@ def create_web_app(
     ai_recognition_config_path: str | Path | None = None,
     ai_provider_prober: Callable[..., Any] | None = None,
     ai_model_lister: Callable[..., Any] | None = None,
-    semantic_review_runner=None,
-    semantic_review_restart_delay_seconds: float = 1.0,
     deepcoin_private_ws_runner=None,
     strategy_management_worker_runner=None,
     entry_revision_risk_reduction_executor=None,
@@ -5753,18 +5706,6 @@ def create_web_app(
                     _log_background_task_result(
                         "message_operation_supervisor_task"
                     )
-                )
-            if (
-                runtime_role_starts_singleton_task(
-                    app.state.runtime_role, "semantic_review"
-                )
-                and app.state.semantic_review_task is None
-            ):
-                app.state.semantic_review_task = asyncio.create_task(
-                    _supervise_semantic_review_runner(app)
-                )
-                app.state.semantic_review_task.add_done_callback(
-                    _log_background_task_result("semantic_review_task")
                 )
             if runtime_role_starts_singleton_task(
                 app.state.runtime_role, "lifecycle_monitor"
@@ -6276,7 +6217,6 @@ def create_web_app(
                 except Exception:
                     pass
                 app.state.position_snapshot_refresh_task = None
-            await _stop_semantic_review_task(app)
             # ── lifecycle monitor shutdown ──
             lcm_task = getattr(app.state, "lifecycle_monitor_task", None)
             if lcm_task is not None:
@@ -6688,12 +6628,6 @@ def create_web_app(
         app.state.session_factory,
         load_ai_recognition_config(app.state.ai_recognition_config_path),
     )
-    app.state.semantic_review_runner = semantic_review_runner or run_semantic_review_loop
-    app.state.semantic_review_restart_delay_seconds = max(
-        0.0,
-        min(float(semantic_review_restart_delay_seconds), 60.0),
-    )
-    app.state.semantic_review_task = None
     app.state.strategy_management_worker_runner = (
         strategy_management_worker_runner or run_strategy_management_worker_loop
     )
@@ -9579,18 +9513,6 @@ def create_web_app(
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
         result = processing_result.recognition
-        semantic_review_status = getattr(
-            processing_result.assessment,
-            "semantic_review_status",
-            None,
-        )
-        if semantic_review_status not in {
-            "pending",
-            "execution_pending",
-            "execution_running",
-            "execution_uncertain",
-        }:
-            semantic_review_status = "pending"
         return {
             "raw_message_id": result.raw_message_id,
             "status": result.status,
@@ -9600,7 +9522,6 @@ def create_web_app(
             "ai_conflict": False,
             "authoritative_model": processing_result.assessment.mimo.model,
             "agreement_status": "pending",
-            "semantic_review_status": semantic_review_status,
             "differences": [],
             "notification_scheduled": (
                 notification_scheduled

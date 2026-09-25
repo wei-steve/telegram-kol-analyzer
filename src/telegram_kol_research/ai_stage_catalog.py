@@ -23,6 +23,13 @@ from every template on 06-14, production logged zero calls to its endpoint in
 thirty days, and ``ai_prompt_invocations`` never held a single row for it. A
 stage nobody can reach is a stage that misleads whoever reads this table, so
 phase 8 removed it along with the endpoint behind it.
+
+``semantic_review`` was here until 2026-09-25. It was a read-only advisor that
+never changed a trading decision, and ``trading_settings`` had no
+``semantic_review_enabled`` row in production, so the code default ``False``
+meant the loop never ran. The whole path was retired; a leftover
+``stages.semantic_review`` key in an existing configuration file is dropped
+with a warning by the same rule that handles ``research_chat``.
 """
 
 from __future__ import annotations
@@ -177,14 +184,6 @@ AI_STAGE_DEFINITIONS: tuple[AiStageDefinition, ...] = (
         production_note="是（权威识别判定需要时调用；另有重分析队列）",
     ),
     AiStageDefinition(
-        stage_key="semantic_review",
-        label="语义分歧复核（只读顾问）",
-        description="只读顾问：复核语义分歧，不改变任何交易判定。",
-        requires_text=True,
-        production_path=True,
-        production_note="是（worker semantic_review 单例循环）",
-    ),
-    AiStageDefinition(
         stage_key="strategy_alert",
         label="策略提醒分类（Telegram 提醒 bot）",
         description="Telegram 提醒 bot 的策略提醒分类；未绑定时沿用环境变量。",
@@ -224,7 +223,6 @@ AI_STAGE_KEYS: tuple[str, ...] = tuple(
 #: provider-health derivation and the prompt centre's historical-message test.
 AUTHORITATIVE_STAGE = "authoritative_recognition"
 CONTEXT_RESOLUTION_STAGE = "context_resolution"
-SEMANTIC_REVIEW_STAGE = "semantic_review"
 STRATEGY_ALERT_STAGE = "strategy_alert"
 BATCH_TEXT_STAGE = "batch_text_recognition"
 BATCH_IMAGE_STAGE = "batch_image_recognition"

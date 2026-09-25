@@ -20,10 +20,6 @@ from test_composite_remainder_market_close import (
     test_the_books_are_terminalized_in_the_same_transaction_as_the_success
     as test_remainder_close_terminalization_atomicity_boundary,
 )
-from test_semantic_disagreement_review import (
-    test_composite_semantic_review_input_preserves_mimo_authority_and_outcomes
-    as test_auxiliary_model_boundary_is_advisory_only,
-)
 from test_strategy_management_executor import (
     test_composite_close_definite_rejection_retries_from_fresh_unchanged_position
     as test_definite_rejection_boundary,

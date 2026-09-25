@@ -515,7 +515,7 @@ def test_database_bootstrap_creates_recognition_decisions_table(tmp_path):
     }.issubset(columns)
 
 
-def test_database_bootstrap_backfills_recognition_decisions_semantic_review_as_completed(
+def test_database_bootstrap_backfills_recognition_decisions_comparison_status_as_completed(
     tmp_path,
 ):
     database_path = tmp_path / "research.db"

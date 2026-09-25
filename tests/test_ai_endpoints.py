@@ -21,7 +21,6 @@ from telegram_kol_research import (
     message_recognition,
     mimo_provider_probe,
     recognition_experiments,
-    semantic_disagreement_review,
     strategy_alerts,
 )
 from telegram_kol_research.ai_endpoints import (
@@ -227,7 +226,6 @@ def test_no_call_site_still_joins_this_url_by_hand():
         message_recognition,
         mimo_provider_probe,
         recognition_experiments,
-        semantic_disagreement_review,
         strategy_alerts,
     )
     offenders = []
@@ -246,10 +244,9 @@ def test_no_call_site_still_joins_this_url_by_hand():
     "helper",
     [
         message_recognition._chat_completions_url,
-        semantic_disagreement_review._chat_completions_url,
         context_resolution._completion_url,
     ],
 )
-def test_the_three_surviving_helpers_are_the_shared_rule(helper):
+def test_the_surviving_helpers_are_the_shared_rule(helper):
     for base_url in BASE_URLS:
         assert helper(base_url) == chat_completions_url(base_url)

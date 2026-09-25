@@ -551,77 +551,6 @@ def test_incomplete_equivalent_assignment_does_not_render_reviewed_provenance():
     assert "等价腿确定性归属" not in attribution["reasons"]
 
 
-def test_semantic_review_worker_lifespan_starts_once_without_telegram_and_stops_first(
-    tmp_path, monkeypatch
-):
-    config_path = tmp_path / "groups.yaml"
-    config_path.write_text(
-        "groups:\n"
-        "  - chat_title: Demo Group\n"
-        "    chat_id: 77\n"
-        "    enabled: true\n"
-        "    ai_strategy_enabled: false\n",
-        encoding="utf-8",
-    )
-    ai_config_path = tmp_path / "ai_recognition.yaml"
-    started = threading.Event()
-    calls = []
-    shutdown_order = []
-
-    async def fake_semantic_review_runner(**kwargs):
-        calls.append(kwargs)
-        started.set()
-        try:
-            await asyncio.Event().wait()
-        finally:
-            shutdown_order.append("semantic_review_stopped")
-
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        live_target_titles=set(),
-        telegram_client=None,
-        group_config=load_group_config(config_path),
-        group_config_path=config_path,
-        ai_recognition_config_path=ai_config_path,
-        semantic_review_runner=fake_semantic_review_runner,
-    )
-    app.state.system_operator_bot_config = SystemOperatorBotConfig(
-        bot_token="system-token",
-        chat_id="system-chat",
-    )
-    app.state.notification_bot_config = SystemOperatorBotConfig(
-        bot_token="notification-token",
-        chat_id="system-chat",
-    )
-    broker_type = type(app.state.live_update_broker)
-    original_close = broker_type.close
-
-    def record_resource_close(broker):
-        shutdown_order.append("resources_closed")
-        original_close(broker)
-
-    monkeypatch.setattr(broker_type, "close", record_resource_close)
-
-    with TestClient(app) as client:
-        assert started.wait(timeout=1)
-        assert len(calls) == 1
-        assert calls[0]["session_factory"] is app.state.session_factory
-        assert calls[0]["config_path"] == ai_config_path
-        assert callable(calls[0]["notifier"])
-        assert app.state.semantic_review_task is not None
-
-        response = client.post(
-            "/api/groups/77/automation",
-            json={"ai_strategy_enabled": True},
-        )
-
-        assert response.status_code == 200
-        assert len(calls) == 1
-
-    assert app.state.semantic_review_task is None
-    assert shutdown_order == ["semantic_review_stopped", "resources_closed"]
-
-
 def test_runtime_incident_notifications_use_system_operator_bot_lifespan(
     tmp_path,
     monkeypatch,
@@ -1557,190 +1486,6 @@ def test_lifespan_bounds_listener_shutdown_when_telegram_disconnect_hangs(
     assert asyncio.run(exercise_lifespan()) is False
 
 
-def test_semantic_review_worker_uses_system_operator_notifier(tmp_path, monkeypatch):
-    started = threading.Event()
-    sent = []
-    bot_config = SystemOperatorBotConfig(
-        bot_token="system-token",
-        chat_id="system-chat",
-    )
-    app = None
-
-    async def fake_sender(**kwargs):
-        sent.append(kwargs)
-
-    async def fake_semantic_review_runner(**kwargs):
-        payload = {
-            "chat_id": 88,
-            "message_id": 12,
-            "sender_name": "Demo",
-            "posted_at": None,
-            "text": "BTC 全部出局",
-            "agreement_status": "disagreed",
-            "conflict_types": ["urgent_exit_missed"],
-            "deepseek": {
-                "status": "exit_full",
-                "kind": "semantic_review",
-                "reason": "DeepSeek 独立复核认为需要退出",
-                "evidence": ["全部出局"],
-                "conflict_types": ["urgent_exit_missed"],
-            },
-            "mimo": {
-                "status": "exit_full",
-                "kind": "authoritative",
-                "reason": "MiMo 识别为空仓退出",
-            },
-            "automation": {
-                "status": "submitted",
-                "reason": "close_position",
-            },
-        }
-        await kwargs["notifier"](
-            raw_message_id=1,
-            payload=payload,
-        )
-        started.set()
-        await asyncio.Event().wait()
-
-    monkeypatch.setattr(
-        "telegram_kol_research.web_app.send_semantic_disagreement_notification",
-        fake_sender,
-    )
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        semantic_review_runner=fake_semantic_review_runner,
-    )
-    app.state.notification_bot_config = bot_config
-
-    with TestClient(app):
-        assert started.wait(timeout=1)
-
-    assert len(sent) == 1
-    assert sent[0]["config"] is bot_config
-    assert sent[0]["payload"]["chat_id"] == 88
-    assert sent[0]["payload"]["message_id"] == 12
-    assert sent[0]["payload"]["sender_name"] == "Demo"
-    assert sent[0]["payload"]["text"] == "BTC 全部出局"
-    assert sent[0]["payload"]["deepseek"] == {
-        "status": "exit_full",
-        "kind": "semantic_review",
-        "reason": "DeepSeek 独立复核认为需要退出",
-        "evidence": ["全部出局"],
-        "conflict_types": ["urgent_exit_missed"],
-    }
-    assert sent[0]["payload"]["conflict_types"] == ["urgent_exit_missed"]
-    assert sent[0]["payload"]["mimo"] == {
-        "status": "exit_full",
-        "kind": "authoritative",
-        "reason": "MiMo 识别为空仓退出",
-    }
-    assert sent[0]["payload"]["automation"] == {
-        "status": "submitted",
-        "reason": "close_position",
-    }
-
-
-def test_semantic_review_worker_clean_exit_is_logged_and_restarted(tmp_path):
-    restarted = threading.Event()
-    calls = 0
-    active = 0
-    max_active = 0
-
-    async def returning_semantic_review_runner(**kwargs):
-        nonlocal calls, active, max_active
-        calls += 1
-        active += 1
-        max_active = max(max_active, active)
-        try:
-            if calls == 1:
-                return
-            restarted.set()
-            await asyncio.Event().wait()
-        finally:
-            active -= 1
-
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        semantic_review_runner=returning_semantic_review_runner,
-        semantic_review_restart_delay_seconds=0,
-    )
-
-    log_path = app.state.log_directory / "telegram-kol.log"
-    with TestClient(app) as client:
-        assert restarted.wait(timeout=1)
-        for _ in range(20):
-            log_text = log_path.read_text(encoding="utf-8")
-            if "Semantic review runner exited unexpectedly; restarting" in log_text:
-                break
-            client.get("/api/freshness")
-            time.sleep(0.01)
-
-        assert calls == 2
-        assert max_active == 1
-
-    assert "Semantic review runner exited unexpectedly; restarting" in log_text
-
-
-def test_semantic_review_worker_failure_is_logged_and_restarted(tmp_path):
-    restarted = threading.Event()
-    calls = 0
-
-    async def failing_semantic_review_runner(**kwargs):
-        nonlocal calls
-        calls += 1
-        if calls == 1:
-            raise RuntimeError("semantic worker crashed")
-        restarted.set()
-        await asyncio.Event().wait()
-
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        semantic_review_runner=failing_semantic_review_runner,
-        semantic_review_restart_delay_seconds=0,
-    )
-
-    log_path = app.state.log_directory / "telegram-kol.log"
-    with TestClient(app) as client:
-        assert restarted.wait(timeout=1)
-        for _ in range(20):
-            log_text = log_path.read_text(encoding="utf-8")
-            if "Semantic review runner exited with error; restarting" in log_text:
-                break
-            client.get("/api/freshness")
-            time.sleep(0.01)
-
-    assert calls == 2
-    assert "Semantic review runner exited with error; restarting" in log_text
-    assert "semantic worker crashed" in log_text
-
-
-def test_semantic_review_worker_is_cleaned_up_when_lifespan_startup_fails(
-    tmp_path, monkeypatch
-):
-    async def fake_semantic_review_runner(**kwargs):
-        await asyncio.Event().wait()
-
-    def fail_live_listener_startup(**kwargs):
-        raise RuntimeError("live listener startup failed")
-
-    monkeypatch.setattr(
-        "telegram_kol_research.web_app.launch_live_listener_task",
-        fail_live_listener_startup,
-    )
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        live_target_titles={"Demo Group"},
-        telegram_client=object(),
-        semantic_review_runner=fake_semantic_review_runner,
-    )
-
-    with pytest.raises(RuntimeError, match="live listener startup failed"):
-        with TestClient(app):
-            pass
-
-    assert app.state.semantic_review_task is None
-
-
 def test_root_page_renders_successfully(tmp_path):
     app = create_web_app(database_path=tmp_path / "research.db")
     client = TestClient(app)
@@ -1923,49 +1668,6 @@ def test_worker_command_mode_api_round_trips_without_changing_message_modes(
     assert response.json()["worker_command_mode"] == "queue"
     assert reloaded.json()["worker_command_mode"] == "queue"
     assert reloaded.json()["message_pipeline_mode"] == "queue"
-
-
-def test_semantic_review_enabled_api_round_trips_without_changing_runtime_modes(
-    tmp_path,
-):
-    app = create_web_app(database_path=tmp_path / "research.db")
-    save_trading_settings(
-        app.state.session_factory,
-        {
-            "message_pipeline_mode": "queue",
-            "worker_command_mode": "queue",
-        },
-    )
-    client = TestClient(app)
-
-    default = client.get("/api/trading-settings")
-    enabled = client.post(
-        "/api/trading-settings", json={"semantic_review_enabled": True}
-    )
-    reloaded = client.get("/api/trading-settings")
-
-    assert default.status_code == 200
-    assert default.json()["semantic_review_enabled"] is False
-    assert enabled.status_code == 200
-    assert reloaded.json()["semantic_review_enabled"] is True
-    assert reloaded.json()["message_pipeline_mode"] == "queue"
-    assert reloaded.json()["worker_command_mode"] == "queue"
-
-
-def test_semantic_review_enabled_api_rejects_non_boolean_without_changing_state(
-    tmp_path,
-):
-    client = TestClient(create_web_app(database_path=tmp_path / "research.db"))
-
-    response = client.post(
-        "/api/trading-settings", json={"semantic_review_enabled": "false"}
-    )
-
-    assert response.status_code == 422
-    assert "semantic_review_enabled" in response.json()["detail"]
-    assert client.get("/api/trading-settings").json()[
-        "semantic_review_enabled"
-    ] is False
 
 
 def test_web_app_state_has_no_process_wide_message_lock(tmp_path):
@@ -5633,7 +5335,6 @@ def test_message_recognition_api_updates_message_result(tmp_path):
                 agreement_status="agreed",
                 differences=[],
                 mimo=SimpleNamespace(model="mimo-v2.5", payload={}, status=result.status),
-                deepseek_payload=None,
             ),
             automation={"status": "skipped", "reason": "test"},
         )
@@ -5685,7 +5386,6 @@ def test_message_recognition_api_runs_auto_trade_executor_after_recognition(tmp_
                 agreement_status="agreed",
                 differences=[],
                 mimo=SimpleNamespace(model="mimo-v2.5", payload={}, status=result.status),
-                deepseek_payload=None,
             ),
             automation=app.state.auto_trade_executor(message_id),
         )
@@ -5735,7 +5435,6 @@ def test_message_recognition_api_delivers_completed_instruction_summary(
         recognition=result,
         assessment=SimpleNamespace(
             agreement_status="pending",
-            semantic_review_status="pending",
             differences=[],
             mimo=SimpleNamespace(model="mimo-v2.5"),
         ),
@@ -5772,7 +5471,7 @@ def test_message_recognition_api_delivers_completed_instruction_summary(
     assert deliveries[0]["chat_title"] == "VIP room"
 
 
-def test_message_recognition_api_reports_pending_without_scheduling_review(
+def test_message_recognition_api_reports_pending_without_scheduling_a_notification(
     tmp_path, monkeypatch
 ):
     database_path = tmp_path / "research.db"
@@ -5799,7 +5498,7 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
         auto_trade_calls.append(raw_message_id) or {"status": "submitted"}
     )
     def fake_schedule_authoritative_notification(**kwargs):
-        raise AssertionError("manual recognition must not schedule semantic review")
+        raise AssertionError("manual recognition must not schedule a notification")
 
     monkeypatch.setattr(
         "telegram_kol_research.web_app._schedule_authoritative_notification",
@@ -5829,7 +5528,6 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
                     payload={"reason": "MiMo认为这是取消旧挂单"},
                     error_message=None,
                 ),
-                deepseek_payload=None,
             ),
             automation=app.state.auto_trade_executor(message_id),
         )
@@ -5842,7 +5540,6 @@ def test_message_recognition_api_reports_pending_without_scheduling_review(
     assert response.status_code == 200
     assert response.json()["ai_conflict"] is False
     assert response.json()["agreement_status"] == "pending"
-    assert response.json()["semantic_review_status"] == "pending"
     assert response.json()["notification_scheduled"] is False
     assert response.json()["auto_trade"] == {"status": "submitted"}
     assert auto_trade_calls == [raw_message_id]
@@ -5888,7 +5585,6 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
             ),
             assessment=SimpleNamespace(
                 agreement_status="authoritative_failed",
-                semantic_review_status="completed",
                 differences=[],
                 mimo=SimpleNamespace(
                     model="mimo-v2.5",
@@ -5896,7 +5592,6 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
                     payload={},
                     error_message="The read operation timed out",
                 ),
-                deepseek_payload=None,
             ),
             automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
         )
@@ -5965,7 +5660,6 @@ def test_message_recognition_api_does_not_alert_without_an_auxiliary_model(
             ),
             assessment=SimpleNamespace(
                 agreement_status="authoritative_failed",
-                semantic_review_status="completed",
                 differences=[],
                 mimo=SimpleNamespace(
                     model="mimo-v2.5",
@@ -5973,7 +5667,6 @@ def test_message_recognition_api_does_not_alert_without_an_auxiliary_model(
                     payload={},
                     error_message="The read operation timed out",
                 ),
-                deepseek_payload=None,
             ),
             automation={"status": "skipped", "reason": "mimo_authoritative_failed"},
         )
@@ -5985,83 +5678,6 @@ def test_message_recognition_api_does_not_alert_without_an_auxiliary_model(
     assert response.status_code == 200
     assert response.json()["notification_scheduled"] is False
     assert [row["notification_status"] for row in audit] == ["suppressed_no_auxiliary"]
-
-
-@pytest.mark.parametrize("semantic_review_status", ["execution_pending", "execution_running"])
-def test_message_recognition_api_preserves_execution_review_state(
-    tmp_path, semantic_review_status
-):
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
-    )
-    with app.state.session_factory() as session:
-        raw_message = RawMessage(chat_id=88, message_id=4, text="BTC long")
-        session.add(raw_message)
-        session.commit()
-        raw_message_id = raw_message.id
-
-    result = MessageRecognitionResult(
-        raw_message_id=raw_message_id,
-        status="是策略",
-        summary="BTC long",
-        reason=None,
-        parse_source="mimo",
-    )
-    app.state.authoritative_processor = lambda _message_id: SimpleNamespace(
-        recognition=result,
-        assessment=SimpleNamespace(
-            agreement_status="agreed",
-            semantic_review_status=semantic_review_status,
-            differences=["must-not-be-returned-before-review"],
-            mimo=SimpleNamespace(model="mimo-v2.5"),
-        ),
-        automation={"status": "pending"},
-    )
-
-    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
-
-    assert response.status_code == 200
-    assert response.json()["semantic_review_status"] == semantic_review_status
-    assert response.json()["agreement_status"] == "pending"
-    assert response.json()["ai_conflict"] is False
-    assert response.json()["differences"] == []
-
-
-def test_message_recognition_api_defaults_review_to_pending_not_immediate_agreement(tmp_path):
-    app = create_web_app(
-        database_path=tmp_path / "research.db",
-        ai_recognition_config_path=tmp_path / "ai_recognition.yaml",
-    )
-    with app.state.session_factory() as session:
-        raw_message = RawMessage(chat_id=88, message_id=5, text="BTC long")
-        session.add(raw_message)
-        session.commit()
-        raw_message_id = raw_message.id
-
-    result = MessageRecognitionResult(
-        raw_message_id=raw_message_id,
-        status="是策略",
-        summary="BTC long",
-        reason=None,
-        parse_source="mimo",
-    )
-    app.state.authoritative_processor = lambda _message_id: SimpleNamespace(
-        recognition=result,
-        assessment=SimpleNamespace(
-            agreement_status="agreed",
-            differences=[],
-            mimo=SimpleNamespace(model="mimo-v2.5"),
-        ),
-        automation={"status": "pending"},
-    )
-
-    response = TestClient(app).post(f"/api/messages/{raw_message_id}/recognize")
-
-    assert response.status_code == 200
-    assert response.json()["semantic_review_status"] == "pending"
-    assert response.json()["agreement_status"] == "pending"
-    assert response.json()["ai_conflict"] is False
 
 
 def test_strategy_mid_panel_loads_only_visible_strategy_list(tmp_path, monkeypatch):

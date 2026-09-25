@@ -200,7 +200,6 @@ def test_outcome_recorded_is_finalize_only_and_never_replays_adapter(tmp_path):
         session_factory,
         attempt_id=claim.attempt_id,
         claim_token=claim.claim_token,
-        semantic_review_enabled=False,
         finalized_at=NOW,
         adapter=lambda: adapter_calls.append("called"),
     )

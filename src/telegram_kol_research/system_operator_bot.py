@@ -1431,64 +1431,6 @@ async def send_stall_induced_expiry_notification(
     )
 
 
-def format_semantic_disagreement_notification(payload: dict[str, Any]) -> str:
-    """Format a final critical semantic review as a read-only audit notice."""
-
-    deepseek = payload.get("deepseek") if isinstance(payload.get("deepseek"), dict) else {}
-    mimo = payload.get("mimo") if isinstance(payload.get("mimo"), dict) else {}
-    automation = payload.get("automation") if isinstance(payload.get("automation"), dict) else {}
-    evidence = deepseek.get("evidence")
-    if not isinstance(evidence, list):
-        evidence = []
-    grounded_evidence = "；".join(
-        str(item).strip() for item in evidence if str(item).strip()
-    )
-    conflict_types = payload.get("conflict_types")
-    if not isinstance(conflict_types, list):
-        conflict_types = deepseek.get("conflict_types")
-    if not isinstance(conflict_types, list):
-        conflict_types = []
-    conflicts = ", ".join(
-        str(item).strip() for item in conflict_types if str(item).strip()
-    )
-    source_label = (
-        payload.get("chat_title")
-        or payload.get("group_label")
-        or payload.get("sender_name")
-        or "-"
-    )
-    source = (
-        f"{source_label} / {payload.get('chat_id') or '-'} / "
-        f"#{payload.get('message_id') or '-'}"
-    )
-    lines = [
-        "【AI语义严重分歧】",
-        f"原始来源: {source}",
-        f"时间: {_format_local_time(payload.get('posted_at'))}",
-        (
-            "权威结果: MiMo / "
-            f"{_format_value(mimo.get('status'))} / "
-            f"{_truncate_text(mimo.get('reason'), limit=400)}"
-        ),
-        (
-            "自动化结果: "
-            f"{_format_value(automation.get('status'))} / "
-            f"{_truncate_text(automation.get('reason'), limit=400)}"
-        ),
-        (
-            "复核结果: DeepSeek / "
-            f"{_format_value(deepseek.get('status'))} / "
-            f"{_truncate_text(deepseek.get('reason'), limit=400)}"
-        ),
-        f"冲突类型: {_truncate_text(conflicts, limit=400)}",
-        f"依据: {_truncate_text(grounded_evidence, limit=700)}",
-        "处理状态: 已按MiMo结果继续，未等待人工复核；消息已处理，不需要审批。",
-        "原文:",
-        _truncate_text(payload.get("text"), limit=900),
-    ]
-    return "\n".join(lines)
-
-
 def format_position_attribution_incident_message(payload: dict[str, Any]) -> str:
     state = str(payload.get("state") or "unassigned")
     state_label = {
@@ -3814,18 +3756,6 @@ async def send_ai_recognition_conflict_review(
     await send_system_operator_bot_message(
         config=config,
         text=format_ai_recognition_conflict_review_message(payload),
-    )
-
-
-async def send_semantic_disagreement_notification(
-    *,
-    config: SystemOperatorBotConfig,
-    payload: dict[str, Any],
-) -> None:
-    await send_system_operator_bot_message(
-        config=config,
-        text=format_semantic_disagreement_notification(payload),
-        reply_markup=None,
     )
 
 

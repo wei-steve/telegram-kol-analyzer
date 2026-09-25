@@ -60,7 +60,6 @@ models:
 # 每个环节能绑哪些模型，取决于它的能力要求：
 #   authoritative_recognition  文本 + 图片（生产主路径）
 #   context_resolution         文本（生产）
-#   semantic_review            文本（生产，只读顾问）
 #   strategy_alert             文本（生产，当 bot token 配置时）；空 = 沿用
 #                              TELEGRAM_KOL_ALERT_LLM_MODEL / TELEGRAM_KOL_LLM_*
 #   batch_text_recognition     文本（只有 CLI / 批量工具）
@@ -70,8 +69,6 @@ stages:
   authoritative_recognition:
   - mimo-v2.5
   context_resolution:
-  - deepseek-v4-flash
-  semantic_review:
   - deepseek-v4-flash
   strategy_alert: []
   batch_text_recognition:

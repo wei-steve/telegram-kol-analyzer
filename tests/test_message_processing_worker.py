@@ -330,10 +330,8 @@ def test_real_leased_nested_failure_is_classified_and_outer_job_is_not_succeeded
                 model="mimo-v2.5",
                 status="非策略",
             ),
-            deepseek_payload=None,
             agreement_status="pending",
             differences=[],
-            semantic_review_status="execution_pending",
             authoritative_generation=str(saved.comparison_claim_token),
         )
 

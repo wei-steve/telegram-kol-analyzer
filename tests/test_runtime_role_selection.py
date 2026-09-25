@@ -21,6 +21,32 @@ def _refresh_endpoint(app):
     )
 
 
+
+#: Every worker singleton on ``origin/main`` at 467d45f2, the commit the
+#: semantic-review retirement branched from.
+RETIREMENT_BASELINE_WORKER_TASKS = frozenset(
+    {
+        "authoritative_gap_recovery_loop",
+        "break_even_convergence_worker",
+        "contract_spec_refresh",
+        "deepcoin_private_ws",
+        "deepcoin_reconcile",
+        "lifecycle_monitor",
+        "message_operation_supervisor",
+        "message_processing_worker",
+        "position_snapshot_startup",
+        "runtime_incident_notification",
+        "semantic_review",
+        "source_message_deletion_worker",
+        "strategy_management_notification",
+        "strategy_management_worker",
+        "system_operator_bot_command",
+        "telegram_bot_command",
+        "worker_command_worker",
+    }
+)
+
+
 @pytest.mark.parametrize("role", ["all", "ingest", "worker", "web"])
 def test_runtime_role_selector_accepts_only_the_closed_role_set(role):
     from telegram_kol_research import web_app
@@ -270,7 +296,6 @@ def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
         "message_processing_worker",
         "position_snapshot_startup",
         "runtime_incident_notification",
-        "semantic_review",
         "source_message_deletion_worker",
         "strategy_management_notification",
         "strategy_management_worker",
@@ -278,6 +303,39 @@ def test_runtime_role_partition_preserves_the_phase_6_responsibility_boundary():
         "telegram_bot_command",
         "worker_command_worker",
     }
+
+
+def test_the_retirement_removed_semantic_review_and_nothing_else(tmp_path):
+    """``semantic_review`` is the only worker singleton the 2026-09-25 batch took.
+
+    The set above is a literal, so an accidental extra deletion would read as a
+    deliberate edit. This states the delta instead: the retired task is gone,
+    and every other worker singleton -- and every ingest and web one -- is still
+    there. It also proves the worker lifespan no longer carries the task's
+    ``app.state`` slot, which is what actually starts it.
+    """
+
+    from telegram_kol_research import web_app
+    from telegram_kol_research.web_app import create_web_app
+
+    worker_tasks = web_app.runtime_role_singleton_tasks("worker")
+    assert "semantic_review" not in worker_tasks
+    assert worker_tasks == RETIREMENT_BASELINE_WORKER_TASKS - {"semantic_review"}
+    assert web_app.runtime_role_singleton_tasks("ingest") == {
+        "live_listener",
+        "reconcile",
+    }
+    assert web_app.runtime_role_singleton_tasks("web") == set()
+    assert web_app.runtime_role_singleton_tasks("all") == (
+        worker_tasks | {"live_listener", "reconcile"}
+    )
+
+    app = create_web_app(
+        database_path=tmp_path / "worker-singletons.db",
+        runtime_role="worker",
+    )
+    assert not hasattr(app.state, "semantic_review_task")
+    assert not hasattr(app.state, "semantic_review_runner")
 
 
 @pytest.mark.parametrize("role", ["all", "ingest", "worker", "web"])
@@ -307,7 +365,6 @@ def test_non_worker_lifespans_do_not_start_worker_singletons(role, tmp_path):
         assert app.state.break_even_convergence_worker_task is None
         assert app.state.source_message_deletion_worker_task is None
         assert app.state.worker_command_worker_task is None
-        assert app.state.semantic_review_task is None
 
 
 @pytest.mark.parametrize("role", ["ingest", "web"])

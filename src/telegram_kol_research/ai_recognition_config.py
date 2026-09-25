@@ -802,7 +802,6 @@ def migrate_v1_ai_config(
         "context_resolution": _chain(
             str(context_resolution_model_id or "").strip() or text_id
         ),
-        "semantic_review": _chain(text_id),
         "strategy_alert": [],
         "batch_text_recognition": _chain(text_id),
         "batch_image_recognition": _chain(

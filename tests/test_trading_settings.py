@@ -109,31 +109,37 @@ def test_worker_command_mode_rejects_values_that_could_enable_unknown_authority(
         trading_settings_from_payload({"worker_command_mode": value})
 
 
-def test_semantic_review_enabled_round_trips_without_changing_runtime_modes(tmp_path):
-    session_factory = create_session_factory(tmp_path / "semantic-review-settings.db")
+def test_a_retired_setting_key_is_ignored_instead_of_refused(tmp_path):
+    """``semantic_review_enabled`` was removed on 2026-09-25 with its path.
+
+    Production never had a row for it, but a stale page or an old script can
+    still post the key. It has to be dropped the way ``message_lock_mode`` is
+    (ARCHITECTURE §3): a settings write that refuses an unknown key would turn
+    one stale caller into a save that fails, and the remaining settings in the
+    same payload must land untouched.
+    """
+
+    session_factory = create_session_factory(tmp_path / "retired-setting.db")
     save_trading_settings(
         session_factory,
         {
             "message_pipeline_mode": "queue",
             "worker_command_mode": "queue",
+            "message_processing_max_parallel_chats": 7,
         },
     )
 
-    enabled = save_trading_settings(
-        session_factory, {"semantic_review_enabled": True}
+    saved = save_trading_settings(
+        session_factory,
+        {"semantic_review_enabled": True, "message_processing_max_parallel_chats": 9},
     )
     reloaded = load_trading_settings(session_factory)
 
-    assert enabled.semantic_review_enabled is True
-    assert reloaded.semantic_review_enabled is True
+    assert not hasattr(saved, "semantic_review_enabled")
+    assert trading_settings_from_payload({"semantic_review_enabled": "nonsense"})
+    assert reloaded.message_processing_max_parallel_chats == 9
     assert reloaded.message_pipeline_mode == "queue"
     assert reloaded.worker_command_mode == "queue"
-
-
-@pytest.mark.parametrize("value", ["false", "true", 0, 1, None, [], {}])
-def test_semantic_review_enabled_rejects_non_boolean_values(value):
-    with pytest.raises(ValueError, match="semantic_review_enabled"):
-        trading_settings_from_payload({"semantic_review_enabled": value})
 
 
 def test_revision_target_min_confidence_round_trips_independently(tmp_path):
@@ -295,7 +301,7 @@ def test_unrelated_save_preserves_message_parallel_chat_limit(tmp_path):
 
     saved = save_trading_settings(
         session_factory,
-        {"semantic_review_enabled": False},
+        {"telegram_source_deletion_exit_enabled": False},
     )
 
     assert saved.message_processing_max_parallel_chats == 3

@@ -153,10 +153,8 @@ logger = logging.getLogger(__name__)
 class AuthoritativeAssessment:
     raw_message_id: int
     mimo: MimoAuthoritativeResult
-    deepseek_payload: dict[str, Any] | None
     agreement_status: str
     differences: list[str]
-    semantic_review_status: str = "not_applicable"
     authoritative_generation: str | None = None
     context_resolution: ContextResolutionDecision | None = None
     context_resolution_triggers: tuple[str, ...] = ()
@@ -271,8 +269,8 @@ def compare_assessments(
 ) -> tuple[str, list[str]]:
     """Field-level differences between two recognition payloads.
 
-    The parameters used to be called ``mimo_payload`` and ``deepseek_payload``,
-    from a design where two vendors answered the same message and were compared.
+    The parameters used to be named after two vendors, from a design where two
+    of them answered the same message and were compared.
     That has not been true for a long time: the only caller is the prompt
     centre's A/B test (``prompt_testing``), which passes the *active* prompt's
     answer and the *draft* prompt's answer -- from the same model. The vendor
@@ -1411,12 +1409,8 @@ def assess_message_authoritatively(
     return AuthoritativeAssessment(
         raw_message_id=raw_message_id,
         mimo=mimo,
-        # A completed prior review remains in the audit row, but never enters
-        # the synchronous return payload or execution decision.
-        deepseek_payload=None,
         agreement_status=saved.agreement_status,
         differences=list(json.loads(saved.differences_json or "[]")),
-        semantic_review_status=saved.comparison_status,
         authoritative_generation=(
             saved.comparison_claim_token
             if saved.comparison_status == "execution_pending"
@@ -2286,9 +2280,6 @@ def _load_completed_execution_for_automatic_retry(
                     session_factory,
                     attempt_id=attempt_id,
                     claim_token=claim_token,
-                    semantic_review_enabled=load_trading_settings(
-                        session_factory
-                    ).semantic_review_enabled,
                     finalized_at=datetime.now(UTC),
                 )
             except RuntimeError:
@@ -2343,10 +2334,8 @@ def _load_completed_execution_for_automatic_retry(
                     else {}
                 ),
             ),
-            deepseek_payload=None,
             agreement_status=str(decision.agreement_status),
             differences=list(json.loads(decision.differences_json or "[]")),
-            semantic_review_status=str(decision.comparison_status),
             authoritative_generation=None,
         )
         recognition = MessageRecognitionResult(
@@ -2461,22 +2450,17 @@ def _run_legacy_authoritative_execution(
             automation_reason=automation_reason,
         )
     else:
-        semantic_review_enabled = load_trading_settings(
-            session_factory
-        ).semantic_review_enabled
         finalized = finalize_authoritative_automation_outcome(
             session_factory,
             raw_message_id=raw_message_id,
             authoritative_generation=assessment.authoritative_generation,
             automation_status=automation_status,
             automation_reason=automation_reason,
-            semantic_review_enabled=semantic_review_enabled,
         )
         assessment = replace(
             assessment,
             agreement_status=finalized.agreement_status,
             differences=list(json.loads(finalized.differences_json or "[]")),
-            semantic_review_status=finalized.comparison_status,
             authoritative_generation=None,
         )
     return recognition, automation, assessment
@@ -2621,21 +2605,16 @@ def _run_leased_authoritative_execution(
             recorded_at=datetime.now(UTC),
         ):
             raise RuntimeError("authoritative_outcome_record_cas_failed")
-        semantic_review_enabled = load_trading_settings(
-            session_factory
-        ).semantic_review_enabled
         finalized = finalize_recorded_authoritative_execution(
             session_factory,
             attempt_id=lease_claim.attempt_id,
             claim_token=lease_claim.claim_token,
-            semantic_review_enabled=semantic_review_enabled,
             finalized_at=datetime.now(UTC),
         )
         assessment = replace(
             assessment,
             agreement_status=finalized.agreement_status,
             differences=list(json.loads(finalized.differences_json or "[]")),
-            semantic_review_status=finalized.comparison_status,
             authoritative_generation=None,
         )
         return recognition, automation, assessment

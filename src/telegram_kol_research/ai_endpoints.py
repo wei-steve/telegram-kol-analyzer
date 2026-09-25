@@ -5,9 +5,9 @@ Design: ``docs/plans/2026-09-13-ai-provider-model-routing-design.md`` §9.3.
 Seven call sites used to join this URL themselves, under three different
 rules, and none of them worked for the providers phase 6 adds:
 
-* ``message_recognition`` / ``context_resolution`` /
-  ``semantic_disagreement_review``: "append ``/chat/completions`` when the base
-  ends in ``/v1``, else ``/v1/chat/completions``".
+* ``message_recognition`` / ``context_resolution``: "append
+  ``/chat/completions`` when the base ends in ``/v1``, else
+  ``/v1/chat/completions``".
 * ``strategy_alerts`` / ``llm_chat``: always ``/v1/chat/completions``.
 * The MiMo direct call and the daily probe: always ``/chat/completions``.
 

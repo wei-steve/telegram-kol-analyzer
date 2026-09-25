@@ -1,10 +1,7 @@
 from pathlib import Path
 
 from telegram_kol_research.ai_recognition_config import AiRecognitionConfig
-from telegram_kol_research.prompt_defaults import (
-    SEMANTIC_DISAGREEMENT_REVIEW_PROMPT,
-    build_prompt_seeds_from_legacy,
-)
+from telegram_kol_research.prompt_defaults import build_prompt_seeds_from_legacy
 
 
 SRC = Path(__file__).parents[1] / "src/telegram_kol_research"
@@ -24,13 +21,25 @@ AI_CALL_MODULES = {
 NO_EMBEDDED_PROMPT_MODULES = AI_CALL_MODULES | {"llm_chat.py"}
 
 
-def test_prompt_inventory_contains_semantic_disagreement_review():
+def test_prompt_inventory_no_longer_seeds_the_retired_review_prompt():
+    """``trading.disagreement.semantic_review`` is not seeded any more.
+
+    The row an existing production database already holds is taken offline by a
+    separate database operation, not by this code path; what this pins is that a
+    fresh database never grows the definition back.
+    """
+
     keys = {
         seed.prompt_key
         for seed in build_prompt_seeds_from_legacy(AiRecognitionConfig())
     }
 
-    assert SEMANTIC_DISAGREEMENT_REVIEW_PROMPT in keys
+    assert "trading.disagreement.semantic_review" not in keys
+    assert keys == {
+        "trading.analysis.shared",
+        "trading.analysis.mimo_vision",
+        "strategy.alert.classifier",
+    }
 
 
 def test_every_ai_call_site_uses_prompt_registry_without_embedded_business_prompts():

@@ -33,10 +33,8 @@ KNOWN_BLOCKING_CALLS = frozenset(
         "deepcoin_private_ws.run_forever -> compute_backoff_delay",
         "lifecycle_monitor._fetch_candles_full -> _candle_from_payload",
         "lifecycle_monitor._scan_contract -> _utc_naive",
-        "semantic_disagreement_review.run_semantic_review_loop -> utc_now",
         # The queue stall monitor reads the clock once per tick and, only when
-        # it is about to alert, formats two instants with ``strftime``. Same
-        # class as the ``run_semantic_review_loop -> utc_now`` entry above: no
+        # it is about to alert, formats two instants with ``strftime``: no
         # session, no client, no network. Its one database read goes through
         # ``asyncio.to_thread`` and is not listed here.
         "message_processing_worker.run_message_processing_queue_stall_monitor"
@@ -63,7 +61,6 @@ KNOWN_BLOCKING_CALLS = frozenset(
         "telegram_bot_commands.run_telegram_bot_command_loop"
         " -> _message_is_from_alert_chat",
         "telegram_bot_commands.run_telegram_bot_command_loop -> split_telegram_message",
-        "web_app._supervise_semantic_review_runner -> _build_semantic_review_notifier",
         "web_app.run_deepcoin_execution_reconcile_loop -> system_operator_bot_enabled",
         # Phase 3 wake accounting: reads an exception's own attributes and
         # appends one dict to an in-memory list. No session, no client, no

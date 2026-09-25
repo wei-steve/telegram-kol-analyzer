@@ -51,7 +51,6 @@ def test_stage_catalogue_matches_the_design_table():
     assert AI_STAGE_KEYS == (
         "authoritative_recognition",
         "context_resolution",
-        "semantic_review",
         "strategy_alert",
         "batch_text_recognition",
         "batch_image_recognition",
@@ -67,7 +66,6 @@ def test_stage_catalogue_matches_the_design_table():
     assert image.production_path is False
     for text_stage in (
         "context_resolution",
-        "semantic_review",
         "strategy_alert",
         "batch_text_recognition",
     ):
@@ -106,6 +104,39 @@ def test_a_stage_that_was_removed_is_dropped_with_a_warning(tmp_path):
     assert "research_chat" not in reloaded["stages"]
 
 
+def test_a_retired_semantic_review_stage_is_dropped_with_a_warning(tmp_path):
+    """An existing file still says ``semantic_review: [...]`` (retired 2026-09-25).
+
+    Same shape as ``research_chat`` above, and the same reason it matters: the
+    file on the server was written by the page before the stage was retired, and
+    a configuration that refuses to load stops recognition entirely. The binding
+    is dropped, reported, and taken out of the file on the next save.
+    """
+
+    path = tmp_path / 'ai_recognition.yaml'
+    raw = yaml.safe_load(
+        Path('config/ai_recognition.example.yaml').read_text(encoding='utf-8')
+    )
+    raw['stages']['semantic_review'] = ['deepseek-v4-flash']
+    path.write_text(
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding='utf-8'
+    )
+
+    config = load_ai_recognition_config(path)
+
+    assert 'semantic_review' not in config.stages
+    assert list(config.stages) == list(AI_STAGE_KEYS)
+    assert any('semantic_review' in item for item in config.config_warnings)
+    # The stages that *are* still bound came through untouched.
+    assert config.stages['authoritative_recognition'] == ['mimo-v2.5']
+    assert config.stages['context_resolution'] == ['deepseek-v4-flash']
+
+    save_ai_recognition_config(path, config)
+    reloaded = yaml.safe_load(path.read_text(encoding='utf-8'))
+    assert 'semantic_review' not in reloaded['stages']
+    assert load_ai_recognition_config(path).config_warnings == ()
+
+
 def test_runtime_incident_agent_is_deliberately_not_a_stage():
     assert "runtime_incident_agent" not in AI_STAGE_KEYS
 
@@ -123,7 +154,6 @@ def test_the_shipped_example_is_v2_and_binds_every_production_stage():
     assert config.stages == {
         "authoritative_recognition": ["mimo-v2.5"],
         "context_resolution": ["deepseek-v4-flash"],
-        "semantic_review": ["deepseek-v4-flash"],
         "strategy_alert": [],
         "batch_text_recognition": ["deepseek-v4-flash"],
         "batch_image_recognition": ["glm-ocr"],
@@ -168,7 +198,6 @@ def test_example_v1_config_migrates_every_stage_to_production_behaviour(tmp_path
     assert config.stages == {
         "authoritative_recognition": ["mimo-v2.5"],
         "context_resolution": ["deepseek-v4-flash"],
-        "semantic_review": ["deepseek-v4-flash"],
         "strategy_alert": [],
         "batch_text_recognition": ["deepseek-v4-flash"],
         "batch_image_recognition": ["glm-ocr"],

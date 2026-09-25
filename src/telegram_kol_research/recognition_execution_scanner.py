@@ -32,7 +32,6 @@ from telegram_kol_research.models import (
     RecognitionDecision,
     RecognitionExecutionScanCursor,
 )
-from telegram_kol_research.trading_settings import load_trading_settings
 
 
 SCAN_FAMILIES = (
@@ -276,9 +275,6 @@ def _inspect_row(session_factory, *, family, row, now, owner_liveness):
                     session_factory,
                     attempt_id=int(row.id),
                     claim_token=str(row.claim_token),
-                    semantic_review_enabled=load_trading_settings(
-                        session_factory
-                    ).semantic_review_enabled,
                     finalized_at=now,
                 )
             else:

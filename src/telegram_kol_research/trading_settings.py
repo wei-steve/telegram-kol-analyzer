@@ -105,7 +105,6 @@ class TradingSettings:
     message_processing_max_parallel_chats: int = 20
     message_pipeline_mode: Literal["queue"] = "queue"
     worker_command_mode: Literal["queue"] = "queue"
-    semantic_review_enabled: bool = False
     authoritative_gap_recovery_max_age_minutes: float = 15.0
     deferred_resume_timeout_minutes: float = 30.0
     # A-5 task 3: a management batch parked in ``recovery_required`` used to
@@ -707,11 +706,6 @@ def trading_settings_from_payload(payload: dict[str, Any] | None) -> TradingSett
         ),
         message_pipeline_mode=message_pipeline_mode,
         worker_command_mode=worker_command_mode,
-        semantic_review_enabled=_boolean_setting(
-            raw,
-            "semantic_review_enabled",
-            defaults.semantic_review_enabled,
-        ),
         authoritative_gap_recovery_max_age_minutes=(
             authoritative_gap_recovery_max_age_minutes
         ),
