@@ -243,7 +243,9 @@ def load_recovery_signals_from_db(
                 take_profit_text=candidate.take_profit_text,
                 symbol=candidate.symbol,
             )
-            if not geometry.passed:
+            if not geometry.passed and _recovery_symbol_allowed(
+                runtime_config, symbol=candidate.symbol
+            ):
                 geometry_alerts.append(
                     {
                         "raw_message_id": int(raw_message.id),
@@ -355,6 +357,33 @@ def evaluate_recovery_signals_with_market_data(
         )
 
     return evaluations
+
+
+def _recovery_symbol_allowed(
+    runtime_config: dict[str, object],
+    *,
+    symbol: str | None,
+) -> bool:
+    """Whether this symbol is one the executor would accept.
+
+    丙 (2026-09-25). This path already narrowed the geometry alert to
+    ``trading_mode == "auto_trade"`` groups but never looked at the whitelist,
+    so a symbol the executor refuses outright still produced a 人工复核
+    notification. The list read here is ``runtime_config["symbol_whitelist"]``,
+    which is the *global* whitelist: ``run_recovery_dry_run`` -- the only caller
+    -- passes a config already through
+    ``apply_trading_settings_to_group_config``, and that function replaces every
+    group's list with ``settings.allowed_symbols``. Reading the database a
+    second time here would ask the same question of the same row.
+    """
+
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return False
+    whitelist = runtime_config.get("symbol_whitelist") or []
+    return normalized in {
+        str(allowed).strip().upper() for allowed in whitelist
+    }
 
 
 def _resolve_runtime_config(

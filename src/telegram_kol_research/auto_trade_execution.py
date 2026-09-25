@@ -880,6 +880,17 @@ def _auto_process_single_message_trade_signal(
             now=now,
         )
         return {"status": "skipped", "reason": ENTRY_NOT_REPLAYED}
+    # 丙 (2026-09-25). Resolved here rather than at the two gates below, which
+    # still read these same two values further down: the geometry notification a
+    # few lines from now must answer the same "would we ever place this order"
+    # question the gates ask, and both functions are pure reads of the config and
+    # the settings already in hand.
+    runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
+    runtime_config = _resolve_runtime_config(
+        runtime_group_config,
+        raw_message=raw_message,
+        source=source,
+    )
     candidate_geometry = validate_candidate_entry_price_geometry(
         side=candidate.side,
         entry_text=candidate.entry_text,
@@ -888,7 +899,11 @@ def _auto_process_single_message_trade_signal(
         symbol=candidate.symbol,
         allow_reference_entry=True,
     )
-    if not candidate_geometry.passed:
+    if not candidate_geometry.passed and _entry_geometry_notice_in_scope(
+        runtime_config,
+        symbol=candidate.symbol,
+        settings=settings,
+    ):
         _enqueue_entry_geometry_rejection(
             session_factory,
             raw_message=raw_message,
@@ -939,12 +954,6 @@ def _auto_process_single_message_trade_signal(
             execution_contract_mode=execution_contract_mode,
         )
 
-    runtime_group_config = apply_trading_settings_to_group_config(group_config, settings)
-    runtime_config = _resolve_runtime_config(
-        runtime_group_config,
-        raw_message=raw_message,
-        source=source,
-    )
     if runtime_config is None:
         return _record_entry_auto_trade_skip(
             session_factory,
@@ -1729,6 +1738,46 @@ def _record_entry_geometry_rejection(
         "reason": reason,
         "geometry": evidence,
         "execution_event_id": int(event_id),
+    }
+
+
+def _entry_geometry_notice_in_scope(
+    runtime_config: dict[str, object] | None,
+    *,
+    symbol: str | None,
+    settings,
+) -> bool:
+    """Whether a geometry refusal for this candidate is worth a person's time.
+
+    丙 (2026-09-25), the same rule as 乙 and for the same reason: the group must
+    trade (``trading_mode == "auto_trade"``) and the symbol must be in the
+    global whitelist. The pre-candidate geometry check runs *before* both of
+    those gates, so a notify_only group and a symbol the executor refuses
+    outright were both producing 人工复核 notifications -- 书'shu-crypto's TRUTH
+    on 2026-09-25 was one of each at once. An unresolvable group config counts
+    as out of scope, the same way ``group_not_configured_for_auto_trade`` does
+    a few lines later.
+
+    Guarding the enqueue in place, rather than relocating it below the two
+    gates: everything between them and it -- ``mimo_symbol_review``,
+    ``auto_trade_disabled`` (the *global* entry switch), ``deployment_entry_
+    frozen``, ``deepcoin_client_unavailable``, ``lifecycle_event_not_new_entry``
+    -- returns early, so a move would also silence geometry review for an
+    auto-trade group on a whitelisted symbol whenever one of those held. That
+    is a second behaviour change nobody asked for, and the narrowing that *was*
+    asked for needs only this predicate. Neither the geometry judgement itself
+    nor the order and meaning of any ``auto_trade_skipped`` branch changes.
+    """
+
+    if runtime_config is None:
+        return False
+    if str(runtime_config.get("trading_mode") or "") != "auto_trade":
+        return False
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return False
+    return normalized in {
+        str(allowed).strip().upper() for allowed in settings.allowed_symbols
     }
 
 

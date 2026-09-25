@@ -2,7 +2,7 @@
 
 设计稿：`docs/plans/2026-09-25-group-symbol-scoped-approvals-design.md`（2026-09-25 用户已批准）
 分支：`group-symbol-scoped-approvals`，基线 `origin/main` = `bf52fbd9`（生产 HEAD `f2fa9d9f`）
-状态：甲（1/2/3）、乙 已完成；丙 进行中
+状态：甲（1/2/3）、乙、丙 已完成。未部署、未推送。
 
 本文件是下一个读者的唯一进度依据。每块记落点、为什么这么选、测试、以及上线时人工要做的事。
 
@@ -154,6 +154,56 @@ YAML 那份不是真正把关下单的值。
 回归：`tests/test_lifecycle_monitor.py`、`tests/test_lifecycle_expiry_review_auto_closeout.py`、
 `tests/test_lifecycle_exit_intents.py`、`tests/test_candidates.py`、
 `tests/test_entry_confirm_sizing_and_lifecycle.py` 全绿（60 项）。
+
+---
+
+## 丙 几何拒绝通知同一口径
+
+**落点 1**：`src/telegram_kol_research/auto_trade_execution.py`
+`_auto_process_single_message_trade_signal`
+
+- 把 `apply_trading_settings_to_group_config` + `_resolve_runtime_config` 这两句
+  **上提**到几何校验之前（两个都是纯函数：前者构造一个新 `GroupConfig`，
+  后者只读配置），下面原来的两道闸继续用这同一份 `runtime_config`，位置与顺序不动；
+- 几何通知的入队改成带判定：
+  `if not candidate_geometry.passed and _entry_geometry_notice_in_scope(runtime_config, symbol=…, settings=settings)`；
+- 新增 `_entry_geometry_notice_in_scope(runtime_config, *, symbol, settings)`：
+  `runtime_config is None` → 出局；`trading_mode != "auto_trade"` → 出局；
+  symbol 不在 `settings.allowed_symbols` → 出局。
+
+**我没有按字面「把这段几何通知移到那两道闸之后」，而是原地加判定。** 理由：
+几何通知与那两道闸之间全是早退分支——`mimo_symbol_review`、
+`auto_trade_disabled`（**全局**入场开关）、`deployment_entry_frozen`、
+`deepcoin_client_unavailable`、`lifecycle_event_not_new_entry`——
+真把入队挪到闸后，这些状态下 auto_trade 群 × 白名单币的几何问题也会一起哑掉。
+这不是用户要的第二个行为改动，而用户要的那一个只需要这条判定。
+
+这不是推测：仓库里已经有一条专门写来固定这个行为的测试——
+`tests/test_auto_trade_execution.py::test_wrong_geometry_candidate_alerts_even_when_entry_submission_is_disabled`
+断言**全局自动交易关掉时几何告警照样发**。按字面移动会直接弄坏它。
+几何判定本身、`auto_trade_skipped` 各分支的语义与顺序都没动。
+
+**落点 2**：`src/telegram_kol_research/recovery_scan.py`
+`load_recovery_signals_from_db` 的 `geometry_alerts` 入队，
+补上 `_recovery_symbol_allowed(runtime_config, symbol=…)`。
+这里的白名单取 `runtime_config["symbol_whitelist"]`，它就是**全局**白名单：
+唯一的调用者 `run_recovery_dry_run` 传进来的 config 已经过
+`apply_trading_settings_to_group_config`，而那个函数把每个群的白名单整体换成
+`settings.allowed_symbols`。再读一次数据库等于对同一行问同一个问题。
+narrowing 只影响「通知谁」，不影响这条扫描看见什么（signals 仍然照旧返回）。
+
+### 丙 的测试
+
+`tests/test_entry_geometry_notice_scope.py`（5 项，全绿）：
+
+- auto_trade 群 × 白名单币 → 照旧入队一条（对照组）；
+- notify_only 群 → 不入队，`reason` 仍是 `kol_or_group_auto_trade_disabled`；
+- auto_trade 群 × `TRUTH`（生产实例）→ 不入队，`reason` 仍是 `symbol_not_allowed`；
+- 配置里没有的 chat → 不入队，`reason` 仍是 `group_not_configured_for_auto_trade`；
+- 恢复扫描：同一轮里 BTC 入队、TRUTH 不入队，两条 signal 都照旧返回。
+
+回归：`tests/test_auto_trade_execution.py`、`tests/test_recovery_scan.py`（116 项）
+与另外 10 个含 geometry 的测试文件（888 项）全绿。
 
 ---
 
