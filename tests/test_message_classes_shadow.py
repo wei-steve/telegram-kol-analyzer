@@ -186,6 +186,60 @@ def test_a_shared_template_without_the_new_field_can_no_longer_be_published():
     assert any("message_classes" in error for error in result.errors)
 
 
+def test_the_gate_no_longer_demands_a_field_the_live_prompt_has_never_had():
+    """A v8-lineage template plus the new block must be publishable.
+
+    The live version (``ai_prompt_versions.id = 8``, published 2026-08-05) has
+    never carried ``entry_fragments``; the marker demanding it was added to this
+    gate afterwards, and because the gate runs on save/publish and never on
+    render, nothing surfaced it. The effect was that no new version built on the
+    running prompt could be published at all. This pins the shape that had to
+    become publishable: everything the live version has, plus the
+    classification block, and no ``entry_fragments`` anywhere.
+    """
+
+    i0 = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT.index("【消息分类 message_classes】")
+    i1 = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT.index("【新开仓识别】")
+    classification_block = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT[i0:i1]
+    k0 = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT.index('  "message_classes": [')
+    k1 = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT.index('  "instructions": [')
+    json_block = DEFAULT_SHARED_TRADING_ANALYSIS_PROMPT[k0:k1]
+    v8_lineage = "\n".join(
+        [
+            "你是 Telegram 加密货币 KOL 消息的交易策略分析器。",
+            classification_block.replace("entry_fragments", "entry_context"),
+            "【新开仓识别】",
+            "- lifecycle_event 的 event_type 可为 none、entry_confirm、cancel_entry、"
+            "exit_position、position_update。",
+            "- order_type 只能是 market、limit、market+limit；side 只能是 long 或 short。",
+            "只输出一个 JSON 对象：",
+            "{",
+            json_block,
+            '  "recognition_result": "是策略 | 非策略 | 识别失败",',
+            '  "reason": "",',
+            '  "strategy": {"symbol": null, "side": null, "entry": null,',
+            '    "stop_loss": null, "take_profit": null, "leverage": null,',
+            '    "order_type": null},',
+            '  "lifecycle_event": {"event_type": "none", "target_lifecycle_id": null,',
+            '    "management_action": null},',
+            '  "input_reading": {"observed_text": "", "image_quality": "none"},',
+            '  "confidence": 0.0',
+            "}",
+        ]
+    )
+
+    assert "entry_fragments" not in v8_lineage
+
+    result = validate_prompt_content(
+        SHARED_TRADING_PROMPT,
+        v8_lineage,
+        validation_profile="trading_shared",
+        required_variables=(),
+    )
+
+    assert result.success is True, result.errors
+
+
 def test_the_validation_gate_is_not_on_the_render_path_of_the_active_prompt():
     """The active production version must never be rejected at recognition time.
 

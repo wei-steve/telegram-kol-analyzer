@@ -116,7 +116,18 @@ def validate_prompt_content(
             '"event_type"', '"target_lifecycle_id"', '"management_action"',
             '"input_reading"', '"observed_text"', '"image_quality"',
             '"confidence"',
-            '"entry_fragments"',
+            # ``"entry_fragments"`` was here and is deliberately not any more.
+            # It was added to this list after the active production version was
+            # published (2026-08-05) and that version has never carried the
+            # field, so the requirement has never been met by the prompt that
+            # actually runs -- and because this gate runs on save/publish and
+            # never on render, nothing surfaced it. The effect was that *no*
+            # new version built on the live one could be published at all.
+            # entry_fragments has also never appeared in production output (0
+            # of the last 939 authoritative decisions), so requiring it here
+            # asserted a contract the system does not have. Restore it once the
+            # live prompt actually carries the field; the separate
+            # investigation into why it never shipped owns that decision.
             # The first-pass classification contract (design §2). A shared
             # trading template without these cannot be published, so no prompt
             # version can silently drop the field once it exists. This runs on
