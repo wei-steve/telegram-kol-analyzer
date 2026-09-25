@@ -131,6 +131,49 @@ recognition_result / strategy` 八个。也就是说：新的写入点与回读�
 
 部署后零 `Traceback`。
 
+### 发布提示词版本时撞到的事实：生产 v8 比代码种子**旧**（2026-09-25，待用户决策）
+
+准备发布带 `message_classes` 的新版本时，先读了生产库里真正在跑的那份，结果与设计稿 §2
+的假设不符。设计稿说「在现有 `trading.analysis.shared` 输出对象里新增」，写这句话时参照的是
+**代码种子**；生产跑的 v8 是另一回事。
+
+**提示词版本历史**（`ai_prompt_definitions.id = 1`，只有四个版本）：
+
+| version id | 编号 | 状态 | 发布时间 | change_note |
+|---|---|---|---|---|
+| 1 | 1 | superseded | 2026-07-13 | Initial registry seed |
+| 6 | 2 | superseded | 2026-07-21 | Support explicit multi-target management |
+| 7 | 3 | superseded | 2026-07-22 | 唯一归属的"求稳可走/稳健者可走"执行全平… |
+| **8** | 4 | **published** | **2026-08-05** | Add reviewed entry preamble risk-multipl… |
+
+**生产 v8 比改动前的代码种子少 1407 个字符**，缺的是：`instructions` 整块、
+`entry_fragments`（【相邻入场消息片段】整节）、以及 `strategy: null` 的新写法。
+
+**三件已核实的事实：**
+
+1. **生产 v8 拿改动前的校验器就已经过不了**，缺 `"entry_fragments"` marker。
+   那个 marker 是 v8 发布（2026-08-05）之后才加进 `validate_prompt_content` 的，
+   而提示词从此没再发布过。校验只在保存/发布路径跑、不在渲染路径跑，所以它一直没被发现。
+   **后果：任何以 v8 为基础的新版本都发不出去**，除非先处理这个 marker。
+2. **`entry_fragments` 在生产输出里从来没出现过**：最近 939 条权威决策中 **0 条**含它
+   （按主键索引范围查询，未做全表扫描）。代码里有完整的 `entry_strategy_fragments`
+   消费链和「半仓 = 0.5 / 分腿 / 补仓」的设计，但**提示词从来没要求模型输出它**——
+   这个功能在生产上是死的。
+3. **`instructions` 出现 65/939（7%）**，但提示词里根本没提它。这些是**代码写的**，
+   不是模型答的——`_resolved_mimo_result` 在上下文解析后会写 `payload["instructions"]`。
+   这也解释了 `authoritative_instructions._legacy_management_kind`
+   （从 `lifecycle_event` 倒推 kind）为什么是承重结构：生产的模型从来不直接给 instructions。
+
+**因此发布这一步被挡住，等用户在三个方案里选一个**（详见当次对话）：
+- **甲（最小、真惰性）**：v9 = v8 + 只加 `message_classes`；为此要处理校验器里那个
+  生产从来没满足过的 `"entry_fragments"` marker。行为真零变化，立刻能拿阶段 2 的数据。
+- **乙（顺带补齐 entry_fragments）**：会让模型第一次开始输出 `entry_fragments`，
+  而它有真实消费者——**这是行为变化，不是 L1**，须按 L2 另行批准。
+- **丙（全量对齐代码种子）**：同时引入 `instructions` 与 `entry_fragments` 要求，
+  改动面最大，不在本次批准范围内。
+
+无论选哪个，**「`entry_fragments` 为什么从未上线」都应单独立项**，它与本设计无关。
+
 ### 落地时的自主判断（设计稿未写明的地方）
 
 1. **缺字段 vs 显式 `null`。** §2.1 说「缺字段 = 违规」，§8 又说阶段 1 必须容忍没有新字段的
