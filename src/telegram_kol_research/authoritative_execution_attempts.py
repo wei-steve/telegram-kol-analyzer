@@ -623,9 +623,19 @@ def finalize_recorded_authoritative_execution(
             or row.status != "outcome_recorded"
         ):
             raise RuntimeError("authoritative outcome is not finalizeable")
-        # The semantic-disagreement review was retired on 2026-09-25, and
-        # production ran with it switched off for its whole life, so this is
-        # the only branch that ever executed here.
+        # The semantic-disagreement review was retired on 2026-09-25. This used
+        # to be the ``else`` of a branch on ``semantic_review_enabled``; the
+        # other side set comparison_status from agreement_status instead.
+        #
+        # The review is not merely off now -- it is gone, and so is the setting
+        # that could turn it back on, so only this side can be reached. It is
+        # **not** true that only this side was ever reached: production has
+        # 4664 `agreed` and 1283 `disagreed` decisions and 5902 rows with a
+        # non-null comparison_model, so the review did run for a stretch before
+        # it was switched off. Those rows are still in the table and still
+        # carry those values; anything reading agreement_status has to expect
+        # them, and a future reader should not conclude from this comment that
+        # they are impossible.
         lease_release_values = {
             "agreement_status": "review_disabled",
             "comparison_status": "completed",
