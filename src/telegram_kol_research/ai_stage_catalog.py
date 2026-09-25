@@ -220,8 +220,8 @@ AI_STAGE_KEYS: tuple[str, ...] = tuple(
     definition.stage_key for definition in AI_STAGE_DEFINITIONS
 )
 
-#: The stage whose chain head every other MiMo-facing check follows: the daily
-#: probe, the provider-health derivation and the prompt centre's "mimo" test.
+#: The stage whose chain head the derived checks follow: the daily probe, the
+#: provider-health derivation and the prompt centre's historical-message test.
 AUTHORITATIVE_STAGE = "authoritative_recognition"
 CONTEXT_RESOLUTION_STAGE = "context_resolution"
 SEMANTIC_REVIEW_STAGE = "semantic_review"

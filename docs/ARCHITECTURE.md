@@ -545,8 +545,14 @@ stages:               # 环节 → 有序模型 id 列表；第 1 个主用，�
 | `batch_text_recognition` | 离线/批量文本识别（V1 `recognize_message_now`，含生命周期事件 AI） | 文本 | 否，只有 CLI / 批量工具 | `message_recognition._batch_text_provider`（只取链首，单次尝试） |
 | `batch_image_recognition` | 离线/批量图片识别（V1；GLM-OCR 走 layout_parsing，其他走多模态 chat） | 图片 | 否，只有 CLI / 批量工具 | `message_recognition._batch_image_provider`（只取链首，单次尝试） |
 
-派生：每日探测（`mimo_provider_probe`）与提示词中心的 mimo 测试跟随
-`authoritative_recognition` 链首；提示词中心的 deepseek 测试跟随 `batch_text_recognition` 链首。
+派生：每日探测（`mimo_provider_probe`）跟随 `authoritative_recognition` 链首。
+**提示词中心的历史消息测试也走这个环节**：候选就是 `authoritative_recognition` 的链
+（`prompt_testing.PROMPT_TEST_STAGE_BY_PROMPT_KEY`），默认取链首，换绑自动跟随。
+`trading.analysis.shared` 与 `trading.analysis.mimo_vision` 都归这个环节——
+后者是前者的图片补充规则，生产里两段合成同一条 system prompt 送进这条链。
+图片提示词只能选 `supports_image` 的模型，判据是**能力**不是厂商名。
+2026-09-25 之前这里是两个硬编码 kind（`mimo` / `deepseek`），
+`deepseek` 取的是 `batch_text_recognition` 链首——一个根本不在生产路径上的环节。
 
 曾经有第 7 个环节 `research_chat`（Web 群消息问答）。它的页面入口 2026-06-14 就从所有模板里
 删掉了，`POST /api/chat` 在删除前 30 天零调用，`ai_prompt_invocations` 里从未有过它的记录，

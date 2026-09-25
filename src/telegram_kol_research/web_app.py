@@ -81,6 +81,7 @@ from telegram_kol_research.ai_recognition_config import (
     build_ai_prompt_views,
     load_ai_recognition_config,
     save_ai_recognition_config,
+    stage_definition,
 )
 from telegram_kol_research.deepcoin_contract_specs import DeepcoinContractSpecProvider
 from telegram_kol_research.deepcoin_contract_spec_cache import (
@@ -212,11 +213,7 @@ from telegram_kol_research.prompt_composition import (
     render_registered_prompt,
     validate_prompt_content,
 )
-from telegram_kol_research.prompt_defaults import (
-    MIMO_VISION_PROMPT,
-    SHARED_TRADING_PROMPT,
-    seed_default_prompt_registry,
-)
+from telegram_kol_research.prompt_defaults import seed_default_prompt_registry
 from telegram_kol_research.prompt_registry import (
     PromptDetail,
     PromptInvocationRecord,
@@ -231,7 +228,12 @@ from telegram_kol_research.prompt_registry import (
     rollback_prompt,
     save_prompt_draft,
 )
-from telegram_kol_research.prompt_testing import run_prompt_draft_test
+from telegram_kol_research.prompt_testing import (
+    prompt_test_models,
+    prompt_test_stage_key,
+    resolve_prompt_test_model,
+    run_prompt_draft_test,
+)
 from telegram_kol_research.recognition_profiles import list_recognition_profiles
 from telegram_kol_research.execution_bindings import bind_deepcoin_position_to_lifecycle
 from telegram_kol_research.execution_bindings import list_active_positions
@@ -9752,6 +9754,45 @@ def create_web_app(
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         return _prompt_detail_response(detail)
 
+    @app.get("/api/ai-prompts/{prompt_key}/test-models")
+    def list_ai_prompt_test_models(prompt_key: str):
+        """The models the prompt centre offers for this prompt's test run.
+
+        They are the stage's current chain, so the page shows model ids that
+        change when somebody rebinds the stage rather than two vendor names
+        that stopped describing what gets called.
+        """
+
+        try:
+            detail = get_prompt_detail(app.state.session_factory, prompt_key)
+        except PromptRegistryNotFound as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if detail.category != "trading":
+            raise HTTPException(
+                status_code=422, detail="historical tests support trading prompts only"
+            )
+        try:
+            stage_key = prompt_test_stage_key(prompt_key)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        definition = stage_definition(stage_key)
+        chain = prompt_test_models(config, prompt_key)
+        return {
+            "stage_key": stage_key,
+            "stage_label": definition.label if definition is not None else stage_key,
+            "items": [
+                {
+                    "id": model.id,
+                    "label": model.label or model.id,
+                    "model": model.model,
+                    "supports_image": model.supports_image,
+                    "is_default": index == 0,
+                }
+                for index, model in enumerate(chain)
+            ],
+        }
+
     @app.post("/api/ai-prompts/{prompt_key}/test")
     def test_ai_prompt_draft(
         prompt_key: str,
@@ -9762,9 +9803,14 @@ def create_web_app(
             raw_message_ids = [
                 int(value) for value in (payload.get("raw_message_ids") or [])
             ]
-            model_kinds = [
-                str(value) for value in (payload.get("model_kinds") or ["mimo"])
-            ]
+            # No id means "whatever the stage starts with". That default is
+            # the point of the change: it follows a rebind instead of naming a
+            # vendor that stopped being true.
+            model_ids = [
+                str(value).strip()
+                for value in (payload.get("model_ids") or [])
+                if str(value).strip()
+            ] or [None]
         except (TypeError, ValueError) as exc:
             raise HTTPException(status_code=422, detail=str(exc)) from exc
         if not raw_message_ids:
@@ -9781,26 +9827,33 @@ def create_web_app(
             )
         if detail.draft_version is None or detail.draft_version.id != draft_version_id:
             raise HTTPException(status_code=409, detail="draft version changed")
-        if not model_kinds or any(kind not in {"mimo", "deepseek"} for kind in model_kinds):
-            raise HTTPException(status_code=422, detail="unsupported model kind")
-        if prompt_key == MIMO_VISION_PROMPT and set(model_kinds) != {"mimo"}:
-            raise HTTPException(
-                status_code=422, detail="MiMo vision prompt can only be tested with MiMo"
-            )
-        if len(raw_message_ids) * len(model_kinds) > 20:
+        if len(raw_message_ids) * len(model_ids) > 20:
             raise HTTPException(status_code=422, detail="at most 20 model calls per test")
 
         config = load_ai_recognition_config(app.state.ai_recognition_config_path)
+        # Resolve every requested model before the first call, so an
+        # unusable one costs nothing. The image rule lives in that resolver
+        # and is a capability check on the model, not a vendor name.
+        try:
+            stage_key = prompt_test_stage_key(prompt_key)
+            models = [
+                resolve_prompt_test_model(
+                    config, prompt_key=prompt_key, model_id=model_id
+                )
+                for model_id in model_ids
+            ]
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
         items: list[dict[str, Any]] = []
         for raw_message_id in raw_message_ids:
-            for model_kind in model_kinds:
+            for model in models:
                 try:
                     result = app.state.prompt_test_runner(
                         app.state.session_factory,
                         prompt_key=prompt_key,
                         draft_version_id=draft_version_id,
                         raw_message_id=raw_message_id,
-                        model_kind=model_kind,
+                        model_id=model.id,
                         ai_recognition_config=config,
                         media_root=app.state.media_root,
                     )
@@ -9810,7 +9863,9 @@ def create_web_app(
                     {
                         "test_run_id": result.test_run_id,
                         "raw_message_id": raw_message_id,
-                        "model_kind": model_kind,
+                        "model_id": model.id,
+                        "model": model.model,
+                        "stage_key": stage_key,
                         "active_payload": result.active_payload,
                         "draft_payload": result.draft_payload,
                         "differences": result.differences,

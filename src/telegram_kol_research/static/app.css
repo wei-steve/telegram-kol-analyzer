@@ -1813,7 +1813,10 @@ body {
   background: rgba(15, 23, 42, .5);
 }
 .prompt-test-controls label { display: grid; gap: 5px; }
-.prompt-test-controls > div { display: flex; gap: 12px; }
+/* The model picker plus the one-line note about where its options come from,
+   stacked rather than side by side -- it used to hold two checkboxes. */
+.prompt-test-controls > div { display: grid; gap: 4px; }
+.prompt-test-controls > div select { min-width: 200px; }
 .prompt-comparison-result {
   max-height: 420px;
   overflow: auto;

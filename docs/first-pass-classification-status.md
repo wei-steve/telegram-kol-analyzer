@@ -285,14 +285,80 @@ model_kind 都有 completed 历史测试」的那段整块删掉。保留的是*
 新测试 `test_a_trading_prompt_publishes_on_validation_alone` 证明：
 中间不跑 `/test` 也能发布，而未校验仍然 409——删掉的是厂商闸门，没有放松其余部分。
 
-#### 处置 2 · 提示词测试改成按 stage 取模型（**下一批，已批准方向**）
+#### 处置 2 · 提示词测试改成按 stage 取模型（**本地完成，2026-09-25，未部署**）
 
-现状：`prompt_testing` 有两个硬编码 kind，`mimo` 走 `_find_mimo_model`、
-`deepseek` 走 `_deepseek_provider`（= `batch_text_recognition` 链首）。两个名字都已脱离现实——
-2026-09-25 的实测里 `mimo` 这个 kind 实际调用的是 `gpt-5.6-luna`。
-**要改成：测试直接用相关 stage 当前绑定的模型**，换模型自动跟随，不再产生新的命名债。
+分支 `prompt-test-stage-models`（基线 `origin/main` `0dd05f25`）。L1：只改提示词中心的
+只读对照测试路径，不碰识别/执行，也不改数据库结构。
 
-波及面（已核实）：
+**改成了什么。** 接口从 `model_kinds: ["mimo", "deepseek"]` 变成 `model_ids: [<模型 id>]`，
+候选由 `prompt_testing.prompt_test_models()` 从 `ai_model_router.resolve_stage_chain`
+取，默认链首，不传 id 就是链首。新增 `GET /api/ai-prompts/{key}/test-models` 给页面
+提供候选（链首标 `is_default`），页面的两个厂商勾选框换成一个下拉。
+删掉了 `_model_name` / `_deepseek_provider` 和那条独立的 httpx DeepSeek 调用分支——
+现在两次对照都走 `_call_mimo_direct_model`，也就是 `authoritative_recognition`
+生产用的同一个调用器。`_find_mimo_model` 本身留着（`recognition_experiments`
+与每日探测仍在用），只是 `prompt_testing` 不再 import 它。
+
+**stage 对应关系（已核实，不是照抄）。** 两个提示词都归 `authoritative_recognition`：
+`recognition_experiments.py:510` 和 `:1283` 用 `compose_trading_prompt(model_kind="mimo")`
+把 `trading.analysis.shared` + `trading.analysis.mimo_vision` 合成一条 system prompt
+送进 `resolve_authoritative_chain`，也就是 `authoritative_recognition` 链
+（`prompt_composition.py:56-59` 是合成处）。`trading.analysis.shared` 另外还被
+`batch_text_recognition` 合成（`message_recognition.py:253`、`:2835`），但按
+ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候选**——拿生产不会
+调的模型测交易提示词，正是「DeepSeek 复核」这个误导的来源。判断写进
+`PROMPT_TEST_STAGE_BY_PROMPT_KEY`，一条用例断言两个键都指向它。
+
+**图片限制换成能力判据。** 原来是 `set(model_kinds) != {"mimo"}`；现在是
+`model.supports_image`。同一份配置里两个模型都绑在同一环节，只差这一个标志位：
+能读图的通过（肯定式断言：返回该模型、endpoint 200、`model_id` 回显），
+不能读图的被拒（`cannot read images`）。候选列表也过滤掉不能读图的，页面不会
+先给出一个随后会被拒的选项。变异检验：同时关掉解析器里的能力检查和候选过滤，
+这条用例转红（拒绝理由从 `cannot read images` 变成 `not a usable member`）。
+
+**空链行为。** 环节没有可用模型（没绑、或 provider 被禁用/没填 base_url）→
+`PromptTestModelError`（`ValueError` 子类，web 层照原样转 422），
+**在写任何 `ai_prompt_test_runs` 行之前**就拒。这是行为变化：旧代码在这里回退到
+字面量 `"mimo-v2.5"`，然后写一行 status=failed、model 指向没人配过的模型。
+两条用例（模块级 + endpoint 级）都断言一行都没写、runner 一次都没被调。
+
+**`ai_prompt_test_runs.model_kind` 这一列现在存 stage key**（`authoritative_recognition`），
+不是模型 id。理由：同表已有 `model` 列存实际模型名，模型 id 与模型名信息高度重合；
+而旧行里的 `mimo` / `deepseek` 本来就是「某个环节的链首」的意思
+（分别是 `authoritative_recognition` 与 `batch_text_recognition`），存 stage key
+就是把同一个事实说准，而且换绑模型后它仍然为真。`String(32)` 装得下
+（`authoritative_recognition` 25 字符）。**列没删**（删列是 L3），列名的债留在原处，
+新含义写在 `models.py` 该列的注释里。
+
+**文案。** `_ai_prompt_center.html` 的「DeepSeek = A + C / MiMo = A + B + C」改成
+「送给模型的 = A + B + C」加一行「权威识别环节当前绑定的模型，换绑后自动跟随」；
+`index.html` 与 `ai_recognition_config.py` 的 `tag=` 从「DeepSeek / …」「MiMo / …」
+改成「批量文本识别 / …」「权威识别 / …」，即按环节而不是按厂商命名。
+`test_web_page_render.py` 顺带加了两条反向断言，钉住这两个厂商串不再出现在页面上。
+`app.css` 里那两个勾选框用的横排规则改成竖排（下拉 + 一行来源说明）。
+
+**明确没做**：没删 `model_kind` 列；没恢复发布闸门（处置 1 已删）；没碰
+`semantic_review`（处置 3）；没碰首次分析契约 / `message_classes` / 候选集合过滤；
+未部署、未动生产库、未发布提示词版本。
+`system_operator_bot.py:1469/1479` 的「权威结果: MiMo / 复核结果: DeepSeek /」
+也是厂商字眼，但属于分析复核的通知文案，留给处置 3。
+
+**测试。** 全套 `9666 passed, 4 skipped`（基线 9648/4，净增 18 条，没有新的 skip）。
+新增/改写的用例分布：`tests/test_prompt_testing.py` +11、
+`tests/test_web_prompt_registry.py` 2 条改成 9 条、`tests/test_ai_stage_routing.py`
+把 `test_the_prompt_centre_deepseek_test_follows_the_batch_text_chain` 换成
+`..._follows_the_authoritative_chain`、`tests/test_web_page_render.py` 换断言。
+两项变异检验都转红：关掉能力检查 + 候选过滤 → 图片用例红；
+把默认值钉成某个名字而不是链首 → 换绑用例红。
+
+**留给下一个读者的两个观察。**
+1. `templates/index.html:89` 那句 `<label>` 文案是乱码（`鎻愮ず璇?`，本该是「提示词」），
+   在本批改动之前就在，属于编码事故不是命名债，没动它。
+2. `mimo_direct_prompt` 这个配置字段名、`trading.analysis.mimo_vision` 这个提示词键、
+   `_call_mimo_direct_model` 这个函数名都还带 `mimo`。改字段名要动配置文件，
+   改提示词键要动生产库里的定义行，都不是本批的 L1 范围。
+
+波及面（原清单，全部处理完）：
 
 | 位置 | 内容 |
 |---|---|

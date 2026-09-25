@@ -8,8 +8,8 @@
   </div>
 
   <div class="prompt-composition-guide" aria-label="模型提示词组合">
-    <span><strong>DeepSeek = A + C</strong><small>统一交易规则 + 当前消息/策略上下文</small></span>
-    <span><strong>MiMo = A + B + C</strong><small>统一交易规则 + 图片规则 + 当前消息/图片/策略上下文</small></span>
+    <span><strong>送给模型的 = A + B + C</strong><small>统一交易规则 + 图片规则 + 当前消息/图片/策略上下文</small></span>
+    <span><strong>测试用哪个模型</strong><small>权威识别环节当前绑定的模型，换绑后自动跟随</small></span>
   </div>
 
   <label class="prompt-mobile-selector">
@@ -60,8 +60,10 @@
       <section class="prompt-test-controls" data-ai-prompt-test-controls>
         <label>历史消息数据库 ID（逗号分隔，最多 20 条）<input data-ai-prompt-test-message-ids placeholder="例如 123, 456" /></label>
         <div>
-          <label><input type="checkbox" value="mimo" data-ai-prompt-test-model checked /> MiMo</label>
-          <label><input type="checkbox" value="deepseek" data-ai-prompt-test-model checked /> DeepSeek</label>
+          <label>测试模型
+            <select data-ai-prompt-test-model aria-label="历史消息测试使用的模型"></select>
+          </label>
+          <p class="ai-helper-text" data-ai-prompt-test-model-note></p>
         </div>
       </section>
 

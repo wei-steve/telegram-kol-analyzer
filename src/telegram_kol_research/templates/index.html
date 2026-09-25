@@ -100,7 +100,7 @@
           <section class="ai-prompt-card">
             <div class="ai-prompt-card-head">
               <div>
-                <span class="ai-prompt-tag">DeepSeek / 文本策略识别</span>
+                <span class="ai-prompt-tag">批量文本识别 / 文本策略识别</span>
                 <h3>单条消息是否为新开仓策略</h3>
               </div>
               <small>在线生效</small>
@@ -115,7 +115,7 @@
           <section class="ai-prompt-card">
             <div class="ai-prompt-card-head">
               <div>
-                <span class="ai-prompt-tag">DeepSeek / 生命周期识别</span>
+                <span class="ai-prompt-tag">批量文本识别 / 生命周期识别</span>
                 <h3>入场、撤单、平仓、仓位管理事件</h3>
               </div>
               <small>在线生效</small>
@@ -130,12 +130,12 @@
           <section class="ai-prompt-card">
             <div class="ai-prompt-card-head">
               <div>
-                <span class="ai-prompt-tag">MiMo / 多模态直识别</span>
+                <span class="ai-prompt-tag">权威识别 / 多模态直识别</span>
                 <h3>文字和图片一起直接判断</h3>
               </div>
               <small>实验链路</small>
             </div>
-            <p>用于 MiMo 小样本实验；直接发送文字和原图，不复用 GLM-OCR 结果。</p>
+            <p>用于权威识别环节当前绑定的模型；直接发送文字和原图，不复用图片转文字的结果。</p>
             <label>
               提示词
               <textarea name="mimo_direct_prompt" data-ai-mimo-direct-prompt-input>{{ ai_recognition_config.mimo_direct_prompt }}</textarea>

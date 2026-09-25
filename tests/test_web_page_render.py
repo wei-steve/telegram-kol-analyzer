@@ -1282,8 +1282,13 @@ image_provider:
         "data-ai-prompt-rollback",
     ):
         assert control in response.text
-    assert "DeepSeek = A + C" in response.text
-    assert "MiMo = A + B + C" in response.text
+    # The composition note and the test target are described by what they are,
+    # not by a vendor: the options come from the stage binding at runtime.
+    assert "送给模型的 = A + B + C" in response.text
+    assert "权威识别环节当前绑定的模型" in response.text
+    assert "data-ai-prompt-test-model" in response.text
+    for vendor in ("DeepSeek = A", "MiMo = A"):
+        assert vendor not in response.text
     assert "never-render-this-secret" not in response.text
     assert "never-render-this-image-secret" not in response.text
 

@@ -566,12 +566,45 @@ def test_glm_ocr_is_still_decided_by_the_chain_heads_model_name():
     assert _is_glm_ocr_model(_batch_image_provider(ocr).model) is True
 
 
-def test_the_prompt_centre_deepseek_test_follows_the_batch_text_chain():
-    from telegram_kol_research.prompt_testing import _model_name
+def test_the_prompt_centre_test_follows_the_authoritative_chain():
+    """It used to follow two vendor names; now it follows the binding.
 
-    config = _chain_config("batch_text_recognition", BACKUP, PRIMARY)
+    The ``deepseek`` kind this test replaced pointed at
+    ``batch_text_recognition``, a stage that is not on the production path at
+    all, so a trading prompt was being measured against a model production
+    never asks. Both testable prompts now follow ``authoritative_recognition``,
+    which is the one stage that sends either of them to a model live.
+    """
 
-    assert _model_name(config, "deepseek") == BACKUP
+    from telegram_kol_research.prompt_defaults import (
+        MIMO_VISION_PROMPT,
+        SHARED_TRADING_PROMPT,
+    )
+    from telegram_kol_research.prompt_testing import (
+        prompt_test_models,
+        prompt_test_stage_key,
+        resolve_prompt_test_model,
+    )
+
+    config = _chain_config(
+        "authoritative_recognition", BACKUP, PRIMARY, image=True
+    )
+
+    for prompt_key in (SHARED_TRADING_PROMPT, MIMO_VISION_PROMPT):
+        assert prompt_test_stage_key(prompt_key) == "authoritative_recognition"
+        assert [model.id for model in prompt_test_models(config, prompt_key)] == [
+            BACKUP,
+            PRIMARY,
+        ]
+        assert (
+            resolve_prompt_test_model(config, prompt_key=prompt_key).model == BACKUP
+        )
+
+    # Bound to the CLI-only stage instead, the same models are not candidates.
+    batch_only = _chain_config(
+        "batch_text_recognition", BACKUP, PRIMARY, image=True
+    )
+    assert prompt_test_models(batch_only, SHARED_TRADING_PROMPT) == []
 
 
 def test_stage_head_provider_falls_back_to_the_v1_field():

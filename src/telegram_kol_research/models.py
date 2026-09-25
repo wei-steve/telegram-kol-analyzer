@@ -1944,6 +1944,14 @@ class AiPromptTestRun(Base):
         index=True,
     )
     model: Mapped[str] = mapped_column(String(128), nullable=False)
+    #: The AI stage whose binding this run followed, e.g.
+    #: ``authoritative_recognition``. Rows written before 2026-09-25 hold
+    #: ``mimo`` / ``deepseek`` instead, which already meant "the head of one
+    #: stage's chain" (``authoritative_recognition`` and
+    #: ``batch_text_recognition`` respectively) -- the stage key is that same
+    #: fact stated precisely, and unlike a vendor name it stays true when the
+    #: bound model changes. Which model actually answered is the ``model``
+    #: column above. The name is kept because dropping a column is L3 work.
     model_kind: Mapped[str] = mapped_column(
         String(32), nullable=False, default="unknown"
     )

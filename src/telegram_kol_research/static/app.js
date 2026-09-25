@@ -3585,13 +3585,9 @@ function renderPromptDetail() {
   detail.querySelector('[data-ai-prompt-publish]').disabled = !promptCenterState.validated;
   detail.querySelector('[data-ai-prompt-import-legacy]').hidden = true;
   const isTrading = item.category === 'trading';
-  const isVision = item.prompt_key === 'trading.analysis.mimo_vision';
   detail.querySelector('[data-ai-prompt-test]').disabled = !isTrading;
   detail.querySelector('[data-ai-prompt-test-controls]').hidden = !isTrading;
-  detail.querySelectorAll('[data-ai-prompt-test-model]').forEach((input) => {
-    input.disabled = !isTrading || (isVision && input.value === 'deepseek');
-    input.checked = isTrading && (input.value === 'mimo' || !isVision);
-  });
+  if (isTrading) loadPromptTestModels(item.prompt_key);
   detail.querySelectorAll('[data-ai-prompt-view]').forEach((button) => {
     button.classList.toggle('is-active', button.dataset.aiPromptView === 'draft');
   });
@@ -3602,6 +3598,34 @@ function renderPromptDetail() {
   const select = document.querySelector('[data-ai-prompt-mobile-select]');
   if (select) select.value = `${item.prompt_key}|${item.scope_chat_id || ''}`;
   setPromptCenterStatus(promptCenterState.validated ? '草稿已通过校验' : '');
+}
+
+// The test runs on whatever the stage is bound to now, so the options come
+// from the server rather than from two vendor names baked into the page.
+async function loadPromptTestModels(promptKey) {
+  const select = document.querySelector('[data-ai-prompt-test-model]');
+  const note = document.querySelector('[data-ai-prompt-test-model-note]');
+  if (!select) return;
+  select.innerHTML = '';
+  try {
+    const payload = await promptApiRequest(promptApiPath(promptKey, 'test-models'));
+    if (promptCenterState.selected?.prompt_key !== promptKey) return;
+    (payload.items || []).forEach((model) => {
+      const option = document.createElement('option');
+      option.value = model.id;
+      option.textContent = model.is_default ? `${model.id}（链首，默认）` : model.id;
+      select.appendChild(option);
+    });
+    select.disabled = !(payload.items || []).length;
+    if (note) {
+      note.textContent = (payload.items || []).length
+        ? `候选来自「${payload.stage_label}」环节当前绑定的模型链`
+        : `「${payload.stage_label}」环节还没有可用模型，请先在「AI模型选择」里绑定一个`;
+    }
+  } catch (error) {
+    select.disabled = true;
+    if (note) note.textContent = error.message;
+  }
 }
 
 function renderLegacyGroupPromptImport(chatId) {
@@ -3684,11 +3708,12 @@ function bindAiPromptCenter() {
     const item = promptCenterState.selected;
     const rawIds = root.querySelector('[data-ai-prompt-test-message-ids]').value.split(',')
       .map((value) => Number(value.trim())).filter(Boolean);
-    const modelKinds = Array.from(root.querySelectorAll('[data-ai-prompt-test-model]:checked')).map((input) => input.value);
+    const modelSelect = root.querySelector('[data-ai-prompt-test-model]');
+    const modelIds = modelSelect && modelSelect.value ? [modelSelect.value] : [];
     try {
       const result = await promptApiRequest(promptApiPath(item.prompt_key, 'test'), {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft_version_id: item.draft_version?.id, raw_message_ids: rawIds, model_kinds: modelKinds }),
+        body: JSON.stringify({ draft_version_id: item.draft_version?.id, raw_message_ids: rawIds, model_ids: modelIds }),
       });
       promptCenterState.tested = result.items.some((row) => !row.error_message);
       const output = root.querySelector('[data-ai-prompt-comparison]');
