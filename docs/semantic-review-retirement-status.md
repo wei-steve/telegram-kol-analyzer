@@ -130,3 +130,54 @@
    因为列还在、租约还在跑，只有复核那部分作废。
 9. **`docs/context/ai-prompt-registry.md` 只改复核相关的三处**，没顺手修它里面
    `research.chat.*`（2026-09-14 已删）那类更早的陈旧内容——那是另一批的事。
+
+## 部署与观察窗（2026-09-26）
+
+| | |
+|---|---|
+| 部署 sha | `f2fa9d9f069f58616d923f6ce81b45ffa52c7c7a` |
+| 回滚 sha | `52b228e37b2962cd9fe394e87fb7be1b09e282ce` |
+| 全套（指挥会话独立复跑） | `9520 passed, 4 skipped`，零失败，与实施方最终候选一致 |
+| 证据 | 服务器 `/root/semantic-retirement-observation.log` |
+
+### 部署前用真实生产配置验过兼容路径
+
+生产 `config/ai_recognition.yaml` 第 145 行确有 `stages.semantic_review`。
+把该文件在服务器上就地脱敏（11 个 `api_key` 全部替换）后取回，用新代码加载：
+两条 stage（`semantic_review`、早已退役的 `research_chat`）均被静默丢弃并告警，
+加载不抛错，其余五条链完好。验完即删脱敏副本。
+
+部署后生产启动日志里两条 warning 如期出现，确认这条路径真的被走到了。
+
+### 窗口结果（04:00:04 – 04:44:16，连续 45 分钟 45 个采样点）
+
+| 指标 | 结果 |
+|---|---|
+| 三服务 | 全程 `active` |
+| Traceback | **0** |
+| 日志提及 `semantic` | **0**（全窗口） |
+| 错误行 | 全程持平于既有基线 |
+| **卡住 >10min 的租约** | **全程 0** |
+| 全库 `execution_running` | **0** |
+
+页面：消息页 HTTP 200 / 327KB，**复核字样残留 0**，`execution_uncertain` 展示块保留
+（生产现有 37 条冻结状态）。`loop-health` 中 `semantic` 计数 0，worker 单例确实少了那一个。
+
+### ⚠️ L2 的消息数指标**没有达成**，如实记录
+
+AGENTS.md 的 L2 目标是「一个连续 30 分钟窗口，含至少 5 条真实消息」。
+本窗口时长达标（45 分钟），**消息数只有 1 条**——窗口落在凌晨 4 点，群几乎没有流量。
+
+那唯一一条（`raw_message_id 19112`）走完了完整的租约周期：
+
+```
+19112 | 非策略 | comparison_status=completed | agreement_status=review_disabled
+      | 租约已释放（claim_token IS NULL） | message_classes=[闲话]
+```
+
+认领 → 执行 → 完成 → 释放，这正是本批唯一的风险点，但 **n=1**。
+
+**因此本批的观察证据是「时长达标、样本不足」**，按 AGENTS.md「安静窗口不算失败，
+记录下来」处理。**建议在白天活跃时段（日均 150–300 条）补一次 30 分钟窗口**，
+把租约样本数补到 5 条以上，再认为 L2 完全满足。在此之前这批标记为
+`deployed / observation_partial`，不标 `completed`。
