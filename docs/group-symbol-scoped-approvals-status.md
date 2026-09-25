@@ -228,6 +228,21 @@ narrowing 只影响「通知谁」，不影响这条扫描看见什么（signals
    `group config reloaded path=… groups=N auto_trade_chat_ids=[…]`，
    且列表跟着变。这一条就是「页面不再骗人」的证据。
 4. 再点回去复原。**这一步会真实开关一次自动交易，执行前单独征得用户同意。**
+5. 乙：上线后 24 小时统计超时审批通知的条数与所属群，应只剩 auto_trade 群 × 白名单币，
+   外加有挂单的 fail-closed 例外。同时查一次
+   `SELECT COUNT(*), symbol FROM strategy_lifecycles WHERE management_action =
+   'expiry_auto_expired_out_of_scope'`——首日会有一批历史行被收口（设计稿那张表里的
+   26 条量级），之后应该只零星出现。
+6. 丙：`SELECT COUNT(*) FROM execution_events WHERE action =
+   'entry_price_geometry_rejected' AND created_at > <上线时刻>`，
+   新增的应只来自 auto_trade 群 × 白名单币。
+
+### 甲-2 与乙的耦合（值得知道）
+
+lifecycle monitor 的群模式来自 `lambda chat: _group_trading_mode(app.state.group_config, chat)`,
+读的是**调用时**的 `app.state.group_config`。所以甲-2 上线后，把一个群的自动交易关掉，
+5 秒内它的超时审批通知也随之停止，不需要重启。这是想要的行为，但也意味着
+甲-2 与乙会在同一次部署里一起生效，观察窗要同时盯这两件事。
 
 ## 测试
 
@@ -245,3 +260,26 @@ narrowing 只影响「通知谁」，不影响这条扫描看见什么（signals
 - 自检把「文件不可写」与「挂载只读」当成两个独立原因分别报出。
 
 回归：`tests/test_web_app.py`、`tests/test_web_cli.py` 全绿（259 项）。
+
+---
+
+## 全量测试（最终候选）
+
+```
+uv run pytest -q
+9546 passed, 4 skipped, 109 warnings in 790.02s (0:13:10)
+```
+
+三块代码全部就位后跑的一次，对应提交 `33775d3e`（丙）之后的工作树。
+没有新增 skip，没有新增 warning 类别。
+
+## 提交
+
+| SHA | 内容 |
+|---|---|
+| `96d92f9b` | 甲-1/2/3 + `tests/test_group_config_hot_reload.py` |
+| `3fd5ffb3` | 乙 + `tests/test_expiry_review_group_symbol_scope.py` |
+| `33775d3e` | 丙 + `tests/test_entry_geometry_notice_scope.py` |
+
+**未推送、未部署**（按指令）。分支 `group-symbol-scoped-approvals`，从 `origin/main`
+（`bf52fbd9`）开出。
