@@ -1285,6 +1285,73 @@ def format_pending_entry_expiry_review_message(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+#: A2 (2026-09-25). Marks a payload on the pending-entry expiry review channel
+#: as the daily automatic close-out summary rather than one strategy's review
+#: request. ``lifecycle_monitor`` imports this constant instead of repeating the
+#: string, so the producer and the consumer cannot drift apart; the direction of
+#: the import is forced -- this module must not import ``lifecycle_monitor``,
+#: which already reaches this one.
+PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_KIND = "expiry_review_auto_closeout_summary"
+#: How many lifecycles the summary lists by name before it starts counting
+#: instead. Telegram rejects a message over 4096 characters, and the first
+#: batch this path will ever see is the standing backlog rather than a day's
+#: worth -- 42 rows on 2026-09-25, and nothing bounds it in principle. A
+#: rejected send loses the *whole* notification, so the list is capped and the
+#: count stays exact; every row keeps its own ``management_note`` regardless.
+PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_LISTED_MAX = 40
+
+
+def format_pending_entry_expiry_auto_closeout_message(payload: dict[str, Any]) -> str:
+    """One message for the whole batch a timeout closed out, never one each.
+
+    The review request this replaces carries three buttons. This one carries
+    none: the decision has already been taken, and offering 继续等待 on an
+    expired strategy would be offering to undo something with a button whose
+    handler refuses it anyway.
+    """
+
+    closed = [item for item in (payload.get("closed") or []) if isinstance(item, dict)]
+    timeout_days = payload.get("timeout_days") or "-"
+    lines = [
+        "【待入场复核超时自动收口】",
+        f"本轮自动标记过期: {len(closed)} 条",
+        (
+            f"判据: 复核通知发出后 {timeout_days} "
+            "天无人答复，且无执行绑定"
+        ),
+        (
+            "注: 这是超时自动收口，"
+            "不是人工判定；"
+            "有执行绑定的从不自动处理，"
+            "仍在等人。"
+        ),
+    ]
+    if payload.get("closed_at") is not None:
+        lines.append(
+            f"收口时间: {_format_local_time(payload.get('closed_at'))}"
+        )
+    for item in closed[:PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_LISTED_MAX]:
+        lines.append(
+            "- 内部ID {lifecycle_id} 群ID {chat_id} "
+            "策略代码 #{message_id} {symbol} {side} "
+            "原策略时间 {signal_at}".format(
+                lifecycle_id=item.get("lifecycle_id"),
+                chat_id=item.get("chat_id"),
+                message_id=item.get("message_id"),
+                symbol=item.get("symbol") or "-",
+                side=item.get("side") or "-",
+                signal_at=_format_local_time(item.get("signal_at")),
+            )
+        )
+    remaining = len(closed) - PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_LISTED_MAX
+    if remaining > 0:
+        lines.append(
+            f"…另有 {remaining} 条未逐条列出，"
+            "见 worker 日志与每条的 management_note。"
+        )
+    return "\n".join(lines)
+
+
 def format_ai_recognition_conflict_review_message(payload: dict[str, Any]) -> str:
     deepseek = (
         payload.get("deepseek")
@@ -3720,6 +3787,18 @@ async def send_pending_entry_expiry_review(
     config: SystemOperatorBotConfig,
     payload: dict[str, Any],
 ) -> None:
+    # A2 reuses this channel rather than building a second one, so the daily
+    # automatic close-out summary arrives through exactly the wiring that
+    # already works. It is not a review request, so it gets no buttons.
+    if (
+        str(payload.get("notification_kind") or "")
+        == PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_KIND
+    ):
+        await send_system_operator_bot_message(
+            config=config,
+            text=format_pending_entry_expiry_auto_closeout_message(payload),
+        )
+        return
     await send_system_operator_bot_message(
         config=config,
         text=format_pending_entry_expiry_review_message(payload),

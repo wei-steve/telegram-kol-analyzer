@@ -29,6 +29,20 @@ REVISION_TERMS = ("更新", "修改", "改为", "调整", "取消", "撤销", "�
 ACTIVE_LIFECYCLE_STATUSES = frozenset(
     {"pending_entry", "entered", "holding", "expired"}
 )
+#: A1 (2026-09-25). How old a never-entered strategy may be and still be
+#: offered as a management target. This is the *same* 72 hours as the
+#: ``recent_active_thread`` score bonus in ``REASON_WEIGHTS`` below, and it is
+#: deliberately one constant used in both places rather than a second number:
+#: the age filter and the age bonus answer the same question ("is this thread
+#: still about now?"), so they must not be able to drift apart.
+STALE_LIFECYCLE_MAX_AGE = timedelta(hours=72)
+#: The only statuses the age filter may act on. ``entered`` and ``holding``
+#: are absent **on purpose**: a position opened a month ago is still a real
+#: position, and age is never a reason to stop seeing it. ``expired`` is in
+#: the list because ``ACTIVE_LIFECYCLE_STATUSES`` still contains it, so
+#: marking a zombie expired does not by itself take it out of the candidate
+#: set -- the age filter is what does.
+STALE_FILTERABLE_LIFECYCLE_STATUSES = frozenset({"pending_entry", "expired"})
 VERIFIED_ATTRIBUTION_STATUSES = frozenset({"verified", "bound", "confirmed"})
 UNCERTAIN_ATTRIBUTION_STATUSES = frozenset(
     {"attribution_conflict", "evidence_unavailable"}
@@ -234,6 +248,57 @@ def _binding_context(
     )
 
 
+def _has_unsettled_exchange_leg(
+    lifecycle: StrategyLifecycle,
+    binding_summary: dict[str, Any] | None,
+    risk_state: str,
+    live_verified_pos_ids: tuple[str, ...],
+    pending_entry_leg_ids: tuple[int, ...],
+    uncertain_entry_leg_ids: tuple[int, ...],
+) -> bool:
+    """Whether anything of ours might still be live on the exchange.
+
+    A1 condition 3, and the last gate before the age filter: while the
+    exchange still holds something for this lifecycle it stays in the
+    candidate set no matter how old it is. A resting order can still fill,
+    and not seeing it is worse than seeing a stale thread.
+
+    Every one of the five inputs comes from ``_binding_context`` -- the binding
+    state is not re-derived here, because two derivations of the same fact
+    drift and then the safe one loses. "Still unsettled" means **any** of:
+
+    * ``execution_binding_id`` is set at all. The design writes condition 3 as
+      ``execution_binding_id IS NULL``, and this is that clause. A closed
+      binding counts as unsettled for this purpose: it is cheap to keep an old
+      thread visible, and "the binding row says closed" is a claim about our
+      own bookkeeping rather than about the exchange.
+    * ``binding_summary`` is present -- the same fact read from the other side.
+    * ``risk_state`` is not ``no_current_risk``. This is the branch that
+      catches a lifecycle pointing at a binding row that has gone missing:
+      ``_binding_context`` returns ``uncertain_risk`` with an empty summary
+      there, so neither of the two checks above would see it.
+    * any live verified position, any pending entry leg, or any leg whose
+      attribution or status is uncertain.
+
+    Today the first clause already implies the rest (``_binding_context``
+    returns nothing but ``no_current_risk`` and empty tuples when there is no
+    binding id), so the later clauses are unreachable belt-and-braces. They
+    are written out anyway: if that function ever learns to report legs
+    without a binding id, the filter must keep failing closed rather than
+    start dropping exposed lifecycles.
+    """
+
+    if lifecycle.execution_binding_id is not None:
+        return True
+    if binding_summary is not None:
+        return True
+    if str(risk_state) != "no_current_risk":
+        return True
+    return bool(
+        live_verified_pos_ids or pending_entry_leg_ids or uncertain_entry_leg_ids
+    )
+
+
 def _candidate_lifecycle_ids(session: Session, threads) -> list[int]:
     """Lifecycle ids the candidate loop is about to consider, in one pass."""
 
@@ -278,6 +343,12 @@ def generate_strategy_thread_candidates(
     there means the snapshot is stale, and a stale snapshot disqualifies
     *everything* rather than nothing -- the caller is expected to ask a person
     instead of guessing, and an empty candidate set is how it finds out.
+
+    A1 (2026-09-25) adds a hard age filter on top of that: a ``pending_entry``
+    or ``expired`` lifecycle older than ``STALE_LIFECYCLE_MAX_AGE`` and with
+    nothing left on the exchange does not enter the set at all. See the comment
+    at the filter itself, and ``_has_unsettled_exchange_leg`` for what counts
+    as "left on the exchange".
     """
 
     current = session.get(RawMessage, int(raw_message_id))
@@ -286,6 +357,17 @@ def generate_strategy_thread_candidates(
     normalized_symbol = str(symbol or "").strip().upper() or None
     normalized_side = str(side or "").strip().lower() or None
     text = str(current.text or "")
+    # One cutoff, computed once, used by both the A1 age filter and the
+    # ``recent_active_thread`` bonus. ``posted_at`` can be null on a persisted
+    # row, and a message with no timestamp cannot be said to be later than
+    # anything: ``None`` here means "do not filter on age at all", which is
+    # exactly what the bonus already did with the same input. Failing open is
+    # right for the filter too -- a missing timestamp is not evidence that a
+    # strategy is stale, and the cost of keeping a thread visible is a low
+    # score, while the cost of dropping one is an invisible position.
+    stale_cutoff = (
+        None if current.posted_at is None else current.posted_at - STALE_LIFECYCLE_MAX_AGE
+    )
     revision_language = any(term in text for term in REVISION_TERMS)
     reply_depths = _reply_link_depths(session, current)
     existing_links = _linked_threads_for_raw_message(session, int(current.id))
@@ -323,6 +405,46 @@ def generate_strategy_thread_candidates(
         if lifecycle is None or lifecycle.lifecycle_status not in ACTIVE_LIFECYCLE_STATUSES:
             continue
 
+        (
+            binding_summary,
+            verified_legs,
+            risk_state,
+            live_verified_pos_ids,
+            pending_entry_leg_ids,
+            uncertain_entry_leg_ids,
+        ) = _binding_context(session, lifecycle)
+        # A1 (2026-09-25). Age out the zombies, and only the zombies. All
+        # three conditions must hold together; each one is blocking a
+        # different way of getting this wrong.
+        #
+        # 1. status. Only ``pending_entry`` / ``expired`` -- a strategy that
+        #    never entered, or that we already gave up on. ``entered`` and
+        #    ``holding`` can never be reached from here.
+        # 2. age. Older than the same 72 hours the score bonus uses.
+        # 3. exposure. Nothing of ours still open on the exchange.
+        #
+        # Why it exists: the 72-hour test used to be a *bonus* only, so a
+        # month-old ``pending_entry`` still entered the set with a low score --
+        # and a low score wins anyway when it is the only candidate for that
+        # symbol and side. On 2026-09-25 lifecycle 909 (a ``pending_entry``
+        # from 2026-08-20, long since ``expiry_review_requested``) was picked
+        # as the ``exact`` target of a management message from that day,
+        # because it was the one ETH long the contract offered.
+        if (
+            stale_cutoff is not None
+            and str(lifecycle.lifecycle_status) in STALE_FILTERABLE_LIFECYCLE_STATUSES
+            and lifecycle.signal_at < stale_cutoff
+            and not _has_unsettled_exchange_leg(
+                lifecycle,
+                binding_summary,
+                risk_state,
+                live_verified_pos_ids,
+                pending_entry_leg_ids,
+                uncertain_entry_leg_ids,
+            )
+        ):
+            continue
+
         reasons: list[str] = []
         reply_depth = reply_depths.get(int(thread.id))
         if reply_depth == 1:
@@ -352,21 +474,10 @@ def generate_strategy_thread_candidates(
                 reasons.append("overlapping_stop_loss")
         if take_profit and lifecycle.take_profit and str(take_profit) == str(lifecycle.take_profit):
             reasons.append("overlapping_take_profit")
-        if (
-            current.posted_at is None
-            or lifecycle.signal_at >= current.posted_at - timedelta(hours=72)
-        ):
+        if stale_cutoff is None or lifecycle.signal_at >= stale_cutoff:
             reasons.append("recent_active_thread")
         ordered_reasons = tuple(reason for reason in REASON_ORDER if reason in reasons)
         score = sum(REASON_WEIGHTS[reason] for reason in ordered_reasons)
-        (
-            binding_summary,
-            verified_legs,
-            risk_state,
-            live_verified_pos_ids,
-            pending_entry_leg_ids,
-            uncertain_entry_leg_ids,
-        ) = _binding_context(session, lifecycle)
         verdict = verdicts.get(int(lifecycle.id))
         verification = verdict.reason if verdict is not None else "not_required"
         if require_verified_position and (verdict is None or not verdict.verified):
@@ -426,6 +537,17 @@ def exact_single_current_risk_thread(
 
     The query streams every active thread in the source chat so display ranking,
     symbol/side hints, and the 20-candidate prompt bound cannot authorize an exit.
+
+    **The A1 age filter is deliberately not applied here.** This sweep is
+    exhaustive on purpose: every extra thread it looks at can only make it
+    *refuse*, because one non-target thread carrying risk is enough to return
+    ``False``. Dropping rows from it therefore points the wrong way -- it makes
+    an exit easier to authorize, and the whole reason the loop streams every
+    thread is that nothing may narrow it. It would also be a no-op today: a
+    lifecycle the A1 filter removes has no execution binding, so
+    ``_binding_context`` already reports ``no_current_risk`` for it and it
+    already cannot cause a refusal. So the filter would buy nothing now and
+    would weaken this gate the moment ``_binding_context`` changed.
     """
 
     current = session.get(RawMessage, int(raw_message_id))

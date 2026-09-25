@@ -18,7 +18,7 @@ import logging
 import re
 import threading
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import Any, Awaitable, Callable
 
 import httpx
@@ -42,10 +42,32 @@ from telegram_kol_research.models import (
     TradeIdea,
     utc_now,
 )
+from telegram_kol_research.system_operator_bot import (
+    PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_KIND,
+)
 
 logger = logging.getLogger(__name__)
 
 ExpiryReviewNotifier = Callable[[dict[str, Any]], Awaitable[None]]
+
+#: A2 (2026-09-25). How long an expiry review may go unanswered before the
+#: monitor closes it out itself. The review notification asks a person once and
+#: then waits forever: three months of unanswered notices left 42 zombie
+#: ``pending_entry`` rows, oldest signalled 2026-07-05, and a zombie that is
+#: still the only candidate for its symbol and side still wins.
+EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT_DAYS = 7
+EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT = timedelta(
+    days=EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT_DAYS
+)
+#: The ``management_action`` an automatic close-out writes. It is deliberately
+#: *not* one of the ``expiry_expired_*`` values the Telegram buttons write, so
+#: "a person decided this" and "nobody answered and the timeout decided this"
+#: stay distinguishable afterwards, in the column an auditor reads first.
+EXPIRY_REVIEW_AUTO_CLOSEOUT_ACTION = "expiry_auto_expired_review_timeout"
+#: Every automatic close-out note starts with this, for the same reason: the
+#: note is the human-readable half of that same distinction, and every manual
+#: note in ``telegram_bot_commands`` starts with 人工.
+EXPIRY_REVIEW_AUTO_CLOSEOUT_NOTE_PREFIX = "超时自动收口（非人工判定）"
 
 # ── helpers ──────────────────────────────────────────────────────────
 
@@ -323,6 +345,12 @@ class LifecycleMonitor:
         self._settle = settle
         self._now = now_provider or (lambda: datetime.now(UTC))
         self._expiry_review_notifier = expiry_review_notifier
+        # A2: the UTC day whose automatic close-out sweep has already run, so
+        # the summary goes out once a day rather than once a minute. Process
+        # state on purpose, and no schema change: this is a worker singleton,
+        # and after a restart the worst case is one extra sweep, which closes
+        # only what is newly eligible and stays silent when that is nothing.
+        self._last_expiry_auto_closeout_day: date | None = None
         self._context_resolution_scheduler = context_resolution_scheduler
         self._context_resolution_worker = context_resolution_worker
         # A-7 task 3. This monitor replays candles to decide when a *notified*
@@ -796,12 +824,170 @@ class LifecycleMonitor:
                     payload.get("lifecycle_id"),
                 )
 
+    def _auto_close_out_timed_out_expiry_reviews(
+        self,
+        now: datetime,
+    ) -> dict[str, Any] | None:
+        """A2: expire the reviews nobody answered, once a day, in one batch.
+
+        A lifecycle qualifies only when **all** of these hold:
+
+        * it is still ``pending_entry`` -- ``entered`` is out of scope. An
+          ``entered`` strategy with an untriggered entry leg always has an
+          execution binding, so the rule below would exclude it anyway; saying
+          so in the query as well means a future change to the leg logic cannot
+          quietly bring real positions into this path.
+        * ``management_action`` is still ``expiry_review_requested``. A person
+          who pressed 继续等待 leaves ``expiry_review_continued`` and a
+          non-null ``expiry_review_next_at``, so their decision is not taken
+          away from them here; the ``next_at IS NULL`` clause says the same
+          thing a second way.
+        * the review notification went out at least
+          ``EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT`` ago.
+        * **there is no execution binding.** This one is absolute. Closing out
+          a bound lifecycle would mean cancelling live exchange orders, which
+          is a real write and must never be triggered by a clock running out.
+          Those keep waiting for a person, however long that takes.
+
+        Runs at most once per UTC day and returns one summary payload for the
+        whole batch, or ``None`` when it closed nothing. Called from inside
+        ``_prepare_pending_expiry_reviews``, which only runs when an expiry
+        review notifier exists -- so a close-out can never happen in a
+        deployment that has no way to tell anyone it happened.
+        """
+
+        current_day = _utc_naive(now).date()
+        if self._last_expiry_auto_closeout_day == current_day:
+            return None
+        deadline = _utc_naive(now) - EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT
+        closed: list[dict[str, Any]] = []
+        with self._session_factory() as session:
+            rows = (
+                session.query(StrategyLifecycle)
+                .filter(
+                    StrategyLifecycle.lifecycle_status == "pending_entry",
+                    StrategyLifecycle.management_action
+                    == "expiry_review_requested",
+                    StrategyLifecycle.execution_binding_id.is_(None),
+                    StrategyLifecycle.expiry_review_next_at.is_(None),
+                    StrategyLifecycle.expiry_review_notified_at.is_not(None),
+                    StrategyLifecycle.expiry_review_notified_at <= deadline,
+                )
+                .order_by(StrategyLifecycle.id.asc())
+                .all()
+            )
+            for row in rows:
+                notified_at = row.expiry_review_notified_at
+                signal_at = row.signal_at
+                chat_id = row.chat_id
+                message_id = row.message_id
+                symbol = row.symbol
+                side = row.side
+                if not self._claim_expiry_auto_closeout(
+                    session,
+                    row,
+                    now=now,
+                    deadline=deadline,
+                ):
+                    continue
+                closed.append(
+                    {
+                        "lifecycle_id": int(row.id),
+                        "chat_id": chat_id,
+                        "message_id": message_id,
+                        "symbol": symbol,
+                        "side": side,
+                        "signal_at": signal_at,
+                        "notified_at": notified_at,
+                    }
+                )
+            if closed:
+                session.commit()
+        self._last_expiry_auto_closeout_day = current_day
+        if not closed:
+            return None
+        # The summary below can fail to deliver, and the notifier swallows that
+        # after logging it. So leave the batch in this process's own log too:
+        # the durable record is the note and the action on each row, and this
+        # line is what lets someone find them without knowing to look.
+        logger.info(
+            "Auto-expired %d unanswered pending-entry expiry reviews after %d days: %s",
+            len(closed),
+            EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT_DAYS,
+            [item["lifecycle_id"] for item in closed],
+        )
+        return {
+            "notification_kind": PENDING_ENTRY_EXPIRY_AUTO_CLOSEOUT_KIND,
+            "timeout_days": EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT_DAYS,
+            "closed_at": now,
+            "closed_count": len(closed),
+            "closed": closed,
+        }
+
+    @staticmethod
+    def _claim_expiry_auto_closeout(
+        session,
+        row: StrategyLifecycle,
+        *,
+        now: datetime,
+        deadline: datetime,
+    ) -> bool:
+        """Write the close-out as one conditional UPDATE, or not at all.
+
+        Every predicate from the selecting query is repeated here. Between the
+        select and the write a person may have pressed a button and an executor
+        may have attached a binding, and the ``execution_binding_id IS NULL``
+        clause in particular has to hold at the moment of the write rather than
+        at the moment of the read -- that is the difference between "no
+        exchange orders exist" and "no exchange orders existed".
+        """
+
+        note = (
+            f"{EXPIRY_REVIEW_AUTO_CLOSEOUT_NOTE_PREFIX}："
+            f"复核通知发出后 {EXPIRY_REVIEW_AUTO_CLOSEOUT_TIMEOUT_DAYS} 天无人答复，"
+            "且该策略无执行绑定（交易所无挂单可撤），"
+            "由系统自动标记过期并停止跟踪。"
+        )
+        claimed = (
+            session.query(StrategyLifecycle)
+            .filter(
+                StrategyLifecycle.id == row.id,
+                StrategyLifecycle.lifecycle_status == "pending_entry",
+                StrategyLifecycle.management_action == "expiry_review_requested",
+                StrategyLifecycle.execution_binding_id.is_(None),
+                StrategyLifecycle.expiry_review_next_at.is_(None),
+                StrategyLifecycle.expiry_review_notified_at.is_not(None),
+                StrategyLifecycle.expiry_review_notified_at <= deadline,
+            )
+            .update(
+                {
+                    StrategyLifecycle.lifecycle_status: "expired",
+                    StrategyLifecycle.exit_reason: "expired",
+                    StrategyLifecycle.exited_at: now,
+                    StrategyLifecycle.management_action: (
+                        EXPIRY_REVIEW_AUTO_CLOSEOUT_ACTION
+                    ),
+                    StrategyLifecycle.management_note: note,
+                    StrategyLifecycle.last_checked_at: now,
+                    StrategyLifecycle.updated_at: now,
+                },
+                synchronize_session=False,
+            )
+        )
+        return claimed == 1
+
     def _prepare_pending_expiry_reviews(
         self,
         now: datetime,
     ) -> list[dict[str, Any]]:
         review_payloads: list[dict[str, Any]] = []
         state_changed = False
+        # A2 runs first, so a row is either closed out or reviewed in one cycle
+        # and never both. The two do not otherwise interact: a closed-out row is
+        # ``expired``, which the review query below does not select.
+        auto_closeout_summary = self._auto_close_out_timed_out_expiry_reviews(now)
+        if auto_closeout_summary is not None:
+            review_payloads.append(auto_closeout_summary)
         with self._session_factory() as session:
             rows = (
                 session.query(StrategyLifecycle)
