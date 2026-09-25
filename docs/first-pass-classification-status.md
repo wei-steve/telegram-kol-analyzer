@@ -174,6 +174,47 @@ recognition_result / strategy` 八个。也就是说：新的写入点与回读�
 
 无论选哪个，**「`entry_fragments` 为什么从未上线」都应单独立项**，它与本设计无关。
 
+### 发布 v9：契约在真实模型上验证通过，但发布闸门卡在 DeepSeek 欠费（2026-09-25，待用户决策）
+
+**已完成的步骤**（生产库，全部经应用自己的 API，未直接改表）：
+
+| 步骤 | 结果 |
+|---|---|
+| 部署校验器改动 | `122bd712`，三服务 active，双向核对 PASS |
+| 存草稿 | `ai_prompt_versions.id = 10`（v9，6704 字符 = 生产 v8 原文 + 只加 `message_classes`） |
+| 校验 | `{"success": true, "errors": []}` |
+| 历史对照测试 · mimo | `ai_prompt_test_runs.id = 18`，**completed**，实际模型 `gpt-5.6-luna` |
+| 历史对照测试 · deepseek | `id = 19`，**failed**：`402 Payment Required`（api.deepseek.com） |
+
+**契约本身已被真实模型验证。** 测试消息 `raw_message_id 18938`（BTC 做多、入场 84500-84800、
+止损 82800、分档止盈）在 v9 下的输出是：
+
+```json
+"message_classes": [{"class": "新策略", "target": null}]
+```
+
+完全合契约：完整策略 → 单元素 `新策略`，`target` 为 `null`。同一条消息的
+`recognition_result` 两边都是 `是策略`，**旧字段没有被新字段带偏**；
+`compare_assessments` 报出的唯一差异就是 `message_classes`，说明 §10 E5 那处改动在生产上生效了。
+
+**被挡住的原因**：`POST /api/ai-prompts/{key}/publish` 对 `category = trading` 的提示词要求
+**mimo 与 deepseek 两个 model_kind 都有 completed 的历史测试**，且测试时的 active 版本组合与
+当前一致。DeepSeek 账户 402，这一半永远拿不到 completed。
+
+**`deepseek` 这个 kind 解析到哪**：`prompt_testing._deepseek_provider` 取
+`batch_text_recognition` 链首，生产上是 `deepseek-v4-flash`。而按 `docs/ARCHITECTURE.md` §5.5，
+`batch_text_recognition` **不在生产路径上**，只有 CLI / 批量工具会用。
+也就是说这道闸门要求的第二个模型，是一个生产主路径根本不用的模型。
+（另一个细节：`mimo` 这个 kind 实际解析到了 `gpt-5.6-luna`，即真正的权威链首，
+所以两个 kind 的命名都已经与现实脱节，与 `reference_recognition_model_is_swappable` 记的命名债同源。）
+
+**三个可选方向，等用户定**：
+- **甲**：给 DeepSeek 充值。保留「两个独立厂商各读一遍提示词」这个闸门的原意，代价是花钱。
+- **乙**：把 `batch_text_recognition` 链首改绑到一个可用模型（页面「AI模型选择」即可改）。
+  不动闸门逻辑，仍然是两个模型独立读一遍；这个 stage 不在生产路径上，风险低。
+  代价是 `deepseek` 这个 kind 名与实际模型进一步脱节。
+- **丙**：改闸门，当某个 kind 没有可用提供商时不再强制要求它。改的是安全闸门本身，须谨慎。
+
 ### 落地时的自主判断（设计稿未写明的地方）
 
 1. **缺字段 vs 显式 `null`。** §2.1 说「缺字段 = 违规」，§8 又说阶段 1 必须容忍没有新字段的
