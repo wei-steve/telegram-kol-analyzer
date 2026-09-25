@@ -832,11 +832,18 @@ class LifecycleMonitor:
 
         A lifecycle qualifies only when **all** of these hold:
 
-        * it is still ``pending_entry`` -- ``entered`` is out of scope. An
-          ``entered`` strategy with an untriggered entry leg always has an
-          execution binding, so the rule below would exclude it anyway; saying
-          so in the query as well means a future change to the leg logic cannot
-          quietly bring real positions into this path.
+        * it is still ``pending_entry`` -- ``entered`` is out of scope, and
+          **this clause is load-bearing, not defence in depth.** It was first
+          written on the belief that an ``entered`` strategy always carries an
+          execution binding, so the no-binding rule below would exclude it
+          anyway. Production says otherwise: on 2026-09-25 there were eight
+          ``entered`` lifecycles holding ``expiry_review_requested`` and *no*
+          execution binding, one of them (1133, BTC long, entered 2026-09-10)
+          old enough to satisfy every other condition here. Without this line
+          that sweep would have expired a position we believe is open. Do not
+          remove it on the grounds that the binding rule covers it; today it
+          does not. Why those eight have no binding is a separate question and
+          a separate investigation.
         * ``management_action`` is still ``expiry_review_requested``. A person
           who pressed 继续等待 leaves ``expiry_review_continued`` and a
           non-null ``expiry_review_next_at``, so their decision is not taken
