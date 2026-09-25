@@ -86,7 +86,8 @@
             </div>
             <p>{{ prompt.description }}</p>
             <label>
-              鎻愮ず璇?              <textarea
+              提示词
+              <textarea
                 name="{{ prompt.field_name }}"
                 data-ai-prompt-input="{{ prompt.field_name }}"
                 {% if prompt.field_name == 'recognition_prompt' %}data-ai-recognition-prompt-input{% endif %}

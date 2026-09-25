@@ -266,31 +266,42 @@ def requires_context_resolution(
 
 
 def compare_assessments(
-    mimo_payload: dict[str, Any],
-    deepseek_payload: dict[str, Any] | None,
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any] | None,
 ) -> tuple[str, list[str]]:
-    if deepseek_payload is None:
+    """Field-level differences between two recognition payloads.
+
+    The parameters used to be called ``mimo_payload`` and ``deepseek_payload``,
+    from a design where two vendors answered the same message and were compared.
+    That has not been true for a long time: the only caller is the prompt
+    centre's A/B test (``prompt_testing``), which passes the *active* prompt's
+    answer and the *draft* prompt's answer -- from the same model. The vendor
+    names said the comparison was across models when it is across prompts,
+    which is the kind of leftover wording that misleads the next reader.
+    """
+
+    if right_payload is None:
         return "not_applicable", []
     differences: list[str] = []
-    if _value(mimo_payload, "recognition_result") != _value(
-        deepseek_payload, "recognition_result"
+    if _value(left_payload, "recognition_result") != _value(
+        right_payload, "recognition_result"
     ):
         differences.append("recognition_result")
     for field in ("symbol", "side", "entry", "order_type", "stop_loss", "take_profit"):
-        if _nested_value(mimo_payload, "strategy", field) != _nested_value(
-            deepseek_payload, "strategy", field
+        if _nested_value(left_payload, "strategy", field) != _nested_value(
+            right_payload, "strategy", field
         ):
             differences.append(f"strategy.{field}")
     for field in ("event_type", "target_lifecycle_id", "symbol", "side", "management_action"):
-        if _nested_value(mimo_payload, "lifecycle_event", field) != _nested_value(
-            deepseek_payload, "lifecycle_event", field
+        if _nested_value(left_payload, "lifecycle_event", field) != _nested_value(
+            right_payload, "lifecycle_event", field
         ):
             differences.append(f"lifecycle_event.{field}")
     # The prompt centre's draft A/B test reuses this comparison
     # (``prompt_testing``), so without this the classification difference between
     # an old and a new prompt version would be invisible on the page -- which is
     # what phase 1 debugging runs on (design §10 E5).
-    if _message_classes_differ(mimo_payload, deepseek_payload):
+    if _message_classes_differ(left_payload, right_payload):
         differences.append("message_classes")
     return ("disagreed" if differences else "agreed"), differences
 
@@ -309,11 +320,11 @@ def _message_classes_identity(payload: dict[str, Any]) -> tuple[Any, ...] | None
 
 
 def _message_classes_differ(
-    mimo_payload: dict[str, Any],
-    deepseek_payload: dict[str, Any],
+    left_payload: dict[str, Any],
+    right_payload: dict[str, Any],
 ) -> bool:
-    return _message_classes_identity(mimo_payload) != _message_classes_identity(
-        deepseek_payload
+    return _message_classes_identity(left_payload) != _message_classes_identity(
+        right_payload
     )
 
 
