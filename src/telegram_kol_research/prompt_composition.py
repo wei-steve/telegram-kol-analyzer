@@ -221,6 +221,7 @@ def validate_prompt_content(
                 errors.append(f"MiMo v2 模板缺少必需契约 {marker}")
         if normalized.count('"contract_version": "mimo-authoritative-v2"') != 1:
             errors.append("MiMo v2 模板必须且只能定义一次契约版本")
+
     if required_variables:
         try:
             referenced = _template_variables(normalized)

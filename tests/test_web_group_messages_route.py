@@ -185,11 +185,10 @@ def test_group_messages_route_renders_decision_card_before_model_analysis(tmp_pa
     assert "本消息新增：" in response.text
     assert "自动执行记录：" in response.text
     assert "主分析 · MiMo" in response.text
-    assert "辅助复核 · DeepSeek" in response.text
+    assert "辅助复核 · DeepSeek" not in response.text
     assert "历史 AI 细节（调试）" in response.text
     assert "is-decision-card-history" in response.text
     assert 'data-message-ai-insights\n            open' not in response.text
-    assert "结论一致 · 不自动执行" in response.text
     assert "未发送交易所请求" in response.text
     assert response.text.index("需人工确认") < response.text.index("主分析 · MiMo")
 
@@ -747,11 +746,12 @@ def test_group_messages_route_shows_authoritative_model_summary(tmp_path):
     assert response.status_code == 200
     assert "权威模型结论" in response.text
     assert "MiMo 主分析" in response.text
-    assert "DeepSeek 辅助复核" in response.text
-    assert "deepseek-v4-flash" in response.text
+    # The auxiliary row was only ever filled by the retired review (2026-09-25).
+    assert "DeepSeek 辅助复核" not in response.text
+    assert "deepseek-v4-flash" not in response.text
     assert "mimo-v2.5" in response.text
     assert "MiMo identified an exit event." in response.text
-    assert "DeepSeek agrees with the exit." in response.text
+    assert "DeepSeek agrees with the exit." not in response.text
     assert "DeepSeek text" not in response.text
     assert "GLM-OCR image" not in response.text
     assert "MiMo text" not in response.text

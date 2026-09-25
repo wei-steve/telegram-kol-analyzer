@@ -525,7 +525,7 @@ def test_load_messages_in_time_window_normalizes_aware_local_bounds_to_utc(tmp_p
     assert [row["message_id"] for row in rows] == [2]
 
 
-def test_load_group_messages_serializes_semantic_review_decisions_in_one_bulk_query(tmp_path):
+def test_load_group_messages_reads_every_decision_in_one_bulk_query(tmp_path):
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         messages = [
@@ -574,17 +574,18 @@ def test_load_group_messages_serializes_semantic_review_decisions_in_one_bulk_qu
         event.remove(engine, "before_cursor_execute", track_decision_queries)
 
     assert len(decision_queries) == 1
-    assert rows[0]["semantic_review"] == {
-        "status": "completed",
-        "severity": "normal",
-        "label": "普通差异",
-        "reason": "止盈细节不同",
-        "conflict_types": ["non_material_price_detail"],
-        "model": "deepseek-v4-flash",
-    }
+    assert len(rows) == 3
+    assert all(row["decision_card"] is not None for row in rows)
+    assert all("semantic_review" not in row for row in rows)
 
 
-def test_load_group_messages_projects_review_disabled_without_model_claim(tmp_path):
+def test_load_group_messages_projects_no_review_for_a_review_disabled_row(tmp_path):
+    """``agreement_status == "review_disabled"`` is what production writes today.
+
+    The review it names was retired on 2026-09-25, so the projection carries no
+    review key at all and never repeats the stored reviewer model.
+    """
+
     session_factory = create_session_factory(tmp_path / "research.db")
     with session_factory() as session:
         message = RawMessage(chat_id=9, message_id=11, text="BTC short")
@@ -605,16 +606,18 @@ def test_load_group_messages_projects_review_disabled_without_model_claim(tmp_pa
         )
         session.commit()
 
-    rows = load_group_messages(session_factory, chat_id=9, limit=10)
+    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
 
-    assert rows[0]["semantic_review"] == {
-        "status": "review_disabled",
-        "severity": "disabled",
-        "label": "辅助复核已关闭",
-        "reason": None,
-        "conflict_types": [],
-        "model": None,
-    }
+    assert "semantic_review" not in row
+    assert row["authoritative_model_summary"] == [
+        {
+            "label": "MiMo 主分析",
+            "model": "mimo-v2.5",
+            "conclusion": "非策略",
+            "reason": None,
+        }
+    ]
+    assert "historical-deepseek-model" not in json.dumps(row, default=str)
 
 
 def test_load_group_messages_distinguishes_submission_from_exchange_confirmation(tmp_path):
@@ -715,41 +718,6 @@ def test_execution_outcome_without_batch_marks_terminal_failures(status):
     assert outcome["label"] == "未执行成功"
 
 
-def test_load_group_messages_defensively_serializes_malformed_semantic_review_json(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        raw_message = RawMessage(chat_id=9, message_id=1, text="BTC long")
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="是策略",
-                authoritative_payload_json="{}",
-                agreement_status="disagreed",
-                differences_json="[]",
-                comparison_status="completed",
-                disagreement_severity="critical",
-                comparison_model="deepseek-v4-flash",
-                comparison_payload_json="not-json",
-            )
-        )
-        session.commit()
-
-    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
-
-    assert row["semantic_review"] == {
-        "status": "completed",
-        "severity": "critical",
-        "label": "严重分歧",
-        "reason": None,
-        "conflict_types": [],
-        "model": "deepseek-v4-flash",
-    }
-
-
 def test_load_group_messages_builds_manual_review_decision_card_from_authoritative_mimo(
     tmp_path,
 ):
@@ -816,12 +784,6 @@ def test_load_group_messages_builds_manual_review_decision_card_from_authoritati
             "conclusion": "仓位管理",
             "reason": "识别到调整止损意图，未提供新的止损价格。",
         },
-        "secondary_review": {
-            "label": "辅助复核 · DeepSeek",
-            "conclusion": "一致",
-            "reason": "同意不可自动执行，建议补充价格后再处理。",
-        },
-        "agreement": {"label": "一致 · 不自动执行", "tone": "agreed"},
         "execution": {
             "state": "not_executed",
             "label": "未发送交易所请求",
@@ -854,7 +816,7 @@ def test_hold_update_decision_card_is_record_only():
         disagreement_severity="none",
     )
 
-    card = _build_message_decision_card(decision=decision, semantic_review=None)
+    card = _build_message_decision_card(decision=decision)
 
     assert card is not None
     assert card["state"] == "record_only"
@@ -886,7 +848,7 @@ def test_complete_strategy_decision_card_is_identified_strategy():
         disagreement_severity="none",
     )
 
-    card = _build_message_decision_card(decision=decision, semantic_review=None)
+    card = _build_message_decision_card(decision=decision)
 
     assert card is not None
     assert card["state"] == "strategy_identified"
@@ -916,206 +878,9 @@ def test_agreed_targeted_lifecycle_event_is_linked_strategy():
         disagreement_severity="none",
     )
 
-    card = _build_message_decision_card(decision=decision, semantic_review=None)
+    card = _build_message_decision_card(decision=decision)
 
     assert card is not None
     assert card["state"] == "strategy_linked"
     assert card["state_label"] == "已关联策略"
     assert card["recommended_action"] == "查看执行记录"
-
-
-def test_semantically_agreed_exit_with_execution_guard_is_linked_strategy():
-    decision = RecognitionDecision(
-        raw_message_id=1,
-        input_kind="text",
-        authoritative_model="mimo-v2.5",
-        authoritative_status="识别失败",
-        authoritative_payload_json=json.dumps(
-            {
-                "reason": "当前消息是在讨论已有空单的仓位管理，建议离场。",
-                "lifecycle_event": {
-                    "event_type": "exit_position",
-                    "symbol": "BTC",
-                    "side": "short",
-                    "target_lifecycle_id": 548,
-                },
-            },
-            ensure_ascii=False,
-        ),
-        agreement_status="disagreed",
-        differences_json="[]",
-        comparison_status="completed",
-        disagreement_severity="critical",
-        automation_status="skipped",
-        automation_reason="mimo_authoritative_not_safely_applied",
-    )
-    semantic_review = {
-        "status": "completed",
-        "severity": "critical",
-        "label": "严重分歧",
-        "reason": "当前消息明确建议平仓已有空单，独立解读为全部退出，与mimo识别的exit_position一致，无实质分歧。",
-        "conflict_types": ["execution_unresolved"],
-        "model": "deepseek-v4-flash",
-    }
-
-    card = _build_message_decision_card(
-        decision=decision, semantic_review=semantic_review
-    )
-
-    assert card is not None
-    assert card["state"] == "strategy_linked"
-    assert card["state_label"] == "已关联策略"
-    assert card["recommended_action"] == "查看执行记录"
-    assert card["agreement"] == {"label": "一致 · 查看执行记录", "tone": "agreed"}
-    assert card["execution"] == {
-        "state": "not_executed",
-        "label": "自动执行未发出",
-        "detail": "MiMo 生命周期事件未能安全落地",
-    }
-
-
-def test_load_group_messages_labels_context_only_target_disagreement(tmp_path):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        raw_message = RawMessage(chat_id=9, message_id=1, text="多单移动止损至开仓价")
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="非策略",
-                authoritative_payload_json=json.dumps(
-                    {
-                        "lifecycle_event": {
-                            "event_type": "position_update",
-                            "symbol": "BTC",
-                            "side": "long",
-                            "target_lifecycle_id": 504,
-                            "management_action": "partial_then_break_even",
-                        }
-                    }
-                ),
-                agreement_status="disagreed",
-                differences_json='["target_lifecycle_id", "symbol"]',
-                comparison_status="completed",
-                disagreement_severity="critical",
-                comparison_model="deepseek-v4-flash",
-                comparison_payload_json=json.dumps(
-                    {
-                        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
-                        "conflict_types": ["symbol", "target_lifecycle"],
-                        "independent_action": {
-                            "action_type": "position_update",
-                            "symbol": None,
-                            "side": "long",
-                            "target_lifecycle_id": None,
-                            "management_action": "partial_take_profit, move_stop_to_protect",
-                            "stop_loss": None,
-                            "take_profit": None,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        )
-        session.commit()
-
-    row = load_group_messages(session_factory, chat_id=9, limit=10)[0]
-
-    assert row["semantic_review"] == {
-        "status": "completed",
-        "severity": "context",
-        "label": "上下文待核对",
-        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
-        "conflict_types": ["symbol", "target_lifecycle"],
-        "model": "deepseek-v4-flash",
-    }
-
-
-@pytest.mark.parametrize("agreement_status", ["disagreed", "unknown", "agreed"])
-def test_load_group_messages_marks_completed_legacy_review_without_severity_unclassified(
-    tmp_path, agreement_status
-):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        raw_message = RawMessage(chat_id=9, message_id=1, text="legacy comparison")
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="是策略",
-                authoritative_payload_json="{}",
-                agreement_status=agreement_status,
-                differences_json='["side"]',
-                comparison_status="completed",
-                disagreement_severity=None,
-                comparison_model="legacy-field-comparison",
-                comparison_payload_json=json.dumps(
-                    {
-                        "reason": "legacy field comparison",
-                        "raw_provider_response": "never-expose-legacy-provider-data",
-                        "notification_claim_token": "never-expose-legacy-claim",
-                    }
-                ),
-            )
-        )
-        session.commit()
-
-    review = load_group_messages(session_factory, chat_id=9, limit=10)[0][
-        "semantic_review"
-    ]
-
-    assert review == {
-        "status": "completed",
-        "severity": "unclassified",
-        "label": "待重新复核",
-        "reason": "历史记录没有语义分歧等级，需重新复核",
-        "conflict_types": [],
-        "model": "legacy-field-comparison",
-    }
-
-
-@pytest.mark.parametrize(
-    ("agreement_status", "expected_severity", "expected_label"),
-    [
-        ("agreed", "agreed", "一致"),
-        ("disagreed", "unclassified", "待重新复核"),
-        ("unknown", "unclassified", "待重新复核"),
-    ],
-)
-def test_load_group_messages_requires_agreement_for_completed_none_severity(
-    tmp_path, agreement_status, expected_severity, expected_label
-):
-    session_factory = create_session_factory(tmp_path / "research.db")
-    with session_factory() as session:
-        raw_message = RawMessage(chat_id=9, message_id=1, text="semantic comparison")
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="是策略",
-                authoritative_payload_json="{}",
-                agreement_status=agreement_status,
-                differences_json="[]",
-                comparison_status="completed",
-                disagreement_severity="none",
-                comparison_model="deepseek-v4-flash",
-                comparison_payload_json="{}",
-            )
-        )
-        session.commit()
-
-    review = load_group_messages(session_factory, chat_id=9, limit=10)[0][
-        "semantic_review"
-    ]
-
-    assert review["severity"] == expected_severity
-    assert review["label"] == expected_label

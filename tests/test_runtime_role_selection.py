@@ -21,7 +21,6 @@ def _refresh_endpoint(app):
     )
 
 
-
 #: Every worker singleton on ``origin/main`` at 467d45f2, the commit the
 #: semantic-review retirement branched from.
 RETIREMENT_BASELINE_WORKER_TASKS = frozenset(

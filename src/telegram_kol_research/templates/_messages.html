@@ -131,7 +131,7 @@
     {% for message in messages %}
       {% set detection = message.strategy_detection %}
       {% set comparison = message.recognition_comparison %}
-      {% set semantic_review = message.semantic_review %}
+      {% set execution_uncertainty = message.execution_uncertainty %}
       {% set execution_outcome = message.execution_outcome %}
       {% set decision_card = message.decision_card %}
       {% set mimo_analysis = message.mimo_analysis %}
@@ -644,16 +644,15 @@
               {% if execution_outcome %}<span>自动交易：{{ execution_outcome.label }}</span>{% if execution_outcome.detail %}<small>{{ execution_outcome.detail }}</small>{% endif %}{% else %}<span>自动交易：未执行</span>{% endif %}
             </details>
           {% endif %}
-          {% if modern_mimo and semantic_review and semantic_review.model %}
-            <details
-              class="mimo-deepseek-review semantic-review semantic-review-{{ semantic_review.severity }}"
-              aria-label="辅助模型复核：{{ semantic_review.label }}"
+          {% if execution_uncertainty %}
+            <div
+              class="message-execution-outcome is-error"
+              role="alert"
+              aria-label="{{ execution_uncertainty.label }}"
             >
-              <summary>DeepSeek辅助复核 · {{ semantic_review.label }}</summary>
-              {% if semantic_review.reason %}<p>{{ semantic_review.reason }}</p>{% endif %}
-              {% if semantic_review.conflict_types %}<small>分歧：{{ semantic_review.conflict_types | join(' · ') }}</small>{% endif %}
-              <small>复核模型：{{ semantic_review.model }}</small>
-            </details>
+              <strong>{{ execution_uncertainty.label }}</strong>
+              <small>{{ execution_uncertainty.detail }}</small>
+            </div>
           {% endif %}
           {% if low_confidence_exit_targets %}
             <div class="message-execution-outcome is-waiting" role="status">
@@ -709,14 +708,6 @@
                     <span>{{ decision_card.primary_analysis.conclusion }}</span>
                     {% if decision_card.primary_analysis.reason %}<small>{{ decision_card.primary_analysis.reason }}</small>{% endif %}
                   </div>
-                  <div class="message-model-analysis-row">
-                    <strong>{{ decision_card.secondary_review.label }}</strong>
-                    <span>{{ decision_card.secondary_review.conclusion }}</span>
-                    {% if decision_card.secondary_review.reason %}<small>{{ decision_card.secondary_review.reason }}</small>{% endif %}
-                  </div>
-                  <div class="message-model-analysis-agreement is-{{ decision_card.agreement.tone }}">
-                    结论{{ decision_card.agreement.label }}
-                  </div>
                 </details>
               {% endif %}
             </section>
@@ -724,7 +715,7 @@
           <details
             class="message-ai-insights {{ ai_panel_class }}{% if decision_card %} is-decision-card-history{% endif %}"
             data-message-ai-insights
-            {% if not modern_mimo and ((not decision_card and strategy_related) or (semantic_review and semantic_review.severity in ['critical', 'context'])) %}open{% endif %}
+            {% if not modern_mimo and not decision_card and strategy_related %}open{% endif %}
           >
             <summary class="message-ai-summary">
               <span class="message-ai-summary-status">{% if decision_card %}历史 AI 细节（调试）{% else %}AI识别结果：{{ detection.status if detection else '待识别' }}{% endif %}</span>
@@ -778,42 +769,6 @@
                   {% if message.entry_revision.remaining_headroom %}<small>{{ message.entry_revision.remaining_headroom }}</small>{% endif %}
                   {% if message.entry_revision.reason_code %}<small>原因代码 {{ message.entry_revision.reason_code }}</small>{% endif %}
                 </div>
-              {% endif %}
-              {% if semantic_review and (not modern_mimo or not semantic_review.model) %}
-                {% if semantic_review.severity in ['normal', 'critical', 'context'] %}
-                  <details class="semantic-review semantic-review-{{ semantic_review.severity }}"
-                    {% if semantic_review.severity == 'critical' %}open role="alert" aria-label="AI复核：严重分歧"{% endif %}
-                    {% if semantic_review.severity == 'context' %}open aria-label="AI复核：上下文待核对"{% endif %}
-                  >
-                    <summary>AI复核：{{ semantic_review.label }}</summary>
-                    <div class="semantic-review-details">
-                      {% if semantic_review.reason %}<p>{{ semantic_review.reason }}</p>{% endif %}
-                      {% if semantic_review.conflict_types %}
-                        <ul aria-label="分歧类型">
-                          {% for conflict_type in semantic_review.conflict_types %}
-                            <li>{{ conflict_type }}</li>
-                          {% endfor %}
-                        </ul>
-                      {% endif %}
-                      {% if semantic_review.model %}<small>复核模型：{{ semantic_review.model }}</small>{% endif %}
-                    </div>
-                  </details>
-                {% elif semantic_review.severity == 'unclassified' %}
-                  <div
-                    class="semantic-review semantic-review-unclassified"
-                    role="status"
-                    aria-label="AI复核：{{ semantic_review.label }}"
-                  >
-                    <strong>AI复核：{{ semantic_review.label }}</strong>
-                    {% if semantic_review.reason %}<small>{{ semantic_review.reason }}</small>{% endif %}
-                  </div>
-                {% else %}
-                  <div
-                    class="semantic-review semantic-review-{{ semantic_review.severity }}"
-                    role="status"
-                    aria-label="AI复核：{{ semantic_review.label }}"
-                  >AI复核：{{ semantic_review.label }}</div>
-                {% endif %}
               {% endif %}
               {% if message.authoritative_model_summary and not modern_mimo %}
                 <div class="recognition-comparison authoritative-model-summary">

@@ -5254,76 +5254,49 @@ def test_message_tab_renders_bounded_adjacent_entry_assembly(tmp_path):
     assert "secret-value" not in response.text
 
 
-def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
+def test_historical_review_columns_are_projected_nowhere(tmp_path):
+    """A row left over from the retired review renders none of its content.
+
+    The semantic-disagreement review was retired on 2026-09-25 and its columns
+    stay on the table, so production rows still hold a reviewer model, its
+    verdict and its raw payload. None of that reaches the page any more -- and
+    the payload's provider response and frozen notification token were never
+    allowed to, which is the part of the old coverage worth keeping.
+    """
+
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
-    states = [
-        ("completed", "none", "agreed", "一致", "equivalent", []),
-        (
-            "completed",
-            "normal",
-            "disagreed",
-            "普通差异",
-            "止盈细节不同",
-            ["non_material_price_detail"],
-        ),
-        (
-            "completed",
-            "critical",
-            "disagreed",
-            "严重分歧",
-            "方向冲突",
-            ["action_family"],
-        ),
-        ("completed", None, "agreed", "待重新复核", None, []),
-        ("execution_pending", None, "pending", "等待中", None, []),
-        ("execution_running", None, "pending", "等待中", None, []),
-        (
-            "execution_uncertain",
-            None,
-            "pending",
-            "执行结果未知",
-            None,
-            [],
-        ),
-        ("failed", None, "pending", "失败", None, []),
-    ]
     with session_factory() as session:
-        for index, (
-            status,
-            severity,
-            agreement_status,
-            _label,
-            reason,
-            conflict_types,
-        ) in enumerate(states, 1):
-            raw_message = RawMessage(chat_id=77, message_id=index, text=f"message {index}")
-            session.add(raw_message)
-            session.flush()
-            session.add(
-                RecognitionDecision(
-                    raw_message_id=raw_message.id,
-                    input_kind="text",
-                    authoritative_model="mimo-v2.5",
-                    authoritative_status="是策略",
-                    authoritative_payload_json="{}",
-                    agreement_status=agreement_status,
-                    differences_json="[]",
-                    comparison_status=status,
-                    disagreement_severity=severity,
-                    comparison_model="deepseek-v4-flash",
-                    comparison_payload_json=json.dumps(
-                        {
-                            "reason": reason,
-                            "conflict_types": conflict_types,
-                            "raw_provider_response": "never-render-provider-secret",
-                            "notification_claim_token": "never-render-frozen-token",
-                        },
-                        ensure_ascii=False,
-                    ),
-                    comparison_error="provider timeout" if status == "failed" else None,
-                )
+        raw_message = RawMessage(chat_id=77, message_id=1, text="message")
+        session.add(raw_message)
+        session.flush()
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message.id,
+                input_kind="text",
+                authoritative_model="mimo-v2.5",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                auxiliary_model="historical-reviewer",
+                auxiliary_status="非策略",
+                auxiliary_payload_json='{"reason":"never-render-auxiliary-reason"}',
+                agreement_status="disagreed",
+                differences_json="[]",
+                comparison_status="completed",
+                disagreement_severity="critical",
+                comparison_model="historical-reviewer",
+                comparison_payload_json=json.dumps(
+                    {
+                        "reason": "never-render-review-reason",
+                        "conflict_types": ["action_family"],
+                        "raw_provider_response": "never-render-provider-secret",
+                        "notification_claim_token": "never-render-frozen-token",
+                    },
+                    ensure_ascii=False,
+                ),
+                comparison_error="never-render-provider-timeout",
             )
+        )
         session.commit()
 
     response = TestClient(create_web_app(database_path=database_path)).get(
@@ -5331,30 +5304,37 @@ def test_message_detail_renders_authoritative_semantic_review_states(tmp_path):
     )
 
     assert response.status_code == 200
-    for _status, _severity, _agreement, label, _reason, _conflicts in states:
-        assert f"AI复核：{label}" in response.text
-    assert 'class="semantic-review semantic-review-critical"' in response.text
-    assert 'role="alert"' in response.text
-    normal_review = re.search(
-        r'<details class="semantic-review semantic-review-normal"(.*?)</details>',
-        response.text,
-        re.S,
-    )
-    assert normal_review is not None
-    assert " open" not in normal_review.group(1).split(">", 1)[0]
-    assert "止盈细节不同" in normal_review.group(1)
-    assert "non_material_price_detail" in normal_review.group(1)
+    for secret in (
+        "never-render-review-reason",
+        "never-render-auxiliary-reason",
+        "never-render-provider-secret",
+        "never-render-frozen-token",
+        "never-render-provider-timeout",
+        "historical-reviewer",
+    ):
+        assert secret not in response.text, secret
+    for wording in (
+        "AI复核",
+        "辅助复核",
+        "复核模型",
+        "semantic-review",
+        "严重分歧",
+    ):
+        assert wording not in response.text, wording
+    # The authoritative conclusion the page does still show.
     assert "权威模型结论" in response.text
     assert "MiMo 主分析" in response.text
-    assert "DeepSeek 辅助复核" in response.text
-    assert "历史实验（非权威）" not in response.text
-    assert "never-render-provider-secret" not in response.text
-    assert "never-render-frozen-token" not in response.text
-    assert "provider timeout" not in response.text
-    assert "历史记录没有语义分歧等级，需重新复核" in response.text
 
 
-def test_execution_uncertain_is_not_masked_by_legacy_auxiliary_model(tmp_path):
+def test_an_uncertain_execution_still_says_so_on_the_message(tmp_path):
+    """The frozen-lease notice outlived the review widget that used to draw it.
+
+    ``execution_uncertain`` means an exchange write started and never got a
+    definite answer, so nothing may retry it. Until 2026-09-25 the page said so
+    through the semantic-review block, under the wording "AI复核：执行结果未知".
+    The review is retired; this notice is not a review and now stands alone.
+    """
+
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -5383,11 +5363,12 @@ def test_execution_uncertain_is_not_masked_by_legacy_auxiliary_model(tmp_path):
     )
 
     assert response.status_code == 200
-    assert "AI复核：执行结果未知" in response.text
+    assert "执行结果未知" in response.text
     assert "交易所副作用结果尚未得到确定证据" in response.text
+    assert "AI复核" not in response.text
 
 
-def test_message_detail_renders_review_disabled_without_deepseek_claim(tmp_path):
+def test_a_review_disabled_row_makes_no_review_claim_at_all(tmp_path):
     database_path = tmp_path / "research.db"
     session_factory = create_session_factory(database_path)
     with session_factory() as session:
@@ -5414,130 +5395,11 @@ def test_message_detail_renders_review_disabled_without_deepseek_claim(tmp_path)
     )
 
     assert response.status_code == 200
-    assert "AI复核：辅助复核已关闭" in response.text
+    assert "AI复核" not in response.text
+    assert "辅助复核" not in response.text
     assert "复核模型：historical-deepseek-model" not in response.text
-    assert "AI复核：一致" not in response.text
-    assert "AI复核：失败" not in response.text
-    assert "AI复核：等待中" not in response.text
+    assert "historical-deepseek-model" not in response.text
     assert 'role="alert"' not in response.text
-
-
-def test_critical_semantic_review_opens_outer_ai_disclosure_for_non_strategy(tmp_path):
-    database_path = tmp_path / "research.db"
-    session_factory = create_session_factory(database_path)
-    with session_factory() as session:
-        raw_message = RawMessage(
-            chat_id=77,
-            message_id=20,
-            text="not actionable",
-        )
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            MessageRecognition(
-                raw_message_id=raw_message.id,
-                status="非策略",
-                reason="MiMo 权威结果为非策略",
-                engine="mimo-v2.5",
-            )
-        )
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="非策略",
-                authoritative_payload_json="{}",
-                agreement_status="disagreed",
-                differences_json='["actionability"]',
-                comparison_status="completed",
-                disagreement_severity="critical",
-                comparison_model="deepseek-v4-flash",
-                comparison_payload_json=json.dumps(
-                    {
-                        "reason": "语义复核认为存在紧急退出动作",
-                        "conflict_types": ["urgent_exit_missed"],
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        )
-        session.commit()
-
-    response = TestClient(create_web_app(database_path=database_path)).get(
-        "/groups/77/detail/tab/messages"
-    )
-
-    assert response.status_code == 200
-    assert re.search(
-        r'<details\s+class="message-ai-insights is-not-strategy is-decision-card-history"\s+'
-        r'data-message-ai-insights\s+open\s*>',
-        response.text,
-    )
-    assert re.search(
-        r'<details class="semantic-review semantic-review-critical"\s+'
-        r'open role="alert" aria-label="AI复核：严重分歧"',
-        response.text,
-    )
-
-
-def test_context_semantic_review_renders_open_without_critical_alert(tmp_path):
-    database_path = tmp_path / "research.db"
-    session_factory = create_session_factory(database_path)
-    with session_factory() as session:
-        raw_message = RawMessage(
-            chat_id=77,
-            message_id=21,
-            text="多单移动止损至开仓价",
-        )
-        session.add(raw_message)
-        session.flush()
-        session.add(
-            MessageRecognition(
-                raw_message_id=raw_message.id,
-                status="非策略",
-                reason="管理已有仓位",
-                engine="mimo-v2.5",
-            )
-        )
-        session.add(
-            RecognitionDecision(
-                raw_message_id=raw_message.id,
-                input_kind="text",
-                authoritative_model="mimo-v2.5",
-                authoritative_status="非策略",
-                authoritative_payload_json="{}",
-                agreement_status="disagreed",
-                differences_json='["target_lifecycle_id", "symbol"]',
-                comparison_status="completed",
-                disagreement_severity="critical",
-                comparison_model="deepseek-v4-flash",
-                comparison_payload_json=json.dumps(
-                    {
-                        "reason": "当前消息未指定目标生命周期，独立判断无法确认504。",
-                        "conflict_types": ["symbol", "target_lifecycle"],
-                        "independent_action": {
-                            "action_type": "position_update",
-                            "symbol": None,
-                            "side": "long",
-                            "target_lifecycle_id": None,
-                        },
-                    },
-                    ensure_ascii=False,
-                ),
-            )
-        )
-        session.commit()
-
-    response = TestClient(create_web_app(database_path=database_path)).get(
-        "/groups/77/detail/tab/messages"
-    )
-
-    assert response.status_code == 200
-    assert "AI复核：上下文待核对" in response.text
-    assert 'class="semantic-review semantic-review-context"' in response.text
-    assert 'aria-label="AI复核：上下文待核对"' in response.text
-    assert 'role="alert" aria-label="AI复核：严重分歧"' not in response.text
 
 
 def test_management_batch_panel_is_read_only_and_has_safety_labels(tmp_path):

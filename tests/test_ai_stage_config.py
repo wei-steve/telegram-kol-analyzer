@@ -113,27 +113,27 @@ def test_a_retired_semantic_review_stage_is_dropped_with_a_warning(tmp_path):
     is dropped, reported, and taken out of the file on the next save.
     """
 
-    path = tmp_path / 'ai_recognition.yaml'
+    path = tmp_path / "ai_recognition.yaml"
     raw = yaml.safe_load(
-        Path('config/ai_recognition.example.yaml').read_text(encoding='utf-8')
+        Path("config/ai_recognition.example.yaml").read_text(encoding="utf-8")
     )
-    raw['stages']['semantic_review'] = ['deepseek-v4-flash']
+    raw["stages"]["semantic_review"] = ["deepseek-v4-flash"]
     path.write_text(
-        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding='utf-8'
+        yaml.safe_dump(raw, allow_unicode=True, sort_keys=False), encoding="utf-8"
     )
 
     config = load_ai_recognition_config(path)
 
-    assert 'semantic_review' not in config.stages
+    assert "semantic_review" not in config.stages
     assert list(config.stages) == list(AI_STAGE_KEYS)
-    assert any('semantic_review' in item for item in config.config_warnings)
+    assert any("semantic_review" in item for item in config.config_warnings)
     # The stages that *are* still bound came through untouched.
-    assert config.stages['authoritative_recognition'] == ['mimo-v2.5']
-    assert config.stages['context_resolution'] == ['deepseek-v4-flash']
+    assert config.stages["authoritative_recognition"] == ["mimo-v2.5"]
+    assert config.stages["context_resolution"] == ["deepseek-v4-flash"]
 
     save_ai_recognition_config(path, config)
-    reloaded = yaml.safe_load(path.read_text(encoding='utf-8'))
-    assert 'semantic_review' not in reloaded['stages']
+    reloaded = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert "semantic_review" not in reloaded["stages"]
     assert load_ai_recognition_config(path).config_warnings == ()
 
 

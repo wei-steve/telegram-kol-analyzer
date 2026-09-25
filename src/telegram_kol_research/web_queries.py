@@ -926,7 +926,7 @@ def _serialize_raw_messages(
             if isinstance(raw_message_classes_violations, list)
             else []
         )
-        semantic_review = _serialize_semantic_review(decision)
+        execution_uncertainty = _serialize_execution_uncertainty(decision)
         message_evidence = evidence_by_msg_id.get(raw_message.id)
         mimo_analysis = _serialize_mimo_analysis(
             recognition=rec_by_msg_id.get(raw_message.id),
@@ -1069,7 +1069,7 @@ def _serialize_raw_messages(
                     candidates=current_authoritative_candidates,
                     mimo_analysis=mimo_analysis,
                 ),
-                "semantic_review": semantic_review,
+                "execution_uncertainty": execution_uncertainty,
                 "execution_outcome": _serialize_execution_outcome(
                     decision,
                     management_batch_by_msg_id.get(raw_message.id),
@@ -1078,11 +1078,9 @@ def _serialize_raw_messages(
                 "entry_revision": entry_revision,
                 "decision_card": _build_message_decision_card(
                     decision=decision,
-                    semantic_review=semantic_review,
                 ),
                 "authoritative_model_summary": _build_authoritative_model_summary(
                     decision=decision,
-                    semantic_review=semantic_review,
                 ),
                 "recognition_comparison": _build_recognition_comparison(
                     recognition=rec_by_msg_id.get(raw_message.id),
@@ -1977,9 +1975,16 @@ def _serialize_low_confidence_exit_targets(
 def _build_authoritative_model_summary(
     *,
     decision: RecognitionDecision | None,
-    semantic_review: dict[str, object | None] | None,
 ) -> list[dict[str, str | None]]:
-    """Return the two persisted decision roles for the message detail UI."""
+    """Return the persisted authoritative conclusion for the message detail UI.
+
+    It used to return a second "辅助复核" row as well, read from
+    ``auxiliary_model`` / ``comparison_model``. Both were written only by the
+    semantic-disagreement review, retired 2026-09-25, so that row could only
+    ever describe history -- under a vendor name that has not been what ran for
+    a long time. Historical rows keep their stored columns; the page stops
+    claiming a reviewer looked at them.
+    """
 
     if decision is None:
         return []
@@ -1994,19 +1999,7 @@ def _build_authoritative_model_summary(
         if isinstance(authoritative_reason, str) and authoritative_reason.strip()
         else None
     )
-    auxiliary_payload = _parse_json_object(
-        decision.auxiliary_payload_json or decision.comparison_payload_json
-    )
-    auxiliary_reason = auxiliary_payload.get("reason")
-    auxiliary_reason = (
-        auxiliary_reason.strip()
-        if isinstance(auxiliary_reason, str) and auxiliary_reason.strip()
-        else None
-    )
-    review_label = semantic_review.get("label") if semantic_review else None
-    review_label = review_label if isinstance(review_label, str) else None
-
-    rows = [
+    return [
         {
             "label": "MiMo 主分析",
             "model": decision.authoritative_model,
@@ -2018,17 +2011,6 @@ def _build_authoritative_model_summary(
             "reason": authoritative_reason,
         }
     ]
-    auxiliary_model = decision.auxiliary_model or decision.comparison_model
-    if auxiliary_model:
-        rows.append(
-            {
-                "label": "DeepSeek 辅助复核",
-                "model": auxiliary_model,
-                "conclusion": decision.auxiliary_status or review_label,
-                "reason": auxiliary_reason,
-            }
-        )
-    return rows
 
 
 def _parse_json_object(value: str | None) -> dict[str, object]:
@@ -2157,112 +2139,31 @@ def _serialize_media_assets(media_assets: list[MediaAsset]) -> list[dict[str, ob
     ]
 
 
-def _serialize_semantic_review(
+def _serialize_execution_uncertainty(
     decision: RecognitionDecision | None,
-) -> dict[str, object | None] | None:
-    if decision is None:
+) -> dict[str, str] | None:
+    """The notice for a message whose exchange write never got a definite answer.
+
+    ``comparison_status == "execution_uncertain"`` is the frozen state the
+    execution claim lease lands in when a side effect started and the outcome is
+    unknown: nothing retries it, and a person has to look. Until 2026-09-25 the
+    page said so through the semantic-review block, so it read "AI复核：执行结果
+    未知" -- but this was never a review, and the review is gone. It is the one
+    part of that block worth keeping, so it stands on its own.
+    """
+
+    if decision is None or decision.comparison_status != "execution_uncertain":
         return None
-
-    payload: dict[str, object] = {}
-    review_payload_json = (
-        decision.comparison_payload_json or decision.auxiliary_payload_json
-    )
-    if review_payload_json:
-        try:
-            loaded = json.loads(review_payload_json)
-        except (json.JSONDecodeError, TypeError):
-            loaded = None
-        if isinstance(loaded, dict):
-            payload = loaded
-
-    reason = payload.get("reason")
-    if not isinstance(reason, str) or not reason.strip():
-        reason = None
-    else:
-        reason = reason.strip()
-
-    conflict_types = payload.get("conflict_types")
-    if not isinstance(conflict_types, list):
-        conflict_types = []
-    conflict_types = [item for item in conflict_types if isinstance(item, str)]
-
-    legacy_auxiliary = bool(decision.auxiliary_model and not decision.comparison_model)
-    recorded_status = decision.comparison_status or "pending"
-    if recorded_status in {
-        "execution_pending",
-        "execution_running",
-        "execution_uncertain",
-    }:
-        status = recorded_status
-    else:
-        status = "completed" if legacy_auxiliary else recorded_status
-    if status == "execution_uncertain":
-        return {
-            "status": status,
-            "severity": "unresolved",
-            "label": "执行结果未知",
-            "reason": "交易所副作用结果尚未得到确定证据",
-            "conflict_types": [],
-            "model": decision.comparison_model or decision.auxiliary_model,
-        }
-    if decision.agreement_status == "review_disabled":
-        return {
-            "status": "review_disabled",
-            "severity": "disabled",
-            "label": "辅助复核已关闭",
-            "reason": None,
-            "conflict_types": [],
-            "model": None,
-        }
-    if status == "failed" or decision.agreement_status == "authoritative_failed":
-        severity = "failed"
-        label = "失败"
-    elif (
-        status == "completed"
-        and decision.disagreement_severity == "critical"
-        and _is_context_only_target_review(payload=payload, conflict_types=conflict_types)
-    ):
-        severity = "context"
-        label = "上下文待核对"
-    elif status == "completed" and decision.disagreement_severity == "critical":
-        severity = "critical"
-        label = "严重分歧"
-    elif status == "completed" and decision.disagreement_severity == "normal":
-        severity = "normal"
-        label = "普通差异"
-    elif (
-        status == "completed"
-        and decision.disagreement_severity == "none"
-        and decision.agreement_status == "agreed"
-    ):
-        severity = "agreed"
-        label = "一致"
-    elif legacy_auxiliary:
-        severity = "legacy"
-        label = decision.auxiliary_status or "历史辅助复核"
-    elif status == "completed":
-        severity = "unclassified"
-        label = "待重新复核"
-        reason = "历史记录没有语义分歧等级，需重新复核"
-        conflict_types = []
-    else:
-        severity = "pending"
-        label = "等待中"
-
     return {
-        "status": status,
-        "severity": severity,
-        "label": label,
-        "reason": reason,
-        "conflict_types": conflict_types,
-        "model": decision.comparison_model or decision.auxiliary_model,
+        "state": "execution_uncertain",
+        "label": "执行结果未知",
+        "detail": "交易所副作用结果尚未得到确定证据",
     }
 
 
 def _build_message_decision_card(
     *,
     decision: RecognitionDecision | None,
-    semantic_review: dict[str, object | None] | None,
 ) -> dict[str, object] | None:
     if decision is None:
         return None
@@ -2294,26 +2195,6 @@ def _build_message_decision_card(
         and decision.agreement_status == "agreed"
         and decision.disagreement_severity == "none"
     )
-    review_reason = (
-        semantic_review.get("reason") if semantic_review is not None else None
-    )
-    review_reason = review_reason if isinstance(review_reason, str) else None
-    review_conflicts = (
-        semantic_review.get("conflict_types") if semantic_review is not None else []
-    )
-    review_conflicts = (
-        {str(item) for item in review_conflicts}
-        if isinstance(review_conflicts, list)
-        else set()
-    )
-    is_execution_guarded_consensus = (
-        event_type not in {"", "none"}
-        and lifecycle_event.get("target_lifecycle_id") not in (None, "")
-        and review_reason is not None
-        and "无实质分歧" in review_reason
-        and review_conflicts <= {"execution_unresolved"}
-    )
-
     if missing_stop_price:
         state = "manual_review"
         state_label = "需人工确认"
@@ -2324,10 +2205,7 @@ def _build_message_decision_card(
         state_label = "仅记录"
         recommended_action = "无需操作"
         blocker = None
-    elif (
-        decision.authoritative_status in {"识别失败", "failed", "failure", "error"}
-        and not is_execution_guarded_consensus
-    ):
+    elif decision.authoritative_status in {"识别失败", "failed", "failure", "error"}:
         state = "fetch_failed"
         state_label = "获取失败"
         recommended_action = "重新识别"
@@ -2337,7 +2215,7 @@ def _build_message_decision_card(
         state_label = "策略已识别"
         recommended_action = "查看执行记录"
         blocker = None
-    elif is_safely_linked_event or is_execution_guarded_consensus:
+    elif is_safely_linked_event:
         state = "strategy_linked"
         state_label = "已关联策略"
         recommended_action = "查看执行记录"
@@ -2365,17 +2243,6 @@ def _build_message_decision_card(
     primary_reason = payload.get("reason")
     primary_reason = primary_reason.strip() if isinstance(primary_reason, str) else None
     primary_conclusion = _candidate_event_status(event_type) if event_type else decision.authoritative_status
-    review_label = (
-        semantic_review.get("label") if semantic_review is not None else "待复核"
-    )
-    review_label = review_label if isinstance(review_label, str) else "待复核"
-    review_tone = (
-        semantic_review.get("severity") if semantic_review is not None else "pending"
-    )
-    review_tone = review_tone if isinstance(review_tone, str) else "pending"
-    if review_reason and "无实质分歧" in review_reason:
-        review_label = "一致"
-        review_tone = "agreed"
 
     execution = _serialize_execution_outcome(decision, None) or {
         "state": "not_executed",
@@ -2385,12 +2252,8 @@ def _build_message_decision_card(
     if execution["state"] == "not_executed":
         execution = {
             "state": "not_executed",
-            "label": (
-                "自动执行未发出"
-                if is_execution_guarded_consensus
-                else "未发送交易所请求"
-            ),
-            "detail": execution["detail"] if is_execution_guarded_consensus else None,
+            "label": "未发送交易所请求",
+            "detail": None,
         }
 
     return {
@@ -2405,37 +2268,8 @@ def _build_message_decision_card(
             "conclusion": primary_conclusion,
             "reason": primary_reason,
         },
-        "secondary_review": {
-            "label": "辅助复核 · DeepSeek",
-            "conclusion": review_label,
-            "reason": review_reason,
-        },
-        "agreement": {
-            "label": f"{review_label} · {'不自动执行' if recommended_action == '不执行' else recommended_action}",
-            "tone": review_tone,
-        },
         "execution": execution,
     }
-
-
-def _is_context_only_target_review(
-    *,
-    payload: dict[str, object],
-    conflict_types: list[str],
-) -> bool:
-    conflicts = {str(item) for item in conflict_types}
-    if not conflicts or not conflicts <= {"symbol", "target_lifecycle"}:
-        return False
-    independent = payload.get("independent_action")
-    if not isinstance(independent, dict):
-        return False
-    action_type = str(independent.get("action_type") or "")
-    if action_type not in {"position_update", "exit_partial"}:
-        return False
-    return (
-        independent.get("target_lifecycle_id") is None
-        or independent.get("symbol") is None
-    )
 
 
 def _build_recognition_comparison(

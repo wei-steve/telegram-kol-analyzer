@@ -3672,8 +3672,7 @@ body {
 .mimo-first-pass,
 .mimo-image-evidence,
 .mimo-context-result,
-.mimo-system-outcome,
-.mimo-deepseek-review {
+.mimo-system-outcome {
   margin-top: 12px;
   padding: 14px;
   border: 1px solid rgba(71, 85, 105, 0.72);
@@ -3719,7 +3718,6 @@ body {
 .mimo-image-evidence { border-left: 4px solid #a78bfa; }
 .mimo-context-result { border-left: 4px solid #f59e0b; }
 .mimo-system-outcome { border-left: 4px solid #22c55e; }
-.mimo-deepseek-review { border-left: 4px solid #64748b; }
 
 .mimo-section-heading,
 .mimo-intent-title,
@@ -3728,8 +3726,7 @@ body {
 .mimo-runtime-facts,
 .mimo-history-notes,
 .mimo-context-result,
-.mimo-system-outcome,
-.mimo-deepseek-review[open] {
+.mimo-system-outcome {
   display: flex;
   gap: 8px;
 }
@@ -3741,7 +3738,6 @@ body {
 .mimo-history-notes,
 .mimo-context-result,
 .mimo-system-outcome,
-.mimo-deepseek-review[open],
 .mimo-image-evidence-body { flex-direction: column; }
 
 .mimo-runtime-status,
@@ -3936,17 +3932,6 @@ body {
 .message-model-analysis-row span { color: #bae6fd; font-weight: 700; }
 .message-model-analysis-row small { color: #94a3b8; }
 
-.message-model-analysis-agreement {
-  padding-top: 6px;
-  color: #94a3b8;
-  font-weight: 700;
-}
-
-.message-model-analysis-agreement.is-agreed { color: #86efac; }
-.message-model-analysis-agreement.is-critical { color: #fca5a5; }
-.message-model-analysis-agreement.is-normal,
-.message-model-analysis-agreement.is-context { color: #fde68a; }
-
 @media (max-width: 760px) {
   .message-decision-card {
     padding: 10px;
@@ -4137,58 +4122,6 @@ body {
   color: #fecaca;
 }
 .message-execution-outcome small { color: inherit; opacity: 0.78; }
-
-.semantic-review {
-  border: 1px solid rgba(148, 163, 184, 0.24);
-  border-left-width: 4px;
-  border-radius: 6px;
-  padding: 7px 9px;
-  background: rgba(15, 23, 42, 0.5);
-  color: #cbd5e1;
-  font-size: 0.78rem;
-  line-height: 1.45;
-}
-
-.semantic-review summary {
-  cursor: pointer;
-  font-weight: 800;
-}
-
-.semantic-review-agreed { border-left-color: #22c55e; color: #dcfce7; }
-.semantic-review-normal { border-left-color: #f59e0b; color: #fde68a; }
-.semantic-review-context {
-  border-left-color: #38bdf8;
-  background: rgba(14, 116, 144, 0.18);
-  color: #cffafe;
-}
-.semantic-review-unclassified {
-  display: grid;
-  gap: 2px;
-  border-left-color: #f59e0b;
-  color: #fde68a;
-}
-.semantic-review-pending { border-left-color: #38bdf8; color: #bae6fd; }
-.semantic-review-failed { border-left-color: #ef4444; color: #fecaca; }
-
-.semantic-review-critical {
-  border-color: rgba(248, 113, 113, 0.7);
-  border-left-color: #ef4444;
-  background: rgba(127, 29, 29, 0.36);
-  color: #fee2e2;
-  box-shadow: 0 0 0 1px rgba(248, 113, 113, 0.16);
-}
-
-.semantic-review-details {
-  display: grid;
-  gap: 5px;
-  margin-top: 6px;
-}
-
-.semantic-review-details p,
-.semantic-review-details ul { margin: 0; }
-.semantic-review-details ul { padding-left: 18px; }
-.semantic-review-details small { color: inherit; opacity: 0.78; }
-.semantic-review-unclassified small { color: inherit; opacity: 0.82; }
 
 .recognition-comparison {
   display: grid;
