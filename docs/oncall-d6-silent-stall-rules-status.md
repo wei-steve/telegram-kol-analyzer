@@ -513,3 +513,22 @@ GROUP BY e.state;
 3. `seals_a_lane` 与 barrier 的 join 仍差 `source_status = 'deleted'` 一个条件。
    目前无害（有删除退出行就意味着消息被删过），但如果哪天出现「消息又被恢复」的路径，
    这里会多报。记在这里，本轮没改。
+
+### 部署记录 · 扩到五状态（2026-09-26 北京时间 14:27）
+
+- 部署 sha `df0a54ab`，**回滚 sha `29eb3389`**（只回退状态范围，D6a/b/c 本身仍在）。
+- 顺序：候选推 `claude/oncall-d6a-active-states` → `tg-deploy` →
+  `systemctl restart telegram-kol-oncall.service` → 推 `main`。两项检查各对两种答案测过。
+- **上线前按新判据重新数过**（不是沿用上一轮那个只数 `recovery_required` 的 0）：
+  五个封锁态在生产上一行都没有（全库只有 `succeeded` 283 + `unbound` 91），
+  精确 join 版本同样是 0。所以首轮开案 0 条，实测也是 0。
+- 部署后：值守 active，心跳 round 1 → 3 推进，`last_error: null`，
+  `consecutive_read_failures = 0`，journal 无 Traceback；案子仍只有既有规则那 14 条。
+
+两点复核结论（我自己验的，不是转述）：
+
+1. `state IN (?,?,?,?,?)` 与旧的 `state = ?` 计划完全相同
+   （`SEARCH ... USING COVERING INDEX`），而 `state NOT IN (...)` 确实 `SCAN`——
+   这三条现在都由 `EXPLAIN QUERY PLAN` 用例钉着，其中「`NOT IN` 会扫表」以前只是注释。
+2. `waiting` 确认不是数据库状态：`_mark_reconciliation_waiting()` 写进行里的是
+   `reconciling`，`"waiting"` 只是它的返回值与计数器键名。有对着 worker 源码的断言用例。
