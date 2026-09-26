@@ -660,7 +660,7 @@ def test_the_telegram_alert_says_recognition_continued_on_the_backup(tmp_path):
 
     assert f"已切换到备用模型 {BACKUP} 继续识别" in text
     assert "新消息无法完成权威识别" not in text
-    assert "MiMo 识别供应商不可用" in text
+    assert "权威识别主用模型不可用" in text
 
 
 def test_without_a_backup_the_alert_says_recognition_is_unavailable(tmp_path):

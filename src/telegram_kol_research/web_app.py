@@ -6013,7 +6013,7 @@ def create_web_app(
                         deepcoin_client_factory=app.state.deepcoin_client_factory,
                         interval_seconds=app.state.deepcoin_reconcile_interval_seconds,
                         now_provider=app.state.now_provider,
-                        system_operator_bot_config=app.state.notification_bot_config,
+                        notification_bot_config=app.state.notification_bot_config,
                         terminal_entry_cleanup_bot_config=(
                             app.state.system_operator_bot_config
                         ),
@@ -6183,6 +6183,9 @@ def create_web_app(
                                     ),
                                     delivery_observer=(
                                         _observe_runtime_incident_delivery(app)
+                                    ),
+                                    notification_config=(
+                                        app.state.notification_bot_config
                                     ),
                                 ),
                                 session_factory=app.state.session_factory,
@@ -9725,13 +9728,13 @@ def create_web_app(
                     )
             if (
                 conflict_payload is not None
-                and system_operator_bot_enabled(app.state.system_operator_bot_config)
+                and system_operator_bot_enabled(app.state.notification_bot_config)
             ):
                 notification_scheduled = _handle_authoritative_failure_notification(
                     session_factory=app.state.session_factory,
                     raw_message_id=raw_message_id,
                     sender=send_ai_recognition_conflict_review,
-                    config=app.state.system_operator_bot_config,
+                    config=app.state.notification_bot_config,
                     payload=conflict_payload,
                 )
             else:
@@ -10788,7 +10791,7 @@ async def run_deepcoin_execution_reconcile_loop(
     deepcoin_client_factory,
     interval_seconds: int = 30,
     now_provider=None,
-    system_operator_bot_config: SystemOperatorBotConfig | None = None,
+    notification_bot_config: SystemOperatorBotConfig | None = None,
     terminal_entry_cleanup_bot_config: SystemOperatorBotConfig | None = None,
     contract_spec_provider: DeepcoinContractSpecProvider | None = None,
     authority_observer=None,
@@ -10846,14 +10849,14 @@ async def run_deepcoin_execution_reconcile_loop(
                         contract_spec_provider=contract_spec_provider,
                         group_trading_mode_provider=group_trading_mode_provider,
                     )
-                    if system_operator_bot_enabled(system_operator_bot_config):
+                    if system_operator_bot_enabled(notification_bot_config):
                         await deliver_pending_position_attribution_incidents(
                             session_factory,
-                            config=system_operator_bot_config,
+                            config=notification_bot_config,
                             delivered_at=synced_at,
                         )
                         await deliver_pending_position_protection_incidents(
-                            session_factory, config=system_operator_bot_config,
+                            session_factory, config=notification_bot_config,
                             delivered_at=synced_at,
                         )
                 await run_on_management_worker(

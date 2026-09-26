@@ -156,7 +156,7 @@ def test_five_rejected_requests_in_a_row_alert_once_and_say_why(tmp_path):
     assert summary["consecutive_failures"] == 5
     assert summary["reason_code"] == "request_rejected"
     text_out = format_runtime_incident_notification(alerts[0])
-    assert "MiMo 识别连续失败" in text_out
+    assert "权威识别主用模型连续失败" in text_out
     assert "请求被供应商拒绝" in text_out
     assert "HTTP 400" in text_out
     assert "同一错误连续: 5 次" in text_out
@@ -505,7 +505,7 @@ def test_a_402_probe_alerts_once_a_day_in_words_and_never_leaks_the_key(tmp_path
     alerts = _incidents(session_factory, "mimo_provider_probe_failed")
     assert len(alerts) == 2
     text_out = format_runtime_incident_notification(alerts[0])
-    assert "MiMo 每日探测失败" in text_out
+    assert "主用模型每日探测失败" in text_out
     assert "余额不足" in text_out
     assert "HTTP 402" in text_out
     assert "同一天只告警一次" in text_out

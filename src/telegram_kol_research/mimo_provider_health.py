@@ -645,6 +645,7 @@ def run_mimo_provider_health_tick(
             bucket=bucket,
             occurred_at=current,
             fallback_model=fallback_model,
+            head_model=head,
         )
         logger.warning(
             "mimo provider unavailable alert raised kind=%s http_status=%s "
@@ -680,7 +681,18 @@ def run_mimo_provider_health_tick(
     ):
         return {"state": "recovery_already_announced", "rows_read": rows_read}
     capture = capture_recovered or _default_capture("capture_mimo_provider_recovered")
-    capture(session_factory, outage=outage, occurred_at=current)
+    recovered_fallback_model = _fallback_model_answering_since(
+        session_factory,
+        since=outage.started_at,
+        chain_head_model=head,
+    )
+    capture(
+        session_factory,
+        outage=outage,
+        occurred_at=current,
+        head_model=head,
+        fallback_model=recovered_fallback_model,
+    )
     logger.warning(
         "mimo provider recovered notice raised kind=%s failures=%s "
         "started_at=%s recovered_at=%s",

@@ -315,8 +315,10 @@ from telegram_kol_research.telegram_session_lock import (
 )
 from telegram_kol_research.time_utils import normalize_to_utc_naive
 from telegram_kol_research.telegram_live_listener import (
+    SUPPRESSED_NO_AUXILIARY,
     _build_authoritative_notification_payload,
     _filter_callable_kwargs,
+    auxiliary_review_disagrees,
     run_live_listener,
 )
 from telegram_kol_research.trade_merge import persist_trade_ideas_from_candidates
@@ -1811,6 +1813,19 @@ async def _process_raw_messages_with_mimo_authority(
                 ),
                 "automation_reason": processing_result.automation.get("reason"),
             }
+            if not auxiliary_review_disagrees(payload):
+                # Same predicate the worker path and the recognize endpoint
+                # ask: with no second model there is no disagreement to
+                # report. The decision row still records why nothing was sent.
+                # Unlike the worker path there is no delayed retry to keep
+                # here -- this loop reads each message exactly once.
+                await asyncio.to_thread(
+                    update_recognition_execution_outcome,
+                    session_factory,
+                    **outcome_kwargs,
+                    notification_status=SUPPRESSED_NO_AUXILIARY,
+                )
+                continue
             await asyncio.to_thread(
                 update_recognition_execution_outcome,
                 session_factory,

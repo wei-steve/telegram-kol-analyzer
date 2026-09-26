@@ -5556,6 +5556,12 @@ def test_message_recognition_api_suppresses_low_value_authoritative_failure(
         bot_token="system-token",
         chat_id="system-chat",
     )
+    # 通知分流后，识别冲突复核走「Kol运行通知」bot -- the suppression audit row
+    # is written from inside that gate, so it needs this config enabled too.
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="notification-token",
+        chat_id="notification-chat",
+    )
     audit: list[dict] = []
 
     monkeypatch.setattr(
@@ -5625,6 +5631,12 @@ def test_message_recognition_api_does_not_alert_without_an_auxiliary_model(
     app.state.system_operator_bot_config = SystemOperatorBotConfig(
         bot_token="system-token",
         chat_id="system-chat",
+    )
+    # 通知分流后，识别冲突复核走「Kol运行通知」bot -- the suppression audit row
+    # is written from inside that gate, so it needs this config enabled too.
+    app.state.notification_bot_config = SystemOperatorBotConfig(
+        bot_token="notification-token",
+        chat_id="notification-chat",
     )
     audit: list[dict] = []
     monkeypatch.setattr(

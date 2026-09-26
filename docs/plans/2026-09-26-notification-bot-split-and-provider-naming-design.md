@@ -1,0 +1,469 @@
+# 通知分流到「Kol运行通知」+ 供应商告警改名 · 设计稿
+
+日期：2026-09-26
+基线：本地 `6fc8e88e`，生产 HEAD `df0a54ab`
+触发：2026-09-25 22:48Z 的两条 AI agent 通知（事件 2388 / 2389）
+状态：**已批准，实施中**（2026-09-26 用户裁定见 4.3）。实施在 worktree `notif-split` / 分支
+`notification-bot-split`，基于 `origin/main`。初稿的三处事实错误已在 4.1 / 4.2 / 4.4 更正。
+
+---
+
+## 0. 这份稿子要解决三件事
+
+| # | 问题 | 结论 |
+|---|---|---|
+| A | 告警把主用模型叫成「MiMo 识别供应商」，可实际是 `gpt-5.6-luna` | 文案按链首模型动态生成，别硬写模型名 |
+| B | 恢复通知无条件说「会按原顺序重新识别」，这次根本没有要补做的消息 | 有备用模型兜住的故障段，恢复通知不发补做承诺 |
+| C | 需要点按钮/打命令的消息和纯通知全挤在「Kol事件处理」 | 通知走「Kol运行通知」，需人操作的留在「Kol事件处理」 |
+
+A 和 B 是同一处文案，一起做。C 是本稿的主体。
+
+---
+
+## 1. 事件 2388 / 2389 的事实认定
+
+先把结论钉死，后面的改动都建立在这上面。
+
+### 1.1 出故障的不是 MiMo
+
+生产 `config/ai_recognition.yaml`：
+
+```yaml
+stages:
+  authoritative_recognition:
+  - gpt-5.6-luna      # 链首（主用），provider = codex-proxy
+  - mimo-v2.5         # 备用
+```
+
+`mimo_provider_health` 只统计**链首模型**的 attempt 行
+（[`_chain_head_filter`](../../src/telegram_kol_research/mimo_provider_health.py) 第 461 行，注释：
+备用模型答得上来不能证明主用模型活着）。所以这条告警的监控对象**就是当前链首**，
+和 MiMo 这个牌子没有关系。
+
+生产 `mimo_recognition_attempts` 在窗口内：
+
+| model | status | error_code | 次数 | 区间（UTC） |
+|---|---|---|---|---|
+| gpt-5.6-luna | http_error | `mimo_provider_unavailable.server_error.http_502` | 15 | 22:46:57 – 23:23:50 |
+| mimo-v2.5 | completed | — | 15 | 22:48:01 – 23:24:54 |
+| gpt-5.6-luna | completed | — | 10 | 00:14:11 起 |
+
+**502 的是 gpt-5.6-luna，顶上来的才是 MiMo。** 通知正文那句「已切换到备用模型 mimo-v2.5」是对的，
+标题「MiMo 识别供应商不可用」正好说反了。
+
+### 1.2 是上游 Codex 故障，不是我们这边挂了
+
+- OpenAI status 2026-09-25「Issues with Codex」，影响 Codex Web / API / CLI / VS Code，
+  23:54Z 宣告全部恢复；用户侧影响约 22:00–00:00 UTC。我们的 502 窗口 22:46–23:54Z 完整落在里面。
+- `codex-proxy.service`（本机 127.0.0.1:3466，nginx `codex-api.dwpc.com.cn` 反代）进程
+  自 2026-09-09 18:55 起**一次都没重启过**。
+- nginx `error.log` 在该时段**没有任何 upstream 报错** —— 如果是 nginx 连不上 3466 会记。
+- 502 响应体只有 101 字节 JSON，是 proxy 进程自己生成的 → **上游错误原样透传**。
+- nginx 访问日志：北京时间 06 点 8 次 502、07 点 22 次 502，08 点起全部 200。
+
+**识别一条都没断**：15 次链首失败对应 15 次 mimo-v2.5 成功，数量刚好对上。
+
+---
+
+## 2. 改动 A · 告警文案按链首模型生成
+
+### 现状
+
+面向 Telegram 的硬写文案集中在
+[`system_operator_bot.py`](../../src/telegram_kol_research/system_operator_bot.py)：
+
+| 行 | 现文案 |
+|---|---|
+| 274 | `MiMo 故障期间的入场未执行，需人工判断` |
+| 287 | `MiMo 故障期间的管理指令未自动执行，需人工判断` |
+| 296 | `MiMo 恢复后开始补做识别` |
+| 334 | `MiMo 识别供应商不可用` |
+| 355 | `MiMo 识别供应商已恢复` |
+| 364 | `MiMo 识别连续失败` |
+| 376 | `MiMo 每日探测失败，但识别正常` / `MiMo 每日探测失败` |
+| 402 | `MiMo {check}本身失败` |
+
+### 改法
+
+`mimo_provider_health` 已经算出了链首模型名（`chain_head_model` / `_resolve_chain_head`），
+把它作为 `head_model` 写进 `redacted_summary`，文案里填进去：
+
+```
+权威识别主用模型不可用
+模型: gpt-5.6-luna
+原因: 供应商服务端错误（HTTP 502）
+```
+
+`head_model` 取不到时（读链失败会回落到「统计每一行 attempt」）退成「权威识别主用模型」，
+**不要退成任何具体牌子名**。
+
+### 边界：只动文案，不动契约
+
+| 层 | 本次动不动 | 理由 |
+|---|---|---|
+| Telegram 文案（上表 8 处） | **改** | 零风险，纯展示 |
+| `incident_type`（`_MIMO_PROVIDER_INCIDENT_TYPES` 里的 8 个） | 不改 | 去重键、配置白名单、库里 2400+ 行都认这个值 |
+| `component: "mimo_provider"` / `source_kind` | 不改 | 同上 |
+| 模块名、表名（`mimo_recognition_attempts` …） | 不改 | 迁移成本，另立项 |
+
+这条和 2026-09-24 记下的三层改名顺序一致：纯命名 → 表名 → 持久化枚举值。本次只做第一层里
+**用户能看见的那一小块**。
+
+---
+
+## 3. 改动 B · 恢复通知别乱承诺补做
+
+### 现状
+
+`mimo_provider_recovered` 的文案是固定模板，无条件带这一行：
+
+> 补做: auto_trade 群在故障期间未完成识别的消息会按原顺序重新识别；入场一律不执行、逐条通知，
+> 管理指令满足条件才执行，否则转人工确认
+
+2389 这条就这么发了，但那段时间备用模型把 15 条全接住了，**没有任何消息需要补做**。
+读的人会以为有一批消息正在重放。
+
+### 改法
+
+不可用告警已经会区分「有没有备用模型在顶」（`fallback_note` / `impact` 两个取值：
+`authoritative_recognition_on_fallback_model` vs `authoritative_recognition_unavailable`）。
+恢复通知按同一个事实分岔：
+
+- 故障期**全程有备用模型成功应答** → 恢复文案写
+  「期间识别未中断，由备用模型 `mimo-v2.5` 完成，无消息需要补做」；
+- 否则 → 保留现有补做文案。
+
+判据用已有的 `_fallback_model_answering_since`，不要新发明一套。
+**实施时请复核**：该函数只回答「有没有一个非链首模型答过」，不回答「是不是每一条都被接住」。
+如果要说「无消息需要补做」这么硬的话，判据得是「故障期内 `authoritative_recognition_failed`
+事件数为 0」，而不是「有备用模型答过」。两者取严。
+
+---
+
+## 4. 改动 C · 通知分流到「Kol运行通知」
+
+### 4.1 现状：运行通知 bot 早就在跑，只是没人把通知类挪过去
+
+> **2026-09-26 复核更正。** 本稿初稿说「`NOTIFICATION_BOT_CHAT_ID` 为空、整条通道没启动」，
+> **那是错的**。初稿读的是 `/opt/telegram-kol-analyzer/config/*.env`（那里确实是空的），
+> 但进程真正读的是 systemd 的 `EnvironmentFile`，而且 `split_runtime` 下
+> `load_notification_bot_config(env_file_paths=[])` **只读 `os.environ`，根本不读那些文件**。
+> 下面是复核后的事实。
+
+生产三个 bot：
+
+| 环境变量前缀 | bot | 名字 | chat_id |
+|---|---|---|---|
+| `TELEGRAM_KOL_SYSTEM_BOT_*` | `@steve_kol_event_bot` | **Kol事件处理** | 8129644952 |
+| `TELEGRAM_KOL_NOTIFICATION_BOT_*` | `@steve_kol_msg_bot` | **Kol运行通知** | 8129644952 |
+| `TELEGRAM_KOL_ALERT_BOT_*` | `@steve_kol_signal_bot` | Kol信号 | （信号推送，本稿不动） |
+
+两个 chat_id 相同不是 bug：私聊里 `chat_id` 就是**用户 id**，两个 bot 各自和同一个人有一条独立会话。
+
+按角色看 `EnvironmentFile`：
+
+| 角色 | 单元 env | SYSTEM | NOTIFICATION |
+|---|---|---|---|
+| worker | `/etc/telegram-kol-worker.env` | ✅ 8129644952 | ✅ 8129644952 |
+| web | `/etc/telegram-kol-web.env` | ❌ 无 | ❌ 无 |
+| ingest | `/etc/telegram-kol-ingest.env` | ❌ 无 | token 有、chat_id 空 → 禁用 |
+
+`RUNTIME_ROLE_SINGLETON_TASKS`（[`web_app.py:421`](../../src/telegram_kol_research/web_app.py)）
+把 `runtime_incident_notification` / `strategy_management_notification` /
+`system_operator_bot_command` / `telegram_bot_command` **全部划给 worker**。
+所以本稿关心的通道几乎都活在 worker 进程里，而 worker 两个 bot 都配齐了。
+
+**结论：运行通知 bot 是活的，而且已经在发东西。** 生产计数：
+
+| 通道 | 已投递 | 待投（被闸门挡住的历史积压） |
+|---|---|---|
+| 策略管理通知 | 75（max id 144） | 69（max id 97） |
+| 持仓保护事件 | 87（max id 518） | 402（max id 422） |
+
+所以这件事**不是「接通一条死通道」，而是「把已经在跑的第二个 bot 用起来」** —— 风险比初稿设想的低得多。
+
+### 4.2 现有出口清单
+
+| # | 通道 | 入口 | 跑在 | 现用 bot | 闸门（**生产当前值**） |
+|---|---|---|---|---|---|
+| 1 | runtime_incidents（AI agent通知） | `deliver_runtime_incident_notifications` | worker | SYSTEM（`web_app.py:6040` 硬传） | `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_AFTER_ID` = **2069** |
+| 2 | 消息操作异常 第1/2阶段 | 同上循环内 | worker | SYSTEM | `..._STAGE1_AFTER_CONTRACT_ID` = 0 / `..._STAGE2_AFTER_HANDOFF_ID` = 0 |
+| 3 | 持仓归因审计 | `deliver_pending_position_attribution_incidents` | worker / ingest | **两处调用不一致**（见下） | `position_attribution_audit_delivery_after_id` = **3844** |
+| 4 | 持仓保护事件 | `deliver_pending_position_protection_incidents` | worker / ingest | **两处调用不一致** | `position_protection_incident_delivery_after_id` = **422** |
+| 5 | 策略管理通知 | `run_strategy_management_notification_loop` | worker | NOTIFICATION（**在跑**，已投 75 条） | `strategy_management_notification_delivery_after_id` = **97** |
+| 6 | 待入场到期复核 **（唯一带按钮）** | `send_pending_entry_expiry_review` | worker（lifecycle_monitor） | SYSTEM | 无（直发） |
+| 7 | 识别冲突复核 / 语义分歧 / 停摆致过期 | `send_*` 三个直发函数 | worker | SYSTEM | 无 |
+| 8 | 值守提醒 / 值守正常 | `oncall_service` 独立进程 | 独立 service | 回落 SYSTEM token | 无 |
+
+**三个闸门都已经落好了**（初稿以为还没落）。剩下的就是代码里的路由，不需要再动闸门。
+
+**#3/#4 不是「两处不一致」，是一个骗人的参数名。** 本稿 4.2 初版说
+[`web_app.py`](../../src/telegram_kol_research/web_app.py) 那处传的是 `system_operator_bot_config`、
+和 [`worker_command_executor.py`](../../src/telegram_kol_research/worker_command_executor.py) 不一致，
+**这也是错的，实施时复核发现的**：`run_deepcoin_execution_reconcile_loop` 的**形参**叫
+`system_operator_bot_config`，但调用方填进去的**实参**一直是 `app.state.notification_bot_config`。
+两处从来就是一致的，都走运行通知；而且 `deepcoin_reconcile` 属于 **worker** 角色（不是 ingest），
+所以它一直是活的 —— 87 条已投递的保护事件就是它发的。
+
+本次的改动因此是**把形参名改成 `notification_bot_config`**，行为零变化，只是让下一个人
+读到这里时不会像我一样判断错。
+
+### 4.3 分流判据：用库里已有的事实，不要手写清单
+
+runtime_incidents 的泛用文案（`format_runtime_incident_notification` 第 461 行）对**所有**
+非供应商类型统一收尾：
+
+> 处理: 已记录，正常交易流程未等待本通知。
+
+也就是说，**按系统自己的说法，绝大多数 incident 本来就是纯通知**。真正需要人动手的，
+在 `redacted_summary` 里都留了痕迹。生产 2026-09-01 起的实际分布：
+
+#### 需人操作 → 留「Kol事件处理」
+
+| incident_type | 依据字段 | 近一月条数 | 要做什么 |
+|---|---|---|---|
+| `management_target_needs_confirmation` | `source_status=awaiting_user_confirmation` | 12 | `/choose` 或 `/dismiss` |
+| `duplicate_entry_needs_confirmation` | `impact=entry_withheld_awaiting_user_confirmation` | 1 | 决定要不要入场 |
+| `provider_outage_entry_not_replayed` | `impact=entry_not_executed_needs_person` | 1 | 手动下单或放弃 |
+| `provider_outage_management_not_replayed` | 文案写死「请人工核对仓位后决定」 | 0 | 人工核对 |
+| `management_recognition_unresolved` | `impact=management_instruction_not_executed` | 7 | 人工判读指令 |
+| `severe_protection_incident` | `source_status=recovery_required` | 31 | 到交易所核对 |
+| `management_recovery_required` | `source_status=recovery_required` | 2 | 人工恢复 |
+| `source_deletion_exit_stuck` | `source_status=recovery_required` | 2 | 人工恢复 |
+| `uncertain_without_write` | `impact=frozen_without_evidence_of_contact` | 11 | 自动管理已冻结，人工决定 |
+| `revision_cancel_outcome_unresolved` | `impact=cancel_outcome_unknown_batch_frozen` | 2 | 人工核对撤单结果 |
+| `revision_batch_too_stale_to_resume` | `impact=frozen_revision_intent_older_than_horizon` | 2 | 人工决定要不要重做 |
+
+**机械判据**：`source_status ∈ {awaiting_user_confirmation, recovery_required}`
+或 `impact` 含 `awaiting_user` / `needs_person` / `frozen` / `not_executed`。
+这条判据能覆盖上表全部 11 类，无需手写白名单 —— 但**新类型必须由捕获方主动打这个标**，
+判据要写进 `runtime_incident_adapters` 的模块 docstring，否则下一个新类型会静默落到通知侧。
+
+#### 纯通知 → 去「Kol运行通知」
+
+`mimo_provider_*`（5 类）、`provider_outage_replay_started`、`authoritative_recognition_failed`(67)、`context_worker_exhausted`(91)、
+`position_marked_manually_closed`(27)、`protection_adopted_from_exchange`(17)、
+`message_processing_queue_stalled`(16)、`deferred_instruction_expired`(14)、
+`entry_admission_expired`(3)、`management_fraction_rejected`(19)、`management_stop_rejected`(5)、
+`entry_revision_authority_blocked_reset`(3)、`management_cancel_precheck_observed`(1)、
+`unclassified_operation_failure`(1)、`notification_delivery_failure`、
+`background_task_restart_exhausted`，以及 #8 值守的全部三种（提醒 / 已恢复 / 每日正常）。
+
+#### 用户裁定（2026-09-26）
+
+| incident_type | 裁定 |
+|---|---|
+| `authoritative_execution_uncertain` | → **事件处理** |
+| `management_recovery_timeout` | → **事件处理** |
+| `management_target_refused` | → 运行通知 |
+| `unclassified_operation_failure` | → 运行通知 |
+
+「事件处理 bot 连续 N 天零消息」的值守判据：**本次不做**。
+
+#### 改成白名单方向：默认不变，只搬明确是通知的
+
+初稿写的是「机械判据决定谁留下」。复核后改成**反过来**，理由是安全方向：
+
+- 机械判据靠 `source_status` / `impact` 打标，**靠的是捕获方记得打**。漏打一个，
+  需要人动手的事件就静默溜进通知 bot —— 这正是本稿风险表第二行担心的事。
+- 真正被投递的类型不止表里这些：`ALWAYS_NOTIFIED_INCIDENT_TYPES`
+  （[`config.py:162`](../../src/telegram_kol_research/config.py)）有 **39 个**，
+  加上 `TELEGRAM_KOL_RUNTIME_INCIDENT_TELEGRAM_TYPES` 手配的 8 个，
+  一共四十多类。要我逐个替用户判断「这个算不算要人管」，错判的成本不对称。
+
+所以最终规则是一句话：
+
+> **默认维持现状（去事件处理）；只有下面这份显式清单里的类型改去运行通知。**
+
+新类型不在清单里 → 行为和今天完全一样，不会有人被静默。清单要改，是一次显式的代码改动。
+
+#### 改去「Kol运行通知」的显式清单（19 类）
+
+```
+mimo_provider_unavailable        mimo_provider_recovered
+mimo_provider_failure_streak     mimo_provider_probe_failed
+mimo_provider_health_check_failed
+provider_outage_replay_started
+authoritative_recognition_failed context_worker_exhausted
+position_marked_manually_closed  protection_adopted_from_exchange
+message_processing_queue_stalled deferred_instruction_expired
+entry_admission_expired          management_fraction_rejected
+management_stop_rejected         entry_revision_authority_blocked_reset
+management_cancel_precheck_observed
+management_target_refused        unclassified_operation_failure
+```
+
+（`notification_delivery_failure` / `background_task_restart_exhausted` **不在清单里**：
+投递本身坏了要是也投到那个可能正坏着的 bot，就没人知道了。它们留在事件处理。）
+
+留在事件处理的那些（不必显式列，是默认）包含 4.3 上表 11 类、用户裁定的 2 类、
+`severe_protection_incident`、以及 `market_fill_attribution_unverified` /
+`naked_market_fill_safety_net` / `conditional_entry_absent_from_exchange` /
+`management_submit_unknown` / `stop_resize_replace_incomplete` 等
+「交易所上可能有一个没有保护的真实仓位」的那一类 —— `ALWAYS_NOTIFIED` 的注释写的就是它们。
+
+#### 通道级归属
+
+- #5 策略管理通知 → 运行通知（它本来就绑 NOTIFICATION，**已经在跑**，不动）
+- #3 归因审计 / #4 保护事件 → 运行通知（**生产早就是了**；本次只把骗人的形参名改掉）
+  - 例外：`severe_protection_incident` 走的是 #1 通道，留事件处理
+- #2 消息操作异常 第1/2 阶段 → **跟随它所属 incident 的路由**，两阶段必须同去一个 bot
+  （第 2 阶段把第 1 阶段的 `telegram_message_id` 存下来做幂等，分到两个 bot 那个 id 就失去意义）
+- #6 到期复核（带按钮） → **保持事件处理，一个字都别动**
+- #7 三个直发（识别冲突复核 / 语义分歧 / 停摆致过期） → 运行通知（都是「告诉你一声」，没有可点的东西）
+- #8 值守 → 运行通知（配独立 env，见 4.4）
+
+### 4.4 实施顺序
+
+初稿把「落闸门」列为第一步。复核后发现**三个闸门生产上早就落好了**
+（3844 / 422 / 97，runtime incident 的 env 闸门 = 2069），`NOTIFICATION_BOT_CHAT_ID`
+在 worker 单元里也早就写了。所以那两步作废，剩下的是纯代码 + 一处 env。
+
+**代码（本次 worktree 内做完）**
+
+1. 改动 A：`head_model` 进 summary，8 处文案按它生成
+2. 改动 B：恢复通知的补做分岔
+3. **改 deliver 循环**：`deliver_runtime_incident_notifications` 现在只收一个 `config`，
+   要按 `incident_type` 选 bot 就得**同时拿到两个 config**。这是唯一有结构改动的地方，
+   不是「把参数从 A 换成 B」。`deliver_message_operation_stage1/stage2` 同理
+4. #3/#4：把 `run_deepcoin_execution_reconcile_loop` 的形参从 `system_operator_bot_config`
+   改名为 `notification_bot_config`（实参一直就是它，行为零变化）
+5. #7：`send_ai_recognition_conflict_review` 的调用处改传 `notification_bot_config`，守卫同步改。
+   `send_semantic_disagreement_notification` / `send_stall_induced_expiry_notification`
+   **在生产里没有调用方**（只有定义和单测），不动；`cli.py` 里还有一处调用，
+   因为另一会话正在改那个文件，本次不碰，留作后续
+
+**部署时（回调度会话确认顺序后再做）**
+
+6. 值守单独配 `TELEGRAM_KOL_ONCALL_BOT_TOKEN` / `TELEGRAM_KOL_ONCALL_CHAT_ID` 指向运行通知，
+   不再回落 SYSTEM（写 `/etc/telegram-kol-oncall.env`，不是 `/opt/.../config/`）
+7. `tg-deploy` 管 web/worker；**值守服务要单独重启**，它不跟 web 走
+
+**回滚**：改动全在代码里，回滚 = `tg-deploy <前一个 sha>`；第 6 步的 env 回滚 = 删掉那两行再重启值守。
+
+### 4.5 收口判据
+
+- 运行通知 bot 收到第一条 `mimo_provider_*` 或 `context_worker_exhausted`
+- 事件处理 bot 收到的下一条消息，要么带按钮，要么是 4.3 默认集里的类型
+- 两个 bot **不出现同一条 incident**（`runtime_incidents.notification_status` 只有一列，
+  一条只会投一次）
+- 供应商告警标题里出现 `gpt-5.6-luna` 而不是 `MiMo`
+- 闸门未被本次改动碰过：部署后 `trading_settings.global` 三个 `*_after_id` 仍是 3844 / 422 / 97
+
+---
+
+## 5. 风险
+
+| 风险 | 缓解 |
+|---|---|
+| 积压冲垮新 bot | 三个闸门生产已落好（4.2 表内数值），本次不动它们 |
+| 新增 incident 类型静默落到通知侧，需人操作的没人看见 | **改成白名单方向**：默认留事件处理，只有 19 类显式搬走（4.3）。新类型行为不变 |
+| #3/#4 双投 | 不存在：两处实参一直都是运行通知，本次只改形参名（4.2） |
+| 投递本身坏了，告警投到坏掉的 bot | `notification_delivery_failure` / `background_task_restart_exhausted` 不进搬迁清单 |
+| 改文案时误动 `incident_type` | 第 2 节的边界表；改完 grep 确认 `_MIMO_PROVIDER_INCIDENT_TYPES` 八个字面量未变 |
+| 与正在进行的其它会话冲突 | 另一会话在 `uncertain-attempt-closeout` 改 `authoritative_execution_attempts.py` / `authoritative_recognition.py` / `cli.py` / `db.py` / `models.py`（含 schema，L3，部署排在本次前面）。本次**不碰这 5 个文件** |
+| 用户裁定的 `authoritative_execution_uncertain` 与另一会话的工作重叠 | 本次只决定它投到哪个 bot，不动它的产生逻辑 |
+
+---
+
+## 6. 不在本稿范围
+
+- 表名、模块名、`parse_source` 枚举值的改名（三层里的第二、三层）
+- `Kol信号` bot 的任何改动
+- 值守判据本身（D6 那条线见 `docs/plans/2026-09-26-oncall-d6-silent-stall-rules-design.md`）
+- codex-proxy 的上游容错（这次是 OpenAI 侧故障，备用模型已经按设计接住了，无需改）
+
+---
+
+## 7. 识别冲突复核那条告警：已复核，只剩死文案 + 一条没上守卫的 CLI 路径
+
+`format_ai_recognition_conflict_review_message`
+（[`system_operator_bot.py`](../../src/telegram_kol_research/system_operator_bot.py) 约 1476 行）
+还有 5 处硬写的 `MiMo`，包括一行 `权威结果: MiMo` —— 本次改完之后它会和隔壁的
+「权威识别主用模型 gpt-5.6-luna」自相矛盾。本次没动它：它不在第 2 节那 8 行表里。
+
+### 7.1 初稿担心的事已经被 2026-09-23 的 d4b77b23 解决了
+
+我一开始以为这条告警还在往外发「分歧告警但没有分歧方」。**复核后：没有。**
+`telegram_live_listener.auxiliary_review_disagrees`（约 575 行）要求 `deepseek` 段确实带结果
+且 `agreement_status ∈ {disagreed, authoritative_failed}`，否则写
+`notification_status = suppressed_no_auxiliary` 并且不发。
+
+生产 `recognition_decisions`（索引 `(agreement_status, updated_at)`，按时间窗查，没有全表扫）：
+
+| agreement_status | notification_status | 条数 | 时间范围 |
+|---|---|---|---|
+| authoritative_failed | `suppressed_empty_input` | 32 | 09-20 05:56 → **09-26 12:02** |
+| authoritative_failed | `sent` | 3 | 09-20 02:05 → **09-22 14:53** |
+| authoritative_failed | `suppressed_no_auxiliary` | 3 | 09-23 07:56 → 09-24 16:16 |
+| authoritative_failed | `suppressed_expired_recovery` | 1 | 09-21 02:17 |
+
+**三条 `sent` 全在 09-22 及以前，即守卫上线之前；守卫上线后是 0 条。** 守卫在工作。
+所以 §7 不用另开专题，剩下的就是格式化函数里那段永远到不了人眼前的死文案。
+
+### 7.2 但是有第三个发送方，它没走那个守卫
+
+`auxiliary_review_disagrees` 的 docstring 写着「This is the one predicate both senders ask,
+so the worker path and `POST /api/messages/{id}/recognize` cannot drift apart」——
+**它只数了两个。还有第三个**：
+
+[`cli.py`](../../src/telegram_kol_research/cli.py) 约 1786-1824 行，
+`_run_telegram_sync` / `_run_parse_mode` 里那段，从
+`agreement_status == "authoritative_failed"` 直接写 `notification_status="scheduled"`
+然后调 `_deliver_cli_authoritative_failure_notification` → `send_ai_recognition_conflict_review`，
+**中间没有 `auxiliary_review_disagrees`**。
+
+它至今没发过：那条路只有人手敲 CLI 才会跑（生产三个服务都是
+`telegram-kol-research web --runtime-role ...`，`systemctl list-timers` 里也只有
+媒体清理那一个定时器），而 09-23 之后库里既没有 `scheduled` 也没有 `sent`。
+
+所以这是个**潜伏的漂移**，正好是那句 docstring 声称已经防住的那种。
+（2026-09-23 的 `docs/codex-oncall-status.md` 8.14「风险与遗留」把它记成已知遗留，
+理由是当时没有服务在跑它 —— 那个判断今天仍然成立，本节只是给它补上实证。）
+
+### 7.3 处理方式：并进本条线，在 rebase 之后做
+
+`cli.py` 现在归另一个会话（`uncertain-attempt-closeout` 线）占用，**本次不碰**。
+2026-09-26 与调度会话约定：等那条线部署、`cli.py` 释放之后，本条线 rebase 到它落地后的
+`origin/main`，把这一处一起做完：
+
+1. CLI 那段（约 1786-1824 行）在写 `notification_status="scheduled"` **之前**先问
+   `auxiliary_review_disagrees`，不通过就写 `SUPPRESSED_NO_AUXILIARY` 并跳过发送；
+2. 把 `auxiliary_review_disagrees` docstring 里的「both senders」改成三个，
+   并点名 CLI 那条路 —— 数错发送方数量正是这次漏掉它的原因；
+3. 补测试。**注意 `tests/test_cli_authoritative_recognition.py` 里这三条**：
+   `test_cli_authoritative_result_sends_no_conflict_alert`、
+   `test_cli_mimo_failure_notification_does_not_block_later_messages`、
+   `test_cli_drains_scheduled_failure_alert_when_later_processing_raises`。
+   后两条断言的是并发 / 排空语义 —— 加上守卫之后它们的 payload 会被拦掉，
+   除非 fixture 里的 `deepseek` 段带上真实结果。**别为了让测试变绿就把守卫放宽**，
+   要改的是 fixture。
+
+### 7.4 同一类漂移还剩一处：CLI 也没有 `_classify_authoritative_failure_notification`
+
+补守卫时顺带看到的，**本次没做**，记在这里。
+
+worker 和 `POST /api/messages/{id}/recognize` 共用的
+`_handle_authoritative_failure_notification`（[`telegram_live_listener.py`](../../src/telegram_kol_research/telegram_live_listener.py) 约 480 行）
+在问 `auxiliary_review_disagrees` **之前**还先问一道
+`_classify_authoritative_failure_notification`（约 613 行），它负责两种抑制：
+
+- `suppressed_empty_input` —— 消息里没有可读的文字或图片
+- `suppressed_low_value` —— 外部行情类的低价值失败
+
+`cli.py` 里这个名字出现 **0 次**。所以 CLI 路径缺的不是一道守卫，是**两道**：
+本次补上了辅助模型那道，行情低价值/空输入那道仍然没有。
+
+为什么今天无害：辅助模型那道守卫现在会拦下 CLI 的**每一条**失败告警
+（没有第二个模型，`auxiliary_review_disagrees` 恒为 False），所以后面那道够不着。
+但这正是 7.2 那个教训的第二只靴子 —— 两条路各自长出自己的抑制逻辑，
+靠的是「反正现在也发不出去」，而不是靠一个共用的入口。
+
+**建议的根治方向不是再补一道判断**，而是让 CLI 也走
+`_handle_authoritative_failure_notification`（或把它拆出一个不依赖
+`retry_processor` 的纯判定函数），这样三个发送方问的就是同一段代码，
+而不是同一段代码的三份抄写。生产证据显示这一路从未触发过，所以不急，
+但别再往 CLI 里单独抄第三份判断。
+
+参考：生产 `recognition_decisions` 里 `suppressed_empty_input` 有 32 条
+（09-20 → 09-26 12:02），是 worker 那道在持续工作；CLI 那一路一条都没有。

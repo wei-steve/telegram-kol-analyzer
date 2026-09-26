@@ -786,6 +786,230 @@ def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
         assert row.notification_claim_token is None
 
 
+def test_select_incident_bot_config_defaults_to_operator_bot():
+    operator = SystemOperatorBotConfig("op-token", "op-chat")
+    notification = SystemOperatorBotConfig("notif-token", "notif-chat")
+
+    # In the explicit搬迁 whitelist -> Kol运行通知.
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "mimo_provider_unavailable",
+            operator_config=operator,
+            notification_config=notification,
+        )
+        is notification
+    )
+    # Not in the whitelist -> stays on Kol事件处理 (the default).
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "severe_protection_incident",
+            operator_config=operator,
+            notification_config=notification,
+        )
+        is operator
+    )
+    # No Kol运行通知 bot configured at all -> falls back to the operator bot
+    # rather than the notification silently disappearing.
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "mimo_provider_unavailable",
+            operator_config=operator,
+            notification_config=None,
+        )
+        is operator
+    )
+
+
+def test_deliver_runtime_incident_notifications_splits_across_two_bots(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "runtime-split-routing.db")
+    notification_incident = _record_runtime_incident(
+        session_factory,
+        source_record_id="mimo-outage-1",
+        incident_type="mimo_provider_unavailable",
+        fingerprint="c" * 64,
+    )
+    operator_incident = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        incident_type="severe_protection_incident",
+        fingerprint="d" * 64,
+    )
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append((kwargs["config"], kwargs["text"]))
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        capture,
+    )
+    operator_config = SystemOperatorBotConfig("op-token", "op-chat")
+    notification_config = SystemOperatorBotConfig("notif-token", "notif-chat")
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=operator_config,
+            notification_config=notification_config,
+            runtime_config=RuntimeIncidentConfig(telegram_notifications_enabled=True),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 2
+    assert len(deliveries) == 2
+    routed = {
+        (
+            "notification"
+            if f"事件ID: {notification_incident.id}" in text
+            else "operator"
+            if f"事件ID: {operator_incident.id}" in text
+            else "unknown"
+        ): config
+        for config, text in deliveries
+    }
+    assert routed == {
+        "notification": notification_config,
+        "operator": operator_config,
+    }
+
+
+def test_provider_unavailable_notification_names_the_chain_head_model(tmp_path):
+    session_factory = create_session_factory(tmp_path / "provider-unavailable-head.db")
+    incident = _record_runtime_incident(
+        session_factory,
+        source_kind="mimo_provider",
+        source_record_id="outage_head_b0",
+        incident_type="mimo_provider_unavailable",
+        fingerprint="e" * 64,
+        redacted_summary=json.dumps(
+            {
+                "component": "mimo_provider",
+                "reason_code": "server_error",
+                "error_code": "http_502",
+                "episode_started_at": "2026-09-25T22:46Z",
+                "last_failure_at": "2026-09-25T23:23Z",
+                "consecutive_failures": 15,
+                "impact": "authoritative_recognition_unavailable",
+                "head_model": "gpt-5.6-luna",
+            },
+            sort_keys=True,
+        ),
+    )
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        rendered = operator_bot_module.format_runtime_incident_notification(row)
+
+    assert "权威识别主用模型不可用" in rendered
+    assert "模型: gpt-5.6-luna" in rendered
+    assert "MiMo" not in rendered
+
+
+def test_provider_unavailable_notification_without_head_model_names_no_brand(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "provider-unavailable-noh.db")
+    incident = _record_runtime_incident(
+        session_factory,
+        source_kind="mimo_provider",
+        source_record_id="outage_nohead_b0",
+        incident_type="mimo_provider_unavailable",
+        fingerprint="f" * 64,
+        redacted_summary=json.dumps(
+            {
+                "component": "mimo_provider",
+                "reason_code": "server_error",
+                "error_code": "http_502",
+                "episode_started_at": "2026-09-25T22:46Z",
+                "last_failure_at": "2026-09-25T23:23Z",
+                "consecutive_failures": 15,
+                "impact": "authoritative_recognition_unavailable",
+            },
+            sort_keys=True,
+        ),
+    )
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        rendered = operator_bot_module.format_runtime_incident_notification(row)
+
+    assert "权威识别主用模型不可用" in rendered
+    assert "模型:" not in rendered
+    assert "MiMo" not in rendered
+    assert "gpt-5.6-luna" not in rendered
+    assert "mimo-v2.5" not in rendered
+
+
+def test_recovered_notification_with_fallback_model_does_not_promise_replay(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "provider-recovered-fb.db")
+    incident = _record_runtime_incident(
+        session_factory,
+        source_kind="mimo_provider",
+        source_record_id="outage_recovered_fb",
+        incident_type="mimo_provider_recovered",
+        fingerprint="1" * 64,
+        redacted_summary=json.dumps(
+            {
+                "component": "mimo_provider",
+                "reason_code": "server_error",
+                "error_code": "http_502",
+                "episode_started_at": "2026-09-25T22:46Z",
+                "recovered_at": "2026-09-25T23:54Z",
+                "consecutive_failures": 15,
+                "impact": "authoritative_recognition_restored",
+                "head_model": "gpt-5.6-luna",
+                "fallback_model": "mimo-v2.5",
+            },
+            sort_keys=True,
+        ),
+    )
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        rendered = operator_bot_module.format_runtime_incident_notification(row)
+
+    assert "权威识别主用模型已恢复" in rendered
+    assert "模型: gpt-5.6-luna" in rendered
+    assert "由备用模型 mimo-v2.5 完成" in rendered
+    assert "会按原顺序重新识别" not in rendered
+    assert "若没有这样的消息，不会再有补做通知" in rendered
+
+
+def test_recovered_notification_without_fallback_model_keeps_original_wording(
+    tmp_path,
+):
+    session_factory = create_session_factory(tmp_path / "provider-recovered-noh.db")
+    incident = _record_runtime_incident(
+        session_factory,
+        source_kind="mimo_provider",
+        source_record_id="outage_recovered_noh",
+        incident_type="mimo_provider_recovered",
+        fingerprint="2" * 64,
+        redacted_summary=json.dumps(
+            {
+                "component": "mimo_provider",
+                "reason_code": "server_error",
+                "error_code": "http_402",
+                "episode_started_at": "2026-09-12T03:00Z",
+                "recovered_at": "2026-09-12T04:10Z",
+                "consecutive_failures": 2,
+                "impact": "authoritative_recognition_restored",
+            },
+            sort_keys=True,
+        ),
+    )
+    with session_factory() as session:
+        row = session.get(RuntimeIncident, incident.id)
+        rendered = operator_bot_module.format_runtime_incident_notification(row)
+
+    assert "权威识别主用模型已恢复" in rendered
+    assert "会按原顺序重新识别" in rendered
+    assert "不会再有补做通知" not in rendered
+
+
 def _seed_message_operation_stage1(session_factory, *, text="reduce by 50%"):
     from telegram_kol_research.message_operation_supervisor import (
         materialize_message_operation_stage1_outbox,

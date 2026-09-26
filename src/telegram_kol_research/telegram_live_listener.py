@@ -584,10 +584,16 @@ def auxiliary_review_disagrees(payload: Mapping[str, Any]) -> bool:
     lines. The account owner ruled that it must not be sent while no auxiliary
     model is in use.
 
-    This is the one predicate both senders ask, so the worker path and
-    ``POST /api/messages/{id}/recognize`` cannot drift apart. The formatter
-    is deliberately untouched: restore a second model and the alert returns
-    with the wording it always had.
+    This is the one predicate all three senders ask, so they cannot drift
+    apart: the worker path, ``POST /api/messages/{id}/recognize`` (both via
+    ``_handle_authoritative_failure_notification``), and the CLI's
+    ``cli._process_raw_messages_with_mimo_authority``, called by
+    ``_run_telegram_sync`` / ``_run_parse_mode``. Until 2026-09-26 this
+    sentence said "both senders", and that miscount is exactly what left the
+    CLI path unguarded: a claim that callers "cannot drift apart" only covers
+    the call sites it actually counted. The formatter is deliberately
+    untouched: restore a second model and the alert returns with the wording
+    it always had.
     """
 
     auxiliary = payload.get("deepseek")
