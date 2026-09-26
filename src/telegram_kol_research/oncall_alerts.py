@@ -40,6 +40,7 @@ from telegram_kol_research.oncall_codex import (
     URGENCY_LABELS_ZH,
 )
 from telegram_kol_research.oncall_state import (
+    LANE_STALL_ACTIVE,
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
     UNHEARD_INCIDENT_CASE_PREFIX,
@@ -97,6 +98,22 @@ ACTION_LABELS = {
 
 SIDE_LABELS = {"long": "多", "short": "空", "buy": "多", "sell": "空"}
 
+#: ``source_message_deletion_exits.state`` -> plain Chinese. The wording is the
+#: operator bot's own (``system_operator_bot``'s ``source_message_deletion_outcome``
+#: report), so the two places that show a person an exit state say the same
+#: thing; ``pending`` and ``unbound`` are added because that report never has to
+#: name them and rule D6a does. Copied rather than imported: the watcher may not
+#: import application modules (see ``tests/test_oncall_architecture_boundary.py``).
+DELETION_EXIT_STATE_LABELS = {
+    "pending": "排队等处理",
+    "cancelling_entries": "正在撤销原策略入场单",
+    "closing_positions": "正在市价退出原策略持仓",
+    "reconciling": "等待交易所归零证明",
+    "recovery_required": "需要人工恢复处理",
+    "succeeded": "已确认归零",
+    "unbound": "没有绑定到任何消息",
+}
+
 #: Reason code -> plain Chinese. Covers every code the phase 0 production
 #: study (design 7.1) turned up, plus the translations that already existed in
 #: ``web_queries._execution_reason_label``.
@@ -142,7 +159,8 @@ REASON_LABELS = {
     "unknown_exchange_outcome": "交易所返回结果不明",
     "unknown": "原因不明",
     # --- rules D6a/D6b/D6c: the silent stalls (2026-09-26 case note) ---
-    "source_deletion_exit_sealed_lane": "删除退出卡住，这个群这个币这个方向的新消息全部被挡下",
+    "source_deletion_exit_sealed_lane": "删除退出卡死（系统不会再认领），这个群这个币这个方向的新消息全部被挡下",
+    "source_deletion_exit_stalled_lane": "删除退出卡在处理中途不动了，这个群这个币这个方向的新消息全部被挡下",
     "waiting_source_deletion_exit": "正在等一条删除退出收口，这条消息暂时被挡下",
     "deferred_expired": "被删除退出挡下，等到超时，系统把这条消息作废了（永不执行）",
     "runtime_incident_never_notified": "这条告警一直在发生，但从来没有通知过任何人",
@@ -196,6 +214,23 @@ def action_label(action: str | None) -> str:
 
 def side_label(side: str | None) -> str:
     return SIDE_LABELS.get(str(side or "").strip().lower(), "")
+
+
+def deletion_exit_state_label(state: str | None) -> str:
+    """Chinese for an exit state, with the raw word kept alongside it.
+
+    The raw word is what an engineer greps for and what the database holds, so
+    it is never dropped; an unknown state is shown and flagged rather than
+    guessed at, the same way :func:`reason_label` treats an unknown code.
+    """
+
+    code = str(state or "").strip()
+    if not code:
+        return "状态未记录"
+    label = DELETION_EXIT_STATE_LABELS.get(code)
+    if label is None:
+        return f"{code}（未收录状态）"
+    return f"{label}（{code}）"
 
 
 STOP_PRICE_ACTIONS = frozenset({"adjust_stop_loss"})
@@ -366,6 +401,12 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
     reading this, so every line translates it: which group, which instrument
     and direction are shut, how long, and -- the line that makes it urgent --
     how many of that group's later messages the seal has already thrown away.
+
+    One shut lane, two causes, and the cause decides who can do something about
+    it, so the second-to-last line differs: an exit the worker still holds is a
+    step going round in circles that no sweep will ever touch, and an exit in
+    ``recovery_required`` is one the worker will never claim again. The rest of
+    the alert -- rule, severity, case key -- is the same, because the loss is.
     """
 
     evidence = case.evidence or {}
@@ -373,6 +414,7 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
     instrument = _instrument_label(evidence) or "未知标的"
     voided = evidence.get("voided_messages")
     examined = evidence.get("voided_scan_examined")
+    sealed_for = _hours_and_minutes(evidence.get("minutes_sealed"))
 
     if voided is None:
         loss_line = "期间被作废的消息：数不出来（读取受限）"
@@ -383,16 +425,29 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
         if examined:
             loss_line += f"（只数了封锁之后这个群的 {int(examined)} 条消息，实际可能更多）"
 
+    if str(evidence.get("stall_class") or "") == LANE_STALL_ACTIVE:
+        cause_line = (
+            f"这条退出还在处理中的状态上，本该几秒钟走完，却已经 {sealed_for}没动过——"
+            "说明认领或其中某一步在原地打转。"
+            "系统的超时清扫只管「需要人工恢复处理」的退出，不会碰这一条。"
+        )
+    else:
+        cause_line = (
+            "这条退出系统不会再认领了：只有超时清扫或人工能动它，"
+            f"而它已经卡了 {sealed_for}，说明清扫也没能放它过去。"
+        )
+
     return "\n".join(
         [
             f"⚠️ 值守提醒 #{case.id}（这条线被封住了）",
             f"群：{group}    被封的方向：{instrument}",
-            f"封了多久：{_hours_and_minutes(evidence.get('minutes_sealed'))}",
+            f"封了多久：{sealed_for}",
             f"原因：{reason_label(case.reason_code)}",
             f"卡住的删除退出：#{evidence.get('exit_id', '?')}"
-            f"（状态 {evidence.get('exit_state') or '未记录'}，"
+            f"（状态 {deletion_exit_state_label(evidence.get('exit_state'))}，"
             f"上次原因 {evidence.get('exit_last_reason') or '未记录'}）",
             loss_line,
+            cause_line,
             "这个方向的新策略现在一条都进不来，直到这条退出收口。",
         ]
     )
@@ -438,7 +493,7 @@ def format_voided_message_alert(case: CaseRecord) -> str:
     if blocking is not None:
         lines.append(
             f"挡住它的是删除退出 #{blocking}"
-            f"（状态 {evidence.get('blocking_exit_state') or '未记录'}）。"
+            f"（状态 {deletion_exit_state_label(evidence.get('blocking_exit_state'))}）。"
         )
     lines.append(f"{subject}不会被执行，也不会重试——要不要补，由你决定。")
     return "\n".join(lines)

@@ -52,6 +52,24 @@ VOIDED_MESSAGE_CASE_PREFIX = "voided:"
 #: the id is what the operator bot's own reports show.
 UNHEARD_INCIDENT_CASE_PREFIX = "unheard:"
 
+#: Rule D6a's two ways for one lane to stay shut. They are the same problem --
+#: nothing of this group, symbol and side can get in -- but not the same cause,
+#: and the cause decides who can do something about it, so the alert has to say
+#: which one it is. The words live here because the detector writes them into
+#: the case evidence and the alert reads them back, and the two modules may not
+#: import each other.
+#:
+#: ``LANE_STALL_ACTIVE``: the exit is in one of the deletion worker's active
+#: states. It is claimable, it should be through in seconds, and nothing
+#: sweeps it -- standing still means the claim or one of the steps is going
+#: round in circles.
+#:
+#: ``LANE_STALL_UNCLAIMABLE``: the exit is in ``recovery_required``, which the
+#: worker never claims again. Only the system's own timeout sweep or a person
+#: can move it.
+LANE_STALL_ACTIVE = "active"
+LANE_STALL_UNCLAIMABLE = "unclaimable"
+
 ALERT_STATUSES = frozenset({"pending", "sent", "dry_run", "failed"})
 WATCH_STATUSES = frozenset({"open", "retired"})
 

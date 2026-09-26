@@ -194,7 +194,7 @@ def test_every_production_read_shape_the_detector_uses_is_declared():
     assert "raw_message_id = ?" in declared
     # D6a/D6c sweep two more tables, each on a named index, and D6a counts the
     # lane's losses through a chat-scoped read plus a keyed one.
-    assert "WHERE state = ? AND updated_at <= ?" in declared
+    assert "WHERE state IN (?, ...) AND updated_at <= ?" in declared
     assert "WHERE status = ? AND last_occurred_at >= ?" in declared
     assert "WHERE chat_id = ? AND id > ?" in declared
     assert "WHERE raw_message_id IN (?, ...)" in declared

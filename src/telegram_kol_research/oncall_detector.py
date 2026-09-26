@@ -48,6 +48,8 @@ from pathlib import Path
 from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from telegram_kol_research.oncall_state import (
+    LANE_STALL_ACTIVE,
+    LANE_STALL_UNCLAIMABLE,
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
     UNHEARD_INCIDENT_CASE_PREFIX,
@@ -124,8 +126,34 @@ DEFERRED_HOLD_REASON = "waiting_source_deletion_exit"
 
 #: Rule D6a. The one source-deletion exit state that hangs about indefinitely
 #: while still sealing a lane: the deletion worker's active states do not
-#: include it, so nothing ever claims such a row again.
+#: include it, so nothing ever claims such a row again. The system's own
+#: timeout sweep (``source_deletion_exit_timeout.STUCK_STATE``, the same word)
+#: is the only automation left that can release it.
 SEALED_LANE_STUCK_STATE = "recovery_required"
+#: Rule D6a, extended 2026-09-26. The deletion worker's own active states,
+#: copied from ``source_message_deletion_worker._ACTIVE_STATES`` (the same four
+#: are spelled out a second time in ``historical_state_repair``). A row in one
+#: of these is claimable and should be through the whole exit in seconds -- but
+#: ``source_execution_barrier`` shuts the lane on ``state != 'succeeded'``, so
+#: while one of them stands still the lane is exactly as shut as a stuck one,
+#: and **nothing sweeps these**: the timeout sweep only looks at
+#: :data:`SEALED_LANE_STUCK_STATE`.
+SEALED_LANE_ACTIVE_STATES = (
+    "pending",
+    "cancelling_entries",
+    "closing_positions",
+    "reconciling",
+)
+#: Every state that shuts a lane, which is every state except two.
+#: ``succeeded`` is the one the barrier lets through, and ``unbound`` has a NULL
+#: ``raw_message_id``, so the barrier's first inner join never reaches the row
+#: (:attr:`SealedLane.seals_a_lane` drops it a second time anyway).
+#:
+#: ``waiting`` is deliberately absent, and is not a state at all:
+#: ``source_message_deletion_worker`` uses that word as a key in its ``counts``
+#: dictionary for a round that ended without a verdict, and writes
+#: ``reconciling`` to the row itself. Re-checked before this list was widened.
+SEALED_LANE_SEALING_STATES = SEALED_LANE_ACTIVE_STATES + (SEALED_LANE_STUCK_STATE,)
 #: The only state ``source_execution_barrier`` treats as "lane open again".
 SEALED_LANE_RELEASED_STATE = "succeeded"
 
@@ -134,10 +162,14 @@ SEALED_LANE_RELEASED_STATE = "succeeded"
 INCIDENT_PENDING_STATUS = "pending"
 INCIDENT_LOUD_SEVERITIES = frozenset({"high", "critical"})
 
-#: D6a's horizon. The system's own sweep releases a stuck exit after
-#: ``source_deletion_exit_timeout_minutes`` (120 in production), so the watch
-#: must sit *later* than the self-healing window or it would page for something
-#: about to be fixed. Six hours is the same bar as ``case_stale_after``.
+#: D6a's horizon, and the only one: both classes of sealed lane use it. For
+#: :data:`SEALED_LANE_STUCK_STATE` the system's own sweep releases the exit
+#: after ``source_deletion_exit_timeout_minutes`` (120 in production), so the
+#: watch must sit *later* than that self-healing window or it would page for
+#: something about to be fixed. For :data:`SEALED_LANE_ACTIVE_STATES` there is
+#: no sweep to wait for and the work is seconds long, so six hours is far past
+#: generous -- which is the point: one bar, no second number to keep in step,
+#: and it is the same bar as ``case_stale_after``.
 SEALED_LANE_STUCK_AFTER = timedelta(hours=6)
 #: D6c's "still happening" window. An incident whose ``last_occurred_at`` has
 #: not moved inside this window has stopped, and a stopped alarm needs nobody.
@@ -193,10 +225,21 @@ COUNTER_STOP_LADDER_LEVEL_UNRECORDED = "counter:stop_ladder_level_unrecorded"
 META_CONSECUTIVE_READ_FAILURES = "consecutive_read_failures"
 META_CONSECUTIVE_WORKER_HEALTH_FAILURES = "consecutive_worker_health_failures"
 
-#: D6a/D6b/D6c reason codes. The watcher's own vocabulary, except
-#: :data:`DEFERRED_EXPIRED_REASON`, which is the pipeline's own spelling and is
-#: reused verbatim so the alert and the database row say the same word.
+# D6a/D6b/D6c reason codes. The watcher's own vocabulary, except
+# :data:`DEFERRED_EXPIRED_REASON`, which is the pipeline's own spelling and is
+# reused verbatim so the alert and the database row say the same word. D6a has
+# two of them, because one shut lane has two possible causes and they need two
+# different people.
+
+#: The lane is shut and the worker will never claim the exit again
+#: (:data:`SEALED_LANE_STUCK_STATE`). Unchanged since 2026-09-26 so that cases
+#: already open in production keep the code they were filed under.
 REASON_SEALED_LANE = "source_deletion_exit_sealed_lane"
+#: The lane is shut and the exit is still one the worker *can* claim
+#: (:data:`SEALED_LANE_ACTIVE_STATES`). Same rule, same severity, same case-key
+#: namespace -- a different cause, and a different person can fix it, so it
+#: gets its own code rather than its own rule number.
+REASON_STALLED_LANE = "source_deletion_exit_stalled_lane"
 REASON_INCIDENT_NEVER_NOTIFIED = "runtime_incident_never_notified"
 REASON_INCIDENT_NOTIFICATION_STALE = "runtime_incident_notification_stale"
 
@@ -220,12 +263,16 @@ ALLOWED_QUERY_SHAPES = (
     # which carries its own index on both tables.
     "message scope: WHERE raw_message_id = ? ORDER BY id [DESC] LIMIT n",
     # D6a's sweep. ``ix_source_message_deletion_exits_state`` is (state,
-    # updated_at), so the equality plus the range is one index seek. The
-    # tempting spelling -- ``state NOT IN ('succeeded', ...)`` -- cannot use
-    # that index at all and scans the table, which is the thing this module
+    # updated_at), and SQLite turns the ``IN`` list into one index seek per
+    # listed state -- ``EXPLAIN QUERY PLAN`` reports the same
+    # ``SEARCH ... USING COVERING INDEX ... (state=? AND updated_at<?)`` as the
+    # single-state spelling did, which is why the five states are one statement
+    # with one shared ``LIMIT`` rather than five statements with five. The
+    # tempting spelling -- ``state NOT IN ('succeeded', 'unbound')`` -- cannot
+    # use that index at all and scans the table, which is the thing this module
     # exists not to do.
     "sealed lane: SELECT ... FROM source_message_deletion_exits "
-    "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT n "
+    "WHERE state IN (?, ...) AND updated_at <= ? ORDER BY id LIMIT n "
     "(never state NOT IN (...), which cannot use that index and scans)",
     # D6a's "how many messages has this lane already eaten". ``automation_reason``
     # carries no index, so the count is driven from the chat side instead:
@@ -288,10 +335,12 @@ class DetectorConfig:
     worker_health_failure_rounds: int = 3
     intake_limit: int = 200
     watch_limit: int = 500
-    #: D6a. How many ``recovery_required`` exits one round looks at. Every one
-    #: of them costs two point queries to name its lane, and production has
-    #: held single digits of them, so a hundred is a generous ceiling rather
-    #: than an expected load.
+    #: D6a. How many lane-sealing exits one round looks at, across all of
+    #: :data:`SEALED_LANE_SEALING_STATES` together. Every one of them costs two
+    #: point queries to name its lane, so this is the round's real cost
+    #: ceiling; it stays at a hundred for the five states because the sweep is
+    #: ordered by id ascending, which returns the oldest rows -- the only ones
+    #: that can be past the six-hour bar -- first.
     stuck_lane_limit: int = 100
     #: D6a. How many of a chat's messages after the seal are examined when
     #: counting what the lane has already voided. The count is reported as
@@ -1082,7 +1131,7 @@ def _recorded_stop_ladder_level(reader: ProductionReader, *, pos_id: str) -> int
 
 @dataclass(frozen=True, slots=True)
 class SealedLane:
-    """One ``recovery_required`` deletion exit, and the lane it seals.
+    """One lane-sealing deletion exit, and the lane it seals.
 
     ``symbol``/``side`` are ``None`` when the lane cannot be named. That is not
     a detail: ``source_execution_barrier`` blocks a new message only through a
@@ -1110,11 +1159,40 @@ class SealedLane:
             and bool(self.side)
         )
 
+    @property
+    def stall_class(self) -> str:
+        """Which of the two stories this lane is, from its state alone.
+
+        The barrier does not care which state it is -- anything but
+        ``succeeded`` shuts the lane -- but the reader does: one class has an
+        owner (the worker still holds the row and is going round in circles)
+        and the other has none (nothing will claim it again).
+        """
+
+        if self.state in SEALED_LANE_ACTIVE_STATES:
+            return LANE_STALL_ACTIVE
+        return LANE_STALL_UNCLAIMABLE
+
+    @property
+    def reason_code(self) -> str:
+        return (
+            REASON_STALLED_LANE
+            if self.stall_class == LANE_STALL_ACTIVE
+            else REASON_SEALED_LANE
+        )
+
 
 def _read_sealed_lanes(
     reader: ProductionReader, now: datetime, config: DetectorConfig
 ) -> tuple[SealedLane, ...]:
-    """Every exit currently parked in ``recovery_required``, lane named.
+    """Every exit currently in a state that shuts a lane, lane named.
+
+    The state list is :data:`SEALED_LANE_SEALING_STATES`, not
+    :data:`SEALED_LANE_STUCK_STATE` alone, because the barrier's filter is
+    ``state != 'succeeded'``: an exit stalled in ``pending`` seals the lane just
+    as completely as one parked in ``recovery_required``, and no sweep will ever
+    release it. The states are listed positively so the read is an index seek
+    per state; the negative spelling cannot use the index at all.
 
     The design asserted that the 91 ``unbound`` exits cannot seal a lane
     because their ``raw_message_id`` is NULL. Re-checked against the barrier
@@ -1124,13 +1202,19 @@ def _read_sealed_lanes(
     filter here removes them anyway. The same join also requires the deleted
     message to own a candidate with *both* symbol and side, which is why
     :attr:`SealedLane.seals_a_lane` demands the same and not less.
+
+    The ``updated_at`` bound is ``now`` rather than the six-hour bar on purpose:
+    D6b reads the same result to *name* the exit that ate a message, and that
+    exit may have been sealing the lane for ten minutes. The age test belongs
+    to :func:`_sealed_lane_observations`.
     """
 
+    placeholders = ", ".join("?" for _ in SEALED_LANE_SEALING_STATES)
     rows = reader.query(
         "SELECT " + _EXIT_COLUMNS + " FROM source_message_deletion_exits "
-        "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT ?",
+        f"WHERE state IN ({placeholders}) AND updated_at <= ? ORDER BY id LIMIT ?",
         (
-            SEALED_LANE_STUCK_STATE,
+            *SEALED_LANE_SEALING_STATES,
             as_production_text(now),
             int(config.stuck_lane_limit),
         ),
@@ -1245,7 +1329,14 @@ def _sealed_lane_observations(
     config: DetectorConfig,
     lanes: Sequence[SealedLane],
 ) -> list[_Observation]:
-    """Rule D6a. A lane sealed longer than the system's own healing window."""
+    """Rule D6a. A lane shut longer than the system's own healing window.
+
+    Two causes, one rule: :data:`REASON_STALLED_LANE` when the worker still
+    holds the row and is not finishing, :data:`REASON_SEALED_LANE` when nothing
+    will claim it again. One case key per exit either way, so a lane that slides
+    from the first cause into the second keeps its case and updates its story
+    instead of opening a second alert about the same shut lane.
+    """
 
     observations: list[_Observation] = []
     seen: set[int] = set()
@@ -1257,6 +1348,7 @@ def _sealed_lane_observations(
         if age is None or age < config.sealed_lane_stuck_after:
             continue
         seen.add(lane.exit_id)
+        reason_code = lane.reason_code
         assert lane.chat_id is not None and lane.raw_message_id is not None
         voided, examined = _count_voided_messages(
             reader,
@@ -1271,10 +1363,11 @@ def _sealed_lane_observations(
                 severity="high",
                 raw_message_id=lane.raw_message_id,
                 chat_id=lane.chat_id,
-                reason_code=REASON_SEALED_LANE,
+                reason_code=reason_code,
                 evidence={
                     "kind": "sealed_lane",
-                    "reason_code": REASON_SEALED_LANE,
+                    "reason_code": reason_code,
+                    "stall_class": lane.stall_class,
                     "exit_id": lane.exit_id,
                     "exit_state": lane.state,
                     "exit_last_reason": lane.last_reason,
@@ -1304,9 +1397,11 @@ def _sealed_lane_clears(
     """A D6a case ends when the exit reaches ``succeeded`` -- and only then.
 
     The barrier reopens the lane on that state alone, whether the system healed
-    itself or a person did it by hand. Any other state, including a fresh
-    ``updated_at`` on the same ``recovery_required`` row, leaves the lane shut
-    and the case open; the six-hour staleness sweep is what ends it otherwise.
+    itself or a person did it by hand. Any other state leaves the lane shut and
+    the case open: a fresh ``updated_at`` on the same row, a ``pending`` that
+    became ``reconciling``, an active state that gave up into
+    ``recovery_required``. The six-hour staleness sweep is what ends such a case
+    otherwise.
     """
 
     clears: list[_Observation] = []
@@ -2061,7 +2156,12 @@ def _blocking_sealed_lane(
     """The sealed lane this message was held behind, if it can be named.
 
     Same test the barrier uses -- same chat, same symbol, same side, a
-    different message -- over the exits this round already read.
+    different message -- over the exits this round already read. Since that read
+    covers every lane-sealing state and not ``recovery_required`` alone, the
+    exit named here is now the one the barrier would actually have blocked on,
+    including an exit still in an active state. This only ever fills in
+    ``blocking_exit_*`` in the D6b alert: whether a D6b case opens is decided by
+    ``automation_reason`` and nothing else.
     """
 
     if chat_id is None or not symbol or not side:

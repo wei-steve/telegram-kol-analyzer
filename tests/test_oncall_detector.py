@@ -1190,27 +1190,244 @@ def test_d6a_ignores_an_exit_whose_message_never_named_a_symbol_and_side(
     assert store.open_cases() == ()
 
 
-@pytest.mark.parametrize("state", ["succeeded", "pending", "reconciling"])
-def test_d6a_only_reads_the_one_state_that_hangs_about_forever(
+_ACTIVE_SEALING_STATES = (
+    "pending",
+    "cancelling_entries",
+    "closing_positions",
+    "reconciling",
+)
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_opens_a_case_for_an_active_state_that_stopped_moving(
     production, store, state
 ):
+    """The gap the first round left open (status document, 2026-09-26).
+
+    ``source_execution_barrier`` shuts the lane on ``state != 'succeeded'``, so
+    an exit stalled in one of the worker's own active states seals it exactly as
+    a ``recovery_required`` one does -- and unlike that one, no sweep will ever
+    release it.
+    """
+
     run_round(production, store)
-    build_sealed_lane_case(
+    built = build_sealed_lane_case(
         production, state=state, updated_at=NOW - timedelta(hours=12)
     )
 
     outcome = run_round(production, store)
 
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"lane:{built['exit_id']}"
+    assert case.rule == "D6a"
+    assert case.severity == "high"
+    assert case.reason_code == "source_deletion_exit_stalled_lane"
+    assert case.evidence["stall_class"] == "active"
+    assert case.evidence["exit_state"] == state
+    assert case.evidence["symbol"] == "BTC"
+    assert case.evidence["side"] == "long"
+
+
+def test_d6a_tells_the_two_stall_causes_apart_by_reason_code(production, store):
+    """Same rule, same severity, same key namespace -- a different cause."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, state="pending", updated_at=NOW - timedelta(hours=12)
+    )
+    build_sealed_lane_case(
+        production,
+        chat_id=CHAT_ID + 7,
+        symbol="ETH",
+        side="short",
+        state="recovery_required",
+        updated_at=NOW - timedelta(hours=12),
+    )
+
+    run_round(production, store)
+
+    cases = store.open_cases()
+    by_reason = {case.reason_code: case for case in cases}
+    assert set(by_reason) == {
+        "source_deletion_exit_stalled_lane",
+        "source_deletion_exit_sealed_lane",
+    }
+    stalled = by_reason["source_deletion_exit_stalled_lane"]
+    sealed = by_reason["source_deletion_exit_sealed_lane"]
+    assert stalled.evidence["stall_class"] == "active"
+    assert sealed.evidence["stall_class"] == "unclaimable"
+    assert {case.rule for case in cases} == {"D6a"}
+    assert {case.severity for case in cases} == {"high"}
+
+
+def test_d6a_says_nothing_about_a_succeeded_exit(production, store):
+    """The one state the barrier lets through is the one state that is fine."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, state="succeeded", updated_at=NOW - timedelta(hours=12)
+    )
+
+    outcome = run_round(production, store)
+
     assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
 
 
-def test_the_sealed_lane_state_is_the_sweepers_own_spelling():
-    """A drifted copy would make D6a silent for the state it exists for."""
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_waits_the_same_six_hours_for_an_active_state(production, store, state):
+    """One threshold for both causes, and no second number to keep in step."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, state=state, updated_at=NOW - timedelta(hours=5)
+    )
+
+    assert run_round(production, store).new_case_ids == ()
+    later = run_round(production, store, now=NOW + timedelta(hours=2))
+    assert len(later.new_case_ids) == 1
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_ignores_an_unbound_exit_in_any_sealing_state(production, store, state):
+    """``raw_message_id`` NULL cannot reach the barrier's join, whatever the state.
+
+    ``unbound`` is the state those 91 production rows actually carry, but a row
+    can also be left with a NULL message in one of these states, and that one
+    seals nothing either.
+    """
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, unbound=True, state=state, updated_at=NOW - timedelta(days=30)
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_d6a_never_looks_at_the_unbound_state_itself(production, store):
+    """``unbound`` is a real state, and deliberately not in the sweep's list."""
+
+    from telegram_kol_research.oncall_detector import SEALED_LANE_SEALING_STATES
+
+    assert "unbound" not in SEALED_LANE_SEALING_STATES
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, state="unbound", updated_at=NOW - timedelta(days=30)
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_resolves_an_active_state_case_once_the_exit_succeeds(
+    production, store, state
+):
+    run_round(production, store)
+    built = build_sealed_lane_case(
+        production, state=state, updated_at=NOW - timedelta(hours=12)
+    )
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    production.set_deletion_exit_state(built["exit_id"], state="succeeded")
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+    assert store.get_case(opened.new_case_ids[0]).status == "resolved"
+
+
+def test_d6a_keeps_one_case_when_an_active_stall_gives_up_into_recovery(
+    production, store
+):
+    """The lane never reopened, so this is one story that changed cause."""
+
+    run_round(production, store)
+    built = build_sealed_lane_case(
+        production, state="closing_positions", updated_at=NOW - timedelta(hours=12)
+    )
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    production.set_deletion_exit_state(
+        built["exit_id"],
+        state="recovery_required",
+        updated_at=NOW - timedelta(hours=12),
+    )
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.new_case_ids == ()
+    assert outcome.resolved_case_ids == ()
+    case = only_case(store)
+    assert case.id == opened.new_case_ids[0]
+    assert case.status == "open"
+    assert case.reason_code == "source_deletion_exit_sealed_lane"
+    assert case.evidence["stall_class"] == "unclaimable"
+
+
+def test_the_sealed_lane_states_are_the_deletion_paths_own_spellings():
+    """A drifted copy would make D6a silent for a state it exists for.
+
+    Two sources, because the two halves of the list have two owners: the stuck
+    state belongs to the timeout sweep, and the four active ones to the worker
+    that claims them.
+    """
 
     from telegram_kol_research import source_deletion_exit_timeout as sweeper
-    from telegram_kol_research.oncall_detector import SEALED_LANE_STUCK_STATE
+    from telegram_kol_research import source_message_deletion_worker as worker
+    from telegram_kol_research.oncall_detector import (
+        SEALED_LANE_ACTIVE_STATES,
+        SEALED_LANE_RELEASED_STATE,
+        SEALED_LANE_SEALING_STATES,
+        SEALED_LANE_STUCK_STATE,
+    )
 
     assert SEALED_LANE_STUCK_STATE == sweeper.STUCK_STATE
+    assert SEALED_LANE_ACTIVE_STATES == worker._ACTIVE_STATES
+    assert SEALED_LANE_SEALING_STATES == (
+        *worker._ACTIVE_STATES,
+        sweeper.STUCK_STATE,
+    )
+    assert SEALED_LANE_RELEASED_STATE not in SEALED_LANE_SEALING_STATES
+
+
+def test_waiting_is_a_counter_label_and_never_a_stored_exit_state():
+    """Checked against the worker, not taken on trust from the state list.
+
+    ``source_message_deletion_worker`` sets ``final_state = "waiting"`` and
+    counts it, but the row it writes in that branch says ``reconciling``. A
+    reader who mistook that word for a state would add a sixth entry to
+    :data:`SEALED_LANE_SEALING_STATES` that no row can ever match.
+    """
+
+    import inspect
+
+    from telegram_kol_research import source_message_deletion_worker as worker
+    from telegram_kol_research.oncall_detector import SEALED_LANE_SEALING_STATES
+
+    source = inspect.getsource(worker)
+    # It exists, and it is a local label and a counter key.
+    assert 'final_state = "waiting"' in source
+    assert 'counts["waiting"]' in source
+    # And it is never written to a row. Every spelling that would write it:
+    for spelling in (
+        '.state = "waiting"',
+        'state="waiting"',
+        'new_state="waiting"',
+        "SourceMessageDeletionExit.state: \"waiting\"",
+    ):
+        assert spelling not in source, spelling
+    # The branch that sets the label writes ``reconciling`` to the row instead.
+    assert '_mark_reconciliation_waiting' in source
+    assert 'deletion_exit.state = "reconciling"' in source
+    assert "waiting" not in SEALED_LANE_SEALING_STATES
 
 
 # ------------------------------------------------------------------- D6b
@@ -1521,9 +1738,11 @@ _BOUNDED_SHAPES = (
     # batch check and D6a's lane naming, which share one shape.
     re.compile(r"WHERE raw_message_id = \? ORDER BY id (?:DESC )?LIMIT \d+$"),
     # D6a's sweep over ix_source_message_deletion_exits_state (state, updated_at).
+    # The ``IN`` list is the five lane-sealing states; SQLite seeks the index
+    # once per listed state, which the plan test below checks is really so.
     re.compile(
         r"FROM source_message_deletion_exits "
-        r"WHERE state = \? AND updated_at <= \? ORDER BY id LIMIT \?$"
+        r"WHERE state IN \(\?(?:, \?)*\) AND updated_at <= \? ORDER BY id LIMIT \?$"
     ),
     # D6a's "how many has this lane already eaten", both halves.
     re.compile(
@@ -1586,7 +1805,7 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
 _INDEX_BACKED_SWEEPS = (
     (
         "SELECT id FROM source_message_deletion_exits "
-        "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT ?",
+        "WHERE state IN (?, ?, ?, ?, ?) AND updated_at <= ? ORDER BY id LIMIT ?",
         "ix_source_message_deletion_exits_state",
     ),
     (
@@ -1620,6 +1839,53 @@ def test_the_new_sweeps_really_do_use_their_index(production, sql, index_name):
     detail = " ".join(str(row["detail"]) for row in plan)
     assert index_name in detail, detail
     assert "SCAN" not in detail, detail
+
+
+def test_the_sweeps_own_statement_is_the_one_the_detector_sends(production, store):
+    """The plan test above checks a statement written out by hand.
+
+    This one checks that the hand-written spelling is the spelling the module
+    actually uses, so the two cannot drift apart: the placeholder count follows
+    ``SEALED_LANE_SEALING_STATES`` at runtime.
+    """
+
+    from telegram_kol_research.oncall_detector import SEALED_LANE_SEALING_STATES
+
+    build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    readers: list[ProductionReader] = []
+    run_round(production, store, readers=readers)
+
+    statements = [
+        " ".join(sql.split())
+        for reader in readers
+        for sql in reader.statements
+        if "FROM source_message_deletion_exits WHERE state IN" in " ".join(sql.split())
+    ]
+    assert statements
+    placeholders = ", ".join("?" for _ in SEALED_LANE_SEALING_STATES)
+    assert all(f"WHERE state IN ({placeholders})" in sql for sql in statements)
+    assert len(SEALED_LANE_SEALING_STATES) == 5
+
+
+def test_the_spelling_the_sweep_rejected_really_does_scan(production):
+    """Evidence for the warning in ``ALLOWED_QUERY_SHAPES``.
+
+    ``state NOT IN (...)`` is the obvious way to say "every state but these two"
+    and it is the reason the positive list exists: the planner cannot use
+    ``ix_source_message_deletion_exits_state`` for it at all.
+    """
+
+    reader = ProductionReader(production.path)
+    try:
+        plan = reader.connection.execute(
+            "EXPLAIN QUERY PLAN SELECT id FROM source_message_deletion_exits "
+            "WHERE state NOT IN (?, ?) AND updated_at <= ? ORDER BY id LIMIT ?",
+            (None, None, None, None),
+        ).fetchall()
+    finally:
+        reader.close()
+    detail = " ".join(str(row["detail"]) for row in plan)
+    assert "SCAN" in detail, detail
 
 
 def test_the_detector_never_writes_to_the_production_database(production, store):

@@ -258,6 +258,7 @@ sudo systemctl restart telegram-kol-oncall.service
 
 1. **6 小时没动的 `pending` / `reconciling` 删除退出没人管**（见"设计稿说错"第 1 条）。
    设计稿只授权 `recovery_required`，没有自行扩大。
+   → **已在 2026-09-26 补掉，见本文最后一节「D6a 的状态范围从一个扩到五个」。**
 2. **D6c 不区分"这个类型本来就不发通知"**。要不要把 `telegram_notification_types` 的语义
    引进判据，得先看上线首日的分布；引进它也意味着值守要读一张配置表，那是另一件事。
 3. 案例备注 5.2「给重复 capture 加节流」与 5.1「`_SUMMARY_FIELDS` 补 `release_reason`」
@@ -294,3 +295,221 @@ D6c 值得记一笔：两小时前它还会命中 2 条（刚清掉的那两个 
 **真正的验证要等第一条命中**：下一条被封 6 小时的 lane、下一条被吃掉的消息、
 下一条还在推进却三天没通知的高危告警。三条都有单测钉着行为，
 但生产上的第一条命中才说明判据接到了真东西。
+
+---
+
+## 追加 · 2026-09-26：D6a 的状态范围从一个扩到五个
+
+分支：`oncall-d6a-active-states`（基线 `origin/main` = `91621bcf`）
+状态：**代码 + 文案 + 用例完成，全量测试绿，未部署、未推送。**
+
+这一节补的就是上面「未做 / 留给下一轮」的第 1 条。上一轮的设计稿只授权
+`recovery_required`，所以实现只看那一个状态，并把缺口写在了这份文件里：
+
+> 如果哪天出现一条 6 小时没动的 `pending` 退出，D6a 不会报它。
+
+指挥会话转达：用户已批准补上（批准来自用户本人，不是代理之间的传话本身）。**barrier 的条件是 `state != 'succeeded'`**，所以一条卡在
+`pending` 的退出，封 lane 封得和 `recovery_required` 一模一样——而且更糟：
+`source_deletion_exit_timeout` 的清扫只认 `recovery_required`，**活跃态没有任何自愈**。
+
+### 状态词表（自己复核过，不是照抄提示）
+
+| 状态 | 谁写的 | 封 lane 吗 | D6a 扫吗 |
+|---|---|---|---|
+| `pending` | `source_message_deletion.py:410`（重开被忽略的退出 / 从 `unbound` 转正） | 是 | **是（新增）** |
+| `cancelling_entries` | `source_message_deletion_worker.py:1361` | 是 | **是（新增）** |
+| `closing_positions` | worker 多处 | 是 | **是（新增）** |
+| `reconciling` | worker 多处 + `_mark_reconciliation_waiting` | 是 | **是（新增）** |
+| `recovery_required` | worker 多处 | 是 | 是（原有） |
+| `succeeded` | `source_message_deletion.py:441`、worker、清扫器 `_release` | **否**（barrier 唯一放行的状态） | 否 |
+| `unbound` | `source_message_deletion.py:262` | 否（`raw_message_id` 为 NULL，进不了 barrier 的第一个 inner join） | 否 |
+
+前四个就是 `source_message_deletion_worker._ACTIVE_STATES`，
+`historical_state_repair.py:44` 里还有同一组的第二份拷贝。
+所以扫描集合 = `_ACTIVE_STATES` + `recovery_required` =
+`SEALED_LANE_SEALING_STATES`（5 个），由
+`test_the_sealed_lane_states_are_the_deletion_paths_own_spellings` 对着
+worker 与清扫器两个源头钉住，任何一边改名都会红。
+
+**`waiting` 不是状态**，提示里让我自己确认这点，确认结果：
+`source_message_deletion_worker` 里 `final_state = "waiting"` 是个局部标签，
+`counts` 字典里也有 `"waiting"` 这个键；写进行里的是 `reconciling`——
+`_mark_reconciliation_waiting()` 第一行就是 `deletion_exit.state = "reconciling"`，
+然后 `return "waiting"`。`test_waiting_is_a_counter_label_and_never_a_stored_exit_state`
+把这件事对着 worker 源码钉住（它同时排除了 `.state = "waiting"` /
+`state="waiting"` / `new_state="waiting"` 三种写法）。
+
+判据里**保留**上一轮的 `seals_a_lane` 四样齐备（raw_message + chat + symbol + side），
+所以 `unbound` 自然出局，一条「有 `raw_message_id` 但那条消息没有 symbol+side 候选」的
+退出也照样出局——它其实没封住任何东西。
+
+### 只读纪律：一条语句，`IN` 列表，走索引
+
+`_read_sealed_lanes` 现在发的是：
+
+```sql
+SELECT ... FROM source_message_deletion_exits
+WHERE state IN (?, ?, ?, ?, ?) AND updated_at <= ? ORDER BY id LIMIT ?
+```
+
+两种写法都实测过 `EXPLAIN QUERY PLAN`（在用真实 SQLAlchemy 元数据建的库上）：
+
+| 写法 | 计划 |
+|---|---|
+| `state = ?`（旧） | `SEARCH ... USING INDEX ix_source_message_deletion_exits_state (state=? AND updated_at<?)` + `USE TEMP B-TREE FOR ORDER BY` |
+| `state IN (?,?,?,?,?)`（新） | **同上，一字不差** |
+| `state NOT IN (?, ?)`（被否掉的那种） | `SCAN`——这就是不许写它的原因 |
+
+两条计划完全相同：SQLite 把 `IN` 展开成「每个状态一次索引 seek」。
+所以选了**一条语句**而不是五条：
+
+- 每轮一次往返，不是五次；
+- `stuck_lane_limit=100` 变成**整轮的总天花板**，而五条语句就是 5×100=500 条 lane、
+  每条两次点查 → 最坏 1000 次点查。一条语句的最坏成本只有五分之一；
+- `ORDER BY id` 升序先给最老的行，而「能过 6 小时横杆」的正是最老的那些，
+  所以 LIMIT 截断时截掉的是最不可能命中的。
+
+第三行那个 `SCAN` 也钉成了用例（`test_the_spelling_the_sweep_rejected_really_does_scan`）：
+`ALLOWED_QUERY_SHAPES` 里那句「never state NOT IN (...)」以前只是注释，现在有证据。
+另外加了 `test_the_sweeps_own_statement_is_the_one_the_detector_sends`，
+让手写进 EXPLAIN 用例的那条语句和模块真正发出的那条不会各自漂移
+（占位符个数在运行时跟着 `SEALED_LANE_SEALING_STATES` 走）。
+
+`updated_at <= ?` 的界**仍然是 `now` 而不是 `now-6h`**，没有改：同一次读取被 D6b 复用来
+「点名挡住这条消息的那个退出」，而那个退出可能才封了十分钟。6 小时的横杆在
+`_sealed_lane_observations` 里用 Python 判，位置没变。
+
+### 两类卡死为什么必须分开说
+
+同一件事（lane 被封着），两种成因，**能动手的人不一样**，所以案文与原因码分开：
+
+| 类别 | `stall_class` | 原因码 | 含义 |
+|---|---|---|---|
+| 活跃态（`pending` / `cancelling_entries` / `closing_positions` / `reconciling`） | `active` | `source_deletion_exit_stalled_lane`（新） | worker 本该几秒走完，行还在它手里却不动了——认领或某一步在原地打转。**没有任何清扫会碰它**，案文明确这么写 |
+| 卡死态（`recovery_required`） | `unclaimable` | `source_deletion_exit_sealed_lane`（沿用） | worker 永不再认领，只有系统的超时清扫或人工能动它；过了 6 小时还在，说明清扫也没放它过去 |
+
+- **规则号仍是 D6a，case-key 仍是 `lane:<exit_id>`，severity 仍是 `high`。**
+  它们是同一个问题的两种成因，不另开规则号（提示里的建议，我同意：从「这条线进不来新策略」
+  这个后果看，两者一模一样）。
+- 沿用旧原因码给 `recovery_required`，是为了**生产里已经开着的案子不用迁移**——
+  它们当初就是按那个码立的案。
+- 一条 lane 从活跃态熬成 `recovery_required` 时，**同一个案子原地换故事**
+  （`upsert_case` 的 `reason_code` 以新值为准、evidence 合并），不会再弹第二条告警。
+  这条有专门用例（`test_d6a_keeps_one_case_when_an_active_stall_gives_up_into_recovery`）。
+- 阈值**仍是 6 小时一根横杆**，沿用 `SEALED_LANE_STUCK_AFTER`，没有引入第二个数字。
+  对活跃态来说 6 小时远超必要（那几步是秒级的），但「一根横杆、不用维护第二个数」
+  比「更早报一点」值钱。
+
+顺带把两处文案做实了：
+- 新增 `DELETION_EXIT_STATE_LABELS`（措辞抄自 `system_operator_bot` 的
+  `source_message_deletion_outcome` 报告，补上它用不到的 `pending` / `unbound`），
+  案文里状态从 `cancelling_entries` 变成「正在撤销原策略入场单（cancelling_entries）」——
+  中文给人看，原词留给工程师 grep。认不出的状态标「未收录状态」，不猜。
+- D6b 案文里「挡住它的是删除退出 #N（状态 …）」同样过这张表。
+
+### 改了哪些文件
+
+| 文件 | 改了什么 |
+|---|---|
+| `src/telegram_kol_research/oncall_state.py` | 新增 `LANE_STALL_ACTIVE` / `LANE_STALL_UNCLAIMABLE`。放这里是因为 detector 写、alerts 读，而这两个模块按架构边界**不能互相 import**（`oncall_state` 是它们唯一的共同词表） |
+| `src/telegram_kol_research/oncall_detector.py` | `SEALED_LANE_ACTIVE_STATES` / `SEALED_LANE_SEALING_STATES`、`REASON_STALLED_LANE`、`SealedLane.stall_class` 与 `.reason_code`、`_read_sealed_lanes` 的 `IN` 写法、evidence 增加 `stall_class`、`ALLOWED_QUERY_SHAPES` 的 sealed-lane 行 |
+| `src/telegram_kol_research/oncall_alerts.py` | `DELETION_EXIT_STATE_LABELS` + `deletion_exit_state_label()`、两类分开的 `cause_line`、两条原因码标签（旧的那条改成「卡死（系统不会再认领）」） |
+| `tests/test_oncall_detector.py` | D6a 一节重写：见下 |
+| `tests/test_oncall_alerts.py` | `open_stalled_lane_case` 夹具 + 6 条文案用例 |
+| `tests/test_oncall_architecture_boundary.py` | 声明断言跟着改成 `WHERE state IN (?, ...) AND updated_at <= ?` |
+
+### 用例
+
+| 用例 | 条数 |
+|---|---|
+| 四个活跃态各自建案，reason_code / `stall_class` / `exit_state` 正确（参数化） | 4 |
+| 两类成因在同一轮里各建一案，rule 与 severity 相同、原因码不同 | 1 |
+| `succeeded` 不建案 | 1 |
+| 活跃态也等满 6 小时，不足不建、过了就建（参数化） | 4 |
+| `raw_message_id` 为 NULL 时，任何封锁态都不建案（参数化） | 4 |
+| `unbound` 这个状态本身不在扫描集合里，也不建案 | 1 |
+| 活跃态案子在 exit 变 `succeeded` 后 cleared（参数化） | 4 |
+| 活跃态熬进 `recovery_required`：同一案、不重复开、故事换成卡死 | 1 |
+| 状态集合等于 worker 的 `_ACTIVE_STATES` + 清扫器的 `STUCK_STATE` | 1 |
+| `waiting` 是计数器标签、从不落库（对着 worker 源码断言） | 1 |
+| `state IN (...)` 真的走索引、不含 `SCAN`（复用上一轮的 harness） | 1 |
+| `state NOT IN (...)` 真的会 `SCAN`（给注释找证据） | 1 |
+| 模块实际发出的语句与 EXPLAIN 用例里手写的那条一致 | 1 |
+| 文案：两类各自的因果句、状态中文标签、缺 `stall_class` 的旧案子仍按卡死讲、每个可见状态都有标签、两条原因码都有中文 | 6 |
+
+原有的 `test_d6a_only_reads_the_one_state_that_hangs_about_forever`
+（断言 `pending` / `reconciling` **不**建案）**已删除**——它断言的正是被批准补掉的缺口。
+它的 `succeeded` 那一半保留成了独立用例。
+
+### 上线前必须重新数一遍首轮量（按新的五个状态）
+
+上一轮部署前数出来 D6a=0，**那个数字只按 `recovery_required` 数的，对新判据无效。**
+必须重数，因为新增的四个活跃态在生产里从没被任何东西盯过，
+谁也不知道有没有长期卡着的行。
+
+**在 `VACUUM INTO` 出来的快照上跑，不要碰在跑的库**（见 memory: no heavy scans on prod DB）。
+
+```sql
+-- 第一条：上限。判据的超集（还没检查"被删消息有没有 symbol+side 的候选"）。
+-- 走 ix_source_message_deletion_exits_state，有界。
+SELECT state, COUNT(*) AS n, MIN(updated_at) AS oldest_updated
+FROM source_message_deletion_exits
+WHERE state IN ('pending', 'cancelling_entries', 'closing_positions',
+                'reconciling', 'recovery_required')
+  AND raw_message_id IS NOT NULL
+  AND updated_at <= datetime('now', '-6 hours')
+GROUP BY state
+ORDER BY n DESC;
+
+-- 第二条：精确数，与 D6a 的 seals_a_lane 四样齐备一致。
+-- 只有第一条数出非 0 才需要跑；join 都走各自的 raw_message_id 索引。
+SELECT e.state, COUNT(DISTINCT e.id) AS n
+FROM source_message_deletion_exits AS e
+JOIN raw_messages AS r ON r.id = e.raw_message_id
+JOIN signal_candidates AS c ON c.raw_message_id = r.id
+WHERE e.state IN ('pending', 'cancelling_entries', 'closing_positions',
+                  'reconciling', 'recovery_required')
+  AND e.updated_at <= datetime('now', '-6 hours')
+  AND c.symbol IS NOT NULL AND TRIM(c.symbol) != ''
+  AND c.side IS NOT NULL AND TRIM(c.side) != ''
+GROUP BY e.state;
+```
+
+第二条的结果就是**上线第一轮会开的 D6a 案子数**，按状态分好了类。
+如果活跃态那几行加起来超过个位数，**先别部署**：那说明生产里确实有一批长期卡住的活跃退出，
+应该先看它们卡在哪一步，而不是让值守一次性刷一屏。
+
+顺便记一件复核时看到的机制，它让「活跃态长期卡住」比直觉上更值得盯：
+`_claim_next_job` 每轮按 `id` 升序只取 20 条活跃行（`source_message_deletion_worker.py:1331`
+起，陈旧认领的界是 5 分钟）。所以**几条永久卡住的低 id 活跃行会把后面的行一起饿住**——
+一处卡死能封住的不止它自己那条 lane。这正是「活跃态卡 6 小时」需要有人知道的理由，
+也是为什么首轮数出来的数字要按状态分开看，而不是只看总数。
+
+（`seals_a_lane` 与 barrier 的 join 还差一个条件：barrier 另外要求
+`raw_messages.source_status = 'deleted'`。D6a 没查这一条——有删除退出行就意味着消息被删过。
+上面的 SQL 与 D6a 的实现对齐，不与 barrier 对齐，这样数出来的才是「值守会开几条案子」。）
+
+部署步骤与上一节相同，**`telegram-kol-oncall.service` 仍不在 `tg-deploy` 的重启清单里**，
+`tg-deploy <sha>` 之后必须单独 `sudo systemctl restart telegram-kol-oncall.service`。
+
+### 这一轮明确没做
+
+- **没碰 D6b 的建案判据**，也没碰 D6c。唯一被动变化：D6b 案文里
+  `blocking_exit_*` 现在能点名一条活跃态的退出（以前只认 `recovery_required`，
+  遇到活跃态挡路就写 `None`）。这是同一次读取被复用的结果，只影响那三个说明字段，
+  **不影响 D6b 是否建案**（那只看 `automation_reason`），而且现在点到的才是 barrier 真正
+  会拦下它的那条退出。判断：这是更准，不是更宽，所以留着并写进 `_blocking_sealed_lane` 的文档串。
+- **没碰 barrier 本身**，也没碰 `source_deletion_exit_timeout` 的自愈范围。
+  `03e303a1` 那条路径仍然只管 `recovery_required`——自动放掉一条**还在活跃状态**的退出
+  是另一件事，风险完全不同（可能正好在撤单或平仓的半路上）。**这次坚决不扩大它。**
+- 没碰生产库、没部署、没推送。
+
+### 留给下一轮
+
+1. **活跃态卡住之后，除了告警没有任何自愈。** 值守现在能看见了，但看见之后仍然只能靠人。
+   要不要给活跃态也做一条超时清扫，是一个独立的、风险高得多的题目
+   （撤单/平仓半路上被放掉会发生什么，得先想清楚）。
+2. 上一节留的第 2 条（D6c 不区分「这个类型本来就不发通知」）没动。
+3. `seals_a_lane` 与 barrier 的 join 仍差 `source_status = 'deleted'` 一个条件。
+   目前无害（有删除退出行就意味着消息被删过），但如果哪天出现「消息又被恢复」的路径，
+   这里会多报。记在这里，本轮没改。

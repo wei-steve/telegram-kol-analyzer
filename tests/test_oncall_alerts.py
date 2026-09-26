@@ -168,12 +168,20 @@ def test_every_new_recognition_reason_code_has_a_chinese_label(code, fragment):
 # ------------------------------------------------------- D6a / D6b / D6c
 
 
-def open_sealed_lane_case(store, *, now=NOW, **evidence):
+def open_sealed_lane_case(
+    store,
+    *,
+    now=NOW,
+    exit_id=310,
+    reason_code="source_deletion_exit_sealed_lane",
+    **evidence,
+):
     payload = {
         "kind": "sealed_lane",
         "group_name": "龚有财群",
-        "exit_id": 310,
+        "exit_id": exit_id,
         "exit_state": "recovery_required",
+        "stall_class": "unclaimable",
         "exit_last_reason": "exit_has_no_known_position",
         "symbol": "BTC",
         "side": "long",
@@ -183,16 +191,29 @@ def open_sealed_lane_case(store, *, now=NOW, **evidence):
     }
     payload.update(evidence)
     case, _created = store.upsert_case(
-        case_key="lane:310",
+        case_key=f"lane:{exit_id}",
         rule="D6a",
         severity="high",
         now=now,
         raw_message_id=15660,
         chat_id=-100,
-        reason_code="source_deletion_exit_sealed_lane",
+        reason_code=reason_code,
         evidence=payload,
     )
     return case
+
+
+def open_stalled_lane_case(store, *, exit_state="cancelling_entries", **evidence):
+    """The other half of D6a: an exit the worker still holds and is not finishing."""
+
+    return open_sealed_lane_case(
+        store,
+        exit_id=evidence.pop("exit_id", 311),
+        reason_code="source_deletion_exit_stalled_lane",
+        exit_state=exit_state,
+        stall_class="active",
+        **evidence,
+    )
 
 
 def test_the_sealed_lane_alert_names_the_group_the_direction_and_the_losses(store):
@@ -207,6 +228,80 @@ def test_the_sealed_lane_alert_names_the_group_the_direction_and_the_losses(stor
     assert "期间已有 11 条消息被作废" in text
     assert "只数了封锁之后这个群的 200 条消息" in text
     assert "这个方向的新策略现在一条都进不来" in text
+    # The state reads in Chinese, and keeps the raw word an engineer greps for.
+    assert "需要人工恢复处理（recovery_required）" in text
+
+
+def test_the_unclaimable_lane_alert_says_no_automation_will_pick_it_up(store):
+    """``recovery_required``: the worker never claims the exit again."""
+
+    case = open_sealed_lane_case(store)
+
+    text = format_sealed_lane_alert(case)
+
+    assert "系统不会再认领" in text
+    assert "只有超时清扫或人工能动它" in text
+    assert "在原地打转" not in text
+    assert "卡死" in reason_label(case.reason_code)
+
+
+def test_the_active_stall_alert_says_a_step_is_going_round_in_circles(store):
+    """An active state: a claim is holding the row and never finishing."""
+
+    case = open_stalled_lane_case(store, exit_last_reason="cancel_entry_retry")
+
+    text = format_sealed_lane_alert(case)
+
+    assert "本该几秒钟走完" in text
+    assert "在原地打转" in text
+    assert "正在撤销原策略入场单（cancelling_entries）" in text
+    # And it says what will *not* happen, which is what decides whether anybody
+    # has to act: no sweep covers an active state.
+    assert "超时清扫只管「需要人工恢复处理」的退出" in text
+    assert "系统不会再认领" not in text
+    assert "卡在处理中途" in reason_label(case.reason_code)
+
+
+def test_the_two_stall_classes_do_not_read_the_same(store):
+    """The whole point of the split: two causes must not print one sentence."""
+
+    unclaimable = format_sealed_lane_alert(open_sealed_lane_case(store))
+    active = format_sealed_lane_alert(open_stalled_lane_case(store))
+
+    assert unclaimable != active
+    # Both still name the same loss, in the same words, and both are urgent.
+    for text in (unclaimable, active):
+        assert "这个方向的新策略现在一条都进不来" in text
+        assert "群：龚有财群    被封的方向：BTC 多" in text
+        assert "封了多久：11 天 3 小时" in text
+
+
+def test_an_unrecorded_or_unknown_exit_state_is_shown_and_flagged(store):
+    from telegram_kol_research.oncall_alerts import deletion_exit_state_label
+
+    assert deletion_exit_state_label(None) == "状态未记录"
+    assert deletion_exit_state_label("") == "状态未记录"
+    assert deletion_exit_state_label("teleported") == "teleported（未收录状态）"
+    assert deletion_exit_state_label("pending") == "排队等处理（pending）"
+    # A case whose evidence carries no stall class at all still reads: anything
+    # that is not the active class tells the ``recovery_required`` story, which
+    # is the one every case filed before this change was.
+    case = open_sealed_lane_case(store)
+    case.evidence.pop("stall_class")
+    assert "系统不会再认领" in format_sealed_lane_alert(case)
+
+
+def test_every_deletion_exit_state_the_watcher_can_see_has_a_label():
+    """Including the two the operator bot's own report never has to name."""
+
+    from telegram_kol_research.oncall_alerts import DELETION_EXIT_STATE_LABELS
+    from telegram_kol_research.oncall_detector import (
+        SEALED_LANE_RELEASED_STATE,
+        SEALED_LANE_SEALING_STATES,
+    )
+
+    for state in (*SEALED_LANE_SEALING_STATES, SEALED_LANE_RELEASED_STATE, "unbound"):
+        assert state in DELETION_EXIT_STATE_LABELS, state
 
 
 def test_the_sealed_lane_alert_says_so_when_nothing_has_been_voided_yet(store):
@@ -376,7 +471,8 @@ def test_an_unheard_incident_is_composed_and_recovers_with_its_own_wording(store
 @pytest.mark.parametrize(
     "code,fragment",
     [
-        ("source_deletion_exit_sealed_lane", "新消息全部被挡下"),
+        ("source_deletion_exit_sealed_lane", "卡死（系统不会再认领）"),
+        ("source_deletion_exit_stalled_lane", "卡在处理中途不动了"),
         ("deferred_expired", "系统把这条消息作废了"),
         ("waiting_source_deletion_exit", "暂时被挡下"),
         ("runtime_incident_never_notified", "从来没有通知过"),
