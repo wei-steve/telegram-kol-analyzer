@@ -20,7 +20,7 @@
 
 | 提交 | 内容 | 全量测试 |
 |---|---|---|
-| `SHA_PLACEHOLDER` | D6a/D6b/D6c 判定、中文文案、夹具与用例 | `9616 passed, 4 skipped in 777.99s` |
+| `13eb058e` | D6a/D6b/D6c 判定、中文文案、夹具与用例 | `9616 passed, 4 skipped in 777.99s` |
 
 基线（`8fdefd63`，未加本项目用例时）9563 条；本项目 **+53 条**。
 提交时逐路径 `git add`，`git diff --cached --name-only` 核对，未用 `git add -A`。
@@ -143,7 +143,7 @@ D6a 不会报它。要补的话是同一个形状再查一次，成本很低。
 9616 passed, 4 skipped, 109 warnings in 777.99s (0:12:57)
 ```
 
-值守这条线的五个文件单跑：
+值守这条线的六个测试文件单跑：
 
 ```
 tests/test_oncall_detector.py tests/test_oncall_alerts.py
