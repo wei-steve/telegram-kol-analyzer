@@ -896,6 +896,33 @@ default_mode: "worker MODE 缺省 off；值守 REQUESTS 缺省 off —— 部署
 3. 三张新表、三个新索引、值守 `state.db` 的四个新列都**保留原地**（旧代码不读；索引只加速）。单元文件里多出的 `EnvironmentFile=-` 行无害，可留。
 4. 自动交易开关在整个过程中都不碰。
 
+#### 9.4.5 部署记录（2026-09-27 06:47 CST，休眠上线；用户在阶段 3 会话中确认「只到休眠上线」）
+
+```yaml
+phase3_status: deployed_dormant
+production_commit: d3e29a798af57658ac4f256642545fc68f9be1c8   # 代码 = 全量通过的 03854cc2，其后只有文档
+rollback_commit: 05f013f1083c15d665ccb71d146aace6e64bb2b1
+worker_mode: off            # /etc/telegram-kol-worker.env 里没有 TELEGRAM_KOL_ONCALL_REMEDIATION_MODE
+oncall_requests: off        # 没有 TELEGRAM_KOL_ONCALL_REMEDIATION_REQUESTS
+auto_trade_switches: untouched
+```
+
+- 部署前：生产 HEAD `05f013f1`，候选是其后代；在途管理批次 0（部署前复查仍为 0），`position_mutation_intents` 全为终态，worker 只有周期性对账日志。
+- 演练（快照 `rehearsal-phase3.db`，已删除，大小 1250508800 字节，sha256 `36dea8da9adff98872038cdabbe7caa70b24329cb436057263a83f69ba21b11d`）：
+  候选代码 bootstrap 建三表三索引共 **1.6 s**；`PRAGMA quick_check` = ok；前后计数一致
+  （`signal_candidates` 2640、`message_instruction_items` 1402、`strategy_management_batches` 182、`execution_bindings` 384、`position_mutation_intents` 797、`worker_command_jobs` 2）；
+  四条新查询均为 `SEARCH ... USING (COVERING) INDEX`。
+- 备份（恢复点）：`/var/backups/telegram-kol/20260926-oncall-phase3/oncall-phase3-d3e29a79-20260926T224452Z.db.zst`
+  （原库 1250361344 字节，sha256 `91fd7cb0e1e2fea660c265f3f379f3ea5b4b6cb7ee90e2382b4edb52ab5c3552`，`quick_check` ok；
+  zstd 后 88789282 字节，sha256 `a5cc13d28eef448e9363a8af555c46bba6f2bd9eeb867421ee5d181f659a7937`）。六表计数同上。
+  按 AGENTS.md 的备份保留规则，本变更收口后 14 天退役。
+- `/etc/telegram-kol-worker.env` 追加令牌与批准人 id（原文件备份为同目录 `.bak-phase3-*`，0600）；新建 `/etc/telegram-kol-oncall-remediation.env`（root 0600，仅令牌）；两处令牌一致；全程未打印任何值。
+- `tg-deploy d3e29a79…` → worker 2143515 / web 2143528 / ingest 2143541 active。值守单元手工同步（差异只有新增的 `EnvironmentFile=-` 行，旧单元备份 `/root/telegram-kol-oncall.service.bak-phase3`）+ `daemon-reload` + 单独重启值守。Codex runner 单元未动。
+- 休眠验证：补救端点无令牌 / 带正确令牌均 **404**（路由不存在）；web 200；worker / web / ingest / 值守 3 分钟内 Traceback、`schema_invalid`、ERROR 均为 0；
+  worker 日志中没有补救后台任务启动；三表三索引存在，`oncall_remediation_proposals` 0 行，六表计数与部署前一致；值守 `state.db` 的 `cases` 已补 4 列；
+  沙箱探针全部 PASS，含新增项「值守补救令牌环境文件 看不见」。按钮 `orm:` 在 off 模式下回「补救未启用」由测试钉住（生产上无按钮可点）。
+- 下一步（均需另行确认）：只提示模式（worker `MODE=shadow` + 值守 `REQUESTS=on`）、部分止盈跟随超时的生产数据核对、批准模式。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
