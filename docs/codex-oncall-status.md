@@ -776,6 +776,114 @@ uv run python -B -m pytest -q   # 最终候选一次全量
   拖住——目前没有对 `handle_callback` 单独设超时，实测第 2 批的 G-B 路径不触碰交易所快照，预期耗时是普通 DB
   查询量级，但没有一个显式的超时兜底。
 
+### 9.4 阶段 3 汇总、指挥会话审阅修复、部署与回滚计划（2026-09-26，**代码完成、未部署**）
+
+```yaml
+phase3_status: code_complete_not_deployed
+phase3_branch: claude/codex-oncall-phase3      # 基于 origin/main edfb08b1，生产 05f013f1 的后代
+verification_level: L3                         # 新表 + 新索引 = schema 变更；新增交易所写入触发入口
+production_rollback_commit: 05f013f1083c15d665ccb71d146aace6e64bb2b1
+default_mode: "worker MODE 缺省 off；值守 REQUESTS 缺省 off —— 部署后行为与现在逐字相同"
+```
+
+提交顺序：`947fe87d` 第 1 批（限定范围计划 + 3 个索引）→ `11ad715d` 第 4 批（值守请求提案）→ `42bc68c8` 第 2 批（核心库、三张表）→
+`89e32b90` 审阅修复 → `eedecb1f` 第 3 批（接线）→ `b2d45587` 审阅修复 → `1d09c85a` 第 3b 批端到端测试 → `53c0de14` 缺陷修复。
+
+**指挥会话审阅中修掉的问题（子代理交付后发现）**
+
+1. 目标为空的扇出消息会出提案（规格 4.2 要求 `target_not_resolved`）——闸门里显式判定。
+2. A9 退化为「pos_ids 非空」——改为断言 pos_ids 全在同一份计划快照里。
+3. 单飞是「先数再 CAS」两条语句——改为一条带 `NOT EXISTS` 的原子 UPDATE。
+4. 拒绝消息不计入每日 30 条上限——已计入。
+5. 交易所客户端创建失败时提案卡在 `executing`（且占住单飞直到重启）；apply 之前的异常被标 `uncertain`——改为 `failed`。
+6. **既有缺陷（CLI 同样受影响）**：`_project_canonical_remediation_candidate` 建投影候选时不带 `stop_price_source`，
+   止损网关（`management_stop_price_gate.py:88`）因此对**每一个** `adjust_stop_loss` 补救都拒 `management_stop_provenance_invalid`。
+   修法：照抄原候选的来源（不硬编码），并纳入投影复用的匹配条件。**这会改变 CLI `repair-position-management` 对调整止损的行为**（以前必然被拒，现在按正常网关判）。
+
+**偏离规格 / 细化（均有测试）**
+
+- 重启时只把「还没拿到管理批次号」的 `executing` 提案标 `uncertain`；已有批次号的继续跟随批次终态（读库，不是重跑）。跟随超时 15 分钟 → `uncertain`。
+- `resolve_remediation_scope` 包含扇出（为了计划完整），`target_not_resolved` 由闸门负责。
+- 路由只在 `runtime_role == 'worker'` 时注册；单进程 `all` 角色不提供补救。
+- `/fix P<n>` 发出的按钮消息不回填 `telegram_message_id`，过期时按钮不会被自动移除（令牌照样失效，点了回"已过期"）。
+- `events.proposal_id` 可空（`/oncall_on` 等控制事件不属于任何提案）。
+
+**已知风险（需指挥会话 / 用户知晓）**
+
+- **指纹漂移**：动作指纹含交易所快照指纹，快照含该币种的委托 / 成交 / 触发历史（`remediation_snapshot.py:17-19`）。
+  提案到点「确认执行」之间，同币种任何别的策略有成交或挂撤单，C2 即判 `plan_changed`（不执行，安全方向），而且按规格计入熔断——连续两次就自动关闭。BTC/ETH 上可能频繁发生。
+- **部分止盈的收口时长**：合成夹具里部分平仓批次停在 `reconciling`，没能在测试里推进到 `succeeded`。若生产上部分止盈批次常常超过 15 分钟才收口，
+  提案会被判 `uncertain` 并计入熔断。建议 shadow 期间从生产批次表核对部分止盈批次的实际收口时长，再定跟随超时。
+- `getUpdates` offset 启动时取最新：重启期间的按钮点击被丢弃（规格 6.3 已接受）。
+
+**测试**：见本节末尾的全量结果。新增测试文件：`test_position_management_remediation_scope.py`、`test_oncall_remediation.py`、
+`test_oncall_remediation_wiring.py`、`test_oncall_remediation_end_to_end.py`、`test_oncall_remediation_requests.py`。
+端到端里 `full_exit`、`move_stop_to_break_even`、`adjust_stop_loss`（收紧成功 / 放宽被拒）走真实计划器 + 真实 apply + 真实 `execute_management_batch`；
+`partial_take_profit` 真实下单，但收口停在 `reconciling`（见上）。唯一打桩：计划器内部的 `reconcile_deepcoin_execution_bindings`（与计划器自身测试同法）。
+
+**全量**：`uv run python -B -m pytest -q` 在候选 `53c0de14` 上 → **9986 passed / 4 skipped / 0 failed**（795 s）。其后只有本文档改动。
+
+#### 9.4.1 部署前（指挥会话执行，本会话未执行任何一步）
+
+1. **磁盘**：服务器磁盘约 91%，另有会话在排查。先 `df -h /opt/telegram-kol-analyzer/data` 与 `ls -l research.db`；
+   演练快照与备份各需约一个库的大小，**不要同时存在**：先做演练、删快照，再做备份。空间不足一个库大小 + 2 GB 余量就停，先与磁盘排查会话协调。
+2. **候选检查**：候选是生产 HEAD（`05f013f1`）的后代（本地已核实）；推候选到自己的分支（不是 `main`）让服务器能 fetch。
+3. **零在途**：管理批次 / mutation intent / claimed job / worker command 均为 0；没有进行中的时效性策略操作。
+4. **schema 演练**（生产库只读，全部在快照上；服务器若没有 `sqlite3` 命令行，就用 venv 里 Python 的 `sqlite3` 模块执行同样的语句）：
+   ```bash
+   sqlite3 /opt/telegram-kol-analyzer/data/research.db "VACUUM INTO '/opt/telegram-kol-analyzer/data/rehearsal-phase3.db'"
+   git -C /opt/telegram-kol-analyzer worktree add /tmp/phase3-candidate <sha>
+   cd /tmp/phase3-candidate && time PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=src /opt/telegram-kol-analyzer/.venv/bin/python -B -c \
+     "from telegram_kol_research.db import create_session_factory; create_session_factory('/opt/telegram-kol-analyzer/data/rehearsal-phase3.db')"
+   sqlite3 .../rehearsal-phase3.db "PRAGMA quick_check"            # 必须 ok
+   sqlite3 .../rehearsal-phase3.db ".tables oncall_remediation%"   # 三张表
+   sqlite3 .../rehearsal-phase3.db "SELECT name FROM sqlite_master WHERE name IN ('ix_signal_candidates_target_lifecycle_id','ix_message_instruction_items_strategy_instance_id','ix_strategy_management_batches_strategy_instance_id')"
+   ```
+   记录 bootstrap 耗时（三个 `CREATE INDEX` 会在 worker 启动时对生产库执行，耗时即启动延迟）；演练前后
+   `signal_candidates`、`message_instruction_items`、`strategy_management_batches` 行数相等；在快照上对第 1 批的三条新查询 `EXPLAIN QUERY PLAN`，确认 `SEARCH ... USING INDEX`。
+   然后删快照与临时 worktree，留下快照的大小与 `sha256`。
+5. **备份**：`VACUUM INTO` 一份部署前备份，记录路径、大小、`sha256`、`PRAGMA quick_check`；before 计数：
+   `strategy_management_batches`、`message_instruction_items`、`signal_candidates`、`execution_bindings`、`position_mutation_intents`、`worker_command_jobs`。
+6. **单元文件**：`deploy/systemd/telegram-kol-oncall.service` 多了 `EnvironmentFile=-/etc/telegram-kol-oncall-remediation.env`；
+   tg-deploy 不同步单元，需手工 `cp` 到 `/etc/systemd/system/` + `systemctl daemon-reload`。**不要**改 `telegram-kol-oncall-codex.service`。
+   （另有会话可能在修 runner / spool 权限，两边都改了 `scripts/oncall_codex_sandbox_probe.py` 时由调度会话排合并顺序。）
+7. **令牌与批准人**（可在休眠部署时一并装好，MODE 仍为 off；任何会话都不打印其值）：
+   ```bash
+   umask 077
+   T=$(python3 -c 'import secrets;print(secrets.token_urlsafe(48))')
+   printf 'TELEGRAM_KOL_ONCALL_REMEDIATION_TOKEN=%s\n' "$T" >> /etc/telegram-kol-worker.env
+   printf 'TELEGRAM_KOL_ONCALL_REMEDIATION_TOKEN=%s\n' "$T" >  /etc/telegram-kol-oncall-remediation.env
+   unset T
+   grep -h '^TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=' /etc/telegram-kol-worker.env | sed 's/^TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID=/TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS=/' >> /etc/telegram-kol-worker.env
+   chmod 600 /etc/telegram-kol-worker.env /etc/telegram-kol-oncall-remediation.env
+   ```
+   先只读确认 `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID` 确实在 `/etc/telegram-kol-worker.env`（运行时配置看 systemd，不看 config 目录）；不在就停下查清楚它从哪来。
+   `/etc/telegram-kol-oncall-remediation.env` 的属主要让值守用户可读（与现有 `/etc/telegram-kol-oncall.env` 同法）。
+
+#### 9.4.2 部署（休眠上线）
+
+1. `tg-deploy <sha>`；worker `MODE` 不设（off）、值守 `REQUESTS` 不设（off）。
+2. 验证：三张新表与三个索引存在；after 计数与 before 相等；
+   `curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:8002/internal/oncall/remediation/proposals` = 404；worker 日志错误行 0，且没有 "Oncall remediation background task starting"。
+3. `systemctl restart telegram-kol-oncall`，心跳正常；跑 `scripts/oncall_codex_sandbox_probe.py`，含新增项全 PASS。
+4. 推同一 sha 到 `main`，跑 AGENTS.md 的 `OFFENDERS` 检查（先各用一个必 FAIL / 必 PASS 的输入试一次检查本身）。
+
+#### 9.4.3 逐级打开（每一级都是单独的决定）
+
+1. worker `MODE=shadow` + 重启 worker；值守 `REQUESTS=on` + 重启值守。真实案件只出「只提示」提案。**至少 3 个真实案件或 3 天**，逐条核对：
+   提案内容、闸门拒绝理由、`plan_changed` 的频率（指纹漂移风险）、部分止盈批次的实际收口时长（决定 15 分钟跟随超时是否够）。
+2. `MODE=approve` + 重启 worker。等第一个真实案件由用户亲手批准；首笔逐项核对：批准前后 `trigger-orders-pending` 全集（按 `TU`/`ordId`，不读仓位行 `slTriggerPx`）、
+   仓位数量、批次 / 组件终态、`position_mutation_intents`、`oncall_remediation_events` 全链路、结果消息与交易所实况一致。
+3. 首笔核对通过前阶段不算完成；不通过 → `/oncall_off`，记录，阶段保持 `in_progress`。
+
+#### 9.4.4 回滚
+
+1. 先在系统 bot 发 `/oncall_off`，再按主键 / 索引确认 `SELECT count(*) FROM oncall_remediation_proposals WHERE state='executing'` = 0
+   （有 executing 就等它收口或人工核对交易所后再回滚——旧代码不认识这张表，会让它永远停在 executing）。
+2. `tg-deploy 05f013f1083c15d665ccb71d146aace6e64bb2b1` + `systemctl restart telegram-kol-oncall`。
+3. 三张新表、三个新索引、值守 `state.db` 的四个新列都**保留原地**（旧代码不读；索引只加速）。单元文件里多出的 `EnvironmentFile=-` 行无害，可留。
+4. 自动交易开关在整个过程中都不碰。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
