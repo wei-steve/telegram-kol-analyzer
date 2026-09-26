@@ -379,30 +379,6 @@ def test_partial_take_profit_real_pipeline_reaches_succeeded(tmp_path, monkeypat
         assert session.get(OncallRemediationProposal, proposal_id).state == "executing"
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "src defect, not a test gap: "
-        "position_management_remediation._project_canonical_remediation_candidate "
-        "(position_management_remediation.py:1401-1418) builds the remediation-"
-        "projected SignalCandidate with stop_loss_text=expected_stop but never sets "
-        "stop_price_source. management_stop_price_gate._evaluate_stop_gate "
-        "(management_stop_price_gate.py:88-94) requires stop_price_source == "
-        "'current_message_text' whenever stop_mode == 'explicit_price' (which "
-        "adjust_stop_loss always is), else it refuses "
-        "'management_stop_provenance_invalid' -- unconditionally, before it even "
-        "reaches the risk-tightening check. Net effect: an adjust_stop_loss "
-        "remediation can NEVER execute in production today, tightening or not, "
-        "because oncall_remediation.execute_proposal's apply_fn call has no way to "
-        "carry that field through. Suggested fix: in "
-        "_project_canonical_remediation_candidate, set "
-        "stop_price_source='current_message_text' whenever expected_stop is not "
-        "None -- the remediation action's own stop_loss text was itself derived "
-        "from resolve_management_directive() reading the original message text "
-        "(position_management_remediation.py's own action-building pass), so this "
-        "is always the correct provenance for a remediation-projected candidate."
-    ),
-)
 def test_adjust_stop_loss_tighten_real_pipeline_reaches_succeeded(tmp_path, monkeypatch):
     _disable_planner_reconciliation(monkeypatch)
     session_factory = create_session_factory(tmp_path / "r.db")
@@ -692,21 +668,22 @@ def test_management_stop_action_conflict_shape_is_refused_with_zero_writes(tmp_p
 
     _disable_planner_reconciliation(monkeypatch)
     session_factory = create_session_factory(tmp_path / "r.db")
+    # The 17813 shape: a break-even instruction that also carries an explicit
+    # stop price. On the main chain that is management_stop_action_conflict;
+    # the remediation planner re-derives the directive from the text and gets
+    # an explicit-price adjust_stop_loss instead, which the same stop gate
+    # inside apply() refuses (here: management_stop_direction_invalid, the
+    # stop sits at the live price). Either way: proposal failed, zero writes.
+    # (An earlier version of this test re-labelled a *valid* tightening with
+    # this reason and only passed because of the stop_price_source defect
+    # fixed in _project_canonical_remediation_candidate.)
     raw_id, lifecycle_id, strategy_id, pos_id, symbol, side, pending_stop = build_ready_remediation_target(
         session_factory,
-        action_kind="adjust_stop_loss",
+        action_kind="move_stop_to_break_even",
+        action_text="{symbol}{side_zh}单止损移到保本 64000",
         verified_stop_price="62000",
-        current_stop_loss_text="63000",
+        current_stop_loss_text="64000",
     )
-    with session_factory() as session:
-        item = (
-            session.query(MessageInstructionItem)
-            .filter(MessageInstructionItem.raw_message_id == raw_id)
-            .one()
-        )
-        item.error_json = json.dumps({"reason": "management_stop_action_conflict"})
-        session.add(item)
-        session.commit()
     _enable_live_management(session_factory)
     client = client_for(symbol, side, pos_id, pending=[pending_stop])
     group_config = _group_config(88)

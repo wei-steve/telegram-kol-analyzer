@@ -1390,6 +1390,7 @@ def _project_canonical_remediation_candidate(
                 SignalCandidate.management_action == action.action_kind,
                 SignalCandidate.management_fraction == expected_fraction,
                 SignalCandidate.stop_loss_text == expected_stop,
+                SignalCandidate.stop_price_source == source.stop_price_source,
                 SignalCandidate.recognition_generation == remediation_generation,
                 SignalCandidate.review_status == "approved_remediation",
             )
@@ -1409,6 +1410,12 @@ def _project_canonical_remediation_candidate(
             recognition_generation=remediation_generation,
             entry_text=source.entry_text,
             stop_loss_text=expected_stop,
+            # Carry the original recognition's provenance, never invent one:
+            # the management stop gate refuses an explicit stop price unless
+            # it is marked as coming from the current message text, and a
+            # projection without it made every adjust_stop_loss remediation
+            # fail with management_stop_provenance_invalid.
+            stop_price_source=source.stop_price_source,
             take_profit_text=source.take_profit_text,
             leverage_text=source.leverage_text,
             parse_source="mimo_authoritative",

@@ -102,7 +102,12 @@ class WritableRemediationClient(_ReadOnlyClient):
     def get_ticker_quote(self, *, inst_id):
         if self.quote is None:
             return None
-        return dict(self.quote)
+        # The management stop gate checks quote freshness against the real
+        # wall clock (management_stop_price_gate.stop_gate_clock), not the
+        # test's business "now", so a live quote is stamped when it is read.
+        quote = dict(self.quote)
+        quote["observed_at"] = datetime.now(UTC).isoformat()
+        return quote
 
     # -- writes -------------------------------------------------------
     def place_order(self, payload):
