@@ -98,8 +98,8 @@ L3 流程要求「备份 + quick_check」，演练还要一份副本；每做一
   旧观测对运行无用，只有审计价值。
 - `context_resolution_attempts.request_summary_json`：读者是 `context_resolution_worker.py:117-123, 315-321`（同一条消息的最新一次尝试）、
   `web_queries.py:1856`（消息卡片详情）、`context_analysis_backfill.py:141, 743`（回填分析）。
-  旧消息的请求全文只用于回看和回填。另有一处异常：快照上 6,713 行的 `created_at` 为 NULL（模型声明非空），
-  做保留期时不能按 `created_at` 取年龄，要用 `updated_at` 或关联 `raw_messages` 的时间。
+  旧消息的请求全文只用于回看和回填。（更正：初稿曾写「6,713 行 `created_at` 为 NULL」，是我查询时取错了列；
+  复核快照 `created_at` / `updated_at` 均 0 行 NULL。保留期任务仍按消息时间做第一道筛选，理由是这些列排在 64 KB 大字段之后，逐行读会扫约 0.5 GB。）
 - 项目文档早有记录但未跟进：`docs/known-issues-and-deferred-work.md:67`（当时两表约 334 MB / 282 MB）。
 
 ### 3.4 媒体：在控，但被磁盘水位挤压
@@ -268,3 +268,16 @@ C1～C7 合计约 **31 GB**；加上 C8 最多约 35 GB。执行后剩余空间�
    库文件大小不会变小（不做 VACUUM），但之后应基本不再增长——一周后复核 `research.db` 大小。
 9. **回滚**：停 timer（`systemctl disable --now telegram-kol-db-retention.timer`）即停止继续删；
    已删的观测行与被替换的请求全文只能从第 2 步的备份取回（按 id 选择性回灌，不整库恢复）。
+
+### 8.3 候选与复核（2026-09-27）
+
+- 代码候选：`8468277c` 之上改正一处代码注释（见上面的更正），最终候选 sha 见本节末。全量测试（在 `8468277c` 上）：9802 通过、4 跳过、0 失败。
+- 改动：`db_retention.py`（新增）、`context_request_storage.py`（新增 `storage: "retention_stub"` 占位契约）、
+  `context_resolution_worker.py`（占位时从占位里取候选线程 id，指纹与替换前一致）、`context_analysis_backfill.py`（导出跳过全是占位的消息）、
+  `stop_loss_size_convergence.py`（「resize skipped」按 pos_id 节流，每小时最多一次并带被抑制次数）、
+  `deploy/systemd/telegram-kol-db-retention.{service,timer}`（User=telegram-kol-worker，避免 root 新建 WAL 锁住服务）。未改 `web_app.py`、`cli.py`、`oncall_*`。
+- 终态白名单：`exhausted`、`superseded`、`failed`、`blocked_disabled`、`blocked_execution_terminal`、`reanalysis_capped`，
+  以及 `completed` 中不再可能被重排的行；快照上的状态分布：completed 4894、exhausted 1528、superseded 221、failed 68、reanalysis_capped 2、blocked_execution_terminal 1。
+- 生产核对：SQLite 3.42.0（行值比较需 ≥ 3.15，满足）；磁盘调度器是 `mq-deadline`，所以单元里的 `IOSchedulingClass=idle` **不起作用**，
+  IO 压力靠分批（每批 ≤ 5000 / 上下文 200 行）+ 批间 0.2 s + 单次 10 分钟上限控制。首次 apply 时按 8.2 第 6 步盯 loop-health。
+- **最终候选 sha：`b03fbb908f520ad354f836eab9bb9670ebb8135d`**（相对 `8468277c` 只改了一段 docstring，聚焦测试 50 通过；按 AGENTS.md 属于生产代码变动，部署前按惯例再跑一次全量）。
