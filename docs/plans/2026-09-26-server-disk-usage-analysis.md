@@ -281,3 +281,64 @@ C1～C7 合计约 **31 GB**；加上 C8 最多约 35 GB。执行后剩余空间�
 - 生产核对：SQLite 3.42.0（行值比较需 ≥ 3.15，满足）；磁盘调度器是 `mq-deadline`，所以单元里的 `IOSchedulingClass=idle` **不起作用**，
   IO 压力靠分批（每批 ≤ 5000 / 上下文 200 行）+ 批间 0.2 s + 单次 10 分钟上限控制。首次 apply 时按 8.2 第 6 步盯 loop-health。
 - **最终候选 sha：`b03fbb908f520ad354f836eab9bb9670ebb8135d`**（相对 `8468277c` 只改了一段 docstring，聚焦测试 50 通过；最终全量在 `b03fbb90` 上：9802 通过、4 跳过、0 失败）。
+
+## 9. 一次性清理执行记录（2026-09-27 06:0x～06:15 CST，用户在本会话确认后执行）
+
+| 时点 | `df -h /` |
+|---|---|
+| 执行前 | 46 G 已用 / 4.9 G 可用 / 91% |
+| C1～C3 退役后 | 22 G / 29 G / 43% |
+| C4、C6、C7 后 | 20 G / 31 G / 39% |
+| C5 轮转后（rsyslog HUP 释放旧文件句柄） | **17 G / 34 G / 34%** |
+
+- **C1～C3**：34 个文件（28.9 GB）逐个复核「大小与 mtime 未变、`lsof` 无打开」后退役；清单
+  `/var/lib/telegram-kol-retired-backups/manifest-20260926.tsv`，全文抄在下面。0 个跳过。
+- **C4**：`/root/research-backup-preA2-20260925T130524Z.db` 删前 sha256 复核与状态文档一致
+  （`66a56ff7…8a80c`），`zstd -T1 -3` 压成 `.db.zst` 87,270,637 字节，`zstd -t` 校验通过。**2026-10-09 后退役**（按 AGENTS.md 规则记 size + sha256）。
+- **C6**：`/opt/telegram-kol-releases/` 只留 `0335de71…`（24 MB，理由见 8.1），其余与 `/opt/telegram-kol-candidates`、`/opt/telegram-kol-candidate-cf68980` 已删。
+- **C7**：`data/backups/` 下 16 个 > 5 MB 的 JSON 用 `zstd -19` 压缩，目录 502 MB → 87 MB。
+- **C5**：`/etc/logrotate.d/rsyslog` 已安装（内容 = 仓库 `deploy/logrotate/rsyslog`），`logrotate -f` 首次轮转：
+  messages 1.18 GB → `messages.1.gz` 84 MB，secure → `secure.1.gz` 23 MB，cron → `cron.1.gz` 3.8 MB；rsyslog 已 HUP 并继续写新文件。
+  注意：手工 `-f` 只读了这一个配置文件，没带上全局 `dateext`，所以首批文件名是 `*.1.gz`；之后每天由 logrotate.timer 走全局配置，
+  文件名会是 `messages-YYYYMMDD.gz`，**`*.1.gz` 不在它的轮换计数里，2026-10-11 后可手工删掉**（约 111 MB）。
+- 未动：C8 全部目录、生产库、任何服务、自动交易开关。
+
+### 9.1 退役清单（path / bytes / sha256 / mtime / retired_at）
+
+```
+path	bytes	sha256	mtime	retired_at
+/root/evidence/authority-reset/research-backup-20260909T142919Z.db	981852160	20bcbb8b300f7016063a8a060c1cafc2d2dae545fee5615c13305a8d336e08fa	2026-09-09 22:29:24	2026-09-27T06:11:04+08:00
+/root/evidence/phase-6-pre-5/research-backup-20260909T161250Z.db	987238400	8d233b54b2f39a27e8b3d64a3051bdf1e5064c1c7271a743a22ed17b107fd0b4	2026-09-10 00:12:50	2026-09-27T06:11:04+08:00
+/root/evidence/step10a-reclaim/research.db.bak-20260910T032253Z	994779136	cfdee5f522d724c62ab3959ca3213c56a65aac51e3d96774bcf38076aa629ca7	2026-09-10 11:22:59	2026-09-27T06:11:04+08:00
+/root/phase2-snapshot.db	1237684224	b4661c1c97a1f4c583d9f98b78e7a850004c77899ea67ca37baa598936723ba6	2026-09-25 22:03:06	2026-09-27T06:11:05+08:00
+/tmp/research-snapshot-20260916.db	1128943616	7ea7553010817251780be37bb1b3c4d34c7a6d53a699ce37c5c251ba2c49ed94	2026-09-17 06:33:51	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/migration-rehearsal-success.db	819150848	29d79b5b93a93ecaef4d8421e3a862fafc4498b9caffd8130e91ea4858a78b21	2026-09-01 07:25:35	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/18434b4552938ae3acb1160ad32618aab9c3ecf4/ai-context/pre-activation.db	819150848	a9f94e7a4578d776d68ab4f43936a872e9003da675b181513d08f3fb25b430b5	2026-09-01 07:21:47	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/18ea345a23812ed131c500a6040174a07a4436db/preamble13-expire-20260831T005721Z-1846228/research-before-preamble13.db	805408768	1f4601ae22eba9dc1d443b60e49cbcebdb7f12e73cc1ff5b6c6b97629f5446c8	2026-08-31 08:57:44	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/21314fc44fd4f7a05d3bbbd4842e73a825523fee/attempt-2/transaction-backup.db	805208064	eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af	2026-08-30 16:10:33	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/287daacf8dbf2d44e56f311800ee85b83579e307/attempt-1/preflight.db	813518848	6a87ab9579217c7f1d96aea6c01cb9598707eba2dea34196b86a726678175b37	2026-08-30 08:36:35	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/3205b074642436ed0f6aa35fefef7941a4f3f62f/ai-context-shadow-20260901T132208Z/pre-shadow-schema.db	817557504	a07882a2b88539050a40487a13ee2488a1c1299a9ac751d50ceee833f814ec23	2026-09-01 21:22:29	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/392a74730d5406d23e2080324e472fcdfdb1ea67/recognition-execution-lease-rehearsal-20260903T044159Z/pre-recognition-execution-schema.db	853778432	525124a0a3623f9f586b5b52ddda981ac7660034fb56fc43d7fdd694c4407414	2026-09-03 12:42:43	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/4284d1a61226eb16812407c4f2489a207241db4c/ai-context-r1-20260901T030531Z/pre-r1-schema.db	812068864	da30f56e45ccc9d185d83c2d713ad5f2e3bf54cba8ff5ecedfd48aba5b78ea05	2026-09-01 11:07:21	2026-09-27T06:11:05+08:00
+/var/lib/telegram-kol-cutover-evidence/7af12a535a786d33c1338e4f6d41d66aff088618/attempt-3/transaction-backup.db	805208064	eb7241a70b3bb66868e819108240da426c904d746b12b3450cb32148d15e09af	2026-08-30 16:31:15	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/89a7dc66ea0c788f48be2e9841cec010cd8feeb1/attempt-1/stopped-preflight.db	814260224	f76b28af4121760436424fc083e6b053cb9caa3565bf6aa2516b83bf4dc20243	2026-08-30 09:55:22	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/8abaf2c6d6e361b7651fc41e11275e899bb6463a/attempt-2/preflight.db	813080576	4216d9828284f4885370f793525bc3402e79bb8651120050f0cce313c57b0e45	2026-08-30 06:39:36	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/90bf0d79b7d1c34bf996d8894157a100aa6ab274/scale-proof-1/memory-bounded-backup.db	4194304	d363c9389243e19b6f2ce9f743f74a3afcc9e4387a1017a4897f515012b92232	2026-08-30 13:48:44	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/b3137ed6c0f67c62ce8c3e35a52a0fdf68bac1f7/main-recognition-observability-20260901T161900Z/pre-main-recognition-schema.db	819408896	50c5f537c00b6220ecb20a9f3fe70eaee320a1dbdc020625812303afc69caa04	2026-09-02 00:19:30	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/b78f16098c591978fe764e15c9b793182fc97f5b/message-recognition-labels-20260902T104316Z/pre-message-recognition-labels-schema.db	840634368	789c5b1b11fdf0874d6ae5f3657c88be6dec76ff7f45f21360a186eb3f64060a	2026-09-02 18:43:44	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/b78f16098c591978fe764e15c9b793182fc97f5b/message-recognition-labels-20260902T104316Z/rehearsal.db	840650752	42f2fc28968bda25d6f5eac9f553cc325cb4d1bc1d5299e580ace78bf14fd955	2026-09-02 18:45:27	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/c1c046a34c5125d7bfe6452d33e9a0ff1a1f0609/preflight-production-copy.db	812896256	bd869faf6b57862d50c58d1fd1a26c496b92883cca22c799337f0e0810048559	2026-08-30 05:41:10	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/recognition-execution-lease-rehearsal-20260902T005943Z/artifacts/production-backup.db	850968576	b5991883ddf0290e100699999ed8f8b303f93567a1fd36d654937cb7c47d2598	2026-09-03 09:00:09	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/recognition-execution-lease-rehearsal-20260902T005943Z/artifacts/schema-rehearsal.db	850993152	f3ec176624dfcc5ba61569245718abc78a28d31cfd5bce1202d1ba3782d6a395	2026-09-03 09:01:29	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-cutover-evidence/rest-ws-phase-1/research-copy.db	914300928	3d6360ad0e30993192b22d2324cb84dc67535e0fbddb9eac31a3a6e4d0f44c7b	2026-09-06 21:33:22	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-maintenance-evidence/backlog-expiry-phase1-f56d557d-20260831T071454Z/research-before.db	806084608	f244d67bfce2f6f9c4e134b30d1bf2173d81f41ecca682b05adb8311a6e701af	2026-08-31 15:16:12	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-maintenance-evidence/batch153-preambles14-15-20260905T063719Z/before.db	895942656	dcafc3c5e509e6b8155b9ef09d49063d59a2e6c12a5d08d2c10c110946da0018	2026-09-05 14:40:35	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-maintenance-evidence/batch153-preambles14-15-20260905T063719Z/rehearsal.db	895942656	dcafc3c5e509e6b8155b9ef09d49063d59a2e6c12a5d08d2c10c110946da0018	2026-09-05 14:40:35	2026-09-27T06:11:06+08:00
+/var/lib/telegram-kol-maintenance-evidence/exchange-empty-alignment-829cfa49-20260831T125122Z/research-before.db	807387136	18c03d5152084256b814a0c2639d9a5b9a38ff4409fc26c73e1b2b32be8dbabd	2026-08-31 20:55:00	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/legacy-running-production-20260905T125030Z/before.db	899104768	da6077d5e9db13c62b058581b55b9277be48e63c96b4fdab833d3b44dc85bccf	2026-09-05 20:57:25	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/legacy-running-rehearsal-20260905T073939Z/before.db	896454656	f8da902fc63f31361be06626b7bb14ef8f83a8c614c83ec17de6b211f789a854	2026-09-05 15:44:40	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/legacy-running-rehearsal-20260905T073939Z/rehearsal.db	896454656	33f966553b0c35b8843e866e3a8fc1083d2a615c2e75dade5651669a403d7a4f	2026-09-05 15:47:16	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/raw14214-terminalization-20260905T133139Z/before.db	900026368	e977688721228d64ba08569a909348b9d4e4dec8a33dfae4e063b9621b343fd9	2026-09-05 21:36:23	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/raw14214-terminalization-20260905T133139Z/rehearsal.db	900026368	e882dc1265aa697835ea37a7ca650405cb7ccc7679b6f8efd1eea2834ed55d29	2026-09-05 21:37:39	2026-09-27T06:11:07+08:00
+/var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z/research-before.db	807567360	d8b1ebd73da9bb2da2af10e1094adad1a0d19d0311a74b1f6d21b5b8eca96a27	2026-08-31 22:33:59	2026-09-27T06:11:07+08:00
+```
