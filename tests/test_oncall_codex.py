@@ -521,14 +521,106 @@ def test_case_directories_carry_setgid_and_results_take_the_directory_group(tmp_
     """Production, 2026-09-22: root-written verdicts were root:root, unreadable
     by the watcher, and every diagnosis was recorded as a timeout."""
 
-    import os, stat
+    import os, stat, sys
 
     from telegram_kol_research.oncall_codex import Spool, atomic_write
 
     spool = Spool(tmp_path / "spool")
+    spool.ensure_root()
+    # In production the runner's ExecStartPre makes the spool root 2770; the
+    # case directory inherits setgid from it (Linux semantics).
+    os.chmod(spool.root, 0o2770)
     spool.enqueue(case_id=1, attempt=1, kind="management", case_payload={"a": 1},
                   now=__import__("datetime").datetime(2026, 9, 22, tzinfo=__import__("datetime").UTC))
     directory = spool.case_dir(1)
-    assert stat.S_IMODE(os.stat(directory).st_mode) & stat.S_ISGID
+    mode = stat.S_IMODE(os.stat(directory).st_mode)
+    assert mode & 0o070 == 0o070
+    if sys.platform.startswith("linux"):
+        assert mode & stat.S_ISGID
     atomic_write(directory / "run.json", "{}")
     assert os.stat(directory / "run.json").st_gid == os.stat(directory).st_gid
+
+
+def _refuse_setgid_chmod(monkeypatch):
+    """What the watcher unit's ``RestrictSUIDSGID=yes`` does: any chmod whose
+    mode carries setuid/setgid fails with EPERM (reproduced on the server,
+    2026-09-27)."""
+
+    import os, stat
+
+    real_chmod = os.chmod
+
+    def chmod(path, mode, *args, **kwargs):
+        if mode & (stat.S_ISUID | stat.S_ISGID):
+            raise PermissionError(1, "Operation not permitted", str(path))
+        return real_chmod(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(os, "chmod", chmod)
+
+
+def _enqueue(spool, case_id=1, attempt=1):
+    return spool.enqueue(case_id=case_id, attempt=attempt, kind="management",
+                         case_payload={"a": 1}, now=datetime(2026, 9, 27, tzinfo=UTC))
+
+
+def test_a_case_directory_is_group_accessible_under_restrict_suid_sgid_and_umask_0077(
+    tmp_path, monkeypatch
+):
+    """Production, 2026-09-23..27: every case directory came out 2700 because
+    ``chmod(0o2770)`` was refused and the error swallowed; the runner (uid 0,
+    no DAC override, reads only through the group) could not open one request."""
+
+    import os, stat
+
+    from telegram_kol_research.oncall_codex import Spool
+
+    _refuse_setgid_chmod(monkeypatch)
+    spool = Spool(tmp_path / "spool")
+    spool.ensure_root()
+    previous = os.umask(0o077)
+    try:
+        _enqueue(spool)
+        assert os.umask(0o077) == 0o077, "the umask must be restored"
+    finally:
+        os.umask(previous)
+    mode = stat.S_IMODE(os.stat(spool.case_dir(1)).st_mode)
+    assert mode & 0o070 == 0o070
+    assert mode & 0o007 == 0
+
+
+def test_an_existing_directory_without_group_access_is_repaired_on_the_next_attempt(
+    tmp_path, monkeypatch
+):
+    import os, stat
+
+    from telegram_kol_research.oncall_codex import Spool
+
+    _refuse_setgid_chmod(monkeypatch)
+    spool = Spool(tmp_path / "spool")
+    spool.ensure_root()
+    spool.case_dir(1).mkdir()
+    os.chmod(spool.case_dir(1), 0o700)
+    _enqueue(spool, attempt=2)
+    assert stat.S_IMODE(os.stat(spool.case_dir(1)).st_mode) & 0o070 == 0o070
+
+
+def test_enqueue_refuses_a_directory_the_runner_could_never_read(tmp_path, monkeypatch):
+    """A request nobody can read used to be recorded as queued and turn into a
+    silent thirty-minute timeout; now the watcher is told it could not write."""
+
+    import os
+
+    from telegram_kol_research.oncall_codex import FILE_REQUEST, Spool
+
+    spool = Spool(tmp_path / "spool")
+    spool.ensure_root()
+    spool.case_dir(1).mkdir()
+    os.chmod(spool.case_dir(1), 0o700)
+
+    def refuse(path, mode, *args, **kwargs):
+        raise PermissionError(1, "Operation not permitted", str(path))
+
+    monkeypatch.setattr(os, "chmod", refuse)
+    with pytest.raises(OSError):
+        _enqueue(spool, attempt=2)
+    assert not (spool.case_dir(1) / FILE_REQUEST).exists()

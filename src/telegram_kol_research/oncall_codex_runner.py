@@ -248,6 +248,26 @@ def codex_version(codex_bin: str, env: dict[str, str]) -> str | None:
 # --------------------------------------------------------------------------
 
 
+#: Case directory name -> the last reason its request could not be read.
+#: Nothing is written for such a case, so without this the same warning was
+#: logged every round: six unreadable cases, 2026-09-23..27, were about 52,000
+#: lines a day in journald and /var/log/messages.
+_UNREADABLE: dict[str, str] = {}
+
+
+def _report_unreadable(name: str, exc: BaseException) -> None:
+    reason = f"{type(exc).__name__}: {exc}"
+    if _UNREADABLE.get(name) == reason:
+        logger.debug("oncall runner still cannot read %s: %s", name, reason)
+        return
+    _UNREADABLE[name] = reason
+    logger.warning(
+        "oncall runner rejected %s: %s (repeats suppressed until it changes)",
+        name,
+        exc,
+    )
+
+
 def process_case_dir(
     case_dir: Path,
     *,
@@ -265,10 +285,13 @@ def process_case_dir(
     try:
         raw_request = read_bounded_file(request_path)
     except FileNotFoundError:
+        _UNREADABLE.pop(case_dir.name, None)
         return None
     except (OSError, RequestContractError) as exc:
-        logger.warning("oncall runner rejected %s: %s", case_dir.name, exc)
+        _report_unreadable(case_dir.name, exc)
         return None
+    if _UNREADABLE.pop(case_dir.name, None) is not None:
+        logger.info("oncall runner: %s is readable again", case_dir.name)
 
     fingerprint = request_fingerprint(raw_request.encode("utf-8"))
     existing = _existing_run(case_dir)
@@ -597,6 +620,9 @@ def scan_once(
     except OSError as exc:
         logger.warning("oncall runner cannot read the spool: %s", type(exc).__name__)
         return records
+    for gone in set(_UNREADABLE) - set(names):
+        # Removed or archived: a later directory of the same name is news.
+        del _UNREADABLE[gone]
     for name in names[:MAX_CASE_DIRS_PER_SCAN]:
         if case_id_from_dir(name) is None:
             continue
