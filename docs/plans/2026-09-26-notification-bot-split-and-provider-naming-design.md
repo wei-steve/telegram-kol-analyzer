@@ -375,34 +375,49 @@ management_target_refused        unclassified_operation_failure
 
 ---
 
-## 7. 实施中发现、**未在本次处理**的一条：识别冲突复核那条告警
+## 7. 识别冲突复核那条告警：已复核，只剩死文案 + 一条没上守卫的 CLI 路径
 
 `format_ai_recognition_conflict_review_message`
 （[`system_operator_bot.py`](../../src/telegram_kol_research/system_operator_bot.py) 约 1476 行）
-还有 5 处硬写的 `MiMo`，本次没动 —— 它不在第 2 节那张 8 行表里，而且要改得连
-`telegram_live_listener._build_authoritative_notification_payload` 一起改，属于超出已批准范围。
+还有 5 处硬写的 `MiMo`，包括一行 `权威结果: MiMo` —— 本次改完之后它会和隔壁的
+「权威识别主用模型 gpt-5.6-luna」自相矛盾。本次没动它：它不在第 2 节那 8 行表里。
 
-但它现在发出去的东西比「叫错名字」更成问题，记在这里等定夺：
+### 7.1 初稿担心的事已经被 2026-09-23 的 d4b77b23 解决了
 
-1. **标题说分歧，内容里没有第二方。** 这条只在 `agreement_status == "authoritative_failed"`
-   时才发，而 `auxiliary`（DeepSeek 那半边）在 2026-09-25 语义复核退役后
-   **恒为空字典**，代码注释自己写了「every construction site had been passing `None`
-   since long before that」。所以实际渲染出来是：
+我一开始以为这条告警还在往外发「分歧告警但没有分歧方」。**复核后：没有。**
+`telegram_live_listener.auxiliary_review_disagrees`（约 575 行）要求 `deepseek` 段确实带结果
+且 `agreement_status ∈ {disagreed, authoritative_failed}`，否则写
+`notification_status = suppressed_no_auxiliary` 并且不发。
 
-   ```
-   【AI识别分歧告警】
-   DeepSeek: - / -
-   DeepSeek原因: -
-   MiMo: <status> / authoritative
-   权威结果: MiMo
-   处理: MiMo 权威识别失败，未执行自动交易；DeepSeek 结果仅供参考。
-   ```
+生产 `recognition_decisions`（索引 `(agreement_status, updated_at)`，按时间窗查，没有全表扫）：
 
-   ——「分歧」没有分歧方，「DeepSeek 结果仅供参考」指的是一个不存在的结果。
+| agreement_status | notification_status | 条数 | 时间范围 |
+|---|---|---|---|
+| authoritative_failed | `suppressed_empty_input` | 32 | 09-20 05:56 → **09-26 12:02** |
+| authoritative_failed | `sent` | 3 | 09-20 02:05 → **09-22 14:53** |
+| authoritative_failed | `suppressed_no_auxiliary` | 3 | 09-23 07:56 → 09-24 16:16 |
+| authoritative_failed | `suppressed_expired_recovery` | 1 | 09-21 02:17 |
 
-2. **`权威结果: MiMo` 这行现在会和隔壁的告警自相矛盾**：本次改完之后，供应商告警说
-   「权威识别主用模型 gpt-5.6-luna」，而这条还在说「权威结果: MiMo」。
+**三条 `sent` 全在 09-22 及以前，即守卫上线之前；守卫上线后是 0 条。** 守卫在工作。
+所以 §7 不用另开专题，剩下的就是格式化函数里那段永远到不了人眼前的死文案。
 
-建议另开一条：要么把它改名成「权威识别失败告警」并删掉 DeepSeek 半边，
-要么确认语义复核会回来、把第二方补上。**别只改名字** —— 名字对了，
-「分歧」两个字还是在骗人。
+### 7.2 但是有第三个发送方，它没走那个守卫
+
+`auxiliary_review_disagrees` 的 docstring 写着「This is the one predicate both senders ask,
+so the worker path and `POST /api/messages/{id}/recognize` cannot drift apart」——
+**它只数了两个。还有第三个**：
+
+[`cli.py`](../../src/telegram_kol_research/cli.py) 约 1786-1824 行，
+`_run_telegram_sync` / `_run_parse_mode` 里那段，从
+`agreement_status == "authoritative_failed"` 直接写 `notification_status="scheduled"`
+然后调 `_deliver_cli_authoritative_failure_notification` → `send_ai_recognition_conflict_review`，
+**中间没有 `auxiliary_review_disagrees`**。
+
+它至今没发过：那条路只有人手敲 CLI 才会跑（生产三个服务都是
+`telegram-kol-research web --runtime-role ...`，`systemctl list-timers` 里也只有
+媒体清理那一个定时器），而 09-23 之后库里既没有 `scheduled` 也没有 `sent`。
+
+所以这是个**潜伏的漂移**，正好是那句 docstring 声称已经防住的那种。修它要动 `cli.py`，
+而那个文件现在归另一个会话（`uncertain-attempt-closeout` 线）占用，本次不碰。
+建议合到那条线里，或等它部署完单独做：把 CLI 那段也改成先问 `auxiliary_review_disagrees`，
+并把 docstring 里的「both senders」改成三个。
