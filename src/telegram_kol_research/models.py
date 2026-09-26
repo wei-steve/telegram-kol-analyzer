@@ -632,9 +632,20 @@ class AuthoritativeExecutionAttempt(Base):
             "claim_token",
             name="uq_authoritative_execution_attempts_claim_token",
         ),
+        # ``closed_no_write`` / ``closed_settled_binding`` are the 2026-09-26
+        # closeout terminals. They are only ever written by
+        # ``uncertain_attempt_closeout``, never by the execution path, and they
+        # exist because ``failed_safe`` means "refused before any side effect"
+        # -- a row with ``side_effect_started_at`` set cannot honestly claim it.
+        # Widening a SQLite CHECK needs a table rebuild: see
+        # ``db._widen_sqlite_authoritative_execution_attempt_status_check``,
+        # which every process runs at startup. Without it this widening alone
+        # would make ``require_recognition_execution_schema`` reject the one
+        # database that matters.
         CheckConstraint(
             "status IN ('claimed','executing','outcome_recorded','succeeded',"
-            "'failed_safe','uncertain')",
+            "'failed_safe','uncertain','closed_no_write',"
+            "'closed_settled_binding')",
             name="ck_authoritative_execution_attempts_status",
         ),
         CheckConstraint(

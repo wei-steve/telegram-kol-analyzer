@@ -85,6 +85,7 @@ from telegram_kol_research.recognition_decisions import (
     update_recognition_execution_outcome,
 )
 from telegram_kol_research.authoritative_execution_attempts import (
+    CLOSEOUT_STATUSES,
     ExecutionOwnerIdentity,
     claim_authoritative_execution_attempt,
     fail_safe_authoritative_execution_attempt,
@@ -2006,6 +2007,26 @@ def _failure_point_for(reason: str) -> str:
     }.get(reason, reason)
 
 
+#: Attempt statuses that keep an automatic or explicit retry out (A-6c), plus
+#: the two 2026-09-26 closeout terminals.
+#:
+#: The closeout terminals are listed deliberately. Before the closeout these
+#: messages were held frozen by *two* independent locks: this one, and
+#: ``recognition_decisions.comparison_status='execution_uncertain'``, which makes
+#: any new decision write raise ``AuthoritativeExecutionInProgress``. The
+#: closeout leaves the decision row untouched on purpose, and leaving the closed
+#: statuses out of this set would have quietly released the other lock -- a retry
+#: would then run recognition, and pay for it, only to be refused one layer down.
+#: Keeping both locks preserves today's behaviour exactly and keeps "a September
+#: strategy must never be re-recognised into an order" a structural property
+#: rather than a careful one. It also means a future project that wants to
+#: unfreeze such a message has to say so about both rows, which is the right bar
+#: for that decision.
+RETRY_BLOCKING_ATTEMPT_STATUSES = frozenset(
+    {"claimed", "executing", "uncertain"} | set(CLOSEOUT_STATUSES)
+)
+
+
 class AutomaticRetryBlocked(RuntimeError):
     """A retry arrived while an execution still owns the message (A-6c).
 
@@ -2258,11 +2279,7 @@ def _load_completed_execution_for_automatic_retry(
             .order_by(AuthoritativeExecutionAttempt.id.desc())
             .first()
         )
-        if attempt is not None and attempt.status in {
-            "claimed",
-            "executing",
-            "uncertain",
-        }:
+        if attempt is not None and attempt.status in RETRY_BLOCKING_ATTEMPT_STATUSES:
             raise AutomaticRetryBlocked(
                 raw_message_id=int(raw_message_id),
                 attempt_status=str(attempt.status),

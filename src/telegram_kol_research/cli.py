@@ -67,6 +67,11 @@ from telegram_kol_research.message_processing_backlog_expiry import (
     apply_message_processing_backlog_expiry,
     build_message_processing_backlog_expiry_plan,
 )
+from telegram_kol_research.uncertain_attempt_closeout import (
+    UncertainAttemptCloseoutRefused,
+    apply_uncertain_attempt_closeout,
+    build_uncertain_attempt_closeout_plan,
+)
 from telegram_kol_research.runtime_incident_scanner import build_scanner_facts, run_scanner_cycle
 from telegram_kol_research.deepcoin_contract_specs import (
     RefreshableDeepcoinContractSpecProvider,
@@ -6409,6 +6414,62 @@ def expire_message_processing_backlog(
             }
     except (BacklogExpiryRefused, OSError, RuntimeError) as exc:
         typer.echo(f"Refusing backlog expiry: {exc}", err=True)
+        raise typer.Exit(code=2) from exc
+    typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+
+
+@app.command("close-out-uncertain-attempts")
+def close_out_uncertain_attempts(
+    database_path: Path = typer.Option(..., "--database-path"),
+    apply: bool = typer.Option(False, "--apply"),
+    expected_count: int | None = typer.Option(
+        None,
+        "--expected-count",
+        min=0,
+        help=(
+            "Required with --apply: the dry run's closeable_count. The plan is "
+            "rebuilt inside the write transaction and refuses if the number "
+            "changed."
+        ),
+    ),
+) -> None:
+    """Dry-run or close out settled ``uncertain`` authoritative attempts.
+
+    Default is a dry run that writes nothing and lists every ``uncertain``
+    attempt with its bucket, its proposed closeout status, and -- for the ones
+    that are refused -- why. ``recognition_decisions`` is never touched in
+    either mode, so a closed-out message stays frozen and un-re-recognisable.
+    """
+
+    resolved_path = database_path.expanduser().resolve()
+    if not resolved_path.is_file():
+        typer.echo(
+            "Refusing uncertain-attempt closeout: database does not exist.",
+            err=True,
+        )
+        raise typer.Exit(code=2)
+    try:
+        session_factory = create_existing_session_factory(resolved_path)
+        if apply:
+            if expected_count is None:
+                raise UncertainAttemptCloseoutRefused(
+                    "expected_count_required_for_apply"
+                )
+            result = apply_uncertain_attempt_closeout(
+                session_factory,
+                expected_count=int(expected_count),
+                closed_at=datetime.now(UTC),
+            )
+            payload = {"mode": "apply", **result.to_dict()}
+        else:
+            plan = build_uncertain_attempt_closeout_plan(session_factory)
+            payload = {
+                "mode": "dry_run",
+                **plan.to_dict(),
+                "changed_count": 0,
+            }
+    except (UncertainAttemptCloseoutRefused, OSError, RuntimeError) as exc:
+        typer.echo(f"Refusing uncertain-attempt closeout: {exc}", err=True)
         raise typer.Exit(code=2) from exc
     typer.echo(json.dumps(payload, ensure_ascii=False, sort_keys=True))
 

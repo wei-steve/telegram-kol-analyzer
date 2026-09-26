@@ -490,8 +490,14 @@ backup_stop_repair.py                     position_attribution_repair.py
 evidence_backfill.py                      position_management_liveness_recovery.py
 historical_attribution_cleanup.py         protection_incident_convergence.py
                                           tpsl_ledger_backfill.py
+                                          uncertain_attempt_closeout.py
                                           worker_command_reconciliation.py
 ```
+
+`uncertain_attempt_closeout.py`（2026-09-26 新增，`close-out-uncertain-attempts`）只改
+`authoritative_execution_attempts` 那一行的 `status`，**绝不碰 `recognition_decisions`**：
+`comparison_status='execution_uncertain'` 是消息"不可重新识别"的那把锁，清掉它等于解冻
+9 月的策略消息。落点与生产跑法见 `docs/uncertain-attempt-closeout-status.md`。
 
 **一次性修复，已归档。** `one_off/` 子包（步骤 5 建立）：目标数据已处置完毕、文档把工具本身
 标为 evidence-only、代码上零在线引用。`tests/test_one_off_isolation.py` 静态守护它不被

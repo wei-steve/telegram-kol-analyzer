@@ -876,6 +876,7 @@ def init_db(engine: Engine) -> None:
     )
     _make_sqlite_entry_assembly_preamble_nullable(engine)
     _widen_sqlite_entry_assembly_attempt_status_check(engine)
+    _widen_sqlite_authoritative_execution_attempt_status_check(engine)
     _backfill_sqlite_columns(engine)
     _backfill_sqlite_expiry_review_state(engine)
     _backfill_sqlite_indexes(engine)
@@ -1057,6 +1058,133 @@ def _widen_sqlite_entry_assembly_attempt_status_check(engine: Engine) -> None:
         raw_connection.close()
     # The rebuild dropped the table's indexes with it; recreate exactly the
     # ones the model declares.
+    with engine.begin() as connection:
+        for index in table.indexes:
+            index.create(bind=connection, checkfirst=True)
+
+
+#: Statuses ``authoritative_execution_attempts`` accepts after the 2026-09-26
+#: uncertain-attempt closeout. Kept next to the rebuild so the two cannot
+#: drift, and a strict superset of what the pre-closeout CHECK allowed -- which
+#: is why the "unknown status" bail-out below can only fire on a database whose
+#: CHECK was already missing or already wider.
+AUTHORITATIVE_EXECUTION_ATTEMPT_STATUSES = (
+    "claimed",
+    "executing",
+    "outcome_recorded",
+    "succeeded",
+    "failed_safe",
+    "uncertain",
+    "closed_no_write",
+    "closed_settled_binding",
+)
+
+
+def _widen_sqlite_authoritative_execution_attempt_status_check(
+    engine: Engine,
+) -> None:
+    """Teach an existing database the two closeout terminals.
+
+    Same shape and the same reason as
+    :func:`_widen_sqlite_entry_assembly_attempt_status_check`: SQLite keeps a
+    CHECK constraint inside the table definition, so nothing that skips
+    existing tables can widen one. This table is skipped twice over -- it is in
+    :data:`EXPLICIT_RECOGNITION_EXECUTION_TABLES`, so ``create_all`` never even
+    looks at it -- and its exact CHECK signature is *validated* on nearly every
+    authoritative execution call by
+    ``authoritative_execution_schema.require_recognition_execution_schema``.
+    Without this rebuild, widening the model's constraint would not merely fail
+    to take effect on the production database: it would make that database
+    read as ``check_signature:authoritative_execution_attempts`` invalid and
+    fail every claim, heartbeat, freeze and scan closed. That is why the
+    rebuild runs from ``init_db``, which every role's process calls before it
+    serves anything.
+
+    Idempotent: the marker for "already widened" is the new status literal
+    appearing in the stored DDL.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+    table = Base.metadata.tables["authoritative_execution_attempts"]
+    raw_connection = engine.raw_connection()
+    cursor = raw_connection.cursor()
+    foreign_keys_enabled = False
+    try:
+        definition_row = cursor.execute(
+            "SELECT sql FROM sqlite_master "
+            "WHERE type='table' AND name='authoritative_execution_attempts'"
+        ).fetchone()
+        if definition_row is None or definition_row[0] is None:
+            # Not installed yet. The reviewed plan-hash-bound schema command
+            # creates it from the current model, already wide enough.
+            return
+        if "'closed_no_write'" in str(definition_row[0]):
+            return
+        unknown = cursor.execute(
+            "SELECT COUNT(*) FROM authoritative_execution_attempts "
+            "WHERE status NOT IN ({})".format(
+                ",".join(
+                    "'%s'" % value
+                    for value in AUTHORITATIVE_EXECUTION_ATTEMPT_STATUSES
+                )
+            )
+        ).fetchone()[0]
+        if int(unknown or 0) > 0:
+            # Copied from the entry-assembly rebuild, and louder here: leaving
+            # the old CHECK in place keeps the database readable but leaves the
+            # schema validator rejecting it, so this branch is an outage, not a
+            # postponement. It cannot fire on a database whose CHECK was the
+            # pre-closeout one, because the new list is a superset of it.
+            logger.error(
+                "authoritative_execution_attempts holds %s rows with an unknown "
+                "status; the closeout status rebuild was skipped and "
+                "require_recognition_execution_schema will now fail closed",
+                int(unknown),
+            )
+            return
+        from sqlalchemy.schema import CreateTable
+
+        create_sql = str(CreateTable(table).compile(dialect=engine.dialect))
+        header = "CREATE TABLE authoritative_execution_attempts "
+        if header not in create_sql:
+            raise RuntimeError(
+                "authoritative_execution_attempts rebuild DDL unrecognised"
+            )
+        create_sql = create_sql.replace(
+            header, "CREATE TABLE authoritative_execution_attempts_rebuild ", 1
+        )
+        columns = ", ".join(column.name for column in table.columns)
+        foreign_keys_enabled = bool(
+            int(cursor.execute("PRAGMA foreign_keys").fetchone()[0])
+        )
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=OFF")
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            "DROP TABLE IF EXISTS authoritative_execution_attempts_rebuild"
+        )
+        cursor.execute(create_sql)
+        cursor.execute(
+            f"INSERT INTO authoritative_execution_attempts_rebuild ({columns}) "
+            f"SELECT {columns} FROM authoritative_execution_attempts"
+        )
+        cursor.execute("DROP TABLE authoritative_execution_attempts")
+        cursor.execute(
+            "ALTER TABLE authoritative_execution_attempts_rebuild "
+            "RENAME TO authoritative_execution_attempts"
+        )
+        raw_connection.commit()
+    except Exception:
+        raw_connection.rollback()
+        raise
+    finally:
+        if foreign_keys_enabled:
+            cursor.execute("PRAGMA foreign_keys=ON")
+        raw_connection.close()
+    # The rebuild dropped the table's indexes with it. Both of them are named
+    # in ``authoritative_execution_schema.REQUIRED_INDEXES``, so a missing one
+    # is another way to fail the validator closed.
     with engine.begin() as connection:
         for index in table.indexes:
             index.create(bind=connection, checkfirst=True)

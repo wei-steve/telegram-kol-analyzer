@@ -429,6 +429,17 @@ def fail_safe_authoritative_execution_attempt(
 NO_WRITE_TRACKED = "no_exchange_write_tracked"
 
 
+#: The two 2026-09-26 closeout terminals. Declared here, next to every other
+#: status this table can hold, so an online consumer does not have to import the
+#: operator tool that writes them (``uncertain_attempt_closeout``). Nothing in
+#: this module ever writes them: an execution reaching ``uncertain`` is still
+#: frozen, and only the audited operator tool may decide a frozen row's exposure
+#: is settled.
+CLOSED_NO_WRITE = "closed_no_write"
+CLOSED_SETTLED_BINDING = "closed_settled_binding"
+CLOSEOUT_STATUSES = frozenset({CLOSED_NO_WRITE, CLOSED_SETTLED_BINDING})
+
+
 def mark_authoritative_execution_uncertain(
     session_factory,
     *,
