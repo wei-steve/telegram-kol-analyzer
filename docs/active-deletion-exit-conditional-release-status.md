@@ -6,7 +6,7 @@
 前序：`docs/stuck-deletion-exit-selfheal-status.md`（`recovery_required` 的同形状自愈，已上线 `0041ae06`）、
 `docs/active-deletion-exit-fairness-status.md`（L1）、`docs/oncall-d6-silent-stall-rules-status.md` 末节（L2）
 案例：`docs/2026-09-26-silent-stall-case-note.md`
-状态：**代码 + 用例完成，全量测试绿，未部署、未推送。**
+状态：**代码 + 用例完成，全量测试绿，未部署、未推送。提交 `272dba2d`（单独一条，可独立回滚）。**
 
 本文件是 L3 这件事跨会话唯一的进度真相。
 
@@ -338,4 +338,12 @@ WHERE l.pos_id = :pos_id OR l.order_id = :ord_id;
 - C2（反复认领、永不完成）在生产上仍然没有样本。L3 能救它的前提是它在两次认领之间被本 pass 撞上
   （那一瞬间 `claim_token` 是 NULL）；撞不上就只会告警。真出现这一类时，
   正确的下一步是去看它卡在哪一步，而不是把第 4 条放宽。
+- **一个残留的读取频率风险，本轮有意没处理。** `_should_capture` 的规矩是"状态或
+  `last_reason` 变了就立刻发声"，而**活跃态的 `last_reason` 是 worker 在改的**
+  （`recovery_required` 没人改，所以这个形状以前不存在）。一条**无凭据**、churning 了 6 小时以上、
+  并且每轮被 worker 写进**不同** `last_reason` 的行，会让节流对它失效 → 每个 tick 一次 lane 读
+  → 最坏 24 次 REST/分钟。三件事把它压得很窄：带凭据的行在 lane 读之前就返回；
+  lane 无主时第一次就释放掉了（自终止）；lane 有主时我们不写任何字段，
+  `last_reason` 不会因为我们而变。但如果哪天真看到这个形状，
+  该做的是给 lane 读单独加一个"每条退出每 30 分钟最多一次"的硬下限，而不是放宽任何判据。
 - `_LAST_STUCK_CAPTURE` 仍然没有淘汰逻辑（量级极小，与上一轮同）。
