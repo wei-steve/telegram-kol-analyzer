@@ -283,3 +283,52 @@ uv run pytest -q
 
 **未推送、未部署**（按指令）。分支 `group-symbol-scoped-approvals`，从 `origin/main`
 （`bf52fbd9`）开出。
+
+---
+
+## 部署记录 · 2026-09-26（北京时间）
+
+- 部署 sha `977c50ab`（`origin/main` 与生产同值）；**回滚 sha `f2fa9d9f`**。
+- 顺序：候选推 `claude/group-symbol-scoped-approvals` → `tg-deploy 977c50ab`
+  （worker/web/ingest 依次重启）→ 人工两步 → 把该 sha 推 `main`。
+- 两项部署检查都跑了，且按 AGENTS.md 的要求对**两种答案**各测一次：
+  `f2fa9d9f..977c50ab` 正确报 FAIL 并列出 9 个代码文件；部署后 `main` 对生产报
+  `PASS: 0 code files beyond production`。
+
+### 人工两步（已执行）
+
+1. `chown root:telegram-kol-runtime` + `chmod 660 config/groups.yaml`
+   （0640 → 0660）；
+2. `cp deploy/systemd/telegram-kol-web.service /etc/systemd/system/` +
+   `systemctl daemon-reload` + `systemctl restart telegram-kol-web`。
+   **tg-deploy 不同步单元文件**：`/etc/systemd/system/*.service` 是副本而非软链，
+   改了仓库里的单元必须手工装一次，否则 `ReadWritePaths` 那行不会生效。
+
+### 验证证据
+
+启动自检把两步的先后拍得很清楚（同一个进程重启前后）：
+
+```
+08:02:44 group_config_write_check path=config/groups.yaml;exists=true;writable=false;reason=no_write_permission
+08:02:56 group_config_write_check path=config/groups.yaml;exists=true;writable=true;reason=ok
+```
+
+端到端（按用户要求用 notify_only 的群，不碰峰哥开关；选 `DeepCoin-API`
+`-4623349778` 这个几乎无流量的工具群，翻的是「AI识别」而不是「自动交易」）：
+
+- `POST /api/groups/-4623349778/automation` → **HTTP 200**
+  `{"ai_strategy_enabled":true,"auto_trade_enabled":false}`（此前同一端点连续 8 次 500）；
+- 文件 mtime 从 `04:53:56` 变成 `08:03:47`；
+- 热加载在 5 秒上限内落到另外两个进程：ingest `08:03:48`（1 秒）、worker `08:03:51`（4 秒），
+  两边都打出 `groups=34 auto_trade_chat_ids=[8 个 id]`，其中没有峰哥；
+- 翻回 false 后与今晚关峰哥之后的备份逐字节比对，除峰哥那一行外**无任何差异**，
+  说明 `yaml.safe_dump` 的整文件重写没有带偏其它群。
+
+### 部署后 24 小时要看的
+
+- `Expired N timed-out pending entries outside the auto-trade scope` 批次日志：
+  出现即说明乙在收口；当天没有立刻出现是**预期**——库里 31 条未了结里，
+  多数是 `entered`（乙只不通知、不改状态）或已经通知过（留给 A2 的 7 天自愈）。
+- 超时复核通知应只剩 auto_trade 群 × 白名单币，外加有挂单的 fail-closed 例外。
+- 既有噪音两条与本次无关，别误记在账上：`RuntimeIncidentBoundsError`（两天 6.8 万条）、
+  `recognition execution finding ... observe_uncertain`（部署前已有 5.6 万条）。
