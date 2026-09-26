@@ -27,15 +27,23 @@ from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.deferred_instruction_recovery import (
+    DEFERRED_EXPIRED_REASON,
+    DEFERRED_HOLD_REASON,
+)
 from telegram_kol_research.models import (
     ExecutionBinding,
     ExecutionOrderLeg,
+    MessageProcessingJob,
     RawMessage,
+    RecognitionDecision,
     SignalCandidate,
     SourceMessageDeletionExit,
     TelegramSourceMessageEvent,
 )
 from telegram_kol_research.source_deletion_exit_timeout import (
+    NO_EXCHANGE_FOOTPRINT_REASON,
+    POSITION_GONE_REASON,
     STUCK_EXIT_CAPTURE_MIN_INTERVAL,
     build_exchange_absence_reader,
     expire_stuck_source_deletion_exits,
@@ -171,12 +179,14 @@ def test_every_stuck_exit_summary_field_is_inside_the_closed_vocabulary(tmp_path
 
     session_factory = create_session_factory(tmp_path / "incidents.db")
     _capture_stuck_incident(session_factory, lane_released=True,
-                            release_reason="position_gone_confirmed")
+                            release_reason=NO_EXCHANGE_FOOTPRINT_REASON)
 
     summary = json.loads(_incident_rows(session_factory)[0].redacted_summary)
     assert set(summary) <= set(_SUMMARY_FIELDS)
-    assert summary["release_reason"] == "position_gone_confirmed"
+    assert summary["release_reason"] == NO_EXCHANGE_FOOTPRINT_REASON
     assert summary["impact"] == "lane_released_after_timeout"
+
+
 # --------------------------------------------------------------------------
 # 乙 and 丙 share one fixture: 陈哥's sealed BTC-long lane
 # --------------------------------------------------------------------------
@@ -459,3 +469,327 @@ def test_the_summary_log_line_is_throttled_with_the_captures(tmp_path):
         if record.getMessage().startswith("source deletion exits stuck alerted=")
     ]
     assert len(summary_lines) == 1
+
+
+# --------------------------------------------------------------------------
+# 丙: an exit holding nothing must be allowed to let go
+# --------------------------------------------------------------------------
+
+
+def test_a_credentialless_exit_over_a_fully_attributed_lane_is_released(tmp_path):
+    """The production shape: our own footprint is empty, the lane is not ours.
+
+    米娅's binding 383 owns the only BTC long on the account, so nothing in
+    this lane can be the orphan exit 310 was supposed to close.
+    """
+
+    session_factory = _lane_fixture(tmp_path)
+    _other_group_binding(session_factory)
+    captured: list[dict] = []
+
+    result = _sweep(
+        session_factory,
+        captured=captured,
+        reader=_reader(
+            positions=[
+                {
+                    "posId": "pos-383",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "3",
+                }
+            ],
+            orders=[
+                {
+                    "ordId": "ord-383",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                }
+            ],
+        ),
+    )
+
+    assert (result.released, result.held) == ((310,), ())
+    assert _exit_state(session_factory) == ("succeeded", NO_EXCHANGE_FOOTPRINT_REASON)
+    # Released is not "nothing happened": the alert still fires, once.
+    assert captured[0]["lane_released"] is True
+    assert captured[0]["release_reason"] == NO_EXCHANGE_FOOTPRINT_REASON
+
+
+def _unattributed_position():
+    """A BTC long on the account that no execution leg claims."""
+
+    return {"posId": "pos-orphan", "instId": "BTC-USDT-SWAP", "posSide": "long",
+            "pos": "5"}
+
+
+def test_an_unattributed_position_in_the_lane_keeps_it_sealed(tmp_path):
+    """The safety boundary. An unclaimed BTC long could be our own orphan."""
+
+    session_factory = _lane_fixture(tmp_path)
+    _other_group_binding(session_factory)
+
+    result = _sweep(
+        session_factory,
+        reader=_reader(positions=[_unattributed_position()]),
+    )
+
+    assert (result.released, result.held) == ((), (310,))
+    assert _exit_state(session_factory) == (
+        "recovery_required",
+        "exact_lifecycle_missing",
+    )
+
+
+def test_an_unattributed_resting_order_in_the_lane_keeps_it_sealed(tmp_path):
+    """Same boundary for a resting order nobody claims."""
+
+    session_factory = _lane_fixture(tmp_path)
+
+    result = _sweep(
+        session_factory,
+        reader=_reader(
+            orders=[
+                {"ordId": "ord-orphan", "instId": "BTC-USDT-SWAP", "posSide": "long"}
+            ]
+        ),
+    )
+
+    assert (result.released, result.held) == ((), (310,))
+
+
+def test_another_lane_does_not_keep_this_one_sealed(tmp_path):
+    """A BTC short and an ETH long are different lanes and prove nothing here."""
+
+    session_factory = _lane_fixture(tmp_path)
+
+    result = _sweep(
+        session_factory,
+        reader=_reader(
+            positions=[
+                {
+                    "posId": "pos-short",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "short",
+                    "pos": "4",
+                },
+                {
+                    "posId": "pos-eth",
+                    "instId": "ETH-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "4",
+                },
+            ]
+        ),
+    )
+
+    assert (result.released, result.held) == ((310,), ())
+
+
+def test_a_failed_exchange_read_never_releases_a_lane(tmp_path):
+    """"Unknown" must never be spent as proof."""
+
+    session_factory = _lane_fixture(tmp_path)
+    captured: list[dict] = []
+
+    result = _sweep(session_factory, captured=captured, reader=_reader(broken=True))
+
+    assert (result.released, result.held) == ((), (310,))
+    assert captured[0]["release_reason"] == "lane_read_failed"
+    assert _exit_state(session_factory) == (
+        "recovery_required",
+        "exact_lifecycle_missing",
+    )
+
+
+def test_a_closed_position_row_does_not_keep_the_lane_sealed(tmp_path):
+    """A zero-size row is history, not a holding."""
+
+    session_factory = _lane_fixture(tmp_path)
+
+    result = _sweep(
+        session_factory,
+        reader=_reader(
+            positions=[
+                {
+                    "posId": "pos-closed",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "0",
+                }
+            ]
+        ),
+    )
+
+    assert (result.released, result.held) == ((310,), ())
+
+
+def test_an_exit_whose_lane_cannot_be_named_is_left_sealed(tmp_path):
+    """No candidate means no symbol/side, so the footprint cannot be judged."""
+
+    session_factory = _lane_fixture(tmp_path, with_candidate=False)
+    captured: list[dict] = []
+
+    result = _sweep(session_factory, captured=captured)
+
+    assert (result.released, result.held) == ((), (310,))
+    assert captured[0]["release_reason"] == "lane_identity_unknown"
+
+
+def test_an_exit_with_a_binding_still_takes_the_position_proof_path(tmp_path):
+    """丙 must not touch the exits that have credentials to reason about."""
+
+    session_factory = _lane_fixture(tmp_path, execution_binding_id=383)
+    _other_group_binding(session_factory, pos_id="pos-310", order_id="ord-310")
+    captured: list[dict] = []
+
+    still_open = _sweep(
+        session_factory,
+        captured=captured,
+        reader=_reader(
+            positions=[
+                {
+                    "posId": "pos-310",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "2",
+                }
+            ]
+        ),
+    )
+    assert (still_open.released, still_open.held) == ((), (310,))
+    assert captured[0]["release_reason"] == "position_still_open"
+
+    gone = _sweep(
+        session_factory,
+        now=NOW + timedelta(minutes=1),
+        captured=captured,
+        reader=_reader(),
+    )
+    assert gone.released == (310,)
+    # The old path keeps its own reason, so the two are distinguishable later.
+    assert _exit_state(session_factory) == ("succeeded", POSITION_GONE_REASON)
+
+
+def test_the_lane_read_only_happens_on_a_speaking_pass(tmp_path):
+    """The venue's rate limit, not only the log volume.
+
+    The old code answered a credential-less exit from memory and read nothing.
+    The lane judgement needs a snapshot, and at five seconds a tick that would
+    be 24 REST calls a minute for as long as the exit sits there -- so it is
+    gated by the same throttle as the alert. A lane sealed for days can wait
+    another half hour.
+    """
+
+    session_factory = _lane_fixture(tmp_path)
+    _other_group_binding(session_factory)
+    reads: list[str] = []
+
+    def fresh_reader():
+        def positions_loader():
+            reads.append("positions")
+            return [_unattributed_position()]
+
+        # The worker builds one reader per tick, so the memoised snapshot does
+        # not survive between passes -- only the throttle does.
+        return build_exchange_absence_reader(
+            positions_loader=positions_loader,
+            resting_orders_loader=lambda: [],
+        )
+
+    for tick in range(4):
+        _sweep(
+            session_factory,
+            now=NOW + timedelta(seconds=5 * tick),
+            reader=fresh_reader(),
+        )
+
+    assert len(reads) == 1
+
+
+# --------------------------------------------------------------------------
+# 丙, the line that must not move: an expired message stays expired
+# --------------------------------------------------------------------------
+
+
+def _held_message(session_factory, *, raw_message_id, message_id, reason):
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                id=raw_message_id,
+                chat_id=CHAT_ID,
+                message_id=message_id,
+                text="BTC 多单 83000-83300",
+                source_status="active",
+                posted_at=NOW.replace(tzinfo=None),
+            )
+        )
+        session.add(
+            SignalCandidate(
+                raw_message_id=raw_message_id,
+                symbol="BTC",
+                side="long",
+                review_status="approved",
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=raw_message_id,
+                input_kind="text",
+                authoritative_model="test",
+                authoritative_status="是策略",
+                authoritative_payload_json="{}",
+                agreement_status="agreement",
+                automation_status="deferred",
+                automation_reason=reason,
+                updated_at=NOW.replace(tzinfo=None),
+            )
+        )
+        session.commit()
+
+
+def test_releasing_the_lane_resumes_the_waiting_but_never_the_expired(tmp_path):
+    """The user's own rule: too much time has passed, do not place the order.
+
+    ``deferred_expired`` is terminal by design -- the resume path keys on
+    ``waiting_source_deletion_exit`` and that difference is the whole
+    mechanism. This asserts it through the new release, which is the first
+    code path that can reach these messages again.
+    """
+
+    session_factory = _lane_fixture(tmp_path)
+    _other_group_binding(session_factory)
+    _held_message(
+        session_factory,
+        raw_message_id=16010,
+        message_id=101,
+        reason=DEFERRED_HOLD_REASON,
+    )
+    _held_message(
+        session_factory,
+        raw_message_id=16011,
+        message_id=102,
+        reason=DEFERRED_EXPIRED_REASON,
+    )
+
+    result = _sweep(
+        session_factory,
+        reader=_reader(
+            positions=[
+                {
+                    "posId": "pos-383",
+                    "instId": "BTC-USDT-SWAP",
+                    "posSide": "long",
+                    "pos": "3",
+                }
+            ]
+        ),
+    )
+
+    assert result.released == (310,)
+    with session_factory() as session:
+        requeued = {
+            int(row.raw_message_id)
+            for row in session.query(MessageProcessingJob).all()
+        }
+    assert requeued == {16010}
