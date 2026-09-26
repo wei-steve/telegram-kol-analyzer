@@ -25,7 +25,9 @@ from telegram_kol_research.prompt_defaults import (
 )
 from telegram_kol_research.recognition_experiments import (
     MimoProviderAttemptTelemetry,
+    _attach_provider_attempt_telemetry,
     _build_mimo_payload,
+    _call_mimo_authoritative_over_chain,
     _call_mimo_authoritative_with_retry,
     _call_mimo_direct_model,
     _validate_authoritative_payload,
@@ -1289,4 +1291,198 @@ def test_run_mimo_authoritative_for_message_accepts_v10_null_strategy_end_to_end
     assert null_result.is_actionable == empty_result.is_actionable
     assert null_result.payload.get("strategy") is None
     assert empty_result.payload.get("strategy") == {}
+
+
+def _http_status_error(status: int, *, request_made: bool = True) -> RuntimeError:
+    """The exception shape ``_call_mimo_direct_model`` raises for an HTTP error:
+    a ``RuntimeError`` with the response body appended and the original
+    ``httpx.HTTPStatusError`` as ``__cause__``, carrying the provider-attempt
+    telemetry the retry loop reads to classify it (mirrors production's
+    ``response.raise_for_status()`` handling)."""
+
+    request = httpx.Request("POST", "https://api.xiaomimimo.com/v1/chat/completions")
+    response = httpx.Response(status, request=request, text="gateway error")
+    cause = httpx.HTTPStatusError(f"status {status}", request=request, response=response)
+    error = RuntimeError(f"{cause}; response_body=gateway error")
+    error.__cause__ = cause
+    _attach_provider_attempt_telemetry(
+        error, MimoProviderAttemptTelemetry(provider_request_made=request_made)
+    )
+    return error
+
+
+def _two_model_chain() -> list[AiModelConfig]:
+    return [
+        AiModelConfig(
+            id="mimo-primary",
+            label="Primary",
+            base_url="https://api.xiaomimimo.com/v1",
+            api_key="key-a",
+            model="mimo-v2.5",
+            supports_text=True,
+            supports_image=True,
+        ),
+        AiModelConfig(
+            id="mimo-backup",
+            label="Backup",
+            base_url="https://backup.example/v1",
+            api_key="key-b",
+            model="mimo-v2.6",
+            supports_text=True,
+            supports_image=True,
+        ),
+    ]
+
+
+_STRATEGY_LESS_SUCCESS_PAYLOAD = {
+    "recognition_result": "非策略",
+    "reason": "闲聊",
+    "strategy": {},
+    "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+    "input_reading": {"observed_text": "闲聊", "image_quality": "none"},
+    "confidence": 0.9,
+}
+
+
+def test_chain_skips_same_model_retry_on_5xx_when_next_model_exists(tmp_path, monkeypatch):
+    """A 5xx from a model that is not last in the chain must not pay for a
+    second same-model attempt (~30s against a slow gateway) before falling
+    back -- the fallback is the next attempt instead."""
+
+    raw_message = RawMessage(id=1, chat_id=100, message_id=1, text="commentary")
+    calls: list[str] = []
+
+    def fake_call(**kwargs):
+        model_id = kwargs["model_config"].id
+        calls.append(model_id)
+        if model_id == "mimo-primary":
+            raise _http_status_error(502)
+        return dict(_STRATEGY_LESS_SUCCESS_PAYLOAD)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+
+    payload, error_message, telemetry, used_model, records = _call_mimo_authoritative_over_chain(
+        _two_model_chain(),
+        raw_message=raw_message,
+        media_assets=[],
+        prompt="prompt",
+        media_root=tmp_path,
+        context_text="",
+        retry_delay_seconds=0,
+    )
+
+    assert calls == ["mimo-primary", "mimo-backup"]
+    assert error_message is None
+    assert used_model is not None and used_model.id == "mimo-backup"
+    assert payload == _STRATEGY_LESS_SUCCESS_PAYLOAD
+    assert len(records) == 2
+    assert records[0].model_id == "mimo-primary"
+    assert records[0].succeeded is False
+    assert len(records[0].telemetry) == 1
+
+
+def test_single_model_chain_still_retries_twice_on_5xx(tmp_path, monkeypatch):
+    """The only model in the chain has nowhere to fall back to, so it keeps
+    its existing same-model retry -- that is still its one chance."""
+
+    raw_message = RawMessage(id=1, chat_id=100, message_id=2, text="commentary")
+    calls: list[str] = []
+
+    def fake_call(**kwargs):
+        calls.append(kwargs["model_config"].id)
+        raise _http_status_error(502)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+
+    payload, error_message, telemetry, used_model, records = _call_mimo_authoritative_over_chain(
+        _two_model_chain()[:1],
+        raw_message=raw_message,
+        media_assets=[],
+        prompt="prompt",
+        media_root=tmp_path,
+        context_text="",
+        retry_delay_seconds=0,
+    )
+
+    assert calls == ["mimo-primary", "mimo-primary"]
+    assert error_message is not None
+    assert used_model is None
+    assert len(records) == 1
+    assert len(records[0].telemetry) == 2
+
+
+def test_chain_still_retries_same_model_on_timeout_before_falling_back(tmp_path, monkeypatch):
+    """Timeout/network retry behaviour is unchanged by the 5xx fix: the first
+    model still gets its full same-model retry before the chain moves on."""
+
+    raw_message = RawMessage(id=1, chat_id=100, message_id=3, text="commentary")
+    calls: list[str] = []
+
+    def fake_call(**kwargs):
+        model_id = kwargs["model_config"].id
+        calls.append(model_id)
+        if model_id == "mimo-primary":
+            raise TimeoutError("mimo timeout")
+        return dict(_STRATEGY_LESS_SUCCESS_PAYLOAD)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+
+    payload, error_message, telemetry, used_model, records = _call_mimo_authoritative_over_chain(
+        _two_model_chain(),
+        raw_message=raw_message,
+        media_assets=[],
+        prompt="prompt",
+        media_root=tmp_path,
+        context_text="",
+        retry_delay_seconds=0,
+    )
+
+    assert calls == ["mimo-primary", "mimo-primary", "mimo-backup"]
+    assert error_message is None
+    assert used_model is not None and used_model.id == "mimo-backup"
+    assert len(records[0].telemetry) == 2
+
+
+def test_chain_still_retries_same_model_on_4xx_before_falling_back(tmp_path, monkeypatch):
+    """A request-rejected 4xx is unchanged by the 5xx fix: still one same-model
+    retry before the chain falls back."""
+
+    raw_message = RawMessage(id=1, chat_id=100, message_id=4, text="commentary")
+    calls: list[str] = []
+
+    def fake_call(**kwargs):
+        model_id = kwargs["model_config"].id
+        calls.append(model_id)
+        if model_id == "mimo-primary":
+            raise _http_status_error(413)
+        return dict(_STRATEGY_LESS_SUCCESS_PAYLOAD)
+
+    monkeypatch.setattr(
+        "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+        fake_call,
+    )
+
+    payload, error_message, telemetry, used_model, records = _call_mimo_authoritative_over_chain(
+        _two_model_chain(),
+        raw_message=raw_message,
+        media_assets=[],
+        prompt="prompt",
+        media_root=tmp_path,
+        context_text="",
+        retry_delay_seconds=0,
+    )
+
+    assert calls == ["mimo-primary", "mimo-primary", "mimo-backup"]
+    assert error_message is None
+    assert used_model is not None and used_model.id == "mimo-backup"
+    assert len(records[0].telemetry) == 2
 

@@ -606,6 +606,12 @@ def _call_mimo_authoritative_over_chain(
     ) -> tuple[dict[str, Any], tuple[MimoProviderAttemptTelemetry, ...]]:
         started_at = utc_now()
         started = time.perf_counter()
+        # A model in the middle of the chain has somewhere to hand a 5xx off
+        # to; the chain's own fallback is the next attempt, so a second
+        # same-model attempt (~30s for a slow gateway 502) is pure latency.
+        # The last (or only) model has nowhere else to go, so it keeps its
+        # full retry -- that is still the one chance to recognize the message.
+        has_next_model = any(item is candidate for item in chain[:-1])
         payload, error_message, telemetry = _call_mimo_authoritative_with_retry(
             raw_message=raw_message,
             media_assets=media_assets,
@@ -616,6 +622,7 @@ def _call_mimo_authoritative_over_chain(
             max_attempts=max_attempts,
             retry_delay_seconds=retry_delay_seconds,
             total_deadline_seconds=deadline_seconds,
+            skip_same_model_retry_on_server_error=has_next_model,
         )
         records.append(
             MimoModelAttempt(
@@ -668,6 +675,7 @@ def _call_mimo_authoritative_with_retry(
     max_attempts: int = MIMO_AUTHORITATIVE_MAX_ATTEMPTS,
     retry_delay_seconds: float = MIMO_AUTHORITATIVE_RETRY_DELAY_SECONDS,
     total_deadline_seconds: float | None = None,
+    skip_same_model_retry_on_server_error: bool = False,
 ) -> tuple[
     dict[str, Any],
     str | None,
@@ -721,6 +729,20 @@ def _call_mimo_authoritative_with_retry(
                 # A second full deadline would not fit inside the job claim
                 # lease; the queue's own retry is the next attempt.
                 break
+            if (
+                skip_same_model_retry_on_server_error
+                and not telemetry_recorded
+                and _is_server_error_failure(exc)
+            ):
+                # A 5xx means the provider itself is unavailable, not that
+                # this request was malformed -- a same-model retry against a
+                # gateway that is already timing out at ~30s just pays that
+                # cost twice before falling back anyway. When the chain has
+                # another model, skip straight to it. A single-model chain
+                # has nowhere to fall back to, so it is excluded by the
+                # caller (``skip_same_model_retry_on_server_error=False``)
+                # and keeps its one same-model retry -- its only chance.
+                break
             if attempt >= attempts:
                 break
             if retry_delay_seconds > 0:
@@ -732,6 +754,29 @@ def _call_mimo_authoritative_with_retry(
         f"MiMo failed after {len(errors)} attempts: "
         + " | ".join(f"attempt {idx + 1}: {error}" for idx, error in enumerate(errors)),
         tuple(provider_attempts),
+    )
+
+
+def _is_server_error_failure(error: BaseException) -> bool:
+    """Whether ``error`` is a provider HTTP 5xx (``mimo_provider_health``).
+
+    A 5xx is a gateway/provider failure, not something about this particular
+    request -- reusing ``classify_provider_failure`` keeps this in the same
+    place ``mimo_provider_health`` already classifies attempt rows from, so
+    the two never disagree about what counts as a server error.
+    """
+
+    from telegram_kol_research.mimo_provider_health import (
+        PROVIDER_UNAVAILABLE,
+        SERVER_ERROR,
+        classify_provider_failure,
+    )
+
+    failure = classify_provider_failure(error)
+    return (
+        failure is not None
+        and failure.failure_class == PROVIDER_UNAVAILABLE
+        and failure.kind == SERVER_ERROR
     )
 
 
