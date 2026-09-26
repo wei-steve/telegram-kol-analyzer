@@ -1,6 +1,10 @@
 # 值守 Codex spool 案例目录权限：根因与修复方案
 
-状态：**方案，待批准**（未改生产）。2026-09-27 只读排查。
+状态：**D 已执行；A+B+C 已实现，未部署**（排在 Codex 阶段 3 之后单独 tg-deploy）。
+
+用户裁定（2026-09-27，经调度会话转达）：现在执行 D；A+B+C 现在实现，不搭车别人的部署、也不马上部署，
+等 `claude/codex-oncall-phase3` 上 `origin/main` 后 rebase、跑全量、报候选 sha，由调度会话安排单独 tg-deploy
+（用户已同意这次会重启交易三服务，不碰自动交易开关），之后再重启两个值守单元。
 来源：`docs/plans/2026-09-26-server-disk-usage-analysis.md` 第 3.5 节（分支 `claude/server-disk-usage`）。
 
 ## 1. 现象（服务器只读核对，2026-09-27 06:1x CST）
@@ -112,8 +116,31 @@ ls -la /var/lib/telegram-kol-oncall/codex-spool
 - 上线后验证（L1）：等下一个真实案例，确认目录 `drwxrws---`、runner 产出 `run.json`、watcher 记 `done`；
   runner 日志 15 分钟内无重复 `rejected`。
 
-## 5. 顺带发现（不在本次范围）
+## 5. 执行记录
+
+### D（2026-09-27 06:35:05 CST，root，未重启任何服务）
+
+- `case-9`～`case-14` 从 `/var/lib/telegram-kol-oncall/codex-spool/` 移到
+  `/var/lib/telegram-kol-oncall/codex-spool-archive/20260927-unreadable/`（新建，`0750 telegram-kol-oncall:telegram-kol-oncall`）。
+- 移动前对 18 个文件做了 sha256，移动后 18/18 校验通过；清单留在归档目录 `MANIFEST.sha256`。
+- spool 剩下 `_health`、`case-1,4,5,6,7,8`（均 2770）和 `health.json`。
+- runner 日志 `rejected`：移动前那一分钟 36 行，移动后 0 行。
+- 回滚：`mv /var/lib/telegram-kol-oncall/codex-spool-archive/20260927-unreadable/case-* /var/lib/telegram-kol-oncall/codex-spool/`。
+
+### A+B+C（本地实现，分支 `claude/oncall-spool-perms`）
+
+- `Spool._make_case_dir`：umask `0o007` 下 `mkdir(0o770)`；已存在且缺组权限 → `chmod 0o770`；仍不行 → `PermissionError`，
+  不写任何文件，调用方按「spool 写不进去」处理。`dir_mode` 改为 `0o770`。
+- runner：`_UNREADABLE` 记住每个案例上次读不了的原因，同一原因只 WARNING 一次；恢复可读记 INFO；目录消失则忘掉。
+- 测试：新增 5 条（模拟 seccomp 拒绝 S 位 chmod、旧目录修复、拒绝无法读的目录、runner 只报一次、目录消失后重新报），
+  修复前 5 条全红，修复后 oncall 相关 185 条全绿。原 setgid 断言改为只在 Linux 上检查（macOS 不继承 S 位）。
+- 生产同等限制下的实测（临时单元 `RestrictSUIDSGID=yes UMask=0077 User=telegram-kol-oncall`，
+  2770 的探针根目录，用生产 venv 的解释器 `-B` 从 stdin 跑候选代码，不 import 发布目录）：
+  带 S 位的 chmod 被拒；新案例目录 `drwxrws---`、文件 `-rw-rw----`；旧 `drwx------` 目录再次入队后变 `drwxrwx---`。探针目录已删除。
+
+## 6. 后续项（本次不做）
 
 - 健康检查只测 `login status` / 每日一次最小 exec，测不出「runner 读不到请求」。6 次 `never answered`
   期间 `codex:state` 一直是 `up`，没有任何告警。可以考虑让 runner 在 `health.json` 里带上「读不了的案例数」，
-  watcher 据此告警。先不做，待你决定。
+  watcher 据此告警。用户裁定：记为后续项，本次不做；排在 Codex 阶段 3 之后，可与磁盘会话的
+  「磁盘水位告警」合并成一次值守规则改动。

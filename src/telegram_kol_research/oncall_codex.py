@@ -27,6 +27,7 @@ is a ``contract`` failure and the verdict is not used at all.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import os
@@ -622,11 +623,15 @@ class Spool:
 
     root: Path
     file_mode: int = 0o660
-    #: setgid on the case directory: the runner is uid 0 with no DAC override,
-    #: so a result it writes here must inherit this group or the watcher can
-    #: never read it (production, 2026-09-22: every verdict recorded as a
-    #: timeout while sitting on disk as root:root).
-    dir_mode: int = 0o2770
+    #: The case directory must give the group ``rwx``: the runner is uid 0 with
+    #: no DAC override and reads only through the group. It should also carry
+    #: setgid so a result the runner writes takes this group (production,
+    #: 2026-09-22: every verdict a timeout while sitting on disk as root:root)
+    #: -- but setgid is *inherited* from the spool root, never chmod-ed on:
+    #: the watcher unit has ``RestrictSUIDSGID=yes``, which refuses any chmod
+    #: carrying S_ISGID, and from 2026-09-23 to 09-27 every case directory
+    #: came out 2700 and no request was ever read.
+    dir_mode: int = 0o770
 
     def case_dir(self, case_id: int) -> Path:
         return Path(self.root) / case_dir_name(case_id)
@@ -655,12 +660,7 @@ class Spool:
         """
 
         self.ensure_root()
-        directory = self.case_dir(case_id)
-        directory.mkdir(parents=True, exist_ok=True)
-        try:
-            os.chmod(directory, self.dir_mode)
-        except OSError:  # pragma: no cover
-            pass
+        directory = self._make_case_dir(self.case_dir(case_id))
         atomic_write(
             directory / FILE_CASE,
             json.dumps(dict(case_payload), ensure_ascii=False, indent=1, sort_keys=True),
@@ -682,6 +682,41 @@ class Spool:
         raw = json.dumps(request.as_dict(), ensure_ascii=False, sort_keys=True)
         atomic_write(directory / FILE_REQUEST, raw, mode=self.file_mode)
         return request_fingerprint(raw.encode("utf-8"))
+
+    def _make_case_dir(self, directory: Path) -> Path:
+        """Create the case directory group-accessible, or refuse loudly.
+
+        A new directory is made under a group-permissive umask so it is born
+        with ``dir_mode`` and inherits setgid from the root without any chmod
+        (the watcher is single-threaded, so the umask window is this one
+        call). An older directory missing group access is chmod-ed without
+        the setgid bit, which is allowed; ``atomic_write`` still gives every
+        result the directory's group. If the group still cannot get in, the
+        request would never be read, so this raises instead of queueing it.
+        """
+
+        try:
+            previous = os.umask(0o007)
+            try:
+                os.mkdir(directory, self.dir_mode)
+            finally:
+                os.umask(previous)
+        except FileExistsError:
+            pass
+        mode = stat.S_IMODE(os.stat(directory).st_mode)
+        if mode & 0o070 != 0o070:
+            try:
+                os.chmod(directory, self.dir_mode)
+            except OSError:
+                pass
+            mode = stat.S_IMODE(os.stat(directory).st_mode)
+        if mode & 0o070 != 0o070:
+            raise PermissionError(
+                errno.EACCES,
+                f"case directory is {mode:04o}, the runner needs group rwx",
+                str(directory),
+            )
+        return directory
 
     def read_run(self, case_id: int) -> dict[str, Any] | None:
         return self._read_optional(self.case_dir(case_id) / FILE_RUN)
