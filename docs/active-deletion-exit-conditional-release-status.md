@@ -347,3 +347,40 @@ WHERE l.pos_id = :pos_id OR l.order_id = :ord_id;
   `last_reason` 不会因为我们而变。但如果哪天真看到这个形状，
   该做的是给 lane 读单独加一个"每条退出每 30 分钟最多一次"的硬下限，而不是放宽任何判据。
 - `_LAST_STUCK_CAPTURE` 仍然没有淘汰逻辑（量级极小，与上一轮同）。
+
+---
+
+## 部署记录 · 2026-09-26（北京时间 15:5x）
+
+- 部署 sha **`7b5f0053`**（= L3 的 `272dba2d` + 文档 `d6fd833b` + 并入 main 的一条 docs 提交）。
+  **回滚 sha `b345d2ba`**（保留 L1/L2）。
+  只想退 L3 本身而保留其余：`git revert 272dba2d`——它单独成提交正是为了这个。
+- L3 不在值守里，也没改单元文件，所以本次**不需要**额外的人工步骤，
+  `tg-deploy` 的 worker→web→ingest 重启已经覆盖。
+- 两项部署检查各对两种答案测过。
+
+### 上线前重新数过的首轮量
+
+| 判据 | 实测 |
+|---|---|
+| 活跃态总行数 | **0** |
+| 满 6 小时 + 无 binding（L3 首轮可能释放的上限） | **0** |
+
+状态文档要求"第二条非 0 就先别部署"，实测为 0，所以按原计划部署。
+
+### 复核时我自己验的（不是转述）
+
+- `_release_unclaimed_active` 的 CAS 读了实现：它同时要求 **state 与本轮判定时一致**，
+  以及 claim 仍是本轮看到的那一个（`claim_token IS NULL`，或同一 token 且租约仍然过期）。
+  worker 中途认领会换成新的 `uuid4` token，两种形状都匹配不上，`rowcount=0`，
+  **不写任何状态**。这是第 4 条守卫的全部安全性所在。
+- 并发与终态两条回归用例我自己跑过：
+  `test_the_release_loses_the_cas_to_a_worker_claiming_the_same_row`、
+  `test_releasing_an_active_lane_resumes_the_waiting_but_never_the_expired` 均通过。
+- 合并 main 时确认 L1/L2 的部署记录没有被分支上的旧版本覆盖（那一节仍在）。
+
+### 上线后 7 天要盯的反例
+
+"释放完又冒出无主挂单"：按 `last_reason='released_active_no_exchange_footprint'`
+找释放事件，对那条 lane 取一次只读账户快照，逐个 `posId`/`ordId` 点查
+`execution_order_legs`；查不到归属就是反例，**立刻 `git revert 272dba2d` 并重新部署**。
