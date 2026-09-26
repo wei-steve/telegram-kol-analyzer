@@ -182,6 +182,24 @@
   recovery point is still identifiable rather than merely reported as gone.
   Any change to real exchange-write semantics must be explicitly included in
   the approved phase scope.
+- **Whole-database copies on the server have a lifetime.** On 2026-09-26 the
+  disk reached 91% and 34 leftover copies of `research.db` (about 29 GB, more
+  than half of all used space) were the reason; nothing had ever retired one,
+  and the next L3 backup no longer fit. See
+  `docs/plans/2026-09-26-server-disk-usage-analysis.md`. The rules:
+  1. Put every copy under `/var/backups/telegram-kol/<YYYYMMDD>-<topic>/`, not
+     in `/root`, `/tmp`, or the old `/var/lib/telegram-kol-*-evidence` trees.
+  2. A rehearsal copy is not a recovery point. Delete it as soon as its result
+     is recorded, leaving size and `sha256` in the status document.
+  3. A recovery-point backup is compressed with `nice -n 19 zstd -T1 -3 --rm`
+     after its `PRAGMA quick_check` passes (about a tenth of the size), kept
+     until 14 days after its change closes, then retired with size and
+     `sha256` appended to `/var/lib/telegram-kol-retired-backups/manifest-*.tsv`.
+     Keep at most 3 whole-database recovery points at any time.
+  4. An analysis snapshot is deleted when the analysis ends; it does not stay
+     overnight.
+  5. Before `VACUUM INTO`, check free space is at least twice the database size
+     plus 5 GB. If it is not, clean up first -- never fall back to "no backup".
 - During development, use focused tests for each edit. Run the full suite once
   after all production-code changes are assembled into the final candidate. If
   production code changes after that run, it becomes a new final candidate: run
