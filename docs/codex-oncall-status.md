@@ -466,6 +466,30 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
 `diagnoses` 表只存「解释」，没有任何字段指向某个可执行动作，这是规格要求的。
 
+### 9.1 阶段 3 第 1 批（2026-09-26，实现子代理，`claude/codex-oncall-phase3` 分支，**未合并未部署**）
+
+规格：`docs/plans/2026-09-26-codex-oncall-phase3-spec.md` 第 2.1、2.3、4.2、9 节第 1 条。
+第 1 批只做补救计划器的「限定范围」，为第 2–4 批（回环端点、确定性闸门、系统 bot 按钮）打底；四批之一，**阶段整体仍是
+`planned`，本批完成后交指挥会话验收再派发下一批**。
+
+- `src/telegram_kol_research/position_management_remediation.py`：新增 `RemediationScope`（`raw_message_id` /
+  `strategy_instance_ids` / `lifecycle_ids` / `symbols` / `instruments`，`to_json`/`from_json`）与
+  `resolve_remediation_scope(session_factory, raw_message_id=…)`；`build_position_management_remediation_plan` 与
+  `apply_position_management_remediation_action` 新增 `scope: RemediationScope | None = None`，**`scope=None` 时行为
+  逐字节不变**（CLI `repair-position-management` 不受影响，未改调用点）；`_predecessor_signature` 同样加 `scope` 参数。
+- `src/telegram_kol_research/models.py` / `db.py`：新增三个索引（`signal_candidates.target_lifecycle_id`、
+  `message_instruction_items.strategy_instance_id`、`strategy_management_batches.strategy_instance_id`——最后一个是
+  EXPLAIN 核实后追加的，原有的 `uq_strategy_management_batches_active_strategy` 是**局部**唯一索引，覆盖不了无状态过滤的
+  等值查询）。未发现对 `sqlite_master` / 索引集合做逐字比对的 schema 校验器，只有断言型（`assert 'ix_...' in
+  index_list(...)`）测试，新增索引不会破坏它们。
+- 新测试 `tests/test_position_management_remediation_scope.py`（10 个），另跑通
+  `tests/test_position_management_remediation.py`（38，全不变）。
+- 已知缺口（留给下一批或指挥会话判断）：`apply()` 的端到端「scope 一路打到真实 `execute_management_batch` 成功」未覆盖——
+  确定性计划器本身的仓位核对/归因逻辑有独立且庞大的夹具要求（对照
+  `tests/test_strategy_management_planner.py::_persist_exact_management_target`，约 150 行），把它整套搭起来超出本批
+  范围；改用手工构造一个与真实计划器输出同形的 `plan-only` 批次 + 打桩 `plan_strategy_management_batch`/
+  `execute_management_batch`，只验证本批引入的 scope 线路（两次计划重建 + 最终交易所快照校验共用同一 scope）。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条

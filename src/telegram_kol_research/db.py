@@ -712,6 +712,21 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "ix_message_instruction_items_message_status_sequence "
         "ON message_instruction_items (raw_message_id, status, sequence)"
     ),
+    "ix_message_instruction_items_strategy_instance_id": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_message_instruction_items_strategy_instance_id "
+        "ON message_instruction_items (strategy_instance_id)"
+    ),
+    "ix_signal_candidates_target_lifecycle_id": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_signal_candidates_target_lifecycle_id "
+        "ON signal_candidates (target_lifecycle_id)"
+    ),
+    "ix_strategy_management_batches_strategy_instance_id": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_strategy_management_batches_strategy_instance_id "
+        "ON strategy_management_batches (strategy_instance_id)"
+    ),
     "uq_instruction_execution_contracts_item": (
         "CREATE UNIQUE INDEX IF NOT EXISTS "
         "uq_instruction_execution_contracts_item "

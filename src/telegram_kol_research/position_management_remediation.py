@@ -8,6 +8,7 @@ from dataclasses import asdict, dataclass, replace
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import or_
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
@@ -104,22 +105,252 @@ class RemediationApplyResult:
     result: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class RemediationScope:
+    """A bounded set of chains one remediation plan is allowed to touch.
+
+    ``strategy_instance_ids`` is the set S of chains (grouped, as the planner
+    groups them, by ``strategy_instance_id``) that the triggering message's
+    candidates can resolve into. ``lifecycle_ids``/``symbols``/``instruments``
+    are derived from S's own execution bindings, never scanned independently.
+    """
+
+    raw_message_id: int
+    strategy_instance_ids: tuple[str, ...]
+    lifecycle_ids: tuple[int, ...]
+    symbols: tuple[str, ...]
+    instruments: tuple[str, ...]
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "raw_message_id": self.raw_message_id,
+                "strategy_instance_ids": list(self.strategy_instance_ids),
+                "lifecycle_ids": list(self.lifecycle_ids),
+                "symbols": list(self.symbols),
+                "instruments": list(self.instruments),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @staticmethod
+    def from_json(payload: str) -> "RemediationScope":
+        data = json.loads(payload)
+        return RemediationScope(
+            raw_message_id=int(data["raw_message_id"]),
+            strategy_instance_ids=tuple(
+                str(value) for value in data["strategy_instance_ids"]
+            ),
+            lifecycle_ids=tuple(int(value) for value in data["lifecycle_ids"]),
+            symbols=tuple(str(value) for value in data["symbols"]),
+            instruments=tuple(str(value) for value in data["instruments"]),
+        )
+
+
+def resolve_remediation_scope(
+    session_factory: sessionmaker,
+    *,
+    raw_message_id: int,
+) -> RemediationScope | None:
+    """Resolve the set S of chains ``raw_message_id``'s candidates can reach.
+
+    Mirrors, without the exchange snapshot or batch bookkeeping, the three
+    ways a candidate is attributed to a chain inside
+    ``build_position_management_remediation_plan``: an identity conflict
+    (the *item's own* binding), an explicit/reply target lifecycle's binding,
+    or (when no target is set) the verified same-group fan-out that
+    ``resolve_management_scope_in_session`` computes from
+    ``(raw_message.chat_id, directive.symbol, directive.side)``. Returns
+    ``None`` when none of the message's eligible candidates resolve to any
+    strategy at all (``target_not_resolved``).
+    """
+
+    strategy_instance_ids: set[str] = set()
+    with session_factory() as session:
+        raw_message = session.get(RawMessage, raw_message_id)
+        if raw_message is None:
+            return None
+        candidates = (
+            session.query(SignalCandidate)
+            .filter(SignalCandidate.raw_message_id == raw_message_id)
+            .filter(SignalCandidate.parse_source == "mimo_authoritative")
+            .filter(SignalCandidate.review_status != "approved_remediation")
+            .filter(
+                SignalCandidate.event_type.in_(("close_signal", "position_update"))
+            )
+            .order_by(SignalCandidate.id)
+            .all()
+        )
+        for candidate in candidates:
+            item = (
+                session.query(MessageInstructionItem)
+                .filter(
+                    MessageInstructionItem.signal_candidate_id == candidate.id,
+                    MessageInstructionItem.retired_at.is_(None),
+                )
+                .one_or_none()
+            )
+            if item is not None and not _item_requires_remediation(item):
+                continue
+            identity_conflict = _candidate_item_strategy_conflict(
+                session=session,
+                candidate=candidate,
+                item=item,
+            )
+            if identity_conflict is not None:
+                _, item_binding, _ = identity_conflict
+                strategy_instance_ids.add(str(item_binding.strategy_instance_id))
+                continue
+            decision = _candidate_decision(candidate)
+            try:
+                directive = resolve_management_directive(
+                    text=raw_message.text or "",
+                    lifecycle_event=decision,
+                )
+                targets = resolve_management_scope_in_session(
+                    session,
+                    raw_message=raw_message,
+                    directive=directive,
+                    explicit_target_lifecycle_id=candidate.target_lifecycle_id,
+                    reply_target_lifecycle_id=None,
+                )
+            except (ManagementScopeError, ValueError):
+                explicit_context = _load_candidate_conflict_context(
+                    session=session,
+                    candidate=candidate,
+                    item=item,
+                )
+                if explicit_context is not None:
+                    _, binding = explicit_context
+                    strategy_instance_ids.add(str(binding.strategy_instance_id))
+                continue
+            for target in targets:
+                lifecycle = session.get(StrategyLifecycle, target.lifecycle_id)
+                binding = (
+                    session.get(ExecutionBinding, lifecycle.execution_binding_id)
+                    if lifecycle is not None
+                    and lifecycle.execution_binding_id is not None
+                    else None
+                )
+                if binding is None or not str(binding.strategy_instance_id or "").strip():
+                    continue
+                strategy_instance_ids.add(str(binding.strategy_instance_id))
+        if not strategy_instance_ids:
+            return None
+        bindings = (
+            session.query(ExecutionBinding)
+            .filter(ExecutionBinding.strategy_instance_id.in_(strategy_instance_ids))
+            .filter(ExecutionBinding.venue == "deepcoin")
+            .all()
+        )
+        binding_ids = [int(binding.id) for binding in bindings]
+        symbols = {
+            str(binding.symbol).upper()
+            for binding in bindings
+            if str(binding.symbol or "").strip()
+        }
+        lifecycle_ids: set[int] = set()
+        if binding_ids:
+            lifecycles = (
+                session.query(StrategyLifecycle.id)
+                .filter(StrategyLifecycle.execution_binding_id.in_(binding_ids))
+                .all()
+            )
+            lifecycle_ids = {int(row[0]) for row in lifecycles}
+    instruments = {f"{symbol}-USDT-SWAP" for symbol in symbols}
+    return RemediationScope(
+        raw_message_id=int(raw_message_id),
+        strategy_instance_ids=tuple(sorted(strategy_instance_ids)),
+        lifecycle_ids=tuple(sorted(lifecycle_ids)),
+        symbols=tuple(sorted(symbols)),
+        instruments=tuple(sorted(instruments)),
+    )
+
+
+def _scope_symbol_variants(symbols: tuple[str, ...]) -> tuple[str, ...]:
+    variants: set[str] = set()
+    for symbol in symbols:
+        variants.add(symbol)
+        variants.add(symbol.upper())
+        variants.add(symbol.lower())
+    return tuple(sorted(variants))
+
+
+def _scoped_candidate_filter(
+    session,
+    scope: RemediationScope,
+    *,
+    include_symbol_fanout: bool,
+):
+    """The union of index-backed ways a candidate can belong to ``scope``.
+
+    (i) an explicit/reply target lifecycle already inside the scope, (ii) an
+    active instruction item already tagged with a strategy in the scope, and
+    (optionally, iii) an unresolved-target candidate whose symbol matches one
+    of the scope's symbols (the same-group fan-out path). Every disjunct is
+    a plain equality/IN on an indexed column, so SQLite can satisfy the OR
+    with one SEARCH per disjunct instead of a table SCAN.
+    """
+
+    conditions = []
+    if scope.lifecycle_ids:
+        conditions.append(
+            SignalCandidate.target_lifecycle_id.in_(scope.lifecycle_ids)
+        )
+    if scope.strategy_instance_ids:
+        conditions.append(
+            SignalCandidate.id.in_(
+                session.query(MessageInstructionItem.signal_candidate_id).filter(
+                    MessageInstructionItem.strategy_instance_id.in_(
+                        scope.strategy_instance_ids
+                    ),
+                    MessageInstructionItem.retired_at.is_(None),
+                )
+            )
+        )
+    if include_symbol_fanout and scope.symbols:
+        conditions.append(
+            (SignalCandidate.target_lifecycle_id.is_(None))
+            & (
+                SignalCandidate.symbol.in_(
+                    _scope_symbol_variants(scope.symbols)
+                )
+            )
+        )
+    if not conditions:
+        return None
+    return or_(*conditions)
+
+
 def build_position_management_remediation_plan(
     session_factory: sessionmaker,
     *,
     deepcoin_client,
     now: datetime | None = None,
+    scope: RemediationScope | None = None,
 ) -> PositionRemediationPlan:
-    """Build a read-only plan from one coherent exchange snapshot."""
+    """Build a read-only plan from one coherent exchange snapshot.
 
-    with session_factory() as session:
-        instruments = {
-            f"{str(symbol or '').upper()}-USDT-SWAP"
-            for (symbol,) in session.query(ExecutionBinding.symbol)
-            .filter(ExecutionBinding.venue == "deepcoin")
-            .all()
-            if str(symbol or "").strip()
-        }
+    When ``scope`` is ``None`` this scans every eligible candidate exactly as
+    before (the CLI's behaviour is unchanged byte-for-byte). When ``scope``
+    is given, the candidate scan, the exchange instrument set, and the
+    predecessor lookup are all bounded to ``scope`` instead of the whole
+    table -- see ``resolve_remediation_scope`` and 4.2 of the phase-3 spec.
+    """
+
+    if scope is not None:
+        instruments = set(scope.instruments)
+    else:
+        with session_factory() as session:
+            instruments = {
+                f"{str(symbol or '').upper()}-USDT-SWAP"
+                for (symbol,) in session.query(ExecutionBinding.symbol)
+                .filter(ExecutionBinding.venue == "deepcoin")
+                .all()
+                if str(symbol or "").strip()
+            }
     snapshot = _load_reconcile_snapshot(
         deepcoin_client,
         instruments=instruments,
@@ -166,16 +397,26 @@ def build_position_management_remediation_plan(
             session,
             live_pos_ids=live_positions,
         )
-        candidates = (
+        candidate_query = (
             session.query(SignalCandidate)
             .filter(SignalCandidate.parse_source == "mimo_authoritative")
             .filter(SignalCandidate.review_status != "approved_remediation")
             .filter(
                 SignalCandidate.event_type.in_(("close_signal", "position_update"))
             )
-            .order_by(SignalCandidate.raw_message_id, SignalCandidate.id)
-            .all()
         )
+        if scope is not None:
+            scope_filter = _scoped_candidate_filter(
+                session, scope, include_symbol_fanout=True
+            )
+            candidate_query = (
+                candidate_query.filter(scope_filter)
+                if scope_filter is not None
+                else candidate_query.filter(False)
+            )
+        candidates = candidate_query.order_by(
+            SignalCandidate.raw_message_id, SignalCandidate.id
+        ).all()
         for candidate in candidates:
             item = (
                 session.query(MessageInstructionItem)
@@ -674,6 +915,7 @@ def build_position_management_remediation_plan(
                         current_candidate=candidate,
                         current_item=item,
                         current_effective_intent=effective_intent,
+                        scope=scope,
                     ),
                 }
                 if protection_health_evidence:
@@ -708,6 +950,25 @@ def build_position_management_remediation_plan(
                         fingerprint=fingerprint,
                     )
                 )
+
+    if scope is not None:
+        scope_ids = set(scope.strategy_instance_ids)
+        actions = [
+            action for action in actions if action.strategy_instance_id in scope_ids
+        ]
+        static_steps = [
+            step for step in static_steps if step.strategy_instance_id in scope_ids
+        ]
+        conflicts = [
+            conflict
+            for conflict in conflicts
+            if (
+                str(conflict.get("strategy_instance_id") or "") in scope_ids
+                if conflict.get("strategy_instance_id")
+                else int(conflict.get("raw_message_id") or 0)
+                == scope.raw_message_id
+            )
+        ]
 
     chains = _build_remediation_chains(
         actions,
@@ -913,8 +1174,16 @@ def apply_position_management_remediation_action(
     expected_fingerprint: str,
     now: datetime,
     contract_spec_provider=None,
+    scope: RemediationScope | None = None,
 ) -> RemediationApplyResult:
-    """Rebuild and apply exactly one reviewed action through the normal path."""
+    """Rebuild and apply exactly one reviewed action through the normal path.
+
+    ``scope`` must be the same ``RemediationScope`` (or ``None``, for the
+    CLI's unbounded behaviour) that produced ``action_id``/
+    ``expected_fingerprint`` in the first place -- both plan rebuilds below
+    and the predecessor-signature check use it, so a mismatched scope simply
+    fails to find the action or its fingerprint, never silently widens it.
+    """
 
     if not action_id or not expected_fingerprint:
         raise ValueError("action_id and expected_fingerprint are required")
@@ -925,6 +1194,7 @@ def apply_position_management_remediation_action(
         session_factory,
         deepcoin_client=deepcoin_client,
         now=now,
+        scope=scope,
     )
     action = _select_executable_action(plan, action_id=action_id)
     if action.fingerprint != expected_fingerprint:
@@ -959,6 +1229,7 @@ def apply_position_management_remediation_action(
         session_factory,
         deepcoin_client=deepcoin_client,
         now=now,
+        scope=scope,
     )
     refreshed_action = _select_executable_action(
         refreshed_plan,
@@ -1013,6 +1284,7 @@ def apply_position_management_remediation_action(
             current_item=source_item,
             current_effective_intent=action.action_kind,
             excluded_batch_id=int(result.batch.id),
+            scope=scope,
         )
         if current_predecessor_signature != action.evidence.get(
             "predecessor_signature"
@@ -1390,6 +1662,7 @@ def _predecessor_signature(
     current_item: MessageInstructionItem | None,
     current_effective_intent: str,
     excluded_batch_id: int | None = None,
+    scope: RemediationScope | None = None,
 ) -> str:
     current_key = (
         current_raw_message.posted_at,
@@ -1397,7 +1670,7 @@ def _predecessor_signature(
         int(current_item.sequence) if current_item is not None else 0,
         int(current_candidate.id),
     )
-    rows = (
+    predecessor_query = (
         session.query(SignalCandidate, RawMessage)
         .join(RawMessage, RawMessage.id == SignalCandidate.raw_message_id)
         .filter(
@@ -1405,8 +1678,23 @@ def _predecessor_signature(
             SignalCandidate.review_status != "approved_remediation",
             SignalCandidate.event_type.in_(("close_signal", "position_update")),
         )
-        .all()
     )
+    if scope is not None:
+        # Only (i) an explicit/reply target lifecycle already in scope and
+        # (ii) an active item already tagged with a strategy in scope -- the
+        # symbol fan-out path (iii) is intentionally excluded here: a
+        # predecessor reached only through fan-out never carries this
+        # strategy_instance_id on its own item, so it cannot change this
+        # chain's predecessor signature. See phase-3 spec 4.2/9.1.
+        scope_filter = _scoped_candidate_filter(
+            session, scope, include_symbol_fanout=False
+        )
+        predecessor_query = (
+            predecessor_query.filter(scope_filter)
+            if scope_filter is not None
+            else predecessor_query.filter(False)
+        )
+    rows = predecessor_query.all()
     predecessors: list[dict[str, Any]] = []
     for candidate, raw_message in rows:
         item = (

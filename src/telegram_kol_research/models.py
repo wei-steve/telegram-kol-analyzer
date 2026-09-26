@@ -1226,6 +1226,12 @@ class EntryRevisionReplacement(Base):
 
 class SignalCandidate(Base):
     __tablename__ = "signal_candidates"
+    __table_args__ = (
+        Index(
+            "ix_signal_candidates_target_lifecycle_id",
+            "target_lifecycle_id",
+        ),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     raw_message_id: Mapped[int] = mapped_column(ForeignKey("raw_messages.id"), index=True)
@@ -1409,6 +1415,10 @@ class MessageInstructionItem(Base):
             "raw_message_id",
             "status",
             "sequence",
+        ),
+        Index(
+            "ix_message_instruction_items_strategy_instance_id",
+            "strategy_instance_id",
         ),
     )
 
@@ -2186,6 +2196,10 @@ class StrategyManagementBatch(Base):
             sqlite_where=text(ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE),
         ),
         Index("ix_strategy_management_batches_status_planned", "status", "planned_at"),
+        Index(
+            "ix_strategy_management_batches_strategy_instance_id",
+            "strategy_instance_id",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
