@@ -49,6 +49,7 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from telegram_kol_research.oncall_state import (
     LANE_STALL_ACTIVE,
+    LANE_STALL_CHURNING,
     LANE_STALL_UNCLAIMABLE,
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
@@ -162,7 +163,10 @@ SEALED_LANE_RELEASED_STATE = "succeeded"
 INCIDENT_PENDING_STATUS = "pending"
 INCIDENT_LOUD_SEVERITIES = frozenset({"high", "critical"})
 
-#: D6a's horizon, and the only one: both classes of sealed lane use it. For
+#: D6a's horizon, and the only one: all three classes of sealed lane use it, and
+#: both of the rule's age tests (``updated_at`` for "nothing has happened" and
+#: ``created_at`` for "it has never finished") are measured against this one
+#: number rather than two. For
 #: :data:`SEALED_LANE_STUCK_STATE` the system's own sweep releases the exit
 #: after ``source_deletion_exit_timeout_minutes`` (120 in production), so the
 #: watch must sit *later* than that self-healing window or it would page for
@@ -240,6 +244,14 @@ REASON_SEALED_LANE = "source_deletion_exit_sealed_lane"
 #: namespace -- a different cause, and a different person can fix it, so it
 #: gets its own code rather than its own rule number.
 REASON_STALLED_LANE = "source_deletion_exit_stalled_lane"
+#: The lane is shut, the exit is active, and it is *moving* -- claimed again and
+#: again, every time landing back in the same active state -- and yet it was
+#: created more than :data:`SEALED_LANE_STUCK_AFTER` ago and has still not
+#: finished. This is the third cause, added 2026-09-26. It needs its own code
+#: because the other two both describe neglect and this one is its opposite:
+#: somebody (the worker) is working on it constantly and getting nowhere, and
+#: ``attempt_count`` is the evidence that says so.
+REASON_CHURNING_LANE = "source_deletion_exit_churning_lane"
 REASON_INCIDENT_NEVER_NOTIFIED = "runtime_incident_never_notified"
 REASON_INCIDENT_NOTIFICATION_STALE = "runtime_incident_notification_stale"
 
@@ -265,9 +277,13 @@ ALLOWED_QUERY_SHAPES = (
     # D6a's sweep. ``ix_source_message_deletion_exits_state`` is (state,
     # updated_at), and SQLite turns the ``IN`` list into one index seek per
     # listed state -- ``EXPLAIN QUERY PLAN`` reports the same
-    # ``SEARCH ... USING COVERING INDEX ... (state=? AND updated_at<?)`` as the
+    # ``SEARCH ... USING INDEX ... (state=? AND updated_at<?)`` as the
     # single-state spelling did, which is why the five states are one statement
-    # with one shared ``LIMIT`` rather than five statements with five. The
+    # with one shared ``LIMIT`` rather than five statements with five. (It is
+    # ``USING COVERING INDEX`` only if the projection is ``id`` alone; the real
+    # projection reads ``last_reason`` and the rest, so the plan fetches the
+    # row. Measured both ways 2026-09-26 -- the seek is identical, and adding
+    # ``created_at``/``attempt_count`` to the projection did not change it.) The
     # tempting spelling -- ``state NOT IN ('succeeded', 'unbound')`` -- cannot
     # use that index at all and scans the table, which is the thing this module
     # exists not to do.
@@ -764,8 +780,17 @@ _DECISION_COLUMNS = (
 
 _LEDGER_COLUMNS = "id, venue, pos_id, purpose, status, evidence_json, updated_at"
 _LADDER_EVENT_ACTION_PREFIX = "stop_ladder"
+#: ``created_at`` and ``attempt_count`` joined this list on 2026-09-26 for D6a's
+#: third cause: "still moving, still not finished" can only be asked of
+#: ``created_at``, and ``attempt_count`` is the evidence that distinguishes a row
+#: nobody claims from one that is claimed constantly. Only the projection grew --
+#: the statement's WHERE / ORDER BY / LIMIT are untouched, and
+#: ``EXPLAIN QUERY PLAN`` reports the same
+#: ``SEARCH ... USING INDEX ix_source_message_deletion_exits_state
+#: (state=? AND updated_at<?)`` as before, measured both ways.
 _EXIT_COLUMNS = (
-    "id, raw_message_id, execution_binding_id, state, last_reason, updated_at"
+    "id, raw_message_id, execution_binding_id, state, last_reason, updated_at, "
+    "created_at, attempt_count"
 )
 #: Deliberately narrow: ``redacted_summary`` is the only free text, and the
 #: incident ledger already guarantees it carries no credential material.
@@ -1146,6 +1171,8 @@ class SealedLane:
     state: str
     last_reason: str
     updated_at: datetime | None
+    created_at: datetime | None = None
+    attempt_count: int = 0
     chat_id: int | None = None
     symbol: str | None = None
     side: str | None = None
@@ -1160,26 +1187,56 @@ class SealedLane:
         )
 
     @property
-    def stall_class(self) -> str:
-        """Which of the two stories this lane is, from its state alone.
+    def is_active(self) -> bool:
+        return self.state in SEALED_LANE_ACTIVE_STATES
 
-        The barrier does not care which state it is -- anything but
-        ``succeeded`` shuts the lane -- but the reader does: one class has an
-        owner (the worker still holds the row and is going round in circles)
-        and the other has none (nothing will claim it again).
+    def idle_for(self, now: datetime) -> timedelta | None:
+        """How long since anything at all touched this row."""
+
+        return _age(now, self.updated_at)
+
+    def unfinished_for(self, now: datetime) -> timedelta | None:
+        """How long since the exit was created without reaching a verdict.
+
+        This is the age the barrier cares about: the lane has been shut since
+        the row appeared, whatever has happened to the row since.
         """
 
-        if self.state in SEALED_LANE_ACTIVE_STATES:
-            return LANE_STALL_ACTIVE
-        return LANE_STALL_UNCLAIMABLE
+        return _age(now, self.created_at)
 
-    @property
-    def reason_code(self) -> str:
-        return (
-            REASON_STALLED_LANE
-            if self.stall_class == LANE_STALL_ACTIVE
-            else REASON_SEALED_LANE
-        )
+    def stall_class(self, now: datetime, *, stuck_after: timedelta) -> str:
+        """Which of the three stories this lane is.
+
+        The barrier does not care -- anything but ``succeeded`` shuts the lane
+        -- but the reader does, because a different person acts on each:
+
+        * ``recovery_required`` has no owner at all; nothing will claim it
+          again (:data:`LANE_STALL_UNCLAIMABLE`).
+        * an active state that has not been touched for the whole window is
+          held by the worker and standing still (:data:`LANE_STALL_ACTIVE`).
+        * an active state that *has* been touched inside the window, on a row
+          older than the window, is being worked on constantly and finishing
+          never (:data:`LANE_STALL_CHURNING`).
+
+        The third is decided last, so a row that both was created long ago and
+        then went quiet reads as the plainer story -- standing still -- rather
+        than as churn it is no longer doing.
+        """
+
+        if not self.is_active:
+            return LANE_STALL_UNCLAIMABLE
+        idle = self.idle_for(now)
+        if idle is not None and idle >= stuck_after:
+            return LANE_STALL_ACTIVE
+        return LANE_STALL_CHURNING
+
+    def reason_code(self, now: datetime, *, stuck_after: timedelta) -> str:
+        stall_class = self.stall_class(now, stuck_after=stuck_after)
+        if stall_class == LANE_STALL_ACTIVE:
+            return REASON_STALLED_LANE
+        if stall_class == LANE_STALL_CHURNING:
+            return REASON_CHURNING_LANE
+        return REASON_SEALED_LANE
 
 
 def _read_sealed_lanes(
@@ -1246,6 +1303,8 @@ def _read_sealed_lanes(
                 state=str(row["state"] or ""),
                 last_reason=str(row["last_reason"] or ""),
                 updated_at=as_utc(row["updated_at"]),
+                created_at=as_utc(row["created_at"]),
+                attempt_count=int(row["attempt_count"] or 0),
                 chat_id=chat_id,
                 symbol=symbol,
                 side=side,
@@ -1331,11 +1390,31 @@ def _sealed_lane_observations(
 ) -> list[_Observation]:
     """Rule D6a. A lane shut longer than the system's own healing window.
 
-    Two causes, one rule: :data:`REASON_STALLED_LANE` when the worker still
-    holds the row and is not finishing, :data:`REASON_SEALED_LANE` when nothing
-    will claim it again. One case key per exit either way, so a lane that slides
-    from the first cause into the second keeps its case and updates its story
-    instead of opening a second alert about the same shut lane.
+    Three causes, one rule: :data:`REASON_STALLED_LANE` when the worker still
+    holds the row and is not finishing, :data:`REASON_CHURNING_LANE` when it is
+    being claimed over and over and still not finishing, and
+    :data:`REASON_SEALED_LANE` when nothing will claim it again. One case key per
+    exit whichever it is, so a lane that slides from one cause into another
+    keeps its case and updates its story instead of opening a second alert
+    about the same shut lane.
+
+    Two independent age tests, one bar:
+
+    * ``updated_at`` older than the bar -- "nothing has happened to it". This is
+      the original test and it finds the first and third causes.
+    * ``created_at`` older than the bar, on an active exit -- "it has never
+      finished", *even when* ``updated_at`` is seconds old. Without this a row
+      claimed every five seconds is invisible: every claim writes
+      ``updated_at = now``, so its idle age never grows. Production says the bar
+      does not misfire: of 160 exits that succeeded in 2026-09, 153 were done
+      inside a minute, the one-to-six-hour bucket was **empty**, and all four
+      beyond six hours were the pathological ones.
+
+    The ``created_at`` test is deliberately limited to the active states.
+    ``recovery_required`` cannot show this shape: the only writer that touches
+    such a row is ``source_deletion_exit_timeout._release``, and it writes
+    ``succeeded`` in the same statement, so there is no path that refreshes a
+    stuck row's ``updated_at`` while leaving it stuck.
     """
 
     observations: list[_Observation] = []
@@ -1344,11 +1423,23 @@ def _sealed_lane_observations(
         if not lane.seals_a_lane:
             # Nothing is held, so there is nothing to tell anybody about.
             continue
-        age = _age(now, lane.updated_at)
-        if age is None or age < config.sealed_lane_stuck_after:
+        age = lane.idle_for(now)
+        unfinished = lane.unfinished_for(now)
+        idle_too_long = age is not None and age >= config.sealed_lane_stuck_after
+        unfinished_too_long = (
+            lane.is_active
+            and unfinished is not None
+            and unfinished >= config.sealed_lane_stuck_after
+        )
+        if not (idle_too_long or unfinished_too_long):
             continue
         seen.add(lane.exit_id)
-        reason_code = lane.reason_code
+        stall_class = lane.stall_class(
+            now, stuck_after=config.sealed_lane_stuck_after
+        )
+        reason_code = lane.reason_code(
+            now, stuck_after=config.sealed_lane_stuck_after
+        )
         assert lane.chat_id is not None and lane.raw_message_id is not None
         voided, examined = _count_voided_messages(
             reader,
@@ -1367,7 +1458,7 @@ def _sealed_lane_observations(
                 evidence={
                     "kind": "sealed_lane",
                     "reason_code": reason_code,
-                    "stall_class": lane.stall_class,
+                    "stall_class": stall_class,
                     "exit_id": lane.exit_id,
                     "exit_state": lane.state,
                     "exit_last_reason": lane.last_reason,
@@ -1380,6 +1471,16 @@ def _sealed_lane_observations(
                         else None
                     ),
                     "minutes_sealed": _minutes(age),
+                    # The two below are what the churning story is told from:
+                    # how long the exit has existed without a verdict, and how
+                    # many times it has been claimed while getting nowhere.
+                    "exit_created_at": (
+                        lane.created_at.isoformat()
+                        if lane.created_at is not None
+                        else None
+                    ),
+                    "minutes_unfinished": _minutes(unfinished),
+                    "attempt_count": lane.attempt_count,
                     "voided_messages": voided,
                     "voided_scan_examined": examined,
                 },

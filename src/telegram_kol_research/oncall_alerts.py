@@ -41,6 +41,7 @@ from telegram_kol_research.oncall_codex import (
 )
 from telegram_kol_research.oncall_state import (
     LANE_STALL_ACTIVE,
+    LANE_STALL_CHURNING,
     RECOGNITION_CASE_PREFIX,
     SEALED_LANE_CASE_PREFIX,
     UNHEARD_INCIDENT_CASE_PREFIX,
@@ -161,6 +162,7 @@ REASON_LABELS = {
     # --- rules D6a/D6b/D6c: the silent stalls (2026-09-26 case note) ---
     "source_deletion_exit_sealed_lane": "删除退出卡死（系统不会再认领），这个群这个币这个方向的新消息全部被挡下",
     "source_deletion_exit_stalled_lane": "删除退出卡在处理中途不动了，这个群这个币这个方向的新消息全部被挡下",
+    "source_deletion_exit_churning_lane": "删除退出一直在被处理却始终完不成，这个群这个币这个方向的新消息全部被挡下",
     "waiting_source_deletion_exit": "正在等一条删除退出收口，这条消息暂时被挡下",
     "deferred_expired": "被删除退出挡下，等到超时，系统把这条消息作废了（永不执行）",
     "runtime_incident_never_notified": "这条告警一直在发生，但从来没有通知过任何人",
@@ -402,11 +404,20 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
     and direction are shut, how long, and -- the line that makes it urgent --
     how many of that group's later messages the seal has already thrown away.
 
-    One shut lane, two causes, and the cause decides who can do something about
-    it, so the second-to-last line differs: an exit the worker still holds is a
-    step going round in circles that no sweep will ever touch, and an exit in
+    One shut lane, three causes, and the cause decides who can do something
+    about it, so the second-to-last line differs: an exit the worker still holds
+    but has stopped touching is a step going round in circles that no sweep will
+    ever touch; an exit the worker claims over and over is the opposite story --
+    somebody *is* working on it, constantly, and it still never finishes, which
+    is what ``attempt_count`` is doing in that line; and an exit in
     ``recovery_required`` is one the worker will never claim again. The rest of
     the alert -- rule, severity, case key -- is the same, because the loss is.
+
+    The churning story also takes its "how long" from a different clock. Its
+    ``updated_at`` is seconds old by definition, so ``minutes_sealed`` would read
+    "3 分钟" about a lane that has in fact been shut all day; the honest number
+    there is ``minutes_unfinished``, the age of the exit row itself. The other
+    two classes keep reading ``minutes_sealed``, unchanged.
     """
 
     evidence = case.evidence or {}
@@ -414,7 +425,10 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
     instrument = _instrument_label(evidence) or "未知标的"
     voided = evidence.get("voided_messages")
     examined = evidence.get("voided_scan_examined")
+    stall_class = str(evidence.get("stall_class") or "")
     sealed_for = _hours_and_minutes(evidence.get("minutes_sealed"))
+    unfinished_for = _hours_and_minutes(evidence.get("minutes_unfinished"))
+    shut_for = unfinished_for if stall_class == LANE_STALL_CHURNING else sealed_for
 
     if voided is None:
         loss_line = "期间被作废的消息：数不出来（读取受限）"
@@ -425,10 +439,21 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
         if examined:
             loss_line += f"（只数了封锁之后这个群的 {int(examined)} 条消息，实际可能更多）"
 
-    if str(evidence.get("stall_class") or "") == LANE_STALL_ACTIVE:
+    if stall_class == LANE_STALL_ACTIVE:
         cause_line = (
             f"这条退出还在处理中的状态上，本该几秒钟走完，却已经 {sealed_for}没动过——"
             "说明认领或其中某一步在原地打转。"
+            "系统的超时清扫只管「需要人工恢复处理」的退出，不会碰这一条。"
+        )
+    elif stall_class == LANE_STALL_CHURNING:
+        attempts = evidence.get("attempt_count")
+        attempts_text = (
+            f"已经被认领 {int(attempts)} 次" if attempts else "反复被认领"
+        )
+        cause_line = (
+            "这一条不是没人管它，而是一直有人在动它却完不成："
+            f"它{attempts_text}，最近一次动作就在 {sealed_for}前，"
+            f"但从建立到现在已经 {unfinished_for}都没走完，本该几秒钟的事。"
             "系统的超时清扫只管「需要人工恢复处理」的退出，不会碰这一条。"
         )
     else:
@@ -441,7 +466,7 @@ def format_sealed_lane_alert(case: CaseRecord) -> str:
         [
             f"⚠️ 值守提醒 #{case.id}（这条线被封住了）",
             f"群：{group}    被封的方向：{instrument}",
-            f"封了多久：{sealed_for}",
+            f"封了多久：{shut_for}",
             f"原因：{reason_label(case.reason_code)}",
             f"卡住的删除退出：#{evidence.get('exit_id', '?')}"
             f"（状态 {deletion_exit_state_label(evidence.get('exit_state'))}，"

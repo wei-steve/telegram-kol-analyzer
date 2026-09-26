@@ -532,3 +532,249 @@ GROUP BY e.state;
    这三条现在都由 `EXPLAIN QUERY PLAN` 用例钉着，其中「`NOT IN` 会扫表」以前只是注释。
 2. `waiting` 确认不是数据库状态：`_mark_reconciliation_waiting()` 写进行里的是
    `reconciling`，`"waiting"` 只是它的返回值与计数器键名。有对着 worker 源码的断言用例。
+
+---
+
+## 追加 · 2026-09-26：D6a 再加一个判据——「一直在动却完不成」
+
+分支：`active-exit-starvation-and-visibility`（基线 `origin/main` = `8cb05a03`）
+设计稿：`docs/plans/2026-09-26-active-deletion-exit-selfheal-design.md` 第 4 节 L2
+（用户已批准 L1+L2；**L3「有条件释放活跃态退出」本轮明确不做，一行都没碰**）
+同批的 L1（worker 调度公平）单独成文：`docs/active-deletion-exit-fairness-status.md`
+状态：**代码 + 文案 + 用例完成，全量测试绿，未部署、未推送。**
+
+### 补的是什么洞
+
+D6a 到上一轮为止只会问一个问题：**这一行多久没动过**（`updated_at <= now-6h`）。
+一条每 5 秒被认领一次、每次都回到同一个活跃态的退出，认领的 UPDATE 会把
+`updated_at` 写成当前时间，所以它的「没动过」的年龄永远长不到 6 小时——
+**D6a 看不见它**，而 lane 一样被封死。设计稿把这一类叫 C2。
+
+补法：同一条规则 D6a 之下再加一个判据——**活跃态的退出 `created_at` 距今超过 6 小时
+且仍未终结，即使 `updated_at` 是新的也建案**。
+
+**没有新开规则号**（仍是 D6a，case-key 仍是 `lane:<exit_id>`，severity 仍是 `high`），
+但原因码是新的一类，与现有两类可分：
+
+| 类别 | `stall_class` | 原因码 | 含义 |
+|---|---|---|---|
+| 活跃态、6 小时没动过 | `active` | `source_deletion_exit_stalled_lane`（原有） | 行还在 worker 手里却不动了 |
+| 活跃态、一直在动却完不成 | `churning`（**新**） | `source_deletion_exit_churning_lane`（**新**） | **不是没人管它，而是一直有人在动它却完不成** |
+| `recovery_required` | `unclaimable` | `source_deletion_exit_sealed_lane`（原有） | worker 永不再认领 |
+
+案文里这三句话互不相同，有用例钉着（见下）。第三类的证据是 `attempt_count`：
+案文写「它已经被认领 N 次，最近一次动作就在 X 前，但从建立到现在已经 Y 都没走完」。
+
+### 依据：6 小时这条线不会误报（生产实测，设计稿第 2 节）
+
+2026-09 至今 160 条 `succeeded` 的退出：≤1 分钟 **153** 条，1 分钟–1 小时 3 条，
+**1–6 小时 0 条**，>6 小时 4 条且全是病例。1 到 6 小时这一档是空的，
+所以 6 小时既不误伤健康的退出，也不需要往下压。**阈值沿用同一个
+`SEALED_LANE_STUCK_AFTER`，没有引入第二个数字**——两个判据共用一根横杆。
+
+### 读取形状：SQL 的 WHERE / ORDER BY / LIMIT 一个字没改
+
+提示的判断正确：**不需要改 SQL 的形状**。判据落在 Python 里。
+唯一的 SQL 变化是**投影**多了两列（`_EXIT_COLUMNS` 加 `created_at`、`attempt_count`）——
+`created_at` 是新判据本身要读的，`attempt_count` 是第三类的证据。
+`ALLOWED_QUERY_SHAPES` 里 sealed-lane 那一行写的是 `SELECT ... FROM ...`，
+声明不需要改；架构边界用例照旧绿。
+
+`EXPLAIN QUERY PLAN` 实测（用真实 SQLAlchemy 元数据建的库，`python -B`，没碰生产库）：
+
+```
+投影 = id（现有 EXPLAIN 用例手写的那条）
+  SEARCH source_message_deletion_exits USING COVERING INDEX ix_source_message_deletion_exits_state (state=? AND updated_at<?)
+  USE TEMP B-TREE FOR ORDER BY
+
+投影 = 改动前的 _EXIT_COLUMNS
+  SEARCH source_message_deletion_exits USING INDEX ix_source_message_deletion_exits_state (state=? AND updated_at<?)
+  USE TEMP B-TREE FOR ORDER BY
+
+投影 = 改动后的 _EXIT_COLUMNS（+created_at, +attempt_count）
+  SEARCH source_message_deletion_exits USING INDEX ix_source_message_deletion_exits_state (state=? AND updated_at<?)
+  USE TEMP B-TREE FOR ORDER BY
+```
+
+**后两条一字不差，加两列没有改变计划，也没有 `SCAN`。**
+
+顺带纠正上一节留下的一处不准确：上一节表格里写这条 sweep 的计划是
+`SEARCH ... USING COVERING INDEX`。那只在投影是 `SELECT id` 时成立——
+现有 EXPLAIN 用例正是这么写的，而模块真正发出的语句要读 `last_reason` 等列，
+所以它一直是 `USING INDEX`（取行），不是覆盖索引。seek 完全相同，结论不变，
+但文档里的措辞过去是错的。新增用例
+`test_the_sealed_lane_sweep_still_seeks_its_index_with_the_real_projection`
+直接用模块自己的 `_EXIT_COLUMNS` 拼语句去 EXPLAIN，这样两者不会再漂移，
+也把「真实投影」这一层补进了证据里。
+
+### 一个刻意的范围限制
+
+`created_at` 判据**只对四个活跃态生效**，不对 `recovery_required` 生效。
+理由（自己复核的，不是照抄）：能写 `recovery_required` 这一行的只有
+`source_deletion_exit_timeout._release`，而它在同一条 UPDATE 里就把 state 写成
+`succeeded`——**不存在「刷新了卡死行的 `updated_at` 却让它继续卡着」的路径**，
+所以这一类在生产上不可能出现「updated_at 新、created_at 老」的形状。
+按「改动最小」的原则不扩大判据。
+`test_d6a_leaves_a_freshly_touched_recovery_required_exit_alone` 把这个决定写成了用例
+（它断言的是当前行为，不是说这个行为一定对）。
+
+### 案文取「封了多久」的时钟换了一个（只对新类）
+
+churning 这一类的 `updated_at` 按定义是秒级新的，
+如果「封了多久」还读 `minutes_sealed`（= 距 `updated_at` 的时长），
+会对一条封了 11 天的 lane 打印「封了多久：0 分钟」。
+所以**只有 churning 这一类**改读新字段 `minutes_unfinished`（= 距 `created_at` 的时长）。
+`active` 与 `unclaimable` 两类的文案一个字没改，原有 16 条文案用例全绿。
+
+### 改了哪些文件
+
+| 文件 | 改了什么 |
+|---|---|
+| `src/telegram_kol_research/oncall_state.py` | 新增 `LANE_STALL_CHURNING`（放这里的理由同前：detector 写、alerts 读，两个模块按架构边界不能互相 import） |
+| `src/telegram_kol_research/oncall_detector.py` | `REASON_CHURNING_LANE`；`_EXIT_COLUMNS` 加两列；`SealedLane` 加 `created_at` / `attempt_count` 与 `is_active` / `idle_for` / `unfinished_for`；`stall_class` 与 `reason_code` 从属性改成带 `now` 与阈值的方法（三分支）；`_sealed_lane_observations` 的两个年龄判据取并集；evidence 增加 `exit_created_at` / `minutes_unfinished` / `attempt_count`；两处注释更正 |
+| `src/telegram_kol_research/oncall_alerts.py` | 新原因码的中文标签；`format_sealed_lane_alert` 的因果句从两分支变三分支；churning 这一类的「封了多久」改读 `minutes_unfinished` |
+| `tests/oncall_test_support.py` | `add_deletion_exit` 与 `build_sealed_lane_case` 增加 `created_at` / `attempt_count` 两个参数（`created_at` 默认跟 `updated_at`，所以既有调用行为不变） |
+| `tests/test_oncall_detector.py` | D6a 新增 20 条 |
+| `tests/test_oncall_alerts.py` | 新增 4 条 + `open_churning_lane_case` 夹具 |
+
+`stall_class` / `reason_code` 从属性改成方法是唯一的接口变化。
+全仓只有 detector 自己读这两个成员（`grep stall_class` 的另外几处都是读 evidence 字典），
+所以没有连带影响。
+
+### 用例
+
+| 用例 | 条数 |
+|---|---|
+| 四个活跃态各自「created_at 老 + updated_at 新」建案，reason_code / `stall_class` / `attempt_count` / `minutes_unfinished` 正确（参数化） | 4 |
+| 新判据也要等满 6 小时（5 小时不建，+2 小时后建，且是 churning） | 1 |
+| `created_at` 老到 30 天但状态是 `succeeded` → 不建案 | 1 |
+| 三类成因在同一轮各建一案：三个原因码、三个 `stall_class`、同一个 rule 与 severity、共 3 条案子 | 1 |
+| 两个判据同时成立 → **只开一案不重复**，且措辞取「没动过」那一侧 | 1 |
+| churning 熬成「没动过」：同一案原地换故事，不弹第二条告警 | 1 |
+| churning 的案子在 exit 变 `succeeded` 后 cleared（参数化四态） | 4 |
+| `recovery_required` + 新 `updated_at` + 老 `created_at` → 不建案（刻意的范围限制） | 1 |
+| `unbound`（`raw_message_id` NULL）即使永不完成也不建案，`seals_a_lane` 优先（参数化四态） | 4 |
+| 三个 `stall_class` 与三个原因码互不相同，且阈值只有一个 6 小时 | 1 |
+| 真实投影下 sweep 仍命中索引、不含 `SCAN`（语句由模块自己的 `_EXIT_COLUMNS` 拼出） | 1 |
+| 文案：churning 的因果句 / 它读的是 `minutes_unfinished` / `attempt_count` 缺失时不打印「0 次」/ 三类文案互不相同 | 4 |
+
+**反向验证（证明用例钉的是新判据）**：把 `unfinished_too_long` 临时改成 `False` 再跑：
+
+```
+11 failed, 128 passed in 9.91s
+```
+红的正是 churning 那 11 条（4 建案 + 1 阈值 + 1 三类分辨 + 1 换故事 + 4 收口），
+其余 128 条全绿——既有 D6a/D6b/D6c 行为没有被改动。
+
+值守六个文件 + 删除退出三个文件：
+
+```
+tests/test_oncall_detector.py tests/test_oncall_alerts.py
+tests/test_oncall_architecture_boundary.py tests/test_oncall_service.py
+tests/test_oncall_casefile.py tests/test_oncall_codex.py
+tests/test_source_message_deletion_worker.py tests/test_source_message_deletion.py
+tests/test_stuck_deletion_exit_selfheal.py
+-> 463 passed in 23.80s
+```
+
+全量（`uv run pytest -q`，L1+L2 最终树）：
+
+```
+9672 passed, 4 skipped, 109 warnings in 788.19s (0:13:08)
+```
+
+L1 commit（`26323fef`）的全量是 `9648 passed, 4 skipped`，所以 L2 恰好 **+24 条**
+（detector 20 + alerts 4），与上表相加一致。基线 `origin/main`（`8cb05a03`）为 9642 条。
+
+### 提交
+
+| 提交 | 内容 | 全量测试 |
+|---|---|---|
+| `26323fef` | L1：worker 的认领排序（另见 `docs/active-deletion-exit-fairness-status.md`） | `9648 passed, 4 skipped in 783.80s` |
+| 本节 | L2：D6a 的第三个判据、文案、夹具与用例 | `9672 passed, 4 skipped in 788.19s` |
+
+两者刻意分成两个提交：风险等级不同（L1 在交易路径上，L2 只读且不写状态），
+回滚粒度要分得开。提交时逐路径 `git add`，`git diff --cached --name-only` 核对，
+未用 `git add -A`。
+
+### 上线前必须重新数一遍首轮量（新判据是新的，旧数字无效）
+
+上一轮部署前数出来 D6a=0，**那是按「五个封锁态 + `updated_at <= now-6h`」数的，
+对新判据无效**：新判据会额外命中「`updated_at` 很新但 `created_at` 很老」的活跃行，
+这类行以前一行都没被数过。
+
+**在 `VACUUM INTO` 出来的快照上跑，不要碰在跑的库**（见 memory: no heavy scans on prod DB）。
+
+```sql
+-- 第一条：上限。新判据的超集（还没检查被删消息有没有 symbol+side 的候选）。
+-- 走 ix_source_message_deletion_exits_state 的 state IN 等值 seek，有界。
+-- 三类分开数，好知道首轮各会开几条。
+SELECT
+  CASE
+    WHEN state = 'recovery_required' THEN 'unclaimable'
+    WHEN updated_at <= datetime('now', '-6 hours') THEN 'active(没动过)'
+    ELSE 'churning(一直在动)'
+  END AS stall_class,
+  COUNT(*) AS n,
+  MIN(created_at) AS oldest_created,
+  MAX(attempt_count) AS max_attempts
+FROM source_message_deletion_exits
+WHERE state IN ('pending', 'cancelling_entries', 'closing_positions',
+                'reconciling', 'recovery_required')
+  AND raw_message_id IS NOT NULL
+  AND (updated_at <= datetime('now', '-6 hours')
+       OR (state != 'recovery_required'
+           AND created_at <= datetime('now', '-6 hours')))
+GROUP BY stall_class
+ORDER BY n DESC;
+
+-- 第二条：精确数，与 seals_a_lane 四样齐备一致。
+-- 只有第一条数出非 0 才需要跑；join 都走各自的 raw_message_id 索引。
+SELECT e.state, COUNT(DISTINCT e.id) AS n
+FROM source_message_deletion_exits AS e
+JOIN raw_messages AS r ON r.id = e.raw_message_id
+JOIN signal_candidates AS c ON c.raw_message_id = r.id
+WHERE e.state IN ('pending', 'cancelling_entries', 'closing_positions',
+                  'reconciling', 'recovery_required')
+  AND (e.updated_at <= datetime('now', '-6 hours')
+       OR (e.state != 'recovery_required'
+           AND e.created_at <= datetime('now', '-6 hours')))
+  AND c.symbol IS NOT NULL AND TRIM(c.symbol) != ''
+  AND c.side IS NOT NULL AND TRIM(c.side) != ''
+GROUP BY e.state;
+```
+
+第二条的结果就是上线第一轮会开的 D6a 案子数。
+`df0a54ab` 部署当天全库只有 `succeeded` 283 + `unbound` 91，所以**预期仍是 0**；
+但那个快照是上一轮取的，**必须重新跑，不要沿用**。
+如果 churning 那一行数出来不是 0，**先别部署**：那说明生产上确实有退出在原地打转，
+应该先看它卡在哪一步（`attempt_count` 与 `last_reason` 是入口），
+而不是让值守一次性刷一屏。
+
+L1 上线后，`active(没动过)` 这一类的期望会更低（被饿死的行现在都能被认领），
+而 `churning` 这一类**不会**因为 L1 变少——L1 让行能被认领，不会让一条原地打转的行前进。
+**这正是 L2 存在的理由，也是设计稿 L3（本轮不做）要处理的东西。**
+
+部署步骤与前两节相同，**`telegram-kol-oncall.service` 仍不在 `tg-deploy` 的重启清单里**，
+`tg-deploy <sha>` 之后必须单独 `sudo systemctl restart telegram-kol-oncall.service`，
+前后各看一次 `/var/lib/telegram-kol-oncall/heartbeat.json`。
+（同批的 L1 改的是 worker，落在 `tg-deploy` 自己的重启清单内。）
+
+### 这一轮明确没做
+
+- **没碰 `source_deletion_exit_timeout` 的释放逻辑**，一行都没碰。
+  设计稿 L3（有条件释放活跃态退出）本轮不做：它是唯一会自动改变
+  「要不要继续封着 lane」这个判断的东西，而一条活跃态的退出可能正好在撤单或平仓的半路上。
+- 没碰 D6b、D6c 的建案判据；没碰 barrier；没碰 `_ACTIVE_STATES` 的成员。
+- 没改任何既有用例。
+- 没碰生产库、没部署、没推送。
+
+### 留给下一轮
+
+1. **活跃态卡住之后仍然只有告警，没有自愈。** 现在三种成因都看得见了（C1 由 L1 消失，
+   C2 由 L2 可见，C3 本来就该有人看），但看见之后还是只能靠人。L3 是那件事。
+2. `created_at` 判据不覆盖 `recovery_required`（见上「一个刻意的范围限制」）。
+   目前无害，理由已复核并写成用例；如果哪天出现会刷新卡死行 `updated_at` 的新路径，
+   这里要跟着改。
+3. 上两节留的第 2、3 条（D6c 不区分「这个类型本来就不发通知」；
+   `seals_a_lane` 与 barrier 的 join 仍差 `source_status = 'deleted'`）都没动。

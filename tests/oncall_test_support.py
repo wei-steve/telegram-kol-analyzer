@@ -589,8 +589,16 @@ class ProductionFixture:
         last_reason: str | None = "exit_has_no_known_position",
         execution_binding_id: int | None = None,
         updated_at: datetime | None = None,
+        created_at: datetime | None = None,
+        attempt_count: int = 0,
     ) -> int:
-        """One deletion exit plus the immutable Telegram event it belongs to."""
+        """One deletion exit plus the immutable Telegram event it belongs to.
+
+        ``created_at`` defaults to ``updated_at``, which is what a row that has
+        never moved looks like. Passing the two apart is how D6a's third cause
+        is built: an old row with a brand-new ``updated_at``, claimed hundreds of
+        times and still not finished.
+        """
 
         self._message_id += 1
         event_message_id = message_id if message_id is not None else self._message_id
@@ -613,7 +621,10 @@ class ProductionFixture:
                 execution_binding_id=execution_binding_id,
                 state=state,
                 last_reason=last_reason,
-                created_at=naive(updated_at or NOW - timedelta(hours=12)),
+                attempt_count=int(attempt_count),
+                created_at=naive(
+                    created_at or updated_at or NOW - timedelta(hours=12)
+                ),
                 updated_at=naive(updated_at or NOW - timedelta(hours=12)),
             )
             session.add(row)
@@ -703,6 +714,8 @@ def build_sealed_lane_case(
     side: str = "long",
     state: str = "recovery_required",
     updated_at: datetime | None = None,
+    created_at: datetime | None = None,
+    attempt_count: int = 0,
     unbound: bool = False,
     with_candidate: bool = True,
 ) -> dict[str, int]:
@@ -732,6 +745,8 @@ def build_sealed_lane_case(
         chat_id=chat_id,
         state=state,
         updated_at=updated_at or (NOW - timedelta(hours=12)),
+        created_at=created_at,
+        attempt_count=attempt_count,
     )
     return {"raw_message_id": deleted_raw_id, "exit_id": exit_id}
 

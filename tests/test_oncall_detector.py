@@ -1971,3 +1971,335 @@ def test_an_item_left_in_submitted_is_not_a_case_once_its_batch_succeeded(produc
 
     assert outcome.new_case_ids == ()
     assert store.open_cases() == ()
+
+
+# ------------------------------------------------------------------
+# D6a's third cause (2026-09-26): the exit that is always moving and
+# never finishing. ``updated_at`` is fresh every round, so the "how long
+# since anything happened" test can never see it; ``created_at`` can.
+# ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_opens_a_case_for_an_exit_that_moves_constantly_and_never_finishes(
+    production, store, state
+):
+    """Claimed every few seconds, back in the same state every time.
+
+    Every claim writes ``updated_at = now``, so this row's idle age never grows
+    past a tick and the original criterion is blind to it. The row's own age is
+    what gives it away.
+    """
+
+    run_round(production, store)
+    built = build_sealed_lane_case(
+        production,
+        state=state,
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=2097,
+    )
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"lane:{built['exit_id']}"
+    assert case.rule == "D6a"
+    assert case.severity == "high"
+    assert case.reason_code == "source_deletion_exit_churning_lane"
+    assert case.evidence["stall_class"] == "churning"
+    assert case.evidence["exit_state"] == state
+    # The evidence that separates this cause from the other two: somebody has
+    # been working on it two thousand times over.
+    assert case.evidence["attempt_count"] == 2097
+    assert case.evidence["minutes_unfinished"] == 12 * 60
+    assert case.evidence["minutes_sealed"] == 0
+
+
+def test_d6a_waits_the_same_six_hours_before_calling_an_exit_churning(
+    production, store
+):
+    """One bar for both age tests -- no second threshold to keep in step."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        state="closing_positions",
+        created_at=NOW - timedelta(hours=5),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=400,
+    )
+
+    assert run_round(production, store).new_case_ids == ()
+    later = run_round(production, store, now=NOW + timedelta(hours=2))
+    assert len(later.new_case_ids) == 1
+    assert only_case(store).reason_code == "source_deletion_exit_churning_lane"
+
+
+def test_d6a_says_nothing_about_a_succeeded_exit_however_old_the_row_is(
+    production, store
+):
+    """The new age test must not resurrect the one state the barrier allows.
+
+    A ``succeeded`` exit from a month ago is a finished job, not a shut lane.
+    """
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        state="succeeded",
+        created_at=NOW - timedelta(days=30),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=12,
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_d6a_tells_all_three_stall_causes_apart_by_reason_code(production, store):
+    """Same rule, same severity, same key namespace -- three different causes."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        state="pending",
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(hours=12),
+    )
+    build_sealed_lane_case(
+        production,
+        chat_id=CHAT_ID + 7,
+        symbol="ETH",
+        side="short",
+        state="recovery_required",
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(hours=12),
+    )
+    build_sealed_lane_case(
+        production,
+        chat_id=CHAT_ID + 9,
+        symbol="SOL",
+        side="long",
+        state="reconciling",
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=888,
+    )
+
+    run_round(production, store)
+
+    cases = store.open_cases()
+    by_reason = {case.reason_code: case for case in cases}
+    assert set(by_reason) == {
+        "source_deletion_exit_stalled_lane",
+        "source_deletion_exit_sealed_lane",
+        "source_deletion_exit_churning_lane",
+    }
+    assert by_reason["source_deletion_exit_stalled_lane"].evidence["stall_class"] == (
+        "active"
+    )
+    assert by_reason["source_deletion_exit_sealed_lane"].evidence["stall_class"] == (
+        "unclaimable"
+    )
+    assert by_reason["source_deletion_exit_churning_lane"].evidence["stall_class"] == (
+        "churning"
+    )
+    assert {case.rule for case in cases} == {"D6a"}
+    assert {case.severity for case in cases} == {"high"}
+    assert len(cases) == 3
+
+
+def test_d6a_opens_one_case_when_both_age_tests_fire_on_the_same_exit(
+    production, store
+):
+    """Two criteria, one case key, so no chance of two alerts for one lane.
+
+    The idle test wins the wording: a row that was created long ago and has also
+    stopped moving is standing still, not churning.
+    """
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        state="cancelling_entries",
+        created_at=NOW - timedelta(hours=30),
+        updated_at=NOW - timedelta(hours=12),
+        attempt_count=3,
+    )
+
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+    again = run_round(production, store, now=NOW + timedelta(minutes=10))
+    assert again.new_case_ids == ()
+
+    case = only_case(store)
+    assert case.reason_code == "source_deletion_exit_stalled_lane"
+    assert case.evidence["stall_class"] == "active"
+
+
+def test_d6a_keeps_one_case_when_a_churning_exit_finally_goes_quiet(
+    production, store
+):
+    """The lane never reopened, so this is one story that changed cause."""
+
+    run_round(production, store)
+    built = build_sealed_lane_case(
+        production,
+        state="closing_positions",
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=500,
+    )
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+    assert only_case(store).reason_code == "source_deletion_exit_churning_lane"
+
+    production.set_deletion_exit_state(
+        built["exit_id"],
+        state="closing_positions",
+        updated_at=NOW - timedelta(hours=12),
+    )
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.new_case_ids == ()
+    assert outcome.resolved_case_ids == ()
+    case = only_case(store)
+    assert case.id == opened.new_case_ids[0]
+    assert case.status == "open"
+    assert case.reason_code == "source_deletion_exit_stalled_lane"
+    assert case.evidence["stall_class"] == "active"
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_resolves_a_churning_case_once_the_exit_succeeds(
+    production, store, state
+):
+    run_round(production, store)
+    built = build_sealed_lane_case(
+        production,
+        state=state,
+        created_at=NOW - timedelta(hours=12),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=90,
+    )
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    production.set_deletion_exit_state(built["exit_id"], state="succeeded")
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+    assert store.get_case(opened.new_case_ids[0]).status == "resolved"
+
+
+def test_d6a_leaves_a_freshly_touched_recovery_required_exit_alone(
+    production, store
+):
+    """The deliberate limit of the ``created_at`` test, written down.
+
+    It applies to the active states only. ``recovery_required`` cannot show this
+    shape in production: the one writer that touches such a row is
+    ``source_deletion_exit_timeout._release``, and the same statement sets the
+    state to ``succeeded`` -- there is no path that refreshes a stuck row's
+    ``updated_at`` and leaves it stuck. So a fabricated row like this one, whose
+    ``updated_at`` is seconds old, stays silent, and this test is the record of
+    that decision rather than an endorsement of it.
+    """
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        state="recovery_required",
+        created_at=NOW - timedelta(days=11),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=2,
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+@pytest.mark.parametrize("state", _ACTIVE_SEALING_STATES)
+def test_d6a_still_ignores_an_unbound_exit_that_never_finishes(
+    production, store, state
+):
+    """``seals_a_lane`` comes first: a row holding nothing is not a shut lane."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        unbound=True,
+        state=state,
+        created_at=NOW - timedelta(days=30),
+        updated_at=NOW - timedelta(seconds=5),
+        attempt_count=700,
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_the_three_stall_classes_and_their_reason_codes_are_distinct():
+    """A duplicated word would silently merge two causes into one story."""
+
+    from telegram_kol_research.oncall_detector import (
+        REASON_CHURNING_LANE,
+        REASON_SEALED_LANE,
+        REASON_STALLED_LANE,
+        SEALED_LANE_STUCK_AFTER,
+    )
+    from telegram_kol_research.oncall_state import (
+        LANE_STALL_ACTIVE,
+        LANE_STALL_CHURNING,
+        LANE_STALL_UNCLAIMABLE,
+    )
+
+    assert len({LANE_STALL_ACTIVE, LANE_STALL_CHURNING, LANE_STALL_UNCLAIMABLE}) == 3
+    assert len({REASON_STALLED_LANE, REASON_CHURNING_LANE, REASON_SEALED_LANE}) == 3
+    assert REASON_CHURNING_LANE == "source_deletion_exit_churning_lane"
+    assert LANE_STALL_CHURNING == "churning"
+    # Both age tests share this one number; there is no second threshold.
+    assert SEALED_LANE_STUCK_AFTER == timedelta(hours=6)
+
+
+def test_the_sealed_lane_sweep_still_seeks_its_index_with_the_real_projection(
+    production,
+):
+    """The hand-written plan test above projects ``id``, which is covering.
+
+    The statement the module actually sends reads ``last_reason`` and the rest,
+    so its plan is ``USING INDEX`` rather than ``USING COVERING INDEX``. Two
+    columns were added to that projection for this rule, and this test is the
+    proof the seek survived it -- built from the module's own constants so the
+    two cannot drift.
+    """
+
+    from telegram_kol_research.oncall_detector import (
+        _EXIT_COLUMNS,
+        SEALED_LANE_SEALING_STATES,
+    )
+
+    assert "created_at" in _EXIT_COLUMNS and "attempt_count" in _EXIT_COLUMNS
+    placeholders = ", ".join("?" for _ in SEALED_LANE_SEALING_STATES)
+    sql = (
+        f"SELECT {_EXIT_COLUMNS} FROM source_message_deletion_exits "
+        f"WHERE state IN ({placeholders}) AND updated_at <= ? ORDER BY id LIMIT ?"
+    )
+    reader = ProductionReader(production.path)
+    try:
+        plan = reader.connection.execute(
+            "EXPLAIN QUERY PLAN " + sql, tuple(None for _ in range(sql.count("?")))
+        ).fetchall()
+    finally:
+        reader.close()
+    detail = " ".join(str(row["detail"]) for row in plan)
+    assert "ix_source_message_deletion_exits_state" in detail, detail
+    assert "SCAN" not in detail, detail

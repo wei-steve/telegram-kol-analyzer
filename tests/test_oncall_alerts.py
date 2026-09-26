@@ -824,3 +824,80 @@ def test_a_full_exit_alert_does_not_print_the_strategys_old_stop(store):
 
     assert "消息要求：全部平仓 / 离场（ETH 空）" in text
     assert "止损→" not in text
+
+
+def open_churning_lane_case(store, *, exit_state="closing_positions", **evidence):
+    """D6a's third cause: an exit that is worked on constantly and never ends."""
+
+    return open_sealed_lane_case(
+        store,
+        exit_id=evidence.pop("exit_id", 312),
+        reason_code="source_deletion_exit_churning_lane",
+        exit_state=exit_state,
+        stall_class="churning",
+        minutes_sealed=evidence.pop("minutes_sealed", 0),
+        minutes_unfinished=evidence.pop(
+            "minutes_unfinished", 11 * 24 * 60 + 3 * 60
+        ),
+        attempt_count=evidence.pop("attempt_count", 2097),
+        **evidence,
+    )
+
+
+def test_the_churning_lane_alert_says_somebody_is_working_on_it_constantly(store):
+    """The opposite story to the other two, so it must not read like neglect."""
+
+    case = open_churning_lane_case(store, exit_last_reason="cancel_entry_retry")
+
+    text = format_sealed_lane_alert(case)
+
+    assert "不是没人管它，而是一直有人在动它却完不成" in text
+    # ``attempt_count`` is the evidence, so it is on the page.
+    assert "已经被认领 2097 次" in text
+    assert "正在市价退出原策略持仓（closing_positions）" in text
+    assert "超时清扫只管「需要人工恢复处理」的退出" in text
+    assert "系统不会再认领" not in text
+    assert "在原地打转" not in text
+    assert "一直在被处理却始终完不成" in reason_label(case.reason_code)
+
+
+def test_the_churning_lane_alert_measures_the_seal_from_the_rows_own_age(store):
+    """Its ``updated_at`` is seconds old; that is not how long the lane was shut.
+
+    Reading ``minutes_sealed`` here would print "封了多久：0 分钟" about a lane
+    that has been shut for eleven days.
+    """
+
+    case = open_churning_lane_case(store)
+
+    text = format_sealed_lane_alert(case)
+
+    assert "封了多久：11 天 3 小时" in text
+    assert "封了多久：0 分钟" not in text
+    assert "从建立到现在已经 11 天 3 小时都没走完" in text
+
+
+def test_the_churning_alert_still_reads_when_the_attempt_count_is_missing(store):
+    """An old case, or a row whose counter is zero, must not print "0 次"."""
+
+    case = open_churning_lane_case(store, attempt_count=0)
+
+    text = format_sealed_lane_alert(case)
+
+    assert "反复被认领" in text
+    assert "被认领 0 次" not in text
+
+
+def test_the_three_stall_classes_do_not_read_the_same(store):
+    """The whole point of the split: three causes must not print one sentence."""
+
+    unclaimable = format_sealed_lane_alert(open_sealed_lane_case(store))
+    active = format_sealed_lane_alert(open_stalled_lane_case(store))
+    churning = format_sealed_lane_alert(open_churning_lane_case(store))
+
+    assert len({unclaimable, active, churning}) == 3
+    # All three still name the same loss, in the same words, and all are urgent.
+    for text in (unclaimable, active, churning):
+        assert "这个方向的新策略现在一条都进不来" in text
+        assert "群：龚有财群    被封的方向：BTC 多" in text
+        assert "封了多久：11 天 3 小时" in text
