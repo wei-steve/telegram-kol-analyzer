@@ -373,6 +373,34 @@ Jev 真正适合的是**上下文分析**：它的输入是纯文本，输出基
 - 首轮识别 P90 从 65 s 回到约 27–30 s，均值从 27.7 s 回到约 18–20 s；
 - 同时减少同群 lane 等待。
 
+### 7.4 审阅结论与候选版本
+
+- 分支 `claude/recognition-validator-fix`，已变基到 `origin/main` 3ed725ca 之上，是生产 d3e29a79 的后代：
+  - `a5244b2f` fix(recognition): accept null strategy on non-strategy v10 payloads
+  - `3de8bc85` fix(recognition): skip same-model retry on 5xx when the chain can fall back（**候选 sha 取这一个**）
+- 改动只涉及 `recognition_experiments.py` 和 `tests/test_recognition_experiments.py`，没有动提示词文本、`ai_recognition_config.py`，也没有改 payload。
+- 测试：
+  - 子代理在变基前跑全量：9761 通过，4 跳过，0 失败，耗时 15 分 33 秒；
+  - 变基后聚焦测试：166 通过；
+  - 变基后全量（在 3de8bc85 上）：9999 通过，4 跳过，0 失败，耗时 14 分 35 秒。
+- 审阅要点：
+  1. **下游读取点**：子代理列出了全仓库所有读取顶层 `strategy` 的地方，结论是都有 `isinstance` 或 `.get` 防御。我抽查了 `authoritative_recognition.py:555`：那里用的是 `payload["strategy"]` 直接取键，但它位于证据回放函数内，payload 在同一函数第 30 行由 `normalized.get("strategy", {})` 构造，键必然存在，所以结论成立。
+  2. **上下文请求**：`mimo_first_pass` 里的 `strategy` 在 v10 下 61 条全是 object。原因是 v10 的 null 形态以前从未通过校验，所以生产上从来没有 null 走到这里；修复后会有。`context_resolution_prompt` 是透传，子代理核查为安全。
+  3. **证据落库**：`message_evidence` 写 `normalized_evidence` 时把 null 归一化为 `{}`，这是既有行为。于是回放路径重建出的 payload 是 `{}`，实时路径是 null。这不影响本次修复，但四分类阶段 3 如果要在回放路径保留 null，需要另行处理。已记下，交四分类线决定。
+  4. **5xx 跳过重试**：
+     - 只在「当前模型不是链尾」时生效，链尾和单模型链仍重试一次；
+     - 5xx 判定复用 `mimo_provider_health.classify_provider_failure`，不会与健康线判据打架；
+     - `provider_request_count` 从 2 变 1，健康线只用它判断 `<= 0`，语义不变；
+     - 已知的小缺口：链总时限剩余不足 20 s 时，备用模型不会被调用。首模型 502 通常只耗 30 s 左右，离 240 s 的预算很远，实际不会碰到。
+- **部署建议**（由调度会话排期；本会话不部署）：
+  - 改变的是识别路径上「由哪个模型答题」，不涉及权威切换或交易所写入，属于 L1。观察窗为 15 分钟或 5 条真实消息，取先到者。
+  - 观察窗的判据：
+    - v10 下 `mimo_recognition_attempts.error_message LIKE '%missing strategy%'` 的新增为 0；
+    - gpt-5.6-luna 在非策略消息上正常 completed；
+    - 没有出现新的 error_code；
+    - 如果期间遇到 502，对应行 `provider_request_count=1`，并紧接一行备用模型的记录。
+  - **与四分类线的交互**：修复后，约 20% 原本由 mimo-v2.5 回退作答的 v10 消息，将改由 gpt-5.6-luna 作答。四分类线正在收集 v10 的数据，调度会话需要让那条线知道这个变化的时间点，最好把部署排在 09-28 数据收集结束之后，或者至少把部署时间记进他们的状态文档。
+
 ## 8. 第 2 项：上下文触发条件逐项分析（只读）
 
 ### 8.1 口径
