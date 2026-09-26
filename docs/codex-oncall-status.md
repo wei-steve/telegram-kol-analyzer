@@ -465,3 +465,12 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
 
 阶段 3（worker 回环端点 + 确定性闸门 + A 线 shadow）。本阶段没有为它预留任何东西：
 `diagnoses` 表只存「解释」，没有任何字段指向某个可执行动作，这是规格要求的。
+
+## 10. 外部送来的案例（2026-09-26）
+
+`docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
+`recovery_required` 的删除退出封了 11 天，4 条入场策略 + 多条止损指令被
+`deferred_expired` 无声作废，值守没有任何规则能看见它（`source_message_deletion_exits`
+不在水位线五张表里，`deferred_expired` 不在 `LOSSY_RECOGNITION_REASONS` 里）。
+备注里带了三条判据草案（被封的 lane / 被系统吃掉的消息 / 喊了没人听），
+供这条线自己定夺，本会话没有改值守的任何代码。
