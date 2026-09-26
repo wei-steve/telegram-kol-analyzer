@@ -821,7 +821,7 @@ default_mode: "worker MODE 缺省 off；值守 REQUESTS 缺省 off —— 部署
 端到端里 `full_exit`、`move_stop_to_break_even`、`adjust_stop_loss`（收紧成功 / 放宽被拒）走真实计划器 + 真实 apply + 真实 `execute_management_batch`；
 `partial_take_profit` 真实下单，但收口停在 `reconciling`（见上）。唯一打桩：计划器内部的 `reconcile_deepcoin_execution_bindings`（与计划器自身测试同法）。
 
-**全量**：`uv run python -B -m pytest -q` 在候选 `53c0de14` 上 → **9986 passed / 4 skipped / 0 failed**（795 s）。其后只有本文档改动。
+**全量**：`uv run python -B -m pytest -q` 在候选 `53c0de14` 上 → 9986 passed / 4 skipped / 0 failed（795 s）；按裁定 1 修改后的**最终候选 `03854cc2`** → **9990 passed / 4 skipped / 0 failed**（810 s）。
 
 **用户裁定（2026-09-26，经调度会话转达）**
 
