@@ -280,4 +280,4 @@ C1～C7 合计约 **31 GB**；加上 C8 最多约 35 GB。执行后剩余空间�
   以及 `completed` 中不再可能被重排的行；快照上的状态分布：completed 4894、exhausted 1528、superseded 221、failed 68、reanalysis_capped 2、blocked_execution_terminal 1。
 - 生产核对：SQLite 3.42.0（行值比较需 ≥ 3.15，满足）；磁盘调度器是 `mq-deadline`，所以单元里的 `IOSchedulingClass=idle` **不起作用**，
   IO 压力靠分批（每批 ≤ 5000 / 上下文 200 行）+ 批间 0.2 s + 单次 10 分钟上限控制。首次 apply 时按 8.2 第 6 步盯 loop-health。
-- **最终候选 sha：`b03fbb908f520ad354f836eab9bb9670ebb8135d`**（相对 `8468277c` 只改了一段 docstring，聚焦测试 50 通过；按 AGENTS.md 属于生产代码变动，部署前按惯例再跑一次全量）。
+- **最终候选 sha：`b03fbb908f520ad354f836eab9bb9670ebb8135d`**（相对 `8468277c` 只改了一段 docstring，聚焦测试 50 通过；最终全量在 `b03fbb90` 上：9802 通过、4 跳过、0 失败）。
