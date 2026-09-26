@@ -10,9 +10,11 @@ went silently missing.
 
 The timeout has two possible outcomes and they are not symmetric:
 
-* **Alert always.** Past ``source_deletion_exit_timeout_minutes`` an
-  always-notified ``source_deletion_exit_stuck`` incident is filed, whatever
-  else happens. That alone is a change: before this, nothing was emitted ever.
+* **Alert always** (but at most once every
+  :data:`STUCK_EXIT_CAPTURE_MIN_INTERVAL`, see below). Past
+  ``source_deletion_exit_timeout_minutes`` an always-notified
+  ``source_deletion_exit_stuck`` incident is filed, whatever else happens.
+  That alone is a change: before this, nothing was emitted ever.
 * **Unseal only on exchange proof.** The lane is released -- exit set to
   ``succeeded`` with reason ``position_gone_confirmed`` -- only when a direct
   exchange read shows the binding's positions *and* its resting orders are all
@@ -20,6 +22,20 @@ The timeout has two possible outcomes and they are not symmetric:
   the lane stays sealed and the alert is the whole outcome. A sealed lane is a
   visible problem; an unsealed lane over a position that still exists is an
   invisible one.
+
+**Capture throttle.** The deletion worker ticks every five seconds
+(``source_message_deletion_worker_interval_seconds``), and this pass used to
+capture every stuck exit on every tick: 陈哥's exits 310/311 reached a combined
+``repeat_count`` of 356933 over eleven days and roughly 69000 log lines a day,
+which is how a real alarm became wallpaper. The same exit is now captured at
+most once per :data:`STUCK_EXIT_CAPTURE_MIN_INTERVAL` -- unless its ``state`` or
+``last_reason`` changed since the last capture, or the pass released it, in
+which case it is captured immediately, because a state change is news and the
+throttle must not sit on news. The throttle lives in this process's memory
+(:data:`_LAST_STUCK_CAPTURE`) and is deliberately not persisted: after a
+restart each stuck exit says its situation once more, which is better than a
+restart inheriting somebody else's silence. ``runtime_incidents`` coalescing is
+untouched -- that is a global mechanism; this is one caller calling less often.
 """
 
 from __future__ import annotations
@@ -39,13 +55,34 @@ logger = logging.getLogger(__name__)
 
 STUCK_STATE = "recovery_required"
 POSITION_GONE_REASON = "position_gone_confirmed"
+#: How long the same unchanged stuck exit stays quiet between captures.
+STUCK_EXIT_CAPTURE_MIN_INTERVAL = timedelta(minutes=30)
+
+#: ``exit_id -> (state, last_reason, last capture moment)``, process memory
+#: only. See the module docstring for why it is not persisted.
+_LAST_STUCK_CAPTURE: dict[int, tuple[str, str, datetime]] = {}
+
+
+def reset_stuck_exit_capture_throttle() -> None:
+    """Forget every throttle decision. For tests and for explicit restarts."""
+
+    _LAST_STUCK_CAPTURE.clear()
 
 
 @dataclass(frozen=True, slots=True)
 class SourceDeletionExitTimeoutResult:
+    """What one pass did.
+
+    ``alerted`` is every timed-out exit the pass judged -- the scope of the
+    sweep, unchanged by the throttle. ``captured`` is the subset that actually
+    filed an incident this pass; the rest were judged identically and stayed
+    quiet because :data:`STUCK_EXIT_CAPTURE_MIN_INTERVAL` had not elapsed.
+    """
+
     alerted: tuple[int, ...] = ()
     released: tuple[int, ...] = ()
     held: tuple[int, ...] = ()
+    captured: tuple[int, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -85,6 +122,7 @@ def expire_stuck_source_deletion_exits(
     alerted: list[int] = []
     released: list[int] = []
     held: list[int] = []
+    captured: list[int] = []
     for candidate in candidates:
         exit_id = int(candidate["id"])
         proof = ExchangeAbsenceProof(False, "exchange_read_unavailable")
@@ -110,26 +148,38 @@ def expire_stuck_source_deletion_exits(
             _resume_behind_exit(session_factory, exit_id=exit_id, now=moment)
         else:
             held.append(exit_id)
-        _capture_stuck(
-            session_factory,
-            capture=capture,
-            candidate=candidate,
-            timeout_minutes=int(timeout_minutes),
-            lane_released=released_now,
-            release_reason=(POSITION_GONE_REASON if released_now else proof.reason),
-            occurred_at=moment,
-        )
+        # A release is the one outcome the throttle may never swallow: the
+        # exit's state changes under it, and "the lane just reopened" is the
+        # single most newsworthy thing this pass can say.
+        if _should_capture(candidate=candidate, moment=moment, force=released_now):
+            _capture_stuck(
+                session_factory,
+                capture=capture,
+                candidate=candidate,
+                timeout_minutes=int(timeout_minutes),
+                lane_released=released_now,
+                release_reason=(
+                    POSITION_GONE_REASON if released_now else proof.reason
+                ),
+                occurred_at=moment,
+            )
+            captured.append(exit_id)
         alerted.append(exit_id)
-    logger.warning(
-        "source deletion exits stuck alerted=%s released=%s held=%s",
-        alerted,
-        released,
-        held,
-    )
+    if captured:
+        # Throttled with the captures: one line per tick over a stuck exit that
+        # has not changed is the same 69000-lines-a-day noise in another file.
+        logger.warning(
+            "source deletion exits stuck alerted=%s released=%s held=%s captured=%s",
+            alerted,
+            released,
+            held,
+            captured,
+        )
     return SourceDeletionExitTimeoutResult(
         alerted=tuple(alerted),
         released=tuple(released),
         held=tuple(held),
+        captured=tuple(captured),
     )
 
 
@@ -188,6 +238,26 @@ def build_exchange_absence_reader(
         return ExchangeAbsenceProof(True, POSITION_GONE_REASON, tuple(sorted(pos_ids)))
 
     return read
+
+
+def _should_capture(
+    *, candidate: Mapping[str, Any], moment: datetime, force: bool = False
+) -> bool:
+    """Throttle repeats, never throttle a change. See the module docstring."""
+
+    exit_id = int(candidate["id"])
+    state = str(candidate["state"])
+    last_reason = str(candidate["last_reason"] or "")
+    seen = _LAST_STUCK_CAPTURE.get(exit_id)
+    now = _naive_utc(moment)
+    if seen is not None and not force:
+        seen_state, seen_reason, seen_at = seen
+        if (seen_state, seen_reason) == (state, last_reason) and (
+            now - seen_at
+        ) < STUCK_EXIT_CAPTURE_MIN_INTERVAL:
+            return False
+    _LAST_STUCK_CAPTURE[exit_id] = (state, last_reason, now)
+    return True
 
 
 def _candidates(session_factory, *, cutoff: datetime) -> list[dict[str, Any]]:

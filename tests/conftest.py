@@ -15,6 +15,25 @@ from telegram_kol_research.runtime_incident_adapters import STRICT_CAPTURE_ENV_V
 os.environ.setdefault(STRICT_CAPTURE_ENV_VAR, "1")
 
 
+@pytest.fixture(autouse=True)
+def reset_stuck_deletion_exit_capture_throttle():
+    """Process memory must not leak between tests.
+
+    ``source_deletion_exit_timeout`` throttles repeat captures of the same
+    stuck exit in a module-level dict keyed by exit id. Two tests using the
+    same fixture id and the same frozen clock would otherwise make the second
+    one silent -- a fake pass, and a confusing one.
+    """
+
+    from telegram_kol_research.source_deletion_exit_timeout import (
+        reset_stuck_exit_capture_throttle,
+    )
+
+    reset_stuck_exit_capture_throttle()
+    yield
+    reset_stuck_exit_capture_throttle()
+
+
 @pytest.fixture
 def allow_incident_capture_to_fail_open(monkeypatch):
     """For the cases that assert the production fail-open behaviour itself."""

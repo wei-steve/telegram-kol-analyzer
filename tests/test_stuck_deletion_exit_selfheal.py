@@ -22,12 +22,61 @@ Three defects, three sections here:
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+import logging
+from contextlib import contextmanager
+from datetime import UTC, datetime, timedelta
 
 from telegram_kol_research.db import create_session_factory
+from telegram_kol_research.models import (
+    ExecutionBinding,
+    ExecutionOrderLeg,
+    RawMessage,
+    SignalCandidate,
+    SourceMessageDeletionExit,
+    TelegramSourceMessageEvent,
+)
+from telegram_kol_research.source_deletion_exit_timeout import (
+    STUCK_EXIT_CAPTURE_MIN_INTERVAL,
+    build_exchange_absence_reader,
+    expire_stuck_source_deletion_exits,
+)
 
 
 NOW = datetime(2026, 9, 26, 9, 46, tzinfo=UTC)
+CHAT_ID = -1002337721508
+STUCK_SINCE = NOW - timedelta(days=11)
+
+
+class _Capture(logging.Handler):
+    """Records straight off the named logger.
+
+    Not ``caplog``: ``app_logging.configure_application_logging`` sets
+    ``propagate = False`` on the ``telegram_kol_research`` logger, so once any
+    test in the suite has called it nothing reaches the root handler ``caplog``
+    installs. The log-throttle case below passed alone and failed in the full
+    run for exactly that reason.
+    """
+
+    def __init__(self):
+        super().__init__(level=logging.NOTSET)
+        self.records: list[logging.LogRecord] = []
+
+    def emit(self, record):
+        self.records.append(record)
+
+
+@contextmanager
+def _captured(logger_name):
+    handler = _Capture()
+    logger = logging.getLogger(logger_name)
+    previous_level = logger.level
+    logger.setLevel(logging.DEBUG)
+    logger.addHandler(handler)
+    try:
+        yield handler.records
+    finally:
+        logger.removeHandler(handler)
+        logger.setLevel(previous_level)
 
 
 # --------------------------------------------------------------------------
@@ -128,3 +177,285 @@ def test_every_stuck_exit_summary_field_is_inside_the_closed_vocabulary(tmp_path
     assert set(summary) <= set(_SUMMARY_FIELDS)
     assert summary["release_reason"] == "position_gone_confirmed"
     assert summary["impact"] == "lane_released_after_timeout"
+# --------------------------------------------------------------------------
+# 乙 and 丙 share one fixture: 陈哥's sealed BTC-long lane
+# --------------------------------------------------------------------------
+
+
+def _lane_fixture(
+    tmp_path,
+    *,
+    execution_binding_id=None,
+    symbol="BTC",
+    side="long",
+    with_candidate=True,
+):
+    """One credential-less stuck exit over a deleted BTC-long message.
+
+    Shaped after exit 310: ``recovery_required`` since 09-15,
+    ``exact_lifecycle_missing``, no binding, no known position.
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+    with session_factory() as session:
+        session.add(
+            RawMessage(
+                id=15900,
+                chat_id=CHAT_ID,
+                message_id=15,
+                text="BTC 多单 76000-67300",
+                source_status="deleted",
+                posted_at=STUCK_SINCE.replace(tzinfo=None),
+            )
+        )
+        if with_candidate:
+            session.add(
+                SignalCandidate(
+                    raw_message_id=15900,
+                    symbol=symbol,
+                    side=side,
+                    review_status="approved",
+                )
+            )
+        session.add(
+            TelegramSourceMessageEvent(
+                id=9001,
+                chat_id=CHAT_ID,
+                message_id=15,
+                event_type="message_deleted",
+                raw_message_id=15900,
+                event_fingerprint="a" * 64,
+                binding_state="bound",
+                occurred_at=STUCK_SINCE.replace(tzinfo=None),
+            )
+        )
+        session.add(
+            SourceMessageDeletionExit(
+                id=310,
+                source_event_id=9001,
+                raw_message_id=15900,
+                execution_binding_id=execution_binding_id,
+                state="recovery_required",
+                last_reason="exact_lifecycle_missing",
+                updated_at=STUCK_SINCE.replace(tzinfo=None),
+                created_at=STUCK_SINCE.replace(tzinfo=None),
+            )
+        )
+        session.commit()
+    return session_factory
+
+
+def _other_group_binding(session_factory, *, pos_id="pos-383", order_id="ord-383"):
+    """米娅's BTC long: the position that really was on the account."""
+
+    with session_factory() as session:
+        session.add(
+            ExecutionBinding(
+                id=383,
+                venue="deepcoin",
+                strategy_instance_id="strategy-383",
+                kol_id="9",
+                chat_id=-1001111111111,
+                message_id=77,
+                symbol="BTC",
+                side="long",
+                status="open",
+                pos_id=pos_id,
+            )
+        )
+        session.add(
+            ExecutionOrderLeg(
+                id=901,
+                execution_binding_id=383,
+                venue="deepcoin",
+                purpose="entry",
+                leg_index=1,
+                status="active",
+                order_id=order_id,
+                pos_id=pos_id,
+                attribution_status="verified",
+                strategy_instance_id="strategy-383",
+            )
+        )
+        session.commit()
+
+
+def _reader(*, positions=(), orders=(), broken=False):
+    def positions_loader():
+        if broken:
+            raise RuntimeError("deepcoin down")
+        return list(positions)
+
+    return build_exchange_absence_reader(
+        positions_loader=positions_loader,
+        resting_orders_loader=lambda: list(orders),
+    )
+
+
+def _sweep(session_factory, *, now=NOW, captured=None, reader=None):
+    return expire_stuck_source_deletion_exits(
+        session_factory,
+        now=now,
+        timeout_minutes=120,
+        exchange_reader=reader if reader is not None else _reader(),
+        capture=(
+            (lambda **kwargs: captured.append(kwargs))
+            if captured is not None
+            else (lambda **kwargs: None)
+        ),
+    )
+
+
+def _exit_state(session_factory, exit_id=310):
+    with session_factory() as session:
+        row = session.get(SourceMessageDeletionExit, exit_id)
+        return row.state, row.last_reason
+
+
+# --------------------------------------------------------------------------
+# 乙: 356933 captures in eleven days
+# --------------------------------------------------------------------------
+
+
+def _held_fixture(tmp_path):
+    """A stuck exit that will not be released, so it can be swept repeatedly.
+
+    Deliberately the *old* held shape -- a bound exit whose position is still
+    open -- so these cases measure the throttle and nothing else.
+    """
+
+    session_factory = _lane_fixture(tmp_path, execution_binding_id=383)
+    _other_group_binding(session_factory, pos_id="pos-310", order_id="ord-310")
+    return session_factory
+
+
+def _live_position(pos_id="pos-310"):
+    return {"posId": pos_id, "instId": "BTC-USDT-SWAP", "posSide": "long",
+            "pos": "5"}
+
+
+def test_an_unchanged_stuck_exit_is_captured_once_per_interval(tmp_path):
+    """Five-second ticks, one alert. This is the 69000-lines-a-day defect."""
+
+    session_factory = _held_fixture(tmp_path)
+    captured: list[dict] = []
+    reader_rows = [_live_position()]
+
+    for tick in range(6):
+        _sweep(
+            session_factory,
+            now=NOW + timedelta(seconds=5 * tick),
+            captured=captured,
+            reader=_reader(positions=reader_rows),
+        )
+
+    assert len(captured) == 1
+    assert captured[0]["release_reason"] == "position_still_open"
+
+    # Just short of the interval: still quiet. One second past it: it speaks.
+    _sweep(
+        session_factory,
+        now=NOW + STUCK_EXIT_CAPTURE_MIN_INTERVAL - timedelta(seconds=1),
+        captured=captured,
+        reader=_reader(positions=reader_rows),
+    )
+    assert len(captured) == 1
+    result = _sweep(
+        session_factory,
+        now=NOW + STUCK_EXIT_CAPTURE_MIN_INTERVAL + timedelta(seconds=1),
+        captured=captured,
+        reader=_reader(positions=reader_rows),
+    )
+    assert len(captured) == 2
+    # The sweep still judged it on every pass; only the alert was throttled.
+    assert (result.alerted, result.held, result.captured) == ((310,), (310,), (310,))
+
+
+def test_a_state_change_is_captured_immediately_despite_the_throttle(tmp_path):
+    """A state change is news, and the throttle must not sit on news."""
+
+    session_factory = _held_fixture(tmp_path)
+    captured: list[dict] = []
+    reader_rows = [_live_position()]
+
+    _sweep(session_factory, captured=captured, reader=_reader(positions=reader_rows))
+    assert len(captured) == 1
+
+    with session_factory() as session:
+        session.query(SourceMessageDeletionExit).filter(
+            SourceMessageDeletionExit.id == 310
+        ).update({SourceMessageDeletionExit.state: "recovery_required"})
+        session.commit()
+    # Same state, same reason, one second later: throttled.
+    _sweep(
+        session_factory,
+        now=NOW + timedelta(seconds=1),
+        captured=captured,
+        reader=_reader(positions=reader_rows),
+    )
+    assert len(captured) == 1
+
+    with session_factory() as session:
+        session.query(SourceMessageDeletionExit).filter(
+            SourceMessageDeletionExit.id == 310
+        ).update({SourceMessageDeletionExit.last_reason: "reconcile_incomplete"})
+        session.commit()
+    _sweep(
+        session_factory,
+        now=NOW + timedelta(seconds=2),
+        captured=captured,
+        reader=_reader(positions=reader_rows),
+    )
+    assert len(captured) == 2
+    assert captured[1]["candidate"]["last_reason"] == "reconcile_incomplete"
+
+
+def test_a_release_is_never_throttled(tmp_path):
+    """The lane reopening is the one thing the throttle may not swallow."""
+
+    session_factory = _lane_fixture(tmp_path, execution_binding_id=383)
+    _other_group_binding(session_factory, pos_id="pos-310", order_id="ord-310")
+    captured: list[dict] = []
+    ours = {
+        "posId": "pos-310",
+        "instId": "BTC-USDT-SWAP",
+        "posSide": "long",
+        "pos": "3",
+    }
+
+    _sweep(session_factory, captured=captured, reader=_reader(positions=[ours]))
+    assert len(captured) == 1 and captured[0]["lane_released"] is False
+
+    # One second later -- deep inside the throttle window -- the position is gone.
+    result = _sweep(
+        session_factory,
+        now=NOW + timedelta(seconds=1),
+        captured=captured,
+        reader=_reader(),
+    )
+    assert result.released == (310,)
+    assert len(captured) == 2
+    assert captured[1]["lane_released"] is True
+
+
+def test_the_summary_log_line_is_throttled_with_the_captures(tmp_path):
+    """Otherwise the noise only moves from two lines a tick to one."""
+
+    session_factory = _held_fixture(tmp_path)
+    reader_rows = [_live_position()]
+    with _captured(
+        "telegram_kol_research.source_deletion_exit_timeout"
+    ) as records:
+        for tick in range(4):
+            _sweep(
+                session_factory,
+                now=NOW + timedelta(seconds=5 * tick),
+                reader=_reader(positions=reader_rows),
+            )
+
+    summary_lines = [
+        record
+        for record in records
+        if record.getMessage().startswith("source deletion exits stuck alerted=")
+    ]
+    assert len(summary_lines) == 1
