@@ -1451,3 +1451,96 @@ def test_new_query_shapes_have_no_full_table_scan(tmp_path, query, placeholders)
     ).fetchall()
     plan_text = " | ".join(str(row[3]) for row in rows)
     assert "SCAN" not in plan_text, plan_text
+
+
+# ---------------------------------------------------------------------------
+# Review fixes (commanding session, 2026-09-26)
+# ---------------------------------------------------------------------------
+
+
+def test_null_target_fanout_candidate_is_refused_even_though_scope_resolves(tmp_path):
+    """Spec 4.2: target not resolved -> no proposal, even if the same-group
+    fan-out would give the planner a scope (resolve_remediation_scope includes
+    the fan-out so the plan stays complete)."""
+
+    session_factory = create_session_factory(tmp_path / "r.db")
+    _binding_id, lifecycle_id, _strategy_id = _persist_strategy(
+        session_factory, chat_id=88, message_id=200, symbol="BTC", side="long", pos_id="pos-a",
+    )
+    raw_id, _candidate_id = _persist_failed_step(
+        session_factory,
+        lifecycle_id=lifecycle_id,
+        posted_at=NOW,
+        chat_id=88,
+        message_id=300,
+        text="BTC多单全部平仓",
+        event_type="close_signal",
+        management_action="full_exit",
+        target_lifecycle_id=None,
+        symbol="BTC",
+        side="long",
+    )
+    _enable_live_management(session_factory)
+    assert remediation.resolve_remediation_scope(session_factory, raw_message_id=raw_id) is not None
+    proposal_id = _new_requested_proposal(session_factory, raw_message_id=raw_id)
+    outcome = _compute(
+        session_factory, config=_approve_config(), proposal_id=proposal_id,
+        client=_client_for("BTC", "long", "pos-a"), group_config=_group_config(88),
+    )
+    assert outcome.state == "refused"
+    assert outcome.refusal_reason == "target_not_resolved"
+
+
+def test_a9_refuses_when_action_pos_ids_are_not_in_the_plan_snapshot(tmp_path):
+    from dataclasses import replace as dc_replace
+
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, _lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    real_build = remediation.build_position_management_remediation_plan
+
+    def regressed_build(*args, **kwargs):
+        plan = real_build(*args, **kwargs)
+        broken = tuple(
+            dc_replace(action, evidence={**action.evidence, "positions": []})
+            for action in plan.actions
+        )
+        return dc_replace(plan, actions=broken)
+
+    proposal_id = _new_requested_proposal(session_factory, raw_message_id=raw_id)
+    outcome = compute_requested_proposal(
+        session_factory, config=_approve_config(), proposal_id=proposal_id,
+        deepcoin_client=_client_for(symbol, side, pos_id), group_config=_group_config(88),
+        now=NOW + timedelta(minutes=2), build_plan=regressed_build,
+    )
+    assert outcome.refusal_reason == "target_position_not_live"
+
+
+def test_refusal_messages_count_against_the_daily_proposal_message_cap(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    now = NOW + timedelta(minutes=2)
+    with session_factory() as session:
+        for index in range(30):
+            session.add(
+                OncallRemediationProposal(
+                    case_key=f"old-{index}", case_no=index, raw_message_id=10_000 + index,
+                    state="refused", refusal_reason="no_ready_action",
+                    requested_at=now, finished_at=now,
+                )
+            )
+        session.commit()
+    proposal_id = _new_requested_proposal(session_factory, raw_message_id=424242)
+    outcome = _compute(
+        session_factory, config=_approve_config(), proposal_id=proposal_id,
+        client=_ReadOnlyClient(), group_config=_group_config(88), now=now,
+    )
+    assert outcome.state == "refused"
+    assert outcome.should_send is False
+
+
+def test_step2_promotion_is_a_single_atomic_statement():
+    """C1 library half: the 'nobody else executing' check lives inside the
+    same UPDATE as the promotion, not in a separate read before it."""
+
+    source = inspect.getsource(remediation._handle_step2)
+    assert "~exists().where(other.state == \"executing\"" in source

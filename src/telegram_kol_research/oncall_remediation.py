@@ -23,8 +23,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time as dtime, timedelta
 from typing import Any, Callable
 
-from sqlalchemy import func, update
-from sqlalchemy.orm import sessionmaker
+from sqlalchemy import exists, func, update
+from sqlalchemy.orm import aliased, sessionmaker
 
 from telegram_kol_research.config import OncallRemediationConfig
 from telegram_kol_research.models import (
@@ -400,6 +400,32 @@ def _window_minutes_for(action_kind: str | None, config: OncallRemediationConfig
     return 0
 
 
+def _proposal_messages_today(session, *, now: datetime) -> int:
+    """Proposal-type messages produced this Beijing day (proposals + refusals)."""
+
+    day_start, day_end = _beijing_day_bounds_utc(now)
+    proposed = (
+        session.query(func.count(OncallRemediationProposal.id))
+        .filter(
+            OncallRemediationProposal.proposed_at >= day_start,
+            OncallRemediationProposal.proposed_at < day_end,
+        )
+        .scalar()
+        or 0
+    )
+    refused = (
+        session.query(func.count(OncallRemediationProposal.id))
+        .filter(
+            OncallRemediationProposal.state == "refused",
+            OncallRemediationProposal.finished_at >= day_start,
+            OncallRemediationProposal.finished_at < day_end,
+        )
+        .scalar()
+        or 0
+    )
+    return int(proposed) + int(refused)
+
+
 def _find_step_reason(plan: PositionRemediationPlan, raw_message_id: int) -> str | None:
     for chain in plan.chains:
         for step in chain.steps:
@@ -548,6 +574,25 @@ def _run_gate_a(
     if config.effective_mode == "off":
         return _GateAResult(ok=False, reason="remediation_disabled", check="A1")
 
+    # Spec 4.2 (last bullet): a message whose management candidate has no
+    # resolved target lifecycle is never proposed. ``resolve_remediation_scope``
+    # deliberately includes the same-group fan-out so the *plan* stays
+    # complete, which is exactly why this has to be refused here explicitly.
+    with session_factory() as session:
+        unresolved_target = (
+            session.query(SignalCandidate.id)
+            .filter(
+                SignalCandidate.raw_message_id == raw_message_id,
+                SignalCandidate.parse_source == "mimo_authoritative",
+                SignalCandidate.review_status != "approved_remediation",
+                SignalCandidate.event_type.in_(("close_signal", "position_update")),
+                SignalCandidate.target_lifecycle_id.is_(None),
+            )
+            .first()
+        )
+    if unresolved_target is not None:
+        return _GateAResult(ok=False, reason="target_not_resolved", check="scope")
+
     scope = resolve_scope(session_factory, raw_message_id=raw_message_id)
     if scope is None:
         return _GateAResult(ok=False, reason="target_not_resolved", check="scope")
@@ -667,7 +712,15 @@ def _run_gate_a(
             window_minutes=window_minutes,
         )
 
-    if not action.pos_ids:
+    # A9: re-assert against the very snapshot the plan used (the plan already
+    # guarantees it; this catches a planner regression, spec 4.4 A9).
+    snapshot_pos_ids = {
+        str(row.get("posId") or row.get("pos_id") or row.get("id") or "")
+        for row in (action.evidence.get("positions") or [])
+        if isinstance(row, dict)
+    }
+    snapshot_pos_ids.discard("")
+    if not action.pos_ids or not set(action.pos_ids) <= snapshot_pos_ids:
         return _GateAResult(ok=False, reason="target_position_not_live", check="A9", scope=scope, plan=plan)
 
     with session_factory() as session:
@@ -874,13 +927,17 @@ def compute_requested_proposal(
             )
             session.commit()
             became_refused = result.rowcount == 1
+            # Spec 6.1: refusal lines count against the same worker-side cap of
+            # 30 proposal-type messages per Beijing day; beyond it they are
+            # recorded only.
+            under_cap = _proposal_messages_today(session, now=now) <= config.daily_proposal_cap
         return ProposalOutcome(
             proposal_id=proposal_id,
             state="refused" if became_refused else "requested",
             refusal_reason=reason,
             text=_format_refusal_text(case_no=case_no, reason=reason) if became_refused else None,
             keyboard=None,
-            should_send=became_refused,
+            should_send=became_refused and under_cap,
         )
 
     try:
@@ -1218,15 +1275,37 @@ def _handle_step2(session, proposal, *, token, now, actor) -> CallbackOutcome:
         session.commit()
         return CallbackOutcome(proposal.id, False, "另一笔补救正在执行，请稍后再试", None)
 
+    # One statement, so the "nobody else is executing" check and the promotion
+    # are atomic under SQLite's single writer (C1, library half; the worker
+    # adds an in-process asyncio.Lock on top).
+    other = aliased(OncallRemediationProposal)
     result = session.execute(
         update(OncallRemediationProposal)
-        .where(OncallRemediationProposal.id == proposal.id, OncallRemediationProposal.state == "confirming")
+        .where(
+            OncallRemediationProposal.id == proposal.id,
+            OncallRemediationProposal.state == "confirming",
+            ~exists().where(other.state == "executing", other.id != proposal.id),
+        )
         .values(state="executing", confirmed_at=now, executing_at=now, step2_token_hash=None, updated_at=now)
     )
+    if result.rowcount != 1:
+        still_confirming = (
+            session.query(OncallRemediationProposal.state)
+            .filter(OncallRemediationProposal.id == proposal.id)
+            .scalar()
+            == "confirming"
+        )
+        _append_event(
+            session, proposal.id, actor=actor, event="callback", gate="C" if still_confirming else "B",
+            check="C1" if still_confirming else "B3", outcome="refused",
+            detail={"reason": "busy" if still_confirming else "state_changed"}, at=now,
+        )
+        session.commit()
+        if still_confirming:
+            return CallbackOutcome(proposal.id, False, "另一笔补救正在执行，请稍后再试", None)
+        return CallbackOutcome(proposal.id, False, "这条提案已处理 / 已过期", None)
     _append_event(session, proposal.id, actor=actor, event="callback", gate="B", check="B3", outcome="executing", at=now)
     session.commit()
-    if result.rowcount != 1:
-        return CallbackOutcome(proposal.id, False, "这条提案已处理 / 已过期", None)
     return CallbackOutcome(proposal.id, True, None, None, execute_proposal_id=proposal.id)
 
 
