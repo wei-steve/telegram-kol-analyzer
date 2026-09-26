@@ -202,7 +202,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 
 ### 4.7 熔断
 
-连续 2 次执行结果为 `failed` 或 `uncertain`，或回读与预期不符 → `control.enabled = 0`、记 `breaker_tripped_at`，发一条"补救已自动关闭：<原因>"，
+连续 2 次执行结果为 `failed` 或 `uncertain`，或回读与预期不符 → `control.enabled = 0`（**2026-09-26 用户裁定补充**：只统计真正进入执行后的失败——产生过 live 管理批次的 `failed`、以及任何 `uncertain`。执行前的拒绝，包括 C2 `plan_changed`（指纹漂移）、执行时超窗、G-A 重跑不过、apply 在提升为 live 之前的拒绝，只拒绝本次提案、不计入熔断，结果消息提示发送 `/fix P<提案号>` 重新生成提案（新提案重走 G-A / G-B / G-C 全部闸门）；A11 的冷却与日执行上限同样只计真正执行过的提案）、记 `breaker_tripped_at`，发一条"补救已自动关闭：<原因>"，
 所有 `proposed / confirming` 提案作废为 `cancelled`。熔断后只能人工恢复：批准人在系统 bot 会话发 `/oncall_on`（用户裁定第 3 条；同样过 B1 校验，并写 `events`）。成功一次清零计数。
 
 ## 5. 值守侧改动
@@ -332,7 +332,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 4. **G-B**：错会话、错用户、未配置批准人；令牌错 / 复用 / 跨步骤；过期（30 分钟 / 2 分钟）；`shadow` 下无按钮、`/fix` 被拒；`/fix` 带额外参数被拒。
 5. **G-C**：并发两个确认只有一个进入 `executing`；计划指纹变化 → `plan_changed` 且未调用 apply；执行时超窗；apply 内部检查失败原样上报。
 6. **状态机**：全部合法迁移与非法迁移（比较交换 0 行）；`events` 只追加（静态断言无 UPDATE/DELETE）；重启时 `executing → uncertain` 且不重跑。
-7. **熔断**：连续 2 次 `failed/uncertain` → 关闭 + 作废在途提案 + 告警；成功清零；熔断后提案请求一律 `refused`。
+7. **熔断**：连续 2 次真正执行后的 `failed/uncertain` → 关闭 + 作废在途提案 + 告警；`plan_changed` 等执行前拒绝连续多次也不熔断；成功清零；熔断后提案请求一律 `refused`。
 8. **总闸**：`/oncall_off` 立即生效（下一次回调即拒绝）；`/oncall_on` 只接受 B1 用户、能解除熔断并写 `events`；它**不修改** `groups.yaml`、交易设置、任何自动交易开关（断言这些对象在测试前后相等）。
 9. **白名单端到端**（fake 交易所）：`full_exit`、`partial_take_profit`、`move_stop_to_break_even`、`adjust_stop_loss`（收紧成功 / 放宽被拒）各一条从请求到结果消息；`adjust_take_profit` 无提案；D1c / D3 / D6 / 健康案件值守不请求。
 10. **回放**：用状态文档与设计 7.1 列出的历史形状做夹具——`prior_partial_batch_unresolved`（前驱已收口 → 出提案）、raw 17813 形状（`management_stop_action_conflict` → apply 内被同一规则再拒，提案 `failed` 而非执行）、raw 18371/18375 形状（仓位已平 → A9 拒绝）、`partial_failed` 批次 → 值守不请求。

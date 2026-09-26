@@ -673,6 +673,7 @@ def test_a11_cooldown_refuses(tmp_path):
                 case_key="prior", case_no=0, raw_message_id=raw_id - 1 if raw_id > 1 else raw_id,
                 lifecycle_id=lifecycle_id, action_kind="full_exit", state="failed",
                 requested_at=NOW, executing_at=NOW + timedelta(minutes=1),
+                management_batch_id=1,  # a real (live-batch) execution that failed
             )
         )
         session.commit()
@@ -695,7 +696,7 @@ def test_a11_daily_execution_cap_refuses(tmp_path):
                 OncallRemediationProposal(
                     case_key=f"p{i}", case_no=i, raw_message_id=10_000 + i, lifecycle_id=90_000 + i,
                     action_kind="full_exit", state="failed", requested_at=NOW,
-                    executing_at=NOW + timedelta(minutes=1),
+                    executing_at=NOW + timedelta(minutes=1), management_batch_id=1 + i,
                 )
             )
         session.commit()
@@ -1589,3 +1590,141 @@ def test_exception_before_apply_is_failed_and_after_apply_entry_is_uncertain(tmp
         apply_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable")),
     )
     assert outcome.state == "failed"
+
+
+
+# ---------------------------------------------------------------------------
+# User ruling 2026-09-26: plan drift does not count toward the breaker
+# ---------------------------------------------------------------------------
+
+
+def _plan_changed_row(session_factory, *, raw_id, lifecycle_id, action, scope):
+    pid = _executing_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+    with session_factory() as session:
+        row = session.get(OncallRemediationProposal, pid)
+        row.action_fingerprint = "drifted-" + row.action_fingerprint[:20]
+        session.add(row)
+        session.commit()
+    return pid
+
+
+def test_repeated_plan_drift_never_trips_the_breaker(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    client = _client_for(symbol, side, pos_id)
+    action, scope = _built_action_and_scope(session_factory, raw_id=raw_id, client=client)
+
+    def never_apply(*args, **kwargs):
+        raise AssertionError("apply must not run on plan drift")
+
+    for attempt in range(4):
+        pid = _plan_changed_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+        outcome = execute_proposal(
+            session_factory, config=_approve_config(), proposal_id=pid, deepcoin_client=client,
+            group_config=_group_config(88), now=NOW + timedelta(minutes=3 + attempt), apply_fn=never_apply,
+        )
+        assert outcome.state == "failed"
+        assert outcome.breaker_tripped is False
+        assert "/fix" in (outcome.text or "")
+    with session_factory() as session:
+        control = session.get(OncallRemediationControl, 1)
+        # never touched (no row) or touched but untripped are both "enabled"
+        assert control is None or (bool(control.enabled) and int(control.consecutive_failures or 0) == 0)
+
+
+def test_real_execution_failures_still_trip_the_breaker_after_two(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    client = _client_for(symbol, side, pos_id)
+    action, scope = _built_action_and_scope(session_factory, raw_id=raw_id, client=client)
+    outcomes = []
+    for attempt in range(2):
+        pid = _executing_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+        # a live batch exists for this message -> the apply error is "uncertain"
+        with session_factory() as session:
+            row = session.get(OncallRemediationProposal, pid)
+            row.executing_at = NOW
+            session.add(row)
+            session.commit()
+
+        def exploding_apply(*args, **kwargs):
+            raise RuntimeError("exchange went away mid-write")
+
+        original = remediation._classify_apply_exception
+        remediation._classify_apply_exception = lambda *a, **k: "uncertain"
+        try:
+            outcomes.append(
+                execute_proposal(
+                    session_factory, config=_approve_config(), proposal_id=pid, deepcoin_client=client,
+                    group_config=_group_config(88), now=NOW + timedelta(minutes=3), apply_fn=exploding_apply,
+                )
+            )
+        finally:
+            remediation._classify_apply_exception = original
+        # the partial unique index allows only one uncertain per target, and the
+        # 10-minute lifecycle cooldown would refuse the next attempt pre-apply;
+        # move this row out of the way so attempt 2 reaches apply again.
+        with session_factory() as session:
+            row = session.get(OncallRemediationProposal, pid)
+            row.raw_message_id = 50_000 + attempt
+            row.executing_at = NOW - timedelta(days=1)
+            session.add(row)
+            session.commit()
+    assert [o.state for o in outcomes] == ["uncertain", "uncertain"]
+    assert outcomes[0].breaker_tripped is False
+    assert outcomes[1].breaker_tripped is True
+
+
+def test_pre_apply_failures_do_not_consume_cooldown_or_daily_cap(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    with session_factory() as session:
+        for i in range(10):
+            session.add(
+                OncallRemediationProposal(
+                    case_key=f"d{i}", case_no=i, raw_message_id=20_000 + i, lifecycle_id=lifecycle_id,
+                    action_kind="full_exit", state="failed", refusal_reason="plan_changed",
+                    requested_at=NOW, executing_at=NOW + timedelta(minutes=1),
+                )
+            )
+        session.commit()
+    proposal_id = _new_requested_proposal(session_factory, raw_message_id=raw_id, case_no=99)
+    outcome = _compute(
+        session_factory, config=_approve_config(daily_execution_cap=10), proposal_id=proposal_id,
+        client=_client_for(symbol, side, pos_id), group_config=_group_config(88),
+        now=NOW + timedelta(minutes=5),
+    )
+    assert outcome.state == "proposed", outcome.refusal_reason
+
+
+def test_fix_regenerates_a_proposal_after_plan_drift(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    client = _client_for(symbol, side, pos_id)
+    action, scope = _built_action_and_scope(session_factory, raw_id=raw_id, client=client)
+    pid = _plan_changed_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+    execute_proposal(
+        session_factory, config=_approve_config(), proposal_id=pid, deepcoin_client=client,
+        group_config=_group_config(88), now=NOW + timedelta(minutes=3),
+        apply_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    outcome = remediation.handle_text_command(
+        session_factory, config=_approve_config(), chat_id=CHAT_ID, from_user_id=APPROVER_ID,
+        text=f"/fix P{pid}", now=NOW + timedelta(minutes=4),
+    )
+    assert outcome.accepted is True
+    assert outcome.proposal_id != pid
+    with session_factory() as session:
+        new_row = session.get(OncallRemediationProposal, outcome.proposal_id)
+        assert new_row.state == "requested"
+        assert new_row.raw_message_id == raw_id
+    # a non-approver cannot regenerate
+    denied = remediation.handle_text_command(
+        session_factory, config=_approve_config(), chat_id=CHAT_ID, from_user_id=APPROVER_ID + 1,
+        text=f"/fix P{pid}", now=NOW + timedelta(minutes=4),
+    )
+    assert denied.accepted is False

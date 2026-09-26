@@ -1032,7 +1032,7 @@ def test_unrelated_exchange_activity_on_same_symbol_causes_fingerprint_drift(
     with session_factory() as session:
         proposal = session.get(OncallRemediationProposal, proposal_id)
         assert proposal.state == "failed"
-        assert proposal.refusal_reason is None  # execute_proposal's _fail doesn't set refusal_reason; see result_json
+        assert proposal.refusal_reason == "plan_changed"  # /fix P<n> keys regeneration on this
         result = json.loads(proposal.result_json)
         assert result["reason"] == "plan_changed"
     assert apply_calls == []  # C2 refused before apply() was ever called

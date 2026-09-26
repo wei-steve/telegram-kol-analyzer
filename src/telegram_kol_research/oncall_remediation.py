@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time as dtime, timedelta
 from typing import Any, Callable
 
-from sqlalchemy import exists, func, update
+from sqlalchemy import exists, func, or_, update
 from sqlalchemy.orm import aliased, sessionmaker
 
 from telegram_kol_research.config import OncallRemediationConfig
@@ -93,6 +93,15 @@ A7_IRREVERSIBLE_REASON_PATTERNS = (
 )
 
 _BEIJING_OFFSET = timedelta(hours=8)
+
+# A11 cooldown / daily execution cap count real executions only: a proposal
+# still executing, one that settled after reaching the exchange-write path
+# (succeeded / uncertain), or one that carries a live management batch. A
+# pre-apply refusal (e.g. plan_changed) never executed anything.
+_REAL_EXECUTION_PREDICATE = or_(
+    OncallRemediationProposal.state.in_(("executing", "succeeded", "uncertain")),
+    OncallRemediationProposal.management_batch_id.is_not(None),
+)
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +275,7 @@ _REFUSAL_REASON_ZH: dict[str, str] = {
     "cooldown": "同一仓位冷却中，请稍后再试",
     "daily_execution_cap": "今日补救执行次数已达上限",
     "daily_proposal_cap": "今日提案消息已达上限",
-    "plan_changed": "计划已变化，补救已取消",
+    "plan_changed": "计划已变化（多为同币种有新成交或挂撤单），本次未执行；可发送 /fix 加本提案号重新生成提案",
     "expired": "提案已过期",
     "state_changed": "提案状态已变化",
 }
@@ -744,6 +753,7 @@ def _run_gate_a(
                 OncallRemediationProposal.lifecycle_id == action.lifecycle_id,
                 OncallRemediationProposal.executing_at.is_not(None),
                 OncallRemediationProposal.id != exclude_proposal_id,
+                _REAL_EXECUTION_PREDICATE,
             )
             .scalar()
         )
@@ -760,6 +770,7 @@ def _run_gate_a(
                 OncallRemediationProposal.executing_at >= day_start,
                 OncallRemediationProposal.executing_at < day_end,
                 OncallRemediationProposal.id != exclude_proposal_id,
+                _REAL_EXECUTION_PREDICATE,
             )
             .scalar()
             or 0
@@ -1392,6 +1403,44 @@ def handle_text_command(
             return CommandOutcome(accepted=False, text="当前为只提示模式", proposal_id=proposal_id)
         with session_factory() as session:
             proposal = session.get(OncallRemediationProposal, proposal_id)
+            regenerate = (
+                proposal is not None
+                and proposal.state == "failed"
+                and proposal.refusal_reason == "plan_changed"
+                and proposal.management_batch_id is None
+            )
+            if regenerate:
+                case_key, case_no, raw_message_id = (
+                    proposal.case_key, proposal.case_no, proposal.raw_message_id,
+                )
+        if regenerate:
+            # User ruling 2026-09-26: plan drift only refuses this proposal and
+            # asks for a fresh one. A new request goes through every gate again
+            # (G-A, then G-B twice, then G-C); nothing from the old proposal is
+            # reused except the identifiers the watcher originally sent.
+            registered = register_proposal_request(
+                session_factory, config=config, case_key=case_key, case_no=case_no,
+                raw_message_id=raw_message_id, now=now,
+            )
+            with session_factory() as session:
+                _append_event(
+                    session, proposal_id, actor=f"telegram_user:{from_user_id}", event="regenerate",
+                    outcome=registered.state, detail={"new_proposal_id": registered.proposal_id}, at=now,
+                )
+                session.commit()
+            if registered.state == "refused":
+                return CommandOutcome(
+                    accepted=False,
+                    text="无法重新生成：补救未启用，或该消息已补救过",
+                    proposal_id=registered.proposal_id,
+                )
+            return CommandOutcome(
+                accepted=True,
+                text=f"已重新请求提案 P{registered.proposal_id}，稍后会收到新的提案消息",
+                proposal_id=registered.proposal_id,
+            )
+        with session_factory() as session:
+            proposal = session.get(OncallRemediationProposal, proposal_id)
             if proposal is None or proposal.state != "proposed":
                 return CommandOutcome(accepted=False, text="这条提案已处理 / 已过期", proposal_id=proposal_id)
             if not proposal.step1_token_hash:
@@ -1436,15 +1485,27 @@ def execute_proposal(
         scope_json = proposal.scope_json
 
     def _fail(state: str, reason: str, *, check: str | None) -> ExecutionOutcome:
+        # User ruling 2026-09-26: the breaker counts only failures of a real
+        # execution. A refusal before anything was promoted to a live batch
+        # (plan_changed and every other pre-apply gate, or an apply() refusal
+        # that never promoted its plan-only batch) only refuses this proposal.
+        # "uncertain" always means a live write may have happened, so it counts.
+        counts_toward_breaker = state == "uncertain"
         with session_factory() as session:
             row = session.get(OncallRemediationProposal, proposal_id)
             row.state = state
+            row.refusal_reason = reason[:128]
             row.finished_at = now
             row.updated_at = now
             row.result_json = _bounded_json({"reason": reason}, limit=4096)
             session.add(row)
-            _append_event(session, proposal_id, actor="worker", event="gate_c", gate="C", check=check, outcome=state, detail={"reason": reason}, at=now)
-            breaker_message = _apply_outcome_to_breaker(session, state)
+            _append_event(
+                session, proposal_id, actor="worker", event="gate_c", gate="C", check=check,
+                outcome=state, detail={"reason": reason, "counts_toward_breaker": counts_toward_breaker}, at=now,
+            )
+            breaker_message = (
+                _apply_outcome_to_breaker(session, state) if counts_toward_breaker else None
+            )
             session.commit()
         return ExecutionOutcome(
             proposal_id=proposal_id,
