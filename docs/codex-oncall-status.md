@@ -651,6 +651,131 @@ G-B 的错会话、错用户、未配置批准人、令牌错误/复用/跨步�
   C1 单飞的进程内 `asyncio.Lock`（本批只交付了库内那一半，见偏离 4）。
 - 本批未连服务器、未跑 schema 演练（12.1 的 `VACUUM INTO` + bootstrap + `PRAGMA quick_check`），留给部署前。
 
+### 9.3 阶段 3 第 3 批（2026-09-26，实现子代理，`claude/codex-oncall-phase3` 分支，**未合并未部署**）
+
+规格：`docs/plans/2026-09-26-codex-oncall-phase3-spec.md` 第 3、4.3、4.4（C1 进程内锁一半）、4.6、4.7、6.1–6.5、8.1、8.2 第一/三层、9 第 2 条。
+第 3 批把第 2 批的库接到回环端点、worker 后台任务、系统 bot 回调循环；**未改第 2 批的闸门逻辑**。
+
+**交付物**
+
+- `src/telegram_kol_research/oncall_remediation_runtime.py`（新模块，worker 侧）：C1 单飞的进程内 `asyncio.Lock`
+  （`_EXECUTION_LOCK`，模块级，全进程唯一）、`execute_proposal_locked`（获取锁 → `asyncio.to_thread` 调
+  `execute_proposal`）、`run_oncall_remediation_background_loop`（消费 `requested` 行、发提案消息、
+  `expire_stale_proposals`/`finalize_executing_proposals`、启动时 `recover_after_restart`）、
+  `OncallRemediationWiring`（frozen dataclass，`config`/`session_factory`/`deepcoin_client_factory`/
+  `group_config_provider`/`now_provider`，`run_system_operator_bot_command_loop` 的新可选参数，默认 `None`）、
+  `clear_system_operator_bot_reply_markup`（过期提案摘按钮）。所有对第 2 批同步函数的调用均在
+  `asyncio.to_thread` 里；每一步单独 `try/except`，任何异常只记日志、循环不死、也绝不导致执行——本模块唯一会调用
+  `execute_proposal`（经 `execute_proposal_locked`）的路径是回调处理里"确认执行"分支创建的后台任务。
+- `src/telegram_kol_research/web_app.py`：新路由 `POST /internal/oncall/remediation/proposals`——仅在
+  `runtime_role == "worker"` 时注册（不是"处理函数内 404"，见"偏离"1）；认证仿 `require_monitor_capture_auth`
+  （回环、无 XFF、令牌 `hmac.compare_digest`），另加 `effective_mode == "off"` 判定，四者任一不满足统一 404；
+  请求体先按原始字节流限 2 KB（`request.stream()` 累加计数，超出 413，早于任何 JSON 解析）、严格 JSON（
+  `object_pairs_hook` 拒绝重复键、字段集合恰好 `{case_key, case_no, raw_message_id}`、类型/范围校验，任何不符
+  400）；成功路径只调用 `asyncio.to_thread(register_proposal_request, ...)`（零交易所调用）并 `set()`
+  `app.state.oncall_remediation_wake_event` 唤醒后台任务；响应体只有 `{"proposal_id", "state"}`，`201`
+  改按规格用 `202`（新建）/`200`（幂等）区分。新增 `app.state.oncall_remediation_config`（复用
+  `load_oncall_remediation_config`，与 `system_operator_bot_config` 同一 `split_runtime` 约定）、
+  `app.state.oncall_remediation_active`（`role == worker and token and effective_mode != off` 的单一判定，
+  端点注册条件、后台任务启动条件、`OncallRemediationWiring` 是否为 `None` 三处共用同一个值，避免三处各自重新
+  推导而彼此不一致）、`app.state.oncall_remediation_wake_event`、`app.state.oncall_remediation_background_task`
+  （新增到 `RUNTIME_ROLE_SINGLETON_TASKS["worker"]` 的 `"oncall_remediation_background"`，用现有
+  `_supervise_restartable_background_task` 包装，`lifespan` 关闭时按现有模式 `cancel()` + `await`）。
+  `run_system_operator_bot_command_loop` 调用处按 `oncall_remediation_active` 决定传 `OncallRemediationWiring`
+  还是 `None`。
+- `src/telegram_kol_research/telegram_bot_commands.py`：`run_system_operator_bot_command_loop` 新增可选形参
+  `oncall_remediation: OncallRemediationWiring | None = None`（默认 `None`，逐字节不改变既有行为）。回调循环里
+  `callback_data.startswith("orm:")` 在现有 `_log_system_operator_callback_processed` 之前分流，绝不落入现有
+  "未识别的操作"回退；分流出的 `_handle_oncall_remediation_callback` 先 `answerCallbackQuery`
+  （Telegram 15 秒 SLA），`oncall_remediation is None` 时直接回"补救未启用"（不导入、不触碰第 2/3 批任何东西）；
+  否则 `asyncio.to_thread(handle_callback, ...)`，按返回的 `text`/`keyboard`/`remove_keyboard` 编辑消息，
+  `execute_proposal_id` 非空时 `asyncio.create_task` 后台执行（`_track_oncall_remediation_execution_task`
+  持有强引用防 GC）。文本命令分支同理：`_is_oncall_remediation_command` 匹配 `/fix`/`/oncall_off`/`/oncall_on`
+  时在现有 `_run_system_operator_command_update` 之前分流，`oncall_remediation is None` 时回"补救未启用"，否则
+  `asyncio.to_thread(handle_text_command, ...)`。三个命令均**未**加入 `_set_bot_commands` 的公开菜单。
+
+**并发模型**
+
+- 端点处理：无锁，纯 DB 写（`register_proposal_request` 本身是一次 SQLite 事务）。
+- 后台单飞任务（`run_oncall_remediation_background_loop`）：单个协程顺序处理 `requested` 行（同一时刻只算一个，
+  与规格"一次只算一个"一致，无需额外锁）；被 `wake_event.wait(timeout=10s)` 唤醒或超时轮询。
+- G-C 执行：C1 由**进程内 `asyncio.Lock`**（`oncall_remediation_runtime._EXECUTION_LOCK`，第 3 批交付，补上第
+  2 批文档里承认的缺口）**与**第 2 批库内 `state='confirming' -> 'executing'` 的比较交换（CAS）共同保证——CAS
+  决定"是否真的该我执行"，锁决定"就算某种竞态让两次调用都拿到了执行许可，也绝不会真的并发跑 apply"。回调处理
+  函数创建的后台任务是唯一调用点；测试
+  `test_orm_callback_schedules_execution_exactly_once_for_two_confirms`（新增测试文件）验证了锁的串行化。
+- 同一提案只执行一次：由第 2 批的状态机保证（CAS 0 行即拒绝），第 3 批不重复该逻辑，只保证"调用入口只有一个、
+  且互斥"。
+
+**给第 2 批库接口做的改动**：无。第 3 批接线时未发现需要改动第 2 批公开函数签名或闸门逻辑的地方。
+
+**测试命令与结果**
+
+```
+uv run python -B -m pytest tests/test_oncall_remediation_wiring.py -q
+# 41 passed
+uv run python -B -m pytest tests/test_oncall_remediation.py tests/test_oncall_remediation_wiring.py \
+  tests/test_position_management_remediation_scope.py tests/test_position_management_remediation.py \
+  tests/test_telegram_bot_commands.py tests/test_oncall_architecture_boundary.py -q
+# 219 passed
+uv run python -B -m pytest tests/test_web_app.py -q
+# 245 passed（既有 web_app 测试全部原样通过，本批未破坏任何现有路由/生命周期行为）
+uv run python -B -m pytest tests/test_auto_trade_execution.py tests/test_db_bootstrap.py \
+  tests/test_protection_ledger.py tests/test_oncall_alerts.py tests/test_oncall_service.py \
+  tests/test_oncall_detector.py tests/test_oncall_casefile.py -q
+# 414 passed
+uv run python -B -m pytest --collect-only -q
+# 9974 tests collected，0 collection errors
+uv run python -B -m pytest -q   # 最终候选一次全量
+# 见下方全量结果（指挥会话验收时以此为准）
+```
+
+新测试 `tests/test_oncall_remediation_wiring.py`（41 个）覆盖：端点的回环/XFF/令牌/`mode=off`/未配置令牌/
+非 worker 角色（`web`/`ingest`/`all`）全部 404；多余字段、类型错误（`bool` 冒充 `int`）、越界、超长
+`case_key`、重复键、超 2 KB body 全部拒绝；成功路径的字段形状与幂等；请求处理路径零交易所调用（
+`deepcoin_client_factory` 传入一个断言型假客户端）；`oncall_remediation_active` 四种组合；后台任务仅在启用时
+创建（用桩 runner + `threading.Event` 断言）；`OncallRemediationWiring` 仅在启用时传给系统 bot 循环；
+`orm:` 回调禁用时回"补救未启用"、启用时"先 answerCallbackQuery 后 editMessageText"的顺序、确认执行分支的锁
+串行化；文本命令禁用/启用路径与命令名匹配范围；后台循环的提案发送/记录、发送失败不落库、`finalize` 结果消息；
+`execute_proposal_locked` 不阻塞事件循环（心跳协程最大间隔 < 0.2 s，同步 `execute_proposal` 桩内 `sleep(0.5)`）。
+
+**偏离规格之处（含理由）**
+
+1. **路由用"仅在 `runtime_role == 'worker'` 时注册"，不是"处理函数内 404"**（web_app.py）。规格 4.3 给了两种
+   写法并说"看清 runtime_role 在那时是否已知"——`runtime_role` 是 `create_web_app` 的参数，在装饰器执行前已经
+   确定，两种写法对外部行为完全等价（`web`/`ingest`/测试里的 `"all"` 角色都拿到同一个 404），选前者是因为
+   它让"这个端点根本不属于这个进程"在代码里也是真的，不必在每次请求里重新判断角色。
+2. **`resolved_runtime_role == "worker"` 严格排除 `"all"`**（web_app.py）。规格原文只说"仅在 worker 时注册"，
+   没提单进程模式；`"all"` 是本仓库单进程/开发/测试模式（部署脚本只用 `worker`/`web`/`ingest` 三个拆分角色，
+   见 `deploy/systemd/telegram-kol-worker.service`），生产从不用 `"all"` 跑 worker 职责，所以按字面执行不影响
+   生产，但会让"用 `runtime_role=all` 起一个本地进程"的场景摸不到这个端点——如果指挥会话认为开发模式也要能测，
+   这是一行的改动（`in {"worker", "all"}`）。
+3. **`OncallRemediationWiring` 何时为 `None` 由 `app.state.oncall_remediation_active` 单点判定，而不是在回调
+   处理函数里重新读取 `config.effective_mode`**。效果是：`mode=off` 时，`orm:` 回调与三个文本命令在**分流层**
+   就回"补救未启用"，从不到达第 2 批的 `handle_callback`/`handle_text_command`（它们各自也有自己的模式判定，
+   但那是给"运行中途通过 `/oncall_off` 关闭"这种**运行时**关闭用的；`mode`/`token` 是进程启动时从环境读一次的
+   常量，关它只能重启 worker，所以在分流层一次性判定是等价且更简单的写法）。这与"默认 off 时行为逐字节不变"
+   的纪律要求是同一件事的两种说法：`None` 就是"这段代码从未存在过"。
+4. **`_process_one_requested_proposal` 用 `group_label=lambda chat_id: _group_label(group_config, chat_id)`
+   而不是接线说明里建议的"用 `telegram_bot_commands._group_label_by_chat_id` 包一层"**。理由：
+   `_group_label_by_chat_id` 返回的是"整个 `GroupConfig` -> `dict[chat_id, label]`"，而
+   `compute_requested_proposal` 的 `group_label` 参数签名是 `Callable[[int], str]`（单个 chat_id 进、单个
+   label 出）；`oncall_remediation_runtime.py` 里的 `_group_label` 是同一份查找逻辑（`custom_group_label` 优先
+   于 `chat_title`，取不到回退 `chat_id`）用生成器直接实现，避免每次都先物化一整个 dict 再查一个键；两者对同一
+   `GroupConfig` 输出完全相同的字符串，只是省了一次不必要的中间结构。
+
+**待指挥会话验收的清单**
+
+- 上面的偏离 2（`"all"` 角色是否也要能测到端点/后台任务）。
+- 本批仍未连服务器、未跑 12.1 的 schema 演练与 12.2 的休眠上线验证——照旧留给部署前的指挥会话步骤。
+- Telegram 侧两个已知风险（规格已接受，仍列出以防遗漏）：(a) `getUpdates` 的 `offset` 在系统 bot 循环启动时
+  取最新（`_latest_update_offset`），worker 重启期间的按钮点击会被丢弃而不是重放——规格 6.3 已判定"宁丢不
+  重放"；(b) `answerCallbackQuery` 必须在 15 秒内完成，本批把"确认执行"的实际 apply 放进
+  `asyncio.create_task` 的后台任务，保证 `answerCallbackQuery` 本身不被 `execute_proposal`（可能较慢的一次
+  `to_thread` 调用）拖住，但如果 `handle_callback` 本身（第 2 批库，包含一次计划重建）异常慢，`answer` 仍会被
+  拖住——目前没有对 `handle_callback` 单独设超时，实测第 2 批的 G-B 路径不触碰交易所快照，预期耗时是普通 DB
+  查询量级，但没有一个显式的超时兜底。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条

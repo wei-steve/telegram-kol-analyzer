@@ -51,6 +51,13 @@ KNOWN_BLOCKING_CALLS = frozenset(
         " -> _log_system_operator_callback_processed",
         "telegram_bot_commands.run_system_operator_bot_command_loop"
         " -> _message_is_from_alert_chat",
+        # Phase 3 remediation dispatch: one ``str.split``/``.lower`` on a
+        # string already in memory, same shape as ``_command_name`` above --
+        # names /fix, /oncall_off, /oncall_on so the loop can route to
+        # ``asyncio.to_thread``-wrapped work; no session, no client, no
+        # network. Reviewed by hand for the phase-3 oncall remediation work.
+        "telegram_bot_commands.run_system_operator_bot_command_loop"
+        " -> _is_oncall_remediation_command",
         # A-9 routes /choose and /dismiss from this loop. Naming the command
         # is one ``split`` and one ``lower`` on a string already in memory --
         # the same call the sibling callback loop above is already allowed to

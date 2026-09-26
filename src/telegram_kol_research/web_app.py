@@ -291,11 +291,18 @@ from telegram_kol_research.strategy_alerts import (
 from telegram_kol_research.config import (
     MessageOperationSupervisorConfig,
     MultiTargetManagementConfig,
+    OncallRemediationConfig,
     RuntimeIncidentConfig,
     load_message_operation_supervisor_config,
     load_multi_target_management_config,
+    load_oncall_remediation_config,
     load_runtime_incident_config,
     message_operation_supervisor_policy_status,
+)
+from telegram_kol_research.oncall_remediation import register_proposal_request
+from telegram_kol_research.oncall_remediation_runtime import (
+    OncallRemediationWiring,
+    run_oncall_remediation_background_loop,
 )
 from telegram_kol_research.message_operation_supervisor import (
     build_message_operation_coverage_snapshot,
@@ -432,6 +439,7 @@ RUNTIME_ROLE_SINGLETON_TASKS = {
             "lifecycle_monitor",
             "message_operation_supervisor",
             "message_processing_worker",
+            "oncall_remediation_background",
             "position_snapshot_startup",
             "runtime_incident_notification",
             "source_message_deletion_worker",
@@ -5750,6 +5758,7 @@ def create_web_app(
     position_snapshot_now_provider=None,
     position_snapshot_refresh_seconds: float = 5.0,
     position_snapshot_stale_seconds: float = 30.0,
+    oncall_remediation_config: OncallRemediationConfig | None = None,
 ) -> FastAPI:
     """Create the minimal FastAPI app used by the web command."""
 
@@ -6213,6 +6222,21 @@ def create_web_app(
                                 deepcoin_client_factory=(
                                     app.state.deepcoin_client_factory
                                 ),
+                                oncall_remediation=(
+                                    OncallRemediationWiring(
+                                        config=app.state.oncall_remediation_config,
+                                        session_factory=app.state.session_factory,
+                                        deepcoin_client_factory=(
+                                            app.state.deepcoin_client_factory
+                                        ),
+                                        group_config_provider=(
+                                            lambda: app.state.group_config
+                                        ),
+                                        now_provider=app.state.now_provider,
+                                    )
+                                    if app.state.oncall_remediation_active
+                                    else None
+                                ),
                             ),
                             session_factory=app.state.session_factory,
                             runtime_config=app.state.runtime_incident_config,
@@ -6226,6 +6250,44 @@ def create_web_app(
                             "system_operator_bot_command_task"
                         )
                     )
+            if (
+                runtime_role_starts_singleton_task(
+                    app.state.runtime_role, "oncall_remediation_background"
+                )
+                and app.state.oncall_remediation_active
+            ):
+                remediation_config = app.state.oncall_remediation_config
+                if remediation_config.approve_downgrade_reason:
+                    logger.warning(
+                        "Oncall remediation approve mode downgraded to shadow: %s",
+                        remediation_config.approve_downgrade_reason,
+                    )
+                logger.info(
+                    "Oncall remediation background task starting effective_mode=%s",
+                    remediation_config.effective_mode,
+                )
+                app.state.oncall_remediation_background_task = asyncio.create_task(
+                    _supervise_restartable_background_task(
+                        "oncall_remediation_background_task",
+                        lambda: run_oncall_remediation_background_loop(
+                            config=app.state.oncall_remediation_config,
+                            session_factory=app.state.session_factory,
+                            deepcoin_client_factory=app.state.deepcoin_client_factory,
+                            group_config_provider=lambda: app.state.group_config,
+                            bot_config=app.state.system_operator_bot_config,
+                            now_provider=app.state.now_provider,
+                            wake_event=app.state.oncall_remediation_wake_event,
+                        ),
+                        session_factory=app.state.session_factory,
+                        runtime_config=app.state.runtime_incident_config,
+                        supervision=_task_supervision(
+                            app, "oncall_remediation_background_task"
+                        ),
+                    )
+                )
+                app.state.oncall_remediation_background_task.add_done_callback(
+                    _log_background_task_result("oncall_remediation_background_task")
+                )
             await ensure_message_processing_worker_mode()
             if (
                 runtime_role_starts_singleton_task(
@@ -6545,6 +6607,18 @@ def create_web_app(
                 except asyncio.CancelledError:
                     pass
                 app.state.system_operator_bot_command_task = None
+            oncall_remediation_background_task = (
+                app.state.oncall_remediation_background_task
+            )
+            if oncall_remediation_background_task is not None:
+                oncall_remediation_background_task.cancel()
+                try:
+                    await oncall_remediation_background_task
+                except asyncio.CancelledError:
+                    pass
+                except Exception:
+                    pass
+                app.state.oncall_remediation_background_task = None
             management_notification_task = app.state.strategy_management_notification_task
             if management_notification_task is not None:
                 management_notification_task.cancel()
@@ -6669,6 +6743,29 @@ def create_web_app(
         if system_operator_bot_enabled(loaded_notification_bot_config)
         else None
     )
+    app.state.oncall_remediation_config = (
+        oncall_remediation_config
+        if oncall_remediation_config is not None
+        else (
+            load_oncall_remediation_config(env_file_paths=[])
+            if split_runtime
+            else load_oncall_remediation_config()
+        )
+    )
+    # Phase-3 remediation is worker-only and defaults to fully off (spec
+    # 4.6/9): no configured token, or effective_mode == "off" (which also
+    # covers "approve" silently downgraded to "shadow" for lack of an
+    # approver -- that downgrade still needs a token+non-off mode to run at
+    # all). Gating this once here, rather than re-deriving it at each call
+    # site, is what keeps the endpoint-registration, background-task-start,
+    # and system-bot-callback-wiring decisions below in agreement.
+    app.state.oncall_remediation_active = bool(
+        app.state.runtime_role == "worker"
+        and app.state.oncall_remediation_config.token
+        and app.state.oncall_remediation_config.effective_mode != "off"
+    )
+    app.state.oncall_remediation_wake_event = asyncio.Event()
+    app.state.oncall_remediation_background_task = None
 
     async def default_runtime_agent_telegram_evidence_runner(
         channel: str,
@@ -7841,6 +7938,108 @@ def create_web_app(
             return {"accepted": True, "captured": captured}
         finally:
             app.state.monitor_incident_capture_lock.release()
+
+    if resolved_runtime_role == "worker":
+        # Phase 3 (docs/plans/2026-09-26-codex-oncall-phase3-spec.md 4.3): a
+        # zero-privilege registration endpoint for the oncall service. It is
+        # only ever registered on the worker process, mirroring
+        # ``require_monitor_capture_auth`` -- and even then it 404s (rather
+        # than 401/403) on any auth failure, so an unauthenticated probe
+        # cannot distinguish "wrong token" from "route does not exist".
+        @app.post("/internal/oncall/remediation/proposals")
+        async def api_internal_oncall_remediation_proposals(request: Request):
+            client_host = request.client.host if request.client is not None else ""
+            remediation_config = app.state.oncall_remediation_config
+            configured_token = remediation_config.token
+            supplied_token = request.headers.get("x-oncall-remediation-token", "")
+            if (
+                client_host not in {"127.0.0.1", "::1"}
+                or "x-forwarded-for" in request.headers
+                or not configured_token
+                or not hmac.compare_digest(configured_token, supplied_token)
+                or remediation_config.effective_mode == "off"
+            ):
+                raise HTTPException(status_code=404, detail="not found")
+
+            raw_content_length = request.headers.get("content-length")
+            try:
+                content_length = (
+                    int(raw_content_length) if raw_content_length is not None else None
+                )
+            except ValueError:
+                content_length = -1
+            if content_length is not None and not 0 <= content_length <= 2048:
+                raise HTTPException(
+                    status_code=413, detail="invalid remediation proposal request"
+                )
+            chunks: list[bytes] = []
+            body_size = 0
+            async for chunk in request.stream():
+                body_size += len(chunk)
+                if body_size > 2048:
+                    raise HTTPException(
+                        status_code=413, detail="invalid remediation proposal request"
+                    )
+                chunks.append(chunk)
+            body = b"".join(chunks)
+
+            def strict_object(pairs):
+                result: dict[str, Any] = {}
+                for key, value in pairs:
+                    if key in result:
+                        raise ValueError("duplicate key")
+                    result[key] = value
+                return result
+
+            try:
+                payload = json.loads(body.decode("utf-8"), object_pairs_hook=strict_object)
+                if not isinstance(payload, dict) or set(payload) != {
+                    "case_key",
+                    "case_no",
+                    "raw_message_id",
+                }:
+                    raise ValueError("invalid fields")
+                case_key = payload["case_key"]
+                case_no = payload["case_no"]
+                raw_message_id = payload["raw_message_id"]
+                if not isinstance(case_key, str) or not 1 <= len(case_key) <= 64:
+                    raise ValueError("invalid case_key")
+                if (
+                    isinstance(case_no, bool)
+                    or not isinstance(case_no, int)
+                    or case_no <= 0
+                ):
+                    raise ValueError("invalid case_no")
+                if (
+                    isinstance(raw_message_id, bool)
+                    or not isinstance(raw_message_id, int)
+                    or raw_message_id <= 0
+                ):
+                    raise ValueError("invalid raw_message_id")
+            except (TypeError, ValueError, UnicodeError, json.JSONDecodeError):
+                raise HTTPException(
+                    status_code=400, detail="invalid remediation proposal request"
+                )
+
+            # Registration only writes one row; it never touches the
+            # exchange or builds a plan (that happens later, off the request
+            # path, in the background loop -- spec 4.3: "同步只做登记，不做计算").
+            result = await asyncio.to_thread(
+                register_proposal_request,
+                app.state.session_factory,
+                config=remediation_config,
+                case_key=case_key,
+                case_no=case_no,
+                raw_message_id=raw_message_id,
+                now=app.state.now_provider(),
+            )
+            wake_event = app.state.oncall_remediation_wake_event
+            if wake_event is not None:
+                wake_event.set()
+            return JSONResponse(
+                status_code=202 if result.created else 200,
+                content={"proposal_id": result.proposal_id, "state": result.state},
+            )
 
     @app.get("/api/management-batches")
     def api_management_batches(chat_id: int, limit: int = 50):

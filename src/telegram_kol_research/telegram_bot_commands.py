@@ -15,6 +15,11 @@ import httpx
 from sqlalchemy.orm import sessionmaker
 
 from telegram_kol_research.group_config import GroupConfig
+from telegram_kol_research.oncall_remediation import handle_callback, handle_text_command
+from telegram_kol_research.oncall_remediation_runtime import (
+    OncallRemediationWiring,
+    execute_proposal_locked,
+)
 from telegram_kol_research.strategy_alerts import StrategyAlertConfig
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
@@ -82,6 +87,18 @@ EXPIRY_LIFECYCLE_STATUS_LABELS = {
     "invalidated": "已失效",
 }
 logger = logging.getLogger(__name__)
+
+# Tasks spawned for a "confirm execute" callback (orm:<id>:2:<token>) must
+# outlive the callback-handling call that spawns them without being garbage
+# collected -- asyncio only keeps a weak reference to a bare create_task()
+# result. This module-level set is that strong reference; each task removes
+# itself on completion.
+_ONCALL_REMEDIATION_EXECUTION_TASKS: set[asyncio.Task] = set()
+
+
+def _track_oncall_remediation_execution_task(task: asyncio.Task) -> None:
+    _ONCALL_REMEDIATION_EXECUTION_TASKS.add(task)
+    task.add_done_callback(_ONCALL_REMEDIATION_EXECUTION_TASKS.discard)
 
 
 @dataclass(frozen=True, slots=True)
@@ -324,12 +341,187 @@ async def run_telegram_bot_command_loop(
             await asyncio.sleep(poll_interval_seconds)
 
 
+async def _handle_oncall_remediation_callback(
+    client: httpx.AsyncClient,
+    base_url: str,
+    *,
+    callback: dict[str, Any],
+    message: dict[str, Any],
+    chat_id: str,
+    oncall_remediation: OncallRemediationWiring | None,
+) -> None:
+    """Route one ``orm:...`` callback. Never reaches the generic "未识别的
+    操作" fallback -- see ``run_system_operator_bot_command_loop``."""
+
+    callback_query_id = str(callback.get("id") or "")
+    message_id = int(message.get("message_id") or 0)
+
+    if oncall_remediation is None:
+        await _answer_callback_query(
+            client, base_url, callback_query_id=callback_query_id, text="补救未启用"
+        )
+        return
+
+    from_user = callback.get("from") or {}
+    try:
+        from_user_id = int(from_user.get("id") or 0)
+    except (TypeError, ValueError):
+        from_user_id = 0
+    data = str(callback.get("data") or "")
+
+    try:
+        outcome = await asyncio.to_thread(
+            handle_callback,
+            oncall_remediation.session_factory,
+            config=oncall_remediation.config,
+            chat_id=chat_id,
+            from_user_id=from_user_id,
+            data=data,
+            now=oncall_remediation.now_provider(),
+        )
+    except Exception:
+        logger.exception("oncall remediation callback handling failed")
+        await _answer_callback_query(
+            client, base_url, callback_query_id=callback_query_id, text="内部错误"
+        )
+        return
+
+    answer_text = outcome.text if outcome.text else ("已处理" if outcome.accepted else "已拒绝")
+    await _answer_callback_query(
+        client, base_url, callback_query_id=callback_query_id, text=answer_text[:180]
+    )
+
+    if message_id and outcome.text:
+        reply_markup = _keyboard_to_reply_markup(outcome.keyboard)
+        if reply_markup is None and outcome.remove_keyboard:
+            reply_markup = {"inline_keyboard": []}
+        try:
+            await _edit_message_text(
+                client,
+                base_url,
+                chat_id=chat_id,
+                message_id=message_id,
+                text=outcome.text,
+                reply_markup=reply_markup,
+            )
+        except httpx.HTTPStatusError:
+            logger.warning("oncall remediation callback message edit failed")
+    elif message_id and outcome.remove_keyboard:
+        try:
+            await client.post(
+                f"{base_url}/editMessageReplyMarkup",
+                json={
+                    "chat_id": chat_id,
+                    "message_id": message_id,
+                    "reply_markup": {"inline_keyboard": []},
+                },
+            )
+        except httpx.HTTPStatusError:
+            logger.warning("oncall remediation callback keyboard clear failed")
+
+    if outcome.execute_proposal_id is not None:
+        task = asyncio.create_task(
+            _run_oncall_remediation_execution(
+                oncall_remediation,
+                proposal_id=outcome.execute_proposal_id,
+                bot_client=client,
+                base_url=base_url,
+                chat_id=chat_id,
+            )
+        )
+        _track_oncall_remediation_execution_task(task)
+
+
+async def _run_oncall_remediation_execution(
+    oncall_remediation: OncallRemediationWiring,
+    *,
+    proposal_id: int,
+    bot_client: httpx.AsyncClient,
+    base_url: str,
+    chat_id: str,
+) -> None:
+    """Background execution for a confirmed proposal (G-C + apply).
+
+    Runs detached from the callback that triggered it -- ``answerCallbackQuery``
+    has already been sent, so Telegram's 15s SLA is satisfied before this
+    starts. ``execute_proposal_locked`` serializes with any other in-flight
+    execution in this process (spec 4.4 C1)."""
+
+    try:
+        outcome = await execute_proposal_locked(
+            oncall_remediation.session_factory,
+            config=oncall_remediation.config,
+            proposal_id=proposal_id,
+            deepcoin_client_factory=oncall_remediation.deepcoin_client_factory,
+            group_config=oncall_remediation.group_config_provider(),
+            now_provider=oncall_remediation.now_provider,
+        )
+    except Exception:
+        logger.exception(
+            "oncall remediation execute_proposal failed proposal_id=%s", proposal_id
+        )
+        return
+    if outcome.text:
+        try:
+            await _send_message(bot_client, base_url, chat_id=chat_id, text=outcome.text)
+        except Exception:
+            logger.warning(
+                "oncall remediation result message failed to send proposal_id=%s",
+                proposal_id,
+            )
+
+
+def _keyboard_to_reply_markup(
+    keyboard: tuple[tuple[str, str], ...] | None,
+) -> dict[str, Any] | None:
+    if not keyboard:
+        return None
+    return {
+        "inline_keyboard": [
+            [{"text": label, "callback_data": data}] for label, data in keyboard
+        ]
+    }
+
+
+async def _handle_oncall_remediation_text_command(
+    *,
+    text: str,
+    chat_id: str,
+    from_user_id: int,
+    oncall_remediation: OncallRemediationWiring | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Returns ``(response_text, reply_markup)`` for ``/fix``/``/oncall_off``/
+    ``/oncall_on``. Never falls through to the generic command handler."""
+
+    if oncall_remediation is None:
+        return "补救未启用", None
+    try:
+        outcome = await asyncio.to_thread(
+            handle_text_command,
+            oncall_remediation.session_factory,
+            config=oncall_remediation.config,
+            chat_id=chat_id,
+            from_user_id=from_user_id,
+            text=text,
+            now=oncall_remediation.now_provider(),
+        )
+    except Exception:
+        logger.exception("oncall remediation text command failed")
+        return "内部错误", None
+    return outcome.text, _keyboard_to_reply_markup(outcome.keyboard)
+
+
+def _is_oncall_remediation_command(text: str) -> bool:
+    return _command_name(text) in {"fix", "oncall_off", "oncall_on"}
+
+
 async def run_system_operator_bot_command_loop(
     *,
     config: SystemOperatorBotConfig,
     session_factory: sessionmaker,
     deepcoin_client_factory=None,
     poll_interval_seconds: float = 1.0,
+    oncall_remediation: OncallRemediationWiring | None = None,
 ) -> None:
     """Handle commands sent to the dedicated system-operator bot."""
 
@@ -358,6 +550,16 @@ async def run_system_operator_bot_command_loop(
                         if not _message_is_from_alert_chat(message, chat_id):
                             continue
                         callback_data = str(callback.get("data") or "")
+                        if callback_data.startswith("orm:"):
+                            await _handle_oncall_remediation_callback(
+                                client,
+                                base_url,
+                                callback=callback,
+                                message=message,
+                                chat_id=chat_id,
+                                oncall_remediation=oncall_remediation,
+                            )
+                            continue
                         _log_system_operator_callback_processed(
                             update_id=update_id,
                             callback_data=callback_data,
@@ -413,6 +615,36 @@ async def run_system_operator_bot_command_loop(
                     if not _message_is_from_alert_chat(message, chat_id):
                         continue
                     text = str(message.get("text") or "").strip()
+                    if _is_oncall_remediation_command(text):
+                        from_user = message.get("from") or {}
+                        try:
+                            from_user_id = int(from_user.get("id") or 0)
+                        except (TypeError, ValueError):
+                            from_user_id = 0
+                        response_text, reply_markup = (
+                            await _handle_oncall_remediation_text_command(
+                                text=text,
+                                chat_id=chat_id,
+                                from_user_id=from_user_id,
+                                oncall_remediation=oncall_remediation,
+                            )
+                        )
+                        if response_text:
+                            if reply_markup is not None:
+                                await client.post(
+                                    f"{base_url}/sendMessage",
+                                    json={
+                                        "chat_id": chat_id,
+                                        "text": response_text,
+                                        "disable_web_page_preview": True,
+                                        "reply_markup": reply_markup,
+                                    },
+                                )
+                            else:
+                                await _send_message(
+                                    client, base_url, chat_id=chat_id, text=response_text
+                                )
+                        continue
                     command_client_factory = (
                         deepcoin_client_factory
                         if deepcoin_client_factory and _command_name(text) == EXPIRY_EXPIRE_CANCEL_COMMAND
