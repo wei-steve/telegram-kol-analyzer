@@ -1858,6 +1858,40 @@ def _is_informational_management_candidate(candidate: SignalCandidate) -> bool:
     return str(candidate.management_action or "").strip().lower() == "hold_update"
 
 
+def group_and_kol_auto_trade_currently_enabled(
+    group_config: GroupConfig,
+    *,
+    raw_message: RawMessage,
+    source: Source | None,
+    settings,
+) -> bool:
+    """Whether this group/KOL is, right now, configured for live auto-trade.
+
+    This is the exact check ``_auto_process_management_signal`` below already
+    makes (``apply_trading_settings_to_group_config`` then
+    ``_resolve_runtime_config(...)["trading_mode"] == "auto_trade"``),
+    factored out into a public predicate rather than duplicated, for
+    ``oncall_remediation.py``'s gate A3
+    (docs/plans/2026-09-26-codex-oncall-phase3-spec.md section 4.4). Adding
+    this function does not change ``_auto_process_management_signal``'s
+    behaviour -- that function is left untouched and still computes its own
+    two distinct skip reasons inline.
+    """
+
+    runtime_group_config = apply_trading_settings_to_group_config(
+        group_config, settings
+    )
+    runtime_config = _resolve_runtime_config(
+        runtime_group_config,
+        raw_message=raw_message,
+        source=source,
+    )
+    return (
+        runtime_config is not None
+        and runtime_config["trading_mode"] == "auto_trade"
+    )
+
+
 def _auto_process_management_signal(
     session_factory: sessionmaker,
     *,

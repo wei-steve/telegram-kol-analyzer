@@ -490,6 +490,167 @@ worker / web / ingest 内存里用到的代码一行没变，因此**没有走 `
   范围；改用手工构造一个与真实计划器输出同形的 `plan-only` 批次 + 打桩 `plan_strategy_management_batch`/
   `execute_management_batch`，只验证本批引入的 scope 线路（两次计划重建 + 最终交易所快照校验共用同一 scope）。
 
+### 9.2 阶段 3 第 2 批（2026-09-26，实现子代理，`claude/codex-oncall-phase3` 分支，**未合并未部署**）
+
+规格：`docs/plans/2026-09-26-codex-oncall-phase3-spec.md` 第 4.4/4.5/4.6/4.7/9 节。
+第 2 批做 worker 侧核心逻辑（三张新表、新配置、确定性闸门、状态机、文案、熔断），**不接线**——
+不碰 `web_app.py`、`telegram_bot_commands.py`、任何 `oncall_{service,alerts,state,detector,casefile,codex,codex_runner}.py`；
+第 3 批负责把它接到回环端点、worker 后台任务、系统 bot 回调循环（均用 `asyncio.to_thread` 调用本批的同步函数）。
+
+**交付物**
+
+- `src/telegram_kol_research/models.py`：新增三张表 `oncall_remediation_proposals`（状态机 + 提案快照，
+  `(raw_message_id, action_kind, lifecycle_id)` 上的部分唯一索引，谓词
+  `state IN ('executing','succeeded','uncertain')`）、`oncall_remediation_events`（只 INSERT 的审计流水，
+  `proposal_id` 改为**可空**——见「偏离」）、`oncall_remediation_control`（单行 `CHECK(id=1)` 总闸/熔断）。
+  三张表均由 `db.py:889` 起的 `Base.metadata.create_all` 自动建表（纯新增表，未在
+  `EXPLICIT_RECOGNITION_EXECUTION_TABLES` 白名单里，不受其排除逻辑影响）；未发现按固定表名列表做逐字断言的校验器，只有
+  枚举式（`assert 'ix_...' in index_list(...)`）测试，新表新索引不会撞上它们。
+- `src/telegram_kol_research/config.py`：新增 `OncallRemediationConfig`（frozen dataclass）与
+  `load_oncall_remediation_config(environ=None, env_file_paths=None)`（沿用本文件既有 loader 的参数命名惯例
+  `environ`，规格建议签名里的 `env` 只是示意）。`effective_mode` 属性实现"`approve` 且无批准人 -> 自动降级
+  `shadow`"；`TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID` 用与 `system_operator_bot.py:195`/`oncall_service.py:246`
+  相同的方式读取（原始 `env.get`，无解析算法可复用）——见「偏离」说明为什么不能直接 import
+  `system_operator_bot.load_system_operator_bot_config`。
+- `src/telegram_kol_research/auto_trade_execution.py`：新增**公开**函数
+  `group_and_kol_auto_trade_currently_enabled(group_config, *, raw_message, source, settings)`，把
+  `_auto_process_management_signal`（:1877-1888）已有的
+  `apply_trading_settings_to_group_config` + `_resolve_runtime_config(...)["trading_mode"] == "auto_trade"`
+  判定抽成一个可复用的公开谓词；`_auto_process_management_signal` 本身未改一行，行为不变
+  （`tests/test_auto_trade_execution.py` 97 个用例原样通过）。
+- `src/telegram_kol_research/oncall_remediation.py`（新模块，worker 侧，不在值守边界测试的 `ONCALL_MODULES` 集合里——
+  该测试文件在第 1 批之前就已预留了 `WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER = ("oncall_remediation.py",)`
+  与对应的 forbidden-fragment 断言，本批未改这份测试就直接通过）：G-A/G-B/G-C 三道闸门、提案/审批/执行状态机、
+  中文文案、限额与熔断。公开函数签名见下方"给第 3 批"清单。
+
+**你核实过的事实（file:line）**
+
+- `raw_messages.posted_at`/`deleted_at`：`models.py:61`（`posted_at: DateTime, nullable=True, index=True`）、
+  `models.py:73`（`deleted_at: DateTime, nullable=True`）。库内无 DateTime 的 `TypeDecorator`，SQLite 往返后
+  一律是 **naive UTC**；本模块的 `_naive_utc()` 复刻了仓库既有惯例（如 `execution_bindings.py:5022`、
+  `entry_revision_executor.py:828` 的 `value.astimezone(UTC).replace(tzinfo=None)`）。
+- A3 复用的函数：`auto_trade_execution.py` 新增的 `group_and_kol_auto_trade_currently_enabled`，其判定逻辑与
+  `_auto_process_management_signal`（`auto_trade_execution.py:1877-1888`）完全一致；`_resolve_runtime_config`
+  本身仍是私有函数，从 `recovery_scan.py` 原样导入（`auto_trade_execution.py:95`），未复制其内部逻辑。
+- A7 在 `runtime_incidents` 上用的索引：`runtime_incident_affected_messages.raw_message_id`
+  （列级 `index=True`，自动生成 `ix_runtime_incident_affected_messages_raw_message_id`）联结
+  `runtime_incidents.id`（主键）；`EXPLAIN QUERY PLAN` 实测两跳都是 `SEARCH ... USING INDEX`/
+  `USING INTEGER PRIMARY KEY`，无 `SCAN`（`tests/test_oncall_remediation.py::test_new_query_shapes_have_no_full_table_scan`
+  钉住，含本模块全部新 SQL 形状：按 `raw_message_id` 查非终态提案、按 `state='executing'` 查在途提案、
+  按 `lifecycle_id` 取最近 `executing_at`、按 `executing_at`/`proposed_at` 区间计数、按 `proposal_id` 取事件流水、
+  按 `raw_message_id` 查批次 `reason_code`、上述 `runtime_incident` 两跳联结）。
+- 批次状态语义（`strategy_management_batches.py`/`strategy_management_executor.py`，结合
+  `models.py:2179-2181` 的 `ACTIVE_MANAGEMENT_BATCH_SQL_PREDICATE`）：终态成功 = `succeeded`/`resolved`；
+  终态失败（从未提交）= `blocked`；提交过/结果不明、需人工 = `partial_failed`/`submit_unknown`/
+  `recovery_required`；仍在途 = `ready`/`executing`/`reserved`/`submitted`/`reconciling`/`protection_ready`。
+  `execute_management_batch` 的 docstring（`strategy_management_executor.py:1400`）原文：
+  `"Submit close legs by durable batch ID; exchange truth closes positions later."`——本模块因此不把
+  `apply_fn` 的同步返回值当终态，`finalize_executing_proposals` 才是读批次最终状态的地方。
+- 未发现任何按固定表名/列名集合做逐字比对的 schema 校验器（`grep sqlite_master`/
+  `EXPLICIT_RECOGNITION_EXECUTION_TABLES` 命中见上）；`production_safety_monitor.py` 未对表数量做断言。
+
+**`action_snapshot_json` 保留字段与典型大小**
+
+`_build_action_snapshot()`：`action_id`、`fingerprint`、`action_kind`、`raw_message_id`、`lifecycle_id`、
+`strategy_instance_id`、`pos_ids`、`expected_effect`、`instrument_scope`、`instruction_item_id`、
+`candidate_id`、以及裁剪过的 `positions`（每条仓位只留 `pos_id`/`pos_side`/`size`/`avg_entry_price`，
+原始交易所行的其余字段——`cTime`、杠杆、保证金模式等——全部丢弃）。实测单仓位典型大小约 400-600 字节，
+CHECK 上限 8192 字节留了充足余量；`_bounded_json()` 对任何仍超限的写入做 fail-closed 截断
+（写一个 `{"_truncated": true}` 标记而不是让 INSERT 因 CHECK 失败而丢事务）。
+
+**测试命令与结果**
+
+```
+uv run python -B -m pytest tests/test_oncall_remediation.py tests/test_position_management_remediation_scope.py tests/test_position_management_remediation.py -q
+# 123 passed
+uv run python -B -m pytest tests/test_db_bootstrap.py tests/test_oncall_architecture_boundary.py tests/test_protection_ledger.py -q
+# 83 passed
+uv run python -B -m pytest tests/test_auto_trade_execution.py -q
+# 97 passed（新增公开函数未改动既有行为）
+uv run python -B -m pytest --collect-only -q
+# 9929 tests collected，0 collection errors（未跑全量，仅确认改动没有破坏任何模块的可导入性）
+```
+
+`tests/test_oncall_remediation.py` 共 83 个用例，覆盖：三张新表的 CHECK/部分唯一索引；`register_proposal_request`
+的幂等与拒绝；G-A 全通路成功案例（`full_exit`/`partial_take_profit`）；A1/A2/A3（消息删除、群未开自动交易）/
+`target_not_resolved`/A5（前驱未解决）/A6（`cancel_entry` 转换）/A6b（`shadow_planned`）/A7（九类原因参数化 + 一条
+经 `runtime_incidents` 联结的用例）/A8（三种窗口的 19/21、59/61、119/121 分钟边界）/A10/A11（冷却、日执行上限）/A12；
+G-B 的错会话、错用户、未配置批准人、令牌错误/复用/跨步骤、两种过期、忽略/取消不动主链路、回调数据超长、`/fix` 多余参数与
+只提示模式拒绝；G-C 的指纹不符（不调用 `apply_fn`）、执行时超窗、成功路径存批次号、`apply_fn` 抛异常分类为
+`failed`、单飞（另一笔 `executing` 时第二笔确认被拒）；`finalize_executing_proposals`/`recover_after_restart`/
+`expire_stale_proposals`；连续两次失败触发熔断并作废在途提案；`/oncall_off` 立即生效、`/oncall_on` 仅批准人可用且
+不改 `trading_settings`/`GroupConfig`；文案中文、有界、不含消息原文；`events` 表只追加的源码静态断言；非法状态迁移
+的 CAS 空操作；本模块全部新 SQL 形状的 `EXPLAIN QUERY PLAN` 无 `SCAN`。
+
+**偏离规格之处（含理由）**
+
+1. **`oncall_remediation_events.proposal_id` 改为可空**（models.py）。规格 4.5 原文把它写成非空外键，但
+   `/oncall_on`、`/oncall_off`（无在途提案时）、熔断跳闸这三个"写 events"的场景（规格 4.7/8.2 明确要求）本身
+   不属于任何一个提案；若坚持非空，这些事件要么插不进去，要么被迫挂在一个语义不相关的提案行上。允许
+   `proposal_id IS NULL` 表示"控制层面事件"，`_append_event` 与调用方都已适配。
+2. **`daily_proposal_cap`/`proposal_expiry_minutes`/`confirm_expiry_minutes` 不做环境变量**（config.py）。
+   规格 4.6 的环境变量表只列了五个（`DAILY_CAP`/`COOLDOWN_MINUTES`/`EXIT_WINDOW_MINUTES`/
+   `PARTIAL_TP_WINDOW_MINUTES`/`STOP_WINDOW_MINUTES`），而第 11 节用户裁定第 7 条对 30/30 分钟/2 分钟这三个数字
+   写的是"照用"，未给环境变量名；实现为 `OncallRemediationConfig` 的固定默认值（不可通过 env 覆盖），避免
+   凭空发明一个规格没有钉住名字的环境变量。
+3. **G-C 的"重跑 G-A 全部"排除了 A10/A11 对自身的计数**（`_run_gate_a(..., exclude_proposal_id=proposal_id)`）。
+   规格原文"再重跑 G-A 全部"若逐字理解，执行中的提案自己已经是 `executing`，会在 A10 撞上"已有 executing 提案"
+   而自我拒绝；`exclude_proposal_id` 是唯一能让"重跑闸门"这句话自洽的读法，正文已在 `_run_gate_a` 的 docstring
+   里写明。
+4. **C1 单飞用"同一数据库事务内计数 + CAS"实现，未引入 `asyncio.Lock`**。规格 4.4 C1 本就写"进程内
+   `asyncio.Lock` + 库内 `state='executing'` 计数双重判定"，`asyncio.Lock` 是第 3 批的职责（worker 事件循环里的
+   在途任务协调，本批没有事件循环可挂）；本批只交付库内那一半，并用两次真实并发确认互斥的测试钉住
+   （`test_single_flight_second_confirm_refused_while_one_is_executing`）。
+5. **A9（"目标仓位此刻仍在场"）退化为"`action.pos_ids` 非空"**，未对同一份快照重新断言逐个 `pos_id` 命中
+   live 持仓集合。理由：`build_position_management_remediation_plan` 产出的 `action.pos_ids` 本身就是同一次
+   快照里 `live_positions` 与入场腿精确匹配后的交集（`position_management_remediation.py:765-779`）——
+   在同一次 `plan` 结果对象上二次校验只是重复同一个布尔表达式，真正有意义的"防实现回归"检查应该独立于计划器再
+   打一次交易所快照做比对，但 G-C 的 C2/C4 已经通过"重建计划 + 指纹逐字相等"覆盖了这个风险（计划器若把一个
+   已消失的仓位错误地留在 `pos_ids` 里，`pos_ids`/`expected_effect`/`evidence` 任一变化都会改变
+   `fingerprint`，C2 会因此拒绝）。这点在你验收时如果认为不够，我建议的补救是在 `execute_proposal` 里对
+   `action.pos_ids` 相对 `apply_fn` 内部最终快照再做一次显式比对（`apply_position_management_remediation_action`
+   本身已经做——见 `_require_batch_matches_confirmed_action`），即本条实际上双重覆盖，只是没有被单独抽成
+   "A9 专属"的一段代码。
+6. **`finalize_executing_proposals` 对批次状态的分类比规格 6.3 写的更细**：规格原文只提到
+   "worker 在 executing 中途重启 -> uncertain（绝不重跑）"；本实现进一步区分"重启时已有
+   `management_batch_id`（继续跟随批次终态，不算中断）"与"重启时还没有批次号（apply 尚未返回，才算真正中断）"，
+   在正文与 spec 的表述里已作为"对规格的细化"写明（见模块内 `execute_proposal`/`recover_after_restart` 的
+   docstring）。
+7. **`_classify_apply_exception` 用"该消息在 executing 开始之后是否出现过 `execution_mode='live'` 批次"
+   而非规格 8.1 写的"批次是否进入过提交（plan-only）"来区分 `failed`/`uncertain`**。理由：`apply_fn`
+   （`apply_position_management_remediation_action`）在真正提交前会先把批次落成
+   `execution_mode='disabled', status='blocked'`（"plan-only"态），只有确认无误后才改 `execution_mode='live'`；
+   若异常发生在 plan-only 阶段之前/之中，本消息不会出现任何 `execution_mode='live'` 的批次，判 `failed`
+   是安全的（从未接近交易所写入）；若异常发生在提交前最后一步之后，批次已经是 `live`，判 `uncertain`
+   更保守。用 `execution_mode='live'` 而非"是否存在批次行"做判据，是因为 plan-only 批次本身也会在库里留下
+   一行，不能仅凭"有没有批次行"区分。
+
+**给第 3 批：公开函数最终签名**
+
+- `register_proposal_request(session_factory, *, config, case_key, case_no, raw_message_id, now) -> RegisterResult(proposal_id: int, state: str, created: bool)`
+- `compute_requested_proposal(session_factory, *, config, proposal_id, deepcoin_client, group_config, now, resolve_scope=resolve_remediation_scope, build_plan=build_position_management_remediation_plan, group_label: Callable[[int], str] | None = None) -> ProposalOutcome(proposal_id, state, refusal_reason, text, keyboard: tuple[tuple[str,str],...] | None, should_send: bool, breaker_tripped: bool)`
+  （`group_label` 传入 **chat_id**，不是 raw_message_id；第 3 批用 `telegram_bot_commands._group_label_by_chat_id` 包一层）
+- `record_proposal_message(session_factory, *, proposal_id, telegram_message_id) -> None`
+- `handle_callback(session_factory, *, config, chat_id, from_user_id, data, now) -> CallbackOutcome(proposal_id, accepted, text, keyboard, remove_keyboard, execute_proposal_id: int | None)`
+  （`execute_proposal_id` 非空即表示"请在后台调用 `execute_proposal`"）
+- `handle_text_command(session_factory, *, config, chat_id, from_user_id, text, now) -> CommandOutcome(accepted, text, proposal_id, keyboard)`
+- `execute_proposal(session_factory, *, config, proposal_id, deepcoin_client, group_config, now, apply_fn=apply_position_management_remediation_action, build_plan=..., resolve_scope=...) -> ExecutionOutcome(proposal_id, state: "executing"|"succeeded"|"failed"|"uncertain", management_batch_id, text, breaker_tripped)`
+  （返回 `state="executing"` 表示已提交、仍需 `finalize_executing_proposals` 跟踪终态；`text` 此时为 `None`）
+- `finalize_executing_proposals(session_factory, *, config, now, follow_timeout=timedelta(minutes=15)) -> list[FinalizeOutcome(proposal_id, state, text, breaker_tripped)]`
+- `recover_after_restart(session_factory, *, now) -> list[str]`（启动时调用一次，返回要发送的"结果未知"文本列表）
+- `expire_stale_proposals(session_factory, *, now) -> list[int]`（返回需要摘除内联键盘的 `telegram_message_id` 列表）
+
+**待指挥会话验收的清单**
+
+- 复核偏离 1（`events.proposal_id` 可空）是否可接受，或要求改为"控制事件另开一张表"。
+- 复核偏离 5（A9 退化）是否需要补一段独立于计划器的显式仓位再校验。
+- 第 3 批需要：把这些函数接到 `POST /internal/oncall/remediation/proposals`（4.3 的回环令牌校验）、worker 内
+  一个消费 `requested` 行的后台单飞任务（`asyncio.to_thread` 调 `compute_requested_proposal`）、系统 bot
+  `getUpdates` 循环里 `orm:` 前缀回调与 `/fix`/`/oncall_off`/`/oncall_on` 文本命令、启动时调用一次
+  `recover_after_restart`、一个定时任务调用 `finalize_executing_proposals`/`expire_stale_proposals`、以及
+  C1 单飞的进程内 `asyncio.Lock`（本批只交付了库内那一半，见偏离 4）。
+- 本批未连服务器、未跑 schema 演练（12.1 的 `VACUUM INTO` + bootstrap + `PRAGMA quick_check`），留给部署前。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条

@@ -823,3 +823,152 @@ def load_runtime_incident_config(
         ),
         monitor_capture_token=monitor_capture_token,
     )
+
+
+ONCALL_REMEDIATION_MODES = ("off", "shadow", "approve")
+
+# Fixed by user ruling 2026-09-26 (phase-3 spec section 11 item 7); not
+# environment-tunable, unlike the five knobs in ``load_oncall_remediation_config``.
+ONCALL_REMEDIATION_DAILY_PROPOSAL_CAP = 30
+ONCALL_REMEDIATION_PROPOSAL_EXPIRY_MINUTES = 30
+ONCALL_REMEDIATION_CONFIRM_EXPIRY_MINUTES = 2
+
+
+@dataclass(frozen=True, slots=True)
+class OncallRemediationConfig:
+    """Worker-side settings for the phase-3 human-approved remediation path.
+
+    See docs/plans/2026-09-26-codex-oncall-phase3-spec.md section 4.6. This
+    config only ever gates whether a proposal is computed/shown/executed; it
+    never changes ``groups.yaml`` or any auto-trade switch.
+    """
+
+    mode: str = "off"
+    token: str | None = None
+    approver_ids: frozenset[int] = frozenset()
+    system_chat_id: str = ""
+    daily_execution_cap: int = 10
+    cooldown_minutes: int = 10
+    exit_window_minutes: int = 60
+    partial_tp_window_minutes: int = 20
+    stop_window_minutes: int = 120
+    daily_proposal_cap: int = ONCALL_REMEDIATION_DAILY_PROPOSAL_CAP
+    proposal_expiry_minutes: int = ONCALL_REMEDIATION_PROPOSAL_EXPIRY_MINUTES
+    confirm_expiry_minutes: int = ONCALL_REMEDIATION_CONFIRM_EXPIRY_MINUTES
+
+    @property
+    def effective_mode(self) -> str:
+        """``approve`` with no configured approver silently degrades to ``shadow``.
+
+        Spec 4.6: "空 -> `approve` 自动降为 `shadow` 并在启动日志说明". This is
+        the property worker startup logging and every gate must read instead
+        of ``mode`` directly.
+        """
+
+        if self.mode == "approve" and not self.approver_ids:
+            return "shadow"
+        return self.mode
+
+    @property
+    def approve_downgrade_reason(self) -> str | None:
+        """Non-``None`` iff :attr:`effective_mode` silently downgraded ``mode``."""
+
+        if self.mode == "approve" and not self.approver_ids:
+            return (
+                "TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS is empty; "
+                "approve mode downgraded to shadow (no one could approve)"
+            )
+        return None
+
+
+def _parse_oncall_remediation_approver_ids(raw: str) -> frozenset[int]:
+    """Parse a comma-separated list of positive Telegram user ids.
+
+    Any single malformed entry invalidates the whole list (spec 4.6: "任何一项
+    非法 -> 整体视为空") -- this deliberately fails closed rather than
+    silently dropping the bad entry and keeping the rest.
+    """
+
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        return frozenset()
+    ids: set[int] = set()
+    for item in items:
+        if not re.fullmatch(r"[0-9]+", item):
+            return frozenset()
+        value = int(item)
+        if value <= 0:
+            return frozenset()
+        ids.add(value)
+    return frozenset(ids)
+
+
+def load_oncall_remediation_config(
+    environ: dict[str, str] | None = None,
+    env_file_paths: list[str | os.PathLike[str]] | None = None,
+) -> OncallRemediationConfig:
+    """Load worker-side remediation settings from ``/etc/telegram-kol-worker.env``.
+
+    ``environ`` follows the same ``Mapping[str, str] | None`` contract as the
+    other loaders in this module (a plain ``dict`` satisfies that; the more
+    permissive annotation is only in the phase-3 spec's suggested signature).
+    ``TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID`` is read the same way
+    ``system_operator_bot.load_system_operator_bot_config`` and
+    ``oncall_service.py`` already read it -- a raw string env lookup, not a
+    parsed/validated value -- because ``config.py`` cannot import
+    ``system_operator_bot`` (that module imports *this* one; importing it
+    back here would be circular), and there is no parsing algorithm to
+    duplicate: both existing call sites are `env.get(...)` one-liners.
+    """
+
+    paths = (
+        [".env", "config/telegram.env"] if env_file_paths is None else env_file_paths
+    )
+    env = dict(_load_env_file_values(paths) if paths else {})
+    env.update(os.environ if environ is None else environ)
+
+    raw_mode = str(env.get("TELEGRAM_KOL_ONCALL_REMEDIATION_MODE", "off")).strip().lower()
+    mode = raw_mode if raw_mode in ONCALL_REMEDIATION_MODES else "off"
+
+    raw_token = env.get("TELEGRAM_KOL_ONCALL_REMEDIATION_TOKEN")
+    token = (
+        raw_token
+        if raw_token is not None and re.fullmatch(r"[A-Za-z0-9_-]{32,128}", raw_token)
+        else None
+    )
+
+    approver_ids = _parse_oncall_remediation_approver_ids(
+        env.get("TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS", "")
+    )
+
+    def _bounded_int(env_key: str, default: int, *, low: int, high: int) -> int:
+        try:
+            value = int(env.get(env_key, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(value, high))
+
+    return OncallRemediationConfig(
+        mode=mode,
+        token=token,
+        approver_ids=approver_ids,
+        system_chat_id=str(env.get("TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID", "")).strip(),
+        daily_execution_cap=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_DAILY_CAP", 10, low=1, high=1000
+        ),
+        cooldown_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_COOLDOWN_MINUTES", 10, low=0, high=1440
+        ),
+        exit_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_EXIT_WINDOW_MINUTES", 60, low=1, high=1440
+        ),
+        partial_tp_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_PARTIAL_TP_WINDOW_MINUTES",
+            20,
+            low=1,
+            high=1440,
+        ),
+        stop_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_STOP_WINDOW_MINUTES", 120, low=1, high=1440
+        ),
+    )

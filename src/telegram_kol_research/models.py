@@ -4635,3 +4635,213 @@ class DeepcoinShadowDiff(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utc_now
     )
+
+
+# ---------------------------------------------------------------------------
+# Codex on-call remediation, phase 3 (docs/plans/2026-09-26-codex-oncall-phase3-spec.md
+# section 4.5). Three new, purely additive tables: a durable proposal/approval
+# state machine, its append-only audit trail, and a single-row kill switch.
+# Nothing here is read or written by the CLI/main execution path; only the
+# new worker module ``oncall_remediation.py`` touches them.
+# ---------------------------------------------------------------------------
+
+ONCALL_REMEDIATION_PROPOSAL_STATES = (
+    "requested",
+    "proposed",
+    "confirming",
+    "executing",
+    "succeeded",
+    "failed",
+    "uncertain",
+    "refused",
+    "expired",
+    "dismissed",
+    "cancelled",
+)
+
+# A message/intent/lifecycle triple may only have one non-terminal-or-settled
+# proposal alive at a time -- see spec 4.4 A10 ("each message, each intent,
+# gets remediated at most once in its life").
+ONCALL_REMEDIATION_ACTIVE_PROPOSAL_SQL_PREDICATE = (
+    "state IN ('executing', 'succeeded', 'uncertain')"
+)
+
+
+class OncallRemediationProposal(Base):
+    """One worker-computed remediation proposal for a missed management instruction.
+
+    Durable state machine for spec section 4: ``requested`` (registered by the
+    round-trip-only endpoint) -> ``proposed`` (gate G-A passed, action snapshot
+    frozen) -> ``confirming`` (first Telegram approval) -> ``executing`` (second
+    confirmation, gate G-C passed, apply in flight) -> one of
+    ``succeeded``/``failed``/``uncertain``; or ``refused``/``expired``/
+    ``dismissed``/``cancelled`` off the non-terminal states. State transitions
+    are all compare-and-swap (``UPDATE ... WHERE id = ? AND state = ?``);
+    ``oncall_remediation_events`` is the append-only audit trail for every gate
+    check and click. Nothing here overlaps the exchange-write tables
+    (``strategy_management_batches`` etc.) -- ``management_batch_id`` merely
+    points at the batch the promoted action produced, once one exists.
+    """
+
+    __tablename__ = "oncall_remediation_proposals"
+    __table_args__ = (
+        CheckConstraint(
+            "state IN ("
+            "'requested','proposed','confirming','executing','succeeded',"
+            "'failed','uncertain','refused','expired','dismissed','cancelled'"
+            ")",
+            name="ck_oncall_remediation_proposals_state",
+        ),
+        CheckConstraint(
+            "length(case_key) <= 64",
+            name="ck_oncall_remediation_proposals_case_key_length",
+        ),
+        CheckConstraint(
+            "action_snapshot_json IS NULL OR length(action_snapshot_json) <= 8192",
+            name="ck_oncall_remediation_proposals_action_snapshot_bounded",
+        ),
+        CheckConstraint(
+            "result_json IS NULL OR length(result_json) <= 4096",
+            name="ck_oncall_remediation_proposals_result_bounded",
+        ),
+        Index(
+            "uq_oncall_remediation_proposals_active_target",
+            "raw_message_id",
+            "action_kind",
+            "lifecycle_id",
+            unique=True,
+            sqlite_where=text(ONCALL_REMEDIATION_ACTIVE_PROPOSAL_SQL_PREDICATE),
+        ),
+        Index("ix_oncall_remediation_proposals_raw_message_id", "raw_message_id"),
+        Index("ix_oncall_remediation_proposals_state", "state"),
+        Index(
+            "ix_oncall_remediation_proposals_lifecycle_executing_at",
+            "lifecycle_id",
+            "executing_at",
+        ),
+        Index(
+            "ix_oncall_remediation_proposals_executing_at",
+            "executing_at",
+        ),
+        Index(
+            "ix_oncall_remediation_proposals_proposed_at",
+            "proposed_at",
+        ),
+        Index(
+            "ix_oncall_remediation_proposals_telegram_message_id",
+            "telegram_message_id",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    case_key: Mapped[str] = mapped_column(String(64), nullable=False)
+    case_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    raw_message_id: Mapped[int] = mapped_column(
+        ForeignKey("raw_messages.id"), nullable=False
+    )
+    lifecycle_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    action_kind: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    action_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    action_fingerprint: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
+    action_snapshot_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    scope_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    state: Mapped[str] = mapped_column(
+        String(16),
+        nullable=False,
+        default="requested",
+        server_default=sql_text("'requested'"),
+    )
+    refusal_reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    step1_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    step2_token_hash: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    telegram_message_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    approver_user_id: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    proposed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    approved_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    confirmed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    executing_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    finished_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    management_batch_id: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True
+    )
+    result_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+
+
+class OncallRemediationEvent(Base):
+    """Append-only audit trail for the remediation state machine.
+
+    INSERT-only by construction: no code path in this repository issues
+    UPDATE or DELETE against this table (``oncall_remediation.py``'s
+    ``_append_event`` is the sole writer, and
+    tests/test_oncall_remediation.py asserts this statically). See spec 4.5.
+    """
+
+    __tablename__ = "oncall_remediation_events"
+    __table_args__ = (
+        CheckConstraint(
+            "detail_json IS NULL OR length(detail_json) <= 2048",
+            name="ck_oncall_remediation_events_detail_bounded",
+        ),
+        Index(
+            "ix_oncall_remediation_events_proposal_id", "proposal_id", "at"
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # Nullable: a proposal-scoped gate check sets this, but a global control
+    # action (/oncall_on, /oncall_off with nothing in flight) is not about
+    # any one proposal -- see oncall_remediation.py's handle_text_command.
+    proposal_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("oncall_remediation_proposals.id"), nullable=True
+    )
+    at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    actor: Mapped[str] = mapped_column(String(64), nullable=False)
+    event: Mapped[str] = mapped_column(String(64), nullable=False)
+    gate: Mapped[Optional[str]] = mapped_column(String(8), nullable=True)
+    check: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    outcome: Mapped[str] = mapped_column(String(32), nullable=False)
+    detail_json: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+
+class OncallRemediationControl(Base):
+    """Single-row runtime kill switch and circuit breaker for remediation.
+
+    Exactly one row (``id = 1``). ``/oncall_off``/``/oncall_on`` and the
+    circuit breaker (two consecutive failed/uncertain executions) both write
+    it; nothing else does.
+    """
+
+    __tablename__ = "oncall_remediation_control"
+    __table_args__ = (
+        CheckConstraint("id = 1", name="ck_oncall_remediation_control_singleton"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True, server_default=sql_text("'1'")
+    )
+    changed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)
+    changed_by: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    reason: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("'0'")
+    )
+    breaker_tripped_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
