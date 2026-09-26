@@ -1,0 +1,20 @@
+# Installed as /etc/logrotate.d/rsyslog on the production server.
+# The server had no rotation for rsyslog's files, so /var/log/messages grew
+# from 2026-06-24 to 1.2 GB. See docs/plans/2026-09-26-server-disk-usage-analysis.md.
+/var/log/cron
+/var/log/maillog
+/var/log/messages
+/var/log/secure
+/var/log/spooler
+{
+    daily
+    rotate 14
+    maxsize 200M
+    compress
+    missingok
+    notifempty
+    sharedscripts
+    postrotate
+        /usr/bin/systemctl kill -s HUP rsyslog.service >/dev/null 2>&1 || true
+    endscript
+}

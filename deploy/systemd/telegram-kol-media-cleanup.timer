@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram KOL media cleanup daily
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=telegram-kol-media-cleanup.service
+
+[Install]
+WantedBy=timers.target
