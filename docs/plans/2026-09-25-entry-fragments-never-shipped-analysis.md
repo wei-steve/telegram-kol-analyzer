@@ -276,3 +276,24 @@ if existing is not None:
 | 窗口口径 ±30 分钟 / 每侧 20 条 | `entry_assembly_admission.py:46-47` |
 | 种子对已存在定义零效果 | `prompt_registry.py:195-203` |
 | 原始设计与计划 | `docs/archive/plans/2026-08-08-adjacent-entry-message-assembly{,-design}.md` |
+
+## 5. 用户裁定（2026-09-26）
+
+第 3 节末尾列的三件待批事项，用户已裁定（经调度会话转达）：
+
+| 事项 | 裁定 | 状态 |
+|---|---|---|
+| ① 在【新开仓前置仓位指令】段落加 `leg_allocation` 规则：「两个点位各半仓」= 整单正常仓位分两腿，**不得**输出 `risk_multiplier = 0.5` | **批准** | **延后约两天** |
+| ② 清理 raw 12769 那条反向 `entry_preamble`（`entry_preambles.id = 9`，`risk_multiplier = 0.5`，`status = pending`），按 L3 生产数据修复走：保留备份、`PRAGMA quick_check`、受影响表前后计数 | **批准** | **延后约两天** |
+| ③ 2.6 的两个顺手发现（`entry_context` 幻觉率、模型违反「轻仓」规则）另立专题 | 以后再说 | 不开工 |
+
+**为什么延后：** 「首次分析四分类」那条线刚在 2026-09-25 03:26 发布提示词 v9，
+需要攒两天真实数据做第二次测量。现在动提示词会污染它的观测数据——
+而 ① 恰恰是一次提示词改动。② 一并延后，两件事同批做。
+
+**开工信号：** 等调度会话通知，不要自行开始。
+
+**延后期间不要做的事：** 不改 `trading.analysis.shared` 的任何版本，
+不动 `entry_preambles` 任何行。本文第 3 节「退役具体包含什么」那三条本地代码/文档改动
+（删种子那一节、删两条测试断言、改 `prompt_composition.py:119` 的注释）
+也一并等到同批，避免在观测窗内产生任何与识别链相关的提交。
