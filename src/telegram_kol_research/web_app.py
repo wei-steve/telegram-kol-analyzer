@@ -170,7 +170,9 @@ from telegram_kol_research.authoritative_execution_schema import (
     validate_recognition_execution_schema,
 )
 from telegram_kol_research.recognition_execution_scanner import (
+    finding_log_level,
     scan_recognition_execution_cycle,
+    should_report_finding,
 )
 from telegram_kol_research.runtime_loop_health import LoopLagMonitor
 from telegram_kol_research.runtime_deployment_identity import (
@@ -5426,14 +5428,20 @@ def _run_recognition_execution_scanner_cycle(
         limit=100,
     )
     for finding in findings:
-        logger.error(
-            "recognition execution finding family=%s row_id=%s raw_message_id=%s phase=%s action=%s",
-            finding.family,
-            finding.row_id,
-            finding.raw_message_id,
-            finding.phase,
-            finding.action,
-        )
+        # The throttle and the level are the scanner's own policy; see its module
+        # docstring. Both gate this log line only -- the incident capture below
+        # runs for every finding and coalesces by fingerprint, so the ledger
+        # keeps a complete count of repeats that the log no longer prints.
+        if should_report_finding(finding, moment=observed_at):
+            logger.log(
+                finding_log_level(finding),
+                "recognition execution finding family=%s row_id=%s raw_message_id=%s phase=%s action=%s",
+                finding.family,
+                finding.row_id,
+                finding.raw_message_id,
+                finding.phase,
+                finding.action,
+            )
         capture_runtime_incident_best_effort(
             capture_recognition_execution_state,
             app.state.session_factory,

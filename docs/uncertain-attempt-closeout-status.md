@@ -4,7 +4,7 @@
 分支：`uncertain-attempt-closeout`（基线 `origin/main` = `92b43cc0`）
 设计稿：`docs/plans/2026-09-26-uncertain-attempt-closeout-design.md`（已批准）
 状态：**本地实现完成，未部署、未推送、未在生产上跑过任何命令（含 dry-run）**
-进度：甲乙已提交（本提交）；丙在紧接着的下一个提交里，落点见第 1.丙 节。
+进度：甲乙、丙各一个提交，都已落地（SHA 见第 6 节）。
 
 ---
 
@@ -91,6 +91,8 @@
   `source_deletion_exit_timeout.STUCK_EXIT_CAPTURE_MIN_INTERVAL` 相等，有用例钉住）内只打一行；
   `phase` 或 `action` 一变立刻打。状态放在进程内存里、**故意不持久化**——重启后每条再说一次，
   好过重启继承别人的沉默。形状照抄 `_should_capture`。
+  那个 dict 每个曾上报过的 `(family, row_id)` 留一个小元组、不清理，与删除退出那个节流同样的取舍：
+  漏掉一条的代价只是多打一行日志，不值得为它加一轮清扫。
 - **分级是允许清单**：只有 `observe_only` / `observe_uncertain` 降为 `WARNING`。
   `family_scan_raised` / `inspection_raised` / `finalize_raised` 这些真异常，以及
   `*_cas_failed`、`expired_owner_still_alive`、`owner_not_alive_lease_active` 等，**全部保持 ERROR**。
@@ -100,6 +102,15 @@
   每一条都调，`runtime_incidents` 按指纹 coalesce 并累加 `repeat_count`。
   用例 `test_the_cycle_logs_a_frozen_row_once_but_captures_it_every_pass` 同时断言
   "5 轮只有 1 行日志"和"5 轮 5 次 capture"。
+
+**写这类用例的一个坑，记在这里。** 两条断日志级别的用例最初用 `caplog`，单文件跑全绿、
+全量跑**失败**：`app_logging.configure_application_logging` 会把
+`logging.getLogger("telegram_kol_research").propagate` 设成 `False`，而且是**进程级、永久**的——
+全量里只要有任何一个更早的用例调过它，之后这个 logger 树的记录就再也到不了 pytest 装在 root 上的
+handler，`caplog.records` 空着，同时那行日志明明白白打在 stderr 上。
+现在的做法是把一个自己的 handler 直接挂到 `web_app.logger` 上（`_Recorder`），
+并强制该 logger 的 level，不依赖 propagate。
+另有一条独立守护：用 `-p` 预先把 `propagate=False` 设好再跑这个文件，25 条仍全绿。
 
 ---
 
@@ -331,7 +342,21 @@ SELECT COUNT(*) AS decisions_still_frozen FROM recognition_decisions
 
 | 阶段 | 提交 | 内容 |
 |---|---|---|
-| 甲 + 乙 | 见最终回报 | 收口模块 + CLI + 终态 + CHECK 放宽与重建 + 重试闸门 + 用例 + 本文档 |
-| 丙 | 见最终回报 | 扫描器节流与分级 + web_app 调用点 + 用例 + 本文档更新 |
+| 甲 + 乙 | `8071314e` | 收口模块 + CLI + 终态 + CHECK 放宽与重建 + 重试闸门 + 用例 + 本文档 |
+| 丙 | 见最终回报（紧随其后） | 扫描器节流与分级 + web_app 调用点 + 用例 + 本文档更新 |
 
-测试：`python -m pytest -q` 全量，两个阶段各一次，结果见最终回报。
+分成两个提交是为了回滚粒度：丙（噪音）可以单独回滚而不动收口能力，反之亦然。
+唯一的例外在第 2 节最后一段：甲乙那个提交的**代码回滚必须连数据一起回滚**，
+因为 CHECK 一旦放宽就不能只退代码。
+
+测试：`python -m pytest -q` 全量，两个阶段各跑一次。
+
+- 甲乙：**9719 passed, 4 skipped, 815s**。
+- 丙：**9744 passed, 4 skipped, 806s**。
+
+丙的第一次全量有 3 条红：2 条是我自己那两条断日志级别的用例（上面那个 `caplog` 坑，已改）；
+第 1 条是 `tests/test_message_processing_worker.py::test_worker_loop_reloads_parallel_limit_before_each_refill`
+断言三个并发 asyncio 任务的启动顺序 `started == [1, 2, 3]`，那次拿到 `[1, 3, 2]`。
+**这条与本次改动无关**：它在甲乙那次全量里是绿的，单文件、单条、连跑 25 次、再加 6 个
+`yes` 抢 CPU 连跑 15 次，全部绿；丙的第二次全量也是绿的。是这条用例本身的竞态
+（断言的是并发任务谁先记录，不是并行度本身），已另立后台任务，不在本稿范围内。

@@ -1,10 +1,42 @@
-"""Bounded, cursor-driven detection and fail-closed lease reconciliation."""
+"""Bounded, cursor-driven detection and fail-closed lease reconciliation.
+
+**Reporting throttle and severity.** Every family's cursor wraps to zero when
+it runs dry (:func:`_wrap_cursor`), so a row that is non-terminal and stays
+non-terminal is re-found about every two minutes, forever. Until 2026-09-26 the
+caller logged each finding at ``ERROR``, and 37 frozen ``uncertain`` attempts
+produced roughly 27000 ``ERROR`` lines a day whose action was
+``observe_uncertain`` -- an action that observes and does nothing. A real alarm
+became wallpaper, the same way it did for the deletion-exit sweep.
+
+Two rules fix that, and neither of them hides anything:
+
+* :func:`should_report_finding` throttles the same ``(family, row_id)`` to one
+  log line per :data:`FINDING_REPORT_MIN_INTERVAL` -- unless its ``phase`` or
+  ``action`` changed since the last report, in which case it is reported at once,
+  because a change is news and a throttle must not sit on news. The state lives
+  in this process's memory (:data:`_LAST_REPORTED_FINDING`) and is deliberately
+  not persisted: after a restart each finding states its situation once more,
+  which beats a restart inheriting somebody else's silence. It gates *logging
+  only*. ``runtime_incidents`` still receives every finding and coalesces by
+  fingerprint with a ``repeat_count``, so nothing is lost from the ledger. The
+  map holds one small tuple per ``(family, row_id)`` this process has ever
+  reported and is never pruned -- the same bounded-by-table-growth trade the
+  deletion-exit throttle makes, and the reason it is not worth a sweep is that
+  forgetting an entry only costs one extra log line.
+* :func:`finding_log_level` is an allowlist, in the same fail-closed direction as
+  ``NON_EXCHANGE_WRITING_EXECUTION_ACTIONS``: only the two actions that provably
+  neither failed nor acted are ``WARNING``, and every other action -- including
+  ``family_scan_raised``, ``inspection_raised``, ``finalize_raised`` and the
+  ``*_cas_failed`` races -- stays ``ERROR``. An action added later is an error
+  until somebody deliberately lists it.
+"""
 
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Callable
 
@@ -43,6 +75,23 @@ SCAN_FAMILIES = (
 )
 
 
+#: How long the same unchanged finding stays quiet between log lines. Equal to
+#: ``source_deletion_exit_timeout.STUCK_EXIT_CAPTURE_MIN_INTERVAL`` on purpose:
+#: the two throttles answer the same question about the same kind of repeat, and
+#: a test asserts they stay equal.
+FINDING_REPORT_MIN_INTERVAL = timedelta(minutes=30)
+
+#: The only actions reported below ``ERROR``. Both mean the scan looked at a row,
+#: changed nothing, and had nothing to complain about. Everything else -- an
+#: exception, a lost CAS, a reclaimed lease, a live owner past its lease --
+#: stays ``ERROR``, so this is an allowlist and a new action is loud by default.
+OBSERVE_ONLY_FINDING_ACTIONS = frozenset({"observe_only", "observe_uncertain"})
+
+#: ``(family, row_id) -> (phase, action, reported_at)``. Process-local, see the
+#: module docstring.
+_LAST_REPORTED_FINDING: dict[tuple[str, int], tuple[str, str, datetime]] = {}
+
+
 @dataclass(frozen=True)
 class RecognitionExecutionFinding:
     family: str
@@ -51,6 +100,40 @@ class RecognitionExecutionFinding:
     phase: str
     fingerprint: str
     action: str
+
+
+def finding_log_level(finding: RecognitionExecutionFinding) -> int:
+    """``WARNING`` for a pure observation, ``ERROR`` for everything else."""
+
+    if str(finding.action) in OBSERVE_ONLY_FINDING_ACTIONS:
+        return logging.WARNING
+    return logging.ERROR
+
+
+def should_report_finding(
+    finding: RecognitionExecutionFinding, *, moment: datetime
+) -> bool:
+    """Throttle an unchanged repeat, never throttle a change."""
+
+    key = (str(finding.family), int(finding.row_id))
+    phase = str(finding.phase)
+    action = str(finding.action)
+    now = _as_utc(moment)
+    seen = _LAST_REPORTED_FINDING.get(key)
+    if seen is not None:
+        seen_phase, seen_action, seen_at = seen
+        if (seen_phase, seen_action) == (phase, action) and (
+            now - seen_at
+        ) < FINDING_REPORT_MIN_INTERVAL:
+            return False
+    _LAST_REPORTED_FINDING[key] = (phase, action, now)
+    return True
+
+
+def reset_finding_report_throttle() -> None:
+    """Forget every throttle decision. For tests and for explicit restarts."""
+
+    _LAST_REPORTED_FINDING.clear()
 
 
 def scan_recognition_execution_cycle(
