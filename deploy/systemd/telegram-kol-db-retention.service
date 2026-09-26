@@ -1,0 +1,68 @@
+# Daily retention for the two append-only tables in research.db
+# (docs/plans/2026-09-26-server-disk-usage-analysis.md section 5.3 / 8.2):
+# prune pending_tpsl_snapshot_observations older than 7 days (keeping the newest
+# row per instrument) and replace request_summary_json of settled
+# context_resolution_attempts older than 30 days with a retention stub.
+# Batches of at most 5000 rows in short transactions, a 10-minute cap, and a
+# clean exit on "database is locked"; whatever is left is picked up next run.
+# It never runs VACUUM.
+#
+# User/Group: the same identity as telegram-kol-worker, the database's main
+# writer. media-cleanup runs as root, but that must not be copied here: SQLite
+# creates research.db-wal / -shm when they are absent, and a root-owned WAL
+# would lock the runtime services (which run as telegram-kol-* users in group
+# telegram-kol-runtime, UMask 0007) out of their own database. UMask 0007 keeps
+# any file this creates group-writable exactly like the worker's.
+#
+# Not installed by tg-deploy: copy to /etc/systemd/system and daemon-reload.
+[Unit]
+Description=Telegram KOL database retention (pending TP/SL observations, old context requests)
+ConditionPathExists=/opt/telegram-kol-analyzer/data/research.db
+
+[Service]
+Type=oneshot
+User=telegram-kol-worker
+Group=telegram-kol-runtime
+UMask=0007
+WorkingDirectory=/opt/telegram-kol-analyzer
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/python -m telegram_kol_research.db_retention --database-path data/research.db --apply
+Nice=19
+IOSchedulingClass=idle
+# Sandbox: the worker's, minus network (this job needs none).
+AmbientCapabilities=
+CapabilityBoundingSet=
+LockPersonality=true
+MemoryDenyWriteExecute=true
+NoNewPrivileges=true
+PrivateDevices=true
+PrivateMounts=true
+PrivateNetwork=true
+PrivateTmp=true
+ProcSubset=pid
+ProtectClock=true
+ProtectControlGroups=true
+ProtectHome=true
+ProtectHostname=true
+ProtectKernelLogs=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectProc=invisible
+ProtectSystem=strict
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+SystemCallArchitectures=native
+SystemCallErrorNumber=EPERM
+SystemCallFilter=@system-service
+SystemCallFilter=~@mount @privileged
+ReadOnlyPaths=/opt/telegram-kol-analyzer
+ReadWritePaths=/opt/telegram-kol-analyzer/data
+InaccessiblePaths=-/opt/telegram-kol-analyzer/.env
+InaccessiblePaths=-/opt/telegram-kol-analyzer/config
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session.lock
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-journal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-wal
+InaccessiblePaths=-/opt/telegram-kol-analyzer/data/telegram.session-shm

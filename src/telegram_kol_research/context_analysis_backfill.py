@@ -674,11 +674,15 @@ def _select_export_records(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     for raw_message_id in sorted(by_message):
         selected: tuple[sqlite3.Row, dict[str, Any], str] | None = None
+        retention_stubbed = 0
         for row in by_message[raw_message_id]:
             try:
-                request = parse_context_request_storage(
+                stored = parse_context_request_storage(
                     str(row["request_summary_json"])
-                ).require_legacy_full()
+                )
+                if stored.storage == "retention-stub":
+                    retention_stubbed += 1
+                request = stored.require_legacy_full()
                 prompt_versions = json.loads(str(row["prompt_versions_json"]))
             except (
                 ContextRequestStorageError,
@@ -697,6 +701,11 @@ def _select_export_records(rows: list[sqlite3.Row]) -> list[dict[str, Any]]:
             selected = (row, request, prompt_version)
             break
         if selected is None:
+            if retention_stubbed == len(by_message[raw_message_id]):
+                # db_retention removed every request this message had. There
+                # is nothing to analyse, which is not the same thing as a
+                # malformed source, so it drops out instead of failing the run.
+                continue
             raise ValueError(
                 f"no valid source request for raw_message_id={raw_message_id}"
             )

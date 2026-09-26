@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Telegram KOL database retention daily
+
+[Timer]
+OnCalendar=*-*-* 04:10:00
+Persistent=true
+Unit=telegram-kol-db-retention.service
+
+[Install]
+WantedBy=timers.target
