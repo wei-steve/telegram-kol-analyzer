@@ -786,6 +786,97 @@ def test_runtime_incident_delivery_is_disabled_without_claiming(tmp_path):
         assert row.notification_claim_token is None
 
 
+def test_select_incident_bot_config_defaults_to_operator_bot():
+    operator = SystemOperatorBotConfig("op-token", "op-chat")
+    notification = SystemOperatorBotConfig("notif-token", "notif-chat")
+
+    # In the explicit搬迁 whitelist -> Kol运行通知.
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "mimo_provider_unavailable",
+            operator_config=operator,
+            notification_config=notification,
+        )
+        is notification
+    )
+    # Not in the whitelist -> stays on Kol事件处理 (the default).
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "severe_protection_incident",
+            operator_config=operator,
+            notification_config=notification,
+        )
+        is operator
+    )
+    # No Kol运行通知 bot configured at all -> falls back to the operator bot
+    # rather than the notification silently disappearing.
+    assert (
+        operator_bot_module.select_incident_bot_config(
+            "mimo_provider_unavailable",
+            operator_config=operator,
+            notification_config=None,
+        )
+        is operator
+    )
+
+
+def test_deliver_runtime_incident_notifications_splits_across_two_bots(
+    tmp_path, monkeypatch
+):
+    session_factory = create_session_factory(tmp_path / "runtime-split-routing.db")
+    notification_incident = _record_runtime_incident(
+        session_factory,
+        source_record_id="mimo-outage-1",
+        incident_type="mimo_provider_unavailable",
+        fingerprint="c" * 64,
+    )
+    operator_incident = _record_runtime_incident(
+        session_factory,
+        source_record_id="42",
+        incident_type="severe_protection_incident",
+        fingerprint="d" * 64,
+    )
+    deliveries = []
+
+    async def capture(**kwargs):
+        deliveries.append((kwargs["config"], kwargs["text"]))
+
+    monkeypatch.setattr(
+        operator_bot_module,
+        "send_system_operator_bot_message",
+        capture,
+    )
+    operator_config = SystemOperatorBotConfig("op-token", "op-chat")
+    notification_config = SystemOperatorBotConfig("notif-token", "notif-chat")
+
+    delivered = asyncio.run(
+        operator_bot_module.deliver_runtime_incident_notifications(
+            session_factory,
+            config=operator_config,
+            notification_config=notification_config,
+            runtime_config=RuntimeIncidentConfig(telegram_notifications_enabled=True),
+            claimed_at=NOW,
+        )
+    )
+
+    assert delivered == 2
+    assert len(deliveries) == 2
+    routed = {
+        (
+            "notification"
+            if f"事件ID: {notification_incident.id}" in text
+            else "operator"
+            if f"事件ID: {operator_incident.id}" in text
+            else "unknown"
+        ): config
+        for config, text in deliveries
+    }
+    assert routed == {
+        "notification": notification_config,
+        "operator": operator_config,
+    }
+
+
 def test_provider_unavailable_notification_names_the_chain_head_model(tmp_path):
     session_factory = create_session_factory(tmp_path / "provider-unavailable-head.db")
     incident = _record_runtime_incident(

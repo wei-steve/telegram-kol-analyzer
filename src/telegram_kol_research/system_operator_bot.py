@@ -78,6 +78,75 @@ class SystemOperatorBotConfig:
 NotificationBotConfig = SystemOperatorBotConfig
 
 
+#: 改投「Kol运行通知」的 incident 类型。默认（不在这里的）维持投「Kol事件处理」。
+#:
+#: 方向是白名单式搬迁，刻意不是反过来：判据要是靠 summary 字段推断「需不需要人
+#: 管」（比如 source_status/impact 打的标），捕获方漏打一个标，需要人动手的事件
+#: 就会静默溜进通知 bot 没人看见 —— 这正是 2026-09-26 复核时想避免的失效模式。
+#: 所以规则改成一句话：默认维持现状（去事件处理），只有下面这份显式清单里的类型
+#: 改去运行通知。新类型不在清单里，行为和今天完全一样，不会有人被静默；清单要
+#: 改，是一次显式的代码改动，而不是某个字段没打对标的副作用。
+#:
+#: 刻意不在清单里、必须留在事件处理的：
+#: - ``notification_delivery_failure`` / ``background_task_restart_exhausted``：
+#:   投递本身坏了，要是也投到那个可能正坏着的 bot，就没人知道了。
+#: - ``severe_protection_incident``、``provider_outage_entry_not_replayed``、
+#:   ``provider_outage_management_not_replayed``、
+#:   ``management_target_needs_confirmation``、
+#:   ``duplicate_entry_needs_confirmation``、
+#:   ``management_recognition_unresolved``、``management_recovery_required``、
+#:   ``management_recovery_timeout``、``source_deletion_exit_stuck``、
+#:   ``uncertain_without_write``、``authoritative_execution_uncertain``、
+#:   ``revision_cancel_outcome_unresolved``、
+#:   ``revision_batch_too_stale_to_resume``：都要人动手（后两个
+#:   ``management_recovery_timeout`` / ``authoritative_execution_uncertain`` 是
+#:   用户 2026-09-26 明确裁定的）。
+NOTIFICATION_BOT_INCIDENT_TYPES = frozenset(
+    {
+        "mimo_provider_unavailable",
+        "mimo_provider_recovered",
+        "mimo_provider_failure_streak",
+        "mimo_provider_probe_failed",
+        "mimo_provider_health_check_failed",
+        "provider_outage_replay_started",
+        "authoritative_recognition_failed",
+        "context_worker_exhausted",
+        "position_marked_manually_closed",
+        "protection_adopted_from_exchange",
+        "message_processing_queue_stalled",
+        "deferred_instruction_expired",
+        "entry_admission_expired",
+        "management_fraction_rejected",
+        "management_stop_rejected",
+        "entry_revision_authority_blocked_reset",
+        "management_cancel_precheck_observed",
+        "management_target_refused",
+        "unclassified_operation_failure",
+    }
+)
+
+
+def select_incident_bot_config(
+    incident_type,
+    *,
+    operator_config: SystemOperatorBotConfig,
+    notification_config: SystemOperatorBotConfig | None,
+) -> SystemOperatorBotConfig:
+    """Which bot one incident goes to; the operator bot is the default.
+
+    ``notification_config`` being ``None`` (no Kol运行通知 bot configured) falls
+    back to the operator bot rather than dropping the message -- an unrouted
+    notification still needs to reach someone.
+    """
+
+    if (
+        notification_config is not None
+        and str(incident_type or "") in NOTIFICATION_BOT_INCIDENT_TYPES
+    ):
+        return notification_config
+    return operator_config
+
+
 def format_entry_revision_operator_notification(
     *,
     assembly_evidence: object,
@@ -660,6 +729,7 @@ async def deliver_message_operation_stage1_notifications(
     lease_seconds: float = 120.0,
     max_attempts: int = MESSAGE_OPERATION_STAGE1_MAX_ATTEMPTS,
     runtime_config: RuntimeIncidentConfig | None = None,
+    notification_config: SystemOperatorBotConfig | None = None,
 ) -> int:
     """Materialize and deliver Stage 1 independently from Agent diagnosis."""
 
@@ -716,8 +786,13 @@ async def deliver_message_operation_stage1_notifications(
         try:
             if not valid:
                 raise ValueError("stage1_evidence_incomplete")
+            target_config = select_incident_bot_config(
+                incident.incident_type,
+                operator_config=config,
+                notification_config=notification_config,
+            )
             message_id = await send_system_operator_bot_message(
-                config=config,
+                config=target_config,
                 text=format_message_operation_stage1_notification(
                     notification=notification,
                     incident=incident,
@@ -938,6 +1013,7 @@ async def deliver_runtime_incident_stage2_notifications(
     claimed_at: datetime | None = None,
     lease_seconds: float = 120.0,
     max_attempts: int = MESSAGE_OPERATION_STAGE2_MAX_ATTEMPTS,
+    notification_config: SystemOperatorBotConfig | None = None,
 ) -> int:
     from telegram_kol_research.models import RuntimeIncidentHandoffArtifact
     from telegram_kol_research.runtime_incident_adapters import (
@@ -959,6 +1035,11 @@ async def deliver_runtime_incident_stage2_notifications(
         artifact = claim["artifact"]
         incident = claim["incident"]
         token = claim["claim_token"]
+        target_config = select_incident_bot_config(
+            incident.incident_type,
+            operator_config=config,
+            notification_config=notification_config,
+        )
         try:
             message_id = (
                 _require_telegram_message_id(artifact.telegram_message_id)
@@ -968,7 +1049,7 @@ async def deliver_runtime_incident_stage2_notifications(
             if message_id is None:
                 message_id = _require_telegram_message_id(
                     await send_system_operator_bot_message(
-                        config=config,
+                        config=target_config,
                         text=format_runtime_incident_stage2_notification(
                             artifact, incident
                         ),
@@ -1003,7 +1084,7 @@ async def deliver_runtime_incident_stage2_notifications(
             if document_message_id is None:
                 document_message_id = _require_telegram_message_id(
                     await send_system_operator_bot_document(
-                        config=config,
+                        config=target_config,
                         filename=f"runtime-incident-handoff-{artifact.id}.json",
                         content=artifact.evidence_document_json,
                         caption=(
@@ -2731,6 +2812,7 @@ async def deliver_runtime_incident_notifications(
     runtime_config: RuntimeIncidentConfig | None = None,
     limit: int = 20,
     claimed_at: datetime | None = None,
+    notification_config: SystemOperatorBotConfig | None = None,
 ) -> int:
     """Deliver with at-least-once crash semantics and stable incident IDs.
 
@@ -2761,6 +2843,7 @@ async def deliver_runtime_incident_notifications(
                     feature_config.message_operation_stage1_max_attempts
                 ),
                 runtime_config=feature_config,
+                notification_config=notification_config,
             )
         except Exception as exc:
             logger.warning(
@@ -2782,6 +2865,7 @@ async def deliver_runtime_incident_notifications(
                 claimed_at=claimed_at,
                 lease_seconds=feature_config.notification_lease_seconds,
                 max_attempts=feature_config.message_operation_stage2_max_attempts,
+                notification_config=notification_config,
             )
         except Exception as exc:
             logger.warning(
@@ -2841,9 +2925,14 @@ async def deliver_runtime_incident_notifications(
                 )
                 session.commit()
             continue
+        target_config = select_incident_bot_config(
+            incident.incident_type,
+            operator_config=config,
+            notification_config=notification_config,
+        )
         try:
             await send_system_operator_bot_message(
-                config=config,
+                config=target_config,
                 text=(
                     format_runtime_incident_diagnosis_notification(incident)
                     if incident.status == "diagnosed"
@@ -3144,6 +3233,7 @@ async def run_runtime_incident_notification_loop(
     runtime_config: RuntimeIncidentConfig | None = None,
     deepcoin_client_factory=None,
     delivery_observer=None,
+    notification_config: SystemOperatorBotConfig | None = None,
 ) -> None:
     """Poll the Phase 2 outbox through the dedicated system operator bot.
 
@@ -3175,6 +3265,7 @@ async def run_runtime_incident_notification_loop(
                 session_factory,
                 config=config,
                 runtime_config=feature_config,
+                notification_config=notification_config,
             )
             if delivered and delivery_observer is not None:
                 delivery_observer(datetime.now(UTC))
