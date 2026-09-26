@@ -1544,3 +1544,48 @@ def test_step2_promotion_is_a_single_atomic_statement():
 
     source = inspect.getsource(remediation._handle_step2)
     assert "~exists().where(other.state == \"executing\"" in source
+
+
+def test_exchange_client_factory_failure_settles_as_failed_not_stuck_executing(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    action, scope = _built_action_and_scope(
+        session_factory, raw_id=raw_id, client=_client_for(symbol, side, pos_id)
+    )
+    pid = _executing_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+
+    def broken_factory():
+        raise RuntimeError("no credentials")
+
+    def fake_apply(*args, **kwargs):
+        raise AssertionError("apply must not be reached")
+
+    outcome = execute_proposal(
+        session_factory, config=_approve_config(), proposal_id=pid,
+        deepcoin_client_factory=broken_factory, group_config=_group_config(88),
+        now=NOW + timedelta(minutes=3), apply_fn=fake_apply,
+    )
+    assert outcome.state == "failed"
+    with session_factory() as session:
+        assert session.get(OncallRemediationProposal, pid).state == "failed"
+
+
+def test_exception_before_apply_is_failed_and_after_apply_entry_is_uncertain(tmp_path):
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, _strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    client = _client_for(symbol, side, pos_id)
+    action, scope = _built_action_and_scope(session_factory, raw_id=raw_id, client=client)
+    pid = _executing_row(session_factory, raw_id=raw_id, lifecycle_id=lifecycle_id, action=action, scope=scope)
+
+    def exploding_resolver(*args, **kwargs):
+        raise RuntimeError("db hiccup")
+
+    outcome = execute_proposal(
+        session_factory, config=_approve_config(), proposal_id=pid, deepcoin_client=client,
+        group_config=_group_config(88), now=NOW + timedelta(minutes=3),
+        resolve_scope=exploding_resolver,
+        apply_fn=lambda *a, **k: (_ for _ in ()).throw(AssertionError("unreachable")),
+    )
+    assert outcome.state == "failed"

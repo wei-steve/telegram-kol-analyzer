@@ -1415,9 +1415,10 @@ def execute_proposal(
     *,
     config: OncallRemediationConfig,
     proposal_id: int,
-    deepcoin_client,
+    deepcoin_client=None,
     group_config,
     now: datetime,
+    deepcoin_client_factory: Callable[[], Any] | None = None,
     apply_fn: Callable[..., Any] = apply_position_management_remediation_action,
     build_plan: Callable[..., PositionRemediationPlan] = build_position_management_remediation_plan,
     resolve_scope: Callable[..., RemediationScope | None] = resolve_remediation_scope,
@@ -1453,7 +1454,15 @@ def execute_proposal(
             breaker_tripped=breaker_message is not None,
         )
 
+    # Anything that goes wrong before apply_fn is entered never reached the
+    # exchange-write path, so it is "failed"; only an exception after that
+    # point is "uncertain" (spec 8.1).
+    apply_started = False
     try:
+        if deepcoin_client is None:
+            if deepcoin_client_factory is None:
+                return _fail("failed", "internal_error:no_exchange_client", check=None)
+            deepcoin_client = deepcoin_client_factory()
         gate = _run_gate_a(
             session_factory,
             config=config,
@@ -1479,6 +1488,7 @@ def execute_proposal(
             _append_event(session, proposal_id, actor="worker", event="gate_c", gate="C", check="C4", outcome="applying", at=now)
             session.commit()
 
+        apply_started = True
         try:
             result = apply_fn(
                 session_factory,
@@ -1516,7 +1526,11 @@ def execute_proposal(
         # by finalize_executing_proposals once the batch itself settles.
         return ExecutionOutcome(proposal_id=proposal_id, state="executing", management_batch_id=batch_id, text=None)
     except Exception as exc:  # noqa: BLE001 - fail-closed
-        return _fail("uncertain", f"internal_error:{type(exc).__name__}", check=None)
+        return _fail(
+            "uncertain" if apply_started else "failed",
+            f"internal_error:{type(exc).__name__}",
+            check=None,
+        )
 
 
 def _classify_apply_exception(

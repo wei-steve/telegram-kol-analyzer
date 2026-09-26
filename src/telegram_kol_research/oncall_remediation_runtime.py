@@ -127,18 +127,29 @@ async def execute_proposal_locked(
     this -- see module docstring."""
 
     async with _EXECUTION_LOCK:
-        deepcoin_client = await asyncio.to_thread(deepcoin_client_factory)
+        # The client is created inside execute_proposal (on the worker
+        # thread) so a factory failure settles the proposal as "failed"
+        # instead of leaving it stuck in "executing" -- which would also hold
+        # the single-flight slot until the next restart.
+        created: list[Any] = []
+
+        def _factory() -> Any:
+            client = deepcoin_client_factory()
+            created.append(client)
+            return client
+
         try:
             return await asyncio.to_thread(
                 execute_proposal,
                 session_factory,
                 config=config,
                 proposal_id=proposal_id,
-                deepcoin_client=deepcoin_client,
+                deepcoin_client_factory=_factory,
                 group_config=group_config,
                 now=now_provider(),
             )
         finally:
+            deepcoin_client = created[0] if created else None
             close = getattr(deepcoin_client, "close", None)
             if callable(close):
                 try:
