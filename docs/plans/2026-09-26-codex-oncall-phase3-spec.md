@@ -4,7 +4,7 @@
 上位设计：`docs/plans/2026-09-18-codex-oncall-remediation-design.md`（3.1、3.2、4.3 A 线、4.4、第 8 节阶段 3、第 9 节内联按钮）
 前置：阶段 1、2 已在生产运行（`docs/codex-oncall-status.md` 7.1、8.8–8.15；D6 见 `docs/oncall-d6-silent-stall-rules-status.md`）
 验证等级：**L3**（新增生产库表 = schema 变更；给现有交易所写入通道新增一个触发入口 = 交易所写入语义变更）
-状态：**草案，待用户拍板第 11 节后才能派工。** 未实施。
+状态：**第 11 节已于 2026-09-26 由用户裁定（经调度会话转达）。** 未实施；实施排在 uncertain-attempt-closeout 与通知分流两次部署之后，由调度会话另行派发（会与它们在表结构、`telegram_bot_commands.py` / `system_operator_bot.py` 上撞文件）。
 
 ## 1. 本阶段做什么 / 不做什么
 
@@ -89,7 +89,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 
 **不在权限路径上。** 状态文档 8.3 已钉住：注入成功的裁决在契约层面与诚实裁决不可区分。所以本阶段：
 提案是否生成、按钮是否出现、执行是否放行，**都不读 `diagnoses` 表、不读 `verdict.json`**。Codex 的诊断照旧作为一条独立文字发给用户，供其判断要不要按按钮。
-（是否让 Codex 裁决"压掉按钮"，是第 11 节第 1 问。）
+**用户裁定（第 11 节第 1 条）：Codex 判"不该执行"时不压按钮**，只作参考文字：提案消息里加一行"Codex 意见见值守 #<案件号> 的诊断消息"（worker 不读 Codex 输出）；值守在 `should_have_executed = no` 的诊断消息末尾加一行"（仅供参考，不影响补救按钮）"。
 
 ## 4. worker 侧实现
 
@@ -146,9 +146,10 @@ telegram-kol-worker（唯一持交易所密钥者）
 | A3 | 源消息存在、未被删除，所在群 / KOL 此刻仍开着自动交易 | `raw_messages`、删除记录、交易设置 |
 | A4 | 限定范围计划的交易所快照完整（否则计划本身就是零动作） | 计划 |
 | A5 | 该消息在范围内**恰好有一个** `ready_for_approval` 的链头动作，且它的 `raw_message_id` 就是本消息；零个 → `no_ready_action`（附计划给出的 step 状态与原因），多个 → `ambiguous_action` | 计划 |
-| A6 | 意图白名单（第 7 节表中"收"的那几项）；`cancel_entry` 转来的 `full_exit`（晚成交转平仓）不收 | 动作 `action_kind` + `evidence.original_action_kind` |
+| A6 | 意图白名单（第 7 节表中"收"的四项）；`partial_then_break_even` 不收；`cancel_entry` 转来的 `full_exit`（晚成交转平仓）不收 | 动作 `action_kind` + `evidence.original_action_kind` |
+| A6b | 该消息的指令项结果是 `shadow_planned`（当时系统有意只计划不执行）→ 拒绝 `shadow_planned_not_remediated`（用户裁定第 8 条） | 指令项 `result_json` |
 | A7 | **不可推翻的拒绝**：该消息的指令项 `error_json` / 结果、同消息的管理批次 `reason_code`、`runtime_incidents` 中任一命中下列原因 → 拒绝：`*_ownership_not_verified`、`exact_position_write_gate` 系拒绝、`protection_authority_frozen:*`、`protection_order_unattributable`、`explicit_stop_adjustment_not_risk_tightening`、`management_price_implausible`、`management_stop_direction_invalid`、`operator_dismissed`、`kol_or_group_auto_trade_disabled` | 生产库主键 / 索引点查 |
-| A8 | 时效：距**消息发布时间**，离场类（`full_exit`、`partial_take_profit`、`partial_then_break_even`）≤ 60 分钟，止损类（`adjust_stop_loss`、`move_stop_to_break_even`）≤ 120 分钟（用户 2026-09-19 决定） | `raw_messages.posted_at` |
+| A8 | 时效：距**消息发布时间**，`full_exit` ≤ 60 分钟，`partial_take_profit` ≤ **20 分钟**（用户 2026-09-26 裁定），止损类（`adjust_stop_loss`、`move_stop_to_break_even`）≤ 120 分钟（2026-09-19 决定）；批准与执行时都必须仍在窗口内 | `raw_messages.posted_at` |
 | A9 | 目标仓位**此刻仍在仓**：动作的 `pos_ids` 全部在这次快照的 live 仓位里（计划已保证，这里对同一份快照再断言一次，防计划实现回归） | 计划快照 |
 | A10 | 幂等：`(raw_message_id, action_kind, lifecycle_id)` 从未有过 `succeeded / executing / uncertain` 的提案（**每条消息每个意图一生只补救一次**） | `proposals` 唯一约束 + 查询 |
 | A11 | 限额：同一 lifecycle 10 分钟冷却；北京日内执行 ≤ 10 次、提案 ≤ 30 条 | `proposals` |
@@ -194,15 +195,15 @@ telegram-kol-worker（唯一持交易所密钥者）
 |---|---|---|
 | `TELEGRAM_KOL_ONCALL_REMEDIATION_MODE` | `off` | `off`：路由不注册、后台任务不起、回调前缀 `orm:` 一律回"补救未启用"；`shadow`：算提案、发"本来会执行：…"，**不带按钮**；`approve`：带按钮，两次确认后执行 |
 | `TELEGRAM_KOL_ONCALL_REMEDIATION_TOKEN` | 空 | 回环端点令牌，格式同 monitor capture（32–128 位 `[A-Za-z0-9_-]`）；空 → 路由不注册 |
-| `TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS` | 空 | 逗号分隔的 Telegram 用户 id；空 → `approve` 自动降为 `shadow` 并在启动日志说明 |
-| `TELEGRAM_KOL_ONCALL_REMEDIATION_DAILY_CAP` / `_COOLDOWN_MINUTES` / `_EXIT_WINDOW_MINUTES` / `_STOP_WINDOW_MINUTES` | 10 / 10 / 60 / 120 | 4.4 的数值 |
+| `TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS` | 空 | Telegram 用户 id；空 → `approve` 自动降为 `shadow` 并在启动日志说明。**用户裁定只允许用户本人**，生产值 = 系统 bot 会话 `TELEGRAM_KOL_SYSTEM_BOT_CHAT_ID` 的值：2026-09-26 在服务器上只读核实该值为正数、10 位，即**私聊**，私聊的 chat id 就是对方用户 id（部署时从该键复制，本文不抄具体数字） |
+| `TELEGRAM_KOL_ONCALL_REMEDIATION_DAILY_CAP` / `_COOLDOWN_MINUTES` / `_EXIT_WINDOW_MINUTES` / `_PARTIAL_TP_WINDOW_MINUTES` / `_STOP_WINDOW_MINUTES` | 10 / 10 / 60 / 20 / 120 | 4.4 的数值（用户裁定照用） |
 
 模式与令牌都在 `/etc/telegram-kol-worker.env`（worker 专属）。**本阶段不向 `groups.yaml` 或交易设置表写任何东西。**
 
 ### 4.7 熔断
 
 连续 2 次执行结果为 `failed` 或 `uncertain`，或回读与预期不符 → `control.enabled = 0`、记 `breaker_tripped_at`，发一条"补救已自动关闭：<原因>"，
-所有 `proposed / confirming` 提案作废为 `cancelled`。熔断后**只能人工恢复**（第 11 节第 3 问决定用哪种方式）。成功一次清零计数。
+所有 `proposed / confirming` 提案作废为 `cancelled`。熔断后只能人工恢复：批准人在系统 bot 会话发 `/oncall_on`（用户裁定第 3 条；同样过 B1 校验，并写 `events`）。成功一次清零计数。
 
 ## 5. 值守侧改动
 
@@ -221,7 +222,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 
 | 规则 | 请求？ | 理由 |
 |---|---|---|
-| D1a（指令项 `failed/unknown`）、D1b（`succeeded` 但 `skipped/shadow_planned`，已排除用户配置类原因） | 是 | 正是 `_item_requires_remediation` 的集合 |
+| D1a（指令项 `failed/unknown`）、D1b（`succeeded` 但结果 `skipped`，已排除用户配置类原因） | 是 | `_item_requires_remediation` 的集合，去掉 `shadow_planned`（用户裁定第 8 条；worker 侧 A6b 再挡一次） |
 | D1d（停在 `pending/executing/submitted` > 5 分钟） | 是 | 计划自己会把在途批次判为 `waiting_for_reconciliation` → 不出动作；让 worker 判，值守不猜 |
 | D2 且 `status='blocked'` | 是 | `partial_failed / submit_unknown / recovery_required` **不请求**：计划对它们必然 `existing_management_batch_unresolved`（G3） |
 | D1c（等待用户确认）、D3、D6a/b/c、D4、D5 | 否 | 目标未定 / 识别失败 / 健康类，本阶段没有安全的动作 |
@@ -241,6 +242,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 消息：<群名> #<raw_message_id>（<北京时间>）
 将执行：<币种> <多/空> <动作中文>：<例：止损 2500 → 2484 / 平掉 50% / 全部平仓>
 依据：这些数字由系统从生产数据重算，不来自 AI
+参考：Codex 意见见值守 #<案件号> 的诊断消息（仅供参考，不影响按钮）
 时效：本提案 <HH:MM> 前有效；消息的补救窗口到 <HH:MM>
 [✅ 执行补救]  [❌ 忽略]
 ```
@@ -287,10 +289,10 @@ telegram-kol-worker（唯一持交易所密钥者）
 | 意图（`action_kind`） | 收？ | 执行路径（`strategy_management_executor.py`） | 备注 |
 |---|---|---|---|
 | `full_exit` | 收 | `execute_management_batch`（:1393）→ 全平分支（:1495 / :4237）→ `position_mutation_gateway.close_exact_position`（:986） | 窗口 60 分钟 |
-| `partial_take_profit` | 收 | → `partial_close` 分支（:2595 起）→ `close_exact_position`（按比例） | 窗口 60 分钟；比例来自 `resolve_management_directive` |
+| `partial_take_profit` | 收 | → `partial_close` 分支（:2595 起）→ `close_exact_position`（按比例） | 窗口 **20 分钟**；比例来自 `resolve_management_directive` |
 | `move_stop_to_break_even` | 收 | 计划器落成 `effective_action='break_even_by_market'`（`strategy_management_planner.py:155`）→ 分派于 :1436 → `_execute_break_even_by_market_batch`（:744）：按仓位由 `reserve_break_even_market_actions` 决定"挂保本止损"或"价格已越过保本 → 市价平"，经 `position_mutation_gateway` 的 `submit_exact_position_sltp`（:806）/ `close_exact_position`（:986）落地 | 窗口 120 分钟；保本价取策略入场价（计划器既有口径）；**注意它可能变成市价平仓**，提案文案必须写出这种可能 |
 | `adjust_stop_loss` | 收（**仅收紧**） | `_PROTECTION_ACTIONS`（:145）→ 保护单分支（:1454 起）→ 先挂后撤 | "仅收紧"由计划器 `_plan_strategy_management_batch_locked` 内联判定（`strategy_management_planner.py:1191–1215`），不收紧 → `explicit_stop_adjustment_not_risk_tightening`，属 A7 不可推翻 |
-| `partial_then_break_even` | **待定**（第 11 节第 5 问） | 分批保护 saga（:2595–2604） | 生产上自 8 月中旬 **0 次成功**（状态文档 8.9）；收进来大概率只是再失败一次并触发熔断 |
+| `partial_then_break_even` | **不收**（用户裁定第 5 条） | 分批保护 saga（:2595–2604） | 生产上自 8 月中旬 **0 次成功**（状态文档 8.9）；收进来大概率只是再失败一次并触发熔断 |
 | `full_exit`（由 `cancel_entry` 晚成交转来） | 不收 | 同全平 | 入场侧语义，另议 |
 | `adjust_take_profit`（**G1**） | **排除**，前置 = 阶段 5 | 无：`resolve_management_directive` 不产出、`SUPPORTED_INTENTS`（`strategy_management_planner.py:134`）不含；交易所层 `deepcoin_execution_actions.py:373/2722` 有能力但**无生产者** | 这类消息今天必然不执行，补救也够不着 |
 | `/choose` 之后的指令项（**G2**） | **排除**，前置 = 阶段 5 | 无：`choose_management_target`（`management_target_confirmation.py:154`）把项改回 `pending` 后无人认领；`claim_next_visibility_retry_instruction_item`（`message_instruction_items.py:387`）只认 `visibility_first_failed_at IS NOT NULL` | 目标未定的案件（D1c）本阶段不请求提案 |
@@ -310,7 +312,7 @@ telegram-kol-worker（唯一持交易所密钥者）
 
 | 层级 | 操作 | 生效 | 影响 |
 |---|---|---|---|
-| 运行时总闸 | 系统 bot 发 `/oncall_off`（仅 B1 用户） | 立即；所有 `proposed / confirming` 作废为 `cancelled` | 只停补救；诊断、告警、主链路不受影响 |
+| 运行时总闸 | 系统 bot 发 `/oncall_off`（仅 B1 用户）；重新打开发 `/oncall_on`（同样仅 B1 用户，也用于熔断后恢复） | 立即；关闭时所有 `proposed / confirming` 作废为 `cancelled` | 只停补救；诊断、告警、主链路不受影响 |
 | 值守不再请求 | `/etc/telegram-kol-oncall.env` 设 `…_REMEDIATION_REQUESTS=off`，`systemctl restart telegram-kol-oncall` | 下一轮 | 同上 |
 | worker 关闭功能 | `/etc/telegram-kol-worker.env` 设 `…_REMEDIATION_MODE=off`，重启 worker（允许，见用户规则"重启可以"） | 重启后；路由消失 | 同上 |
 
@@ -326,12 +328,12 @@ telegram-kol-worker（唯一持交易所密钥者）
 
 1. **限定范围计划**：scope 只含目标 lifecycle；与全量计划的动作等价（4.2）；同 lifecycle 更早未解决消息仍是链头；`scope=None` 与改动前逐字节一致（快照测试）；每条新 SQL `EXPLAIN QUERY PLAN` 无 SCAN；计划与 apply 在 `to_thread` 里运行（断言事件循环未被阻塞 > 阈值）。
 2. **端点**：非回环 / 带 XFF / 无令牌 / 错令牌 → 404；未配令牌 → 路由不存在；web/ingest 角色 → 404；多余字段、价格字段、超长 → 拒绝；幂等返回同一提案；请求处理中**不调用**交易所客户端（桩计数为 0）。
-3. **G-A**：A1–A12 每条一正一反；A7 九类原因各一条；A8 两类窗口的边界（59/61、119/121 分钟）；A5 零个 / 多个链头；A6 `cancel_entry` 转来的 `full_exit` 被拒。
+3. **G-A**：A1–A12 每条一正一反；A7 九类原因各一条；A8 三类窗口的边界（19/21、59/61、119/121 分钟）；A6b `shadow_planned` 被拒；A5 零个 / 多个链头；A6 `cancel_entry` 转来的 `full_exit` 被拒。
 4. **G-B**：错会话、错用户、未配置批准人；令牌错 / 复用 / 跨步骤；过期（30 分钟 / 2 分钟）；`shadow` 下无按钮、`/fix` 被拒；`/fix` 带额外参数被拒。
 5. **G-C**：并发两个确认只有一个进入 `executing`；计划指纹变化 → `plan_changed` 且未调用 apply；执行时超窗；apply 内部检查失败原样上报。
 6. **状态机**：全部合法迁移与非法迁移（比较交换 0 行）；`events` 只追加（静态断言无 UPDATE/DELETE）；重启时 `executing → uncertain` 且不重跑。
 7. **熔断**：连续 2 次 `failed/uncertain` → 关闭 + 作废在途提案 + 告警；成功清零；熔断后提案请求一律 `refused`。
-8. **总闸**：`/oncall_off` 立即生效（下一次回调即拒绝）；它**不修改** `groups.yaml`、交易设置、任何自动交易开关（断言这些对象在测试前后相等）。
+8. **总闸**：`/oncall_off` 立即生效（下一次回调即拒绝）；`/oncall_on` 只接受 B1 用户、能解除熔断并写 `events`；它**不修改** `groups.yaml`、交易设置、任何自动交易开关（断言这些对象在测试前后相等）。
 9. **白名单端到端**（fake 交易所）：`full_exit`、`partial_take_profit`、`move_stop_to_break_even`、`adjust_stop_loss`（收紧成功 / 放宽被拒）各一条从请求到结果消息；`adjust_take_profit` 无提案；D1c / D3 / D6 / 健康案件值守不请求。
 10. **回放**：用状态文档与设计 7.1 列出的历史形状做夹具——`prior_partial_batch_unresolved`（前驱已收口 → 出提案）、raw 17813 形状（`management_stop_action_conflict` → apply 内被同一规则再拒，提案 `failed` 而非执行）、raw 18371/18375 形状（仓位已平 → A9 拒绝）、`partial_failed` 批次 → 值守不请求。
 11. **值守侧**：只对 5.2 的规则请求；3 次重试上限；失败不影响告警 / 诊断的发送（顺序与独立性断言）；只取 `proposal_id / state`；令牌不在 `state.db`、日志、案件包、Codex spool 里（全文搜索断言）；值守七个模块仍不 import `oncall_remediation` 与写交易所模块。
@@ -350,17 +352,18 @@ telegram-kol-worker（唯一持交易所密钥者）
 - 写 `groups.yaml` / 交易设置 / 任何自动交易开关；重启服务作为补救手段。
 - 修 `worker_command_jobs`、CLI `repair-position-management` 的跨进程锁缺口（本阶段只保证新路径在 worker 内；CLI 维持原样，另议）。
 
-## 11. 需要用户拍板的问题（未决定，不要替用户选）
+## 11. 用户裁定（2026-09-26，经调度会话转达；原为待拍板问题）
 
-1. **Codex 诊断要不要能"压掉按钮"？** 本规格的默认是 Codex 完全不在权限路径上（3.2）。另一种做法：Codex 判 `should_have_executed=no` 时提案消息不带按钮。
-   代价：一个被注入带偏的裁决能让该补救的没按钮（只会少做，不会多做）；好处：少一次误按。
-2. **谁可以批准**：只有你本人的 Telegram 用户 id，还是再加别人？需要你提供（或授权指挥会话在服务器上从系统 bot 会话里读出）用户 id 填进 `APPROVER_IDS`。
-3. **总闸 / 熔断之后怎么重新打开**：(a) 同一批准人发 `/oncall_on`；(b) 只能登服务器执行一条命令。前者方便，后者更不容易误开。
-4. **时效从哪算**：本规格按**消息发布时间**算 60 / 120 分钟，且批准与执行时都要在窗口内（即：消息发出 55 分钟时才看到，只剩 5 分钟可批）。是否改为"从建案时间算"或放宽？
-5. **`partial_then_break_even` 收不收**：生产上 8 月中旬以来 0 次成功，收进来多半只是再失败并触发熔断。建议先不收、等主链路修好；由你决定。
-6. **部分止盈过了一段时间还要不要补**：价格可能已经走远，补的是"按现价减仓"。60 分钟窗口够不够，还是部分止盈应更短（例如 20 分钟）？
-7. **限额数值**：每日执行 ≤ 10、同仓位冷却 10 分钟、连续 2 次失败熔断、提案 30 分钟 / 二次确认 2 分钟有效——是否照此。
-8. **D1b 里的 `shadow_planned`**：那是"当时管理执行处于 shadow、系统有意只计划不执行"的项。补救它等于事后替当时的配置做了决定。收还是排除？（规格暂按计划器口径收进来，A3 只保证"此刻"开着自动交易。）
+| # | 问题 | 裁定 | 落到正文 |
+|---|---|---|---|
+| 1 | Codex 判"不该执行"时压不压按钮 | **不压**；它的意见只作参考文字，Codex 仍不在权限路径上 | 3.2 |
+| 2 | 谁可以批准 | **只有用户本人**；id 取系统 bot 私聊的 chat id（2026-09-26 服务器只读核实为私聊） | 4.6 `APPROVER_IDS`、G-B B1 |
+| 3 | 总闸 / 熔断后怎么重开 | 批准人在系统 bot 发 **`/oncall_on`**，不必登服务器 | 4.7、8.2 |
+| 4 | 时效从哪算 | **按消息发布时间**，批准与执行时都要在窗口内 | A8、C3 |
+| 5 | `partial_then_break_even` 收不收 | **本版不收** | A6、第 7 节 |
+| 6 | 部分止盈窗口 | 60 → **20 分钟** | A8、4.6、第 7 节 |
+| 7 | 限额数值 | **照用**：每日执行 ≤ 10、同仓位冷却 10 分钟、连续 2 次失败熔断、提案 30 分钟 / 二次确认 2 分钟 | 4.4、4.6、4.7、6.2 |
+| 8 | 当初"只计划不执行"（`shadow_planned`）的项 | **本版不补救** | 5.2、A6b |
 
 ## 12. 部署与 L3 验证计划（指挥会话执行）
 
