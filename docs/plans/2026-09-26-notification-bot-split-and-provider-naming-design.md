@@ -372,3 +372,37 @@ management_target_refused        unclassified_operation_failure
 - `Kol信号` bot 的任何改动
 - 值守判据本身（D6 那条线见 `docs/plans/2026-09-26-oncall-d6-silent-stall-rules-design.md`）
 - codex-proxy 的上游容错（这次是 OpenAI 侧故障，备用模型已经按设计接住了，无需改）
+
+---
+
+## 7. 实施中发现、**未在本次处理**的一条：识别冲突复核那条告警
+
+`format_ai_recognition_conflict_review_message`
+（[`system_operator_bot.py`](../../src/telegram_kol_research/system_operator_bot.py) 约 1476 行）
+还有 5 处硬写的 `MiMo`，本次没动 —— 它不在第 2 节那张 8 行表里，而且要改得连
+`telegram_live_listener._build_authoritative_notification_payload` 一起改，属于超出已批准范围。
+
+但它现在发出去的东西比「叫错名字」更成问题，记在这里等定夺：
+
+1. **标题说分歧，内容里没有第二方。** 这条只在 `agreement_status == "authoritative_failed"`
+   时才发，而 `auxiliary`（DeepSeek 那半边）在 2026-09-25 语义复核退役后
+   **恒为空字典**，代码注释自己写了「every construction site had been passing `None`
+   since long before that」。所以实际渲染出来是：
+
+   ```
+   【AI识别分歧告警】
+   DeepSeek: - / -
+   DeepSeek原因: -
+   MiMo: <status> / authoritative
+   权威结果: MiMo
+   处理: MiMo 权威识别失败，未执行自动交易；DeepSeek 结果仅供参考。
+   ```
+
+   ——「分歧」没有分歧方，「DeepSeek 结果仅供参考」指的是一个不存在的结果。
+
+2. **`权威结果: MiMo` 这行现在会和隔壁的告警自相矛盾**：本次改完之后，供应商告警说
+   「权威识别主用模型 gpt-5.6-luna」，而这条还在说「权威结果: MiMo」。
+
+建议另开一条：要么把它改名成「权威识别失败告警」并删掉 DeepSeek 半边，
+要么确认语义复核会回来、把第二方补上。**别只改名字** —— 名字对了，
+「分歧」两个字还是在骗人。
