@@ -923,6 +923,34 @@ auto_trade_switches: untouched
   沙箱探针全部 PASS，含新增项「值守补救令牌环境文件 看不见」。按钮 `orm:` 在 off 模式下回「补救未启用」由测试钉住（生产上无按钮可点）。
 - 下一步（均需另行确认）：只提示模式（worker `MODE=shadow` + 值守 `REQUESTS=on`）、部分止盈跟随超时的生产数据核对、批准模式。
 
+#### 9.4.6 开启只提示模式（2026-09-27，用户在阶段 3 会话中确认）
+
+```yaml
+phase3_status: shadow_since_2026-09-26T23:07:08Z   # 「至少 3 个真实案件或 3 天」的起点
+production_commit: d3e29a798af57658ac4f256642545fc68f9be1c8   # 未重新部署，只改 env + 重启
+worker_mode: shadow        # /etc/telegram-kol-worker.env: TELEGRAM_KOL_ONCALL_REMEDIATION_MODE=shadow
+oncall_requests: on        # /etc/telegram-kol-oncall-remediation.env: TELEGRAM_KOL_ONCALL_REMEDIATION_REQUESTS=on
+approve_mode: not_enabled
+auto_trade_switches: untouched   # trading_settings 最后修改 2026-09-26 03:37 UTC、groups.yaml 00:04 UTC，均早于本次
+```
+
+- 开启前：在途管理批次 0；值守 `MODE=notify`。
+- `systemctl restart telegram-kol-worker`（只重启 worker，web / ingest 未动；新 PID 2149696），随后单独重启值守。worker 日志：
+  `Oncall remediation background task starting effective_mode=shadow`（23:07:08Z）。
+- 冒烟（用不存在的消息号，案件号 999999，case_key `phase3-shadow-smoke`）：无令牌 404；带价格字段 400；`case_no=0` 400；
+  正常请求 202 → 提案 P1，同一请求再发 200 且返回同一个 P1；后台任务按闸门拒绝 `target_not_resolved`，审计流水 2 行
+  （`register` / `gate_a scope refused`）；拒绝消息「ℹ️ 值守 #999999 没有可执行的补救」经系统 bot 发出（无发送失败告警）。**P1 是冒烟记录，不是真实案件。**
+- 只提示下提案消息不带按钮、`/fix` 回「当前为只提示模式」：由测试钉住，等第一个真实案件时核对。
+
+#### 9.4.7 只提示期真实案件核对表（开自动模式的证据）
+
+每个真实案件一行：提案是否生成、参数是否对（动作、比例、止损价、目标仓位）、时机（消息发布 → 提案发出）、
+**若自动执行会不会是对的**（与交易所实况 / KOL 后续消息对照）、拒绝理由是否合理、`plan_changed` 是否出现。
+
+| 提案 | 值守案件 | 消息 | 动作 / 结果 | 参数正确？ | 时机 | 自动执行会对吗？ | 备注 |
+|---|---|---|---|---|---|---|---|
+| P1 | — | — | 冒烟，`target_not_resolved` | — | — | — | 非真实案件 |
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
