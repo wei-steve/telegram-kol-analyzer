@@ -417,7 +417,24 @@ so the worker path and `POST /api/messages/{id}/recognize` cannot drift apart」
 `telegram-kol-research web --runtime-role ...`，`systemctl list-timers` 里也只有
 媒体清理那一个定时器），而 09-23 之后库里既没有 `scheduled` 也没有 `sent`。
 
-所以这是个**潜伏的漂移**，正好是那句 docstring 声称已经防住的那种。修它要动 `cli.py`，
-而那个文件现在归另一个会话（`uncertain-attempt-closeout` 线）占用，本次不碰。
-建议合到那条线里，或等它部署完单独做：把 CLI 那段也改成先问 `auxiliary_review_disagrees`，
-并把 docstring 里的「both senders」改成三个。
+所以这是个**潜伏的漂移**，正好是那句 docstring 声称已经防住的那种。
+（2026-09-23 的 `docs/codex-oncall-status.md` 8.14「风险与遗留」把它记成已知遗留，
+理由是当时没有服务在跑它 —— 那个判断今天仍然成立，本节只是给它补上实证。）
+
+### 7.3 处理方式：并进本条线，在 rebase 之后做
+
+`cli.py` 现在归另一个会话（`uncertain-attempt-closeout` 线）占用，**本次不碰**。
+2026-09-26 与调度会话约定：等那条线部署、`cli.py` 释放之后，本条线 rebase 到它落地后的
+`origin/main`，把这一处一起做完：
+
+1. CLI 那段（约 1786-1824 行）在写 `notification_status="scheduled"` **之前**先问
+   `auxiliary_review_disagrees`，不通过就写 `SUPPRESSED_NO_AUXILIARY` 并跳过发送；
+2. 把 `auxiliary_review_disagrees` docstring 里的「both senders」改成三个，
+   并点名 CLI 那条路 —— 数错发送方数量正是这次漏掉它的原因；
+3. 补测试。**注意 `tests/test_cli_authoritative_recognition.py` 里这三条**：
+   `test_cli_authoritative_result_sends_no_conflict_alert`、
+   `test_cli_mimo_failure_notification_does_not_block_later_messages`、
+   `test_cli_drains_scheduled_failure_alert_when_later_processing_raises`。
+   后两条断言的是并发 / 排空语义 —— 加上守卫之后它们的 payload 会被拦掉，
+   除非 fixture 里的 `deepseek` 段带上真实结果。**别为了让测试变绿就把守卫放宽**，
+   要改的是 fixture。
