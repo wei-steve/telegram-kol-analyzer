@@ -202,3 +202,40 @@ fail-closed 的具体方向（都写在注释里）：
 - `_LAST_STUCK_CAPTURE` 无淘汰逻辑（量级极小，见上）。
 - 丙只在「本轮要发声」的 pass 上判定，所以可释放的 lane 最长多封 30 分钟；若将来觉得慢，
   该调的是这个门槛而不是 fail-closed 的方向。
+
+---
+
+## 部署记录 · 2026-09-26（北京时间 11:15）
+
+- 部署 sha `0041ae06`，**回滚 sha `977c50ab`**。顺序：候选推
+  `claude/stuck-deletion-exit-selfheal` → `tg-deploy` → 推 `main`。
+- 两项检查各对两种答案测过：`983e4e26..0041ae06` 正确报 FAIL 并列出 6 个代码文件；
+  部署后 `main` 对生产报 `PASS: 0 code files beyond production`。
+- 本次不涉及 systemd 单元与文件权限，没有人工两步。
+
+### 上线前核实过的那件事
+
+状态文档「上线注意」担心的是：甲改了摘要 → 指纹变 → 首个 tick 每条已超时的
+`recovery_required` 退出会新开一行 incident 并发一次通知。**部署前查过生产：
+`recovery_required` 为 0 条**（281 succeeded + 91 unbound，后者 `raw_message_id` 为 NULL，
+本来就不进这条路径），所以没有任何集中通知，实际观察也是 0 条。
+
+### 复核时另外验证的两点（不是转述子代理的结论）
+
+1. **丙不是死代码。** 释放判据第 3 条要求 lane 内每一张在仓持仓都已归属别的绑定。
+   查了生产：当前唯一的持仓 `posId=1001125399244160` 在
+   `execution_order_legs` 里有行（leg 655 → binding 383 → 米娅群），**可归属**。
+   也就是说如果 310/311 今天还卡着，这条新判据会自动放掉它们——与人工判断一致。
+2. **TPSL 触发单不会误堵。** `resting_orders_loader` 走的是 `list_open_orders()`，
+   不含止盈止损触发单（那是另一个端点，快照里单列 `tpsl_orders`），所以三张挂在
+   米娅持仓上的触发单不会被算成"无主挂单"而否决释放。
+
+### 部署后观察
+
+worker/web/ingest 全部 active，无新异常（`RuntimeIncidentBoundsError` 与
+`recognition execution finding` 两条既有噪音除外——前者本次之后应当消失，
+因为它只在有卡死退出时才发生）。卡死告警 0 条（本来就没有卡死的退出）。
+自动交易开关未动：auto_trade 群仍是 8 个，峰哥 `notify_only`、陈哥 `auto_trade`。
+
+**下一条卡死的退出出现时，才是真正的验证时刻**：预期看到它每 30 分钟说一次而不是每 5 秒，
+告警正文带「释放判定」一行，并且在 lane 里没有无主持仓时自行释放。
