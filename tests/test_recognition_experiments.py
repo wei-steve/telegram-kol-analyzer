@@ -28,6 +28,7 @@ from telegram_kol_research.recognition_experiments import (
     _build_mimo_payload,
     _call_mimo_authoritative_with_retry,
     _call_mimo_direct_model,
+    _validate_authoritative_payload,
     run_mimo_authoritative_for_message,
     run_mimo_direct_experiment,
     run_mimo_direct_for_message,
@@ -1138,7 +1139,154 @@ def test_mimo_v1_invalid_payload_counts_one_provider_request(
     )
 
     assert payload == {}
-    assert "missing strategy" in (error or "")
+    # ``strategy`` is allowed to be absent on a "非策略" payload (the v10
+    # four-classification contract's null shape); ``lifecycle_event`` is still
+    # required, so that is what this still-invalid payload fails on.
+    assert "missing lifecycle_event" in (error or "")
     assert len(attempts) == 1
     assert attempts[0].provider_usage == {"prompt_tokens": 5}
+
+
+def _v10_shaped_payload(*, recognition_result: str, strategy) -> dict:
+    payload = {
+        "recognition_result": recognition_result,
+        "reason": "测试",
+        "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+        "input_reading": {"observed_text": "测试文本", "image_quality": "none"},
+        "confidence": 0.5,
+    }
+    if strategy is not _MISSING:
+        payload["strategy"] = strategy
+    return payload
+
+
+_MISSING = object()
+
+
+def test_validate_authoritative_payload_accepts_null_strategy_on_non_strategy_message():
+    # v10's four-classification contract (design
+    # docs/plans/2026-09-24-first-pass-classification-contract-design.md):
+    # ``strategy`` must be ``null`` when the message carries no 新策略 element,
+    # i.e. whenever ``recognition_result`` is not "是策略". Rejecting this shape
+    # was the phase-1 gap this fix closes.
+    _validate_authoritative_payload(
+        _v10_shaped_payload(recognition_result="非策略", strategy=None)
+    )
+    _validate_authoritative_payload(
+        _v10_shaped_payload(recognition_result="识别失败", strategy=None)
+    )
+
+
+def test_validate_authoritative_payload_accepts_missing_strategy_key_on_non_strategy_message():
+    _validate_authoritative_payload(
+        _v10_shaped_payload(recognition_result="非策略", strategy=_MISSING)
+    )
+
+
+def test_validate_authoritative_payload_still_requires_strategy_dict_when_is_strategy():
+    with pytest.raises(ValueError, match="missing strategy"):
+        _validate_authoritative_payload(
+            _v10_shaped_payload(recognition_result="是策略", strategy=None)
+        )
+    with pytest.raises(ValueError, match="missing strategy"):
+        _validate_authoritative_payload(
+            _v10_shaped_payload(recognition_result="是策略", strategy=_MISSING)
+        )
+
+
+def test_validate_authoritative_payload_rejects_non_dict_non_null_strategy():
+    with pytest.raises(ValueError, match="missing strategy"):
+        _validate_authoritative_payload(
+            _v10_shaped_payload(recognition_result="非策略", strategy="none")
+        )
+    with pytest.raises(ValueError, match="missing strategy"):
+        _validate_authoritative_payload(
+            _v10_shaped_payload(recognition_result="非策略", strategy=[])
+        )
+    with pytest.raises(ValueError, match="missing strategy"):
+        _validate_authoritative_payload(
+            _v10_shaped_payload(recognition_result="是策略", strategy="none")
+        )
+
+
+def test_run_mimo_authoritative_for_message_accepts_v10_null_strategy_end_to_end(
+    tmp_path, monkeypatch
+):
+    """A v10 non-策略 payload with ``strategy: null`` must recognize on the
+    first provider call, with no retry and no fallback -- and land the same
+    outcome as the equivalent payload using ``strategy: {}`` (the shape the
+    validator already accepted before this fix).
+    """
+
+    session_factory = create_session_factory(tmp_path / "research.db")
+
+    def _make_raw(message_id: int) -> int:
+        with session_factory() as session:
+            raw = RawMessage(chat_id=100, message_id=message_id, text="今天行情不错，随便聊聊")
+            session.add(raw)
+            session.commit()
+            return int(raw.id)
+
+    config = AiRecognitionConfig(
+        ai_models=[
+            AiModelConfig(
+                id="mimo-v2.5",
+                label="MiMo",
+                base_url="https://api.xiaomimimo.com/v1",
+                api_key="key",
+                model="mimo-v2.5",
+                supports_text=True,
+                supports_image=True,
+            )
+        ]
+    )
+
+    def _run(strategy_value, message_id: int, call_counter: list[int]):
+        payload = {
+            "recognition_result": "非策略",
+            "reason": "闲聊，非交易信号",
+            "strategy": strategy_value,
+            "lifecycle_event": {"event_type": "none", "confidence": 0.0},
+            "input_reading": {
+                "observed_text": "今天行情不错，随便聊聊",
+                "image_quality": "none",
+            },
+            "confidence": 0.9,
+        }
+
+        def fake_call(**kwargs):
+            call_counter.append(1)
+            return payload
+
+        monkeypatch.setattr(
+            "telegram_kol_research.recognition_experiments._call_mimo_direct_model",
+            fake_call,
+        )
+        raw_id = _make_raw(message_id)
+        return run_mimo_authoritative_for_message(
+            session_factory,
+            raw_message_id=raw_id,
+            ai_recognition_config=config,
+        )
+
+    null_calls: list[int] = []
+    null_result = _run(None, 20, null_calls)
+
+    empty_calls: list[int] = []
+    empty_result = _run({}, 21, empty_calls)
+
+    assert len(null_calls) == 1
+    assert null_result.status == "非策略"
+    assert null_result.error_message is None
+    assert null_result.is_actionable is False
+    assert null_result.model == "mimo-v2.5"
+
+    # Same outcome as the long-accepted ``strategy: {}`` shape, other than the
+    # raw strategy value itself, which four-classification shadow parsing
+    # depends on seeing untouched.
+    assert null_result.status == empty_result.status
+    assert null_result.error_message == empty_result.error_message
+    assert null_result.is_actionable == empty_result.is_actionable
+    assert null_result.payload.get("strategy") is None
+    assert empty_result.payload.get("strategy") == {}
 

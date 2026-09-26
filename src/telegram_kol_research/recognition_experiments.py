@@ -736,11 +736,29 @@ def _call_mimo_authoritative_with_retry(
 
 
 def _validate_authoritative_payload(payload: dict[str, Any]) -> None:
-    if str(payload.get("recognition_result") or "") not in {"是策略", "非策略", "识别失败"}:
+    recognition_result = str(payload.get("recognition_result") or "")
+    if recognition_result not in {"是策略", "非策略", "识别失败"}:
         raise ValueError("MiMo response has invalid recognition_result")
-    for field in ("strategy", "lifecycle_event", "input_reading"):
+    for field in ("lifecycle_event", "input_reading"):
         if not isinstance(payload.get(field), dict):
             raise ValueError(f"MiMo response missing {field}")
+    # The shared prompt v10 four-classification contract (design
+    # docs/plans/2026-09-24-first-pass-classification-contract-design.md) requires
+    # ``strategy`` to be ``null`` when the message has no 新策略 element, which is
+    # every ``recognition_result`` other than "是策略". Rejecting that shape here
+    # was phase 1's own gap: a missing or ``null`` ``strategy`` on a non-策略
+    # message is the contract working as designed, not a broken response, and
+    # must not cost a same-model retry (or a fallback to the next model) that a
+    # 20% share of v10 calls were paying for nothing. A "是策略" message must
+    # still carry a strategy object -- that requirement is unchanged -- and any
+    # other type (a string, a list, ...) is still invalid regardless of
+    # ``recognition_result``, because that is not the contract's null shape.
+    strategy = payload.get("strategy")
+    if recognition_result == "是策略":
+        if not isinstance(strategy, dict):
+            raise ValueError("MiMo response missing strategy")
+    elif strategy is not None and not isinstance(strategy, dict):
+        raise ValueError("MiMo response missing strategy")
     # Phase 1 (shadow) of the first-pass classification contract: read
     # ``message_classes`` but never fail on it. Neither a missing field nor a
     # violated rule may raise here -- the production prompt (v8) does not emit
