@@ -1,4 +1,4 @@
-"""Detection rules D1a-D1d, D2, D4, D5 and the read-only discipline."""
+"""Detection rules D1a-D1d, D2, D4, D5, D6a-D6c and the read-only discipline."""
 
 from __future__ import annotations
 
@@ -14,6 +14,8 @@ from oncall_test_support import (
     ProductionFixture,
     build_open_position_case,
     build_recognition_failure_case,
+    build_sealed_lane_case,
+    build_voided_message_case,
     sqlite_write_authorizer,
 )
 from telegram_kol_research.oncall_detector import (
@@ -1055,6 +1057,446 @@ def test_d3_never_replays_the_recognition_history_that_predates_the_watcher(
     assert store.get_watermark("recognition_decisions") is not None
 
 
+# ------------------------------------------------------------------- D6a
+
+
+def test_d6a_opens_a_case_once_the_lane_has_been_sealed_for_six_hours(
+    production, store
+):
+    """陈哥 BTC-long, sealed 2026-09-15 to 09-25 with nobody told."""
+
+    run_round(production, store)
+    built = build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"lane:{built['exit_id']}"
+    assert case.rule == "D6a"
+    assert case.severity == "high"
+    assert case.reason_code == "source_deletion_exit_sealed_lane"
+    assert case.chat_id == CHAT_ID
+    assert case.evidence["group_name"] == "龚有财群"
+    assert case.evidence["symbol"] == "BTC"
+    assert case.evidence["side"] == "long"
+    assert case.evidence["exit_id"] == built["exit_id"]
+    assert case.evidence["minutes_sealed"] == 12 * 60
+    assert case.evidence["exit_last_reason"] == "exit_has_no_known_position"
+
+
+def test_d6a_leaves_a_lane_alone_while_the_system_can_still_heal_it(
+    production, store
+):
+    """The system's own sweep runs at 120 minutes; the watch waits for six hours."""
+
+    run_round(production, store)
+    build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=5))
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+    # And it does open once the horizon passes.
+    later = run_round(production, store, now=NOW + timedelta(hours=2))
+    assert len(later.new_case_ids) == 1
+
+
+def test_d6a_case_text_carries_the_symbol_side_and_how_many_were_voided(
+    production, store
+):
+    """Translating "exit 310 is stuck" into "you are two strategies down"."""
+
+    run_round(production, store)
+    build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    for text in ("BTC 80400 进多", "BTC 83300-83500 进多"):
+        build_voided_message_case(production, text=text)
+    # A later message the system did *not* void must not be counted.
+    production.add_recognition_decision(
+        raw_message_id=production.add_raw_message(text="BTC 空单减半"),
+        automation_reason="management_stop_action_conflict",
+    )
+
+    run_round(production, store)
+
+    lane = next(
+        case for case in store.open_cases() if case.case_key.startswith("lane:")
+    )
+    assert lane.evidence["voided_messages"] == 2
+    assert lane.evidence["voided_scan_examined"] >= 3
+
+
+def test_d6a_resolves_when_the_exit_finally_succeeds(production, store):
+    run_round(production, store)
+    built = build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    production.set_deletion_exit_state(built["exit_id"], state="succeeded")
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+    assert store.get_case(opened.new_case_ids[0]).status == "resolved"
+
+
+def test_d6a_keeps_the_case_open_while_the_exit_is_merely_touched(
+    production, store
+):
+    """The barrier reopens the lane on ``succeeded`` alone, so nothing else clears."""
+
+    run_round(production, store)
+    built = build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    opened = run_round(production, store)
+
+    production.set_deletion_exit_state(
+        built["exit_id"], state="recovery_required", updated_at=NOW
+    )
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == ()
+    assert store.get_case(opened.new_case_ids[0]).status == "open"
+
+
+def test_d6a_ignores_an_unbound_exit_because_it_seals_nothing(production, store):
+    """91 rows in production. ``raw_message_id`` NULL is not in the barrier's join."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production,
+        unbound=True,
+        state="recovery_required",
+        updated_at=NOW - timedelta(days=30),
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_d6a_ignores_an_exit_whose_message_never_named_a_symbol_and_side(
+    production, store
+):
+    """The barrier's join also needs a candidate with both, so this seals nothing."""
+
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, with_candidate=False, updated_at=NOW - timedelta(hours=12)
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+@pytest.mark.parametrize("state", ["succeeded", "pending", "reconciling"])
+def test_d6a_only_reads_the_one_state_that_hangs_about_forever(
+    production, store, state
+):
+    run_round(production, store)
+    build_sealed_lane_case(
+        production, state=state, updated_at=NOW - timedelta(hours=12)
+    )
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+
+
+def test_the_sealed_lane_state_is_the_sweepers_own_spelling():
+    """A drifted copy would make D6a silent for the state it exists for."""
+
+    from telegram_kol_research import source_deletion_exit_timeout as sweeper
+    from telegram_kol_research.oncall_detector import SEALED_LANE_STUCK_STATE
+
+    assert SEALED_LANE_STUCK_STATE == sweeper.STUCK_STATE
+
+
+# ------------------------------------------------------------------- D6b
+
+
+def test_d6b_opens_a_case_for_a_message_the_system_voided(production, store):
+    run_round(production, store)
+    built = build_voided_message_case(production)
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"voided:{built['raw_message_id']}"
+    assert case.rule == "D6b"
+    assert case.severity == "high"
+    assert case.reason_code == "deferred_expired"
+    assert case.chat_id == CHAT_ID
+    assert case.evidence["group_name"] == "龚有财群"
+    assert case.evidence["symbol"] == "BTC"
+    assert case.evidence["side"] == "long"
+    assert case.evidence["message_text"].startswith("BTC 83000-83300")
+
+
+def test_d6b_opens_a_case_even_though_the_group_holds_no_position(
+    production, store
+):
+    """The whole reason D6b is not in ``LOSSY_RECOGNITION_REASONS``.
+
+    D3 drops a lossy decision when the group has no open binding. Four of
+    陈哥's eleven voided messages were *entries* -- no position by definition --
+    and that filter would have swallowed every one of them.
+    """
+
+    run_round(production, store)
+    build_voided_message_case(production, with_binding=False)
+
+    outcome = run_round(production, store)
+
+    assert len(outcome.new_case_ids) == 1
+    assert outcome.skipped_no_position == 0
+    assert store.get_int_meta(COUNTER_SKIPPED_NO_POSITION, 0) == 0
+    assert only_case(store).rule == "D6b"
+
+
+def test_deferred_expired_is_deliberately_not_a_lossy_recognition_reason():
+    """Adding it to D3's set is the one implementation mistake to prevent."""
+
+    from telegram_kol_research.oncall_detector import (
+        DEFERRED_EXPIRED_REASON,
+        DEFERRED_HOLD_REASON,
+        LOSSY_RECOGNITION_REASONS,
+    )
+
+    assert DEFERRED_EXPIRED_REASON not in LOSSY_RECOGNITION_REASONS
+    assert DEFERRED_HOLD_REASON not in LOSSY_RECOGNITION_REASONS
+
+
+def test_the_deferral_reason_codes_are_the_pipelines_own_spelling():
+    from telegram_kol_research import deferred_instruction_recovery as recovery
+    from telegram_kol_research.oncall_detector import (
+        DEFERRED_EXPIRED_REASON,
+        DEFERRED_HOLD_REASON,
+    )
+
+    assert DEFERRED_EXPIRED_REASON == recovery.DEFERRED_EXPIRED_REASON
+    assert DEFERRED_HOLD_REASON == recovery.DEFERRED_HOLD_REASON
+
+
+def test_d6b_says_nothing_while_the_message_is_merely_waiting(production, store):
+    """``waiting_source_deletion_exit`` may still resume and execute normally."""
+
+    run_round(production, store)
+    built = build_voided_message_case(
+        production, automation_reason="waiting_source_deletion_exit"
+    )
+
+    outcome = run_round(production, store)
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+    # But the row stays under watch, so the terminal state is not missed.
+    production.set_recognition_decision(
+        built["decision_id"],
+        automation_status="deferred",
+        automation_reason="deferred_expired",
+    )
+    later = run_round(production, store, now=NOW + timedelta(minutes=35))
+    assert len(later.new_case_ids) == 1
+    assert only_case(store).rule == "D6b"
+
+
+def test_d6b_names_the_exit_that_ate_the_message(production, store):
+    """So the D6a case and the D6b case read as one event, not two faults."""
+
+    run_round(production, store)
+    built = build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    build_voided_message_case(production)
+
+    run_round(production, store)
+
+    voided = next(
+        case for case in store.open_cases() if case.case_key.startswith("voided:")
+    )
+    assert voided.evidence["blocking_exit_id"] == built["exit_id"]
+    assert voided.evidence["blocking_exit_state"] == "recovery_required"
+
+
+def test_d6b_never_replays_the_voided_history_that_predates_the_watcher(
+    production, store
+):
+    build_voided_message_case(production)
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.get_watermark("recognition_decisions") is not None
+
+
+# ------------------------------------------------------------------- D6c
+
+
+def _still_shouting(production, **kwargs) -> int:
+    defaults = dict(
+        source_kind="source_deletion_exit",
+        source_record_id="310",
+        incident_type="source_deletion_exit_stuck",
+        severity="high",
+        status="pending",
+        repeat_count=356933,
+        first_occurred_at=NOW - timedelta(days=11),
+        last_occurred_at=NOW - timedelta(minutes=2),
+        notified_at=None,
+    )
+    defaults.update(kwargs)
+    return production.add_runtime_incident(**defaults)
+
+
+def test_d6c_opens_a_case_for_an_alarm_still_ringing_that_nobody_was_told_about(
+    production, store
+):
+    run_round(production, store)
+    incident_id = _still_shouting(production)
+
+    outcome = run_round(production, store)
+
+    case = only_case(store)
+    assert outcome.new_case_ids == (case.id,)
+    assert case.case_key == f"unheard:{incident_id}"
+    assert case.rule == "D6c"
+    assert case.severity == "high"
+    assert case.reason_code == "runtime_incident_never_notified"
+    assert case.evidence["incident_type"] == "source_deletion_exit_stuck"
+    assert case.evidence["repeat_count"] == 356933
+    assert case.evidence["minutes_since_last_occurrence"] == 2
+
+
+def test_d6c_opens_a_case_when_the_last_notification_is_three_days_old(
+    production, store
+):
+    run_round(production, store)
+    _still_shouting(production, notified_at=NOW - timedelta(days=11))
+
+    run_round(production, store)
+
+    assert only_case(store).reason_code == "runtime_incident_notification_stale"
+
+
+def test_d6c_says_nothing_about_an_alarm_that_has_stopped(production, store):
+    """"Happened a lot in the past" is not the criterion; "happening now" is."""
+
+    run_round(production, store)
+    _still_shouting(production, last_occurred_at=NOW - timedelta(days=4))
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+def test_d6c_says_nothing_when_somebody_was_told_recently(production, store):
+    run_round(production, store)
+    _still_shouting(production, notified_at=NOW - timedelta(hours=6))
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+    assert store.open_cases() == ()
+
+
+@pytest.mark.parametrize("severity", ["info", "low", "medium"])
+def test_d6c_leaves_the_quiet_severities_alone(production, store, severity):
+    run_round(production, store)
+    _still_shouting(production, severity=severity)
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+
+
+@pytest.mark.parametrize("status", ["claimed", "diagnosed", "resolved", "closed"])
+def test_d6c_only_looks_at_incidents_nobody_has_picked_up(
+    production, store, status
+):
+    run_round(production, store)
+    _still_shouting(production, status=status)
+
+    outcome = run_round(production, store)
+
+    assert outcome.new_case_ids == ()
+
+
+def test_d6c_resolves_when_the_alarm_stops_progressing(production, store):
+    run_round(production, store)
+    incident_id = _still_shouting(production)
+    opened = run_round(production, store)
+    assert len(opened.new_case_ids) == 1
+
+    outcome = run_round(production, store, now=NOW + timedelta(hours=3))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+    assert store.get_case(opened.new_case_ids[0]).status == "resolved"
+    assert incident_id
+
+
+def test_d6c_resolves_when_somebody_is_finally_told(production, store):
+    run_round(production, store)
+    incident_id = _still_shouting(production)
+    opened = run_round(production, store)
+
+    production.set_runtime_incident(incident_id, notified_at=NOW)
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+
+
+def test_d6c_resolves_when_the_incident_is_picked_up(production, store):
+    run_round(production, store)
+    incident_id = _still_shouting(production)
+    opened = run_round(production, store)
+
+    production.set_runtime_incident(incident_id, status="claimed")
+    outcome = run_round(production, store, now=NOW + timedelta(minutes=1))
+
+    assert outcome.resolved_case_ids == opened.new_case_ids
+
+
+def test_the_incident_status_and_severities_are_the_ledgers_own_spelling():
+    from telegram_kol_research import runtime_incidents
+    from telegram_kol_research.oncall_detector import (
+        INCIDENT_LOUD_SEVERITIES,
+        INCIDENT_PENDING_STATUS,
+    )
+
+    assert INCIDENT_PENDING_STATUS == runtime_incidents._CLAIMABLE_STATUS
+    assert INCIDENT_LOUD_SEVERITIES <= set(runtime_incidents._SEVERITY_RANKS)
+    # And they really are the loud end of that scale.
+    ranks = runtime_incidents._SEVERITY_RANKS
+    assert min(ranks[name] for name in INCIDENT_LOUD_SEVERITIES) > ranks["medium"]
+
+
+def test_the_three_d6_thresholds_are_the_designs_own_numbers():
+    from telegram_kol_research.oncall_detector import (
+        INCIDENT_NOTIFICATION_SILENCE,
+        INCIDENT_STILL_OCCURRING_WITHIN,
+        SEALED_LANE_STUCK_AFTER,
+        DetectorConfig,
+    )
+
+    assert SEALED_LANE_STUCK_AFTER == timedelta(hours=6)
+    assert INCIDENT_STILL_OCCURRING_WITHIN == timedelta(hours=1)
+    assert INCIDENT_NOTIFICATION_SILENCE == timedelta(days=3)
+    defaults = DetectorConfig()
+    assert defaults.sealed_lane_stuck_after == SEALED_LANE_STUCK_AFTER
+    assert defaults.incident_still_occurring_within == INCIDENT_STILL_OCCURRING_WITHIN
+    assert defaults.incident_notification_silence == INCIDENT_NOTIFICATION_SILENCE
+
+
+def test_the_sql_cutoff_is_spelled_the_way_production_stores_a_timestamp():
+    """Rules D6a and D6c compare timestamps inside SQL, which is lexicographic."""
+
+    from telegram_kol_research.oncall_detector import as_production_text
+
+    assert as_production_text(NOW) == "2026-09-19 06:00:00.000000"
+
+
 # ------------------------------------------------------- read discipline
 
 
@@ -1075,9 +1517,25 @@ _BOUNDED_SHAPES = (
         r"^SELECT id, action, after_json FROM execution_events "
         r"WHERE pos_id = \? ORDER BY id DESC LIMIT 20$"
     ),
-    # D3's "has this message already produced management work?" lookups, and
-    # D1d's batch check, which share one shape.
+    # D3's "has this message already produced management work?" lookups, D1d's
+    # batch check and D6a's lane naming, which share one shape.
     re.compile(r"WHERE raw_message_id = \? ORDER BY id (?:DESC )?LIMIT \d+$"),
+    # D6a's sweep over ix_source_message_deletion_exits_state (state, updated_at).
+    re.compile(
+        r"FROM source_message_deletion_exits "
+        r"WHERE state = \? AND updated_at <= \? ORDER BY id LIMIT \?$"
+    ),
+    # D6a's "how many has this lane already eaten", both halves.
+    re.compile(
+        r"^SELECT id FROM raw_messages WHERE chat_id = \? AND id > \? "
+        r"ORDER BY id LIMIT \?$"
+    ),
+    re.compile(r"WHERE raw_message_id IN \(\?(?:,\?)*\)$"),
+    # D6c's sweep over ix_runtime_incidents_claimable (status, ...).
+    re.compile(
+        r"FROM runtime_incidents "
+        r"WHERE status = \? AND last_occurred_at >= \? ORDER BY id LIMIT \?$"
+    ),
 )
 
 
@@ -1094,6 +1552,9 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
     run_round(production, store)
     build_open_position_case(production)
     build_recognition_failure_case(production)
+    build_sealed_lane_case(production, updated_at=NOW - timedelta(hours=12))
+    build_voided_message_case(production)
+    _still_shouting(production)
     production.add_processing_job(raw_message_id=production.add_raw_message())
     _ladder_fill(production)
     readers: list[ProductionReader] = []
@@ -1104,15 +1565,61 @@ def test_every_production_statement_is_a_watermark_a_point_query_or_a_bounded_lo
     assert statements
     # The ladder's own read is in there, not just the shapes that predate it.
     assert any("FROM execution_events" in sql for sql in statements)
-    # So are D3's, which are the newest.
+    # So are D3's.
     assert any("FROM recognition_decisions" in sql for sql in statements)
     assert any(
         "FROM message_instruction_items WHERE raw_message_id" in " ".join(sql.split())
         for sql in statements
     )
+    # And D6's three sweeps, which are the newest.
+    assert any("FROM source_message_deletion_exits" in sql for sql in statements)
+    assert any("FROM runtime_incidents" in sql for sql in statements)
+    assert any(
+        "FROM recognition_decisions WHERE raw_message_id IN" in " ".join(sql.split())
+        for sql in statements
+    )
     offenders = [sql for sql in statements if not _statement_is_allowed(sql)]
     assert offenders == []
     assert all("SELECT" in sql.upper() for sql in statements)
+
+
+_INDEX_BACKED_SWEEPS = (
+    (
+        "SELECT id FROM source_message_deletion_exits "
+        "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT ?",
+        "ix_source_message_deletion_exits_state",
+    ),
+    (
+        "SELECT id FROM runtime_incidents "
+        "WHERE status = ? AND last_occurred_at >= ? ORDER BY id LIMIT ?",
+        "ix_runtime_incidents_claimable",
+    ),
+    (
+        "SELECT id FROM raw_messages WHERE chat_id = ? AND id > ? ORDER BY id LIMIT ?",
+        "ix_raw_messages_chat_id",
+    ),
+)
+
+
+@pytest.mark.parametrize("sql,index_name", _INDEX_BACKED_SWEEPS)
+def test_the_new_sweeps_really_do_use_their_index(production, sql, index_name):
+    """The shape regexes say what was written; the planner says what runs.
+
+    A bounded-looking statement over an unindexed column is exactly the
+    full-table scan that froze the worker's event loop eight times on
+    2026-09-15, and the regex above cannot tell the difference.
+    """
+
+    reader = ProductionReader(production.path)
+    try:
+        plan = reader.connection.execute(
+            "EXPLAIN QUERY PLAN " + sql, tuple(None for _ in range(sql.count("?")))
+        ).fetchall()
+    finally:
+        reader.close()
+    detail = " ".join(str(row["detail"]) for row in plan)
+    assert index_name in detail, detail
+    assert "SCAN" not in detail, detail
 
 
 def test_the_detector_never_writes_to_the_production_database(production, store):

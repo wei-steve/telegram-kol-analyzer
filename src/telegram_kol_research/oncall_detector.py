@@ -11,8 +11,12 @@ production database read-only (``mode=ro`` plus ``PRAGMA query_only=ON``), one
 short connection per round, and never scans: each table is read forward by
 primary-key watermark, and rows that need re-checking later are remembered by
 primary key in the watcher's own state database and re-read as point queries.
-:data:`ALLOWED_QUERY_SHAPES` names the only three shapes allowed, and a test
-asserts every statement this module runs matches one of them.
+:data:`ALLOWED_QUERY_SHAPES` names every shape allowed, and a test asserts
+every statement this module runs matches one of them. Rules D6a and D6c add
+two bounded sweeps that seek on a named index instead of a watermark, and a
+second test reads the query planner's own answer for each of them -- a
+statement that *looks* bounded over an unindexed column is exactly the scan
+this module exists to avoid, and the shape regexes cannot tell the difference.
 
 **A failed read is "unknown", never "healthy".** A locked, missing or
 unexpected database ends the round as ``read_failed`` -- it never produces the
@@ -24,6 +28,13 @@ strategies that never had a position at all -- 35 of 220 in thirty days failed
 with ``target_strategy_binding_visibility_retry_expired`` and *none* of them
 had an execution binding. Those are not missed operations, and alerting on
 them is how an on-call channel becomes noise nobody reads.
+
+**Rules D6a/D6b/D6c** (``docs/plans/2026-09-26-oncall-d6-silent-stall-rules-design.md``)
+answer three questions the first five rules could not: is a lane still sealed
+by a source-deletion exit, did the system void a real instruction by itself,
+and is an alarm still ringing that nobody has been told about. All three come
+from one production case where three layers stayed silent for eleven days --
+``docs/2026-09-26-silent-stall-case-note.md``.
 """
 
 from __future__ import annotations
@@ -38,6 +49,9 @@ from typing import Any, Callable, Iterable, Mapping, Sequence
 
 from telegram_kol_research.oncall_state import (
     RECOGNITION_CASE_PREFIX,
+    SEALED_LANE_CASE_PREFIX,
+    UNHEARD_INCIDENT_CASE_PREFIX,
+    VOIDED_MESSAGE_CASE_PREFIX,
     OncallStateStore,
 )
 
@@ -90,6 +104,51 @@ LOSSY_RECOGNITION_REASONS = frozenset(
     }
 )
 
+#: Rule D6b (design 2026-09-26, section 2). The terminal automation reason a
+#: deferral gets when it outlives ``deferred_resume_timeout_minutes``: the
+#: system decided by itself that a real KOL instruction will never run.
+#:
+#: **It is deliberately not in** :data:`LOSSY_RECOGNITION_REASONS`. D3 applies
+#: a second filter after the lossy test -- the group must be holding a position
+#: (:func:`read_chat_open_bindings`) -- and what D6b exists to catch is an
+#: *entry* signal being eaten, where by definition there is no position yet.
+#: Four of 陈哥's expired messages on 2026-09-15..25 were entries, and every one
+#: of them would have been dropped by that filter. So D6b shares the intake but
+#: not the verdict.
+DEFERRED_EXPIRED_REASON = "deferred_expired"
+#: The non-terminal twin: the message is *still waiting* behind a deletion
+#: exit and may yet be resumed and executed normally. Never a case -- but it
+#: must not be retired from the watch list either, or the row would be
+#: forgotten before it can become :data:`DEFERRED_EXPIRED_REASON`.
+DEFERRED_HOLD_REASON = "waiting_source_deletion_exit"
+
+#: Rule D6a. The one source-deletion exit state that hangs about indefinitely
+#: while still sealing a lane: the deletion worker's active states do not
+#: include it, so nothing ever claims such a row again.
+SEALED_LANE_STUCK_STATE = "recovery_required"
+#: The only state ``source_execution_barrier`` treats as "lane open again".
+SEALED_LANE_RELEASED_STATE = "succeeded"
+
+#: Rule D6c. ``runtime_incidents.status`` while nobody has picked the incident
+#: up, and the severities worth waking somebody for.
+INCIDENT_PENDING_STATUS = "pending"
+INCIDENT_LOUD_SEVERITIES = frozenset({"high", "critical"})
+
+#: D6a's horizon. The system's own sweep releases a stuck exit after
+#: ``source_deletion_exit_timeout_minutes`` (120 in production), so the watch
+#: must sit *later* than the self-healing window or it would page for something
+#: about to be fixed. Six hours is the same bar as ``case_stale_after``.
+SEALED_LANE_STUCK_AFTER = timedelta(hours=6)
+#: D6c's "still happening" window. An incident whose ``last_occurred_at`` has
+#: not moved inside this window has stopped, and a stopped alarm needs nobody.
+#: This is the criterion on purpose, rather than a large ``repeat_count``:
+#: that number only says the failure happened a lot in the past.
+INCIDENT_STILL_OCCURRING_WITHIN = timedelta(hours=1)
+#: D6c's "nobody has heard" window. ``runtime_incidents`` coalesces by
+#: fingerprint and notifies once, so ``notified_at`` can sit weeks behind a
+#: failure that is still happening every five seconds.
+INCIDENT_NOTIFICATION_SILENCE = timedelta(days=3)
+
 #: The agreement status that means no authoritative decision was produced.
 RECOGNITION_FAILED_STATUS = "authoritative_failed"
 
@@ -134,6 +193,13 @@ COUNTER_STOP_LADDER_LEVEL_UNRECORDED = "counter:stop_ladder_level_unrecorded"
 META_CONSECUTIVE_READ_FAILURES = "consecutive_read_failures"
 META_CONSECUTIVE_WORKER_HEALTH_FAILURES = "consecutive_worker_health_failures"
 
+#: D6a/D6b/D6c reason codes. The watcher's own vocabulary, except
+#: :data:`DEFERRED_EXPIRED_REASON`, which is the pipeline's own spelling and is
+#: reused verbatim so the alert and the database row say the same word.
+REASON_SEALED_LANE = "source_deletion_exit_sealed_lane"
+REASON_INCIDENT_NEVER_NOTIFIED = "runtime_incident_never_notified"
+REASON_INCIDENT_NOTIFICATION_STALE = "runtime_incident_notification_stale"
+
 HEALTH_CASE_DB_READ = "health:D5a_database_unreadable"
 HEALTH_CASE_WORKER_LOOP = "health:D5b_worker_loop_health"
 HEALTH_CASE_STALLED_JOBS = "health:D4_message_processing_stalled"
@@ -153,6 +219,27 @@ ALLOWED_QUERY_SHAPES = (
     # whether its batch succeeded. Both are index-seeking on raw_message_id,
     # which carries its own index on both tables.
     "message scope: WHERE raw_message_id = ? ORDER BY id [DESC] LIMIT n",
+    # D6a's sweep. ``ix_source_message_deletion_exits_state`` is (state,
+    # updated_at), so the equality plus the range is one index seek. The
+    # tempting spelling -- ``state NOT IN ('succeeded', ...)`` -- cannot use
+    # that index at all and scans the table, which is the thing this module
+    # exists not to do.
+    "sealed lane: SELECT ... FROM source_message_deletion_exits "
+    "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT n "
+    "(never state NOT IN (...), which cannot use that index and scans)",
+    # D6a's "how many messages has this lane already eaten". ``automation_reason``
+    # carries no index, so the count is driven from the chat side instead:
+    # ix_raw_messages_chat_id is covering for (chat_id, rowid), and the decisions
+    # are then read by their own unique raw_message_id index.
+    "chat scope: SELECT id FROM raw_messages WHERE chat_id = ? AND id > ? "
+    "ORDER BY id LIMIT n",
+    "message key: WHERE raw_message_id = ? / WHERE raw_message_id IN (?, ...)",
+    # D6c's sweep. ``ix_runtime_incidents_claimable`` is (status,
+    # claim_expires_at, last_occurred_at); the equality on status is the seek
+    # and ``last_occurred_at`` is filtered from the same index entry. Severity
+    # and ``notified_at`` are decided in Python because no index covers them.
+    "unheard incident: SELECT ... FROM runtime_incidents "
+    "WHERE status = ? AND last_occurred_at >= ? ORDER BY id LIMIT n",
 )
 
 
@@ -183,6 +270,12 @@ class DetectorConfig:
     #: that heals on its own a minute later. The design names no threshold;
     #: five minutes is D1d's, and it leaves room for several retries.
     recognition_failure_after: timedelta = timedelta(minutes=5)
+    #: Rules D6a and D6c. The module-level constants are the policy; these
+    #: fields exist so a test can inject a clock and a threshold together
+    #: instead of sleeping.
+    sealed_lane_stuck_after: timedelta = SEALED_LANE_STUCK_AFTER
+    incident_still_occurring_within: timedelta = INCIDENT_STILL_OCCURRING_WITHIN
+    incident_notification_silence: timedelta = INCIDENT_NOTIFICATION_SILENCE
     case_stale_after: timedelta = timedelta(hours=6)
     #: How recently reconcile must have rewritten a binding for "open" to be a
     #: verified fact rather than an assumption. Matches
@@ -195,6 +288,17 @@ class DetectorConfig:
     worker_health_failure_rounds: int = 3
     intake_limit: int = 200
     watch_limit: int = 500
+    #: D6a. How many ``recovery_required`` exits one round looks at. Every one
+    #: of them costs two point queries to name its lane, and production has
+    #: held single digits of them, so a hundred is a generous ceiling rather
+    #: than an expected load.
+    stuck_lane_limit: int = 100
+    #: D6a. How many of a chat's messages after the seal are examined when
+    #: counting what the lane has already voided. The count is reported as
+    #: "at least", together with this bound.
+    voided_scan_limit: int = 200
+    #: D6c. How many still-occurring pending incidents one round looks at.
+    incident_limit: int = 200
 
 
 @dataclass(frozen=True, slots=True)
@@ -317,6 +421,23 @@ def as_utc(value: Any) -> datetime | None:
         except ValueError:
             return None
     return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=UTC)
+
+
+def as_production_text(moment: datetime) -> str:
+    """One moment, spelled the way production's own DATETIME columns are.
+
+    Rules D6a and D6c compare a timestamp *inside* SQL, which nothing in this
+    module did before: it is what makes their sweeps index-seeking instead of
+    table scans. SQLAlchemy's SQLite dialect writes naive UTC with six digits
+    of microseconds, and the comparison is lexicographic, so the cutoff has to
+    be produced in exactly that spelling -- ``datetime.isoformat`` drops the
+    microseconds when they are zero, which would sort *before* an otherwise
+    equal stored value.
+    """
+
+    return moment.astimezone(UTC).replace(tzinfo=None).strftime(
+        "%Y-%m-%d %H:%M:%S.%f"
+    )
 
 
 def _age(now: datetime, moment: datetime | None) -> timedelta | None:
@@ -594,6 +715,17 @@ _DECISION_COLUMNS = (
 
 _LEDGER_COLUMNS = "id, venue, pos_id, purpose, status, evidence_json, updated_at"
 _LADDER_EVENT_ACTION_PREFIX = "stop_ladder"
+_EXIT_COLUMNS = (
+    "id, raw_message_id, execution_binding_id, state, last_reason, updated_at"
+)
+#: Deliberately narrow: ``redacted_summary`` is the only free text, and the
+#: incident ledger already guarantees it carries no credential material.
+#: ``diagnosis_json`` and ``evidence_refs_json`` are never selected.
+_INCIDENT_COLUMNS = (
+    "id, source_kind, source_record_id, incident_type, severity, status, "
+    "repeat_count, first_occurred_at, last_occurred_at, notified_at, "
+    "redacted_summary"
+)
 
 _WATERMARK_TABLES = (
     ("message_instruction_items", WATCH_INSTRUCTION_ITEM),
@@ -943,6 +1075,390 @@ def _recorded_stop_ladder_level(reader: ProductionReader, *, pos_id: str) -> int
     return max(levels)
 
 
+# --------------------------------------------------------------------------
+# Rule D6a: a lane nobody can use, and nobody can see
+# --------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SealedLane:
+    """One ``recovery_required`` deletion exit, and the lane it seals.
+
+    ``symbol``/``side`` are ``None`` when the lane cannot be named. That is not
+    a detail: ``source_execution_barrier`` blocks a new message only through a
+    join of exit -> ``raw_messages`` -> ``signal_candidates`` with both symbol
+    and side present, so an exit that cannot be named here seals nothing and
+    :attr:`seals_a_lane` is false.
+    """
+
+    exit_id: int
+    raw_message_id: int | None
+    execution_binding_id: int | None
+    state: str
+    last_reason: str
+    updated_at: datetime | None
+    chat_id: int | None = None
+    symbol: str | None = None
+    side: str | None = None
+
+    @property
+    def seals_a_lane(self) -> bool:
+        return (
+            self.raw_message_id is not None
+            and self.chat_id is not None
+            and bool(self.symbol)
+            and bool(self.side)
+        )
+
+
+def _read_sealed_lanes(
+    reader: ProductionReader, now: datetime, config: DetectorConfig
+) -> tuple[SealedLane, ...]:
+    """Every exit currently parked in ``recovery_required``, lane named.
+
+    The design asserted that the 91 ``unbound`` exits cannot seal a lane
+    because their ``raw_message_id`` is NULL. Re-checked against the barrier
+    rather than taken on trust: ``source_execution_barrier``'s overlapping-exit
+    query inner-joins ``RawMessage.id == SourceMessageDeletionExit.raw_message_id``,
+    so a NULL there removes the row from the join entirely -- and the state
+    filter here removes them anyway. The same join also requires the deleted
+    message to own a candidate with *both* symbol and side, which is why
+    :attr:`SealedLane.seals_a_lane` demands the same and not less.
+    """
+
+    rows = reader.query(
+        "SELECT " + _EXIT_COLUMNS + " FROM source_message_deletion_exits "
+        "WHERE state = ? AND updated_at <= ? ORDER BY id LIMIT ?",
+        (
+            SEALED_LANE_STUCK_STATE,
+            as_production_text(now),
+            int(config.stuck_lane_limit),
+        ),
+    )
+    lanes: list[SealedLane] = []
+    for row in rows:
+        raw_message_id = (
+            int(row["raw_message_id"]) if row["raw_message_id"] is not None else None
+        )
+        chat_id: int | None = None
+        symbol: str | None = None
+        side: str | None = None
+        if raw_message_id is not None:
+            raw_message = reader.read_one(
+                "raw_messages", _RAW_MESSAGE_COLUMNS, raw_message_id
+            )
+            if raw_message is not None:
+                chat_id = int(raw_message["chat_id"])
+                symbol, side = _latest_candidate_symbol_side(reader, raw_message_id)
+        lanes.append(
+            SealedLane(
+                exit_id=int(row["id"]),
+                raw_message_id=raw_message_id,
+                execution_binding_id=(
+                    int(row["execution_binding_id"])
+                    if row["execution_binding_id"] is not None
+                    else None
+                ),
+                state=str(row["state"] or ""),
+                last_reason=str(row["last_reason"] or ""),
+                updated_at=as_utc(row["updated_at"]),
+                chat_id=chat_id,
+                symbol=symbol,
+                side=side,
+            )
+        )
+    return tuple(lanes)
+
+
+def _latest_candidate_symbol_side(
+    reader: ProductionReader, raw_message_id: int
+) -> tuple[str | None, str | None]:
+    """Name the lane the way the barrier names it, and no other way.
+
+    ``deferred_instruction_recovery._latest_candidate_symbol_side`` is the one
+    function the barrier's own resume path uses: the highest-id candidate of
+    the message that carries both a symbol and a side, upper-cased symbol and
+    lower-cased side. That module cannot be imported here (architecture
+    boundary), so the rule is reproduced -- reading the last 20 candidates and
+    picking in Python keeps the statement inside the declared message-scope
+    shape instead of inventing a new one for two ``IS NOT NULL`` predicates.
+    """
+
+    rows = reader.query(
+        "SELECT id, symbol, side FROM signal_candidates "
+        "WHERE raw_message_id = ? ORDER BY id DESC LIMIT 20",
+        (int(raw_message_id),),
+    )
+    for row in rows:
+        symbol = str(row["symbol"] or "").strip().upper()
+        side = str(row["side"] or "").strip().lower()
+        if symbol and side:
+            return symbol, side
+    return None, None
+
+
+def _count_voided_messages(
+    reader: ProductionReader,
+    *,
+    chat_id: int,
+    after_raw_message_id: int,
+    config: DetectorConfig,
+) -> tuple[int, int]:
+    """How many of this group's later messages the system has already voided.
+
+    Returns ``(voided, examined)``. This is the line that turns "exit 310 is
+    stuck" into "you are four entry strategies down", so it is worth two
+    bounded reads. ``examined`` is reported with it, because the answer is
+    always "at least this many, out of the next ``examined`` messages".
+    """
+
+    rows = reader.query(
+        "SELECT id FROM raw_messages WHERE chat_id = ? AND id > ? "
+        "ORDER BY id LIMIT ?",
+        (int(chat_id), int(after_raw_message_id), int(config.voided_scan_limit)),
+    )
+    ids = [int(row["id"]) for row in rows]
+    if not ids:
+        return 0, 0
+    voided = 0
+    for start in range(0, len(ids), 100):
+        chunk = ids[start : start + 100]
+        placeholders = ",".join("?" for _ in chunk)
+        decisions = reader.query(
+            "SELECT raw_message_id, automation_reason FROM recognition_decisions "
+            f"WHERE raw_message_id IN ({placeholders})",
+            chunk,
+        )
+        voided += sum(
+            1
+            for decision in decisions
+            if str(decision["automation_reason"] or "").strip()
+            == DEFERRED_EXPIRED_REASON
+        )
+    return voided, len(ids)
+
+
+def _sealed_lane_observations(
+    reader: ProductionReader,
+    store: OncallStateStore,
+    now: datetime,
+    config: DetectorConfig,
+    lanes: Sequence[SealedLane],
+) -> list[_Observation]:
+    """Rule D6a. A lane sealed longer than the system's own healing window."""
+
+    observations: list[_Observation] = []
+    seen: set[int] = set()
+    for lane in lanes:
+        if not lane.seals_a_lane:
+            # Nothing is held, so there is nothing to tell anybody about.
+            continue
+        age = _age(now, lane.updated_at)
+        if age is None or age < config.sealed_lane_stuck_after:
+            continue
+        seen.add(lane.exit_id)
+        assert lane.chat_id is not None and lane.raw_message_id is not None
+        voided, examined = _count_voided_messages(
+            reader,
+            chat_id=lane.chat_id,
+            after_raw_message_id=lane.raw_message_id,
+            config=config,
+        )
+        observations.append(
+            _Observation(
+                case_key=_sealed_lane_case_key(lane.exit_id),
+                rule="D6a",
+                severity="high",
+                raw_message_id=lane.raw_message_id,
+                chat_id=lane.chat_id,
+                reason_code=REASON_SEALED_LANE,
+                evidence={
+                    "kind": "sealed_lane",
+                    "reason_code": REASON_SEALED_LANE,
+                    "exit_id": lane.exit_id,
+                    "exit_state": lane.state,
+                    "exit_last_reason": lane.last_reason,
+                    "execution_binding_id": lane.execution_binding_id,
+                    "symbol": lane.symbol or "",
+                    "side": lane.side or "",
+                    "sealed_since": (
+                        lane.updated_at.isoformat()
+                        if lane.updated_at is not None
+                        else None
+                    ),
+                    "minutes_sealed": _minutes(age),
+                    "voided_messages": voided,
+                    "voided_scan_examined": examined,
+                },
+            )
+        )
+    observations.extend(
+        _sealed_lane_clears(reader, store, exclude=seen)
+    )
+    return observations
+
+
+def _sealed_lane_clears(
+    reader: ProductionReader, store: OncallStateStore, *, exclude: set[int]
+) -> list[_Observation]:
+    """A D6a case ends when the exit reaches ``succeeded`` -- and only then.
+
+    The barrier reopens the lane on that state alone, whether the system healed
+    itself or a person did it by hand. Any other state, including a fresh
+    ``updated_at`` on the same ``recovery_required`` row, leaves the lane shut
+    and the case open; the six-hour staleness sweep is what ends it otherwise.
+    """
+
+    clears: list[_Observation] = []
+    for case in store.open_cases():
+        if not case.case_key.startswith(SEALED_LANE_CASE_PREFIX):
+            continue
+        exit_id = _case_key_object_id(case.case_key, SEALED_LANE_CASE_PREFIX)
+        if exit_id is None or exit_id in exclude:
+            continue
+        row = reader.read_one(
+            "source_message_deletion_exits", _EXIT_COLUMNS, exit_id
+        )
+        if row is not None and str(row["state"] or "") != SEALED_LANE_RELEASED_STATE:
+            continue
+        clears.append(
+            _Observation(
+                case_key=case.case_key,
+                rule=None,
+                cleared=True,
+                chat_id=case.chat_id,
+                raw_message_id=case.raw_message_id,
+            )
+        )
+    return clears
+
+
+# --------------------------------------------------------------------------
+# Rule D6c: the alarm is still ringing and nobody has been told since
+# --------------------------------------------------------------------------
+
+
+def _unheard_incident_observations(
+    reader: ProductionReader,
+    store: OncallStateStore,
+    now: datetime,
+    config: DetectorConfig,
+) -> list[_Observation]:
+    """Rule D6c. Four conditions, and the third is "still happening".
+
+    ``repeat_count`` is not one of them. Exits 310/311 reached 356933 repeats
+    while notified once, on 2026-09-15 -- but a count that large is equally
+    consistent with a failure that stopped a week ago, and nobody needs waking
+    for that. ``last_occurred_at`` inside the window is the fact that makes it
+    urgent.
+    """
+
+    rows = reader.query(
+        "SELECT " + _INCIDENT_COLUMNS + " FROM runtime_incidents "
+        "WHERE status = ? AND last_occurred_at >= ? ORDER BY id LIMIT ?",
+        (
+            INCIDENT_PENDING_STATUS,
+            as_production_text(now - config.incident_still_occurring_within),
+            int(config.incident_limit),
+        ),
+    )
+    observations: list[_Observation] = []
+    seen: set[int] = set()
+    for row in rows:
+        reason_code = _unheard_incident_reason(row, now=now, config=config)
+        if reason_code is None:
+            continue
+        incident_id = int(row["id"])
+        seen.add(incident_id)
+        notified_at = as_utc(row["notified_at"])
+        observations.append(
+            _Observation(
+                case_key=_unheard_incident_case_key(incident_id),
+                rule="D6c",
+                severity="high",
+                reason_code=reason_code,
+                evidence={
+                    "kind": "unheard_incident",
+                    "reason_code": reason_code,
+                    "incident_id": incident_id,
+                    "incident_type": str(row["incident_type"] or ""),
+                    "incident_severity": str(row["severity"] or ""),
+                    "source_kind": str(row["source_kind"] or ""),
+                    "source_record_id": str(row["source_record_id"] or "")[:64],
+                    "repeat_count": (
+                        int(row["repeat_count"])
+                        if row["repeat_count"] is not None
+                        else None
+                    ),
+                    "first_occurred_at": _isoformat(as_utc(row["first_occurred_at"])),
+                    "last_occurred_at": _isoformat(as_utc(row["last_occurred_at"])),
+                    "notified_at": _isoformat(notified_at),
+                    "minutes_since_last_occurrence": _minutes(
+                        _age(now, as_utc(row["last_occurred_at"]))
+                    ),
+                    "minutes_since_notified": _minutes(_age(now, notified_at)),
+                    "summary": str(row["redacted_summary"] or "")[:400],
+                },
+            )
+        )
+    observations.extend(_unheard_incident_clears(reader, store, now, config, seen))
+    return observations
+
+
+def _unheard_incident_reason(
+    row: Mapping[str, Any] | sqlite3.Row,
+    *,
+    now: datetime,
+    config: DetectorConfig,
+) -> str | None:
+    """The code D6c opens under, or ``None`` when this incident is fine."""
+
+    if str(row["status"] or "").strip().lower() != INCIDENT_PENDING_STATUS:
+        return None
+    if str(row["severity"] or "").strip().lower() not in INCIDENT_LOUD_SEVERITIES:
+        return None
+    last_occurred = as_utc(row["last_occurred_at"])
+    age = _age(now, last_occurred)
+    if age is None or age > config.incident_still_occurring_within:
+        return None
+    notified_at = as_utc(row["notified_at"])
+    if notified_at is None:
+        return REASON_INCIDENT_NEVER_NOTIFIED
+    silence = _age(now, notified_at)
+    if silence is not None and silence >= config.incident_notification_silence:
+        return REASON_INCIDENT_NOTIFICATION_STALE
+    return None
+
+
+def _unheard_incident_clears(
+    reader: ProductionReader,
+    store: OncallStateStore,
+    now: datetime,
+    config: DetectorConfig,
+    exclude: set[int],
+) -> list[_Observation]:
+    """Stopped happening, or somebody was told: either way the case is over."""
+
+    clears: list[_Observation] = []
+    for case in store.open_cases():
+        if not case.case_key.startswith(UNHEARD_INCIDENT_CASE_PREFIX):
+            continue
+        incident_id = _case_key_object_id(case.case_key, UNHEARD_INCIDENT_CASE_PREFIX)
+        if incident_id is None or incident_id in exclude:
+            continue
+        row = reader.read_one("runtime_incidents", _INCIDENT_COLUMNS, incident_id)
+        if (
+            row is not None
+            and _unheard_incident_reason(row, now=now, config=config) is not None
+        ):
+            # The sweep's limit hid it this round; the condition still holds.
+            continue
+        clears.append(
+            _Observation(case_key=case.case_key, rule=None, cleared=True)
+        )
+    return clears
+
+
 def _recheck(
     reader: ProductionReader,
     store: OncallStateStore,
@@ -950,9 +1466,18 @@ def _recheck(
     config: DetectorConfig,
 ) -> list[_Observation]:
     observations: list[_Observation] = []
+    # The sealed lanes are read once and used twice: D6a opens a case for the
+    # ones that have been stuck long enough, and D6b names the exit that ate a
+    # message. Reading them once is both cheaper and self-consistent -- the two
+    # alerts then agree about which exit is to blame.
+    lanes = _read_sealed_lanes(reader, now, config)
     observations.extend(_recheck_instruction_items(reader, store, now, config))
     observations.extend(_recheck_management_batches(reader, store, now, config))
-    observations.extend(_recheck_recognition_decisions(reader, store, now, config))
+    observations.extend(
+        _recheck_recognition_decisions(reader, store, now, config, lanes=lanes)
+    )
+    observations.extend(_sealed_lane_observations(reader, store, now, config, lanes))
+    observations.extend(_unheard_incident_observations(reader, store, now, config))
     return observations
 
 
@@ -1283,6 +1808,8 @@ def _recheck_recognition_decisions(
     store: OncallStateStore,
     now: datetime,
     config: DetectorConfig,
+    *,
+    lanes: Sequence[SealedLane] = (),
 ) -> list[_Observation]:
     watch_items = store.open_watch_items(WATCH_RECOGNITION_DECISION, config.watch_limit)
     if not watch_items:
@@ -1301,7 +1828,9 @@ def _recheck_recognition_decisions(
     observations: list[_Observation] = []
     retire: list[int] = []
     for row in rows:
-        observation = _evaluate_recognition_decision(reader, row, now=now, config=config)
+        observation = _evaluate_recognition_decision(
+            reader, row, now=now, config=config, lanes=lanes
+        )
         if observation is None:
             retire.append(int(row["id"]))
             continue
@@ -1365,12 +1894,25 @@ def _evaluate_recognition_decision(
     *,
     now: datetime,
     config: DetectorConfig,
+    lanes: Sequence[SealedLane] = (),
 ) -> _Observation | None:
-    """Rule D3: the message was never read, and the group holds a position."""
+    """Rules D3 and D6b, in that order, over one recognition decision row."""
 
     raw_message_id = row["raw_message_id"]
     if raw_message_id is None:
         return None
+    automation_reason = str(row["automation_reason"] or "").strip()
+    if automation_reason == DEFERRED_EXPIRED_REASON:
+        # Rule D6b. Its own branch and its own case key: no lossy-reason test
+        # and, above all, no "the group must hold a position" filter.
+        return _voided_message_observation(reader, row, now=now, lanes=lanes)
+    if automation_reason == DEFERRED_HOLD_REASON:
+        # Still held behind a deletion exit, and it may yet be resumed and
+        # executed normally. Not a case -- and deliberately not a *clear*
+        # either, because a clear retires the watch item and the row would then
+        # never be re-read when it turns into ``deferred_expired`` half an hour
+        # later, which is the only state D6b is allowed to report.
+        return _Observation(case_key=None, rule=None)
     case_key = _recognition_case_key(raw_message_id)
     reason_code = lossy_recognition_reason(
         row["agreement_status"], row["automation_reason"]
@@ -1449,6 +1991,87 @@ def _evaluate_recognition_decision(
         ),
         retire=False,
     )
+
+
+def _voided_message_observation(
+    reader: ProductionReader,
+    row: sqlite3.Row,
+    *,
+    now: datetime,
+    lanes: Sequence[SealedLane],
+) -> _Observation:
+    """Rule D6b. The system decided this real instruction will never run.
+
+    No age threshold: ``deferred_expired`` is already terminal, and the row only
+    reached it by outliving ``deferred_resume_timeout_minutes`` (30 in
+    production). No position prerequisite either -- see
+    :data:`DEFERRED_EXPIRED_REASON` for why that filter would have swallowed
+    every entry this rule exists to report.
+    """
+
+    raw_message_id = int(row["raw_message_id"])
+    raw_message = reader.read_one("raw_messages", _RAW_MESSAGE_COLUMNS, raw_message_id)
+    chat_id = int(raw_message["chat_id"]) if raw_message is not None else None
+    symbol, side = _latest_candidate_symbol_side(reader, raw_message_id)
+    blocking = _blocking_sealed_lane(
+        lanes, chat_id=chat_id, symbol=symbol, side=side, raw_message_id=raw_message_id
+    )
+    evidence = _build_recognition_evidence(
+        raw_message=raw_message,
+        reason_code=DEFERRED_EXPIRED_REASON,
+        agreement_status=str(row["agreement_status"] or ""),
+        automation_status=str(row["automation_status"] or ""),
+        automation_reason=str(row["automation_reason"] or ""),
+        position_state=POSITION_ABSENT,
+        group_open_positions=(),
+        now=now,
+    )
+    evidence["kind"] = "voided_message"
+    evidence["symbol"] = symbol or ""
+    evidence["side"] = side or ""
+    # Naming the exit is what lets a reader line this alert up with the D6a
+    # case for the same lane instead of treating them as two unrelated faults.
+    evidence["blocking_exit_id"] = blocking.exit_id if blocking is not None else None
+    evidence["blocking_exit_state"] = blocking.state if blocking is not None else None
+    evidence["blocking_exit_last_reason"] = (
+        blocking.last_reason if blocking is not None else None
+    )
+    return _Observation(
+        case_key=_voided_message_case_key(raw_message_id),
+        rule="D6b",
+        severity="high",
+        raw_message_id=raw_message_id,
+        chat_id=chat_id,
+        reason_code=DEFERRED_EXPIRED_REASON,
+        evidence=evidence,
+        # Terminal, so nothing will ever clear it: the six-hour staleness
+        # sweep is what closes the case file.
+        retire=True,
+    )
+
+
+def _blocking_sealed_lane(
+    lanes: Sequence[SealedLane],
+    *,
+    chat_id: int | None,
+    symbol: str | None,
+    side: str | None,
+    raw_message_id: int,
+) -> SealedLane | None:
+    """The sealed lane this message was held behind, if it can be named.
+
+    Same test the barrier uses -- same chat, same symbol, same side, a
+    different message -- over the exits this round already read.
+    """
+
+    if chat_id is None or not symbol or not side:
+        return None
+    for lane in lanes:
+        if not lane.seals_a_lane or lane.raw_message_id == raw_message_id:
+            continue
+        if lane.chat_id == chat_id and lane.symbol == symbol and lane.side == side:
+            return lane
+    return None
 
 
 def _build_recognition_evidence(
@@ -1639,6 +2262,31 @@ def _management_case_key(raw_message_id: Any, action: str) -> str:
 
 def _recognition_case_key(raw_message_id: Any) -> str:
     return f"{RECOGNITION_CASE_PREFIX}{int(raw_message_id)}"
+
+
+def _sealed_lane_case_key(exit_id: Any) -> str:
+    return f"{SEALED_LANE_CASE_PREFIX}{int(exit_id)}"
+
+
+def _voided_message_case_key(raw_message_id: Any) -> str:
+    return f"{VOIDED_MESSAGE_CASE_PREFIX}{int(raw_message_id)}"
+
+
+def _unheard_incident_case_key(incident_id: Any) -> str:
+    return f"{UNHEARD_INCIDENT_CASE_PREFIX}{int(incident_id)}"
+
+
+def _case_key_object_id(case_key: str, prefix: str) -> int | None:
+    """The production row id a D6 case key names, or ``None`` if unreadable."""
+
+    try:
+        return int(str(case_key).removeprefix(prefix))
+    except (TypeError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+def _isoformat(moment: datetime | None) -> str | None:
+    return moment.isoformat() if moment is not None else None
 
 
 def _minutes(delta: timedelta | None) -> int | None:

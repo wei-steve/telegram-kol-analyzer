@@ -28,11 +28,13 @@ from telegram_kol_research.models import (
     RuntimeIncident,
     SignalCandidate,
     Source,
+    SourceMessageDeletionExit,
     StrategyAlert,
     StrategyLifecycle,
     StrategyManagementBatch,
     StrategyManagementComponent,
     StrategyManagementLeg,
+    TelegramSourceMessageEvent,
 )
 
 
@@ -528,6 +530,11 @@ class ProductionFixture:
         incident_type: str = "management_stop_rejected",
         severity: str = "high",
         summary: str = "管理批次被拦下：同仓位有冲突的止损动作。",
+        status: str = "pending",
+        repeat_count: int = 1,
+        first_occurred_at: datetime | None = None,
+        last_occurred_at: datetime | None = None,
+        notified_at: datetime | None = None,
     ) -> int:
         with self.session_factory() as session:
             row = RuntimeIncident(
@@ -535,9 +542,14 @@ class ProductionFixture:
                 source_record_id=source_record_id,
                 incident_type=incident_type,
                 severity=severity,
+                status=status,
+                repeat_count=int(repeat_count),
                 fingerprint=f"fp-{source_kind}-{source_record_id}",
-                first_occurred_at=naive(NOW - timedelta(minutes=20)),
-                last_occurred_at=naive(NOW - timedelta(minutes=2)),
+                first_occurred_at=naive(
+                    first_occurred_at or NOW - timedelta(minutes=20)
+                ),
+                last_occurred_at=naive(last_occurred_at or NOW - timedelta(minutes=2)),
+                notified_at=naive(notified_at) if notified_at is not None else None,
                 redacted_summary=summary,
                 feature_policy_version="v1",
                 prompt_version="v1",
@@ -546,6 +558,76 @@ class ProductionFixture:
             session.add(row)
             session.commit()
             return int(row.id)
+
+    def set_runtime_incident(
+        self,
+        incident_id: int,
+        *,
+        status: str | None = None,
+        last_occurred_at: datetime | None = None,
+        notified_at: datetime | None = None,
+    ) -> None:
+        with self.session_factory() as session:
+            row = session.get(RuntimeIncident, int(incident_id))
+            if status is not None:
+                row.status = status
+            if last_occurred_at is not None:
+                row.last_occurred_at = naive(last_occurred_at)
+            if notified_at is not None:
+                row.notified_at = naive(notified_at)
+            session.commit()
+
+    # ------------------------------------------- D6a: source deletion exits
+
+    def add_deletion_exit(
+        self,
+        *,
+        raw_message_id: int | None,
+        chat_id: int = CHAT_ID,
+        message_id: int | None = None,
+        state: str = "recovery_required",
+        last_reason: str | None = "exit_has_no_known_position",
+        execution_binding_id: int | None = None,
+        updated_at: datetime | None = None,
+    ) -> int:
+        """One deletion exit plus the immutable Telegram event it belongs to."""
+
+        self._message_id += 1
+        event_message_id = message_id if message_id is not None else self._message_id
+        with self.session_factory() as session:
+            event = TelegramSourceMessageEvent(
+                event_type="message_deleted",
+                chat_id=chat_id,
+                message_id=event_message_id,
+                raw_message_id=raw_message_id,
+                event_fingerprint=f"del-{chat_id}-{event_message_id}",
+                binding_state="unbound" if raw_message_id is None else "bound",
+                telegram_event_json="{}",
+                occurred_at=naive(updated_at or NOW - timedelta(hours=12)),
+            )
+            session.add(event)
+            session.commit()
+            row = SourceMessageDeletionExit(
+                source_event_id=int(event.id),
+                raw_message_id=raw_message_id,
+                execution_binding_id=execution_binding_id,
+                state=state,
+                last_reason=last_reason,
+                created_at=naive(updated_at or NOW - timedelta(hours=12)),
+                updated_at=naive(updated_at or NOW - timedelta(hours=12)),
+            )
+            session.add(row)
+            session.commit()
+            return int(row.id)
+
+    def set_deletion_exit_state(
+        self, exit_id: int, *, state: str, updated_at: datetime | None = None
+    ) -> None:
+        with self.session_factory() as session:
+            row = session.get(SourceMessageDeletionExit, int(exit_id))
+            row.state = state
+            row.updated_at = naive(updated_at or NOW)
+            session.commit()
 
 
 def build_open_position_case(
@@ -611,6 +693,84 @@ def build_recognition_failure_case(
         "binding_id": binding_id or 0,
         "decision_id": decision_id,
     }
+
+
+def build_sealed_lane_case(
+    fixture: ProductionFixture,
+    *,
+    chat_id: int = CHAT_ID,
+    symbol: str = "BTC",
+    side: str = "long",
+    state: str = "recovery_required",
+    updated_at: datetime | None = None,
+    unbound: bool = False,
+    with_candidate: bool = True,
+) -> dict[str, int]:
+    """Rule D6a's canonical shape: 陈哥's BTC-long lane, sealed by exit 310.
+
+    ``unbound=True`` reproduces the 91 rows whose ``raw_message_id`` is NULL and
+    which the design says seal nothing, and ``with_candidate=False`` the exit
+    whose message never named a symbol and a side -- neither of which the
+    barrier's join reaches.
+    """
+
+    fixture.add_group_name(chat_id=chat_id)
+    deleted_raw_id: int | None = None
+    if not unbound:
+        deleted_raw_id = fixture.add_raw_message(
+            chat_id=chat_id, text=f"{symbol} 现价附近进多，止损 74800"
+        )
+        if with_candidate:
+            fixture.add_candidate(
+                raw_message_id=deleted_raw_id,
+                management_action="",
+                symbol=symbol,
+                side=side,
+            )
+    exit_id = fixture.add_deletion_exit(
+        raw_message_id=deleted_raw_id,
+        chat_id=chat_id,
+        state=state,
+        updated_at=updated_at or (NOW - timedelta(hours=12)),
+    )
+    return {"raw_message_id": deleted_raw_id, "exit_id": exit_id}
+
+
+def build_voided_message_case(
+    fixture: ProductionFixture,
+    *,
+    chat_id: int = CHAT_ID,
+    symbol: str = "BTC",
+    side: str = "long",
+    automation_reason: str = "deferred_expired",
+    text: str = "BTC 83000-83300 进多，止损 80000",
+    with_binding: bool = False,
+    updated_at: datetime | None = None,
+) -> dict[str, int]:
+    """Rule D6b's canonical shape: an *entry* the system voided by itself.
+
+    ``with_binding`` defaults to false on purpose. This is the case D3's
+    position filter would swallow, and the reason D6b is a separate rule.
+    """
+
+    fixture.add_group_name(chat_id=chat_id)
+    raw_message_id = fixture.add_raw_message(chat_id=chat_id, text=text)
+    fixture.add_candidate(
+        raw_message_id=raw_message_id,
+        management_action="",
+        symbol=symbol,
+        side=side,
+    )
+    if with_binding:
+        fixture.add_binding(chat_id=chat_id, symbol=symbol, side=side)
+    decision_id = fixture.add_recognition_decision(
+        raw_message_id=raw_message_id,
+        agreement_status="agree",
+        automation_status="deferred",
+        automation_reason=automation_reason,
+        updated_at=updated_at,
+    )
+    return {"raw_message_id": raw_message_id, "decision_id": decision_id}
 
 
 def sqlite_write_authorizer(recorded: list[str]):

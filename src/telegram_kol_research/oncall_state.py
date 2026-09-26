@@ -40,6 +40,17 @@ MANAGEMENT_CASE_PREFIX = "mgmt:"
 #: Rule D3: one case per message, because a recognition that produced nothing
 #: has no action to key on.
 RECOGNITION_CASE_PREFIX = "recog:"
+#: Rule D6a: one case per sealed source-deletion exit. The exit id is what a
+#: person acts on, and it is stable for the whole life of the seal.
+SEALED_LANE_CASE_PREFIX = "lane:"
+#: Rule D6b: one case per message the system voided. Deliberately *not* the
+#: D3 prefix -- the two rules can both have something to say about one
+#: message, and a resolved D3 case must not swallow a later loss.
+VOIDED_MESSAGE_CASE_PREFIX = "voided:"
+#: Rule D6c: one case per runtime incident that is still happening and that
+#: nobody has been told about lately. Keyed by incident id, not fingerprint:
+#: the id is what the operator bot's own reports show.
+UNHEARD_INCIDENT_CASE_PREFIX = "unheard:"
 
 ALERT_STATUSES = frozenset({"pending", "sent", "dry_run", "failed"})
 WATCH_STATUSES = frozenset({"open", "retired"})

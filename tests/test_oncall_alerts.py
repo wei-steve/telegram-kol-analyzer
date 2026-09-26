@@ -22,6 +22,9 @@ from telegram_kol_research.oncall_alerts import (
     deliver_pending_alerts,
     format_case_alert,
     format_recognition_case_alert,
+    format_sealed_lane_alert,
+    format_unheard_incident_alert,
+    format_voided_message_alert,
     maybe_compose_daily_summary,
     message_excerpt,
     reason_label,
@@ -157,6 +160,230 @@ def test_a_recovered_recognition_case_says_the_message_was_recognised_later(stor
     ],
 )
 def test_every_new_recognition_reason_code_has_a_chinese_label(code, fragment):
+    label = reason_label(code)
+    assert fragment in label
+    assert "未收录原因" not in label
+
+
+# ------------------------------------------------------- D6a / D6b / D6c
+
+
+def open_sealed_lane_case(store, *, now=NOW, **evidence):
+    payload = {
+        "kind": "sealed_lane",
+        "group_name": "龚有财群",
+        "exit_id": 310,
+        "exit_state": "recovery_required",
+        "exit_last_reason": "exit_has_no_known_position",
+        "symbol": "BTC",
+        "side": "long",
+        "minutes_sealed": 11 * 24 * 60 + 3 * 60,
+        "voided_messages": 11,
+        "voided_scan_examined": 200,
+    }
+    payload.update(evidence)
+    case, _created = store.upsert_case(
+        case_key="lane:310",
+        rule="D6a",
+        severity="high",
+        now=now,
+        raw_message_id=15660,
+        chat_id=-100,
+        reason_code="source_deletion_exit_sealed_lane",
+        evidence=payload,
+    )
+    return case
+
+
+def test_the_sealed_lane_alert_names_the_group_the_direction_and_the_losses(store):
+    case = open_sealed_lane_case(store)
+
+    text = format_sealed_lane_alert(case)
+
+    assert "群：龚有财群    被封的方向：BTC 多" in text
+    assert "封了多久：11 天 3 小时" in text
+    assert "删除退出：#310" in text
+    assert "exit_has_no_known_position" in text
+    assert "期间已有 11 条消息被作废" in text
+    assert "只数了封锁之后这个群的 200 条消息" in text
+    assert "这个方向的新策略现在一条都进不来" in text
+
+
+def test_the_sealed_lane_alert_says_so_when_nothing_has_been_voided_yet(store):
+    case = open_sealed_lane_case(store, voided_messages=0)
+
+    text = format_sealed_lane_alert(case)
+
+    assert "期间还没有消息因此被作废。" in text
+    assert "条消息被作废，永不执行" not in text
+
+
+def test_a_sealed_lane_is_composed_with_its_own_wording(store):
+    case = open_sealed_lane_case(store)
+
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+
+    body = store.pending_alerts()[0].body
+    assert "这条线被封住了" in body
+    assert "消息要求" not in body
+
+
+def test_a_released_lane_says_the_direction_is_open_again(store):
+    case = open_sealed_lane_case(store)
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+
+    compose_case_alerts(
+        store,
+        now=NOW + timedelta(minutes=5),
+        new_case_ids=[],
+        resolved_case_ids=[case.id],
+    )
+
+    bodies = [alert.body for alert in store.pending_alerts()]
+    assert any("已解封" in body and "又能进新策略" in body for body in bodies)
+
+
+def open_voided_message_case(store, *, now=NOW, **evidence):
+    payload = {
+        "kind": "voided_message",
+        "group_name": "龚有财群",
+        "symbol": "BTC",
+        "side": "long",
+        "message_text": "BTC 83000-83300 进多\n止损 80000",
+        "posted_at": "2026-09-19T05:52:00+00:00",
+        "minutes_since_message": 40,
+        "blocking_exit_id": 310,
+        "blocking_exit_state": "recovery_required",
+    }
+    payload.update(evidence)
+    case, _created = store.upsert_case(
+        case_key="voided:15660",
+        rule="D6b",
+        severity="high",
+        now=now,
+        raw_message_id=15660,
+        chat_id=-100,
+        reason_code="deferred_expired",
+        evidence=payload,
+    )
+    return case
+
+
+def test_the_voided_message_alert_quotes_what_was_thrown_away(store):
+    case = open_voided_message_case(store)
+
+    text = format_voided_message_alert(case)
+
+    assert "消息被系统作废" in text
+    assert "群：龚有财群    消息 #15660（13:52）" in text
+    assert "原文：「BTC 83000-83300 进多 止损 80000」" in text
+    assert "系统把这条消息作废了" in text
+    assert "挡住它的是删除退出 #310" in text
+    assert "这条 BTC 多 的消息不会被执行" in text
+
+
+def test_the_voided_message_alert_works_when_the_exit_cannot_be_named(store):
+    case = open_voided_message_case(
+        store, blocking_exit_id=None, blocking_exit_state=None
+    )
+
+    text = format_voided_message_alert(case)
+
+    assert "挡住它的是" not in text
+    assert "不会被执行" in text
+
+
+def test_a_voided_message_is_composed_with_its_own_wording(store):
+    case = open_voided_message_case(store)
+
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+
+    body = store.pending_alerts()[0].body
+    assert "消息被系统作废" in body
+    assert "识别结果" not in body
+
+
+def open_unheard_incident_case(store, *, now=NOW, reason=None, **evidence):
+    payload = {
+        "kind": "unheard_incident",
+        "incident_id": 1841,
+        "incident_type": "source_deletion_exit_stuck",
+        "incident_severity": "high",
+        "source_kind": "source_deletion_exit",
+        "source_record_id": "310",
+        "repeat_count": 356933,
+        "last_occurred_at": "2026-09-19T05:58:00+00:00",
+        "notified_at": None,
+        "minutes_since_last_occurrence": 2,
+        "minutes_since_notified": None,
+        "summary": "删除退出仍未释放：交易所缺席证明拒绝。",
+    }
+    payload.update(evidence)
+    case, _created = store.upsert_case(
+        case_key="unheard:1841",
+        rule="D6c",
+        severity="high",
+        now=now,
+        reason_code=reason or "runtime_incident_never_notified",
+        evidence=payload,
+    )
+    return case
+
+
+def test_the_unheard_incident_alert_says_it_is_happening_now_and_nobody_knows(store):
+    case = open_unheard_incident_case(store)
+
+    text = format_unheard_incident_alert(case)
+
+    assert "告警在喊，没人听见" in text
+    assert "source_deletion_exit_stuck" in text
+    assert "记录 #1841" in text
+    assert "对象：source_deletion_exit 310" in text
+    assert "仍在发生：2 分钟前还在报，累计 356933 次。" in text
+    assert "上次通知：从来没有通知过。" in text
+    assert "系统的说法：「删除退出仍未释放：交易所缺席证明拒绝。」" in text
+
+
+def test_the_unheard_incident_alert_dates_a_stale_notification(store):
+    case = open_unheard_incident_case(
+        store,
+        reason="runtime_incident_notification_stale",
+        notified_at="2026-09-08T06:00:00+00:00",
+        minutes_since_notified=11 * 24 * 60,
+    )
+
+    text = format_unheard_incident_alert(case)
+
+    assert "上次通知：11 天 0 小时前（2026-09-08）。" in text
+
+
+def test_an_unheard_incident_is_composed_and_recovers_with_its_own_wording(store):
+    case = open_unheard_incident_case(store)
+    compose_case_alerts(store, now=NOW, new_case_ids=[case.id], resolved_case_ids=[])
+    assert "告警在喊，没人听见" in store.pending_alerts()[0].body
+
+    compose_case_alerts(
+        store,
+        now=NOW + timedelta(minutes=5),
+        new_case_ids=[],
+        resolved_case_ids=[case.id],
+    )
+
+    bodies = [alert.body for alert in store.pending_alerts()]
+    assert any("已经不再发生，或者已经重新通知过了" in body for body in bodies)
+
+
+@pytest.mark.parametrize(
+    "code,fragment",
+    [
+        ("source_deletion_exit_sealed_lane", "新消息全部被挡下"),
+        ("deferred_expired", "系统把这条消息作废了"),
+        ("waiting_source_deletion_exit", "暂时被挡下"),
+        ("runtime_incident_never_notified", "从来没有通知过"),
+        ("runtime_incident_notification_stale", "上次通知已经很久以前"),
+    ],
+)
+def test_every_new_d6_reason_code_has_a_chinese_label(code, fragment):
     label = reason_label(code)
     assert fragment in label
     assert "未收录原因" not in label

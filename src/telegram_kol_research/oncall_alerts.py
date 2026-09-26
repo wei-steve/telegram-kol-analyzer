@@ -41,6 +41,9 @@ from telegram_kol_research.oncall_codex import (
 )
 from telegram_kol_research.oncall_state import (
     RECOGNITION_CASE_PREFIX,
+    SEALED_LANE_CASE_PREFIX,
+    UNHEARD_INCIDENT_CASE_PREFIX,
+    VOIDED_MESSAGE_CASE_PREFIX,
     CaseRecord,
     OncallStateStore,
     isoformat,
@@ -138,6 +141,12 @@ REASON_LABELS = {
     "management_disabled_plan_only": "只做了计划，没有执行（管理开关未打开）",
     "unknown_exchange_outcome": "交易所返回结果不明",
     "unknown": "原因不明",
+    # --- rules D6a/D6b/D6c: the silent stalls (2026-09-26 case note) ---
+    "source_deletion_exit_sealed_lane": "删除退出卡住，这个群这个币这个方向的新消息全部被挡下",
+    "waiting_source_deletion_exit": "正在等一条删除退出收口，这条消息暂时被挡下",
+    "deferred_expired": "被删除退出挡下，等到超时，系统把这条消息作废了（永不执行）",
+    "runtime_incident_never_notified": "这条告警一直在发生，但从来没有通知过任何人",
+    "runtime_incident_notification_stale": "这条告警还在发生，但上次通知已经很久以前了",
     # --- the watcher's own codes ---
     "instruction_stuck_pending": "指令一直排队，没有开始执行",
     "instruction_stuck_executing": "指令开始执行后没有下文",
@@ -324,6 +333,181 @@ def format_case_resolved_alert(case: CaseRecord) -> str:
             f"✅ 值守提醒 #{case.id} 已自行恢复",
             f"群：{group}    消息 #{case.raw_message_id}",
             f"{action_label(evidence.get('action'))} 后来执行成功了，不用处理。",
+        ]
+    )
+
+
+def _hours_and_minutes(minutes: Any) -> str:
+    """"11 天 3 小时" reads; "16003 分钟" does not."""
+
+    try:
+        total = max(0, int(minutes))
+    except (TypeError, ValueError):
+        return "时长不详"
+    days, rest = divmod(total, 1440)
+    hours, remainder = divmod(rest, 60)
+    if days:
+        return f"{days} 天 {hours} 小时"
+    if hours:
+        return f"{hours} 小时 {remainder} 分钟"
+    return f"{remainder} 分钟"
+
+
+def _instrument_label(evidence: Mapping[str, Any]) -> str:
+    symbol = str(evidence.get("symbol") or "").upper()
+    side = side_label(evidence.get("side"))
+    return " ".join(part for part in (symbol, side) if part)
+
+
+def format_sealed_lane_alert(case: CaseRecord) -> str:
+    """Rule D6a's opening alert (design 2026-09-26, section 1).
+
+    The exit id is what an engineer acts on, but it says nothing to the person
+    reading this, so every line translates it: which group, which instrument
+    and direction are shut, how long, and -- the line that makes it urgent --
+    how many of that group's later messages the seal has already thrown away.
+    """
+
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    instrument = _instrument_label(evidence) or "未知标的"
+    voided = evidence.get("voided_messages")
+    examined = evidence.get("voided_scan_examined")
+
+    if voided is None:
+        loss_line = "期间被作废的消息：数不出来（读取受限）"
+    elif int(voided) == 0:
+        loss_line = "期间还没有消息因此被作废。"
+    else:
+        loss_line = f"期间已有 {int(voided)} 条消息被作废，永不执行。"
+        if examined:
+            loss_line += f"（只数了封锁之后这个群的 {int(examined)} 条消息，实际可能更多）"
+
+    return "\n".join(
+        [
+            f"⚠️ 值守提醒 #{case.id}（这条线被封住了）",
+            f"群：{group}    被封的方向：{instrument}",
+            f"封了多久：{_hours_and_minutes(evidence.get('minutes_sealed'))}",
+            f"原因：{reason_label(case.reason_code)}",
+            f"卡住的删除退出：#{evidence.get('exit_id', '?')}"
+            f"（状态 {evidence.get('exit_state') or '未记录'}，"
+            f"上次原因 {evidence.get('exit_last_reason') or '未记录'}）",
+            loss_line,
+            "这个方向的新策略现在一条都进不来，直到这条退出收口。",
+        ]
+    )
+
+
+def format_sealed_lane_resolved_alert(case: CaseRecord) -> str:
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    instrument = _instrument_label(evidence) or "未知标的"
+    return "\n".join(
+        [
+            f"✅ 值守提醒 #{case.id} 已解封",
+            f"群：{group}    方向：{instrument}",
+            f"删除退出 #{evidence.get('exit_id', '?')} 已收口，这条线又能进新策略了。",
+        ]
+    )
+
+
+def format_voided_message_alert(case: CaseRecord) -> str:
+    """Rule D6b's opening alert (design 2026-09-26, section 2).
+
+    Not the same story as D3: the message *was* read and understood, and then
+    the system's own state threw it away. So the alert says what was thrown
+    away, quotes it, and -- when it can -- names the exit that did it, so this
+    and the D6a alert for the same lane read as one event.
+    """
+
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    instrument = _instrument_label(evidence)
+    posted_at = parse_isoformat(evidence.get("posted_at"))
+    excerpt = message_excerpt(evidence.get("message_text"))
+    blocking = evidence.get("blocking_exit_id")
+
+    subject = "这条消息" if not instrument else f"这条 {instrument} 的消息"
+    lines = [
+        f"⚠️ 值守提醒 #{case.id}（消息被系统作废）",
+        f"群：{group}    消息 #{case.raw_message_id if case.raw_message_id is not None else '?'}"
+        f"（{beijing_time(posted_at)}）",
+        f"原文：「{excerpt}」",
+        f"结果：{reason_label(case.reason_code)}",
+    ]
+    if blocking is not None:
+        lines.append(
+            f"挡住它的是删除退出 #{blocking}"
+            f"（状态 {evidence.get('blocking_exit_state') or '未记录'}）。"
+        )
+    lines.append(f"{subject}不会被执行，也不会重试——要不要补，由你决定。")
+    return "\n".join(lines)
+
+
+def format_voided_message_resolved_alert(case: CaseRecord) -> str:  # pragma: no cover
+    """Never expected: ``deferred_expired`` is terminal and nothing undoes it."""
+
+    evidence = case.evidence or {}
+    group = str(evidence.get("group_name") or case.chat_id or "未知群")
+    return "\n".join(
+        [
+            f"✅ 值守提醒 #{case.id} 已结束",
+            f"群：{group}    消息 #{case.raw_message_id}",
+            "这条被作废的消息后来又有了进展，不用处理。",
+        ]
+    )
+
+
+def format_unheard_incident_alert(case: CaseRecord) -> str:
+    """Rule D6c's opening alert (design 2026-09-26, section 3).
+
+    The one fact that makes it worth sending: this is happening *now*, and the
+    last time anybody was told about it was long ago -- or never.
+    """
+
+    evidence = case.evidence or {}
+    notified_at = parse_isoformat(evidence.get("notified_at"))
+    repeat_count = evidence.get("repeat_count")
+    summary = message_excerpt(evidence.get("summary"), limit=120)
+
+    if notified_at is None:
+        heard_line = "上次通知：从来没有通知过。"
+    else:
+        heard_line = (
+            f"上次通知：{_hours_and_minutes(evidence.get('minutes_since_notified'))}前"
+            f"（{beijing_date(notified_at)}）。"
+        )
+    still_line = (
+        "仍在发生："
+        f"{_hours_and_minutes(evidence.get('minutes_since_last_occurrence'))}前还在报"
+    )
+    if repeat_count is not None:
+        still_line += f"，累计 {int(repeat_count)} 次"
+    still_line += "。"
+
+    return "\n".join(
+        [
+            f"⚠️ 值守提醒 #{case.id}（告警在喊，没人听见）",
+            f"告警：{evidence.get('incident_type') or '未知类型'}"
+            f"（严重度 {evidence.get('incident_severity') or '未记录'}，"
+            f"记录 #{evidence.get('incident_id', '?')}）",
+            f"对象：{evidence.get('source_kind') or '未记录'} "
+            f"{evidence.get('source_record_id') or ''}".strip(),
+            still_line,
+            heard_line,
+            f"系统的说法：「{summary}」" if summary else "系统没有留下摘要。",
+        ]
+    )
+
+
+def format_unheard_incident_resolved_alert(case: CaseRecord) -> str:
+    evidence = case.evidence or {}
+    return "\n".join(
+        [
+            f"✅ 值守提醒 #{case.id} 已结束",
+            f"告警 {evidence.get('incident_type') or '未知类型'}"
+            f"（记录 #{evidence.get('incident_id', '?')}）"
+            "已经不再发生，或者已经重新通知过了。",
         ]
     )
 
@@ -730,21 +914,50 @@ def compose_codex_state_alert(
     )
 
 
+#: Case-key prefix -> (opening formatter, recovery formatter). The key is the
+#: only thing that decides which story a case tells, so the mapping lives in
+#: one place rather than in two ``if`` ladders that can disagree.
+_CASE_FORMATTERS = (
+    (
+        RECOGNITION_CASE_PREFIX,
+        format_recognition_case_alert,
+        format_recognition_case_resolved_alert,
+    ),
+    (
+        SEALED_LANE_CASE_PREFIX,
+        format_sealed_lane_alert,
+        format_sealed_lane_resolved_alert,
+    ),
+    (
+        VOIDED_MESSAGE_CASE_PREFIX,
+        format_voided_message_alert,
+        format_voided_message_resolved_alert,
+    ),
+    (
+        UNHEARD_INCIDENT_CASE_PREFIX,
+        format_unheard_incident_alert,
+        format_unheard_incident_resolved_alert,
+    ),
+)
+
+
 def _format_open_alert(case: CaseRecord, *, is_health: bool) -> str:
-    """The case key decides which of the three stories this case is."""
+    """The case key decides which story this case is."""
 
     if is_health:
         return format_health_alert(case)
-    if case.case_key.startswith(RECOGNITION_CASE_PREFIX):
-        return format_recognition_case_alert(case)
+    for prefix, opening, _resolved in _CASE_FORMATTERS:
+        if case.case_key.startswith(prefix):
+            return opening(case)
     return format_case_alert(case)
 
 
 def _format_resolved_alert(case: CaseRecord, *, is_health: bool) -> str:
     if is_health:
         return format_health_resolved_alert(case)
-    if case.case_key.startswith(RECOGNITION_CASE_PREFIX):
-        return format_recognition_case_resolved_alert(case)
+    for prefix, _opening, resolved in _CASE_FORMATTERS:
+        if case.case_key.startswith(prefix):
+            return resolved(case)
     return format_case_resolved_alert(case)
 
 

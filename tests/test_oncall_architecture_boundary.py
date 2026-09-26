@@ -192,9 +192,20 @@ def test_every_production_read_shape_the_detector_uses_is_declared():
     # D3 reads recognition decisions forward, then asks whether the message
     # already produced management work. Both are new shapes.
     assert "raw_message_id = ?" in declared
+    # D6a/D6c sweep two more tables, each on a named index, and D6a counts the
+    # lane's losses through a chat-scoped read plus a keyed one.
+    assert "WHERE state = ? AND updated_at <= ?" in declared
+    assert "WHERE status = ? AND last_occurred_at >= ?" in declared
+    assert "WHERE chat_id = ? AND id > ?" in declared
+    assert "WHERE raw_message_id IN (?, ...)" in declared
+    # The spelling that would scan the exits table instead of seeking it is
+    # named here so a later reader knows it was considered and rejected.
+    assert "state NOT IN" in declared
 
     source = (SOURCE_ROOT / "oncall_detector.py").read_text(encoding="utf-8")
     assert "recognition_decisions" in source
+    assert "source_message_deletion_exits" in source
+    assert "runtime_incidents" in source
 
 
 @pytest.mark.architecture
