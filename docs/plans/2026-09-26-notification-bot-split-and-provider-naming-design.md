@@ -438,3 +438,32 @@ so the worker path and `POST /api/messages/{id}/recognize` cannot drift apart」
    后两条断言的是并发 / 排空语义 —— 加上守卫之后它们的 payload 会被拦掉，
    除非 fixture 里的 `deepseek` 段带上真实结果。**别为了让测试变绿就把守卫放宽**，
    要改的是 fixture。
+
+### 7.4 同一类漂移还剩一处：CLI 也没有 `_classify_authoritative_failure_notification`
+
+补守卫时顺带看到的，**本次没做**，记在这里。
+
+worker 和 `POST /api/messages/{id}/recognize` 共用的
+`_handle_authoritative_failure_notification`（[`telegram_live_listener.py`](../../src/telegram_kol_research/telegram_live_listener.py) 约 480 行）
+在问 `auxiliary_review_disagrees` **之前**还先问一道
+`_classify_authoritative_failure_notification`（约 613 行），它负责两种抑制：
+
+- `suppressed_empty_input` —— 消息里没有可读的文字或图片
+- `suppressed_low_value` —— 外部行情类的低价值失败
+
+`cli.py` 里这个名字出现 **0 次**。所以 CLI 路径缺的不是一道守卫，是**两道**：
+本次补上了辅助模型那道，行情低价值/空输入那道仍然没有。
+
+为什么今天无害：辅助模型那道守卫现在会拦下 CLI 的**每一条**失败告警
+（没有第二个模型，`auxiliary_review_disagrees` 恒为 False），所以后面那道够不着。
+但这正是 7.2 那个教训的第二只靴子 —— 两条路各自长出自己的抑制逻辑，
+靠的是「反正现在也发不出去」，而不是靠一个共用的入口。
+
+**建议的根治方向不是再补一道判断**，而是让 CLI 也走
+`_handle_authoritative_failure_notification`（或把它拆出一个不依赖
+`retry_processor` 的纯判定函数），这样三个发送方问的就是同一段代码，
+而不是同一段代码的三份抄写。生产证据显示这一路从未触发过，所以不急，
+但别再往 CLI 里单独抄第三份判断。
+
+参考：生产 `recognition_decisions` 里 `suppressed_empty_input` 有 32 条
+（09-20 → 09-26 12:02），是 worker 那道在持续工作；CLI 那一路一条都没有。
