@@ -31,6 +31,23 @@ The timeout has three possible outcomes and they are not symmetric:
   question "is *this* position gone" is unanswerable and the answerable one is
   "is anything in this lane ours at all": see
   :func:`_no_exchange_footprint_verdict`.
+* **Unseal an exit still in one of the worker's own active states** (reason
+  :data:`ACTIVE_NO_EXCHANGE_FOOTPRINT_REASON`), which is L3 of
+  ``docs/plans/2026-09-26-active-deletion-exit-selfheal-design.md``. Until this
+  existed the sweep looked at :data:`STUCK_STATE` alone, so an exit standing
+  still in ``pending`` / ``cancelling_entries`` / ``closing_positions`` /
+  ``reconciling`` sealed its lane exactly as completely and with no automation
+  able to end it -- the same shape as 陈哥's eleven days, on the other branch.
+  The three conditions above are reused **unchanged**, and two more are added
+  because these rows have an owner: the claim lease must be free
+  (:func:`_claim_lease_is_free`) and the release must win a CAS naming the claim
+  it saw (:func:`_release_unclaimed_active`), so a row a worker is holding right
+  now is never pulled out of its hands. The age bar is
+  :data:`ACTIVE_STATE_STUCK_AFTER` -- six hours, D6a's one bar -- rather than
+  ``source_deletion_exit_timeout_minutes``, which belongs to the stuck state.
+  An active exit that still has execution credentials is never released here: it
+  may be halfway through cancelling something, and that judgement belongs to the
+  worker that owns the row.
 
 **Capture throttle.** The deletion worker ticks every five seconds
 (``source_message_deletion_worker_interval_seconds``), and this pass used to
@@ -57,7 +74,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Mapping
 
-from sqlalchemy import or_
+from sqlalchemy import and_, or_
 
 from telegram_kol_research.models import (
     ExecutionBinding,
@@ -75,8 +92,49 @@ POSITION_GONE_REASON = "position_gone_confirmed"
 #: position was proven gone. The two paths are deliberately distinguishable in
 #: ``last_reason`` afterwards.
 NO_EXCHANGE_FOOTPRINT_REASON = "released_no_exchange_footprint"
+#: L3. Released out of one of the worker's *active* states because nothing in
+#: the lane was ever ours. The third release reason on purpose: afterwards
+#: ``last_reason`` alone says which path let a lane go --
+#: :data:`POSITION_GONE_REASON` proved a known position gone,
+#: :data:`NO_EXCHANGE_FOOTPRINT_REASON` found an unowned lane under a row
+#: nothing would ever claim again, and this one found an unowned lane under a
+#: row that was still claimable and simply never finished.
+ACTIVE_NO_EXCHANGE_FOOTPRINT_REASON = "released_active_no_exchange_footprint"
+#: Why an active exit was *not* released. All four are ``release_reason`` values
+#: in the alert only; none of them is ever written to ``last_reason``.
+ACTIVE_EXIT_CLAIMED_REASON = "active_exit_is_claimed"
+ACTIVE_EXIT_CREDENTIALS_REASON = "active_exit_has_execution_credentials"
+ACTIVE_LANE_JUDGEMENT_THROTTLED_REASON = "active_lane_judgement_throttled"
+ACTIVE_RELEASE_LOST_THE_RACE_REASON = "active_release_lost_the_race"
 #: How long the same unchanged stuck exit stays quiet between captures.
 STUCK_EXIT_CAPTURE_MIN_INTERVAL = timedelta(minutes=30)
+#: The deletion worker's own active states, copied from
+#: ``source_message_deletion_worker._ACTIVE_STATES``. Not imported: that module
+#: imports this one, so the dependency only goes one way at import time. A test
+#: asserts this tuple still equals the worker's -- and
+#: ``oncall_detector.SEALED_LANE_ACTIVE_STATES``, the watcher's copy of the same
+#: four words.
+ACTIVE_STATES = (
+    "pending",
+    "cancelling_entries",
+    "closing_positions",
+    "reconciling",
+)
+#: L3's age bar, and deliberately not a third threshold: it is the same six
+#: hours as ``oncall_detector.SEALED_LANE_STUCK_AFTER`` (a test asserts the two
+#: are equal), so what D6a files a case about is exactly what this may release.
+#: ``source_deletion_exit_timeout_minutes`` (120 in production) stays what it
+#: always was -- the bar for :data:`STUCK_STATE` -- because that state has no
+#: owner left and needs no grace, while an active exit is by definition still
+#: somebody's work. The bar is measured against ``created_at`` ("it has never
+#: finished"), which is D6a's own union for these states rather than a second
+#: reading of it: ``updated_at`` only ever moves forward from ``created_at``, so
+#: ``updated_at <= cutoff`` implies ``created_at <= cutoff``, and the wider test
+#: is the one that also catches a row being re-claimed every five seconds and
+#: finishing never.
+ACTIVE_STATE_STUCK_AFTER = timedelta(hours=6)
+#: The same bar in the unit the incident summary carries it in.
+_ACTIVE_STATE_STUCK_MINUTES = int(ACTIVE_STATE_STUCK_AFTER.total_seconds() // 60)
 
 #: ``exit_id -> (state, last_reason, last capture moment)``, process memory
 #: only. See the module docstring for why it is not persisted.
@@ -161,7 +219,13 @@ def expire_stuck_source_deletion_exits(
     | None = None,
     capture: Callable[..., Any] | None = None,
 ) -> SourceDeletionExitTimeoutResult:
-    """Alert on every timed-out exit; release only the provably empty ones."""
+    """Alert on every timed-out exit; release only the provably empty ones.
+
+    ``timeout_minutes`` is the bar for :data:`STUCK_STATE` and only for it. An
+    exit in one of :data:`ACTIVE_STATES` is judged on
+    :data:`ACTIVE_STATE_STUCK_AFTER` instead, and takes L3's road through the
+    loop (:func:`_judge_active_candidate`).
+    """
 
     moment = now or datetime.now(UTC)
     if timeout_minutes is None:
@@ -173,7 +237,10 @@ def expire_stuck_source_deletion_exits(
             ).source_deletion_exit_timeout_minutes
         )
     cutoff = _naive_utc(moment) - timedelta(minutes=float(timeout_minutes))
-    candidates = _candidates(session_factory, cutoff=cutoff)
+    active_cutoff = _naive_utc(moment) - ACTIVE_STATE_STUCK_AFTER
+    candidates = _candidates(
+        session_factory, cutoff=cutoff, active_cutoff=active_cutoff
+    )
     if not candidates:
         return SourceDeletionExitTimeoutResult()
 
@@ -183,8 +250,17 @@ def expire_stuck_source_deletion_exits(
     captured: list[int] = []
     for candidate in candidates:
         exit_id = int(candidate["id"])
+        # L3's rows take a different road through this loop, and the fork is
+        # here rather than inside the branches below so that everything the
+        # stuck state used to do is still spelled exactly as it was.
+        active = str(candidate["state"]) in ACTIVE_STATES
         proof = ExchangeAbsenceProof(False, "exchange_read_unavailable")
-        if exchange_reader is not None:
+        # The per-exit absence proof is asked only for the stuck state. It is of
+        # no use to an active row -- L3 never releases one that has credentials
+        # to prove anything about -- and asking anyway would touch the venue
+        # snapshot on *every* five-second tick for such a row, outside the
+        # throttle that exists precisely to stop that.
+        if exchange_reader is not None and not active:
             try:
                 proof = exchange_reader(
                     tuple(candidate["pos_ids"]), tuple(candidate["order_ids"])
@@ -204,7 +280,15 @@ def expire_stuck_source_deletion_exits(
         speak = _should_capture(candidate=candidate, moment=moment)
         released_now = False
         release_reason = proof.reason
-        if proof.proven:
+        if active:
+            released_now, release_reason = _judge_active_candidate(
+                session_factory,
+                candidate=candidate,
+                exchange_reader=exchange_reader,
+                moment=moment,
+                speak=speak,
+            )
+        elif proof.proven:
             released_now = _release(
                 session_factory,
                 exit_id=exit_id,
@@ -244,7 +328,12 @@ def expire_stuck_source_deletion_exits(
                 session_factory,
                 capture=capture,
                 candidate=candidate,
-                timeout_minutes=int(timeout_minutes),
+                # The bar this row actually crossed, so the alert does not
+                # quote the stuck state's 120 minutes at a row judged on six
+                # hours.
+                timeout_minutes=(
+                    _ACTIVE_STATE_STUCK_MINUTES if active else int(timeout_minutes)
+                ),
                 lane_released=released_now,
                 release_reason=release_reason,
                 occurred_at=moment,
@@ -453,6 +542,95 @@ def _no_exchange_footprint_verdict(
     return _NoFootprintVerdict(True, NO_EXCHANGE_FOOTPRINT_REASON)
 
 
+def _judge_active_candidate(
+    session_factory,
+    *,
+    candidate: Mapping[str, Any],
+    exchange_reader: Any,
+    moment: datetime,
+    speak: bool,
+) -> tuple[bool, str]:
+    """L3: may this *active* exit stop sealing its lane, and did it.
+
+    Five conditions, in this order, and every unknown is a refusal. The first
+    three are :func:`_no_exchange_footprint_verdict` reused without a word
+    changed; the last two exist only because an active row, unlike a
+    :data:`STUCK_STATE` one, still has an owner:
+
+    4. **nobody is working on it** -- :func:`_claim_lease_is_free`, re-checked
+       inside the release CAS against the very claim this pass saw. The design's
+       words: never pull a row a worker is processing out of its hands.
+    5. **it is older than** :data:`ACTIVE_STATE_STUCK_AFTER`, which the candidate
+       query has already applied.
+
+    The credential test comes first because it is the cheapest and because it is
+    the one that must never be reached by a different route: an active exit that
+    holds a ``execution_binding_id``, a ``pos_id`` or an ``order_id`` may be
+    halfway through cancelling or closing it, and L3 does not write to the
+    exchange and does not decide for the worker. The lease test comes before the
+    lane read so a row somebody is holding costs nothing to skip, and the
+    throttle test comes before it as well, for the reason the module docstring
+    gives: the lane judgement is an exchange read and may only happen on a pass
+    that was going to speak anyway.
+    """
+
+    if not _has_no_execution_credentials(candidate):
+        return False, ACTIVE_EXIT_CREDENTIALS_REASON
+    if not _claim_lease_is_free(candidate, moment=moment):
+        return False, ACTIVE_EXIT_CLAIMED_REASON
+    if not speak:
+        return False, ACTIVE_LANE_JUDGEMENT_THROTTLED_REASON
+    verdict = _no_exchange_footprint_verdict(
+        session_factory,
+        candidate=candidate,
+        exchange_reader=exchange_reader,
+    )
+    if not verdict.release:
+        return False, verdict.reason
+    if _release_unclaimed_active(
+        session_factory,
+        candidate=candidate,
+        released_at=moment,
+        reason=ACTIVE_NO_EXCHANGE_FOOTPRINT_REASON,
+    ):
+        return True, ACTIVE_NO_EXCHANGE_FOOTPRINT_REASON
+    # Lost the CAS: somebody claimed the row between the read and the write.
+    # Nothing was written, and the next pass will judge it again from scratch.
+    return False, ACTIVE_RELEASE_LOST_THE_RACE_REASON
+
+
+def _claim_lease() -> timedelta:
+    """The deletion worker's claim lease, read from the worker itself.
+
+    Imported here rather than at module import because the dependency runs the
+    other way at import time: ``source_message_deletion_worker`` imports this
+    module. By the time this is called that module is loaded, and a repeat
+    ``import`` is a dictionary lookup. The alternative -- a fifth copy of "five
+    minutes" -- is how two numbers that must agree stop agreeing.
+    """
+
+    from telegram_kol_research.source_message_deletion_worker import CLAIM_LEASE
+
+    return CLAIM_LEASE
+
+
+def _claim_lease_is_free(candidate: Mapping[str, Any], *, moment: datetime) -> bool:
+    """True when no live claim holds this row -- L3's fourth condition.
+
+    Exactly the predicate ``_claim_next_job`` uses to decide it may take a row:
+    no ``claim_token``, or a ``claimed_at`` older than the lease. A token with no
+    ``claimed_at`` cannot be aged, so it counts as held -- fail closed, like
+    every other unknown on this path.
+    """
+
+    if candidate.get("claim_token") is None:
+        return True
+    claimed_at = candidate.get("claimed_at")
+    if claimed_at is None:
+        return False
+    return _naive_utc(claimed_at) <= _naive_utc(moment) - _claim_lease()
+
+
 def _lane_identity(session_factory, *, exit_id: int) -> _LaneIdentity | None:
     """Name the sealed lane exactly as ``source_execution_barrier`` does.
 
@@ -559,13 +737,46 @@ def _should_capture(*, candidate: Mapping[str, Any], moment: datetime) -> bool:
     return True
 
 
-def _candidates(session_factory, *, cutoff: datetime) -> list[dict[str, Any]]:
+def _candidates(
+    session_factory, *, cutoff: datetime, active_cutoff: datetime
+) -> list[dict[str, Any]]:
+    """Every exit this pass will judge: the stuck one and the stalled active one.
+
+    Two branches, one statement, because the pass runs every five seconds and a
+    second statement would double a read that almost always returns nothing.
+    ``EXPLAIN QUERY PLAN`` on a database built from this project's own metadata
+    (2026-09-26) answers::
+
+        MULTI-INDEX OR
+        INDEX 1
+        SEARCH ... USING INDEX ix_source_message_deletion_exits_state
+                (state=? AND updated_at<?)
+        INDEX 2
+        SEARCH ... USING INDEX ix_source_message_deletion_exits_state (state=?)
+        USE TEMP B-TREE FOR ORDER BY
+
+    -- the stuck branch keeps the exact plan it had before this was widened, and
+    the new branch is an index seek per state with ``created_at`` filtered after
+    it. Neither branch scans. The index is ``(state, updated_at)``, so
+    ``created_at`` cannot be part of the seek; the bound is the number of rows
+    in an active state, which in production is normally zero and is bounded by
+    the worker's own throughput rather than by table size.
+    """
+
     with session_factory() as session:
         rows = (
             session.query(SourceMessageDeletionExit)
             .filter(
-                SourceMessageDeletionExit.state == STUCK_STATE,
-                SourceMessageDeletionExit.updated_at <= cutoff,
+                or_(
+                    and_(
+                        SourceMessageDeletionExit.state == STUCK_STATE,
+                        SourceMessageDeletionExit.updated_at <= cutoff,
+                    ),
+                    and_(
+                        SourceMessageDeletionExit.state.in_(ACTIVE_STATES),
+                        SourceMessageDeletionExit.created_at <= active_cutoff,
+                    ),
+                )
             )
             .order_by(SourceMessageDeletionExit.id.asc())
             .all()
@@ -594,6 +805,11 @@ def _candidates(session_factory, *, cutoff: datetime) -> list[dict[str, Any]]:
                     "execution_binding_id": row.execution_binding_id,
                     "target_lifecycle_id": row.target_lifecycle_id,
                     "updated_at": row.updated_at,
+                    "created_at": row.created_at,
+                    # L3's fourth condition reads these two, and the release CAS
+                    # names the claim they describe.
+                    "claim_token": row.claim_token,
+                    "claimed_at": row.claimed_at,
                     "pos_ids": sorted(set(pos_ids)),
                     "order_ids": sorted(set(order_ids)),
                 }
@@ -630,6 +846,66 @@ def _release(
         return updated == 1
 
 
+def _release_unclaimed_active(
+    session_factory,
+    *,
+    candidate: Mapping[str, Any],
+    released_at: datetime,
+    reason: str,
+) -> bool:
+    """Release an active exit, or lose the race and write nothing.
+
+    A separate statement from :func:`_release` rather than a parameter on it,
+    for two reasons. Its ``WHERE`` is strictly larger -- the exact state this
+    pass judged, *and* the claim this pass saw, *and* that claim still being
+    releasable -- and folding both shapes into one function would make the
+    conditions depend on an argument, which is how a guard gets widened by
+    accident later. And the two proven paths (:data:`POSITION_GONE_REASON`,
+    :data:`NO_EXCHANGE_FOOTPRINT_REASON`) then keep a statement that cannot
+    change behaviour because of anything L3 does.
+
+    The CAS is the whole safety of condition 4. If the row was unclaimed when
+    judged, the update demands it still be unclaimed; if it was claimed with an
+    expired lease, the update demands that same token *and* a lease still
+    expired. A worker that claimed the row in between holds a fresh ``uuid4``
+    token, so either shape fails and ``rowcount`` is 0: no state is written, and
+    the pass reports :data:`ACTIVE_RELEASE_LOST_THE_RACE_REASON`. Taking an
+    expired lease is not a new liberty -- ``_claim_next_job`` already does it,
+    and ``_transition_claimed`` filters on ``claim_token``, so a worker whose
+    lease ran out cannot write over this release either.
+    """
+
+    exit_id = int(candidate["id"])
+    state = str(candidate["state"])
+    token = candidate.get("claim_token")
+    stale_before = _naive_utc(released_at) - _claim_lease()
+    with session_factory() as session:
+        query = session.query(SourceMessageDeletionExit).filter(
+            SourceMessageDeletionExit.id == exit_id,
+            SourceMessageDeletionExit.state == state,
+        )
+        if token is None:
+            query = query.filter(SourceMessageDeletionExit.claim_token.is_(None))
+        else:
+            query = query.filter(
+                SourceMessageDeletionExit.claim_token == token,
+                SourceMessageDeletionExit.claimed_at <= stale_before,
+            )
+        updated = query.update(
+            {
+                SourceMessageDeletionExit.state: "succeeded",
+                SourceMessageDeletionExit.last_reason: reason,
+                SourceMessageDeletionExit.claim_token: None,
+                SourceMessageDeletionExit.claimed_at: None,
+                SourceMessageDeletionExit.completed_at: released_at,
+                SourceMessageDeletionExit.updated_at: released_at,
+            },
+            synchronize_session=False,
+        )
+        session.commit()
+        return updated == 1
+
+
 def _resume_behind_exit(session_factory, *, exit_id: int, now: datetime) -> None:
     from telegram_kol_research.deferred_instruction_recovery import (
         resume_instructions_deferred_by_exit,
@@ -660,6 +936,10 @@ def _capture_stuck(
     if capture is not None:
         capture(
             candidate=candidate,
+            # Passed to the injected sink as well as to the real adapter, so a
+            # test can see *which* bar the alert quotes -- 120 minutes for the
+            # stuck state, 360 for an active one. Every caller takes ``**kwargs``.
+            timeout_minutes=timeout_minutes,
             lane_released=lane_released,
             release_reason=release_reason,
             occurred_at=occurred_at,

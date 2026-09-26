@@ -53,6 +53,14 @@ _ACTIVE_STATES = (
     "closing_positions",
     "reconciling",
 )
+#: How long a claim holds a row before anybody else may take it. Promoted from
+#: an inline literal inside :func:`_claim_next_job` (its only use, and it is
+#: still spelled exactly once there) because
+#: ``source_deletion_exit_timeout`` now has to answer the same question --
+#: "is somebody working on this row right now" -- before it may release an
+#: active exit. One number, read from here, rather than a second five minutes
+#: drifting on its own.
+CLAIM_LEASE = timedelta(minutes=5)
 _TERMINAL_LIFECYCLE_STATES = frozenset(
     {"exited", "expired", "invalidated", "cancelled"}
 )
@@ -1370,7 +1378,7 @@ def _claim_next_job(
     ordering -- the old ``ORDER BY id`` already paid for that sort.
     """
 
-    stale_before = claimed_at - timedelta(minutes=5)
+    stale_before = claimed_at - CLAIM_LEASE
     with session_factory() as session:
         query = session.query(
             SourceMessageDeletionExit.id, SourceMessageDeletionExit.state

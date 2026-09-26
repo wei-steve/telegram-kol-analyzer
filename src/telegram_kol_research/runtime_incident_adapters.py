@@ -1320,6 +1320,12 @@ def capture_source_deletion_exit_stuck(
     ``lane_released`` says whether the exchange proved the position and orders
     were already gone -- when it did not, the lane is still held on purpose and
     only a person can settle it.
+
+    Since L3 (2026-09-26) ``state`` can also be one of the worker's four active
+    states, which seal a lane exactly as completely; ``timeout_minutes`` is then
+    the six-hour bar those are judged on rather than
+    ``source_deletion_exit_timeout_minutes``. ``release_reason`` is what
+    distinguishes the paths, and it always names one.
     """
 
     if not config.captures("source_deletion_exit_stuck"):
