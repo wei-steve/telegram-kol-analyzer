@@ -321,9 +321,7 @@ def prune_tpsl_observations(
 def _context_candidate_ids(connection: sqlite3.Connection, cutoff: str) -> list[int]:
     """Ids with a settled status whose *message* is older than the cutoff.
 
-    Why the message time and not the row's own ``created_at``: the production
-    snapshot has ``created_at`` NULL on nearly every row (6,713 of 6,714), so
-    that column cannot carry an age. Why not the row's ``updated_at`` alone:
+    Why the message time and not the row's own ``created_at`` / ``updated_at``:
     ``status``, ``created_at`` and ``updated_at`` sit *after* the ~64 KB
     ``request_summary_json`` in the record, so reading any of them for every row
     walks every row's overflow chain -- a ~0.5 GB read each night, the kind of
