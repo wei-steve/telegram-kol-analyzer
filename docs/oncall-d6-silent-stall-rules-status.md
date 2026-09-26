@@ -262,3 +262,35 @@ sudo systemctl restart telegram-kol-oncall.service
    引进判据，得先看上线首日的分布；引进它也意味着值守要读一张配置表，那是另一件事。
 3. 案例备注 5.2「给重复 capture 加节流」与 5.1「`_SUMMARY_FIELDS` 补 `release_reason`」
    已由 `1817d0c9` / `78a35cb1` 做掉，不属于本项目。
+
+---
+
+## 部署记录 · 2026-09-26（北京时间 13:08）
+
+- 部署 sha `29eb3389`，**回滚 sha `0041ae06`**。顺序：候选推
+  `claude/oncall-d6-silent-stall-rules` → `tg-deploy` → **`systemctl restart
+  telegram-kol-oncall.service`**（它不在 tg-deploy 的重启清单里）→ 推 `main`。
+- 两项部署检查各对两种答案测过：`0041ae06..29eb3389` 正确报 FAIL 并列出 7 个代码文件；
+  部署后 `main` 对生产报 `PASS: 0 code files beyond production`。
+
+### 上线前重新数过的首轮量（按新判据的原话，只读有界）
+
+| 规则 | 判据 | 实测 |
+|---|---|---|
+| D6a | `state='recovery_required'` 且 `updated_at <= now-6h` | **0** |
+| D6b | 水位线之后的 `deferred_expired` | **0**（水位线 `recognition_decisions=19189`，历史 39 条不回填） |
+| D6c | `pending` + 高危 + `last_occurred_at >= now-1h` + 通知超 3 天 | **0** |
+
+D6c 值得记一笔：两小时前它还会命中 2 条（刚清掉的那两个 revision batch），
+是「`last_occurred_at` 还在推进」这条判据让它们在停止推进 60 分钟后自动出局——
+**判据选「还在推进」而不是「repeat_count 大」的价值，上线当天就兑现了一次。**
+
+### 部署后观察
+
+值守服务 active，心跳逐轮推进（round 1 → 4，`last_error: null`），
+`consecutive_read_failures = 0`，journal 无 Traceback。
+新规则的案子 0 条，与上表一致；库里现存案子全部来自 D1/D2/D3/D4 等既有规则。
+
+**真正的验证要等第一条命中**：下一条被封 6 小时的 lane、下一条被吃掉的消息、
+下一条还在推进却三天没通知的高危告警。三条都有单测钉着行为，
+但生产上的第一条命中才说明判据接到了真东西。
