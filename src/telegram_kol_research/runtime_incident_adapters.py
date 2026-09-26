@@ -1339,10 +1339,19 @@ def capture_source_deletion_exit_stuck(
         severity="high",
         detailed_summary=_summary(
             **fixed,
+            # The minutes travel as an integer, and the label carries no digits.
+            # Welded together they made one 33-character mixed-class token --
+            # ``lane_still_held_after_120_minutes`` -- which the opaque-secret
+            # heuristic reads as a credential blob, so the *held* summary was
+            # refused on length even once ``release_reason`` was admitted to the
+            # vocabulary. Held is the case this alert exists for, so the whole
+            # fix would have changed nothing. Integers are not scanned as
+            # strings, and a digit-free label cannot reach the heuristic's
+            # three-character-class floor at any timeout value.
             impact=_safe_label(
-                f"lane_{'released' if lane_released else 'still_held'}"
-                f"_after_{int(timeout_minutes)}_minutes"
+                f"lane_{'released' if lane_released else 'still_held'}_after_timeout"
             ),
+            timeout_minutes=int(timeout_minutes),
             release_reason=_safe_label(release_reason or "not_released"),
         ),
         minimal_summary=_summary(**fixed),

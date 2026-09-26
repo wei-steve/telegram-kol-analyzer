@@ -436,6 +436,12 @@ def format_runtime_incident_notification(incident) -> str:
         "notification_status": "通知状态",
         "containment": "当前遏制",
         "impact": "影响",
+        # The stuck source-deletion exit's verdict, for both directions: why the
+        # lane was not released, or on what grounds it was. Carrying it in the
+        # summary row alone was not enough -- the person who has to act reads
+        # this message, and for eleven days in September 2026 the message did
+        # not say why 陈哥's BTC-long lane stayed sealed.
+        "release_reason": "释放判定",
     }
     lines = [
         "运行异常",

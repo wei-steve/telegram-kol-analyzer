@@ -165,6 +165,25 @@ _SUMMARY_FIELDS = frozenset(
         "stalled_jobs",
         "oldest_enqueued_at",
         "last_claim_at",
+        # The stuck source-deletion exit alert, and the third time this exact
+        # failure has been paid for: A-8c lost an alarm to
+        # ``group_trading_mode`` and A-10b lost one to ``pos_id``, both refused
+        # by this vocabulary, both silent because the refusal is logged rather
+        # than raised. Here the refusal cost eleven days: exits 310/311 sealed
+        # 陈哥's BTC-long lane from 2026-09-15, the detailed summary was refused
+        # on every one of 356933 passes, and the only field it carried beyond
+        # the minimal fallback -- ``release_reason``, holding the single answer
+        # to "why was the lane not released" (``exit_has_no_known_position``) --
+        # was the one thing nobody could read. The value is a fixed reason
+        # label from this module's own callers passed through ``_safe_label``,
+        # and the redaction scan below still runs over the assembled JSON.
+        # ``timeout_minutes`` is an integer and comes with it: the minutes used
+        # to be welded into ``impact``, where 33 characters of mixed classes
+        # read as an opaque secret and got the *held* summary refused on length
+        # even with the word above admitted -- the same lesson as ``chat_id`` /
+        # ``deadline_at``, which is that a number belongs in its own field.
+        "release_reason",
+        "timeout_minutes",
     }
 )
 _DIAGNOSIS_FIELDS = frozenset(
