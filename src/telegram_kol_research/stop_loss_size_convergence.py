@@ -42,7 +42,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable, Iterable, Mapping
 
@@ -71,6 +71,51 @@ RESIZE_INCIDENT_TYPE = "stop_loss_resize_readback_mismatch"
 #: automatically -- cancelling the new stop to tidy up would be the one change
 #: that could leave the position naked. A person cancels the old order.
 REPLACE_INCOMPLETE_INCIDENT_TYPE = "stop_resize_replace_incomplete"
+
+#: How long an unchanged "verified stops disagree" situation stays quiet between
+#: log lines. The planner runs every reconcile round, so before 2026-09-26 the
+#: same ``(pos_id, count)`` produced about 660 identical ``WARNING`` lines an
+#: hour. A change of ``count`` -- or a ``pos_id`` never reported by this process
+#: -- is reported at once; an unchanged repeat is reported at most once per
+#: interval and carries how many repeats it stood for. Logging only: the skip
+#: decision itself is untouched. The state is process-local on purpose, the same
+#: trade :mod:`telegram_kol_research.recognition_execution_scanner` makes: after
+#: a restart each disagreement is stated once more.
+DISAGREEMENT_REPORT_MIN_INTERVAL = timedelta(hours=1)
+
+#: ``pos_id -> (disagreeing_count, reported_at, suppressed_since_report)``.
+_LAST_REPORTED_DISAGREEMENT: dict[str, tuple[int, datetime, int]] = {}
+
+
+def should_report_stop_disagreement(
+    pos_id: str, count: int, *, moment: datetime
+) -> tuple[bool, int]:
+    """Throttle an unchanged repeat, never throttle a change.
+
+    Returns ``(report, suppressed)``: whether to log now, and how many repeats
+    of the same ``(pos_id, count)`` were held back since the previous line.
+    """
+
+    key = str(pos_id)
+    count = int(count)
+    now = moment.replace(tzinfo=UTC) if moment.tzinfo is None else moment.astimezone(UTC)
+    seen = _LAST_REPORTED_DISAGREEMENT.get(key)
+    if seen is not None:
+        seen_count, seen_at, suppressed = seen
+        if seen_count == count and (now - seen_at) < DISAGREEMENT_REPORT_MIN_INTERVAL:
+            _LAST_REPORTED_DISAGREEMENT[key] = (seen_count, seen_at, suppressed + 1)
+            return False, suppressed + 1
+        held_back = suppressed if seen_count == count else 0
+    else:
+        held_back = 0
+    _LAST_REPORTED_DISAGREEMENT[key] = (count, now, 0)
+    return True, held_back
+
+
+def reset_stop_disagreement_report_throttle() -> None:
+    """Forget every throttle decision. For tests and for explicit restarts."""
+
+    _LAST_REPORTED_DISAGREEMENT.clear()
 
 
 @dataclass(frozen=True, slots=True)
@@ -137,11 +182,17 @@ def plan_stop_loss_resizes(
             if any(_decimal(item.size_text) == live_size for item in group):
                 continue
             if len(group) != 1:
-                logger.warning(
-                    "stop-loss resize skipped: %s verified stops disagree pos_id=%s",
-                    len(group),
-                    pos_id,
+                report, suppressed = should_report_stop_disagreement(
+                    pos_id, len(group), moment=datetime.now(UTC)
                 )
+                if report:
+                    logger.warning(
+                        "stop-loss resize skipped: %s verified stops disagree pos_id=%s"
+                        " suppressed_repeats=%s",
+                        len(group),
+                        pos_id,
+                        suppressed,
+                    )
                 continue
             row = group[0]
             ledger_size = _decimal(row.size_text)

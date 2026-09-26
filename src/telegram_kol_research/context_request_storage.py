@@ -23,6 +23,22 @@ REQUEST_COMPONENTS = (
     "mimo_first_pass",
 )
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+#: Exact field set of the marker ``db_retention`` leaves in place of an old
+#: request (``docs/plans/2026-09-26-server-disk-usage-analysis.md`` section 5.3).
+#: It keeps the one projection an online reader still derives from the request,
+#: ``candidate_thread_ids`` (the worker's state fingerprint falls back to the
+#: request when ``candidate_thread_ids_json`` is NULL, which it is for every row
+#: written before R1), so replacing the request never changes a fingerprint.
+RETENTION_STUB_FIELDS = frozenset(
+    {
+        "candidate_thread_ids",
+        "contract",
+        "original_bytes",
+        "original_sha256",
+        "storage",
+        "stubbed_at",
+    }
+)
 
 
 class ContextRequestStorageError(ValueError):
@@ -31,14 +47,21 @@ class ContextRequestStorageError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class ParsedContextRequestStorage:
-    storage: Literal["legacy-full", "reference-only", "archived"]
+    storage: Literal["legacy-full", "reference-only", "archived", "retention-stub"]
     request_payload: dict[str, Any] | None
     archive_artifact_sha256: str | None = None
     record_sha256: str | None = None
+    #: Only for ``retention-stub``: the exact ``collect_candidate_thread_ids``
+    #: projection of the request that was removed.
+    candidate_thread_ids: tuple[int, ...] | None = None
 
     def require_legacy_full(self) -> dict[str, Any]:
         if self.storage == "archived":
             raise ContextRequestStorageError("request payload is archived")
+        if self.storage == "retention-stub":
+            raise ContextRequestStorageError(
+                "request payload was removed by retention"
+            )
         if self.storage == "reference-only":
             raise ContextRequestStorageError("request payload is reference-only")
         if self.request_payload is None:
@@ -119,7 +142,73 @@ def parse_context_request_storage(
             archive_artifact_sha256=archive_sha,
             record_sha256=record_sha,
         )
+    if storage == "retention_stub":
+        if set(parsed) != RETENTION_STUB_FIELDS:
+            raise ContextRequestStorageError(
+                "retention stub marker must have exact fields"
+            )
+        original_sha = parsed.get("original_sha256")
+        if not isinstance(original_sha, str) or not _SHA256_RE.fullmatch(original_sha):
+            raise ContextRequestStorageError(
+                "retention stub has invalid original SHA-256"
+            )
+        original_bytes = parsed.get("original_bytes")
+        if (
+            isinstance(original_bytes, bool)
+            or not isinstance(original_bytes, int)
+            or original_bytes < 0
+        ):
+            raise ContextRequestStorageError(
+                "retention stub has invalid original byte count"
+            )
+        if not isinstance(parsed.get("stubbed_at"), str):
+            raise ContextRequestStorageError("retention stub has invalid stubbed_at")
+        thread_ids = parsed.get("candidate_thread_ids")
+        if (
+            not isinstance(thread_ids, list)
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in thread_ids)
+            or thread_ids != sorted(set(thread_ids))
+        ):
+            raise ContextRequestStorageError(
+                "retention stub candidate thread IDs must be sorted unique integers"
+            )
+        return ParsedContextRequestStorage(
+            storage="retention-stub",
+            request_payload=None,
+            record_sha256=original_sha,
+            candidate_thread_ids=tuple(thread_ids),
+        )
     raise ContextRequestStorageError("unknown storage state")
+
+
+def build_retention_stub(stored: str, *, stubbed_at: str) -> str | None:
+    """Return the marker that replaces a legacy full request, or ``None``.
+
+    ``None`` means "leave this value alone": it is already a tagged marker
+    (reference-only, archived, or an earlier stub -- which is what makes the
+    retention job idempotent), or it is not parseable at all, in which case
+    replacing it would destroy the only evidence of what was wrong with it.
+    """
+
+    try:
+        parsed = parse_context_request_storage(stored)
+    except ContextRequestStorageError:
+        return None
+    if parsed.storage != "legacy-full" or parsed.request_payload is None:
+        return None
+    encoded = stored.encode("utf-8")
+    return _canonical_json(
+        {
+            "candidate_thread_ids": collect_candidate_thread_ids(
+                parsed.request_payload
+            ),
+            "contract": REQUEST_STORAGE_CONTRACT,
+            "original_bytes": len(encoded),
+            "original_sha256": hashlib.sha256(encoded).hexdigest(),
+            "storage": "retention_stub",
+            "stubbed_at": str(stubbed_at),
+        }
+    )
 
 
 def collect_candidate_thread_ids(value: Any) -> list[int]:

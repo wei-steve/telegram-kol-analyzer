@@ -350,6 +350,10 @@ def _attempt_candidate_thread_ids(latest_attempt: Any) -> set[int]:
     if projection_json is not None:
         return parse_candidate_thread_ids(str(projection_json))
     stored = parse_context_request_storage(str(latest_attempt[1]))
+    if stored.storage == "retention-stub":
+        # db_retention replaced the request but kept this exact projection,
+        # so the fingerprint is the one the full request would have given.
+        return set(stored.candidate_thread_ids or ())
     return set(collect_candidate_thread_ids(stored.require_legacy_full()))
 
 
