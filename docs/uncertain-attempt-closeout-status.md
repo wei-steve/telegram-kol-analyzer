@@ -360,3 +360,47 @@ SELECT COUNT(*) AS decisions_still_frozen FROM recognition_decisions
 **这条与本次改动无关**：它在甲乙那次全量里是绿的，单文件、单条、连跑 25 次、再加 6 个
 `yes` 抢 CPU 连跑 15 次，全部绿；丙的第二次全量也是绿的。是这条用例本身的竞态
 （断言的是并发任务谁先记录，不是并行度本身），已另立后台任务，不在本稿范围内。
+
+---
+
+## 部署与执行记录 · 2026-09-26（北京时间）
+
+### 部署
+
+- sha **`1c992eae`**（甲乙 = `8071314e`，丙 = `c96e6d8a`，外加并入 main 的四条他人文档提交），
+  **回滚 sha `7b5f0053`**。
+- **回滚有约束**：本次代码与 schema 绑定（CHECK 加宽 + 表重建）。回滚代码前要想清楚
+  已经写成 `closed_no_write` / `closed_settled_binding` 的 37 行怎么办——
+  旧代码的 schema 校验器会因 CHECK 签名不符而对权威执行全线 fail closed。
+- 备份没做全库 `VACUUM INTO`：服务器磁盘 91% 已用、仅剩 4.9 GB，而本次写入只碰一张表。
+  改为单表 dump：`/root/authoritative_execution_attempts.dump-20260927-014822.sql`（2.3 MB，4285 行）。
+
+### 部署后实测（复核方自己跑的）
+
+CHECK 已加宽为
+`(status IN (...,'uncertain','closed_no_write','closed_settled_binding'))`；
+4285 行完好；四个索引齐全（`ix_..._raw_message_id`、`ix_..._status_lease` 与两个 autoindex）；
+worker/web/ingest active，无 `schema_invalid`、无 Traceback。
+
+### dry-run → apply
+
+```
+dry_run: scanned 37 | closeable 37 | refused 0 | exchange_write_count 0
+apply  : changed_count 37 | refused 0 | exchange_write_count 0
+         transaction_lock_seconds 0.61 | manifest_sha256 2910df19...
+```
+
+分桶：`closed_no_write` 35（29 条无任何执行事件 + 6 条只有确认提醒/超时通知）、
+`closed_settled_binding` 2（峰哥 ETH：attempt 319→绑定 340、attempt 360→绑定 342，
+写入事件 `open_market_position` + `set_position_tpsl`，`live_binding_ids` 均为空）。
+
+### 收口后核对（三条全部通过）
+
+| 检查 | 结果 |
+|---|---|
+| `uncertain` 归零 | ✅ 状态表里已无该取值 |
+| `closed_no_write` / `closed_settled_binding` | ✅ 35 / 2 |
+| **`decisions_still_frozen`** | ✅ **仍为 37** —— 决定行一字未动，消息继续冻结 |
+
+最后一条是本次交付的验收核心在生产上的复现：收口没有解冻任何消息，
+因此不可能有 9 月的策略被重新识别进而下单。
