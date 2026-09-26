@@ -1334,6 +1334,42 @@ def _claim_next_job(
     claimed_at: datetime,
     excluded_exit_ids: set[int] | None = None,
 ):
+    """Claim one active exit, newest-untouched first and then round robin.
+
+    The candidate ordering is the fairness guarantee, so it is spelled out
+    here rather than left to the reader:
+
+    1. ``attempt_count == 0`` first -- an exit nobody has ever claimed. A
+       freshly recorded deletion needs its entry orders cancelled *now*, and
+       under a pure age ordering (key 2) it would sort behind every older row,
+       because its ``updated_at`` equals its ``created_at`` and is therefore
+       the newest value in the table. This bucket drains by construction: the
+       CAS below increments ``attempt_count``, and nothing in the codebase
+       ever resets it, so one claim removes a row from the bucket for good.
+    2. then ``updated_at`` ascending -- least recently touched first. This
+       *is* the round robin, and it needs no separate backoff: every path that
+       touches a row pushes ``updated_at`` to the current tick (the claim CAS
+       below, ``_transition_claimed``, ``_mark_reconciliation_waiting``, the
+       direct releases in the exchange stages, and the timeout sweeper's
+       ``_release``). No path ever writes an older value. So a row that was
+       just worked on sorts to the tail on its own, and a row that keeps
+       failing cannot monopolise ``max_jobs``.
+    3. then ``id`` ascending -- a stable tiebreak, because every row claimed
+       within one tick shares the same ``updated_at``.
+
+    The previous ordering was ``id`` alone, which starved every row beyond
+    the first ``max_jobs`` of them: this function re-queries per job and
+    returns the lowest claimable id, so with enough permanently active rows
+    the high ids were never reached. ``LIMIT 20`` is kept -- with this
+    ordering the window now holds the 20 most deserving rows, not the 20
+    oldest ids.
+
+    The plan does not change: ``EXPLAIN QUERY PLAN`` gives
+    ``SEARCH ... USING INDEX ix_source_message_deletion_exits_state (state=?)``
+    plus ``USE TEMP B-TREE FOR ORDER BY`` for both the old and the new
+    ordering -- the old ``ORDER BY id`` already paid for that sort.
+    """
+
     stale_before = claimed_at - timedelta(minutes=5)
     with session_factory() as session:
         query = session.query(
@@ -1351,7 +1387,11 @@ def _claim_next_job(
                     SourceMessageDeletionExit.claimed_at <= stale_before,
                 )
             )
-            .order_by(SourceMessageDeletionExit.id.asc())
+            .order_by(
+                (SourceMessageDeletionExit.attempt_count == 0).desc(),
+                SourceMessageDeletionExit.updated_at.asc(),
+                SourceMessageDeletionExit.id.asc(),
+            )
             .limit(20)
             .all()
         )

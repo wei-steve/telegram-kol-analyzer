@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +27,7 @@ from telegram_kol_research.source_message_deletion import (
     record_source_message_deleted,
 )
 from telegram_kol_research.source_message_deletion_worker import (
+    _claim_next_job,
     _transition_claimed,
     finalize_source_message_deletion_exit,
     run_source_message_deletion_worker_loop,
@@ -1952,3 +1953,237 @@ def test_flat_finalization_requires_exact_identity_for_bound_strategy(tmp_path):
     with session_factory() as session:
         deletion_exit = session.get(SourceMessageDeletionExit, deletion.exit_id)
         assert deletion_exit.last_reason == "frozen_ledger_identity_unverified"
+
+
+# --------------------------------------------------------------------------
+# L1: the candidate ordering in ``_claim_next_job`` is a fairness guarantee.
+# The old ``ORDER BY id`` starved every active row beyond the first
+# ``max_jobs`` of them, because this function re-queries per job and always
+# returned the lowest claimable id.
+# --------------------------------------------------------------------------
+
+
+_CLAIM_TICK = timedelta(seconds=5)
+
+
+def _add_active_exit(
+    session_factory,
+    *,
+    chat_id: int,
+    message_id: int,
+    created_at: datetime,
+    state: str = "cancelling_entries",
+    attempt_count: int = 1,
+    updated_at: datetime | None = None,
+) -> int:
+    """One active deletion exit with the timestamps the ordering reads."""
+
+    with session_factory() as session:
+        event = TelegramSourceMessageEvent(
+            event_type="message_deleted",
+            chat_id=chat_id,
+            message_id=message_id,
+            event_fingerprint=f"claim-order-{chat_id}-{message_id}",
+            binding_state="bound",
+            telegram_event_json="{}",
+            occurred_at=created_at,
+        )
+        session.add(event)
+        session.commit()
+        deletion_exit = SourceMessageDeletionExit(
+            source_event_id=int(event.id),
+            state=state,
+            attempt_count=attempt_count,
+            created_at=created_at,
+            updated_at=updated_at if updated_at is not None else created_at,
+        )
+        session.add(deletion_exit)
+        session.commit()
+        return int(deletion_exit.id)
+
+
+def _release_claim(session_factory, *, exit_id: int, released_at: datetime) -> None:
+    """What every real release path does: drop the claim, push ``updated_at``."""
+
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, int(exit_id))
+        deletion_exit.claim_token = None
+        deletion_exit.claimed_at = None
+        deletion_exit.updated_at = released_at
+        session.commit()
+
+
+def _run_claim_tick(session_factory, *, now: datetime, max_jobs: int = 10):
+    """One worker tick: claim up to ``max_jobs`` distinct rows, release each."""
+
+    processed: set[int] = set()
+    for _ in range(max_jobs):
+        claim = _claim_next_job(
+            session_factory, claimed_at=now, excluded_exit_ids=processed
+        )
+        if claim is None:
+            break
+        exit_id, _state, _token = claim
+        processed.add(exit_id)
+        _release_claim(session_factory, exit_id=exit_id, released_at=now)
+    return processed
+
+
+def test_claim_order_reaches_every_active_row_in_bounded_rounds(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    exit_ids = [
+        _add_active_exit(
+            session_factory,
+            chat_id=771,
+            message_id=6000 + index,
+            created_at=NOW - timedelta(hours=30) + timedelta(minutes=index),
+        )
+        for index in range(25)
+    ]
+    # Every row is already claimable and stays active for the whole test, which
+    # is exactly the shape that starved ids 11..25 under ``ORDER BY id``.
+    assert len(exit_ids) == 25
+
+    seen: set[int] = set()
+    rounds = 0
+    for tick in range(3):
+        rounds += 1
+        seen |= _run_claim_tick(session_factory, now=NOW + tick * _CLAIM_TICK)
+
+    assert rounds == 3, "ceil(25 rows / 10 jobs per tick) == 3"
+    assert seen == set(exit_ids)
+    # The highest id -- the one the old ordering never reached -- is in there.
+    assert max(exit_ids) in seen
+
+
+def test_claim_order_does_not_starve_the_highest_id_across_many_ticks(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    exit_ids = [
+        _add_active_exit(
+            session_factory,
+            chat_id=772,
+            message_id=6100 + index,
+            created_at=NOW - timedelta(hours=30) + timedelta(minutes=index),
+        )
+        for index in range(21)
+    ]
+    last_id = max(exit_ids)
+
+    claimed_in_round: dict[int, int] = {}
+    for tick in range(4):
+        for exit_id in _run_claim_tick(
+            session_factory, now=NOW + tick * _CLAIM_TICK
+        ):
+            claimed_in_round.setdefault(exit_id, tick)
+
+    assert last_id in claimed_in_round
+    # 21 rows, 10 jobs a tick: nothing should wait longer than the third tick.
+    assert max(claimed_in_round.values()) <= 2
+
+
+def test_a_brand_new_exit_is_claimed_before_a_pile_of_older_active_rows(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    for index in range(15):
+        _add_active_exit(
+            session_factory,
+            chat_id=773,
+            message_id=6200 + index,
+            created_at=NOW - timedelta(hours=20) + timedelta(minutes=index),
+        )
+    # A deletion recorded this second: ``created_at == updated_at == now``, so
+    # a pure ``updated_at`` ordering would put it dead last, behind 15 rows
+    # whose entry orders have already been attempted once.
+    fresh_id = _add_active_exit(
+        session_factory,
+        chat_id=773,
+        message_id=6299,
+        state="pending",
+        attempt_count=0,
+        created_at=NOW,
+    )
+
+    claim = _claim_next_job(session_factory, claimed_at=NOW)
+
+    assert claim is not None
+    assert claim[0] == fresh_id
+    assert claim[1] == "cancelling_entries"
+
+
+def test_the_never_claimed_bucket_drains_after_one_claim(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    older_id = _add_active_exit(
+        session_factory,
+        chat_id=774,
+        message_id=6300,
+        created_at=NOW - timedelta(hours=20),
+    )
+    fresh_id = _add_active_exit(
+        session_factory,
+        chat_id=774,
+        message_id=6301,
+        state="pending",
+        attempt_count=0,
+        created_at=NOW,
+    )
+
+    first = _run_claim_tick(session_factory, now=NOW, max_jobs=1)
+    assert first == {fresh_id}
+    # The claim incremented ``attempt_count``, so the fresh row left the
+    # priority bucket for good and the older row is next.
+    second = _run_claim_tick(session_factory, now=NOW + _CLAIM_TICK, max_jobs=1)
+    assert second == {older_id}
+    with session_factory() as session:
+        assert session.get(SourceMessageDeletionExit, fresh_id).attempt_count == 1
+
+
+def test_a_claim_lease_still_lasts_exactly_five_minutes(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    exit_id = _add_active_exit(
+        session_factory,
+        chat_id=775,
+        message_id=6400,
+        created_at=NOW - timedelta(hours=20),
+    )
+
+    first = _claim_next_job(session_factory, claimed_at=NOW)
+    assert first is not None and first[0] == exit_id
+
+    # A live lease is nobody else's business.
+    assert (
+        _claim_next_job(
+            session_factory, claimed_at=NOW + timedelta(minutes=4, seconds=59)
+        )
+        is None
+    )
+    # Five minutes on, a dead process's claim is up for grabs again.
+    stolen = _claim_next_job(session_factory, claimed_at=NOW + timedelta(minutes=5))
+    assert stolen is not None and stolen[0] == exit_id
+    assert stolen[2] != first[2]
+
+
+def test_a_claim_lost_to_another_worker_is_not_returned_twice(tmp_path):
+    session_factory = create_session_factory(tmp_path / "research.db")
+    exit_id = _add_active_exit(
+        session_factory,
+        chat_id=776,
+        message_id=6500,
+        created_at=NOW - timedelta(hours=20),
+    )
+    sessions_opened = {"count": 0}
+
+    def racing_session_factory():
+        sessions_opened["count"] += 1
+        if sessions_opened["count"] == 2:
+            # Between the candidate read and our CAS, another worker claims it.
+            with session_factory() as session:
+                stolen = session.get(SourceMessageDeletionExit, exit_id)
+                stolen.claim_token = "other-worker"
+                stolen.claimed_at = NOW
+                session.commit()
+        return session_factory()
+
+    assert _claim_next_job(racing_session_factory, claimed_at=NOW) is None
+    with session_factory() as session:
+        deletion_exit = session.get(SourceMessageDeletionExit, exit_id)
+        assert deletion_exit.claim_token == "other-worker"
+        assert deletion_exit.attempt_count == 1
