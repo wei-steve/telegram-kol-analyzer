@@ -142,6 +142,14 @@ _SUMMARY_FIELDS = frozenset(
         "episode_started_at",
         "last_failure_at",
         "recovered_at",
+        # 2026-09-26: a chain-head outage on ``gpt-5.6-luna`` was announced as
+        # "MiMo unavailable" because the Telegram copy hard-coded the brand
+        # instead of reading which model this monitor actually watches. Both
+        # fields are model names passed through ``_safe_label``, so the copy
+        # can name the model on the unavailable and recovered notices without
+        # the model name joining the fingerprint-free dedup key.
+        "head_model",
+        "fallback_model",
         # step-18 step 3: an instruction the outage delayed and that was not
         # executed is handed to a person, who needs when it was posted and --
         # for an entry -- the price range it named. The instant is bare, like

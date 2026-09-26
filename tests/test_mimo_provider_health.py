@@ -469,7 +469,7 @@ def test_the_first_failure_alerts_then_every_thirty_minutes_then_once_on_recover
     assert len(_incidents(session_factory, "mimo_provider_unavailable")) == 3
 
     alert_text = format_runtime_incident_notification(first[0])
-    assert "MiMo 识别供应商不可用" in alert_text
+    assert "权威识别主用模型不可用" in alert_text
     assert "余额不足" in alert_text
     assert "HTTP 402" in alert_text
     assert "每 30 分钟" in alert_text
@@ -478,9 +478,89 @@ def test_the_first_failure_alerts_then_every_thirty_minutes_then_once_on_recover
     assert summary["consecutive_failures"] == 1
 
     recovery_text = format_runtime_incident_notification(recovered[0])
-    assert "MiMo 识别供应商已恢复" in recovery_text
+    assert "权威识别主用模型已恢复" in recovery_text
     assert "2026-09-12T03:00Z 至 2026-09-12T04:10Z" in recovery_text
     assert json.loads(recovered[0].redacted_summary)["consecutive_failures"] == 2
+
+
+def test_the_tick_passes_head_model_and_fallback_model_to_both_captures(tmp_path):
+    """2026-09-26: the alert names the model this monitor watches, not a brand.
+
+    A chain-head outage on ``gpt-5.6-luna`` was announced as "MiMo
+    unavailable" because the Telegram copy hard-coded the brand instead of
+    reading which model the tick actually watches. The fix threads
+    ``head_model`` -- and, on recovery, ``fallback_model`` -- from the tick
+    into both captures. This asserts the tick's own call shape; the rendered
+    text is asserted separately in test_system_operator_bot.py.
+    """
+
+    session_factory = _session_factory(tmp_path)
+    head = "gpt-5.6-luna"
+    backup = "mimo-v2.5"
+
+    def _attempt_as(model, *, at, status="http_error", error_code=None):
+        run = start_mimo_run(
+            session_factory,
+            raw_message_id=1,
+            run_kind="v1_authoritative",
+            contract_version="v1",
+            model=model,
+            input_kind="text",
+            input_fingerprint="fp",
+            prompt_versions={},
+            started_at=at,
+        )
+        record_mimo_attempt(
+            session_factory,
+            run_id=run.id,
+            ordinal=1,
+            status=status,
+            model=model,
+            error_code=error_code,
+            error_message=None if status == "completed" else "failed",
+            duration_ms=0,
+            started_at=at,
+            completed_at=at,
+            attempt_phase="v1_authoritative",
+        )
+
+    captured_unavailable: dict = {}
+    captured_recovered: dict = {}
+
+    def capture_unavailable(factory, **kwargs):
+        captured_unavailable.update(kwargs)
+        return capture_mimo_provider_unavailable(factory, config=CONFIG, **kwargs)
+
+    def capture_recovered(factory, **kwargs):
+        captured_recovered.update(kwargs)
+        return capture_mimo_provider_recovered(factory, config=CONFIG, **kwargs)
+
+    _attempt_as(head, at=OUTAGE_START, error_code=BALANCE)
+    _attempt_as(backup, at=OUTAGE_START + timedelta(minutes=1), status="completed")
+
+    health.run_mimo_provider_health_tick(
+        session_factory,
+        now=(OUTAGE_START + timedelta(minutes=2)).replace(tzinfo=UTC),
+        chain_head_model=head,
+        capture_unavailable=capture_unavailable,
+        capture_recovered=capture_recovered,
+    )
+
+    assert captured_unavailable["head_model"] == head
+    assert captured_unavailable["fallback_model"] == backup
+
+    _attempt_as(head, at=OUTAGE_START + timedelta(minutes=5), status="completed")
+
+    health.run_mimo_provider_health_tick(
+        session_factory,
+        now=(OUTAGE_START + timedelta(minutes=6)).replace(tzinfo=UTC),
+        chain_head_model=head,
+        capture_unavailable=capture_unavailable,
+        capture_recovered=capture_recovered,
+    )
+
+    assert captured_recovered["head_model"] == head
+    assert captured_recovered["fallback_model"] == backup
 
 
 def test_a_failure_that_never_reached_the_provider_does_not_end_the_outage(tmp_path):

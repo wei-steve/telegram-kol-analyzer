@@ -268,10 +268,16 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
     def value(key: str, limit: int = 64) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=limit)
 
+    head = (
+        _safe_runtime_incident_value(summary.get("head_model"), limit=64)
+        if summary.get("head_model")
+        else None
+    )
+
     incident_type = str(incident.incident_type or "")
     if incident_type == "provider_outage_entry_not_replayed":
         lines = [
-            "MiMo 故障期间的入场未执行，需人工判断",
+            "识别主用模型故障期间的入场未执行，需人工判断",
             f"群: {value('chat_id')}",
             f"消息时间: {value('message_posted_at')} (UTC)",
             f"价格区间: {value('entry_summary', 128)}",
@@ -284,7 +290,7 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
             str(summary.get("reason_code") or ""), value("reason_code")
         )
         lines = [
-            "MiMo 故障期间的管理指令未自动执行，需人工判断",
+            "识别主用模型故障期间的管理指令未自动执行，需人工判断",
             f"群: {value('chat_id')}",
             f"消息时间: {value('message_posted_at')} (UTC)",
             f"原文: {value('instruction_excerpt', 200)}",
@@ -293,11 +299,13 @@ def _format_provider_outage_replay_notification(incident, summary) -> str:
         ]
     else:
         lines = [
-            "MiMo 恢复后开始补做识别",
+            "识别主用模型恢复后开始补做识别",
             f"故障期: {value('episode_started_at')} 至 {value('recovered_at')} (UTC)",
             f"补做消息: {value('retry_count')} 条（auto_trade 群，按原顺序）",
             "规则: 入场一律不执行、逐条通知；管理指令扣除故障时长后 15 分钟内且目标仓位仍在才执行，否则转人工确认",
         ]
+    if head:
+        lines.insert(1, f"模型: {head}")
     lines.append(f"事件ID: {int(incident.id)}")
     return wrap_ai_agent_notification(
         "\n".join(lines),
@@ -316,6 +324,12 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
     def value(key: str) -> str:
         return _safe_runtime_incident_value(summary.get(key), limit=64)
 
+    head = (
+        _safe_runtime_incident_value(summary.get("head_model"), limit=64)
+        if summary.get("head_model")
+        else None
+    )
+
     kind = str(summary.get("reason_code") or "")
     reason = _MIMO_PROVIDER_KIND_TEXT.get(kind) or _MIMO_FAILURE_CLASS_TEXT.get(
         kind, f"未分类（{value('reason_code')}）"
@@ -331,7 +345,7 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
         # the urgency they should keep for the day the backup fails too.
         fallback_note = str(summary.get("fallback_note") or "")
         lines = [
-            "MiMo 识别供应商不可用",
+            "权威识别主用模型不可用",
             f"原因: {reason}",
             f"开始于: {value('episode_started_at')} (UTC)",
             f"最近一次失败: {value('last_failure_at')} (UTC)",
@@ -351,17 +365,30 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
         if str(summary.get("incident_state") or "").endswith("start_beyond_scan"):
             lines.append("注意: 故障开始时间早于本次读取范围，实际开始得更早")
     elif incident_type == "mimo_provider_recovered":
+        fallback_model = str(summary.get("fallback_model") or "")
         lines = [
-            "MiMo 识别供应商已恢复",
+            "权威识别主用模型已恢复",
             f"故障原因: {reason}",
             f"故障期: {value('episode_started_at')} 至 {value('recovered_at')} (UTC)",
             f"故障期间失败调用: {value('consecutive_failures')} 次",
-            "补做: auto_trade 群在故障期间未完成识别的消息会按原顺序重新识别；"
-            "入场一律不执行、逐条通知，管理指令满足条件才执行，否则转人工确认",
         ]
+        if fallback_model:
+            lines.append(
+                "影响: 识别未中断，由备用模型 "
+                f"{_safe_runtime_incident_value(fallback_model, limit=64)} 完成"
+            )
+            lines.append(
+                "补做: 只针对故障期内确实未完成识别的消息；"
+                "若没有这样的消息，不会再有补做通知"
+            )
+        else:
+            lines.append(
+                "补做: auto_trade 群在故障期间未完成识别的消息会按原顺序重新识别；"
+                "入场一律不执行、逐条通知，管理指令满足条件才执行，否则转人工确认"
+            )
     elif incident_type == "mimo_provider_failure_streak":
         lines = [
-            "MiMo 识别连续失败",
+            "权威识别主用模型连续失败",
             f"原因: {reason}",
             f"同一错误连续: {value('consecutive_failures')} 次（连续 5 次即告警）",
             f"首次: {value('episode_started_at')}，最近: {value('last_failure_at')} (UTC)",
@@ -373,7 +400,11 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
             str(summary.get("incident_state") or "") == "probe_failed_recognition_ok"
         )
         lines = [
-            "MiMo 每日探测失败，但识别正常" if recognition_ok else "MiMo 每日探测失败",
+            (
+                "主用模型每日探测失败，但识别正常"
+                if recognition_ok
+                else "主用模型每日探测失败"
+            ),
             f"原因: {reason}",
         ]
         if summary.get("error_type"):
@@ -386,7 +417,8 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
             )
         else:
             lines.append(
-                "影响: 供应商此刻可能无法完成识别；若同时收到“识别供应商不可用”告警，以那条为准"
+                "影响: 供应商此刻可能无法完成识别；"
+                "若同时收到“权威识别主用模型不可用”告警，以那条为准"
             )
         lines.append("提醒: 同一天只告警一次；下次探测在 24 小时后或 worker 重启时")
     else:
@@ -399,11 +431,13 @@ def _format_mimo_provider_incident_notification(incident, summary) -> str:
         else:
             impact = "影响: 这项检查停摆期间，它负责发现的问题不会告警"
         lines = [
-            f"MiMo {check}本身失败",
+            f"识别健康检查 {check}本身失败",
             f"已连续失败: {value('consecutive_failures')} 次",
             f"错误类型: {value('error_type')}",
             f"{impact}；请查 worker 日志 {log_line}",
         ]
+    if head:
+        lines.insert(1, f"模型: {head}")
     lines.append(f"事件ID: {int(incident.id)}")
     return wrap_ai_agent_notification(
         "\n".join(lines),

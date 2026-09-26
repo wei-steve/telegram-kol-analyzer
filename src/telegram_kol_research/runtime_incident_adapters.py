@@ -1483,6 +1483,7 @@ def capture_mimo_provider_unavailable(
     bucket: int,
     occurred_at: datetime,
     fallback_model: str | None = None,
+    head_model: str | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
     """Capture one 30-minute bucket of a MiMo provider outage (step-18).
@@ -1492,6 +1493,14 @@ def capture_mimo_provider_unavailable(
     failed -- an empty balance does not top itself up -- but "recognition has
     stopped" and "a backup is carrying it" call for different urgency, so the
     summary says which.
+
+    ``head_model`` names the chain-head model this outage is actually about
+    (2026-09-26: a chain-head outage on ``gpt-5.6-luna`` was announced as "MiMo
+    unavailable" because the Telegram copy hard-coded the brand instead of
+    reading which model this monitor watches). It goes only into
+    ``detailed_summary`` -- never ``minimal_summary``, which stays a fixed,
+    fingerprint-free shape -- so the notification text can name the model
+    without touching dedup.
 
     ``outage`` is a ``mimo_provider_health.ProviderOutage``. The outage key
     travels only in ``source_record_id``, which the reminder dedup reads. The
@@ -1542,6 +1551,7 @@ def capture_mimo_provider_unavailable(
                 if fallback_model
                 else None
             ),
+            head_model=_safe_label(head_model) if head_model else None,
         ),
         minimal_summary=_summary(**fixed, retry_count=int(bucket)),
         occurred_at=occurred_at,
@@ -1555,9 +1565,19 @@ def capture_mimo_provider_recovered(
     config: RuntimeIncidentConfig,
     outage: Any,
     occurred_at: datetime,
+    head_model: str | None = None,
+    fallback_model: str | None = None,
     recorder: Callable[..., Any] | None = None,
 ):
-    """Capture the end of an announced MiMo provider outage, once."""
+    """Capture the end of an announced MiMo provider outage, once.
+
+    ``head_model`` and ``fallback_model`` mirror the fields added to
+    ``capture_mimo_provider_unavailable`` for the same reason: the recovery
+    copy needs to name the model that was actually down, and say whether a
+    backup carried recognition through the outage, without either fact
+    joining the fingerprint-free dedup summary. Both go only into
+    ``detailed_summary``.
+    """
 
     incident_type = "mimo_provider_recovered"
     if not config.captures(incident_type):
@@ -1586,6 +1606,8 @@ def capture_mimo_provider_recovered(
             recovered_at=_deadline_label(outage.recovered_at),
             consecutive_failures=int(outage.failures),
             impact="authoritative_recognition_restored",
+            head_model=_safe_label(head_model) if head_model else None,
+            fallback_model=_safe_label(fallback_model) if fallback_model else None,
         ),
         minimal_summary=_summary(**fixed),
         occurred_at=occurred_at,
