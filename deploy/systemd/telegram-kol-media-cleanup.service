@@ -1,0 +1,7 @@
+[Unit]
+Description=Clean Telegram KOL local media cache
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/telegram-kol-analyzer
+ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research media-cleanup --apply --retain-days 14 --max-media-dir-gb 5 --min-free-disk-gb 10
