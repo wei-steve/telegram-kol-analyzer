@@ -197,13 +197,16 @@ stages:
 
 **三个闸门都已经落好了**（初稿以为还没落）。剩下的就是代码里的路由，不需要再动闸门。
 
-**#3/#4 的既存不一致**：同样两个 deliverer，
-[`worker_command_executor.py:336`](../../src/telegram_kol_research/worker_command_executor.py) 传
-`notification_bot_config`，而 [`web_app.py:10663`](../../src/telegram_kol_research/web_app.py) 传
-`system_operator_bot_config`。生产里 worker 那条路是活的（保护事件已投 87 条 → 走的
-**运行通知**），web_app 那条挂在 ingest 的对账循环上，而 ingest 没有 SYSTEM 环境变量，
-`system_operator_bot_enabled()` 判 false，整块被跳过 —— **今天是哑的，所以没人发现**。
-哪天角色划分一变它就醒过来，同一类消息去两个 bot。本次顺手统一成 `notification_bot_config`。
+**#3/#4 不是「两处不一致」，是一个骗人的参数名。** 本稿 4.2 初版说
+[`web_app.py`](../../src/telegram_kol_research/web_app.py) 那处传的是 `system_operator_bot_config`、
+和 [`worker_command_executor.py`](../../src/telegram_kol_research/worker_command_executor.py) 不一致，
+**这也是错的，实施时复核发现的**：`run_deepcoin_execution_reconcile_loop` 的**形参**叫
+`system_operator_bot_config`，但调用方填进去的**实参**一直是 `app.state.notification_bot_config`。
+两处从来就是一致的，都走运行通知；而且 `deepcoin_reconcile` 属于 **worker** 角色（不是 ingest），
+所以它一直是活的 —— 87 条已投递的保护事件就是它发的。
+
+本次的改动因此是**把形参名改成 `notification_bot_config`**，行为零变化，只是让下一个人
+读到这里时不会像我一样判断错。
 
 ### 4.3 分流判据：用库里已有的事实，不要手写清单
 
@@ -302,7 +305,7 @@ management_target_refused        unclassified_operation_failure
 #### 通道级归属
 
 - #5 策略管理通知 → 运行通知（它本来就绑 NOTIFICATION，**已经在跑**，不动）
-- #3 归因审计 / #4 保护事件 → 运行通知（生产已经是了；把 web_app 那处统一成 `notification_bot_config`）
+- #3 归因审计 / #4 保护事件 → 运行通知（**生产早就是了**；本次只把骗人的形参名改掉）
   - 例外：`severe_protection_incident` 走的是 #1 通道，留事件处理
 - #2 消息操作异常 第1/2 阶段 → **跟随它所属 incident 的路由**，两阶段必须同去一个 bot
   （第 2 阶段把第 1 阶段的 `telegram_message_id` 存下来做幂等，分到两个 bot 那个 id 就失去意义）
@@ -323,8 +326,12 @@ management_target_refused        unclassified_operation_failure
 3. **改 deliver 循环**：`deliver_runtime_incident_notifications` 现在只收一个 `config`，
    要按 `incident_type` 选 bot 就得**同时拿到两个 config**。这是唯一有结构改动的地方，
    不是「把参数从 A 换成 B」。`deliver_message_operation_stage1/stage2` 同理
-4. 统一 #3/#4：`web_app.py` 那处改成 `notification_bot_config`
-5. #7 三个直发函数改传 `notification_bot_config`
+4. #3/#4：把 `run_deepcoin_execution_reconcile_loop` 的形参从 `system_operator_bot_config`
+   改名为 `notification_bot_config`（实参一直就是它，行为零变化）
+5. #7：`send_ai_recognition_conflict_review` 的调用处改传 `notification_bot_config`，守卫同步改。
+   `send_semantic_disagreement_notification` / `send_stall_induced_expiry_notification`
+   **在生产里没有调用方**（只有定义和单测），不动；`cli.py` 里还有一处调用，
+   因为另一会话正在改那个文件，本次不碰，留作后续
 
 **部署时（回调度会话确认顺序后再做）**
 
@@ -351,7 +358,7 @@ management_target_refused        unclassified_operation_failure
 |---|---|
 | 积压冲垮新 bot | 三个闸门生产已落好（4.2 表内数值），本次不动它们 |
 | 新增 incident 类型静默落到通知侧，需人操作的没人看见 | **改成白名单方向**：默认留事件处理，只有 19 类显式搬走（4.3）。新类型行为不变 |
-| #3/#4 双投 | 统一成 `notification_bot_config`；且 ingest 侧今天本就是哑的 |
+| #3/#4 双投 | 不存在：两处实参一直都是运行通知，本次只改形参名（4.2） |
 | 投递本身坏了，告警投到坏掉的 bot | `notification_delivery_failure` / `background_task_restart_exhausted` 不进搬迁清单 |
 | 改文案时误动 `incident_type` | 第 2 节的边界表；改完 grep 确认 `_MIMO_PROVIDER_INCIDENT_TYPES` 八个字面量未变 |
 | 与正在进行的其它会话冲突 | 另一会话在 `uncertain-attempt-closeout` 改 `authoritative_execution_attempts.py` / `authoritative_recognition.py` / `cli.py` / `db.py` / `models.py`（含 schema，L3，部署排在本次前面）。本次**不碰这 5 个文件** |
