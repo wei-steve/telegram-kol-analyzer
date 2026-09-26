@@ -220,3 +220,30 @@ WHERE state IN ('pending', 'cancelling_entries', 'closing_positions', 'reconcili
 
 部署路径与 `AGENTS.md` 相同；**本改动在 worker 里，落在 `tg-deploy` 的重启清单内
 （worker → web → ingest），不需要像值守那样额外 restart。**
+
+---
+
+## 部署记录 · 2026-09-26（北京时间 15:36）
+
+- L1 与 L2 同批部署，sha `b345d2ba`（L1 = `26323fef`，L2 = `b345d2ba`）。
+  **回滚点两个**：退到 `26323fef` 只回退 L2（保留调度公平），
+  退到 `df0a54ab` 两块一起回退。
+- 顺序：候选推 `claude/active-exit-starvation-and-visibility` → `tg-deploy` →
+  `systemctl restart telegram-kol-oncall.service`（L2 在值守里，不在 tg-deploy 的清单内）
+  → 推 `main`。两项部署检查各对两种答案测过。
+- 上线前按 L2 的新判据在生产上重新数过：四个活跃态**一行都没有**，
+  churning 首轮命中 0；实测上线后也是 0。
+- 部署后：worker/web/ingest 全部 active，值守 active、心跳 round 1、
+  `last_error: null`，两边 journal 无 Traceback。
+
+### 复核时我自己验的两条不变量（不是转述）
+
+1. `SourceMessageDeletionExit.attempt_count` 全仓只有两处写：建行时 `=0`
+   （`source_message_deletion.py:263`）、认领时 `+1`
+   （`source_message_deletion_worker.py:1378`），**从不重置**。
+   所以「`attempt_count == 0` 排在最前」这个桶确实一次认领就永久出桶，不会反复占先。
+2. 删除退出路径上每一处 `updated_at` 的写入都是 `now`（worker 里 20 处、
+   清扫器的 `_release`），**没有任何一条写回旧值**。
+   所以「按 `updated_at` 升序即轮转、不需要额外退避」成立。
+
+这两条正是 L1 公平性的全部依据，所以没有只看测试就放过去。
