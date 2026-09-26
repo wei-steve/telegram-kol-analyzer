@@ -233,3 +233,38 @@ C1～C7 合计约 **31 GB**；加上 C8 最多约 35 GB。执行后剩余空间�
 6. **数据库保留期**：TP/SL 观测留 7 天、上下文解析请求全文留 30 天，可以吗？要不要做一次停 worker 1～2 分钟的 VACUUM 把文件缩小？
 7. **告警水位**：10 GB 提醒 / 5 GB 高优先级，合适吗？
 8. **备份规则**（5.4）写进 AGENTS.md，作为以后所有会话的硬规则，同意吗？
+
+## 8. 用户裁定（2026-09-27，经调度会话转达）
+
+- C1～C7 按建议执行；C4 preA2 压缩保留到 2026-10-09；C8（非本项目目录）**全部保留**。
+- rsyslog logrotate：每天、14 天、压缩；TP/SL 观测留 7 天；上下文请求全文 30 天后换摘要；
+  水位 10 GB 提醒 / 5 GB 高优先级；备份规则写进 AGENTS.md；**本次不做 VACUUM**。
+- 值守相关（水位判据、runner 的 Permission denied）等 Codex 阶段 3 与 runner 修复会话落地后再做，本线不改 `oncall_*`。
+
+### 8.1 执行前补充核对
+
+- `/opt/telegram-kol-releases/0335de71…` 仍被三个安全监视器单元的 drop-in 引用
+  （`/etc/systemd/system/telegram-kol-monitor*.service.d/10-telegram-kol-release.conf` 的 PYTHONPATH / ReadOnlyPaths）。
+  监视器是刻意停用的（timer disabled），但为了不让它的单元失效，**C6 保留这一份（24 MB），只删其余**。
+- 当前运行的 telegram-kol 进程的 cwd 都在 `/opt/telegram-kol-analyzer`、`/root`、`/var/lib/telegram-kol-oncall`，没有进程在 release 目录下；`lsof` 无打开。
+- 已落仓库：`deploy/logrotate/rsyslog`（`logrotate -d` 在服务器上干跑无错误）、
+  `deploy/systemd/telegram-kol-media-cleanup.{service,timer}`（与服务器现状逐字一致）。
+
+### 8.2 数据库保留期上线计划（L3，未执行）
+
+代码：`src/telegram_kol_research/db_retention.py`（`python -m telegram_kol_research.db_retention`，默认 dry-run），
+`deploy/systemd/telegram-kol-db-retention.{service,timer}`（每天 04:10，Nice 19，IO idle）。候选 sha 见 8.3。
+
+1. **前置**：一次性清理完成后剩余空间 ≥ 2 × 库大小 + 5 GB（约 8 GB），满足 AGENTS.md 新规则第 5 条。
+2. **备份**：`VACUUM INTO /var/backups/telegram-kol/<日期>-db-retention/before.db` → 在备份上 `PRAGMA quick_check` → `zstd -T1 -3 --rm`；记 size + sha256。
+3. **演练**：在另一份快照上跑 `--apply`，记录两表前后行数、`request_summary_json` 总字节、占位行数；
+   同时核对关键业务表（`execution_bindings`、`execution_order_legs`、`authoritative_execution_attempts`、`raw_messages`、`strategy_threads`）行数前后不变。演练结束删除演练副本（留 size + sha256）。
+4. **部署**：按 AGENTS.md 流程 tg-deploy 候选 sha（读者对占位值的兼容改动需要随代码上线）；部署时避开时效性策略操作。
+5. **生产 dry-run**：`python -B -m telegram_kol_research.db_retention --database-path data/research.db`，候选数应与演练一致。
+6. **首次 apply**：手动跑一次（单次最长 10 分钟，分批 ≤ 5000 行、短事务、遇锁即退）；未跑完的部分由之后每天的定时器接着做。
+   跑的时候看 worker 事件循环健康（`/api/runtime/loop-health`）与消息处理积压。
+7. **装定时器**：`cp deploy/systemd/telegram-kol-db-retention.* /etc/systemd/system/ && systemctl daemon-reload && systemctl enable --now telegram-kol-db-retention.timer`（tg-deploy 不同步单元）。
+8. **事后**：两表行数与预期一致、关键业务表不变、`PRAGMA quick_check`（在事后快照上跑，不压生产库）；
+   库文件大小不会变小（不做 VACUUM），但之后应基本不再增长——一周后复核 `research.db` 大小。
+9. **回滚**：停 timer（`systemctl disable --now telegram-kol-db-retention.timer`）即停止继续删；
+   已删的观测行与被替换的请求全文只能从第 2 步的备份取回（按 id 选择性回灌，不整库恢复）。
