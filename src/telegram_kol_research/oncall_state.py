@@ -25,7 +25,7 @@ import json
 import sqlite3
 from contextlib import closing
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
@@ -175,6 +175,23 @@ SCHEMA_STATEMENTS = (
     "CREATE INDEX IF NOT EXISTS ix_diagnoses_status ON diagnoses (status, id)",
 )
 
+#: Phase 3 (``docs/plans/2026-09-26-codex-oncall-phase3-spec.md`` 5.3). Four
+#: columns added to the existing ``cases`` table rather than a new table --
+#: the spec is explicit that the watcher's state database keeps only the
+#: proposal id and the request's own outcome, never a copy of the worker's
+#: proposal record. Added with ``ALTER TABLE ... ADD COLUMN`` (below) instead
+#: of in :data:`SCHEMA_STATEMENTS` so a ``state.db`` from before this phase
+#: gains them on the next start rather than needing a fresh file.
+_CASES_REMEDIATION_COLUMNS = (
+    ("remediation_proposal_id", "INTEGER"),
+    # ``NULL`` = never requested (not eligible, or not yet tried this round).
+    # ``"failed:<category>"`` / ``"ok:<worker state>"`` otherwise -- see
+    # ``oncall_service._request_remediation_proposal``.
+    ("remediation_request_state", "TEXT"),
+    ("remediation_request_attempts", "INTEGER NOT NULL DEFAULT 0"),
+    ("remediation_request_last_at", "TEXT"),
+)
+
 
 def isoformat(moment: datetime) -> str:
     """One spelling for every timestamp written to this database."""
@@ -233,6 +250,12 @@ class CaseRecord:
     alerted_at: datetime | None
     resolved_at: datetime | None
     evidence: dict[str, Any] = field(default_factory=dict)
+    #: Phase 3 (spec 5.3). ``None`` until the watcher has asked the worker
+    #: for a remediation proposal at least once.
+    remediation_proposal_id: int | None = None
+    remediation_request_state: str | None = None
+    remediation_request_attempts: int = 0
+    remediation_request_last_at: datetime | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -292,6 +315,14 @@ def _case_from_row(row: sqlite3.Row) -> CaseRecord:
         alerted_at=parse_isoformat(row["alerted_at"]),
         resolved_at=parse_isoformat(row["resolved_at"]),
         evidence=_json_dict(row["evidence_json"]),
+        remediation_proposal_id=(
+            int(row["remediation_proposal_id"])
+            if row["remediation_proposal_id"] is not None
+            else None
+        ),
+        remediation_request_state=row["remediation_request_state"],
+        remediation_request_attempts=int(row["remediation_request_attempts"] or 0),
+        remediation_request_last_at=parse_isoformat(row["remediation_request_last_at"]),
     )
 
 
@@ -335,6 +366,26 @@ class OncallStateStore:
         with self.connection:
             for statement in SCHEMA_STATEMENTS:
                 self.connection.execute(statement)
+            self._ensure_cases_remediation_columns()
+
+    def _ensure_cases_remediation_columns(self) -> None:
+        """Idempotent column migration for a ``state.db`` from before phase 3.
+
+        ``CREATE TABLE IF NOT EXISTS`` (used everywhere else in this module)
+        cannot add a column to a table that already exists, so an existing
+        deployment needs one explicit ``ALTER TABLE`` per new column. Reading
+        ``PRAGMA table_info`` first makes running this twice, or against a
+        brand-new file that already has the columns, a no-op either way.
+        """
+
+        existing = {
+            str(row["name"])
+            for row in self.connection.execute("PRAGMA table_info(cases)")
+        }
+        for name, ddl_type in _CASES_REMEDIATION_COLUMNS:
+            if name in existing:
+                continue
+            self.connection.execute(f"ALTER TABLE cases ADD COLUMN {name} {ddl_type}")
 
     def close(self) -> None:
         with closing(self.connection):
@@ -599,6 +650,58 @@ class OncallStateStore:
                 "WHERE id = ? AND status = 'open'",
                 (isoformat(now), int(case_id)),
             )
+
+    # ----------------------------------------------------- remediation (5.3)
+
+    def record_remediation_attempt(
+        self,
+        case_id: int,
+        *,
+        now: datetime,
+        state: str,
+        proposal_id: int | None = None,
+    ) -> None:
+        """One request attempt: bump the counter, stamp the time, record why.
+
+        ``proposal_id`` is only ever written on a successful call (an
+        ``"ok:<state>"`` result); a failed attempt leaves whatever proposal id
+        a *previous* attempt for this case may have recorded untouched, which
+        in practice never happens because A10 (worker side) and this
+        module's own "first build only" rule together mean a case is only
+        ever attempted again after a prior *failure*.
+        """
+
+        with self.connection:
+            self.connection.execute(
+                "UPDATE cases SET remediation_request_state = ?, "
+                "remediation_request_attempts = remediation_request_attempts + 1, "
+                "remediation_request_last_at = ?, "
+                "remediation_proposal_id = COALESCE(?, remediation_proposal_id) "
+                "WHERE id = ?",
+                (str(state), isoformat(now), proposal_id, int(case_id)),
+            )
+
+    def remediation_retry_candidates(
+        self, *, now: datetime, cooldown: timedelta, max_attempts: int
+    ) -> tuple[CaseRecord, ...]:
+        """Open cases whose last remediation request failed and may retry.
+
+        Spec 5.1: at most ``max_attempts`` tries per case, at least
+        ``cooldown`` apart, and only while the case is still open (a case
+        that resolved itself needs no remediation any more).
+        """
+
+        cutoff = isoformat(now - cooldown)
+        rows = self.connection.execute(
+            "SELECT * FROM cases WHERE status = 'open' "
+            "AND remediation_request_state LIKE 'failed:%' "
+            "AND remediation_request_attempts > 0 "
+            "AND remediation_request_attempts < ? "
+            "AND (remediation_request_last_at IS NULL OR remediation_request_last_at <= ?) "
+            "ORDER BY id",
+            (int(max_attempts), cutoff),
+        ).fetchall()
+        return tuple(_case_from_row(row) for row in rows)
 
     def count_cases_alerted_since(self, *, chat_id: int | None, since: datetime) -> int:
         if chat_id is None:

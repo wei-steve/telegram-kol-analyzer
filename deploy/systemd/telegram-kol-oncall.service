@@ -30,6 +30,12 @@ EnvironmentFile=/etc/telegram-kol-oncall.env
 # needs to read the file. TELEGRAM_KOL_ONCALL_BOT_TOKEN / _CHAT_ID in the file
 # above still win when set.
 EnvironmentFile=-/opt/telegram-kol-analyzer/config/system_operator_bot.env
+# Phase 3 remediation-request token (spec 5.1). A separate, watcher-only file
+# -- never merged into /etc/telegram-kol-oncall.env, which the root-side
+# Codex runner unit (telegram-kol-oncall-codex.service) also loads. "-" so a
+# host that has not enabled phase 3 yet still starts (TELEGRAM_KOL_ONCALL_
+# REMEDIATION_REQUESTS then stays unset, which OncallConfig treats as off).
+EnvironmentFile=-/etc/telegram-kol-oncall-remediation.env
 ExecStart=/opt/telegram-kol-analyzer/.venv/bin/telegram-kol-research oncall-watch --database-path /opt/telegram-kol-analyzer/data/research.db --state-path /var/lib/telegram-kol-oncall/state.db --poll-seconds 60
 
 AmbientCapabilities=

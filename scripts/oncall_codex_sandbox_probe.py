@@ -79,6 +79,12 @@ hidden() {
 
 hidden /etc/telegram-kol-worker.env "worker 环境文件"
 hidden /etc/telegram-kol-oncall.env "值守环境文件"
+# Phase 3 (spec 5.1): the remediation-request token's own file, loaded only by
+# the watcher unit. A host that has not deployed phase 3 yet has no such file
+# at all, which "hidden" already treats as PASS (missing == unreadable) --
+# this line does not wait for the file to exist to start proving the runner
+# can never see it.
+hidden /etc/telegram-kol-oncall-remediation.env "值守补救令牌环境文件"
 hidden /opt/telegram-kol-analyzer/config "应用配置目录"
 hidden /opt/telegram-kol-analyzer/data "应用数据目录"
 hidden /opt/telegram-kol-analyzer/.git "git 目录"

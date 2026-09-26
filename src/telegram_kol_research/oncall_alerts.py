@@ -71,6 +71,13 @@ ALERT_KIND_DAILY_SUMMARY = "daily_summary"
 ALERT_KIND_DIAGNOSIS = "diagnosis"
 ALERT_KIND_CODEX_DOWN = "codex_down"
 ALERT_KIND_CODEX_RECOVERED = "codex_recovered"
+#: Phase 3 (spec 5.1): the watcher gave up asking the worker for a
+#: remediation proposal after three tries. Deliberately not in
+#: :data:`CAPPED_ALERT_KINDS` -- it can fire at most once per case (A10-style
+#: idempotence enforced by the caller), so it is not a flood risk, and a
+#: capped-out day must never be the reason a human never hears "needs manual
+#: attention".
+ALERT_KIND_REMEDIATION_REQUEST_FAILED = "remediation_request_failed"
 
 #: Alerts that count against the daily cap.
 CAPPED_ALERT_KINDS = (
@@ -641,18 +648,35 @@ def format_diagnosis_message(case: CaseRecord, verdict: Mapping[str, Any]) -> st
 
     urgency = URGENCY_LABELS_ZH.get(str(verdict.get("urgency")), "无需处理")
     category = CATEGORY_LABELS_ZH.get(str(verdict.get("category")), "无法归类")
-    should = SHOULD_LABELS_ZH.get(str(verdict.get("should_have_executed")), "说不准是否应该")
+    should_raw = str(verdict.get("should_have_executed"))
+    should = SHOULD_LABELS_ZH.get(should_raw, "说不准是否应该")
     confidence = CONFIDENCE_LABELS_ZH.get(str(verdict.get("confidence")), "低")
-    return "\n".join(
-        [
-            f"🔎 值守诊断 #{case.id}（{urgency}）",
-            f"消息本意：{verdict.get('what_message_wanted_zh', '')}",
-            f"没执行的原因：{verdict.get('explanation_zh', '')}",
-            f"结论：{category}；按消息本意{should}执行",
-            f"建议：{verdict.get('recommended_action_zh', '')}",
-            f"把握：{confidence}",
-        ]
-    )
+    lines = [
+        f"🔎 值守诊断 #{case.id}（{urgency}）",
+        f"消息本意：{verdict.get('what_message_wanted_zh', '')}",
+        f"没执行的原因：{verdict.get('explanation_zh', '')}",
+        f"结论：{category}；按消息本意{should}执行",
+        f"建议：{verdict.get('recommended_action_zh', '')}",
+        f"把握：{confidence}",
+    ]
+    if should_raw == "no":
+        # Phase 3 spec 3.2 / user ruling #1 (2026-09-26): Codex judging "should
+        # not have executed" never suppresses the remediation button -- it is
+        # reference text only. Say so here so the reader does not assume a
+        # missing button means Codex vetoed it.
+        lines.append("（仅供参考，不影响补救按钮）")
+    return "\n".join(lines)
+
+
+def format_remediation_request_failed_alert(case: CaseRecord) -> str:
+    """Phase 3 spec 5.1: the last of three failed proposal requests.
+
+    A short, independent notice -- not folded into the case-open text -- so
+    composing it never has to thread remediation state through the existing
+    open/resolved formatters, which know nothing about phase 3.
+    """
+
+    return f"ℹ️ 值守 #{case.id} 补救提案请求失败，需人工。"
 
 
 def format_codex_down_alert(failure_class: str | None) -> str:

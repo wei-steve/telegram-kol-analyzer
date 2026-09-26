@@ -1748,6 +1748,13 @@ def _evaluate_instruction_item(
     severity = "high"
     reason_code: str | None = None
     terminal_clear = False
+    # Phase 3 (remediation requests, spec 5.2/A6b): whether the *outcome* was
+    # specifically ``shadow_planned`` -- distinct from ``reason_code``, which
+    # prefers a human-readable ``result.reason`` over the raw status and so
+    # cannot be trusted to say "shadow_planned" even when that is what
+    # happened. Carried in evidence so the request-eligibility check does not
+    # need to re-derive it from production.
+    result_status_for_evidence: str | None = None
 
     if status in {"failed", "unknown"}:
         rule = "D1a"
@@ -1760,6 +1767,7 @@ def _evaluate_instruction_item(
                 return _clear_observation(row, candidate)
             rule = "D1b"
             reason_code = reason
+            result_status_for_evidence = result_status
         else:
             terminal_clear = True
     elif status == AWAITING_CONFIRMATION:
@@ -1830,6 +1838,7 @@ def _evaluate_instruction_item(
         verdict=verdict,
         now=now,
         item_status=status,
+        result_status=result_status_for_evidence,
     )
     return _Observation(
         case_key=_management_case_key(row["raw_message_id"], action),
@@ -2505,11 +2514,18 @@ def _build_case_evidence(
     verdict: PositionVerdict,
     now: datetime,
     item_status: str,
+    result_status: str | None = None,
 ) -> dict[str, Any]:
     """Everything the alert text needs, captured once, bounded to 8 KB.
 
     The message excerpt is untrusted external text. It is stored verbatim but
     bounded, and the formatter is the only place that decides how to show it.
+
+    ``result_status`` (D1b only) is the instruction item's raw
+    ``result_json["status"]`` -- ``"skipped"`` or ``"shadow_planned"`` --
+    kept separate from ``reason_code`` because a remediation-request decision
+    needs to tell those two apart and ``reason_code`` prefers the human
+    ``result.reason`` over the status word whenever one is present.
     """
 
     posted_at = as_utc(raw_message["posted_at"]) if raw_message is not None else None
@@ -2517,6 +2533,7 @@ def _build_case_evidence(
         "action": action,
         "reason_code": reason_code,
         "item_status": item_status,
+        "result_status": result_status,
         "symbol": (
             str(candidate["symbol"] or "")
             if candidate is not None and candidate["symbol"]

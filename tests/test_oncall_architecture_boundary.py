@@ -35,6 +35,17 @@ PHASE_TWO_MODULES = (
 
 ONCALL_MODULES = PHASE_ONE_MODULES + PHASE_TWO_MODULES
 
+#: Phase 3 (``docs/plans/2026-09-26-codex-oncall-phase3-spec.md`` 4.1):
+#: ``oncall_remediation.py`` is a *worker* module even though its name starts
+#: with ``oncall_`` like the seven watcher modules above. It computes
+#: remediation plans against production with SQLAlchemy and the exchange
+#: client, which is exactly what the watcher must never touch. It is
+#: deliberately **not** added to :data:`ONCALL_MODULES` -- the watcher's only
+#: contact with it is one outbound HTTP request (``oncall_service.py``), never
+#: an import -- and this stays true even before the file exists on this
+#: branch (worker-side phase 3 lands in a separate change).
+WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER = ("oncall_remediation.py",)
+
 #: Spec section 1. None of these may appear in the watcher's import closure.
 FORBIDDEN_MODULE_FRAGMENTS = (
     "deepcoin_client",
@@ -46,6 +57,11 @@ FORBIDDEN_MODULE_FRAGMENTS = (
     "position_authority_lock",
     "auto_trade_execution",
     "sqlalchemy",
+    # Phase 3: the worker module that plans and applies remediation. The
+    # watcher may only ever reach it over HTTP (see
+    # ``test_the_watcher_does_not_import_the_worker_remediation_module``).
+    "oncall_remediation",
+    "position_management_remediation",
 )
 
 #: Package modules each watcher module may import. Everything else is stdlib.
@@ -315,6 +331,10 @@ def test_the_systemd_unit_is_a_watchdogged_read_only_sandbox():
         "StateDirectory=telegram-kol-oncall",
         "EnvironmentFile=/etc/telegram-kol-oncall.env",
         "ConditionPathExists=/etc/telegram-kol-oncall.env",
+        # Phase 3 (spec 5.1): the remediation-request token's own file, loaded
+        # only by this unit -- never merged into the shared env file above,
+        # which the root-side Codex runner unit also loads.
+        "EnvironmentFile=-/etc/telegram-kol-oncall-remediation.env",
         "TemporaryFileSystem=/opt/telegram-kol-analyzer:ro",
         "BindReadOnlyPaths=/opt/telegram-kol-analyzer/data/research.db",
         "ReadWritePaths=/var/lib/telegram-kol-oncall",
@@ -445,6 +465,12 @@ def test_the_codex_unit_mounts_nothing_that_holds_a_secret():
         assert ".env" not in stripped, stripped
         assert "config" not in stripped.lower(), stripped
     assert "telegram-kol-worker.env" not in unit
+    # Phase 3 (spec 5.1): the remediation-request token's file is loaded only
+    # by the watcher unit. This root-side runner unit must never load it --
+    # it runs next to the OpenAI-reachable sandbox, and status doc 8.6#3's
+    # rule ("runner never loads the file with a token in it") applies to this
+    # new file exactly as it already does to the system operator bot's.
+    assert "oncall-remediation.env" not in unit
 
 
 @pytest.mark.architecture
@@ -493,3 +519,51 @@ def test_the_environment_example_has_placeholders_and_no_secret():
     for line in example.splitlines():
         if line.startswith("TELEGRAM_KOL_ONCALL_BOT_TOKEN="):
             assert line.strip() == "TELEGRAM_KOL_ONCALL_BOT_TOKEN="
+
+
+@pytest.mark.architecture
+def test_oncall_remediation_is_a_worker_module_not_a_watcher_module():
+    """Phase 3 spec 4.1: ``oncall_remediation.py`` is excluded on purpose.
+
+    It starts with ``oncall_`` like the seven watcher modules, but it plans
+    and applies exchange writes and runs inside the worker process, not the
+    watcher. This must hold even before the file exists (worker-side phase 3
+    lands separately) and even if someone later adds it next to the other
+    seven without reading this comment.
+    """
+
+    assert "oncall_remediation.py" not in ONCALL_MODULES
+    assert "oncall_remediation.py" in WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER
+    assert "oncall_remediation" in FORBIDDEN_MODULE_FRAGMENTS
+
+
+@pytest.mark.architecture
+@pytest.mark.parametrize("filename", ONCALL_MODULES)
+def test_the_watcher_does_not_import_the_worker_remediation_module(filename):
+    """Belt-and-braces on top of the generic forbidden-fragment scan above:
+    the watcher's only contact with remediation is the one outbound HTTP
+    request in ``oncall_service.py`` (spec 3.1) -- never an *import* of the
+    module that actually plans or applies an exchange write.
+
+    This checks actual import statements (like the generic scan above), not
+    a raw substring search over the whole file: ``oncall_service.py``
+    legitimately spells the words ``oncall_remediation`` and ``sqlalchemy``
+    inside comments and inside its own
+    ``TELEGRAM_KOL_ONCALL_REMEDIATION_*`` environment-variable names, and a
+    plain-text scan would trip on those false positives.
+    """
+
+    path = SOURCE_ROOT / filename
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    imported = {name.lower() for name in _package_imports(tree)}
+    for forbidden in (
+        "oncall_remediation",
+        "position_management_remediation",
+        "worker_command_jobs",
+        "position_mutation_gateway",
+        "strategy_management_executor",
+        "sqlalchemy",
+    ):
+        assert not any(forbidden in name for name in imported), (
+            f"{filename} imports {forbidden}"
+        )

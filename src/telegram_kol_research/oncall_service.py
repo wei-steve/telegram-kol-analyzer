@@ -20,6 +20,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import socket
 import time
 import urllib.error
@@ -27,9 +28,10 @@ import urllib.request
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from telegram_kol_research.oncall_alerts import (
+    ALERT_KIND_REMEDIATION_REQUEST_FAILED,
     AlertPolicy,
     TelegramAlertSender,
     beijing_date,
@@ -39,6 +41,7 @@ from telegram_kol_research.oncall_alerts import (
     compose_codex_state_alert,
     compose_diagnosis_alert,
     deliver_pending_alerts,
+    format_remediation_request_failed_alert,
     maybe_compose_daily_summary,
 )
 from telegram_kol_research.oncall_casefile import CasefileConfig, build_case_file
@@ -72,6 +75,7 @@ from telegram_kol_research.oncall_state import (
     DIAGNOSIS_SKIPPED,
     MESSAGE_QUEUED,
     MESSAGE_SUPPRESSED,
+    CaseRecord,
     OncallStateStore,
     isoformat,
 )
@@ -108,6 +112,19 @@ CODEX_MODE_SHADOW = "shadow"
 CODEX_MODE_ON = "on"
 VALID_CODEX_MODES = (CODEX_MODE_OFF, CODEX_MODE_SHADOW, CODEX_MODE_ON)
 
+#: Phase 3 (``docs/plans/2026-09-26-codex-oncall-phase3-spec.md`` 5.1). Token
+#: lives in its own env file (``/etc/telegram-kol-oncall-remediation.env``,
+#: loaded only by the watcher unit) so it is never present in
+#: ``/etc/telegram-kol-oncall.env``, which the root-side Codex runner unit
+#: also loads (spec 5.1 / status doc 8.6#3). This module never logs it.
+ENV_REMEDIATION_REQUESTS = "TELEGRAM_KOL_ONCALL_REMEDIATION_REQUESTS"
+ENV_REMEDIATION_URL = "TELEGRAM_KOL_ONCALL_REMEDIATION_URL"
+ENV_REMEDIATION_TOKEN = "TELEGRAM_KOL_ONCALL_REMEDIATION_TOKEN"
+DEFAULT_REMEDIATION_URL = "http://127.0.0.1:8002/internal/oncall/remediation/proposals"
+#: Same shape as the monitor-capture token (``config.py:747`` on the worker
+#: side): 32-128 characters of ``[A-Za-z0-9_-]``.
+_REMEDIATION_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{32,128}$")
+
 #: A health case that fixes itself in four minutes is not worth a token: both
 #: 2026-09-20 stalls recovered on their own (spec 6.1).
 HEALTH_DIAGNOSIS_DELAY = timedelta(minutes=10)
@@ -142,10 +159,37 @@ class OncallConfig:
     codex_mode: str = CODEX_MODE_OFF
     codex_spool: str = DEFAULT_SPOOL
     codex_daily_cap: int = 20
+    #: Phase 3. ``remediation_url`` / ``remediation_token`` are already
+    #: normalised to ``""`` (== "not configured") by
+    #: :func:`load_oncall_config` when the environment value fails its own
+    #: format check -- nothing downstream needs to re-validate them.
+    remediation_requests: bool = False
+    remediation_url: str = ""
+    remediation_token: str = ""
 
     @property
     def can_send(self) -> bool:
         return self.mode == MODE_NOTIFY and bool(self.bot_token) and bool(self.chat_id)
+
+    @property
+    def remediation_enabled(self) -> bool:
+        """Spec 5.1's "一律不请求" list, as one predicate.
+
+        ``dry_run`` deliberately does not count as notify here even though
+        ``effective_codex_mode`` downgrades ``on`` to ``shadow`` rather than
+        ``off`` for Codex -- a remediation *request* is an outbound network
+        call with a side effect on the worker (it writes a ``requested`` row
+        and may send a Telegram message there), not a rehearsal-safe no-op
+        like composing an alert nobody sends. Spec 5.1 says exactly that: "值
+        守 MODE != notify 时不请求".
+        """
+
+        return (
+            self.mode == MODE_NOTIFY
+            and self.remediation_requests
+            and bool(self.remediation_url)
+            and bool(self.remediation_token)
+        )
 
     def effective_codex_mode(self) -> str:
         """``on`` while the watcher itself is rehearsing means ``shadow``.
@@ -182,6 +226,15 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
         codex_cap = int(str(source.get(ENV_CODEX_DAILY_CAP, "20") or "20"))
     except ValueError:
         codex_cap = 20
+    remediation_requests_raw = str(
+        source.get(ENV_REMEDIATION_REQUESTS, "off") or "off"
+    ).strip().lower()
+    if remediation_requests_raw not in ("off", "on"):
+        logger.warning(
+            "oncall remediation requests flag is not recognised, treating as off: %r",
+            remediation_requests_raw,
+        )
+        remediation_requests_raw = "off"
     return OncallConfig(
         mode=mode,
         bot_token=(
@@ -197,7 +250,41 @@ def load_oncall_config(env: Mapping[str, str] | None = None) -> OncallConfig:
         codex_mode=codex_mode,
         codex_spool=str(source.get(ENV_CODEX_SPOOL, "") or "").strip() or DEFAULT_SPOOL,
         codex_daily_cap=max(0, codex_cap),
+        remediation_requests=remediation_requests_raw == "on",
+        remediation_url=_valid_remediation_url(
+            str(source.get(ENV_REMEDIATION_URL, "") or "").strip()
+        ),
+        remediation_token=_valid_remediation_token(
+            str(source.get(ENV_REMEDIATION_TOKEN, "") or "")
+        ),
     )
+
+
+def _valid_remediation_url(raw: str) -> str:
+    """Spec 5.1: only a loopback URL is ever used; anything else is "not set".
+
+    An empty environment value falls back to :data:`DEFAULT_REMEDIATION_URL`
+    (itself loopback, so it always passes); a *non-empty but wrong* value is
+    treated as unconfigured rather than silently swapped for the default, so
+    a typo in the env file disables requests instead of quietly pointing
+    somewhere the operator did not choose.
+    """
+
+    candidate = raw or DEFAULT_REMEDIATION_URL
+    if candidate.startswith("http://127.0.0.1") or candidate.startswith("http://localhost"):
+        return candidate
+    logger.warning("oncall remediation URL is not loopback, disabling requests: %r", raw)
+    return ""
+
+
+def _valid_remediation_token(raw: str) -> str:
+    value = str(raw or "").strip()
+    if not value:
+        return ""
+    if _REMEDIATION_TOKEN_RE.match(value) is None:
+        logger.warning("oncall remediation token has the wrong shape, ignoring it")
+        return ""
+    return value
 
 
 def build_worker_health_probe(url: str) -> Callable[[], bool] | None:
@@ -651,6 +738,247 @@ def run_codex_cycle(
     return counters
 
 
+# --------------------------------------------------------------------------
+# Remediation requests (phase 3 spec 5). The watcher's entire contribution to
+# remediation is one outbound HTTP request per eligible case, carrying only
+# ``{case_key, case_no, raw_message_id}`` (5.1/4.3) -- no price, no target, no
+# button token ever passes through here, and the response is trusted for
+# exactly two fields (``proposal_id``, ``state``), the rest is discarded. Any
+# failure here is recorded and, after three tries, surfaced as one line the
+# operator has to act on by hand; it never touches the case-open alert or the
+# Codex diagnosis, and an exception here must never propagate into
+# ``run_oncall_round`` (see the ``try/except`` around the call site).
+# --------------------------------------------------------------------------
+
+#: The worker's proposal state machine (spec 4.5). The watcher validates
+#: against this closed set and discards anything else -- "zero trust" of the
+#: response body, per spec 5.1.
+REMEDIATION_STATES = frozenset(
+    {
+        "requested",
+        "proposed",
+        "confirming",
+        "executing",
+        "succeeded",
+        "failed",
+        "uncertain",
+        "refused",
+        "expired",
+        "dismissed",
+        "cancelled",
+    }
+)
+
+#: Spec 11#7: at most 3 attempts per case, at least 1 minute apart.
+MAX_REMEDIATION_ATTEMPTS = 3
+REMEDIATION_RETRY_COOLDOWN = timedelta(minutes=1)
+REMEDIATION_REQUEST_TIMEOUT_SECONDS = 3.0
+
+#: Spec 5.2: a D2 fault batch is only worth a request while it is
+#: ``blocked`` -- the other three fault statuses always resolve to
+#: ``existing_management_batch_unresolved`` on the worker's own plan (G3),
+#: so asking would only spend one of the 30-request daily cap on a refusal.
+_D2_REQUESTABLE_BATCH_STATUS = "blocked"
+
+
+def _case_wants_remediation(case: CaseRecord) -> bool:
+    """Spec 5.2, judged off the case's own combined ``rule`` and evidence.
+
+    ``case.rule`` is a ``"+"``-joined set (``oncall_state._combine_rules``):
+    more than one rule can own a case, because D1's per-item rules and D2's
+    per-batch rule share one case key (``(raw_message_id, action)``,
+    ``oncall_detector._management_case_key``). This walks each rule name in
+    the set on its own and returns ``True`` the moment any one of them
+    qualifies -- so a D1b component excluded for being ``shadow_planned``, or
+    a D2 component excluded for not being ``blocked``, never suppresses a
+    sibling rule on the same case that still qualifies on its own.
+    """
+
+    evidence = case.evidence or {}
+    parts = {part for part in str(case.rule or "").split("+") if part}
+    for part in parts:
+        if part in {"D1a", "D1d"}:
+            return True
+        if part == "D1b":
+            # User ruling #8 / worker gate A6b: an outcome that was itself
+            # deliberately shadow-planned (system chose not to execute, on
+            # purpose) is never remediated. ``result_status`` is written by
+            # ``oncall_detector._build_case_evidence`` specifically for this
+            # check; ``reason_code`` alone cannot be trusted here because it
+            # prefers a human ``result.reason`` over the raw status word.
+            if str(evidence.get("result_status") or "") == "shadow_planned":
+                continue
+            return True
+        if part == "D2":
+            if str(evidence.get("batch_status") or "") == _D2_REQUESTABLE_BATCH_STATUS:
+                return True
+            continue
+        # D1c, D3, D4, D5*, D6a/b/c and anything future: no safe action this
+        # phase, per spec 5.2's table -- never request.
+    return False
+
+
+@dataclass(frozen=True, slots=True)
+class _RemediationRequestOutcome:
+    ok: bool
+    category: str | None = None
+    proposal_id: int | None = None
+    state: str | None = None
+
+
+def _request_remediation_proposal(
+    *,
+    url: str,
+    token: str,
+    case_key: str,
+    case_no: int,
+    raw_message_id: int,
+    timeout: float = REMEDIATION_REQUEST_TIMEOUT_SECONDS,
+) -> _RemediationRequestOutcome:
+    """Spec 4.3's client side. Exactly the three identifier fields, no more.
+
+    No ``X-Forwarded-For`` is ever set (nothing here adds one), which is what
+    lets the worker's loopback check (spec 4.3, modelled on
+    ``require_monitor_capture_auth``) tell a same-host caller from a proxied
+    one. The token is read from config and only ever placed in this one
+    header; it is never logged, and neither is the URL if resolving it fails
+    (``urllib`` folds the URL into an ``HTTPError``'s ``str()``, but this
+    function never lets one reach a log call).
+    """
+
+    body = json.dumps(
+        {
+            "case_key": str(case_key)[:64],
+            "case_no": int(case_no),
+            "raw_message_id": int(raw_message_id),
+        }
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=body,
+        headers={
+            "content-type": "application/json",
+            "x-oncall-remediation-token": token,
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            status = int(response.status)
+            raw = response.read()
+    except urllib.error.HTTPError as exc:
+        return _RemediationRequestOutcome(
+            False, "not_found" if int(exc.code) == 404 else "http_error"
+        )
+    except (urllib.error.URLError, OSError, TimeoutError, ValueError):
+        return _RemediationRequestOutcome(False, "network")
+
+    if status not in (200, 202):
+        return _RemediationRequestOutcome(False, "http_error")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return _RemediationRequestOutcome(False, "bad_response")
+    if not isinstance(payload, dict):
+        return _RemediationRequestOutcome(False, "bad_response")
+
+    proposal_id = payload.get("proposal_id")
+    state = payload.get("state")
+    if isinstance(proposal_id, bool) or not isinstance(proposal_id, int):
+        return _RemediationRequestOutcome(False, "bad_response")
+    if not isinstance(state, str) or state not in REMEDIATION_STATES:
+        return _RemediationRequestOutcome(False, "bad_response")
+    # Everything else in the response body -- price, target, fingerprint,
+    # button token, whatever the worker might one day add -- is discarded
+    # right here, never reaching the caller.
+    return _RemediationRequestOutcome(True, proposal_id=proposal_id, state=state)
+
+
+def run_remediation_request_cycle(
+    store: OncallStateStore,
+    *,
+    config: OncallConfig,
+    now: datetime,
+    new_case_ids: Sequence[int],
+) -> dict[str, int]:
+    """Ask the worker for a proposal on each eligible, freshly-opened case.
+
+    Two sources of work, both capped at :data:`MAX_REMEDIATION_ATTEMPTS`
+    tries: a case that just opened this round (first-ever attempt, spec
+    5.1's "只在案件首次建案时请求一次"), and an older open case whose last
+    attempt failed and has waited out :data:`REMEDIATION_RETRY_COOLDOWN`
+    since (spec "同一案件最多 3 次、间隔 1 分钟" -- across rounds, no
+    blocking sleep: the cooldown is just a timestamp comparison against the
+    next round's ``now``).
+    """
+
+    counters = {"requested": 0, "ok": 0, "failed": 0, "gave_up": 0}
+    if not config.remediation_enabled:
+        return counters
+
+    attempted: set[int] = set()
+
+    def _attempt(case: CaseRecord) -> None:
+        attempted.add(case.id)
+        outcome = _request_remediation_proposal(
+            url=config.remediation_url,
+            token=config.remediation_token,
+            case_key=case.case_key,
+            case_no=case.id,
+            raw_message_id=int(case.raw_message_id or 0),
+        )
+        counters["requested"] += 1
+        if outcome.ok:
+            store.record_remediation_attempt(
+                case.id,
+                now=now,
+                state=f"ok:{outcome.state}",
+                proposal_id=outcome.proposal_id,
+            )
+            counters["ok"] += 1
+            return
+        store.record_remediation_attempt(
+            case.id, now=now, state=f"failed:{outcome.category}"
+        )
+        counters["failed"] += 1
+        if case.remediation_request_attempts + 1 >= MAX_REMEDIATION_ATTEMPTS:
+            store.enqueue_alert(
+                kind=ALERT_KIND_REMEDIATION_REQUEST_FAILED,
+                body=format_remediation_request_failed_alert(case),
+                now=now,
+                case_id=case.id,
+                dedupe_key=f"remediation_gave_up:{case.id}",
+            )
+            counters["gave_up"] += 1
+
+    for case_id in new_case_ids:
+        if case_id in attempted:
+            continue
+        case = store.get_case(case_id)
+        if case is None or case.raw_message_id is None:
+            continue
+        if case.remediation_request_attempts > 0:
+            # Not this case's first build -- retries are handled below, on
+            # their own cooldown, so a case that keeps re-triggering D1's
+            # "still open" observation every round never gets asked twice in
+            # the same round it opened.
+            continue
+        if not _case_wants_remediation(case):
+            continue
+        _attempt(case)
+
+    for case in store.remediation_retry_candidates(
+        now=now,
+        cooldown=REMEDIATION_RETRY_COOLDOWN,
+        max_attempts=MAX_REMEDIATION_ATTEMPTS,
+    ):
+        if case.id in attempted:
+            continue
+        _attempt(case)
+
+    return counters
+
+
 def run_oncall_round(
     *,
     store: OncallStateStore,
@@ -694,6 +1022,22 @@ def run_oncall_round(
         policy=policy,
         codex_note=codex_note,
     )
+    try:
+        # Deliberately *after* the case-open alert is composed (spec 3.2 /
+        # 5.1: "先建案告警，再请求") and independently wrapped: a network
+        # failure, a malformed worker response, or any other exception here
+        # must never delay or suppress the alert or the Codex diagnosis that
+        # follows.
+        run_remediation_request_cycle(
+            store,
+            config=config,
+            now=now,
+            new_case_ids=outcome.new_case_ids,
+        )
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except Exception:  # noqa: BLE001 - a remediation request is never a gate
+        logger.exception("oncall remediation request cycle failed")
     try:
         run_codex_cycle(
             store,
