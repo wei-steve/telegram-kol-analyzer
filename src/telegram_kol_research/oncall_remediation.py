@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import json
 import math
+from decimal import Decimal, InvalidOperation
 import re
 import secrets
 from dataclasses import dataclass
@@ -49,6 +50,8 @@ from telegram_kol_research.oncall_remediation_auto import (
     redact_structure,
     run_gate_d,
 )
+from telegram_kol_research.deepcoin_trigger_rows import order_id_or_none, stop_trigger_price
+from telegram_kol_research.protection_ledger import load_account_protection_ownership
 from telegram_kol_research.position_management_remediation import (
     PositionRemediationAction,
     PositionRemediationPlan,
@@ -1999,6 +2002,87 @@ def _min_quantity_for_instrument(session, *, strategy_instance_id: str | None) -
         return None
 
 
+def _stop_prices_for_position(
+    session,
+    *,
+    pos_id: str,
+    live_positions: dict[str, dict[str, Any]],
+    pending_trigger_orders: list[dict[str, Any]],
+) -> list[Decimal] | None:
+    """Stop trigger prices on ``trigger-orders-pending`` that protect ``pos_id``.
+
+    Venue TPSL rows carry ``slTriggerPrice`` and **no ``posId``**
+    (``deepcoin_trigger_rows`` module docstring), so a row is attributed to
+    the position by order id through the canonical protection ledger, or --
+    only when this is the sole live position on its ``instId`` + ``posSide``
+    -- by instrument and side. Never reads the position row's
+    ``slTriggerPx`` (ARCHITECTURE 4.8). Returns ``None`` when the position is
+    not in the snapshot.
+    """
+
+    position = live_positions.get(str(pos_id))
+    if position is None:
+        return None
+    inst_id = str(position.get("instId") or "")
+    pos_side = str(position.get("posSide") or "").lower()
+    same_side_positions = [
+        row for row in live_positions.values()
+        if str(row.get("instId") or "") == inst_id and str(row.get("posSide") or "").lower() == pos_side
+    ]
+    owned_order_ids = set(
+        load_account_protection_ownership(session, live_pos_ids=list(live_positions)).orders_for_position(pos_id)
+    )
+    prices: list[Decimal] = []
+    for row in pending_trigger_orders:
+        stop_text = stop_trigger_price(row)
+        if stop_text in (None, ""):
+            continue
+        row_pos_id = str(row.get("posId") or row.get("pos_id") or "")
+        order_id = order_id_or_none(row)
+        attributed = (
+            (row_pos_id and row_pos_id == str(pos_id))
+            or (order_id is not None and order_id in owned_order_ids)
+            or (
+                not row_pos_id
+                and len(same_side_positions) == 1
+                and str(row.get("instId") or "") == inst_id
+                and str(row.get("posSide") or "").lower() == pos_side
+            )
+        )
+        if not attributed:
+            continue
+        try:
+            price = Decimal(str(stop_text))
+        except (InvalidOperation, ValueError):
+            continue
+        if price > 0:
+            prices.append(price)
+    return prices
+
+
+def _effective_stop(prices: list[Decimal], pos_side: str) -> Decimal | None:
+    """The stop that fires first: the one closest to the market -- the highest
+    for a long, the lowest for a short. set-position-sltp accumulates
+    (ARCHITECTURE 4.8), so an old tighter stop left behind would make a new
+    one ineffective; checking only "a stop at the target exists" would miss it."""
+
+    if not prices:
+        return None
+    return max(prices) if pos_side == "long" else min(prices) if pos_side == "short" else None
+
+
+def _decimal_close(actual: Decimal | None, expected: Any) -> bool:
+    if actual is None:
+        return False
+    try:
+        target = Decimal(str(expected))
+    except (InvalidOperation, ValueError):
+        return False
+    if target <= 0:
+        return False
+    return abs(actual - target) <= target * Decimal("0.000001")
+
+
 def _perform_post_execution_readback(
     session_factory: sessionmaker,
     *,
@@ -2031,11 +2115,6 @@ def _perform_post_execution_readback(
         pid = row.get("posId") or row.get("pos_id")
         if pid is not None:
             positions_by_pos[str(pid)] = row
-    pending_by_pos: dict[str, list[dict[str, Any]]] = {}
-    for row in snapshot.pending_trigger_orders:
-        pid = row.get("posId") or row.get("pos_id")
-        if pid is not None:
-            pending_by_pos.setdefault(str(pid), []).append(row)
 
     with session_factory() as session:
         if action_kind == "full_exit":
@@ -2104,20 +2183,21 @@ def _perform_post_execution_readback(
             if entry_price is None:
                 return ReadbackResult("unknown", {"reason": "entry_price_unavailable"})
             for pid in still_open:
-                triggers = pending_by_pos.get(str(pid), [])
-                matched = any(
-                    _price_close(row.get("slTriggerPx"), entry_price)
-                    for row in triggers
-                    if row.get("slTriggerPx") not in (None, "")
-                )
-                if not matched:
+                prices = _stop_prices_for_position(
+                    session, pos_id=str(pid), live_positions=positions_by_pos,
+                    pending_trigger_orders=list(snapshot.pending_trigger_orders),
+                ) or []
+                side = str(positions_by_pos[str(pid)].get("posSide") or "").lower()
+                effective = _effective_stop(prices, side)
+                if not _decimal_close(effective, entry_price):
                     return ReadbackResult(
                         "mismatch",
                         {
                             "branch": "stop_placed",
                             "pos_id": pid,
                             "entry_price": entry_price,
-                            "pending_triggers": triggers,
+                            "effective_stop": str(effective) if effective is not None else None,
+                            "attributed_stops": [str(p) for p in prices],
                         },
                         branch="stop_placed",
                     )
@@ -2132,14 +2212,24 @@ def _perform_post_execution_readback(
                 return ReadbackResult("unknown", {"reason": "target_stop_unavailable"})
             mismatches = []
             for pid in pos_ids:
-                triggers = pending_by_pos.get(str(pid), [])
-                matched = any(
-                    _price_close(row.get("slTriggerPx"), target_price)
-                    for row in triggers
-                    if row.get("slTriggerPx") not in (None, "")
-                )
-                if not matched:
-                    mismatches.append({"pos_id": pid, "target": target_price, "pending_triggers": triggers})
+                if str(pid) not in positions_by_pos:
+                    mismatches.append({"pos_id": pid, "reason": "position_not_in_snapshot"})
+                    continue
+                prices = _stop_prices_for_position(
+                    session, pos_id=str(pid), live_positions=positions_by_pos,
+                    pending_trigger_orders=list(snapshot.pending_trigger_orders),
+                ) or []
+                side = str(positions_by_pos[str(pid)].get("posSide") or "").lower()
+                effective = _effective_stop(prices, side)
+                if not _decimal_close(effective, target_price):
+                    mismatches.append(
+                        {
+                            "pos_id": pid,
+                            "target": target_price,
+                            "effective_stop": str(effective) if effective is not None else None,
+                            "attributed_stops": [str(p) for p in prices],
+                        }
+                    )
             if mismatches:
                 return ReadbackResult("mismatch", {"mismatches": mismatches})
             return ReadbackResult("confirmed", {"target": target_price})
