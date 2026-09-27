@@ -1,6 +1,6 @@
 # 值守 Codex spool 案例目录权限：根因与修复方案
 
-状态：**D 已执行；A+B+C 已实现，未部署**（排在 Codex 阶段 3 之后单独 tg-deploy）。
+状态：**D 已执行；A+B+C 已于 2026-09-27 08:57 CST 部署（`ba93788a`，回滚 = `tg-deploy d3e29a798af57658ac4f256642545fc68f9be1c8`）**；正向路径待首个真实案例验证。
 
 用户裁定（2026-09-27，经调度会话转达）：现在执行 D；A+B+C 现在实现，不搭车别人的部署、也不马上部署，
 等 `claude/codex-oncall-phase3` 上 `origin/main` 后 rebase、跑全量、报候选 sha，由调度会话安排单独 tg-deploy
@@ -137,6 +137,23 @@ ls -la /var/lib/telegram-kol-oncall/codex-spool
 - 生产同等限制下的实测（临时单元 `RestrictSUIDSGID=yes UMask=0077 User=telegram-kol-oncall`，
   2770 的探针根目录，用生产 venv 的解释器 `-B` 从 stdin 跑候选代码，不 import 发布目录）：
   带 S 位的 chmod 被拒；新案例目录 `drwxrws---`、文件 `-rw-rw----`；旧 `drwx------` 目录再次入队后变 `drwxrwx---`。探针目录已删除。
+
+### 部署（2026-09-27 08:57 CST，用户在本会话直接确认）
+
+- 候选 `ba93788a`（rebase 到 `6c209b29` 之上：`76757846` 文档、`3051e50b` 修复、`ba93788a` 测试改用替身 logger）。
+- 全量：第一轮 9993 passed / 2 failed——两条是本次新加的 runner 测试，全量中前序测试重配了 logging，caplog 收不到；
+  改为替换 `runner.logger` 后第二轮 9994 passed / 1 failed / 4 skipped。剩下那条是
+  `test_mimo_step4_active_watch.py::test_failing_checks_are_raised_naming_the_task_and_do_not_stop_the_loop`：
+  靠 0.3 秒计时循环凑 3 次失败，与本次改动无关，第一轮全量里通过，单独连跑 3 次都通过，判定为本机另一会话同时跑全量造成的负载偶发。
+- 部署前：生产 HEAD `d3e29a79`，候选是它的后代；零在途（消息任务无 pending/claimed，mutation intent 只有 confirmed/rejected，
+  worker 命令只有 succeeded，最新管理批次 09-25）；两个值守单元文件与 `/etc/systemd/system` 一致，本次不改单元。
+- `tg-deploy ba93788a…` → worker / web / ingest active，web 200，worker 错误 0；随后重启 `telegram-kol-oncall`、
+  `telegram-kol-oncall-codex`，均 active、`NRestarts=0`。自动交易开关未动。
+- 部署后：`ba93788a` 推到 `origin/main`；`PASS: 0 code files beyond production`、`PASS: deployed sha is on the shared branch`
+  （检查自测：对 `d3e29a79` 报 FAIL，符合预期）。
+- 部署间隙出现 `case-15`（07:24 由旧代码创建，同样 2700；案件已 resolved、诊断已记超时）。新 runner 对它只报了 1 行
+  `(repeats suppressed until it changes)`，验证了去重；随后按 D 同法归档，清单追加后 21/21 校验通过。
+- 待验证：下一个真实案例的目录应为 `drwxrws---`，runner 写出 `run.json`，watcher 记 `done`。
 
 ## 6. 后续项（本次不做）
 
