@@ -1255,6 +1255,52 @@ uv run python -B -m pytest tests/test_runtime_loop_health.py -q
    本批未新增任何绕过它的路径。
 5. 未连服务器、未 push、未部署；`AUTO_ACTIONS` 默认仍为空（休眠）。
 
+### 9.7 阶段 4 汇总、指挥会话审阅修复、部署与回滚计划（2026-09-27，**代码完成、未部署**）
+
+```yaml
+phase4_status: code_complete_not_deployed
+phase4_branch: claude/codex-oncall-phase4      # 基于 origin/main 6c209b29，含生产 d3e29a79
+verification_level: L3                         # 已部署表加列 + 新审计表；新增无人点击的交易所写入入口
+default: "MODE 仍为 shadow（生产现状）；auto 需要 MODE=auto 且 AUTO_ACTIONS 非空且批准人已配置，任一缺失即表现为 shadow"
+rollback_commit: d3e29a798af57658ac4f256642545fc68f9be1c8
+```
+
+提交：`6a35ef23` / `92cba390` 规格与裁定 → `a0b77c47` 第 1 批（核心库、G-D、schema）→ `badbf41f` 审阅修复 → `31b2945e` 第 2 批（回读门控、接线、端到端）→ `c30b08cb` 审阅修复。
+
+**指挥会话审阅中修掉的问题**
+
+1. 自动路径「requested → executing」的单飞是先数再写——改为一条带 `NOT EXISTS` 的原子 UPDATE（与阶段 3 第 2 步同构）。
+2. G-D 不过而降级成带按钮提案的，也被标成 `execution_origin='auto'`，批准人点按钮后执行时会被同一 G-D 理由再拒（违背裁定第 4 条）——只有真正被自动提升的才标 auto；加了测试。
+3. **执行后回读读错了交易所的行形状**：按 `posId` 分组挂单、读 `slTriggerPx`。交易所 `trigger-orders-pending` 的 TPSL 行**没有 `posId`**、价格字段是 `slTriggerPrice`
+   （`deepcoin_trigger_rows.py` 模块说明）。上生产后，每一笔挂止损的补救（保本挂止损、调止损）都会回读「不符」→ 结果未知 → 暂停自动。
+   端到端的假交易所发的行带 `posId`，所以测试是绿的——**代码和测试都对、理由错**的又一例。改为：按保护账本的订单号归属（该品种该方向只有这一个仓位时，也接受按 `instId + posSide` 归属），
+   价格用 `stop_trigger_price` 读、按 Decimal 比较；判据是**生效止损**（多单取最高、空单取最低，因为 set-position-sltp 是叠加语义）等于目标价——
+   旧的更紧止损没撤掉、会先触发时，也会判不符。新增 `test_oncall_remediation_readback_shapes.py`（8 条，全部用生产行形状）。
+
+**全量**：`uv run python -B -m pytest -q` 在候选 `c30b08cb` 上 → **10054 passed / 4 skipped / 0 failed**（922 s）。其后只有本文档改动。
+
+**已知限制（部署 / 放开前需知悉）**
+
+- 审计里的「交易所往来」按执行绑定 + 时间窗 `[executing_at, finished_at + 1 分钟]` 收集，不是按批次精确关联（底层三张表都没有批次外键）；同一绑定同一时间窗内若有别的写入会被一并带上。
+- 部分止盈的回读容差取绑定冻结草稿里的合约最小数量；生产合约规格上未验证。部分止盈的跟随超时仍待只提示期数据（9.4 裁定 2）。
+- D5 无法在执行前只读预判保本走哪个分支；实际分支由回读给出并写进审计与通知。
+- 快照不完整 / 无法比较的回读记为 `unknown`，与「不符」同样处理（→ 结果未知 → 暂停自动），偏保守。
+
+#### 9.7.1 部署（到休眠为止；开 auto 另行确认）
+
+与阶段 3 相同的 L3 流程（9.4.1–9.4.2），差别：
+
+- **schema**：对已部署的 `oncall_remediation_proposals` 加 2 列、`oncall_remediation_control` 加 4 列（`ALTER TABLE ADD COLUMN`，无 CHECK），新建 `oncall_remediation_audit`（带 CHECK）。
+  演练时核对：补列后 `PRAGMA table_info` 与新库一致；阶段 3 已有的提案行（冒烟 P1 等）读取正常。
+- **部署前**：rebase 到 runner spool 修复会话（`claude/oncall-spool-perms`）落地后的 main，重跑受影响测试与全量；候选必须是当时生产 HEAD 的后代。
+- **env**：部署时**不写** `MODE=auto`、不写 `AUTO_ACTIONS`，生产保持 `MODE=shadow`。
+- **验证**：新列与新表存在；worker 日志中补救后台任务仍以 `effective_mode=shadow` 启动；只提示行为不变；`/auto_off` `/auto_on` `/audit` 对非批准人拒绝。
+- **回滚**：`/oncall_off` → 确认 `executing` 为 0 → `tg-deploy d3e29a79…` + 重启值守；新列与新表保留（旧代码不读）。
+
+#### 9.7.2 逐个放开（每一步单独确认，规格第 9 节）
+
+前置：只提示期（9.4.7）该动作 ≥ 3 条「自动执行会是对的」且零错判（D9）。然后 `MODE=auto`、`AUTO_ACTIONS=full_exit` → 首笔逐项核对（审计两行、批次终态、`trigger-orders-pending` 全集前后、通知与交易所实况）→ 再加下一个动作。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
