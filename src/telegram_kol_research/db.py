@@ -111,6 +111,40 @@ EXPLICIT_RECOGNITION_EXECUTION_TABLES = frozenset(
 
 
 SQLITE_COMPAT_COLUMNS: dict[str, dict[str, str]] = {
+    # Phase 4 (2026-09-27 auto-remediation spec section 2): production already
+    # has these two tables from the phase-3 deployment, so create_all skips
+    # them entirely -- these two ADD COLUMNs are the only way an existing
+    # database picks up the new columns. No CHECK constraint is added here on
+    # purpose: SQLite keeps CHECKs inside the table's own DDL, so widening one
+    # via a bare ADD COLUMN is impossible without the rebuild dance used
+    # elsewhere in this file (see _widen_sqlite_entry_assembly_attempt_status_check)
+    # -- unnecessary here because both new enums are validated in Python
+    # (config.py's ONCALL_REMEDIATION_AUTO_ACTION_CHOICES /
+    # oncall_remediation.py's execution_origin literals), not by the database.
+    "oncall_remediation_proposals": {
+        "execution_origin": (
+            "ALTER TABLE oncall_remediation_proposals ADD COLUMN execution_origin VARCHAR(16)"
+        ),
+        "auto_gate_result": (
+            "ALTER TABLE oncall_remediation_proposals ADD COLUMN auto_gate_result VARCHAR(64)"
+        ),
+    },
+    "oncall_remediation_control": {
+        "auto_suspended": (
+            "ALTER TABLE oncall_remediation_control "
+            "ADD COLUMN auto_suspended INTEGER NOT NULL DEFAULT 0"
+        ),
+        "auto_suspended_at": (
+            "ALTER TABLE oncall_remediation_control ADD COLUMN auto_suspended_at DATETIME"
+        ),
+        "auto_suspend_reason": (
+            "ALTER TABLE oncall_remediation_control ADD COLUMN auto_suspend_reason VARCHAR(128)"
+        ),
+        "auto_consecutive_errors": (
+            "ALTER TABLE oncall_remediation_control "
+            "ADD COLUMN auto_consecutive_errors INTEGER NOT NULL DEFAULT 0"
+        ),
+    },
     "trigger_protection_intents": {
         "recovery_disposition": (
             "ALTER TABLE trigger_protection_intents "

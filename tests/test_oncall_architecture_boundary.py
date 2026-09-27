@@ -44,7 +44,13 @@ ONCALL_MODULES = PHASE_ONE_MODULES + PHASE_TWO_MODULES
 #: contact with it is one outbound HTTP request (``oncall_service.py``), never
 #: an import -- and this stays true even before the file exists on this
 #: branch (worker-side phase 3 lands in a separate change).
-WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER = ("oncall_remediation.py",)
+WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER = (
+    "oncall_remediation.py",
+    # Phase 4 (2026-09-27 auto-remediation spec): the G-D gate module. Same
+    # worker-only status as oncall_remediation.py above; already caught by
+    # the "oncall_remediation" substring in FORBIDDEN_MODULE_FRAGMENTS.
+    "oncall_remediation_auto.py",
+)
 
 #: Spec section 1. None of these may appear in the watcher's import closure.
 FORBIDDEN_MODULE_FRAGMENTS = (

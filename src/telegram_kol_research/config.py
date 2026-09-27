@@ -825,7 +825,7 @@ def load_runtime_incident_config(
     )
 
 
-ONCALL_REMEDIATION_MODES = ("off", "shadow", "approve")
+ONCALL_REMEDIATION_MODES = ("off", "shadow", "approve", "auto")
 
 # Fixed by user ruling 2026-09-26 (phase-3 spec section 11 item 7); not
 # environment-tunable, unlike the five knobs in ``load_oncall_remediation_config``.
@@ -833,14 +833,29 @@ ONCALL_REMEDIATION_DAILY_PROPOSAL_CAP = 30
 ONCALL_REMEDIATION_PROPOSAL_EXPIRY_MINUTES = 30
 ONCALL_REMEDIATION_CONFIRM_EXPIRY_MINUTES = 2
 
+# Phase 4 (2026-09-27 spec section 3): the only action_kind values that may
+# ever be auto-executed, and the only ones ``AUTO_ACTIONS`` may name. Any
+# unrecognised entry in the env var invalidates the whole list (fail closed,
+# same convention as ``_parse_oncall_remediation_approver_ids``).
+ONCALL_REMEDIATION_AUTO_ACTION_CHOICES = frozenset(
+    {
+        "full_exit",
+        "move_stop_to_break_even",
+        "partial_take_profit",
+        "adjust_stop_loss",
+    }
+)
+
 
 @dataclass(frozen=True, slots=True)
 class OncallRemediationConfig:
-    """Worker-side settings for the phase-3 human-approved remediation path.
+    """Worker-side settings for the phase-3/4 remediation path.
 
-    See docs/plans/2026-09-26-codex-oncall-phase3-spec.md section 4.6. This
-    config only ever gates whether a proposal is computed/shown/executed; it
-    never changes ``groups.yaml`` or any auto-trade switch.
+    See docs/plans/2026-09-26-codex-oncall-phase3-spec.md section 4.6 and
+    docs/plans/2026-09-27-codex-oncall-phase4-auto-remediation-spec.md
+    section 2. This config only ever gates whether a proposal is
+    computed/shown/executed/auto-executed; it never changes ``groups.yaml``
+    or any auto-trade switch.
     """
 
     mode: str = "off"
@@ -856,16 +871,38 @@ class OncallRemediationConfig:
     proposal_expiry_minutes: int = ONCALL_REMEDIATION_PROPOSAL_EXPIRY_MINUTES
     confirm_expiry_minutes: int = ONCALL_REMEDIATION_CONFIRM_EXPIRY_MINUTES
 
+    # Phase 4 knobs (spec section 2/4). ``auto_actions`` empty means "no
+    # action is enabled for auto-execution", which makes ``effective_mode``
+    # behave exactly like ``shadow`` even when ``mode == "auto"``.
+    auto_actions: frozenset[str] = frozenset()
+    auto_exit_window_minutes: int = 15
+    auto_partial_tp_window_minutes: int = 10
+    auto_break_even_window_minutes: int = 30
+    auto_stop_window_minutes: int = 30
+    auto_daily_cap: int = 3
+    auto_per_chat_daily_cap: int = 2
+    auto_cooldown_minutes: int = 30
+    auto_min_stop_distance_pct: float = 0.3
+    auto_min_process_uptime_minutes: float = 5.0
+    auto_health_lookback_minutes: int = 10
+    auto_first_n_review: int = 5
+
     @property
     def effective_mode(self) -> str:
-        """``approve`` with no configured approver silently degrades to ``shadow``.
+        """Resolve the mode actually in effect.
 
-        Spec 4.6: "空 -> `approve` 自动降为 `shadow` 并在启动日志说明". This is
-        the property worker startup logging and every gate must read instead
-        of ``mode`` directly.
+        - ``approve``/``auto`` with no configured approver degrade to
+          ``shadow`` (an approver is required for ``auto`` too: the
+          downgrade-to-approve path on a D-gate miss, and ``/auto_on``/
+          ``/auto_off``, both need one).
+        - ``auto`` with an empty ``auto_actions`` also behaves like
+          ``shadow`` (spec section 2: "未配置 AUTO_ACTIONS 或为空 -> auto 等价
+          于 shadow").
         """
 
-        if self.mode == "approve" and not self.approver_ids:
+        if self.mode in {"approve", "auto"} and not self.approver_ids:
+            return "shadow"
+        if self.mode == "auto" and not self.auto_actions:
             return "shadow"
         return self.mode
 
@@ -873,10 +910,16 @@ class OncallRemediationConfig:
     def approve_downgrade_reason(self) -> str | None:
         """Non-``None`` iff :attr:`effective_mode` silently downgraded ``mode``."""
 
-        if self.mode == "approve" and not self.approver_ids:
+        if self.mode in {"approve", "auto"} and not self.approver_ids:
             return (
                 "TELEGRAM_KOL_ONCALL_REMEDIATION_APPROVER_IDS is empty; "
-                "approve mode downgraded to shadow (no one could approve)"
+                f"{self.mode} mode downgraded to shadow (no one could approve)"
+            )
+        if self.mode == "auto" and not self.auto_actions:
+            return (
+                "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_ACTIONS is empty; "
+                "auto mode downgraded to shadow (nothing is enabled for "
+                "auto-execution)"
             )
         return None
 
@@ -901,6 +944,25 @@ def _parse_oncall_remediation_approver_ids(raw: str) -> frozenset[int]:
             return frozenset()
         ids.add(value)
     return frozenset(ids)
+
+
+def _parse_oncall_remediation_auto_actions(raw: str) -> frozenset[str]:
+    """Parse a comma-separated ``action_kind`` allowlist for auto-execution.
+
+    Any single entry outside :data:`ONCALL_REMEDIATION_AUTO_ACTION_CHOICES`
+    invalidates the whole list -- same fail-closed convention as
+    ``_parse_oncall_remediation_approver_ids``.
+    """
+
+    items = [item.strip() for item in raw.split(",") if item.strip()]
+    if not items:
+        return frozenset()
+    actions: set[str] = set()
+    for item in items:
+        if item not in ONCALL_REMEDIATION_AUTO_ACTION_CHOICES:
+            return frozenset()
+        actions.add(item)
+    return frozenset(actions)
 
 
 def load_oncall_remediation_config(
@@ -948,6 +1010,15 @@ def load_oncall_remediation_config(
             return default
         return max(low, min(value, high))
 
+    def _bounded_float(
+        env_map: dict[str, str], env_key: str, default: float, *, low: float, high: float
+    ) -> float:
+        try:
+            value = float(env_map.get(env_key, str(default)))
+        except (TypeError, ValueError):
+            return default
+        return max(low, min(value, high))
+
     return OncallRemediationConfig(
         mode=mode,
         token=token,
@@ -970,5 +1041,58 @@ def load_oncall_remediation_config(
         ),
         stop_window_minutes=_bounded_int(
             "TELEGRAM_KOL_ONCALL_REMEDIATION_STOP_WINDOW_MINUTES", 120, low=1, high=1440
+        ),
+        auto_actions=_parse_oncall_remediation_auto_actions(
+            env.get("TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_ACTIONS", "")
+        ),
+        auto_exit_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_EXIT_WINDOW_MINUTES", 15, low=1, high=1440
+        ),
+        auto_partial_tp_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_PARTIAL_TP_WINDOW_MINUTES",
+            10,
+            low=1,
+            high=1440,
+        ),
+        auto_break_even_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_BREAK_EVEN_WINDOW_MINUTES",
+            30,
+            low=1,
+            high=1440,
+        ),
+        auto_stop_window_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_STOP_WINDOW_MINUTES", 30, low=1, high=1440
+        ),
+        auto_daily_cap=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_DAILY_CAP", 3, low=1, high=1000
+        ),
+        auto_per_chat_daily_cap=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_PER_CHAT_DAILY_CAP", 2, low=1, high=1000
+        ),
+        auto_cooldown_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_COOLDOWN_MINUTES", 30, low=0, high=1440
+        ),
+        auto_min_stop_distance_pct=_bounded_float(
+            env,
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_MIN_STOP_DISTANCE_PCT",
+            0.3,
+            low=0.0,
+            high=100.0,
+        ),
+        auto_min_process_uptime_minutes=_bounded_float(
+            env,
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_MIN_PROCESS_UPTIME_MINUTES",
+            5.0,
+            low=0.0,
+            high=1440.0,
+        ),
+        auto_health_lookback_minutes=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_HEALTH_LOOKBACK_MINUTES",
+            10,
+            low=1,
+            high=1440,
+        ),
+        auto_first_n_review=_bounded_int(
+            "TELEGRAM_KOL_ONCALL_REMEDIATION_AUTO_FIRST_N_REVIEW", 5, low=0, high=1000
         ),
     )

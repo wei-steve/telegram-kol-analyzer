@@ -4779,6 +4779,22 @@ class OncallRemediationProposal(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime, nullable=False, default=utc_now
     )
+    # Phase 4 (2026-09-27 spec section 3/4). 'manual' for every phase-3
+    # proposal (the historical default, hence nullable rather than a NOT NULL
+    # column with a server default that would need a rebuild -- see db.py's
+    # SQLITE_COMPAT_COLUMNS backfill for why a bare ADD COLUMN cannot carry a
+    # CHECK on an existing production table); 'auto' iff a phase-4 background
+    # task promoted this proposal without a human click.
+    execution_origin: Mapped[Optional[str]] = mapped_column(
+        String(16), nullable=True
+    )
+    # 'passed' when every G-D check passed; otherwise the reason code of the
+    # first failing check (spec section 4). NULL for every proposal that
+    # never went through G-D (i.e. every phase-3 proposal, and every phase-4
+    # proposal computed while effective_mode != 'auto').
+    auto_gate_result: Mapped[Optional[str]] = mapped_column(
+        String(64), nullable=True
+    )
 
 
 class OncallRemediationEvent(Base):
@@ -4844,4 +4860,54 @@ class OncallRemediationControl(Base):
     )
     breaker_tripped_at: Mapped[Optional[datetime]] = mapped_column(
         DateTime, nullable=True
+    )
+    # Phase 4 (2026-09-27 spec section 8): a *stricter* breaker that only
+    # applies to execution_origin='auto' proposals. Suspending auto never
+    # touches ``enabled`` (which still gates phase-3 approve/shadow) -- see
+    # oncall_remediation_auto.control_gate_d9 and _apply_outcome_to_breaker.
+    auto_suspended: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("'0'")
+    )
+    auto_suspended_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime, nullable=True
+    )
+    auto_suspend_reason: Mapped[Optional[str]] = mapped_column(
+        String(128), nullable=True
+    )
+    auto_consecutive_errors: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default=sql_text("'0'")
+    )
+
+
+#: Phase 4 (2026-09-27 spec section 6.2): a self-contained, append-only audit
+#: row per proposal per phase ('pre_apply' written just before ``apply_fn`` is
+#: called for *any* execution -- auto or human-approved; 'result' written once
+#: the batch settles). INSERT-only by construction, same convention as
+#: ``OncallRemediationEvent`` -- see the static assertion in
+#: tests/test_oncall_remediation_auto.py.
+class OncallRemediationAudit(Base):
+    __tablename__ = "oncall_remediation_audit"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('pre_apply', 'result')",
+            name="ck_oncall_remediation_audit_phase",
+        ),
+        CheckConstraint(
+            "length(payload_json) <= 65536",
+            name="ck_oncall_remediation_audit_payload_bounded",
+        ),
+        Index("ix_oncall_remediation_audit_proposal_id", "proposal_id", "phase"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    proposal_id: Mapped[int] = mapped_column(
+        ForeignKey("oncall_remediation_proposals.id"), nullable=False
+    )
+    phase: Mapped[str] = mapped_column(String(16), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, nullable=False, default=utc_now
+    )
+    payload_json: Mapped[str] = mapped_column(Text, nullable=False)
+    truncated: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=sql_text("'0'")
     )

@@ -29,6 +29,7 @@ from sqlalchemy.orm import aliased, sessionmaker
 from telegram_kol_research.config import OncallRemediationConfig
 from telegram_kol_research.models import (
     MessageInstructionItem,
+    OncallRemediationAudit,
     OncallRemediationControl,
     OncallRemediationEvent,
     OncallRemediationProposal,
@@ -38,6 +39,12 @@ from telegram_kol_research.models import (
     SignalCandidate,
     Source,
     StrategyManagementBatch,
+)
+from telegram_kol_research.oncall_remediation_auto import (
+    AutoHealthInputs,
+    GateDOutcome,
+    redact_structure,
+    run_gate_d,
 )
 from telegram_kol_research.position_management_remediation import (
     PositionRemediationAction,
@@ -119,12 +126,17 @@ class RegisterResult:
 @dataclass(frozen=True, slots=True)
 class ProposalOutcome:
     proposal_id: int
-    state: str  # "proposed" | "refused"
+    state: str  # "proposed" | "refused" | "executing"
     refusal_reason: str | None
     text: str | None
     keyboard: tuple[tuple[str, str], ...] | None
     should_send: bool
     breaker_tripped: bool = False
+    # Phase 4: non-None iff G-D passed and this proposal was just promoted
+    # straight to "executing" (single-flight CAS won) -- the caller must
+    # invoke ``execute_proposal`` for it, exactly like ``CallbackOutcome``'s
+    # ``execute_proposal_id`` in the human-approved path.
+    auto_execute_proposal_id: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -244,6 +256,80 @@ def _append_event(
     )
 
 
+def _append_audit(session, proposal_id: int, *, phase: str, payload: dict[str, Any]) -> None:
+    """INSERT one ``oncall_remediation_audit`` row (spec 6.2). INSERT-only:
+    no code path in this module UPDATEs or DELETEs this table -- see the
+    static assertion in tests/test_oncall_remediation_auto.py.
+
+    Redacted (via ``oncall_remediation_auto.redact_structure``, the same
+    patterns ``oncall_codex.py`` uses) and bounded to 64KB; truncation drops
+    the largest ``execution_events`` response bodies first (the ones most
+    likely to carry raw exchange payloads) rather than failing the INSERT.
+    """
+
+    redacted_payload, _hits = redact_structure(payload)
+    encoded = json.dumps(redacted_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    truncated = False
+    if len(encoded) > 65536:
+        truncated = True
+        trimmed = dict(redacted_payload)
+        exchange_traffic = trimmed.get("exchange_traffic")
+        if isinstance(exchange_traffic, list) and exchange_traffic:
+            events = [row for row in exchange_traffic if row.get("kind") == "execution_event"]
+            events.sort(key=lambda row: row.get("id", 0))
+            while events and len(
+                json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+            ) > 65536:
+                oldest = events.pop(0)
+                if oldest in exchange_traffic:
+                    exchange_traffic.remove(oldest)
+        encoded = json.dumps(trimmed, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if len(encoded) > 65536:
+            encoded = json.dumps({"_truncated": True}, ensure_ascii=False)
+    session.add(
+        OncallRemediationAudit(
+            proposal_id=proposal_id,
+            phase=phase,
+            created_at=datetime.now(UTC).replace(tzinfo=None),
+            payload_json=encoded,
+            truncated=truncated,
+        )
+    )
+
+
+def _render_audit_report(session_factory: sessionmaker, *, proposal_id: int) -> str:
+    """``/audit P<n>`` (spec 6.2): merge the pre_apply/result audit rows for
+    one proposal into one human-readable report, <= 4000 chars."""
+
+    with session_factory() as session:
+        proposal = session.get(OncallRemediationProposal, proposal_id)
+        if proposal is None:
+            return f"提案 P{proposal_id} 不存在"
+        rows = (
+            session.query(OncallRemediationAudit)
+            .filter(OncallRemediationAudit.proposal_id == proposal_id)
+            .order_by(OncallRemediationAudit.id)
+            .all()
+        )
+        lines = [
+            f"倒查 P{proposal_id}（值守 #{proposal.case_no}）",
+            f"动作：{proposal.action_kind or '?'}  来源：{proposal.execution_origin or 'manual'}",
+            f"状态：{proposal.state}  批次：{proposal.management_batch_id}",
+        ]
+        if not rows:
+            lines.append("尚无审计记录（可能还未进入执行）")
+        for row in rows:
+            try:
+                payload = json.loads(row.payload_json)
+            except (TypeError, ValueError):
+                payload = {}
+            lines.append(f"--- {row.phase} @ {row.created_at} {'(截断)' if row.truncated else ''}")
+            for key in ("trigger", "target", "gates", "params", "exchange_traffic", "result", "readback"):
+                if key in payload:
+                    lines.append(f"{key}: {json.dumps(payload[key], ensure_ascii=False)[:400]}")
+    return "\n".join(lines)[:4000]
+
+
 def _get_or_create_control(session) -> OncallRemediationControl:
     control = session.get(OncallRemediationControl, 1)
     if control is None:
@@ -278,6 +364,26 @@ _REFUSAL_REASON_ZH: dict[str, str] = {
     "plan_changed": "计划已变化（多为同币种有新成交或挂撤单），本次未执行；可发送 /fix 加本提案号重新生成提案",
     "expired": "提案已过期",
     "state_changed": "提案状态已变化",
+    # Phase 4 G-D reason codes (docs/plans/2026-09-27 spec section 4).
+    "d1_reason_not_transient": "原失败原因不属于可自动重试的瞬时原因",
+    "d2_successor_message": "该目标之后又有新的消息/批次",
+    "d3_protection_unhealthy": "仓位保护状态不健康",
+    "d3_protection_ownership_gap": "保护单归属核对不上",
+    "d3_position_externally_changed": "仓位疑似被外部改动",
+    "d4_quote_unavailable": "无法取得可用行情",
+    "d4_stop_direction_invalid": "新止损方向不对",
+    "d4_stop_distance_too_close": "新止损距离市价太近",
+    "d6_process_uptime_too_short": "系统刚重启，运行时间不足",
+    "d6_recent_loop_stall": "近期出现事件循环卡顿",
+    "d6_severe_protection_incident": "近期出现严重保护事故",
+    "d7_auto_window_expired": "已超出自动补救时效窗",
+    "d8_auto_daily_cap": "今日自动执行次数已达上限",
+    "d8_auto_per_chat_daily_cap": "该群今日自动执行次数已达上限",
+    "d8_auto_cooldown": "同一仓位自动补救冷却中",
+    "d9_action_not_enabled": "该类型动作暂未放开自动执行",
+    "auto_suspended": "自动补救已暂停",
+    "auto_single_flight_busy": "另一笔正在自动执行，本次改为只提示",
+    "d_internal_error": "自动闸门内部错误",
 }
 
 
@@ -345,6 +451,7 @@ def _format_proposal_text(
     group_label: str,
     window_minutes: int,
     posted_at: datetime,
+    auto_downgrade_reason: str | None = None,
 ) -> str:
     symbol, side = _symbol_and_side_from_action(action)
     action_zh = _action_kind_zh(action.action_kind, action.expected_effect)
@@ -363,6 +470,8 @@ def _format_proposal_text(
     else:
         expires_text = _beijing_hhmm(expires_at) if expires_at is not None else "?"
         lines.append(f"时效：本提案 {expires_text} 前有效；消息的补救窗口到 {_beijing_hhmm(window_end)}")
+    if auto_downgrade_reason:
+        lines.append(f"未自动执行：{_refusal_text_zh(auto_downgrade_reason)}")
     return "\n".join(lines)[:4096]
 
 
@@ -890,6 +999,7 @@ def compute_requested_proposal(
     resolve_scope: Callable[..., RemediationScope | None] = resolve_remediation_scope,
     build_plan: Callable[..., PositionRemediationPlan] = build_position_management_remediation_plan,
     group_label: Callable[[int], str] | None = None,
+    auto_health: AutoHealthInputs | None = None,
 ) -> ProposalOutcome:
     """G-A: the full deterministic proposal gate. Called from a background task."""
 
@@ -976,8 +1086,45 @@ def compute_requested_proposal(
         action = gate.action
         assert action is not None and gate.scope is not None
 
+        # Phase 4 (spec section 5): in ``auto`` mode, G-D runs right here,
+        # before anything is written, using the same action/gate context G-A
+        # just produced. A pass tries to CAS straight to "executing" (no
+        # human step at all); a miss downgrades to an ordinary proposed
+        # message with an approve-mode button attached (user ruling 2026-09-27
+        # item 4), one line explaining why it was not auto-executed.
+        gate_d: GateDOutcome | None = None
+        if config.effective_mode == "auto":
+            settings = load_trading_settings(session_factory)
+            gate_d = run_gate_d(
+                session_factory,
+                config=config,
+                action=action,
+                posted_at=gate.posted_at or now,
+                now=now,
+                deepcoin_client=deepcoin_client,
+                settings=settings,
+                health=auto_health or AutoHealthInputs(process_started_at=now),
+                chat_id=gate.raw_message.chat_id if gate.raw_message is not None else None,
+                exclude_proposal_id=proposal_id,
+            )
+            with session_factory() as session:
+                for check in gate_d.checks:
+                    _append_event(
+                        session,
+                        proposal_id,
+                        actor="worker",
+                        event="gate_d",
+                        gate="D",
+                        check=check.check,
+                        outcome="passed" if check.passed else "refused",
+                        detail={"reason": check.reason_code} if check.reason_code else None,
+                        at=now,
+                    )
+                session.commit()
+
         snapshot = _build_action_snapshot(action)
         token1: str | None = None
+        promote_to_executing = bool(gate_d is not None and gate_d.passed)
         with session_factory() as session:
             row = session.get(OncallRemediationProposal, proposal_id)
             if row is None or row.state != "requested":
@@ -995,26 +1142,74 @@ def compute_requested_proposal(
             row.action_fingerprint = action.fingerprint
             row.action_snapshot_json = _bounded_json(snapshot, limit=8192)
             row.scope_json = gate.scope.to_json()
-            row.state = "proposed"
             row.proposed_at = now
             row.expires_at = now + timedelta(minutes=config.proposal_expiry_minutes)
             row.updated_at = now
-            if config.effective_mode == "approve":
-                token1 = _new_token()
-                row.step1_token_hash = _hash_token(token1)
+            if gate_d is not None:
+                row.execution_origin = "auto"
+                row.auto_gate_result = "passed" if gate_d.passed else (gate_d.first_failure_reason or "unknown")
+            if promote_to_executing:
+                row.state = "executing"
+                row.approved_at = now
+                row.confirmed_at = now
+                row.executing_at = now
+            else:
+                row.state = "proposed"
+                if config.effective_mode in {"approve", "auto"}:
+                    token1 = _new_token()
+                    row.step1_token_hash = _hash_token(token1)
             session.add(row)
+            single_flight_lost = False
+            if promote_to_executing:
+                # The single-flight guarantee (spec 4/G-C's C1) also applies
+                # to the auto path: promoting straight from "requested" to
+                # "executing" must not race a proposal that is already
+                # executing. If it does, this proposal falls back to a
+                # downgraded, button-carrying proposal instead of blocking.
+                other_executing = (
+                    session.query(func.count(OncallRemediationProposal.id))
+                    .filter(
+                        OncallRemediationProposal.state == "executing",
+                        OncallRemediationProposal.id != proposal_id,
+                    )
+                    .scalar()
+                    or 0
+                )
+                if other_executing > 0:
+                    single_flight_lost = True
+                    row.state = "proposed"
+                    row.approved_at = None
+                    row.confirmed_at = None
+                    row.executing_at = None
+                    row.auto_gate_result = "auto_single_flight_busy"
+                    token1 = _new_token()
+                    row.step1_token_hash = _hash_token(token1)
+                    session.add(row)
             _append_event(
                 session,
                 proposal_id,
                 actor="worker",
                 event="gate_a",
                 gate="A",
-                outcome="proposed",
+                outcome=row.state,
                 detail={"action_kind": action.action_kind, "action_id": action.action_id},
                 at=now,
             )
             session.commit()
             expires_at = row.expires_at
+            final_state = row.state
+            auto_gate_result = row.auto_gate_result
+
+        if final_state == "executing":
+            return ProposalOutcome(
+                proposal_id=proposal_id,
+                state="executing",
+                refusal_reason=None,
+                text=None,
+                keyboard=None,
+                should_send=False,
+                auto_execute_proposal_id=proposal_id,
+            )
 
         text = _format_proposal_text(
             proposal_id=proposal_id,
@@ -1022,7 +1217,7 @@ def compute_requested_proposal(
             raw_message_id=raw_message_id,
             expires_at=expires_at,
             action=action,
-            shadow=config.effective_mode != "approve",
+            shadow=config.effective_mode not in {"approve", "auto"},
             group_label=(
                 group_label(gate.raw_message.chat_id)
                 if group_label and gate.raw_message is not None
@@ -1030,9 +1225,10 @@ def compute_requested_proposal(
             ),
             window_minutes=gate.window_minutes,
             posted_at=gate.posted_at or now,
+            auto_downgrade_reason=auto_gate_result if gate_d is not None else None,
         )
         keyboard = None
-        if config.effective_mode == "approve" and token1 is not None:
+        if config.effective_mode in {"approve", "auto"} and token1 is not None:
             keyboard = (
                 ("✅ 执行补救", f"orm:{proposal_id}:1:{token1}"),
                 ("❌ 忽略", f"orm:{proposal_id}:d:{token1}"),
@@ -1088,7 +1284,7 @@ def handle_callback(
     step = match.group(2)
     token = match.group(3)
 
-    if config.effective_mode != "approve":
+    if config.effective_mode not in {"approve", "auto"}:
         return CallbackOutcome(
             proposal_id=proposal_id,
             accepted=False,
@@ -1395,11 +1591,51 @@ def handle_text_command(
             session.commit()
         return CommandOutcome(accepted=True, text="补救已开启")
 
+    if parts and parts[0] == "/auto_off":
+        if len(parts) != 1:
+            return CommandOutcome(accepted=False, text="命令格式错误")
+        actor = f"telegram_user:{from_user_id}"
+        with session_factory() as session:
+            control = _get_or_create_control(session)
+            control.auto_suspended = True
+            control.auto_suspended_at = now
+            control.auto_suspend_reason = "manual_off"
+            control.auto_consecutive_errors = 0
+            session.add(control)
+            _append_event(session, None, actor=actor, event="control", outcome="auto_suspended", detail={"reason": "manual_off"}, at=now)
+            session.commit()
+        return CommandOutcome(accepted=True, text="自动补救已暂停，改为只提示（其余照旧）")
+
+    if parts and parts[0] == "/auto_on":
+        if len(parts) != 1:
+            return CommandOutcome(accepted=False, text="命令格式错误")
+        actor = f"telegram_user:{from_user_id}"
+        with session_factory() as session:
+            control = _get_or_create_control(session)
+            control.auto_suspended = False
+            control.auto_suspended_at = None
+            control.auto_suspend_reason = None
+            control.auto_consecutive_errors = 0
+            session.add(control)
+            _append_event(session, None, actor=actor, event="control", outcome="auto_resumed", detail={"reason": "manual_on"}, at=now)
+            session.commit()
+        return CommandOutcome(accepted=True, text="自动补救已恢复")
+
+    if parts and parts[0] == "/audit":
+        if len(parts) != 2 or not re.fullmatch(r"P\d+", parts[1]):
+            return CommandOutcome(accepted=False, text="命令格式错误，应为 /audit P<提案号>")
+        proposal_id = int(parts[1][1:])
+        return CommandOutcome(
+            accepted=True,
+            text=_render_audit_report(session_factory, proposal_id=proposal_id),
+            proposal_id=proposal_id,
+        )
+
     if parts and parts[0] == "/fix":
         if len(parts) != 2 or not re.fullmatch(r"P\d+", parts[1]):
             return CommandOutcome(accepted=False, text="命令格式错误，应为 /fix P<提案号>")
         proposal_id = int(parts[1][1:])
-        if config.effective_mode != "approve":
+        if config.effective_mode not in {"approve", "auto"}:
             return CommandOutcome(accepted=False, text="当前为只提示模式", proposal_id=proposal_id)
         with session_factory() as session:
             proposal = session.get(OncallRemediationProposal, proposal_id)
@@ -1471,6 +1707,7 @@ def execute_proposal(
     apply_fn: Callable[..., Any] = apply_position_management_remediation_action,
     build_plan: Callable[..., PositionRemediationPlan] = build_position_management_remediation_plan,
     resolve_scope: Callable[..., RemediationScope | None] = resolve_remediation_scope,
+    auto_health: AutoHealthInputs | None = None,
 ) -> ExecutionOutcome:
     """G-C: rerun every gate, then (and only then) call ``apply_fn``."""
 
@@ -1483,6 +1720,8 @@ def execute_proposal(
         stored_action_id = proposal.action_id
         stored_fingerprint = proposal.action_fingerprint
         scope_json = proposal.scope_json
+        execution_origin = proposal.execution_origin
+        case_no = proposal.case_no
 
     def _fail(state: str, reason: str, *, check: str | None) -> ExecutionOutcome:
         # User ruling 2026-09-26: the breaker counts only failures of a real
@@ -1490,6 +1729,10 @@ def execute_proposal(
         # (plan_changed and every other pre-apply gate, or an apply() refusal
         # that never promoted its plan-only batch) only refuses this proposal.
         # "uncertain" always means a live write may have happened, so it counts.
+        # Phase 4: an auto proposal's pre-apply refusal (including a G-D
+        # rerun miss, "auto_gate_changed:*") is exactly this same category --
+        # it never suspends auto-execution (spec section 8: only a *real*
+        # execution failure/uncertain does that).
         counts_toward_breaker = state == "uncertain"
         with session_factory() as session:
             row = session.get(OncallRemediationProposal, proposal_id)
@@ -1506,6 +1749,10 @@ def execute_proposal(
             breaker_message = (
                 _apply_outcome_to_breaker(session, state) if counts_toward_breaker else None
             )
+            if counts_toward_breaker and row.execution_origin == "auto":
+                auto_message = _suspend_auto(session, reason=f"real_execution_{state}")
+                if auto_message:
+                    breaker_message = f"{breaker_message}\n{auto_message}" if breaker_message else auto_message
             session.commit()
         return ExecutionOutcome(
             proposal_id=proposal_id,
@@ -1543,10 +1790,55 @@ def execute_proposal(
         if action.action_id != stored_action_id or action.fingerprint != stored_fingerprint:
             return _fail("failed", "plan_changed", check="C2")
 
+        # Phase 4 (spec section 4/C's "重跑 G-D"): an auto-originated proposal
+        # gets D1/D2/D3/D4/D6/D7 rerun here too (D8 excludes itself, D9/D0 are
+        # config/control facts that cannot have changed mid-flight). Any miss
+        # refuses this execution -- it never reached apply_fn, so it is
+        # "failed", never "uncertain", and per the rule above never suspends
+        # auto-execution.
+        if execution_origin == "auto":
+            settings_for_d = load_trading_settings(session_factory)
+            gate_d = run_gate_d(
+                session_factory,
+                config=config,
+                action=action,
+                posted_at=gate.posted_at or now,
+                now=now,
+                deepcoin_client=deepcoin_client,
+                settings=settings_for_d,
+                health=auto_health or AutoHealthInputs(process_started_at=now - timedelta(hours=1)),
+                chat_id=gate.raw_message.chat_id if gate.raw_message is not None else None,
+                exclude_proposal_id=proposal_id,
+            )
+            if not gate_d.passed:
+                return _fail(
+                    "failed", f"auto_gate_changed:{gate_d.first_failure_reason}", check="D"
+                )
+
         scope = RemediationScope.from_json(scope_json) if scope_json else gate.scope
 
         with session_factory() as session:
             _append_event(session, proposal_id, actor="worker", event="gate_c", gate="C", check="C4", outcome="applying", at=now)
+            _append_audit(
+                session,
+                proposal_id,
+                phase="pre_apply",
+                payload={
+                    "trigger": {"case_no": case_no, "raw_message_id": raw_message_id},
+                    "target": {
+                        "lifecycle_id": action.lifecycle_id,
+                        "strategy_instance_id": action.strategy_instance_id,
+                        "pos_ids": list(action.pos_ids),
+                    },
+                    "params": {
+                        "action_kind": action.action_kind,
+                        "action_id": action.action_id,
+                        "fingerprint": action.fingerprint,
+                        "expected_effect": action.expected_effect,
+                        "execution_origin": execution_origin,
+                    },
+                },
+            )
             session.commit()
 
         apply_started = True
@@ -1621,6 +1913,92 @@ _BATCH_IN_FLIGHT_STATUSES = frozenset(
 )
 
 
+def _gather_exchange_traffic_for_audit(session, *, batch_id: int | None) -> list[dict[str, Any]]:
+    """Best-effort, read-only collection of this batch's exchange requests/
+    responses for the audit trail (spec 6.2 "交易所往来").
+
+    ``position_mutation_intents``/``execution_events`` carry no
+    ``management_batch_id`` column (they are keyed by
+    ``execution_binding_id``/``strategy_instance_id`` instead -- see
+    models.py:3090-3130/3173-3203), so this joins through
+    ``strategy_management_legs``' own ``execution_binding_id`` for the given
+    batch and takes everything on that binding, which is the same
+    binding-scoped join the phase-3 code already uses elsewhere in this
+    module (e.g. ``_classify_apply_exception``'s ``raw_message_id`` filter is
+    the batch-level analogue). This is intentionally coarse -- it can include
+    unrelated mutation intents/events on a binding that has managed more than
+    one batch -- and is documented as a known limitation.
+    """
+
+    from telegram_kol_research.models import (
+        ExecutionEvent,
+        ExecutionOrderLeg,
+        PositionMutationIntent,
+        StrategyManagementLeg,
+    )
+
+    if batch_id is None:
+        return []
+    legs = (
+        session.query(StrategyManagementLeg)
+        .filter(StrategyManagementLeg.management_batch_id == batch_id)
+        .order_by(StrategyManagementLeg.id)
+        .all()
+    )
+    rows: list[dict[str, Any]] = []
+    for leg in legs:
+        rows.append(
+            {
+                "kind": "strategy_management_leg",
+                "id": int(leg.id),
+                "status": leg.status,
+                "request": leg.request_json,
+                "response": leg.response_json,
+            }
+        )
+    binding_ids: set[int] = set()
+    for leg in legs:
+        if leg.execution_order_leg_id is None:
+            continue
+        order_leg = session.get(ExecutionOrderLeg, int(leg.execution_order_leg_id))
+        if order_leg is not None and order_leg.execution_binding_id is not None:
+            binding_ids.add(int(order_leg.execution_binding_id))
+    for binding_id in binding_ids:
+        for intent in (
+            session.query(PositionMutationIntent)
+            .filter(PositionMutationIntent.execution_binding_id == binding_id)
+            .order_by(PositionMutationIntent.id)
+            .all()
+        ):
+            rows.append(
+                {
+                    "kind": "position_mutation_intent",
+                    "id": int(intent.id),
+                    "operation": intent.operation,
+                    "status": intent.status,
+                    "request": getattr(intent, "request_json", None),
+                    "response": getattr(intent, "response_json", None),
+                }
+            )
+        for event in (
+            session.query(ExecutionEvent)
+            .filter(ExecutionEvent.execution_binding_id == binding_id)
+            .order_by(ExecutionEvent.id)
+            .all()
+        ):
+            rows.append(
+                {
+                    "kind": "execution_event",
+                    "id": int(event.id),
+                    "action": event.action,
+                    "status": event.status,
+                    "request": getattr(event, "request_json", None),
+                    "response": getattr(event, "response_json", None),
+                }
+            )
+    return rows
+
+
 def finalize_executing_proposals(
     session_factory: sessionmaker,
     *,
@@ -1679,23 +2057,87 @@ def finalize_executing_proposals(
             session.add(proposal)
             _append_event(session, proposal_id_val, actor="worker", event="finalize", outcome=state, detail=detail, at=now)
             breaker_message = _apply_outcome_to_breaker(session, state)
+            if state in {"failed", "uncertain"} and proposal.execution_origin == "auto":
+                auto_message = _suspend_auto(session, reason=f"real_execution_{state}")
+                if auto_message:
+                    breaker_message = f"{breaker_message}\n{auto_message}" if breaker_message else auto_message
+            elapsed_seconds = None
+            if proposal.requested_at is not None:
+                elapsed_seconds = (now - _naive_utc(proposal.requested_at)).total_seconds()
+            _append_audit(
+                session,
+                proposal_id_val,
+                phase="result",
+                payload={
+                    "result": {
+                        "batch_status": detail.get("batch_status"),
+                        "reason_code": detail.get("reason_code"),
+                        "proposal_state": state,
+                        "elapsed_seconds": elapsed_seconds,
+                    },
+                    "exchange_traffic": _gather_exchange_traffic_for_audit(
+                        session, batch_id=proposal.management_batch_id
+                    ),
+                },
+            )
             session.commit()
             detail_text = (
                 "仓位/止损已按计划变化"
                 if state == "succeeded"
                 else str(detail.get("reason_code") or detail.get("batch_status") or "未知")
             )
+            result_text = _format_result_text(
+                proposal_id=proposal_id_val, state=state, detail=detail_text, breaker_message=breaker_message
+            )
+            if state == "succeeded" and proposal.execution_origin == "auto" and proposal.action_kind:
+                ordinal = (
+                    session.query(func.count(OncallRemediationProposal.id))
+                    .filter(
+                        OncallRemediationProposal.execution_origin == "auto",
+                        OncallRemediationProposal.action_kind == proposal.action_kind,
+                        OncallRemediationProposal.state == "succeeded",
+                        OncallRemediationProposal.id <= proposal_id_val,
+                    )
+                    .scalar()
+                    or 0
+                )
+                if 0 < ordinal <= config.auto_first_n_review:
+                    action_zh = _ACTION_KIND_ZH.get(proposal.action_kind, proposal.action_kind)
+                    result_text = (
+                        f"{result_text}\n这是{action_zh}的第 {ordinal} 笔自动补救，请回看"
+                    )
             outcomes.append(
                 FinalizeOutcome(
                     proposal_id=proposal_id_val,
                     state=state,
-                    text=_format_result_text(
-                        proposal_id=proposal_id_val, state=state, detail=detail_text, breaker_message=breaker_message
-                    ),
+                    text=result_text,
                     breaker_tripped=breaker_message is not None,
                 )
             )
     return outcomes
+
+
+def _suspend_auto(session, *, reason: str) -> str | None:
+    """Phase 4's stricter breaker (spec section 8): one real execution
+    failure/uncertain/readback-mismatch immediately suspends *auto*
+    execution (``control.auto_suspended``), independent of the phase-3
+    ``enabled``/``consecutive_failures`` breaker this sits next to. A no-op
+    (returns ``None``) if auto is already suspended -- the notification only
+    fires once.
+    """
+
+    control = _get_or_create_control(session)
+    if control.auto_suspended:
+        return None
+    control.auto_suspended = True
+    control.auto_suspended_at = datetime.now(UTC).replace(tzinfo=None)
+    control.auto_suspend_reason = reason[:128]
+    session.add(control)
+    _append_event(
+        session, None, actor="circuit_breaker", event="control", outcome="auto_suspended",
+        detail={"reason": reason}, at=control.auto_suspended_at,
+    )
+    return "自动补救已暂停，改为只提示（可发 /auto_on 恢复）"
 
 
 def _apply_outcome_to_breaker(session, state: str) -> str | None:

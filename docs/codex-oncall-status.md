@@ -951,6 +951,167 @@ auto_trade_switches: untouched   # trading_settings 最后修改 2026-09-26 03:3
 |---|---|---|---|---|---|---|---|
 | P1 | — | — | 冒烟，`target_not_resolved` | — | — | — | 非真实案件 |
 
+### 9.5 阶段 4 第 1 批（2026-09-27，实现子代理，`claude/codex-oncall-phase4` 分支，**未合并未部署**）
+
+规格：`docs/plans/2026-09-27-codex-oncall-phase4-auto-remediation-spec.md` 全文。本批只做核心库（配置、schema、
+G-D 闸门模块、`oncall_remediation.py` 里的 auto 流程），**不接线**——未改 `web_app.py`、`telegram_bot_commands.py`、
+`oncall_remediation_runtime.py`、值守七个模块、`oncall_codex.py`/`oncall_codex_runner.py`。第 2 批负责真正的后台任务
+接线、`/audit` 等命令的系统 bot 分流、启动时的 `AutoHealthInputs`（真实进程启动时间 / 事件循环卡顿信号）、真实端到端测试。
+
+**交付物**
+
+- `src/telegram_kol_research/config.py`：`ONCALL_REMEDIATION_MODES` 新增 `"auto"`；`OncallRemediationConfig` 新增
+  `auto_actions`（`frozenset[str]`）与 11 个 `AUTO_*` 数值字段；`effective_mode`/`approve_downgrade_reason` 扩展为
+  "`approve`/`auto` 无批准人 -> `shadow`；`auto` 且 `auto_actions` 为空 -> `shadow`"；新增
+  `_parse_oncall_remediation_auto_actions`（同 `_parse_oncall_remediation_approver_ids` 的整体失效纪律）与
+  `load_oncall_remediation_config` 里对应的 env 读取（`_bounded_float` 辅助函数，`_bounded_int` 的浮点版）。
+- `src/telegram_kol_research/models.py`：`OncallRemediationProposal` 加两列（`execution_origin`、
+  `auto_gate_result`，均可空、无 CHECK）；`OncallRemediationControl` 加四列（`auto_suspended`、`auto_suspended_at`、
+  `auto_suspend_reason`、`auto_consecutive_errors`）；新表 `OncallRemediationAudit`（`oncall_remediation_audit`，
+  CHECK `phase IN ('pre_apply','result')` 与 `length(payload_json) <= 65536`，`(proposal_id, phase)` 索引）。
+- `src/telegram_kol_research/db.py`：`SQLITE_COMPAT_COLUMNS` 新增这两张已部署表的 ADD COLUMN 语句（新表由
+  `create_all` 建）；未加 CHECK（ADD COLUMN 无法带 CHECK，枚举值在 Python 侧校验）。已用手工脚本核实：全新库
+  一步到位、只有阶段 3 三张表（缺新列）的旧库能被补齐到相同列集合。
+- `src/telegram_kol_research/oncall_remediation_auto.py`（新模块，worker 侧，standalone——不 import
+  `oncall_remediation.py`，避免循环）：`GateDCheck`、`AutoHealthInputs`、`GateDOutcome`、`run_gate_d`，以及
+  `check_d1_reason_whitelist` .. `check_d9_action_enabled`（D0 为控制层总闸 `check_auto_not_suspended`）、
+  `predict_break_even_branch`（D5，恒返回 `unknown_until_execution`，见下）、从 `oncall_codex.py` 复制的三条脱敏
+  正则 + `redact`/`redact_structure`。已加入值守边界测试的 `WORKER_ONLY_MODULES_NOT_PART_OF_THE_WATCHER`（
+  `FORBIDDEN_MODULE_FRAGMENTS` 的 `"oncall_remediation"` 子串已经覆盖它，一并写清楚）。
+- `src/telegram_kol_research/oncall_remediation.py`：
+  - `compute_requested_proposal` 新增 `auto_health: AutoHealthInputs | None = None`；`effective_mode == "auto"`
+    时 G-A 通过后跑 `run_gate_d`；全通过 -> 同一写事务里把 `requested` 直接 CAS 到 `executing`（`execution_origin=
+    "auto"`、`auto_gate_result="passed"`），带单飞判定（另一笔已在 `executing` -> 降级，理由
+    `auto_single_flight_busy`）；不通过 -> `proposed` + 批准按钮（复用 `approve` 模式的令牌机制）+ 文案末尾
+    "未自动执行：<理由>"。`ProposalOutcome` 新增 `auto_execute_proposal_id`（非空即需要调用 `execute_proposal`）。
+  - `execute_proposal` 新增 `auto_health` 参数；`execution_origin == "auto"` 时在 C2 指纹核对之后重跑 G-D
+    （排除 D8 对自身计数），不过 -> `failed:auto_gate_changed:<码>`（`_fail` 现有的 "只有 `uncertain` 计入熔断"
+    规则天然让这类执行前拒绝既不计阶段 3 熔断也不触发阶段 4 自动暂停）；通过后、调用 `apply_fn` 前写一行
+    `pre_apply` 审计（触发 / 目标 / 重算参数）。
+  - `finalize_executing_proposals`：批次终态后写一行 `result` 审计（结果、耗时、`_gather_exchange_traffic_for_audit`
+    收集的往来副本，经 `redact_structure` 脱敏）；`execution_origin == "auto"` 且终态 `failed`/`uncertain` ->
+    立即 `_suspend_auto`（独立于阶段 3 `enabled`/`consecutive_failures` 熔断）；`succeeded` 且是该动作前
+    `auto_first_n_review` 笔自动执行之一 -> 通知末尾加"这是 <动作> 的第 k 笔自动补救，请回看"。
+  - `handle_callback`/`handle_text_command` 的模式判定从 `!= "approve"` 改为 `not in {"approve", "auto"}`。
+  - `handle_text_command` 新增 `/auto_off`（置 `control.auto_suspended=1`）、`/auto_on`（清零并解除）、
+    `/audit P<n>`（`_render_audit_report`：合并该提案 `pre_apply`/`result` 审计行为 <= 4000 字符的可读报告）；
+    三者复用现有的 B1（批准人 + 系统 bot 会话）授权检查，不新增授权路径。
+  - 新增 `_append_audit`（INSERT-only，先 `redact_structure` 再裁剪超限；裁剪策略：先砍最旧的
+    `execution_events` 响应体）、`_suspend_auto`、`_gather_exchange_traffic_for_audit`、`_render_audit_report`。
+  - `_REFUSAL_REASON_ZH` 补齐全部 D 系与 `auto_suspended`/`auto_single_flight_busy` 的中文文案。
+
+**你核实过的事实（file:line）**
+
+- **原因字段键名**：`message_instruction_items.py:342`/`:401` 写 `error_json = json.dumps({"reason": "target_strategy_
+  binding_visibility_retry_expired", ...})`；D1 因此既解析 `reason`/`reason_code` 键，也在解析失败时退化为整段
+  文本子串匹配（与阶段 3 A7 的 `_match_a7_pattern` 同一惯例）。
+- **快照读失败/D1 白名单的第三/四类原因**：`exchange_snapshot_incomplete` 见
+  `position_management_remediation.py`（`build_position_management_remediation_plan` 快照不完整时的唯一冲突原因，
+  `oncall_remediation.py:643` 已引用）；`close_final_preflight_failed`/`protection_missing_cancellable_order_id`
+  的中文映射已存在于 `oncall_alerts.py:130-142`，确认是真实生产原因码而非本批发明。
+- **健康的 `protection_health` 分类值**：`protection_health.py:26-31` 定义
+  `CURRENT_PROTECTION_HEALTH_CLASSIFICATIONS = {"healthy_current_evidence", "recovery_required",
+  "evidence_insufficient"}`，`:259` 只有 `healthy_current_evidence` 对应 `healthy=True`；D3(a) 用这一个值作为
+  唯一"健康"判据（`D3_HEALTHY_PROTECTION_CLASSIFICATIONS`）。
+- **人为/外部改动的执行事件类型**：未找到 `ExecutionEvent.action` 上明确的"人工/外部"枚举值（`record_execution_
+  event` 的调用点里 `action` 是自由文本，如 `close_bound_position_market`/`reconcile_manual_pending_entry_cancel`
+  均是系统自身路径）；改用 `ExecutionBinding.last_exchange_status`（`execution_bindings.py:4505-4507`，
+  `sync_manual_closed_deepcoin_positions` 写入的 `"manual_closed_or_not_found_on_exchange"`）作为 D3(c) 的判据——
+  这是一个已存在、明确表示"这个仓位是被对账扫描发现在场外关闭的"的字段，比在自由文本 `action` 里猜测子串更精确。
+  **这是对规格 D3(c) 的偏离**，理由与判据见下方"D3 精确判据"。
+- **`runtime_incidents` 的字段与查询方式**：`models.py:3491-3600`；`incident_type`（自由字符串，`severe_protection_
+  incident` 是其一个值，`config.py:23`/`runtime_incident_adapters.py:2229` 等处production）、
+  `last_occurred_at`（NOT NULL DateTime）。表上唯一相关索引是 `ix_runtime_incidents_claimable`
+  （`status, claim_expires_at, last_occurred_at`），不含 `incident_type`；D6 因此按规格的建议做法——
+  `ORDER BY id DESC LIMIT 200` 再在 Python 里按 `incident_type == "severe_protection_incident"` 与时间窗过滤。
+  **EXPLAIN 的已知局限**：这个查询没有 WHERE 子句，SQLite 的 `EXPLAIN QUERY PLAN` 对"无 WHERE、按 rowid 倒序、
+  LIMIT 200"必然打印 `SCAN runtime_incidents`（它按 rowid B-tree 直接倒序读取，从末尾读 200 行就停，并不是
+  真正的全表扫描，但 EXPLAIN 的文字标签不区分这两种情况）；测试改为断言不出现 `USE TEMP B-TREE`（证明没有为
+  ORDER BY 物化临时排序结构），而不是断言不出现字面 `SCAN`。
+- **`position_mutation_intents` 与批次的关联路径**：核实为真——该表按 `execution_binding_id`（`models.py:3128`）
+  索引，没有到 `strategy_management_batches`/`_legs` 的外键。`_gather_exchange_traffic_for_audit` 的路径：
+  `StrategyManagementLeg.management_batch_id == batch_id` 取该批次的腿（**这些腿自己就带
+  `request_json`/`response_json`，见 `models.py` 该类定义**，不需要外部关联即可拿到批次自身的交易所往来）；
+  再经每条腿的 `execution_order_leg_id` -> `ExecutionOrderLeg.execution_binding_id`（`models.py:2129` 起）取
+  绑定集合，最后按绑定 id 查 `PositionMutationIntent`/`ExecutionEvent`。**已知粗糙点**：这个绑定级过滤会带上
+  同一绑定上其它批次的往来（一个绑定可能被多个批次管理过），本批未按时间窗进一步收紧，留给第 2 批或验收判断
+  是否需要加 `created_at`/`updated_at` 落在批次执行窗口内的过滤。
+- **保本分支能否只读预判**：`strategy_management_planner.py:855-865` 表明 `move_stop_to_break_even` 在**计划期**
+  无条件把 `effective_action` 设为 `break_even_by_market`（挂止损 vs 市价平的真正判定被推迟到执行期）；真正的
+  分支决策在 `strategy_management_executor.py:519` 的 `reserve_break_even_market_actions`，它要求批次已处于
+  `executing` 状态且会调用交易所客户端、写批次内部的"预留"状态——**不能在不提前把批次推进到 executing（也就是
+  已经在执行路径上）的前提下只读调用它**。结论：D5 无法在 G-D（执行之前）阶段只读预判，`predict_break_even_
+  branch` 因此恒返回 `"unknown_until_execution"`；实际走的分支由 `finalize_executing_proposals` 事后从批次/组件
+  终态读出（本批**未**实现"从终态反推分支"这一步的显式记录，只是把批次的 `reason_code`/`status` 记入
+  `result` 审计——见下方"偏离"）。
+- **脱敏正则的来源**：`oncall_codex.py:71-92`（`REDACTED`、`BOT_TOKEN_RE`、`KEYED_SECRET_RE`、`LONG_OPAQUE_RE`）；
+  本批不 import 该模块（会拖入 Codex runner 依赖面），三个正则常量与 `redact`/`redact_structure` 逐字复制到
+  `oncall_remediation_auto.py`，测试 `test_redaction_patterns_match_oncall_codex_verbatim` 断言两份 `.pattern`
+  字符串相等。
+
+**D3 的精确判据**（见 `check_d3_position_untouched` 的 docstring）：三条子检查，全部只读现有数据，不追加一次
+新的交易所调用（G-A/G-C 的快照指纹逐字比对已经是"重新读交易所并比对"的那道闸）——
+
+1. `evidence["protection_health"]`（仅当计划器发现过先前的保护事故时才存在）里每一条的 `classification` 必须是
+   `healthy_current_evidence`；该字段整体不存在时视为通过（没有先前事故可判）。
+2. `action.pos_ids` 里的每个仓位在账本 `load_account_protection_ownership` 里必须能查到 >= 1 条归属记录，
+   **除非** `action.action_kind == "full_exit"`（全平动作本身就是要让保护单不再需要存在）。
+3. `action.evidence["execution_binding_id"]` 对应的 `ExecutionBinding.last_exchange_status` 不能是
+   `"manual_closed_or_not_found_on_exchange"` 且其 `updated_at` 在消息发布之后——这是唯一已找到的、明确表示
+   "对账扫描判定该仓位是场外/人为关闭的"字段。
+
+**已知偏离与简化（按你的要求逐条列出）**
+
+1. **D5 恒 `unknown_until_execution`**：已在上面用 file:line 论证不可只读预判；`finalize_executing_proposals`
+   目前只把批次 `status`/`reason_code` 写入 `result` 审计，**未**额外解析"这次终态到底是挂了保本止损还是市价
+   平仓"这一具体分支并单独记入通知文案（规格 7 节要求"实际走了哪个分支"要在成功通知里写明）——这是本批对规格
+   的一个真实缺口，建议第 2 批或验收阶段用批次的 `effective_action`/组件类型（挂单 vs 平仓）反推。
+2. **执行后回读未按动作语义门控**：规格第 4 节末段与第 8 节要求"回读不符 -> `uncertain` 并暂停自动"。本批的
+   `finalize_executing_proposals` 只是**收集**往来记录写入审计，**没有**发起一次新的交易所快照并按
+   `full_exit`/`partial_take_profit`/`move_stop_to_break_even`/`adjust_stop_loss` 各自的预期效果去核对
+   （"pos_ids 是否真的消失"、"数量是否按比例减少"等）——这需要 `deepcoin_client_factory` 在 finalize 阶段可用
+   （目前 `finalize_executing_proposals` 签名里没有它）且要设计每种动作的核对规则与容差。这是本批**最大的一处
+   范围收缩**：核心库交付了审计骨架（`pre_apply`/`result` 两阶段、脱敏、裁剪、只 INSERT），但"回读并据此改变
+   `succeeded`→`uncertain`"这一严格门控留给第 2 批。
+3. **D3(c) 用 `ExecutionBinding.last_exchange_status` 而非 `execution_events` 的某个"人工"动作枚举**：
+   如上文核实，`execution_events.action` 没有现成的人工/外部枚举值，`last_exchange_status` 是更精确、已存在
+   的信号。
+4. **D8 的复合过滤未加专属索引**：`execution_origin='auto' AND <真实执行谓词> AND executing_at 在某范围`
+   在测试库上被 SQLite 规划为 `SCAN`（表本身预期体量约每两天一行，规格里其它类似计数——如 A11——也没有为
+   `execution_origin` 单独加索引）。未加新索引，认为风险与阶段 3 A11 相同量级；验收如认为需要，可加
+   `(execution_origin, executing_at)` 复合索引，属一行改动。
+5. **`_gather_exchange_traffic_for_audit` 按 `execution_binding_id` 而非时间窗收紧**：见上文"你核实过的事实"
+   的对应条目。
+6. **`auto_min_process_uptime_minutes`/`recent_loop_stall` 在本批全部由调用方注入**（`AutoHealthInputs`）；
+   真实的"进程启动时刻"与"事件循环卡顿"信号来自 worker 运行时状态，属第 2 批接线范围。
+
+**测试命令与结果**
+
+```
+uv run python -B -m pytest tests/test_oncall_remediation_auto.py tests/test_oncall_remediation*.py \
+  tests/test_position_management_remediation*.py tests/test_db_bootstrap.py -q
+# 338 passed
+uv run python -B -m pytest tests/test_web_app.py tests/test_telegram_bot_commands.py \
+  tests/test_oncall_architecture_boundary.py -q
+# 288 passed（未改动这三个文件之外的行为；boundary 测试文件本身加了一行新模块名）
+```
+
+新测试 `tests/test_oncall_remediation_auto.py`（39 个）覆盖：schema 迁移（新库、补列旧库、CHECK、新 SQL 形状
+EXPLAIN）；`effective_mode`/`auto_actions` 的三种降级/失效路径；D1（白名单命中/未命中/无原因）、D2（无后继/有
+后继）、D6（进程运行不足/事件循环卡顿/严重保护事故/健康）、D7（窗内/超窗）、D8（日执行上限/冷却/正常通过）、
+D9（启用/未启用）；auto 全通过直达 `executing` 且不发提案消息；G-D 未过降级为带按钮的提案且文案含"未自动执行"；
+单飞抢不到时降级而非阻塞；G-C 重跑 G-D 未过 -> `failed` 且不触发任一暂停/熔断；真实执行失败（`apply_fn` 抛异常）
+立即暂停自动（`control.auto_suspended`）且写 `pre_apply` 审计；`/auto_off`/`/auto_on` 的权限与效果，且不改
+`groups.yaml`/交易设置（前后快照相等）；`/audit` 对不存在提案的响应；审计表只 INSERT 的静态断言（同 `events`
+表的既有惯例）；脱敏正则与 `oncall_codex.py` 逐字相等、`redact`/`redact_structure` 实际生效。
+
+**待第 2 批 / 验收会话确认的清单**
+
+- 上面"已知偏离"1/2/4 是否需要在第 2 批补齐（尤其 2：严格的执行后回读门控是规格第 8 节熔断条件的一部分，
+  目前只有"真实执行 failed/uncertain"触发暂停，"回读不符"这条路径尚未真正生效）。
+- D3(c) 用 `last_exchange_status` 替代规格原文"执行事件类型"表述是否可接受。
+- `_gather_exchange_traffic_for_audit` 的绑定级粗粒度是否需要收紧到时间窗。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条
