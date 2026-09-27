@@ -1262,10 +1262,10 @@ phase4_status: code_complete_not_deployed
 phase4_branch: claude/codex-oncall-phase4      # 基于 origin/main 6c209b29，含生产 d3e29a79
 verification_level: L3                         # 已部署表加列 + 新审计表；新增无人点击的交易所写入入口
 default: "MODE 仍为 shadow（生产现状）；auto 需要 MODE=auto 且 AUTO_ACTIONS 非空且批准人已配置，任一缺失即表现为 shadow"
-rollback_commit: d3e29a798af57658ac4f256642545fc68f9be1c8
+rollback_commit: a856d4a71156381d375fed715086bab90aed6b7a   # rebase 后（原为 d3e29a79）
 ```
 
-提交：`6a35ef23` / `92cba390` 规格与裁定 → `a0b77c47` 第 1 批（核心库、G-D、schema）→ `badbf41f` 审阅修复 → `31b2945e` 第 2 批（回读门控、接线、端到端）→ `c30b08cb` 审阅修复。
+提交（rebase 前的 sha）：`6a35ef23` / `92cba390` 规格与裁定 → `a0b77c47` 第 1 批（核心库、G-D、schema）→ `badbf41f` 审阅修复 → `31b2945e` 第 2 批（回读门控、接线、端到端）→ `c30b08cb` 审阅修复。
 
 **指挥会话审阅中修掉的问题**
 
@@ -1278,6 +1278,7 @@ rollback_commit: d3e29a798af57658ac4f256642545fc68f9be1c8
    旧的更紧止损没撤掉、会先触发时，也会判不符。新增 `test_oncall_remediation_readback_shapes.py`（8 条，全部用生产行形状）。
 
 **全量**：`uv run python -B -m pytest -q` 在候选 `c30b08cb` 上 → **10054 passed / 4 skipped / 0 failed**（922 s）。其后只有本文档改动。
+**rebase 到保留期上线后的 main（生产 `a856d4a7`）后**：新候选代码 `a40df6d0`，全量 **10118 passed / 4 skipped / 0 failed**（838 s）；回滚点改为 `a856d4a7`。
 
 **已知限制（部署 / 放开前需知悉）**
 
@@ -1295,7 +1296,7 @@ rollback_commit: d3e29a798af57658ac4f256642545fc68f9be1c8
 - **部署前**：rebase 到 runner spool 修复会话（`claude/oncall-spool-perms`）落地后的 main，重跑受影响测试与全量；候选必须是当时生产 HEAD 的后代。
 - **env**：部署时**不写** `MODE=auto`、不写 `AUTO_ACTIONS`，生产保持 `MODE=shadow`。
 - **验证**：新列与新表存在；worker 日志中补救后台任务仍以 `effective_mode=shadow` 启动；只提示行为不变；`/auto_off` `/auto_on` `/audit` 对非批准人拒绝。
-- **回滚**：`/oncall_off` → 确认 `executing` 为 0 → `tg-deploy d3e29a79…` + 重启值守；新列与新表保留（旧代码不读）。
+- **回滚**：`/oncall_off` → 确认 `executing` 为 0 → `tg-deploy a856d4a7…` + 重启值守；新列与新表保留（旧代码不读）。
 
 #### 9.7.2 逐个放开（每一步单独确认，规格第 9 节）
 
