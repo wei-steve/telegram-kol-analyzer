@@ -340,6 +340,24 @@ class LoopLagMonitor:
     def uptime_seconds(self) -> float:
         return round(max(0.0, self._monotonic() - self._started_monotonic), 3)
 
+    def had_stall_since(self, cutoff: datetime) -> bool:
+        """Read-only: was there a recorded stall at/after ``cutoff``?
+
+        Used by the phase-4 auto-remediation D6 health check
+        (``oncall_remediation_auto.AutoHealthInputs.recent_loop_stall``) to
+        ask "any stall in the last N minutes" without this monitor knowing
+        anything about remediation. Pure read of ``_last_stall_at`` under
+        the same lock every other reader uses; never mutates state.
+        """
+
+        with self._lock:
+            last_stall_at = self._last_stall_at
+        if last_stall_at is None:
+            return False
+        cutoff_naive = cutoff.replace(tzinfo=None) if cutoff.tzinfo is not None else cutoff
+        last_naive = last_stall_at.replace(tzinfo=None) if last_stall_at.tzinfo is not None else last_stall_at
+        return last_naive >= cutoff_naive
+
     def snapshot(self) -> dict[str, Any]:
         with self._lock:
             samples = list(self._samples)

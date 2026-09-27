@@ -534,7 +534,17 @@ def test_text_command_routes_to_library(monkeypatch):
     assert seen["text"] == "/oncall_off"
 
 
-@pytest.mark.parametrize("text", ["/fix P1", "/oncall_off", "/oncall_on"])
+@pytest.mark.parametrize(
+    "text",
+    [
+        "/fix P1",
+        "/oncall_off",
+        "/oncall_on",
+        "/auto_off",
+        "/auto_on",
+        "/audit P1",
+    ],
+)
 def test_is_oncall_remediation_command_matches_only_these(text):
     assert tbc_module._is_oncall_remediation_command(text) is True
 

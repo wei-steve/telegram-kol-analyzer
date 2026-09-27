@@ -68,6 +68,12 @@ KNOWN_BLOCKING_CALLS = frozenset(
         "telegram_bot_commands.run_telegram_bot_command_loop"
         " -> _message_is_from_alert_chat",
         "telegram_bot_commands.run_telegram_bot_command_loop -> split_telegram_message",
+        # Phase 4 batch 2: /audit's report can exceed Telegram's single-
+        # message limit, so this loop splits it exactly like the sibling
+        # loop above already does -- same pure in-memory string function,
+        # no session/client/network.
+        "telegram_bot_commands.run_system_operator_bot_command_loop"
+        " -> split_telegram_message",
         "web_app.run_deepcoin_execution_reconcile_loop -> system_operator_bot_enabled",
         # Phase 3 wake accounting: reads an exception's own attributes and
         # appends one dict to an in-memory list. No session, no client, no

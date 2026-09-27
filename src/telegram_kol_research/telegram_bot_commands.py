@@ -447,6 +447,7 @@ async def _run_oncall_remediation_execution(
     starts. ``execute_proposal_locked`` serializes with any other in-flight
     execution in this process (spec 4.4 C1)."""
 
+    auto_health_provider = getattr(oncall_remediation, "auto_health_provider", None)
     try:
         outcome = await execute_proposal_locked(
             oncall_remediation.session_factory,
@@ -455,6 +456,7 @@ async def _run_oncall_remediation_execution(
             deepcoin_client_factory=oncall_remediation.deepcoin_client_factory,
             group_config=oncall_remediation.group_config_provider(),
             now_provider=oncall_remediation.now_provider,
+            auto_health=auto_health_provider() if auto_health_provider is not None else None,
         )
     except Exception:
         logger.exception(
@@ -512,7 +514,18 @@ async def _handle_oncall_remediation_text_command(
 
 
 def _is_oncall_remediation_command(text: str) -> bool:
-    return _command_name(text) in {"fix", "oncall_off", "oncall_on"}
+    # Phase 4 batch 2: /auto_off, /auto_on (spec section 8's one-click
+    # "只停自动"/its reversal) and /audit (spec section 6.2's read-only
+    # per-proposal倒查) all already exist as handle_text_command outcomes
+    # since phase-4 batch 1 -- this loop just never routed them here.
+    return _command_name(text) in {
+        "fix",
+        "oncall_off",
+        "oncall_on",
+        "auto_off",
+        "auto_on",
+        "audit",
+    }
 
 
 async def run_system_operator_bot_command_loop(
@@ -641,9 +654,14 @@ async def run_system_operator_bot_command_loop(
                                     },
                                 )
                             else:
-                                await _send_message(
-                                    client, base_url, chat_id=chat_id, text=response_text
-                                )
+                                # /audit can produce a report longer than
+                                # Telegram's single-message limit (spec 6.2:
+                                # up to 4000 chars) -- split rather than
+                                # truncate a second time.
+                                for chunk in split_telegram_message(response_text):
+                                    await _send_message(
+                                        client, base_url, chat_id=chat_id, text=chunk
+                                    )
                         continue
                     command_client_factory = (
                         deepcoin_client_factory

@@ -4731,6 +4731,15 @@ class OncallRemediationProposal(Base):
             "ix_oncall_remediation_proposals_telegram_message_id",
             "telegram_message_id",
         ),
+        # Phase 4 batch 2 (D8, status doc 9.5 deviation 4): supports the
+        # execution_origin='auto' AND executing_at-range query without a
+        # SCAN. Also created for existing databases via
+        # db.SQLITE_COMPAT_INDEXES.
+        Index(
+            "ix_oncall_remediation_proposals_auto_origin_executing_at",
+            "execution_origin",
+            "executing_at",
+        ),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

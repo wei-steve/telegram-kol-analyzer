@@ -300,6 +300,7 @@ from telegram_kol_research.config import (
     message_operation_supervisor_policy_status,
 )
 from telegram_kol_research.oncall_remediation import register_proposal_request
+from telegram_kol_research.oncall_remediation_auto import AutoHealthInputs
 from telegram_kol_research.oncall_remediation_runtime import (
     OncallRemediationWiring,
     run_oncall_remediation_background_loop,
@@ -1424,6 +1425,32 @@ def _notify_message_processing_queue_stall(app: FastAPI):
         await send_system_operator_bot_message(config=config, text=text)
 
     return _notify
+
+
+def _oncall_remediation_auto_health(app: FastAPI) -> AutoHealthInputs:
+    """Phase 4 batch 2 (spec section 4 row D6): real ``AutoHealthInputs`` for
+    G-D, built from this app instance's own process-start timestamp and its
+    ``loop_lag_monitor``'s recorded stalls -- see
+    ``oncall_remediation_auto.check_d6_system_health`` and
+    ``runtime_loop_health.LoopLagMonitor.had_stall_since``. Called fresh on
+    every use (never cached) so ``recent_loop_stall`` reflects the lookback
+    window as of the call, not as of process start."""
+
+    config = app.state.oncall_remediation_config
+    now = app.state.now_provider()
+    lookback_minutes = getattr(config, "auto_health_lookback_minutes", 10)
+    cutoff = now - timedelta(minutes=lookback_minutes)
+    recent_loop_stall = False
+    monitor = getattr(app.state, "loop_lag_monitor", None)
+    if monitor is not None:
+        try:
+            recent_loop_stall = monitor.had_stall_since(cutoff)
+        except Exception:  # noqa: BLE001 - fail closed: treat as "stalled" (blocks auto), not healthy
+            recent_loop_stall = True
+    return AutoHealthInputs(
+        process_started_at=app.state.process_started_at,
+        recent_loop_stall=recent_loop_stall,
+    )
 
 
 def _task_supervision(app: FastAPI, task_name: str) -> BackgroundTaskSupervision:
@@ -6233,6 +6260,9 @@ def create_web_app(
                                             lambda: app.state.group_config
                                         ),
                                         now_provider=app.state.now_provider,
+                                        auto_health_provider=(
+                                            lambda: _oncall_remediation_auto_health(app)
+                                        ),
                                     )
                                     if app.state.oncall_remediation_active
                                     else None
@@ -6277,6 +6307,9 @@ def create_web_app(
                             bot_config=app.state.system_operator_bot_config,
                             now_provider=app.state.now_provider,
                             wake_event=app.state.oncall_remediation_wake_event,
+                            auto_health_provider=(
+                                lambda: _oncall_remediation_auto_health(app)
+                            ),
                         ),
                         session_factory=app.state.session_factory,
                         runtime_config=app.state.runtime_incident_config,
@@ -7052,6 +7085,12 @@ def create_web_app(
     app.state.runtime_authority_status = RuntimeAuthorityStatus()
     app.state.deployment_entry_frozen = deployment_entry_frozen
     app.state.process_start_ticks = read_self_process_start_ticks()
+    # Phase 4 batch 2 (spec section 4 row D6): the real wall-clock moment
+    # this app instance's state was constructed -- ``process_start_ticks``
+    # above is jiffies from /proc/self/stat and cannot be turned into a
+    # wall-clock datetime without also reading the system boot time, so this
+    # is a separate, purpose-built timestamp for D6's "worker 启动已满 5 分钟".
+    app.state.process_started_at = app.state.now_provider()
     app.state.web_event_loop = None
     app.state.telegram_auth_loader = load_telegram_auth_config
     app.state.telegram_client_factory = create_telegram_client

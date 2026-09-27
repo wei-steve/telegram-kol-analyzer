@@ -1112,6 +1112,149 @@ D9（启用/未启用）；auto 全通过直达 `executing` 且不发提案消�
 - D3(c) 用 `last_exchange_status` 替代规格原文"执行事件类型"表述是否可接受。
 - `_gather_exchange_traffic_for_audit` 的绑定级粗粒度是否需要收紧到时间窗。
 
+### 9.6 阶段 4 第 2 批（2026-09-27，实现子代理，`claude/codex-oncall-phase4` 分支，**未合并未部署**）
+
+补齐第 1 批"待第 2 批确认"清单里的 1（部分）、2、3 三项，加上运行时接线、CLI、真实自动端到端测试。
+
+**A. 库内缺口**
+
+- **执行后回读门控**（`oncall_remediation.py`：`ReadbackResult`、
+  `_perform_post_execution_readback`、`_run_post_execution_readback_for_proposal`，接在
+  `finalize_executing_proposals` 判定批次 `succeeded` 之后）：新读一次交易所快照
+  （`_load_reconcile_snapshot`，复用 `execution_bindings.py` 现成的快照读取，instruments 取自提案自己的
+  `scope_json`），按动作核对：
+  - `full_exit`：`pos_ids` 全不在快照仓位里；
+  - `partial_take_profit`：仓位数量 ≈ 冻结在 `action_snapshot_json`（`_build_action_snapshot` 已经存的
+    `positions[].size`/`avg_entry_price`）里的执行前数量 ×(1−fraction)；容差取
+    `ExecutionBinding.payload_json` 里冻结的 `draft.contract_spec.min_quantity`（找不到就退到相对误差
+    `max(expected*1e-6, 1e-9)`，见 `_min_quantity_for_instrument`）；
+  - `move_stop_to_break_even`：仓位已消失（`market_closed`）或仓位仍在且存在一条触发价 ≈ 入场价（冻结的
+    `avg_entry_price`）的止损单（`stop_placed`）——按 pending trigger 订单的 `posId`/`slTriggerPx` 判断，
+    **不读仓位行 `slTriggerPx`**（ARCHITECTURE 4.8）；哪个分支被实际走过第一次能被观测到（第 1 批的已知
+    缺口 #1：`predict_break_even_branch` 只能在执行前给出 `unknown_until_execution`，见该函数 docstring 的
+    file:line 论证）；
+  - `adjust_stop_loss`：存在触发价 ≈ `expected_effect.stop_loss` 的止损单。
+  - 快照 `errors` 非空、无法解析、或动作类型不认得 -> `unknown`。**偏离规格**：规格原文只写"回读不符 ->
+    uncertain"，本批把 `unknown` 也一并降级为 `uncertain`（而非默默当作确认），理由是 AGENTS.md
+    「Treat an incomplete external query as unknown, never as zero or healthy」这条项目级纪律；`mismatch`
+    与 `unknown` 都会：把批次终态改判为 `uncertain`，`execution_origin='auto'` 立即 `_suspend_auto`（原因
+    `readback_mismatch`/`readback_unknown`），人工执行按阶段 3 熔断计数照旧。回读的预期/实际/是否达成、
+    分支写入 `result` 审计的 `readback` 字段；成功通知文案按分支写"挂保本止损，回读确认"/"市价平仓，回读确认"。
+  - 传入 `deepcoin_client_factory=None`（`finalize_executing_proposals` 的新可选参数）时整段回读跳过——保持
+    每一个尚未升级到传 factory 的既有调用方行为不变。
+- **往来记录时间窗**：`_gather_exchange_traffic_for_audit` 新增 `window_start`/`window_end`，`finalize_executing_proposals`
+  传 `[proposal.executing_at, now + 1 分钟]`。`position_mutation_intents`/`execution_events` 都没有
+  `management_batch_id` 外键，精确到批次级的关联点只有 `strategy_management_legs` 自身的
+  `request_json`/`response_json`（原样保留，不受窗口过滤）；绑定级的往来只能靠时间窗收紧，不能靠 id 精确
+  关联——这是延续第 1 批 file:line 已经核实过的表结构限制，本批把粗粒度收紧到窗口而非消除它。
+- **D8 索引**：新增复合索引 `ix_oncall_remediation_proposals_auto_origin_executing_at (execution_origin,
+  executing_at)`（`models.py` 的 `__table_args__` + `db.py` 的 `SQLITE_COMPAT_INDEXES`，新库/旧库都建）。
+  `db.py._backfill_sqlite_indexes` 新增一个"索引所需列存在性"守卫
+  （`_SQLITE_COMPAT_INDEX_REQUIRED_COLUMNS`），只对这一条索引生效——`executing_at` 不在任何 ADD COLUMN 补丁里
+  （假定所有真实表都在建表时就有），一个手搭的、连 `executing_at` 都没有的极简测试表因此会被跳过而不是报错；
+  真实数据库不受影响。
+- **G-D/后台任务异常计数**（spec 8 "连续 3 次 -> shadow"，第 1 批未实现）：`_note_auto_internal_error`/公开的
+  `note_auto_background_outcome` 复用 `OncallRemediationControl.auto_consecutive_errors`（第 1 批已加列但
+  未使用）；在 `compute_requested_proposal`/`execute_proposal` 的两处 `run_gate_d` 调用点，检查
+  `gate_d.checks` 里是否出现 `d_internal_error`（`run_gate_d._run` 捕获异常时写的合成检查），出现记一次、
+  ≥3 立即 `_suspend_auto`；正常一轮（无论通过还是普通拒绝）清零计数。后台循环（下面 B 节）在
+  compute/execute/finalize 各自的 `except`/成功分支里也调用同一个公开函数，覆盖"后台任务异常"这一半。
+
+**B. 运行时接线**
+
+- `oncall_remediation_runtime.py`：`OncallRemediationWiring` 新增可选 `auto_health_provider`；
+  `_process_one_requested_proposal` 把它转成 `AutoHealthInputs` 传给 `compute_requested_proposal`，
+  outcome 带 `auto_execute_proposal_id` 时调用 `execute_proposal_locked`（同一把进程锁，同阶段 3 C1）执行，
+  成功后若有文案发通知；`execute_proposal_locked` 新增 `auto_health` 转发参数。
+  `run_oncall_remediation_background_loop` 新增同名参数并传给两处调用点，`finalize_executing_proposals` 调用
+  改传 `deepcoin_client_factory=deepcoin_client_factory`（回读需要它）。
+- `web_app.py`：新增 `app.state.process_started_at`（进程状态构造时刻的真实 wall-clock，`process_start_ticks`
+  是 jiffies 换不回时间，专门加一个字段）；新增 `_oncall_remediation_auto_health(app)`，用
+  `app.state.process_started_at` 与 `app.state.loop_lag_monitor.had_stall_since(now - lookback)` 组出
+  `AutoHealthInputs`；`system_operator_bot_command_task`（`OncallRemediationWiring`）与
+  `oncall_remediation_background_task`（`run_oncall_remediation_background_loop`）两处调用都接上
+  `auto_health_provider=lambda: _oncall_remediation_auto_health(app)`。
+  `runtime_loop_health.LoopLagMonitor` 新增只读方法 `had_stall_since(cutoff)`（读现有 `_last_stall_at`，不加
+  新状态）。
+- `telegram_bot_commands.py`：`_is_oncall_remediation_command` 加入 `auto_off`/`auto_on`/`audit`
+  （处理函数 `handle_text_command` 第 1 批已经实现，只是没被路由到）；`_run_oncall_remediation_execution`
+  转发 `auto_health_provider`；`/audit` 的长回复改用既有 `split_telegram_message` 分段发送（同 `/fix`/系统
+  操作命令回路已经在用的同一个函数），`test_runtime_event_loop_blocking_census.py` 补了一条对应的允许项
+  （纯内存字符串函数，同阶段 3 那条一样的理由）。
+- `cli.py`：新增只读命令 `oncall-remediation-audit <提案号> [--database-path]`，用
+  `create_existing_session_factory`（不跑迁移、不写）+ 新增的公开函数
+  `oncall_remediation.render_remediation_audit_report` 打印报告——与 `/audit` 是同一份实现，测试断言两者
+  输出逐字相等。
+
+**C. 真实端到端测试**（新文件 `tests/test_oncall_remediation_auto_end_to_end.py`，全部走真实计划器 + 真实
+`execute_management_batch`，只按阶段 3 端到端同样的方式禁用 `plan_strategy_management_batch` 内部的
+`reconcile_deepcoin_execution_bindings`；D1 用 `target_strategy_binding_visibility_retry_expired` 这个白名单
+原因，复用 `tests/test_oncall_remediation_auto.py::_mark_transient_reason`）：
+
+1. `full_exit` 自动：register -> compute（G-A+G-D 全过，CAS 直达 executing，`should_send=False`）->
+   execute_proposal（真实 apply，真实一次 `place_order`）-> 真实 `reconcile_strategy_management_batches` ->
+   finalize（真实回读，`outcome=confirmed`）-> 提案 `succeeded`；断言两行审计（`pre_apply`/`result`）字段齐全、
+   `result` 审计里 `readback.outcome=="confirmed"`、`exchange_traffic` 非空；通知文案含"第 1 笔"提示；
+   `control.auto_suspended` 仍为 `False`。**全真实**，无任何打桩。
+2. `move_stop_to_break_even` 自动，两分支各一条，**全真实**：
+   - 挂保本止损分支（价格未越过保本价）：批次在 `apply()` 内同步 `succeeded`（同阶段 3
+     `test_move_stop_to_break_even_real_pipeline_reaches_succeeded` 的已证行为），回读看到该 posId 下
+     `slTriggerPx` ≈ 入场价的挂单，通知含"挂保本止损，回读确认"。
+   - 市价平仓分支（价格已越过保本价，用户裁定第 5 条允许）：这条走的是与 `full_exit` 相同的平仓路径，批次
+     先 `reconciling`（**不是**像挂单分支那样同步 `succeeded`——这是本批真实运行才发现的行为差异，之前只
+     假设两分支都同步结算），需要一次真实 `reconcile_strategy_management_batches` 才到 `succeeded`；回读
+     看到仓位已消失，通知含"市价平仓，回读确认"。
+3. 回读不符 -> `uncertain` + 立即暂停自动 + 通知：真实平仓成功后，人为往假交易所的 `client.positions`
+   里塞回一条同 `posId` 的仓位（模拟对账竞态/交易所侧回滚），`finalize_executing_proposals` 的真实回读发现
+   仍开着 -> `uncertain`，`control.auto_suspended=True`，通知含"回读不符"/"结果未知"与"自动补救已暂停"；紧接
+   着为同一场景建一个新案件，`compute_requested_proposal` 走真实 G-A/G-D，因 `auto_suspended` 降级为带按钮
+   的提案（文案含"未自动执行"），零交易所写入。
+4. `/auto_on` 恢复：`handle_text_command` 真实执行 `/auto_on` 后，一次全新 `full_exit` 案件真实走完整链路到
+   `succeeded`。
+5. apply 提升为 live 后失败：只在 `position_management_remediation` 模块把
+   `execute_management_batch`（真实执行器函数）替换成一个抛异常的桩——这是本文件唯一的打桩点，理由：
+   `apply_position_management_remediation_action` 内部先 `plan_strategy_management_batch`（把批次行写成
+   `live`）再调用 `execute_management_batch`，要让批次行已存在、随后再失败，除了在这一层打桩没有更轻的办法
+   真实触发 `_classify_apply_exception` 判定为 `uncertain` 的路径。断言 1 次即暂停（`auto_suspend_reason
+   == "real_execution_uncertain"`），不是 2 次。
+6. 休眠：`shadow`/`approve`/`auto`+空 `auto_actions` 三种参数化，**全真实**跑一次
+   `compute_requested_proposal`，断言 `auto_execute_proposal_id is None` 且 `client` 的 `close_calls`/
+   `set_calls`/两种撤单调用全为空列表。
+7. 运行时层（`test_background_loop_executes_auto_proposal_exactly_once_without_blocking`）：仿阶段 3
+   `test_execute_proposal_locked_does_not_block_the_event_loop` 的打点法，在 `oncall_remediation_runtime`
+   模块边界打桩 `compute_requested_proposal`/`execute_proposal`（隔离接线行为本身，真实规划器/执行器已在上面
+   1–6 项跑过），断言 `_process_one_requested_proposal` 对一个带 `auto_execute_proposal_id` 的 outcome 只调用
+   一次 `execute_proposal_locked`、心跳最大间隔 < 0.2s（同阶段 3 判据）。
+8. CLI 与 `/audit` 输出逐字相等（`test_cli_oncall_remediation_audit_matches_library_report`）。
+9. D8 复合索引 `EXPLAIN QUERY PLAN` 不含 `SCAN`（`test_d8_daily_cap_query_uses_composite_index_not_a_scan`）。
+
+`tests/test_runtime_loop_health.py` 补一条 `had_stall_since` 单测；`tests/test_oncall_remediation_wiring.py`
+的 `_is_oncall_remediation_command` 参数化补了 `/auto_off`/`/auto_on`/`/audit P1` 三条。
+
+**测试命令与结果**
+
+```
+uv run python -B -m pytest tests/test_oncall_remediation_auto*.py tests/test_oncall_remediation*.py \
+  tests/test_position_management_remediation*.py tests/test_telegram_bot_commands.py tests/test_web_app.py \
+  tests/test_runtime_event_loop_blocking_census.py tests/test_runtime_role_selection.py -q
+# 667 passed
+uv run python -B -m pytest tests/test_runtime_loop_health.py -q
+# 9 passed
+```
+
+**已知偏离与遗留**
+
+1. `unknown` 回读与 `mismatch` 同等处理（降级为 `uncertain`）——如上文 A 节所述，规格原文字面只提
+   "回读不符"；本批认为项目既有的 fail-closed 纪律更适用，但这是需要指挥会话确认的一处解读选择。
+2. `_gather_exchange_traffic_for_audit` 仍是绑定级过滤 + 时间窗二次收紧，**不是**精确到批次的关联——底层表
+   结构没有能精确关联的外键（见上文 A 节），这是结构性限制，不是本批遗留的实现缺口。
+3. `partial_take_profit` 回读的容差来源（合同最小下单量 vs 相对误差兜底）未在真实交易所样本上验证过——
+   `build_ready_remediation_target` 的冻结 draft 里 `min_quantity` 是测试用假值（`1`），真实生产的合约规格
+   是否总能在 `ExecutionBinding.payload_json` 里找到，需要在只提示期观察真实样本时核对。
+4. D9 证据门槛（每动作 ≥3 条只提示样本零错判）与逐步放开顺序（第 9 节）不受本批影响，仍是运行前的人工判断，
+   本批未新增任何绕过它的路径。
+5. 未连服务器、未 push、未部署；`AUTO_ACTIONS` 默认仍为空（休眠）。
+
 ## 10. 外部送来的案例（2026-09-26）
 
 `docs/2026-09-26-silent-stall-case-note.md`：陈哥群 BTC 多单 lane 被两条

@@ -17,6 +17,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import re
 import secrets
 from dataclasses import dataclass
@@ -27,7 +28,9 @@ from sqlalchemy import exists, func, or_, update
 from sqlalchemy.orm import aliased, sessionmaker
 
 from telegram_kol_research.config import OncallRemediationConfig
+from telegram_kol_research.execution_bindings import _load_reconcile_snapshot
 from telegram_kol_research.models import (
+    ExecutionBinding,
     MessageInstructionItem,
     OncallRemediationAudit,
     OncallRemediationControl,
@@ -174,6 +177,30 @@ class FinalizeOutcome:
     breaker_tripped: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class ReadbackResult:
+    """Post-execution exchange readback (spec section 4 tail / section 8).
+
+    ``outcome`` is ``"confirmed"`` (expected effect observed on a fresh
+    snapshot), ``"mismatch"`` (snapshot read fine but does not match), or
+    ``"unknown"`` (snapshot incomplete, or nothing to compare against --
+    treated the same as ``"mismatch"`` by the caller: this repository's
+    fail-closed convention never treats an incomplete read as healthy).
+    ``"skipped"`` means no ``deepcoin_client_factory`` was supplied to
+    ``finalize_executing_proposals`` -- readback is a no-op then, not a
+    gate (keeps every caller that predates this change unaffected).
+    ``branch`` is only meaningful for ``move_stop_to_break_even``
+    (``"stop_placed"`` | ``"market_closed"``), which is otherwise
+    ``predict_break_even_branch``'s ``"unknown_until_execution"`` right up
+    to this point -- see oncall_remediation_auto.py's D5 docstring and
+    docs/codex-oncall-status.md 9.5 known gap #1.
+    """
+
+    outcome: str
+    detail: dict[str, Any]
+    branch: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Small shared helpers
 # ---------------------------------------------------------------------------
@@ -295,6 +322,15 @@ def _append_audit(session, proposal_id: int, *, phase: str, payload: dict[str, A
             truncated=truncated,
         )
     )
+
+
+def render_remediation_audit_report(session_factory: sessionmaker, *, proposal_id: int) -> str:
+    """Public entry point for the read-only ``oncall-remediation-audit`` CLI
+    command (cli.py) -- identical to what ``/audit P<n>`` sends, so the two
+    "倒查" paths (Telegram, CLI) can never drift. Thin wrapper kept so the
+    CLI module never has to reach into this module's private helpers."""
+
+    return _render_audit_report(session_factory, proposal_id=proposal_id)
 
 
 def _render_audit_report(session_factory: sessionmaker, *, proposal_id: int) -> str:
@@ -1121,6 +1157,11 @@ def compute_requested_proposal(
                         at=now,
                     )
                 session.commit()
+            _note_auto_internal_error(
+                session_factory,
+                occurred=any(check.reason_code == "d_internal_error" for check in gate_d.checks),
+                now=now,
+            )
 
         snapshot = _build_action_snapshot(action)
         token1: str | None = None
@@ -1811,6 +1852,11 @@ def execute_proposal(
                 chat_id=gate.raw_message.chat_id if gate.raw_message is not None else None,
                 exclude_proposal_id=proposal_id,
             )
+            _note_auto_internal_error(
+                session_factory,
+                occurred=any(check.reason_code == "d_internal_error" for check in gate_d.checks),
+                now=now,
+            )
             if not gate_d.passed:
                 return _fail(
                     "failed", f"auto_gate_changed:{gate_d.first_failure_reason}", check="D"
@@ -1914,7 +1960,255 @@ _BATCH_IN_FLIGHT_STATUSES = frozenset(
 )
 
 
-def _gather_exchange_traffic_for_audit(session, *, batch_id: int | None) -> list[dict[str, Any]]:
+def _price_close(actual: Any, expected: float, *, rel_tol: float = 1e-4, abs_tol: float = 1e-6) -> bool:
+    try:
+        return math.isclose(float(actual), float(expected), rel_tol=rel_tol, abs_tol=abs_tol)
+    except (TypeError, ValueError):
+        return False
+
+
+def _min_quantity_for_instrument(session, *, strategy_instance_id: str | None) -> float | None:
+    """Best-effort contract-spec ``min_quantity`` for a partial-take-profit
+    readback tolerance (spec batch-2 item A "容差取该合约最小下单数量").
+
+    The only place a remediated binding's contract spec survives is the
+    frozen order draft in ``ExecutionBinding.payload_json`` (see
+    ``tests/oncall_remediation_fixtures.py``'s ``build_ready_remediation_target``
+    docstring: "resolve_existing_position_contract_spec...tries this before
+    ever consulting contract_spec_provider"). No live provider call is made
+    here -- this is a read-only audit comparison, not an order-sizing
+    decision. Returns ``None`` (falls back to the relative-tolerance rule)
+    when the draft or its contract spec is absent/malformed.
+    """
+
+    if not strategy_instance_id:
+        return None
+    binding = (
+        session.query(ExecutionBinding)
+        .filter(ExecutionBinding.strategy_instance_id == str(strategy_instance_id))
+        .filter(ExecutionBinding.venue == "deepcoin")
+        .first()
+    )
+    if binding is None or not binding.payload_json:
+        return None
+    try:
+        payload = json.loads(binding.payload_json)
+        value = (payload.get("draft") or {}).get("contract_spec", {}).get("min_quantity")
+        return float(value) if value is not None else None
+    except (TypeError, ValueError, AttributeError, json.JSONDecodeError):
+        return None
+
+
+def _perform_post_execution_readback(
+    session_factory: sessionmaker,
+    *,
+    deepcoin_client,
+    action_kind: str | None,
+    expected_effect: dict[str, Any],
+    pos_ids: tuple[str, ...],
+    pre_execution_positions: list[dict[str, Any]],
+    scope: RemediationScope | None,
+    strategy_instance_id: str | None,
+) -> ReadbackResult:
+    """Read a fresh exchange snapshot and check it against the action's
+    expected effect (spec section 4 tail / section 8's "回读不符 ->
+    uncertain"). Every branch below reads only the same snapshot this call
+    fetches once -- never the exchange calls the batch itself already made
+    (those already live in ``_gather_exchange_traffic_for_audit``).
+    """
+
+    if scope is None or not scope.instruments or not pos_ids:
+        return ReadbackResult("unknown", {"reason": "no_scope_for_readback"})
+    try:
+        snapshot = _load_reconcile_snapshot(deepcoin_client, instruments=set(scope.instruments))
+    except Exception as exc:  # noqa: BLE001 - fail-closed: a read error is "unknown", never healthy
+        return ReadbackResult("unknown", {"reason": f"snapshot_error:{type(exc).__name__}"})
+    if snapshot.errors:
+        return ReadbackResult("unknown", {"reason": "snapshot_incomplete", "errors": dict(snapshot.errors)})
+
+    positions_by_pos: dict[str, dict[str, Any]] = {}
+    for row in snapshot.positions:
+        pid = row.get("posId") or row.get("pos_id")
+        if pid is not None:
+            positions_by_pos[str(pid)] = row
+    pending_by_pos: dict[str, list[dict[str, Any]]] = {}
+    for row in snapshot.pending_trigger_orders:
+        pid = row.get("posId") or row.get("pos_id")
+        if pid is not None:
+            pending_by_pos.setdefault(str(pid), []).append(row)
+
+    with session_factory() as session:
+        if action_kind == "full_exit":
+            still_open = [pid for pid in pos_ids if str(pid) in positions_by_pos]
+            if still_open:
+                return ReadbackResult("mismatch", {"expected": "all_closed", "still_open": still_open})
+            return ReadbackResult("confirmed", {"expected": "all_closed", "still_open": []})
+
+        if action_kind == "partial_take_profit":
+            try:
+                fraction_value = float(expected_effect.get("fraction"))
+            except (TypeError, ValueError):
+                return ReadbackResult("unknown", {"reason": "fraction_unavailable"})
+            mismatches: list[dict[str, Any]] = []
+            for pid in pos_ids:
+                before_row = next(
+                    (r for r in pre_execution_positions if str(r.get("pos_id")) == str(pid)),
+                    None,
+                )
+                try:
+                    before_qty = float(before_row.get("size")) if before_row else None
+                except (TypeError, ValueError):
+                    before_qty = None
+                if before_qty is None:
+                    mismatches.append({"pos_id": pid, "reason": "no_pre_execution_size"})
+                    continue
+                expected_after = before_qty * (1.0 - fraction_value)
+                after_row = positions_by_pos.get(str(pid))
+                try:
+                    after_qty = float(after_row.get("pos") or after_row.get("size") or 0) if after_row else 0.0
+                except (TypeError, ValueError):
+                    mismatches.append({"pos_id": pid, "reason": "live_size_invalid"})
+                    continue
+                min_qty = _min_quantity_for_instrument(session, strategy_instance_id=strategy_instance_id)
+                tolerance = min_qty if min_qty else max(abs(expected_after) * 1e-6, 1e-9)
+                if abs(after_qty - expected_after) > tolerance:
+                    mismatches.append(
+                        {
+                            "pos_id": pid,
+                            "expected_after": expected_after,
+                            "actual_after": after_qty,
+                            "tolerance": tolerance,
+                        }
+                    )
+            if mismatches:
+                return ReadbackResult("mismatch", {"mismatches": mismatches})
+            return ReadbackResult("confirmed", {"fraction": fraction_value})
+
+        if action_kind == "move_stop_to_break_even":
+            # D5 (oncall_remediation_auto.predict_break_even_branch): the
+            # branch is only decided inside execute_management_batch's
+            # reserve_break_even_market_actions, which this repository
+            # cannot replay read-only ahead of execution -- see that
+            # function's docstring and status doc 9.5 known gap #1. This is
+            # the first point that can observe which branch was actually
+            # taken.
+            entry_price = None
+            if pre_execution_positions:
+                try:
+                    entry_price = float(pre_execution_positions[0].get("avg_entry_price"))
+                except (TypeError, ValueError):
+                    entry_price = None
+            still_open = [pid for pid in pos_ids if str(pid) in positions_by_pos]
+            if not still_open:
+                return ReadbackResult("confirmed", {"branch": "market_closed"}, branch="market_closed")
+            if entry_price is None:
+                return ReadbackResult("unknown", {"reason": "entry_price_unavailable"})
+            for pid in still_open:
+                triggers = pending_by_pos.get(str(pid), [])
+                matched = any(
+                    _price_close(row.get("slTriggerPx"), entry_price)
+                    for row in triggers
+                    if row.get("slTriggerPx") not in (None, "")
+                )
+                if not matched:
+                    return ReadbackResult(
+                        "mismatch",
+                        {
+                            "branch": "stop_placed",
+                            "pos_id": pid,
+                            "entry_price": entry_price,
+                            "pending_triggers": triggers,
+                        },
+                        branch="stop_placed",
+                    )
+            return ReadbackResult(
+                "confirmed", {"branch": "stop_placed", "entry_price": entry_price}, branch="stop_placed"
+            )
+
+        if action_kind == "adjust_stop_loss":
+            try:
+                target_price = float(expected_effect.get("stop_loss"))
+            except (TypeError, ValueError):
+                return ReadbackResult("unknown", {"reason": "target_stop_unavailable"})
+            mismatches = []
+            for pid in pos_ids:
+                triggers = pending_by_pos.get(str(pid), [])
+                matched = any(
+                    _price_close(row.get("slTriggerPx"), target_price)
+                    for row in triggers
+                    if row.get("slTriggerPx") not in (None, "")
+                )
+                if not matched:
+                    mismatches.append({"pos_id": pid, "target": target_price, "pending_triggers": triggers})
+            if mismatches:
+                return ReadbackResult("mismatch", {"mismatches": mismatches})
+            return ReadbackResult("confirmed", {"target": target_price})
+
+    return ReadbackResult("unknown", {"reason": f"unsupported_action_kind:{action_kind}"})
+
+
+def _run_post_execution_readback_for_proposal(
+    session_factory: sessionmaker,
+    *,
+    proposal: OncallRemediationProposal,
+    deepcoin_client_factory: Callable[[], Any] | None,
+) -> ReadbackResult:
+    """Reconstruct the action's expected effect from the proposal's own
+    frozen ``action_snapshot_json``/``scope_json`` (never re-plans -- this is
+    a read-only check of what already happened, not a re-derivation of what
+    should happen) and run ``_perform_post_execution_readback`` against a
+    fresh exchange snapshot."""
+
+    if deepcoin_client_factory is None:
+        return ReadbackResult("skipped", {"reason": "no_client_factory"})
+    try:
+        snapshot_data = json.loads(proposal.action_snapshot_json or "{}")
+    except (TypeError, ValueError):
+        snapshot_data = {}
+    action_kind = snapshot_data.get("action_kind") or proposal.action_kind
+    pos_ids = tuple(str(value) for value in (snapshot_data.get("pos_ids") or []))
+    expected_effect = snapshot_data.get("expected_effect") or {}
+    pre_positions = snapshot_data.get("positions") or []
+    strategy_instance_id = snapshot_data.get("strategy_instance_id")
+    scope: RemediationScope | None = None
+    if proposal.scope_json:
+        try:
+            scope = RemediationScope.from_json(proposal.scope_json)
+        except (TypeError, ValueError, KeyError):
+            scope = None
+    if not pos_ids or scope is None:
+        return ReadbackResult("unknown", {"reason": "no_snapshot_for_readback"})
+    try:
+        client = deepcoin_client_factory()
+    except Exception as exc:  # noqa: BLE001 - fail-closed
+        return ReadbackResult("unknown", {"reason": f"client_factory_error:{type(exc).__name__}"})
+    try:
+        return _perform_post_execution_readback(
+            session_factory,
+            deepcoin_client=client,
+            action_kind=action_kind,
+            expected_effect=expected_effect,
+            pos_ids=pos_ids,
+            pre_execution_positions=pre_positions,
+            scope=scope,
+            strategy_instance_id=strategy_instance_id,
+        )
+    finally:
+        close = getattr(client, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:  # noqa: BLE001 - best-effort cleanup
+                pass
+
+
+def _gather_exchange_traffic_for_audit(
+    session,
+    *,
+    batch_id: int | None,
+    window_start: datetime | None = None,
+    window_end: datetime | None = None,
+) -> list[dict[str, Any]]:
     """Best-effort, read-only collection of this batch's exchange requests/
     responses for the audit trail (spec 6.2 "交易所往来").
 
@@ -1923,12 +2217,16 @@ def _gather_exchange_traffic_for_audit(session, *, batch_id: int | None) -> list
     ``execution_binding_id``/``strategy_instance_id`` instead -- see
     models.py:3090-3130/3173-3203), so this joins through
     ``strategy_management_legs``' own ``execution_binding_id`` for the given
-    batch and takes everything on that binding, which is the same
-    binding-scoped join the phase-3 code already uses elsewhere in this
-    module (e.g. ``_classify_apply_exception``'s ``raw_message_id`` filter is
-    the batch-level analogue). This is intentionally coarse -- it can include
-    unrelated mutation intents/events on a binding that has managed more than
-    one batch -- and is documented as a known limitation.
+    batch and takes everything on that binding within
+    ``[window_start, window_end]`` (batch 2: tightened from the phase-4
+    batch-1 binding-wide collection -- see docs/codex-oncall-status.md 9.5
+    "已知偏离" item 5 -- to the proposal's own
+    ``executing_at``..``finished_at + 1 minute`` window, which is the
+    precise relation available: neither table carries a
+    ``management_batch_id``/leg id to join on exactly, and the window is
+    still narrow enough to exclude another batch's traffic on a
+    multiply-managed binding). Passing no window keeps the old unbounded
+    behaviour (only used by call sites that have no proposal timing yet).
     """
 
     from telegram_kol_research.models import (
@@ -1965,12 +2263,14 @@ def _gather_exchange_traffic_for_audit(session, *, batch_id: int | None) -> list
         if order_leg is not None and order_leg.execution_binding_id is not None:
             binding_ids.add(int(order_leg.execution_binding_id))
     for binding_id in binding_ids:
-        for intent in (
-            session.query(PositionMutationIntent)
-            .filter(PositionMutationIntent.execution_binding_id == binding_id)
-            .order_by(PositionMutationIntent.id)
-            .all()
-        ):
+        intent_query = session.query(PositionMutationIntent).filter(
+            PositionMutationIntent.execution_binding_id == binding_id
+        )
+        if window_start is not None:
+            intent_query = intent_query.filter(PositionMutationIntent.created_at >= window_start)
+        if window_end is not None:
+            intent_query = intent_query.filter(PositionMutationIntent.created_at <= window_end)
+        for intent in intent_query.order_by(PositionMutationIntent.id).all():
             rows.append(
                 {
                     "kind": "position_mutation_intent",
@@ -1981,12 +2281,14 @@ def _gather_exchange_traffic_for_audit(session, *, batch_id: int | None) -> list
                     "response": getattr(intent, "response_json", None),
                 }
             )
-        for event in (
-            session.query(ExecutionEvent)
-            .filter(ExecutionEvent.execution_binding_id == binding_id)
-            .order_by(ExecutionEvent.id)
-            .all()
-        ):
+        event_query = session.query(ExecutionEvent).filter(
+            ExecutionEvent.execution_binding_id == binding_id
+        )
+        if window_start is not None:
+            event_query = event_query.filter(ExecutionEvent.created_at >= window_start)
+        if window_end is not None:
+            event_query = event_query.filter(ExecutionEvent.created_at <= window_end)
+        for event in event_query.order_by(ExecutionEvent.id).all():
             rows.append(
                 {
                     "kind": "execution_event",
@@ -2006,6 +2308,7 @@ def finalize_executing_proposals(
     config: OncallRemediationConfig,
     now: datetime,
     follow_timeout: timedelta = timedelta(minutes=15),
+    deepcoin_client_factory: Callable[[], Any] | None = None,
 ) -> list[FinalizeOutcome]:
     """Read (never rerun) the exchange batch each executing proposal produced.
 
@@ -2015,6 +2318,22 @@ def finalize_executing_proposals(
     executor's own docstring "exchange truth closes positions later" --
     ``execute_management_batch`` itself never blocks on that closure, so this
     function is the piece that eventually reads it back).
+
+    Phase 4 batch 2 (spec section 4 tail / section 8, status doc 9.5 known
+    gap #2): a batch that just settled ``succeeded`` gets one additional
+    read-only exchange snapshot compared against the action's expected
+    effect (``_run_post_execution_readback_for_proposal``). A mismatch *or*
+    an incomplete/unavailable read downgrades the proposal to ``uncertain``
+    -- this repository's fail-closed convention (AGENTS.md "Treat an
+    incomplete external query as unknown, never as zero or healthy") is
+    read as applying here too, so "unknown" is not silently accepted as
+    success even though the spec's own wording ("回读不符") only names the
+    mismatch case by name; this is a deliberate, documented deviation.
+    Passing no ``deepcoin_client_factory`` skips readback entirely (state
+    is decided by batch status alone, exactly like before this batch) --
+    every real caller (the runtime background loop, the new auto
+    end-to-end tests) passes one; only pre-existing tests that construct
+    this call without it keep the old behaviour unchanged.
     """
 
     now = _naive_utc(now)
@@ -2047,6 +2366,16 @@ def finalize_executing_proposals(
                 state = "uncertain"
 
             proposal_id_val = int(proposal.id)
+            readback: ReadbackResult | None = None
+            if state == "succeeded":
+                readback = _run_post_execution_readback_for_proposal(
+                    session_factory,
+                    proposal=proposal,
+                    deepcoin_client_factory=deepcoin_client_factory,
+                )
+                if readback.outcome in {"mismatch", "unknown"}:
+                    state = "uncertain"
+
             proposal.state = state
             proposal.finished_at = now
             proposal.updated_at = now
@@ -2054,17 +2383,36 @@ def finalize_executing_proposals(
                 "batch_status": str(batch.status) if batch is not None else None,
                 "reason_code": str(batch.reason_code) if batch is not None and batch.reason_code else None,
             }
+            if readback is not None and readback.outcome in {"mismatch", "unknown"}:
+                detail["reason_code"] = detail.get("reason_code") or f"readback_{readback.outcome}"
             proposal.result_json = _bounded_json(detail, limit=4096)
             session.add(proposal)
             _append_event(session, proposal_id_val, actor="worker", event="finalize", outcome=state, detail=detail, at=now)
+            if readback is not None:
+                _append_event(
+                    session,
+                    proposal_id_val,
+                    actor="worker",
+                    event="readback",
+                    outcome=readback.outcome,
+                    detail={"branch": readback.branch, **readback.detail} if readback.branch else readback.detail,
+                    at=now,
+                )
             breaker_message = _apply_outcome_to_breaker(session, state)
             if state in {"failed", "uncertain"} and proposal.execution_origin == "auto":
-                auto_message = _suspend_auto(session, reason=f"real_execution_{state}")
+                reason = (
+                    f"readback_{readback.outcome}"
+                    if readback is not None and readback.outcome in {"mismatch", "unknown"}
+                    else f"real_execution_{state}"
+                )
+                auto_message = _suspend_auto(session, reason=reason)
                 if auto_message:
                     breaker_message = f"{breaker_message}\n{auto_message}" if breaker_message else auto_message
             elapsed_seconds = None
             if proposal.requested_at is not None:
                 elapsed_seconds = (now - _naive_utc(proposal.requested_at)).total_seconds()
+            window_start = _naive_utc(proposal.executing_at) if proposal.executing_at else None
+            window_end = now + timedelta(minutes=1)
             _append_audit(
                 session,
                 proposal_id_val,
@@ -2076,17 +2424,31 @@ def finalize_executing_proposals(
                         "proposal_state": state,
                         "elapsed_seconds": elapsed_seconds,
                     },
+                    "readback": (
+                        {"outcome": readback.outcome, "branch": readback.branch, **readback.detail}
+                        if readback is not None
+                        else None
+                    ),
                     "exchange_traffic": _gather_exchange_traffic_for_audit(
-                        session, batch_id=proposal.management_batch_id
+                        session,
+                        batch_id=proposal.management_batch_id,
+                        window_start=window_start,
+                        window_end=window_end,
                     ),
                 },
             )
             session.commit()
-            detail_text = (
-                "仓位/止损已按计划变化"
-                if state == "succeeded"
-                else str(detail.get("reason_code") or detail.get("batch_status") or "未知")
-            )
+            if readback is not None and readback.branch:
+                branch_zh = "市价平仓" if readback.branch == "market_closed" else "挂保本止损"
+                detail_text = f"{branch_zh}，回读确认" if readback.outcome == "confirmed" else f"{branch_zh}，回读不符"
+            elif readback is not None and readback.outcome in {"mismatch", "unknown"}:
+                detail_text = f"回读{'不符' if readback.outcome == 'mismatch' else '结果未知'}"
+            else:
+                detail_text = (
+                    "仓位/止损已按计划变化"
+                    if state == "succeeded"
+                    else str(detail.get("reason_code") or detail.get("batch_status") or "未知")
+                )
             result_text = _format_result_text(
                 proposal_id=proposal_id_val, state=state, detail=detail_text, breaker_message=breaker_message
             )
@@ -2116,6 +2478,55 @@ def finalize_executing_proposals(
                 )
             )
     return outcomes
+
+
+def _note_auto_internal_error(session_factory: sessionmaker, *, occurred: bool, now: datetime) -> str | None:
+    """Spec section 8: "G-D 或后台任务异常连续 3 次 -> 降为 shadow", independent
+    of the "one real execution failure" breaker in ``_suspend_auto``'s other
+    callers. ``occurred=True`` means ``run_gate_d`` itself raised inside one
+    of its checks (surfaced as a synthetic ``"D?"``/``d_internal_error``
+    check -- see ``run_gate_d``'s ``_run`` wrapper) or the background loop's
+    own per-proposal/tick call raised; any clean tick (gate ran and produced
+    an ordinary pass/refusal, or the tick completed normally) resets the
+    streak to 0, mirroring ``control.consecutive_failures``'s reset on
+    ``succeeded``."""
+
+    with session_factory() as session:
+        control = _get_or_create_control(session)
+        if not occurred:
+            if control.auto_consecutive_errors:
+                control.auto_consecutive_errors = 0
+                session.add(control)
+                session.commit()
+            return None
+        control.auto_consecutive_errors = int(control.auto_consecutive_errors or 0) + 1
+        session.add(control)
+        message = None
+        if control.auto_consecutive_errors >= 3:
+            message = _suspend_auto(session, reason="auto_internal_error_streak")
+        _append_event(
+            session,
+            None,
+            actor="worker",
+            event="auto_internal_error",
+            outcome="error",
+            detail={"consecutive": control.auto_consecutive_errors},
+            at=now,
+        )
+        session.commit()
+        return message
+
+
+def note_auto_background_outcome(session_factory: sessionmaker, *, ok: bool, now: datetime) -> str | None:
+    """Public entry point for ``oncall_remediation_runtime.py``'s background
+    loop: an uncaught exception from a per-tick auto-relevant call
+    (``compute_requested_proposal``/``execute_proposal_locked``/
+    ``finalize_executing_proposals``) counts the same way a G-D internal
+    error does (spec section 8's "后台任务异常连续 3 次"). Thin wrapper around
+    ``_note_auto_internal_error`` so the runtime module never needs to reach
+    into this module's private helpers."""
+
+    return _note_auto_internal_error(session_factory, occurred=not ok, now=now)
 
 
 def _suspend_auto(session, *, reason: str) -> str | None:

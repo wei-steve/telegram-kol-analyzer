@@ -122,6 +122,26 @@ def test_stalls_are_counted_with_last_and_worst_recorded():
     assert snapshot["last_stall_at"] == "2026-08-18T12:02:00+00:00"
 
 
+def test_had_stall_since_reflects_the_last_recorded_stall():
+    """Phase 4 batch 2: oncall_remediation_auto's D6 health check reads this
+    to decide ``recent_loop_stall`` -- see web_app._oncall_remediation_auto_health."""
+
+    clock = FakeClock()
+    monitor = _monitor(clock, stall_threshold_ms=3000.0)
+    base = datetime(2026, 8, 18, 12, 0, tzinfo=UTC)
+
+    assert monitor.had_stall_since(base - timedelta(minutes=10)) is False
+
+    monitor.record_lag(5000.0)  # stall at t=0 -> last_stall_at == base
+    assert monitor.had_stall_since(base - timedelta(minutes=10)) is True
+    assert monitor.had_stall_since(base + timedelta(seconds=1)) is False
+
+    clock.advance(600.0)  # 10 minutes later, no further stall
+    now = base + timedelta(seconds=clock.value)
+    lookback_cutoff = now - timedelta(minutes=5)
+    assert monitor.had_stall_since(lookback_cutoff) is False
+
+
 def test_stall_warnings_are_rate_limited():
     # The application logger disables propagation, so capture at the source
     # rather than through caplog's root handler.

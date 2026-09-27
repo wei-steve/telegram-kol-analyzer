@@ -6088,6 +6088,26 @@ def session_release(pid: int = typer.Option(..., "--pid")) -> None:
     typer.echo(f"Released Telegram session owner: {owner.format_for_humans()}")
 
 
+@app.command("oncall-remediation-audit")
+def oncall_remediation_audit(
+    proposal_id: int = typer.Argument(..., help="Oncall remediation proposal id (the 'P<n>' number)."),
+    database_path: Path = Path("data/research.db"),
+) -> None:
+    """Print the read-only 倒查 report for one oncall remediation proposal.
+
+    Identical output to the system-bot ``/audit P<n>`` command (spec
+    section 6.2) -- see ``oncall_remediation.render_remediation_audit_report``.
+    Opens the database read-only (``create_existing_session_factory``: no
+    bootstrap migration, no write) and never touches the exchange.
+    """
+
+    from telegram_kol_research.oncall_remediation import render_remediation_audit_report
+
+    session_factory = create_existing_session_factory(database_path)
+    report = render_remediation_audit_report(session_factory, proposal_id=proposal_id)
+    typer.echo(report)
+
+
 @app.command()
 def alerts(
     database_path: Path = Path("data/research.db"),

@@ -905,6 +905,31 @@ SQLITE_COMPAT_INDEXES: dict[str, str] = {
         "(venue, operation, order_id, request_fingerprint) "
         "WHERE order_id IS NOT NULL AND order_id != ''"
     ),
+    # Phase 4 batch 2 (2026-09-27 spec section 4 row D8, status doc 9.5
+    # deviation 4): D8's daily-cap/per-chat-cap query filters
+    # execution_origin='auto' AND executing_at in a range; the existing
+    # ix_oncall_remediation_proposals_executing_at index has no
+    # execution_origin column, so this composite index gives it one without
+    # requiring the "SCAN is actually fine at this row count" argument.
+    "ix_oncall_remediation_proposals_auto_origin_executing_at": (
+        "CREATE INDEX IF NOT EXISTS "
+        "ix_oncall_remediation_proposals_auto_origin_executing_at "
+        "ON oncall_remediation_proposals (execution_origin, executing_at)"
+    ),
+}
+
+#: Columns an index in ``SQLITE_COMPAT_INDEXES`` needs beyond mere table
+#: existence. ``execution_origin`` is only added via ``SQLITE_COMPAT_COLUMNS``
+#: ADD COLUMN (which runs before this backfill); ``executing_at`` predates
+#: phase 4 entirely and is assumed present on every real table (it is an
+#: ordinary model column, created by ``Base.metadata.create_all`` on any
+#: genuinely new database) -- this guard exists for the case where neither
+#: has landed yet (a hand-built minimal test fixture, or a bootstrap that
+#: somehow runs the index pass first), so it skips rather than errors.
+_SQLITE_COMPAT_INDEX_REQUIRED_COLUMNS: dict[str, frozenset[str]] = {
+    "ix_oncall_remediation_proposals_auto_origin_executing_at": frozenset(
+        {"execution_origin", "executing_at"}
+    ),
 }
 
 
@@ -1330,6 +1355,23 @@ def _backfill_sqlite_indexes(engine: Engine) -> None:
                     # unsafe duplicate rows continue to fail closed until an audited
                     # repair can make the matching unique index installable.
                     continue
+                required_columns = _SQLITE_COMPAT_INDEX_REQUIRED_COLUMNS.get(index_name)
+                if required_columns:
+                    existing_columns = {
+                        row[1]
+                        for row in connection.execute(
+                            text(f"PRAGMA table_info({table_name})")
+                        ).fetchall()
+                    }
+                    if not required_columns.issubset(existing_columns):
+                        # A hand-built/legacy table missing a column this
+                        # index needs (e.g. a test's minimal ad-hoc schema,
+                        # or a real table that predates that column and has
+                        # not yet run the corresponding ADD COLUMN backfill
+                        # in this same bootstrap pass) -- skip rather than
+                        # error; the index is created on the next bootstrap
+                        # once the column exists.
+                        continue
                 connection.execute(text(create_index_sql))
 
 

@@ -40,9 +40,11 @@ from telegram_kol_research.oncall_remediation import (
     execute_proposal,
     expire_stale_proposals,
     finalize_executing_proposals,
+    note_auto_background_outcome,
     record_proposal_message,
     recover_after_restart,
 )
+from telegram_kol_research.oncall_remediation_auto import AutoHealthInputs
 from telegram_kol_research.system_operator_bot import (
     SystemOperatorBotConfig,
     send_system_operator_bot_message,
@@ -75,6 +77,13 @@ class OncallRemediationWiring:
     deepcoin_client_factory: Callable[[], Any]
     group_config_provider: Callable[[], GroupConfig]
     now_provider: Callable[[], Any]
+    # Phase 4 batch 2: real process-uptime/event-loop-stall signals for G-D's
+    # D6 check (spec section 4 row D6). Optional and defaulting to ``None``
+    # so every phase-3-only caller (and every pre-batch-2 test) is
+    # unaffected -- ``None`` makes every call site below fall back to the
+    # library's own default (a healthy ``AutoHealthInputs``), never to an
+    # exception.
+    auto_health_provider: Callable[[], AutoHealthInputs] | None = None
 
 
 def _keyboard_to_reply_markup(
@@ -120,11 +129,15 @@ async def execute_proposal_locked(
     deepcoin_client_factory: Callable[[], Any],
     group_config: GroupConfig,
     now_provider: Callable[[], Any],
+    auto_health: AutoHealthInputs | None = None,
 ) -> ExecutionOutcome:
     """The G-C promotion path: acquire the process-wide execution lock, then
     run the library's ``execute_proposal`` (which reruns every gate) on a
-    worker thread. Only the callback handler for step 2 ("确认执行") calls
-    this -- see module docstring."""
+    worker thread. Called both by the callback handler for step 2 ("确认执行")
+    and, since phase-4 batch 2, by the background loop itself for a proposal
+    G-D already promoted straight to ``executing`` without any human click
+    (see module docstring and ``_process_one_requested_proposal`` below) --
+    either way it is the sole place ``execute_proposal`` is ever invoked."""
 
     async with _EXECUTION_LOCK:
         # The client is created inside execute_proposal (on the worker
@@ -147,6 +160,7 @@ async def execute_proposal_locked(
                 deepcoin_client_factory=_factory,
                 group_config=group_config,
                 now=now_provider(),
+                auto_health=auto_health,
             )
         finally:
             deepcoin_client = created[0] if created else None
@@ -185,6 +199,7 @@ async def _process_one_requested_proposal(
     group_config_provider: Callable[[], GroupConfig],
     bot_config: SystemOperatorBotConfig | None,
     now_provider: Callable[[], Any],
+    auto_health_provider: Callable[[], AutoHealthInputs] | None = None,
 ) -> None:
     group_config = group_config_provider()
     deepcoin_client = await asyncio.to_thread(deepcoin_client_factory)
@@ -198,6 +213,7 @@ async def _process_one_requested_proposal(
             group_config=group_config,
             now=now_provider(),
             group_label=lambda chat_id: _group_label(group_config, chat_id),
+            auto_health=auto_health_provider() if auto_health_provider is not None else None,
         )
     finally:
         close = getattr(deepcoin_client, "close", None)
@@ -210,6 +226,34 @@ async def _process_one_requested_proposal(
                     "(propose) proposal_id=%s",
                     proposal_id,
                 )
+
+    if outcome.auto_execute_proposal_id is not None:
+        # G-D passed and the library's own single-flight CAS already
+        # promoted this row to "executing" with no human click at all (spec
+        # section 5) -- execute_proposal_locked is the *only* place
+        # execute_proposal is ever called, exactly as it is for the
+        # human-approved path (_run_oncall_remediation_execution in
+        # telegram_bot_commands.py), so this reuses it rather than calling
+        # execute_proposal directly.
+        exec_outcome = await execute_proposal_locked(
+            session_factory,
+            config=config,
+            proposal_id=outcome.auto_execute_proposal_id,
+            deepcoin_client_factory=deepcoin_client_factory,
+            group_config=group_config,
+            now_provider=now_provider,
+            auto_health=auto_health_provider() if auto_health_provider is not None else None,
+        )
+        if exec_outcome.text and bot_config is not None:
+            try:
+                await send_system_operator_bot_message(config=bot_config, text=exec_outcome.text)
+            except Exception:  # noqa: BLE001 - spec 8.1: send failure never blocks the loop
+                logger.warning(
+                    "oncall remediation auto-execution result message failed "
+                    "to send proposal_id=%s",
+                    outcome.auto_execute_proposal_id,
+                )
+        return
 
     if not outcome.should_send or not outcome.text:
         return
@@ -267,6 +311,7 @@ async def run_oncall_remediation_background_loop(
     wake_event: asyncio.Event,
     poll_interval_seconds: float = 10.0,
     follow_timeout_minutes: float = 15.0,
+    auto_health_provider: Callable[[], AutoHealthInputs] | None = None,
 ) -> None:
     """Consume ``requested`` rows and finalize/expire settled ones.
 
@@ -338,6 +383,7 @@ async def run_oncall_remediation_background_loop(
                     group_config_provider=group_config_provider,
                     bot_config=bot_config,
                     now_provider=now_provider,
+                    auto_health_provider=auto_health_provider,
                 )
             except Exception:  # noqa: BLE001
                 logger.exception(
@@ -345,6 +391,28 @@ async def run_oncall_remediation_background_loop(
                     "proposal_id=%s",
                     proposal_id,
                 )
+                # Spec section 8: an uncaught exception from the auto-relevant
+                # per-tick path counts toward the "后台任务异常连续 3 次" streak,
+                # same as a G-D internal error -- see note_auto_background_outcome.
+                try:
+                    await asyncio.to_thread(
+                        note_auto_background_outcome,
+                        session_factory,
+                        ok=False,
+                        now=now_provider(),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("oncall remediation auto error-streak bookkeeping failed")
+            else:
+                try:
+                    await asyncio.to_thread(
+                        note_auto_background_outcome,
+                        session_factory,
+                        ok=True,
+                        now=now_provider(),
+                    )
+                except Exception:  # noqa: BLE001
+                    logger.warning("oncall remediation auto error-streak bookkeeping failed")
 
         try:
             finalized = await asyncio.to_thread(
@@ -353,10 +421,17 @@ async def run_oncall_remediation_background_loop(
                 config=config,
                 now=now_provider(),
                 follow_timeout=timedelta(minutes=follow_timeout_minutes),
+                deepcoin_client_factory=deepcoin_client_factory,
             )
         except Exception:  # noqa: BLE001
             logger.warning("oncall remediation finalize_executing_proposals failed")
             finalized = []
+            try:
+                await asyncio.to_thread(
+                    note_auto_background_outcome, session_factory, ok=False, now=now_provider()
+                )
+            except Exception:  # noqa: BLE001
+                logger.warning("oncall remediation auto error-streak bookkeeping failed")
         for finalize_outcome in finalized:
             if bot_config is None:
                 continue
