@@ -342,3 +342,32 @@ path	bytes	sha256	mtime	retired_at
 /var/lib/telegram-kol-maintenance-evidence/raw14214-terminalization-20260905T133139Z/rehearsal.db	900026368	e882dc1265aa697835ea37a7ca650405cb7ccc7679b6f8efd1eea2834ed55d29	2026-09-05 21:37:39	2026-09-27T06:11:07+08:00
 /var/lib/telegram-kol-maintenance-evidence/unified-claim-alignment-00cda060-20260831T143155Z/research-before.db	807567360	d8b1ebd73da9bb2da2af10e1094adad1a0d19d0311a74b1f6d21b5b8eca96a27	2026-08-31 22:33:59	2026-09-27T06:11:07+08:00
 ```
+
+## 10. 数据库保留期上线记录（2026-09-27 13:13～13:27 CST，用户在本会话确认后执行，L3）
+
+| | |
+|---|---|
+| 部署 sha | `a856d4a71156381d375fed715086bab90aed6b7a`（rebase 到 origin/main `200b62c3`；受影响测试 174 通过，最终全量 10054 通过 / 4 跳过 / 0 失败） |
+| 回滚 sha | `e1d29708012720db1134d67caeeb286425f04f55` |
+| 双向核对 | 部署前：生产 HEAD 与 origin/main 都是候选祖先（PASS）；部署后：候选在 origin/main 上（PASS），`PASS: 0 code files beyond production` |
+| 备份 | `/var/backups/telegram-kol/20260927-db-retention/before.db.zst`（89,082,554 字节）；原 before.db 1,252,552,704 字节，sha256 `5495f7699685e76881b0ee897a67e6c3c9fffdb85eaac47664976d2d2de145d2`，quick_check ok；VACUUM INTO 用时 28.7 s |
+| 演练副本（已删） | rehearsal.db 1,252,552,704 字节，sha256 `9f1a4cd2a60aa866ec733ea12403b07f813256c0bf512e7c9be32b44a321f3e0` |
+| 首次 apply 证据 | 同目录 `first-apply.json` |
+
+| 指标 | 前（备份） | 演练后 | 生产 apply 后（事后快照） |
+|---|---|---|---|
+| pending_tpsl_snapshot_observations | 2,014,113 | 214,813 | 214,864（三个币种各留最新一条，最老 09-20 05:25） |
+| context_resolution_attempts 行数 | 6,757 | 6,757 | 6,757 |
+| 其中占位摘要 | 0 | 4,071 | 4,071（平均 288 字节） |
+| request_summary_json 总字节 | 435.8 M | 188.6 M | 188.6 M |
+| execution_bindings / order_legs / authoritative_attempts | 384 / 656 / 4,337 | 不变 | 不变 |
+| raw_messages / strategy_threads / trade_signals / execution_events | 19,304 / 708 / 557 / 4,653 | 不变 | 不变 |
+| quick_check | ok | ok | ok |
+
+- 生产 dry-run 与演练对数：上下文 4,071 = 4,071；TP/SL 1,799,390 对 1,799,300，差值为截止点后移约 4 分钟的新观测。
+- 首次 apply：141 s 完成（TP/SL 362 批 104 s，上下文 21 批 37 s），`stop_reason=completed`。期间每 15 s 采样 worker loop-health：stall 0，无 ≥ 1 s 的样本；三个服务无 ERROR / locked。
+- 定时器：`telegram-kol-db-retention.{service,timer}` 已手工装入 `/etc/systemd/system` 并 enable，下次 2026-09-28 04:10；手动触发一次 `Result=success`（以 telegram-kol-worker 身份在沙箱内正常运行）。
+- 库文件：大小不变（1.27 GB，按裁定不 VACUUM），库内空闲页 189,248（约 775 MB），今后新数据先复用这些页。若将来想缩小文件，VACUUM 后约 480 MB（事后快照实测）。
+- WAL 在批量删除后为 49.6 MB，会被复用，不会继续涨。
+- 回滚：`systemctl disable --now telegram-kol-db-retention.timer` 停止继续删；代码回滚 `tg-deploy e1d29708…`（注意：回滚后旧代码读到占位摘要会当成完整请求，只影响超过 30 天的旧消息，如需回滚应先从 before.db.zst 按 id 回灌 request_summary_json）。
+- 待办：一周后（≈ 10-04）复核 `research.db` 大小应基本不变；10-09 后按规则退役 preA2 与本次 before.db.zst 之外多余的恢复点（上限 3 份）。
