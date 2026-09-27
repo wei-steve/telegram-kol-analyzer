@@ -1146,45 +1146,46 @@ def compute_requested_proposal(
             row.expires_at = now + timedelta(minutes=config.proposal_expiry_minutes)
             row.updated_at = now
             if gate_d is not None:
-                row.execution_origin = "auto"
                 row.auto_gate_result = "passed" if gate_d.passed else (gate_d.first_failure_reason or "unknown")
-            if promote_to_executing:
-                row.state = "executing"
-                row.approved_at = now
-                row.confirmed_at = now
-                row.executing_at = now
-            else:
-                row.state = "proposed"
-                if config.effective_mode in {"approve", "auto"}:
-                    token1 = _new_token()
-                    row.step1_token_hash = _hash_token(token1)
+            # Always land in "proposed" first; only an atomic promotion below
+            # can turn it into an automatic execution.
+            row.state = "proposed"
             session.add(row)
-            single_flight_lost = False
+            session.flush()
+            promoted = False
             if promote_to_executing:
-                # The single-flight guarantee (spec 4/G-C's C1) also applies
-                # to the auto path: promoting straight from "requested" to
-                # "executing" must not race a proposal that is already
-                # executing. If it does, this proposal falls back to a
-                # downgraded, button-carrying proposal instead of blocking.
-                other_executing = (
-                    session.query(func.count(OncallRemediationProposal.id))
-                    .filter(
-                        OncallRemediationProposal.state == "executing",
-                        OncallRemediationProposal.id != proposal_id,
+                # Single statement: the "no other proposal executing" check and
+                # the promotion are atomic under SQLite's single writer (C1,
+                # same construction as phase 3's step-2 CAS). Only a promoted
+                # row is marked execution_origin='auto'; a downgraded one stays
+                # manual so an approver's button click is not re-refused by the
+                # same G-D reason at execution time (user ruling item 4).
+                other = aliased(OncallRemediationProposal)
+                result = session.execute(
+                    update(OncallRemediationProposal)
+                    .where(
+                        OncallRemediationProposal.id == proposal_id,
+                        OncallRemediationProposal.state == "proposed",
+                        ~exists().where(other.state == "executing", other.id != proposal_id),
                     )
-                    .scalar()
-                    or 0
+                    .values(
+                        state="executing",
+                        execution_origin="auto",
+                        approved_at=now,
+                        confirmed_at=now,
+                        executing_at=now,
+                        updated_at=now,
+                    )
+                    .execution_options(synchronize_session=False)
                 )
-                if other_executing > 0:
-                    single_flight_lost = True
-                    row.state = "proposed"
-                    row.approved_at = None
-                    row.confirmed_at = None
-                    row.executing_at = None
+                promoted = result.rowcount == 1
+                session.refresh(row)
+                if not promoted:
                     row.auto_gate_result = "auto_single_flight_busy"
-                    token1 = _new_token()
-                    row.step1_token_hash = _hash_token(token1)
-                    session.add(row)
+            if not promoted and config.effective_mode in {"approve", "auto"}:
+                token1 = _new_token()
+                row.step1_token_hash = _hash_token(token1)
+            session.add(row)
             _append_event(
                 session,
                 proposal_id,

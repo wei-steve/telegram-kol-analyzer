@@ -571,7 +571,9 @@ def test_auto_gate_d_miss_downgrades_to_proposed_with_button(tmp_path):
     assert "未自动执行" in outcome.text
     with session_factory() as session:
         row = session.get(OncallRemediationProposal, proposal_id)
-        assert row.execution_origin == "auto"
+        # A downgraded proposal is not an automatic execution: it stays manual,
+        # so an approver's button click is not re-refused by G-D at execution.
+        assert row.execution_origin is None
         assert row.auto_gate_result == "d1_reason_not_transient"
 
 
@@ -816,3 +818,59 @@ def test_redact_structure_masks_nested_secrets():
     redacted, hits = auto.redact_structure(payload)
     assert hits >= 1
     assert "a" * 40 not in json.dumps(redacted)
+
+
+def test_downgraded_proposal_approved_by_button_is_not_rerun_through_gate_d(tmp_path):
+    """User ruling item 4: a G-D miss downgrades to a button proposal. If the
+    approver clicks through, the execution is manual and must not be refused
+    again by the very G-D reason that caused the downgrade."""
+
+    from telegram_kol_research.oncall_remediation import execute_proposal, handle_callback
+
+    session_factory = create_session_factory(tmp_path / "r.db")
+    raw_id, lifecycle_id, strategy_id, pos_id, symbol, side = _setup_ready_message(session_factory)
+    _enable_live_management(session_factory)
+    client = _client_for(symbol, side, pos_id)
+    proposal_id = _new_requested_proposal(session_factory, raw_message_id=raw_id)
+    outcome = compute_requested_proposal(
+        session_factory, config=_auto_config(), proposal_id=proposal_id, deepcoin_client=client,
+        group_config=_group_config(88), now=NOW + timedelta(minutes=2), auto_health=_health(),
+    )
+    assert outcome.state == "proposed"  # D1 miss (default non-transient reason)
+    token1 = outcome.keyboard[0][1].split(":")[-1]
+    step1 = handle_callback(
+        session_factory, config=_auto_config(), chat_id=CHAT_ID, from_user_id=APPROVER_ID,
+        data=f"orm:{proposal_id}:1:{token1}", now=NOW + timedelta(minutes=3),
+    )
+    token2 = step1.keyboard[0][1].split(":")[-1]
+    step2 = handle_callback(
+        session_factory, config=_auto_config(), chat_id=CHAT_ID, from_user_id=APPROVER_ID,
+        data=f"orm:{proposal_id}:2:{token2}", now=NOW + timedelta(minutes=3),
+    )
+    assert step2.execute_proposal_id == proposal_id
+
+    calls = []
+
+    class _Result:
+        status = "submitted"
+        batch_id = None
+
+    def fake_apply(*args, **kwargs):
+        calls.append(kwargs)
+        return _Result()
+
+    def exploding_gate_d(*args, **kwargs):
+        raise AssertionError("G-D must not run for a manually approved proposal")
+
+    original = remediation.run_gate_d
+    remediation.run_gate_d = exploding_gate_d
+    try:
+        result = execute_proposal(
+            session_factory, config=_auto_config(), proposal_id=proposal_id, deepcoin_client=client,
+            group_config=_group_config(88), now=NOW + timedelta(minutes=4), apply_fn=fake_apply,
+            auto_health=_health(),
+        )
+    finally:
+        remediation.run_gate_d = original
+    assert len(calls) == 1
+    assert result.state == "executing"
