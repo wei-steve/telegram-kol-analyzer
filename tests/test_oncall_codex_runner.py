@@ -59,9 +59,9 @@ def stub_env(mode: str = "verdict", **extra: str) -> dict[str, str]:
 def _forget_unreadable_cases():
     import telegram_kol_research.oncall_codex_runner as runner
 
-    runner._UNREADABLE.clear()
+    getattr(runner, "_UNREADABLE", {}).clear()
     yield
-    runner._UNREADABLE.clear()
+    getattr(runner, "_UNREADABLE", {}).clear()
 
 
 @pytest.fixture
@@ -610,16 +610,40 @@ def test_the_runner_is_startable_as_a_module_without_the_cli(spool):
     assert (spool.root / FILE_HEALTH).exists()
 
 
-def test_the_same_unreadable_request_is_reported_once_not_every_round(
-    spool, monkeypatch, caplog
-):
+class _RecordingLogger:
+    """Stands in for the runner's logger: the full suite reconfigures logging
+    (disabled loggers, levels), so caplog cannot be trusted to see it."""
+
+    def __init__(self):
+        self.lines: list[tuple[str, str]] = []
+
+    def _record(self, level, message, *args, **kwargs):
+        self.lines.append((level, message % args if args else message))
+
+    def debug(self, *a, **k):
+        self._record("debug", *a, **k)
+
+    def info(self, *a, **k):
+        self._record("info", *a, **k)
+
+    def warning(self, *a, **k):
+        self._record("warning", *a, **k)
+
+    def exception(self, *a, **k):
+        self._record("error", *a, **k)
+
+    def warnings_about(self, name):
+        return [m for level, m in self.lines if level in ("warning", "error") and name in m]
+
+
+def test_the_same_unreadable_request_is_reported_once_not_every_round(spool, monkeypatch):
     """Production, 2026-09-23..27: six unreadable cases, one warning each every
     ten seconds, about 52,000 lines a day in journald and /var/log/messages."""
 
-    import logging
-
     import telegram_kol_research.oncall_codex_runner as runner
 
+    log = _RecordingLogger()
+    monkeypatch.setattr(runner, "logger", log)
     enqueue(spool, 7)
     request_path = spool.case_dir(7) / FILE_REQUEST
     real_read = runner.read_bounded_file
@@ -631,34 +655,25 @@ def test_the_same_unreadable_request_is_reported_once_not_every_round(
         return real_read(path, *args, **kwargs)
 
     monkeypatch.setattr(runner, "read_bounded_file", read)
-    caplog.set_level(logging.DEBUG, logger=runner.logger.name)
 
     def rounds(count):
         for _ in range(count):
             scan_once(spool=spool.root, codex_bin=FAKE_CODEX, env=stub_env(), now=NOW)
 
-    def warnings():
-        return [r for r in caplog.records
-                if r.levelno >= logging.WARNING and "case-7" in r.getMessage()]
-
     rounds(3)
-    assert len(warnings()) == 1
+    assert len(log.warnings_about("case-7")) == 1
 
     state["error"] = OSError(5, "Input/output error", str(request_path))
     rounds(2)
-    assert len(warnings()) == 2, "a different error is news"
+    assert len(log.warnings_about("case-7")) == 2, "a different error is news"
 
     state["error"] = None
-    caplog.clear()
     rounds(1)
-    assert any("readable again" in r.getMessage() for r in caplog.records)
+    assert any("readable again" in m for _level, m in log.lines)
     assert (spool.case_dir(7) / "run.json").exists()
 
 
-def test_a_vanished_case_is_forgotten_so_a_new_failure_is_reported_again(
-    spool, monkeypatch, caplog
-):
-    import logging
+def test_a_vanished_case_is_forgotten_so_a_new_failure_is_reported_again(spool, monkeypatch):
     import shutil
 
     import telegram_kol_research.oncall_codex_runner as runner
@@ -666,13 +681,14 @@ def test_a_vanished_case_is_forgotten_so_a_new_failure_is_reported_again(
     def refuse(path, *args, **kwargs):
         raise PermissionError(13, "Permission denied", str(path))
 
+    log = _RecordingLogger()
+    monkeypatch.setattr(runner, "logger", log)
     enqueue(spool, 7)
     monkeypatch.setattr(runner, "read_bounded_file", refuse)
-    caplog.set_level(logging.WARNING, logger=runner.logger.name)
     scan_once(spool=spool.root, codex_bin=FAKE_CODEX, env=stub_env(), now=NOW)
     shutil.rmtree(spool.case_dir(7))
     scan_once(spool=spool.root, codex_bin=FAKE_CODEX, env=stub_env(), now=NOW)
     enqueue(spool, 7)
     scan_once(spool=spool.root, codex_bin=FAKE_CODEX, env=stub_env(), now=NOW)
     scan_once(spool=spool.root, codex_bin=FAKE_CODEX, env=stub_env(), now=NOW)
-    assert len([r for r in caplog.records if "case-7" in r.getMessage()]) == 2
+    assert len(log.warnings_about("case-7")) == 2
