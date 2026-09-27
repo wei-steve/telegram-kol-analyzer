@@ -508,6 +508,24 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 
 ① 触发判据换成 §5（删 3 留 4）；② 降级不再抹平首次分析；③ 契约类失败不重问。
 
+**切换前的验收回放项（2026-09-27 追加）。**
+
+- 出处：识别时延报告 `docs/plans/2026-09-26-recognition-latency-and-jev-assessment.md` §9，分支 `claude/recognition-latency-jev`，提交 `63646d60`。
+- 数据口径：首轮结论取自 `context_resolution_attempts.request_summary_json.mimo_first_pass`，统计范围是 2026-09-16 方案甲生效以来。
+- 调度会话裁定：上下文触发收紧（时延报告 §8.3）**并入本阶段，不单独做**。过渡门是否先做，等 09-29 派发阶段 2 时，看本阶段的预计时间再定。
+
+1. **`cancellation_language` 删除前须回放 raw 18602。**
+   - 该判据 14 天只触发 3 次，其中 1 次是真实抓回：raw 18602「……先取消先观望……」首轮为不可执行，上下文判为 `cancel_thread`，置信度 0.93。
+   - 它是仅有的两个在首轮不可执行时真正抓回过动作的判据之一，另一个是 `text_image_conflict`（raw 17368），本阶段保留。
+   - 验收要求：用 v9 契约重跑 18602 这类消息，确认会被判为「策略管理 + `resolution=unknown`」、由新判据接住。**接不住就保留 `cancellation_language`。**
+2. **`entered_holder_language` 删除前须人工标注首轮可执行时的单独触发样本。**
+   - 09-16 以来，该判据单独触发、且首轮可执行的有 30 次。
+   - 其中 **8 次**改变或重定目标，**3 次**压下首轮动作，17 次 exhausted，2 次 reanalysis_capped。
+   - 那 11 次有结果变化的调用，删除后要靠新判据接住（`unknown`，或「`exact` 目标不在候选集合内」）。
+   - 它们里面哪些是纠正、哪些是 2026-09-24 米娅 msg 696 式的误覆盖，**尚未人工标注**。
+   - 验收要求：重做快照取出这 11 条的 raw_message_id，逐条人工标注，再用新判据回放。时延报告当时的分析快照已按规定删除，所以样本 id 需要重新取。
+
+
 ## 阶段 4 · 收口（planned）
 
 `recognition_result` / `lifecycle_event` 双轨是否退役、`识别失败` 旧值的两种含义怎么拆干净。
