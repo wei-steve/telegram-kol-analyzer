@@ -1298,6 +1298,29 @@ rollback_commit: a856d4a71156381d375fed715086bab90aed6b7a   # rebase 后（原�
 - **验证**：新列与新表存在；worker 日志中补救后台任务仍以 `effective_mode=shadow` 启动；只提示行为不变；`/auto_off` `/auto_on` `/audit` 对非批准人拒绝。
 - **回滚**：`/oncall_off` → 确认 `executing` 为 0 → `tg-deploy a856d4a7…` + 重启值守；新列与新表保留（旧代码不读）。
 
+#### 9.7.1a 部署记录（2026-09-28 00:38 CST，休眠上线；用户在本会话确认）
+
+```yaml
+phase4_status: deployed_dormant
+production_commit: 9363a6c8f9347b716bb754cca7aa73c5b6c74073   # 代码 = 全量通过的 a40df6d0，其后只有文档
+rollback_commit: a856d4a71156381d375fed715086bab90aed6b7a
+worker_mode: shadow          # 未改 env；没有 AUTO_ACTIONS
+auto_trade_switches: untouched
+```
+
+- 部署前：生产 HEAD `a856d4a7`，候选是其后代；在途管理批次 0、执行中提案 0、无未终态的 mutation intent；最近 5 分钟无下单动作；剩余 33 GB（≥ 库大小 × 2 + 5 GB）。
+- 演练（`/var/backups/telegram-kol/20260927-oncall-phase4/rehearsal-phase4.db`，已删，485638144 字节，sha256 `07215aea6ad6d751ae944bef5a61a9b49bf4a2b4e90be99b73597b4d8a7675c6`）：
+  补列 + 建审计表 **1.8 s**；`quick_check` ok；前后计数一致（补救提案 1、事件 2、控制 1、批次 182、指令项 1410、候选 2648、绑定 384、intents 797、worker 命令 2）；
+  新列（提案 2 列、控制 4 列）与 `oncall_remediation_audit` 及其索引就位，阶段 3 既有行读取正常、新列取默认值。
+- 备份（恢复点，现共 3 个）：`/var/backups/telegram-kol/20260927-oncall-phase4/oncall-phase4-9363a6c8-20260927T163806Z.db.zst`
+  （原库 485625856 字节，sha256 `49bb515b37ee09affebb353b9eb87d23534d0ea557e0cbdfa91027b17062b512`，`quick_check` ok；
+  zstd 41715231 字节，sha256 `46e8da96c5cba08a3885a75d5735d892442a6860a208db81b50cdc264c3e5d25`）。
+- `tg-deploy 9363a6c8…` → worker 2437614 / web 2437623 / ingest 2437638 active。值守文件本次无改动，未重启值守；单元文件无改动。
+- 休眠验证：worker 日志 `Oncall remediation background task starting effective_mode=shadow`；四服务 active，Traceback / `schema_invalid` / ERROR 为 0；
+  端点无令牌 404；web 200；env 只有 `MODE=shadow`、没有 `AUTO_ACTIONS`；生产库新列与审计表存在、审计 0 行、计数与部署前一致、`quick_check` ok。
+  `/auto_off` `/auto_on` `/audit` 对非批准人拒绝、只提示行为不变：由测试钉住（生产上未发 Telegram 冒烟）。
+- 下一步（均需单独确认）：只提示期证据（9.4.7）满足 D9 后，`MODE=auto` + `AUTO_ACTIONS=full_exit`。
+
 #### 9.7.2 逐个放开（每一步单独确认，规格第 9 节）
 
 前置：只提示期（9.4.7）该动作 ≥ 3 条「自动执行会是对的」且零错判（D9）。然后 `MODE=auto`、`AUTO_ACTIONS=full_exit` → 首笔逐项核对（审计两行、批次终态、`trigger-orders-pending` 全集前后、通知与交易所实况）→ 再加下一个动作。
