@@ -454,6 +454,48 @@ ARCHITECTURE §5.5 那个环节只有 CLI / 批量工具，**没有取它作候�
 设计稿 §8：**先部署代码，再发布提示词版本**；回滚只需把提示词退回 v8，不必回滚代码。
 本批次只交付代码与种子，**没有**在生产数据库里发布任何提示词版本。
 
+### 校验器缺陷修复部署：v9 下 20% 的 gpt 调用被自己的校验器拒收（2026-09-27 01:32:14 UTC，部署 `e1d29708`）
+
+- **本线的所有测量必须以 2026-09-27 01:32:14 UTC 为界，分前后两段统计。**
+- 部署 sha：`e1d29708012720db1134d67caeeb286425f04f55`；回滚点：`ba93788a`。
+- 部署由识别时延评估会话执行，用户在该会话中亲自确认。
+- 完整分析见 `docs/plans/2026-09-26-recognition-latency-and-jev-assessment.md` §7，在分支 `claude/recognition-latency-jev` 上。
+
+**缺陷是什么。** 本线的 v9（`ai_prompt_versions.id = 10`；`prompt_versions_json` 中 `trading.analysis.shared` 记为 10）要求「没有 新策略 元素时 strategy 必须为 null」。但 `recognition_experiments._validate_authoritative_payload` 仍要求 `strategy` 必须是 dict，模型照契约输出 null，就被判为 `MiMo response missing strategy`。设计稿 §10 A4 本来规定阶段 1「缺字段与违规都不抛错」，这一处是阶段 1 漏改的。
+
+**规模。**
+
+| 版本 | gpt-5.6-luna 调用 | 其中「missing strategy」 |
+|---|---|---|
+| v8 | 2 229 | 0 |
+| v9 | 301 | 61（20%） |
+
+此外 mimo-v2.5 在 v9 下 79 次调用中也有 8 次。
+
+被拒的调用先在同模型上重试一次，约 28 s，再回退到 mimo-v2.5，又要 35–100 s。回退的结果全部是非策略（66 条 none、3 条 position_update、1 条 exit_position），所以**「识别失败」计数没有反映出来**。
+
+第一次失败发生在 2026-09-25 03:56 UTC（北京时间 11:56），正好落在本线 v9 首个观察窗之内。那次观察窗的「识别失败 0」是真实的，但它漏看了 attempt 行上的失败。
+
+**对本线数据的影响。**
+- 部署前：v9 下约 20% 的非新策略消息，是由 **mimo-v2.5 回退作答**的；它们的 `message_classes` 来自 mimo，不是链首的 gpt。
+- 部署后：这部分改由 gpt-5.6-luna 作答。
+- 因此按模型、按时延、按分类一致率做的任何统计，都要按上面的时刻分段。部署前那段里的「gpt 分类样本」天然偏向没被拒收的那 80%。
+
+**改了什么、没改什么。**
+- 校验器：`是策略` 时仍要求 `strategy` 是 dict；非策略或识别失败时，接受 `null` 或缺键。其他类型（字符串、列表）照旧拒收。
+- **不改写 payload**，`parse_message_classes` 看到的仍是原样的 null。
+- 另一个提交：HTTP 5xx 且链上还有备用模型时，不再做同模型重试，直接回退。
+- 提示词、契约语义、合同违规的同模型重试策略（本线阶段 3 的事）**都没动**。
+
+**L1 观察窗（2026-09-27 01:35–01:50 UTC，满 15 分钟，通过）。**
+- 三服务全程 `active`。
+- 新消息 2 条（raw 19282、19283），都是 v9 形态：`非策略`、`message_classes = [闲话]`、**`strategy: null`**。两条都由 gpt-5.6-luna **一次请求**答完，耗时 11.0 s 和 12.5 s。
+- 「missing strategy」新增 0 条，失败 attempt 0 行，没有新的 error_code，没有回退。
+- 这两条在修复前都会被拒收并回退到 mimo，所以修复路径已被真实消息走通。
+- 窗口内没有遇到 502，5xx 跳过重试这一支在生产上尚未被触发，由测试覆盖。
+
+**遗留，交本线决定。** `message_evidence` 写 `normalized_evidence` 时把 `strategy: null` 归一化为 `{}`，这是既有行为。于是回放路径重建出的 payload 是 `{}`，实时路径是 `null`。阶段 3 如果要在回放路径保留 null 语义，需要另行处理。
+
 ---
 
 ## 阶段 2 · 观察与人工核准（planned）
