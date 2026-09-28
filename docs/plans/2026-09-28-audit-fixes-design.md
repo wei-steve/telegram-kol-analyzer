@@ -1,7 +1,7 @@
 # 2026-09-28 12 小时核对问题修复设计稿（待批准）
 
 - 来源：`docs/plans/2026-09-28-12h-group-action-audit.md`（分支 `claude/youthful-wu-db596d`，提交 `bf1db60e`）
-- 基线：生产 HEAD / `origin/main` = `546d991346fd063d1c0d3098cf24de2589476fcd`
+- 基线：设计时生产 HEAD / `origin/main` = `546d9913`；2026-09-28 rebase 到 `origin/main` = `42e5ba3d`（生产 = `2402773f873f55ff2366ee0a7deea4421ff94baf`，值守补救修正已上线）
 - 核实方式：服务器 `VACUUM INTO` 快照（487 190 528 字节，sha256
   `8c588272c595ff1d2483e462bb16e5df26aae7fc8583c4b40621d747967bf94f`，2026-09-28 17:57Z 取，
   查完已删除）；值守状态库 `/var/lib/telegram-kol-oncall/state.db` 只读查询；
@@ -177,7 +177,7 @@
   5. L2 观察：一个连续 30 分钟、≥5 条真实消息的窗口；重点看有没有新的
      `protection_rows_unattributed_on_exchange` / `global_unowned_order_present`、有没有新的
      `management_fraction_invalid`、incident 投递是否正常。
-  6. 回滚：`tg-deploy 546d991346fd063d1c0d3098cf24de2589476fcd`，并重启值守。
+  6. 回滚：`tg-deploy 2402773f873f55ff2366ee0a7deea4421ff94baf`（rebase 后的回滚点），并重启值守。
 - 大漂亮腿 2（…523253，85810×7）仍挂着：部署前若大漂亮发移止损 / 保本且被拒，仍需人工在交易所调整；部署后这一拦截消失。
 
 ## 6. 需要用户拍板
