@@ -10655,14 +10655,7 @@ def create_web_app(
     @app.get("/api/freshness")
     def api_freshness(chat_id: int | None = None):
         with app.state.session_factory() as session:
-            global_latest = (
-                session.query(
-                    func.max(RawMessage.id).label("raw_message_id"),
-                    func.max(RawMessage.created_at).label("created_at"),
-                    func.max(RawMessage.posted_at).label("posted_at"),
-                )
-                .one()
-            )
+            global_latest = session.execute(build_global_freshness_statement()).one()
             selected_latest = None
             selected_count = 0
             if chat_id is not None:
@@ -11757,6 +11750,27 @@ def _prompt_detail_response(detail: PromptDetail) -> dict[str, Any]:
         ),
         "history": [_prompt_version_response(item) for item in detail.history],
     }
+
+
+def build_global_freshness_statement():
+    """Global part of /api/freshness, answered from indexes only.
+
+    The page polls this every 5 seconds per open tab, so it must never scan
+    raw_messages (a full scan froze the worker event loop on 2026-09-15).
+    created_at has no index, but it is only ever set at insert time, so the
+    newest insert is the max(id) row and a primary-key lookup replaces
+    max(created_at). max(id) reads the rowid b-tree end and max(posted_at)
+    reads ix_raw_messages_posted_at.
+    """
+    max_id = select(func.max(RawMessage.id)).scalar_subquery()
+    return select(
+        max_id.label("raw_message_id"),
+        select(RawMessage.created_at)
+        .where(RawMessage.id == max_id)
+        .scalar_subquery()
+        .label("created_at"),
+        select(func.max(RawMessage.posted_at)).scalar_subquery().label("posted_at"),
+    )
 
 
 def _datetime_to_iso(value: datetime | None) -> str | None:
