@@ -56,3 +56,16 @@
   - `legacy_conditional_cancel.py:1010`、`protection_replacement_persistence.py:175`：按 `(venue, order_id)` 查，对应 `uq_position_backup_stop_orders_venue_order`。
   - `protection_replacement_persistence.py:298`：带状态过滤，并且有部分唯一索引 `uq_position_backup_stop_orders_active_position`。
 - 停摆期间的交易所事件：05:40:44Z 之后，大镖客（pos `1001125406750883`）和陈哥（pos `1001125406857038`）在 WS 上都没有新的成交或离场推送。部署后还要用交易所实时读数再核对一次。
+
+## 部署与 L2 观察结果（2026-09-28）
+
+| 部署 | sha | 回滚点 | 观察窗（UTC） | 结果 |
+|---|---|---|---|---|
+| 陈哥线 | `099d6cdc`（05:51Z） | `9363a6c8` | 05:55:33–06:25:43 | PASS：11 条消息，来自 4 个群；stale 0、failed 0、deadlock 0、failed_open 0。期间的 Traceback 全部来自当时并存的对账缺陷 |
+| 对账热修复 | `294386f0`（06:48Z） | `099d6cdc` | 06:52:03–07:28:12 | PASS：6 条消息；stale 0、failed 0、deadlock 0、failed_open 0、Traceback 0、对账失败 0 |
+
+- 两次部署之后，origin/main 与生产一致，OFFENDERS 判决式都是 PASS。
+- 白名单修复已在生产上得到验证：incident 2409（`authoritative_recognition_failed`，raw 19537）按详细摘要入库，包含 `failure_point`、`chat_id` 和 `impact`。
+- 观察期间没有出现 `target_terminal_noop` 或 `mimo_authoritative_failed_exhausted`：没有碰上这两种场景，所以这两条代码路径还没有生产样本。
+- 与交易所的只读核对结果见 `/root/evidence-2026-09-28-chen-l2/exch_check.out`：陈哥两条腿、大镖客一笔持仓，仓位和止盈止损都与数据库一致。
+- 服务器证据目录：`/root/evidence-2026-09-28-chen-l2/`（第一个窗口）和 `/root/evidence-2026-09-28-chen-l2/hotfix/`（第二个窗口）。
