@@ -192,7 +192,10 @@ def resolve_management_directive(
     risk_increasing = raw_action in {
         "add_position", "increase_position", "open_position", "reverse_position",
     } or any(
-        term in combined.replace("平加仓", "")
+        # "平加仓" and the narrative "加仓后" (#19597 "加仓后浮盈600点")
+        # describe past adds, not a new one. Only that exact form is
+        # stripped; "可以加仓" / "加仓了" / "补仓" still count.
+        term in combined.replace("平加仓", "").replace("加仓后", "")
         for term in _RISK_INCREASING_TERMS
     )
     if risk_increasing:
@@ -533,9 +536,16 @@ def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
                 raise ManagementFractionInvalid("invalid_format", source)
             previous_quantity = False
             continue
-        previous_quantity = True
         # Bind to the nearest quantity verb, not an earlier price discussion.
         clause = percent.group(1)[matches[-1].end():]
+        if not _percent_belongs_to_verb(clause):
+            # The verb sits in an earlier sentence (or an earlier comma
+            # chunk that already carried its own number), so this percent
+            # is not its quantity: "剩余…83200！\n…减50%" across the raw
+            # text / observed_text join, or "出局！…收益370％".
+            previous_quantity = False
+            continue
+        previous_quantity = True
         token = re.search(r"([+\-−－\d.a-zA-Z].*)$", clause.strip(), flags=re.DOTALL)
         raw_value = token.group(1) if token else clause.strip()
         try:
@@ -547,6 +557,25 @@ def _percentage_values(text: str, verbs: str, *, source: str) -> list[float]:
             raise
         values.append(value)
     return values
+
+
+# Sentence boundaries and clause commas. An ASCII comma between two digits
+# is a number separator ("减仓1,5%"), not a clause break, so it never splits.
+_CLAUSE_BREAK = re.compile(r"[\n。！!？?；;‼，]|(?<!\d),|,(?!\d)")
+
+
+def _percent_belongs_to_verb(clause: str) -> bool:
+    """Whether the text between a quantity verb and its '%' keeps them bound.
+
+    The clause is split at sentence boundaries and clause commas. If any
+    chunk before the percent's own chunk already carries a digit, the verb
+    had its own statement ("剩余仓位止损位上移至83200！\\n…减50%",
+    "平仓78031.7，盈利126.05%") and the percent describes something else.
+    A break with no number in between still binds, so malformed content
+    such as "减仓\\n150%" or "减仓；比例120%" is rejected, never defaulted.
+    """
+    chunks = _CLAUSE_BREAK.split(clause)
+    return not any(re.search(r"\d", chunk) for chunk in chunks[:-1])
 
 
 def _close_percentage_values(text: str) -> list[float]:

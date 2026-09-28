@@ -557,3 +557,169 @@ def test_malformed_continued_percentage_is_rejected(text):
 def test_unrelated_market_percentage_does_not_change_close_fraction():
     result = resolve_management_directive(text="减仓20%，行情涨了150%", lifecycle_event={"management_action": "partial_take_profit"})
     assert result.fraction == 0.2
+
+
+# --- 2026-09-28 audit fixes, problem 2: percent misbinding across sentences ---
+# Raw text and the model's observed_text are joined with "\n" before fraction
+# validation, so a verb in the raw text used to bind to a percent in the
+# observed text (docs/plans/2026-09-28-audit-fixes-design.md section 2).
+
+_R2_19597_RAW = (
+    "目前BTC现价83800，加仓后浮盈600点，相当于正常仓位1200点收益，加仓后仓位比较大，"
+    "减50%仓位，剩余仓位止损位上移至83200！\n@Tarderfengge QQ:158241758"
+)
+_R2_19597_OBSERVED = "BTC现价83800；加仓后浮盈600点；减50%仓位；剩余仓位止损上移至83200。"
+_R2_19597_EVENT = {
+    "event_type": "position_update",
+    "management_action": "partial_take_profit,move_stop_to_protect",
+    "side": "long",
+    "stop_loss": "83200",
+    "symbol": "BTC",
+    "target_lifecycle_id": 1343,
+    "confidence": 0.99,
+}
+
+
+def _r2_combined(raw: str, observed: str) -> str:
+    from telegram_kol_research.message_recognition import (
+        _authoritative_current_message_text,
+    )
+
+    return _authoritative_current_message_text(
+        raw, {"input_reading": {"observed_text": observed}}
+    )
+
+
+def test_r2a_19597_partial_then_break_even_passes_both_gates() -> None:
+    from telegram_kol_research.management_fraction_gate import (
+        validate_management_fraction_payload,
+    )
+
+    combined = _r2_combined(_R2_19597_RAW, _R2_19597_OBSERVED)
+    assert "\n" in combined and _R2_19597_OBSERVED in combined
+    validate_management_fraction_payload({"lifecycle_event": _R2_19597_EVENT}, combined)
+
+    for text in (_R2_19597_RAW, combined):
+        directive = resolve_management_directive(
+            text=text, lifecycle_event=_R2_19597_EVENT
+        )
+        assert directive.intent == "partial_then_break_even"
+        assert directive.reason_code == "partial_then_break_even"
+        assert directive.fraction == 0.5
+        assert directive.stop_loss == "83200"
+        assert directive.stop_price_source == "current_message_text"
+        assert directive.risk_reducing is True
+
+
+@pytest.mark.parametrize(
+    ("raw", "observed", "action", "expected"),
+    [
+        (  # 17900
+            "BTC多单目前获利600点，止盈40%，剩余仓位上移至80600，夜晚风险较大，做无风险持仓！"
+            "\n@Tarderfengge QQ:158241758",
+            "BTC多单获利600点，止盈40%，剩余仓位止损上移至80600，做无风险持仓；"
+            "图片显示BTCUSDT行情，最新价81146.2。",
+            "partial_take_profit",
+            0.4,
+        ),
+        (  # 18153
+            "恭喜跟上BTC多单的朋友，目前获利1100点，止盈60%，剩余仓位止损位上移至64100，做无风险持仓！"
+            "\n@Tarderfengge QQ:158241758",
+            "BTC多单获利1100点，止盈60%，剩余仓位止损位上移至64100，做无风险持仓。"
+            "图片显示BTCUSDT行情，最新价85154.7。",
+            "move_stop_to_protect",
+            0.6,
+        ),
+    ],
+    ids=["17900", "18153"],
+)
+def test_r2b_joined_raw_and_observed_keep_the_stated_fraction(
+    raw, observed, action, expected
+) -> None:
+    from telegram_kol_research.management_fraction_gate import (
+        validate_management_fraction_payload,
+    )
+
+    event = {
+        "event_type": "position_update",
+        "management_action": action,
+        "side": "long",
+        "symbol": "BTC",
+    }
+    combined = _r2_combined(raw, observed)
+    validate_management_fraction_payload({"lifecycle_event": event}, combined)
+    directive = resolve_management_directive(text=combined, lifecycle_event=event)
+    assert directive.fraction == expected
+
+
+def test_r2c_18603_full_exit_is_not_blocked_by_a_later_profit_percent() -> None:
+    from telegram_kol_research.management_fraction_gate import (
+        validate_management_fraction_payload,
+    )
+
+    raw = (
+        "🔥直接触发止盈价！准不准？🔥\n🔥全部出局！全部出局！🔥\n🔥本轮空单最大获利95点！🔥\n"
+        "🔥持仓收益高达370％！🔥\n🔥🔥🔥\n@Tarderfengge QQ:158241758"
+    )
+    event = {"event_type": "exit_full", "management_action": "exit_full", "symbol": "BTC"}
+    validate_management_fraction_payload({"lifecycle_event": event}, raw)
+    directive = resolve_management_directive(text=raw, lifecycle_event=event)
+    assert directive.fraction != 3.7
+
+
+def test_r2c_a_number_already_stated_before_the_comma_unbinds_the_percent() -> None:
+    result = resolve_management_directive(
+        text="平仓78031.7，盈利126.05%",
+        lifecycle_event={"event_type": "exit_full", "management_action": "exit_full"},
+    )
+    assert result.fraction != 1.2605
+
+
+@pytest.mark.parametrize("text", ["减仓-20%", "止盈50-60%", "保留120%", "剩余100%"])
+def test_r2d_invalid_percentages_are_still_rejected(text) -> None:
+    with pytest.raises(ValueError, match="management_fraction_invalid"):
+        resolve_management_directive(
+            text=text, lifecycle_event={"management_action": "partial_take_profit"}
+        )
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("止盈，70%", 0.7),
+        ("减仓约30%", 0.3),
+        ("分批止盈80%！留尾仓", 0.8),
+        ("保留剩余30％冲击止盈位", 0.7),
+    ],
+)
+def test_r2e_ordinary_wording_keeps_its_fraction(text, expected) -> None:
+    result = resolve_management_directive(
+        text=text, lifecycle_event={"management_action": "partial_take_profit"}
+    )
+    assert result.fraction == pytest.approx(expected)
+
+
+def test_r2f_add_position_wording_is_still_risk_increasing() -> None:
+    result = resolve_management_directive(
+        text="可以加仓同等仓位",
+        lifecycle_event={"event_type": "position_update", "symbol": "BTC", "side": "long"},
+    )
+    assert result.reason_code == "risk_increasing_fanout_forbidden"
+    assert result.fanout_allowed is False
+
+
+def test_r2f_narrative_add_is_only_stripped_in_its_exact_form() -> None:
+    narrative = resolve_management_directive(
+        text="加仓后浮盈600点，减仓50%",
+        lifecycle_event={
+            "event_type": "position_update",
+            "management_action": "partial_take_profit",
+        },
+    )
+    assert narrative.reason_code != "risk_increasing_fanout_forbidden"
+    assert narrative.fraction == 0.5
+    for text in ("加仓后浮盈600点，可以加仓", "加仓了", "补仓"):
+        result = resolve_management_directive(
+            text=text, lifecycle_event={"event_type": "position_update"}
+        )
+        assert result.reason_code == "risk_increasing_fanout_forbidden"
