@@ -30,7 +30,8 @@
 ## 测试
 
 - 在最终候选 `a0b00007` 上跑了全量：10190 passed，18 failed，4 skipped。
-  - 其中 15 条在 `tests/test_minimal_server_updater.py` 和 `tests/test_server_update_scripts.py`。它们在 `origin/main` 上同样失败，与本线无关，是本地环境导致的旧失败。
+  - 其中 15 条在 `tests/test_minimal_server_updater.py` 和 `tests/test_server_update_scripts.py`，与本线无关，是运行环境问题：这两个文件会去找 **worktree 自己的** `.venv/bin/python`（`scripts/server_git_update.sh` 里的 `PLANNER_PYTHON` 默认值，以及测试里直接用到的路径），而这次的 worktree 里没有 `.venv`。
+  - 核对（2026-09-28）：在仓库内 `.claude/worktrees/` 下，分别建 `origin/main`（`4ff0d43c`）和候选（`9179d509`）的干净 worktree。两边都是先 15 failed；把 `.venv` 软链接到主检出的 venv 之后，两边都是 **46 passed / 0 failed**。所以失败只取决于 worktree 里有没有 `.venv`，和 worktree 放在仓库内还是仓库外、和代码改动都无关。
   - 另外 3 条是本线新增的 caplog 断言受执行顺序影响：包日志器的 `propagate` 被 `configure_application_logging` 关掉了。已在测试提交里修复，按全量中的顺序复现过：修复前 3 条失败，修复后全部通过。只动了测试文件，生产代码在这次全量之后没有变。
 - 回放用例覆盖了 19481（2a、2b）、19490（3a、3d、4a、4b）和 19491（入场放行）。每项都用 `git stash` 核对过：修复前失败，修复后通过。
 
