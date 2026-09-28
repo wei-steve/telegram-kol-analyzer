@@ -439,3 +439,336 @@ def test_the_worker_launch_passes_the_wakeup_hook():
     end = source.index("# The claim loop is supervised rather than bare", start)
     assert "entry_assembly_wakeup=" in source[start:end]
     assert "_run_exhausted_recognition_entry_wakeup" in source[start:end]
+
+
+# --------------------------------------------------------------------------
+# Fail-closed guard: a later, unreadable cancellation of this very entry
+# --------------------------------------------------------------------------
+
+LATER_CANCEL_RAW_ID = 19493
+LATER_CANCEL_POSTED_AT = datetime(2026, 9, 28, 3, 14, 10, tzinfo=UTC)
+
+
+def _later_cancel_evidence(
+    *,
+    symbol="BTC",
+    side="long",
+    target_lifecycle_id=None,
+    event_type="cancel_entry",
+    management_action=None,
+    message_classes=None,
+):
+    payload = {
+        "recognition_result": "非策略",
+        "strategy": {},
+        "lifecycle_event": {
+            "event_type": event_type,
+            "target_lifecycle_id": target_lifecycle_id,
+            "symbol": symbol,
+            "side": side,
+            "management_action": management_action,
+        },
+    }
+    if message_classes is not None:
+        payload["message_classes"] = message_classes
+    return json.dumps(payload, ensure_ascii=False)
+
+
+def _entry_then_later_cancel(
+    tmp_path,
+    *,
+    evidence_json: str,
+    reason: str = MIMO_AUTHORITATIVE_FAILED,
+    job_status: str = "failed",
+    own_lifecycle_id: int | None = None,
+    attempt_count: int = 5,
+):
+    """19491's entry, then a later "BTC多单取消，不进了" whose recognition died."""
+
+    session_factory = create_session_factory(tmp_path / "later-cancel.db")
+    engine = session_factory.kw["bind"]
+    plan = build_recognition_execution_schema_plan(engine)
+    apply_recognition_execution_schema(engine, expected_plan_sha256=plan.plan_sha256)
+    with session_factory() as session:
+        session.add_all(
+            [
+                RawMessage(
+                    id=STRATEGY_RAW_ID,
+                    chat_id=CHAT_ID,
+                    message_id=10792,
+                    posted_at=STRATEGY_POSTED_AT,
+                    text="BTC 83000-83300 做多，止损 81400，止盈 85600-87000",
+                ),
+                RawMessage(
+                    id=LATER_CANCEL_RAW_ID,
+                    chat_id=CHAT_ID,
+                    message_id=10794,
+                    posted_at=LATER_CANCEL_POSTED_AT,
+                    text="BTC多单取消，不进了",
+                ),
+            ]
+        )
+        session.flush()
+        candidate = SignalCandidate(
+            raw_message_id=STRATEGY_RAW_ID,
+            symbol="BTC",
+            side="long",
+            event_type="entry_signal",
+            parse_source="mimo_authoritative",
+            confidence=1,
+            recognition_generation="chen-19491",
+        )
+        session.add(candidate)
+        session.flush()
+        if own_lifecycle_id is not None:
+            from telegram_kol_research.models import StrategyLifecycle
+
+            session.add(
+                StrategyLifecycle(
+                    id=own_lifecycle_id,
+                    signal_candidate_id=candidate.id,
+                    chat_id=CHAT_ID,
+                    message_id=10792,
+                    symbol="BTC",
+                    side="long",
+                    lifecycle_status="pending_entry",
+                    signal_at=STRATEGY_POSTED_AT.replace(tzinfo=None),
+                )
+            )
+        session.add(
+            MessageEvidenceVersion(
+                raw_message_id=LATER_CANCEL_RAW_ID,
+                version=1,
+                input_fingerprint="chen-19493",
+                model="mimo",
+                prompt_versions_json="{}",
+                extraction_status="completed",
+                confidence=1,
+                text_evidence_json="{}",
+                image_evidence_json="{}",
+                normalized_evidence_json=evidence_json,
+            )
+        )
+        session.add(
+            RecognitionDecision(
+                raw_message_id=LATER_CANCEL_RAW_ID,
+                input_kind="text",
+                authoritative_model="mimo",
+                authoritative_status="识别失败",
+                authoritative_payload_json="{}",
+                agreement_status="authoritative_failed",
+                differences_json="[]",
+                prompt_versions_json="{}",
+                automation_status="skipped",
+                automation_reason=reason,
+            )
+        )
+        session.add(
+            MessageProcessingJob(
+                raw_message_id=LATER_CANCEL_RAW_ID,
+                chat_id=CHAT_ID,
+                status=job_status,
+                attempt_count=attempt_count,
+                claim_token=_CLAIM_TOKEN if job_status == "claimed" else None,
+                claimed_at=(
+                    FIFTH_FAILURE_AT.replace(tzinfo=None)
+                    if job_status == "claimed"
+                    else None
+                ),
+                last_reason="processing_error:AuthoritativeProcessingFailed",
+            )
+        )
+        session.commit()
+        return session_factory, int(candidate.id)
+
+
+def test_the_replayed_19490_is_released_because_it_came_first(tmp_path):
+    """(a) 19490 precedes 19491 and names lifecycle 1327 exactly: released."""
+
+    session_factory, candidate_id, _ = _chen_chat(
+        tmp_path, job_status="failed", attempt_count=5
+    )
+
+    assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+@pytest.mark.parametrize(
+    "reason", [MIMO_AUTHORITATIVE_FAILED, MIMO_AUTHORITATIVE_FAILED_EXHAUSTED]
+)
+def test_a_later_unreadable_cancellation_of_this_entry_keeps_blocking(
+    tmp_path, reason
+):
+    """(b) Both exhausted forms: job ``failed``, or the rewritten reason."""
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path, evidence_json=_later_cancel_evidence(), reason=reason
+    )
+
+    decision = _assess(session_factory, candidate_id)
+
+    assert decision.status == "deferred"
+    assert decision.blocking_raw_message_ids == (LATER_CANCEL_RAW_ID,)
+
+
+def test_a_later_cancellation_naming_another_lifecycle_is_released(tmp_path):
+    """(c) An exact first-pass target that is not this entry's lifecycle."""
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(
+            target_lifecycle_id=1327,
+            message_classes=[
+                {
+                    "class": "策略管理",
+                    "target": {
+                        "resolution": "exact",
+                        "lifecycle_id": 1327,
+                        "symbol": "BTC",
+                        "side": "long",
+                    },
+                }
+            ],
+        ),
+    )
+
+    assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+def test_a_later_cancellation_naming_this_entrys_own_lifecycle_keeps_blocking(
+    tmp_path,
+):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(target_lifecycle_id=1400),
+        own_lifecycle_id=1400,
+    )
+
+    assert _assess(session_factory, candidate_id).status == "deferred"
+
+
+def test_a_later_exit_for_another_symbol_is_released(tmp_path):
+    """(d) Risk-reducing, but for ETH while the entry is BTC."""
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(
+            symbol="ETHUSDT", side="long", event_type="exit_position"
+        ),
+    )
+
+    assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+def test_a_later_exit_for_the_opposite_side_is_released(tmp_path):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(side="short", event_type="exit_position"),
+    )
+
+    assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+def test_a_later_cancellation_with_no_symbol_keeps_blocking(tmp_path):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(symbol=None, side=None),
+    )
+
+    assert _assess(session_factory, candidate_id).status == "deferred"
+
+
+def test_a_management_action_alone_makes_it_risk_reducing(tmp_path):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(
+            event_type="position_update", management_action="full_exit"
+        ),
+    )
+
+    assert _assess(session_factory, candidate_id).status == "deferred"
+
+
+def test_a_later_message_that_takes_no_risk_off_is_released(tmp_path):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(
+            event_type="position_update", management_action="move_stop_to_break_even"
+        ),
+    )
+
+    assert _assess(session_factory, candidate_id).status != "deferred"
+
+
+def test_a_later_cancellation_still_being_retried_blocks_as_before(tmp_path):
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(target_lifecycle_id=1327),
+        job_status="pending",
+    )
+
+    assert _assess(session_factory, candidate_id).status == "deferred"
+
+
+def test_the_worker_wakeup_does_not_release_what_the_guard_holds(
+    tmp_path, monkeypatch
+):
+    """The completed-message wakeup skips re-assessment, so it must not be used
+    to release an entry the later cancellation may target."""
+
+    session_factory, candidate_id = _entry_then_later_cancel(
+        tmp_path,
+        evidence_json=_later_cancel_evidence(),
+        job_status="claimed",
+        attempt_count=4,
+    )
+    with session_factory() as session:
+        job_id = session.query(MessageProcessingJob.id).scalar()
+    assert _assess(
+        session_factory, candidate_id, at=FIFTH_FAILURE_AT - timedelta(seconds=30)
+    ).blocking_raw_message_ids == (LATER_CANCEL_RAW_ID,)
+    executed = []
+
+    result = asyncio.run(
+        run_message_processing_worker_tick(
+            session_factory,
+            now=FIFTH_FAILURE_AT,
+            job_processor=_authoritative_failure,
+            loop_lag_snapshot_provider=lambda: {"last_stall_at": None},
+            entry_assembly_wakeup=_production_wakeup(
+                session_factory, monkeypatch, executed
+            ),
+            _preclaimed_jobs=[
+                MessageProcessingClaim(
+                    job_id=job_id,
+                    raw_message_id=LATER_CANCEL_RAW_ID,
+                    chat_id=CHAT_ID,
+                    attempt_count=4,
+                    claim_token=_CLAIM_TOKEN,
+                    source_reason="worker_claimed",
+                )
+            ],
+        )
+    )
+
+    assert result.failed == 1
+    assert executed == []
+    with session_factory() as session:
+        attempt = session.query(EntryAssemblyAttempt).one()
+        assert attempt.status == "pending"
+        assert json.loads(attempt.blocking_raw_message_ids_json) == [
+            LATER_CANCEL_RAW_ID
+        ]
+    assert _decision_reason_for(session_factory, LATER_CANCEL_RAW_ID) == (
+        MIMO_AUTHORITATIVE_FAILED_EXHAUSTED
+    )
+    # And the reconciler's re-assessment keeps holding it too.
+    assert _assess(session_factory, candidate_id).status == "deferred"
+
+
+def _decision_reason_for(session_factory, raw_message_id):
+    with session_factory() as session:
+        return (
+            session.query(RecognitionDecision.automation_reason)
+            .filter(RecognitionDecision.raw_message_id == raw_message_id)
+            .scalar()
+        )

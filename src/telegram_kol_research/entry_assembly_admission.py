@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal, InvalidOperation
 
-from sqlalchemy import func, update
+from sqlalchemy import and_, func, or_, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import sessionmaker
 
@@ -37,6 +37,7 @@ from telegram_kol_research.models import (
     RawMessage,
     RecognitionDecision,
     SignalCandidate,
+    StrategyLifecycle,
 )
 from telegram_kol_research.message_evidence import (
     has_material_strategy_evidence,
@@ -44,6 +45,7 @@ from telegram_kol_research.message_evidence import (
 )
 from telegram_kol_research.recognition_failure_attribution import (
     MIMO_AUTHORITATIVE_FAILED,
+    MIMO_AUTHORITATIVE_FAILED_EXHAUSTED,
 )
 
 
@@ -80,6 +82,45 @@ _TERMINAL_NO_ACTION_STATUSES = frozenset({"completed", "blocked"})
 _NON_TERMINAL_SKIP_REASONS = frozenset({MIMO_AUTHORITATIVE_FAILED})
 #: ``message_processing_jobs.status`` values after which no retry is coming.
 _JOB_EXHAUSTED_STATUSES = frozenset({"failed"})
+
+#: Lifecycle ``event_type`` values that take risk off: the first-pass prompt's
+#: own vocabulary (``prompt_defaults.py``: ``cancel_entry``, ``exit_position``),
+#: the candidate-level ``close_signal`` this module already maps to a
+#: cancellation (``_load_source_facts``), and the full-exit spellings the
+#: management readers accept as event types (``management_directives.py``,
+#: ``message_recognition.py``).
+_RISK_REDUCING_EVENT_TYPES = frozenset(
+    {
+        "cancel_entry",
+        "exit_position",
+        "close_signal",
+        "exit_full",
+        "full_exit",
+        "close_position",
+    }
+)
+#: ``management_action`` values that take risk off, whatever the event type
+#: says: ``message_operation_contracts._CANCEL_ACTIONS`` / ``_EXIT_ACTIONS``
+#: plus the partial/full aliases ``authoritative_instructions._canonical_kind``
+#: folds together.
+_RISK_REDUCING_ACTIONS = frozenset(
+    {
+        "cancel",
+        "cancel_entry",
+        "cancel_order",
+        "cancel_pending_entry",
+        "exit",
+        "exit_position",
+        "exit_full",
+        "full_exit",
+        "full_close",
+        "close_position",
+        "partial_exit",
+        "exit_partial",
+    }
+)
+_MANAGEMENT_CLASS_LABELS = frozenset({"策略管理", "仓位管理"})
+_QUOTE_SUFFIXES = ("SWAP", "USDT", "USDC", "USD")
 
 
 @dataclass(frozen=True, slots=True)
@@ -163,6 +204,132 @@ def _decision_is_terminal_no_action(
     if reason not in _NON_TERMINAL_SKIP_REASONS:
         return True
     return str(job_status or "").strip().lower() in _JOB_EXHAUSTED_STATUSES
+
+
+def _decision_is_exhausted_failure(
+    decision: RecognitionDecision | None,
+    *,
+    job_status: str | None,
+) -> bool:
+    """Whether the decision is terminal only because its retries ran out."""
+
+    if decision is None:
+        return False
+    if str(decision.automation_status or "").strip().lower() != "skipped":
+        return False
+    reason = str(decision.automation_reason or "").strip().lower()
+    if reason == MIMO_AUTHORITATIVE_FAILED_EXHAUSTED:
+        return True
+    return (
+        reason == MIMO_AUTHORITATIVE_FAILED
+        and str(job_status or "").strip().lower() in _JOB_EXHAUSTED_STATUSES
+    )
+
+
+def _base_symbol(value: object) -> str | None:
+    text = "".join(ch for ch in str(value or "").upper() if ch.isascii() and ch.isalnum())
+    for suffix in _QUOTE_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            text = text[: -len(suffix)]
+    return text or None
+
+
+def _side(value: object) -> str | None:
+    text = str(value or "").strip().lower()
+    if text in {"long", "buy"} or text in {"多", "做多", "开多"}:
+        return "long"
+    if text in {"short", "sell"} or text in {"空", "做空", "开空"}:
+        return "short"
+    return None
+
+
+def _exhausted_blocker_may_cancel_entry(
+    normalized: dict,
+    *,
+    blocker: RawMessage,
+    strategy: RawMessage,
+    candidate: SignalCandidate,
+    own_lifecycle_ids: frozenset[int],
+) -> bool:
+    """Whether an unreadable neighbour could be the cancellation of this entry.
+
+    4a/4b made an exhausted recognition failure terminal, which releases the
+    entry behind it after about ten minutes. Before that it waited six hours
+    and expired -- fail-closed. That is still the right answer for the one
+    shape where releasing is dangerous: the KOL posts an entry, then a
+    "取消 / 不进了 / 全部出局" for it, and the cancellation is the message we
+    could not read. The first-pass evidence survives the failure, so it says
+    enough to tell that shape apart; anything else is released.
+
+    Released (``False``) when any of these holds:
+
+    * the neighbour was posted before the strategy message. A cancellation
+      cannot cancel an entry that did not exist yet -- 陈哥's 19490 preceded
+      19491 by five seconds. Posting *after* is necessary, not sufficient: the
+      adjacent window also holds later messages about other positions, which
+      the three tests below tell apart;
+    * its lifecycle event takes no risk off (``_RISK_REDUCING_EVENT_TYPES`` /
+      ``_RISK_REDUCING_ACTIONS``). ``message_classes`` carries no action of its
+      own, so it cannot make a message risk-reducing -- only targets come
+      from it;
+    * every target it names is an ``exact`` lifecycle that is not this
+      entry's. Admission runs before this entry has a lifecycle in the normal
+      order, so the entry's own set is whatever ``strategy_lifecycles`` row
+      already carries its candidate or its (chat, message) -- usually none,
+      in which case any exact target is another position's;
+    * every target it names is for a different symbol or side. A missing or
+      unreadable symbol or side matches, so ignorance keeps the block.
+    """
+
+    if source_order_key(
+        blocker.posted_at, blocker.message_id, blocker.id
+    ) < source_order_key(strategy.posted_at, strategy.message_id, strategy.id):
+        return False
+    lifecycle = normalized.get("lifecycle_event")
+    lifecycle = lifecycle if isinstance(lifecycle, dict) else {}
+    event_type = str(lifecycle.get("event_type") or "").strip().lower()
+    action = str(lifecycle.get("management_action") or "").strip().lower()
+    if (
+        event_type not in _RISK_REDUCING_EVENT_TYPES
+        and action not in _RISK_REDUCING_ACTIONS
+    ):
+        return False
+
+    targets: list[tuple[int | None, object, object]] = []
+    try:
+        lifecycle_target = int(lifecycle.get("target_lifecycle_id"))
+    except (TypeError, ValueError):
+        lifecycle_target = None
+    targets.append((lifecycle_target, lifecycle.get("symbol"), lifecycle.get("side")))
+    classes = normalized.get("message_classes")
+    for element in classes if isinstance(classes, list) else []:
+        if not isinstance(element, dict):
+            continue
+        if str(element.get("class") or "") not in _MANAGEMENT_CLASS_LABELS:
+            continue
+        target = element.get("target")
+        target = target if isinstance(target, dict) else {}
+        exact_id = None
+        if str(target.get("resolution") or "") == "exact":
+            try:
+                exact_id = int(target.get("lifecycle_id"))
+            except (TypeError, ValueError):
+                exact_id = None
+        targets.append((exact_id, target.get("symbol"), target.get("side")))
+
+    entry_symbol = _base_symbol(candidate.symbol)
+    entry_side = _side(candidate.side)
+    for exact_id, symbol, side in targets:
+        if exact_id is not None and exact_id not in own_lifecycle_ids:
+            continue
+        target_symbol = _base_symbol(symbol)
+        target_side = _side(side)
+        if target_symbol and entry_symbol and target_symbol != entry_symbol:
+            continue
+        if target_side and entry_side and target_side != entry_side:
+            continue
+        return True
+    return False
 
 
 def _is_adjacent_entry_context_defer(result_json: str | None) -> bool:
@@ -451,6 +618,7 @@ def _load_source_facts(
             )
         )
         represented_raw_ids.add(int(raw.id))
+    own_lifecycle_ids: frozenset[int] | None = None
     for raw_id, raw in raw_by_id.items():
         if raw_id in active_claim_ids:
             facts.append(
@@ -523,13 +691,34 @@ def _load_source_facts(
                 # ``fragment_application_pending`` is decided by the evidence
                 # alone (fragment rows are persisted straight from it), so it
                 # deliberately stays outside the decision test.
+                decision = decisions_by_raw.get(raw_id)
+                job_status = job_status_by_raw.get(raw_id)
+                decision_terminal = _decision_is_terminal_no_action(
+                    decision, job_status=job_status
+                )
+                if (
+                    decision_terminal
+                    and action_expected
+                    and raw_id not in candidate_raw_ids
+                    and _decision_is_exhausted_failure(
+                        decision, job_status=job_status
+                    )
+                ):
+                    if own_lifecycle_ids is None:
+                        own_lifecycle_ids = _own_lifecycle_ids(
+                            session, strategy=strategy, candidate=candidate
+                        )
+                    decision_terminal = not _exhausted_blocker_may_cancel_entry(
+                        normalized,
+                        blocker=raw,
+                        strategy=strategy,
+                        candidate=candidate,
+                        own_lifecycle_ids=own_lifecycle_ids,
+                    )
                 application_pending = fragment_application_pending or (
                     action_expected
                     and raw_id not in candidate_raw_ids
-                    and not _decision_is_terminal_no_action(
-                        decisions_by_raw.get(raw_id),
-                        job_status=job_status_by_raw.get(raw_id),
-                    )
+                    and not decision_terminal
                 )
             facts.append(
                 AdjacentEntryFact(
@@ -549,6 +738,103 @@ def _load_source_facts(
                 )
             )
     return facts, cutoff
+
+
+def _own_lifecycle_ids(
+    session,
+    *,
+    strategy: RawMessage,
+    candidate: SignalCandidate,
+) -> frozenset[int]:
+    """Lifecycles that already belong to the entry being admitted, if any."""
+
+    rows = (
+        session.query(StrategyLifecycle.id)
+        .filter(
+            or_(
+                StrategyLifecycle.signal_candidate_id == int(candidate.id),
+                and_(
+                    StrategyLifecycle.chat_id == int(strategy.chat_id),
+                    StrategyLifecycle.message_id == int(strategy.message_id),
+                ),
+            )
+        )
+        .all()
+    )
+    return frozenset(int(row_id) for (row_id,) in rows)
+
+
+def exhausted_blocker_wake_is_safe(
+    session_factory: sessionmaker,
+    *,
+    blocker_raw_message_id: int,
+) -> bool:
+    """Whether naming this exhausted message as completed may release entries.
+
+    The completed-message wakeup removes the message from every pending
+    attempt's blocker list without re-assessing admission, which is right for
+    a message that finished and wrong for an unreadable later cancellation of
+    the entry (``_exhausted_blocker_may_cancel_entry``). When any attempt it
+    blocks could be that, or its evidence cannot be read, the caller must not
+    name it: the reconciler re-assesses each attempt on its own and releases
+    the ones the guard allows.
+    """
+
+    with session_factory() as session:
+        blocker = session.get(RawMessage, int(blocker_raw_message_id))
+        if blocker is None:
+            return False
+        attempts = (
+            session.query(EntryAssemblyAttempt)
+            .filter(EntryAssemblyAttempt.status == "pending")
+            .all()
+        )
+        blocked = []
+        for attempt in attempts:
+            try:
+                blockers = {
+                    int(value)
+                    for value in json.loads(attempt.blocking_raw_message_ids_json or "[]")
+                }
+            except (TypeError, ValueError, json.JSONDecodeError):
+                return False
+            if int(blocker.id) in blockers:
+                blocked.append(attempt)
+        if not blocked:
+            return True
+        evidence = (
+            session.query(MessageEvidenceVersion)
+            .filter(
+                MessageEvidenceVersion.raw_message_id == int(blocker.id),
+                MessageEvidenceVersion.superseded_at.is_(None),
+            )
+            .order_by(MessageEvidenceVersion.version.desc())
+            .first()
+        )
+        if evidence is None or evidence.extraction_status != "completed":
+            return False
+        try:
+            normalized = json.loads(evidence.normalized_evidence_json or "{}")
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return False
+        if not isinstance(normalized, dict):
+            return False
+        for attempt in blocked:
+            strategy = session.get(RawMessage, int(attempt.strategy_raw_message_id))
+            candidate = session.get(SignalCandidate, int(attempt.signal_candidate_id))
+            if strategy is None or candidate is None:
+                return False
+            if _exhausted_blocker_may_cancel_entry(
+                normalized,
+                blocker=blocker,
+                strategy=strategy,
+                candidate=candidate,
+                own_lifecycle_ids=_own_lifecycle_ids(
+                    session, strategy=strategy, candidate=candidate
+                ),
+            ):
+                return False
+        return True
 
 
 def _persist_attempt(

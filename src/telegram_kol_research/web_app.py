@@ -5455,9 +5455,25 @@ def _run_exhausted_recognition_entry_wakeup(
         or app.state.auto_trade_executor is None
     ):
         return
+    from telegram_kol_research.entry_assembly_admission import (
+        exhausted_blocker_wake_is_safe,
+    )
+
+    # Naming the message releases every entry it blocks without re-assessing.
+    # When it could be an unreadable cancellation of one of them, only the
+    # already-admitted entries are drained and the reconciler decides the
+    # rest one by one, fail-closed.
+    completed = (
+        int(raw_message_id)
+        if exhausted_blocker_wake_is_safe(
+            app.state.session_factory,
+            blocker_raw_message_id=int(raw_message_id),
+        )
+        else None
+    )
     _run_entry_assembly_wakeups(
         app.state.session_factory,
-        completed_raw_message_id=int(raw_message_id),
+        completed_raw_message_id=completed,
         auto_trade_executor=app.state.auto_trade_executor,
         execution_owner=app.state.recognition_execution_owner,
         execution_registry=app.state.recognition_execution_registry,

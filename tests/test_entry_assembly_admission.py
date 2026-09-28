@@ -785,7 +785,11 @@ def _persist_neighbor_evidence_and_decision(
         ("blocked", "source_message_deleted", False),
         ("skipped", "mimo_authoritative_failed", True),
         # 2026-09-28: written once the processing job has spent its retries.
-        ("skipped", "mimo_authoritative_failed_exhausted", False),
+        # Terminal, but this neighbour is a later exit_position naming no
+        # symbol, so it could be this entry's cancellation and stays
+        # fail-closed; the release cases are in
+        # test_exhausted_recognition_unblocks_entry.py.
+        ("skipped", "mimo_authoritative_failed_exhausted", True),
         ("deferred", "source_message_deletion_hold", True),
     ],
 )
